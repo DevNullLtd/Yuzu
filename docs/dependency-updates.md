@@ -303,9 +303,10 @@ audit log.
 the default branch may use; once the owner has moved it there and deleted the
 repository copy, a workflow on another branch cannot read it, and until then it
 is still a repository secret (see "The cla environment"). The bump App's
-private key is to be stored the same way,
-in the `vcpkg-baseline` environment, which only `main` may use (see "Where
-the credentials are stored"). Neither makes the merge rule a control.
+private key is to be stored the same way, in the `vcpkg-baseline`
+environment, which only `main` may use (see "Where the credentials are
+stored"); until the owner has created it, the bump job fails at its
+credentials check. Neither makes the merge rule a control.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
@@ -529,8 +530,9 @@ run fails at its first step and the `vcpkg-baseline-broken` issue stays open.
 `CLA_REPO_ACCESS_TOKEN` is to be stored in the `cla` environment, which only
 the default branch may use. Once the setup below is complete, including
 deleting the repository copy, a workflow on another branch cannot read it;
-until then it is still a repository secret. The token lets `cla.yml` write the signatures store. Its `cla-check` job, the
-only job that reads the token, declares the environment:
+until then it is still a repository secret. The token lets `cla.yml` write the
+signatures store. Its `cla-check` job, the only job that reads the token,
+declares the environment:
 
 ```yaml
 environment:

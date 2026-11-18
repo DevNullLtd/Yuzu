@@ -1118,14 +1118,18 @@ Dev and Protect Main, a deliberate break-glass route whose use is visible in the
 It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
 2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
 from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
-supply-chain CODEOWNERS entries (#8243, owners `@fjarvis`
-and `@Tr3kkR`) request review but do not require it, and both owners can bypass the
-rulesets as organisation admins. This is to be reviewed by 2027-05-18, tracked in #8228.
+supply-chain CODEOWNERS entries proposed in #8243 (owners `@fjarvis` and `@Tr3kkR`) will
+request review once that pull request is merged, but will not require it, and both owners
+can bypass the rulesets as organisation admins. This is to be reviewed by 2027-05-18,
+tracked in #8228.
 
 Until the owner completes the `cla` environment setup ([Dependency updates](dependency-updates.md),
 "The cla environment"), `CLA_REPO_ACCESS_TOKEN` is still a repository secret that a workflow on
-any branch can read, and so a second route around the review rule. This interim state is
-tracked in #8228 and ends when the repository copy is deleted.
+any branch can read, and so a second route around the review rule. A merge that used it
+cannot be told apart in the audit log from the token owner's own actions, so for that
+period review records are evidence of review only for merges the token's owner did not
+approve. This interim state is tracked in #8228 and ends when the repository copy is
+deleted.
 
 A pull request merged through the bypass is not covered by the rulesets' review
 requirement, so the PR review records cited above are evidence of review only for merges

@@ -46,16 +46,16 @@ name: vcpkg baseline update
 # admin's ruleset bypass, environment or not (docs/dependency-updates.md,
 # "Self-hosted CI is held until a maintainer approves the head"). The
 # OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
-# break-glass route, accepted by fjarvis (project owner) on 2026-11-18
-# (review by 2027-05-18, tracked in #8228), and its use is visible in the
-# audit log. CLA_REPO_ACCESS_TOKEN is to be stored in the `cla` environment,
-# which only the default branch may use; until the owner has moved it there
-# and deleted the repository copy it is still a repository secret
-# (docs/dependency-updates.md, "The cla environment"). The `vcpkg-baseline` environment is an owner setting
-# (docs/dependency-updates.md, "The bump App", "Where the credentials are
-# stored"); a dispatch of this workflow from any branch but `main` therefore
-# fails at job start. No other job, and no other workflow,
-# may name the key, the client ID or the environment
+# break-glass route, accepted by fjarvis (project owner) on 2026-11-18 (review
+# by 2027-05-18, tracked in #8228), and its use is visible in the audit log.
+# CLA_REPO_ACCESS_TOKEN is to be stored in the `cla` environment, which only
+# the default branch may use; until the owner has moved it there and deleted
+# the repository copy it is still a repository secret
+# (docs/dependency-updates.md, "The cla environment"). The `vcpkg-baseline`
+# environment is an owner setting (docs/dependency-updates.md, "The bump App",
+# "Where the credentials are stored"); a dispatch of this workflow from any
+# branch but `main` therefore fails at job start. No other job, and no other
+# workflow, may name the key, the client ID or the environment
 # (tests/shell/test_vcpkg_baseline_bump.sh).
 #
 # SELF-HOSTED APPROVAL. The PR builds an unreviewed microsoft/vcpkg HEAD.
@@ -103,9 +103,10 @@ jobs:
     name: Propose vcpkg baseline bump
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # The bump App's client ID and private key live in this environment,
-    # which only `main` may use (see ENVIRONMENT in the header). Never add it
-    # to another job.
+    # The bump App's client ID and private key are to be stored in this
+    # environment, which only `main` may use (owner setup; see ENVIRONMENT in
+    # the header). Until they are, this job fails at its credentials check.
+    # Never add the environment to another job.
     environment: vcpkg-baseline
     permissions:
       contents: read          # actions/checkout

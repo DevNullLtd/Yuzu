@@ -12,7 +12,7 @@ name: CLA Assistant
 #  ACTIVE on DevNullLtd/Yuzu (activated 2026-05-21, while the repo was
 #  Tr3kkR/Yuzu; transferred to the DevNullLtd org 2026-09-28).
 # ─────────────────────────────────────────────────────────────────────────
-# Provisioning (in place):
+# Provisioning (owner setup; see docs/dependency-updates.md, "The cla environment"):
 #   - Secret `CLA_REPO_ACCESS_TOKEN`: a token able to write the signatures
 #     store. It is to be stored in the `cla` environment, which only the
 #     default branch may use. Once the owner has moved it there and deleted
@@ -41,7 +41,7 @@ name: CLA Assistant
 # requests, which a plain `pull_request` run cannot (read-only token, no
 # secrets). The job never checks out or executes pull-request code: it runs
 # one SHA-pinned action that reads event metadata through the API. The token
-# it hands that action is in the `cla` environment (Provisioning above).
+# it hands that action is to be stored in the `cla` environment (Provisioning above).
 on:
   issue_comment:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     types: [created]
@@ -61,8 +61,9 @@ jobs:
       statuses: write
     # Live on the canonical repo only; forks of Yuzu skip the CLA gate.
     if: github.repository == 'DevNullLtd/Yuzu'
-    # CLA_REPO_ACCESS_TOKEN is in this environment, whose only deployment
-    # branch is `main`. Both triggers run the default branch's copy of this
+    # CLA_REPO_ACCESS_TOKEN is to be stored in this environment, whose only
+    # deployment branch is `main` (owner setup; until then it is still a
+    # repository secret). Both triggers run the default branch's copy of this
     # file with GITHUB_REF set to the default branch, which is what the
     # environment's branch rule is matched against, so fork pull requests
     # pass it too. `deployment: false` keeps GitHub from creating a
