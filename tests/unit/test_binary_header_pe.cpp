@@ -85,7 +85,7 @@ struct VerSpec {
     std::array<std::uint16_t, 4> fv{1, 2, 3, 4};
     std::array<std::uint16_t, 4> pv{5, 6, 7, 8};
     std::vector<TableSpec> tables;
-    std::vector<std::pair<std::uint16_t, std::uint16_t>> translations;
+    std::vector<std::array<std::uint16_t, 2>> translations; // {language, code page}
     bool no_nul_first_string{false}; // first String's text has no NUL inside its node
 };
 
@@ -339,7 +339,7 @@ void check_canonical_values(const PeVersionInfo& v) {
     std::sort(want.begin(), want.end());
     CHECK(got == want);
     REQUIRE(v.translations.size() == 1);
-    CHECK(v.translations[0] == std::pair<std::uint16_t, std::uint16_t>{0x409, 1200});
+    CHECK(v.translations[0] == std::pair{std::uint16_t{0x409}, std::uint16_t{1200}});
 }
 
 } // namespace
@@ -406,7 +406,7 @@ TEST_CASE("binary_header_pe: several tables, translations and an empty value", "
     CHECK(r->string_tables[0].strings[1] == std::pair<std::string, std::string>{"K2", ""});
     CHECK(r->string_tables[1].language == 0x407);
     CHECK(r->translations.size() == 2);
-    CHECK(r->translations[1] == std::pair<std::uint16_t, std::uint16_t>{0x407, 1252});
+    CHECK(r->translations[1] == std::pair{std::uint16_t{0x407}, std::uint16_t{1252}});
 }
 
 TEST_CASE("binary_header_pe: no resource directory, or no RT_VERSION, is a value",

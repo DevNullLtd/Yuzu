@@ -362,8 +362,8 @@ TEST_CASE("elf: no program headers is a plain header", "[binary_header][elf]") {
     for (const auto& sh : kShapes) {
         INFO(sh.name);
         auto c = canonical(sh);
-        c.spec.phnum = 0;
-        c.spec.phentsize = 7; // ignored when there is nothing to read
+        c.spec.phnum = u16{0};
+        c.spec.phentsize = u16{7}; // ignored when there is nothing to read
         const auto i = must_read(build(c.spec));
         CHECK(i.program_headers.empty());
         CHECK(i.interpreter.empty());
@@ -398,9 +398,9 @@ TEST_CASE("elf: program-header count, size and table placement", "[binary_header
         const std::size_t phent = sh.is64 ? 56 : 32;
         {
             auto c = canonical(sh);
-            c.spec.phnum = 0xFFFF; // PN_XNUM
+            c.spec.phnum = u16{0xFFFF}; // PN_XNUM
             expect_err(build(c.spec), bh::ParseError::limit_exceeded);
-            c.spec.phnum = 129; // one over the default cap
+            c.spec.phnum = u16{129}; // one over the default cap
             expect_err(build(c.spec), bh::ParseError::limit_exceeded);
         }
         {
