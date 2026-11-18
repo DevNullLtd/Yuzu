@@ -46,7 +46,10 @@ machine-independent, and keeping a test honest about the host it ran on.
    `rows[0]` carries on into an out-of-range read when the size is wrong. (`.at()` throws, a clean
    failure.) Found at `test_echo_store.cpp` (`rows[0]` after a size `CHECK`) and
    `test_echo_netqual_nstat.cpp` (`kept[1]`) (#8212); the sweep found the same shape twice in
-   `tests/unit/server/test_echo_process_tree.cpp`.
+   `tests/unit/server/test_echo_process_tree.cpp`. An index already bounded by the same size is safe
+   and takes the marker instead: a `REQUIRE` inside a data-driven loop would end the case on its
+   first bad row (`tests/unit/server/test_echo_timeline_render.cpp`, where the loop bounds `i` by
+   `labels.size()`).
 
 ## Host dependence and honesty
 
@@ -76,7 +79,10 @@ machine-independent, and keeping a test honest about the host it ran on.
 9. **Every timeout and bound cites a recorded measurement.** A limit is set from data and raised only
    with a new measurement recorded beside it. `tests/meson.build` carries the Echo limits with their
    figures; #8234 tracks CI keeping no per-case timing, and `must_return_within` prints the real
-   elapsed seconds of every bounded call to the test log so bounds can be re-derived. Both
+   elapsed seconds of every bounded call to the test log so bounds can be re-derived. A pure hang
+   backstop on an in-memory wait that the code under test releases (`kBound` in
+   `test_echo_open_retry.cpp`: a zero-delay loop, no I/O) is not a performance limit; it says so
+   beside the constant instead of citing a measurement. Both
    directions are on record: 187cf77e83 moved the v10 migration cases into their own entry, from
    per-case times, rather than raise the 90 s limit that would also have hidden a real slowdown, and
    3fc601419b raised the echo limit to 180 s and the agent shards to 480 s from measured runs,
@@ -92,18 +98,28 @@ VM active, CPU 12-31%) was **38.7 s**. A shutdown happens inside a leaf, so that
 any shutdown. Shared CI amplifies I/O 3-6x (the "Budget rule" in
 [unit-test-conventions.md](unit-test-conventions.md)); at the lower end, 3 x 38.7 s = 116.1 s,
 rounded up to **120 s**. On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown
-case 0.007 s. 120 s is below agent shard C's 480 s limit, so a hang still gets a named message
-before the meson timeout. The Windows figure is itself under investigation (#8244). Revise the
-constant only with a new recorded measurement.
+case 0.007 s. The Windows figure is itself under investigation (#8244). Revise the constant only
+with a new recorded measurement.
+
+It is **120 s in every build**: `must_return_within` applies the bound it is given exactly. 120 s is
+below each meson limit it races, 180 s (`echo unit tests`, where the `OpenRetryLoop` cases run) and
+480 s (agent shard C, where the dispatcher fixture's shutdown runs). `EchoSession`'s default bound
+is `kReturnBound * kSpinScale`, because a real plugin shutdown is legitimately slower under a
+sanitizer: 720 s on the sanitizer legs, against shard C's 960 s there, since those legs run
+`meson test --timeout-multiplier 2` (`sanitizer-tests.yml`, `nightly.yml`). A hang early in a run
+gets the named message. One that starts late in a slow run can still reach the meson timeout first:
+the echo unit tests measure 40-82 s on Windows, so a hang after about 60 s of a 180 s entry ends at
+the limit, before the bound.
 
 One case is tighter on purpose. The real-plugin offline case ("a failed v10 migration loads Echo
 offline ... shuts down promptly") bounds its shutdown by **half of `yuzu::echo::open_retry_delay(1)`**
-(the first retry delay, so 30 s today), taken from the header so it follows the schedule. A shutdown
-that waits out the first back-off is exactly the regression that case exists to catch, and a 120 s
-bound would let it through. Half the delay and not the whole, because the back-off began when init
-returned, before `shutdown()` is called: a shutdown that waits it out returns slightly before a bound
-equal to the delay expires. Measured with the `stop()` wake-up removed, 2 of 4 runs at the full delay
-were not caught; at half the delay, 4 of 4 were.
+(the first retry delay, so 30 s today), taken from the header so it follows the schedule and passed
+unscaled: this bound is the property under test, and the first back-off does not stretch under a
+sanitizer. A shutdown that waits out the first back-off is exactly the regression that case exists
+to catch, and a 120 s bound would let it through. Half the delay and not the whole, because the
+back-off began when init returned, before `shutdown()` is called: a shutdown that waits it out
+returns slightly before a bound equal to the delay expires. Measured with the `stop()` wake-up
+removed, 2 of 4 runs at the full delay were not caught; at half the delay, 4 of 4 were.
 
 ### What `must_return_within` does on a hang
 
@@ -112,7 +128,9 @@ that ran `start()` and `init()`) while a watchdog waits. If the bound passes, th
 stdio, prints what hung, and ends the process through `hard_exit(3)`. A hung `stop()` cannot be
 unwound (the owner's destructor blocks in the same call), so a clean test failure is not available;
 ending the process with a message replaces a silent hang to the meson timeout. The CI flake classifier
-reports the abnormal exit as unclassifiable, which is correct for a hang.
+reports the abnormal exit as unclassifiable, which is correct for a hang. The `[echo][bounded_return]`
+cases in `test_echo_open_retry.cpp` pin the rest of the contract with a recording expiry action; the
+real exit code and stderr text are not covered by a retained test (a unit test never spawns a process).
 
 ## The gate
 
@@ -133,7 +151,8 @@ string literal or a `/* */` block comment waives nothing. Every marker is visibl
 justify it in the PR. **There is no baseline file:** the tree is clean or the finding is marked.
 
 **Known limits.** The gate is lexical. A guard token that is present but does not protect the wait
-passes. A size `CHECK` more than 10 lines before its index, or through an alias, is missed. A raw
+passes, and it checks presence, not order: a guard declared before what it releases (rule 4 asks for
+the opposite) passes too. A marker waives every flag on its line, not only the one it justifies. A size `CHECK` more than 10 lines before its index, or through an alias, is missed. A raw
 thread with a throwing assertion before its join is not flagged. The source-health ledger,
 retention-guard counters and pid-name map live in the plugin singleton and cannot be reset from a
 test, so a case asserts on what it changed, never on a count another case could have moved. The gate

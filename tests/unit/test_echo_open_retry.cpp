@@ -31,6 +31,8 @@ using namespace std::chrono_literals;
 
 namespace {
 // Generous: only a hang would reach it; every wait below is released by the code under test.
+// A hang backstop on in-memory waits (a zero-delay loop, no I/O), not a performance limit, and the
+// value this file already carried, so it cites no measurement (rule 9 of the Echo test standard).
 constexpr auto kBound = 30s;
 
 // Wait for a promise a worker sets. Every caller's OpenRetryLoop destructor stops and joins the
@@ -342,7 +344,7 @@ TEST_CASE("OpenRetryLoop: an attempt that throws counts as failed and the loop c
     CHECK(calls.load() == 2);
 }
 
-TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minute away and stop() ends the wait",
+TEST_CASE("OpenRetryLoop: with the default back-off stop() returns before the first attempt, a minute away",
           "[echo][open_retry]") {
     std::atomic<int> attempts{0};
     OpenRetryLoop loop;
@@ -352,8 +354,77 @@ TEST_CASE("OpenRetryLoop: with the default back-off the first attempt is a minut
     });
     // No delay argument, so this case cannot know the worker is already waiting; the long back-off
     // case above is the one that proves stop() wakes a wait. This one pins only the default
-    // schedule's first delay (a minute, never an attempt) and that stop() returns.
+    // schedule's first delay (a minute, never an attempt) and that stop() returns. The trade-off:
+    // the bound is 120 s against a 60 s default delay, so a stop() that waited out the default
+    // back-off would still pass here; the long back-off case is the detector for that regression.
     yuzu::test::must_return_within(yuzu::test::kReturnBound, "OpenRetryLoop::stop() with the default back-off",
                                    [&] { loop.stop(); });
     CHECK(attempts.load() == 0);
+}
+
+// must_return_within itself. The expiry is driven through detail::must_return_within_ms with a tiny
+// limit and a recording action, so no test ends the process or spawns one. Not covered here: the
+// default action's real exit code 3 and stderr text (see test_bounded_return.hpp). None of these
+// sleeps or asserts an elapsed time: the watchdog is joined before each call returns, so every
+// counter read below is ordered after the watchdog's last write.
+TEST_CASE("must_return_within: a call that outlives the limit runs the expiry action once, with the "
+          "call's name and exactly the limit",
+          "[echo][bounded_return]") {
+    std::promise<void> release;
+    auto released = release.get_future();
+    int actions = 0;
+    const char* acted_for = nullptr;
+    std::chrono::milliseconds acted_limit{0};
+    std::thread::id call_thread;
+    bool call_released = false;
+    yuzu::test::detail::must_return_within_ms(
+        1ms, "the call under test",
+        [&] {
+            call_thread = std::this_thread::get_id();
+            // echo-test-ok: the helper under test joins its own watchdog, so this wait cannot outlive the case
+            call_released = released.wait_for(kBound) == std::future_status::ready;
+        },
+        [&](const char* what, std::chrono::milliseconds limit) {
+            ++actions;
+            acted_for = what;
+            acted_limit = limit;
+            release.set_value(); // the call blocks until the expiry action releases it
+        });
+    CHECK(call_released); // a watchdog that never fires fails here after kBound, not by hanging
+    CHECK(actions == 1);
+    REQUIRE(acted_for != nullptr);
+    CHECK(std::string_view{acted_for} == "the call under test");
+    CHECK(acted_limit == 1ms); // exactly the limit given: nothing scales it
+    CHECK(call_thread == std::this_thread::get_id());
+}
+
+TEST_CASE("must_return_within: a call that returns runs on the calling thread and never trips the watchdog",
+          "[echo][bounded_return]") {
+    std::thread::id call_thread;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "an immediate call",
+                                   [&] { call_thread = std::this_thread::get_id(); });
+    CHECK(call_thread == std::this_thread::get_id());
+
+    // With a one-hour limit the watchdog cannot expire first, so the action never running is
+    // deterministic, not a race.
+    int actions = 0;
+    bool ran = false;
+    yuzu::test::detail::must_return_within_ms(
+        std::chrono::hours{1}, "an immediate call", [&] { ran = true; },
+        [&](const char*, std::chrono::milliseconds) { ++actions; });
+    CHECK(ran);
+    CHECK(actions == 0);
+}
+
+TEST_CASE("must_return_within: a call that throws propagates, joins the watchdog and never trips it",
+          "[echo][bounded_return]") {
+    int actions = 0;
+    // An unjoined std::thread would terminate the process as the exception left must_return_within,
+    // so reaching the checks below also proves the watchdog was joined on the unwind.
+    CHECK_THROWS_AS(yuzu::test::detail::must_return_within_ms(
+                        std::chrono::hours{1}, "a throwing call",
+                        []() -> void { throw std::runtime_error("boom"); },
+                        [&](const char*, std::chrono::milliseconds) { ++actions; }),
+                    std::runtime_error);
+    CHECK(actions == 0);
 }

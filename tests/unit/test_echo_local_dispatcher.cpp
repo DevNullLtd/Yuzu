@@ -230,8 +230,10 @@ struct EchoSession {
     const YuzuPluginDescriptor* desc;
     yuzu::agent::StandalonePluginContext ctx;
     yuzu::agent::LocalDispatcher d;
-    // The bound on shutdown(); a case whose shutdown has a tighter, derived bound lowers it.
-    std::chrono::seconds shutdown_bound = yuzu::test::kReturnBound;
+    // The bound on shutdown(); a case whose shutdown has a tighter, derived bound replaces it.
+    // A real plugin shutdown is legitimately slower under a sanitizer, so this liveness backstop
+    // stretches by kSpinScale (must_return_within itself applies its bound exactly).
+    std::chrono::seconds shutdown_bound = yuzu::test::kReturnBound * yuzu::test::kSpinScale;
 
     EchoSession(const YuzuPluginDescriptor* descriptor, const fs::path& data_dir, yuzu::agent::KvStore& kv)
         : desc(descriptor), ctx("echo", {{"agent.data_dir", data_dir.string()}}, &kv) {
@@ -1299,18 +1301,21 @@ struct LoopbackPair {
 
 // Blocks until the peer's FIN arrives (recv returns 0), which leaves this end in CLOSE_WAIT. A
 // blocking kernel event, not a poll: nothing is sent on the pair, so 0 can only mean the FIN. The
-// receive is bounded at 5 s (a loopback FIN arrives in microseconds, so only a missing FIN reaches
-// it): a timed-out recv returns non-zero, so a missing FIN is a false return, never a hang.
-bool wait_for_peer_fin(SockT s) {
+// receive is bounded by `bound` (5 s by default; a loopback FIN arrives in microseconds, so only a
+// missing FIN reaches it): a timed-out recv returns non-zero, so a missing FIN is a false return,
+// never a hang.
+bool wait_for_peer_fin(SockT s, std::chrono::milliseconds bound = std::chrono::seconds{5}) {
     char buf[16];
 #ifdef _WIN32
-    const DWORD timeout_ms = 5000;
+    const DWORD timeout_ms = static_cast<DWORD>(bound.count());
     if (::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms),
                      sizeof timeout_ms) != 0)
         return false;
     return ::recv(s, buf, static_cast<int>(sizeof buf), 0) == 0;
 #else
-    const timeval timeout{5, 0};
+    timeval timeout{};
+    timeout.tv_sec = static_cast<time_t>(bound.count() / 1000);
+    timeout.tv_usec = static_cast<suseconds_t>((bound.count() % 1000) * 1000);
     if (::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0)
         return false;
     return ::recv(s, buf, sizeof buf, 0) == 0;
@@ -1318,6 +1323,23 @@ bool wait_for_peer_fin(SockT s) {
 }
 
 } // namespace
+
+// The bounded receive's other half: the CLOSE_WAIT cases below only ever call wait_for_peer_fin with
+// a FIN already sent, so deleting its timeout would fail none of them. Nothing is sent here, so the
+// only way out of the recv is the timeout. This is the standard's permitted bounded negative wait (a
+// "did not happen" can only be seen by waiting; a slow host can make it pass vacuously, never fail)
+// and the bound is short. It asserts the false return only, never the elapsed time: Windows rounds a
+// short SO_RCVTIMEO up. must_return_within turns a deleted timeout into a named exit instead of a hang
+// to the shard timeout.
+TEST_CASE("loopback: a receive with no FIN pending times out and reports false", "[echo][loopback_fin]") {
+    LoopbackPair pair;
+    REQUIRE(pair.open());
+    bool got_fin = true;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, "wait_for_peer_fin with no FIN pending", [&] {
+        got_fin = wait_for_peer_fin(pair.server, std::chrono::milliseconds{50});
+    });
+    CHECK_FALSE(got_fin);
+}
 
 TEST_CASE("echo plugin: status counts each source's finest tier and query and export "
           "read the hourly views as buckets",
@@ -1512,6 +1534,24 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
         REQUIRE(rows.size() == 1);
         CHECK(rows[0][0].empty());
     }
+
+    // The unwind the restore above exists for, taken on purpose: a second session pauses the source
+    // and a thrown local type leaves its scope, the same unwind a failed REQUIRE causes. Its
+    // destructor must put the flag back and shut the plugin down (bounded) without terminating.
+    // The paused flag is asserted BEFORE the throw, so the final read is not vacuous.
+    session.shutdown();
+    struct Unwound {};
+    try {
+        EchoSession unwound{desc, dir_guard.path, *kv};
+        unwound.pause_source("process", "collect_fast");
+        REQUIRE(plugin_status_value(unwound.d, desc, "config|process_enabled") ==
+                std::optional<std::string>{"false"});
+        throw Unwound{};
+    } catch (const Unwound&) {
+    }
+    const auto restored = raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'process_enabled'");
+    REQUIRE(restored.size() == 1);
+    CHECK(restored[0][0] == "true");
 }
 
 TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on the next tick, not "
@@ -1615,6 +1655,15 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
         REQUIRE(rows.size() == 1);
     }
     CHECK(rows[0][0] == "1");
+
+    // The half-closed client is still this process's and still on its port. A close_sock instead of
+    // the half-close would free the port for another process to reuse, the cause the half-close is
+    // here to remove, and getsockname on the closed socket would fail.
+    sockaddr_in local{};
+    SockLen local_len = sizeof local;
+    REQUIRE(pair.client != kNoSock);
+    REQUIRE(::getsockname(pair.client, reinterpret_cast<sockaddr*>(&local), &local_len) == 0);
+    CHECK(static_cast<int>(ntohs(local.sin_port)) == pair.client_port);
 }
 
 TEST_CASE("echo plugin: a query over a retired $X_Live name fails as an unknown table",
@@ -1702,7 +1751,9 @@ TEST_CASE("echo plugin: a failed v10 migration loads Echo offline with the reaso
     // exists to catch, so the general 120 s bound would be too loose here. Half the delay, not the
     // whole: the back-off began when init returned, before shutdown() is called, so a shutdown that
     // waits it out returns slightly BEFORE a bound equal to the delay expires (measured with the
-    // stop() wake-up removed: 2 of 4 runs at the full delay were not caught).
+    // stop() wake-up removed: 2 of 4 runs at the full delay were not caught). It is passed
+    // unscaled: this bound is the property under test, not a liveness backstop, and the first
+    // back-off does not stretch under a sanitizer.
     session.shutdown_bound = yuzu::echo::open_retry_delay(1) / 2;
 
     const auto status = d.run(desc, "status");
