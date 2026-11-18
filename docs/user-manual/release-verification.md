@@ -60,7 +60,7 @@ certificate at build time and cannot be restamped.
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
 | Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, `<N>` being the workflow run attempt (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
-| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
 
 **Do not trust an image tag that has no GitHub Release.** The images are pushed and signed before the
 GitHub Release is created, and a failed publish job stops the release. So a `:X.Y.Z` tag can exist in
@@ -78,6 +78,31 @@ images and the previous one for others. (The agent-bundle image is pushed only a
 Release.) So do not deploy `:latest` or `:X.Y` blind: resolve it to a digest, and check that digest
 belongs to a version with a published GitHub Release and passes `cosign verify` for that release's
 tag. Pinning a release's exact tag or digest avoids the question.
+
+Check that the Release exists, verify every image of it, and compare `:latest` with it:
+
+```bash
+TAG=vX.Y.Z    # the release you mean to deploy
+# 1. The GitHub Release exists (exit 1, "release not found", when it does not):
+gh release view "$TAG" --repo DevNullLtd/Yuzu --json tagName,isDraft,publishedAt
+# 2. Every image of that release is signed by that release's workflow and tag:
+for img in yuzu-server yuzu-gateway yuzu-postgres yuzu-server-chisel yuzu-gateway-chisel \
+           yuzu-agent-chisel yuzu-agent-bundle-chisel; do
+  cosign verify \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "ghcr.io/${OWNER}/${img}:${TAG#v}" > /dev/null && echo "${img}:${TAG#v} verified"
+done
+# 3. What :latest names now, against the release's own tag (repeat per image you pull):
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-server:latest" --format '{{.Manifest.Digest}}'
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-server:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+Every `verified` line must print, and the two digests must be equal before you deploy `:latest`.
+Releases before the chisel variants and the agent bundle have no such images, so those names fail to
+resolve there (the agent bundle is pushed only as `:X.Y.Z`, never `:latest`). If only
+`yuzu-agent-bundle-chisel` fails to verify, that release's bundle image was not published, or not
+signed (see the agent-bundle scan report below).
 
 ## Image vulnerability scan before publishing
 
@@ -134,17 +159,43 @@ date, the OS, the OS package count, the coverage, the advisory-data check, the a
 file's hash and the result, and the check that the pushed image has the scanned image's layers).
 `<N>` is the release workflow's run attempt. When the scan refused an image and that job was re-run,
 the release carries the refused attempt's reports (`gate: FAIL: <reason>`, or `gate: FAIL: cancelled
-...` for a cancelled scan) beside the re-run's; for each image, the reports with the HIGHEST `<N>`
-are the ones for the image that was published, and the release is not created unless those record
-`gate: pass`. A refusal that was never followed by a release (the tag was cut again instead) is kept
-only in that workflow run's artifacts, for 90 days. The agent-bundle image is built after the release
-exists, so its reports are attached afterwards with their own signed checksum list per attempt (table
-above); verify that list the way step 2 verifies `SHA256SUMS`, with the same
-`--certificate-identity`, then run `sha256sum -c
-yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS`. The agent-bundle image was
-published only if its highest attempt's report records `gate: pass`. A re-run adds new report assets
-and never replaces one. The reports are a point-in-time record: a vulnerability disclosed after the
-release is not in them.
+...` for a cancelled scan) beside the re-run's; for each of these six images, the reports with the
+HIGHEST `<N>` are the ones for the image that was published, and the release is not created unless
+those record `gate: pass`. A refusal that was never followed by a release (the tag was cut again
+instead) is kept only in that workflow run's artifacts, for 90 days.
+
+The agent-bundle image is built after the release exists, so its reports are attached afterwards,
+with their own signed checksum list per attempt (table above). For the bundle the highest attempt is
+**not** necessarily the published image: one attempt can pass and push, and a re-run of its job can
+then refuse or be cancelled before pushing, which leaves the earlier attempt's image published. Each
+attempt's `.gate.txt` records whether that attempt published an image: a line `verify-pushed: ok,
+ghcr.io/<owner>/yuzu-agent-bundle-chisel@sha256:<digest> ...` means it pushed that digest, and the
+release workflow refuses to attach a report that disagrees with its own record of the push. The
+published image is the one whose `verify-pushed` digest equals what the tag resolves to:
+
+```bash
+TAG=vX.Y.Z
+gh release download "$TAG" --repo DevNullLtd/Yuzu --dir bundle-scan \
+  --pattern 'yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*' \
+  --pattern 'trivy-yuzu-agent-bundle-chisel.attempt-*'
+cd bundle-scan
+for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
+  cosign verify-blob --bundle "${sums}.sigstore" \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$sums"
+  sha256sum -c "$sums"
+done
+grep -H '^gate:\|^verify-pushed:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+Every list must print `Verified OK` and every file `OK`. The digest the last command prints must
+appear in an attempt's `verify-pushed` line, and that attempt's `gate:` line must be
+`gate: pass`; when no attempt has a `verify-pushed` line, the bundle image was not published for this
+release. A re-run adds new report assets and never replaces a completed one (an upload that was
+interrupted, which GitHub never served, is replaced). The reports are a point-in-time record: a
+vulnerability disclosed after the release is not in them.
 
 ## Prerequisites
 

@@ -956,9 +956,8 @@ and do not fail it. It also fails, rather than pass a scan that could not mean a
   attestations API), so the gate cannot verify it. A DB substituted at, or on the way from, the
   registry is detectable only by TLS to the registry and, after the fact, by the recorded digest;
   a tampered DB with a fresh `UpdatedAt` (one CVE's version range edited) passes the gate. Every
-  network call has an overall deadline (the digest lookup 90 s, the Trivy download 300 s, each DB
-  download 900 s), so a registry that trickles bytes ends the attempt instead of holding the job
-  until its timeout;
+  long call has its own deadline and the gate has an overall budget ("Time budget" below), so a
+  registry that trickles bytes ends the attempt instead of holding the job until its timeout;
 - **no advisory data for the OS release**: Trivy marks the OS end of service life
   (`Metadata.OS.EOSL`), or its family is not one the gate has a canary for (Debian, Ubuntu, Alpine:
   every image the release publishes), or its version is a pre-release (`verdict=pre-release`, "no
@@ -997,6 +996,21 @@ the checker's canonical YAML copy of the entries in force, so a plain-format fil
 parser did not see cannot reach it. Trivy's temporary files go under the script's own work
 directory.
 
+**Time budget.** Every long call runs under `timeout`, bounded by its own deadline and by what is
+left of the gate's overall budget: the DB digest lookup 60 s per source, the whole Trivy download
+(all of curl's retries) 180 s, each DB download 420 s per source, each scan 600 s (with Trivy's own
+`--timeout` 10 s inside it; Trivy's default is 5 minutes). The network calls alone are at most
+2 x 60 + 180 + 2 x 420 = 1140 s (19 minutes) with both DB sources failing slowly. The budget is 1500 s
+(25 minutes) by default (`GATE_BUDGET`; `--budget SECONDS` overrides it, 1 to 3600): when it runs
+out the gate stops, writes `gate: FAIL: gate stopped before this image was judged: the gate ran out
+of its <N>s budget` for every image not yet judged, and exits 1. So the gate ends by itself, with its
+reports, within its budget plus a few seconds (the 2 s `--kill-after`, the cleanup).
+`pre-release.yml`'s `security-scan` (timeout 30 minutes) passes `--budget 1200`, leaving 10 minutes
+for checkout and the seven pulls before it; the `release.yml` jobs that run it have 60 to 120 minute
+timeouts, but each builds its image first, so a slow build can still bring the job timeout before the
+gate's budget, which is then a cancel (next paragraph). `tests/test_image_vuln_gate.py` checks that
+every call names a deadline and that each job's budget plus 5 minutes fits its `timeout-minutes`.
+
 **Where.** `docker-publish` and `docker-publish-chisel` scan the image their healthcheck
 verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
 (pre-push gate)", between the healthcheck probe and the tag re-check). `docker-publish-postgres`
@@ -1014,12 +1028,16 @@ OS package count, coverage, the advisory canary's result, the ignore-file hash w
 were in force and pending, and the result). A `.gate.txt` is written for every image on every exit
 the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
 the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why, and
-a SIGTERM or SIGINT (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGTERM) before
-this image was judged`. The step `exec`s the script so the runner's signal reaches it, and the
-script runs each long child (Trivy, curl, the digest lookup) in the background and `wait`s, so the
-trap runs at once rather than after the scan. A SIGKILL, or a usage error before the image list is
-read, leaves no report. After the push the job appends the `verify-pushed` result to its attempt's
-`.gate.txt`. The upload, as the `yuzu-<image>-image-vuln-gate-attempt-<N>` artifact with
+a SIGINT or SIGTERM (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGINT) before
+this image was judged` (or `(SIGTERM)`). The step `exec`s the script so the runner's signal reaches
+it, and the script runs each long child (Trivy, curl, the digest lookup) in the background and
+`wait`s, so the trap runs at once rather than after the scan. The runner cancels with SIGINT, then
+SIGTERM about 7.5 s later, then SIGKILL: on the first signal the trap ignores any further SIGINT or
+SIGTERM, writes the reports at once, then stops the child (SIGTERM, SIGKILL after 3 s at most) and
+exits 130 or 143, well inside the 7.5 s. A SIGKILL, or a usage error before the image list is read,
+leaves no report. After the push the job appends the `verify-pushed` result to its attempt's
+`.gate.txt`. The upload, as the `<image>-image-vuln-gate-attempt-<N>` artifact (for example
+`yuzu-server-image-vuln-gate-attempt-1`) with
 `retention-days: 90` (the repository's maximum) and no `overwrite`, runs whenever the gate step ran,
 passed, failed or was cancelled (`if: always() && (steps.gate.outcome == 'success' ||
 steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled')`), so a refusal, the control
@@ -1037,14 +1055,40 @@ bundle's job runs after the release exists, so its report cannot be inside `SHA2
 `attach-bundle-gate-report` attaches it to the GitHub Release afterwards (pass, refusal or
 cancellation), downloading exactly the attempt the bundle job reports (`gate_attempt`), with its own
 checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the
-same `release.yml` identity and verified in-job. It never replaces an asset: one already on the
-release with identical content is kept (a `.sigstore` when it verifies the list), and a different one
-fails the job. If that job fails, the Release run is red, so Pre-release QA does not start (it runs
-only on a successful Release run), and the report exists only as the 90-day artifact, which is
-shorter than a SOC 2 Type II observation window: "Re-run failed jobs" re-runs the attach job alone,
-and its success turns the run green; dispatch `pre-release.yml` with the tag if QA still has not
-started. Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle
-job never uploaded a report there is nothing to attach; its job log is the record. The report globs
+same `release.yml` identity and verified in-job.
+
+The attached report is tied to the push. The bundle job's `pushed_ref` output is
+`<image>@<digest>`, set only after "Verify the pushed image is the scanned one" passes, and empty when
+that attempt pushed nothing. The attach job refuses a report that disagrees with it: with a
+`pushed_ref`, the `.gate.txt` must record `gate: pass` and `verify-pushed: ok, <that exact ref> ...`;
+without one, it must record no `verify-pushed` line. So an attached report names the digest its
+attempt published, or records that it published nothing. The highest attempt on the release is NOT
+necessarily the published image: attempt N can pass and push, and a re-run attempt N+1 can refuse or
+be cancelled before its push, leaving attempt N's image published. The published image is the one
+whose attempt's `.gate.txt` has the `verify-pushed` line naming the digest the tag resolves to.
+
+It never replaces a completed asset. For each name already on the release (the attach job re-run
+for the same attempt) it reads GitHub's asset `state`, `size` and `digest`: an asset whose state is
+not `uploaded` (`starter`, `open`: an upload that was interrupted, which GitHub never served), or
+whose downloaded bytes do not match GitHub's own size or digest for it, is an incomplete upload, not
+evidence, and is deleted and uploaded again; a completed asset is kept when identical to this run's
+file (a `.sigstore` when it verifies this run's list) and fails the job when it differs. Every
+refusal is decided before anything is deleted, and a failed download stops the job rather than
+counting as incomplete. If the attach job fails, the Release run is red, so Pre-release QA does not
+start (it runs only on a successful Release run), and the report exists only as the 90-day artifact,
+which is shorter than a SOC 2 Type II observation window:
+
+- **A transient failure, or an interrupted upload** (a network error, a cosign or GitHub outage, a
+  cancel during `gh release upload`): "Re-run failed jobs" re-runs the attach job (and any other job
+  that failed); it replaces the incomplete assets and adds the rest. Dispatch `pre-release.yml` with
+  the tag if QA still has not started once the run is green.
+- **A refusal** (`already on the release with different content`, `does not verify`, or a report
+  that does not record the pushed digest): a re-run fails the same way. A completed asset under
+  this attempt's name with other content means something other than this job wrote it; do not
+  delete it to make the job pass. Investigate it as a release-integrity incident with the owner.
+
+Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle job never
+uploaded a report there is nothing to attach; its job log is the record. The report globs
 in the release job, `SHA256SUMS`, the release upload, the pre-release upload and the bundle
 attachment take every scanner's files (`trivy-*` and `grype-*`), while the coverage check reads
 Trivy's JSON report only (it refuses any other). The script also writes a step summary table,
@@ -1130,9 +1174,19 @@ document may present them as one. The control is human review of every change to
 `scripts/ci/image-identity.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
 (`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
 changes the entry, and the fields record where to find it. That review is as strong as the branch
-protection that requires it. **Owner action (recommended, not in the repository):** a `CODEOWNERS`
-entry for those paths, with "Require review from Code Owners" on `main`, so a change to an acceptance
-or to the gate cannot merge without the owner's review.
+protection that requires it.
+
+**The approver can be the change's author.** Nothing in the gate, the checker or the format stops
+`approved_by` from naming the person who wrote the entry. GitHub does not let a pull request's
+author approve it, but nothing ties `approved_by` to whoever did review it, and without branch
+protection that requires a review the pull request can merge with none. Separation of duties
+therefore rests entirely on that branch protection and on `CODEOWNERS`: a
+separate change (not in this one) adds `.github/CODEOWNERS` entries owned by `@fjarvis` and `@Tr3kkR`
+for `.trivyignore.yaml`, `scripts/ci/image-vuln-gate*` and the workflows, which with "Require review
+from Code Owners" on the protected branches makes a code owner's review required for any change to an
+acceptance, a not-covered listing or the gate. Until that change merges and the setting is on, an
+acceptance can be authored and "approved" by one person. When one of the two owners writes the
+entry, the other approves it.
 
 **Recording an approval.** For an acceptance or a not-covered listing:
 
@@ -1148,7 +1202,13 @@ or to the gate cannot merge without the owner's review.
    branch rules; then the approver re-approves the final diff, and `approved_on` is that date.
 4. Merge. Before tagging, the release skills run `python3 -I scripts/ci/image-vuln-gate-checks.py
    pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt`, which fails while any
-   entry in force is still pending.
+   entry in force is still pending, and while any entry or listing has expired or expires today or
+   tomorrow (each publish leg re-reads the date, so one that lapses during the release fails the legs
+   that run after it); it warns for one expiring within 21 days.
+
+Steps 1 and 3 are alternatives for when the reference is filled in: in the same pull request after
+the approving review (step 3), or in a follow-up pull request after merging the pending entry (step
+1). Either way, a tagged tree that still holds a pending entry fails the pre-tag check.
 
 Whoever audits an acceptance later follows `approval_ref` to the pull request and checks the
 approving review there; the gate does not.
@@ -1180,8 +1240,12 @@ except the agent bundle:
   first.
 - **An acceptance that expires mid-release, or a CRITICAL disclosed between legs**: the legs that
   ran before it have pushed and the rest fail, and "Re-run failed jobs" fails the same way. Renew
-  the entry (a commit) and re-tag; the gate warns only in a run's own log 21 days before an entry
-  expires, and nothing warns between releases (a tracked gap).
+  the entry (a commit) and re-tag. The pre-tag `pending` check fails on an entry or listing that has
+  expired or expires within two days, and warns 21 days ahead, as does every gate run's log; nothing
+  warns between releases (a tracked gap).
+- **The gate ran out of its budget** (`ran out of its <N>s budget`): a registry or the DB mirror
+  was slow, or a scan hung. "Re-run failed jobs"; if it recurs, look at which call used the time
+  in the step log before raising the budget.
 - **A fix that is not in the distro yet, or in a binary the base image ships** (a Go tool, an
   upstream-built binary): refresh the base image digest if upstream has rebuilt it; otherwise
   accept it in `.trivyignore.yaml` with the evidence. Either is a commit, so re-tag.
