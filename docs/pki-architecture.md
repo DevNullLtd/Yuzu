@@ -911,7 +911,7 @@ reads the database and is unaffected, but anything that reads `GET /api/v1/ca/cr
 4. **Is the leader's clock right?** The freshness pass compares `nextUpdate` with the leader's own clock, so a clock far from real time hides the problem from the leader while Prometheus still sees it.
 5. **Restart only the single wedged or leaderless replica**, one at a time. Do not restart every replica (that is the re-root procedure above, not this), and do not restart while Postgres is unreachable: the server fails closed at boot without it, so a restart turns a degraded state into an outage. A booting server publishes a CRL (the boot pre-publish is not leader-gated); success is the gauge moving to about 48 hours of headroom and no `PKI: initial CRL publish failed` warning in its log.
 
-What these two alerts do **not** cover: a server process that is down or an unreachable `/metrics` (both silence the series; `YuzuServerMetricsScrapeDown` covers them on a job named `yuzu-server`), a publisher clock stepped forward (a CRL dated in the future shows more than 48 hours of headroom and raises nothing here; `YuzuCaCrlFutureDated` covers it, below), and consumers failing to fetch the CRL. Rolling back to a build without the gauges silences both alerts.
+What these two alerts do **not** cover: a server process that is down or an unreachable `/metrics` (both silence the series; `YuzuServerMetricsScrapeDown` covers them on a job named `yuzu-server`), a publisher clock stepped forward (a CRL dated in the future shows more than 48 hours of headroom and raises nothing here; `YuzuCaCrlFutureDated` covers it, below), and consumers failing to fetch the CRL. Both alerts exist only where the server exports the gauges.
 
 ### CRL dated in the future
 
