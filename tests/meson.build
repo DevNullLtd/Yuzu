@@ -1744,6 +1744,7 @@ if build_server
       'unit/server/test_dispatch_chokepoint.cpp',
       'unit/server/test_capability_catalogue.cpp',
       'unit/server/test_operator_surface_twins.cpp',
+      'unit/server/test_arming_param_escalation.cpp', # sg10: schedule/outbox arming judges the parameter-escalated securable
       'unit/server/test_api_parity_ledger_catalogue.cpp', # every API-parity ledger mcp_twin claim vs the compiled kTools[]/kResources[]
       'unit/server/test_twin_completeness.cpp', # every registry MCP tool is a ledger mcp_twin and has a kExpectedTwins row (shrink-only backfill sets)
       'unit/server/test_schedule_params.cpp',

@@ -8,6 +8,8 @@
 #include "capability_decls/plugin_action_catalogue_d.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
+#include "schedule_arming_check.hpp"
+#include "schedule_arming_params.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -95,4 +97,95 @@ TEST_CASE("patch_connectivity: a dry run with no parameters does not evaluate th
     auto ok = classify_and_authorize_dispatch(reg, kCaller, "windows_updates", "patch_connectivity", sd);
     REQUIRE(ok.has_value());
     CHECK(ok->securable == "SoftwareDeployment");
+}
+
+// ── The ONE rule, shared by the send chokepoint and the schedule/outbox arming check ──────────
+
+TEST_CASE("effective_securable: the shared rule, edge values",
+          "[server][dispatch][security][capability][sg10]") {
+    auto reg = registry();
+    const auto cap = *reg.classify("windows_updates", "patch_connectivity");
+    using yuzu::server::effective_securable;
+    CHECK(effective_securable(cap, nullptr) == "SoftwareDeployment"); // unknown parameters
+    const Params none;
+    CHECK(effective_securable(cap, &none) == "SoftwareDeployment");
+    const Params empty{{"targets", ""}};
+    CHECK(effective_securable(cap, &empty) == "SoftwareDeployment");
+    const Params blank{{"targets", "   "}}; // whitespace is SUPPLIED: the stricter reading
+    CHECK(effective_securable(cap, &blank) == "Infrastructure");
+    const Params other{{"target", "x"}}; // a different key never escalates
+    CHECK(effective_securable(cap, &other) == "SoftwareDeployment");
+    const Params real{{"targets", "h"}};
+    CHECK(effective_securable(cap, &real) == "Infrastructure");
+    // A row without an escalation never changes.
+    const auto plain = *reg.classify("windows_updates", "installed");
+    CHECK(effective_securable(plain, &real) == plain.securable);
+}
+
+TEST_CASE("classify_and_authorize_dispatch: a system caller is refused a parameter-escalated "
+          "securable and admitted otherwise",
+          "[server][dispatch][security][capability][sg10]") {
+    auto reg = registry();
+    const DispatchCaller sys{.system = true};
+    Grants none{};
+    const Params with_targets{{"targets", "https://wsus.example.test/"}};
+    auto no = classify_and_authorize_dispatch(reg, sys, "windows_updates", "patch_connectivity", none,
+                                              &with_targets);
+    REQUIRE_FALSE(no.has_value());
+    CHECK(no.error().reason == DispatchDenialReason::Forbidden);
+    CHECK(no.error().securable == "Infrastructure");
+    const Params empty{{"targets", ""}};
+    CHECK(classify_and_authorize_dispatch(reg, sys, "windows_updates", "patch_connectivity", none,
+                                          &empty)
+              .has_value());
+    CHECK(classify_and_authorize_dispatch(reg, sys, "windows_updates", "patch_connectivity", none)
+              .has_value());
+    CHECK(classify_and_authorize_dispatch(reg, sys, "windows_updates", "installed", none,
+                                          &with_targets)
+              .has_value());
+}
+
+TEST_CASE("decode_arming_parameters: decodes as the outbox send does, fails closed on bad text",
+          "[server][dispatch][security][schedule][outbox][sg10]") {
+    using yuzu::server::decode_arming_parameters;
+    REQUIRE(decode_arming_parameters("").has_value());
+    CHECK(decode_arming_parameters("")->empty());
+    const auto ok = decode_arming_parameters(R"({"targets":"a","n":3,"l":[1],"z":null})");
+    REQUIRE(ok.has_value());
+    CHECK(ok->at("targets") == "a");
+    CHECK(ok->at("n") == "3");
+    CHECK(ok->at("l") == "[1]");
+    CHECK(ok->at("z") == "null"); // a non-string value is SUPPLIED (non-empty), never absent
+    CHECK_FALSE(decode_arming_parameters("[1,2]").has_value());
+    CHECK_FALSE(decode_arming_parameters("{not json").has_value());
+    CHECK_FALSE(decode_arming_parameters(std::string(200, '[') + std::string(200, ']')).has_value());
+    // A non-string `targets` escalates exactly like a string one.
+    auto reg = registry();
+    const auto cap = *reg.classify("windows_updates", "patch_connectivity");
+    const auto p = decode_arming_parameters(R"({"targets":["h"]})");
+    REQUIRE(p.has_value());
+    CHECK(yuzu::server::effective_securable(cap, &*p) == "Infrastructure");
+}
+
+namespace {
+constexpr yuzu::server::CommandCapability kHalfPair[] = {
+    {.plugin = "p", .action = "a", .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+     .mutability = yuzu::server::Mutability::None, .securable = "S",
+     .operation = Operation::Read, .risk_tier = yuzu::server::authz::RiskTier::Low,
+     .execute_gate = yuzu::server::ExecuteGate::None, .param_escalation_key = "k"},
+};
+constexpr yuzu::server::CommandCapability kFullPair[] = {
+    {.plugin = "p", .action = "a", .dispatch_class = yuzu::server::DispatchClass::ReadOnly,
+     .mutability = yuzu::server::Mutability::None, .securable = "S",
+     .operation = Operation::Read, .risk_tier = yuzu::server::authz::RiskTier::Low,
+     .execute_gate = yuzu::server::ExecuteGate::None, .param_escalation_key = "k",
+     .param_escalation_securable = "T"},
+};
+} // namespace
+
+TEST_CASE("the capability sweep rejects a half-set escalation pair",
+          "[server][dispatch][capability][sg10]") {
+    static_assert(!yuzu::server::detail::all_gates_specified(kHalfPair));
+    static_assert(yuzu::server::detail::all_gates_specified(kFullPair));
+    SUCCEED();
 }

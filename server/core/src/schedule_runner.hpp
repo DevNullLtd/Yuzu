@@ -109,7 +109,9 @@ public:
     /// callback denies every fire. p14 wires the real RBAC/arming lookup.
     using ArmingCheckFn = std::function<bool(const std::string& principal,
                                              const std::string& plugin,
-                                             const std::string& action)>;
+                                             const std::string& action,
+                                             const std::unordered_map<std::string, std::string>&
+                                                 parameters)>;
 
     /// #6096: the outbox as a SPENT-TICKET LEDGER (clock-free). Every occurrence key the
     /// outbox holds for an approval ticket id; an approved scheduled ticket with a row for a

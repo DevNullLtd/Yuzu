@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include "ascii_fold.hpp" // #4990: the one ASCII plugin-name fold
 
@@ -118,6 +119,27 @@ struct CommandCapability {
     std::string_view param_escalation_securable{};
 };
 
+/// The ONE rule for a row's parameter-dependent securable (sg10). Returns
+/// `param_escalation_securable` when the row declares an escalation AND `parameters` carries a
+/// NON-EMPTY value (whitespace counts as non-empty, a non-string value arrives already stringified
+/// by the caller's decoder) under `param_escalation_key`; otherwise the row's own `securable`.
+/// `parameters == nullptr` = the caller cannot know them: the row's own securable (the escalation
+/// is then NOT evaluated). Used by BOTH `classify_and_authorize_dispatch` (send) and
+/// `schedule_arming_permitted` (schedule/outbox arming) so the two can never judge a dispatch
+/// under different securables, and a `DispatchCaller{.system = true}` dispatch (which skips the
+/// permission check) is still gated by the arming principal's own grant.
+[[nodiscard]] inline std::string_view
+effective_securable(const CommandCapability& cap,
+                    const std::unordered_map<std::string, std::string>* parameters) {
+    if (parameters != nullptr && !cap.param_escalation_key.empty() &&
+        !cap.param_escalation_securable.empty()) {
+        if (const auto it = parameters->find(std::string(cap.param_escalation_key));
+            it != parameters->end() && !it->second.empty())
+            return cap.param_escalation_securable;
+    }
+    return cap.securable;
+}
+
 namespace detail {
 /// The per-fragment compile-time sweep every `capability_decls/*.hpp` file
 /// must invoke via `static_assert` immediately after its `constexpr` array —
@@ -128,6 +150,10 @@ namespace detail {
 all_gates_specified(std::span<const CommandCapability> rows) {
     for (const auto& row : rows) {
         if (row.execute_gate == ExecuteGate::Unspecified)
+            return false;
+        // sg10: `param_escalation_key` and `param_escalation_securable` are set together or not at
+        // all; half a pair would silently disable `effective_securable`'s escalation.
+        if (row.param_escalation_key.empty() != row.param_escalation_securable.empty())
             return false;
     }
     return true;

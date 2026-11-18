@@ -40,18 +40,25 @@
 #include "rbac_store.hpp"
 
 #include <string>
+#include <unordered_map>
 
 namespace yuzu::server {
 
-/// Decide whether `principal` may still arm `plugin.action`. `rbac` may be
-/// null (denies). Pure with respect to its inputs — no metrics, no logging,
+/// Decide whether `principal` may still arm `plugin.action` with `parameters`. `rbac` may be
+/// null (denies). The securable judged is `effective_securable(cap, &parameters)`, the SAME rule
+/// `classify_and_authorize_dispatch` applies on the send path: a scheduled / outbox dispatch fires
+/// as `DispatchCaller{.system = true}` (or a re-resolved caller) whose chokepoint check does not
+/// re-ask the arming principal's grant for a parameter-escalated securable, so this is where
+/// `windows_updates.patch_connectivity` + `targets` (Infrastructure) is enforced for them.
+/// Pure with respect to its inputs — no metrics, no logging,
 /// no audit: the caller owns those, so this can be exercised directly in a
 /// unit test with a real registry and a `:memory:` store.
 [[nodiscard]] inline bool schedule_arming_permitted(const CommandCapabilityRegistry& registry,
                                                     const RbacStore* rbac,
                                                     const std::string& principal,
                                                     const std::string& plugin,
-                                                    const std::string& action) {
+                                                    const std::string& action,
+                                                    const std::unordered_map<std::string, std::string>& parameters) {
     const auto classified = registry.classify(plugin, action);
     if (!classified)
         return false;
@@ -63,7 +70,7 @@ namespace yuzu::server {
         // Legacy-open arms for everyone EXCEPT an engine principal, whose only authority is an
         // explicit RBAC grant (and RBAC is off here).
         return !yuzu::server::authz::is_engine_principal_name(principal);
-    return rbac->check_permission(principal, std::string(classified->securable),
+    return rbac->check_permission(principal, std::string(effective_securable(*classified, &parameters)),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }
 

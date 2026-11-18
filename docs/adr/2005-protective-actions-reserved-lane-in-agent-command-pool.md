@@ -45,6 +45,14 @@ must not be starvable by ordinary commands. The agent command pool therefore has
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary
   commands. A protective command that itself blocks holds its worker; the reserve is one worker.
+- **No protective-versus-protective reserve.** The lane has one worker (more on a larger pool); several
+  stuck protective commands can occupy all of it.
+- **A stagger or delay sleep runs on the worker.** A command carrying `stagger_seconds` or
+  `delay_seconds` (up to 600 s) sleeps on its worker, protective commands included; the protective lane
+  does not skip it.
+- **Result writes share `stream_write_mu_`.** A protective result waits on the same stream write mutex as
+  every ordinary result.
+- **The `firewall` plugin has no plugin-level mutex**, so two protective commands can enter it together.
 - It does not bound a stall inside an ordinary command (that is the helper-thread work in the plugins)
   and does not free a worker that is already stuck.
 - A wedge is still visible only as commands that never finish; the tag above makes the pool state

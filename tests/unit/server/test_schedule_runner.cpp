@@ -157,7 +157,8 @@ struct Harness {
     // blocks it. D7-specific test cases pass `false` or an explicitly empty
     // ScheduleRunner::ArmingCheckFn{} to prove the deny/unset paths.
     explicit Harness(ScheduleRunner::ArmingCheckFn arming =
-                          [](const std::string&, const std::string&, const std::string&) {
+                          [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
                               return true;
                           },
                       AuditStore* audit = nullptr, yuzu::MetricsRegistry* metrics_reg = nullptr,
@@ -452,7 +453,8 @@ TEST_CASE("ScheduleRunner: InstructionStore DB error skips the occurrence WITHOU
     REQUIRE_FALSE(broken_is.is_open());
 
     Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, nullptr,
+        [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; }, nullptr,
         nullptr, &broken_is);
     auto id = h.make_due("test.def", "interval");
 
@@ -1216,7 +1218,8 @@ TEST_CASE("ScheduleRunner: an approved ticket already used by an earlier occurre
 TEST_CASE("ScheduleRunner: a failed ledger-spent settle holds the occurrence (#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1277,7 +1280,8 @@ TEST_CASE("ScheduleRunner: an unreadable outbox on the already-ran check holds a
           "(#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1297,7 +1301,8 @@ TEST_CASE("ScheduleRunner: the already-ran branch settles observed tickets befor
           "and a settle failure holds (#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1364,7 +1369,8 @@ TEST_CASE("ScheduleRunner: ledger settle ok then an A4 settle failure holds and 
           "(#6096)",
           "[schedule][runner][approval][pg][6096]") {
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; },
               nullptr, &metrics);
     h.model_outbox = true;
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
@@ -1522,7 +1528,8 @@ TEST_CASE("ScheduleRunner: an unwired outbox ledger holds an approval-gated occu
                                req.execution_id, req.principal, req.approval_id, req.parameters});
             return yuzu::server::OutboxEnqueueOutcome::Enqueued;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
     });
@@ -1741,7 +1748,8 @@ TEST_CASE("ScheduleRunner: a schedule created with no parameters defaults to the
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval) fire path",
           "[schedule][runner][d7][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; });
     auto id = h.make_due("test.def", "interval");
 
     h.runner.tick();
@@ -1752,7 +1760,8 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
           "[schedule][runner][d7][approval][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; });
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
     h.runner.tick();
@@ -1783,7 +1792,8 @@ TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and app
 TEST_CASE("ScheduleRunner: D7 true arming_check still lets the auto and approved-ticket paths "
           "fire (existing approval behaviour unchanged)",
           "[schedule][runner][d7][approval][pg]") {
-    Harness h([](const std::string&, const std::string&, const std::string&) { return true; });
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; });
 
     auto auto_id = h.make_due("test.def", "interval");
     h.runner.tick();
@@ -1822,7 +1832,8 @@ TEST_CASE("ScheduleRunner: D7 a denied arming check audits the principal + targe
     AuditStore audit{pool};
     REQUIRE(audit.is_open());
     yuzu::MetricsRegistry metrics;
-    Harness h([](const std::string&, const std::string&, const std::string&) { return false; },
+    Harness h([](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return false; },
              &audit, &metrics);
     h.make_due("test.def", "interval");
 
@@ -1864,7 +1875,8 @@ TEST_CASE("ScheduleRunner: a content mismatch audits once, with the approved vs.
     AuditStore audit{pool};
     REQUIRE(audit.is_open());
     Harness h(
-        [](const std::string&, const std::string&, const std::string&) { return true; }, &audit);
+        [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) { return true; }, &audit);
     auto id = h.make_due("test.def", "interval", /*requires_approval=*/true);
 
     h.runner.tick(); // submits a ticket for procs.list
@@ -1964,7 +1976,8 @@ TEST_CASE("ScheduleRunner: an unset should_stop fires every due schedule, "
                                req.parameters});
             return yuzu::server::OutboxEnqueueOutcome::Enqueued;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
         // .should_stop left unset (default std::function<bool()>{}).
@@ -2028,7 +2041,8 @@ TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
                         .status() == PGRES_COMMAND_OK);
             return yuzu::server::OutboxEnqueueOutcome::FencedOut;
         },
-        .arming_check = [](const std::string&, const std::string&, const std::string&) {
+        .arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
             return true;
         },
     });
@@ -2048,4 +2062,24 @@ TEST_CASE("ScheduleRunner: mark_cancelled failing on a FencedOut fire is now "
     // genuinely failed, not merely was skipped.
     const auto s = h.get(id);
     CHECK(s.next_execution_at == 1);
+}
+
+// ── sg10: the arming check judges the schedule's own parameters ─────────────
+
+TEST_CASE("ScheduleRunner: the arming check receives the schedule's decoded parameters",
+          "[schedule][runner][sg10][pg]") {
+    std::unordered_map<std::string, std::string> seen;
+    Harness h([&seen](const std::string&, const std::string&, const std::string&,
+                      const std::unordered_map<std::string, std::string>& parameters) {
+        seen = parameters;
+        return true;
+    });
+    h.make_due("test.def", "interval", /*requires_approval=*/false,
+               R"({"targets":"https://wsus.example.test/","n":3})");
+
+    h.runner.tick();
+
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(seen.at("targets") == "https://wsus.example.test/");
+    CHECK(seen.at("n") == "3"); // a non-string value arrives as its JSON text
 }

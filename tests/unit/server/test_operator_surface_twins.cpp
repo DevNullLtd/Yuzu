@@ -94,8 +94,10 @@ namespace {
 // read unchanged.
 bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacStore* rbac,
                           const std::string& principal, const std::string& plugin,
-                          const std::string& action) {
-    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action);
+                          const std::string& action,
+                          const std::unordered_map<std::string, std::string>& parameters = {}) {
+    return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action,
+                                                   parameters);
 }
 
 } // namespace
@@ -301,8 +303,9 @@ struct Harness {
                   },
               .arming_check =
                   [this](const std::string& principal, const std::string& plugin,
-                        const std::string& action) {
-                      return compose_arming_check(registry, &rbac, principal, plugin, action);
+                        const std::string& action, const std::unordered_map<std::string, std::string>& parameters) {
+                      return compose_arming_check(registry, &rbac, principal, plugin, action,
+                                                  parameters);
                   },
               // #6096: the outbox spent-ticket ledger. This harness's enqueue_fn writes no
               // outbox row, so the ledger is empty and no occurrence has run.

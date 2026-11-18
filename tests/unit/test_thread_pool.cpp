@@ -138,7 +138,7 @@ TEST_CASE("ThreadPool applies backpressure when the queue is full", "[thread_poo
     // release_on_exit unblocks the workers so ~ThreadPool joins cleanly.
 }
 
-// ── Protective lane (ADR-0074): a reserved slot containment can always use ──────────────────────
+// ── Protective lane (ADR-2005): a reserved slot containment can always use ──────────────────────
 
 namespace {
 // Blocks until released; counts how many have STARTED.

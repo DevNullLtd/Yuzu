@@ -136,13 +136,10 @@ classify_and_authorize_dispatch(
     // param_escalation_key`) is judged, and reported, under the escalated securable when the
     // parameter is supplied and non-empty. `parameters == nullptr` means the caller does not know
     // them (the MCP/REST pre-dispatch DRY RUN): the escalation is then NOT evaluated here and is
-    // enforced at the send path, `ServerImpl::build_classified_command`, which always passes them.
-    if (parameters != nullptr && !cap.param_escalation_key.empty() &&
-        !cap.param_escalation_securable.empty()) {
-        if (const auto it = parameters->find(std::string(cap.param_escalation_key));
-            it != parameters->end() && !it->second.empty())
-            cap.securable = cap.param_escalation_securable;
-    }
+    // enforced at the send path, `ServerImpl::build_classified_command`, which always passes them, and
+    // at schedule/outbox arming (`schedule_arming_permitted`) for the `.system = true` dispatches
+    // that skip the permission check below.
+    cap.securable = effective_securable(cap, parameters);
 
     // #1398 defense in depth: see DispatchDenialReason::Unclassified's doc
     // comment — every fragment's compile-time sweep should make this
@@ -157,8 +154,22 @@ classify_and_authorize_dispatch(
             DispatchDenial{DispatchDenialReason::Unclassified, {}, authz::Operation::Read});
     }
 
-    if (caller.system)
+    if (caller.system) {
+        // sg10 RULE for every `.system = true` dispatch (policy evaluator, preflight, canned
+        // panels, schedule/outbox when no caller is resolved): a system caller holds no grant, so
+        // a PARAMETER-ESCALATED securable (`cap.securable` above differs from the row's own) has no one to
+        // prove it and is REFUSED, never admitted by the early return. Operator-authored
+        // parameters therefore cannot ride a system dispatch past an escalation. A system dispatch with
+        // NO escalating parameter (policy evaluator, triggers, pre-flight, canned panels) is
+        // unaffected. Schedule and outbox dispatches are not system dispatches: they re-resolve the
+        // arming principal and are authorised against the escalated securable at arming
+        // (`schedule_arming_permitted`) and again here as that caller.
+        if (cap.securable != classified->securable)
+            return std::unexpected(
+                DispatchDenial{DispatchDenialReason::Forbidden, std::string(cap.securable),
+                               cap.operation});
         return cap;
+    }
 
     // No anonymous operator dispatch (PLAN item 2): an empty principal must
     // never reach `has_permission`, where a legacy-open store would admit it

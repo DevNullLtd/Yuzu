@@ -82,7 +82,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
-#include <yuzu/protective_actions.hpp> // is_protective_action: the reserved-lane predicate (ADR-0074)
+#include <yuzu/protective_actions.hpp> // is_protective_action: the reserved-lane predicate (ADR-2005)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -274,7 +274,7 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
 
-// Command pool shape (ADR-0074): the queue depth every lane uses (the ThreadPool default), and the
+// Command pool shape (ADR-2005): the queue depth every lane uses (the ThreadPool default), and the
 // number of workers held back for PROTECTIVE actions so containment cannot be starved by stuck
 // ordinary commands. Both pool construction sites use these two names.
 constexpr std::size_t kCommandQueueDepth = 1000;
@@ -2874,7 +2874,7 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
-                            // ADR-0074: the command pool's in-flight gauge (tasks executing now,
+                            // ADR-2005: the command pool's in-flight gauge (tasks executing now,
                             // "running/workers", plus "queued"): a wedge (every ordinary worker
                             // held by a stalled filesystem or resolver) shows here while the
                             // reserved protective worker keeps containment running.
@@ -3908,7 +3908,7 @@ public:
                     // so concurrent dispatch is required.
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
-                    // ADR-0074: a protective action (the closed firewall containment set and
+                    // ADR-2005: a protective action (the closed firewall containment set and
                     // __guard__.push_rules) goes to the pool's reserved lane; every other command
                     // can never occupy the last reserved worker.
                     const bool protective_lane =

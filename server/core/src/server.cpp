@@ -19650,10 +19650,11 @@ private:
             // `test_operator_surface_twins.cpp` exercise; the fail-closed
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                   const std::string& action) -> bool {
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
-                                                               plugin, action);
+                                                               plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19696,10 +19697,11 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action) -> bool {
+                                       const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                     return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                    rbac_store_.get(), principal,
-                                                                   plugin, action);
+                                                                   plugin, action, parameters);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is

@@ -7,6 +7,7 @@
 #include "execution_tracker.hpp"
 #include "instruction_store.hpp"
 #include "on_behalf_guard.hpp" // onbehalf::sanitize_for_log
+#include "schedule_arming_params.hpp" // decode_arming_parameters
 #include "schedule_engine.hpp"
 #include "schedule_params_parsers.hpp"
 
@@ -110,7 +111,12 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // lockdown) denies the fire exactly like an explicit `false`. Always
     // advance so a permanently-denied schedule cannot spin retrying every
     // tick forever.
-    if (!d_.arming_check || !d_.arming_check(s.created_by, def.plugin, def.action)) {
+    // sg10: the arming check judges the schedule's own stored parameters (a parameter-escalated
+    // securable, e.g. patch_connectivity + `targets`, is the arming principal's to hold). Stored
+    // parameters that do not decode are a denial: authority is never decided on a guess.
+    const auto arming_params = decode_arming_parameters(s.parameter_values);
+    if (!d_.arming_check || !arming_params ||
+        !d_.arming_check(s.created_by, def.plugin, def.action, *arming_params)) {
         count("yuzu_schedule_arming_denied_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check denied — "
                      "principal='{}' target={}.{}",

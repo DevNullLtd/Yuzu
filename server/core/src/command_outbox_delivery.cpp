@@ -4,6 +4,7 @@
 #include "command_outbox_store.hpp"
 #include "execution_tracker.hpp"
 #include "leader_elector.hpp" // kServerBackgroundLeaderLock, LeaderElector::epoch()
+#include "schedule_arming_params.hpp" // decode_arming_parameters (sg10)
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "refusal_log_throttle.hpp" // RefusalLogThrottle: bounded log lines for repeated holds (#3678)
 
@@ -185,7 +186,12 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                                     std::int64_t epoch) {
     // 1. Re-authorize at SEND time — authority may have been revoked since
     //    enqueue. Fail-closed on an unset check. A denial is PERMANENT.
-    if (!d_.arming_check || !d_.arming_check(c.principal, c.plugin, c.action)) {
+    // sg10: judged on the row's own parameters. Text that does not decode yields an empty map
+    // here ONLY because that row is failed permanently by the depth/decode guards below before any
+    // send; it never reaches a dispatch under an unescalated securable.
+    const auto arming_params =
+        decode_arming_parameters(c.parameters).value_or(std::unordered_map<std::string, std::string>{});
+    if (!d_.arming_check || !d_.arming_check(c.principal, c.plugin, c.action, arming_params)) {
         count("yuzu_server_command_outbox_deliver_denied_total");
         spdlog::warn("command_outbox_delivery: occurrence '{}' arming denied at delivery — "
                      "principal='{}' target={}.{}",

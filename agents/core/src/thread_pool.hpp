@@ -14,7 +14,7 @@
 // own exceptions; this firewall is the last-resort net that keeps one task's
 // failure from taking down the process or the other workers.
 //
-// Protective lane (ADR-0074, owner ruling 2026-11-18): `reserved_protective` workers' worth of
+// Protective lane (ADR-2005, owner ruling 2026-11-18): `reserved_protective` workers' worth of
 // capacity is held back for PROTECTIVE tasks (`submit(task, /*protective=*/true)`, the caller decides
 // with `yuzu::protective::is_protective_action`). A non-protective task is only STARTED while fewer
 // than `workers - reserved_protective` non-protective tasks are running, so N-1 stuck ordinary

@@ -17,6 +17,7 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::shared {
 

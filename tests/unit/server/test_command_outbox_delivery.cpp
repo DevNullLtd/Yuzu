@@ -169,7 +169,8 @@ public:
                                         yuzu::MetricsRegistry* metrics = nullptr,
                                         std::int64_t horizon =
                                             yuzu::kMaxOutboxRedeliveryHorizonCommands,
-                                        yuzu::server::AuditStore* audit = nullptr) {
+                                        yuzu::server::AuditStore* audit = nullptr,
+                                        CommandOutboxDelivery::ArmingCheckFn arming_override = {}) {
         CommandOutboxDelivery::Deps d;
         d.outbox = store_.get();
         d.audit_store = audit;
@@ -199,7 +200,10 @@ public:
             return c;
         };
         d.arming_check = [arming_allow](const std::string&, const std::string&,
-                                        const std::string&) { return arming_allow; };
+                                        const std::string&,
+                                        const std::unordered_map<std::string, std::string>&) { return arming_allow; };
+        if (arming_override)
+            d.arming_check = std::move(arming_override);
         return CommandOutboxDelivery{std::move(d)};
     }
 
@@ -580,7 +584,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: mark_cancelled failing after an "
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return false; // deny — the authority_denied branch, no dispatch attempted
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -659,7 +664,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: an already-terminal execution reaching "
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return false; // deny — the authority_denied branch, no dispatch attempted
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -771,7 +777,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine successful dispatch (sent>0) com
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return true; // re-authorization passes — the dispatch proceeds
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -901,7 +908,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: a genuine dispatch whose target-count writ
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return true; // re-authorization passes — the dispatch proceeds
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -985,7 +993,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: a redrive to sent==0 does NOT cancel an "
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return true;
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -1074,7 +1083,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: authority denied at redelivery does NOT "
         c.principal = principal;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return false; // authority revoked since enqueue
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -1432,7 +1442,8 @@ TEST_CASE("CommandOutboxDelivery[pg]: a horizon dead-letter keeps the approval t
         c.principal = p;
         return c;
     };
-    d.arming_check = [](const std::string&, const std::string&, const std::string&) {
+    d.arming_check = [](const std::string&, const std::string&, const std::string&,
+          const std::unordered_map<std::string, std::string>&) {
         return true;
     };
     CommandOutboxDelivery loop{std::move(d)};
@@ -1712,4 +1723,30 @@ TEST_CASE("CommandOutboxDelivery: the constructor clamps a Deps horizon into [1,
     CHECK(horizon_after(0) == 1);
     CHECK(horizon_after(-7) == 1);
     CHECK(horizon_after(42) == 42);
+}
+
+// sg10: the send-time arming check judges the row's own stored parameters, so a parameter-escalated
+// securable (windows_updates.patch_connectivity + `targets`) is the arming principal's to hold.
+TEST_CASE("CommandOutboxDelivery[pg]: the arming check receives the row's decoded parameters",
+          "[command_outbox][pg][delivery][sg10]") {
+    DeliveryPg fx;
+    auto r = fx.req("occ-sg10", "cmd-sg10");
+    r.parameters = R"({"targets":"https://wsus.example.test/","n":3})";
+    REQUIRE(fx.store().claim_and_enqueue(r, fx.lock(), fx.epoch()) == OutboxEnqueueOutcome::Enqueued);
+
+    std::unordered_map<std::string, std::string> seen;
+    DispatchProbe probe;
+    auto loop = fx.make_delivery(
+        probe, /*arming_allow=*/true, nullptr, yuzu::kMaxOutboxRedeliveryHorizonCommands, nullptr,
+        [&seen](const std::string&, const std::string&, const std::string&,
+                const std::unordered_map<std::string, std::string>& parameters) {
+            seen = parameters;
+            return false; // deny: the row must fail with no dispatch
+        });
+    loop.tick();
+
+    CHECK(seen.at("targets") == "https://wsus.example.test/");
+    CHECK(seen.at("n") == "3");
+    CHECK(probe.calls == 0);
+    CHECK(fx.raw_state("occ-sg10") == "failed");
 }
