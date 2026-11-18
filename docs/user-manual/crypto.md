@@ -944,7 +944,7 @@ shapes are in [REST API: Revocation sources](rest-api.md#revocation-sources-regi
 
 ## Roadmap
 
-The following are planned and not yet available. No dates are committed.
+The following are planned and not yet available, unless marked available. No dates are committed.
 
 - A fleet certificate inventory with full X.509 fields. Certificate data is not available on
   this page until that slice ships (the endpoint `certificates` plugin already lists system store
@@ -957,8 +957,8 @@ The following are planned and not yet available. No dates are committed.
   as they are collected, still carrying inventory facts only, with no security-level fields.
 
 This page reports facts (libraries and versions today; certificates and keys later). The library
-view labels nothing as weak, outdated or unsupported. Yuzu has a small, fixed set of built-in
-checks and no others. Only the counts of Yuzu's own CA are available today; the rest are planned:
+view labels nothing as weak, outdated or unsupported. The built-in checks are a small, fixed
+set and no others. Only the counts of Yuzu's own CA are available today; the rest are planned:
 
 - four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
   `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order

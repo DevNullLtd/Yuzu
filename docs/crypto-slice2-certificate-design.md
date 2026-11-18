@@ -21,7 +21,8 @@ branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstone
 `feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
-The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see [Decisions](#decisions)); they land as the CRL store's migration v2 before 2b-1b.
+The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see
+[Decisions](#decisions)); they land as the CRL store's migration v2 before 2b-1b.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1574,9 +1575,10 @@ review, as a new egress surface.
   attacker or a stale mirror could serve an older CRL that still verifies, possibly one from before
   the rebuild with a higher number. So:
   - the reset body lists the source's keys after the rebuild, and every key not listed is removed,
-    in the same transaction as the reset. **Deferred to #6590 (ruled 2026-11-18), not in 2b-1a:** the shipped reset
-    accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this must land before
-    2b-1b accepts any CRL. Every held CRL of the CA is deleted in the reset's transaction;
+    in the same transaction as the reset. **Deferred (#6590, ruled 2026-11-18), not in 2b-1a:**
+    the shipped reset accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this
+    must land before 2b-1b accepts any CRL. Shipped in 2b-1a: every held CRL of the CA is deleted
+    in the reset's transaction;
   - the reset clears each scope's number and `this_update` but writes `reset_at` (Postgres `now()`
     at the reset) on every high-water row of the CA, and on a CA-level row that scopes first seen
     later inherit. **`reset_at` is kept permanently**: every CRL accepted afterwards, not only the
@@ -1639,7 +1641,7 @@ separate from `ca_store`, in the readiness conjunction.
 | `fetch_status` | `url_id` | `last_attempt_at`, `last_success_at`, `last_failure_cause`, `consecutive_failures`, `next_attempt_at`, `etag`, `last_modified` |
 | `crl` | `id` | `source_id`, `scope_key`, `url_id`, `crl_number`, `this_update`, `next_update`, `is_delta`, `base_crl_number`, `idp_reasons`, `expired_certs_on_crl`, `verified_key_sha256`, `der_sha256`, `entry_count`, `fetched_at` |
 | `crl_entry` | (`crl_id`, `serial`) | `revocation_date`, `reason`, `invalidity_date` |
-| `rollback_high_water` | (`ca_subject_name_sha256`, `scope_key`; `scope_key = '*'` is the CA-level row) | `crl_number`, `this_update`, `reset_at` (permanent once set) |
+| `rollback_high_water` | (`ca_subject_name_sha256`, `scope_key`; `scope_key = '*'` is the CA-level row) | `crl_number`, `this_update`, `reset_at` (permanent once set), `pinned_crl_sha256` |
 | `cert_signature_check` (2b-2) | (`cert_sha256`, `ca_key_sha256`) | `source_id`, `verified` |
 
 - `this_update`, `next_update` and `revocation_date` are the CA's own times, from the CRL.
@@ -2057,8 +2059,11 @@ recommended; they land as the CRL store's migration v2, before 2b-1b accepts any
   held CRL of the CA are removed in the reset's transaction. A body without the list is refused.
 - **One encoded scope key, replaced delete-then-insert.** `scope_key` is `full` or
   `idp:<64 lowercase hex of the IDP DER SHA-256>`, followed by `:base` or `:delta`, pinned by a
-  `CHECK` and used identically in `crl` and `rollback_high_water`; `crl.is_delta` is derived from
-  it. A newer CRL replaces the held one by delete-then-insert inside the acceptance transaction,
+  `CHECK` and used identically in `crl` and `rollback_high_water`. The encoded column carries only
+  the IDP and base-or-delta parts; the CA is in the table's own column (`source_id`,
+  `ca_subject_name_sha256`). `rollback_high_water`'s `CHECK` also accepts `'*'`, the CA-level row
+  whose permanent `reset_at` scopes first seen later inherit; `crl`'s does not. `crl.is_delta`
+  becomes a column generated from the suffix, so the two cannot disagree. A newer CRL replaces the held one by delete-then-insert inside the acceptance transaction,
   so `UNIQUE (source_id, scope_key, is_delta)` stays and a reader sees the old CRL or the new one,
   never both.
 - **`config_version` stays a per-row counter.** Source ids come from an identity column that is
