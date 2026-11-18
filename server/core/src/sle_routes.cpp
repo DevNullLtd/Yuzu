@@ -358,7 +358,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                           "pause has lifted (the server rechecks about once a minute) will fail "
                           "the same way; re-issue the DELETE only AFTER the repair (the cascade "
                           "is idempotent). A caller whose Decommission:Delete grant is scoped to a "
-                          "management group is refused (403) when it re-issues after this "
+                          "management group is refused (403) when it re-issues if this "
                           "call has removed the device from its groups; use an "
                           "Administrator or a global grant.";
                     if (other_failed > 0)
