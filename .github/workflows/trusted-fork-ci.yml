@@ -125,7 +125,7 @@ jobs:
     # risk the audit names does not apply here. GitHub's `$/` syntax (July
     # 2026) is rejected by actionlint 1.7.12; revisit when the tooling
     # accepts it or when the repository turns on SHA-pinning enforcement.
-    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository] approver: pending, revisit: 2027-05-18
+    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository] approver: fjarvis (2026-11-18), revisit: 2027-05-18
     with:
       pr_number: ${{ needs.validate-approval.outputs.pr_number }}
       head_sha: ${{ needs.validate-approval.outputs.head_sha }}
