@@ -2221,9 +2221,16 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     if (lockout_active) {
         login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
         if (!login_lk.try_lock()) {
-            StripeWaiterGuard waiter(stripe_waiters_);
+            // Per-stripe first (a flood on one stripe cannot use up the global ceiling), then the
+            // global ceiling (the pinned-worker bound across all stripes).
+            StripeWaiterGuard stripe_waiter(stripe_waiters_per_[login_stripe_index(username)]);
             const bool login_route = opts.metric_route == "login";
             const char* cls = !login_route ? "authenticated" : "unauthenticated";
+            if (stripe_waiter.prior() >= kStripeWaitersPerStripe) {
+                count_budget_refusal(opts.metric_route, cls, "stripe_cap");
+                return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+            }
+            StripeWaiterGuard waiter(stripe_waiters_); // counted only once the stripe admits it
             if (waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {
                 count_budget_refusal(opts.metric_route, cls, "stripe_cap");
                 return {PasswordCheckOutcome::kBusy, std::nullopt, {}};

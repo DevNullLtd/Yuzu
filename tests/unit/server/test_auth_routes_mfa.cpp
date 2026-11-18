@@ -3483,4 +3483,81 @@ TEST_CASE("stripe waiters are capped: with the stripe held, only `cap` requests 
     CHECK(peak.load() <= 2);
 }
 
+
+namespace {
+/// A name whose stripe differs from `other`'s (or equals it when `same`), found deterministically.
+std::string name_on_stripe(AuthRoutes& r, const std::string& other, bool same) {
+    const auto idx = r.login_stripe_index_for_test(other);
+    for (int i = 0; i < 5000; ++i) {
+        const std::string n = "stripe-pick-" + std::to_string(i);
+        if ((r.login_stripe_index_for_test(n) == idx) == same)
+            return n;
+    }
+    return {};
+}
+} // namespace
+
+TEST_CASE("stripe waiter cap: the blast radius is the flooded stripe, not unrelated names",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->set_stripe_waiter_cap(4); // global ceiling; per-stripe cap is 2
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    const std::string a = "flood-a";
+    const std::string b = name_on_stripe(*h.auth_routes, a, false); // another stripe
+    const std::string c = name_on_stripe(*h.auth_routes, a, true);  // collides on A's stripe
+    REQUIRE_FALSE(b.empty());
+    REQUIRE_FALSE(c.empty());
+    std::string d; // a third stripe, free of any contention
+    for (int i = 0; i < 5000 && d.empty(); ++i) {
+        const std::string n = "stripe-free-" + std::to_string(i);
+        const auto idx = h.auth_routes->login_stripe_index_for_test(n);
+        if (idx != h.auth_routes->login_stripe_index_for_test(a) &&
+            idx != h.auth_routes->login_stripe_index_for_test(b))
+            d = n;
+    }
+    REQUIRE_FALSE(d.empty());
+    auto call = [&](const std::string& name, const char* addr) {
+        httplib::Request req;
+        req.remote_addr = addr;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r = h.auth_routes->verify_password_with_lockout(name, "whatever-123456", req, opts);
+        return std::pair{r.outcome, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - t0)};
+    };
+    auto& stripe_a = h.auth_routes->login_lock_for_test(a);
+    auto& stripe_b = h.auth_routes->login_lock_for_test(b);
+    stripe_a.lock(); // a slow request holds A's stripe: the flood below waits behind it
+    std::vector<std::thread> flood;
+    for (int i = 0; i < 6; ++i)
+        flood.emplace_back([&, i] { call(a, ("203.0.113." + std::to_string(i + 1)).c_str()); });
+    for (int i = 0; i < 300 && h.auth_routes->stripe_waiters() < 2; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    // All three probes start while the flood's two waiters are still inside their 150 ms wait.
+    // (c) A name on a DIFFERENT, contended stripe is still ADMITTED as a waiter (the flood used
+    // only 2 of the global 4): it waits the bounded 150 ms, it is not refused at once.
+    stripe_b.lock();
+    std::pair<PasswordCheckOutcome, std::chrono::milliseconds> b2{};
+    std::thread b2_thread([&] { b2 = call(b, "198.51.100.10"); });
+    // A name that COLLIDES onto the flooded stripe is refused at once: accepted and documented.
+    auto [c_outcome, c_ms] = call(c, "198.51.100.11");
+    CHECK(c_outcome == PasswordCheckOutcome::kBusy);
+    CHECK(c_ms < std::chrono::milliseconds(100));
+    // (a)/(b) An UNCONTENDED name on another stripe never touches the cap: it is served (an
+    // unknown-name verdict), not refused.
+    auto [b_outcome, b_ms] = call(d, "198.51.100.9");
+    (void)b_ms;
+    b2_thread.join();
+    stripe_b.unlock();
+    CHECK(b2.first == PasswordCheckOutcome::kBusy);
+    CHECK(b2.second >= std::chrono::milliseconds(120)); // mutation: per-stripe cap removed -> <50 ms
+    CHECK(b_outcome == PasswordCheckOutcome::kBadCredential);
+    stripe_a.unlock();
+    for (auto& t : flood)
+        t.join();
+}
+
 #endif // !_WIN32

@@ -1272,7 +1272,11 @@ private:
     std::atomic<int> stripe_waiters_{0};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};
-    /// RAII: counts one stripe waiter for its scope; `prior()` is the count before it joined.
+    /// Most requests that may wait for ONE stripe at once, so a flood on one stripe cannot use
+    /// up the global ceiling and refuse contended requests on other stripes.
+    static constexpr int kStripeWaitersPerStripe = 2;
+    std::array<std::atomic<int>, kLoginLockStripes> stripe_waiters_per_{};
+    /// RAII: counts one waiter in `c` for its scope; `prior()` is the count before it joined.
     class StripeWaiterGuard {
     public:
         explicit StripeWaiterGuard(std::atomic<int>& c)

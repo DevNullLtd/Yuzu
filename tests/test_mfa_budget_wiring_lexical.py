@@ -112,6 +112,8 @@ def check_gate_order(t):
         bad.append("a login stripe unique_lock without std::defer_lock blocks unboundedly")
     if "try_lock_for(std::chrono" in fn:
         bad.append("the stripe wait must be kLoginStripeWait, not an ad-hoc duration")
+    if "kStripeWaitersPerStripe" not in fn or "stripe_waiters_per_" not in fn:
+        bad.append("the per-stripe waiter cap (kStripeWaitersPerStripe) is missing")
     if "stripe_waiter_cap_" not in fn or "StripeWaiterGuard" not in fn:
         bad.append("the stripe waiter cap (StripeWaiterGuard + stripe_waiter_cap_) is missing")
     return bad
@@ -207,6 +209,7 @@ def selftest(files):
         ("ad-hoc stripe wait", "try_lock_for(kLoginStripeWait)", "try_lock_for(kLoginStripeWait)) || login_lk.try_lock_for(std::chrono::hours(1)"),
         ("extra lock_guard", "std::unique_lock<std::timed_mutex> login_lk;", "std::lock_guard<std::timed_mutex> extra(login_lock_for(username)); std::unique_lock<std::timed_mutex> login_lk;"),
         ("waiter cap dropped", "stripe_waiter_cap_.load", "stripe_cap_gone_.load"),
+        ("per-stripe cap dropped", "kStripeWaitersPerStripe", "kStripeWaitersGone"),
     ):
         if a in base:
             m = dict(files)
