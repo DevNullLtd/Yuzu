@@ -225,10 +225,26 @@ TEST_CASE("file_search matcher: worst-case work is bounded", "[file_search][quer
     steps = 0;
     CHECK_FALSE(hostile->matches_counted(wide, steps));
     CHECK(steps <= 128u * 256u);
-    // A name over the canonical cap never matches and costs nothing.
+    // A name over the canonical cap never matches and costs nothing, and it is NOT EVALUATED: neither
+    // a match nor a non-match, so a caller can record a gap instead of reading it as "no match".
     steps = 0;
-    CHECK_FALSE(p->matches_counted(std::string(fs::kMaxCanonicalNameBytes + 1, 'a'), steps));
+    const std::string over(fs::kMaxCanonicalNameBytes + 1, 'a');
+    CHECK_FALSE(p->matches_counted(over, steps));
     CHECK(steps == 0);
+    CHECK(p->evaluate(over) == fs::Match::not_evaluated);
+    CHECK(p->evaluate(std::string(255, 'a')) == fs::Match::no); // an ordinary miss is a plain no
+    // A canonicaliser that expands a short name past the cap (only a name with a 'b', so the pattern
+    // itself still compiles): a real match reads as not evaluated.
+    fs::NameSemantics grow = fs::byte_exact();
+    grow.canon = [](std::string_view s) {
+        return s.find('b') == std::string_view::npos ? std::string(s)
+                                                     : std::string(s) + std::string(fs::kMaxCanonicalNameBytes, 'x');
+    };
+    const auto grown = fs::Pattern::compile("aaa*", grow);
+    REQUIRE(grown);
+    CHECK(grown->evaluate("aaac") == fs::Match::yes);
+    CHECK(grown->evaluate("aaab") == fs::Match::not_evaluated);
+    CHECK_FALSE(grown->matches("aaab")); // the bool form cannot say why
     // At the cap itself the matcher still answers, through its last cells (offsets 1019, 1020).
     const std::string head(fs::kMaxCanonicalNameBytes - 4, 'a');
     CHECK(m("aaa*?", head + "\xf0\x9f\x98\x80")); // one scalar ends at the last offset

@@ -26,6 +26,9 @@
 
 namespace yuzu::shared::file_search {
 
+// The longest directory-entry name a Position can hold (the POSIX NAME_MAX). A longer name that a
+// filesystem allows (255 UTF-16 units can be 765 UTF-8 bytes on HFS-family and Windows volumes) is
+// never placed in a Position: the walker reports it as a `name_too_long` gap instead.
 inline constexpr std::size_t kMaxNameBytes = 255;
 inline constexpr std::size_t kMaxPositionDepth = 64;
 
@@ -38,7 +41,8 @@ enum class GapCause {
     memory_cap,
     permission_denied,
     dataless,
-    private_namespace
+    private_namespace,
+    name_too_long // an entry whose name cannot be held in a Position: it is not searched
 };
 
 [[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
@@ -61,6 +65,8 @@ enum class GapCause {
         return "dataless";
     case GapCause::private_namespace:
         return "private_namespace";
+    case GapCause::name_too_long:
+        return "name_too_long";
     }
     return "unknown";
 }

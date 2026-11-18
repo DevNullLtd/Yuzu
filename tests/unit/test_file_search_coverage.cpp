@@ -156,9 +156,11 @@ TEST_CASE("coverage: tokens are distinct and the shared gap tokens are exact",
     std::set<std::string> s;
     for (auto c : {GapCause::depth, GapCause::dir_unreadable, GapCause::dir_truncated,
                    GapCause::other_device, GapCause::network_mount, GapCause::memory_cap,
-                   GapCause::permission_denied, GapCause::dataless, GapCause::private_namespace})
+                   GapCause::permission_denied, GapCause::dataless, GapCause::private_namespace,
+                   GapCause::name_too_long})
         s.insert(fs::to_token(c));
-    CHECK(s.size() == 9);
+    CHECK(s.size() == 10);
+    CHECK(std::string(fs::to_token(GapCause::name_too_long)) == "name_too_long");
     CHECK(std::string(fs::to_token(GapCause::depth)) == "depth");
     CHECK(std::string(fs::to_token(GapCause::dir_unreadable)) == "dir_unreadable");
     CHECK(std::string(fs::to_token(GapCause::dir_truncated)) == "dir_truncated");

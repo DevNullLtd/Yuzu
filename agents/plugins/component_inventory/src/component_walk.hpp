@@ -320,8 +320,9 @@ private:
 
         bool on_path = true;
         if (depth == 0) {
-            if (identity_changed(resume_.root_dev, resume_.root_file_id, known(lr.dev, resume_.root_dev),
-                                 known(lr.file_id, resume_.root_file_id))) {
+            // The RAW reading is compared: a half the record knows that now reads as unknown is a
+            // change (a replaced root whose identity cannot be read), not a half to keep.
+            if (identity_changed(resume_.root_dev, resume_.root_file_id, lr.dev, lr.file_id)) {
                 restart();
                 resume_ = fsr::Position{}; // the whole root starts again
             }
@@ -329,8 +330,7 @@ private:
             pos_root_id_ = known(lr.file_id, resume_.root_file_id);
         } else {
             fsr::Frame& f = stack_.back();
-            if (recorded != nullptr &&
-                identity_changed(f.dev, f.file_id, known(lr.dev, f.dev), known(lr.file_id, f.file_id))) {
+            if (recorded != nullptr && identity_changed(f.dev, f.file_id, lr.dev, lr.file_id)) {
                 restart();
                 f.dev = lr.dev;
                 f.file_id = lr.file_id;
@@ -389,6 +389,15 @@ private:
             if (out_.rows >= limits_.max_rows)
                 return stop(Stop::section_rows);
             ++out_.stats.entries;
+
+            // A name a Position cannot hold (over kMaxNameBytes) is never placed in one, or the
+            // cursor for this slice would be empty and every retry would stall at this directory.
+            // It is not searched and says so. After a slice boundary right here the entry is met
+            // and reported again: the gap count may over-count, never under-count.
+            if (!fsr::valid_component(e.name)) {
+                add_gap(walk_detail::join(path, e.name), Cause::name_too_long);
+                continue;
+            }
 
             switch (e.type) {
             case Type::link: ++out_.stats.links_skipped; complete(e.name); continue;

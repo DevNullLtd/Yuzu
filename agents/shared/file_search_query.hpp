@@ -45,6 +45,9 @@ inline constexpr std::size_t kMaxCanonicalNameBytes = 4 * 255;
 
 enum class PatternError { empty, too_long, too_many_stars, too_few_literals, forbidden_byte };
 
+/// The answer for one name: not_evaluated is neither a match nor a non-match (see Pattern::evaluate).
+enum class Match { no, yes, not_evaluated };
+
 using Canonicaliser = std::function<std::string(std::string_view)>;
 
 /// How names are compared: the id is bound into the query hash; canon maps both the pattern and
@@ -102,18 +105,30 @@ public:
         return p;
     }
 
+    /// A plain yes or no; false ALSO when the name could not be evaluated (see evaluate). A caller
+    /// that reports what it did not search uses evaluate().
     [[nodiscard]] bool matches(std::string_view raw_name) const {
+        return evaluate(raw_name) == Match::yes;
+    }
+
+    /// not_evaluated: the canonical name is over kMaxCanonicalNameBytes (an expanding canonicaliser,
+    /// or a name bound raised past the matcher's), so a real match must not read as "no match": the
+    /// caller records a gap for it.
+    [[nodiscard]] Match evaluate(std::string_view raw_name) const {
         std::size_t steps = 0;
-        return matches_counted(raw_name, steps);
+        return evaluate_counted(raw_name, steps);
     }
 
     /// matches(), also reporting the matcher's work: one step per (pattern byte, name offset) cell
     /// it visits, so steps grow by at most (canonical pattern bytes) * (canonical name bytes + 1);
     /// lets a test assert the worst-case bound. A name over the canonical cap costs no steps.
     [[nodiscard]] bool matches_counted(std::string_view raw_name, std::size_t& steps) const {
+        return evaluate_counted(raw_name, steps) == Match::yes;
+    }
+    [[nodiscard]] Match evaluate_counted(std::string_view raw_name, std::size_t& steps) const {
         const std::string name = canon_fn_ ? canon_fn_(raw_name) : std::string(raw_name);
         if (name.size() > kMaxCanonicalNameBytes)
-            return false;
+            return Match::not_evaluated;
         // rows[r][n]: the pattern bytes consumed so far can end exactly at name offset n.
         std::array<std::array<bool, kMaxCanonicalNameBytes + 1>, 2> rows{};
         auto* cur = &rows[0];
@@ -143,10 +158,10 @@ public:
                 }
             }
             if (!any)
-                return false;
+                return Match::no;
             std::swap(cur, nxt);
         }
-        return (*cur)[name.size()];
+        return (*cur)[name.size()] ? Match::yes : Match::no;
     }
 
     [[nodiscard]] const std::string& canonical() const noexcept { return canonical_; }

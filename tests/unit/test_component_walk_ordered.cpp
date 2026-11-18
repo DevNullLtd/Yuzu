@@ -45,6 +45,7 @@
 
 #include "component_fixture_tree.hpp"
 #include "component_walk.hpp"
+#include "file_search_cursor.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -568,19 +569,65 @@ TEST_CASE("walk_ordered: unknown identities never trigger other_device or restar
         CHECK(r.visits == Strs{"/r/a/y"});
         CHECK(res.position.dirs == std::vector<fsr::Frame>{{"a", 1, 9}}); // the reading is learned
     }
-    SECTION("recorded frame known, listing unknown") {
+    SECTION("recorded frame known, listing unknown: a change, the directory starts again") {
         const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 9}}, "x"}, one);
-        CHECK(!res.restarted);
-        CHECK(r.visits == Strs{"/r/a/y"});
-        CHECK(res.position.dirs == std::vector<fsr::Frame>{{"a", 1, 9}}); // the known identity is kept
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a/x"}); // from its first entry: the resume point "x" is not skipped
     }
-    SECTION("recorded root known, listing unknown") {
+    SECTION("recorded root known, listing unknown: a change, the whole root starts again") {
         const auto res = slice(r, fsr::Position{4, 4, {{"a", 0, 0}}, "x"}, one);
-        CHECK(!res.restarted);
-        CHECK(r.visits == Strs{"/r/a/y"});
-        CHECK(res.position.root_dev == 4); // kept: the cursor validator refuses known-to-unknown
-        CHECK(res.position.root_file_id == 4);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a"}); // the resume position was dropped: the root's first entry
     }
+}
+
+TEST_CASE("walk_ordered: a directory replaced by one whose identity cannot be read is walked from its "
+          "start, and the cursor chain stays valid",
+          "[walk_ordered][file_search][component_walk]") {
+    // Slice 1 stopped in /r/d (identity 1/123) after "m". Before slice 2 the directory is replaced by
+    // one holding a, m and z whose listing reports no identity. Resuming as if unchanged would visit
+    // only "z" and report the walk complete with "a" never visited.
+    Rig r;
+    r.dir("/r", {D("d")});
+    r.dir("/r/d", {F("a"), F("m"), F("z")});
+    const fsr::Position stopped{0, 0, {{"d", 1, 123}}, "m"};
+    const auto res = slice(r, stopped, {});
+    CHECK(res.restarted);
+    CHECK(res.stop == Stop::complete);
+    CHECK(res.gaps.empty());
+    CHECK(r.visits == Strs{"/r/d/a", "/r/d/m", "/r/d/z"}); // every entry, "a" included
+
+    // The restart is a generation step, so the cursor validator accepts the new position.
+    fsr::Cursor before;
+    before.sequence = 1;
+    before.position = stopped;
+    const auto after = fsr::next_cursor(before, res.position, res.restarted, res.gaps.size());
+    CHECK(after.generation == before.generation + 1);
+    CHECK(fsr::strictly_advances(before, after));
+}
+
+TEST_CASE("walk_ordered: an entry whose name a Position cannot hold is a name_too_long gap, never placed",
+          "[walk_ordered][file_search][component_walk]") {
+    // A legal name on an HFS-family or Windows volume can be longer than kMaxNameBytes. Placing it
+    // in the position would make the cursor empty and stall every retry at this directory.
+    Rig r;
+    const std::string wide = "b" + std::string(fsr::kMaxNameBytes, 'w'); // sorts between "a" and "c"
+    r.dir("/r", {F("a"), F(wide), F("c")});
+    WalkLimits one;
+    one.max_entries = 2; // stops after "a" and the wide entry
+    const auto res = slice(r, {}, one);
+    CHECK(r.visits == Strs{"/r/a"}); // the wide name is not searched
+    REQUIRE(res.gaps.size() == 1);
+    CHECK(res.gaps[0].cause == Cause::name_too_long);
+    CHECK(res.gaps[0].path == "/r/" + wide);
+    CHECK(fsr::valid_position(res.position)); // so the cursor can be issued: no stall
+    CHECK(res.position.after == "a");
+    // Resumed from there the walk finishes; the wide entry is met again, so it is reported again.
+    const auto rest = slice(r, res.position, {});
+    CHECK(r.visits == Strs{"/r/a", "/r/c"});
+    CHECK(rest.stop == Stop::complete);
+    CHECK(!rest.gaps.empty());
+    CHECK(rest.gaps[0].cause == Cause::name_too_long);
 }
 
 TEST_CASE("walk_ordered: a listing that does not fit max_retained_bytes is a memory_cap gap, siblings continue",
