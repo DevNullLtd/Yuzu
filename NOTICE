@@ -61,7 +61,7 @@ section is maintained manually; see `vcpkg.json` and
       Copyright (c) 2016-2021 Tao An; the Muduo-derived code, Copyright (c) 2010, Shuo Chen
       (the port declares BSD-2-Clause, but its copyright text carries the non-endorsement
       clause, so BSD-3-Clause is recorded)
-  jsoncpp (build canary) ................ Public Domain / MIT
+  jsoncpp (build canary) ................ Public Domain OR MIT
   libuuid (build canary) ................ BSD-3-Clause
   cpp-httplib ........................... MIT
   Brotli ................................ MIT

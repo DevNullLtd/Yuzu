@@ -28,8 +28,10 @@ npm tarball: https://registry.npmjs.org/cytoscape/-/cytoscape-3.33.3.tgz
 Vendored file: server/core/static/cytoscape.min.js, byte-identical to the
 tarball's dist/cytoscape.esm.min.mjs (the ESM build, so the importmap in
 viz_host_page_ui.cpp can resolve `import cytoscape from "cytoscape"`).
-Upstream ships that file without a licence banner, so this file carries the
-licence text instead.
+Upstream ships that file without a licence banner, so the licence text is
+recorded here and in the repository's top-level NOTICE. Neither file is yet
+packaged with release archives, packages or images: the attribution lives in
+the source repository only.
 SPDX-License-Identifier: MIT
 
 Integrity
