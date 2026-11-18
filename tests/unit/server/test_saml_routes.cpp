@@ -2460,6 +2460,14 @@ TEST_CASE("SAML ACS failure path: hostile StatusCode text never reaches the log 
     CHECK(yuzu::test::stray_control_bytes(text) == 0);
     CHECK(text.find("\xC2\x9B") == std::string::npos);
     CHECK(text.find("\xE2\x80\xA8") == std::string::npos);
+    // stray_control_bytes skips '\n': the hostile LF must not split the failure line either.
+    {
+        const auto p = text.find("SAML ACS validation failed");
+        const auto q = text.find("forged", p);
+        REQUIRE(p != std::string::npos);
+        REQUIRE(q != std::string::npos);
+        CHECK(text.substr(p, q - p).find('\n') == std::string::npos);
+    }
 
     const auto events = fix.audit_events();
     const auto* ev = find_event(events, "auth.saml_login_failed");

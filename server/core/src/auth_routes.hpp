@@ -43,10 +43,13 @@ namespace detail {
 /// is a flat "k=v;k=v" string parsed by SIEM tooling and rendered on the
 /// dashboard audit log; an unsanitised value could inject `;`/`=` to forge
 /// additional fields, or `\r`/`\n`/other control bytes to inject fake log
-/// lines or corrupt terminal/log-viewer rendering. Replaces `;`, `=`, `\r`,
-/// `\n`, and any control byte (incl. DEL) with `_`, then truncates to 128
-/// bytes — backing up to a UTF-8 code-point boundary so a multi-byte value
-/// never ends mid-sequence. Dependency-free by design. Exposed in
+/// lines or corrupt terminal/log-viewer rendering. First folds the value
+/// through `yuzu::log_key_token` (C0 controls, DEL, well-formed C1 U+0080-U+009F,
+/// U+2028 and U+2029 become `_`; input over 256 bytes is shortened there), then
+/// replaces `;`, `=`, `\r`, `\n` and any remaining control byte with `_`, then
+/// truncates to 128 bytes — backing up to a UTF-8 code-point boundary so a
+/// multi-byte value never ends mid-sequence. Depends only on the header-only
+/// `log_token.hpp`. Exposed in
 /// `yuzu::server::detail` (mirrors the rest_a4_envelope.hpp pattern) so unit
 /// tests can call it directly.
 ///

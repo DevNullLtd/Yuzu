@@ -4755,7 +4755,7 @@ groups:
             which can quote part of a DSN password; for a failed probe query it
             carries the failing step plus the first line of libpq's message (the libpq
             portion is folded and capped at 120 bytes, the step name is added to it),
-            and a failure matching no fixed cause logs the step followed by
+            and a connect failure matching no fixed cause logs the step followed by
             "(libpq details withheld)". Probe
             from the server host with psql against the same DSN for more detail, check the
             database, and the network or proxy path to it.
