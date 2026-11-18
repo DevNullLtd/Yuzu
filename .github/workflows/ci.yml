@@ -451,8 +451,12 @@ jobs:
       # control for this step. Today a write collaborator can defeat it: a
       # workflow pushed to any branch can read CLA_REPO_ACCESS_TOKEN (cla.yml:
       # a classic `repo`-scope PAT kept as a repository secret) and push or
-      # approve as that token's owner. Organisation admins can bypass it.
-      # The bump App's private key is kept in the
+      # approve as that token's owner; accepted by the project owner on
+      # 2026-11-18 pending replacement of the archived CLA action.
+      # Organisation admins can bypass it: the OrganizationAdmin bypass on
+      # Protect Dev and Protect Main is a deliberate break-glass route,
+      # accepted by the project owner on 2026-11-18, and its use is visible in
+      # the audit log. The bump App's private key is kept in the
       # `vcpkg-baseline` environment, which only `main` may use, so that it
       # does not add another such route; that does not make the merge rule a
       # control (docs/dependency-updates.md, "Self-hosted CI is held until a

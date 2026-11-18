@@ -1112,6 +1112,14 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
+**Accepted risk — organisation-admin bypass of the merge rulesets (CC8.1), 2026-11-18.** The
+OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate break-glass route,
+accepted by the project owner on 2026-11-18, and its use is visible in the audit log. A
+pull request merged through it is not covered by the rulesets' review requirement, so the PR
+review records cited above are evidence of review for every merge except a bypassed one
+([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a maintainer
+approves the head").
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)

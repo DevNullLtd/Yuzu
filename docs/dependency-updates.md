@@ -300,14 +300,18 @@ admin can bypass it:
   access token kept as a repository secret, which a workflow pushed to any
   branch can read. With it, anyone who can push a branch can push a head as
   the token's owner and approve it, or approve any pull request as the
-  token's owner, and merge with no independent review;
-- the rulesets let organisation admins bypass the merge rule.
+  token's owner, and merge with no independent review. This is accepted by
+  the project owner on 2026-11-18 pending replacement of the archived CLA
+  action;
+- the rulesets let organisation admins bypass the merge rule. The
+  OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
+  break-glass route, accepted by the project owner on 2026-11-18, and its use
+  is visible in the audit log.
 
 The bump App's private key is stored in the `vcpkg-baseline` environment,
 which only `main` may use (see "Where the credentials are stored"), so that it
 does not add another such route. That does not make the merge rule a
-control; scoping or replacing `CLA_REPO_ACCESS_TOKEN` and the admin bypass
-are owner decisions.
+control.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
@@ -688,10 +692,15 @@ These are flat vendored files embedded into the server binary at build time — 
   If the last commit touching `gateway/rebar.config` is more than 90
   days old, the review is overdue.
 
-## CODEOWNERS auto-assignment
+## CODEOWNERS review requests
 
-Dependabot can auto-assign PR reviewers via CODEOWNERS. This requires
-`.github/CODEOWNERS` to exist, which is tracked in #366 (currently
-blocked). Once #366 lands, add `codeowners: true`-style routing to the
-dependabot entries so dependency PRs automatically ping the right
-reviewer group.
+`.github/CODEOWNERS` exists (#366). Code-owner entries for the release
+supply-chain paths, among them `/.github/workflows/`, `/vcpkg.json` and
+`/vcpkg-configuration.json` with owners `@fjarvis` and `@Tr3kkR`, are
+provided by the change that adds them to `.github/CODEOWNERS` (branch
+`fix/codeowners-supply-chain`), not by this document. Every vcpkg baseline
+bump PR edits workflow files and both vcpkg manifests, so once that change is
+merged GitHub requests a review from those owners on it, as on any other pull
+request touching those paths, Dependabot's and a change to `cla.yml`'s
+allowlist included. Whether such a review is also required to merge is a
+ruleset setting, not something CODEOWNERS decides.

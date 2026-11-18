@@ -45,7 +45,11 @@ name: vcpkg baseline update
 # rulesets' review rule. That rule does not hold against an organisation
 # admin's ruleset bypass or the repository secret CLA_REPO_ACCESS_TOKEN
 # either, environment or not (docs/dependency-updates.md, "Self-hosted CI is
-# held until a maintainer approves the head"). The environment is an
+# held until a maintainer approves the head"). The OrganizationAdmin bypass
+# on Protect Dev and Protect Main is a deliberate break-glass route, accepted
+# by the project owner on 2026-11-18, and its use is visible in the audit
+# log; CLA_REPO_ACCESS_TOKEN is accepted by the project owner on 2026-11-18
+# pending replacement of the archived CLA action. The environment is an
 # owner setting (docs/dependency-updates.md, "The bump App", "Where the
 # credentials are stored"); a dispatch of this workflow from any branch but
 # `main` therefore fails at job start. No other job, and no other workflow,
