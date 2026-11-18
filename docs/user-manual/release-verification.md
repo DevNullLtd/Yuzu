@@ -189,7 +189,7 @@ sha256sum yuzu-agent_X.Y.Z_amd64.deb
 **What a file's SBOM lists.** The release unpacks each file and lists what is
 in it:
 
-- **The C++ libraries its binaries are built with.** They are linked
+- **The vcpkg libraries its C++ binaries are built with.** They are linked
   statically (on Windows most ship as DLLs next to the agent instead), and a
   scanner identifies neither, so the release takes them from the vcpkg
   installation it built with, with the installed version,
@@ -197,20 +197,61 @@ in it:
   source, and a CPE where NVD has a product for the library. The agent's files
   list the agent's libraries; a file holding `yuzu-server` also lists the
   server's (`libpq`, `xmlsec`, `drogon` and what they need). The list is every
-  library the build installs for that component, so it can include one a
-  binary ends up not using; it does not omit one the binary uses.
+  vcpkg library the build installs for that component, so it can include one
+  a binary ends up not using; it does not omit a vcpkg library the binary
+  uses. A library whose vcpkg record gives no licence is listed without one
+  (`NOASSERTION` in SPDX), and the SBOM names those libraries in its
+  `yuzu:sbom:licence-noassertion` property (CycloneDX) or root comment (SPDX).
 - **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
   `pkg:hex` purl) and the Erlang runtime.
 - **Anything else a scanner recognises in the unpacked file.**
 
-Not listed: the web assets compiled into `yuzu-server` (htmx, ECharts,
-three.js, Cytoscape, qrcodegen, IBM Plex fonts; see `NOTICE`), and libraries
-the binaries load from the operating system (glibc, `libsystemd`, the MSVC
-runtime). The Windows installer is not unpacked by the release; its SBOM lists
-the contents of `yuzu-agent-windows-x64.zip`, which is built from the same
-output, and says so on its root. SBOMs of releases before this change were a
-scan of the whole build workspace and list thousands of components (the vcpkg
-ports catalogue among them) that the release does not ship.
+The Windows installer is not unpacked by the release: its SBOM lists the files
+of `yuzu-agent-windows-x64.zip` (built from the same output) that the
+installer's script, `yuzu-agent.iss`, installs, and leaves out any file of the
+archive the installer does not install. The SBOM says so in its
+`yuzu:sbom:contents` property (CycloneDX `metadata.properties`; in SPDX, the
+comment on the described package), while its root names the installer and
+its SHA-256.
+
+Not listed yet: code vendored into the source tree and compiled into
+`yuzu-server` (qrcodegen, and the web assets it embeds: htmx, ECharts,
+three.js, Cytoscape, IBM Plex fonts; see `NOTICE`), the Windows installer's own
+InnoSetup runtime, and libraries the binaries load from the operating system
+(glibc, `libsystemd`, the MSVC runtime, and the host OpenSSL `libcrypto` the
+gateway's `crypto` application loads). An SBOM whose file holds something it
+does not list says so in the data: a CycloneDX `compositions` entry with
+`aggregate: incomplete` for its root, and in SPDX (which has no such field) a
+`CONTAINS NOASSERTION` relationship on the described package; the
+`yuzu:sbom:incomplete` property says what is missing. Today that is every SBOM
+of a file holding `yuzu-server` and the installer's. SBOMs of releases before
+this change were a scan of the whole build workspace and list thousands of
+components (the vcpkg ports catalogue among them) that the release does not
+ship.
+
+**What to expect from a dependency scanner.** Feeding these SBOMs to grype,
+Dependency-Track or a similar tool, expect:
+
+- **No CVE match for libraries without a CPE.** NVD has no product for `re2`,
+  `jsoncpp`, `nlohmann-json`, `cli11`, `libuuid`, `trantor` or `utf8-range`
+  under the names tried, so those are listed with a purl only and a
+  CPE-matching scanner reports nothing for them, whatever their state.
+- **Matches that do not apply.** `libpq` carries PostgreSQL's CPE, so server
+  CVEs in PostgreSQL are reported against it although only the client library
+  ships; triage each against the libpq client.
+- **Duplicates.** A library can appear twice: once from the vcpkg record and
+  once where the scanner recognises the same library in a file (a DLL on
+  Windows, for example). `utf8-range` carries protobuf's source purl, because
+  vcpkg builds it from the protobuf repository.
+- **No dependency graph for the vcpkg libraries.** They are listed as
+  components of the file; the SBOM does not record which library depends on
+  which.
+
+```bash
+# What a file's SBOM says it does not list, and the libraries without a licence
+jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-linux-x64.cdx.json
+jq '.compositions' yuzu-linux-x64.cdx.json
+```
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
@@ -231,9 +272,22 @@ jq -r '.components[] | select(.licenses[]? | (.license.id // .expression) == "MI
 
 ```bash
 jq -r '.packages[] | "\(.name)\t\(.versionInfo)"' yuzu-linux-x64.spdx.json | column -t
+
+# Check the SPDX SBOM belongs to the file you hold: name and SHA-256 of the described package
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root)
+        | "\(.name) \(.checksums[] | select(.algorithm == "SHA256") | .checksumValue)"' yuzu-linux-x64.spdx.json
+sha256sum yuzu-linux-x64.tar.gz
 ```
 
 ### Docker image SBOMs
+
+An image SBOM is a syft scan (v1.57.2, the same version as the file SBOMs) of
+the image as published. It lists the operating-system packages and what syft
+recognises in the image's files, so it does not list the C++ libraries linked
+statically into `yuzu-server`: the `yuzu-linux-x64` and `yuzu-server` package
+SBOMs list those. Image SBOMs are not checked by the release's SBOM scope
+check, which covers the file SBOMs only.
 
 ```bash
 jq '.components | length' yuzu-server-image.cdx.json
@@ -329,7 +383,8 @@ first; the GitHub CLI must be able to query
 rate-limited and can return empty lists.
 
 **`cyclonedx validate: unable to parse`** — the CycloneDX CLI pins to
-CycloneDX 1.5 by default; Yuzu ships CycloneDX 1.6. Upgrade the CLI
+CycloneDX 1.5 by default; Yuzu's SBOMs are CycloneDX 1.7 (syft v1.57.2; earlier
+releases shipped 1.6). Upgrade the CLI
 (`npm i -g @cyclonedx/cyclonedx-cli@latest`) or use `jq` for structural
 validation (`jq empty yuzu-linux-x64.cdx.json`).
 

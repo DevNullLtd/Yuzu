@@ -11,6 +11,27 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: release SBOMs describe each shipped file, and every package and installer has its own
+
+**What changed.** The release used to publish one CycloneDX and one SPDX SBOM per platform, made by scanning the whole build workspace: they listed the vcpkg ports catalogue, docs and test tooling (40,853 components for v0.15.0's Linux SBOM) and not the C++ libraries the binaries link. Each release asset now has its own SBOM pair, made from that file alone:
+
+| Asset | SBOM |
+|---|---|
+| `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` | same names as before: `<archive without .tar.gz/.zip>.{cdx,spdx}.json` |
+| each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
+| `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files of the agent zip the installer installs |
+| `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
+| container images | unchanged names; now made with the same syft version (v1.57.2) |
+
+Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries its C++ binaries are built with (version, licence, upstream purl, CPE where NVD has one), the gateway's Erlang/OTP release, and what syft recognises in the file. A pre-release uses the pre-release package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`).
+
+**Who is affected.** Anyone who imports the release SBOMs into a dependency scanner or an asset inventory (Dependency-Track, grype, a procurement portal), and anyone who downloads them by name.
+
+**What to do.**
+- Re-baseline scanner findings on the first release with the new SBOMs: the component set changes completely (thousands of workspace entries disappear; the shipped OpenSSL, libpq and other vcpkg libraries appear at their real versions), so findings appear and close that did not change in the product.
+- To describe a package or the installer, use its own SBOM rather than the archive's.
+- Read "What a file's SBOM lists" and "What to expect from a dependency scanner" in [Release verification](release-verification.md) section 5 for what is not listed yet (vendored code in `yuzu-server`, the installer's InnoSetup runtime, operating-system libraries) and how an SBOM marks itself incomplete.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.
@@ -203,7 +224,7 @@ The top-level directory inside each archive is renamed the same way (`yuzu-agent
 - If you run the server on Windows or macOS, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md): the old server's data cannot be carried over, so you deploy a new Linux server (the container image or the Linux packages), enroll agents with it as new installations, and delete the old server's leftover files, which hold secrets.
 - Do not unpack the new agent archive over a directory a server still runs from.
 
-**Known limitations.** The Windows and macOS SBOMs are generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of an SBOM can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.)
+**Known limitations (releases before the per-file SBOMs).** In the releases this entry first applied to, the Windows and macOS SBOMs were generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of one of those SBOMs can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.) From the release that describes each shipped file (the "release SBOMs describe each shipped file" entry above), each SBOM lists only its own file's contents.
 
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 

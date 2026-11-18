@@ -460,13 +460,20 @@ release when:
   archive, package or image of the release (supply-chain S8);
 - an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
   in the release or whose SHA-256 differs, has more entries than the bound in
-  `scripts/ci/artifact-sbom.py` (400; measured locally at 22 to 58, about
-  100 estimated for the Windows agent archive), or
-  lists a path under `vcpkg/`, `site/`, `tests/`, `_build_*`, `.git` or
-  `.github`, the marks of a checkout scan ("Check artifact SBOM scope", S8).
-  The build jobs make these SBOMs with that script: each artifact is unpacked
-  and scanned on its own with a pinned syft, and the vcpkg ports its binaries
-  are built from are added from the installed tree for the release triplet;
+  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 58 for the
+  Linux files and 212 for v0.15.0's Windows archive, the largest), has no entries and no record
+  that its file was unpacked and held files, or lists a path under `vcpkg/`,
+  `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
+  `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
+  ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
+  caught only by the bound). This step runs after the images are pushed, so a
+  failure here needs a fix and a new tag, not a re-run (the release skill's
+  failure table). The build jobs make these SBOMs with that script: each
+  artifact is unpacked and scanned on its own with syft pinned to v1.57.2 (the
+  image SBOM steps pin the same version), and the vcpkg ports its binaries are
+  built from are added from the installed tree for the release triplet; the
+  Windows installer's SBOM lists the archive files `yuzu-agent.iss` installs.
+  Each `generate` command runs with a timeout;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
