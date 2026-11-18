@@ -130,7 +130,7 @@ PIN_MUTATIONS = [
     ("pin f: system added in the macOS config checks", "config_checks.hpp",
      "inline std::vector<ConfigCheckResult> run_macos_checks(const MacosReader& reader) {\n",
      "inline std::vector<ConfigCheckResult> run_macos_checks(const MacosReader& reader) {\n    (void)system(\"true\");\n"),
-    ("pin f: popen helper compiled on macOS again", "config_checks.hpp",
+    ("pin f: popen helper compiled on macOS", "config_checks.hpp",
      "#ifdef __linux__\n// popen with RAII", "#if defined(__linux__) || defined(__APPLE__)\n// popen with RAII"),
     ("pin f: exec added at the top level", "vuln_scan_plugin.cpp",
      "std::vector<Finding> do_config_scan_impl(", "int g_x = execv(\"/bin/true\", nullptr);\nstd::vector<Finding> do_config_scan_impl("),
