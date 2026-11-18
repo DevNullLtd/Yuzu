@@ -1136,9 +1136,10 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
-  An approver may be the change's author: the `CODEOWNERS` entries for those paths (PR #8243) only
-  request a review from a release owner, and "Require review from Code Owners" is off on the
-  protected branches by owner decision, so any one approving review merges such a change and
+  An approver may be the change's author: the `CODEOWNERS` entries for those paths will request a
+  review from a release owner once PR #8243 is merged (until then nothing requests one), they only
+  request it, and "Require review from Code Owners" is off on the protected branches by owner
+  decision, so any one approving review merges such a change and
   separation of duties is a practice, not an enforced control. Disclose it with the control.
 - *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed

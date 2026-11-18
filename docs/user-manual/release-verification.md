@@ -122,9 +122,10 @@ approver's login, an approval date and a pull-request reference that are not `pe
 scan checks those three approval fields for **format only**: it does not confirm with GitHub that the
 pull request exists or that the named person approved it, and nothing stops the approver it names
 from being the change's own author. The control behind an acceptance is the project's review of the
-change that adds it, and that review is requested, not required: the repository's code-owner entries
-for these files request a review from a release owner, but the branch rules do not require a code
-owner's review (an owner decision), so any one approving review merges the change. To audit an
+change that adds it, and that review is not required: once pull request #8243 is merged, the
+repository's code-owner entries for these files will request a review from a release owner (until
+then nothing requests one), but the branch rules do not require a code owner's review (an owner
+decision), so any one approving review merges the change. To audit an
 acceptance, follow its pull-request reference and check who approved it there.
 
 The release scan also refuses to push, rather than report a clean scan, when:
@@ -181,11 +182,33 @@ publish: tagged <repository>:<tag>[,...] sha256:<digest>
 Each line is written before the next step starts, and the image's tags are moved only after the
 `signed-attested` line: the digest was first checked to have the scanned image's layers, then signed
 and attested. A journal that stops early records how far that attempt got (`tagging` means some of
-its tags may have moved). An attempt with no journal pushed nothing. For each of the six images the
-published image is the HIGHEST attempt whose journal ends `publish: tagged`, and the release is not
-created unless there is one and no higher attempt ends `publish: tagging`. A refusal that was never
-followed by a release (the tag was cut again instead) is kept only in that workflow run's artifacts,
-for 90 days.
+its tags may have moved). An attempt with no journal normally pushed nothing (its scan refused the
+image, or the job stopped first), but a missing journal is absence of a record, not proof: the
+upload of the record can fail.
+
+For each of the six images the published image is the HIGHEST attempt whose journal ends
+`publish: tagged`, and the release is not created unless there is one and no higher attempt ends
+`publish: tagging`. To check one of them (the release's assets, downloaded beside `SHA256SUMS` and
+verified as above):
+
+```bash
+img=yuzu-server   # or yuzu-gateway, yuzu-postgres, yuzu-server-chisel, ...
+# Each attempt's last journal line, in attempt order (attempt 10 after 9):
+for f in $(ls publish-${img}.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
+docker buildx imagetools inspect "ghcr.io/${OWNER}/${img}:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+The highest attempt whose last line is `publish: tagged ...` must name the digest the last command
+prints. A refusal that was never followed by a release (the tag was cut again instead) is kept only
+in that workflow run's artifacts, for 90 days.
+
+**Candidate tags and untagged digests are not releases.** The packages also hold images no release
+names: a `:candidate-<run>-<N>` tag on `yuzu-agent-bundle-chisel` (how the bundle is pushed before
+it is checked), and untagged digests in every package (an attempt whose push was not verified,
+signed or tagged, or that a later attempt replaced). Do not deploy them, and do not take a
+signature on one as a release: a published image is the digest a release tag (`:X.Y.Z`) names, of a
+version with a published GitHub Release, that `cosign verify` accepts for that release's tag. Old
+candidates may be deleted later without notice.
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
 afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and
@@ -206,7 +229,7 @@ for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
   sha256sum -c "$sums"
 done
 grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt
-tail -n 1 publish-yuzu-agent-bundle-chisel.attempt-*.txt
+for f in $(ls publish-yuzu-agent-bundle-chisel.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
 docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
 ```
 
@@ -214,8 +237,11 @@ Every list must print `Verified OK` and every file `OK`. The highest attempt who
 line is `publish: tagged ...` is the published bundle image: the digest on that line must equal
 what the last command prints, and that attempt's `gate:` line must be `gate: pass`. If an attempt
 above it ends `publish: tagging`, the tag may name either digest: do not deploy the bundle until a
-later attempt ends `tagged`. When no attempt ends `publish: tagged`, no attempt moved the bundle's
-tag for this release. A re-run adds new report assets and never replaces a completed one (an upload
+later attempt ends `tagged`. When no attempt ends `publish: tagged`, the record cannot say what the
+tag names: an attempt ending `tagging` may have moved it, and so may an attempt whose record was
+never uploaded. Deploy the bundle only if the digest the last command prints is on some attempt's
+`tagging` or `tagged` line (that digest was checked and signed before any tag moved) and passes
+`cosign verify` for the release's tag; otherwise do not deploy it, and ask the project. A re-run adds new report assets and never replaces a completed one (an upload
 that was interrupted, which GitHub never served, is replaced). The reports are a point-in-time record:
 a vulnerability disclosed after the release is not in them.
 

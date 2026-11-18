@@ -438,8 +438,9 @@ flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
 the `release` job needs `docker-publish`, `docker-publish-postgres` and
-`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
-`:latest`) first (the agent-bundle image needs `release`, so it is not
+`docker-publish-chisel`, which have moved `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) to their verified, signed digests first (each of their publish journals
+ends `tagged`; the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
 An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
 `docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
@@ -1065,8 +1066,10 @@ per attempt, its reports, its journal and a checksum list
 attempt's files are on the release.
 
 **The publish journal** (`scripts/ci/image-publish.sh`). A release tag (`:X.Y.Z`, and on a stable
-tag `:X.Y` and `:latest`) is public the moment it moves, so it moves LAST, and every step that
-touches the registry is announced before it runs. The contract:
+tag `:X.Y` and `:latest`) is public the moment it moves, so it moves LAST, and every push of the
+image and every tag move is announced before it runs. (The SBOMs, the provenance attestation and the
+cosign signature are pushed as referrers of the digest before `signed-attested` records them: the
+digest was announced at `push-started`, and no tag names it yet.) The contract:
 
 - The journal is `publish-<image>.attempt-<N>.txt`, beside the gate's reports. Only
   `image-publish.sh` writes it, appending one line per completed step; it is never rewritten, and
@@ -1086,23 +1089,46 @@ touches the registry is announced before it runs. The contract:
   5. `publish: tagging <tags> <digest>`, appended BEFORE the first tag moves;
   6. `publish: tagged <tags> <digest>`, once every tag, applied with `docker buildx imagetools
      create --prefer-index=false -t <tag> <repository>@<digest>`, resolves to the digest.
-- No journal means nothing was pushed by that attempt: the gate refused the image, or the job
-  stopped before the journal was opened. With no journal the `.gate.txt` is not `pass` (or the run
-  stopped between the two); either way it is the record of a refusal or of nothing pushed.
-- A failure or a cancellation simply stops the journal. There is no failure label and no trap. So
-  a journal's last label claims at least what the registry holds: `push-started` may have pushed an
-  untagged digest (or the bundle's candidate tag), `tagging` may have moved some of the tags.
+- No journal for an attempt means one of three things: its gate refused the image (its `.gate.txt`
+  is not `pass`), the job stopped before the journal was opened, or the journal never reached the
+  artifact (the evidence upload and its one retry both failed, or the runner was lost: residuals
+  below). The first two pushed nothing; the third is absence of evidence, not proof that nothing
+  was pushed.
+- A failure or a cancellation simply stops the journal. There is no failure label, and nothing is
+  written on a cancel. So a journal's last label claims at least what the registry holds:
+  `push-started` may have pushed an untagged digest (or the bundle's candidate tag), `tagging` may
+  have moved some of the tags. A cancel reaches the script itself: every step runs it as `exec
+  scripts/ci/image-publish.sh ...`, because the Actions runner signals only the step's PID (SIGINT,
+  SIGTERM 7.5 s later, SIGKILL 2.5 s after that; `actions/runner` `ProcessInvoker`), never its
+  process group. On SIGINT or SIGTERM the script stops at the next step boundary: it stops the
+  registry call it is waiting on (each runs in the background, so the trap acts at once), appends
+  nothing further and exits 130 or 143. No process of it outlives the step to append or move a tag
+  after the evidence upload has read the journal (G8P6-chaos-injector-1), in this run or in a later
+  run of the same tag (G8P6-chaos-injector-2: the chisel and bundle jobs' `cancel-in-progress`
+  groups cancel an older run's leg the same way).
 - The pushes carry no release tag: the buildx jobs push with `outputs:
   type=image,name=<repository>,push-by-digest=true,name-canonical=true,push=true` and no `tags:`,
   and the agent bundle pushes `:candidate-<run id>-<attempt>` and resolves its digest. The tags are
   applied only by `image-publish.sh tag`, which moves every one of them from the digest; a failed
   check that a tag resolves to the digest leaves the journal at `tagging`.
-- The journal is uploaded with the gate reports under the same `if: always()` status function.
-  Job outputs carry no publish state; consumers read the journal through `image-publish.sh state`
-  (one attempt) or `published` (all attempts), and accept only a legal prefix.
+- The journal is uploaded with the gate reports under the same `if: always()` status function, and
+  a retry step (`if: always() && steps.upload_gate.outcome == 'failure'`, no `overwrite`) uploads
+  it again when that upload failed. Job outputs carry no publish state; consumers read the journal
+  through `image-publish.sh state` (one attempt) or `published` (all attempts), and accept only a
+  legal prefix.
 - Across attempts, the published image is the HIGHEST attempt whose journal ends `tagged`. The
   release check and the attach job fail when any attempt above it ends `tagging`: a tag may then
   name either digest. A re-run that completes `tagged` heals it.
+
+**Decision record (2026-11-18).** This contract and the "Future findings on this path" rule
+below are the enterprise-architect contract, accepted by the project owner (fjarvis) on 2026-11-18.
+After repeated Gate 8 governance passes kept finding orderings in which the publish state reported
+by job outputs and the attach job disagreed with what the registry held, the enterprise-architect
+review recommended replacing further point fixes with this write-ahead journal and a closed
+definition of a defect on this path; the project owner accepted that ruling, and later passes
+judge findings on this path by it. Review this decision if a publish job gains a registry write
+the journal does not announce, or if a release tag starts moving anywhere other than
+`image-publish.sh tag`.
 
 Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
 --prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
@@ -1115,17 +1141,46 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
 
 **What the journal does not cover** (residuals, disclosed once here):
 
-- **A runner killed before the upload** (SIGKILL, a lost runner) leaves no evidence for that
-  attempt. That is absence, not disagreement: no journal claims less than the registry holds.
+- **No evidence reaches the artifact** for an attempt when the runner is killed or lost before the
+  upload, or when the evidence upload and its retry both fail (an artifact-service outage). That
+  is absence, not disagreement: no journal claims less than the registry holds. Its cost: for one
+  of the six images the release job does not run (it needs that job green, and a re-run tags a new
+  digest the release then names). For the agent bundle, if that attempt had moved `:X.Y.Z`, the
+  attach job reads only the other attempts, so it may name an older attempt as published (or none)
+  while `:X.Y.Z` names the missing attempt's verified, signed digest (G8P6-architect-4); the bundle
+  job is red. The release skill's terminal check (resolve `:X.Y.Z`, compare it with every journal)
+  is how that is caught before the release is announced.
+- **A SIGKILL of the script, or a lost runner process, mid-call.** The script stops its own
+  registry call within about 3 s of the first signal, well before the runner's SIGKILL (10 s), so
+  only a runner that kills or loses the script earlier can leave a registry call running. The
+  journal already announced that call; the runner's orphan cleanup (at the end of the job) stops
+  what remains unless the runner itself died, and such a call could then still move a tag after a
+  later run's `tagged`.
 - **A re-run moves the tag to a new digest.** Each attempt pushes and tags its own build; the
   release check requires the release's assets to name the published (highest `tagged`) attempt.
+  That holds only until the release exists: re-running ONE publish job by hand ("Re-run job" on a
+  green `docker-publish`, `-postgres` or `-chisel` leg) after the release is published reuses the
+  earlier `release-guard` result, passes the tag re-check, and moves `:X.Y.Z` (and `:X.Y`,
+  `:latest`) to a new verified, signed digest that the release's SBOMs, gate reports and journals
+  do not name; its `Create Release` then fails (`already PUBLISHED`). Pre-existing (the old code
+  pushed `:X.Y.Z` directly); the release skill forbids it and gives the repair
+  (G8P6-unhappy-path-1).
 - **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
   `tagged` moves all of them again.
 - **Untagged candidate digests and the bundle's candidate tag stay in GHCR.** A digest that was
   pushed but never tagged (a verify failure, a cancel) and the `:candidate-<run id>-<attempt>` tag
-  are not deleted: GHCR deletes a package VERSION, which is the digest itself, so deleting the
-  candidate of a published bundle would delete the published image. Clean them up by hand, by
-  digest, only for digests no journal ends `tagged` with.
+  are not deleted: GHCR deletes a package VERSION, which is the digest itself, and every tag naming
+  it goes with it. No journal can say which digests are safe (one ending `tagging` may have moved a
+  release tag to its digest, and a `tagged` attempt whose upload failed has none), so the rule is
+  the registry's, at delete time: resolve every live tag of the package and refuse any digest a tag
+  other than a `candidate-*` tag names. `scripts/ci/image-candidate-delete.sh OWNER PACKAGE
+  DIGEST...` does exactly that (it lists the tags with `gh api --paginate
+  /orgs/<owner>/packages/container/<package>/versions`, resolves each with `docker buildx
+  imagetools inspect`, refuses an index's children too, and refuses everything while a
+  `release.yml` run is queued or in progress); it only checks unless given `--delete`, re-checks
+  before each deletion, and deletes only when every named digest passes. A deleted digest's
+  signature and attestation referrers (`sha256-<hex>.sig`/`.att`) stay behind, tagged, so the
+  script refuses them; they are harmless. Confirm with the operator before any deletion.
 
 **Future findings on this path.** A defect is a reachable row (a gate outcome, a point where the
 job stops, a publish shape, and for attach an attempt order) in which the journal's last label
@@ -1133,11 +1188,16 @@ claims LESS than the registry holds, or in which the attach job or `check-releas
 accepts an illegal sequence. Anything else on this path is non-blocking.
 `tests/test_image_publish.py` is the table: gate pass, fail, SIGINT, SIGTERM and budget, times
 stop points before the push, mid-push, a verify failure or cancel, an attest or sign failure,
-before the tags, mid-tag with and without a tag applied, after the tags before `tagged`, and
-complete, for both the buildx and the bundle shapes, run in `release.yml`'s own step order against
-a stub registry; cross-attempt rows with the attach job interrupted at each attempt; and mutants
-(adjacent step swaps, named reorders, a dropped intent line, `tagged` recorded early) that must be
-killed.
+before the tags, mid-tag with and without a tag applied, a cancel while `tag` is still loading the
+journal, a tag move in flight that would complete later, another writer moving a tag, after the
+tags before `tagged`, a failed evidence upload, and complete, for both the buildx and the bundle
+shapes, run in `release.yml`'s own step order against a stub registry, with every cancel delivered
+to the step's PID only (as the runner delivers it) and the evidence read as uploaded; cross-attempt
+rows with the attach job interrupted at each attempt; a cross-run row (an older run cancelled
+mid-tag while a newer run publishes); journal-reader rows; and mutants (adjacent step swaps, named
+reorders, a dropped intent line, `tagged` recorded early, a writing step without `exec`, a script
+that ignores the signal or waits on its registry call in the foreground, unchecked late journal
+lines) that must be killed.
 
 It never replaces a completed asset. For each name already on the release (the attach job re-run
 for the same attempt) it reads GitHub's asset `state`, `size` and `digest`: an asset whose state is
@@ -1148,7 +1208,8 @@ file (a `.sigstore` when it verifies this run's list) and fails the job when it 
 refusal is decided before anything is deleted, and a failed download stops the job rather than
 counting as incomplete. If the attach job fails, the Release run is red, so Pre-release QA does not
 start (it runs only on a successful Release run), and the report exists only as the 90-day artifact,
-which is shorter than a SOC 2 Type II observation window:
+which is shorter than a SOC 2 Type II observation window (except when the only failure is a higher
+attempt stopped while tagging: the files are attached first, then the job fails):
 
 - **A transient failure, or an interrupted upload** (a network error, a cosign or GitHub outage, a
   cancel during `gh release upload`): "Re-run failed jobs" re-runs the attach job (and any other job
@@ -1160,7 +1221,17 @@ which is shorter than a SOC 2 Type II observation window:
   delete it to make the job pass. Investigate it as a release-integrity incident with the owner.
 - **A higher attempt stopped while tagging** (`stopped while moving the bundle's tag`): the record is
   attached, then the job fails, because `:X.Y.Z` may name either attempt's digest. "Re-run failed
-  jobs" re-runs the bundle job; once an attempt ends `tagged`, this job passes.
+  jobs" re-runs the bundle job; once an attempt ends `tagged`, this job passes. When the bundle
+  job's re-run cannot pass (its gate refuses for a reason that needs a commit), this state is
+  terminal for the release: do not keep re-running. Resolve `:X.Y.Z` (`docker buildx imagetools
+  inspect ghcr.io/<owner>/yuzu-agent-bundle-chisel:X.Y.Z --format '{{.Manifest.Digest}}'`) and
+  compare it with every attempt's journal: a digest on a `tagging` or `tagged` line was verified
+  and signed before any tag moved (`cosign verify` it), so that is the bundle image this version
+  ships, and the announcement says so. A digest on no uploaded journal's line is looked for in the
+  bundle job's logs (the script prints every line it records; an attempt whose report never
+  uploaded shows its tag move only there); found nowhere, or no tag at all, it is an incident to
+  investigate with the owner. The same check applies whenever the run is red around the bundle,
+  because an attempt whose evidence never uploaded can have moved the tag (residuals above).
 
 Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle job never
 uploaded a report there is nothing to attach; its job log is the record. The report globs
@@ -1258,9 +1329,9 @@ protection that requires it.
 author approve it, but nothing ties `approved_by` to whoever did review it, and without branch
 protection that requires a review the pull request can merge with none. Separation of duties
 therefore rests entirely on that branch protection, and it is not enforced: the `.github/CODEOWNERS`
-entries for these paths (PR #8243, owners `@fjarvis` and `@Tr3kkR`) only REQUEST a review from either
-owner, "Require review from Code Owners" is off on the Protect Dev and Protect Main rulesets by owner
-decision (2026-11-18), and both owners can bypass the rulesets as organisation admins. So any one
+entries for these paths will request a review from either owner (`@fjarvis`, `@Tr3kkR`) once PR
+#8243 is merged (until then nothing requests one), and they only REQUEST it: "Require review from
+Code Owners" is off on the Protect Dev and Protect Main rulesets by owner decision (2026-11-18), and both owners can bypass the rulesets as organisation admins. So any one
 approval merges a change to an acceptance, a not-covered listing or the gate, and an approver
 recorded in `approved_by` may be the change's own author. By practice, when one of the two owners
 writes an entry, the other approves it; a reviewer of these paths checks that the named approver
@@ -1370,8 +1441,13 @@ published images (a tracked gap).
 job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
 BEFORE any SBOM, attestation or signature. The release tag moves only after verify, sign and
 attest, and the publish journal is write-ahead ("The publish journal" above): only
-`image-publish.sh` writes it, only `image-publish.sh tag` moves a release tag, and a consumer
-accepts only a legal prefix. The gate fails closed: a scan, DB, coverage or
+`image-publish.sh` writes it, only `image-publish.sh tag` moves a release tag, every writing step
+runs it with `exec` and it appends nothing after a SIGINT or SIGTERM, consumers read it only through
+`image-publish.sh state` or `published` (one reader), and accept only a legal prefix; the published
+image is the HIGHEST attempt ending `tagged`, and any higher attempt ending `tagging` fails both the
+release check and the attach job. A GHCR version is deleted only when no tag other than a
+`candidate-*` tag names it, decided from the registry at delete time
+(`scripts/ci/image-candidate-delete.sh`). The gate fails closed: a scan, DB, coverage or
 advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
 SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
 never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
@@ -1382,8 +1458,8 @@ the review of the change is the control. Trivy reads only the checker's canonica
 file, and the DB only from this run's fresh cache, pinned by digest. Widening any of these (a glob
 or one-word scope, a bare id, an honoured pending approval, an inherited cache, a second coverage
 reader that is not Trivy's report, an overwritten or clobbered report, a push that carries a
-release tag, a second journal writer, a consumer that accepts an illegal sequence) is a security
-decision, not a fix.
+release tag, a second journal writer or reader, a consumer that accepts an illegal sequence, a
+deletion decided from a journal instead of the registry) is a security decision, not a fix.
 
 ### Pre-release QA (`pre-release.yml`)
 
