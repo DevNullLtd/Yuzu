@@ -21,6 +21,7 @@
 #include <yuzu/server/auth.hpp>
 
 #include "authz_model.hpp" // authz::VisibleSet (WP06 F4)
+#include "instruction_authority.hpp"
 #include "http_route_sink.hpp"
 #include "policy_store.hpp"
 
@@ -56,25 +57,9 @@ public:
                                            const nlohmann::json& attrs,
                                            const nlohmann::json& payload_data)>;
 
-    /// WP06 F4 (interim; #6065 owns the dispatch-identity change and is untouched): the
-    /// REQUEST principal's authority over ONE instruction id. A policy fragment's check /
-    /// postCheck / fix instruction later runs through the evaluator as the SYSTEM caller, so the
-    /// per-action RBAC, the `ExecuteGate` and per-device visibility are never consulted at fire
-    /// time. This closure is the authoring-time (and manual-remediate) check: it resolves the
-    /// instruction id to its (plugin, action), runs the SHARED `authorize_dispatch` dry run for
-    /// the request's principal as a NON-system caller, and reports the principal's per-device
-    /// execution visibility. server.cpp wires it from the same `authorize_dispatch` closure MCP
-    /// and the workflow execute twins use (set after construction: that closure is defined
-    /// later than this route group). Unset or unresolvable = REFUSED (fail closed).
-    struct InstructionAuthority {
-        bool ok{false};
-        int status{403};         ///< HTTP status to answer when !ok (401/403/400/503)
-        std::string message;     ///< operator-facing refusal text when !ok
-        std::string plugin_action; ///< "plugin.action" the instruction id resolved to (when ok)
-        authz::VisibleSet visible{authz::deny_all()}; ///< exec visibility (nullopt = unrestricted)
-    };
-    using AuthorizeInstructionFn =
-        std::function<InstructionAuthority(const httplib::Request&, const std::string& instruction_id)>;
+    /// See `instruction_authority.hpp`: unwired or unresolvable = REFUSED (fail closed).
+    using InstructionAuthority = ::yuzu::server::InstructionAuthority;
+    using AuthorizeInstructionFn = ::yuzu::server::AuthorizeInstructionFn;
     void set_authorize_instruction_fn(AuthorizeInstructionFn fn) {
         authorize_instruction_fn_ = std::move(fn);
     }

@@ -11,6 +11,7 @@
  * coverage, not a move of pre-existing tests.
  */
 
+#include "test_policy_fragment_helper.hpp"
 #include "agent_registry.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_exec.hpp"
@@ -167,7 +168,7 @@ TEST_CASE("DELETE /api/policy-fragments/:id: deletes a real fragment", "[complia
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
     REQUIRE(store.is_open());
-    auto created = store.create_fragment(kFragmentYaml);
+    auto created = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(created);
 
     PolicyAdminHarness h{&store};
@@ -185,7 +186,7 @@ TEST_CASE("POST /api/policies/:id/enable + /disable: round-trips a real policy",
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
     REQUIRE(store.is_open());
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag);
     auto policy = store.create_policy(R"(
 apiVersion: yuzu.io/v1alpha1
@@ -263,7 +264,7 @@ TEST_CASE("POST /api/policies/:id/evaluate and /remediate: a degraded scope "
     // a fix instruction — resolve_targets aborts before dispatch_instruction
     // is ever reached on either path, so neither instruction needs a real
     // InstructionStore entry to exercise this specific abort.
-    auto fid = ps.create_fragment(
+    auto fid = yuzu::test::create_fragment_for_test(ps, 
         "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: Degraded Route "
         "Fragment\ndescription: check+fix\nspec:\n  check:\n    instruction: test.check\n"
         "    compliance: \"result.hostname != ''\"\n  fix:\n    instruction: test.fix\n");
@@ -334,7 +335,7 @@ TEST_CASE("POST /api/policies: the policy.create audit row records the stored ta
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
     REQUIRE(store.is_open());
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     PolicyAdminHarness h{&store};
 
@@ -376,7 +377,7 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
     PolicyStore store{pool};
     REQUIRE(store.is_open());
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     PolicyAdminHarness h{&store};
     const std::string yaml =
@@ -400,7 +401,7 @@ TEST_CASE("POST /api/policies: policy.create audit records an empty group list a
 namespace {
 
 std::string make_policy(PolicyStore& store) {
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag);
     auto policy = store.create_policy(R"(
 apiVersion: yuzu.io/v1alpha1

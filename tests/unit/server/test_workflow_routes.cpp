@@ -20,6 +20,7 @@
  */
 
 #include "command_capability.hpp" // BR-001: CommandCapability / CommandCapabilityRegistry fixture
+#include "test_policy_fragment_helper.hpp"
 #include "execution_event_bus.hpp"
 #include "stream_budget.hpp"
 #include "execution_tracker.hpp"
@@ -145,6 +146,14 @@ void exec_sql(const std::string& dsn, const std::string& sql) {
 }
 
 struct ExecHarness {
+    /// The pack-install authorization fake (instruction_authority.hpp): admitted by default, as
+    /// `test.pair`; a test flips `instruction_authority.ok` to model an unauthorized installer, or
+    /// `instruction_authority_wired = false` to model an unwired closure.
+    yuzu::server::InstructionAuthority instruction_authority{
+        .ok = true, .status = 200, .message = {}, .plugin_action = "test.pair",
+        .visible = std::nullopt};
+    bool instruction_authority_wired{true};
+    std::vector<std::string> authorized_instruction_ids;
     /// Declared BEFORE `sink`, so it destructs AFTER it. `sink` — not `routes` —
     /// owns the route lambdas that capture `&metrics`, so this ordering is what
     /// keeps the borrowed pointer valid for as long as a handler could run. An
@@ -608,6 +617,12 @@ struct ExecHarness {
         wf_deps.product_pack_store = product_pack_store.get();
         wf_deps.referrers_fn = std::move(referrers_arg);
         wf_deps.policy_store = policy_store_arg;
+        if (instruction_authority_wired)
+            wf_deps.authorize_instruction_fn = [this](const httplib::Request&,
+                                                      const std::string& id) {
+                authorized_instruction_ids.push_back(id);
+                return instruction_authority;
+            };
         wf_deps.schedule_api = schedule_api; // ADR-0031 WS-A4 (seventh family), was #2146 A2-R1's raw engine
         // PR 3 — wire the per-execution event bus. The SSE handler at
         // /sse/executions/{id} returns 503 at request time when this is
@@ -6939,7 +6954,7 @@ TEST_CASE("M2-2: a pack's own policy fragment still used by a policy blocks the 
                 def_id = *id;
             return id;
         }
-        return policies.create_fragment(fragment_naming(def_id, "own-frag-used"));
+        return yuzu::test::create_fragment_for_test(policies, fragment_naming(def_id, "own-frag-used"));
     };
     auto installed = h.product_pack_store->install(bundle.yaml, install_fn);
     REQUIRE(installed.has_value());
@@ -7009,7 +7024,7 @@ std::string install_def_fragment_pack(ExecHarness& h, PolicyStore& policies,
             return id;
         }
         if (kind == "PolicyFragment")
-            return policies.create_fragment(fragment_naming(def_id, fragment_id));
+            return yuzu::test::create_fragment_for_test(policies, fragment_naming(def_id, fragment_id));
         auto pid = policies.create_policy(policy_using(fragment_id));
         if (pid)
             policy_id = *pid;
@@ -7275,7 +7290,7 @@ TEST_CASE("N4-2: a policy-held fragment of a pack with no definition is still to
                                "name: held-frag\n";
     auto install_fn = [&](const std::string&,
                           const std::string&) -> std::expected<std::string, std::string> {
-        return policies.create_fragment(fragment_naming("no-such-definition", "held-frag"));
+        return yuzu::test::create_fragment_for_test(policies, fragment_naming("no-such-definition", "held-frag"));
     };
     auto installed = h.product_pack_store->install(bundle, install_fn);
     REQUIRE(installed.has_value());
@@ -7305,7 +7320,7 @@ TEST_CASE("N4-2b: a failed delete of a pack's own policy aborts the uninstall an
     REQUIRE(policies.is_open());
     ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
                   /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, {}, &policies);
-    REQUIRE(policies.create_fragment(fragment_naming("no-such-definition", "frag-for-pol"))
+    REQUIRE(yuzu::test::create_fragment_for_test(policies, fragment_naming("no-such-definition", "frag-for-pol"))
                 .has_value());
     std::string policy_id;
     const std::string bundle = "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: policy-only\n"
@@ -7990,7 +8005,7 @@ TEST_CASE("7921: sixty own fragments: the used one names its first three policie
                 def_id = *id;
             return id;
         }
-        return policies.create_fragment(fragment_naming(def_id, "frag-" + std::to_string(fragment_n++)));
+        return yuzu::test::create_fragment_for_test(policies, fragment_naming(def_id, "frag-" + std::to_string(fragment_n++)));
     };
     auto installed = h.product_pack_store->install(yaml, install_fn);
     REQUIRE(installed.has_value());
@@ -8046,11 +8061,11 @@ TEST_CASE("7921: the batched referrer reads match any id of the list, once, and 
     auto w_o = workflows.create_workflow(workflow_naming("def-other", "w-other"));
     REQUIRE((w_ab && w_c && w_o));
     // a fragment naming "a" and "b" (check and fix), one naming "c"
-    auto f_ab = policies.create_fragment(
+    auto f_ab = yuzu::test::create_fragment_for_test(policies, 
         "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: frag-ab\ndisplayName: frag-ab\n"
         "spec:\n  check:\n    instruction: def-a\n    compliance: \"true\"\n"
         "  fix:\n    instruction: def-b\n");
-    auto f_c = policies.create_fragment(fragment_naming("def-c", "frag-c"));
+    auto f_c = yuzu::test::create_fragment_for_test(policies, fragment_naming("def-c", "frag-c"));
     REQUIRE((f_ab && f_c));
 
     const std::vector<std::string> ids{"def-a", "def-b", "def-c"};
@@ -8323,13 +8338,13 @@ TEST_CASE("7921: hostile definition ids are matched exactly by the batched reads
     const std::string hostile = "a b\"c,d{e}f\\g";
     auto s = schedules.create_schedule(schedule_naming(hostile));
     auto w = workflows.create_workflow(workflow_naming_quoted(hostile, "hostile-wf"));
-    auto f = policies.create_fragment(fragment_naming_quoted(hostile, "frag-hostile"));
+    auto f = yuzu::test::create_fragment_for_test(policies, fragment_naming_quoted(hostile, "frag-hostile"));
     REQUIRE((s && w && f));
     // decoys: the pieces a naive split would produce
     REQUIRE(schedules.create_schedule(schedule_naming("a b")).has_value());
     REQUIRE(schedules.create_schedule(schedule_naming("c")).has_value());
     REQUIRE(workflows.create_workflow(workflow_naming_quoted("d{e}f\\g", "decoy-wf")).has_value());
-    REQUIRE(policies.create_fragment(fragment_naming_quoted("c,d", "frag-decoy")).has_value());
+    REQUIRE(yuzu::test::create_fragment_for_test(policies, fragment_naming_quoted("c,d", "frag-decoy")).has_value());
 
     auto many = fn.lookup_many({hostile, "plain-id"}, {}, 100);
     CHECK(referrer_keys(many) == ReferrerKey{{"schedule", *s}, {"workflow", *w},
@@ -8362,8 +8377,8 @@ TEST_CASE("7921: the one-id and batch forms of the production closure answer the
     auto s2 = schedules.create_schedule(schedule_naming("def-a"));
     auto w1 = workflows.create_workflow(workflow_naming("def-a", "wf-a"));
     auto w2 = workflows.create_workflow(workflow_naming("def-b", "wf-b"));
-    auto f1 = policies.create_fragment(fragment_naming("def-a", "frag-a"));
-    auto f2 = policies.create_fragment(fragment_naming("def-b", "frag-b"));
+    auto f1 = yuzu::test::create_fragment_for_test(policies, fragment_naming("def-a", "frag-a"));
+    auto f2 = yuzu::test::create_fragment_for_test(policies, fragment_naming("def-b", "frag-b"));
     REQUIRE((s1 && s2 && w1 && w2 && f1 && f2));
 
     yuzu::server::DefinitionReferrerExclusions none, exclude_some;
@@ -8506,7 +8521,7 @@ TEST_CASE("7921: the blocked DELETE costs the same leases for 5 and for 60 own f
                     def_id = *id;
                 return id;
             }
-            return policies.create_fragment(
+            return yuzu::test::create_fragment_for_test(policies, 
                 fragment_naming(def_id, prefix + "frag-" + std::to_string(n++)));
         };
         auto installed = h.product_pack_store->install(yaml, install_fn);
@@ -8606,7 +8621,7 @@ TEST_CASE("7921: the batch route lists schedule, then workflow, then policy frag
                   yuzu::server::make_definition_referrers_fn(&schedules, &workflows, &policies),
                   &policies);
     const auto [pack_id, def_id] = install_one_definition_pack(h);
-    auto frag = policies.create_fragment(fragment_naming(def_id, "foreign-frag"));
+    auto frag = yuzu::test::create_fragment_for_test(policies, fragment_naming(def_id, "foreign-frag"));
     auto wf = workflows.create_workflow(workflow_naming(def_id, "foreign-wf"));
     auto sched = schedules.create_schedule(schedule_naming(def_id));
     REQUIRE((frag && wf && sched));
@@ -8645,4 +8660,49 @@ TEST_CASE("7921: the batch route with 22 referrers of one kind counts 21 and lis
     CHECK(msg.find("21 items still use one of its definitions: schedule ") != std::string::npos);
     CHECK(count_of(msg, "schedule ") == 20);
     CHECK(msg.find(", and 1 more. Remove each of them") != std::string::npos);
+}
+
+// ── WP06 F4: a product pack's PolicyFragment is authorized like POST /api/policy-fragments ──────
+
+TEST_CASE("POST /api/product-packs: a PolicyFragment naming an instruction the installer is not "
+          "authorized for is refused and stores nothing; an authorized one is stored with the "
+          "authorized pair",
+          "[pg][workflow][product_pack][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore policies{pool};
+    REQUIRE(policies.is_open());
+    ExecHarness h(pool, true, nullptr, true, /*with_workflow_engine=*/true, true,
+                  /*with_product_pack_store=*/true, {}, {}, false, {}, {}, {}, {}, {}, &policies);
+
+    const std::string pack =
+        "apiVersion: yuzu.io/v1alpha1\nkind: ProductPack\nname: f4-pack\nversion: 1.0.0\n"
+        "description: d\n---\napiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: f4-frag\n"
+        "displayName: f4-frag\nspec:\n  check:\n    instruction: destructive.instr\n"
+        "    compliance: \"true\"\n";
+
+    // The installer is NOT authorized for the pair the instruction resolves to.
+    h.instruction_authority.ok = false;
+    h.instruction_authority.status = 403;
+    h.instruction_authority.message = "permission denied: Execution:Execute";
+    auto denied = h.sink.Post("/api/product-packs", pack, "text/x-yaml");
+    REQUIRE(denied);
+    CHECK(denied->status != 201);
+    auto none = policies.query_fragments();
+    REQUIRE(none.has_value());
+    CHECK(none->empty()); // nothing was stored, so nothing can be dispatched later
+    REQUIRE_FALSE(h.authorized_instruction_ids.empty());
+    CHECK(h.authorized_instruction_ids.front() == "destructive.instr");
+
+    // An authorized installer stores the fragment WITH the authorized pair snapshot.
+    h.instruction_authority.ok = true;
+    h.instruction_authority.plugin_action = "script_exec.exec";
+    auto ok = h.sink.Post("/api/product-packs", pack, "text/x-yaml");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    auto stored = policies.query_fragments();
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->size() == 1);
+    CHECK((*stored)[0].instruction_pairs.find("\"destructive.instr\":\"script_exec.exec\"") !=
+          std::string::npos);
 }

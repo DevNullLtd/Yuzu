@@ -11,6 +11,7 @@
  * TSan-hostile live-socket pattern.
  */
 
+#include "test_policy_fragment_helper.hpp"
 #include "authz_gates.hpp"
 #include "compliance_api.hpp"
 #include "compliance_api_local.hpp" // make_local_compliance_api — ADR-0031 WS-A4
@@ -476,7 +477,7 @@ TEST_CASE("GET /api/v1/policies: enabled_only=false does NOT filter (regression 
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto p1 = store.create_policy(make_policy_yaml(frag.value(), "Enabled Policy"));
     auto p2 = store.create_policy(make_policy_yaml(frag.value(), "Disabled Policy"));
@@ -499,7 +500,7 @@ TEST_CASE("GET /api/v1/policies: enabled_only=true filters to enabled only",
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto p1 = store.create_policy(make_policy_yaml(frag.value(), "Enabled Policy"));
     auto p2 = store.create_policy(make_policy_yaml(frag.value(), "Disabled Policy"));
@@ -540,7 +541,7 @@ TEST_CASE("GET /api/v1/policies: limit clamps and pagination.page_size reflects 
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy A")).has_value());
     REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy B")).has_value());
@@ -562,7 +563,7 @@ TEST_CASE("GET /api/v1/policies: a negative limit clamps to 1 rather than bindin
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy A")).has_value());
     REQUIRE(store.create_policy(make_policy_yaml(frag.value(), "Policy B")).has_value());
@@ -583,9 +584,9 @@ TEST_CASE("GET /api/v1/policy-fragments: limit clamps and page_size reflects the
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment A")).has_value());
-    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment B")).has_value());
-    REQUIRE(store.create_fragment(make_fragment_yaml("Fragment C")).has_value());
+    REQUIRE(yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Fragment A")).has_value());
+    REQUIRE(yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Fragment B")).has_value());
+    REQUIRE(yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Fragment C")).has_value());
 
     ComplianceHarness h{&store};
     auto res = h.sink.Get("/api/v1/policy-fragments?limit=1");
@@ -609,7 +610,7 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit-persist failure fails CLOSED (503)
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Test Policy"));
     REQUIRE(pol.has_value());
@@ -640,7 +641,7 @@ TEST_CASE("GET /api/v1/compliance/{id}: audit succeeds -> 200 with the per-agent
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Success Policy"));
     REQUIRE(pol.has_value());
@@ -786,7 +787,7 @@ TEST_CASE("/fragments/compliance/{id}: confined to the caller's scope, audited w
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "Confined Policy"));
     REQUIRE(pol.has_value());
@@ -826,7 +827,7 @@ TEST_CASE("/fragments/compliance/{id}: an audit-persist failure flags the header
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "Audit Flag Policy"));
     REQUIRE(pol.has_value());
@@ -902,8 +903,8 @@ TEST_CASE("/fragments/policy-fragments: counts policies per fragment, honest emp
     REQUIRE(empty);
     CHECK(empty->body.find("No policy fragments") != std::string::npos);
 
-    auto used = store.create_fragment(make_fragment_yaml("Used Fragment"));
-    auto idle = store.create_fragment(make_fragment_yaml("Idle Fragment"));
+    auto used = yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Used Fragment"));
+    auto idle = yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Idle Fragment"));
     REQUIRE(used.has_value());
     REQUIRE(idle.has_value());
     REQUIRE(store.create_policy(make_policy_yaml(used.value(), "P1")).has_value());
@@ -924,8 +925,8 @@ TEST_CASE("/fragments/policy-fragments: a capped policy list falls back to per-f
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto used = store.create_fragment(make_fragment_yaml("Capped Fragment"));
-    auto idle = store.create_fragment(make_fragment_yaml("Free Fragment"));
+    auto used = yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Capped Fragment"));
+    auto idle = yuzu::test::create_fragment_for_test(store, make_fragment_yaml("Free Fragment"));
     REQUIRE(used.has_value());
     REQUIRE(idle.has_value());
     // PolicyQuery{}.limit policies: the one policy read is cut at its cap, so
@@ -995,7 +996,7 @@ TEST_CASE("/fragments/compliance/{id}: reads the agent registry once per render 
     yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFragmentYaml);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentYaml);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "Registry Read Policy"));
     REQUIRE(pol.has_value());

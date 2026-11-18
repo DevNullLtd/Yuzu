@@ -4308,7 +4308,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
     // POST /api/product-packs -- install product pack from YAML bundle
     sink.Post("/api/product-packs", [perm_fn, audit_fn, emit_fn, product_pack_store,
-                                     instruction_store, policy_store, workflow_engine](
+                                     instruction_store, policy_store, workflow_engine,
+                                     authorize_instruction_fn = deps.authorize_instruction_fn](
                                         const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn(req, res, "ProductPack", "Write"))
             return;
@@ -4351,7 +4352,8 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
 
         // Install callback: delegate each document to the appropriate store
         auto install_fn =
-            [instruction_store, policy_store, workflow_engine](
+            [instruction_store, policy_store, workflow_engine, authorize_instruction_fn,
+             &req](
                 const std::string& kind,
                 const std::string& yaml_source) -> std::expected<std::string, std::string> {
             if (kind == "InstructionDefinition") {
@@ -4389,7 +4391,25 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             } else if (kind == "PolicyFragment") {
                 if (!policy_store || !policy_store->is_open())
                     return std::unexpected("policy store not available");
-                return policy_store->create_fragment(yaml_source);
+                // WP06 F4: a pack's PolicyFragment is authorized exactly like
+                // POST /api/policy-fragments: the installing principal must be authorized for the
+                // plugin.action of every instruction it names (resolved NOW, so an
+                // InstructionDefinition installed earlier in the same pack is seen), and the
+                // authorized pairs are snapshotted on the stored fragment. Unwired = refused.
+                nlohmann::json pairs = nlohmann::json::object();
+                const auto named = PolicyStore::peek_fragment_instructions(yaml_source);
+                if (!named.empty() && !authorize_instruction_fn)
+                    return std::unexpected("instruction authorization is not available");
+                for (const auto& [role, instruction_id] : named) {
+                    const auto a = authorize_instruction_fn(req, instruction_id);
+                    if (!a.ok || a.plugin_action.empty())
+                        return std::unexpected("policy fragment " + role + " instruction " +
+                                               instruction_id + " is not authorized for the "
+                                               "installing principal: " +
+                                               (a.message.empty() ? std::string("refused") : a.message));
+                    pairs[instruction_id] = a.plugin_action;
+                }
+                return policy_store->create_fragment(yaml_source, pairs.dump());
             } else if (kind == "Policy") {
                 if (!policy_store || !policy_store->is_open())
                     return std::unexpected("policy store not available");

@@ -5671,6 +5671,28 @@ public:
         // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
         // before the health recompute thread's first sweep (started in run()).
         health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
+        // WP06 F31: the served plugin catalogue (discover_plugins, dashboard help) is bounded to
+        // what the same capability catalogue recognises. `classify` is const and the registry is
+        // fixed after construction, so the filter is safe to run under the registry's lock.
+        registry_.set_catalogue_filter([this](std::string_view plugin, std::string_view action) {
+            return capability_registry_.classify(std::string(plugin), std::string(action)).has_value();
+        });
+        for (const char* phase : {"check", "fix", "verify"})
+            metrics_.counter("yuzu_server_policy_instruction_pair_mismatch_total",
+                             {{"phase", phase}});
+        metrics_.describe("yuzu_server_policy_instruction_pair_mismatch_total",
+                          "Policy instruction dispatches refused because the instruction's "
+                          "plugin.action no longer matches the pair authorized when its fragment "
+                          "was stored. Zero means no stored fragment was refused.",
+                          "counter");
+        for (const char* field : {"name", "version", "description", "actions", "action", "plugins"})
+            metrics_.counter("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                             {{"field", field}});
+        metrics_.describe("yuzu_server_agent_registry_plugin_meta_dropped_total",
+                          "Agent-reported plugin metadata fields dropped at registration because "
+                          "they fell outside their bound (a plugin entry beyond the per-agent "
+                          "cap counts under field=plugins). Zero means every report was within bounds.",
+                          "counter");
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
@@ -14129,15 +14151,27 @@ private:
     /// store error, or no auth store at all — yields an EMPTY-principal,
     /// deny-all caller, which `build_classified_command` refuses as
     /// `AnonymousOperator` before any permission check runs.
-    /// WP06 F53: the creator's CURRENT legacy admin role, resolved from the auth store at fire
-    /// time (never cached). JIT elevation does not count: a background fire has no session to
-    /// carry one (same posture as `derive_dispatch_caller_for_username`). Unresolvable (no
-    /// store, deleted user, store error) = false: fail closed. Feeds `schedule_arming_permitted`.
-    [[nodiscard]] bool schedule_creator_is_legacy_admin(const std::string& username) {
-        if (!auth_db_ || username.empty())
-            return false;
-        auto user = auth_db_->get_user(username);
-        return user && user->role == auth::Role::admin;
+    /// The ONE arming check, used by BOTH the schedule runner and the outbox delivery loop (a
+    /// second hand-copied lambda is how the two would drift). Tri-state: permitted / denied /
+    /// UNAVAILABLE (a transient auth-store fault while resolving the creator's role): the caller
+    /// holds, it never records "authority denied" for an infrastructure fault. The creator's
+    /// legacy admin role is read LAZILY and fresh (never cached); JIT elevation does not count (a
+    /// background fire has no session). No auth store wired, or no creator = denied (fail closed).
+    [[nodiscard]] yuzu::server::ArmingResult schedule_arming(const std::string& principal,
+                                                             const std::string& plugin,
+                                                             const std::string& action) {
+        return yuzu::server::schedule_arming_permitted(
+            capability_registry_, rbac_store_.get(), principal, plugin, action,
+            [this, &principal]() -> yuzu::server::ArmingResult {
+                if (!auth_db_ || principal.empty())
+                    return false;
+                auto user = auth_db_->get_user(principal);
+                if (user)
+                    return user->role == auth::Role::admin;
+                if (user.error() == AuthDBError::UserNotFound)
+                    return false;
+                return std::unexpected(std::string("auth store error"));
+            });
     }
 
     yuzu::server::DispatchCaller derive_dispatch_caller_for_username(const std::string& username) {
@@ -18708,6 +18742,7 @@ private:
             inline_sink, yuzu::server::legacy_events::Deps{
                              .deny_service_scoped_fn = deny_service_scoped_fn,
                              .fleet_read_fn = fleet_read_fn, // WP06 F11
+                             .audit_fn = audit_fn,
                              .resolve_session_fn = resolve_session_fn,
                              .event_bus = &event_bus_,
                              .stream_budget = stream_budget_.get(),
@@ -19540,6 +19575,19 @@ private:
                           "which denies fail-closed). Zero means the check ran and passed.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_denied_total");
+        // The arming answer could not be determined (a transient auth-store fault): the occurrence
+        // is HELD (schedule not advanced / outbox rescheduled), never counted as a denial.
+        metrics_.describe("yuzu_schedule_arming_unavailable_total",
+                          "Scheduled occurrences held because the arming principal's authority "
+                          "could not be determined (auth-store fault). Not a denial; retried.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_unavailable_total");
+        metrics_.describe("yuzu_server_command_outbox_deliver_arming_unavailable_total",
+                          "Outbox occurrences rescheduled because the arming principal's "
+                          "authority could not be determined at send time (auth-store fault). "
+                          "Not a denial; retried with back-off.",
+                          "counter");
+        metrics_.counter("yuzu_server_command_outbox_deliver_arming_unavailable_total");
         // ADR-1007: absent-vs-zero carries the same meaning as the arming
         // counter above — zero means the second definition read always
         // succeeded and per-device enforcement applied to every fire;
@@ -19610,10 +19658,8 @@ private:
             // `test_operator_surface_twins.cpp` exercise; the fail-closed
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                   const std::string& action) -> bool {
-                return yuzu::server::schedule_arming_permitted(
-                    capability_registry_, rbac_store_.get(), principal, plugin, action,
-                    schedule_creator_is_legacy_admin(principal));
+                                   const std::string& action) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19656,11 +19702,9 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action) -> bool {
-                    return yuzu::server::schedule_arming_permitted(
-                        capability_registry_, rbac_store_.get(), principal, plugin, action,
-                        schedule_creator_is_legacy_admin(principal));
-                },
+                                   const std::string& action) -> yuzu::server::ArmingResult {
+                return schedule_arming(principal, plugin, action);
+            },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
                 // measured on. An unwired tracker reads as unreadable, which HOLDS every
@@ -22623,12 +22667,11 @@ private:
         // closure MCP and the workflow execute twins share, as a non-system caller. A degraded
         // instruction read refuses (503), never admits. Residual: a principal demoted AFTER
         // authoring keeps the stored fragment live (closing that needs an author column).
-        if (policy_admin_routes_)
-            policy_admin_routes_->set_authorize_instruction_fn(
+        const AuthorizeInstructionFn authorize_instruction =
                 [this, authorize_dispatch](const httplib::Request& req,
                                            const std::string& instruction_id)
-                    -> PolicyAdminRoutes::InstructionAuthority {
-                    PolicyAdminRoutes::InstructionAuthority out;
+                    -> InstructionAuthority {
+                    InstructionAuthority out;
                     auto sess = auth_routes_ ? auth_routes_->resolve_session(req) : std::nullopt;
                     if (!sess) {
                         out.status = 401;
@@ -22668,7 +22711,11 @@ private:
                     out.plugin_action = (*def)->plugin + "." + (*def)->action;
                     out.visible = caller.exec_visible;
                     return out;
-                });
+                };
+        // ONE closure, every storing surface (policy fragments AND product packs).
+        wf_deps.authorize_instruction_fn = authorize_instruction;
+        if (policy_admin_routes_)
+            policy_admin_routes_->set_authorize_instruction_fn(authorize_instruction);
         // The per-step credential liveness check of the v1 execute run: the SAME function MCP's
         // held-open streams re-validate through (tri-state; an engine principal's Active check
         // included), asked authoritatively: the API-token row and an engine principal are read

@@ -17,6 +17,7 @@
  * matching how a real presentation/MCP caller will use it.
  */
 
+#include "test_policy_fragment_helper.hpp"
 #include "compliance_api_local.hpp"
 
 #include "policy_store.hpp"
@@ -119,7 +120,7 @@ TEST_CASE("ComplianceApi: list_fragments forwards to the store, empty and non-em
     REQUIRE(empty.has_value());
     CHECK(empty->empty());
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
 
     auto listed = api->list_fragments(FragmentQuery{});
@@ -142,7 +143,7 @@ TEST_CASE("ComplianceApi: list_policies forwards to the store, empty and non-emp
     REQUIRE(empty.has_value());
     CHECK(empty->empty());
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -164,7 +165,7 @@ TEST_CASE("ComplianceApi: get_policy composite -- remediation_available true whe
 
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "With Fix"));
     REQUIRE(pol.has_value());
@@ -189,7 +190,7 @@ TEST_CASE("ComplianceApi: get_policy composite -- remediation_available false wh
 
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentNoFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentNoFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value(), "No Fix"));
     REQUIRE(pol.has_value());
@@ -226,7 +227,7 @@ TEST_CASE("ComplianceApi: fleet_compliance forwards to the store",
 
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -270,7 +271,7 @@ TEST_CASE("ComplianceApi: compliance_by_policy forwards to the store",
     REQUIRE(store.is_open());
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -295,7 +296,7 @@ TEST_CASE("ComplianceApi: compliance_summary forwards to the store",
 
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -320,7 +321,7 @@ TEST_CASE("ComplianceApi: policy_agent_statuses returns the unfiltered fleet-wid
 
     auto api = make_local_compliance_api(store);
 
-    auto frag = store.create_fragment(kFragmentWithFix);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFragmentWithFix);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());

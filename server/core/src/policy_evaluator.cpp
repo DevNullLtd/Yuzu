@@ -371,7 +371,8 @@ std::expected<PolicyEvaluator::DispatchInstructionResult, std::string>
 PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                       const std::unordered_map<std::string, std::string>& parameters,
                                       const std::vector<std::string>& targets,
-                                      const std::string& instruction_pairs) {
+                                      const std::string& instruction_pairs,
+                                      std::string_view phase) {
     if (targets.empty() || !d_.dispatch_fn)
         return DispatchInstructionResult{};
     // db_error, not a legitimate no-op (gov Gate 3 architect finding): a null
@@ -406,7 +407,9 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
     // the authorization does not carry over: refuse (the same empty result an unknown
     // instruction gives, so the verdict is "error", never a dispatch), logged and counted.
     // "" = a fragment with no snapshot: unchanged.
-    if (!instruction_pairs.empty()) {
+    {
+        // A fragment with no snapshot for this instruction is refused too (fail closed): the
+        // store refuses to persist one, so an empty/absent snapshot is never a legitimate state.
         std::string expected;
         auto pairs = nlohmann::json::parse(instruction_pairs, nullptr, false);
         if (pairs.is_object() && pairs.contains(instruction_id) && pairs[instruction_id].is_string())
@@ -417,9 +420,11 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                          "dispatch",
                          instruction_id, def.plugin, def.action);
             if (d_.metrics)
-                d_.metrics->counter("yuzu_server_policy_instruction_pair_mismatch_total")
+                d_.metrics
+                    ->counter("yuzu_server_policy_instruction_pair_mismatch_total",
+                              {{"phase", std::string(phase)}})
                     .increment();
-            return DispatchInstructionResult{};
+            return DispatchInstructionResult{.pair_mismatch = true};
         }
     }
     auto execid = gen_execution_id();
@@ -478,7 +483,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // dispatch_instruction invokes the blocking dispatch_fn — call it WITHOUT mu_.
     // ADR-0058: a genuine InstructionStore error propagates as `unexpected` here
     // too, the same way the degraded-fragment-read path above does.
-    auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets, frag.instruction_pairs);
+    auto dispatch_result = dispatch_instruction(frag.check_instruction, params, targets, frag.instruction_pairs, "check");
     if (!dispatch_result)
         // gov Gate 8 (#4981 PR-1 fix-round re-review, security-guardian HIGH):
         // dispatch_result.error() can carry a raw PQerrorMessage() (via
@@ -493,6 +498,23 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
         return std::unexpected(
             yuzu::server::genericize_db_error("PolicyEvaluator::kickoff_check dispatch",
                                               dispatch_result.error()));
+    if (dispatch_result->pair_mismatch) {
+        // WP06 F4: the verdict is an explicit per-agent `error` (never a stale compliant), with a
+        // named reason, exactly as the verify path records a failed dispatch.
+        for (const auto& tgt : targets) {
+            auto r = d_.policy_store->update_agent_status(
+                p.id, tgt, "error", R"({"phase":"check","result":"instruction_pair_mismatch"})",
+                std::nullopt);
+            if (!r)
+                spdlog::warn("policy_evaluator: pair-mismatch status write failed for {}/{}: {}",
+                             p.id, tgt, r.error());
+        }
+        if (d_.metrics)
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
+                .increment();
+        return std::unexpected("instruction_pair_mismatch: the check instruction no longer matches "
+                               "the pair authorized when the fragment was stored");
+    }
     if (dispatch_result->execution_id.empty())
         return "";
     const std::string& execid = dispatch_result->execution_id;
@@ -639,8 +661,13 @@ PolicyEvaluator::evaluate_now(const std::string& policy_id) {
         return std::unexpected("dispatch claim failed for " + policy_id + ": " + r.error());
     }
     auto k = kickoff_check(**p_res); // dispatch runs without mu_ held
-    if (!k)
+    if (!k) {
+        // A refused (mismatched) instruction is an authorization outcome, not a store degrade:
+        // pass its text through so the route can answer 409 and not 503.
+        if (k.error().starts_with("instruction_pair_mismatch"))
+            return std::unexpected(k.error());
         return std::unexpected("kickoff_check degraded for " + policy_id + ": " + k.error());
+    }
     return *k;
 }
 
@@ -803,7 +830,7 @@ PolicyEvaluator::remediate(const std::string& policy_id,
     // Dispatch the fix to the CLAIMED subset only (never the full `targets`
     // — a target the claim above did not win must never be dispatched to).
     // dispatch_instruction must run without mu_ held.
-    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, claimed, frag->instruction_pairs);
+    auto dispatch_result = dispatch_instruction(frag->fix_instruction, fix_params, claimed, frag->instruction_pairs, "fix");
     if (!dispatch_result) {
         // Dispatch never happened — release every claim so it does not sit
         // orphaned until the stale window expires.
@@ -827,7 +854,10 @@ PolicyEvaluator::remediate(const std::string& policy_id,
             spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
                         "after an empty dispatch: {}",
                         policy_id, rel.error());
-        out.error = "fix dispatch failed (unknown instruction or no agents)";
+        out.error = dispatch_result->pair_mismatch
+                        ? "instruction_pair_mismatch: the fix instruction no longer matches the "
+                          "pair authorized when the fragment was stored"
+                        : "fix dispatch failed (unknown instruction or no agents)";
         return out;
     }
     const auto& execid = dispatch_result->execution_id;
@@ -1029,7 +1059,7 @@ void PolicyEvaluator::collect_ready() {
             }
             if (!verify_targets.empty()) {
                 auto vparams = params_from_json_obj(f.verify_parameters_json);
-                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets, f.verify_pairs);
+                auto result = dispatch_instruction(f.verify_instruction, vparams, verify_targets, f.verify_pairs, "verify");
                 if (result && !result->execution_id.empty()) {
                     std::lock_guard<std::mutex> lk(mu_);
                     in_flight_.push_back(InFlight{.phase = Phase::Check,

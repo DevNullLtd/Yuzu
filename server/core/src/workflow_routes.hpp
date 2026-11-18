@@ -18,6 +18,7 @@
 #include "instruction_referrers.hpp" // DefinitionReferrersFn (Deps::referrers_fn)
 #include "instruction_param_schema.hpp" // ParamValidatorCache (Deps::param_validators)
 #include "instruction_store.hpp"
+#include "instruction_authority.hpp"
 #include "policy_store.hpp"
 #include "product_pack_store.hpp"
 #include "response_store.hpp"
@@ -272,6 +273,11 @@ public:
         ProductPackStore* product_pack_store{nullptr};
         InstructionStore* instruction_store{nullptr};
         PolicyStore* policy_store{nullptr};
+        /// WP06 F4: the SAME authorize-an-instruction closure `PolicyAdminRoutes` takes
+        /// (`instruction_authority.hpp`), used by `POST /api/product-packs` to authorize the
+        /// installing principal for every instruction a PolicyFragment item names. Unwired (the
+        /// default) REFUSES a pack carrying a fragment that names an instruction.
+        AuthorizeInstructionFn authorize_instruction_fn;
         /// The shared "what still points at this definition?" lookup (instruction_referrers.hpp),
         /// the SAME closure the instruction DELETE routes take. `DELETE /api/product-packs/{id}`
         /// asks it about every InstructionDefinition item the pack carries BEFORE deleting any

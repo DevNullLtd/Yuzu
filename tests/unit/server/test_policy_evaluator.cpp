@@ -18,6 +18,7 @@
  * policy_store.hpp's header comment on why collect stays per-replica).
  */
 
+#include "test_policy_fragment_helper.hpp"
 #include "agent_registry.hpp"
 #include "instruction_store.hpp"
 #include "management_group_store.hpp"
@@ -278,7 +279,10 @@ struct Harness {
             frag += "  postCheck:\n    instruction: test.verify\n    compliance: \"result.fixed "
                     "== 'yes'\"\n";
         }
-        auto fid = ps.create_fragment(frag, instruction_pairs);
+        const std::string pairs = instruction_pairs.empty()
+                                      ? yuzu::test::authorized_pairs_for(frag, &is)
+                                      : instruction_pairs;
+        auto fid = ps.create_fragment(frag, pairs);
         REQUIRE(fid.has_value());
 
         std::string pol = std::string("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n") + "spec:\n  fragment: " +
@@ -650,8 +654,18 @@ TEST_CASE("policy evaluator: an instruction whose plugin.action changed since th
                           R"({"test.check":"benign.run"})");
     PolicyEvaluator ev(h.deps());
     const int before = h.dispatch_calls;
-    (void)ev.evaluate_now(stale);
+    auto refused = ev.evaluate_now(stale);
     CHECK(h.dispatch_calls == before); // refused: nothing dispatched
+    // The verdict is an explicit per-agent `error` with a named reason, never a stale compliant
+    // (a closure claim that rested only on dispatch_calls would be a false green).
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().starts_with("instruction_pair_mismatch"));
+    CHECK(h.status_of(stale, "agentA") == "error");
+    auto row = h.ps.get_agent_status(stale, "agentA");
+    REQUIRE(row.has_value());
+    REQUIRE(row->has_value());
+    CHECK((*row)->check_result.find("instruction_pair_mismatch") != std::string::npos);
+
 
     // The same fragment authored with the pair that still matches dispatches normally.
     auto fresh = h.author("result.hostname != ''", false, 0, "test.check",
@@ -1297,7 +1311,7 @@ TEST_CASE("policy evaluator: dispatch_due() processes every claimed policy "
     const std::string frag_b = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
                                "spec:\n  check:\n    instruction: test.check2\n    compliance: "
                                "\"result.hostname != ''\"\n";
-    auto fid_b = h.ps.create_fragment(frag_b);
+    auto fid_b = yuzu::test::create_fragment_for_test(h.ps, frag_b, &h.is);
     REQUIRE(fid_b.has_value());
     const std::string pol_b = "apiVersion: yuzu.io/v1alpha1\nkind: Policy\n"
                               "spec:\n  fragment: " +
@@ -1464,10 +1478,10 @@ TEST_CASE("policy evaluator: a scope-expression policy's target resolution repor
     // reaches d_.registry->evaluate_scope inside resolve_targets. Defines a
     // fix_instruction so remediate() below reaches its own resolve_targets
     // call rather than short-circuiting on "no remediation pathway".
-    auto fid = h.ps.create_fragment("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
+    auto fid = yuzu::test::create_fragment_for_test(h.ps, "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
                                     "spec:\n  check:\n    instruction: test.check\n"
                                     "    compliance: \"result.hostname != ''\"\n"
-                                    "  fix:\n    instruction: test.fix\n");
+                                    "  fix:\n    instruction: test.fix\n", &h.is);
     REQUIRE(fid.has_value());
     auto pid = h.ps.create_policy("apiVersion: yuzu.io/v1alpha1\nkind: Policy\n"
                                   "spec:\n  fragment: " +

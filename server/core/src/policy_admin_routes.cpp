@@ -473,10 +473,12 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 // below and the rest-api.md contract this route is documented against —
                 // the previous generic "policy evaluation degraded" literal discarded
                 // the specific reason on this route while /remediate already surfaced it.
-                audit_fn_(req, "policy.evaluate", "error", "policy", id, exec_res.error());
-                res.status = 503;
+                const bool mismatch = exec_res.error().starts_with("instruction_pair_mismatch");
+                audit_fn_(req, "policy.evaluate", mismatch ? "denied" : "error", "policy", id,
+                          exec_res.error());
+                res.status = mismatch ? 409 : 503;
                 res.set_content(
-                    nlohmann::json({{"error", {{"code", 503}, {"message", exec_res.error()}}},
+                    nlohmann::json({{"error", {{"code", res.status}, {"message", exec_res.error()}}},
                                     {"meta", {{"api_version", "v1"}}}})
                         .dump(),
                     "application/json");
@@ -652,6 +654,7 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 else if (result.error.find("not found") != std::string::npos)
                     code = 404;
                 else if (result.error.find("remediation pathway") != std::string::npos ||
+                         result.error.starts_with("instruction_pair_mismatch") ||
                          result.error.find("no non_compliant") != std::string::npos ||
                          result.error.find("no in-scope") != std::string::npos ||
                          result.error.find("already in flight") != std::string::npos)

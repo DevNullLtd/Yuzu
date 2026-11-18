@@ -19,6 +19,7 @@
  * YUZU_REQUIRE_PG_DB, per that macro's plain-migration-test carve-out.
  */
 
+#include "test_policy_fragment_helper.hpp"
 #include "policy_store.hpp"
 
 #include "pg/pg_exec.hpp"
@@ -177,7 +178,7 @@ TEST_CASE("PolicyStore: create fragment from YAML", "[policy_store][pg][fragment
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment(kCheckOnlyFragment);
+    auto result = yuzu::test::create_fragment_for_test(store, kCheckOnlyFragment);
     REQUIRE(result.has_value());
     CHECK(!result.value().empty());
 
@@ -197,7 +198,7 @@ TEST_CASE("PolicyStore: create fragment with explicit ID", "[policy_store][pg][f
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment(kFullFragment);
+    auto result = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(result.has_value());
     CHECK(result.value() == "frag-full-001");
 
@@ -212,9 +213,9 @@ TEST_CASE("PolicyStore: query fragments", "[policy_store][pg][fragment]") {
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    (void)store.create_fragment(kCheckOnlyFragment);
-    (void)store.create_fragment(kFullFragment);
-    (void)store.create_fragment(kCheckOnlyNoFix);
+    (void)yuzu::test::create_fragment_for_test(store, kCheckOnlyFragment);
+    (void)yuzu::test::create_fragment_for_test(store, kFullFragment);
+    (void)yuzu::test::create_fragment_for_test(store, kCheckOnlyNoFix);
 
     auto all = store.query_fragments();
     REQUIRE(all.has_value());
@@ -238,7 +239,7 @@ TEST_CASE("PolicyStore: delete fragment", "[policy_store][pg][fragment]") {
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment(kCheckOnlyFragment);
+    auto result = yuzu::test::create_fragment_for_test(store, kCheckOnlyFragment);
     REQUIRE(result.has_value());
 
     CHECK(store.delete_fragment(result.value()) == true);
@@ -255,7 +256,7 @@ TEST_CASE("PolicyStore: create fragment with duplicate ID", "[policy_store][pg][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto r1 = store.create_fragment(kFullFragment);
+    auto r1 = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(r1.has_value());
     CHECK(r1.value() == "frag-full-001");
 
@@ -263,7 +264,7 @@ TEST_CASE("PolicyStore: create fragment with duplicate ID", "[policy_store][pg][
     // displayName. The #396 name guard fires first (and is more informative
     // than the id PK-conflict), so the error carries the "conflict:" prefix
     // routes use to map to HTTP 409.
-    auto r2 = store.create_fragment(kFullFragment);
+    auto r2 = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(!r2.has_value());
     CHECK(is_conflict_error(r2.error()));
 }
@@ -273,7 +274,7 @@ TEST_CASE("PolicyStore: create fragment with empty YAML", "[policy_store][pg][fr
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment("");
+    auto result = yuzu::test::create_fragment_for_test(store, "");
     REQUIRE(!result.has_value());
     CHECK(result.error() == "yaml_source is required");
 }
@@ -283,7 +284,7 @@ TEST_CASE("PolicyStore: create fragment with wrong kind", "[policy_store][pg][fr
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment("kind: Policy\nname: oops\n");
+    auto result = yuzu::test::create_fragment_for_test(store, "kind: Policy\nname: oops\n");
     REQUIRE(!result.has_value());
     CHECK_THAT(result.error(), ContainsSubstring("kind must be 'PolicyFragment'"));
     // Issue #621: error must include a worked example so operators sending
@@ -302,7 +303,7 @@ TEST_CASE("PolicyStore: create fragment with missing kind", "[policy_store][pg][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment("name: no-kind\ndescription: missing kind field\n");
+    auto result = yuzu::test::create_fragment_for_test(store, "name: no-kind\ndescription: missing kind field\n");
     REQUIRE(!result.has_value());
     CHECK_THAT(result.error(), ContainsSubstring("kind must be 'PolicyFragment'"));
     CHECK_THAT(result.error(), ContainsSubstring("apiVersion: yuzu.io/v1alpha1"));
@@ -321,7 +322,7 @@ TEST_CASE("PolicyStore: fragment with check only (no fix, no postCheck)",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment(kCheckOnlyNoFix);
+    auto result = yuzu::test::create_fragment_for_test(store, kCheckOnlyNoFix);
     REQUIRE(result.has_value());
 
     auto frag = store.get_fragment(result.value());
@@ -340,7 +341,7 @@ TEST_CASE("PolicyStore: fragment with all three sections", "[policy_store][pg][f
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto result = store.create_fragment(kFullFragment);
+    auto result = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(result.has_value());
 
     auto frag = store.get_fragment("frag-full-001");
@@ -359,7 +360,7 @@ TEST_CASE("PolicyStore: cannot delete fragment referenced by a policy",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag_result = store.create_fragment(kFullFragment);
+    auto frag_result = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag_result.has_value());
 
     auto yaml = make_policy_yaml(frag_result.value());
@@ -382,7 +383,7 @@ TEST_CASE("PolicyStore: create policy from YAML", "[policy_store][pg][policy]") 
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     auto yaml = make_policy_yaml(frag.value(), "My Service Policy");
@@ -424,7 +425,7 @@ TEST_CASE("PolicyStore: scope.selector mapping lowers to an expression (PR-E)",
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     std::string yaml = R"(
@@ -458,7 +459,7 @@ TEST_CASE("PolicyStore: scope selector survives blank/comment lines and any line
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     const std::string lf = "apiVersion: yuzu.io/v1alpha1\n"
@@ -522,7 +523,7 @@ TEST_CASE("PolicyStore: list extent never widens groups or drops tags (#2123)",
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     const std::string head = "apiVersion: yuzu.io/v1alpha1\n"
                              "kind: Policy\n"
@@ -638,7 +639,7 @@ TEST_CASE("PolicyStore: scope.fromResultSet is rejected for policies (deferred t
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     std::string yaml = R"(
@@ -660,7 +661,7 @@ TEST_CASE("PolicyStore: scalar scope.fromResultSet is also rejected (#1221 MEDIU
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     std::string yaml = R"(
@@ -693,7 +694,7 @@ TEST_CASE("PolicyStore: inline flow-mapping scope is rejected (UP-6)",
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     std::string yaml = R"(
@@ -714,7 +715,7 @@ TEST_CASE("PolicyStore: query policies with filters", "[policy_store][pg][policy
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     (void)store.create_policy(make_policy_yaml(frag.value(), "Alpha Policy"));
@@ -750,7 +751,7 @@ TEST_CASE("PolicyStore: enable and disable policy", "[policy_store][pg][policy]"
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     auto pol_result = store.create_policy(make_policy_yaml(frag.value()));
@@ -803,7 +804,7 @@ TEST_CASE("PolicyStore: delete policy cascades", "[policy_store][pg][policy]") {
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     auto pol_result = store.create_policy(make_policy_yaml(frag.value()));
@@ -844,7 +845,7 @@ TEST_CASE("PolicyStore: delete policy invalidates the fleet compliance cache "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -940,7 +941,7 @@ TEST_CASE("PolicyStore: get_policy/query_policies degrade on a detail-table fail
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto yaml = make_policy_yaml(frag.value(), "Detail-Degrade Policy");
     auto pol = store.create_policy(yaml);
@@ -975,7 +976,7 @@ TEST_CASE("PolicyStore: update and get agent status", "[policy_store][pg][compli
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -998,7 +999,7 @@ TEST_CASE("PolicyStore: update agent status overwrites", "[policy_store][pg][com
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1043,7 +1044,7 @@ TEST_CASE("PolicyStore: fix retry cap forces error after 3 fixing transitions",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1085,7 +1086,7 @@ TEST_CASE("PolicyStore: get compliance summary", "[policy_store][pg][compliance]
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1126,7 +1127,7 @@ TEST_CASE("PolicyStore: get fleet compliance", "[policy_store][pg][compliance]")
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1172,7 +1173,7 @@ TEST_CASE("PolicyStore: fleet compliance cache is invalidated on the store's "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1202,7 +1203,7 @@ TEST_CASE("PolicyStore: compliance_by_policy_checked groups per policy, agrees w
     PolicyStore store{pool};
     REQUIRE(store.is_open());
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto p1 = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(p1.has_value());
@@ -1266,7 +1267,7 @@ TEST_CASE("PolicyStore: compliance_by_policy_checked shape, all five statuses, a
     REQUIRE(none.has_value());
     CHECK(none->empty());
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto p1 = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(p1.has_value());
@@ -1337,7 +1338,7 @@ TEST_CASE("PolicyStore: get policy agent statuses", "[policy_store][pg][complian
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1359,7 +1360,7 @@ TEST_CASE("PolicyStore: fixing status updates last_fix_at", "[policy_store][pg][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1386,7 +1387,7 @@ TEST_CASE("PolicyStore: invalidate policy resets statuses", "[policy_store][pg][
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1421,7 +1422,7 @@ TEST_CASE("PolicyStore: invalidate policy clears a capped fix_attempt_count "
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1481,7 +1482,7 @@ TEST_CASE("PolicyStore: invalidate all policies", "[policy_store][pg][invalidati
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     auto pol1 = store.create_policy(make_policy_yaml(frag.value(), "Policy A"));
@@ -1529,7 +1530,7 @@ TEST_CASE("PolicyStore: policy with multiple triggers and groups",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     std::string yaml = R"(
@@ -1605,10 +1606,10 @@ TEST_CASE("PolicyStore: duplicate fragment name rejected with conflict prefix",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto first = store.create_fragment(kCheckOnlyNoFix);
+    auto first = yuzu::test::create_fragment_for_test(store, kCheckOnlyNoFix);
     REQUIRE(first.has_value());
 
-    auto second = store.create_fragment(kCheckOnlyNoFix);
+    auto second = yuzu::test::create_fragment_for_test(store, kCheckOnlyNoFix);
     REQUIRE_FALSE(second.has_value());
     CHECK(is_conflict_error(second.error()));
 
@@ -1631,7 +1632,7 @@ TEST_CASE("claim_due_policies claims a due policy once, then not again within th
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     std::string yaml = R"(
 apiVersion: yuzu.io/v1alpha1
@@ -1670,7 +1671,7 @@ TEST_CASE("claim_due_policies does not claim a disabled policy",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1695,7 +1696,7 @@ TEST_CASE("claim_due_policies sweeps a stale 'fixing' row back to 'unknown'",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1749,7 +1750,7 @@ TEST_CASE("claim_due_policies sweep does NOT erase a FRESH reclaim of a stranded
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1829,7 +1830,7 @@ TEST_CASE("claim_remediation claims a fresh target with no pre-existing policy_s
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1860,7 +1861,7 @@ TEST_CASE("claim_remediation dedups a duplicate agent id in the input list",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1877,7 +1878,7 @@ TEST_CASE("claim_remediation refuses a second concurrent claim of the same targe
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1901,7 +1902,7 @@ TEST_CASE("claim_remediation refuses a target that has already exhausted the fix
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1928,7 +1929,7 @@ TEST_CASE("claim_remediation re-claims a stale claim past the staleness window",
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1959,7 +1960,7 @@ TEST_CASE("release_remediation_claim frees a claim so it can be re-claimed immed
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -1994,7 +1995,7 @@ TEST_CASE("release_remediation_claim with a stale generation is a fenced no-op t
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -2043,7 +2044,7 @@ TEST_CASE("update_agent_status with expected_gen is a fenced write: the owning g
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
 
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
     auto pol = store.create_policy(make_policy_yaml(frag.value()));
     REQUIRE(pol.has_value());
@@ -2101,7 +2102,7 @@ TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path se
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
     PolicyStore store{pool};
-    auto frag = store.create_fragment(kFullFragment);
+    auto frag = yuzu::test::create_fragment_for_test(store, kFullFragment);
     REQUIRE(frag.has_value());
 
     const std::vector<std::string> bad = {"..", ".", "a/b", "../x", "a?b", "a b",
@@ -2110,7 +2111,7 @@ TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path se
         INFO("id=" << id);
         auto p = store.create_policy(with_id_line(make_policy_yaml(frag.value()), id));
         CHECK_FALSE(p.has_value());
-        auto f = store.create_fragment(with_id_line(kCheckOnlyFragment, id));
+        auto f = yuzu::test::create_fragment_for_test(store, with_id_line(kCheckOnlyFragment, id));
         CHECK_FALSE(f.has_value());
     }
 
@@ -2123,4 +2124,32 @@ TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path se
         CHECK(p.value() == id);
     }
     CHECK(store.create_policy(make_policy_yaml(frag.value())).has_value());
+}
+
+// WP06 F4: create_fragment has no default for the authorization snapshot, and the store derives the
+// instruction ids from the YAML itself.
+TEST_CASE("PolicyStore::create_fragment refuses a snapshot that does not cover every instruction "
+          "the YAML names, and takes an empty snapshot only for an instruction-free fragment",
+          "[pg][policy_store][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    const std::string yaml =
+        "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: f4a\nspec:\n  check:\n"
+        "    instruction: a.chk\n    compliance: \"true\"\n  fix:\n    instruction: a.fix\n";
+    CHECK_FALSE(store.create_fragment(yaml, "").has_value());
+    CHECK_FALSE(store.create_fragment(yaml, R"({"a.chk":"p.a"})").has_value()); // fix uncovered
+    CHECK_FALSE(store.create_fragment(yaml, R"({"a.chk":"p.a","a.fix":""})").has_value());
+    CHECK_FALSE(store.create_fragment(yaml, "not json").has_value());
+    auto ok = store.create_fragment(yaml, R"({"a.chk":"p.a","a.fix":"p.b"})");
+    REQUIRE(ok.has_value());
+    auto frag = store.get_fragment(*ok);
+    REQUIRE(frag.has_value());
+    REQUIRE(frag->has_value());
+    CHECK((*frag)->instruction_pairs == R"({"a.chk":"p.a","a.fix":"p.b"})");
+    // An instruction-free fragment needs no snapshot.
+    CHECK(store.create_fragment("apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\nid: f4b\n"
+                                "spec:\n  check:\n    compliance: \"true\"\n", "")
+              .has_value());
 }

@@ -93,9 +93,15 @@ public:
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
 
+    /// WP06 F4: `instruction_pairs` is REQUIRED and has no default - a defaulted authorization
+    /// parameter is how a storing path skips the authorization. It is the JSON object
+    /// `{instruction_id: "plugin.action"}` the caller authorized the author for; the store derives
+    /// the instruction ids from the YAML itself and REFUSES when the snapshot does not cover every
+    /// id. "" is legal only for a fragment that names no instruction.
+
     // ── Fragments ────────────────────────────────────────────────────────
     [[nodiscard]] std::expected<std::string, std::string>
-    create_fragment(const std::string& yaml_source, const std::string& instruction_pairs = {});
+    create_fragment(const std::string& yaml_source, const std::string& instruction_pairs);
     [[nodiscard]] std::expected<std::vector<PolicyFragment>, PolicyReadError>
     query_fragments(const FragmentQuery& q = {}) const;
     [[nodiscard]] std::expected<std::optional<PolicyFragment>, PolicyReadError>

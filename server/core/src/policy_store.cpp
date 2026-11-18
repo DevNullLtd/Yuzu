@@ -354,9 +354,8 @@ const std::vector<pg::PgMigration>& migrations() {
          "   OR fix_instruction LIKE 'crossplatform.tar.%' "
          "   OR post_check_instruction LIKE 'crossplatform.tar.%' "
          "   OR yaml_source LIKE '%crossplatform.tar.%';"},
-        // v6 (WP06 F4 interim): the authoring-time snapshot of each instruction's resolved
-        // plugin.action. Additive, constant default (instant, no rewrite): every existing row
-        // reads '' = no snapshot = behaviour unchanged.
+        // v6: the authorized plugin.action of each fragment instruction, stored with the
+        // fragment (a JSON object; '' for a fragment that names no instruction).
         {6, "ALTER TABLE policy_fragments ADD COLUMN IF NOT EXISTS instruction_pairs TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
@@ -469,6 +468,22 @@ PolicyStore::create_fragment(const std::string& yaml_source, const std::string& 
             "      action: <action>\n"
             "      compliance: <CEL expression>\n",
             "docs/user-manual/policy-engine.md"));
+
+    // WP06 F4: the snapshot must cover EVERY instruction the YAML names (derived here, never taken
+    // from the caller), so no storing path can persist an instruction nobody authorized.
+    {
+        const auto named = peek_fragment_instructions(yaml_source);
+        if (!named.empty()) {
+            auto pairs = nlohmann::json::parse(instruction_pairs, nullptr, false);
+            if (!pairs.is_object())
+                return std::unexpected("fragment instructions were not authorized (no authorization snapshot)");
+            for (const auto& [role, instruction_id] : named)
+                if (!pairs.contains(instruction_id) || !pairs[instruction_id].is_string() ||
+                    pairs[instruction_id].get<std::string>().empty())
+                    return std::unexpected("fragment " + role + " instruction '" + instruction_id +
+                                           "' was not authorized");
+        }
+    }
 
     auto id_val = extract_yaml_value(yaml_source, "id");
     if (auto err = explicit_id_error(id_val, "fragment"))

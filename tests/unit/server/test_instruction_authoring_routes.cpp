@@ -12,6 +12,7 @@
 ///   - everything that reaches a real store is `[pg]`, gated behind YUZU_TEST_POSTGRES_DSN via a
 ///     pre-migrated PgTestTemplate sharing test_instruction_store.cpp's "instructionstore" key.
 
+#include "test_policy_fragment_helper.hpp"
 #include "instruction_authoring_routes.hpp"
 #include "instruction_definition_model.hpp"
 #include "test_route_sink.hpp"
@@ -1277,7 +1278,7 @@ TEST_CASE("DELETE /api/v1/instructions/{id}: a definition that a schedule; workf
                                                    fragment("frag-post", "other", "other", id)};
         for (const auto& yaml : variants) {
             INFO(yaml);
-            auto fid = policies.create_fragment(yaml);
+            auto fid = yuzu::test::create_fragment_for_test(policies, yaml);
             REQUIRE(fid.has_value());
             refused("policy fragment " + *fid);
             REQUIRE(policies.delete_fragment(*fid));
@@ -1370,12 +1371,12 @@ TEST_CASE("workflows_referencing_instruction and fragments_referencing_instructi
                 y += "  postCheck:\n    instruction: " + post + "\n    compliance: \"true\"\n";
             return y;
         };
-        auto in_check = policies.create_fragment(fragment("lk-check", target, "", ""));
-        auto in_fix = policies.create_fragment(fragment("lk-fix", "other", target, ""));
-        auto in_post = policies.create_fragment(fragment("lk-post", "other", "other", target));
-        auto unrelated = policies.create_fragment(
+        auto in_check = yuzu::test::create_fragment_for_test(policies, fragment("lk-check", target, "", ""));
+        auto in_fix = yuzu::test::create_fragment_for_test(policies, fragment("lk-fix", "other", target, ""));
+        auto in_post = yuzu::test::create_fragment_for_test(policies, fragment("lk-post", "other", "other", target));
+        auto unrelated = yuzu::test::create_fragment_for_test(policies, 
             fragment("lk-unrelated", "ref.lookup.targetX", "ref.lookup.targe", ""));
-        auto removed = policies.create_fragment(fragment("lk-removed", target, "", ""));
+        auto removed = yuzu::test::create_fragment_for_test(policies, fragment("lk-removed", target, "", ""));
         for (const auto* r : {&in_check, &in_fix, &in_post, &unrelated, &removed}) {
             INFO("create_fragment error: " << (r->has_value() ? std::string{} : r->error()));
             REQUIRE(r->has_value());
@@ -1402,7 +1403,7 @@ TEST_CASE("workflows_referencing_instruction and fragments_referencing_instructi
                    "\n    compliance: \"true\"\n";
         };
         for (const char* fid : {"ex-a", "ex-b", "ex-c"})
-            REQUIRE(policies.create_fragment(fragment(fid)).has_value());
+            REQUIRE(yuzu::test::create_fragment_for_test(policies, fragment(fid)).has_value());
         auto first = policies.fragments_referencing_instruction(target, 1, {"ex-a"});
         REQUIRE(first.has_value());
         REQUIRE(first->size() == 1);

@@ -255,6 +255,9 @@ private:
     // fields). kickoff_check() and collect_ready()'s verify-dispatch call
     // site keep ignoring `.outcome`, same as before this struct existed.
     struct DispatchInstructionResult {
+        /// WP06 F4: the instruction's plugin.action no longer matches the pair authorized when
+        /// the fragment was stored (or the fragment carries no snapshot at all): NOT dispatched.
+        bool pair_mismatch{false};
         std::string execution_id;
         yuzu::server::ConfinedDispatchOutcome outcome;
     };
@@ -298,7 +301,7 @@ private:
     dispatch_instruction(const std::string& instruction_id,
                          const std::unordered_map<std::string, std::string>& parameters,
                          const std::vector<std::string>& targets,
-                         const std::string& instruction_pairs = {});
+                         const std::string& instruction_pairs, std::string_view phase);
 
     int64_t now() const;
     static std::string gen_execution_id();
