@@ -1112,6 +1112,30 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
+**Evidence line — release SBOMs and the image vulnerability gate (CC7.1; CC8.1 for the
+acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's sample:
+- *SBOMs:* the four platform archives and the six images published before the release each
+  have a CycloneDX and an SPDX SBOM inside the release's cosign-signed `SHA256SUMS`
+  (`scripts/check-release-artifacts.sh` refuses a release without them; the agent-bundle image's
+  SBOM stays a workflow artifact). Verification: `docs/user-manual/release-verification.md`.
+- *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
+  and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
+  image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
+  packages the scanner cannot see. Each run attempt's reports (`trivy-<image>.attempt-<N>.*`,
+  passes and refusals, cancellations included) are kept: as release assets inside `SHA256SUMS`
+  for a release that was created (the agent bundle's with its own signed checksum list), and as
+  90-day workflow artifacts otherwise. A refusal never followed by a release exists only as that
+  90-day artifact, shorter than a Type II window: export it if the period needs it.
+- *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+  carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
+  the control is the pull-request review of changes to those files, the gate scripts and the
+  workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
+  Owner action: a `CODEOWNERS` entry for those paths with required code-owner review.
+- *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
+  in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
+  findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
+  `pre-release.yml` rescans the published images afterwards; it is detective only.
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)

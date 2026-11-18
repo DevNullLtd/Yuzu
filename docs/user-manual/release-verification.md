@@ -59,14 +59,25 @@ certificate at build time and cannot be restamped.
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
-| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.{json,txt,gate.txt}` (from the first release built with the pre-push scan) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
-| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.{json,txt,gate.txt}`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS` and `.sigstore` (from the first release built with this attachment) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list |
+| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, `<N>` being the workflow run attempt (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list |
 
 **Do not trust an image tag that has no GitHub Release.** The images are pushed and signed before the
 GitHub Release is created, and a failed publish job stops the release. So a `:X.Y.Z` tag can exist in
 GHCR, signed or not, for a version that has no GitHub Release, or whose release lacks that image's
 SBOM in `SHA256SUMS`. Use an image only when its version has a published GitHub Release and the image
 passes `cosign verify` (step 3) with the exact release identity.
+
+**`:latest` moves before the Release exists.** For a stable release, the floating tags `:latest` and
+`:X.Y` of `yuzu-server`, `yuzu-gateway`, `yuzu-postgres` and the three `-chisel` images move when
+each image is pushed, which is during the release workflow and BEFORE the GitHub Release is created
+(the Release is created only after every one of those images is published). For the minutes in
+between, and for as long as the release stays unfinished when a later image or the release step
+fails, `:latest` names a version that has no GitHub Release, and can name the new version for some
+images and the previous one for others. (The agent-bundle image is pushed only as `:X.Y.Z`, after the
+Release.) So do not deploy `:latest` or `:X.Y` blind: resolve it to a digest, and check that digest
+belongs to a version with a published GitHub Release and passes `cosign verify` for that release's
+tag. Pinning a release's exact tag or digest avoids the question.
 
 ## Image vulnerability scan before publishing
 
@@ -75,17 +86,25 @@ Trivy and refuses to push it when the scanner finds a **CRITICAL vulnerability t
 available** in what it can see and the finding is not an accepted one. "What it can see" is narrower
 than the image: the list below says what it does not cover. Accepted findings are listed in
 `.trivyignore.yaml` in the repository at the release tag; the release scan honours an entry only when
-it names one concrete file path or one package at one version (never a pattern or a bare
-vulnerability id), states why the finding does not apply, expires at most 92 days out, and records
-who approved it, when, and in which pull request.
+it is scoped to one file path inside the image (a path with a `/`, with no wildcard character and not
+a scanner result name such as `Python`) or to one package at one version, never to a bare
+vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
+approver's login, an approval date and a pull-request reference that are not `pending`. The release
+scan checks those three approval fields for **format only**: it does not confirm with GitHub that the
+pull request exists or that the named person approved it. The control behind an acceptance is the
+project's review of the change that adds it; to audit one, follow its pull-request reference and
+check the approving review there.
 
 The release scan also refuses to push, rather than report a clean scan, when:
 
 - the scanner sees no operating-system package in an image that is not on the reviewed not-covered
   list (the chiselled images are on it, below);
-- the image's operating-system release is one the scanner's vulnerability database holds no
-  advisories for (a release past its end of life, or an unreleased or rolling one such as Debian
-  testing): a scan of such an image finds nothing whatever it contains;
+- the scanner cannot show its database holds advisories for the image's operating-system release,
+  as the scanner identifies that release from the image's files: the scanner marks the release end
+  of life; the distribution is not Debian, Ubuntu or Alpine; the version is a pre-release (`_alpha`,
+  `_rc`, `~rc1`, `-rc`, Debian testing or sid, Alpine edge, and similar markers) or not a plain
+  release number; or a test scan of that release holding packages older than every fix matches
+  nothing. A clean scan of such an image would prove nothing about what it ships;
 - the vulnerability database is older than 72 hours, or was not downloaded by that run.
 
 After the release, the pre-release QA workflow scans the published tags again with a newer database;
@@ -108,15 +127,24 @@ What this does **not** gate:
   but a database altered before the download is not detected.
 
 Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
-`trivy-<image>.json` (the full report, including the image ID, the layer digests and every package),
-`trivy-<image>.txt` (the same as a table) and `trivy-<image>.gate.txt` (the Trivy version, the
-database's digest and date, the OS, the OS package count, the coverage, the advisory-data check, the
-accepted-findings file's hash and the result, and the check that the pushed image has the scanned
-image's layers). The agent-bundle image is built after the release exists, so its reports are attached
-afterwards with their own signed checksum list (table above); verify that list the way step 2
-verifies `SHA256SUMS`, with the same `--certificate-identity`, then run `sha256sum -c
-yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS`. The reports are a point-in-time record: a
-vulnerability disclosed after the release is not in them.
+`trivy-<image>.attempt-<N>.json` (the full report, including the image ID, the layer digests and
+every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
+`trivy-<image>.attempt-<N>.gate.txt` (the run attempt, the Trivy version, the database's digest and
+date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
+file's hash and the result, and the check that the pushed image has the scanned image's layers).
+`<N>` is the release workflow's run attempt. When the scan refused an image and that job was re-run,
+the release carries the refused attempt's reports (`gate: FAIL: <reason>`, or `gate: FAIL: cancelled
+...` for a cancelled scan) beside the re-run's; for each image, the reports with the HIGHEST `<N>`
+are the ones for the image that was published, and the release is not created unless those record
+`gate: pass`. A refusal that was never followed by a release (the tag was cut again instead) is kept
+only in that workflow run's artifacts, for 90 days. The agent-bundle image is built after the release
+exists, so its reports are attached afterwards with their own signed checksum list per attempt (table
+above); verify that list the way step 2 verifies `SHA256SUMS`, with the same
+`--certificate-identity`, then run `sha256sum -c
+yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS`. The agent-bundle image was
+published only if its highest attempt's report records `gate: pass`. A re-run adds new report assets
+and never replaces one. The reports are a point-in-time record: a vulnerability disclosed after the
+release is not in them.
 
 ## Prerequisites
 

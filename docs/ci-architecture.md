@@ -955,10 +955,18 @@ and do not fail it. It also fails, rather than pass a scan that could not mean a
   and no GitHub attestation (checked 2026-11-18 with `cosign tree`, the referrers API and the
   attestations API), so the gate cannot verify it. A DB substituted at, or on the way from, the
   registry is detectable only by TLS to the registry and, after the fact, by the recorded digest;
-  a tampered DB with a fresh `UpdatedAt` (one CVE's version range edited) passes the gate;
+  a tampered DB with a fresh `UpdatedAt` (one CVE's version range edited) passes the gate. Every
+  network call has an overall deadline (the digest lookup 90 s, the Trivy download 300 s, each DB
+  download 900 s), so a registry that trickles bytes ends the attempt instead of holding the job
+  until its timeout;
 - **no advisory data for the OS release**: Trivy marks the OS end of service life
   (`Metadata.OS.EOSL`), or its family is not one the gate has a canary for (Debian, Ubuntu, Alpine:
-  every image the release publishes), or the canary matches nothing. The canary is a tiny root
+  every image the release publishes), or its version is a pre-release (`verdict=pre-release`, "no
+  advisory data for a pre-release": `_alpha`, `_beta`, `_pre`, `_rc`, `_git`, `~`, `-rc`, `.rc`,
+  `sid`, `testing`, `edge`, ...) or not a released version number (`N`, `N.N`, `N.N.N`), or the
+  canary matches nothing. A pre-release is refused before the canary because Trivy reads it against
+  the released version's advisories (Alpine `3.24.0_alpha...` as 3.24, Debian `13.0~rc1` as 13), so
+  the canary would match and the image would read as covered. The canary is a tiny root
   filesystem of the image's exact OS release holding `openssl` and `zlib` at versions older than
   every fix, scanned against the run's DB once per OS release per run; it proves the DB holds
   advisories for that release. Trivy matches nothing for an OS release with no advisory bucket, so without this an
@@ -997,32 +1005,50 @@ gains its own no-push build for the scan. `docker-publish-agent-bundle` runs
 `pre-release.yml` `security-scan` runs the same script on all seven published tags afterwards
 with a fresher DB (detective: see "Pre-release QA"); it pulls each tag first.
 
-**Evidence.** Each publish job runs the gate with `--release --report-dir`, which writes, per
-image, `trivy-<image>.json` (the full Trivy report: image ID, layer diff IDs, OS, every package,
-the HIGH/CRITICAL findings and the accepted ones), `trivy-<image>.txt` (the table) and
-`trivy-<image>.gate.txt` (mode, Trivy version, the DB's `repository@digest`, `UpdatedAt` and
-`DownloadedAt`, image ID, OS, OS package count, coverage, the advisory canary's result, the
-ignore-file hash with how many entries were in force and pending, and the result). A `.gate.txt`
-is written for every image on EVERY exit: a refused image's says `gate: FAIL: <reason>`, and when
-the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why.
-After the push the job appends the `verify-pushed` result. The upload, as the
-`yuzu-<image>-image-vuln-gate` artifact with `retention-days: 90` (the repository's maximum), runs
-whenever the gate step ran, passed or failed (`if: always() && (steps.gate.outcome == 'success' ||
-steps.gate.outcome == 'failure')`), so a refusal, the control operating, is retained too. The
-`release` job attaches the six pre-release images' reports to the GitHub Release, inside the
-signed `SHA256SUMS`, the same way it ships the image SBOMs, and
-`scripts/check-release-artifacts.sh` refuses a release that lacks Trivy's three reports for one of
-them, or in which any `*.gate.txt` (whichever scanner wrote it) lacks a `gate: pass` line or has
-any other gate line. The agent bundle's job runs after the release exists, so its report cannot be
-inside `SHA256SUMS`; `attach-bundle-gate-report` attaches it to the GitHub Release afterwards
-(pass or refusal), with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS`
-signed keyless by the same `release.yml` identity and verified in-job. If that job fails or the
-bundle job never uploaded a report, the report exists only as the 90-day artifact, which is
-shorter than a SOC 2 Type II observation window: attach it by hand (`gh release upload`) before it
-expires. The report globs in the release job, `SHA256SUMS`, the release upload, the pre-release
-upload and the bundle attachment take every scanner's files (`trivy-*` and `grype-*`), while the
-coverage check reads Trivy's JSON report only (it refuses any other). The script also writes a
-step summary table, including the rows of a run that stopped early.
+**Evidence.** Each publish job runs the gate with `--release --attempt <run attempt> --report-dir`,
+which writes, per image, `trivy-<image>.attempt-<N>.json` (the full Trivy report: image ID, layer
+diff IDs, OS, every package, the HIGH/CRITICAL findings and the accepted ones),
+`trivy-<image>.attempt-<N>.txt` (the table) and `trivy-<image>.attempt-<N>.gate.txt` (mode, run
+attempt, Trivy version, the DB's `repository@digest`, `UpdatedAt` and `DownloadedAt`, image ID, OS,
+OS package count, coverage, the advisory canary's result, the ignore-file hash with how many entries
+were in force and pending, and the result). A `.gate.txt` is written for every image on every exit
+the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
+the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why, and
+a SIGTERM or SIGINT (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGTERM) before
+this image was judged`. The step `exec`s the script so the runner's signal reaches it, and the
+script runs each long child (Trivy, curl, the digest lookup) in the background and `wait`s, so the
+trap runs at once rather than after the scan. A SIGKILL, or a usage error before the image list is
+read, leaves no report. After the push the job appends the `verify-pushed` result to its attempt's
+`.gate.txt`. The upload, as the `yuzu-<image>-image-vuln-gate-attempt-<N>` artifact with
+`retention-days: 90` (the repository's maximum) and no `overwrite`, runs whenever the gate step ran,
+passed, failed or was cancelled (`if: always() && (steps.gate.outcome == 'success' ||
+steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled')`), so a refusal, the control
+operating, is retained too, and **a re-run adds its attempt's reports beside the refused attempt's
+instead of replacing them**. The `release` job downloads every `yuzu-*` artifact of the run, every
+attempt's gate reports included, and attaches them to the GitHub Release, inside the signed
+`SHA256SUMS`, the same way it ships the image SBOMs. `scripts/check-release-artifacts.sh` refuses a
+release in which a gate report is not named per attempt, or, for one of the six images, the HIGHEST
+attempt present lacks Trivy's three reports, or the highest attempt's `*.gate.txt` (whichever
+scanner wrote it) lacks a `gate: pass` line or has any other gate line; an earlier attempt's report
+may record a failure, and is kept as the evidence that the gate refused it. The highest attempt is
+the one the published image passed: a publish job succeeds only when its gate passed in that
+attempt, and the `release` job needs every publish job's latest attempt to have succeeded. The agent
+bundle's job runs after the release exists, so its report cannot be inside `SHA256SUMS`;
+`attach-bundle-gate-report` attaches it to the GitHub Release afterwards (pass, refusal or
+cancellation), downloading exactly the attempt the bundle job reports (`gate_attempt`), with its own
+checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the
+same `release.yml` identity and verified in-job. It never replaces an asset: one already on the
+release with identical content is kept (a `.sigstore` when it verifies the list), and a different one
+fails the job. If that job fails, the Release run is red, so Pre-release QA does not start (it runs
+only on a successful Release run), and the report exists only as the 90-day artifact, which is
+shorter than a SOC 2 Type II observation window: "Re-run failed jobs" re-runs the attach job alone,
+and its success turns the run green; dispatch `pre-release.yml` with the tag if QA still has not
+started. Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle
+job never uploaded a report there is nothing to attach; its job log is the record. The report globs
+in the release job, `SHA256SUMS`, the release upload, the pre-release upload and the bundle
+attachment take every scanner's files (`trivy-*` and `grype-*`), while the coverage check reads
+Trivy's JSON report only (it refuses any other). The script also writes a step summary table,
+including the rows of a run that stopped early.
 
 **Scanning the right image.** Four Big Tam runners share one Docker daemon, so a tag is not a
 safe handle. Each verification build gets a tag salted with the commit, run id and run attempt
@@ -1073,22 +1099,59 @@ Trivy (Apache-2.0) is a CI-time tool only; it ships in no image.
 does not apply, with the evidence), an unquoted `expired_at` at most 92 days out, `approved_by`
 (the GitHub login of the person who accepted it), and `approval_ref` (the pull request in which
 they approved it, `"#N"` or its URL) with `approved_on` (the date). The scope is never a bare CVE
-id: a `paths` item is one concrete relative path (no glob character, no empty string, no leading
-`/`, no `.`/`..` component), because Trivy matches `paths` as globs and an OS package's path is
-empty, so `**`, `*` or `""` would suppress the CVE in every package; a `purls` item is a full
-package URL with its version, because Trivy matches a purl without one against every version.
-Until the approving review exists, `approval_ref: pending` (and no `approved_on`) records a
-proposed acceptance: the release gate (`--release`) does not honour it, local runs and the
-post-release scan do and report it as pending. `image-vuln-gate-checks.py` parses the file (a
-strict block-style subset of YAML: flow style, anchors, a comment after a value, an unknown key or
-a second top-level section are refused, so a decoy line cannot satisfy it), the gate refuses a
-file that breaks any rule, and Trivy reads only the checker's canonical copy of the entries in
-force. It warns 21 days before an entry expires. An expired entry is not in force, so the next
-release fails on that finding again. Today there is one entry: the Go standard library
-CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not link `crypto/tls`), with
-`approval_ref: pending`, as are the four not-covered listings: until the owner's approving review
-is recorded in them, a release fails at the postgres and chisel legs. The entry is a commit, so it
-is in the tag a release builds: it can only help a release cut after it.
+id: a `paths` item is one concrete relative path to a file in the image (it contains a `/`; no glob
+character, no empty string, no leading `/`, no `.`/`..` component, and not a Trivy result target,
+class or type name such as `Python`, `Node.js`, `Java`, `gobinary` or `os-pkgs`), because Trivy
+matches `paths` as globs against a package's path AND its result's target, and an OS package's path
+is empty: `**`, `*` or `""` would suppress the CVE in every package, and `Python` in every Python
+package (verified with Trivy 0.70.0: an entry scoped `Python` hid CVE-2020-14343, a fixable CRITICAL
+in PyYAML 5.3.1, from a `--release` run). A `purls` item is a full package URL with its version,
+because Trivy matches a purl without one against every version. Until the approval is recorded,
+`approval_ref: pending` (and no `approved_on`) records a proposed acceptance: the release gate
+(`--release`) does not honour it, local runs and the post-release scan do and report it as pending.
+`image-vuln-gate-checks.py` parses the file (a strict block-style subset of YAML: flow style,
+anchors, a comment after a value, an unknown key or a second top-level section are refused, so a
+decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and Trivy reads only
+the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
+expired entry is not in force, so the next release fails on that finding again. Today there is one
+entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
+link `crypto/tls`), with `approval_ref: pending`, as are the four not-covered listings: until an
+approval is recorded in them, a release fails at the postgres and chisel legs. The entry is a
+commit, so it is in the tag a release builds: it can only help a release cut after it.
+
+**What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
+`approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
+GitHub login, a past date, `#N` or a pull-request URL) and nothing else. It does not ask GitHub
+whether that pull request exists, was merged, or was approved by `approved_by`, so a typed `"#9999"`
+with a date passes it exactly like a real approval. They are not a verified approval and no
+document may present them as one. The control is human review of every change to
+`.trivyignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
+(`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
+`scripts/ci/image-identity.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
+(`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
+changes the entry, and the fields record where to find it. That review is as strong as the branch
+protection that requires it. **Owner action (recommended, not in the repository):** a `CODEOWNERS`
+entry for those paths, with "Require review from Code Owners" on `main`, so a change to an acceptance
+or to the gate cannot merge without the owner's review.
+
+**Recording an approval.** For an acceptance or a not-covered listing:
+
+1. Open a pull request that adds (or changes) the entry with `approved_by: <the approver's login>`
+   and `approval_ref: pending` (no `approved_on`; in the not-covered list, `approved_on=-
+   approval_ref=pending`), and the evidence in `statement` (or `reason=`). A pending entry is not
+   honoured by a release, so merging it changes no release yet.
+2. The approver reviews that pull request and approves it in GitHub's review UI. The approval is
+   that review; it is not given anywhere else.
+3. In the same pull request, after the approving review, set `approval_ref` to that pull request
+   (`"#N"`, or its URL) and `approved_on` to the date of the review (in the not-covered list,
+   `approved_on=<YYYY-MM-DD> approval_ref=#N`). A push after an approval may dismiss it under the
+   branch rules; then the approver re-approves the final diff, and `approved_on` is that date.
+4. Merge. Before tagging, the release skills run `python3 -I scripts/ci/image-vuln-gate-checks.py
+   pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt`, which fails while any
+   entry in force is still pending.
+
+Whoever audits an acceptance later follows `approval_ref` to the pull request and checks the
+approving review there; the gate does not.
 
 **When it fails.** The leg whose gate failed pushed nothing (a failure in "Verify the pushed image
 is the scanned one" is different: see that paragraph and the release skill). Its sibling matrix
@@ -1107,11 +1170,12 @@ except the agent bundle:
   package database from an image that used to have one. Fix the image; listing it in
   `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
-  it expired (re-review it), or its `approval_ref` is `pending` (record the approving review).
-- **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the owner's approving
-  review (its pull request and date) in the entry; a commit, so re-tag.
-- **No advisory data** (`end of service life`, `no advisory data`): the image's base moved to an
-  unreleased, rolling or end-of-life OS release. Move it back to a released, supported one; a
+  it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
+- **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
+  "Recording an approval" describes; a commit, so re-tag.
+- **No advisory data** (`end of service life`, `no advisory data`, `no advisory data for a
+  pre-release`): the image's base moved to an unreleased, pre-release, rolling or end-of-life OS
+  release. Move it back to a released, supported one; a
   commit, so re-tag. An unknown OS family needs a canary added to `image-vuln-gate-checks.py`
   first.
 - **An acceptance that expires mid-release, or a CRITICAL disclosed between legs**: the legs that
@@ -1162,13 +1226,17 @@ published images (a tracked gap).
 **Routed-concern invariants** (the `.claude/routed-concerns.md` row points here). Every publish
 job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
 BEFORE any SBOM, attestation or signature. The gate fails closed: a scan, DB, coverage or
-advisory-data failure is never a pass, and every exit writes a report the upload keeps. An
-acceptance is in force only when its scope is concrete (a concrete path, or a full purl with its
-version), it has not expired, and, in a release, its approval names the approving pull request and
-date; the same holds for a not-covered listing. Trivy reads only the checker's canonical copy of
-the ignore file, and the DB only from this run's fresh cache, pinned by digest. Widening any of
-these (a glob scope, a bare id, an honoured pending approval, an inherited cache, a second
-coverage reader that is not Trivy's report) is a security decision, not a fix.
+advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
+SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
+never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
+the image, containing a `/` and naming no Trivy target, or a full purl with its version), it has not
+expired, and, in a release, its approval fields are filled in and well formed (not `pending`); the
+same holds for a not-covered listing. Those fields are a recorded reference, checked for format only;
+the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
+file, and the DB only from this run's fresh cache, pinned by digest. Widening any of these (a glob
+or one-word scope, a bare id, an honoured pending approval, an inherited cache, a second coverage
+reader that is not Trivy's report, an overwritten or clobbered report) is a security decision, not a
+fix.
 
 ### Pre-release QA (`pre-release.yml`)
 
@@ -4146,8 +4214,10 @@ itself re-warm the new key.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
 old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
-(`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
-built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+(`$RUNNER_TOOL_CACHE/yuzu-docker-buildcache/*-chisel`, `mode=max` — several
+GB/arch, no built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux
+only, each removal under an exclusive non-blocking `flock` on `<dir>.lock`, so a
+directory a publish job holds is skipped with a notice, never removed under it.
 Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
 on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
 databases (thresholds and semantics: "Test-database lifecycle" above). It runs
@@ -4170,7 +4240,11 @@ hours, removes a BROKEN directory (unparseable index, or an index naming a
 missing blob, which would fail its next import) whole so the next build runs
 cold, and refuses a symlinked directory or lock. A directory it cannot read is
 an error: reported, left untouched, and the step exits 1 after the last
-directory. Its clock-guard disposition is in `docs/clock-guarded-retention.md`.
+directory. So is a directory holding a file dated more than an hour in the
+future (a clock or file time that would otherwise keep the 3-hour window open
+for ever), and one holding a blob that starts like JSON but is over the 64 MiB
+read cap (read as a layer, its references would be lost and blobs a manifest
+needs removed). Its clock-guard disposition is in `docs/clock-guarded-retention.md`.
 
 **A corrupted release cache** (a publish build failing to import its cache with
 `NotFound content`, or a prune error naming a directory): on the runner that ran

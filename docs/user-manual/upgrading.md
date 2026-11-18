@@ -603,7 +603,9 @@ Every image the release publishes now takes its distribution's security updates 
 except the PostgreSQL packages in `yuzu-postgres`, which stay at the pinned minor until the
 image's base is moved to a newer one. The release refuses to push an image that has a CRITICAL
 vulnerability with a fix available, as far as its scanner can see it, or whose operating-system
-release the scanner has no advisory data for: the OS packages of the four chiselled images,
+release it cannot show the scanner has advisory data for (end of life, a pre-release or rolling
+release, or a distribution other than Debian, Ubuntu and Alpine): the OS packages of the four
+chiselled images,
 PostgreSQL itself, the gateway's Erlang/OTP runtime and the statically linked server and agent
 binaries are not covered (see
 [release-verification.md](release-verification.md#image-vulnerability-scan-before-publishing)).
