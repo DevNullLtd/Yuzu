@@ -1122,11 +1122,15 @@ public:
         for (const char* route : {"login", "password_change", "mfa_recovery"})
             for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
                 for (const char* reason : {"per_source", "per_principal", "class_full",
-                                           "global_full"})
+                                           "global_full", "stripe_busy"})
                     metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
                                      {{"route", route}, {"class", cls}, {"reason", reason}});
         metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight",
-                          "Password-hash (PBKDF2) slots in use now, sampled by the periodic sweep",
+                          "Peak password-hash (PBKDF2) slots in use since the previous periodic sweep",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiters",
+                          "Login requests now waiting (at most 150 ms each) for their username's "
+                          "serialisation stripe",
                           "gauge");
         metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
                           "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
@@ -10420,8 +10424,14 @@ public:
                 try {
                     publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
                     if (auth_routes_)
+                    {
+                        // Peak since the last sweep: an instantaneous reading is ~0 for a
+                        // 50-150 ms hash.
                         metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight")
-                            .set(static_cast<double>(auth_routes_->pbkdf2_budget().in_flight()));
+                            .set(static_cast<double>(auth_routes_->pbkdf2_budget().take_peak()));
+                        metrics_.gauge("yuzu_auth_login_stripe_waiters")
+                            .set(static_cast<double>(auth_routes_->stripe_waiters()));
+                    }
                 } catch (const std::exception& e) {
                     spdlog::warn("mfa binding gauge publish failed: {}", e.what());
                 } catch (...) {

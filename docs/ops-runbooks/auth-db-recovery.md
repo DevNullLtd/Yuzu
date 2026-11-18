@@ -41,7 +41,7 @@ the Windows event log shows one of these, and they mean different things:
 | `SecretCodec::init() failed` … `kek_orphaned: stored secret blobs reference KEK version(s) […] absent from kek_meta` | A stored secret blob (for example one account's TOTP secret) names a key-encryption-key version that is not registered in `secrets.kek_meta` | [Stored secret names an unregistered KEK version](#stored-secret-names-an-unregistered-kek-version) |
 | `AuthDB: the MFA factor-generation trigger (auth.users_mfa_factor_gen) is missing, not ENABLE ALWAYS, or altered - auth store disabled`, followed by `Failed to open the Postgres auth store (migration or MFA trigger check failed; see the preceding AuthDB log line)` | The trigger that binds an MFA proof to the account's factor generation is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
 | `SessionStore: sessions_mfa_rebind_guard is missing, not ENABLE ALWAYS, or altered; refusing to open …`, followed by `[PG] Refusing to start: session store migration/open failed` | The session rebind guard trigger is not in force | [MFA binding enforcement failed](#mfa-binding-enforcement-failed) |
-| `PgMigrationRunner: migration v3 failed for auth: …` or `PgMigrationRunner: migration v3 failed for session_store: …`, ending `canceling statement due to lock timeout` (SQLSTATE `55P03`), followed by the refusal line for that store; or the same line printed by the first `yuzu-server --mfa-reset` | The migration could not get its table lock within 3 seconds because another session holds a lock on `auth.users` or `session_store.sessions`; it rolled back whole and changed nothing | [Migration lock timeout](#migration-lock-timeout) |
+| `PgMigrationRunner: migration v3 failed for auth: …`, `PgMigrationRunner: migration v4 failed for auth: …` or `PgMigrationRunner: migration v3 failed for session_store: …`, ending `canceling statement due to lock timeout` (SQLSTATE `55P03`), followed by the refusal line for that store; or the same line printed by the first `yuzu-server --mfa-reset` | The migration could not get its table lock within 3 seconds because another session holds a lock on `auth.users` or `session_store.sessions`; it rolled back whole and changed nothing | [Migration lock timeout](#migration-lock-timeout) |
 | `[auth] Refusing to start: the 'engine:' namespace …` | An `engine:`-prefixed principal collides with the reserved namespace | `docs/ops-runbooks/engine-principal-store-recovery.md` |
 
 A server that refuses to start serves no `/metrics`, so the two binding gauges below cannot report this
@@ -152,7 +152,7 @@ opened. Usual causes, in likelihood order:
 
 ### Migration lock timeout
 
-The `PgMigrationRunner` line above means another session held a lock on `auth.users` (the `auth` v3 migration) or
+The `PgMigrationRunner` line above means another session held a lock on `auth.users` (the `auth` v3 or v4 migration) or
 `session_store.sessions` (the `session_store` v3 migration) for longer than the migration's 3 second wait. Nothing
 was applied. Find the holder:
 
@@ -621,15 +621,16 @@ until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, th
 `mfa.login.failed` / `mfa.step_up.failed` with detail `mfa locked`). Remedies, cheapest first:
 
 1. **Wait the window** (default 900 s): zero risk.
-2. **Another administrator**, or an admin API/MCP token: `POST /api/v1/users/{name}/unlock` or the
-   MCP `unlock_account` tool (clears the password lock and the MFA lock in one statement).
+2. **Another administrator**, or an admin API/MCP token **minted beforehand** (you cannot mint one
+   while locked out): `POST /api/v1/users/{name}/unlock` or the MCP `unlock_account` tool (clears the
+   password lock and the MFA lock in one statement).
 3. **Host CLI**: `yuzu-server --break-glass-arm` resets the lock, but ONLY for the configured
    break-glass user; `yuzu-server --mfa-reset <user>` removes the factor (and the lock) and the user
    re-enrols.
 4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which now clears the
    three MFA columns too).
 
-**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the window clears a lock, a backward step lengthens one.
+**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the REMAINING lock time ends a live lock early and starts a fresh failure count (a new set of guesses), and a backward step lengthens it. An operator unlock still clears a lock.
 
 **Sole-administrator wedge.** If the only administrator's second factor is locked, they hold no API
 token and no break-glass account is configured, options 2 and `--break-glass-arm` are unavailable:

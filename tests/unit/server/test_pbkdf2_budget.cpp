@@ -12,6 +12,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <thread>
 #include <vector>
@@ -47,7 +48,7 @@ TEST_CASE("Pbkdf2Budget sizes: cap 66 gives 16 / 50 / 25 / 25, cap 8 gives 2 / 6
     CHECK(b.break_glass_cap() == 16);
     CHECK(b.main_cap() == 50);
     CHECK(take_unauth(b, 100, "u").size() == 25);
-    CHECK(take_auth(b, 100, "a").size() == 50); // the unauth slots above were freed; main share 50
+    CHECK(take_auth(b, 100, "a").size() == 25); // the unauth slots above were freed; authenticated lane 25
     Pbkdf2Budget t{8};
     CHECK(t.break_glass_cap() == 2);
     CHECK(t.main_cap() == 6);
@@ -58,7 +59,7 @@ TEST_CASE("Pbkdf2Budget (a): break-glass still gets a slot with the authenticate
     Pbkdf2Budget b{66, /*per_source_cap=*/64};
     b.set_per_principal_cap(64); // isolate the class bound from the per-principal bound
     auto auth = take_auth(b, 100, "p");
-    CHECK(auth.size() == 50); // the authenticated class stops at the main share, not at 66
+    CHECK(auth.size() == 25); // the authenticated class stops at ITS half of the main share
     auto bg = b.try_acquire(Pbkdf2Class::kBreakGlass, "bg-source");
     CHECK(bg.ok());
 }
@@ -143,6 +144,54 @@ TEST_CASE("fill_pbkdf2_budget takes every slot", "[pbkdf2_budget]") {
     CHECK_FALSE(b.try_acquire(Pbkdf2Class::kBreakGlass, "x").ok());
 }
 
+TEST_CASE("Pbkdf2Budget: neither shared class can fill the main share and starve the other",
+          "[pbkdf2_budget]") {
+    Pbkdf2Budget b{66, 64};
+    b.set_per_principal_cap(64);
+    auto auth = take_auth(b, 100, "p");
+    CHECK(auth.size() == 25);
+    auto unauth = take_unauth(b, 100, "u"); // /login still has its 25 with authenticated at cap
+    CHECK(unauth.size() == 25);
+}
+
+TEST_CASE("Pbkdf2Budget at the minimum cap 4: floor 1, main 3 (unauthenticated 2, authenticated 1)",
+          "[pbkdf2_budget]") {
+    Pbkdf2Budget b{4, 64};
+    b.set_per_principal_cap(64);
+    CHECK(b.break_glass_cap() == 1);
+    CHECK(b.main_cap() == 3);
+    CHECK(take_unauth(b, 10, "u").size() == 2);
+    CHECK(take_auth(b, 10, "p").size() == 1);
+    Pbkdf2Budget c{4, 64};
+    c.set_per_principal_cap(64);
+    auto u = take_unauth(c, 10, "u");
+    auto a = take_auth(c, 10, "p");
+    auto bg = c.try_acquire(Pbkdf2Class::kBreakGlass, "x");
+    CHECK(bg.ok()); // the floor holds at the minimum cap
+    CHECK_FALSE(c.try_acquire(Pbkdf2Class::kBreakGlass, "y").ok());
+}
+
+TEST_CASE("Pbkdf2Budget: the break-glass lane is subject to the per-source cap", "[pbkdf2_budget]") {
+    Pbkdf2Budget b{66, /*per_source_cap=*/1};
+    auto first = b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.7");
+    REQUIRE(first.ok());
+    auto second = b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.7");
+    CHECK_FALSE(second.ok());
+    CHECK(second.refusal() == Pbkdf2Refusal::kPerSource);
+    CHECK(b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.8").ok());
+}
+
+TEST_CASE("Pbkdf2Budget: take_peak reports the high-water mark then resets", "[pbkdf2_budget]") {
+    Pbkdf2Budget b{66};
+    {
+        auto a = take_unauth(b, 5, "u");
+        CHECK(b.in_flight() == 5);
+    }
+    CHECK(b.in_flight() == 0);
+    CHECK(b.take_peak() == 5); // a point-in-time read would say 0
+    CHECK(b.take_peak() == 0);
+}
+
 TEST_CASE("Pbkdf2Budget: concurrent acquirers never exceed the cap", "[pbkdf2_budget][concurrency]") {
     Pbkdf2Budget b{4, 64};
     b.set_per_principal_cap(64);
@@ -158,11 +207,13 @@ TEST_CASE("Pbkdf2Budget: concurrent acquirers never exceed the cap", "[pbkdf2_bu
                 const int now = ++cur;
                 int p = peak.load();
                 while (now > p && !peak.compare_exchange_weak(p, now)) {}
+                std::this_thread::sleep_for(std::chrono::microseconds(100)); // real contention
                 --cur;
             }
         });
     for (auto& t : ts)
         t.join();
     CHECK(peak.load() <= 3); // cap 4: floor 1, main 3
+    CHECK(peak.load() >= 2); // and the contention was real
     CHECK(b.in_flight() == 0);
 }

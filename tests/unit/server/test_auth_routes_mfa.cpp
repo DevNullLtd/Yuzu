@@ -60,6 +60,7 @@
 #include <atomic>
 #include <chrono>
 #include <filesystem>
+#include <future>
 #include <fstream>
 #include <memory>
 #include <optional>
@@ -3268,6 +3269,129 @@ TEST_CASE("POST /login/mfa: a 429 on a recovery code leaves the pending token us
                           "application/x-www-form-urlencoded");
     REQUIRE(ok);
     CHECK(ok->status == 200); // the same token still works: the Retry-After hint is honest
+}
+
+
+// ---------------------------------------------------------------------------
+// WP03 r4: the per-username login stripe wait is BOUNDED
+// ---------------------------------------------------------------------------
+TEST_CASE("verify_password_with_lockout: a held stripe answers kBusy within the bounded wait",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 3;
+    auto& stripe = h.auth_routes->login_lock_for_test("stripe-ghost");
+    stripe.lock(); // a slow same-name request holds the stripe
+    PasswordCheckResult result{};
+    std::chrono::milliseconds waited{0};
+    std::promise<void> done;
+    auto finished = done.get_future();
+    std::thread t([&] {
+        httplib::Request req;
+        req.remote_addr = "203.0.113.9";
+        PasswordCheckOptions opts;
+        const auto t0 = std::chrono::steady_clock::now();
+        result = h.auth_routes->verify_password_with_lockout("stripe-ghost", "whatever-123456", req,
+                                                             opts);
+        waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        done.set_value();
+    });
+    // A bounded wait returns by itself; an unbounded one (a plain blocking lock) is still parked
+    // here, so the check goes RED instead of the test hanging.
+    const bool returned_in_time = finished.wait_for(std::chrono::milliseconds(700)) ==
+                                  std::future_status::ready;
+    stripe.unlock(); // lets an unbounded waiter finish so the thread can be joined
+    t.join();
+    CHECK(returned_in_time);
+    CHECK(result.outcome == PasswordCheckOutcome::kBusy);
+    CHECK(waited >= std::chrono::milliseconds(100)); // it did wait for the stripe...
+    CHECK(waited < std::chrono::milliseconds(400));  // ...but never unboundedly
+    CHECK(h.auth_routes->stripe_waiters() == 0);
+}
+
+TEST_CASE("live pool of 10: a flood of one unknown name cannot pin the workers",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->pbkdf2_budget().set_cap(66); // not what this test is about
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    httplib::Server svr;
+    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 400); };
+    // The production login path, minus the route plumbing register_routes() needs a full server
+    // for: the shared lockout-accounted check (stripe, gate, slot, lockout, hash) on a real
+    // 10-worker pool.
+    std::atomic<int> saw_ghost{0};
+    svr.Post("/login", [&h, &saw_ghost](const httplib::Request& req, httplib::Response& res) {
+        if (req.get_param_value("username") == "flood-ghost")
+            ++saw_ghost;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto r = h.auth_routes->verify_password_with_lockout(
+            req.get_param_value("username"), req.get_param_value("password"), req, opts);
+        res.status = r.outcome == PasswordCheckOutcome::kBusy       ? 429
+                     : r.outcome == PasswordCheckOutcome::kVerified ? 200
+                                                                    : 401;
+        res.set_content("x", "text/plain");
+    });
+    svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&] { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    // A same-name request that holds the stripe for seconds (a slow hash, a stalled lockout read)
+    // is modelled by holding it here. The flood below is the K same-unknown-name logins behind it.
+    auto& stripe = h.auth_routes->login_lock_for_test("flood-ghost");
+    stripe.lock();
+    constexpr int kFlood = 80;
+    std::vector<std::thread> flood;
+    std::atomic<int> answered{0};
+    for (int i = 0; i < kFlood; ++i)
+        flood.emplace_back([&, port] {
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(30, 0);
+            auto r = c.Post("/login", "username=flood-ghost&password=whatever-123456",
+                            "application/x-www-form-urlencoded");
+            if (r)
+                ++answered;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // the pool is now saturated
+
+    auto timed = [&](auto&& fn) {
+        const auto t0 = std::chrono::steady_clock::now();
+        const bool ok = fn();
+        return std::pair{ok, std::chrono::duration_cast<std::chrono::milliseconds>(
+                                 std::chrono::steady_clock::now() - t0)};
+    };
+    auto [health_ok, health_ms] = timed([&] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(10, 0);
+        auto r = c.Get("/healthz");
+        return r && r->status == 200;
+    });
+    auto [other_ok, other_ms] = timed([&] {
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(10, 0);
+        auto r = c.Post("/login", "username=alice&password=wrong-password-1",
+                        "application/x-www-form-urlencoded");
+        return r && (r->status == 401 || r->status == 429);
+    });
+    stripe.unlock(); // the slow holder finishes; an unbounded waiter is released only now
+    for (auto& t : flood)
+        t.join();
+    svr.stop();
+    server_thread.join();
+    // With the stripe held for the whole measurement, an UNBOUNDED wait pins all ten workers and
+    // /healthz queues behind them (RED); the bounded wait frees each worker after 150 ms.
+    CHECK(health_ok);
+    CHECK(health_ms < std::chrono::milliseconds(2000));
+    CHECK(other_ok);
+    CHECK(other_ms < std::chrono::milliseconds(2000));
+    CHECK(answered.load() == kFlood); // every flooded request got an answer (200/401/429)
+    CHECK(saw_ghost.load() == kFlood); // and the handler really received the flooded name
+    INFO("healthz " << health_ms.count() << " ms, other login " << other_ms.count() << " ms");
 }
 
 #endif // !_WIN32

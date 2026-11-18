@@ -1002,7 +1002,7 @@ public:
     /// exactly as the REST `POST /api/v1/users/{name}/unlock` handler does,
     /// without pulling in rest_api_v1.hpp for one nested type (same mirror-not-
     /// reuse discipline as `PublishCrlFn` below, which mirrors `CaRoutes::
-    /// PublishCrlFn`). Wraps `AuthDB::clear_failed_logins`. Returns true when
+    /// PublishCrlFn`). Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget). Returns true when
     /// the underlying auth store write succeeded. Empty/unset callback = the
     /// tool answers "lockout subsystem unavailable" (503-equivalent), matching
     /// the REST route's degrade when `lockout_clear_fn` is unwired.

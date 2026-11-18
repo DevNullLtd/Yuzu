@@ -72,6 +72,29 @@ def check_routes(t):
     return bad
 
 
+def check_gate_order(t):
+    """verify_password_with_lockout: the sso-only gate runs BEFORE the PBKDF2 slot, and the
+    stripe acquire (try_lock_for) comes before the slot; both are bounded-wait."""
+    bad = []
+    a = t.find("AuthRoutes::verify_password_with_lockout(")
+    b = t.find("Account-lockout pre-check", a) if a >= 0 else -1
+    if a < 0:
+        return ["verify_password_with_lockout not found"]
+    body = t[a:] if b < 0 else t[a:]
+    gate = body.find("opts.pre_verify_gate()")
+    slot = body.find("acquire_pbkdf2(")
+    stripe = body.find("try_lock_for(")
+    if gate < 0 or slot < 0 or stripe < 0:
+        return [f"gate/slot/stripe anchors missing ({gate},{slot},{stripe})"]
+    if not gate < slot:
+        bad.append("the sso-only pre_verify_gate must run BEFORE the PBKDF2 slot is taken")
+    if not stripe < gate:
+        bad.append("the bounded stripe wait (try_lock_for) must come before the gate/slot")
+    if "login_lk.lock()" in body[:slot]:
+        bad.append("the login stripe must use try_lock_for, never an unbounded lock()")
+    return bad
+
+
 def check(files):
     bad = []
     sites = {}
@@ -84,6 +107,7 @@ def check(files):
         bad.append(f"verifier callers outside auth_routes.cpp: {sorted(sites)}")
     if "auth_routes.cpp" in files:
         bad += check_routes(files["auth_routes.cpp"])
+        bad += check_gate_order(files["auth_routes.cpp"])
     else:
         bad.append("auth_routes.cpp missing")
     return bad
@@ -117,6 +141,25 @@ def selftest(files):
             m["auth_routes.cpp"] = mutated
             if not check(m):
                 failures.append(f"MUTATION NOT DETECTED: {tok} removed from {name}")
+    # Moving the gate after the slot, or an unbounded stripe lock, must be caught.
+    gate_stmt = re.search(
+        r"if \(opts\.pre_verify_gate && !opts\.pre_verify_gate\(\)\)\s*return \{[^;]*\};", base)
+    if gate_stmt and "int prior_failed_count = 0;" in base:
+        mutated = base.replace(gate_stmt.group(0), "", 1).replace(
+            "int prior_failed_count = 0;", gate_stmt.group(0) + " int prior_failed_count = 0;", 1)
+        m = dict(files)
+        m["auth_routes.cpp"] = mutated
+        if not check(m):
+            failures.append("MUTATION NOT DETECTED: gate moved after the slot")
+    else:
+        failures.append("selftest cannot find the gate statement")
+    if "try_lock_for(kLoginStripeWait)" in base:
+        m = dict(files)
+        m["auth_routes.cpp"] = base.replace("try_lock_for(kLoginStripeWait)", "lock()", 1)
+        if not check(m):
+            failures.append("MUTATION NOT DETECTED: unbounded stripe lock")
+    else:
+        failures.append("selftest cannot find the bounded stripe wait")
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"

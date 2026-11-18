@@ -19,9 +19,10 @@
 ///   - kUnauthenticated (POST /login, the recovery-code check behind a pending login token) may
 ///     hold at most `main_cap - max(1, main_cap/2)` slots (25) and at most `per_source_cap` per
 ///     source address.
-///   - kAuthenticated (step-up recovery, the password-change proof) may use any free slot of the
-///     main share, so `max(1, main_cap/2)` (25) are always left for it, but at most
-///     `per_principal_cap` (3) per principal, so one session holder cannot fill the share.
+///   - kAuthenticated (step-up recovery, the password-change proof) may hold at most
+///     `max(1, main_cap/2)` (25), and at most `per_principal_cap` (3) per principal, so one
+///     session holder cannot fill even that. The split with kUnauthenticated is fixed (no
+///     borrowing), so neither class can fill the main share and starve /login or step-up.
 /// Header-only, no I/O.
 
 #include <algorithm>
@@ -65,6 +66,14 @@ public:
     int in_flight() const {
         std::lock_guard lk(mu_);
         return total_;
+    }
+    /// High-water mark of slots in use since the last call (then reset to the current level):
+    /// a point-in-time gauge reads ~0 for a 50-150 ms hash, so the sweep publishes this.
+    int take_peak() {
+        std::lock_guard lk(mu_);
+        const int p = peak_;
+        peak_ = total_;
+        return p;
     }
 
     /// RAII slot. `ok()` is false when refused (no slot held; `refusal()` says why).
@@ -115,7 +124,11 @@ public:
             // The union bound: break-glass keeps its floor whatever the other classes do.
             if (auth_ + unauth_ >= main_cap)
                 return Slot{Pbkdf2Refusal::kGlobalFull};
+            // A fixed split, no borrowing: each of the two shared classes is capped at its own
+            // half, so neither can fill the main share and starve the other.
             if (cls == Pbkdf2Class::kUnauthenticated && unauth_ >= unauth_cap)
+                return Slot{Pbkdf2Refusal::kClassFull};
+            if (cls == Pbkdf2Class::kAuthenticated && auth_ >= auth_reserve)
                 return Slot{Pbkdf2Refusal::kClassFull};
         }
         auto& map = cls == Pbkdf2Class::kAuthenticated ? per_principal_ : per_source_;
@@ -133,6 +146,8 @@ public:
          : cls == Pbkdf2Class::kBreakGlass    ? break_glass_
                                               : auth_) += 1;
         ++total_;
+        if (total_ > peak_)
+            peak_ = total_;
         return Slot{this, cls, std::move(key)};
     }
 
@@ -154,6 +169,7 @@ private:
     int cap_{4};
     int per_source_cap_{1};
     int total_{0};
+    int peak_{0};
     int unauth_{0};
     int break_glass_{0};
     int auth_{0};

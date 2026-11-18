@@ -3021,7 +3021,7 @@ void remove_commit_failer(PGconn* c, const std::string& table) {
 
 } // namespace
 
-TEST_CASE("AuthDB migrates v3 -> v4: the MFA failure-budget columns arrive inert on existing rows",
+TEST_CASE("AuthDB migrates v3 -> v4: the MFA budget columns are added with inert defaults",
           "[pg][auth_db][migration][mfa_budget]") {
     YUZU_REQUIRE_PG_MIGRATION_DB(db);
     PgPool pool{{.conninfo = db.dsn(), .size = 2}};

@@ -2142,7 +2142,7 @@ void AuthRoutes::emit_event(const std::string& event_type, const httplib::Reques
 // Pick the striped login mutex for a username (account-lockout race close).
 // Any hash is fine — same-stripe collisions across distinct usernames just
 // serialize harmlessly. See the header for the full rationale.
-std::mutex& AuthRoutes::login_lock_for(const std::string& username) {
+std::timed_mutex& AuthRoutes::login_lock_for(const std::string& username) {
     return login_locks_[std::hash<std::string>{}(username) % login_locks_.size()];
 }
 
@@ -2171,9 +2171,29 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // account is serialized, which is the intended throttle. (Taken whenever
     // the threshold is on, INCLUDING for a lockout-exempt break-glass attempt,
     // exactly as the pre-extraction /login did.)
-    std::unique_lock<std::mutex> login_lk;
+    // The wait is BOUNDED (kLoginStripeWait): a waiter pins an httplib worker, and a flood of
+    // logins for ONE name (an unknown name never locks, so each holder spends a full PBKDF2)
+    // would otherwise queue unboundedly and starve the pool, invisibly to the slot budget. A
+    // timeout answers the existing 429 (kBusy), uniform for any name.
+    std::unique_lock<std::timed_mutex> login_lk;
     if (cfg_.auth_lockout_threshold > 0) {
-        login_lk = std::unique_lock<std::mutex>(login_lock_for(username));
+        login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);
+        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
+        const bool got = login_lk.try_lock_for(kLoginStripeWait);
+        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
+        if (!got) {
+            if (auto* m = auth_mgr_.metrics_registry()) {
+                const bool login_route = opts.metric_route == "login";
+                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                           {{"route", opts.metric_route},
+                            {"class", !login_route          ? "authenticated"
+                                      : opts.lockout_exempt ? "break_glass"
+                                                            : "unauthenticated"},
+                            {"reason", "stripe_busy"}})
+                    .increment();
+            }
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+        }
     }
 
     // The caller's pre-verify gate (the sso-only local-login gate) runs BEFORE any PBKDF2 slot is

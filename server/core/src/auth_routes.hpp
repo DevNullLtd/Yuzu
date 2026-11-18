@@ -21,6 +21,7 @@
 #include <nlohmann/json.hpp>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -227,6 +228,15 @@ public:
     /// least 4 (the budget's own minimum).
     void set_pbkdf2_cap(int cap) { pbkdf2_budget_.set_cap(cap); }
     Pbkdf2Budget& pbkdf2_budget() { return pbkdf2_budget_; }
+    /// Requests now waiting for a per-username login stripe (a gauge source; bounded by
+    /// `kLoginStripeWait` each).
+    int stripe_waiters() const { return stripe_waiters_.load(std::memory_order_relaxed); }
+    /// Test seam: the stripe a name maps to, so a test can hold it.
+    std::timed_mutex& login_lock_for_test(const std::string& username) {
+        return login_lock_for(username);
+    }
+    /// How long a request may wait for its username's stripe before answering 429.
+    static constexpr std::chrono::milliseconds kLoginStripeWait{150};
 
     // -- Auth helpers (called by server.cpp to create callbacks for other modules) --
 
@@ -1237,8 +1247,12 @@ private:
     // DB-atomic attempt reservation, landing with the auth store's Postgres
     // migration (see docs/security-reviews/account-lockout-2026-06-12.md).
     static constexpr std::size_t kLoginLockStripes = 256;
-    std::array<std::mutex, kLoginLockStripes> login_locks_;
-    std::mutex& login_lock_for(const std::string& username);
+    // A std::timed_mutex, never a plain mutex: a waiter holds an httplib worker, and a plain
+    // mutex gave every waiter an unbounded, invisible wait (a flood of one name, which never
+    // locks, pinned the whole pool). `kLoginStripeWait` bounds it; a timeout is the 429 `kBusy`.
+    std::array<std::timed_mutex, kLoginLockStripes> login_locks_;
+    std::timed_mutex& login_lock_for(const std::string& username);
+    std::atomic<int> stripe_waiters_{0};
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};
     /// Uniform 429 + Retry-After for a full PBKDF2 budget (A4 envelope; same shape for any name).

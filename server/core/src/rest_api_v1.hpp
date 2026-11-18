@@ -406,7 +406,7 @@ public:
         std::function<SessionRevokeResult(const std::string& username, bool revoke_api_tokens)>;
 
     /// Clear a user's account-lockout counter (admin unlock — SOC 2 CC6.3).
-    /// Wraps `AuthDB::clear_failed_logins` so RestApiV1 stays decoupled from
+    /// Wraps `AuthDB::clear_account_lockouts` (password lockout AND MFA failure budget) so RestApiV1 stays decoupled from
     /// AuthDB (same injection pattern as SessionRevokeFn). Returns true when
     /// the underlying auth.db write succeeded. Empty/missing callback =
     /// `POST /api/v1/users/<name>/unlock` returns 503.
