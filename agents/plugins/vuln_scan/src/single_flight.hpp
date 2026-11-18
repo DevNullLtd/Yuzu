@@ -48,6 +48,12 @@ public:
             ~Done() {
                 f->running_.store(false); // lock-free: cannot throw
                 try {
+                    // Take the mutex before notifying so a waiter that has checked running_ but not
+                    // yet blocked cannot miss the wake-up (the wait cap bounds it if this throws).
+                    std::lock_guard<std::mutex> g(f->mu_);
+                } catch (...) {
+                }
+                try {
                     f->cv_.notify_all();
                 } catch (...) {
                 }

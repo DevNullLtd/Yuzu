@@ -10,8 +10,11 @@
 #include <chrono>
 #include <future>
 #include <stdexcept>
+#include <new>
 #include <string>
 #include <thread>
+#include <utility>
+#include <vector>
 
 using namespace std::chrono_literals;
 using yuzu::vuln::SingleFlight;
@@ -68,27 +71,35 @@ TEST_CASE("single flight: a throwing run returns the failed result and does not 
     CHECK(fut.get() != "");
 }
 
-TEST_CASE("single flight: a throwing result copy (bad_alloc) does not wedge later callers",
+TEST_CASE("single flight: a throwing result copy (bad_alloc) is survived and does not wedge",
           "[vuln][flight]") {
     SingleFlight<Payload> f;
-    g_throw_on_copy = true;
-    // run() succeeds but caching the result copy throws inside the flight
+    // run() builds its payload, THEN the copy starts throwing: the best-effort cache write (a copy
+    // assignment inside the flight) throws, and get() must still return the run's result.
     auto r1 = std::async(std::launch::async, [&] {
         try {
-            return f.get([] { return Payload("a"); }, 10s, 5s, Payload("failed")).text;
+            return f
+                .get(
+                    [] {
+                        Payload p("a");
+                        g_throw_on_copy = true;
+                        return p;
+                    },
+                    10s, 5s, Payload("failed"))
+                .text;
         } catch (...) {
             return std::string("threw");
         }
     });
     REQUIRE(r1.wait_for(5s) == std::future_status::ready);
-    (void)r1.get();
+    CHECK(r1.get() == "a"); // not "threw": the cache-write exception was contained
     g_throw_on_copy = false;
-    // the flag was cleared by the scope guard: this must not block for the 5 s wait cap
+    // the flag was cleared by the scope guard and nothing was cached: the next caller runs
     const auto t0 = std::chrono::steady_clock::now();
     auto r2 = std::async(std::launch::async,
                          [&] { return f.get([] { return Payload("b"); }, 10s, 5s, Payload("failed")).text; });
     REQUIRE(r2.wait_for(3s) == std::future_status::ready);
-    CHECK(!r2.get().empty());
+    CHECK(r2.get() == "b");
     CHECK(std::chrono::steady_clock::now() - t0 < 3s);
 }
 
@@ -96,16 +107,22 @@ TEST_CASE("single flight: a waiter behind an overdue leader gets the failed resu
           "[vuln][flight]") {
     SingleFlight<std::string> f;
     std::promise<void> release;
+    std::promise<void> started;
     auto gate = release.get_future().share();
     auto leader = std::async(std::launch::async, [&] {
-        return f.get([&] { gate.wait(); return std::string("late"); }, 10s, 5s, std::string("failed"));
+        return f.get([&] { started.set_value(); gate.wait(); return std::string("late"); }, 10s, 5s,
+                     std::string("failed"));
     });
-    std::this_thread::sleep_for(100ms);
+    started.get_future().wait(); // the leader is inside run()
     const auto t0 = std::chrono::steady_clock::now();
-    auto waiter = f.get([] { return std::string("second"); }, 10s, 300ms, std::string("failed"));
-    CHECK(waiter == "failed");
+    auto waiter = std::async(std::launch::async, [&] {
+        return f.get([] { return std::string("second"); }, 10s, 300ms, std::string("failed"));
+    });
+    const bool done = waiter.wait_for(3s) == std::future_status::ready;
+    release.set_value(); // always let the leader finish so a failure here cannot hang the suite
+    REQUIRE(done);
+    CHECK(waiter.get() == "failed");
     CHECK(std::chrono::steady_clock::now() - t0 < 3s);
-    release.set_value();
     CHECK(leader.get() == "late");
 }
 

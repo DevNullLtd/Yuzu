@@ -275,7 +275,9 @@ metadata:
     could not run and is not counted as an issue). On macOS, Homebrew formulae
     and casks are not scanned (use pkg_inventory.packages), and the output ends
     with summary|COVERAGE|<text> rows saying so (one per cause); the counts cover only the
-    software enumerated.
+    software enumerated. On macOS the UNREADABLE count is at least 1 on a
+    healthy host because of the standing "Open Ports" row (the open-port check
+    does not exist there).
   tags: [security, vulnerability, compliance, dashboard]
 
 spec:
@@ -346,7 +348,7 @@ metadata:
     in REST, MCP or the dashboard): treat the list as "system_profiler
     applications only, Homebrew excluded", and never read an empty macOS list
     as "no software installed" (an empty list means the read failed or nothing was found). A backslash in an application name or version
-    is shown as "/" (lossy by design until a versioned decoder change exists).
+    is shown as "/" (the owner accepted this lossy fold).
   tags: [security, vulnerability, inventory, software]
 
 spec:

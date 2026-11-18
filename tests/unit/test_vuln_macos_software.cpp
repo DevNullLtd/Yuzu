@@ -91,7 +91,7 @@ TEST_CASE("macos enumeration: provenance tokens match the leg-token grammar", "[
 TEST_CASE("macos commands: every argv[0] is an absolute path (no daemon-PATH resolution)",
           "[vuln][macos]") {
     const auto cmds = macos_commands();
-    CHECK(cmds.size() == 7);
+    CHECK(cmds.size() == 8);
     for (const Argv* argv : cmds) {
         REQUIRE_FALSE(argv->empty());
         INFO((*argv)[0]);
@@ -432,11 +432,12 @@ TEST_CASE("macos config: a BAD line is judged from any completed run; GOOD needs
           "HIGH");
 }
 
-TEST_CASE("macos config: the shipped defaults argv reaches the absent-key INFO",
+TEST_CASE("macos config: the shipped defaults argvs (bare domain and path form) both reach the "
+          "absent-key INFO",
           "[vuln][macos][config]") {
-    // An echoing reader that prints the absent-key line only when the read names the BARE domain.
     const auto rows = run_macos_checks_table([](const Argv& a, bool) {
-        if (a.size() == 4 && a[2] == "com.apple.SoftwareUpdate")
+        if (a.size() == 4 && (a[2] == "com.apple.SoftwareUpdate" ||
+                              a[2] == "/Library/Preferences/com.apple.SoftwareUpdate"))
             return CommandRead{"Error: Could not find key 'AutomaticCheckEnabled' in domain "
                                "'com.apple.SoftwareUpdate'.",
                                false, true};
@@ -446,9 +447,48 @@ TEST_CASE("macos config: the shipped defaults argv reaches the absent-key INFO",
     CHECK(r.title == "Automatic update check");
     CHECK(r.severity == "INFO");
     CHECK(r.detail == "Automatic update check: not set (macOS default applies)");
-    CHECK(kMacosDefaultsCmd[2] == "com.apple.SoftwareUpdate"); // never the /Library/... path form
+    CHECK(kMacosDefaultsCmd[2] == "com.apple.SoftwareUpdate");
+    CHECK(kMacosDefaultsPathCmd[2] == "/Library/Preferences/com.apple.SoftwareUpdate");
+    CHECK(macos_spec(MacosCheck::AutoUpdate).argv_alt == &kMacosDefaultsPathCmd);
     CHECK(macos_spec(MacosCheck::AutoUpdate).good_detail ==
           "Enabled (check only; install not assessed)");
+}
+
+namespace {
+const char* const kAbsent =
+    "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.";
+ConfigCheckResult dual(const CommandRead& bare, const CommandRead& path) {
+    return macos_check_result_dual(MacosCheck::AutoUpdate, bare, path);
+}
+CommandRead rd(const char* t) { return {t, true, true}; }
+CommandRead absent_rd() { return {kAbsent, false, true}; } // measured: exit 1
+CommandRead dead() { return {"", false, false}; }
+} // namespace
+
+TEST_CASE("macos config: the update check is read twice and the WORSE answer wins",
+          "[vuln][macos][config][dual]") {
+    // bare says absent/shadowed, the system plist says 0: a real finding must not be hidden
+    CHECK(dual(absent_rd(), rd("0")).severity == "MEDIUM");
+    CHECK(dual(rd("1"), rd("0")).severity == "MEDIUM");   // a per-user/managed 1 shadows system 0
+    CHECK(dual(rd("0"), absent_rd()).severity == "MEDIUM"); // MDM-forced 0, system absent
+    CHECK(dual(rd("0"), rd("0")).severity == "MEDIUM");
+    CHECK(dual(rd("0"), dead()).severity == "MEDIUM");    // bad wins over an unreadable read
+    CHECK(dual(dead(), rd("0")).severity == "MEDIUM");
+    // INFO needs both reads good-or-absent AND agreeing
+    CHECK(dual(absent_rd(), absent_rd()).severity == "INFO");
+    CHECK(dual(absent_rd(), absent_rd()).detail ==
+          "Automatic update check: not set (macOS default applies)");
+    CHECK(dual(rd("1"), rd("1")).severity == "INFO");
+    CHECK(dual(rd("1"), rd("1")).detail == "Enabled (check only; install not assessed)");
+    // a good read beside an absent read is a disagreement, not a pass
+    CHECK(dual(absent_rd(), rd("1")).severity == "UNREADABLE");
+    CHECK(dual(rd("1"), absent_rd()).severity == "UNREADABLE");
+    // either read unreadable
+    CHECK(dual(dead(), absent_rd()).severity == "UNREADABLE");
+    CHECK(dual(absent_rd(), dead()).severity == "UNREADABLE");
+    CHECK(dual(rd("x"), absent_rd()).severity == "UNREADABLE");
+    CHECK(dual(rd("1"), rd("weird")).severity == "UNREADABLE");
+    CHECK(dual(dead(), dead()).severity == "UNREADABLE");
 }
 
 TEST_CASE("macos config: the standing open-port unavailability does not raise the config token",
@@ -478,11 +518,12 @@ TEST_CASE("macos config: the table drives the reader with each check's own argv"
         return CommandRead{};
     });
     CHECK(rows.size() == 6);
-    CHECK(seen.size() == 6);
+    CHECK(seen.size() == 7); // the update-check setting is read twice
     CHECK(seen[0] == "/usr/sbin/spctl");
-    // only the defaults row reports on stderr
-    CHECK(std::count(merged.begin(), merged.end(), true) == 1);
+    // only the two defaults reads report on stderr
+    CHECK(std::count(merged.begin(), merged.end(), true) == 2);
     CHECK(merged[5]);
+    CHECK(merged[6]);
 }
 
 TEST_CASE("macos config: an UNREADABLE row is counted in summary's UNREADABLE bucket",
@@ -617,4 +658,39 @@ TEST_CASE("parse: a localized Version label leaves no versions, so the read is u
     auto mixed = parse_system_profiler_apps("    A:\n    B:\n      Version: 1\n", true);
     CHECK(mixed.readable);
     CHECK(mixed.apps.size() == 2);
+}
+
+TEST_CASE("parse: a report where most apps lack a recognised version is unreadable",
+          "[vuln][macos]") {
+    // mixed labels: 1 English-versioned app, 3 with a localized label -> more than half unversioned
+    auto mixed = parse_system_profiler_apps(
+        "    A:\n      Version: 1\n    B:\n      Versi\xC3\xB3n: 2\n    C:\n      Versi\xC3\xB3n: 3\n"
+        "    D:\n      Versi\xC3\xB3n: 4\n",
+        true);
+    CHECK(mixed.apps.empty());
+    CHECK_FALSE(mixed.readable);
+    // exactly half unversioned stays readable; a minority of unversioned apps stays readable
+    auto half = parse_system_profiler_apps("    A:\n      Version: 1\n    B:\n", true);
+    CHECK(half.readable);
+    auto minor = parse_system_profiler_apps(
+        "    A:\n      Version: 1\n    B:\n      Version: 2\n    C:\n", true);
+    CHECK(minor.readable);
+    CHECK(minor.apps.size() == 3);
+}
+
+TEST_CASE("parse: NUL bytes are replaced and over-long names and versions are capped",
+          "[vuln][macos]") {
+    std::string name = "Evil";
+    name.push_back('\0');
+    name += "Tail";
+    auto e = parse_system_profiler_apps("    " + name + ":\n      Version: 1.0\n", true);
+    REQUIRE(e.apps.size() == 1);
+    CHECK(e.apps[0].name == "Evil?Tail");
+    CHECK(e.apps[0].name.find('\0') == std::string::npos);
+
+    const std::string huge(5 * 1024 * 1024, 'x'); // a >4 MiB name would be an oversize frame
+    auto big = parse_system_profiler_apps("    " + huge + ":\n      Version: " + huge + "\n", true);
+    REQUIRE(big.apps.size() == 1);
+    CHECK(big.apps[0].name.size() == kMaxNameBytes);
+    CHECK(big.apps[0].version.size() == kMaxVersionBytes);
 }

@@ -35,16 +35,22 @@ inline const Argv kMacosCsrutilCmd = {"/usr/bin/csrutil", "status"};
 inline const Argv kMacosSocketfilterfwCmd = {"/usr/libexec/ApplicationFirewall/socketfilterfw",
                                              "--getglobalstate"};
 inline const Argv kMacosSystemsetupCmd = {"/usr/sbin/systemsetup", "-getremotelogin"};
-// The BARE domain, not the /Library/Preferences path: a domain name goes through CFPreferences, which
-// also sees managed (MDM) values, and prints the absent-key line the check matches. The path form
-// reads only the system plist and would miss an MDM-forced value. The bare-domain absent line is
-// matched exactly as measured; if a Mac prints a different line the check reads UNREADABLE.
+// The update-check setting is read TWICE and the worse answer wins (see macos_check_result_dual):
+//   - the BARE domain goes through CFPreferences and may see a managed (MDM) or per-user value;
+//     its output text is NOT measured, and it may or may not cascade to the system plist;
+//   - the /Library/Preferences PATH form reads only the system plist; its output WAS measured
+//     (macOS 27.0.1, one host: key absent -> the absent-key line, exit 1).
+// A read whose text is not one the table recognises is UNREADABLE, never a pass.
 inline const Argv kMacosDefaultsCmd = {"/usr/bin/defaults", "read", "com.apple.SoftwareUpdate",
                                        "AutomaticCheckEnabled"};
+inline const Argv kMacosDefaultsPathCmd = {"/usr/bin/defaults", "read",
+                                           "/Library/Preferences/com.apple.SoftwareUpdate",
+                                           "AutomaticCheckEnabled"};
 
 inline std::vector<const Argv*> macos_commands() {
     return {&kMacosSystemProfilerCmd, &kMacosSpctlCmd,   &kMacosFdesetupCmd, &kMacosCsrutilCmd,
-            &kMacosSocketfilterfwCmd, &kMacosSystemsetupCmd, &kMacosDefaultsCmd};
+            &kMacosSocketfilterfwCmd, &kMacosSystemsetupCmd, &kMacosDefaultsCmd,
+            &kMacosDefaultsPathCmd};
 }
 
 // Bounds: a stalled tool cannot park a pool worker, a runaway cannot grow RSS. One action's worst
@@ -89,6 +95,19 @@ struct MacosEnumeration {
     bool readable = false; // the command ran, exited 0, and yielded at least one app
 };
 
+// Per-field bounds: a NUL would cut the row at the C-string plugin ABI and an enormous name would
+// become an oversize frame. NUL bytes are replaced with '?', over-long text is truncated.
+inline constexpr std::size_t kMaxNameBytes = 1024;
+inline constexpr std::size_t kMaxVersionBytes = 256;
+
+inline std::string bound_text(std::string_view v, std::size_t max_bytes) {
+    std::string out(v.substr(0, max_bytes));
+    for (char& c : out)
+        if (c == '\0')
+            c = '?';
+    return out;
+}
+
 namespace detail {
 inline std::string_view trim(std::string_view v) {
     const auto a = v.find_first_not_of(" \t\r\n");
@@ -127,7 +146,8 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
     bool have_version = false;
     const auto flush = [&] {
         if (have_name)
-            r.apps.push_back({current_name, current_version});
+            r.apps.push_back({bound_text(current_name, kMaxNameBytes),
+                              bound_text(current_version, kMaxVersionBytes)});
         current_name.clear();
         current_version.clear();
         have_name = have_version = false;
@@ -159,11 +179,13 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         }
     }
     flush();
-    // A localized or reshaped "Version:" label leaves every app without a version; the scan would
-    // then skip all CVE matching and read clean. English labels only are understood: when apps were
-    // found and NONE has a version, treat the read as unreadable.
-    if (!r.apps.empty() &&
-        std::none_of(r.apps.begin(), r.apps.end(), [](const MacosApp& a) { return !a.version.empty(); }))
+    // A localized or reshaped "Version:" label leaves apps without a version; CVE matching skips
+    // them and the scan reads clean. English labels only are understood: when MORE THAN HALF of the
+    // apps have no recognised version, the read is unreadable (this covers every app unversioned and
+    // a report that mixes labels). A real Mac lists nearly every application with a version.
+    const auto unversioned = std::count_if(r.apps.begin(), r.apps.end(),
+                                           [](const MacosApp& a) { return a.version.empty(); });
+    if (!r.apps.empty() && unversioned * 2 > static_cast<std::ptrdiff_t>(r.apps.size()))
         r.apps.clear();
     if (!command_ok)
         r.apps.clear();
