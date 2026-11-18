@@ -46,6 +46,13 @@ struct LiveKind {
     // for the existing typed-row kinds above.
     std::string row_prefix;
     std::vector<std::string> columns;
+    // True only for a kind whose producing action writes a literal pipe as `\|` and folds a literal
+    // backslash to `/` for EVERY field of the row (yuzu::util::safe_output_field), so the generic
+    // renderer may split it on an UNESCAPED pipe and unescape (#7040). Leave it false for any kind
+    // whose action writes raw text: a field ending in a backslash would then swallow the next
+    // separator. Declared here, beside the table that names each kind, so the producer contract
+    // is not a string compare on a plugin name in the renderer.
+    bool escaped_rows = false;
 };
 
 inline std::optional<LiveKind> resolve_kind(const std::string& kind) {

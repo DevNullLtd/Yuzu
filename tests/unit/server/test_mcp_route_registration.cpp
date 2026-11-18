@@ -317,8 +317,8 @@ TEST_CASE("mcp route registration: wiring -- server.cpp describes and pre-seeds 
     }
 }
 
-TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner before "
-          "register_routes",
+TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync runner, the sync "
+          "status closures and the lookup reads before register_routes",
           "[server][routes][mcp]") {
     std::ifstream in(std::filesystem::path(YUZU_SERVER_SRC_DIR) / "server.cpp");
     REQUIRE(in.is_open());
@@ -329,6 +329,17 @@ TEST_CASE("mcp route registration: wiring -- server.cpp wires the software sync 
     REQUIRE(reg != std::string::npos);
     REQUIRE(run != std::string::npos);
     CHECK(run < reg);
+    // SAM-21: an unwired setter leaves its tools answering "unavailable" with every unit test
+    // green, and the status route and the MCP tool must be handed the SAME two closures.
+    const auto status =
+        find_live_call(src, "mcp_server_->set_software_sync_status_fns(sync_status_read_fn, "
+                            "sync_unfiltered_fn)");
+    const auto lookup = find_live_call(src, "mcp_server_->set_software_lookup_reads(");
+    REQUIRE(status != std::string::npos);
+    REQUIRE(lookup != std::string::npos);
+    CHECK(status < reg);
+    CHECK(lookup < reg);
+    CHECK(find_live_call(src, ".sync_status_fn = sync_status_read_fn") != std::string::npos);
 }
 
 // The fleet "Sync now" composition cannot be built in a unit test (it lives in ServerImpl), so the
