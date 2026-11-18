@@ -46,6 +46,8 @@ TEST_CASE("governor: limits validation", "[file_search][governor]") {
     l = {};
     l.work_quantum = l.slice + milliseconds{1}; // a quantum longer than the slice never paces
     CHECK_FALSE(fs::valid(l));
+    l.work_quantum = l.slice;
+    CHECK(fs::valid(l));
     l = {};
     l.slice = fs::kMaxSlice;
     CHECK(fs::valid(l));
@@ -58,6 +60,11 @@ TEST_CASE("governor: deadline is construction time plus slice", "[file_search][g
     const auto start = c.t;
     fs::SliceGovernor g({}, c.env());
     CHECK(g.deadline() == start + milliseconds{10'000});
+    fs::GovernorLimits l; // valid() refuses both; an unvalidated slice is clamped, never overflowed
+    l.slice = milliseconds::max();
+    CHECK(fs::SliceGovernor(l, c.env()).deadline() == start + std::chrono::hours{1});
+    l.slice = milliseconds{-1};
+    CHECK(fs::SliceGovernor(l, c.env()).deadline() == start);
 }
 
 TEST_CASE("governor: 50 percent duty over a slice of per-entry work", "[file_search][governor]") {
@@ -207,7 +214,10 @@ TEST_CASE("governor: max_restarts gives unstable and health is sticky", "[file_s
     // The verdict follows from the cursor alone: a caller that kept no state reaches it too.
     CHECK(fs::record_slice({}, l, true, true, l.max_restarts - 1).health == fs::Health::unstable);
     CHECK(fs::record_slice({}, l, true, false, l.max_restarts).health == fs::Health::unstable);
+    CHECK(fs::record_failed_slice({}, l, l.max_restarts).health == fs::Health::unstable);
+    CHECK(fs::record_slice({}, l, true, true, 0xFFFFFFFFu).restarts == 4294967296ull); // 64-bit sum
     fs::GovernorLimits zero;
     zero.max_restarts = 0; // acts as 1: unstable at the first restart, not before it
     CHECK(fs::record_slice({}, zero, true, false, 0).health == fs::Health::ok);
+    CHECK(fs::record_slice({}, zero, true, true, 0).health == fs::Health::unstable);
 }

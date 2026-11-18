@@ -506,8 +506,9 @@ private:
  * change between slices that moves neither is not seen and leaves no gap: an entry added at or before
  * the resume point of a directory that kept its identity, a completed directory swapped for another of
  * the same name, and a replacement that reports the same identity as the directory it replaced (a
- * filesystem may reuse one) or reports none, or the directory it replaced had reported none. Such
- * entries are not visited. A walk of more than one slice is not a snapshot.
+ * filesystem may reuse one), or differs from it only in halves (device, file id) that one of the two
+ * left unreported: the rule is per half. Such entries are not visited. A walk of more than one slice is
+ * not a snapshot.
  *
  * MEMORY. The sorted listings of the directories currently entered are held and the entry budget does
  * NOT bound them (descending through first children counts one entry per level while every level holds

@@ -27,6 +27,7 @@
 #include <cstdint>
 #include <expected>
 #include <functional>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -82,37 +83,22 @@ public:
             return std::unexpected(PatternError::too_long);
         std::string collapsed;
         collapsed.reserve(raw.size());
-        std::size_t stars = 0, literals = 0;
         for (const char c : raw) {
             if (c == '/' || c == '\0')
                 return std::unexpected(PatternError::forbidden_byte);
-            if (c == '*') {
-                ++stars;
-                if (!collapsed.empty() && collapsed.back() == '*')
-                    continue;
-            } else if (c != '?') {
-                ++literals;
-            }
-            collapsed.push_back(c);
+            if (c != '*' || collapsed.empty() || collapsed.back() != '*')
+                collapsed.push_back(c);
         }
-        if (stars > kMaxStars)
-            return std::unexpected(PatternError::too_many_stars);
-        if (literals < kMinLiteralBytes)
-            return std::unexpected(PatternError::too_few_literals);
+        if (const auto e = over_limits(raw))
+            return std::unexpected(*e);
         Pattern p;
         p.canon_fn_ = sem.canon;
         p.sem_id_ = sem.id;
         p.canonical_ = p.canon_fn_ ? p.canon_fn_(collapsed) : collapsed;
         if (p.canonical_.size() > kMaxCanonicalPatternBytes)
             return std::unexpected(PatternError::too_long);
-        // The same two limits on the canonical pattern: a canonicaliser must not add a wildcard.
-        stars = static_cast<std::size_t>(std::ranges::count(p.canonical_, '*'));
-        literals = p.canonical_.size() - stars -
-                   static_cast<std::size_t>(std::ranges::count(p.canonical_, '?'));
-        if (stars > kMaxStars)
-            return std::unexpected(PatternError::too_many_stars);
-        if (literals < kMinLiteralBytes)
-            return std::unexpected(PatternError::too_few_literals);
+        if (const auto e = over_limits(p.canonical_)) // a canonicaliser must not add a wildcard
+            return std::unexpected(*e);
         return p;
     }
 
@@ -168,6 +154,16 @@ public:
 
 private:
     Pattern() = default;
+    // The star and literal limits, checked on the raw pattern and again on the canonical one.
+    [[nodiscard]] static std::optional<PatternError> over_limits(std::string_view s) {
+        const auto stars = static_cast<std::size_t>(std::ranges::count(s, '*'));
+        const auto marks = static_cast<std::size_t>(std::ranges::count(s, '?'));
+        if (stars > kMaxStars)
+            return PatternError::too_many_stars;
+        if (s.size() - stars - marks < kMinLiteralBytes)
+            return PatternError::too_few_literals;
+        return std::nullopt;
+    }
     Canonicaliser canon_fn_;
     std::string canonical_;
     std::string sem_id_;

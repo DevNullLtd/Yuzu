@@ -109,6 +109,7 @@ struct Search {
         if (before)
             before(results.size());
         first_visit.push_back(visits.size());
+        REQUIRE(fsr::valid(gl)); // a driver gates on valid() before it builds a governor
         fsr::SliceGovernor g(gl, {[this] { return fs.clock; }, [this](std::chrono::milliseconds d) { fs.clock += d; }});
         FsOps ops = fs.ops();
         const auto inner = ops.list;
@@ -209,6 +210,7 @@ TEST_CASE("resume contract: an unchanged tree cut by entries, rows or the deadli
     }
     SECTION("fake-clock deadline") {
         s.gl.slice = 25ms;
+        s.gl.work_quantum = 10ms; // the pacer naps inside the slice
         s.visit_step = 10ms;
         expect = Stop::budget_time;
     }

@@ -38,7 +38,8 @@ struct GovernorLimits {
     unsigned max_restarts{3};
 };
 
-// The longest slice valid() accepts (one hour): a valid slice's deadline sum cannot overflow.
+// The longest slice valid() accepts (one hour). The governor clamps any slice to [0, kMaxSlice], so
+// its deadline sum cannot overflow unless the injected clock reads within an hour of its maximum.
 inline constexpr std::chrono::milliseconds kMaxSlice{3'600'000};
 
 [[nodiscard]] inline bool valid(const GovernorLimits& l) noexcept {
@@ -55,7 +56,8 @@ class SliceGovernor {
 public:
     SliceGovernor(const GovernorLimits& limits, GovernorEnv env)
         : limits_(limits), env_(std::move(env)), last_resume_(env_.now()),
-          deadline_(last_resume_ + limits.slice) {}
+          deadline_(last_resume_ +
+                    std::clamp(limits.slice, std::chrono::milliseconds{0}, kMaxSlice)) {}
 
     [[nodiscard]] Clock::time_point deadline() const noexcept { return deadline_; }
 
@@ -101,20 +103,17 @@ struct GovernorState {
 
 // Pure. A restart legitimately returns an earlier position, so it is never a stall and takes
 // precedence over `advanced`. Any non-ok health is sticky.
-// `generation` is Cursor::generation of the cursor the slice resumed from; with `restarted` it is
-// the restart count, so `unstable` follows from the cursor alone (a zero max_restarts acts as 1).
+// `generation` is the Cursor::generation the slice resumed from; a zero max_restarts acts as 1.
 [[nodiscard]] inline GovernorState record_slice(GovernorState s, const GovernorLimits& l,
                                                 bool advanced, bool restarted,
                                                 std::uint32_t generation) noexcept {
     s.restarts = std::uint64_t{generation} + (restarted ? 1u : 0u);
     if (s.restarts >= (std::max)(l.max_restarts, 1u) && s.health == Health::ok)
         s.health = Health::unstable;
-    if (restarted) { // never a stall: the stall count stands
-    } else if (advanced) {
-        s.consecutive_stalls = 0;
-    } else {
-        ++s.consecutive_stalls;
-        if (s.consecutive_stalls >= l.max_stalls && s.health == Health::ok)
+    if (!restarted) { // a restart is never a stall: the stall count stands
+        if (advanced)
+            s.consecutive_stalls = 0;
+        else if (++s.consecutive_stalls >= l.max_stalls && s.health == Health::ok)
             s.health = Health::stalled;
     }
     return s;

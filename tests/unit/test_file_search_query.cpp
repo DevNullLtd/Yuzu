@@ -181,7 +181,7 @@ TEST_CASE("file_search pattern: limits apply to the raw pattern, then the canoni
     CHECK(fs::Pattern::compile("abc/def", slash_eater).error() == fs::PatternError::forbidden_byte);
     CHECK(fs::Pattern::compile(std::string(129, 'a'), dbl(1)).error() ==
           fs::PatternError::too_long);
-    // A canonicaliser that writes wildcards cannot widen the query: both limits hold on its output.
+    // A canonicaliser that writes wildcards stays bounded: both numeric limits hold on its output.
     const auto to = [](std::string out) {
         return fs::NameSemantics{"z", [out](std::string_view) { return out; }};
     };
