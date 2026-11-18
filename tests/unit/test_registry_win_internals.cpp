@@ -888,4 +888,109 @@ TEST_CASE("Win32Registry::query_value returns a REG_SZ stored without its termin
     CHECK(q.bytes[3] == 0);
 }
 
+// WP06 F62: the four ungated read actions refuse a registry link. RegOpenKeyExW(.., 0, ..) follows a REG_LINK, so a
+// link planted in a machine hive (admin, or a weak-ACL machine key) carried an ungated read into a per-user hive; the
+// reads now open through open_checked (REG_OPTION_OPEN_LINK, link probe, kernel-name check). Mutation: change
+// open_read_key to RegOpenKeyExW(hive_root, key, 0, ...) and the link sections go red (the value or subkey is read
+// through the link).
+namespace {
+struct ReadRun {
+    int rc = 0;
+    std::vector<std::string> lines;
+};
+
+ReadRun run_read(std::string_view action, const std::string& key, const char* value_name = nullptr) {
+    g_body = [action, &key, value_name](yuzu::CommandContext& ctx) -> int {
+        const YuzuParam params[] = {{"hive", "HKLM"}, {"key", key.c_str()}, {"name", value_name != nullptr ? value_name : ""}};
+        return yuzu::registry::execute_guarded(ctx, action, yuzu::Params{std::span<const YuzuParam>{params, 3u}});
+    };
+    const auto result = yuzu::agent::LocalDispatcher{}.run(&kFakeDescriptor, "seam");
+    g_body = nullptr;
+    ReadRun out;
+    out.rc = result.rc;
+    std::string line;
+    for (const char c : result.captured) {
+        if (c == '\n' || c == '\r') {
+            if (!line.empty()) out.lines.push_back(std::move(line));
+            line.clear();
+        } else {
+            line += c;
+        }
+    }
+    if (!line.empty()) out.lines.push_back(std::move(line));
+    return out;
+}
+
+bool has_line(const ReadRun& r, std::string_view prefix) {
+    for (const auto& l : r.lines)
+        if (l.rfind(prefix, 0) == 0) return true;
+    return false;
+}
+} // namespace
+
+TEST_CASE("the four read actions refuse a registry link at the leaf or mid-path and still read a plain key",
+          "[registry][windows][internals][f62]") {
+    const std::string root = scratch_root("readlink");
+    ScratchTree cleanup{root};
+    yuzu::win::RegKey target;
+    if (RegCreateKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target\\Sub").c_str(), 0, nullptr, REG_OPTION_NON_VOLATILE,
+                        KEY_READ | KEY_SET_VALUE, nullptr, target.put(), nullptr) != ERROR_SUCCESS) {
+        skip_or_fail("not elevated -- HKLM scratch not writable, read-link case");
+        return;
+    }
+    yuzu::win::RegKey target_parent;
+    REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(root + "\\Target").c_str(), 0, KEY_SET_VALUE | KEY_READ,
+                          target_parent.put()) == ERROR_SUCCESS);
+    const wchar_t data[] = L"link-sentinel";
+    REQUIRE(RegSetValueExW(target_parent.get(), L"V", 0, REG_SZ, reinterpret_cast<const BYTE*>(data), sizeof data) ==
+            ERROR_SUCCESS);
+    yuzu::win::RegKey parent;
+    REQUIRE(RegOpenKeyExW(HKEY_LOCAL_MACHINE, widen(root).c_str(), 0, KEY_READ, parent.put()) == ERROR_SUCCESS);
+    Win32Registry reg;
+    LinkSweep sweep{reg, as_handle(parent.get())}; // before the link exists, so a link made by a failing call goes too
+    if (!make_machine_link(root + "\\Link", root + "\\Target")) {
+        skip_or_fail("could not create a registry link here");
+        return;
+    }
+
+    SECTION("control: the plain key reads") {
+        const auto r = run_read("get_value", root + "\\Target", "V");
+        CHECK(r.rc == 0);
+        CHECK(has_line(r, "value|link-sentinel"));
+        CHECK(has_line(run_read("key_exists", root + "\\Target"), "exists|true"));
+        CHECK(has_line(run_read("enumerate_keys", root + "\\Target"), "subkey|Sub"));
+        CHECK(has_line(run_read("enumerate_values", root + "\\Target"), "value|V|"));
+    }
+    SECTION("the link as the leaf is refused by all four reads") {
+        const std::string link = root + "\\Link";
+        const auto gv = run_read("get_value", link, "V");
+        CHECK(gv.rc != 0);
+        CHECK(has_line(gv, "error|key_is_link"));
+        CHECK_FALSE(has_line(gv, "value|"));
+        const auto ke = run_read("key_exists", link);
+        CHECK(ke.rc != 0);
+        CHECK(has_line(ke, "error|key_is_link"));
+        CHECK_FALSE(has_line(ke, "exists|true"));
+        const auto ek = run_read("enumerate_keys", link);
+        CHECK(ek.rc != 0);
+        CHECK(has_line(ek, "error|key_is_link"));
+        CHECK_FALSE(has_line(ek, "subkey|"));
+        const auto ev = run_read("enumerate_values", link);
+        CHECK(ev.rc != 0);
+        CHECK(has_line(ev, "error|key_is_link"));
+        CHECK_FALSE(has_line(ev, "value|"));
+    }
+    SECTION("a link in the middle of the path is refused too") {
+        const auto ek = run_read("enumerate_keys", root + "\\Link\\Sub");
+        CHECK(ek.rc != 0);
+        CHECK(has_line(ek, "error|key_is_link"));
+    }
+    SECTION("a key that does not exist is still the old answer") {
+        CHECK(has_line(run_read("key_exists", root + "\\NoSuchKey"), "exists|false"));
+        const auto gv = run_read("get_value", root + "\\NoSuchKey", "V");
+        CHECK(gv.rc != 0);
+        CHECK(has_line(gv, "error|key not found"));
+    }
+}
+
 #endif // defined(_WIN32)

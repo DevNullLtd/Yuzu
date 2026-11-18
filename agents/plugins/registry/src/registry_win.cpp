@@ -346,6 +346,45 @@ bool refuse_per_user_hku_read(yuzu::CommandContext& ctx, const Target& t) {
     return true;
 }
 
+/// WP06 F62: the four ungated read actions open their key through the SAME checked walk the write actions use
+/// (open_checked, registry_core.hpp): every component from the previous HANDLE with REG_OPTION_OPEN_LINK, a link
+/// refused (key_is_link), the leaf handed over only when its kernel name is the requested path. A bare
+/// RegOpenKeyExW(.., 0, ..) FOLLOWS a REG_LINK, so a link planted in a machine hive (admin, or a weak-ACL machine
+/// key) would carry an ungated read into a per-user hive. After the open the resolved kernel name is judged once
+/// more: a HKLM/HKCR request whose handle resolved under \REGISTRY\USER is a per-user hive and is refused with the
+/// same token as a direct HKU request (the HKCU and HKU requests were judged by read_refuses_per_user_hive on the
+/// request path). Writes its own `error|...` line and returns nullopt on a refusal or a failed open; `missing` is
+/// set when the key does not exist (the caller words that, e.g. `exists|false`).
+[[nodiscard]] std::optional<Opened> open_read_key(yuzu::CommandContext& ctx, Win32Registry& reg, const Target& t,
+                                                  std::uint32_t access, bool& missing) {
+    missing = false;
+    Opened op = open_checked(reg, as_handle(hive_root(t.hive)), t.key, access, /*create=*/false,
+                             /*leaf_may_be_link=*/false, t.fast);
+    if (!op.error.empty()) {
+        if (op.error == kTokKeyNotFound) {
+            missing = true;
+        } else {
+            ctx.write_output(std::format("error|{}", op.error)); // key_is_link, access_denied, win32:<n>
+        }
+        return std::nullopt;
+    }
+    if (t.hive != Hive::hku && t.hive != Hive::hkcu) {
+        std::string resolved;
+        constexpr std::string_view kUserRoot = "\\REGISTRY\\USER\\";
+        if (reg.final_name(op.handle(), resolved) != ERROR_SUCCESS) {
+            ctx.write_output(std::format("error|{}", kTokKeyIsLink)); // a handle that cannot be identified is refused
+            return std::nullopt;
+        }
+        if (resolved.size() > kUserRoot.size() &&
+            names_equal_ascii_ci(std::string_view{resolved}.substr(0, kUserRoot.size()), kUserRoot) &&
+            read_refuses_per_user_hive(Hive::hku, std::string_view{resolved}.substr(kUserRoot.size()))) {
+            ctx.write_output(std::format("error|{}", kTokPerUserHiveRequiresGetUserValue));
+            return std::nullopt;
+        }
+    }
+    return op;
+}
+
 /// A refused single action: the audit line and `error|<token>` with rc 1. `dry_run` is the request's own flag (when it
 /// parsed), which delete_key's audit line and `dry_run|` row report even for a refusal.
 int refuse(yuzu::CommandContext& ctx, const AuditRecord& base, std::string_view reason, bool is_delete_key = false,
@@ -375,18 +414,21 @@ int do_get_value(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (refuse_per_user_hku_read(ctx, t)) return 1;
     const auto val_name = params.get("name");
 
-    yuzu::win::RegKey opened;
-    if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_READ, opened.put()) != ERROR_SUCCESS) {
-        ctx.write_output("error|key not found");
+    Win32Registry reg;
+    bool missing = false;
+    const auto opened_key = open_read_key(ctx, reg, t, kKeyQueryValue, missing);
+    if (!opened_key) {
+        if (missing) ctx.write_output("error|key not found");
         return 1;
     }
+    const HKEY opened_h = as_hkey(opened_key->handle());
 
     // The shared guarded read, bounded at kMaxWriteBytes (the bound get_user_value and the write path use): a larger
     // value is reported by size alone (q.bytes stays empty) and refused, never read whole into memory three times
     // (the bytes, the hex string, the sanitised copy).
     const Wide wname{val_name};
     QueryResult q;
-    if (const long rc = query_value_bounded(kMaxWriteBytes, raw_query(opened.get(), wname.c_str()), q, kMaxWriteBytes);
+    if (const long rc = query_value_bounded(kMaxWriteBytes, raw_query(opened_h, wname.c_str()), q, kMaxWriteBytes);
         rc != ERROR_SUCCESS) {
         ctx.write_output(get_value_error_line(rc, t.key));
         return 1;
@@ -424,10 +466,11 @@ int do_key_exists(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (!target) return 1;
     const Target& t = *target;
     if (refuse_per_user_hku_read(ctx, t)) return 1;
-    yuzu::win::RegKey opened;
-    const bool exists =
-        RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_READ, opened.put()) == ERROR_SUCCESS;
-    ctx.write_output(std::format("exists|{}", exists ? "true" : "false"));
+    Win32Registry reg;
+    bool missing = false;
+    const auto opened_key = open_read_key(ctx, reg, t, kKeyQueryValue, missing);
+    if (!opened_key && !missing) return 1; // a link, a per-user redirect or an unreadable key: the line is written
+    ctx.write_output(std::format("exists|{}", opened_key ? "true" : "false"));
     return 0;
 }
 
@@ -436,16 +479,18 @@ int do_enumerate_keys(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (!target) return 1;
     const Target& t = *target;
     if (refuse_per_user_hku_read(ctx, t)) return 1;
-    yuzu::win::RegKey opened;
-    if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_ENUMERATE_SUB_KEYS, opened.put()) !=
-        ERROR_SUCCESS) {
-        ctx.write_output("error|key not found");
+    Win32Registry reg;
+    bool missing = false;
+    const auto opened_key = open_read_key(ctx, reg, t, kKeyEnumerateSubKeys, missing);
+    if (!opened_key) {
+        if (missing) ctx.write_output("error|key not found");
         return 1;
     }
+    const HKEY opened_h = as_hkey(opened_key->handle());
     wchar_t name[256];
     for (DWORD i = 0;; ++i) {
         DWORD name_len = 256;
-        if (RegEnumKeyExW(opened.get(), i, name, &name_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+        if (RegEnumKeyExW(opened_h, i, name, &name_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
         ctx.write_output(std::format("subkey|{}", sanitize_field(from_wide(name, static_cast<int>(name_len)))));
     }
     return 0;
@@ -456,15 +501,18 @@ int do_enumerate_values(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (!target) return 1;
     const Target& t = *target;
     if (refuse_per_user_hku_read(ctx, t)) return 1;
-    yuzu::win::RegKey opened;
-    if (RegOpenKeyExW(hive_root(t.hive), to_wide(t.key).c_str(), 0, KEY_QUERY_VALUE, opened.put()) != ERROR_SUCCESS) {
-        ctx.write_output("error|key not found");
+    Win32Registry reg;
+    bool missing = false;
+    const auto opened_key = open_read_key(ctx, reg, t, kKeyQueryValue, missing);
+    if (!opened_key) {
+        if (missing) ctx.write_output("error|key not found");
         return 1;
     }
+    const HKEY opened_h = as_hkey(opened_key->handle());
     wchar_t name[16384]; // a value name is at most 16,383 characters: a smaller buffer ends the list early on a long name
     for (DWORD i = 0;; ++i) {
         DWORD name_len = static_cast<DWORD>(std::size(name)), type = 0;
-        if (RegEnumValueW(opened.get(), i, name, &name_len, nullptr, &type, nullptr, nullptr) != ERROR_SUCCESS) break;
+        if (RegEnumValueW(opened_h, i, name, &name_len, nullptr, &type, nullptr, nullptr) != ERROR_SUCCESS) break;
         ctx.write_output(std::format("value|{}|{}", sanitize_field(from_wide(name, static_cast<int>(name_len))),
                                      reg_type_name(type)));
     }
