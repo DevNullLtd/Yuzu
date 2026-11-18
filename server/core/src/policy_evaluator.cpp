@@ -448,7 +448,11 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
     auto execid = gen_execution_id();
     auto outcome = d_.dispatch_fn(def.plugin, def.action, targets, /*scope_expr=*/"", parameters,
                                   execid);
-    return DispatchInstructionResult{.execution_id = execid, .outcome = std::move(outcome)};
+    return DispatchInstructionResult{.execution_id = execid,
+                                     .outcome = std::move(outcome),
+                                     .denial = std::nullopt,
+                                     .denied_plugin = {},
+                                     .denied_action = {}};
 }
 
 void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_view phase,
@@ -604,7 +608,7 @@ PolicyEvaluator::kickoff_check(const Policy& p, DispatchOrigin origin) {
         // Refused (G01): nothing was sent and no execution id exists, so there is no in-flight
         // entry to keep. Record it for every resolved target, then report it to the caller.
         record_denial(p.id, "check", targets, *dispatch_result, origin, std::nullopt);
-        return KickoffOutcome{.denial = dispatch_result->denial};
+        return KickoffOutcome{.execution_id = {}, .denial = dispatch_result->denial};
     }
     if (dispatch_result->execution_id.empty())
         return KickoffOutcome{};
@@ -623,7 +627,7 @@ PolicyEvaluator::kickoff_check(const Policy& p, DispatchOrigin origin) {
                                       .verify_compliance = "",
                                       .verify_parameters_json = ""});
     }
-    return KickoffOutcome{.execution_id = execid};
+    return KickoffOutcome{.execution_id = execid, .denial = std::nullopt};
 }
 
 void PolicyEvaluator::dispatch_due() {
