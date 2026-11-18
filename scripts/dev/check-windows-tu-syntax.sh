@@ -71,6 +71,7 @@ tus=(
     agents/plugins/middleware/src/middleware_win.cpp
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
     agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
+    agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp

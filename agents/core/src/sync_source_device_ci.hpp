@@ -121,8 +121,10 @@ YUZU_EXPORT std::string device_ci_canonical_blob(const CiRecord& rec);
 // provenance / status-row token passes through verbatim (e.g. `linux:planned`).
 //
 // PIPES IN A FIELD: the plugins write a literal `|` as `\|` (and fold a literal backslash to `/`),
-// so the v2 row and scalar projections split on an UNESCAPED pipe and unescape before the clamp. The
-// 22 v1 positions keep the raw split: their bytes are frozen.
+// so the v2 row and scalar projections split on an UNESCAPED pipe and unescape before the clamp, and
+// since #7040 so do the v1 cpu and dimm aggregations (cpu_model, cpu_cores, cpu_threads, ram_bytes).
+// The other v1 positions (disks, adapters, the key|value scalars) keep the raw split: their bytes are
+// frozen.
 //
 // FAILURE PROVENANCE: a section whose level is `unavailable` or `permission_denied` carries its
 // status record and NO rows (and its scalar positions stay blank). Nothing from a failed,
