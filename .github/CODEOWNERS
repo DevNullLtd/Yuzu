@@ -55,6 +55,7 @@
 /.grype.yaml                                           @fjarvis @Tr3kkR
 /scripts/ci/image-vuln-gate*                           @fjarvis @Tr3kkR
 /scripts/ci/image-identity.sh                          @fjarvis @Tr3kkR
+/scripts/ci/image-publish.sh                           @fjarvis @Tr3kkR
 /scripts/ci/artifact-sbom.py                           @fjarvis @Tr3kkR
 /scripts/ci/check-release-signing.sh                   @fjarvis @Tr3kkR
 /scripts/check-release-artifacts.sh                    @fjarvis @Tr3kkR
