@@ -141,7 +141,8 @@ DIGEST=$(docker buildx imagetools inspect ghcr.io/<owner>/yuzu-agent-bundle-chis
   --format '{{.Manifest.Digest}}')
 
 # 2. verify that digest against the exact, tag-bound identity; only a successful
-#    verify sets VERIFIED
+#    verify sets VERIFIED (needs cosign v3.0 or later: an older cosign reports
+#    "no signatures found" for the genuine image)
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>' \
@@ -345,6 +346,7 @@ the digest form from "Use it (partner)"; `DIGEST` is resolved with the same
 `docker buildx imagetools inspect` call:
 
 ```bash
+# needs cosign v3.0 or later (an older cosign reports "no signatures found" for the genuine image)
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'

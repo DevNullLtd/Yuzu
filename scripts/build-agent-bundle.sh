@@ -457,7 +457,8 @@ Verify the image, then extract the whole tree
   DIGEST=\$(docker buildx imagetools inspect ${IMAGE_REF} --format '{{.Manifest.Digest}}')
 
   # 2. verify that digest against the exact, tag-bound signer identity; only a
-  #    successful verify sets VERIFIED
+  #    successful verify sets VERIFIED (needs cosign v3.0 or later: an older
+  #    cosign reports "no signatures found" for the genuine image)
   cosign verify ${IMAGE_REPO}@\$DIGEST \\
     --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
     --certificate-oidc-issuer ${SIGNER_ISSUER} && VERIFIED=\$DIGEST

@@ -12,6 +12,12 @@ All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
 that the tag under verification is `v0.11.0`. Substitute as needed.
 
+**cosign version.** Every `cosign verify` of a Docker image on this page needs **cosign v3.0 or
+later**. Recent releases' images are signed with cosign v3's bundle format, and cosign v2.x reports
+`no signatures found` for a genuine image (some v2.x builds accept `--new-bundle-format` but
+ignore it, so do not rely on that flag). cosign v3 also verifies older releases' images. `cosign
+verify-blob` of a release's `SHA256SUMS` works with cosign v2.6.2 or later.
+
 > **Warning: older release pages show a wildcard command.** The GitHub release
 > pages for v0.7.0-rc1 to v0.15.0 (18 of the 22 pages published in that range,
 > all published before the fix in #7529) print a `cosign verify-blob` command
@@ -294,9 +300,8 @@ a vulnerability disclosed after the release is not in them.
 #   macOS:   brew install gh
 #   Windows: winget install --id GitHub.cli
 
-# cosign v3.0 or later, for Sigstore signature verification. Releases are signed with
-# cosign v3 (the new bundle format): cosign v2.x reports "no signatures found" for a
-# genuine image unless you add --new-bundle-format to every `cosign verify` below.
+# cosign v3.0 or later, for Sigstore signature verification (see "cosign version" at
+# the top of this page)
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
 #   macOS:         brew install cosign
 #   Windows:       winget install --id Sigstore.Cosign
@@ -607,7 +612,8 @@ subject cosign prints. A network error reaching Sigstore's TUF root usually
 clears on a re-run (cosign needs network access to the TUF root, or a local
 `--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
 it persists for about an hour, or cosign reports an expired or unverifiable
-trusted root, update cosign (v3.0 or later) instead of waiting.
+trusted root, update cosign (v2.6.2 or later for this check; v3.0 or later if you also verify
+images) instead of waiting.
 
 **`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
 bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to
