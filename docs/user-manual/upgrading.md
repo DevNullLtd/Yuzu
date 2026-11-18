@@ -11,6 +11,12 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
+
+**What changed.** The `gh attestation verify` commands on [Release Verification](release-verification.md) now pin the attestation to `release.yml` at the release's tag (`--signer-workflow`, `--source-ref`). GitHub CLI versions before 2.102.0 do not enforce those flags as written, so the page now requires `gh` 2.102.0 or later, and its end-to-end verification script exits 1, before checking anything, when `gh` is older or reports a version it cannot read.
+
+**What to do.** Before verifying a downloaded release, check `gh --version` on the machine that runs the check and install 2.102.0 or later if needed (the page's Prerequisites section links GitHub's own packages). This concerns only the tool you verify downloads with. It changes nothing about how a Yuzu build is deployed and is not an upgrade path for any Yuzu component; the deployment contract on this page still governs that.
+
 ## Behaviour change: the installed-software export gains `format=xlsx`, a new build dependency and a directory under the data dir
 
 **In short.** Affected: anyone who builds the server from source, anyone who reads `GET /api/v1/inventory/software/export`, and anyone who sizes the server's data volume. To do: nothing is required to keep the JSONL and CSV exports working; read the disk figures below before enabling XLSX for large exports.
