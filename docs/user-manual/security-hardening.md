@@ -113,7 +113,7 @@ Run each component under its own system user:
 > agent listener lets an on-path attacker inject commands (fleet RCE).
 > **One-way (server-authenticated) TLS now exists for it (PKI PR5c)** — enable it on
 > the agent listener (a `tls` map in its `{yuzu_gw, grpc_listeners}` entry with
-> `verify => verify_none`, `fail_if_no_peer_cert => false`; see
+> `verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; see
 > `gateway/config/sys.config.prod`) and ship the
 > CA to your agents. `docker-compose.reference-gateway.yml` ships it (#1314); the
 > cluster compose boots the image default `sys.config` and the demo and UAT composes use their own UAT/demo `sys.config`; all of those listen in plaintext.

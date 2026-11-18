@@ -28,21 +28,43 @@ refusal) are called from both fast paths, before `registry_.register_agent`.
 - Refusal is a gRPC status (`UNAUTHENTICATED`; `UNAVAILABLE` for a store failure), uniform message, never
   `accepted=false`. Mode `off|audit|enforce`, default `audit` (D3).
 
+## Governance rounds and owner rulings
+
+Fix commits on `fix/wp01-reregistration`: the original fix `df2851d309`; governance round 1
+`f628b94e60` (concurrency, missing-row, audit, alerting, docs); the pending-row and audit-budget
+follow-up `b96ec367b2`; the alert tests `34a9af4aa0`; and the Gate 8 commits that follow them (see
+`git log`). Owner rulings of 2026-11-17: (1) `enforce` REFUSES a re-registration relayed by a gateway
+that cannot witness (`unattested_gateway`), fail closed; (2) the spare-single-use-token takeover is the
+accepted token-custody residual, tracked as #8171 (an agent-bound token design); (3) `audit` stays
+the default and `enforce` is not made the default by this change.
+
 ## Residual risk (recorded, not accepted silently)
 
 1. **Compromised gateway.** The witnessed certificate is as trustworthy as the gateway (same level as
    `gateway_observed_peer`, R-6 in `pki-pr5-gateway-tls.md`). A pin-authorized gateway can assert any
-   certificate. This change closes the unauthenticated-caller hole, not the malicious-gateway one.
-2. **Not covered (D7):** `--no-tls`, plain TLS without a client CA, operator-CA-certificate agents, and
-   expired leaves are claim-based as before.
-3. **Audit-mode window.** Until `enforce` is set the hole is open, by owner decision D3, but visible: every
-   would-refuse is counted and logged.
-4. **Enforce lockout.** An agent that lost its key and has no operator-issued single-use token is refused
-   (retrying) until one is issued. An un-upgraded gateway cannot witness, so under `enforce` its
-   leaf-holding agents are refused (`unattested_gateway`): upgrade gateways first.
-5. **Multi-use token burn.** A multi-use token presented for a live-leaf id is counted by the store before
-   the single-use check can refuse it; the use is not refunded.
-6. **Verify-all at the TLS layer.** With `witness_client_cert` the gateway's TLS layer accepts any
-   presented certificate chain; the server is the only verifier. A future change that trusts the witnessed
-   PEM without `attested_leaf_proves_identity` would be a vulnerability.
-7. **No rate limit** on re-registration attempts (#828, out of scope); the new read is one indexed query.
+   certificate. This closes the unauthenticated-caller hole, not the malicious-gateway one. Key
+   possession is NOT delegated to the gateway: the TLS CertificateVerify is checked at the handshake
+   even under the accept-any `verify_fun` (empirical test `witness_no_key_possession`: a victim's
+   certificate presented without its key is refused with `bad_certificate`).
+2. **Not covered (D7):** `--no-tls`, plain TLS without a client CA, operator-CA-certificate agents and
+   expired leaves are claim-based (the gate does not apply to them). Wizard, demo and UAT fleets with
+   plaintext gateways cannot satisfy `enforce`.
+3. **Audit-mode window.** Until `enforce` is set the hole is open, by owner decision D3, but visible:
+   every would-refuse is counted, logged, and written as an `agent.reregistration_unproven` audit row
+   (bounded per agent id with an aggregate row, so an attacker looping on one id cannot turn the audit
+   store into a disk-fill lever: ~330 B per row at 1000 attempts/s was ~28 GB/day unbounded).
+4. **Enforce lockout.** An agent that lost its key and has no operator-issued single-use token is
+   refused (retrying) until one is issued. A plaintext gateway, or a TLS listener without
+   `witness_client_cert`, cannot witness, so under `enforce` its leaf-holding agents are refused
+   (`unattested_gateway`, reported before any token is considered).
+5. **Multi-use tokens** are refused INSIDE the consume UPDATE (`require_single_use`): the use is not
+   counted. (An earlier draft counted it first; fixed.)
+6. **Token-holder takeover (accepted, #8171).** Under `enforce` a holder of an unspent single-use token
+   can re-enrol any live-leaf id and supersede its leaf; recovery is a new single-use token for the
+   victim. Token custody is the control.
+7. **Revoked-as-`reenrolled` presenter.** A direct-TLS agent whose leaf was superseded keeps presenting it
+   and is answered "client certificate is revoked" before any token is read; documented manual
+   recovery (delete the agent's certificate and key, restart with a fresh single-use token).
+8. **CRL file latency.** The superseded leaf is refused by the server's mTLS gate immediately; the CRL
+   file lags the leader's freshness tick.
+9. **No rate limit** on re-registration attempts (#828, out of scope); the new read is one indexed query.

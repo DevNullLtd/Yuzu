@@ -3950,7 +3950,7 @@ groups:
           runbook_url: "https://docs.yuzu.io/runbooks/ca-reissue-blocked"
 
       # WP01: agent re-registration proof-of-identity rollout (--agent-reregistration-proof).
-      # `audit` (the default of the first release) ADMITS what `enforce` would refuse; these rules
+      # `audit` (the default) ADMITS what `enforce` would refuse; these rules
       # are the soak criterion for switching to enforce. All series are seeded to 0 at boot.
       - alert: YuzuAgentReregistrationWouldRefuse
         expr: |
@@ -3963,7 +3963,7 @@ groups:
             yuzu_register_reregistration_total in audit mode counted an unproven re-registration
             of an already-enrolled agent id (no_proof, unattested_gateway, revoked_identity or
             lookup_failed). Either a real agent would be locked out by --agent-reregistration-proof=enforce
-            (an un-upgraded or non-witnessing gateway, a lost key), or this is the takeover the
+            (a plaintext or non-witnessing gateway, a lost key), or this is the takeover the
             control exists to stop. Do not switch to enforce while this fires for real agents.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
 
@@ -3976,7 +3976,7 @@ groups:
           summary: "A gateway cannot witness client certificates: its agents cannot satisfy enforce"
           description: >-
             A gateway-relayed re-registration reported gateway_attests_peer_cert=false: the gateway
-            is too old, plaintext, or its agent listener lacks witness_client_cert. Under
+            is plaintext, or its agent listener lacks witness_client_cert. Under
             --agent-reregistration-proof=enforce every leaf-holding agent behind it is refused.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
 
@@ -4042,8 +4042,8 @@ groups:
         annotations:
           summary: "Server replicas run different --agent-reregistration-proof modes"
           description: >-
-            The flag is per process. A fleet is only as enforced as its weakest replica; finish the
-            rollout (or roll back) on every replica.
+            The flag is per process. A fleet is only as enforced as its weakest replica; set the
+            same --agent-reregistration-proof value on every replica.
           runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
 
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration

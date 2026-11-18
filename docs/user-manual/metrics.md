@@ -3250,20 +3250,20 @@ This data reveals your fleet's attack surface to anyone who can reach the metric
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `yuzu_register_reregistration_total` | counter | `path` (`direct`, `gateway_proxy`), `outcome`, `mode` | One increment per re-registration decision of an already-enrolled agent id (and per first enrolment, `no_leaf_on_record`). `outcome`: `no_leaf_on_record`, `proven_by_leaf`, `via_token`, `no_proof`, `unattested_gateway`, `revoked_identity`, `lookup_failed`. In `audit` mode `no_proof`, `unattested_gateway`, `revoked_identity` and `lookup_failed` were ADMITTED; in `enforce` they were refused. All series are seeded to 0 at boot. |
+| `yuzu_register_reregistration_audit_dropped_total` | counter | `action` | Audit rows NOT written because the per-id audit budget was spent (a flood on one id); one aggregate row (`suppressed=N`) is written per closed window. |
+| `yuzu_register_reregistration_audit_write_failures_total` | counter | none | A re-registration audit row whose write FAILED. |
 | `yuzu_register_reenrol_token_refused_total` | counter | `reason` | A token re-enrolment was refused (`multi_use_token`, `not_found`, `expired`, `revoked`, `already_consumed`, `invalid_input_length`). |
 | `yuzu_server_ca_superseded_leaf_total` | counter | none | Older agent leaves revoked as `reenrolled`. |
 | `yuzu_server_ca_supersede_failed_total` | counter | none | Revoking the older leaves failed (see `ca.cert.supersede_failed`). |
 | `yuzu_server_agent_reregistration_proof_mode` | gauge | `mode` | 1 for this process's `--agent-reregistration-proof` mode, 0 for the others. The flag is per process. |
 
 Shipped alerts (`docs/prometheus/yuzu-alerts.yml`, group `yuzu-pki`): `YuzuAgentReregistrationWouldRefuse`,
-`YuzuAgentReregistrationUnattestedGateway`, `YuzuAgentLeafSupersedeFailed`, `YuzuAgentReregistrationModeMixed`.
+`YuzuAgentReregistrationUnattestedGateway`, `YuzuAgentLeafSupersedeFailed`, `YuzuAgentReregistrationModeMixed`, and the enforce-phase `YuzuAgentReregistrationRefused`, `YuzuAgentReregistrationLookupFailed`, `YuzuAgentReenrolTokenRefusedBurst`.
 
-**Soak criterion for `audit` -> `enforce`.** Run `audit` for at least one full agent restart cycle of the
-fleet (a week covers a patch cycle), and switch only when this returns no real agent for the whole window:
+**Soak criterion for `audit` -> `enforce`.** Run `audit` for at least one full agent restart cycle of the fleet (a week covers a patch cycle), with `witness_client_cert` set on every gateway's agent listener and each gateway restarted. Switch only when EVERY value this returns is 0 (the query is filtered to `> 0`, so it must return no rows) for the whole window:
 
 ```promql
-sum by (path, outcome) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[7d]))
+sum by (path, outcome) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[7d])) > 0
 ```
 
-and `sum(increase(yuzu_register_reregistration_total{mode="audit",outcome="proven_by_leaf"}[7d]))` is
-non-zero for each ingest path you use (proof the witnessed leaf path actually works end to end).
+Then check, as separate lines: `sum by (path) (increase(yuzu_register_reregistration_total{mode="audit",outcome="proven_by_leaf"}[7d]))` is non-zero for each ingest path you use (the witnessed leaf path works end to end), and `sum by (path) (increase(yuzu_register_reregistration_total{mode="audit",outcome="via_token"}[7d]))`: in `audit` mode a token for a live-leaf id is admitted without being consumed, so the token path is NOT exercised by the soak; review each `via_token` and test the path once by hand.

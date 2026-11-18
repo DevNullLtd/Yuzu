@@ -622,4 +622,5 @@ by system code (`revoke_older_agent_leaves`, one statement that revokes only lea
 one by `(issued_at, serial_hex)`, so concurrent re-enrolments converge on the newest and never
 cross-revoke), is skipped by `agent_leaf_state` and `sign_agent_csr`'s revoked-identity guard, and is
 counted in the superseded revocation bucket, never in "other". The revoked set stays append-only. A
-rollback of the server does NOT un-revoke `reenrolled` leaves.
+Returning to an earlier build is outside the deployment contract; `reenrolled` revocations are
+append-only and are never undone.
