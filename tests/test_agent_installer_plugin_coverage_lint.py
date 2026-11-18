@@ -9,9 +9,9 @@ line ships in the zip and silently not in the installer; six had drifted out
 that way (browser_inventory, license_scan, netprobe, printing,
 privacy_permissions, rdp_control). Five are now installed; license_scan is a
 recorded `plugin-not-installed` exclusion (ADR-3006 D10: installing it would
-start the daily software_licensing collection with no operator action), and
-the release zip still carries it. These checks read the source text; stdlib
-only, no Windows, no Inno Setup.
+start the daily software_licensing collection with no operator action;
+follow-up #8309), and the release zip still carries it. These checks read the
+source text; stdlib only, no Windows, no Inno Setup.
 
 What they pin:
 
@@ -33,6 +33,12 @@ What they pin:
 - No `Source:` line names a plugin the build does not produce (ISCC would
   fail on it at release time), no plugin is both listed and excluded, and an
   exclusion names a plugin the build produces.
+- [UninstallDelete] deletes, by exact name, every excluded plugin's DLL
+  (`{app}\plugins\<name>.dll`: the zip carries it, so an operator may have
+  copied it in, and the uninstaller removes only what [Files] installed) and
+  the two files agent self-update leaves in `{app}\bin`
+  (`yuzu-agent.old.exe`, `.yuzu-update-verified`). No `files` entry there
+  uses a wildcard.
 
 Each check also runs against a mutated copy of the sources and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -57,6 +63,13 @@ CORE_PLUGINS = frozenset({
     "status", "agent_actions", "agent_logging", "tags", "diagnostics",
     "content_dist", "device_identity",
 })
+
+# Files agent self-update writes beside yuzu-agent.exe (agents/core/src/updater.cpp):
+# the previous executable, kept for rollback, and the update-verified marker.
+OTA_LEFTOVERS = (
+    'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"',
+    'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"',
+)
 
 EXCLUDE_RE = re.compile(r"^\s*;\s*plugin-not-installed:\s*([a-z0-9_]+)\s*:\s*(.*?)\s*$")
 SOURCE_RE = re.compile(r'^\s*Source:\s*"([^"]*)"(.*)$')
@@ -187,6 +200,23 @@ def problems(iss: str, meson_text: str, read_plugin_meson, options: str, release
                          f"`; plugin-not-installed: {d}: <reason>` record in yuzu-agent.iss")
     for d in sorted(set(excluded) - set(expected)):
         found.append(f"plugin-not-installed: {d} is not a plugin the build produces (stale record)")
+
+    # [UninstallDelete]: an excluded plugin's DLL and the self-update leftovers.
+    ud = [l.strip() for l in section(iss, "UninstallDelete").splitlines()
+          if l.strip() and not l.strip().startswith(";")]
+    if not ud:
+        found.append("[UninstallDelete] section not found or empty")
+    for d in sorted(set(excluded) & set(expected)):
+        entry = f'Type: files; Name: "{{app}}\\plugins\\{expected[d]}"'
+        if ud.count(entry) != 1:
+            found.append(f"[UninstallDelete]: excluded plugin {d} needs exactly one `{entry}` "
+                         f"(the zip carries it; uninstall must not leave it to be loaded)")
+    for entry in OTA_LEFTOVERS:
+        if ud.count(entry) != 1:
+            found.append(f"[UninstallDelete]: needs exactly one `{entry}` (left by agent self-update)")
+    for l in ud:
+        if l.startswith("Type: files;") and re.search(r"[*?]", l):
+            found.append(f"[UninstallDelete]: a files entry uses a wildcard: {l}")
     return found
 
 
@@ -232,6 +262,14 @@ class InstallerPluginCoverage(unittest.TestCase):
             "a core plugin moved off core": ("iss", 'plugins\\status\\status.dll"; DestDir: "{app}\\plugins"; Components: core;', 'plugins\\status\\status.dll"; DestDir: "{app}\\plugins"; Components: plugins\\system;'),
             "a new plugin added to the build": ("meson", "  subdir('agents/plugins/pkg_inventory')", "  subdir('agents/plugins/pkg_inventory')\n  subdir('agents/plugins/zz_new_plugin')"),
             "build_examples default flipped": ("options", "option('build_examples', type: 'boolean', value: true", "option('build_examples', type: 'boolean', value: false"),
+            "license_scan uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\n', ""),
+            "license_scan uninstall entry misnamed": ("iss", '{app}\\plugins\\license_scan.dll"\n', '{app}\\plugins\\licence_scan.dll"\n'),
+            "license_scan uninstall entry commented out": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\n', '; Type: files; Name: "{app}\\plugins\\license_scan.dll"\n'),
+            "a new exclusion without an uninstall entry": ("iss", netprobe, "; plugin-not-installed: netprobe: kept out of the installer on purpose\n"),
+            "old exe uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', ""),
+            "update marker uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\n', ""),
+            "a wildcard uninstall entry added": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\nType: files; Name: "{app}\\plugins\\*.dll"\n'),
+            "uninstall section renamed": ("iss", "[UninstallDelete]\n", "[UninstallDeleted]\n"),
             "release turns build_examples off": ("release", "            -Dbuild_tests=false `\n", "            -Dbuild_tests=false `\n            -Dbuild_examples=false `\n"),
         }
         for name, (which, old, new) in mutations.items():

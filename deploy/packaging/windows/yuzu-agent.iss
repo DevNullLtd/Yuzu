@@ -69,7 +69,7 @@ Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan)"; T
 ; tests/test_agent_installer_plugin_coverage_lint.py fails otherwise (#4867).
 ; The release zip takes every plugin by glob, so a plugin missing here ships in
 ; the zip and silently not in the installer. One plugin is excluded today:
-; plugin-not-installed: license_scan: ADR-3006 D10. Installing it starts the agent's daily software_licensing collection on every device the installer is run on, with no operator action, and no release may add a unit that runs by default until the fleet-level additions setting exists. The release zip still carries it.
+; plugin-not-installed: license_scan: ADR-3006 D10, follow-up #8309. Installing it starts the agent's daily software_licensing collection on every device the installer is run on, with no operator action, and no release may add a unit that runs by default until the fleet-level additions setting exists. The release zip still carries it.
 ; --- Core agent ---
 ; The Microsoft Visual C++ runtime that the agent, its plugins and the vcpkg
 ; DLLs import (vcruntime140*.dll, msvcp140*.dll), installed app-local next to
@@ -314,6 +314,28 @@ Type: files; Name: "{app}\plugins\tar.dll"
 Type: files; Name: "{app}\plugins\quarantine.dll"
 
 [UninstallDelete]
+; Three files the installer does not install, deleted by exact name: the
+; uninstaller removes only what [Files] installed, and the plugin loader loads
+; every DLL in {app}\plugins, so without these an uninstall can leave Yuzu code
+; that a later install would run.
+;   - plugins\license_scan.dll: not installed by this installer (see the
+;     plugin-not-installed record in [Files], #8309) but carried by the release
+;     zip, so an operator may have copied it in.
+;   - bin\yuzu-agent.old.exe and bin\.yuzu-update-verified: written by agent
+;     self-update (agents/core/src/updater.cpp: the previous executable kept
+;     for rollback, and the marker that the new one registered). A leftover
+;     yuzu-agent.old.exe without the marker is what the next agent start rolls
+;     back to.
+; Exact names only, never a wildcard. [UninstallRun], which runs first, stops
+; the service; a file still locked after that is not deleted. Randomly named
+; temporaries that an interrupted self-update can leave in bin
+; (yuzu-update-*.tmp, .yuzu-update-verified.tmp.*) are not removed; nothing
+; loads them. docs/user-manual/README.md ("What uninstalling removes") lists
+; what uninstall keeps. tests/test_agent_installer_plugin_coverage_lint.py
+; pins these entries (one for every plugin-not-installed record).
+Type: files; Name: "{app}\plugins\license_scan.dll"
+Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
+Type: files; Name: "{app}\bin\.yuzu-update-verified"
 Type: filesandordirs; Name: "{app}\logs"
 Type: files; Name: "{commonappdata}\Yuzu\enrollment-token"
 Type: dirifempty; Name: "{commonappdata}\Yuzu\enrollment-token.stage"
