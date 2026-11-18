@@ -87,7 +87,7 @@ Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}\bin"; Components: core
 Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 ; Third-party attribution, including the Microsoft Visual C++ runtime above.
-Source: "..\..\..\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion
 
 ; --- Plugins: core (always installed) ---
 Source: "{#BuildDir}\agents\plugins\status\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion

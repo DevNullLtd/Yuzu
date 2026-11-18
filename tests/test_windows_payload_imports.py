@@ -72,8 +72,12 @@ _spec.loader.exec_module(chk)
 CHECK_STEP = "Check the DLL import closure of both payloads"
 RUNTIME_LINE = 'Source: "{#BuildDir}\\msvc-runtime\\*.dll"; DestDir: "{app}\\bin"; Components: core; Flags: ignoreversion'
 EXE_LINE = 'Source: "{#BuildDir}\\agents\\core\\yuzu-agent.exe"; DestDir: "{app}\\bin"; Components: core; Flags: ignoreversion'
-NOTICE_LINE = 'Source: "..\\..\\..\\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion'
+# NOTICE is packed from the build directory, not the repository root: the
+# installer SBOM step refuses a manifest row outside --inno-build-dir.
+NOTICE_LINE = 'Source: "{#BuildDir}\\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion'
 NOTICE_COPY = 'Copy-Item "NOTICE" "${staging}/"'
+NOTICE_BUILD_COPY = 'Copy-Item "NOTICE" "build-windows/NOTICE"'
+NOTICE_BUILD_SH = 'cp "$SCRIPT_DIR/../../../NOTICE" "$BUILD_DIR/NOTICE"'
 SIGNER_MATCH = "-cnotmatch '(^|,\\s*)O=Microsoft Corporation(\\s*,|$)'"
 STAGE_CALL = '& ./deploy/packaging/windows/stage-msvc-runtime.ps1 -Destination "${staging}/bin", "build-windows/msvc-runtime"'
 STAGE_CHECK = 'if ($LASTEXITCODE -ne 0) { Write-Error "stage-msvc-runtime.ps1 failed"; exit 1 }'
@@ -633,6 +637,14 @@ def wiring_problems(release, iss, stage, build_sh):
         found.append("yuzu-agent.iss: NOTICE is not installed into {app} under core")
     if NOTICE_COPY not in pkg_code or not (0 <= pkg_code.find(NOTICE_COPY) < pkg_code.find("Compress-Archive")):
         found.append("Package archive: NOTICE is not copied into the zip before Compress-Archive")
+    if NOTICE_BUILD_COPY not in pkg_code or not (0 <= pkg_code.find(NOTICE_BUILD_COPY) < pkg_code.find("Compress-Archive")):
+        found.append("release.yml: NOTICE is not staged into build-windows before the installer is built "
+                     "(the installer SBOM step refuses a source outside the build directory)")
+    if NOTICE_BUILD_SH not in build_sh:
+        found.append("build-installer.sh: NOTICE is not copied into the build directory the .iss packs it from")
+    stray = [l for l in iss_lines if l.startswith("Source:") and not l.startswith('Source: "{#BuildDir}\\')]
+    if stray:
+        found.append("yuzu-agent.iss: [Files] Source outside {#BuildDir} (the installer SBOM step refuses it): " + stray[0])
 
     stage_code = re.sub(r"<#.*?#>", "", stage, flags=re.S)
     stage_code = "\n".join(l for l in stage_code.splitlines() if not l.lstrip().startswith("#"))
@@ -705,6 +717,9 @@ class Wiring(unittest.TestCase):
             "iss runtime line after the exe": ("iss", RUNTIME_LINE + "\n" + EXE_LINE, EXE_LINE + "\n" + RUNTIME_LINE),
             "iss NOTICE dropped": ("iss", NOTICE_LINE, "; NOTICE"),
             "zip NOTICE dropped": ("release", NOTICE_COPY, "$null = 0"),
+            "build-dir NOTICE copy dropped (release)": ("release", NOTICE_BUILD_COPY, "$null = 0"),
+            "build-dir NOTICE copy dropped (build-installer.sh)": ("build_sh", NOTICE_BUILD_SH, ": no-op"),
+            "iss NOTICE back to the repository root": ("iss", NOTICE_LINE, NOTICE_LINE.replace("{#BuildDir}\\", "..\\..\\..\\")),
             "build-installer stops staging": ("build_sh", '"$PWSH" -NoProfile -ExecutionPolicy Bypass -File "$WIN_STAGE" -Destination "$WIN_RUNTIME_DIR"', "true"),
         }
         for name, (which, old, new) in mutations.items():

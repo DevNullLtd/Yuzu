@@ -112,6 +112,10 @@ if [[ "$TARGET" == "agent" ]]; then
     WIN_RUNTIME_DIR=$(cygpath -w "$BUILD_DIR/msvc-runtime" 2>/dev/null || echo "$BUILD_DIR/msvc-runtime")
     "$PWSH" -NoProfile -ExecutionPolicy Bypass -File "$WIN_STAGE" -Destination "$WIN_RUNTIME_DIR"
 
+    # NOTICE goes into the build directory too: yuzu-agent.iss packs it from
+    # {#BuildDir}, and the installer SBOM step refuses a source outside it.
+    cp "$SCRIPT_DIR/../../../NOTICE" "$BUILD_DIR/NOTICE"
+
     WIN_ISS=$(cygpath -w "$SCRIPT_DIR/yuzu-agent.iss" 2>/dev/null || echo "$SCRIPT_DIR/yuzu-agent.iss")
 
     MSYS_NO_PATHCONV=1 "$ISCC" \

@@ -388,6 +388,13 @@ def iss_sources() -> list:
     another shape is skipped here rather than failing the test."""
     text = (ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss").read_text(encoding="utf-8-sig")
     sources = re.findall(r'^Source: "\{#BuildDir\}\\([^"]+)";', text, re.M)
+    # Every [Files] Source must come from the build directory: the installer
+    # SBOM step refuses a manifest row outside --inno-build-dir, and a source
+    # of another shape (e.g. "..\\..\\..\\NOTICE") would only fail on a release.
+    all_sources = re.findall(r'^Source: "([^"]+)";', text, re.M)
+    assert len(all_sources) == len(sources), (
+        "yuzu-agent.iss has [Files] Source line(s) outside {#BuildDir}: "
+        + ", ".join(s for s in all_sources if not s.startswith("{#BuildDir}\\")))
     assert len(sources) > 40, "yuzu-agent.iss no longer installs the plugins from {#BuildDir}"
     return sources
 
@@ -399,10 +406,10 @@ def make_inno_build(build: Path) -> list:
     path already listed)."""
     rows, seen = [], set()
     for src in iss_sources():
-        folder, name = src.rsplit("\\", 1)
+        folder, _, name = src.rpartition("\\")
         wild = MSVC_RUNTIME_DLLS if folder.lower().rsplit("\\", 1)[-1] == "msvc-runtime" else CORE_DLLS
         for n in (wild if name == "*.dll" else (name,)):
-            rel = f"{folder}\\{n}"
+            rel = f"{folder}\\{n}" if folder else n
             if rel.lower() in seen:
                 continue
             seen.add(rel.lower())

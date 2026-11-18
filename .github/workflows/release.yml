@@ -887,6 +887,10 @@ jobs:
           # Third-party attribution, including the Visual C++ runtime staged
           # below (yuzu-agent.iss installs the same file into {app}).
           Copy-Item "NOTICE" "${staging}/"
+          # The installer packs the same file from the build directory: the
+          # installer SBOM step refuses a manifest row outside it, and
+          # yuzu-agent.iss would otherwise reach out to the repository root.
+          Copy-Item "NOTICE" "build-windows/NOTICE"
 
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
           # every DLL vcpkg installed; since ADR-0035 step 3 the install above

@@ -1449,9 +1449,11 @@ Actions cache service.
   `release.yml` identity before the release is created.
 - Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
   The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
-  app-local. The Windows SBOM step scans `path: .`, which holds them in the
-  staged archive directory and in `build-windows\msvc-runtime`; its syft
-  cataloguer lists each as an application component named and versioned from
+  app-local. Each Windows SBOM describes its own
+  artifact: the archive's SBOM is made from the unpacked archive, which holds
+  them in `bin`, and the installer's SBOM lists the files its ISCC manifest
+  names, at their build-directory paths (`msvc-runtime\...`). Syft's
+  cataloguer lists each DLL in the archive's SBOM as an application component named and versioned from
   its version resource, with a CPE and no package URL (purl), possibly more
   than once, so a purl-matching scanner does not see them (not yet inspected in
   a release SBOM). Their authoritative version is the file version of the

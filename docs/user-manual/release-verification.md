@@ -411,11 +411,12 @@ Visual C++ runtime in the agent's `bin` directory, unmodified and signed by
 Microsoft: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
 `msvcp140_atomic_wait.dll` and any other `vcruntime140_*.dll` or
 `msvcp140_*.dll` the build machine's Visual Studio redistributable directory
-holds. The Windows SBOM step scans the whole workspace, which holds these DLLs
-in two places (the staged archive directory and `build-windows\msvc-runtime`).
-The cataloguer that step uses (syft, through the pinned
-`anchore/sbom-action`) lists each native DLL it finds as an application
-component, named and versioned from the DLL's version resource (for a
+holds. Each Windows SBOM describes its own artifact: the archive's SBOM
+is made from the unpacked archive, which holds these DLLs in `bin`, and the
+installer's SBOM lists the files its installer packs, with the runtime DLLs at
+`msvc-runtime\...` (see "What a file's SBOM lists" above). The cataloguer that
+makes the archive's SBOM (syft, through the pinned `anchore/sbom-action`)
+lists each native DLL it finds as an application component, named and versioned from the DLL's version resource (for a
 Microsoft DLL, its file description), with a CPE and no package URL (purl), so
 a runtime DLL can appear more than once. A scanner or policy that matches
 components on purl does not see them. No release SBOM has yet been inspected
