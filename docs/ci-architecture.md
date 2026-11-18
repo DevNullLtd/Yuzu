@@ -730,9 +730,9 @@ fixed by reviewing the edit, not by re-running the job.
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — seven parser families
-(six under `server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
