@@ -11,6 +11,20 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: agent plugin result rows neutralise `|`, CR and LF, and the `network_config` proxy row redacts credentials (WP11)
+
+**In short.** Affected: anything that parses stored results of the `filesystem` (`list_dir`, `search_dir`, Windows `get_version_info`), `installed_apps` (`list`, `query`, `list_per_user`), `processes` (`list`, `query`, `list_hashed`, `list_tree`), `procfetch`, `wmi` (`query`, `get_instance`) and `network_config` (`proxy`, including its `bypass` rows) plugins, or that matched on a raw proxy value.
+
+**What changed.**
+
+- A file name, registry string, process name, WMI value or proxy setting containing `|`, CR or LF can no longer add columns or forge rows. `|` is escaped (`\|`) (`processes` folds it to a space instead), CR and LF become a space, interior backslashes are kept (`C:\x` stays `C:\x`) and a TRAILING backslash is folded to `/`, because the server decoder would otherwise read `\|` as an escaped pipe and merge the field with the next column. One shared helper (`agents/shared/row_field.hpp`) does this for `filesystem`, `procfetch`, `wmi`, `installed_apps` and `network_config`; `processes` applies the same backslash rule.
+- Against the previous build: `procfetch` already escaped `|` and kept backslashes, so it now also folds CR and LF and a trailing backslash; `wmi` emitted raw values and now escapes them; `installed_apps` `list` folded EVERY backslash to `/` (`C:/Program Files/x`) and now keeps them (`C:\Program Files\x`; a trailing one still reads `/`), and its `query` and `list_per_user` rows, which were raw, are now escaped like `list`; `filesystem` `list_dir`, `search_dir` and the Windows `get_version_info` leg were raw and are now escaped (the macOS `get_version_info` leg already folded every backslash to `/` and still does); in `processes` only the `query` row was raw (`list`, `list_hashed` and `list_tree` were already sanitised, and now also fold a trailing backslash). A `wmi` value that ends in a backslash reads `/` at the end.
+- The `network_config` `proxy_address` value is credential-scrubbed on every OS and fails closed: when the value contains any `@`, the row is `REDACTED@` plus the text after the LAST `@` of the whole value. The scheme, the host of any earlier entry in a Windows proxy list and a path `@` in a PAC URL are dropped too (`http://u:p@proxy:3128` becomes `REDACTED@proxy:3128`). This is deliberate over-redaction: a decoy `@` anywhere in the value (for example in a path) makes the whole value read `REDACTED@<tail>`, which can hide the real proxy host, so treat a `REDACTED@` row as "a credential was present" rather than as the full address. A value with no `@` is reported with the row escape above. Only `user:password@` userinfo is scrubbed: a secret in a PAC URL's query string, in a path, or in a `bypass` / `no_proxy` row is NOT removed (`bypass` rows get the row escape only).
+
+**Who is affected.** Parsers and dashboards that matched `proxy_address` on a scheme or an earlier list entry; anything that matched a `/`-folded `installed_apps` `list` path, or a `procfetch`/`wmi` value containing a CR, LF or trailing backslash; scripts reading file names with `|` or newlines.
+
+**What to do.** Update the parsers. Mixed fleets are safe to run: an agent on the previous build still sends the previous output (raw `wmi` values, raw `installed_apps` `query` and `list_per_user` rows, raw `filesystem` `list_dir` / `search_dir` / Windows `get_version_info` rows, the raw `processes` `query` row, raw proxy and `bypass` values, `/`-folded `installed_apps` `list` paths), so the credential exposure remains for those endpoints until they are upgraded, one fleet can report two spellings of one `installed_apps` path, and an old agent still glues a `processes` row whose name ends in a backslash. **Rows already stored are not rewritten**: a proxy credential that an earlier agent sent stays in the stored responses until they age out, so rotate any proxy credential that was reachable through an `*_proxy` variable. There is no purge for these rows: stored responses are removed by the response retention reap, which defaults to 90 days and is set with `--response-retention-days` (`YUZU_RESPONSE_RETENTION_DAYS`); a value of 0 or less disables the reap (responses never expire). The `response_retention_days` runtime configuration key is stored only and does not change the window of a running server.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.
@@ -78,6 +92,24 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - Update a parser of the add-member success `detail` to split off the LAST space-delimited token (`agent_known=...`): the agent id is caller text and may itself contain spaces or the text ` agent_known=1`, so do not parse the id out of the front of the string. Filter on `result=success` first, before applying that last-token rule: an agent id is caller-supplied text, so an `attempted` or failure row can end in the same text (an id such as `x agent_known=1`).
 - At the supervised MCP tier, after a refusal for audit reasons, request a new approval before retrying.
 - An `attempted` row with no outcome row after it means "started, outcome unknown". Pair each outcome row (success or failure) with an earlier `attempted` row of the same verb, earliest first, one outcome per `attempted` row. Create: by principal and group name, ignoring `target_id` on the success row (it carries the new group's id; the `attempted` and failure rows have an empty one). Add member: by principal, `target_id` (the group id) and agent id, where a success row's agent id is its `detail` without the trailing ` agent_known=<flag>` token. Remove member: by principal, `target_id` and agent id (`detail`). A failure row's key is the part of its `detail` after the token. An `attempted` row left without an outcome row is an orphan, so check whether the group or member exists before retrying. There is no per-request correlator, so two concurrent requests by one principal with the same key are paired by count only, and on MCP where the session writer is unwired the principal on a row can be empty.
+
+## ⚠️ Breaking: outbound address checks decode SIIT and IPv4-compatible IPv6 addresses and refuse an undecodable local-use NAT64 address
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** This applies to an OIDC issuer, JWKS or token endpoint, or a CRL source host, whose name resolves to an IPv6 address that embeds an IPv4 address in the SIIT or IPv4-compatible form, or to an address in the local-use NAT64 prefix `64:ff9b:1::/48`. An ordinary public IdP or CRL host needs no configuration. On a network that translates through a local-use prefix, declare its exact prefix and length with `--oidc-nat64-prefix`.
+
+**What the build does.**
+
+- **Embedded forms are decoded.** SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the IPv4 address they embed, as IPv4-mapped, NAT64 and 6to4 addresses are, but never as more open than `non-global`.
+- **OIDC.** An embedded unspecified, link-local, cloud-metadata, multicast or reserved address is refused even with `--oidc-allow-private-networks` set. An embedded loopback or private address stays behind that switch, as its plain form is. Plain http to the SIIT or IPv4-compatible form of a public address is refused, as plain http to a public address is.
+- **Local-use NAT64.** An address in `64:ff9b:1::/48` cannot be decoded without the network's prefix length, so one that no known prefix covers is refused whatever the switch says. For OIDC a prefix is known when it is configured with `--oidc-nat64-prefix` or learned from `ipv4only.arpa`. For CRL source registration only the declared prefixes are known.
+- **CRL source registration.** An embedded loopback address and one of this server's own addresses are refused with no override, as their plain forms are.
+- **Registering or replacing a source classifies its URLs.** This includes a `PUT /api/v1/crypto/revocation-sources/{id}` (or MCP `update_revocation_source`). A host whose SIIT or IPv4-compatible address embeds a private or carrier-grade NAT address is classed `private` or `carrier-grade-nat`, and the request needs `confirmed_address_classes` to list that class.
+
+**Who is affected.** A deployment whose OIDC or CRL hosts resolve to one of these forms. Ordinary IPv4, IPv4-mapped, well-known NAT64 and global IPv6 addresses are not affected.
+
+**Configuring a local-use translator.** If a request or registration is refused for an address in `64:ff9b:1::/48`, add your translator's exact prefix and length to `--oidc-nat64-prefix` and restart. Ask whoever runs the translator for it: the prefix can be longer than the `64:ff9b:1::/48` block, and a prefix of the wrong length decodes the wrong IPv4 address, which can make an internal address read as public. The flag is shared: a prefix declared for CRL sources is also trusted for OIDC egress, where it can permit HTTPS to a unique-local address without `--oidc-allow-private-networks` (see the operator warning under "Egress policy" in [authentication.md](authentication.md)), so declare only real translation prefixes.
 
 ## Behaviour change: a service-scoped credential's execution visibility is limited to its service scope (#5557)
 
@@ -728,7 +760,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 ## Behaviour change: Echo holds `echo.db` to a byte budget (an existing database is trimmed on the first maintenance pass)
 
-**What changed.** The Echo agent plugin holds `echo.db` to a byte budget, `db_budget_bytes` (default 262144000, 250 MiB; minimum 33554432, 32 MiB; set with `echo.configure`). The figure compared with it is `db_size_bytes` in `echo.status`, which now counts the used database pages plus the write-ahead log and no longer counts free pages (it counted every page in the database file before). When that figure is over the budget, the maintenance pass (every 15 minutes, or `echo.rollup`) permanently deletes hourly rows older than 48 hours (5 days for `procperf`), even inside their retention window. Since the roll-up-only change (schema v10) the pass deletes hourly rows only; before it the pass also deleted the oldest raw capture rows that their first summary tier had already passed, never the newest 24 hours. Daily and monthly rows, the `usage` tables and paused or errored sources are never removed. The budget applies to an `echo.db` that already exists, not only to new ones.
+**What changed.** The Echo agent plugin holds `echo.db` to a byte budget, `db_budget_bytes` (default 262144000, 250 MiB; minimum 33554432, 32 MiB; set with `echo.configure`). The figure compared with it is `db_size_bytes` in `echo.status`, which now counts the used database pages plus the write-ahead log and no longer counts free pages (it counted every page in the database file before). When that figure is over the budget, the maintenance pass (every 15 minutes, or `echo.rollup`) permanently deletes hourly rows older than 48 hours (5 days for `procperf`), even inside their retention window. Since the roll-up-only change (schema v10) the pass deletes hourly rows only; before it the pass also deleted the oldest raw capture rows that their first summary tier had already passed, never the newest 24 hours. Daily and monthly rows, the `usage` tables, paused sources and sources errored while paused are never removed. The budget applies to an `echo.db` that already exists, not only to new ones.
 
 **Before you upgrade an agent whose `echo.db` is near or above 250 MiB.** The trim runs on the first maintenance pass, about 15 minutes after the upgraded agent starts, needs no approval and cannot be undone. A database is affected when its used pages exceed 245,366,784 bytes (the 250 MiB default less a 16 MiB allowance for the log). The `db_size_bytes` an older agent reports counted free pages too, so a host that reads under 245,366,784 there holds less than that in used pages and cannot be trimmed.
 
@@ -745,6 +777,12 @@ Lowering `db_budget_bytes` later deletes history the same way, within 15 minutes
 - A database far over budget converges over successive passes and fast-tick slices (each at most 2 seconds of deletes) rather than in one pass.
 - New capture is also lighter by design: a socket first seen already closing is recorded once per hour per process and remote, module loads once per hour per loader, module and folder, unloads are not stored, and a registry change stores the new value up to 512 bytes and not the old value. See "Raw capture row volume" in the Echo manual.
 - Watch `budget_evicted_hourly_rows_total`, `budget_over_bytes` and `db_auto_vacuum` in `echo.status`; "If `budget_over_bytes` stays above 0" in the Echo manual lists the causes. Nothing server-side aggregates them: dispatch `echo.status` to a group and filter.
+
+## Behaviour change: Echo ages out the rows of an errored source that was never paused (#1572)
+
+**What changed.** A source whose `<source>_enabled` value is `errored` (not the literal `true` or `false`) still stops collecting. Its rows used to be held past their retention for ever; when `<source>_paused_at` is absent or `0` (the source was never paused), they now follow the normal retention ceiling and the byte-budget eviction. Rows of a source an operator paused, of one paused when its flag went bad, and of one whose `paused_at` is unreadable or malformed are still preserved.
+
+**Caveat for sources paused before v0.12.0.** An agent older than v0.12.0 did not stamp `paused_at` when a source was paused. If such a source was never re-configured since, and its `<source>_enabled` value is later damaged, it reads as never paused and its expired rows are removed. Every pause made by a current agent stamps `paused_at`. To protect a source paused on an older agent, re-issue `configure <source>_enabled=false` on it, which stamps the marker.
 
 ## ⚠️ Breaking: `GET /api/v1/dex/apps` now covers every platform by default
 
@@ -1901,7 +1939,7 @@ the session store it uses to end the account's sessions the same way.
 
 ## ⚠️ Breaking: the OpenAPI document is larger and typed, every operation has an `operationId`, and there is a `/swagger` page
 
-**What changed.** `GET /api/v1/openapi.json` now gives 304 of its 306 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 64 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) and `GET`, `PUT` and `DELETE /dex/score-policy`; all 64 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
+**What changed.** `GET /api/v1/openapi.json` now gives 305 of its 307 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 64 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) and `GET`, `PUT` and `DELETE /dex/score-policy`; all 64 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
 
 **Who is affected.** Anyone who generates a client from the document (typed return types, renamed methods and a changed security-scheme model can break generated code), anyone who compares or hash-pins the document byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
 
@@ -9216,16 +9254,59 @@ overridden.
 
 | Symptom | Diagnose | Fix |
 |---|---|---|
-| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -t yuzu-gateway \| grep -i cookie` shows "insecure distribution cookie" (for manual/`foreground` or container runs, check stdout / `gateway.log` instead) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
+| `systemctl status yuzu-gateway` shows `start-limit-hit` / `failed` | `journalctl -u yuzu-gateway \| grep -i cookie` shows `yuzu-gateway: YUZU_GW_COOKIE is unset, empty or the published default value ...` (the unit's pre-start check) or, for a start that bypassed it, "insecure distribution cookie" / "shorter than 32 characters" (container runs: `[gateway-entrypoint] FATAL: ...` on stderr via `docker logs`; manual `foreground` runs: the terminal / `gateway.log`) | Create `/etc/yuzu/gateway.env` with `YUZU_GW_COOKIE=$(openssl rand -hex 32)` (see above), then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. **Do not** use `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production. |
 | Gateway container restarts at boot on an AMX-capable Intel host (Sapphire Rapids+, AWS c7i/m7i/r7i) | Container log has `sys_sigaltstack(): Internal error: Failed to set alternate signal stack`; image is 0.13.0 through 0.14.0-rc4 (#2150) | Pull an image that carries the #2150 fix (0.14.0-rc5 or later). Until then, run the gateway on a host without AMX. A single-node gateway may use `yuzu-gateway-chisel` instead; a clustered one may not (it never joins the cluster). Do not roll back to 0.13.0 on that host: it is affected too. |
 
 > The generated `/etc/yuzu/gateway.env` is intentionally **preserved across
 > `apt purge` / `rpm -e`** (the `/etc/yuzu` directory may be shared with other
 > Yuzu packages). To remove the cookie after uninstall: `sudo shred -u /etc/yuzu/gateway.env`.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production** — it disables the
-> guard and restores the unauthenticated-RPC surface. It exists only for
-> ephemeral dev/CI stacks.
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (the container entrypoint then uses a
+> random per-boot one; see "Gateway cookie is checked before the VM starts"
+> below). It exists only for ephemeral dev/CI stacks.
+
+### Gateway cookie is checked before the VM starts (2026-11-17 security scan, F24) — **BREAKING**
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+`vm.args.src` has no fallback cookie (the published value is
+`yuzu_gw_secret_change_me`), and the container entrypoint and the systemd unit
+refuse a bad cookie **before the VM starts**; the in-VM guard alone would run
+only after distribution is already listening. The
+policy is one file, `gateway-cookie-policy.sh`, installed next to the release.
+A cookie must be **at least 32 characters** from **`[A-Za-z0-9._~+=-]`**, not
+starting with `-` or `+`, and not the published default. Whitespace, CR/LF,
+backslash, `&` and `$` are refused because the release start script mangles
+them differently under busybox and GNU awk (replicas would disagree on the
+cookie) or, for `\&`, loops forever. A cookie of 256 or more characters is refused too
+(the Erlang VM crashes on it at boot). So the length must be 32 to 255. `openssl rand -hex 32`
+always qualifies.
+
+| Install type | Effect | Action |
+|---|---|---|
+| `.deb` / `.rpm` (cookie written by the package: 64 hex) | Passes the check | None. The package also installs `/opt/yuzu_gw/gateway-cookie-policy.sh`, which the unit needs. |
+| Manual / tarball systemd unit | The unit has an `ExecStartPre` and **no override**. If `/opt/yuzu_gw/gateway-cookie-policy.sh` is missing the unit fails at once with `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2) and, after a few restarts, `start-limit-hit`. A unit with no cookie (the override does not apply to the unit), a short cookie or an odd-character cookie fails to start. | The release tarball has one top-level directory, `yuzu-gateway-<version>-linux-x64/`, containing the release, `gateway-cookie-policy.sh` and `yuzu-gateway.service`. Extract it so that content lands directly in `/opt/yuzu_gw/`: `sudo mkdir -p /opt/yuzu_gw && sudo tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`. Then install the bundled unit with `sudo install -m 0644 /opt/yuzu_gw/yuzu-gateway.service /etc/systemd/system/yuzu-gateway.service` and run `sudo systemctl daemon-reload`. The same file is `deploy/docker/gateway-cookie-policy.sh` in the source tree. Set a conforming `YUZU_GW_COOKIE` in `/etc/yuzu/gateway.env`. Then `systemctl reset-failed yuzu-gateway && systemctl start yuzu-gateway`. |
+| Container with a short or odd-character cookie | The entrypoint exits 1 before the VM starts (restart loop under `restart:`). | Set a conforming cookie, identical on every replica. |
+| Container on `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` with no cookie | Starts, but with a random per-boot cookie. **N replicas on the override are N singletons that cannot form a cluster** (each draws its own cookie), and the node is not reachable with the published value. | Fine for one throwaway node. For a cluster set one shared `YUZU_GW_COOKIE`. |
+| Container on the override with a real shared cookie that contains the published literal in the middle or at the end | Passed through unchanged (only an empty or *exactly* default cookie is replaced). | None; replace the cookie when convenient. |
+| Container on the override with a custom cookie that is **short** (under 32) or **starts with** the published literal | **Refused** (`... is shorter than 32 characters ...` or `... contains the published default value.`). | Drop the cookie to get a random per-boot one (single node), or set a strong shared cookie. |
+| Container **without** the override, real shared cookie that contains the published literal | Refused: `... contains the published default value.` | Generate a fresh cookie and set it on every replica. |
+
+Messages to search for (the cookie value is never printed):
+
+- Container, on stderr (`docker logs` shows it): `[gateway-entrypoint] FATAL: YUZU_GW_COOKIE is unset, empty or the published default value. The Erlang distribution cookie is the sole authentication ...`, `... contains a character outside the allowed set [A-Za-z0-9._~+=-] ...`, `... is shorter than 32 characters ...`, `... contains the published default value.`, `... must not start with - or + ...`, `... is longer than 255 characters ...`
+- systemd: `journalctl -u yuzu-gateway` shows the same text prefixed `yuzu-gateway:` (for example `yuzu-gateway: YUZU_GW_COOKIE is shorter than 32 characters, which is brute-forceable offline from a node that dials out. Use e.g. 'openssl rand -hex 32'.`).
+- A start that bypasses the entrypoint and the unit runs the in-VM guard only: `Refusing to start: Erlang distribution cookie is ...` (logger output, after distribution is listening). Under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` that guard ALSO accepts an empty, short or literal-containing cookie (unlike the entrypoint), with a warning.
+- Image with no entrypoint (`yuzu-gateway-chisel`, or `bin/yuzu_gw` run by hand): no pre-VM check. The node boots with OTP's per-host `~/.erlang.cookie`, and the in-VM guard then refuses it ("shorter than 32 characters"), after distribution is listening. If `$HOME` is unwritable the VM cannot create that file and crash-loops; set a conforming `YUZU_GW_COOKIE`.
+
+**No return path.** A return to an earlier build is not a supported path (see
+"Deployment contract (hard cutover)" in the Forensics section of this page).
+Never run with the published default cookie: it is an unauthenticated-RPC
+surface (#659).
+
+Gateway Erlang distribution is plain TCP, outside the PKI, with no encryption:
+keep the cluster network trusted and firewalled (see the gateway manual).
 
 ### Gateway distribution-cookie length floor + shared node identity (HA WS-4 `#4555`) — **BREAKING**
 
@@ -9241,9 +9322,13 @@ shipped together as part of gateway multi-node cluster formation:
   documented cookie-generation path already clears this floor with room to
   spare** (`openssl rand -hex 32` produces 64 characters) — no action
   needed if you followed the `#659` guidance above verbatim. Only an
-  operator who hand-picked a short custom cookie is affected; the same
+  operator who hand-picked a short custom cookie is affected; the
   `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override (dev/CI only, never production)
-  bypasses this check too.
+  tolerates an empty, short, exactly-default or literal-containing cookie in the
+  in-VM guard, which is all that runs on an entrypoint-less start (`docker run
+  --entrypoint`, hand-run `bin/yuzu_gw`, the chisel image); the container
+  entrypoint refuses a short or literal-prefixed cookie even with the override,
+  and the systemd unit has no override (see below).
 - **Node identity change.** The Erlang node short name changed from a
   hardcoded `yuzu_gw1` to a shared `yuzu_gw` — every gateway replica in a
   cluster now advertises the SAME short name, distinguished only by an
@@ -9260,7 +9345,10 @@ shipped together as part of gateway multi-node cluster formation:
 **Recovery** for the cookie-length case uses the same diagnostic path as
 `#659` above (`journalctl -t yuzu-gateway | grep -i cookie` / stdout /
 `gateway.log`) — the log line names the specific failure (`shorter than 32
-characters`) separately from the known-default rejection.
+characters`) separately from the known-default rejection. With the pre-VM check
+(see "Gateway cookie is checked before the VM starts" above) the message text
+is `YUZU_GW_COOKIE is shorter than 32 characters ...` from the entrypoint
+(`[gateway-entrypoint] FATAL: ...`) or the unit (`yuzu-gateway: ...`).
 
 ### InstructionDefinition import signature enforcement now on-by-default (#1073 / W7.4 sibling-gap) — **BREAKING**
 
