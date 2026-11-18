@@ -122,17 +122,17 @@ class RegistryDeleteKey(unittest.TestCase):
             with self.subTest(needle=needle):
                 self.assertIn(needle, text)
 
-    def test_the_2_0_x_dry_run_hazard_is_stated_where_the_operator_reads_it(self):
-        # A registry 2.0.x agent never reads dry_run: delete_key(dry_run=true) DELETES a leaf key there, and nothing on the
-        # server compares a plugin version at dispatch (#6484), so the definition itself has to say so.
+    def test_the_earlier_agent_hazard_is_one_sentence_in_the_description(self):
+        # An earlier registry agent (1.x or 2.0.x) never reads dry_run: delete_key(dry_run=true) deletes a childless key
+        # there, and nothing on the server compares a plugin version at dispatch (#6484). ONE hazard sentence, with no
+        # rollout order or mixed-fleet procedure (owner ruling: the build describes a fresh deployment).
         defn = _definitions()["windows.registry.delete_key"]
-        for where, text in (("description", defn["metadata"]["description"]),
-                            ("dry_run parameter", _spec("delete_key")["parameters"]["properties"]["dry_run"]["description"])):
-            with self.subTest(where=where):
-                words = _words(text)
-                self.assertIn("2.0.x", words)
-                self.assertIn("DELETES a key that has no subkeys", words)
-        self.assertIn("#6484", _words(defn["metadata"]["description"]))
+        words = _words(defn["metadata"]["description"])
+        self.assertIn("An earlier registry agent (1.x or 2.0.x) is unsupported: reprovision it.", words)
+        self.assertIn("deletes a childless key", words)
+        self.assertIn("#6484", words)
+        for banned in ("MIXED FLEETS", "kill switch", "upgrade the server, then the agents"):
+            self.assertNotIn(banned, words)
 
     def test_min_agent_version_is_declared_as_the_input_to_the_dispatch_gate(self):
         # Declared and exported, not compared at dispatch today (#6484); pinned so the gate is correct the day it lands.
@@ -161,12 +161,7 @@ class RegistryPerUserWrites(unittest.TestCase):
         self.assertEqual(sorted(props), ["key", "name", "sid", "username"])
         self.assertEqual(_spec("delete_user_value")["parameters"]["required"], ["key", "name"])
 
-    def test_both_state_the_flush_the_guard_and_the_mixed_fleet_answer(self):
-        for action in ("set_user_value", "delete_user_value"):
-            with self.subTest(action=action):
-                text = _words(_definitions()[f"windows.registry.{action}"]["metadata"]["description"])
-                self.assertIn("2.0.x", text)
-                self.assertIn("unknown action", text)
+    def test_both_state_the_flush_and_the_guard(self):
         text = _words(_definitions()["windows.registry.set_user_value"]["metadata"]["description"])
         self.assertIn("flushed", text)
         self.assertIn("hive-file guard", text)
@@ -206,7 +201,7 @@ class RegistryApply(unittest.TestCase):
         text = _words(_definitions()["windows.registry.apply"]["metadata"]["description"])
         for needle in ("Dry run is the default", "ONE verdict function", "dependent_items", "NOT transactional",
                        "unrepresentable_name", "THE EXACT-NAME RULE", "512 KiB", "undo_complete=0",
-                       "cannot see the ACL a key that does not exist yet will inherit", "2.0.x", "unknown action",
+                       "cannot see the ACL a key that does not exist yet will inherit",
                        "600 rows per agent per minute"):
             with self.subTest(needle=needle):
                 self.assertIn(needle, text)
