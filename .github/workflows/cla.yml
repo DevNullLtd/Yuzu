@@ -47,9 +47,9 @@ name: CLA Assistant
 # that remains is the PAT this job hands that action (see KNOWN POSTURE DEBT
 # above), not code execution from the pull request.
 on:
-  issue_comment:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18
+  issue_comment:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     types: [created]
-  pull_request_target:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18
+  pull_request_target:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     types: [opened, synchronize, closed]
 
 permissions:
@@ -73,7 +73,7 @@ jobs:
         # SHA-pinned until the maintainers choose a replacement CLA bot that
         # can keep reading the existing signatures store; that is an owner
         # decision, not a CI fix.
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1 # zizmor: ignore[archived-uses] approver: fjarvis (2026-11-18), revisit: 2027-05-18
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1 # zizmor: ignore[archived-uses] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with `repo` scope; required because GITHUB_TOKEN cannot write

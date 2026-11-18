@@ -18,7 +18,7 @@ on:
   # covers the whole trigger, so a later edit that checks out the triggering
   # head or downloads its artifacts would not be flagged: review such an edit
   # by hand.
-  workflow_run:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18
+  workflow_run:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
