@@ -61,8 +61,9 @@ def check_agent_cpp(text):
     if not m:
         return ["agent.cpp: the 'Registered with server' spdlog call was not found"]
     call = m.group(0)
-    if "session_fp={}" not in call or "session_log_fingerprint(" not in call:
-        errs.append("agent.cpp: the Registered line must log session_fp via session_log_fingerprint(")
+    if "session_fp={}" not in call or not re.search(r"session_log_fingerprint\(\s*session_id_\s*\)", call):
+        errs.append("agent.cpp: the Registered line must log session_fp via session_log_fingerprint(session_id_) "
+                    "(the argument IS the session id: a constant or another field would break every shell join)")
     if re.search(r"\bsession_id_\b", call.replace("session_log_fingerprint(session_id_)", "")):
         errs.append("agent.cpp: the Registered line must not pass session_id_ to the logger")
     return errs
@@ -97,6 +98,12 @@ def iter_files():
 
 
 def selftest():
+    good_call = 'spdlog::info("Registered with server (session_fp={}, enrollment={})", session_log_fingerprint(session_id_), e);'
+    assert not check_agent_cpp(good_call), "selftest: the real call shape must pass"
+    for mutant in (good_call.replace("session_id_)", '"constant")'),
+                   good_call.replace("session_id_)", "agent_id_)"),
+                   good_call.replace("session_log_fingerprint(session_id_)", "session_id_")):
+        assert check_agent_cpp(mutant), ("selftest: must fire on", mutant)
     bad = [
         'sed -n "s/.*Registered with server (session=\\(.*\\),.*/\\1/p"',
         'grep "Registered with server" "$log" | \\\n    python3 -c "re.findall(r\'session=[^ ]+\')"',

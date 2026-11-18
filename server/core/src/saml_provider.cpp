@@ -1220,7 +1220,8 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         }
     }
 
-    spdlog::debug("SamlProvider: signature verified (assertion_id={})", assertion_id);
+    spdlog::debug("SamlProvider: signature verified (assertion_id={})",
+                  ::yuzu::log_key_token(assertion_id));
 
     // ── 11.5. Validate Assertion-level <saml:Issuer> ─────────────────────────
     // Read the Issuer from the VERIFIED assertion node.  The SAML 2.0 WebSSO

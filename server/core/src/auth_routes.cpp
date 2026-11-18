@@ -280,9 +280,12 @@ namespace detail {
 // `detail` namespace (not the anonymous one above) so unit tests can link
 // against it directly — mirrors the rest_a4_envelope.hpp pattern.
 std::string sanitize_detail_value(std::string_view v) {
+    // log_key_token first: it folds UTF-8 C1 controls (U+0080-U+009F) and the Unicode line
+    // separators (U+2028/U+2029), which the byte loop below cannot see (WP04).
+    const std::string folded = ::yuzu::log_key_token(v);
     std::string out;
-    out.reserve(std::min(v.size(), kMaxDetailValueLength));
-    for (char c : v) {
+    out.reserve(std::min(folded.size(), kMaxDetailValueLength));
+    for (char c : folded) {
         const auto uc = static_cast<unsigned char>(c);
         out.push_back((c == ';' || c == '=' || c == '\r' || c == '\n' || uc < 0x20 || uc == 0x7F)
                           ? '_'

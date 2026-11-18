@@ -629,7 +629,7 @@ AccountRemoval remove_account_or_respond(const DeprovisionCtx& ctx, auth::AuthMa
     case auth::RemoveUserOutcome::NotFound:
         spdlog::info("SCIM: '{}' (scim_id={}) was already inactive at the guarded deactivation; "
                      "treating the deprovision as converged",
-                     username, scim_id);
+                     ::yuzu::log_key_token(username), scim_id);
         return AccountRemoval::Done;
     case auth::RemoveUserOutcome::LastAdministratorRefused: {
         send_scim_error(res, 409,
@@ -651,7 +651,7 @@ AccountRemoval remove_account_or_respond(const DeprovisionCtx& ctx, auth::AuthMa
         spdlog::error("ScimRoutes: '{}' (scim_id={}) was deactivated but its durable session wipe "
                       "failed; answering 500. The account is deactivated and a retry of this "
                       "request is not promised to repeat the wipe (#5214)",
-                      username, scim_id);
+                      ::yuzu::log_key_token(username), scim_id);
         send_scim_error(res, 500, "failed to deactivate the underlying account");
         audit(auth_mgr, audit_store, req, failure_audit_action, "failure", scim_id,
               "account deactivated; durable session wipe failed; " + revoke_detail);
@@ -661,7 +661,7 @@ AccountRemoval remove_account_or_respond(const DeprovisionCtx& ctx, auth::AuthMa
     }
     spdlog::error("ScimRoutes: AuthManager::remove_user_checked failed for '{}' (scim_id={}); "
                   "answering 503, the linked credentials were already revoked",
-                  username, scim_id);
+                  ::yuzu::log_key_token(username), scim_id);
     send_scim_unavailable(res, "temporarily unable to deactivate the underlying account "
                                "(authorization store unavailable; the account state may be "
                                "indeterminate); retry");
@@ -710,7 +710,7 @@ bool compensate_created_account(auth::AuthManager* auth_mgr, AuditStore* audit_s
     }
     spdlog::critical("SCIM: compensation for '{}' ({}) did NOT complete ({}); the account is left "
                      "{} and needs operator attention",
-                     username, reason, why, state);
+                     ::yuzu::log_key_token(username), reason, why, state);
     audit(auth_mgr, audit_store, req, "scim.user.compensation_failed", "failure", username,
           std::string("reason=") + reason + " outcome=" + why);
     bump_compensation_failed(auth_mgr, why);
@@ -926,7 +926,7 @@ bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditSto
         // prove we provisioned.
         spdlog::error("ScimRoutes: provenance check unavailable (no AuthDB) — refusing "
                      "mutation of '{}'",
-                     username);
+                     ::yuzu::log_key_token(username));
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
              "no AuthDB configured");
@@ -948,7 +948,7 @@ bool require_bearer(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditSto
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: refusing to mutate account '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (this account was not created by SCIM)",
-                    username, scim_id);
+                    ::yuzu::log_key_token(username), scim_id);
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
              "provisioning_source is not 'scim' for username=" + username);
@@ -1051,7 +1051,7 @@ db_authoritative_role_checked(auth::AuthManager* auth_mgr, const std::string& us
                     "could not be authoritatively determined (an operator may have elevated "
                     "this account outside SCIM's ownership, or the account has no active "
                     "row)",
-                    username, scim_id);
+                    ::yuzu::log_key_token(username), scim_id);
         send_scim_error(res, 404, "resource not found");
         audit(auth_mgr, audit_store, req, "scim.user.provenance_denied", "denied", scim_id,
              "role is not 'user' (or undetermined) for username=" + username);
@@ -1224,7 +1224,7 @@ RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManag
     if (!source || *source != kProvisioningSourceScim) {
         spdlog::warn("SCIM: recompute_scim_user_role refusing to touch '{}' (scim_id={}) — "
                     "provisioning_source is not 'scim' (a Group referenced a non-SCIM account)",
-                    resource->username, user_scim_id);
+                    ::yuzu::log_key_token(resource->username), user_scim_id);
         // Metric-only signal (Minor #2, reviewer-adjudicated): this IS a
         // provenance-based skip, so it reuses the same counter every other
         // provenance refusal on this surface bumps. Deliberately NOT an
@@ -1333,7 +1333,7 @@ RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManag
         const bool role_unknown = outcome == auth::UpdateRoleOutcome::StoreFailure;
         spdlog::error("SCIM: recompute_scim_user_role — update_role failed for '{}' "
                      "(scim_id={}, intended {} -> {}); {}",
-                     resource->username, user_scim_id, old_role_str, new_role_str,
+                     ::yuzu::log_key_token(resource->username), user_scim_id, old_role_str, new_role_str,
                      role_applied   ? "the role IS changed but its durable session wipe failed"
                      : role_unknown ? "the role change may not have applied"
                                     : "role change did NOT apply");
@@ -1378,7 +1378,7 @@ RecomputeOutcome recompute_scim_user_role(ScimStore* scim_store, auth::AuthManag
     }
     spdlog::info("SCIM: recompute_scim_user_role — '{}' (scim_id={}) role changed {} -> {} "
                 "via group membership",
-                resource->username, user_scim_id, old_role_str, new_role_str);
+                ::yuzu::log_key_token(resource->username), user_scim_id, old_role_str, new_role_str);
     // Set-and-proceed (UP-N2) — see `audit()`'s doc comment; the role change
     // above already committed.
     audit(auth_mgr, audit_store, req, "scim.user.role_changed", "success", user_scim_id,
@@ -1655,7 +1655,7 @@ void maybe_flag_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_mgr,
     spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a login observation "
                 "matching externalId '{}' but no formed identity_link — possible "
                 "--oidc-scim-link-claim misconfiguration",
-                resource.username, resource.scim_id, resource.external_id);
+                ::yuzu::log_key_token(resource.username), resource.scim_id, ::yuzu::log_key_token(resource.external_id));
     bump_deprovision_unlinked(auth_mgr);
 }
 
@@ -1694,7 +1694,7 @@ void maybe_flag_saml_d2_unlinked(ScimStore* scim_store, auth::AuthManager* auth_
     spdlog::warn("ScimRoutes: deprovision of '{}' (scim_id={}) found a SAML login observation "
                 "matching externalId '{}' but no formed saml_identity_link — the user "
                 "authenticated via SAML but the identity was never linked",
-                resource.username, resource.scim_id, resource.external_id);
+                ::yuzu::log_key_token(resource.username), resource.scim_id, ::yuzu::log_key_token(resource.external_id));
     bump_deprovision_saml_unlinked(auth_mgr);
 }
 
@@ -1759,7 +1759,7 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
     if (!token_store || !token_store->is_open()) {
         spdlog::error("ScimRoutes: ApiTokenStore unavailable — refusing to deprovision '{}' "
                      "(scim_id={}) without being able to revoke its credentials",
-                     resource.username, resource.scim_id);
+                     ::yuzu::log_key_token(resource.username), resource.scim_id);
         send_scim_error(res, 503, "credential store unavailable");
         audit(auth_mgr, audit_store, req, audit_action, "failure", resource.scim_id,
              "api_token_store_unavailable");
@@ -1802,7 +1802,7 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
                      "sessions={}) for one or more principals linked to '{}' (scim_id={}) — "
                      "refusing to report a clean deprovision (ADR-2001 §3 fail-closed)",
                      revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
-                     resource.username, resource.scim_id);
+                     ::yuzu::log_key_token(resource.username), resource.scim_id);
         send_scim_error(res, 500,
                         "failed to revoke " + std::string(failed_legs_phrase(gating)) +
                             " for one or more linked identities");
@@ -1814,7 +1814,7 @@ bool revoke_linked_credentials_or_fail(ScimStore* scim_store, ApiTokenStore* tok
         // own post-deactivation session wipe fails closed if the store is still unwell.
         spdlog::warn("ScimRoutes: the session delete did not persist for '{}' (scim_id={}); "
                      "the account removal's own session wipe is the backstop (#4772)",
-                     resource.username, resource.scim_id);
+                     ::yuzu::log_key_token(resource.username), resource.scim_id);
     }
     if (principals_out)
         *principals_out = std::move(*principals);
@@ -2025,7 +2025,7 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
         if (!tombstone_role) {
             spdlog::error("ScimRoutes: could not read the role of tombstone '{}' before "
                           "reviving it - failing closed",
-                          username);
+                          ::yuzu::log_key_token(username));
             return ProvisionPrecheck::TombstoneRoleUnreadable;
         }
         if (*tombstone_role != auth::Role::user) {
@@ -2033,7 +2033,7 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
                 spdlog::warn("ScimRoutes: refusing to revive '{}' - its tombstoned role is not "
                              "'user' (nothing was reactivated); repeats within the throttle "
                              "window are not logged",
-                             username);
+                             ::yuzu::log_key_token(username));
             return ProvisionPrecheck::TombstoneRoleElevated;
         }
     }
@@ -2042,7 +2042,7 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
     if (!holds_admin_grant.has_value()) {
         spdlog::error("ScimRoutes: could not read the Administrator grants of '{}' before "
                       "provisioning it - failing closed",
-                      username);
+                      ::yuzu::log_key_token(username));
         return ProvisionPrecheck::GrantReadUnavailable;
     }
     if (*holds_admin_grant) {
@@ -2050,7 +2050,7 @@ ProvisionPrecheck provisioning_prechecks(auth::AuthManager* auth_mgr, const std:
             spdlog::warn("ScimRoutes: refusing to provision '{}' - the username already holds an "
                          "Administrator grant (a SCIM slug may never be a counted "
                          "administrator); repeats within the throttle window are not logged",
-                         username);
+                         ::yuzu::log_key_token(username));
         return ProvisionPrecheck::HoldsAdministratorGrant;
     }
     return ProvisionPrecheck::Ok;
@@ -2103,7 +2103,7 @@ bool reactivate(ScimStore* scim_store, auth::AuthManager* auth_mgr, AuditStore* 
     }
     if (!auth_mgr->reactivate_user(resource.username)) {
         spdlog::error("ScimRoutes: AuthManager::reactivate_user failed for '{}' (scim_id={})",
-                     resource.username, resource.scim_id);
+                     ::yuzu::log_key_token(resource.username), resource.scim_id);
         send_scim_error(res, 500, "failed to reactivate the underlying account");
         audit(auth_mgr, audit_store, req, "scim.user.reactivated", "failure", resource.scim_id);
         return false;
@@ -2929,7 +2929,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                             "ScimRoutes: PUT active:false — scim_resource mirror for '{}' "
                             "(scim_id={}) says inactive but the auth account is still live; "
                             "re-running deactivation",
-                            resource->username, resource->scim_id);
+                            ::yuzu::log_key_token(resource->username), resource->scim_id);
                         if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req, res,
                                         *resource, "scim.user.deactivated", engine_principal_store,
                                         analytics_store, on_deprovisioned)) {
@@ -3114,7 +3114,7 @@ void ScimRoutes::register_routes(HttpRouteSink& sink, ScimStore* scim_store,
                                   "ScimRoutes: PATCH active:false — scim_resource mirror for "
                                   "'{}' (scim_id={}) says inactive but the auth account is "
                                   "still live; re-running deactivation",
-                                  resource->username, resource->scim_id);
+                                  ::yuzu::log_key_token(resource->username), resource->scim_id);
                               if (!deactivate(scim_store, token_store, auth_mgr, audit_store, req,
                                               res, *resource, "scim.user.deactivated",
                                               engine_principal_store, analytics_store, on_deprovisioned)) {
