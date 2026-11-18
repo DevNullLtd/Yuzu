@@ -3,8 +3,8 @@
 # was scanned (WP15/S9).
 #
 # release.yml builds each published image twice: once with `load: true`, which
-# the healthcheck probe and scripts/ci/image-vuln-gate.sh check, and once with
-# `push: true`. The second build normally reuses the first's layers, but
+# the healthcheck probe and scripts/ci/image-vuln-gate.sh check, and once
+# pushed by digest (`push-by-digest=true`). The second build normally reuses the first's layers, but
 # nothing forces it to, and the Big Tam runners share one Docker daemon, so a
 # tag can be re-pointed by another job. This script closes both gaps:
 #
@@ -18,8 +18,9 @@
 #       Read the pushed image's layer diff IDs from the registry and fail
 #       unless they equal LAYERS (from `pin`). The image config (labels,
 #       created time) legitimately differs between the two builds; the
-#       filesystem must not. Run it right after the push and before the image
-#       is attested or signed.
+#       filesystem must not. Run right after the push and before the image is
+#       attested or signed, by scripts/ci/image-publish.sh `verified`, which
+#       records the result in the publish journal.
 #
 # Exit status: 0 ok; 1 mismatch, unreadable image or registry error (fail
 # closed); 2 usage error.

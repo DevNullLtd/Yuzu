@@ -91,7 +91,17 @@ STUB = textwrap.dedent(
     if args[0] == "convert":
         if mode == "convert-error":
             sys.exit(1)
-        open(opt("--output"), "w").write("table\\n")
+        # As Trivy 0.70.0 does (checked 2026-11-18): without --scanners vuln,
+        # `convert --format table` writes a 0-byte table for a report with no
+        # findings (or no Results); with it, a "Report Summary" table. The
+        # empty-table mode writes nothing either way.
+        rep = json.load(open(args[-1]))
+        vulns = sum(len(r.get("Vulnerabilities") or []) for r in rep.get("Results") or [])
+        out = ""
+        if mode != "empty-table" and (vulns or opt("--scanners") == "vuln"):
+            out = "\\nReport Summary\\n\\n| Target | Type | Vulnerabilities |\\n| %s | os | %d |\\n" % (
+                rep.get("ArtifactName", "?"), vulns)
+        open(opt("--output"), "w").write(out)
         sys.exit(0)
     if args[0] == "rootfs":
         # The advisory canary: detect the OS the way Trivy does from the files
@@ -335,6 +345,26 @@ class GateBehaviour(unittest.TestCase):
         r = self.run_gate("img:1", mode="convert-error")
         self.assertEqual(r.returncode, 1)
         self.assertIn("could not scan", r.stderr)
+
+    def test_clean_image_table_is_not_empty(self):
+        # G8P5-unhappy-path-1: the table conversion names --scanners vuln, so
+        # a clean image's .txt is a summary, never 0 bytes (which
+        # check-release-artifacts.sh refuses after the push).
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", extra=("--report-dir", str(rep), "--attempt", "1"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        conv = [c.split() for c in self.calls() if c.startswith("convert ")]
+        self.assertTrue(conv)
+        for c in conv:
+            self.assertEqual(c[c.index("--scanners") + 1], "vuln", c)
+        self.assertGreater((rep / "trivy-img.attempt-1.txt").stat().st_size, 0)
+
+    def test_an_empty_table_fails_before_any_push(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", mode="empty-table", extra=("--report-dir", str(rep), "--attempt", "1"))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: Trivy could not scan the image",
+                      (rep / "trivy-img.attempt-1.gate.txt").read_text(encoding="utf-8"))
 
     def test_one_bad_image_fails_but_every_image_is_scanned(self):
         r = self.run_gate("a:1", "b:1", "c:1", mode="findings", bad_image="b:1")
@@ -1370,7 +1400,7 @@ PUSH_MARKERS = re.compile(
     r"|\$\{?(?i:[A-Za-z0-9_]*(?:docker|podman|buildah|nerdctl|engine|container)[A-Za-z0-9_]*)\}?\"?"
     r"\s+(?:image\s+|manifest\s+)?push\b"
     r"|(?:^|\s)--push(?:=(?!false\b)\S*)?(?=\s|$)"
-    r"|(?:(?:^|\s)-o|--output|\boutputs:)[=\s]*\S*\b(?:type=registry|push=true)\b"
+    r"|(?:(?:^|\s)-o|--output|\boutputs:)[=\s]*[^\n#]*\b(?:type=registry|push=true)\b"
     r"|\bimagetools\s+create\b"
     r"|\b(?:crane|skopeo|oras|regctl)\s+(?:push|copy|cp|tag|mutate|image\s+copy)\b"
     r"|\bcosign\s+copy\b",
@@ -1439,6 +1469,9 @@ NOT_RELEASE_IMAGES = {
         "internal CI build image (Dockerfile.ci-gateway), never a release artifact",
     ("close-linked-issues.yml", "close"):
         "not an image: `--push` is the script's git push-range argument",
+    ("release.yml", "attach-bundle-gate-report"):
+        "runs only scripts/ci/image-publish.sh `published`, which reads files; the script is followed "
+        "because its `tag` subcommand moves tags",
 }
 
 
@@ -1514,7 +1547,27 @@ COSIGN_STUB = textwrap.dedent(
     """
 )
 BUNDLE_IMAGE = "ghcr.io/o/yuzu-agent-bundle-chisel"
-PUSHED = BUNDLE_IMAGE + "@sha256:" + "e" * 64
+DIGEST_E = "sha256:" + "e" * 64
+PUBLISH = ROOT / "scripts" / "ci" / "image-publish.sh"
+
+
+def journal(upto, digest=DIGEST_E, attempt=2, repo=BUNDLE_IMAGE, tags=None):
+    """A legal publish journal ending at label `upto` (None: no journal)."""
+    if upto is None:
+        return None
+    tags = tags or f"{repo}:1.2.3"
+    seq = [("none", "publish: none"),
+           ("push-started", f"publish: push-started {repo}:candidate-77-{attempt}"),
+           ("verified", f"publish: verified {repo}@{digest}"),
+           ("signed-attested", f"publish: signed-attested {repo}@{digest}"),
+           ("tagging", f"publish: tagging {tags} {digest}"),
+           ("tagged", f"publish: tagged {tags} {digest}")]
+    out = []
+    for label, line in seq:
+        out.append(line)
+        if label == upto:
+            return "\n".join(out) + "\n"
+    raise ValueError(upto)
 
 
 def attach_block():
@@ -1558,22 +1611,26 @@ class AttachBundleReport(unittest.TestCase):
         (self.tmp / "rt").mkdir()
         self.write_report()
 
-    def write_report(self, result="pass", pushed=PUSHED, attempt=2):
+    def write_report(self, result="pass", upto="tagged", attempt=2, digest=DIGEST_E, text=None):
         d = self.work / "bundle-gate"
-        stem = f"trivy-yuzu-agent-bundle-chisel.attempt-{attempt}"
-        (d / f"{stem}.json").write_text('{"SchemaVersion": 2}\n')
-        (d / f"{stem}.txt").write_text("table\n")
+        stem = f"yuzu-agent-bundle-chisel.attempt-{attempt}"
+        (d / f"trivy-{stem}.json").write_text('{"SchemaVersion": 2}\n')
+        (d / f"trivy-{stem}.txt").write_text("table\n")
         lines = ["image: yuzu-agent-bundle-chisel (sha256:1)", f"run attempt: {attempt}", f"gate: {result}",
                  "scanned at: 2026-11-18T00:00:00Z"]
-        if pushed:
-            lines.append(f"verify-pushed: ok, {pushed} has the scanned image's layers")
-        (d / f"{stem}.gate.txt").write_text("\n".join(lines) + "\n")
+        (d / f"trivy-{stem}.gate.txt").write_text("\n".join(lines) + "\n")
+        j = d / f"publish-{stem}.txt"
+        body = text if text is not None else journal(upto, digest=digest, attempt=attempt)
+        if body is None:
+            j.unlink(missing_ok=True)
+        else:
+            j.write_text(body)
 
-    def run_attach(self, pushed_ref=PUSHED, interrupt=""):
+    def run_attach(self, interrupt=""):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "STUB_"))}
         env.update(PATH=f"{self.bin}{os.pathsep}{env.get('PATH', '')}", GH_REPO="o/r", GH_TOKEN="x",
                    SIGN_REPOSITORY="o/r", SIGN_REF="refs/tags/v1.2.3", GITHUB_REF_NAME="v1.2.3",
-                   ATTEMPT="2", PUSHED_REF=pushed_ref, RUNNER_TEMP=str(self.tmp / "rt"),
+                   PUBLISH=str(PUBLISH), RUNNER_TEMP=str(self.tmp / "rt"),
                    STUB_GH_STATE=str(self.state), STUB_GH_LOG=str(self.log), STUB_GH_INTERRUPT=interrupt)
         return subprocess.run(["bash", str(self.script)], cwd=self.work, env=env,
                               capture_output=True, text=True, timeout=60)
@@ -1606,7 +1663,8 @@ class AttachBundleReport(unittest.TestCase):
         return a["id"]
 
     SUMS = "yuzu-agent-bundle-chisel-image-vuln-gate.attempt-2.SHA256SUMS"
-    FILES = ["trivy-yuzu-agent-bundle-chisel.attempt-2." + s for s in ("gate.txt", "json", "txt")]
+    FILES = (["trivy-yuzu-agent-bundle-chisel.attempt-2." + s for s in ("gate.txt", "json", "txt")]
+             + ["publish-yuzu-agent-bundle-chisel.attempt-2.txt"])
 
     def complete_first_run(self):
         r = self.run_attach()
@@ -1708,30 +1766,81 @@ class AttachBundleReport(unittest.TestCase):
         self.assertEqual(self.deletes(), [])
         self.assertEqual(self.uploads(), [])
 
-    def test_the_report_is_tied_to_the_pushed_digest(self):
-        other = BUNDLE_IMAGE + "@sha256:" + "f" * 64
+    def test_every_attempt_is_attached_and_the_journal_decides(self):
+        # The report is tied to the push by the journal (G8P5-security-guardian-1):
+        # (gate result, journal end, attach exit status).
         cases = (
-            # (report result, report's verify-pushed ref, job's pushed_ref, expected rc)
-            ("pass", PUSHED, PUSHED, 0),
-            ("pass", PUSHED, other, 1),       # the report names another digest
-            ("pass", None, PUSHED, 1),        # the job pushed, the report does not say so
-            ("pass", PUSHED, "", 1),          # the report says pushed, the job pushed nothing
-            ("FAIL: fixable CRITICAL", None, "", 0),  # a refusal that pushed nothing
-            ("FAIL: fixable CRITICAL", None, PUSHED, 1),
-            ("FAIL: fixable CRITICAL", PUSHED, PUSHED, 1),  # a push the gate did not pass
+            ("pass", "tagged", 0),
+            ("pass", None, 0),                    # gate passed, cancelled before the journal opened
+            ("pass", "push-started", 0),          # a candidate, never tagged
+            ("pass", "signed-attested", 0),
+            ("pass", "tagging", 1),               # attached, then refused: a tag may name either digest
+            ("FAIL: fixable CRITICAL", None, 0),  # a refusal: nothing pushed
+            ("FAIL: fixable CRITICAL", "none", 1),  # a journal beside a failed gate is illegal
+            ("FAIL: cancelled (SIGINT) before this image was judged", "tagged", 1),
         )
-        for result, in_report, job_ref, rc in cases:
-            with self.subTest(result=result, in_report=in_report, job_ref=job_ref):
+        for result, upto, rc in cases:
+            with self.subTest(result=result, upto=upto):
                 self.state.write_text(json.dumps({"tag": "v1.2.3", "release_id": 42, "next_id": 100, "assets": []}))
                 self.log.unlink(missing_ok=True)
-                self.write_report(result=result, pushed=in_report)
-                r = self.run_attach(pushed_ref=job_ref)
+                self.write_report(result=result, upto=upto)
+                r = self.run_attach()
                 self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
-                if rc:
-                    self.assertEqual(self.gh_calls(), [], "a refused report reached the release")
-        r = self.run_attach(pushed_ref="ghcr.io/o/yuzu-server@sha256:" + "e" * 64)
+                legal = not (result != "pass" and upto is not None)
+                if legal:
+                    names = set(self.assets())
+                    self.assertIn("trivy-yuzu-agent-bundle-chisel.attempt-2.gate.txt", names)
+                    self.assertEqual("publish-yuzu-agent-bundle-chisel.attempt-2.txt" in names, upto is not None)
+                else:
+                    self.assertEqual(self.gh_calls(), [], "an illegal journal reached the release")
+
+    def test_an_illegal_journal_is_refused_before_anything_is_uploaded(self):
+        good = journal("tagged")
+        ls = good.splitlines()
+        for label, text in (("two steps swapped", "\n".join(ls[:2] + [ls[3], ls[2]] + ls[4:]) + "\n"),
+                            ("two digests", journal("tagged").replace("e" * 64, "f" * 64, 1)),
+                            ("tagged without tagging", "\n".join(l for l in good.splitlines()
+                                                                if "tagging" not in l) + "\n"),
+                            ("no intent line", "\n".join(l for l in good.splitlines()
+                                                         if "push-started" not in l) + "\n"),
+                            ("truncated last line", good[:-1]),
+                            ("failure label", "publish: none\npublish: failed\n")):
+            with self.subTest(label=label):
+                self.state.write_text(json.dumps({"tag": "v1.2.3", "release_id": 42, "next_id": 100, "assets": []}))
+                self.log.unlink(missing_ok=True)
+                self.write_report(text=text)
+                r = self.run_attach()
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("not a legal publish journal", r.stdout + r.stderr)
+                self.assertEqual(self.gh_calls(), [])
+
+    def test_zero_artifacts_fail(self):
+        for f in (self.work / "bundle-gate").iterdir():
+            f.unlink()
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no gate report", r.stdout)
+
+    def test_earlier_attempts_are_attached_beside_later_ones(self):
+        # G8P5-consistency-auditor-2: attempt 1 refused, attempt 2 published,
+        # attempt 3 refused after a re-run; every attempt's files are attached.
+        self.write_report(result="FAIL: fixable CRITICAL", upto=None, attempt=1)
+        self.write_report(result="FAIL: cancelled (SIGTERM) before this image was judged", upto=None, attempt=3)
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("attempt 2 published", r.stdout)
+        names = set(self.assets())
+        for n in (1, 2, 3):
+            self.assertIn(f"trivy-yuzu-agent-bundle-chisel.attempt-{n}.gate.txt", names)
+            self.assertIn(f"yuzu-agent-bundle-chisel-image-vuln-gate.attempt-{n}.SHA256SUMS", names)
+            self.assertIn(f"yuzu-agent-bundle-chisel-image-vuln-gate.attempt-{n}.SHA256SUMS.sigstore", names)
+
+    def test_an_unexpected_file_is_refused(self):
+        (self.work / "bundle-gate" / "trivy-yuzu-server.attempt-1.gate.txt").write_text("gate: pass\n")
+        r = self.run_attach()
         self.assertEqual(r.returncode, 1)
-        self.assertIn("bad pushed image reference", r.stdout)
+        self.assertIn("unexpected file", r.stdout)
+        self.assertEqual(self.gh_calls(), [])
 
 
 class WorkflowWiring(unittest.TestCase):
@@ -1756,6 +1865,8 @@ class WorkflowWiring(unittest.TestCase):
                       "  docker buildx build --push=true -t a .", "  docker buildx build -o type=registry .",
                       "  docker buildx build --output=type=image,name=a,push=true .",
                       "          outputs: type=image,push=true", "  docker manifest push a:1",
+                      "          outputs: type=image,name=ghcr.io/${{ steps.owner.outputs.value }}/x,"
+                      "push-by-digest=true,name-canonical=true,push=true",
                       "  podman push a:1", "  buildah push a:1", "  cosign copy a b",
                       '  "$DOCKER" push a:1', "  ${DOCKER} push a:1", "  $docker image push a:1",
                       "  $CONTAINER_ENGINE push a:1",
@@ -1806,31 +1917,65 @@ class WorkflowWiring(unittest.TestCase):
             self.assertLess(gate, min(pushes), f"{job}: the gate must run before the push")
 
     def test_publish_jobs_scan_the_pinned_id_and_check_the_push(self):
+        # The frozen order (docs/ci-architecture.md "The publish journal"):
+        # pin < gate < open < push-started < push < verified < SBOM/attest/sign
+        # < signed-attested < tag re-check < tag < upload of the reports.
         text = RELEASE.read_text(encoding="utf-8")
         for job in ("docker-publish", "docker-publish-postgres", "docker-publish-chisel",
                     "docker-publish-agent-bundle"):
             body = job_block(text, job)
-            pin = body.find("scripts/ci/image-identity.sh pin")
-            gate = body.find("scripts/ci/image-vuln-gate.sh")
-            push = min(i for i in (body.find("push: true"), body.find("docker push")) if i != -1)
-            check = body.find("scripts/ci/image-identity.sh verify-pushed")
-            sign = min(i for i in (body.find("uses: anchore/sbom-action"),
-                                   body.find("uses: actions/attest-build-provenance"),
-                                   body.find("cosign sign --yes")) if i != -1)
-            self.assertTrue(-1 < pin < gate < push < check < sign,
-                            f"{job}: need pin < gate < push < verify-pushed < sbom/attest/sign")
-            gate_step = body[body.rfind("- name:", 0, gate):gate]
+            pos = {
+                "pin": body.find("scripts/ci/image-identity.sh pin"),
+                "gate": body.find("scripts/ci/image-vuln-gate.sh"),
+                "open": body.find("scripts/ci/image-publish.sh open"),
+                "intent": body.find("scripts/ci/image-publish.sh push-started"),
+                "push": min((m.start() for m in PUSH_MARKERS.finditer(body)), default=-1),
+                "verified": body.find("scripts/ci/image-publish.sh verified"),
+                "sbom": body.find("uses: anchore/sbom-action"),
+                "attest": body.find("uses: actions/attest-build-provenance"),
+                "sign": body.find("cosign sign --yes"),
+                "signed": body.find("scripts/ci/image-publish.sh signed-attested"),
+                "recheck": body.find("scripts/ci/check-release-tag-sha.sh"),
+                "tag": body.find("scripts/ci/image-publish.sh tag"),
+                "upload": body.find("- name: Upload image vulnerability gate report"),
+            }
+            self.assertTrue(all(v != -1 for v in pos.values()), f"{job}: {pos}")
+            chain = ["pin", "gate", "open", "intent", "push", "verified", "sbom", "signed", "recheck", "tag", "upload"]
+            for x, y in zip(chain, chain[1:]):
+                self.assertLess(pos[x], pos[y], f"{job}: {x} must come before {y}")
+            self.assertLess(max(pos["sbom"], pos["attest"], pos["sign"]), pos["signed"], job)
+            self.assertGreater(min(pos["sbom"], pos["attest"], pos["sign"]), pos["verified"], job)
+            self.assertEqual(body.count("scripts/ci/image-publish.sh tag"), 1, job)
+            self.assertNotIn("imagetools create", body, f"{job}: tags move only through image-publish.sh tag")
+            gate_step = body[body.rfind("- name:", 0, pos["gate"]):pos["gate"]]
             self.assertIn("IMAGE: ${{ steps.built.outputs.id }}", gate_step,
                           f"{job}: the gate must scan the pinned image ID, not a tag")
             self.assertIn("LAYERS: ${{ steps.built.outputs.layers }}",
-                          body[body.rfind("- name:", 0, check):check], job)
+                          body[body.rfind("- name:", 0, pos["verified"]):pos["verified"]], job)
+            # No release tag is pushed by the push itself (G8P5-security-guardian-1).
+            self.assertNotRegex(body, r"\n\s+push: true\b", job)
+            self.assertNotRegex(body, r"\n\s+tags: \$\{\{ steps\.meta\.outputs\.tags \}\}", job)
+            self.assertNotRegex(body, r"docker push \"\$IMAGE\"", job)
         for job in ("docker-publish", "docker-publish-postgres", "docker-publish-chisel"):
             body = job_block(text, job)
+            self.assertRegex(body, r"\n\s+outputs: type=image,name=ghcr\.io/[^\n]*,push-by-digest=true,"
+                                   r"name-canonical=true,push=true\n", job)
             tags = re.findall(r"yuzu-hc-verify/[^\n]+", body)
             self.assertTrue(tags, job)
             for t in tags:
                 self.assertIn("${{ github.run_id }}-${{ github.run_attempt }}", t,
                               f"{job}: shared-daemon scan tag {t} must be salted per run attempt")
+        bundle = job_block(text, "docker-publish-agent-bundle")
+        self.assertIn('candidate="$REPO:candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"', bundle)
+        self.assertLess(bundle.index("image-publish.sh push-started"), bundle.index('docker push "$candidate"'))
+
+    def test_no_step_but_the_gate_writes_a_gate_report(self):
+        # gate.txt belongs to the gate script alone; the publish state is the
+        # journal's, and no job output carries it.
+        text = _code_lines(RELEASE.read_text(encoding="utf-8"))
+        self.assertNotRegex(text, r">>?\s*\S*\.gate\.txt")
+        for gone in ("pushed_ref", "gate_attempt", "PUSHED_REF", "verify-pushed: ok"):
+            self.assertNotIn(gone, text)
 
     def test_publish_jobs_keep_the_gate_report_as_evidence(self):
         # K7: each gate writes its reports, names the image (so the not-covered
@@ -1849,12 +1994,14 @@ class WorkflowWiring(unittest.TestCase):
             self.assertIn('exec scripts/ci/image-vuln-gate.sh --release --attempt "$GITHUB_RUN_ATTEMPT"',
                           gate_step, job)
             self.assertIn('--report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"', gate_step, job)
-            check = body.find("scripts/ci/image-identity.sh verify-pushed")
-            check_step = body[body.rfind("- name:", 0, check):body.find("- name:", check)]
-            self.assertIn('>> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.attempt-$GITHUB_RUN_ATTEMPT.gate.txt"',
-                          check_step, job)
+            for sub in ("open", "push-started", "verified", "signed-attested", "tag"):
+                at = body.find(f"scripts/ci/image-publish.sh {sub} ")
+                st = body[body.rfind("- name:", 0, at):body.find("- name:", at)]
+                self.assertIn(f"NAME: {name}\n", st, f"{job} {sub}")
+                self.assertIn(f'scripts/ci/image-publish.sh {sub} "$RUNNER_TEMP/image-vuln-gate" "$NAME" '
+                              '"$GITHUB_RUN_ATTEMPT"', st, f"{job} {sub}")
             up = body.find("- name: Upload image vulnerability gate report")
-            self.assertGreater(up, check, job)
+            self.assertGreater(up, body.find("scripts/ci/image-publish.sh tag "), job)
             up_step = body[up:body.find("- name:", up + 1)]
             self.assertIn("path: ${{ runner.temp }}/image-vuln-gate/", up_step, job)
             self.assertIn("retention-days: 90", up_step, job)
@@ -1868,6 +2015,12 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn("-name 'trivy-*.json'", rel)
         self.assertIn('*.spdx.json "${gate_reports[@]}" > SHA256SUMS', rel)
         self.assertIn('"${GATE_REPORTS[@]}" \\', rel)
+        # Every attempt's reports and journals (G8P5-consistency-auditor-2).
+        dl = rel[rel.index("- name: Download every attempt's gate reports and publish journals"):]
+        dl = dl[:dl.index("- name:", 10)]
+        self.assertIn("pattern: '*-image-vuln-gate-attempt-*'", dl)
+        self.assertIn("merge-multiple: true", dl)
+        self.assertIn("rm -rf ./*-image-vuln-gate-attempt-*/", rel)
 
     def test_release_gate_runs_in_release_mode_and_its_report_survives_a_refusal(self):
         # C2 / G8-RD-2: the upload runs whenever the gate ran, pass or fail,
@@ -1899,44 +2052,47 @@ class WorkflowWiring(unittest.TestCase):
                                      f"{wf.name}: {c}")
 
     def test_bundle_gate_report_is_attached_to_the_release(self):
-        # G8-CO-4: the bundle's report outlives the 90-day artifact.
+        # G8-CO-4: the bundle's reports outlive the 90-day artifact, every
+        # attempt's (G8P5-consistency-auditor-2), read through the journal.
         text = RELEASE.read_text(encoding="utf-8")
         bundle = job_block(text, "docker-publish-agent-bundle")
-        self.assertIn("gate_report: ${{ steps.gate_report_uploaded.outputs.value }}", bundle)
-        self.assertIn("if: always() && steps.upload_gate.outcome == 'success'", bundle)
+        self.assertNotRegex(bundle, r"\n    outputs:", "job outputs carry no publish state")
         att = job_block(text, "attach-bundle-gate-report")
         self.assertIn("needs: [release, docker-publish-agent-bundle]", att)
         self.assertIn("if: always() && needs.release.result == 'success' && "
-                      "needs.docker-publish-agent-bundle.outputs.gate_report == 'true'", att)
+                      "needs.docker-publish-agent-bundle.result != 'skipped'", att)
         self.assertIn("contents: write", att)
-        self.assertIn("gate_attempt: ${{ steps.gate_report_uploaded.outputs.attempt }}", bundle)
-        self.assertIn("name: yuzu-agent-bundle-chisel-image-vuln-gate-attempt-"
-                      "${{ needs.docker-publish-agent-bundle.outputs.gate_attempt }}", att)
-        self.assertIn('stem="yuzu-agent-bundle-chisel.attempt-${ATTEMPT}"', att)
-        self.assertIn('reports=("trivy-${stem}".* "grype-${stem}".*)', att)
-        self.assertIn('sums="yuzu-agent-bundle-chisel-image-vuln-gate.attempt-${ATTEMPT}.SHA256SUMS"', att)
+        dl = att[att.index("uses: actions/download-artifact@"):]
+        dl = dl[:dl.index("- name:")]
+        self.assertIn("pattern: yuzu-agent-bundle-chisel-image-vuln-gate-attempt-*", dl)
+        self.assertIn("merge-multiple: true", dl)
+        self.assertNotIn("name:", dl)
+        self.assertIn('bash "$PUBLISH" published . "$name"', att)
+        self.assertIn('sums="${name}-image-vuln-gate.attempt-${n}.SHA256SUMS"', att)
         for needle in ('cosign sign-blob --yes "$sums"', "cosign verify-blob", "--certificate-identity",
                        'gh release upload "$GITHUB_REF_NAME" "${upload[@]}"', "cmp -s"):
             self.assertIn(needle, att)
-        # The report is tied to the push (G8P4-security-guardian-2).
-        self.assertIn("pushed_ref: ${{ steps.verify_pushed.outputs.ref }}", bundle)
-        self.assertIn("PUSHED_REF: ${{ needs.docker-publish-agent-bundle.outputs.pushed_ref }}", att)
-        verify = bundle[bundle.index("id: verify_pushed"):]
-        verify = verify[:verify.index("- name:")]
-        self.assertLess(verify.index("image-identity.sh verify-pushed"), verify.index('echo "ref=$REF" >> "$GITHUB_OUTPUT"'))
         # Add, never replace (G8P3-security-guardian-2): no --clobber upload.
         self.assertNotRegex(att, r"gh release upload[^\n]*--clobber")
-        self.assertNotRegex(att, r"\bdocker\s+(?:build|buildx|run|push)|actions/checkout",
-                            "the job that holds contents: write builds and checks out nothing")
+        self.assertNotRegex(att, r"\bdocker\s+(?:build|buildx|run|push)",
+                            "the job that holds contents: write builds nothing")
+        # It checks out only the journal reader.
+        co = att[att.index("uses: actions/checkout@"):]
+        co = co[:co.index("- name:")]
+        self.assertIn("sparse-checkout: |\n            scripts/ci/image-publish.sh\n", co)
+        self.assertIn("sparse-checkout-cone-mode: false", co)
+        self.assertIn("persist-credentials: false", co)
+        self.assertEqual(att.count("actions/checkout@"), 1)
 
     def test_report_globs_take_every_scanners_reports(self):
         # A second scanner's reports (grype-*) reach the release exactly like
         # Trivy's: flattened, hashed into SHA256SUMS, uploaded, not attested.
         rel = job_block(RELEASE.read_text(encoding="utf-8"), "release")
         for needle in ("-name 'trivy-*.json'", "-name 'trivy-*.txt'", "-name 'grype-*.json'",
-                       "-name 'grype-*.txt'", "gate_reports=(trivy-* grype-*)",
-                       "GATE_REPORTS=(artifacts/trivy-* artifacts/grype-*)",
-                       "|trivy-*|grype-*) continue ;;"):
+                       "-name 'grype-*.txt'", "gate_reports=(trivy-* grype-* publish-*)",
+                       "GATE_REPORTS=(artifacts/trivy-* artifacts/grype-* artifacts/publish-*)",
+                       "|trivy-*|grype-*|publish-*) continue ;;",
+                       "../gate-reports/trivy-* ../gate-reports/grype-* ../gate-reports/publish-*"):
             self.assertIn(needle, rel)
         self.assertNotIn("artifacts/trivy-* \\", rel)
         pre = PRE_RELEASE.read_text(encoding="utf-8")
@@ -1996,31 +2152,74 @@ class WorkflowWiring(unittest.TestCase):
 
     def test_gate_budget_fits_inside_every_job_that_runs_it(self):
         # G8P4-unhappy-path-1: the gate stops itself (with reports) before the
-        # job's timeout. Its budget, plus a 5-minute margin for the job's other
-        # steps' worst case before it on pre-release (checkout, pulls) and the
-        # gate's own kill grace, stays under the job's timeout-minutes.
-        default = int(re.search(r"^GATE_BUDGET=(\d+)$", GATE.read_text(encoding="utf-8"), re.M).group(1))
-        checked, timeouts = [], []
-        for path in (RELEASE, PRE_RELEASE):
-            text = path.read_text(encoding="utf-8")
-            for job, body in jobs_of(text).items():
-                calls = re.findall(r"image-vuln-gate\.sh([^\n]*)", _code_lines(body))
-                if not calls:
-                    continue
-                checked.append(job)
-                minutes = int(re.search(r"^    timeout-minutes: (\d+)", body, re.M).group(1))
-                timeouts.append(minutes)
-                for c in calls:
-                    m = re.search(r"--budget (\d+)", c)
-                    budget = int(m.group(1)) if m else default
-                    with self.subTest(workflow=path.name, job=job):
-                        self.assertLessEqual(budget + 300, minutes * 60, f"{job}: budget {budget}s, timeout {minutes} min")
-        # The default alone also fits the shortest such job, so dropping a
-        # --budget never puts the gate past a job timeout.
-        self.assertLessEqual(default + 300, min(timeouts) * 60)
+        # job's timeout. Each call's budget plus BUDGET_MARGIN must fit the
+        # job's timeout-minutes.
+        default = gate_default_budget()
+        texts = {p.name: p.read_text(encoding="utf-8") for p in (RELEASE, PRE_RELEASE)}
+        violations, checked = gate_budget_violations(texts, default)
+        self.assertEqual(violations, [])
         self.assertEqual(sorted(checked), sorted(["docker-publish", "docker-publish-postgres", "docker-publish-chisel",
                                                   "docker-publish-agent-bundle", "security-scan"]))
 
+    def test_budget_check_kills_mutants_of_the_pre_release_call(self):
+        # G8P5-quality-engineer-3 / G8P5-build-ci-1: mutants aimed at the CALL
+        # in pre-release.yml (its code line, not the comment above it, which
+        # also says "--budget 1200"), on in-memory copies.
+        default = gate_default_budget()
+        text = PRE_RELEASE.read_text(encoding="utf-8")
+        lines = text.split("\n")
+        call = [i for i, ln in enumerate(lines)
+                if "image-vuln-gate.sh" in ln and not ln.lstrip().startswith("#")]
+        self.assertEqual(len(call), 1, "pre-release.yml should call the gate once")
+        i = call[0]
+        self.assertIn("--budget 1200", lines[i])
+        self.assertTrue(any("--budget 1200" in ln and ln.lstrip().startswith("#") for ln in lines[:i]),
+                        "the decoy comment the first mutant hit is gone; re-aim this test")
+        indent = lines[i][:len(lines[i]) - len(lines[i].lstrip())]
+        mutants = {
+            "raised to 1600": lines[i].replace("--budget 1200", "--budget 1600"),
+            "dropped": lines[i].replace("--budget 1200 ", ""),
+            "1600 on a continuation line": lines[i].replace("--budget 1200 ", "\\\n" + indent + "  --budget 1600 "),
+        }
+        others = {RELEASE.name: RELEASE.read_text(encoding="utf-8")}
+        for label, mutated in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(mutated, lines[i])
+                copy = "\n".join(lines[:i] + [mutated] + lines[i + 1:])
+                violations, _ = gate_budget_violations({**others, PRE_RELEASE.name: copy}, default)
+                self.assertTrue([v for v in violations if v.startswith("pre-release.yml:security-scan")],
+                                f"mutant '{label}' of pre-release.yml line {i + 1} survived")
+
+
+# The time the job needs besides the gate's budget: on pre-release.yml the
+# checkout and the seven pulls before the gate (docs/ci-architecture.md sizes
+# them at 10 minutes), plus the gate's own kill grace and cleanup.
+BUDGET_MARGIN = 600
+
+
+def gate_default_budget():
+    return int(re.search(r"^GATE_BUDGET=(\d+)$", GATE.read_text(encoding="utf-8"), re.M).group(1))
+
+
+def gate_budget_violations(texts, default):
+    """[violation], [job] over {workflow name: text}: every image-vuln-gate.sh
+    call, its shell continuation lines joined, must have its --budget (or the
+    script's default) plus BUDGET_MARGIN within its job's timeout-minutes."""
+    violations, checked = [], []
+    for wf, text in texts.items():
+        for job, body in jobs_of(text).items():
+            code = re.sub(r"\\\n\s*", " ", _code_lines(body))
+            calls = re.findall(r"image-vuln-gate\.sh([^\n]*)", code)
+            if not calls:
+                continue
+            checked.append(job)
+            minutes = int(re.search(r"^    timeout-minutes: (\d+)", body, re.M).group(1))
+            for c in calls:
+                m = re.search(r"--budget (\d+)", c)
+                budget = int(m.group(1)) if m else default
+                if budget + BUDGET_MARGIN > minutes * 60:
+                    violations.append(f"{wf}:{job}: budget {budget}s + {BUDGET_MARGIN}s > timeout {minutes} min")
+    return violations, checked
 
 if __name__ == "__main__":
     unittest.main()

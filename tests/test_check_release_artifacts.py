@@ -49,11 +49,35 @@ def script_gate_report_images() -> list:
     return re.findall(r'^\s*"([^"]+)"', block, re.M)
 
 
-def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str = "trivy") -> None:
+LABELS = ["none", "push-started", "verified", "signed-attested", "tagging", "tagged"]
+
+
+def journal_text(img: str, attempt: int, upto: str = "tagged", digest: str = "a" * 64) -> str:
+    """A legal publish journal (scripts/ci/image-publish.sh) ending at `upto`."""
+    repo = f"ghcr.io/o/{img}"
+    tags = f"{repo}:0.14.0-rc9"
+    lines = {"none": "publish: none",
+             "push-started": f"publish: push-started {repo}",
+             "verified": f"publish: verified {repo}@sha256:{digest}",
+             "signed-attested": f"publish: signed-attested {repo}@sha256:{digest}",
+             "tagging": f"publish: tagging {tags} sha256:{digest}",
+             "tagged": f"publish: tagged {tags} sha256:{digest}"}
+    return "".join(lines[l] + "\n" for l in LABELS[:LABELS.index(upto) + 1])
+
+
+def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str = "trivy",
+                  upto=None) -> None:
+    """One attempt's gate reports; with `upto`, its publish journal too. A
+    passing Trivy attempt gets a `tagged` journal unless upto says otherwise
+    (`upto=""`: no journal)."""
     stem = f"{scanner}-{img}.attempt-{attempt}"
     (d / f"{stem}.json").write_text(json.dumps({"ArtifactName": img}))
     (d / f"{stem}.txt").write_text("table\n")
     (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\ngate: {verdict}\n")
+    if upto is None and scanner == "trivy" and verdict == "pass":
+        upto = "tagged"
+    if upto:
+        (d / f"publish-{img}.attempt-{attempt}.txt").write_text(journal_text(img, attempt, upto, f"{attempt:x}" * 64))
 
 
 def make_artifacts(d: Path) -> None:
@@ -140,13 +164,14 @@ class GateReports(unittest.TestCase):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            for f in d.glob("trivy-yuzu-postgres.*"):
+            for f in [*d.glob("trivy-yuzu-postgres.*"), *d.glob("publish-yuzu-postgres.*")]:
                 f.unlink()
             r = self.run_script(d)
             self.assertNotEqual(r.returncode, 0)
             self.assertIn("missing image vulnerability gate report: trivy-yuzu-postgres.attempt-<N>", r.stderr)
 
     def test_a_report_without_a_pass_fails(self):
+        # The published attempt's journal sits beside a refusal: illegal.
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
@@ -190,60 +215,111 @@ class GateReports(unittest.TestCase):
             (d / "grype-yuzu-gateway.attempt-1.json").write_text("{not json")
             self.assertNotEqual(self.run_script(d).returncode, 0)
 
-    # ── G8P3-security-guardian-2: a re-run adds evidence, never replaces it ──
+    # ── The publish journal decides which attempt is published ──
     def test_refused_earlier_attempt_is_kept_beside_the_passing_one(self):
-        # postgres refused in attempt 1, passed in attempt 2 ("Re-run failed
-        # jobs"); the other legs passed in attempt 1 and were not re-run.
+        # postgres refused in attempt 1, published by attempt 2 ("Re-run failed
+        # jobs"); the other legs published in attempt 1 and were not re-run.
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
+            (d / "publish-yuzu-postgres.attempt-1.txt").unlink()
             write_reports(d, "yuzu-postgres", 1, "FAIL: fixable CRITICAL")
             write_reports(d, "yuzu-postgres", 2)
             r = self.run_script(d)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-            self.assertTrue((d / "trivy-yuzu-postgres.attempt-1.gate.txt").exists())
+            self.assertIn("yuzu-postgres: published by attempt 2", r.stdout)
 
     def test_cancelled_or_refused_earlier_attempt_with_only_a_verdict_is_accepted(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            (d / "trivy-yuzu-postgres.attempt-1.json").unlink()
-            (d / "trivy-yuzu-postgres.attempt-1.txt").unlink()
+            for f in d.glob("*yuzu-postgres.attempt-1.*"):
+                f.unlink()
             (d / "trivy-yuzu-postgres.attempt-1.gate.txt").write_text(
                 "gate: FAIL: cancelled (SIGTERM) before this image was judged\n")
             write_reports(d, "yuzu-postgres", 3)
             r = self.run_script(d)
             self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
-    def test_the_latest_attempt_must_pass(self):
-        # The highest attempt is the one the published image passed; an
-        # earlier pass does not stand in for a later refusal (attempt 10 > 9
+    def test_a_higher_attempt_that_never_tagged_leaves_the_published_one(self):
+        # G8P4-security-guardian-2: the highest attempt is not necessarily the
+        # published image. A later refusal, or a later attempt stopped before
+        # its tags moved, leaves attempt 1 published (attempt 10 > 9
         # numerically, not as text).
-        for passing, failing in ((1, 2), (9, 10)):
-            with self.subTest(passing=passing, failing=failing), \
+        for low, high, verdict, upto in ((1, 2, "FAIL: fixable CRITICAL", ""),
+                                         (9, 10, "pass", ""),
+                                         (1, 2, "pass", "push-started"),
+                                         (1, 2, "pass", "signed-attested")):
+            with self.subTest(high=high, verdict=verdict, upto=upto), \
                     tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
                 d = Path(t)
                 make_artifacts(d)
-                write_reports(d, "yuzu-postgres", passing)
-                write_reports(d, "yuzu-postgres", failing, "FAIL: fixable CRITICAL")
+                for f in d.glob("*yuzu-postgres.attempt-1.*"):
+                    f.unlink()
+                write_reports(d, "yuzu-postgres", low)
+                write_reports(d, "yuzu-postgres", high, verdict, upto=upto)
+                r = self.run_script(d)
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"yuzu-postgres: published by attempt {low}", r.stdout)
+
+    def test_a_higher_attempt_stopped_while_tagging_fails(self):
+        for low_upto in ("tagged", "verified"):
+            with self.subTest(low=low_upto), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / "publish-yuzu-postgres.attempt-1.txt").write_text(
+                    journal_text("yuzu-postgres", 1, low_upto, "1" * 64))
+                write_reports(d, "yuzu-postgres", 2, upto="tagging")
                 r = self.run_script(d)
                 self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
-                self.assertIn(f"trivy-yuzu-postgres.attempt-{failing}.gate.txt does not record a passing gate",
-                              r.stderr)
+                self.assertIn("stopped while moving its tags", r.stderr)
 
-    def test_the_latest_attempt_needs_all_three_reports(self):
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
-            d = Path(t)
-            make_artifacts(d)
-            (d / "trivy-yuzu-postgres.attempt-2.gate.txt").write_text("gate: pass\n")
-            r = self.run_script(d)
-            self.assertNotEqual(r.returncode, 0)
-            self.assertIn("trivy-yuzu-postgres.attempt-2.json", r.stderr)
+    def test_no_tagged_attempt_fails(self):
+        for upto in ("", "none", "signed-attested"):
+            with self.subTest(upto=upto), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / "publish-yuzu-postgres.attempt-1.txt").unlink()
+                if upto:
+                    (d / "publish-yuzu-postgres.attempt-1.txt").write_text(journal_text("yuzu-postgres", 1, upto))
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("no attempt's publish journal ends 'publish: tagged'", r.stderr)
+
+    def test_an_illegal_journal_fails(self):
+        good = journal_text("yuzu-postgres", 1)
+        ls = good.splitlines()
+        for label, text in (("swapped", "\n".join(ls[:2] + [ls[3], ls[2]] + ls[4:]) + "\n"),
+                            ("no intent", "\n".join(l for l in ls if "push-started" not in l) + "\n"),
+                            ("no tagging", "\n".join(l for l in ls if "tagging" not in l) + "\n"),
+                            ("two digests", good.replace("a" * 64, "b" * 64, 1)),
+                            ("other repo", good.replace("ghcr.io/o/yuzu-postgres:", "ghcr.io/o/yuzu-server:")),
+                            ("truncated", good[:-1]),
+                            ("empty", "")):
+            with self.subTest(label=label), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / "publish-yuzu-postgres.attempt-1.txt").write_text(text)
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("not a legal publish journal", r.stderr)
+
+    def test_the_published_attempt_needs_all_three_reports(self):
+        for suffix in ("json", "txt"):
+            with self.subTest(suffix=suffix), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                write_reports(d, "yuzu-postgres", 2)
+                (d / f"trivy-yuzu-postgres.attempt-2.{suffix}").write_text("")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(f"trivy-yuzu-postgres.attempt-2.{suffix}", r.stderr)
 
     def test_a_gate_report_not_named_per_attempt_is_refused(self):
         for stray in ("trivy-yuzu-server.gate.txt", "trivy-yuzu-server.json", "grype-yuzu-gateway.gate.txt",
                       "trivy-yuzu-server.attempt-0.gate.txt", "trivy-yuzu-server.attempt-x.gate.txt",
-                      "trivy-yuzu-server.attempt-1.html"):
+                      "trivy-yuzu-server.attempt-1.html", "publish-yuzu-server.txt",
+                      "publish-yuzu-server.attempt-1.json"):
             with self.subTest(stray=stray), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
                 d = Path(t)
                 make_artifacts(d)

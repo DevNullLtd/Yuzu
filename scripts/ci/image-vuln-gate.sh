@@ -526,12 +526,18 @@ for idx in "${!NAMES[@]}"; do
     # (--show-suppressed), as JSON, which also lists every package (that is
     # what the coverage check counts). Not --quiet: Trivy's log names the OS
     # it detected and warns when it finds no OS package. Informational, but a
-    # scan that cannot complete is a failure, not an empty report.
+    # scan that cannot complete is a failure, not an empty report. The table
+    # names --scanners vuln: without it Trivy 0.70.0's `convert` writes a
+    # 0-byte table for a clean report (no findings, or no Results), and an
+    # empty table is refused here, before any push, so a published attempt's
+    # three reports are never empty (scripts/check-release-artifacts.sh
+    # requires that; G8P5-unhappy-path-1).
     if ! child "$SCAN_DEADLINE" "$TRIVY" image "${COMMON[@]}" "${SCAN_TIMEOUT[@]}" --skip-db-update --image-src docker --scanners vuln \
             --severity HIGH,CRITICAL --show-suppressed --ignorefile "$TRIVY_IGNORE" \
             --format json --output "$json" "$image" \
-        || ! child "$SCAN_DEADLINE" "$TRIVY" convert --quiet --format table --severity HIGH,CRITICAL --show-suppressed \
-            --output "$table" "$json"; then
+        || ! child "$SCAN_DEADLINE" "$TRIVY" convert --quiet --format table --scanners vuln --severity HIGH,CRITICAL \
+            --show-suppressed --output "$table" "$json" \
+        || [ ! -s "$table" ]; then
         err "$image: Trivy could not scan the image (treated as a failure)"
         failed=1
         summary "| $name | ? | ? | could not scan |"

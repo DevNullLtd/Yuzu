@@ -3539,6 +3539,18 @@ test('image vulnerability gate',
   timeout: 60,
 )
 
+# WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
+# outcomes x stop points x publish shapes runs release.yml's publish steps in
+# the workflow's order against a stub registry and checks the journal never
+# claims less than the registry holds; cross-attempt rows run the attach job;
+# step-reorder and script mutants must be killed. Bash + PyYAML, no Docker.
+test('image publish journal',
+  _python3_test,
+  args: [files('test_image_publish.py')],
+  suite: 'docs',
+  timeout: 300,
+)
+
 # WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
 # release publish jobs' buildx type=local caches, removes only unreferenced
 # blobs and never leaves an index naming a removed blob. Synthetic layout.

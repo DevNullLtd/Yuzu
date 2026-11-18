@@ -48,19 +48,25 @@
 #   (yuzu-agent-bundle-chisel is built after the release from its assets, so
 #   its SBOM is not a release asset and is not expected here.)
 #
-#   Image vulnerability gate reports (WP15/S9), for the same six images, named
-#   per workflow run attempt (release.yml passes --attempt):
+#   Image vulnerability gate reports and publish journals (WP15/S9), for the
+#   same six images, named per workflow run attempt (release.yml passes
+#   --attempt), every attempt of the run:
 #     trivy-<image>.attempt-<N>.json + .txt + .gate.txt
 #                                  (e.g. trivy-yuzu-server.attempt-1.json)
-#   A re-run adds its attempt's reports beside the earlier attempts' (which
-#   stay, a refusal's included: they are the evidence that the gate refused).
-#   For each image and scanner, the reports of the HIGHEST attempt present are
-#   the ones the published image passed: Trivy's three are required for it
-#   (the coverage check reads Trivy's report), and its .gate.txt must record a
-#   pass and no other gate result, whichever scanner wrote it (another
-#   scanner's, grype-<image>.attempt-<N>.*, is optional). An earlier attempt's
-#   .gate.txt may record a failure. A gate report not named per attempt is
-#   refused. (The agent bundle's report is attached after the release, for the
+#     publish-<image>.attempt-<N>.txt  (scripts/ci/image-publish.sh; only for
+#                                  an attempt whose gate passed)
+#   A re-run adds its attempt's files beside the earlier attempts' (which stay,
+#   a refusal's included: they are the evidence that the gate refused). Every
+#   publish journal must be a legal prefix of none, push-started, verified,
+#   signed-attested, tagging, tagged, with one digest throughout, and sit
+#   beside gate reports that all record `gate: pass`. For each image the
+#   PUBLISHED attempt is the highest one whose journal ends `tagged`
+#   (`image-publish.sh published`): there must be one, no higher attempt may
+#   end `tagging` (its tags may name another digest), and Trivy's three reports
+#   for it must be present and non-empty. Another scanner's reports
+#   (grype-<image>.attempt-<N>.*) are optional; its .gate.txt counts in the
+#   journal's gate check. A gate report or journal not named per attempt is
+#   refused. (The agent bundle's files are attached after the release, for the
 #   same reason as its SBOM: release.yml attach-bundle-gate-report.)
 #
 # Every file's name must also be one GitHub stores unchanged (letters,
@@ -186,64 +192,66 @@ GATE_REPORT_IMAGES=(
   "yuzu-agent-chisel"
 )
 
-# A gate verdict file records a pass when it has a `gate: pass` line and NO
-# line that records any other gate result (`gate: FAIL...`,
-# `<scanner> gate: FAIL...`). Requiring only a pass line would let a second
-# scanner's failure, appended to the same file, through.
-gate_verdict_bad() {
-  local f="$1"
-  grep -qx 'gate: pass' "$f" || return 0
-  grep -E '(^|[[:space:]])gate:' "$f" | grep -qvE '(^|[[:space:]])gate: pass$'
-}
-
-# Every gate report file must be named <scanner>-<image>.attempt-<N>.<ext>.
-# latest[<scanner>-<image>] is the highest attempt N present.
-declare -A latest=()
+# Every gate report must be named <scanner>-<image>.attempt-<N>.<ext> and every
+# publish journal publish-<image>.attempt-<N>.txt.
+PUBLISH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/ci/image-publish.sh"
+declare -A gate_images=()
 shopt -s nullglob
-gate_all=("$ART_DIR"/trivy-* "$ART_DIR"/grype-*)
+gate_all=("$ART_DIR"/trivy-* "$ART_DIR"/grype-* "$ART_DIR"/publish-*)
 shopt -u nullglob
 for f in "${gate_all[@]}"; do
   [[ -f "$f" ]] || continue
   name="${f##*/}"
-  if [[ ! "$name" =~ ^((trivy|grype)-[a-z0-9][a-z0-9._-]*)\.attempt-([1-9][0-9]{0,3})\.(json|txt|gate\.txt)$ ]]; then
-    echo "::error::$name is not a gate report named <scanner>-<image>.attempt-<N>.{json,txt,gate.txt}" >&2
+  if [[ "$name" =~ ^(trivy|grype)-([a-z0-9][a-z0-9._-]*)\.attempt-([1-9][0-9]{0,3})\.(json|txt|gate\.txt)$ ]]; then
+    gate_images[${BASH_REMATCH[2]}]=1
+  elif [[ "$name" =~ ^publish-([a-z0-9][a-z0-9._-]*)\.attempt-([1-9][0-9]{0,3})\.txt$ ]]; then
+    gate_images[${BASH_REMATCH[1]}]=1
+  else
+    echo "::error::$name is not a gate report named <scanner>-<image>.attempt-<N>.{json,txt,gate.txt} or a publish journal named publish-<image>.attempt-<N>.txt" >&2
     fail=1
-    continue
-  fi
-  key="${BASH_REMATCH[1]}"
-  n="${BASH_REMATCH[3]}"
-  if [[ -z "${latest[$key]:-}" ]] || (( n > latest[$key] )); then
-    latest[$key]="$n"
   fi
 done
 
+# The published attempt of each image, from its publish journals. Every image
+# present is read (an illegal journal anywhere fails the release); the six
+# images this release publishes must each have one.
+declare -A published=()
+for img in "${!gate_images[@]}"; do
+  out="" rc=0
+  out="$(bash "$PUBLISH" published "$ART_DIR" "$img")" || rc=$?
+  case "$rc" in
+    0) published[$img]="$(sed -n 's/^published=//p' <<<"$out")" ;;
+    3) echo "::error::$img: an attempt above the published one stopped while moving its tags (publish journal ends 'tagging'); re-run that publish job so a new attempt ends 'tagged'" >&2
+       fail=1 ;;
+    *) echo "::error::$img: a publish journal is not a legal prefix of none, push-started, verified, signed-attested, tagging, tagged, or has no passing gate beside it (above)" >&2
+       fail=1 ;;
+  esac
+done
+
 for img in "${GATE_REPORT_IMAGES[@]}"; do
-  n="${latest[trivy-$img]:-}"
-  if [[ -z "$n" ]]; then
+  n="${published[$img]:-}"
+  if [[ -z "${gate_images[$img]:-}" ]]; then
     echo "::error::missing image vulnerability gate report: trivy-${img}.attempt-<N>.gate.txt" >&2
     fail=1
     continue
   fi
+  [[ -n "$n" ]] || continue   # the journal check above already failed
+  if [[ "$n" == none ]]; then
+    echo "::error::${img}: no attempt's publish journal ends 'publish: tagged' (publish-${img}.attempt-<N>.txt): no published image to release" >&2
+    fail=1
+    continue
+  fi
+  # The published attempt's reports. image-vuln-gate.sh refuses, before any
+  # push, an image whose table it could not write (G8P5-unhappy-path-1), so a
+  # published attempt always has all three non-empty.
   for suffix in json txt gate.txt; do
     f="trivy-${img}.attempt-${n}.${suffix}"
     if [[ ! -s "$ART_DIR/$f" ]]; then
-      echo "::error::missing or empty image vulnerability gate report: $f (attempt $n is the latest)" >&2
+      echo "::error::missing or empty image vulnerability gate report: $f (attempt $n is the published one)" >&2
       fail=1
     fi
   done
-done
-
-# The latest attempt's verdict, for every scanner and image present. Earlier
-# attempts' verdicts are evidence and may record a failure.
-for key in "${!latest[@]}"; do
-  f="$ART_DIR/${key}.attempt-${latest[$key]}.gate.txt"
-  if [[ ! -s "$f" ]]; then
-    echo "::error::${f##*/} is missing or empty (attempt ${latest[$key]} is the latest for ${key})" >&2
-    fail=1
-  elif gate_verdict_bad "$f"; then
-    echo "::error::${f##*/} does not record a passing gate (a pass line and no other gate result); it is the latest attempt for ${key}" >&2
-    fail=1
-  fi
+  echo "  ${img}: published by attempt ${n}"
 done
 
 # ── Sanity check: SBOMs parse as JSON ────────────────────────────────
