@@ -4755,6 +4755,14 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13 F21: the installer sets no file capability and strips any it finds (lexical + executed
+# `--dry-run` with tool stubs + in-memory mutants; nothing runs as root).
+test('agent installer no file capabilities (WP13/F21)',
+  _python3_test,
+  args: [files('test_agent_installer_no_file_caps.py')],
+  suite: 'docs',
+  timeout: 90,
+)
 # WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
 test('proc access status lexical gate (WP13/UP14)',
   _python3_test,
