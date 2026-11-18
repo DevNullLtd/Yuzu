@@ -120,7 +120,7 @@ def check_gate_order(t, hpp="", server=""):
         bad.append("the stripe lock must be TRIED first (only a would-be waiter counts)")
     if not re.search(r"if \(stripe_waiter\.prior\(\) >= kStripeWaitersPerStripe\) \{[^}]*return \{PasswordCheckOutcome::kBusy", fn):
         bad.append("the per-stripe waiter comparison must be present and return kBusy")
-    if not re.search(r"if \(waiter\.prior\(\) >= stripe_waiter_cap_\.load\(std::memory_order_relaxed\)\) \{[^}]*return \{PasswordCheckOutcome::kBusy", fn):
+    if not re.search(r"BoundedWaiterGuard waiter\(stripe_waiters_,\s*stripe_waiter_cap_\.load\(std::memory_order_relaxed\)\);\s*if \(!waiter\.admitted\(\)\) \{[^}]*return \{PasswordCheckOutcome::kBusy", fn):
         bad.append("the global waiter ceiling comparison must be present and return kBusy")
     if hpp:
         if not re.search(r"kLoginStripeWait\{150\}", hpp):
@@ -248,7 +248,7 @@ def selftest(files):
     mut("extra lock_guard", sub_cpp("std::unique_lock<std::timed_mutex> login_lk;", "std::lock_guard<std::timed_mutex> extra(login_lock_for(username)); std::unique_lock<std::timed_mutex> login_lk;"))
     mut("blocking login_lock_for(...).lock()", sub_cpp("std::unique_lock<std::timed_mutex> login_lk;", "login_lock_for(username).lock(); std::unique_lock<std::timed_mutex> login_lk;"))
     mut("per-stripe comparison neutralised", sub_cpp("if (stripe_waiter.prior() >= kStripeWaitersPerStripe) {", "if (false && stripe_waiter.prior() >= kStripeWaitersPerStripe) {"))
-    mut("global comparison neutralised", sub_cpp("if (waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {", "if (false && waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {"))
+    mut("global comparison neutralised", sub_cpp("if (!waiter.admitted()) {", "if (false && !waiter.admitted()) {"))
     mut("both caps deleted, tokens kept in a string", lambda m: m.__setitem__("auth_routes.cpp", re.sub(r"if \((?:false && )?(?:stripe_waiter|waiter)\.prior\(\)[^{]*\{", 'const char* x = "kStripeWaitersPerStripe stripe_waiter_cap_"; if (false) {', m["auth_routes.cpp"])) or True)
     mut("kLoginStripeWait 150 -> 3600000", sub_cpp("kLoginStripeWait{150}", "kLoginStripeWait{3600000}", key="auth_routes.hpp"))
     mut("kStripeWaitersPerStripe 2 -> 1000", sub_cpp("kStripeWaitersPerStripe = 2", "kStripeWaitersPerStripe = 1000", key="auth_routes.hpp"))

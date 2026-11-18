@@ -1305,6 +1305,31 @@ private:
         std::atomic<int>& c_;
         int prior_;
     };
+    /// RAII admission: joins the counter only while it is BELOW `cap` (a CAS loop), so the count
+    /// never exceeds the cap, not even transiently (the gauge and a sampler never read cap + 1).
+    class BoundedWaiterGuard {
+    public:
+        BoundedWaiterGuard(std::atomic<int>& c, int cap) : c_(c) {
+            int cur = c.load(std::memory_order_relaxed);
+            while (cur < cap) {
+                if (c.compare_exchange_weak(cur, cur + 1, std::memory_order_relaxed)) {
+                    admitted_ = true;
+                    break;
+                }
+            }
+        }
+        ~BoundedWaiterGuard() {
+            if (admitted_)
+                c_.fetch_sub(1, std::memory_order_relaxed);
+        }
+        BoundedWaiterGuard(const BoundedWaiterGuard&) = delete;
+        BoundedWaiterGuard& operator=(const BoundedWaiterGuard&) = delete;
+        bool admitted() const { return admitted_; }
+
+    private:
+        std::atomic<int>& c_;
+        bool admitted_{false};
+    };
     void count_budget_refusal(const std::string& route, const char* cls, const char* reason);
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};

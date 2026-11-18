@@ -2224,8 +2224,9 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                 count_budget_refusal(opts.metric_route, cls, "stripe_cap");
                 return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
             }
-            StripeWaiterGuard waiter(stripe_waiters_); // counted only once the stripe admits it
-            if (waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {
+            BoundedWaiterGuard waiter(stripe_waiters_,
+                                      stripe_waiter_cap_.load(std::memory_order_relaxed));
+            if (!waiter.admitted()) {
                 count_budget_refusal(opts.metric_route, cls, "stripe_cap");
                 return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
             }
