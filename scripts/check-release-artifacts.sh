@@ -254,15 +254,32 @@ for img in "${GATE_REPORT_IMAGES[@]}"; do
   echo "  ${img}: published by attempt ${n}"
 done
 
-# ── Sanity check: SBOMs parse as JSON ────────────────────────────────
+# ── Sanity check: SBOMs and the published attempts' reports parse as JSON ──
 # `jq` is available on ubuntu-24.04 runners. If absent we skip rather
 # than fail — the structural check is a bonus, not the contract.
+# A gate report's JSON is judged only for the PUBLISHED attempt of its image
+# (G8P6-unhappy-path-2): another attempt's report is kept as the evidence of
+# that attempt, whatever it holds (a scan killed by its deadline can leave a
+# truncated file), and is reported, not refused; refusing it would fail every
+# re-run of the run.
 if command -v jq >/dev/null 2>&1; then
-  for f in "$ART_DIR"/*.cdx.json "$ART_DIR"/*.spdx.json "$ART_DIR"/trivy-*.json "$ART_DIR"/grype-*.json; do
+  for f in "$ART_DIR"/*.cdx.json "$ART_DIR"/*.spdx.json; do
     [[ -f "$f" ]] || continue
     if ! jq empty "$f" >/dev/null 2>&1; then
       echo "::error file=$f::SBOM is not valid JSON" >&2
       fail=1
+    fi
+  done
+  for f in "$ART_DIR"/trivy-*.json "$ART_DIR"/grype-*.json; do
+    [[ -f "$f" ]] || continue
+    name="${f##*/}"
+    jq empty "$f" >/dev/null 2>&1 && continue
+    if [[ "$name" =~ ^(trivy|grype)-([a-z0-9][a-z0-9._-]*)\.attempt-([1-9][0-9]{0,3})\.json$ ]] \
+        && [[ "${published[${BASH_REMATCH[2]}]:-}" == "${BASH_REMATCH[3]}" ]]; then
+      echo "::error file=$name::gate report of the published attempt is not valid JSON" >&2
+      fail=1
+    else
+      echo "::warning file=$name::gate report of an attempt that is not the published one is not valid JSON; kept as that attempt's evidence" >&2
     fi
   done
 fi

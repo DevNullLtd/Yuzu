@@ -9,7 +9,13 @@ in the WORKFLOW'S order, every `run:` block that touches the registry or the
 journal executed as written (bash, `${{ }}` filled from a context), the `uses:`
 steps that touch the registry simulated, against stub `docker` and `cosign`
 that hold a fake registry in a JSON file. A stop point is a failure or a
-cancel (SIGINT, then SIGTERM, to the step's process group) at a given moment.
+cancel at a given moment, delivered as the Actions runner delivers it: SIGINT
+to the step's PID only (never its process group), SIGTERM after a grace, then
+SIGKILL of the PID (actions/runner src/Runner.Sdk/ProcessInvoker.cs
+CancelAndKillProcessTree/SendSignal: kill(pid, sig)). A process the step left
+behind keeps running, as on a runner, until the job ends (the runner's orphan
+cleanup, JobExtension FinalizeJob), which the rig models by waiting for the
+step's leftovers after the last step.
 Then, on the journal as UPLOADED (the evidence a consumer reads):
 
   I0  this attempt pushed anything            => the label is push-started or later
@@ -78,8 +84,14 @@ DOCKER_STUB = textwrap.dedent(
         f.write(json.dumps(a) + "\\n")
     fault = os.environ.get("STUB_FAULT", "")
     def hang():
+        # A stalled call. It fails on its own after 20 s, or as soon as the
+        # step that ran it is gone (it was orphaned: it moves nothing later).
         open(os.environ["STUB_HANG_MARK"], "w").write(str(os.getpid()))
-        time.sleep(20)
+        ppid = os.getppid()
+        for _ in range(200):
+            if os.getppid() != ppid:
+                sys.exit(1)
+            time.sleep(0.1)
         sys.exit(1)
     def count(kind):
         p = st_path + "." + kind + "." + os.environ["GITHUB_RUN_ATTEMPT"]
@@ -137,16 +149,42 @@ DOCKER_STUB = textwrap.dedent(
         n = count("create")
         if fault == "create-hang-before:%d" % n:
             hang()
+        if fault == "create-late:%d" % n:
+            # A slow registry call that COMPLETES: if nothing stops it, it moves
+            # the tag ~8 s later, orphaned or not.
+            open(os.environ["STUB_HANG_MARK"], "w").write(str(os.getpid()))
+            time.sleep(8)
         st = load()
         d = resolve(st, src)
         if d is None:
             sys.exit(1)
         st["tags"][tag] = d
+        if fault == "tag-raced:%d" % n:
+            # Another writer moves the tag right after this one did.
+            st["tags"][tag] = "sha256:" + "e" * 64
         save(st)
         if fault == "create-hang-after:%d" % n:
             hang()
         sys.exit(0)
     sys.exit(2)
+    """
+)
+
+# `tail`, for the stall row: image-publish.sh reads a journal's last byte with
+# `tail -c 1 FILE` while loading it. When the journal is the one `tag` is about
+# to extend (its last line `signed-attested`), this stalls 3 s first (a loaded
+# runner, slow storage): long enough to outlast the rig's SIGINT grace.
+TAIL_STUB = textwrap.dedent(
+    """\
+    import os, sys, time
+    a = sys.argv[1:]
+    f = a[-1] if a else ""
+    lines = open(f).read().splitlines() if os.path.basename(f).startswith("publish-") and os.path.isfile(f) else []
+    if os.environ.get("STUB_FAULT") == "stall-before-tagging" and lines and \
+            lines[-1].startswith("publish: signed-attested "):
+        open(os.environ["STUB_HANG_MARK"], "w").write(str(os.getpid()))
+        time.sleep(3)
+    os.execv(os.environ["STUB_REAL_TAIL"], ["tail"] + a)
     """
 )
 
@@ -188,6 +226,23 @@ def digest_of(*parts):
     return "sha256:" + hashlib.sha256("/".join(map(str, parts)).encode()).hexdigest()
 
 
+# A step `if:` as the rig evaluates it: always(), step outcomes, && and ||.
+def condition_holds(cond, status, outcomes_by_id):
+    cond = cond.strip()
+    if cond.startswith("${{") and cond.endswith("}}"):
+        cond = cond[3:-2].strip()
+    if not cond:
+        return status == "success"
+    if not re.search(r"\balways\(\)|\bfailure\(\)|\bcancelled\(\)", cond) and status != "success":
+        return False
+    expr = re.sub(r"steps\.([A-Za-z0-9_-]+)\.outcome",
+                  lambda m: repr(outcomes_by_id.get(m.group(1), "skipped")), cond)
+    expr = (expr.replace("&&", " and ").replace("||", " or ").replace("always()", "True")
+            .replace("failure()", repr(status == "failure")).replace("cancelled()", repr(status == "cancelled")))
+    assert re.fullmatch(r"[\sA-Za-z0-9_'()=!.-]*", expr), expr
+    return bool(eval(expr, {"__builtins__": {}}, {}))   # noqa: S307 (rig-built text only)
+
+
 # ── The workflow, as data ────────────────────────────────────────────────────
 def load_steps(text, job):
     """The job's steps from its gate step (id: gate) on, as dicts."""
@@ -202,7 +257,9 @@ def step_key(st):
     uses = st.get("uses") or ""
     for sub in ("open", "push-started", "verified", "signed-attested", "tag", "state"):
         if re.search(rf"image-publish\.sh {sub} ", run):
-            return "push" if "docker push" in run else sub
+            return sub
+    if re.search(r"^\s*docker push ", run, re.M):
+        return "push"   # the agent bundle's push of its candidate tag
     if "check-release-tag-sha.sh" in run:
         return "recheck"
     if "cosign sign --yes" in run:
@@ -268,13 +325,34 @@ STOPS = {
     "mid-tag applied": ("fault", "create-hang-after:1"),
     "mid-tag not applied": ("fault", "create-hang-before:1"),
     "post-tag before tagged": ("fault", "resolve-hang"),
+    # G8P6-chaos-injector-1: the cancel lands while `tag` is still loading the
+    # journal, before it appends `tagging`, and that load stalls past the
+    # runner's SIGINT grace. Unless the script is the step's process (`exec`)
+    # and stops at the next boundary, it outlives the step and moves the tags
+    # after the upload has captured `signed-attested`.
+    "cancel mid-tag before tagging": ("fault", "stall-before-tagging"),
+    # A tag move in flight when the cancel lands, that would complete ~8 s
+    # later if nothing stopped it (G8P6-chaos-injector-2 across runs).
+    "mid-tag late create": ("fault", "create-late:1"),
+    # Another writer moves the first tag right after `tag` did: the post-move
+    # resolve must see it and leave the journal at `tagging`.
+    "tag raced": ("fault", "tag-raced:1"),
+    # The evidence upload fails once; the retry step uploads it.
+    "upload fails once": ("upload", "fail-once"),
 }
+
+
+SIGINT_GRACE = 1.5    # the runner waits 7.5 s after SIGINT
+SIGTERM_GRACE = 2.5   # and 2.5 s after SIGTERM, then SIGKILLs the PID
 
 
 class Rig:
     """One fake registry, one release; runs publish-job attempts on them."""
 
-    def __init__(self, tmp, release_text=None, scripts=None):
+    def __init__(self, tmp, release_text=None, scripts=None, registry=None, salt=None, run_id="77"):
+        self.salt = salt
+        self.run_id = run_id
+        self.pending = []      # process groups of steps that ran, drained at the job's end
         self.tmp = Path(tmp)
         self.root = self.tmp / "root"
         (self.root / "scripts" / "ci").mkdir(parents=True)
@@ -287,28 +365,56 @@ class Rig:
         self.release_text = release_text if release_text is not None else RELEASE.read_text(encoding="utf-8")
         self.bin = self.tmp / "bin"
         self.bin.mkdir()
-        for name, body in (("docker", DOCKER_STUB), ("cosign", COSIGN_STUB), ("gh", tivg.GH_STUB)):
+        self.real_tail = shutil.which("tail")
+        for name, body in (("docker", DOCKER_STUB), ("cosign", COSIGN_STUB), ("gh", tivg.GH_STUB),
+                           ("tail", TAIL_STUB)):
             p = self.bin / name
             p.write_text(f"#!{sys.executable}\n" + body, encoding="utf-8")
             p.chmod(0o755)
-        self.reg = self.tmp / "registry.json"
-        self.reg.write_text(json.dumps({"manifests": {}, "tags": {}, "signed": [], "attested": []}))
+        if registry is not None:
+            self.reg = Path(registry)   # another run on the same registry
+        else:
+            self.reg = self.tmp / "registry.json"
+            self.reg.write_text(json.dumps({"manifests": {}, "tags": {}, "signed": [], "attested": []}))
         self.artifacts = {}   # attempt -> {file name: bytes}, as uploaded
 
     def registry(self):
         return json.loads(self.reg.read_text())
 
+    def digest(self, kind, attempt):
+        """The digest this rig's run pushes for one attempt."""
+        return digest_of(kind, attempt) if self.salt is None else digest_of(kind, attempt, self.salt)
+
+    def drain(self, cap=20):
+        """The job's end: wait for what the steps left behind, then kill it
+        (the runner's orphan cleanup runs after the last step)."""
+        deadline = time.monotonic() + cap
+        for pgid in self.pending:
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(pgid, 0)
+                except (ProcessLookupError, PermissionError):
+                    break
+                time.sleep(0.05)
+            try:
+                os.killpg(pgid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        self.pending = []
+
     def env(self, attempt, extra=None):
         env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "STUB_", "RUNNER_"))}
         env.update(PATH=f"{self.bin}{os.pathsep}{env.get('PATH', '')}", STUB_REG=str(self.reg),
-                   GITHUB_RUN_ID="77", GITHUB_RUN_ATTEMPT=str(attempt), GITHUB_SERVER_URL="https://github.com",
+                   GITHUB_RUN_ID=self.run_id, GITHUB_RUN_ATTEMPT=str(attempt), GITHUB_SERVER_URL="https://github.com",
                    GITHUB_WORKFLOW_REF="o/r/.github/workflows/release.yml@refs/tags/v1.2.3",
-                   GITHUB_REF_NAME="v1.2.3", STUB_IMAGE_ID=IMAGE_ID)
+                   GITHUB_REF_NAME="v1.2.3", STUB_IMAGE_ID=IMAGE_ID, STUB_REAL_TAIL=self.real_tail)
         env.update(extra or {})
         return env
 
-    def run_job(self, kind, attempt, gate="pass", stop="complete"):
-        """Runs one attempt of the publish job. Returns the step outcomes."""
+    def run_job(self, kind, attempt, gate="pass", stop="complete", drain=True):
+        """Runs one attempt of the publish job. Returns the step outcomes.
+        drain=False leaves whatever the steps left running (another run may
+        start meanwhile); call drain() later."""
         k = KINDS[kind]
         rt = self.tmp / f"rt-{kind}-{attempt}"
         rt.mkdir()
@@ -318,20 +424,23 @@ class Rig:
                "steps.built.outputs.id": IMAGE_ID, "steps.built.outputs.layers": ",".join(SCANNED),
                "steps.meta.outputs.tags": "\n".join(k["tags"]), "steps.meta.outputs.labels": "",
                "steps.ref.outputs.image": k["repo"], "steps.ref.outputs.version": "1.2.3",
-               "github.run_id": "77", "github.run_attempt": str(attempt), "github.sha": "abc",
+               "github.run_id": self.run_id, "github.run_attempt": str(attempt), "github.sha": "abc",
                "runner.temp": str(rt), "runner.tool_cache": str(rt), "env.YUZU_BUILD_JOBS": "2",
                "matrix.dockerfile": "x"}
-        push_digest = digest_of(kind, attempt)
+        push_digest = self.digest(kind, attempt)
         layers = OTHER if (where, how) == ("layers", "other") else SCANNED
         stub = {"STUB_FAULT": how if where == "fault" else "", "STUB_PUSH_DIGEST": push_digest,
                 "STUB_PUSH_LAYERS": json.dumps(layers), "RUNNER_TEMP": str(rt),
                 "STUB_HANG_MARK": str(rt / "hang")}
-        status, outcomes = "success", []
+        status, outcomes, by_id = "success", [], {}
+        self.upload_failures = 1 if (where, how) == ("upload", "fail-once") else 0
         for st in load_steps(self.release_text, k["job"]):
             role = step_key(st)
             cond = str(st.get("if", ""))
-            if status != "success" and "always()" not in cond:
+            if not condition_holds(cond, status, by_id):
                 outcomes.append((role, "skipped"))
+                if st.get("id"):
+                    by_id[st["id"]] = "skipped"
                 continue
             hit = role in ("push-started", "push") if how == "push" else role == how
             if where == "before" and hit and status == "success":
@@ -340,8 +449,12 @@ class Rig:
                 continue
             out = self.run_step(st, role, ctx, rep, attempt, gate, stub, where, how, push_digest, layers)
             outcomes.append((role, out))
+            if st.get("id"):
+                by_id[st["id"]] = out
             if out in ("failure", "cancelled") and status == "success" and not st.get("continue-on-error"):
                 status = out
+        if drain:
+            self.drain()
         return outcomes
 
     def run_step(self, st, role, ctx, rep, attempt, gate, stub, where, how, push_digest, layers):
@@ -380,6 +493,11 @@ class Rig:
                 self.reg.write_text(json.dumps(reg))
                 return "success"
             if role == "upload-gate":
+                if self.upload_failures:
+                    self.upload_failures -= 1
+                    return "failure"   # nothing reached the artifact service
+                if attempt in self.artifacts:
+                    return "failure"   # an artifact name is never overwritten
                 if rep.is_dir():
                     self.artifacts[attempt] = {p.name: p.read_bytes() for p in rep.iterdir()}
                 return "success"
@@ -390,34 +508,43 @@ class Rig:
         env = self.env(attempt, stub)
         for key, val in (st.get("env") or {}).items():
             env[key] = fill(val, ctx)
-        gh_out = rep.parent / f"out-{len(os.listdir(rep.parent))}"
+        n_step = len(os.listdir(rep.parent))
+        gh_out = rep.parent / f"out-{n_step}"
         env["GITHUB_OUTPUT"] = str(gh_out)
         env["GITHUB_STEP_SUMMARY"] = str(rep.parent / "summary.md")
-        script = rep.parent / "step.sh"
+        script = rep.parent / f"step-{n_step}.sh"
         script.write_text(run)
+        log = rep.parent / f"log-{n_step}.txt"
         mark = Path(stub["STUB_HANG_MARK"])
         mark.unlink(missing_ok=True)
-        p = subprocess.Popen(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)], cwd=self.root,
-                             env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                             start_new_session=True)
+        # Output to a file, not a pipe: a process the step leaves behind must
+        # not hold the rig up (the runner gives up on the pipe after 5 s).
+        with open(log, "wb") as logf:
+            p = subprocess.Popen(["bash", "--noprofile", "--norc", "-eo", "pipefail", str(script)], cwd=self.root,
+                                 env=env, stdout=logf, stderr=subprocess.STDOUT, start_new_session=True)
+        self.pending.append(p.pid)   # its own process group, for the job-end cleanup
         cancelled = False
         deadline = time.monotonic() + 30
         while p.poll() is None and time.monotonic() < deadline:
             if mark.exists():
-                # The runner's cancel: SIGINT, then SIGTERM.
-                os.killpg(p.pid, signal.SIGINT)
+                # The runner's cancel, to the step's PID ONLY: SIGINT, SIGTERM
+                # after a grace, then SIGKILL (scaled down from 7.5 s and 2.5 s).
+                os.kill(p.pid, signal.SIGINT)
                 try:
-                    p.wait(timeout=2)
+                    p.wait(timeout=SIGINT_GRACE)
                 except subprocess.TimeoutExpired:
-                    os.killpg(p.pid, signal.SIGTERM)
+                    os.kill(p.pid, signal.SIGTERM)
+                    try:
+                        p.wait(timeout=SIGTERM_GRACE)
+                    except subprocess.TimeoutExpired:
+                        os.kill(p.pid, signal.SIGKILL)
                 cancelled = True
                 break
             time.sleep(0.01)
         if p.poll() is None:
-            os.killpg(p.pid, signal.SIGKILL)
+            os.kill(p.pid, signal.SIGKILL)
         p.wait()
-        self.last_output = p.stdout.read()
-        p.stdout.close()
+        self.last_output = log.read_text(errors="replace")
         if gh_out.exists():
             for line in gh_out.read_text().splitlines():
                 key, _, val = line.partition("=")
@@ -461,7 +588,7 @@ def violations(rig, kind, attempt, gate, stop):
     out = []
     k = KINDS[kind]
     reg = rig.registry()
-    mine = digest_of(kind, attempt)
+    mine = rig.digest(kind, attempt)
     rc, info = rig.state(kind, attempt)
     if attempt not in rig.artifacts:
         out.append("the gate reports were not uploaded")
@@ -526,7 +653,9 @@ class PublishTable(unittest.TestCase):
         want = {"pre-push": "none", "mid-push": "push-started", "verify fail": "push-started",
                 "verify cancel": "push-started", "attest fail": "verified", "sign fail": "verified",
                 "pre-tag": "signed-attested", "mid-tag applied": "tagging", "mid-tag not applied": "tagging",
-                "post-tag before tagged": "tagging", "complete": "tagged"}
+                "post-tag before tagged": "tagging", "complete": "tagged",
+                "cancel mid-tag before tagging": "signed-attested", "mid-tag late create": "tagging",
+                "tag raced": "tagging", "upload fails once": "tagged"}
         for kind in KINDS:
             for stop, label in want.items():
                 with self.subTest(kind=kind, stop=stop), \
@@ -540,12 +669,18 @@ class PublishTable(unittest.TestCase):
                     applied = [t_ for t_ in KINDS[kind]["tags"] if reg["tags"].get(t_) == mine]
                     if stop == "mid-tag applied":
                         self.assertTrue(applied, "the first tag should have moved")
-                    if stop == "mid-tag not applied":
+                    if stop in ("mid-tag not applied", "cancel mid-tag before tagging", "mid-tag late create"):
+                        # Nothing moved, and nothing moves later: the script
+                        # stopped its own registry call on the cancel.
                         self.assertEqual(applied, [])
                     if stop == "post-tag before tagged":
                         self.assertEqual(applied, KINDS[kind]["tags"])
                     if stop in ("mid-push", "verify fail", "verify cancel"):
                         self.assertIn(mine, reg["manifests"])
+                    if stop in ("cancel mid-tag before tagging", "mid-tag late create"):
+                        log = "".join(p.read_text(errors="replace")
+                                      for p in rig.tmp.glob(f"rt-{kind}-1/log-*.txt"))
+                        self.assertRegex(log, r"stopped by SIG(INT|TERM); nothing further is recorded")
         for gate in ("fail", "SIGINT", "SIGTERM", "budget"):
             with self.subTest(gate=gate), tempfile.TemporaryDirectory(prefix="yuzu_test_publish_") as t:
                 rig = Rig(t)
@@ -645,6 +780,28 @@ class CrossAttempt(unittest.TestCase):
                         self.assertEqual(reg["tags"][tag], digest_of("buildx", int(want_pub)), tag)
 
 
+def cross_run_violations(release_text=None, scripts=None):
+    """G8P6-chaos-injector-2: run A of the same tag is cancelled mid-tag (a
+    tag move in flight that would complete later), and run B publishes on the
+    same registry before A's job has ended. Nothing of A's may move a tag
+    after B's `tagged`: every violation of either run's invariants, as text."""
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_publish_xr_") as ta, \
+            tempfile.TemporaryDirectory(prefix="yuzu_test_publish_xr_") as tb:
+        a = Rig(ta, release_text, scripts)
+        b = Rig(tb, release_text, scripts, registry=a.reg, salt="run-78", run_id="78")
+        a.run_job("buildx", 1, "pass", "mid-tag late create", drain=False)
+        b.run_job("buildx", 1, "pass", "complete")
+        a.drain()
+        return ([f"run A: {v}" for v in violations(a, "buildx", 1, "pass", "mid-tag late create")]
+                + [f"run B: {v}" for v in violations(b, "buildx", 1, "pass", "complete")])
+
+
+@unittest.skipIf(os.name == "nt" or shutil.which("bash") is None, "needs a POSIX bash")
+class CrossRun(unittest.TestCase):
+    def test_a_cancelled_runs_tag_move_cannot_land_after_a_later_run(self):
+        self.assertEqual(cross_run_violations(), [])
+
+
 # ── Mutants ──────────────────────────────────────────────────────────────────
 def swap_steps(text, job, a, b):
     """release.yml text with job's steps of roles a and b (first of each)
@@ -675,8 +832,8 @@ def swap_steps(text, job, a, b):
 PUBLISH_ROLES = {
     "buildx": ["open", "push-started", "push", "verified", "sbom", "attest", "cosign-install", "sign",
                "signed-attested", "upload", "recheck", "tag", "upload-gate"],
-    "bundle": ["open", "push", "verified", "sbom", "upload", "attest", "sign", "signed-attested", "recheck", "tag",
-               "upload-gate"],
+    "bundle": ["open", "push-started", "push", "verified", "sbom", "upload", "attest", "sign", "signed-attested",
+               "recheck", "tag", "upload-gate"],
 }
 # Adjacent swaps that change nothing the journal or the registry can see: the
 # SBOM (it reads the registry, by digest) against verify, the by-digest
@@ -717,6 +874,7 @@ class Mutants(unittest.TestCase):
     def test_named_reorders_are_killed(self):
         text = RELEASE.read_text(encoding="utf-8")
         for kind, a, b in (("buildx", "push-started", "push"),      # push before its intent
+                           ("bundle", "push-started", "push"),
                            ("buildx", "tag", "sign"),               # tags before the signature
                            ("bundle", "tag", "sign"),
                            ("buildx", "upload-gate", "tag"),        # evidence uploaded before the tags move
@@ -726,11 +884,12 @@ class Mutants(unittest.TestCase):
             with self.subTest(kind=kind, swap=(a, b)):
                 mutant = swap_steps(text, KINDS[kind]["job"], a, b)
                 self.assertIsNotNone(first_killing_row(kind, release_text=mutant), f"{kind}: {a}<->{b} survived")
-        # The bundle's intent line moved after its push, inside one step.
-        old = 'scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$candidate"'
+        # The bundle's intent and push folded back into one step, the intent
+        # after the push.
+        old = ('          exec scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" '
+               '"$GITHUB_RUN_ATTEMPT" "$candidate"\n')
         self.assertEqual(text.count(old), 1)
-        moved = text.replace(old + "\n", "").replace('          docker push "$candidate"\n',
-                                                     '          docker push "$candidate"\n          ' + old + "\n")
+        moved = text.replace(old, '          docker push "$candidate"\n' + old.replace("exec ", ""))
         self.assertNotEqual(moved, text)
         self.assertIsNotNone(first_killing_row("bundle", release_text=moved), "intent after the bundle push survived")
 
@@ -753,6 +912,96 @@ class Mutants(unittest.TestCase):
                     self.assertNotEqual(mutant, src)
                     self.assertIsNotNone(first_killing_row(kind, scripts={"image-publish.sh": mutant}),
                                          f"{label} survived")
+
+    def test_cancellation_mutants_are_killed(self):
+        # G8P6-chaos-injector-1/-2: the script must be the step's process
+        # (exec), act on SIGINT/SIGTERM (trap), and run its registry calls so
+        # the trap can stop them (background + wait); and after a signal it
+        # appends nothing.
+        src = (ROOT / "scripts" / "ci" / "image-publish.sh").read_text(encoding="utf-8")
+        text = RELEASE.read_text(encoding="utf-8")
+        traps = "        trap 'on_signal INT' INT\n        trap 'on_signal TERM' TERM\n"
+        background = ('    if [ "$out" = - ]; then "$@" & else "$@" >"$out" & fi\n    CHILD=$!\n'
+                      '    wait "$CHILD" || rc=$?\n')
+        foreground = '    if [ "$out" = - ]; then "$@" || rc=$?; else "$@" >"$out" || rc=$?; fi\n'
+        append_check = "    stop_if_signalled\n    printf 'publish: %s\\n'"
+        for needle in (traps, background, append_check):
+            self.assertEqual(src.count(needle), 1, needle)
+        self.assertEqual(text.count("exec scripts/ci/image-publish.sh tag "), 4)
+        mutants = {
+            "the script ignores the signal": (None, {"image-publish.sh": src.replace(traps, "")}),
+            "registry calls in the foreground": (None, {"image-publish.sh": src.replace(background, foreground)}),
+            "the tag step without exec": (text.replace("exec scripts/ci/image-publish.sh tag ",
+                                                       "scripts/ci/image-publish.sh tag "), None),
+        }
+        for label, (rt, sc) in mutants.items():
+            with self.subTest(mutant=label):
+                self.assertNotEqual(cross_run_violations(rt, sc), [], f"{label} survived")
+        with self.subTest(mutant="appends after the signal"), \
+                tempfile.TemporaryDirectory(prefix="yuzu_test_publish_mut_") as t:
+            rig = Rig(t, scripts={"image-publish.sh": src.replace(append_check, "    printf 'publish: %s\\n'")})
+            rig.run_job("buildx", 1, "pass", "cancel mid-tag before tagging")
+            self.assertNotEqual(rig.state("buildx", 1)[1].get("state"), "signed-attested", "survived")
+
+    def test_journal_check_mutants_are_killed(self):
+        # G8P6-quality-engineer-2: the reader's signed-attested and tagged
+        # checks, and `tag`'s post-move resolve check.
+        src = (ROOT / "scripts" / "ci" / "image-publish.sh").read_text(encoding="utf-8")
+        e1 = ('                [ "$rest" = "$J_REPO@$J_DIGEST" ] \\\n'
+              '                    || { J_WHY="signed-attested \'$rest\' is not the verified $J_REPO@$J_DIGEST"; return 1; } ;;\n')
+        e2 = ('                [ "$rest" = "$J_TAGS $J_DIGEST" ] \\\n'
+              '                    || { J_WHY="tagged \'$rest\' is not the tagging line\'s \'$J_TAGS $J_DIGEST\'"; return 1; } ;;\n')
+        j = ('            [ "$RESOLVED" = "$J_DIGEST" ] || { err "$t names $RESOLVED, not $J_DIGEST; '
+             'the journal stays at tagging"; exit 1; }\n')
+        for needle in (e1, e2, j):
+            self.assertEqual(src.count(needle), 1, needle)
+        for label, mutant in (("signed-attested digest unchecked", src.replace(e1, "                ;;\n")),
+                              ("tagged line unchecked", src.replace(e2, "                ;;\n"))):
+            with self.subTest(mutant=label), tempfile.TemporaryDirectory(prefix="yuzu_test_publish_mut_") as t:
+                p = Path(t) / "image-publish.sh"
+                p.write_text(mutant)
+                self.assertNotEqual(illegal_journals_accepted(p), [], f"{label} survived")
+        with self.subTest(mutant="post-move resolve unchecked"):
+            self.assertIsNotNone(first_killing_row("buildx", scripts={"image-publish.sh": src.replace(j, "")},
+                                                   rows=[("pass", "tag raced")]))
+
+
+# Journals that break only the one-digest / same-tags rule at a late line.
+REPO = f"{OWNER_REPO}/yuzu-server"
+D1, D2 = "sha256:" + "a" * 64, "sha256:" + "b" * 64
+GOOD = [f"publish: none", f"publish: push-started {REPO}", f"publish: verified {REPO}@{D1}",
+        f"publish: signed-attested {REPO}@{D1}", f"publish: tagging {REPO}:1.2.3,{REPO}:latest {D1}",
+        f"publish: tagged {REPO}:1.2.3,{REPO}:latest {D1}"]
+ILLEGAL_LATE = {
+    "signed-attested names another digest": GOOD[:3] + [f"publish: signed-attested {REPO}@{D2}"],
+    "signed-attested names another repository": GOOD[:3] + [f"publish: signed-attested {OWNER_REPO}/x@{D1}"],
+    "tagged names another digest": GOOD[:5] + [f"publish: tagged {REPO}:1.2.3,{REPO}:latest {D2}"],
+    "tagged names other tags": GOOD[:5] + [f"publish: tagged {REPO}:1.2.3 {D1}"],
+}
+
+
+def illegal_journals_accepted(script):
+    """The ILLEGAL_LATE journals `state` accepts (it must refuse them all)."""
+    accepted = []
+    for label, lines in ILLEGAL_LATE.items():
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_publish_j_") as t:
+            (Path(t) / "publish-yuzu-server.attempt-1.txt").write_text("".join(ln + "\n" for ln in lines))
+            r = subprocess.run(["bash", str(script), "state", t, "yuzu-server", "1"], capture_output=True, text=True)
+            if r.returncode == 0:
+                accepted.append(label)
+    return accepted
+
+
+@unittest.skipIf(os.name == "nt" or shutil.which("bash") is None, "needs a POSIX bash")
+class JournalReader(unittest.TestCase):
+    def test_a_late_line_that_changes_the_digest_or_tags_is_refused(self):
+        self.assertEqual(illegal_journals_accepted(ROOT / "scripts" / "ci" / "image-publish.sh"), [])
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_publish_j_") as t:
+            (Path(t) / "publish-yuzu-server.attempt-1.txt").write_text("".join(ln + "\n" for ln in GOOD))
+            r = subprocess.run(["bash", str(ROOT / "scripts" / "ci" / "image-publish.sh"), "state", t,
+                                "yuzu-server", "1"], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            self.assertIn("state=tagged", r.stdout)
 
 
 if __name__ == "__main__":

@@ -215,6 +215,53 @@ class GateReports(unittest.TestCase):
             (d / "grype-yuzu-gateway.attempt-1.json").write_text("{not json")
             self.assertNotEqual(self.run_script(d).returncode, 0)
 
+    def test_only_the_published_attempts_json_is_judged(self):
+        # G8P6-unhappy-path-2: a truncated report of an attempt that is not the
+        # published one (a scan killed by its deadline) is that attempt's
+        # evidence, reported and kept; refusing it would fail every re-run. The
+        # published attempt's reports must parse.
+        if shutil.which("jq") is None:
+            self.skipTest("jq not installed (the script skips the JSON check too)")
+        for broken, scanner, want_rc in ((1, "trivy", 0), (1, "grype", 0), (2, "trivy", 1), (2, "grype", 1)):
+            with self.subTest(attempt=broken, scanner=scanner), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / "publish-yuzu-postgres.attempt-1.txt").unlink()
+                write_reports(d, "yuzu-postgres", 1, "FAIL: cancelled (SIGTERM) before this image was judged")
+                write_reports(d, "yuzu-postgres", 2)
+                if scanner == "grype":
+                    (d / f"grype-yuzu-postgres.attempt-{broken}.gate.txt").write_text(
+                        "gate: pass\n" if broken == 2 else "gate: FAIL: x\n")
+                name = f"{scanner}-yuzu-postgres.attempt-{broken}.json"
+                (d / name).write_text('{"SchemaVersion": 2, "Results": [')
+                r = self.run_script(d)
+                self.assertEqual(r.returncode, want_rc, r.stdout + r.stderr)
+                self.assertIn(name, r.stderr)
+                if want_rc == 0:
+                    self.assertIn("kept as that attempt's evidence", r.stderr)
+                else:
+                    self.assertIn("gate report of the published attempt is not valid JSON", r.stderr)
+
+    def test_journal_refusals_reach_the_log_under_actions(self):
+        # G8P6-consistency-auditor-1: image-publish.sh's diagnostics go to
+        # stderr (an ::error:: annotation under Actions), which this script
+        # does not capture, so the reason a journal was refused is in the log.
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            (d / "publish-yuzu-postgres.attempt-1.txt").write_text("publish: tagged x\n")
+            r = subprocess.run(["bash", str(SCRIPT), str(d), VERSION], capture_output=True, text=True,
+                               env={**os.environ, "GITHUB_ACTIONS": "true"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("::error::publish-yuzu-postgres.attempt-1.txt is not a legal publish journal", r.stderr)
+            (d / "publish-yuzu-postgres.attempt-1.txt").write_text(journal_text("yuzu-postgres", 1))
+            (d / "trivy-yuzu-postgres.attempt-1.gate.txt").write_text("gate: FAIL: x\n")
+            r = subprocess.run(["bash", str(SCRIPT), str(d), VERSION], capture_output=True, text=True,
+                               env={**os.environ, "GITHUB_ACTIONS": "true"})
+            self.assertNotEqual(r.returncode, 0)
+            self.assertIn("has a publish journal but its gate did not pass", r.stderr)
+
     # ── The publish journal decides which attempt is published ──
     def test_refused_earlier_attempt_is_kept_beside_the_passing_one(self):
         # postgres refused in attempt 1, published by attempt 2 ("Re-run failed

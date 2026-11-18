@@ -3543,12 +3543,25 @@ test('image vulnerability gate',
 # outcomes x stop points x publish shapes runs release.yml's publish steps in
 # the workflow's order against a stub registry and checks the journal never
 # claims less than the registry holds; cross-attempt rows run the attach job;
-# step-reorder and script mutants must be killed. Bash + PyYAML, no Docker.
+# step-reorder and script mutants must be killed. Cancels are delivered to the
+# step's PID only, as the Actions runner delivers them, and some rows wait out
+# a stall or a cancelled run, hence the timeout. Bash + PyYAML, no Docker.
 test('image publish journal',
   _python3_test,
   args: [files('test_image_publish.py')],
   suite: 'docs',
-  timeout: 300,
+  timeout: 600,
+)
+
+# WP15/S9 (G8P6-release-deploy-1): scripts/ci/image-candidate-delete.sh deletes
+# a leftover candidate digest from GHCR only when no release tag names it,
+# resolved in the registry at delete time; it only checks unless --delete.
+# Stub gh/docker, real jq; mutants must be killed. Bash + jq, no Docker.
+test('image candidate delete',
+  _python3_test,
+  args: [files('test_image_candidate_delete.py')],
+  suite: 'docs',
+  timeout: 180,
 )
 
 # WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
@@ -3568,7 +3581,7 @@ test('release artifact gate',
   _python3_test,
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
-  timeout: 60,
+  timeout: 120,
 )
 
 # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's

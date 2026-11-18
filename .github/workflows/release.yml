@@ -1662,18 +1662,21 @@ jobs:
       # tagged. The push is by digest and carries no tag; the release tags
       # are applied only once that digest is verified, signed and attested.
       # A failure or cancel just stops the journal, which then claims at least
-      # what the registry holds. Contract: docs/ci-architecture.md "The
-      # publish journal" (WP15/S9).
+      # what the registry holds. Every step runs the script with `exec`: the
+      # runner signals only the step's PID on a cancel, and the script stops
+      # at its next step boundary, appending nothing (image-publish.sh
+      # "Cancellation"). Contract: docs/ci-architecture.md "The publish
+      # journal" (WP15/S9).
       - name: Open the publish journal
         env:
           NAME: yuzu-${{ matrix.image }}
-        run: scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
+        run: exec scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
 
       - name: Record the push intent
         env:
           NAME: yuzu-${{ matrix.image }}
           REPO: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}
-        run: scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
+        run: exec scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
 
       - name: Build and push by digest (no tag)
         id: build
@@ -1723,7 +1726,7 @@ jobs:
           NAME: yuzu-${{ matrix.image }}
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
+        run: exec scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Syft scans the pushed image by digest (pulls manifest +
@@ -1784,7 +1787,7 @@ jobs:
         env:
           NAME: yuzu-${{ matrix.image }}
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
-        run: scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
+        run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242), before the tags move: if this upload
@@ -1825,7 +1828,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           mapfile -t tags < <(printf '%s\n' "$TAGS" | sed '/^[[:space:]]*$/d')
-          scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
+          exec scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
 
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}.json (the full
@@ -1853,6 +1856,21 @@ jobs:
           # One artifact per run attempt, never overwritten: a re-run ("Re-run
           # failed jobs") adds its attempt's reports beside the refused
           # attempt's instead of replacing them.
+
+      # One retry of the evidence upload (G8P6-architect-4,
+      # G8P6-security-guardian-2): an attempt that moved a tag and then lost
+      # its journal to a failed upload leaves no record of that move, and the
+      # consumers would read an older attempt (or none) as the published one.
+      # No `overwrite`: when the first upload did complete despite its error,
+      # this one fails on the existing name and changes nothing.
+      - name: Retry the image vulnerability gate report upload
+        if: always() && steps.upload_gate.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-${{ matrix.image }}-image-vuln-gate-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Image summary
         env:
@@ -2013,13 +2031,13 @@ jobs:
       - name: Open the publish journal
         env:
           NAME: yuzu-postgres
-        run: scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
+        run: exec scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
 
       - name: Record the push intent
         env:
           NAME: yuzu-postgres
           REPO: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres
-        run: scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
+        run: exec scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
 
       - name: Build and push by digest (no tag)
         id: build
@@ -2051,7 +2069,7 @@ jobs:
           NAME: yuzu-postgres
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
+        run: exec scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
@@ -2103,7 +2121,7 @@ jobs:
         env:
           NAME: yuzu-postgres
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
-        run: scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
+        run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242), before the tags move: if this upload
@@ -2144,7 +2162,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           mapfile -t tags < <(printf '%s\n' "$TAGS" | sed '/^[[:space:]]*$/d')
-          scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
+          exec scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
 
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-postgres.json (the full
@@ -2172,6 +2190,21 @@ jobs:
           # One artifact per run attempt, never overwritten: a re-run ("Re-run
           # failed jobs") adds its attempt's reports beside the refused
           # attempt's instead of replacing them.
+
+      # One retry of the evidence upload (G8P6-architect-4,
+      # G8P6-security-guardian-2): an attempt that moved a tag and then lost
+      # its journal to a failed upload leaves no record of that move, and the
+      # consumers would read an older attempt (or none) as the published one.
+      # No `overwrite`: when the first upload did complete despite its error,
+      # this one fails on the existing name and changes nothing.
+      - name: Retry the image vulnerability gate report upload
+        if: always() && steps.upload_gate.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-postgres-image-vuln-gate-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Image summary
         env:
@@ -2234,7 +2267,10 @@ jobs:
     # GitHub cancels two of them at scheduling time. Observed on
     # v0.12.0 release run 26413256206 where server-chisel and
     # agent-chisel were cancelled at 1s runtime, leaving gateway-chisel
-    # as the only published variant.
+    # as the only published variant. A leg cancelled this way gets the same
+    # PID-only SIGINT/SIGTERM as any cancel: its `exec`'d image-publish.sh
+    # stops its own registry call before exiting, so it cannot move a tag
+    # after the newer run's leg has tagged (G8P6-chaos-injector-2).
     concurrency:
       group: chisel-publish-${{ github.ref }}-${{ matrix.image }}
       cancel-in-progress: true
@@ -2402,13 +2438,13 @@ jobs:
       - name: Open the publish journal
         env:
           NAME: yuzu-${{ matrix.image }}-chisel
-        run: scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
+        run: exec scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
 
       - name: Record the push intent
         env:
           NAME: yuzu-${{ matrix.image }}-chisel
           REPO: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel
-        run: scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
+        run: exec scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REPO"
 
       - name: Build and push by digest (no tag)
         id: build
@@ -2450,7 +2486,7 @@ jobs:
           NAME: yuzu-${{ matrix.image }}-chisel
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
+        run: exec scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Mirrors docker-publish's SBOM steps so the chisel demo images get
@@ -2507,7 +2543,7 @@ jobs:
         env:
           NAME: yuzu-${{ matrix.image }}-chisel
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
-        run: scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
+        run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
       - name: Upload image SBOM artifacts
         # After attest + sign (#5242), before the tags move: if this upload
@@ -2548,7 +2584,7 @@ jobs:
           TAGS: ${{ steps.meta.outputs.tags }}
         run: |
           mapfile -t tags < <(printf '%s\n' "$TAGS" | sed '/^[[:space:]]*$/d')
-          scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
+          exec scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "${tags[@]}"
 
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}-chisel.json (the full
@@ -2576,6 +2612,21 @@ jobs:
           # One artifact per run attempt, never overwritten: a re-run ("Re-run
           # failed jobs") adds its attempt's reports beside the refused
           # attempt's instead of replacing them.
+
+      # One retry of the evidence upload (G8P6-architect-4,
+      # G8P6-security-guardian-2): an attempt that moved a tag and then lost
+      # its journal to a failed upload leaves no record of that move, and the
+      # consumers would read an older attempt (or none) as the published one.
+      # No `overwrite`: when the first upload did complete despite its error,
+      # this one fails on the existing name and changes nothing.
+      - name: Retry the image vulnerability gate report upload
+        if: always() && steps.upload_gate.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-${{ matrix.image }}-chisel-image-vuln-gate-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Image summary
         env:
@@ -2612,7 +2663,9 @@ jobs:
     timeout-minutes: 60
     # No job outputs: what this job published is in its publish journal
     # (scripts/ci/image-publish.sh), which attach-bundle-gate-report reads from
-    # the uploaded gate artifact of every attempt.
+    # the uploaded gate artifact of every attempt. A run cancelled by this
+    # group stops its tag move as any cancel does (image-publish.sh
+    # "Cancellation", G8P6-chaos-injector-2).
     concurrency:
       group: agent-bundle-publish-${{ github.ref }}
       cancel-in-progress: true
@@ -2713,10 +2766,12 @@ jobs:
       - name: Open the publish journal
         env:
           NAME: yuzu-agent-bundle-chisel
-        run: scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
+        run: exec scripts/ci/image-publish.sh open "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT"
 
-      - name: Push the candidate
-        id: push
+      # The intent, BEFORE anything reaches the registry, in its own step so
+      # the script is the step's process (`exec`: the runner signals only the
+      # step's PID on a cancel; see scripts/ci/image-publish.sh "Cancellation").
+      - name: Record the push intent
         env:
           NAME: yuzu-agent-bundle-chisel
           IMAGE: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
@@ -2730,8 +2785,20 @@ jobs:
           fi
           candidate="$REPO:candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
           docker tag "$SCANNED_ID" "$candidate"
-          # The intent, BEFORE anything reaches the registry.
-          scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$candidate"
+          exec scripts/ci/image-publish.sh push-started "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$candidate"
+
+      - name: Push the candidate
+        id: push
+        env:
+          REPO: ${{ steps.ref.outputs.image }}
+          SCANNED_ID: ${{ steps.built.outputs.id }}
+        run: |
+          candidate="$REPO:candidate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          now="$(docker image inspect --format '{{.Id}}' "$candidate")"
+          if [ "$now" != "$SCANNED_ID" ]; then
+            echo "::error::$candidate now names $now, not the scanned image $SCANNED_ID; refusing to push"
+            exit 1
+          fi
           docker push "$candidate"
           digest="$(docker buildx imagetools inspect "$candidate" --format '{{.Manifest.Digest}}')"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -2744,7 +2811,7 @@ jobs:
           NAME: yuzu-agent-bundle-chisel
           REF: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
+        run: exec scripts/ci/image-publish.sh verified "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$LAYERS"
 
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -2794,7 +2861,7 @@ jobs:
         env:
           NAME: yuzu-agent-bundle-chisel
           REF: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
-        run: scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
+        run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
       # The publishing act: :X.Y.Z only (no :X.Y or :latest for the bundle).
       # See the same steps in docker-publish.
@@ -2806,7 +2873,7 @@ jobs:
           NAME: yuzu-agent-bundle-chisel
           REF: ${{ steps.ref.outputs.image }}@${{ steps.push.outputs.digest }}
           TAG: ${{ steps.ref.outputs.image }}:${{ steps.ref.outputs.version }}
-        run: scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$TAG"
+        run: exec scripts/ci/image-publish.sh tag "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF" "$TAG"
 
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-agent-bundle-chisel.json (the full
@@ -2835,6 +2902,21 @@ jobs:
           # One artifact per run attempt, never overwritten: a re-run ("Re-run
           # failed jobs") adds its attempt's reports beside the refused
           # attempt's instead of replacing them.
+
+      # One retry of the evidence upload (G8P6-architect-4,
+      # G8P6-security-guardian-2): an attempt that moved a tag and then lost
+      # its journal to a failed upload leaves no record of that move, and the
+      # consumers would read an older attempt (or none) as the published one.
+      # No `overwrite`: when the first upload did complete despite its error,
+      # this one fails on the existing name and changes nothing.
+      - name: Retry the image vulnerability gate report upload
+        if: always() && steps.upload_gate.outcome == 'failure'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-agent-bundle-chisel-image-vuln-gate-attempt-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Bundle summary
         env:

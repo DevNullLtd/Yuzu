@@ -1998,19 +1998,31 @@ class WorkflowWiring(unittest.TestCase):
                 at = body.find(f"scripts/ci/image-publish.sh {sub} ")
                 st = body[body.rfind("- name:", 0, at):body.find("- name:", at)]
                 self.assertIn(f"NAME: {name}\n", st, f"{job} {sub}")
-                self.assertIn(f'scripts/ci/image-publish.sh {sub} "$RUNNER_TEMP/image-vuln-gate" "$NAME" '
+                # G8P6-chaos-injector-1: the writer is the step's process, so
+                # the runner's PID-only SIGINT/SIGTERM reaches its trap.
+                self.assertIn(f'exec scripts/ci/image-publish.sh {sub} "$RUNNER_TEMP/image-vuln-gate" "$NAME" '
                               '"$GITHUB_RUN_ATTEMPT"', st, f"{job} {sub}")
+            # Every writer call, anywhere in the job, is exec'd.
+            for m in re.finditer(r"image-publish\.sh (open|push-started|verified|signed-attested|tag) ", body):
+                line = body[body.rfind("\n", 0, m.start()) + 1:m.start()]
+                self.assertRegex(line, r"^\s+(run: )?exec scripts/ci/$", f"{job}: {m.group(0)} is not exec'd")
             up = body.find("- name: Upload image vulnerability gate report")
             self.assertGreater(up, body.find("scripts/ci/image-publish.sh tag "), job)
-            up_step = body[up:body.find("- name:", up + 1)]
-            self.assertIn("path: ${{ runner.temp }}/image-vuln-gate/", up_step, job)
-            self.assertIn("retention-days: 90", up_step, job)
-            self.assertIn("if-no-files-found: error", up_step, job)
-            # G8P3-security-guardian-2: one artifact per run attempt, never
-            # overwritten, so a re-run cannot erase a refusal's evidence.
-            self.assertRegex(up_step, r"\n\s+name: [^\n]+-image-vuln-gate-attempt-\$\{\{ github\.run_attempt \}\}\n",
-                             job)
-            self.assertNotRegex(up_step, r"\n\s+overwrite:\s*true", job)
+            retry = body.find("- name: Retry the image vulnerability gate report upload")
+            self.assertGreater(retry, up, job)
+            for start in (up, retry):
+                up_step = body[start:body.find("- name:", start + 1)]
+                self.assertIn("path: ${{ runner.temp }}/image-vuln-gate/", up_step, job)
+                self.assertIn("retention-days: 90", up_step, job)
+                self.assertIn("if-no-files-found: error", up_step, job)
+                # G8P3-security-guardian-2: one artifact per run attempt, never
+                # overwritten, so a re-run cannot erase a refusal's evidence.
+                self.assertRegex(up_step,
+                                 r"\n\s+name: [^\n]+-image-vuln-gate-attempt-\$\{\{ github\.run_attempt \}\}\n", job)
+                self.assertNotRegex(up_step, r"\n\s+overwrite:\s*true", job)
+            # G8P6-architect-4: the retry runs only when the first upload failed.
+            retry_step = body[retry:body.find("- name:", retry + 1)]
+            self.assertIn("if: always() && steps.upload_gate.outcome == 'failure'\n", retry_step, job)
         rel = job_block(text, "release")
         self.assertIn("-name 'trivy-*.json'", rel)
         self.assertIn('*.spdx.json "${gate_reports[@]}" > SHA256SUMS', rel)

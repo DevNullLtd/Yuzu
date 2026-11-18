@@ -5,10 +5,13 @@
 #
 # Why. A release tag (`:X.Y.Z`, `:X.Y`, `:latest`) is public the moment it
 # moves. So the tag moves LAST, after the pushed digest is verified to be the
-# scanned image and is signed and attested, and every step that touches the
-# registry is announced in the journal BEFORE it runs. Whatever stops the job
-# (a failure, a cancel, a timeout), the journal's last line claims at least
-# what the registry holds, never less.
+# scanned image and is signed and attested, and every push of the image and
+# every tag move is announced in the journal BEFORE it runs. (The SBOM,
+# provenance and signature referrers are pushed by digest before their
+# `signed-attested` line: the digest was already announced at `push-started`
+# and no tag names it yet.) Whatever stops the job (a failure, a cancel, a
+# timeout), the journal's last line claims at least what the registry holds
+# for the image and its tags, never less.
 #
 # The file: <DIR>/publish-<NAME>.attempt-<N>.txt, beside the gate's reports
 # (<scanner>-<NAME>.attempt-<N>.*), uploaded with them. One line per completed
@@ -25,11 +28,29 @@
 #
 # <candidate> is <repo> (a buildx push by digest: no tag at all) or
 # <repo>:candidate-<run id>-<N> (the agent bundle's `docker push`). <repo>'s
-# last path component is <NAME>. No file at all means nothing was pushed by that
-# attempt: the gate refused the image, or the job stopped before the journal was
-# opened. A failure or a cancel simply stops the journal: there is no failure
-# label and no trap. A `tagging` journal means some of the tags may name the
-# digest and some may not (moving several tags is not atomic).
+# last path component is <NAME>. No file at all: the gate refused the image, or
+# the job stopped before the journal was opened (both pushed nothing), or the
+# attempt's gate artifact never uploaded (absence, not proof that nothing was
+# pushed). A failure or a cancel simply stops the journal: there is no failure
+# label. A
+# `tagging` journal means some of the tags may name the digest and some may not
+# (moving several tags is not atomic).
+#
+# Cancellation. Every workflow step runs a writing command as
+# `exec scripts/ci/image-publish.sh ...`, so this script IS the step's process:
+# the Actions runner signals only that PID (actions/runner ProcessInvoker:
+# kill(pid, SIGINT), 7.5 s, kill(pid, SIGTERM), 2.5 s, then SIGKILL of the PID;
+# never the process group), and a script running as a child of the step's
+# shell would never see the signal and could append and move tags after the job's
+# always() upload had already snapshotted the journal (G8P6-chaos-injector-1).
+# A SIGINT or SIGTERM sets STOP; at the next step boundary (before any append,
+# and as soon as a registry child returns or is stopped) the script stops the
+# child it is waiting on (SIGTERM to it and its children, SIGKILL after 3 s),
+# appends NOTHING further, and exits 130 or 143. Registry calls run in the
+# background with `wait`, so the trap acts at once instead of after the call:
+# no child outlives this script to move a tag later, in this run or across runs
+# (G8P6-chaos-injector-2). The journal already announced any call in flight, so
+# stopping it leaves the last line claiming at least what the registry holds.
 #
 # Usage:
 #   image-publish.sh open            DIR NAME N
@@ -67,13 +88,16 @@
 #       attempt can be called the published image).
 #
 # A step summary is not a consumer: job outputs carry no publish state.
-# Contract and the residuals (a SIGKILL before the upload, a re-run moving the
-# tag to a new digest, non-atomic multi-tag moves, leftover candidate digests):
+# Contract and the residuals (a SIGKILL or a failed upload before the evidence
+# is kept, a re-run moving the tag to a new digest, non-atomic multi-tag moves,
+# leftover candidate digests, deleted only via image-candidate-delete.sh):
 # docs/ci-architecture.md "Release image vulnerability gate", "The publish
 # journal". Tests: tests/test_image_publish.py.
 #
 # Exit status: 0 ok; 1 refused, failed check, or illegal journal; 2 usage;
-# 3 (`published` only) a higher attempt stopped while tagging.
+# 3 (`published` only) a higher attempt stopped while tagging; 130/143 stopped
+# by SIGINT/SIGTERM. Diagnostics go to stderr (an `::error::` annotation under
+# Actions); stdout carries only the result lines, which the consumers capture.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -81,8 +105,55 @@ ISSUER="https://token.actions.githubusercontent.com"
 LABELS=(none push-started verified signed-attested tagging tagged)
 
 err() {
-    if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*"; else echo "ERROR: $*" >&2; fi
+    if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*" >&2; else echo "ERROR: $*" >&2; fi
 }
+
+# ── Cancellation (see the header) ──
+STOP=""
+CHILD=""
+on_signal() { STOP="$1"; }
+
+# stop_child PID: SIGTERM to PID's children and PID, SIGKILL after 3 s.
+stop_child() {
+    local pid="$1" i
+    kill -0 "$pid" 2>/dev/null || return 0
+    pkill -TERM -P "$pid" 2>/dev/null || true
+    kill -TERM "$pid" 2>/dev/null || true
+    for i in $(seq 1 30); do
+        kill -0 "$pid" 2>/dev/null || return 0
+        sleep 0.1
+    done
+    pkill -KILL -P "$pid" 2>/dev/null || true
+    kill -KILL "$pid" 2>/dev/null || true
+}
+
+# stop_if_signalled: the step boundary. After a SIGINT or SIGTERM, stops the
+# registry child (if any) and exits without appending anything.
+stop_if_signalled() {
+    [ -n "$STOP" ] || return 0
+    trap '' INT TERM
+    [ -z "$CHILD" ] || stop_child "$CHILD"
+    err "stopped by SIG$STOP; nothing further is recorded (the journal's last line stands)"
+    if [ "$STOP" = INT ]; then exit 130; fi
+    exit 143
+}
+
+# bg OUT CMD...: runs CMD in the background with its stdout in the file OUT
+# (`-`: this script's stdout; stderr passes through) and waits for it, so a
+# signal is acted on at once (bash runs a trap only after a FOREGROUND child
+# returns). Returns CMD's status.
+bg() {
+    local out="$1" rc=0
+    shift
+    stop_if_signalled
+    if [ "$out" = - ]; then "$@" & else "$@" >"$out" & fi
+    CHILD=$!
+    wait "$CHILD" || rc=$?
+    stop_if_signalled
+    CHILD=""
+    return "$rc"
+}
+
 usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0" >&2; exit 2; }
 
 RE_NAME='^[a-z0-9][a-z0-9._-]*$'
@@ -208,8 +279,9 @@ gates_pass() {
     [ "$have_trivy" = 1 ] || { GATE_WHY="no trivy-$name.attempt-$n.gate.txt"; return 1; }
 }
 
-# append DIR NAME N LINE: one write of one complete line.
+# append DIR NAME N LINE: one write of one complete line, never after a signal.
 append() {
+    stop_if_signalled
     printf 'publish: %s\n' "$4" >>"$(journal_of "$1" "$2" "$3")"
 }
 
@@ -219,8 +291,15 @@ split_ref() {
     [ "$1" = "$REF_REPO@$REF_DIGEST" ] && [[ "$REF_DIGEST" =~ $RE_DIGEST ]]
 }
 
+# resolve_digest REF: sets RESOLVED to the manifest digest REF names. Not for
+# use inside $(...): a command substitution is a subshell, whose child the
+# trap could not reach until it returned.
 resolve_digest() {
-    docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}'
+    local rc=0
+    RESOLVED=""
+    bg "$OUTF" docker buildx imagetools inspect "$1" --format '{{.Manifest.Digest}}' || rc=$?
+    RESOLVED="$(cat "$OUTF")"
+    return "$rc"
 }
 
 cmd="${1:-}"
@@ -240,6 +319,16 @@ case "$cmd" in
         [[ "$NAME" =~ $RE_NAME ]] || { err "bad image name '$NAME'"; exit 2; }
         ;;
     *) usage ;;
+esac
+
+case "$cmd" in
+    open|push-started|verified|signed-attested|tag)
+        # A writing command: act on a cancel at the next step boundary.
+        trap 'on_signal INT' INT
+        trap 'on_signal TERM' TERM
+        OUTF="$(mktemp)"
+        trap 'rm -f "$OUTF"' EXIT
+        ;;
 esac
 
 case "$cmd" in
@@ -276,10 +365,10 @@ case "$cmd" in
         split_ref "$ref" || { err "verified needs REPO@sha256:<digest>, got '$ref'"; exit 1; }
         [ "$REF_REPO" = "$J_REPO" ] || { err "$ref is not in the candidate's repository $J_REPO"; exit 1; }
         if [ "$J_CAND" != "$J_REPO" ]; then
-            got="$(resolve_digest "$J_CAND")" || { err "could not resolve $J_CAND"; exit 1; }
-            [ "$got" = "$REF_DIGEST" ] || { err "$J_CAND names $got, not $REF_DIGEST"; exit 1; }
+            resolve_digest "$J_CAND" || { err "could not resolve $J_CAND"; exit 1; }
+            [ "$RESOLVED" = "$REF_DIGEST" ] || { err "$J_CAND names $RESOLVED, not $REF_DIGEST"; exit 1; }
         fi
-        "$HERE/image-identity.sh" verify-pushed "$ref" "$layers"
+        bg - "$HERE/image-identity.sh" verify-pushed "$ref" "$layers"
         append "$DIR" "$NAME" "$N" "verified $ref"
         echo "publish: verified $ref"
         ;;
@@ -293,7 +382,7 @@ case "$cmd" in
             err "GITHUB_SERVER_URL and GITHUB_WORKFLOW_REF name the signing identity; not set"; exit 1
         fi
         identity="$GITHUB_SERVER_URL/$GITHUB_WORKFLOW_REF"
-        cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$ISSUER" "$ref" >/dev/null \
+        bg /dev/null cosign verify --certificate-identity "$identity" --certificate-oidc-issuer "$ISSUER" "$ref" \
             || { err "$ref has no signature from $identity that verifies"; exit 1; }
         append "$DIR" "$NAME" "$N" "signed-attested $ref"
         echo "publish: signed-attested $ref (signature verified for $identity)"
@@ -310,12 +399,12 @@ case "$cmd" in
         append "$DIR" "$NAME" "$N" "tagging $list $J_DIGEST"
         echo "publish: tagging $list $J_DIGEST"
         for t in "${TAGS_ARR[@]}"; do
-            docker buildx imagetools create --prefer-index=false -t "$t" "$ref" \
+            bg - docker buildx imagetools create --prefer-index=false -t "$t" "$ref" \
                 || { err "could not point $t at $ref; the journal stays at tagging"; exit 1; }
         done
         for t in "${TAGS_ARR[@]}"; do
-            got="$(resolve_digest "$t")" || { err "could not resolve $t; the journal stays at tagging"; exit 1; }
-            [ "$got" = "$J_DIGEST" ] || { err "$t names $got, not $J_DIGEST; the journal stays at tagging"; exit 1; }
+            resolve_digest "$t" || { err "could not resolve $t; the journal stays at tagging"; exit 1; }
+            [ "$RESOLVED" = "$J_DIGEST" ] || { err "$t names $RESOLVED, not $J_DIGEST; the journal stays at tagging"; exit 1; }
         done
         append "$DIR" "$NAME" "$N" "tagged $list $J_DIGEST"
         echo "publish: tagged $list $J_DIGEST"
