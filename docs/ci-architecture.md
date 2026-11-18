@@ -524,6 +524,8 @@ naming, and its header lists where each lives.
 
 #### The installer manifest contract (`OutputManifestFile`)
 
+**Decision record (2026-11-18).** After five governance passes found the `.iss` parser kept accepting forms it then mapped differently from the Inno Setup compiler, the enterprise-architect review recommended replacing it with the compiler's own manifest, verified by SHA-256 against the build directory; the project owner (fjarvis) accepted that ruling on 2026-11-18. The manifest format below was checked against issrc tag is-6_7_3. Review this decision if Inno Setup changes the manifest format, or if the installer starts taking files at install time (`external`, `download`).
+
 The Windows installer's SBOM is made from the file list the Inno Setup
 compiler (ISCC) writes when it builds the installer. The installer script is
 never parsed. `deploy/packaging/windows/yuzu-agent.iss` sets
