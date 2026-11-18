@@ -246,7 +246,7 @@ TEST_CASE("sanitize_detail_value: folds UTF-8 C1 controls and Unicode line separ
     CHECK(yuzu::server::detail::sanitize_detail_value("a\xE2\x80\xA8" "b") == "a_b");
     CHECK(yuzu::server::detail::sanitize_detail_value("a\xE2\x80\xA9" "b") == "a_b");
     // A forged second row through U+2028 stays one value.
-    CHECK(yuzu::server::detail::sanitize_detail_value("x\xE2\x80\xA8action=evil") == "x_action_evil");
+    CHECK(yuzu::server::detail::sanitize_detail_value("x\xE2\x80\xA8" "action=evil") == "x_action_evil");
 }
 
 TEST_CASE("sanitize_detail_value: caps length at a UTF-8 code-point boundary",
