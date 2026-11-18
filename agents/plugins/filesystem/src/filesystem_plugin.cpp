@@ -1656,11 +1656,19 @@ private:
                 ctx.write_output("error|regex contains nested quantifiers (potential ReDoS)");
                 return 1;
             }
+            // No standard library bounds a lookahead and one regex_match cannot be interrupted
+            // by the walk's deadline (sd::has_lookahead), so it never reaches the engine.
+            if (sd::has_lookahead(pat_str)) {
+                ctx.write_output("error|regex lookahead is not supported (use (?: to group)");
+                return 1;
+            }
             auto flags = std::regex::ECMAScript | std::regex::optimize;
 #if defined(__GLIBCXX__)
-            // The GNU library's linear-time executor. Without it that library backtracks with no
-            // complexity limit, so one name could outlive the walk deadline. It refuses a
-            // back-reference at compile, which lands in the invalid-regex row below.
+            // The GNU library's breadth-first executor: time linear in the name for a pattern
+            // with no lookahead (refused above: that executor re-runs one from every position).
+            // Without the flag the library backtracks with no complexity limit, so one name could
+            // outlive the walk deadline. It refuses a back-reference at compile, which lands in
+            // the invalid-regex row below.
             flags |= std::regex_constants::__polynomial;
 #endif
             try {
@@ -1716,7 +1724,8 @@ private:
         if (max_results > 1000) max_results = 1000;
 
         // Set by the name predicate when the regex library gives up on a name: the walk then ends
-        // through env.cancelled and the shell reports that the answer is not complete.
+        // through env.cancelled and the shell ends the run with the regex-too-complex error row
+        // (return code 1, no trailer and no count).
         bool regex_gave_up = false;
         fbh::WalkEnv env;
         env.cancelled = [&regex_gave_up] {

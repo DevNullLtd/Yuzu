@@ -5,7 +5,8 @@
 // search_dir finds directories and/or files by NAME. It rides the plugin's ONE bounded walker
 // (find_by_hash::walk_bounded) with a name-matching visitor, so it has the same bounds and the same
 // guards as find_by_hash: a 20 s wall clock, an entry cap, the shutdown signal, a network-mount
-// refusal that precedes every call touching a path, a depth limit that never opens a directory at
+// refusal judged on a path's spelling before any call touches it (a root reached through a symlink
+// is the disclosed residual, #4875), a depth limit that never opens a directory at
 // the limit, and a symlink or junction below the root that is counted and never followed or
 // matched. Whatever the walk skipped or stopped short of is reported by the shared `truncated|...`
 // trailer. Everything OS-bound is injected through WalkEnv, so the unit suites run it over a TempDir
@@ -48,6 +49,26 @@ enum class MatchType { directories, files, both };
     if (v == "both")
         return MatchType::both;
     return std::nullopt;
+}
+
+/// True when a regex holds a `(?` group other than the non-capturing `(?:`. In the ECMAScript
+/// grammar that is a lookahead, `(?=` or `(?!`, and search_dir refuses one: no standard library
+/// bounds it (each lookahead is a fresh sub-match with its own complexity budget, so ONE lookahead
+/// over one 255-byte name ran for 5 s on libc++ and nested or repeated ones multiply), and a single
+/// regex_match cannot be interrupted by the walk's deadline. Judged on the spelling alone, with no
+/// grammar of its own: an escaped `\(` is skipped, and a `(?` inside a bracket class is refused too
+/// (the three libraries need not parse a class alike, and refusing is the safe side).
+[[nodiscard]] inline bool has_lookahead(std::string_view pattern) {
+    for (std::size_t i = 0; i + 1 < pattern.size(); ++i) {
+        if (pattern[i] == '\\') {
+            ++i; // an escaped character never opens a group
+            continue;
+        }
+        if (pattern[i] == '(' && pattern[i + 1] == '?' &&
+            (i + 2 >= pattern.size() || pattern[i + 2] != ':'))
+            return true;
+    }
+    return false;
 }
 
 /// `result|<path>|<directory|file>`.

@@ -9,10 +9,10 @@
 // The walk is a PURE CORE with every OS interaction injected (WalkEnv): a clock, a cancel
 // predicate, a per-entry hasher, a directory-readability probe and the network mount list. The
 // unit suites drive it with fakes -- no sleep, no real process, no network -- and the production
-// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells. The one OS
-// call the core makes itself is on macOS: walk_bounded switches the thread's dataless-file
-// materialization policy off for the walk (DatalessMaterializationOff), so no action riding the
-// walker can omit it.
+// hashers (hash_entry_posix / hash_entry_win, at the bottom) are the thin OS shells. The one
+// process-state change the core makes itself is on macOS: walk_bounded switches the thread's
+// dataless-file materialization policy off for the walk (DatalessMaterializationOff), so no action
+// riding the walker can omit it.
 //
 // What is bounded, and why the numbers are what they are (find_by_hash's limits):
 //   * wall clock    kWalkDeadline 20 s -- the Instructions gate polls at 30 s and the result still
@@ -421,7 +421,9 @@ struct WalkEnv {
 enum class EntryKind { directory, regular };
 
 /// A visitor's verdict: none (not a match), match (counts toward max_results, runs the one-entry
-/// look-ahead), stop (the visitor's own budget tripped: the walk ends with budget.stop()).
+/// look-ahead), stop (the visitor's own budget tripped: the walk ends with budget.stop()). A
+/// visitor returns stop only after the budget it was handed has tripped (otherwise the walk ends
+/// with reason `none` and no trailer), and the `entry` it is given is valid only for that call.
 enum class Visit { none, match, stop };
 
 #ifdef __APPLE__

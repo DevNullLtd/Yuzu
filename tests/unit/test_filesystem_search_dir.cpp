@@ -13,7 +13,11 @@
  *   symlinks / FIFO / junction -- entry classification through is_directory() (stats THROUGH a
  *                       link) instead of symlink_status.
  *   unreadable       -- a probe refusal turned into a silent skip.
- *   mounts           -- the mount check running after a stat, or the guard row missing.
+ *   mounts           -- the mount check running after a stat (the symlink named as a mount is the
+ *                       one entry that tells the two orders apart), or the guard row missing.
+ *   regex guard      -- has_lookahead missing a lookahead (any spelling, any depth), taking an
+ *                       escaped paren for one, or refusing the non-capturing group.
+ *   limits           -- a documented number (400,000 entries, 256 pattern bytes) drifting.
  *   escaping         -- a row built without acl::row_field (separator injection, invalid UTF-8,
  *                       a trailing backslash); the formatter's file suffix.
  *   closing rows     -- search_dir's count row carrying fbh::format_outcome_rows' default label
@@ -40,6 +44,7 @@
 #include <functional>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <vector>
 
 #ifndef _WIN32
@@ -133,8 +138,43 @@ TEST_CASE("search_dir: limits_for uses the search_dir entry cap and the caller's
           "[filesystem][search_dir]") {
     const auto l = sd::limits_for(7);
     CHECK(l.max_files_visited == sd::kMaxEntriesVisited);
+    // the documented numbers as literals: the README, definition and upgrade note quote them
+    CHECK(sd::kMaxEntriesVisited == 400'000);
+    CHECK(sd::kMaxPatternBytes == 256);
     CHECK(l.max_results == 7);
     CHECK(l.deadline == fbh::kWalkDeadline);
+}
+
+// -- Regex guard ----------------------------------------------------------------------------------
+
+TEST_CASE("search_dir: has_lookahead refuses every (? group but the non-capturing one",
+          "[filesystem][search_dir]") {
+    // Never executed here: the first is the 49-byte shape that ran unbounded, the next two are ONE
+    // lookahead each (5 s for one 255-byte name on libc++).
+    for (const std::string_view refused :
+         {"(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*x))))))))", ".*.*(?=.*.*x)y", ".*.*(?!.*.*x)y",
+          "^(?!.*\\.bak$).*\\.log$", "a(?=b)", "(?!x)", "(?<n>x)", "x(?",
+          "\\\\(?=x)", // an escaped backslash, then a real lookahead
+          "[(?=]"}) {  // judged on the spelling: a class is refused too
+        INFO(refused);
+        CHECK(sd::has_lookahead(refused));
+    }
+    for (const std::string_view accepted :
+         {"", "(", "x(", "a?b", "(a)?", "(a|b)c", "(?:a|b)c", "^backup-\\d+$",
+          "\\(?=x\\)",      // an escaped paren is a literal
+          "\\\\\\(?=x"}) { // an escaped backslash, then an escaped paren
+        INFO(accepted);
+        CHECK(!sd::has_lookahead(accepted));
+    }
+    for (int depth = 1; depth <= 50; ++depth) {
+        std::string nested;
+        for (int i = 0; i < depth; ++i)
+            nested += "(?=.*";
+        nested += 'x';
+        nested.append(static_cast<std::size_t>(depth), ')');
+        INFO("nesting depth " << depth);
+        CHECK(sd::has_lookahead(nested));
+    }
 }
 
 // -- Clean runs and depth -------------------------------------------------------------------------
@@ -328,6 +368,21 @@ TEST_CASE("search_dir: a FIFO is counted skipped_not_regular and never matched a
     CHECK(w.out.c.skipped_not_regular == 1);
 }
 
+TEST_CASE("search_dir: a symlink named as a mount is refused as a mount, before symlink_status",
+          "[filesystem][search_dir]") {
+    // Only a symlink tells the order apart: judged as a mount first it is skipped_network_mount,
+    // with symlink_status first it would be counted skipped_symlink.
+    Tree t;
+    t.write("real/inside.txt");
+    fs::create_symlink(t.root / "real", t.root / "netlink");
+    Probe probe;
+    auto env = fake_env(probe);
+    env.network_mounts = {(t.root / "netlink").string()};
+    const auto w = walk(t, sd::MatchType::both, 5, sd::limits_for(100), env);
+    CHECK(w.out.c.skipped_network_mount == 1);
+    CHECK(w.out.c.skipped_symlink == 0);
+}
+
 #else
 
 TEST_CASE("search_dir: a junction is counted and never entered", "[filesystem][search_dir]") {
@@ -359,7 +414,7 @@ TEST_CASE("search_dir: a directory the probe refuses is counted and constrains, 
     CHECK(w.out.constrained());
 }
 
-TEST_CASE("search_dir: mounts are refused before any hook runs and before symlink_status",
+TEST_CASE("search_dir: mounts are refused before any hook runs",
           "[filesystem][search_dir]") {
     Tree t;
     t.write("net/inside.txt");
@@ -401,6 +456,10 @@ TEST_CASE("search_dir: mounts are refused before any hook runs and before symlin
 }
 
 #ifdef __APPLE__
+// The guard owns a per-thread policy: a copy would restore it twice (docs/cpp-conventions.md).
+static_assert(!std::is_copy_constructible_v<fbh::DatalessMaterializationOff> &&
+              !std::is_move_constructible_v<fbh::DatalessMaterializationOff>);
+
 TEST_CASE("search_dir: the walk switches dataless materialization off from its first touch and restores it",
           "[filesystem][search_dir]") {
     // The policy is per THREAD and the walk runs on this one, so the walk's own hooks (the probe,

@@ -717,7 +717,7 @@ Not implemented. Integrity verification of directory trees.
 
 ### 10.15 Directory Search by Name :white_check_mark: `T2`
 
-`search_dir` action in `filesystem` plugin. `fs::recursive_directory_iterator` (the plugin's one bounded walker, shared with `find_by_hash`) with glob or regex name matching. Parameters: root, pattern, match_type (directories/files/both), max_depth, max_results. Respects base_dir. Bounded at 20 seconds, 400,000 entries visited and `max_results` matches; a symlink or junction below the root is never followed or matched, a network mount is refused before it is touched, and what was skipped or cut short is reported in a `truncated` trailer row and a `CONSTRAINED`/`PARTIAL` status (#6478).
+`search_dir` action in `filesystem` plugin. `fs::recursive_directory_iterator` (the plugin's one bounded walker, shared with `find_by_hash`) with glob or regex name matching. Parameters: root, pattern, match_type (directories/files/both), max_depth, max_results. Respects base_dir. Bounded at 20 seconds (checked between entries: a single blocked read or listing is not interrupted), 400,000 entries visited and `max_results` matches; a symlink or junction below the root is never followed or matched, a root on a network mount is refused on its spelling before it is touched, a regex lookahead is refused, and what was skipped or cut short is reported in a `truncated` trailer row and a `CONSTRAINED`/`PARTIAL` status (#6478; residuals in the plugin README, Caveat 2).
 
 ### 10.16 Upload Grants and Server Blob Store :large_orange_diamond: `T2` *(new row, v4.1)*
 

@@ -21,10 +21,17 @@ metadata:
     max_depth are examined and a directory at max_depth is matched but not
     opened. Below the search root a symlink or junction is never followed and
     never matches (it is counted), a FIFO, device or socket is never matched,
-    pseudo-filesystems such as /proc and /sys are never entered, and a subtree
-    on a network mount is skipped before anything under it is read; a root
-    (or base_dir) on a network mount is refused on its spelling before it is
-    touched. The root itself is resolved through any symlink, as before. When
+    on Linux pseudo-filesystems such as /proc and /sys are never entered (each
+    counts as unreadable, so a search whose tree holds one is reported
+    constrained), and on macOS and Linux a subtree on a network mount is
+    skipped before anything under it is read; a root (or base_dir) on a network
+    mount is refused on its spelling before it is touched. A refused root is
+    not an error: the run returns 0 with skipped_network_mount=1 in the
+    truncated row, total_matches|0 and a constrained result. On Windows that
+    covers a UNC share, a drive that is not a fixed disk and a root written
+    with a \\?\ or \\.\ prefix (pass the plain drive spelling); a host whose /
+    is itself a network or paravirtual mount (9p, virtiofs) refuses every root.
+    The root itself is resolved through any symlink, as before. When
     the mount table cannot be read the walk runs without that guard, says so
     with a network_mount_guard|unavailable row ahead of the count, and is
     reported constrained and partial. When anything was skipped or the walk
@@ -38,15 +45,31 @@ metadata:
     skipped, but only the status number is stored on the server: the truncated
     and network_mount_guard rows are the operator-visible signal, and
     total_matches|0 beside either means not found in the part examined. Only
-    result rows are data rows to a column matcher. Regex mode uses the
-    platform's standard-library engine: on Linux it runs in linear time and a
+    result rows are data rows to a column matcher, and a column matcher cannot
+    tell a partly searched device from a fully searched one: a device whose
+    partial search found nothing is left out of the set like any device with no
+    match, and the set is not marked partial (read the output rows for that).
+    The bounds are fixed: when the reason is deadline, file_cap or max_results,
+    search a narrower root or lower max_depth; max_results means the cap was
+    reached while entries remained, whether or not any of them would have
+    matched. Regex mode uses the platform's standard-library engine and refuses
+    a lookahead ((?= or (?!: any (? group other than the non-capturing (?:)
+    with error|regex lookahead is not supported (use (?: to group), because no
+    engine bounds one and a match over one name cannot be interrupted. With no
+    lookahead, on Linux a match takes time linear in the name's length and a
     back-reference is refused; on macOS and Windows a pattern too costly for a
-    name ends the run with an error row (the rows already written stay, and the
-    error row says the answer is not complete). A pattern over 256 bytes and an
-    unknown match_type are refused. A name byte that is not valid UTF-8 is shown
-    as '?' in the path. A path whose last character is a backslash is reported
-    with a forward slash in its place. An agent older than this release still
-    runs the unbounded, symlink-following walk.
+    name ends the run with an error row: the rows already written stay, no
+    total_matches row follows and the run fails with return code 1, so the
+    device counts as failed. An unexpected failure ends a run the same way on
+    any OS (error|search_dir failed: <cause>). A pattern over 256 bytes and an
+    unknown match_type are refused. In a result path a CR or LF is shown as a
+    space, a pipe is escaped, a name byte that is not valid UTF-8 is shown as
+    '?' and a last character that is a backslash is shown as a forward slash,
+    so two names that differ only in such characters can read alike. To find a
+    file by content hash use device.filesystem.find_by_hash; to search inside
+    one file use device.filesystem.search. An agent older than this release
+    still runs the earlier walk: unbounded, and it reported a link to a
+    matching file or directory by its target's type.
   tags: [filesystem, search, diagnostics, inventory]
 
 spec:
@@ -74,6 +97,7 @@ spec:
         description: >
           Glob pattern (default) or regex to match against entry names.
           Examples: "*.log", "config*", "^backup-\d+$" (with regex=true).
+          Matching is case-sensitive on every OS.
         validation:
           maxLength: 256
       regex:
@@ -81,7 +105,7 @@ spec:
         displayName: Use Regex
         description: >
           If "true", interpret the pattern as an ECMAScript regex instead
-          of a glob. Default: "false".
+          of a glob. A lookahead ((?= or (?!) is refused. Default: "false".
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -126,7 +150,7 @@ spec:
     # network_mount_guard|unavailable   (only when the mount table could not be read in full)
     # truncated|<reason>|visited=N|hashed=N|skipped_unreadable=N|skipped_symlink=N|skipped_not_regular=N|skipped_oversize=N|skipped_network_mount=N   (only when something was skipped or the walk stopped early)
     # total_matches|<count>   (the last row of every run that returns 0)
-    # error|<message>   (a failed run, return code 1, in place of total_matches; in regex mode on macOS and Windows it can follow result rows already written)
+    # error|<message>   (a failed run, return code 1, in place of total_matches; a run that fails part-way -- a regex too costly for a name on macOS and Windows, or an unexpected failure on any OS -- writes it after result rows already written, with no truncated row)
     columns:
       - name: row_kind
         type: string

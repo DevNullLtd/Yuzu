@@ -11,6 +11,8 @@
  *   regex bound            -- a regex compile without the linear-time flag on the GNU library, or a
  *                             regex_error escaping the name predicate (the suite timeout is the
  *                             oracle: no sleep, no timer).
+ *   lookahead refusal      -- a regex lookahead reaching the engine (the has_lookahead check
+ *                             dropped from the shell, or applied in glob mode).
  *   shutdown latch         -- search_dir not wired to the agent's cancel signal.
  *   mount refusal          -- validate_path running before the mount check (a dead mount blocks),
  *                             for the root AND for the base_dir arm (a base_dir on a mount that is
@@ -21,7 +23,9 @@
  *                             pinned at the core, test_filesystem_search_dir.cpp.
  *   trailer / status       -- a skip that is not reported, or reported with the wrong status.
  *
- * UNGUARDED TU on every OS; only the symlink / permission / live-mount cases are #ifndef _WIN32.
+ * UNGUARDED TU on every OS; the symlink, permission and live-mount cases are #ifndef _WIN32, the
+ * two UNC cases are #ifdef _WIN32, the dataless-policy case is #ifdef __APPLE__, and the
+ * back-reference case and one arm of the ambiguous-alternation case are #if defined(__GLIBCXX__).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -161,6 +165,12 @@ TEST_CASE("filesystem search_dir: error rows for bad parameters and roots",
         CHECK(captured_rows(r.captured) == Rows{"error|pattern too long (max 256 chars)"});
     }
     {
+        // exactly at the cap: accepted (a glob that matches nothing here)
+        const auto r = search(*plugin, t, std::string(256, 'a'));
+        CHECK(r.rc == 0);
+        CHECK(captured_rows(r.captured) == Rows{"total_matches|0"});
+    }
+    {
         const auto r = search_dir(*plugin, {{"root", (t.root / "absent").string()}, {"pattern", "*"}});
         CHECK(r.rc == 1);
         CHECK(captured_rows(r.captured) ==
@@ -213,6 +223,40 @@ TEST_CASE("filesystem search_dir: regex mode matches, and a nested-quantifier re
         const auto r = search(*plugin, t, std::string(257, 'a'), {{"regex", "true"}});
         CHECK(r.rc == 1);
         CHECK(captured_rows(r.captured) == Rows{"error|pattern too long (max 256 chars)"});
+    }
+}
+
+TEST_CASE("filesystem search_dir: a regex lookahead is refused before it reaches the engine",
+          "[filesystem][search_dir][dispatcher]") {
+    // Nesting depth 3 at most: unrefused it returns in about a millisecond (rc 0, total_matches|0),
+    // so a missing check FAILS this case and never hangs it. Deeper shapes are pinned on the pure
+    // predicate (test_filesystem_search_dir.cpp) and never executed.
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    Tree t;
+    t.write(std::string(48, 'a'));
+    t.write("a.log");
+    for (const std::string pattern : {"(?=.*(?=.*(?=.*x)))", "^(?!.*\\.bak$).*\\.log$"}) {
+        INFO(pattern);
+        const auto r = search(*plugin, t, pattern, {{"regex", "true"}, {"match_type", "files"}});
+        CHECK(r.rc == 1);
+        CHECK(captured_rows(r.captured) ==
+              Rows{"error|regex lookahead is not supported (use (?: to group)"});
+    }
+    {
+        // the non-capturing group is still accepted
+        const auto r =
+            search(*plugin, t, "^(?:a|b)\\.log$", {{"regex", "true"}, {"match_type", "files"}});
+        CHECK(r.rc == 0);
+        CHECK(captured_rows(r.captured) ==
+              Rows{"result|" + (t.root / "a.log").string() + "|file", "total_matches|1"});
+    }
+    {
+        // glob mode has no groups: the same bytes are an ordinary pattern that matches nothing here
+        const auto r = search(*plugin, t, "(?=x)", {{"match_type", "files"}});
+        CHECK(r.rc == 0);
+        CHECK(captured_rows(r.captured) == Rows{"total_matches|0"});
     }
 }
 
