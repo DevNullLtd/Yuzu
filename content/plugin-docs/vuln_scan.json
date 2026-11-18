@@ -132,7 +132,7 @@
     }
   ],
   "caveats": [
-    "**A clean scan is not \"patched\".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined.",
+    "**A clean scan is not \"patched\".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined. On macOS, Homebrew formulae and casks are never matched, so a clean macOS result is not evidence about them; use pkg_inventory.packages (which lists, not matches). The four macOS software-consuming actions say so in their result status (see Result status).",
     "**Substring matching produces false positives, and the version test is naive.** A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, and `windows` matches .NET runtimes and Windows utilities; the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.",
     "**A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed `popen` command returns empty output, and only the Linux file checks surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).",
     "**`summary` does not match its declared result columns.** It emits three pipe fields per row (`summary|<severity or TOTAL>|<count>`) against two declared columns, `severity` and `count`, and the `TOTAL` row's `count` cell is the string `<n> findings (<n> issues)` rather than the declared `int32`.",
@@ -166,7 +166,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Scan installed software against known CVE rules. Enumerates installed applications (registry on Windows, dpkg/rpm/pacman on Linux, system_profiler on macOS) and compares versions against the built-in CVE database. Returns only CVE findings, not configuration checks. Use the full \"scan\" action for combined results.",
+      "description": "Scan installed software against known CVE rules. Enumerates installed applications (registry on Windows, dpkg/rpm/pacman on Linux, system_profiler on macOS; Homebrew formulae and casks are not scanned, use pkg_inventory.packages) and compares versions against the built-in CVE database. Returns only CVE findings, not configuration checks. A result with no CVE rows means only that no built-in rule matched the software enumerated above. Use the full \"scan\" action for combined results.",
       "display_name": "CVE Vulnerability Scan",
       "execute_roles": [
         "endpoint-admin",
@@ -553,7 +553,19 @@
       "completeness": "`UNKNOWN`",
       "provenance": "(empty)",
       "status": "`UNDECLARED`",
-      "when": "every action on every OS: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding"
+      "when": "every action on Windows and Linux, and macOS `config_scan`: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`macos:vuln_scan:homebrew_not_scanned`",
+      "status": "`CONSTRAINED`",
+      "when": "macOS `cve_scan`, `scan`, `summary` and `inventory` when `system_profiler` returned applications. Homebrew formulae and casks are never read, so a result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed"
+    },
+    {
+      "completeness": "`PARTIAL`",
+      "provenance": "`macos:vuln_scan:system_profiler_unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. The rows then describe an empty software list (`TOTAL` 0 or an empty `inventory`), not a clean host"
     }
   ],
   "samples": {
@@ -948,11 +960,13 @@
     "plugin": [
       "agents/plugins/vuln_scan/src/config_checks.hpp",
       "agents/plugins/vuln_scan/src/cve_rules.hpp",
+      "agents/plugins/vuln_scan/src/macos_software.hpp",
       "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp"
     ],
     "privilege_row": false,
     "tests": [
-      "tests/test_vuln_scan_no_brew_lexical.py"
+      "tests/test_vuln_scan_no_brew_lexical.py",
+      "tests/test_vuln_scan_no_brew_lexical_selftest.py"
     ]
   },
   "version": "1.0.0",

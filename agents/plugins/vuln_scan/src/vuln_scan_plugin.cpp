@@ -27,6 +27,7 @@
 
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
+#include <sys/wait.h>
 #endif
 
 #ifdef _WIN32
@@ -42,32 +43,40 @@
 
 #include "config_checks.hpp"
 #include "cve_rules.hpp"
+#include "macos_software.hpp"
 
 namespace {
 
 // ── Subprocess helper (Linux / macOS) ──────────────────────────────────────
 
 #if defined(__linux__) || defined(__APPLE__)
-std::string run_command(const char* cmd) {
+// `exited_ok` (optional) reports whether the command started and exited 0.
+std::string run_command(const char* cmd, bool* exited_ok = nullptr) {
     std::string result;
     std::array<char, 256> buf{};
+    if (exited_ok)
+        *exited_ok = false;
     FILE* pipe = popen(cmd, "r");
     if (!pipe)
         return result;
     while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
         result += buf.data();
     }
-    pclose(pipe);
+    const int rc = pclose(pipe);
+    if (exited_ok)
+        *exited_ok = rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
     return result;
 }
 
+#if defined(__linux__)  // the macOS enumeration reads one fixed absolute-path tool
 bool command_exists(const char* cmd) {
     auto check = std::string("command -v ") + cmd + " >/dev/null 2>&1";
     return system(check.c_str()) == 0;
 }
+#endif
 #endif
 
 // ── App record ────────────────────────────────────────────────────────────
@@ -220,7 +229,7 @@ void enumerate_uninstall_key(HKEY root, const char* subkey, REGSAM extra_sam,
     // hkey_guard closes hkey
 }
 
-std::vector<AppInfo> get_installed_apps() {
+std::vector<AppInfo> get_installed_apps([[maybe_unused]] std::string_view* coverage_token = nullptr) {
     std::vector<AppInfo> apps;
     static const char* kUninstallKey = "SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Uninstall";
     enumerate_uninstall_key(HKEY_LOCAL_MACHINE, kUninstallKey, KEY_WOW64_64KEY, apps);
@@ -239,7 +248,7 @@ std::vector<AppInfo> get_installed_apps() {
     return apps;
 }
 #elif defined(__linux__)
-std::vector<AppInfo> get_installed_apps() {
+std::vector<AppInfo> get_installed_apps([[maybe_unused]] std::string_view* coverage_token = nullptr) {
     std::vector<AppInfo> apps;
 
     if (command_exists("dpkg-query")) {
@@ -299,45 +308,28 @@ std::vector<AppInfo> get_installed_apps() {
     return apps;
 }
 #elif defined(__APPLE__)
-std::vector<AppInfo> get_installed_apps() {
-    std::vector<AppInfo> apps;
-
-    auto out = run_command("system_profiler SPApplicationsDataType -detailLevel mini 2>/dev/null"
-                           " | grep -E '^ {4}\\w|Version:'");
-    if (!out.empty()) {
-        std::istringstream ss(out);
-        std::string line;
-        std::string current_name;
-        std::string current_version;
-        while (std::getline(ss, line)) {
-            auto start = line.find_first_not_of(" \t");
-            if (start == std::string::npos)
-                continue;
-            line = line.substr(start);
-
-            if (line.find("Version:") == 0) {
-                current_version = line.substr(line.find(':') + 2);
-            } else if (!line.empty() && line.back() == ':') {
-                if (!current_name.empty()) {
-                    apps.push_back({current_name, current_version});
-                }
-                current_name = line.substr(0, line.size() - 1);
-                current_version.clear();
-            }
-        }
-        if (!current_name.empty()) {
-            apps.push_back({current_name, current_version});
-        }
-    }
+std::vector<AppInfo> get_installed_apps(std::string_view* coverage_token) {
+    bool ok = false;
+    // Absolute argv[0]; the line filter runs in C++ so the exit status is not swallowed by a pipe.
+    const std::string cmd(yuzu::vuln::kMacosSystemProfilerCmd);
+    auto out = run_command(cmd.c_str(), &ok);
+    auto parsed = yuzu::vuln::parse_system_profiler_apps(out, ok);
 
     // Homebrew is deliberately NOT enumerated here (WP13c/C-2): the agent runs as root and a
     // Homebrew prefix is owned by the installing user, so exec'ing its `brew` script would run
-    // a user-controlled file as root. Homebrew data is reported by pkg_inventory (no subprocess).
+    // a user-controlled file as root. Homebrew formulae and casks are listed by
+    // pkg_inventory.packages (no subprocess); this plugin does not scan them.
+    if (coverage_token)
+        *coverage_token = yuzu::vuln::macos_status_token(parsed);
 
+    std::vector<AppInfo> apps;
+    apps.reserve(parsed.apps.size());
+    for (auto& a : parsed.apps)
+        apps.push_back({std::move(a.name), std::move(a.version)});
     return apps;
 }
 #else
-std::vector<AppInfo> get_installed_apps() {
+std::vector<AppInfo> get_installed_apps([[maybe_unused]] std::string_view* coverage_token = nullptr) {
     return {};
 }
 #endif
@@ -353,9 +345,9 @@ struct Finding {
 
 // ── CVE scan ──────────────────────────────────────────────────────────────
 
-std::vector<Finding> do_cve_scan_impl() {
+std::vector<Finding> do_cve_scan_impl(std::string_view* coverage_token = nullptr) {
     std::vector<Finding> findings;
-    auto apps = get_installed_apps();
+    auto apps = get_installed_apps(coverage_token);
 
     for (const auto& rule : yuzu::vuln::kCveRules) {
         for (const auto& app : apps) {
@@ -393,6 +385,15 @@ std::vector<Finding> do_config_scan_impl() {
 }
 
 // ── Output helpers ────────────────────────────────────────────────────────
+
+// A non-empty token means the software list this action consumed is known-incomplete (macOS:
+// Homebrew is never scanned, or the system_profiler read failed/was empty): declare it so a clean
+// result is not mistaken for full coverage. Empty on Linux/Windows -> no-op.
+void declare_coverage(yuzu::CommandContext& ctx, std::string_view token) {
+    if (!token.empty())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              token);
+}
 
 void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings) {
     if (findings.empty()) {
@@ -432,19 +433,22 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     (iptables/nft/ufw) — the leg is genuinely wired throughout, but the
 //     firewall check's acquisition method is the worst (least-native) one
 //     actually exercised, so rung 3.
-//   - macOS: get_installed_apps shells out via popen (system_profiler); run_macos_checks is almost entirely popen
-//     (spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults) — rung 3.
+//   - macOS: get_installed_apps shells out via popen (/usr/sbin/system_profiler); run_macos_checks
+//     is almost entirely popen (spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults) — rung 3.
+//     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never
+//     scanned (see macos_software.hpp), and the same actions report CONSTRAINED + PARTIAL at run
+//     time (declare_coverage). config_scan reads no software list and stays SUPPORTED.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler+security-checks)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(system_profiler+security-checks)", "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
         "cve_scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(system_profiler)", "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
@@ -456,13 +460,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "summary",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler+security-checks)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(system_profiler+security-checks)", "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
         "inventory",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(dpkg-query/rpm/pacman/apk)", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "popen(system_profiler)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 3, "popen(system_profiler)", "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
 };
@@ -500,7 +504,8 @@ public:
 
         if (action == "scan") {
             ctx.report_progress(0);
-            auto cve_findings = do_cve_scan_impl();
+            std::string_view coverage;
+            auto cve_findings = do_cve_scan_impl(&coverage);
             ctx.report_progress(50);
             auto config_findings = do_config_scan_impl();
             ctx.report_progress(90);
@@ -511,14 +516,17 @@ public:
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_findings(ctx, all);
+            declare_coverage(ctx, coverage);
             ctx.report_progress(100);
             return 0;
         }
 
         if (action == "cve_scan") {
             ctx.report_progress(0);
-            auto findings = do_cve_scan_impl();
+            std::string_view coverage;
+            auto findings = do_cve_scan_impl(&coverage);
             output_findings(ctx, findings);
+            declare_coverage(ctx, coverage);
             ctx.report_progress(100);
             return 0;
         }
@@ -534,16 +542,19 @@ public:
         if (action == "inventory") {
             // Return raw software inventory for server-side NVD matching.
             // Format: name|version (one per line, pipe-delimited)
-            auto apps = get_installed_apps();
+            std::string_view coverage;
+            auto apps = get_installed_apps(&coverage);
             for (const auto& app : apps) {
                 ctx.write_output(std::format("{}|{}", escape_pipes(sanitize_utf8(app.name)),
                                              escape_pipes(sanitize_utf8(app.version))));
             }
+            declare_coverage(ctx, coverage);
             return 0;
         }
 
         if (action == "summary") {
-            auto cve_findings = do_cve_scan_impl();
+            std::string_view coverage;
+            auto cve_findings = do_cve_scan_impl(&coverage);
             auto config_findings = do_config_scan_impl();
 
             std::vector<Finding> all;
@@ -552,6 +563,7 @@ public:
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
             output_summary(ctx, all);
+            declare_coverage(ctx, coverage);
             return 0;
         }
 

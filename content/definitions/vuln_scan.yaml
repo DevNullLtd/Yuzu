@@ -106,9 +106,12 @@ metadata:
   description: >
     Scan installed software against known CVE rules. Enumerates installed
     applications (registry on Windows, dpkg/rpm/pacman on Linux,
-    system_profiler on macOS) and compares versions against the
+    system_profiler on macOS; Homebrew formulae and casks are not scanned,
+    use pkg_inventory.packages) and compares versions against the
     built-in CVE database. Returns only CVE findings, not configuration
-    checks. Use the full "scan" action for combined results.
+    checks. A result with no CVE rows means only that no built-in rule
+    matched the software enumerated above. Use the full "scan" action for
+    combined results.
   tags: [security, vulnerability, cve, compliance]
 
 spec:

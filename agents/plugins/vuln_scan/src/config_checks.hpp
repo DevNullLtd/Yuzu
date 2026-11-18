@@ -15,6 +15,8 @@
 #include <utility>
 #include <vector>
 
+#include "macos_software.hpp"
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
 #include <sys/stat.h>
@@ -505,7 +507,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 
     // Gatekeeper
     {
-        auto out = detail::run_cmd("spctl --status 2>&1");
+        auto out = detail::run_cmd(std::string(kMacosSpctlCmd).c_str());
         bool enabled = out.find("enabled") != std::string::npos;
         results.push_back({enabled ? "INFO" : "HIGH", "Gatekeeper",
                            enabled ? "Enabled - only verified apps can run"
@@ -515,7 +517,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 
     // FileVault
     {
-        auto out = detail::run_cmd("fdesetup status 2>&1");
+        auto out = detail::run_cmd(std::string(kMacosFdesetupCmd).c_str());
         bool on = out.find("On") != std::string::npos;
         results.push_back({on ? "INFO" : "HIGH", "FileVault Disk Encryption",
                            on ? "Enabled" : "Disabled - disk is not encrypted", on});
@@ -523,7 +525,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 
     // SIP (System Integrity Protection)
     {
-        auto out = detail::run_cmd("csrutil status 2>&1");
+        auto out = detail::run_cmd(std::string(kMacosCsrutilCmd).c_str());
         bool enabled = out.find("enabled") != std::string::npos;
         results.push_back({enabled ? "INFO" : "CRITICAL", "System Integrity Protection (SIP)",
                            enabled ? "Enabled" : "Disabled - system files are unprotected",
@@ -533,7 +535,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
     // Firewall
     {
         auto out = detail::run_cmd(
-            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1");
+            std::string(kMacosSocketfilterfwCmd).c_str());
         bool enabled = out.find("enabled") != std::string::npos;
         results.push_back({enabled ? "INFO" : "MEDIUM", "Application Firewall",
                            enabled ? "Enabled" : "Disabled", enabled});
@@ -541,7 +543,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 
     // Remote Login (SSH)
     {
-        auto out = detail::run_cmd("systemsetup -getremotelogin 2>&1");
+        auto out = detail::run_cmd(std::string(kMacosSystemsetupCmd).c_str());
         bool off = out.find("Off") != std::string::npos;
         results.push_back({off ? "INFO" : "MEDIUM", "Remote Login (SSH)",
                            off ? "Disabled" : "Enabled - SSH access is open", off});
@@ -549,8 +551,7 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 
     // Automatic updates
     {
-        auto out = detail::run_cmd("defaults read /Library/Preferences/com.apple.SoftwareUpdate "
-                                   "AutomaticCheckEnabled 2>&1");
+        auto out = detail::run_cmd(std::string(kMacosDefaultsCmd).c_str());
         bool enabled = out.find("1") != std::string::npos;
         results.push_back({enabled ? "INFO" : "MEDIUM", "Automatic Software Updates",
                            enabled ? "Enabled" : "Disabled - system may miss security patches",

@@ -25,7 +25,7 @@ flowchart LR
   EX --> WIN["Windows leg: registry reads"]
   EX --> MAC["macOS leg: system_profiler, system commands"]
   EX --> LIN["Linux leg: package manager, /proc, sshd_config, firewall tools"]
-  WIN --> ROWS["Pipe-delimited rows, result status UNDECLARED"]
+  WIN --> ROWS["Pipe-delimited rows; result status UNDECLARED (Windows, Linux), CONSTRAINED (macOS software actions)"]
   MAC --> ROWS
   LIN --> ROWS
   ROWS --> RS[("ResponseStore")] --> API["REST /api/responses, MCP"]
@@ -166,7 +166,9 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` | `UNKNOWN` | (empty) | every action on every OS: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding |
+| `UNDECLARED` | `UNKNOWN` | (empty) | every action on Windows and Linux, and macOS `config_scan`: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding |
+| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:homebrew_not_scanned` | macOS `cve_scan`, `scan`, `summary` and `inventory` when `system_profiler` returned applications. Homebrew formulae and casks are never read, so a result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed |
+| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:system_profiler_unreadable` | the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. The rows then describe an empty software list (`TOTAL` 0 or an empty `inventory`), not a clean host |
 
 ### Where the data goes
 
@@ -367,7 +369,7 @@ bsdutils|1:2.41.5-0+deb13u1
 
 ## Caveats and known gaps
 
-1. **A clean scan is not "patched".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined.
+1. **A clean scan is not "patched".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined. On macOS, Homebrew formulae and casks are never matched, so a clean macOS result is not evidence about them; use pkg_inventory.packages (which lists, not matches). The four macOS software-consuming actions say so in their result status (see Result status).
 2. **Substring matching produces false positives, and the version test is naive.** A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, and `windows` matches .NET runtimes and Windows utilities; the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.
 3. **A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed `popen` command returns empty output, and only the Linux file checks surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).
 4. **`summary` does not match its declared result columns.** It emits three pipe fields per row (`summary|<severity or TOTAL>|<count>`) against two declared columns, `severity` and `count`, and the `TOTAL` row's `count` cell is the string `<n> findings (<n> issues)` rather than the declared `int32`.
@@ -376,9 +378,9 @@ bsdutils|1:2.41.5-0+deb13u1
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/vuln_scan/src/config_checks.hpp` · `agents/plugins/vuln_scan/src/cve_rules.hpp` · `agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp`
+- Plugin: `agents/plugins/vuln_scan/src/config_checks.hpp` · `agents/plugins/vuln_scan/src/cve_rules.hpp` · `agents/plugins/vuln_scan/src/macos_software.hpp` · `agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp`
 - Definitions: `content/definitions/vuln_scan.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_a.hpp`
-- Tests: `tests/test_vuln_scan_no_brew_lexical.py`
+- Tests: `tests/test_vuln_scan_no_brew_lexical.py` · `tests/test_vuln_scan_no_brew_lexical_selftest.py`
 - Privilege row: `docs/agent-privilege-model.md` (no row yet)
 <!-- END GENERATED -->
