@@ -126,7 +126,7 @@ TEST_CASE("bulk read cap [control]: with no cap, bulk readers equal to the pool 
     std::vector<std::thread> threads;
     for (int i = 0; i < kPool; ++i)
         threads.emplace_back([&] {
-            (void)hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, /*slots=*/nullptr);
+            (void)hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, /*slots=*/nullptr, hcp::kRestRowBudgetBytes);
         });
     REQUIRE(readers.wait_for_holding(kPool)); // every pooled connection is held by a bulk read
 
@@ -161,7 +161,7 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
     std::vector<std::thread> threads;
     std::vector<std::optional<hcp::ReadError>> outcome(kPool);
     auto run_reader = [&](int i) {
-        const auto page = hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, &slots);
+        const auto page = hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         if (!page)
             outcome[static_cast<std::size_t>(i)] = page.error();
     };

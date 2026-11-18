@@ -2058,7 +2058,13 @@ sync, defeating the hash-skip protocol.
 - **Bulk pull.** To read every stored record without one call per device, page through
   `GET /api/v1/hardware-ci` (MCP: `list_hardware_ci_records`): the scalar `ci` fields of each
   device plus its stored `content_hash` and `blob_version`, 100 devices per page by default (the MCP tool defaults to 20) and
-  1000 at most, with no sections. It reads the stored records, not the 30-day device roster, so a
+  1000 at most, with no sections. A page also ends early at a byte bound (REST: device rows up to
+  4 MiB of JSON, so the body is at most 4 MiB plus a few KB; MCP: 1 MiB of rows, and the payload
+  is emitted twice, so the body can reach about 3 MiB), signalled by `page_bytes_capped: true`: a
+  page is therefore sometimes shorter than `limit`, so follow `next_cursor` until it is empty and
+  never take a short page as the last. A page always holds at least one device and a row is never
+  truncated. The byte bound limits the response only: a `limit=1000` request still reads 1001 rows
+  from the store, and only the per-replica read cap bounds that. It reads the stored records, not the 30-day device roster, so a
   device that has been offline longer still appears while its record exists. Walk the pages one
   at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
   the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and

@@ -59,7 +59,7 @@ TEST_CASE("device_ci read gate: read_page refuses under Mismatch and Unproven an
     std::atomic<CollationGate> g{CollationGate::Trusted};
 
     SECTION("Trusted serves") {
-        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &g, nullptr);
+        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &g, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.size() == 2);
         CHECK(store.reads == 1);
@@ -67,14 +67,14 @@ TEST_CASE("device_ci read gate: read_page refuses under Mismatch and Unproven an
     SECTION("Mismatch and Unproven refuse before the store is asked") {
         for (const auto refused : {CollationGate::Mismatch, CollationGate::Unproven}) {
             g.store(refused);
-            const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &g, nullptr);
+            const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &g, nullptr, hcp::kRestRowBudgetBytes);
             REQUIRE_FALSE(page.has_value());
             CHECK(page.error() == hcp::ReadError::kOrderingUnverified);
             CHECK(store.reads == 0); // refused before the store was asked
             // a named device, and a confined scope, are refused the same way
             hcp::Request named;
             named.agent_id = "a";
-            const auto one = hcp::read_page(store.reader(), named, authz::VisibleSet{std::unordered_set<std::string>{"a"}}, &g, nullptr);
+            const auto one = hcp::read_page(store.reader(), named, authz::VisibleSet{std::unordered_set<std::string>{"a"}}, &g, nullptr, hcp::kRestRowBudgetBytes);
             REQUIRE_FALSE(one.has_value());
             CHECK(one.error() == hcp::ReadError::kOrderingUnverified);
             CHECK(store.reads == 0);
@@ -82,7 +82,7 @@ TEST_CASE("device_ci read gate: read_page refuses under Mismatch and Unproven an
     }
     SECTION("a null gate (none wired) serves, whatever any gate holds") {
         g.store(CollationGate::Mismatch);
-        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.size() == 2);
     }
@@ -91,7 +91,7 @@ TEST_CASE("device_ci read gate: read_page refuses under Mismatch and Unproven an
         authz::VisibleSet wide = std::unordered_set<std::string>{};
         for (std::size_t i = 0; i <= hcp::kMaxPushdownScopeIds; ++i)
             wide->insert("x" + std::to_string(i));
-        const auto page = hcp::read_page(store.reader(), {}, wide, &g, nullptr);
+        const auto page = hcp::read_page(store.reader(), {}, wide, &g, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE_FALSE(page.has_value());
         CHECK(page.error() == hcp::ReadError::kScopeTooWide);
     }

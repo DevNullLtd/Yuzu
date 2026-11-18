@@ -211,7 +211,7 @@ TEST_CASE("read_page: the slot is held ONLY around the store call and gone befor
         return store.read(q);
     };
     CHECK(slots.in_use() == 0);
-    const auto page = hcp::read_page(reader, {}, std::nullopt, nullptr, &slots);
+    const auto page = hcp::read_page(reader, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE(page.has_value());
     CHECK(page->rows.size() == 3);
     CHECK(in_use_inside == 1);
@@ -223,7 +223,7 @@ TEST_CASE("read_page: a store failure and a throwing reader both release the slo
           "[bulk_read_slots][hardware_ci_page]") {
     BulkReadSlots slots{1, kShortWait};
     const hcp::Reader failing = [](const DeviceCiKeysetQuery&) { return std::nullopt; };
-    const auto degraded = hcp::read_page(failing, {}, std::nullopt, nullptr, &slots);
+    const auto degraded = hcp::read_page(failing, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(degraded.has_value());
     CHECK(degraded.error() == hcp::ReadError::kDegraded);
     CHECK(slots.in_use() == 0);
@@ -232,7 +232,7 @@ TEST_CASE("read_page: a store failure and a throwing reader both release the slo
         [](const DeviceCiKeysetQuery&) -> std::optional<std::vector<DeviceCiRecord>> {
         throw std::runtime_error("store threw");
     };
-    CHECK_THROWS_AS(hcp::read_page(throwing, {}, std::nullopt, nullptr, &slots), std::runtime_error);
+    CHECK_THROWS_AS(hcp::read_page(throwing, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes), std::runtime_error);
     CHECK(slots.in_use() == 0);
 }
 
@@ -243,7 +243,7 @@ TEST_CASE("read_page: a saturated cap is kBusy, reads nothing, and waits the bou
     REQUIRE(held.has_value());
     auto store = seeded({"a", "b"});
     const auto t0 = Clock::now();
-    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots);
+    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(page.has_value());
     CHECK(page.error() == hcp::ReadError::kBusy);
     CHECK(Clock::now() - t0 >= 45ms);
@@ -251,7 +251,7 @@ TEST_CASE("read_page: a saturated cap is kBusy, reads nothing, and waits the bou
     CHECK(slots.in_use() == 1); // only the test's own slot; the refusal took none
     // Once the slot frees, the same call serves.
     held.reset();
-    const auto again = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots);
+    const auto again = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE(again.has_value());
     CHECK(store.reads == 1);
 }
@@ -266,14 +266,14 @@ TEST_CASE("read_page: a refusal that needs no read takes no slot, so a saturated
 
     SECTION("a refusing collation gate") {
         const std::atomic<CollationGate> mismatch{CollationGate::Mismatch};
-        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &mismatch, &slots);
+        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, &mismatch, &slots, hcp::kRestRowBudgetBytes);
         REQUIRE_FALSE(page.has_value());
         CHECK(page.error() == hcp::ReadError::kOrderingUnverified);
     }
     SECTION("a malformed cursor") {
         hcp::Request rq;
         rq.cursor = "garbage";
-        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots);
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         REQUIRE_FALSE(page.has_value());
         CHECK(page.error() == hcp::ReadError::kCursorMalformed);
     }
@@ -282,7 +282,7 @@ TEST_CASE("read_page: a refusal that needs no read takes no slot, so a saturated
         other.agent_id = "a";
         hcp::Request rq;
         rq.cursor = hcp::encode_cursor({"a"}, hcp::filter_fingerprint(other)); // issued for agent_id=a
-        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots);
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         REQUIRE_FALSE(page.has_value());
         CHECK(page.error() == hcp::ReadError::kCursorFilterMismatch);
     }
@@ -290,7 +290,7 @@ TEST_CASE("read_page: a refusal that needs no read takes no slot, so a saturated
         std::unordered_set<std::string> ids;
         for (std::size_t i = 0; i <= hcp::kMaxPushdownScopeIds; ++i)
             ids.insert("d" + std::to_string(i));
-        const auto page = hcp::read_page(store.reader(), {}, authz::VisibleSet{std::move(ids)}, nullptr, &slots);
+        const auto page = hcp::read_page(store.reader(), {}, authz::VisibleSet{std::move(ids)}, nullptr, &slots, hcp::kRestRowBudgetBytes);
         REQUIRE_FALSE(page.has_value());
         CHECK(page.error() == hcp::ReadError::kScopeTooWide);
     }
@@ -299,7 +299,7 @@ TEST_CASE("read_page: a refusal that needs no read takes no slot, so a saturated
         rq.agent_id = "a";
         const auto page = hcp::read_page(store.reader(), rq,
                                          authz::VisibleSet{std::unordered_set<std::string>{"z"}},
-                                         nullptr, &slots);
+                                         nullptr, &slots, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->target_denied);
     }
@@ -320,7 +320,7 @@ TEST_CASE("read_page: a point read (agent_id) takes no slot and is served while 
     };
     hcp::Request rq;
     rq.agent_id = "b";
-    const auto page = hcp::read_page(reader, rq, std::nullopt, nullptr, &slots);
+    const auto page = hcp::read_page(reader, rq, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE(page.has_value());
     CHECK(page->rows.size() == 1);
     CHECK(page->rows[0].agent_id == "b");
@@ -330,7 +330,7 @@ TEST_CASE("read_page: a point read (agent_id) takes no slot and is served while 
 
 TEST_CASE("read_page: a null slots pointer is no cap and serves", "[bulk_read_slots][hardware_ci_page]") {
     auto store = seeded({"a"});
-    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr);
+    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE(page.has_value());
     CHECK(page->rows.size() == 1);
 }

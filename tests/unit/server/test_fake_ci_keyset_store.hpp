@@ -44,6 +44,34 @@ inline DeviceCiRecord make_ci_record(std::string id) {
     return r;
 }
 
+/// The widest row the wire can carry: every free-text field at the 1024-byte ingest clamp and made
+/// of 0x01 bytes, which JSON escapes to the six-byte `\u0001` (the longest form per byte), so one
+/// row serves at roughly 180 KB. `fill` picks another byte (a `"` doubles in the row's own JSON and
+/// doubles again in the MCP text copy, the worst case for that copy). The numeric fields stay plain
+/// decimals. `id` is the agent_id; the byte-bound tests walk and measure rows made with it.
+inline DeviceCiRecord make_worst_case_ci_record(std::string id, char fill = '\x01') {
+    DeviceCiRecord r;
+    const std::string wide(1024, fill);
+    r.agent_id = std::move(id);
+    for (std::string* f :
+         {&r.manufacturer, &r.model, &r.serial, &r.system_uuid, &r.hostname, &r.domain, &r.ou,
+          &r.bios_vendor, &r.bios_version, &r.bios_date, &r.cpu_model, &r.disks_summary,
+          &r.primary_mac, &r.macs_summary, &r.os_name, &r.os_version, &r.os_build, &r.arch,
+          &r.chassis_type, &r.chassis_serial, &r.chassis_asset_tag, &r.chassis_source,
+          &r.board_vendor, &r.board_product, &r.board_serial, &r.board_source, &r.machine_id_hash,
+          &r.machine_id_algorithm, &r.machine_id_source})
+        *f = wide;
+    r.cpu_cores = "64";
+    r.cpu_threads = "128";
+    r.ram_bytes = "17179869184";
+    r.nic_count = "8";
+    r.first_seen = 1700000000;
+    r.last_seen = 1700000999;
+    r.blob_version = 2;
+    r.content_hash = std::string(64, 'f');
+    return r;
+}
+
 /// The store's own row ceiling (`kListRowCap` in device_inventory_store.cpp, 100000), which the
 /// store's ceiling test reads for real.
 inline constexpr int kStoreRowCeiling = 100000;

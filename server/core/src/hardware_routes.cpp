@@ -853,7 +853,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         // `deps_.ci_read_slots` is the bulk-read concurrency cap (bulk_read_slots.hpp), held only
         // around the store call; a point read (agent_id) takes none. Null means no cap (tests only).
         const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
-                                                      deps_.ci_collation_gate, deps_.ci_read_slots);
+                                                      deps_.ci_collation_gate, deps_.ci_read_slots,
+                                                      hardware_ci_page::kRestRowBudgetBytes);
         if (!read) {
             // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
             // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),

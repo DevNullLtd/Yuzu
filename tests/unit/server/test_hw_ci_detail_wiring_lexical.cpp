@@ -341,11 +341,11 @@ TEST_CASE("collation read gate wiring (LEXICAL pin, not behaviour): both bulk-re
     const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
     CHECK(count_occurrences(rest, "hardware_ci_page::read_page(") == 1);
     CHECK(count_occurrences(rest, "hardware_ci_page::read_page(deps_.ci_page_reader,rq,gate.scope,"
-                                  "deps_.ci_collation_gate,deps_.ci_read_slots)") == 1);
+                                  "deps_.ci_collation_gate,deps_.ci_read_slots,hardware_ci_page::kRestRowBudgetBytes)") == 1);
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
     CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(") == 1);
     CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(deps->ci_page_reader,*rq,gate.scope,"
-                                 "deps->ci_collation_gate,deps->ci_read_slots)") == 1);
+                                 "deps->ci_collation_gate,deps->ci_read_slots,hardware_ci_page::kMcpRowBudgetBytes)") == 1);
 }
 
 // #7949/#7951: the bulk-read concurrency cap (bulk_read_slots.hpp). A NULL slots pointer means "no
@@ -367,10 +367,11 @@ TEST_CASE("bulk read cap wiring (LEXICAL pin, not behaviour): both bulk-read con
     // One instance: constructed in the two arms of the boot resolution and nowhere else.
     CHECK(count_occurrences(flat, "BulkReadSlots>(") == 2);
 
-    // The transports pass the slots their deps carry as the LAST argument of the one call (the
-    // gate before it is pinned above), so a point-read exemption or a null cannot be hardcoded.
+    // The transports pass the slots their deps carry right after the gate (the gate before it is
+    // pinned above; the surface's byte budget follows), so a point-read exemption or a null cannot
+    // be hardcoded.
     const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
-    CHECK(count_occurrences(rest, "deps_.ci_collation_gate,deps_.ci_read_slots);") == 1);
+    CHECK(count_occurrences(rest, "deps_.ci_collation_gate,deps_.ci_read_slots,") == 1);
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
-    CHECK(count_occurrences(mcp, "deps->ci_collation_gate,deps->ci_read_slots);") == 1);
+    CHECK(count_occurrences(mcp, "deps->ci_collation_gate,deps->ci_read_slots,") == 1);
 }

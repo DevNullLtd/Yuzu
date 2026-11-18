@@ -2691,3 +2691,201 @@ TEST_CASE("audit outage [control]: with no cap the same burst reads concurrently
     (void)burst(12, [&] { return std::to_string(t.sink.Get("/api/v1/hardware-ci")->status); });
     CHECK(f.peak.load() > 2);
 }
+
+// ───────────────── the byte bound per page (#7950) ─────────────────────────────────────────────────
+
+namespace {
+
+using yuzu::server::test::make_worst_case_ci_record;
+
+std::string wide_id(int i) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "dev-%05d", i);
+    return buf;
+}
+
+void seed_worst_case(Twin& t, int n, char fill) {
+    for (int i = 0; i < n; ++i)
+        t.ci_store.add(make_worst_case_ci_record(wide_id(i), fill));
+}
+
+// The documented per-surface body maxima (user manual, OpenAPI): REST is the row budget plus a few
+// KB of framing (array separators, envelope, cursor); MCP emits the payload twice (as the text
+// copy, escaped, and as structuredContent), the text copy at most twice the payload, so three times
+// the row budget plus the same framing.
+constexpr std::size_t kFramingSlack = 8 * 1024;
+constexpr std::size_t kRestBodyMax = hardware_ci_page::kRestRowBudgetBytes + kFramingSlack;
+constexpr std::size_t kMcpBodyMax = 3 * hardware_ci_page::kMcpRowBudgetBytes + kFramingSlack;
+
+// Walks the REST route to the end at limit=1000, asserting the bound on every real body; returns
+// the ids served and leaves the audit details of every page in `details`.
+std::vector<std::string> rest_walk(Twin& t, std::vector<std::size_t>& sizes,
+                                   std::vector<bool>& capped, std::vector<std::size_t>& counts) {
+    std::vector<std::string> served;
+    std::string cursor;
+    for (int pages = 0; pages < 200; ++pages) {
+        std::string url = "/api/v1/hardware-ci?limit=1000";
+        if (!cursor.empty())
+            url += "&cursor=" + cursor;
+        auto res = t.sink.Get(url);
+        REQUIRE(res);
+        REQUIRE(res->status == 200);
+        sizes.push_back(res->body.size());
+        const json data = json::parse(res->body)["data"];
+        capped.push_back(data.contains("page_bytes_capped"));
+        counts.push_back(data["devices"].size());
+        for (const auto& id : record_ids(data))
+            served.push_back(id);
+        cursor = data["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    return served;
+}
+
+std::vector<std::string> mcp_walk(Twin& t, std::vector<std::size_t>& sizes, std::vector<bool>& capped,
+                                  std::vector<std::size_t>& counts) {
+    std::vector<std::string> served;
+    std::string cursor;
+    for (int pages = 0; pages < 200; ++pages) {
+        json args = {{"limit", 1000}};
+        if (!cursor.empty())
+            args["cursor"] = cursor;
+        json params = {{"name", "list_hardware_ci_records"}, {"arguments", args}};
+        auto res = t.post(json{{"jsonrpc", "2.0"}, {"method", "tools/call"}, {"id", 7},
+                               {"params", params}}.dump());
+        REQUIRE(res);
+        sizes.push_back(res->body.size());
+        const json r = json::parse(res->body);
+        REQUIRE_FALSE(r.contains("error"));
+        const json& data = r["result"]["structuredContent"];
+        capped.push_back(data.contains("page_bytes_capped"));
+        counts.push_back(data["devices"].size());
+        for (const auto& id : record_ids(data))
+            served.push_back(id);
+        cursor = data["next_cursor"].get<std::string>();
+        if (cursor.empty())
+            break;
+    }
+    return served;
+}
+
+std::vector<std::string> expected_ids(int n) {
+    std::vector<std::string> v;
+    for (int i = 0; i < n; ++i)
+        v.push_back(wide_id(i));
+    return v;
+}
+
+} // namespace
+
+TEST_CASE("byte bound: REST pages of worst-case rows stay within the documented body maximum and walk "
+          "every row once",
+          "[hardware][route][rest][ci_page][bytes]") {
+    for (const char fill : {'\x01', '"'}) {
+        INFO("fill " << static_cast<int>(fill));
+        Twin t;
+        constexpr int kRows = 70;
+        seed_worst_case(t, kRows, fill);
+        std::vector<std::size_t> sizes, counts;
+        std::vector<bool> capped;
+        t.clear_audit();
+        const auto served = rest_walk(t, sizes, capped, counts);
+        CHECK(served == expected_ids(kRows)); // every seeded row, once, in order
+        REQUIRE(sizes.size() > 1);            // the budget, not limit, ended the pages
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            CHECK(sizes[i] <= kRestBodyMax);
+            const bool last = i + 1 == sizes.size();
+            CHECK(capped[i] == !last); // limit is 1000: only the byte bound can cut a page
+            CHECK(counts[i] >= 1);
+            // The audit detail agrees with what was served (rows= is the SERVED count), and
+            // carries byte_capped=1 exactly when the body says page_bytes_capped.
+            REQUIRE(t.domain_details.size() == sizes.size());
+            const std::string expect =
+                "hardware CI records (REST): rows=" + std::to_string(counts[i]) +
+                (i == 0 ? "" : " page=continuation") + " scope=fleet" + (capped[i] ? " byte_capped=1" : "");
+            CHECK(t.domain_details[i] == expect);
+        }
+        CHECK(sizes.front() > hardware_ci_page::kRestRowBudgetBytes / 2); // a real page, not a stub
+    }
+}
+
+TEST_CASE("byte bound: MCP pages of worst-case rows stay within the documented body maximum and walk "
+          "every row once",
+          "[mcp][hardware][ci_page][bytes]") {
+    for (const char fill : {'\x01', '"'}) {
+        INFO("fill " << static_cast<int>(fill));
+        Twin t;
+        constexpr int kRows = 70;
+        seed_worst_case(t, kRows, fill);
+        std::vector<std::size_t> sizes, counts;
+        std::vector<bool> capped;
+        t.clear_audit();
+        const auto served = mcp_walk(t, sizes, capped, counts);
+        CHECK(served == expected_ids(kRows));
+        REQUIRE(sizes.size() > 1);
+        for (std::size_t i = 0; i < sizes.size(); ++i) {
+            CHECK(sizes[i] <= kMcpBodyMax);
+            const bool last = i + 1 == sizes.size();
+            CHECK(capped[i] == !last);
+            CHECK(counts[i] >= 1);
+            REQUIRE(t.domain_details.size() == sizes.size());
+            const std::string expect =
+                "hardware CI records (MCP): rows=" + std::to_string(counts[i]) +
+                (i == 0 ? "" : " page=continuation") + " scope=fleet" + (capped[i] ? " byte_capped=1" : "");
+            CHECK(t.domain_details[i] == expect);
+            CHECK(t.generic_details[i] == expect); // the same text on both rows
+        }
+        // The documented maximum is not vacuous: the double emission really does exceed the row
+        // budget on the wire, so the body bound has to be stated per surface.
+        CHECK(sizes.front() > hardware_ci_page::kMcpRowBudgetBytes);
+    }
+}
+
+// The two surfaces share ONE cut and differ only in the budget: the same store gives REST more
+// rows per page than MCP, and neither serves a row the other would not.
+TEST_CASE("byte bound: REST and MCP cut the same store at their own budgets",
+          "[hardware][route][mcp][ci_page][bytes]") {
+    Twin t;
+    seed_worst_case(t, 70, '\x01');
+    std::vector<std::size_t> rs, rc, ms, mc;
+    std::vector<bool> rcap, mcap;
+    const auto rest_ids = rest_walk(t, rs, rcap, rc);
+    const auto mcp_ids = mcp_walk(t, ms, mcap, mc);
+    CHECK(rest_ids == mcp_ids);
+    CHECK(rc.front() > mc.front());
+    CHECK(rc.size() < mc.size());
+}
+
+// A walk that is not byte-bound is byte-for-byte what it was: no marker, no audit suffix.
+TEST_CASE("byte bound: a page the budget does not touch carries no page_bytes_capped and no audit suffix",
+          "[hardware][route][mcp][ci_page][bytes]") {
+    Twin t;
+    seed(t, {"a", "b", "c"});
+    t.clear_audit();
+    const json rest = t.rest_data("/api/v1/hardware-ci?limit=2");
+    CHECK_FALSE(rest.contains("page_bytes_capped"));
+    CHECK(rest.size() == 2);
+    const json mcp = t.call("list_hardware_ci_records", {{"limit", 2}});
+    CHECK_FALSE(mcp["result"]["structuredContent"].contains("page_bytes_capped"));
+    REQUIRE(t.domain_details.size() == 2);
+    CHECK(t.domain_details[0] == "hardware CI records (REST): rows=2 scope=fleet");
+    CHECK(t.domain_details[1] == "hardware CI records (MCP): rows=2 scope=fleet");
+}
+
+TEST_CASE("byte bound: the published schemas and descriptions name page_bytes_capped",
+          "[mcp][hardware][ci_page][bytes]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const json listed = json::parse(res->body);
+    const json& tool = tool_entry(listed, "list_hardware_ci_records");
+    const auto& props = tool["outputSchema"]["properties"];
+    REQUIRE(props.contains("page_bytes_capped"));
+    CHECK(props["page_bytes_capped"]["type"] == "boolean");
+    CHECK_FALSE(tool["outputSchema"]["required"].dump().find("page_bytes_capped") != std::string::npos);
+    const std::string d = tool["description"];
+    CHECK(d.find("page_bytes_capped") != std::string::npos);
+    CHECK(d.find("1 MiB") != std::string::npos);
+    CHECK(d.find("a short page never means the walk is done") != std::string::npos);
+}

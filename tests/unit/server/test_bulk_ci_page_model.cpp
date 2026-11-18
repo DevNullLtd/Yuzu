@@ -54,7 +54,7 @@ std::vector<std::string> walk(FakeStore& store, hcp::Request rq, const authz::Vi
     std::vector<std::string> all;
     int n = 0;
     for (;;) {
-        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         ++n;
         REQUIRE(n < 1000); // a runaway walk is a defect, not a long test
@@ -451,14 +451,14 @@ TEST_CASE("hardware ci page: an unfiltered walk visits every device exactly once
     SECTION("one page larger than the data carries no cursor") {
         hcp::Request rq;
         rq.limit = 1000;
-        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.size() == 7);
         CHECK(page->next_cursor.empty());
     }
     SECTION("an empty store is an empty page") {
         FakeStore none;
-        const auto page = hcp::read_page(none.reader(), {}, std::nullopt, nullptr, nullptr);
+        const auto page = hcp::read_page(none.reader(), {}, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.empty());
         CHECK(page->next_cursor.empty());
@@ -476,7 +476,7 @@ TEST_CASE("hardware ci page: an unfiltered walk visits every device exactly once
         const auto all = walk(odd, rq, std::nullopt, &pages);
         CHECK(pages == 2);
         CHECK(all == std::vector<std::string>{"p", boundary, "s"});
-        const auto first = hcp::read_page(odd.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto first = hcp::read_page(odd.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(first.has_value());
         const auto pos = hcp::decode_cursor(first->next_cursor, hcp::filter_fingerprint(rq));
         REQUIRE(pos.has_value());
@@ -485,11 +485,11 @@ TEST_CASE("hardware ci page: an unfiltered walk visits every device exactly once
     SECTION("the cursor resumes after a row inserted behind it, without a duplicate") {
         hcp::Request rq;
         rq.limit = 3;
-        auto first = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        auto first = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(first.has_value());
         store.add("dev-05"); // sorts between dev-0 and dev-1: behind the cursor
         rq.cursor = first->next_cursor;
-        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(second.has_value());
         const auto served = ids_of(*first);
         for (const auto& id : ids_of(*second))
@@ -503,13 +503,13 @@ TEST_CASE("hardware ci page: the agent_id filter reads one device", "[hardware_c
         store.add(id);
     hcp::Request rq;
     rq.agent_id = "b";
-    const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+    const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE(page.has_value());
     CHECK(ids_of(*page) == std::vector<std::string>{"b"});
     CHECK(page->next_cursor.empty());
 
     rq.agent_id = "nope";
-    const auto none = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+    const auto none = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE(none.has_value());
     CHECK(none->rows.empty());
     CHECK_FALSE(none->target_denied);
@@ -534,7 +534,7 @@ TEST_CASE("hardware ci page: scope confines the exact set returned", "[hardware_
         }
     }
     SECTION("an engaged-empty scope returns nothing") {
-        const auto page = hcp::read_page(store.reader(), {}, authz::deny_all(), nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), {}, authz::deny_all(), nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.empty());
         CHECK(page->next_cursor.empty());
@@ -546,7 +546,7 @@ TEST_CASE("hardware ci page: scope confines the exact set returned", "[hardware_
         const authz::VisibleSet scope = std::unordered_set<std::string>{"a"};
         hcp::Request rq;
         rq.agent_id = "b";
-        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(page->rows.empty());
         CHECK(page->target_denied);
@@ -556,7 +556,7 @@ TEST_CASE("hardware ci page: scope confines the exact set returned", "[hardware_
         const authz::VisibleSet scope = std::unordered_set<std::string>{"b"};
         hcp::Request rq;
         rq.agent_id = "b";
-        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(ids_of(*page) == std::vector<std::string>{"b"});
         CHECK_FALSE(page->target_denied);
@@ -627,7 +627,7 @@ TEST_CASE("hardware ci page: a scope over the ceiling with no agent_id is refuse
     const authz::VisibleSet scope = scope_of_size(real, hcp::kMaxPushdownScopeIds + 1);
     REQUIRE(scope->size() == 10001);
 
-    const auto page = hcp::read_page(store.reader(), {}, scope, nullptr, nullptr);
+    const auto page = hcp::read_page(store.reader(), {}, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(page.has_value());
     CHECK(page.error() == hcp::ReadError::kScopeTooWide);
     CHECK(store.reads == 0);
@@ -640,13 +640,13 @@ TEST_CASE("hardware ci page: a scope over the ceiling with no agent_id is refuse
     small.add("b");
     small.add("c");
     small.add("d");
-    const auto head = hcp::read_page(small.reader(), first, std::nullopt, nullptr, nullptr);
+    const auto head = hcp::read_page(small.reader(), first, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE(head.has_value());
     REQUIRE_FALSE(head->next_cursor.empty());
     hcp::Request next = first;
     next.cursor = head->next_cursor;
     small.reads = 0;
-    const auto again = hcp::read_page(small.reader(), next, scope, nullptr, nullptr);
+    const auto again = hcp::read_page(small.reader(), next, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(again.has_value());
     CHECK(again.error() == hcp::ReadError::kScopeTooWide);
     CHECK(small.reads == 0);
@@ -669,7 +669,7 @@ TEST_CASE("hardware ci page: a scope over the ceiling with an agent_id reads tha
     SECTION("an in-scope device is served") {
         hcp::Request rq;
         rq.agent_id = "dev-003"; // 3 % 3 == 0: in scope
-        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         CHECK(ids_of(*page) == std::vector<std::string>{"dev-003"});
         CHECK_FALSE(page->target_denied);
@@ -681,10 +681,10 @@ TEST_CASE("hardware ci page: a scope over the ceiling with an agent_id reads tha
     SECTION("an out-of-scope device that exists is the empty page of a device with no record") {
         hcp::Request hidden;
         hidden.agent_id = "dev-001"; // exists, not in scope
-        const auto denied = hcp::read_page(store.reader(), hidden, scope, nullptr, nullptr);
+        const auto denied = hcp::read_page(store.reader(), hidden, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         hcp::Request ghost;
         ghost.agent_id = "pad-5"; // in scope, no record
-        const auto none = hcp::read_page(store.reader(), ghost, scope, nullptr, nullptr);
+        const auto none = hcp::read_page(store.reader(), ghost, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(denied.has_value());
         REQUIRE(none.has_value());
         CHECK(denied->rows.empty());
@@ -705,12 +705,12 @@ TEST_CASE("hardware ci page: a degraded store read is an error, never an empty p
     FakeStore store;
     store.add("a");
     store.degraded = true;
-    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr);
+    const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(page.has_value());
     CHECK(page.error() == hcp::ReadError::kDegraded); // not a cursor or scope error
 
     const authz::VisibleSet scope = std::unordered_set<std::string>{"a"};
-    CHECK_FALSE(hcp::read_page(store.reader(), {}, scope, nullptr, nullptr).has_value());
+    CHECK_FALSE(hcp::read_page(store.reader(), {}, scope, nullptr, nullptr, hcp::kRestRowBudgetBytes).has_value());
 }
 
 TEST_CASE("hardware ci page: a refused cursor surfaces its reason", "[hardware_ci_page][cursor]") {
@@ -718,7 +718,7 @@ TEST_CASE("hardware ci page: a refused cursor surfaces its reason", "[hardware_c
     store.add("a");
     hcp::Request rq;
     rq.cursor = "nonsense";
-    const auto bad = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+    const auto bad = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(bad.has_value());
     CHECK(bad.error() == hcp::ReadError::kCursorMalformed);
     CHECK(store.reads == 0);
@@ -728,7 +728,7 @@ TEST_CASE("hardware ci page: a refused cursor surfaces its reason", "[hardware_c
     named.agent_id = "a";
     hcp::Request unnamed;
     unnamed.cursor = hcp::encode_cursor({"a"}, hcp::filter_fingerprint(named));
-    const auto mismatch = hcp::read_page(store.reader(), unnamed, std::nullopt, nullptr, nullptr);
+    const auto mismatch = hcp::read_page(store.reader(), unnamed, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE_FALSE(mismatch.has_value());
     CHECK(mismatch.error() == hcp::ReadError::kCursorFilterMismatch);
     CHECK(store.reads == 0);
@@ -778,7 +778,7 @@ TEST_CASE("hardware ci page: the second page is exact when a row is inserted ahe
         store.add(id);
     hcp::Request rq;
     rq.limit = 2;
-    const auto first = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+    const auto first = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
     REQUIRE(first.has_value());
     REQUIRE(ids_of(*first) == std::vector<std::string>{"d1", "d2"});
     REQUIRE_FALSE(first->next_cursor.empty());
@@ -786,20 +786,20 @@ TEST_CASE("hardware ci page: the second page is exact when a row is inserted ahe
 
     SECTION("a row inserted ahead of the cursor is served on the page where it sorts") {
         store.add("d25"); // between d2 (the cursor) and d3
-        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(second.has_value());
         CHECK(ids_of(*second) == std::vector<std::string>{"d25", "d3"});
         CHECK_FALSE(second->next_cursor.empty());
     }
     SECTION("a row inserted behind the cursor is missed by this walk, never served twice") {
         store.add("d15"); // between d1 and d2: already passed
-        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(second.has_value());
         CHECK(ids_of(*second) == std::vector<std::string>{"d3", "d4"});
     }
     SECTION("the cursor's own row deleted: the next page continues after its key") {
         store.erase("d2");
-        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(second.has_value());
         CHECK(ids_of(*second) == std::vector<std::string>{"d3", "d4"});
         CHECK_FALSE(second->next_cursor.empty());
@@ -807,7 +807,7 @@ TEST_CASE("hardware ci page: the second page is exact when a row is inserted ahe
     SECTION("every later row deleted: an empty final page with no cursor") {
         for (const char* id : {"d3", "d4", "d5", "d6"})
             store.erase(id);
-        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto second = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(second.has_value());
         CHECK(second->rows.empty());
         CHECK(second->next_cursor.empty());
@@ -827,7 +827,7 @@ TEST_CASE("hardware ci page: a hand-built Request's limit is clamped before it r
     for (const int bad : {0, -5, INT_MIN}) {
         hcp::Request rq;
         rq.limit = bad;
-        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         INFO(bad);
         CHECK(page->rows.size() == 1); // clamped up to 1
@@ -836,7 +836,7 @@ TEST_CASE("hardware ci page: a hand-built Request's limit is clamped before it r
     for (const int big : {1001, INT_MAX}) {
         hcp::Request rq;
         rq.limit = big;
-        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr);
+        const auto page = hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kRestRowBudgetBytes);
         REQUIRE(page.has_value());
         INFO(big);
         CHECK(page->rows.size() == 1000); // clamped down to kPageMax
@@ -1057,4 +1057,236 @@ TEST_CASE("hardware ci page: hostname is null when empty or the literal unknown,
     CHECK(hcp::row_json(rec)["hostname"] == "build-07");
     rec.hostname = "Unknown"; // only the exact stored sentinel is a sentinel
     CHECK(hcp::row_json(rec)["hostname"] == "Unknown");
+}
+
+// ── the byte bound (#7950) ───────────────────────────────────────────────────
+
+namespace {
+
+using yuzu::server::test::make_worst_case_ci_record;
+
+constexpr std::size_t kBudgets[] = {hcp::kRestRowBudgetBytes, hcp::kMcpRowBudgetBytes};
+
+std::string dump_replace_str(const json& j) {
+    return j.dump(-1, ' ', false, json::error_handler_t::replace);
+}
+
+// Zero-padded ids so byte order is numeric order.
+std::string idx_id(int i) {
+    char buf[32];
+    std::snprintf(buf, sizeof buf, "dev-%05d", i);
+    return buf;
+}
+
+FakeStore worst_case_store(int n) {
+    FakeStore store;
+    for (int i = 0; i < n; ++i)
+        store.add(make_worst_case_ci_record(idx_id(i)));
+    return store;
+}
+
+} // namespace
+
+// Kills: a measure that drifts from the serialiser (a different dump, a missing replace handler, a
+// reordered row), which would let a page exceed its budget while the sum says it fits. The array
+// the surfaces serve is "[" + rows joined by "," + "]", so the sum plus the separators is exact.
+TEST_CASE("hardware ci page: the summed row_wire_bytes equals the served devices array's bytes",
+          "[hardware_ci_page][bytes]") {
+    hcp::Page page;
+    page.rows.push_back(make_worst_case_ci_record("w-1"));
+    page.rows.push_back(make_record("plain"));
+    DeviceCiRecord odd = make_record("odd");
+    odd.model = std::string("bad\xff\xfe""utf8 \"quoted\" \\ back\n", 22); // not valid UTF-8: replaced
+    page.rows.push_back(odd);
+    page.rows.push_back(make_worst_case_ci_record("w-2"));
+
+    std::size_t sum = 0;
+    for (const auto& r : page.rows)
+        sum += hcp::row_wire_bytes(r);
+    const std::string array = dump_replace_str(hcp::page_json(page)["devices"]);
+    CHECK(sum + (page.rows.size() - 1) + 2 == array.size());
+
+    // And it is the per-row dump, not an approximation.
+    for (const auto& r : page.rows)
+        CHECK(hcp::row_wire_bytes(r) == dump_replace_str(hcp::row_json(r)).size());
+}
+
+TEST_CASE("hardware ci page: a worst-case row is wide enough to make the budgets bite",
+          "[hardware_ci_page][bytes]") {
+    const std::size_t w = hcp::row_wire_bytes(make_worst_case_ci_record("x"));
+    // About 160 KB and never past the documented ceiling of one row (180 KB).
+    CHECK(w > 100 * 1024);
+    CHECK(w <= 180 * 1024);
+    CHECK(hcp::kMcpRowBudgetBytes > w); // the first row alone always fits both budgets
+    CHECK(hcp::kRestRowBudgetBytes > hcp::kMcpRowBudgetBytes);
+}
+
+TEST_CASE("hardware ci page: a full walk of worst-case rows serves each once, within the budget",
+          "[hardware_ci_page][bytes]") {
+    constexpr int kRows = 90; // more than either budget holds in one page
+    for (const std::size_t budget : kBudgets) {
+        INFO("budget " << budget);
+        FakeStore store = worst_case_store(kRows);
+        const std::size_t w = hcp::row_wire_bytes(store.rows.front());
+        hcp::Request rq;
+        rq.limit = 1000; // the count never cuts: only the byte bound can
+        std::vector<std::string> served;
+        int pages = 0;
+        for (;;) {
+            const auto page =
+                hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, budget);
+            REQUIRE(page.has_value());
+            REQUIRE(++pages < 200);
+            REQUIRE_FALSE(page->rows.empty()); // never an empty page with rows left
+            std::size_t sum = 0;
+            for (const auto& r : page->rows)
+                sum += hcp::row_wire_bytes(r);
+            CHECK(sum <= budget);
+            // The page is MAXIMAL: one more row would have exceeded the budget.
+            if (!page->next_cursor.empty())
+                CHECK(sum + w > budget);
+            // byte_capped says exactly "the budget, not the count, ended this page".
+            CHECK(page->byte_capped == !page->next_cursor.empty());
+            if (!page->next_cursor.empty()) {
+                // Minted from the last KEPT row, even though fewer than limit + 1 rows were read.
+                const auto at = hcp::decode_cursor(page->next_cursor, hcp::filter_fingerprint(rq));
+                REQUIRE(at.has_value());
+                CHECK(at->after == page->rows.back().agent_id);
+            }
+            // The store is still asked for limit + 1 rows: the byte bound does not narrow the read.
+            CHECK(store.queries.back().limit == 1001);
+            for (const auto& id : ids_of(*page))
+                served.push_back(id);
+            if (page->next_cursor.empty())
+                break;
+            rq.cursor = page->next_cursor;
+        }
+        CHECK(pages > 1);
+        REQUIRE(served.size() == static_cast<std::size_t>(kRows));
+        for (int i = 0; i < kRows; ++i)
+            CHECK(served[static_cast<std::size_t>(i)] == idx_id(i)); // each once, in order, no skip
+    }
+}
+
+// Kills: setting byte_capped whenever a cursor exists (the count cut is not a byte cut), and a
+// byte cut that is applied before the count cut so a small page is reported as capped.
+TEST_CASE("hardware ci page: the count cut alone does not set byte_capped", "[hardware_ci_page][bytes]") {
+    FakeStore store = worst_case_store(10);
+    hcp::Request rq;
+    rq.limit = 3; // 3 worst-case rows fit both budgets
+    const auto page =
+        hcp::read_page(store.reader(), rq, std::nullopt, nullptr, nullptr, hcp::kMcpRowBudgetBytes);
+    REQUIRE(page.has_value());
+    CHECK(page->rows.size() == 3);
+    CHECK_FALSE(page->next_cursor.empty());
+    CHECK_FALSE(page->byte_capped);
+    CHECK_FALSE(hcp::page_json(*page).contains("page_bytes_capped"));
+    CHECK(hcp::audit_detail(*page, rq, "MCP", false).find("byte_capped") == std::string::npos);
+}
+
+// The last page, and a page the budget does not touch, are never marked.
+TEST_CASE("hardware ci page: a page that fits is not byte_capped, even when it is the last",
+          "[hardware_ci_page][bytes]") {
+    FakeStore store = worst_case_store(2);
+    for (const std::size_t budget : kBudgets) {
+        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, budget);
+        REQUIRE(page.has_value());
+        CHECK(page->rows.size() == 2);
+        CHECK(page->next_cursor.empty());
+        CHECK_FALSE(page->byte_capped);
+    }
+}
+
+TEST_CASE("hardware ci page: the first row is always served and a row is never truncated",
+          "[hardware_ci_page][bytes]") {
+    FakeStore store = worst_case_store(3);
+    const std::size_t w = hcp::row_wire_bytes(store.rows.front());
+    for (const std::size_t budget : {std::size_t{0}, std::size_t{1}, w - 1}) {
+        INFO("budget " << budget);
+        const auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, budget);
+        REQUIRE(page.has_value());
+        REQUIRE(page->rows.size() == 1); // over budget alone: served alone
+        CHECK(page->rows.front().agent_id == idx_id(0));
+        CHECK(hcp::row_wire_bytes(page->rows.front()) == w); // untruncated
+        CHECK(page->byte_capped);
+        const auto at = hcp::decode_cursor(page->next_cursor, hcp::filter_fingerprint({}));
+        REQUIRE(at.has_value());
+        CHECK(at->after == idx_id(0));
+    }
+    // One row in the store: over budget alone, but nothing was left over, so it is not capped.
+    FakeStore one = worst_case_store(1);
+    const auto page = hcp::read_page(one.reader(), {}, std::nullopt, nullptr, nullptr, 0);
+    REQUIRE(page.has_value());
+    CHECK(page->rows.size() == 1);
+    CHECK(page->next_cursor.empty());
+    CHECK_FALSE(page->byte_capped);
+}
+
+// The boundary is inclusive: a sum equal to the budget fits, one byte less does not.
+TEST_CASE("hardware ci page: the budget boundary is inclusive", "[hardware_ci_page][bytes]") {
+    FakeStore store;
+    for (int i = 0; i < 6; ++i)
+        store.add(make_record(idx_id(i))); // equal-width rows
+    const std::size_t w = hcp::row_wire_bytes(store.rows.front());
+    for (const auto& r : store.rows)
+        REQUIRE(hcp::row_wire_bytes(r) == w);
+    const auto at = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, 3 * w);
+    REQUIRE(at.has_value());
+    CHECK(at->rows.size() == 3);
+    CHECK(at->byte_capped);
+    const auto under = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, 3 * w - 1);
+    REQUIRE(under.has_value());
+    CHECK(under->rows.size() == 2);
+    CHECK(under->byte_capped);
+    const auto all = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, nullptr, 6 * w);
+    REQUIRE(all.has_value());
+    CHECK(all->rows.size() == 6);
+    CHECK_FALSE(all->byte_capped);
+    CHECK(all->next_cursor.empty());
+}
+
+// A confined caller's pages carry the same bound and the cursor binds the same way.
+TEST_CASE("hardware ci page: the byte bound applies under a pushed-down scope",
+          "[hardware_ci_page][bytes][security]") {
+    FakeStore store = worst_case_store(40);
+    std::unordered_set<std::string> ids;
+    for (int i = 0; i < 40; i += 2)
+        ids.insert(idx_id(i));
+    const authz::VisibleSet scope{ids};
+    hcp::Request rq;
+    rq.limit = 1000;
+    std::vector<std::string> served;
+    for (int guard = 0; guard < 100; ++guard) {
+        const auto page =
+            hcp::read_page(store.reader(), rq, scope, nullptr, nullptr, hcp::kMcpRowBudgetBytes);
+        REQUIRE(page.has_value());
+        for (const auto& id : ids_of(*page)) {
+            CHECK(ids.contains(id)); // never an out-of-scope row
+            served.push_back(id);
+        }
+        if (page->next_cursor.empty())
+            break;
+        rq.cursor = page->next_cursor;
+    }
+    REQUIRE(served.size() == ids.size());
+}
+
+TEST_CASE("hardware ci page: byte_capped reaches the body and the audit text only when set",
+          "[hardware_ci_page][bytes][json]") {
+    hcp::Page page;
+    page.rows.push_back(make_record("a"));
+    page.next_cursor = "tok";
+    hcp::Request rq;
+    // Not capped: byte-identical to the pre-existing shapes.
+    CHECK(hcp::page_json(page).size() == 2);
+    CHECK(hcp::audit_detail(page, rq, "REST", false) == "hardware CI records (REST): rows=1 scope=fleet");
+    page.byte_capped = true;
+    const json j = hcp::page_json(page);
+    CHECK(j.size() == 3);
+    CHECK(j["page_bytes_capped"] == true);
+    CHECK(hcp::audit_detail(page, rq, "REST", false) ==
+          "hardware CI records (REST): rows=1 scope=fleet byte_capped=1");
+    rq.cursor = "c";
+    CHECK(hcp::audit_detail(page, rq, "MCP", true) ==
+          "hardware CI records (MCP): rows=1 page=continuation scope=authority_scoped byte_capped=1");
 }
