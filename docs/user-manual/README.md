@@ -189,7 +189,7 @@ agent does not load them). Before it copies its own files, the installer deletes
 **The agent data directory, `%ProgramData%\Yuzu`.** Apart from the files named above, the
 uninstaller deletes it only when asked to. Once the program is removed, an interactive
 uninstall asks "Remove agent data directory?"; the default answer is **No**, which leaves the
-directory, and **Yes** deletes the whole directory and everything in it. A silent uninstall
+directory, and **Yes** deletes the directory and everything in it that is not in use. A silent uninstall
 (`/SILENT` or `/VERYSILENT`) never asks and leaves the directory. The directory holds the
 agent's identity and local state, including `agent.db` (the agent id); `certs`, which by
 default holds the agent's client certificate and private key, and where the agent looks for
@@ -201,7 +201,7 @@ which on a quarantined device holds the firewall plugin's quarantine record, the
 policy the quarantine replaced and the list of firewall rules it turned off. Uninstalling does
 not undo a quarantine, so answering **Yes** on a quarantined device deletes that record while
 the firewall changes stay in force: the host stays contained, and an agent installed on it has
-a new agent id (unless `YUZU_AGENT_ID` sets one) and no record of the quarantine.
+a new agent id (unless `--agent-id` or `YUZU_AGENT_ID` sets one) and no record of the quarantine.
 
 ## Quick Start
 
