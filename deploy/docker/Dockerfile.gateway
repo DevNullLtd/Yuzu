@@ -205,6 +205,7 @@ RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
 
 COPY --from=builder /src/_build/prod/rel/yuzu_gw/ /opt/yuzu_gw/
 COPY --chmod=755 deploy/docker/gateway-entrypoint.sh /opt/yuzu_gw/gateway-entrypoint.sh
+COPY --chmod=644 deploy/docker/gateway-cookie-policy.sh /opt/yuzu_gw/gateway-cookie-policy.sh
 RUN chown -R yuzu-gw:yuzu-gw /opt/yuzu_gw
 
 USER yuzu-gw

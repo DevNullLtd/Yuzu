@@ -32,6 +32,18 @@ fuzz_targets = {
     'sources': files('fuzz_component_zip.cpp'),
     'deps': [],
   },
+  'fuzz_binary_header_pe': {
+    'sources': files('fuzz_binary_header_pe.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_elf': {
+    'sources': files('fuzz_binary_header_elf.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_macho': {
+    'sources': files('fuzz_binary_header_macho.cpp'),
+    'deps': [],
+  },
   'fuzz_deployment_parse': {
     'sources': files('fuzz_deployment_parse.cpp'),
     'deps': [],

@@ -226,6 +226,24 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_software_collection_settings", "ManagementGroup", "Read", true},
     {"set_software_collection_settings", "ManagementGroup", "Write", false},
     {"get_software_host_collection_settings", "Inventory", "Read", true},
+    // SAM-29 lifecycle-rule and normalisation-curation twins, pinned against
+    // software_lifecycle_routes.cpp and software_curation_routes.cpp: the GLOBAL Inventory:Read /
+    // Inventory:Write pair each route takes through perm_fn.
+    {"list_software_lifecycle_rules", "Inventory", "Read", true},
+    {"import_software_lifecycle_rules", "Inventory", "Write", false},
+    {"delete_software_lifecycle_rules", "Inventory", "Write", false},
+    {"get_software_normalization_status", "Inventory", "Read", true},
+    {"list_software_curation_queue", "Inventory", "Read", true},
+    {"curate_software_alias", "Inventory", "Write", false},
+    {"reject_software_curation", "Inventory", "Write", false},
+    {"replace_software_normalization_pack", "Inventory", "Write", false},
+    // SAM-21: the components lookup twin, pinned against GET /api/v1/inventory/software/components
+    // (rest_api_v1.cpp: fleet_read_fn Inventory:Read), and the sync status twin, pinned against
+    // GET /api/v1/hardware/sync/{execution_id} (hardware_routes.cpp). The status row is a READ
+    // (Execution:Read: the tier, the approval rule and the readOnlyHint see a read) while the
+    // handler runs perm_fn(Execution, Execute), the REST route's own RBAC gate.
+    {"query_software_components", "Inventory", "Read", true},
+    {"get_software_sync_status", "Execution", "Read", true},
     // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},

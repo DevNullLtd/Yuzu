@@ -149,5 +149,10 @@ WORKDIR /opt/yuzu_gw
 
 EXPOSE 50051 50063 8081 9568
 
+# NO gateway-entrypoint.sh here, so NO pre-VM cookie check (F24): an unset
+# YUZU_GW_COOKIE boots with OTP's per-host random ~/.erlang.cookie and the in-VM
+# guard then refuses it as too short (after distribution is listening). If $HOME
+# is unwritable the VM cannot create that file and crash-loops. Always set a
+# strong YUZU_GW_COOKIE (or YUZU_GW_ALLOW_DEFAULT_COOKIE=1 for a throwaway demo).
 ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
 CMD ["foreground"]
