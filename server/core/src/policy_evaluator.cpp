@@ -525,9 +525,10 @@ void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_vi
         ev.result = "denied";
         ev.detail = std::move(detail);
         // Synchronous and fail-hard: AuditStore::log returns false on a pool timeout or an
-        // INSERT error, and the row is then lost (counted by the store's emit_failed_ metric,
-        // not retried: the next identical tick refusal changes nothing, so writes no row). The
-        // result is discarded on purpose: the refusal already happened and nothing was sent.
+        // INSERT error, and the row is then lost (counted by the store's emit_failed_ metric).
+        // It is not retried once the status write succeeded: the next identical tick refusal
+        // changes nothing, so no row is written; a failed status write does retry (write_error).
+        // The result is discarded on purpose: the refusal already happened and nothing was sent.
         // The operator's own row is the route's.
         (void)d_.audit_store->log(ev);
     }

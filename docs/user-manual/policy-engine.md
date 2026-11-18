@@ -313,9 +313,12 @@ What this means in use:
   phase `verify`; it is not counted as a failed evaluation (`error`).
   A `blocked` status from a refused fix is not kept: the next check of an allowed
   instruction records the device's own result in its place. The lasting record of a
-  refused fix is the `policy.dispatch` audit row, the
-  `yuzu_server_policy_dispatch_denied_total` counter and the `409` that every retry of the
-  remediate receives.
+  refused fix is the `policy.remediate` `denied` row the route writes, the `policy.dispatch`
+  audit row (attempted every time, but lost if the audit store fails to persist it; see the
+  [audit log](audit-log.md)) and the `yuzu_server_policy_dispatch_denied_total` counter. A
+  retry that names `agent_ids` answers the refusal `409` again; a retry with no `agent_ids`
+  selects `non_compliant` devices only, so it answers "no non_compliant agents" until the
+  next check scores the devices.
 - `blocked` counts as **failing** in the "N failing" pill, the Failing checks readout and
   the home page tile. A later dispatch that records a real result replaces it. A
   refusal that repeats on every interval changes no status and writes no audit row, but it
@@ -334,7 +337,8 @@ What this means in use:
   whose instruction is refused: it installs, and shows `blocked` at its first dispatch.
   Enabling such a policy through the route answers `400`.
 - A refusal is counted in `yuzu_server_policy_dispatch_denied_total{reason}` and a
-  `policy.dispatch` audit row is written (see the [audit log](audit-log.md)).
+  `policy.dispatch` audit row is attempted (see the [audit log](audit-log.md) for when one is
+  written and when one can be lost).
 - `POST /api/policies/{id}/invalidate` resets `blocked` devices to `unknown`; the next
   dispatch records the refusal again if it still applies.
 
