@@ -41,6 +41,8 @@
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auth_db.hpp>
+#include "pg/pg_raii.hpp"
+#include <libpq-fe.h>
 #include <yuzu/server/server.hpp>
 
 #include <catch2/catch_test_macros.hpp>
@@ -52,6 +54,7 @@
 #include <memory>
 #include <vector>
 #include <thread>
+#include <tuple>
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
@@ -180,6 +183,7 @@ struct HardenedHarness {
 
     void arm(const std::string& name, int window_secs = 3600) {
         REQUIRE(auth_db->arm_break_glass(name, window_secs).has_value());
+        auth_routes->reset_break_glass_arm_cache_for_test(); // the gate caches the arm state
     }
 
     int count_audits(const std::string& action, const std::string& principal = {}) {
@@ -380,57 +384,21 @@ TEST_CASE("sso-only: wrong password against an armed break-glass user is a norma
     CHECK(h.count_audits("auth.login_failed") >= 1);
 }
 
-TEST_CASE("sso-only: with every lane full only the break-glass NAME answers 429; other names 401",
+TEST_CASE("sso-only: with every lane full the break-glass name and every other name answer the same 401",
           "[pg][auth][hardened][routes][concurrency]") {
     HardenedHarness h("sso-only", "admin"); // admin is the break-glass name, NOT armed
     h.enroll_mfa("admin");
-    // Fill every slot: the whole process-wide budget is in use, the break-glass lane included.
     auto& budget = h.auth_routes->pbkdf2_budget();
     budget.set_cap(8);
     auto held = yuzu::test::fill_pbkdf2_budget(budget);
     REQUIRE(held.size() == 8);
-    // Other and unknown names are refused by the sso-only gate before any slot: the same 401.
-    for (const char* user : {"alice", "no-such-user-xyz"}) {
+    for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);
         REQUIRE(res);
         CHECK(res->status == 401);
         CHECK(res->get_header_value("Retry-After").empty());
     }
-    // The break-glass name takes its lane slot first, armed or not: 429, the same either way
-    // (the arm state is not disclosed). Mutation: gate before the slot -> 401 for the unarmed name.
-    auto bg = h.sink.Post("/login", form({{"username", "admin"}, {"password", "whatever-123456"}}),
-                          kFormCt);
-    REQUIRE(bg);
-    CHECK(bg->status == 429);
-}
-
-TEST_CASE("sso-only: the armed break-glass login is not denied by a flood of its own name (stripe skipped)",
-          "[pg][auth][hardened][routes][concurrency][stripe]") {
-    HardenedHarness h("sso-only", "admin");
-    h.enroll_mfa("admin");
-    h.arm("admin");
-    h.cfg.auth_lockout_threshold = 5;
-    // A same-name flood (or a name colliding onto admin's stripe) keeps the stripe held. The
-    // break-glass account keeps no lockout counter, so it never takes the stripe.
-    auto& stripe = h.auth_routes->login_lock_for_test("admin");
-    stripe.lock();
-    int status = 0;
-    std::promise<void> done;
-    auto finished = done.get_future();
-    std::thread t([&] {
-        auto res = h.sink.Post("/login",
-                               form({{"username", "admin"}, {"password", "adminpassword1"}}),
-                               kFormCt);
-        status = res ? res->status : -1;
-        done.set_value();
-    });
-    const bool in_time = finished.wait_for(std::chrono::milliseconds(700)) ==
-                         std::future_status::ready;
-    stripe.unlock();
-    t.join();
-    CHECK(in_time);
-    CHECK(status == 202); // the MFA challenge, never the stripe-timeout 429 (mutation: RED)
 }
 
 namespace {
@@ -465,8 +433,10 @@ TEST_CASE("sso-only: break-glass guesses are bounded by the lane (exact numbers)
     {
         auto four = hold_break_glass_lane(budget, 4, "attacker-"); // the lane is full
         const auto t0 = std::chrono::steady_clock::now();
-        CHECK(login("WRONGpassword1") == 429); // refused at once, right password or wrong
-        CHECK(login("adminpassword1") == 429);
+        // Refused at once, right password or wrong, with the SAME generic 401 as any bad
+        // credential (never a distinguishable 429: no name oracle).
+        CHECK(login("WRONGpassword1") == 401);
+        CHECK(login("adminpassword1") == 401);
         const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
             std::chrono::steady_clock::now() - t0);
         CHECK(ms < std::chrono::milliseconds(500)); // no waiting: the slot is non-blocking
@@ -475,28 +445,38 @@ TEST_CASE("sso-only: break-glass guesses are bounded by the lane (exact numbers)
     CHECK(login("adminpassword1") == 202);              // the operator is back in at once
 }
 
-TEST_CASE("sso-only: a saturated break-glass lane gives the break-glass NAME the same 429 armed or "
-          "not, and every other name the same 401",
+TEST_CASE("sso-only: a full break-glass lane answers the break-glass name exactly like a decoy "
+          "(status, body, headers), armed or not",
           "[pg][auth][hardened][routes][concurrency][stripe]") {
-    HardenedHarness h("sso-only", "admin"); // admin is the break-glass name, NOT armed
-    auto& budget = h.auth_routes->pbkdf2_budget();
-    budget.set_cap(66);
-    auto held = hold_break_glass_lane(budget, budget.break_glass_cap(), "attacker-");
-    // The break-glass user's request takes its lane slot BEFORE the sso-only gate (which reads
-    // the arm state from the database), so an UNARMED flood consumes the lane exactly like an
-    // armed one: the armed-429 versus unarmed-401 difference does not exist. Other and unknown
-    // names never touch the lane. (Mutation: gate before the slot -> the unarmed name answers
-    // 401 here.)
-    auto admin = h.sink.Post("/login", form({{"username", "admin"}, {"password", "whatever-123456"}}),
-                             kFormCt);
-    REQUIRE(admin);
-    CHECK(admin->status == 429);
-    for (const char* user : {"alice", "no-such-user-xyz"}) {
+    auto answer = [](HardenedHarness& h, const char* user) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);
         REQUIRE(res);
-        CHECK(res->status == 401);
-        CHECK(res->get_header_value("Retry-After").empty());
+        const auto body = nlohmann::json::parse(res->body, nullptr, false);
+        std::string msg = body.is_discarded() ? res->body
+                                              : body["error"].value("message", std::string{});
+        return std::tuple{res->status, msg, res->get_header_value("Retry-After"),
+                          res->get_header_value("Set-Cookie")};
+    };
+    for (const bool armed : {false, true}) {
+        HardenedHarness h("sso-only", "admin");
+        h.enroll_mfa("admin");
+        if (armed)
+            h.arm("admin");
+        auto& budget = h.auth_routes->pbkdf2_budget();
+        budget.set_cap(66);
+        auto held = hold_break_glass_lane(budget, budget.break_glass_cap(), "attacker-");
+        // LANE FULL: the break-glass name and decoys answer identically. (Mutation: a 429 for the
+        // busy lane -> the armed row differs from the decoy.)
+        const auto decoy = answer(h, "alice");
+        CHECK(std::get<0>(decoy) == 401);
+        CHECK(answer(h, "admin") == decoy);
+        CHECK(answer(h, "no-such-user-xyz") == decoy);
+        held.clear();
+        // LANE FREE: still the same for the break-glass name (armed: a wrong password is the
+        // ordinary 401 of a failed credential; unarmed: the gate's 401).
+        CHECK(std::get<0>(answer(h, "admin")) == 401);
+        CHECK(std::get<2>(answer(h, "admin")).empty());
     }
 }
 
@@ -539,4 +519,37 @@ TEST_CASE("break-glass: an over-length password takes the lane too (no flood byp
     // credential (kBadCredential) however many of these were in flight.
     CHECK(h.auth_routes->verify_password_with_lockout("admin", over, req, opts).outcome ==
           PasswordCheckOutcome::kBusy);
+}
+
+TEST_CASE("break-glass arm-state gate: one request reads the database, the rest are served from the "
+          "cache (a flood naming the break-glass user cannot park workers)",
+          "[pg][auth][hardened][routes][concurrency][stripe]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
+    REQUIRE(h.auth_routes->sso_only_local_password_gate("admin") ==
+            SsoOnlyLocalGate::kBreakGlassArmed); // warm the cache
+    std::this_thread::sleep_for(std::chrono::milliseconds(1100)); // past the 1 s TTL
+    // Make the arm-state read SLOW: another connection holds an exclusive lock on auth.users.
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{PQexec(locker.get(), "BEGIN")}.ok());
+    REQUIRE(yuzu::server::pg::PgResult{
+        PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")}.ok());
+    constexpr int kCallers = 8;
+    std::atomic<int> done{0};
+    std::vector<std::jthread> callers;
+    for (int i = 0; i < kCallers; ++i)
+        callers.emplace_back([&] {
+            (void)h.auth_routes->sso_only_local_password_gate("admin");
+            ++done;
+        });
+    std::this_thread::sleep_for(std::chrono::milliseconds(400));
+    const int finished_while_locked = done.load();
+    (void)yuzu::server::pg::PgResult{PQexec(locker.get(), "COMMIT")};
+    callers.clear(); // join
+    // Exactly the single-flight refresher is parked on the locked table; the other seven answered
+    // from the stale value at once. (Mutation: no single flight -> all eight park, 0 finished.)
+    CHECK(finished_while_locked == kCallers - 1);
 }

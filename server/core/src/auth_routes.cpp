@@ -2165,13 +2165,22 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
                                                              const PasswordCheckOptions& opts) {
     const bool lockout_active = cfg_.auth_lockout_threshold > 0 && !opts.lockout_exempt;
 
-    // 1. The BREAK-GLASS NAME (lockout-exempt on /login: the configured break-glass user under
-    // sso-only, armed or not) takes its budget slot FIRST: non-blocking, ONE per source address,
-    // in a lane of min(4, cap/4) slots, keyed on the TCP peer. The slot is taken before the
-    // sso-only gate because that gate reads the arm state from the database (a lease wait of up
-    // to 1.5 s), so a flood naming the break-glass user would otherwise do that read unbounded,
-    // and an unarmed flood would leave the lane free (an armed-429 vs unarmed-401 oracle). It
-    // is taken for EVERY attempt, including an over-length password whose hash is skipped.
+    // 1. The caller's pre-verify gate (the sso-only local-login gate) runs FIRST, before any
+    // stripe or slot: a refused attempt never hashes, so it must never consume (or be refused
+    // for lack of) shared capacity. Under sso-only every name except the armed break-glass
+    // account is rejected here with the one generic 401. The gate's only database read (the
+    // break-glass arm state) is cached and single-flight (see the gate), so this position
+    // cannot park workers.
+    if (opts.pre_verify_gate && !opts.pre_verify_gate())
+        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
+
+    // 2. The armed break-glass account (lockout-exempt on /login) keeps no lockout counter, so it
+    // takes no stripe; its CONCURRENT guesses are bounded by its budget lane: a NON-blocking
+    // slot, ONE per TCP peer address, in a lane of min(4, cap/4) slots (1 on pools of 10-15).
+    // The slot is taken for EVERY attempt, including an over-length password whose hash is
+    // skipped (that request still does database and audit work). A refusal is answered with
+    // the generic 401 by the /login handler (never a distinguishable 429), so the busy lane
+    // does not tell a caller which name is the break-glass user.
     const bool break_glass_attempt = opts.lockout_exempt && opts.metric_route == "login";
     std::optional<Pbkdf2Budget::Slot> pbkdf2_slot;
     if (break_glass_attempt) {
@@ -2179,15 +2188,6 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         if (!pbkdf2_slot->ok())
             return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
     }
-
-    // 2. The caller's pre-verify gate (the sso-only local-login gate) runs before any stripe or
-    // ordinary slot: a refused attempt never hashes, so it must never consume (or be refused for
-    // lack of) shared capacity. Under sso-only every name except the armed break-glass account
-    // is rejected here with the one generic 401; other and unknown names never touch any lane.
-    // The break-glass name (armed or not) answers 429 when its lane is full, so saturation shows
-    // that a name IS the break-glass name but not whether it is armed.
-    if (opts.pre_verify_gate && !opts.pre_verify_gate())
-        return {PasswordCheckOutcome::kGateRejected, std::nullopt, {}};
 
     // Serialize concurrent attempts for THIS username across the whole
     // lockout-critical section below (pre-check → verify_password →
@@ -2575,17 +2575,46 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
 SsoOnlyLocalGate AuthRoutes::sso_only_local_password_gate(const std::string& username) {
     if (cfg_.auth_mode != "sso-only")
         return SsoOnlyLocalGate::kOpen;
-    if (!cfg_.break_glass_user.empty() && username == cfg_.break_glass_user) {
-        if (auto* db = auth_mgr_.auth_db_ptr()) {
-            // Fail CLOSED on a read error: unlike lockout (which guards against
-            // wrong passwords and so fails open), this gate is the credential
-            // path itself — a transient read error must not become a free pass
-            // to the disabled local-login path.
-            if (auto bg = db->break_glass_status(username); bg && bg->armed)
-                return SsoOnlyLocalGate::kBreakGlassArmed;
-        }
+    if (cfg_.break_glass_user.empty() || username != cfg_.break_glass_user)
+        return SsoOnlyLocalGate::kRefused; // every other name: no database read at all
+    // The break-glass name: the arm state is a database read with a lease wait of up to 1.5 s, and
+    // this gate runs for EVERY request naming that user, before any slot. So the answer is cached
+    // for kBreakGlassArmCacheTtl and refreshed by ONE request at a time (single flight); the
+    // others are answered from the last value at once (or fail CLOSED when there is none), so a
+    // flood naming the break-glass user cannot park workers on this read. An arm or disarm shows
+    // up after at most the TTL (plus one refresh); --break-glass-arm is an out-of-band host
+    // operation, so that lag is the operator-visible cost.
+    const auto now = std::chrono::steady_clock::now();
+    {
+        std::lock_guard lk(bg_arm_mu_);
+        if (bg_arm_valid_ && now - bg_arm_at_ < kBreakGlassArmCacheTtl)
+            return bg_arm_armed_ ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
     }
-    return SsoOnlyLocalGate::kRefused;
+    bool expected = false;
+    if (bg_arm_refreshing_.compare_exchange_strong(expected, true)) {
+        struct Done {
+            std::atomic<bool>& f;
+            ~Done() { f.store(false); }
+        } done{bg_arm_refreshing_};
+        bool ok = false, armed = false;
+        if (auto* db = auth_mgr_.auth_db_ptr()) {
+            // Fail CLOSED on a read error: unlike lockout (which guards against wrong passwords
+            // and so fails open), this gate is the credential path itself.
+            if (auto bg = db->break_glass_status(username)) {
+                ok = true;
+                armed = bg->armed;
+            }
+        }
+        std::lock_guard lk(bg_arm_mu_);
+        bg_arm_valid_ = ok;
+        bg_arm_armed_ = armed;
+        bg_arm_at_ = std::chrono::steady_clock::now();
+        return armed ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
+    }
+    std::lock_guard lk(bg_arm_mu_);
+    if (bg_arm_valid_) // stale by at most one refresh: served at once
+        return bg_arm_armed_ ? SsoOnlyLocalGate::kBreakGlassArmed : SsoOnlyLocalGate::kRefused;
+    return SsoOnlyLocalGate::kRefused; // no value and a refresh in flight: fail CLOSED
 }
 
 // ---------------------------------------------------------------------------
@@ -2710,12 +2739,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // while armed — an out-of-band host operator ran --break-glass-arm
         // within the window. A non-exempt or un-armed attempt is rejected with
         // the SAME generic 401 as a bad password (no "disabled"/"sso-only"
-        // wording, no Retry-After), so nothing in the answer tells them apart; a request naming
-        // the BREAK-GLASS user (armed or not) can answer 429 where every other name answers
-        // 401 (a second same-source request or a full lane), and that answer's STATUS, BODY and
-        // Retry-After all differ. That shows the name IS the break-glass user, not whether it
-        // is armed; it is equivalent in kind to the timing residue below, and the 429 is
-        // deliberately NOT turned into a 401 (it is the operator-facing busy signal). verify_password (PBKDF2) is skipped for the rejected names. The one other
+        // wording, no Retry-After), so nothing in the answer tells them apart. A busy
+        // break-glass lane is answered with the same generic 401 (below), so the status does
+        // not depend on the name either. verify_password (PBKDF2) is skipped for the rejected names. The one other
         // residue is response TIMING: an armed break-glass user
         // runs PBKDF2 (slow) while every other username short-circuits (fast),
         // so timing can reveal that the break-glass account is currently armed
@@ -2801,6 +2827,16 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
                             "application/json");
             return;
         case PasswordCheckOutcome::kBusy:
+            if (break_glass_lockout_exempt) {
+                // The break-glass lane refused (a second request from this address or a full
+                // lane): answer the SAME generic 401 as a bad password, so the answer does not
+                // depend on whether the name is the break-glass user (no name oracle). The
+                // refusal is counted in yuzu_auth_pbkdf2_budget_rejected_total{class="break_glass"}.
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "Invalid username or password"),
+                                "application/json");
+                return;
+            }
             refuse_pbkdf2_busy(res);
             return;
         case PasswordCheckOutcome::kGateRejected:

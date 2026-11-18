@@ -236,6 +236,12 @@ public:
     void set_stripe_waiter_cap(int cap) {
         stripe_waiter_cap_.store(cap < 1 ? 1 : cap, std::memory_order_relaxed);
     }
+    /// Test seam: forget the cached break-glass arm state (a test that arms or disarms through
+    /// the database wants the next gate call to read it).
+    void reset_break_glass_arm_cache_for_test() {
+        std::lock_guard lk(bg_arm_mu_);
+        bg_arm_valid_ = false;
+    }
     /// Test seams: the stripe a name maps to (so a test can hold it) and its index.
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
@@ -1269,6 +1275,14 @@ private:
     std::string stripe_salt_{std::to_string((static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
                                             std::random_device{}())};
     std::atomic<int> stripe_waiters_{0};
+    /// The break-glass arm state, cached (single flight) so the sso-only gate that runs before
+    /// every slot never parks workers on a slow database read.
+    static constexpr std::chrono::milliseconds kBreakGlassArmCacheTtl{1000};
+    std::mutex bg_arm_mu_;
+    bool bg_arm_valid_{false};
+    bool bg_arm_armed_{false};
+    std::chrono::steady_clock::time_point bg_arm_at_{};
+    std::atomic<bool> bg_arm_refreshing_{false};
     /// Most requests allowed to WAIT for a stripe at once (server.cpp: max(2, pool/8)).
     std::atomic<int> stripe_waiter_cap_{4};
     /// Most requests that may wait for ONE stripe at once, so a flood on one stripe cannot use
