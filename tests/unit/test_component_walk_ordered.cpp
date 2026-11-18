@@ -547,7 +547,7 @@ TEST_CASE("walk_ordered: a directory on another device is one gap and none of it
     CHECK(r.visits == Strs{"/r/b", "/r/b/y"});
 }
 
-TEST_CASE("walk_ordered: unknown identities never trigger other_device or restarted",
+TEST_CASE("walk_ordered: unknown identities never trigger other_device; a known half that reads unknown restarts",
           "[walk_ordered][file_search][component_walk]") {
     Rig r;
     r.dir("/r", {D("a")});
@@ -651,7 +651,7 @@ TEST_CASE("walk_ordered: an unplaceable name never pins bounded continuations, w
             const auto out = slice(r, p, lim);
             CAPTURE(budget, i, out.position.after, out.advanced);
             CHECK(fsr::valid_position(out.position));
-            if (!done && out.stop != Stop::complete)
+            if (out.stop != Stop::complete)
                 CHECK(out.advanced); // never a slice that moves nothing
             done = out.stop == Stop::complete;
             p = out.position;

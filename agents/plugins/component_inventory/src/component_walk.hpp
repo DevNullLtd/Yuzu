@@ -382,7 +382,8 @@ private:
                 continue;
             }
 
-            // A name a Position cannot hold (over kMaxNameBytes) is never placed in one, or the
+            // A name a Position cannot hold (valid_component false: over kMaxNameBytes, or holding a
+            // slash or NUL) is never placed in one, or the
             // cursor for this slice would be empty and every retry would stall at this directory.
             // It is not searched and says so. It is judged BEFORE the budget checks and costs none
             // of the entry budget: charged, it would be consumed again by every retry that stops
