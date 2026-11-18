@@ -97,7 +97,7 @@ register_checked(Ctx, RegisterReq0) ->
     %% in them is discarded (an agent must not be able to name a certificate or
     %% claim an attestation), and the marker is what lets the server tell "a
     %% witnessing listener saw no certificate" from "a listener that never asked"
-    %% (plaintext, TLS without witness_client_cert, or a gateway too old to say). The
+    %% (plaintext, or TLS without witness_client_cert). The
     %% value is evidence, not a verdict: the server checks it against its own CA.
     RegisterReq = RegisterReq0#{gateway_observed_peer => Origin,
                                 gateway_attested_peer_cert_pem => peer_cert_pem(Ctx),

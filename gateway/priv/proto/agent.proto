@@ -107,8 +107,8 @@ message RegisterRequest {
   // OVERWRITES both fields on every Register it proxies, discarding whatever the
   // agent sent, and the DIRECT Register path IGNORES them entirely (a direct
   // agent cannot use them to claim an identity). `gateway_attests_peer_cert` is
-  // true iff the gateway ran this overwrite, so a server can tell "an upgraded
-  // gateway saw no certificate" from "a gateway too old to say"; the server
+  // true iff the gateway's LISTENER can witness client certificates, so a server can tell "a
+  // witnessing listener saw no certificate" from "a listener that cannot witness"; the server
   // cannot distinguish a gateway that overwrites honestly from a compromised one
   // (same trust level as gateway_observed_peer; R-6 residual).
   //

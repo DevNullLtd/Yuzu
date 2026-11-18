@@ -703,7 +703,12 @@ check_tls_values(Tls) ->
 %% A witnessing listener must request a certificate (verify_peer) and must not
 %% require one: an unenrolled agent has none and must still reach Register.
 check_witness(#{witness_client_cert := true} = Tls) ->
-    case {maps:get(verify, Tls, verify_peer), maps:get(fail_if_no_peer_cert, Tls, false)} of
+    %% The EFFECTIVE values, with the same defaults ssl_opts/1 applies (verify_peer, and
+    %% fail_if_no_peer_cert true under verify_peer): a map that sets only witness_client_cert
+    %% would otherwise pass here and then REQUIRE a client certificate at the handshake, cutting
+    %% off every agent that is still enrolling.
+    Verify = maps:get(verify, Tls, verify_peer),
+    case {Verify, maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer)} of
         {verify_peer, false} -> ok;
         _ -> {error, {bad_tls_values, [witness_client_cert]}}
     end;
