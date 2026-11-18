@@ -81,6 +81,12 @@
 #include <xlsxwriter.h>
 #include <minizip/unzip.h>
 
+// The completeness check below depends on facts read from libxlsxwriter 1.2.4's source (listed at
+// the top of this file and in the header) and on two of its internals. A library change must be
+// re-read against them before this number moves.
+static_assert(LXW_VERSION_ID == 124,
+              "libxlsxwriter changed: re-derive the completeness check (software_export_xlsx.hpp)");
+
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
