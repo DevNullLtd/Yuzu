@@ -1885,7 +1885,10 @@ jobs:
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
 
-      # As in docker-publish: pgvector is built from source, so syft lists it nowhere.
+      # pgvector is built from source: syft lists its vector.so as a file but no
+      # package, so the scan names no pgvector. mark-image marks the pair
+      # pgvector-source because it finds vector.so, and refuses this image
+      # (titled yuzu-postgres) if syft stops listing that file.
       - name: Mark the image SBOM incomplete where the scan cannot see
         env:
           SBOM: yuzu-postgres-image
@@ -2380,7 +2383,8 @@ jobs:
             echo ""
             echo "**Tag:** \`${IMAGE}:${VERSION}\`  **Digest:** \`${DIGEST}\`"
             echo ""
-            echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance + SBOM."
+            echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance."
+            echo "Its syft SBOM pair is a 3-day workflow artifact of this run, not a release asset, and is not marked incomplete."
           } >> "$GITHUB_STEP_SUMMARY"
 
   # ── Create GitHub Release ────────────────────────────────────────────
@@ -2703,11 +2707,13 @@ jobs:
           zstd, Ryu, OpenSSL's MD5). An SBOM whose file or image holds
           something it does not list says so: a CycloneDX composition with
           \`aggregate: incomplete\`, in SPDX a \`CONTAINS NOASSERTION\`
-          relationship on its root, and the reason tokens in
-          \`yuzu:sbom:incomplete-reasons\`. The image SBOMs are marked too:
-          an image scan cannot see the vcpkg libraries linked into
-          \`yuzu-server\` and \`yuzu-agent\`, nor pgvector, which the
-          \`yuzu-postgres\` image builds from source. A scanner such as
+          relationship on its root, and the reason tokens in the
+          \`yuzu:sbom:incomplete-reasons\` note (a CycloneDX property; in SPDX
+          a line of the root's comment). The release's six image SBOMs are
+          marked too: an image scan cannot see the vcpkg libraries linked into
+          \`yuzu-server\` and \`yuzu-agent\`, what the gateway's Erlang
+          emulator vendors, nor pgvector, which the \`yuzu-postgres\` image
+          builds from source. A scanner such as
           grype reports nothing for the marker, so read it yourself
           (release-verification.md section 5). Libraries the binaries load
           from the operating system at run time (glibc, \`libsystemd\`, the
@@ -2759,12 +2765,19 @@ jobs:
           and installer (\`yuzu-linux-x64\`, \`yuzu-gateway-linux-x64\`,
           \`yuzu-agent-windows-x64\` and \`yuzu-agent-macos-arm64\` with
           \`.cdx.json\`/\`.spdx.json\` for the archives, the package or installer
-          name for the others) and per image
+          name for the others) and per release image
           (\`yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json\` and
-          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`; a syft
-          v1.57.2 scan of the published image, which does not see the C++
-          libraries linked statically into \`yuzu-server\`: the
-          \`yuzu-linux-x64\` and \`yuzu-server\` package SBOMs list them), GitHub-native
+          \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`: a syft
+          v1.57.2 scan of the image by the digest this release signs). An image
+          scan does not see the C++ libraries linked statically into
+          \`yuzu-server\` and \`yuzu-agent\` (the \`yuzu-linux-x64\`, server
+          and agent package SBOMs list them), what the gateway's Erlang emulator vendors,
+          or the \`yuzu-postgres\` image's source-built pgvector, so each of
+          the six image SBOMs is marked incomplete with its reasons
+          (server: \`server-vendored, image-static-cpp\`; agent:
+          \`image-static-cpp\`; gateway: \`erts-static\`; postgres:
+          \`pgvector-source\`). The agent-bundle image published after the
+          release has no SBOM among the release assets. GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See
