@@ -229,11 +229,17 @@ maintainer scripts (`scripts/docker-release.sh`, `scripts/build-agent-bundle.sh 
 release tags outside the release workflow, bypassing its gate and journal; they are not used to
 publish a release, and an image they pushed is not one the release's signed records name. If a
 release image or tag ever had to stop being served, the project would announce it with the release.
-If you suspect a release digest is compromised, or a release's `:X.Y.Z`, or a digest its journal
-names, stops resolving or changes without such an announcement, treat it as an incident, not as a
-registry fault to wait out: report it through
-[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new), and
-keep running what you have meanwhile; do not replace it with an image no release names.
+Either of the following is an incident, not a registry fault to wait out; report it through
+[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new):
+
+- **A release's `:X.Y.Z`, or a digest its journal names, stops resolving or changes without such an
+  announcement.** Do not adopt the new digest. Keep deploying the digest you already have only if it
+  still passes `cosign verify` for that release's tag (section 3); never replace it with an image
+  no release names.
+- **You suspect a release digest itself is compromised.** Stop deploying that digest to new hosts,
+  and handle the hosts already running it under your own incident process (isolating them if your
+  process calls for it). Do not switch to an image no release names; move only to a digest a later
+  release announces and that passes `cosign verify` for that release's tag.
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
 afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and

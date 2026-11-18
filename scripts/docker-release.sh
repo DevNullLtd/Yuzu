@@ -1,17 +1,18 @@
 #!/usr/bin/env bash
 # docker-release.sh — Build and push Yuzu Docker images to GHCR
 #
-# Usage:
-#   ./scripts/docker-release.sh v0.8.0              # build + push
+# Usage (local builds; publishing is not a use of this script):
 #   ./scripts/docker-release.sh --build-only v0.8.0  # build only, no push
 #   ./scripts/docker-release.sh --dry-run v0.8.0     # print commands only
+# Without a flag it pushes :X.Y.Z, :X.Y, :latest to GHCR: NOT a release procedure.
 #
 # Requires: docker, gh (GitHub CLI, authenticated)
 # Designed for: Windows (Docker Desktop) + MSYS2 bash
 #
-# Pushing at a release version bypasses the release image gate and the publish
-# journal; releases are published by release.yml only (docs/ci-architecture.md,
-# "Release tag policy", Limit 1).
+# Releases are published by release.yml; a push from this script moves release
+# tags outside it, bypassing the release image gate and the publish journal
+# (docs/ci-architecture.md, "Release tag policy", Limit 1). Doing so is an
+# owner-decided incident, recorded in a tracking issue and announced.
 
 set -euo pipefail
 
