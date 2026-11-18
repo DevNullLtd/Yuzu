@@ -181,10 +181,10 @@ build workspace (the vcpkg ports tree and build trees included), not from the
 archive alone, so they can list components the archive does not ship or load.
 A finding in a component the archive does not contain does not apply to it.
 Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
-dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`) are no
+dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`, `libxlsxwriter`) are no
 longer installed on those build machines and the Windows agent archive carries
 none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
-refuses an archive that does; it has not yet run on a real release tag). What a
+refuses an archive that carries the DLLs of `libpq`, `drogon` or `xmlsec`, and does not yet check those of `libxlsxwriter`; it has not yet run on a real release tag). What a
 given release's SBOM lists beyond the archive is not asserted here: inspect the
 SBOM of the release you verify.
 

@@ -2142,6 +2142,8 @@ if build_server
       # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
       'unit/server/test_software_export_stream.cpp',
       'unit/server/test_software_export_routes.cpp',
+      # SAM-36b XLSX writer: real (tiny) workbooks in a yuzu_test_ dir, read back through minizip; the sheet-byte accounting, the read-back check (damaged zips, and failed writes made with RLIMIT_FSIZE), the pure disk budget, exclusive file creation
+      'unit/server/test_software_export_xlsx.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -2307,7 +2309,9 @@ if build_server
     # it links Catch2 without Catch2Main.
     # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
     # to pin the OTA flag/env contract (header-only, no link cost).
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
+    # minizip_dep (server/core/meson.build): test_software_export_xlsx.cpp and the XLSX cases of
+    # test_software_export_routes.cpp read the finished workbook back through minizip's unzip API.
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system'), minizip_dep],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
