@@ -6,24 +6,41 @@ name: vcpkg baseline update
 # sync) to the current vcpkg master HEAD. CI on the PR re-resolves every
 # port against the new baseline so regressions are caught before merge.
 #
-# TOKEN (S10). The bump rewrites files under .github/workflows/, and GitHub
+# TOKEN. The bump rewrites files under .github/workflows/, and GitHub
 # refuses any push that creates or updates a workflow file unless the pushing
 # credential holds the `workflows` permission. GITHUB_TOKEN can never be
-# granted that permission, so every run from May to November 2026 failed at
-# "Create pull request" with `git` exiting 1 (the branch push) and never
-# opened a PR. The PR is therefore opened with the repository secret
-# VCPKG_BASELINE_PR_TOKEN: a fine-grained token scoped to this repository
-# with Contents, Pull requests and Workflows read/write (or a classic PAT
-# with `repo` + `workflow`). Do NOT "fix" this by dropping the workflow files
-# from the bump list: VCPKG_COMMIT must move with builtin-baseline. A PR
-# opened with that token also triggers CI, which one opened by GITHUB_TOKEN
-# would not. When the secret is unset the run fails before the bump, naming
-# it, and the `alert` job below files the issue.
+# granted that permission, so the scheduled runs from June to November 2026
+# failed at "Create pull request" with `git` exiting 1 (the branch push) and
+# never opened a PR (May's run failed earlier, in job setup). The PR is
+# therefore pushed and opened with the repository secret
+# VCPKG_BASELINE_PR_TOKEN: a fine-grained token, repository access limited to
+# this repository, with Contents, Pull requests and Workflows read/write and
+# nothing else, expiring in 90 days or less. Its owner role, the rotation
+# procedure and the preferred bot identity are in docs/dependency-updates.md
+# ("The PR token"). Do NOT "fix" a failure by dropping the workflow files from
+# the bump list: VCPKG_COMMIT must move with builtin-baseline. A PR opened
+# with that token also triggers CI, which one opened by GITHUB_TOKEN would
+# not, and it is attributed to the token's owner, so a different maintainer
+# reviews it. When the secret is unset the run fails at its first step,
+# before the bump, naming it, and the `alert` job files the issue.
 #
-# FAILURE SIGNAL. A scheduled run emails nobody, so any failure opens (or
-# comments on) a `vcpkg-baseline-broken` issue, the nightly-broken pattern
-# from nightly.yml. No merge discipline is attached: the issue is a repair
-# prompt. Close it by hand after the next green run.
+# SELF-HOSTED OPT-IN. The PR builds an unreviewed microsoft/vcpkg HEAD. ci.yml
+# skips its self-hosted legs on a deps/vcpkg-baseline-* branch, and keeps
+# `Preflight (runner health)` red, until a maintainer has reviewed the
+# upstream range and added the `vcpkg-bump-reviewed` label. The PR is always
+# on the one branch below, so each month's bump updates the open PR instead
+# of opening another; the label is removed before every new push, so a
+# review of last month's range never covers this month's.
+#
+# FAILURE SIGNAL. A scheduled run's failure notification goes only to the
+# user who last edited the cron line, so any failure opens (or comments on) a
+# `vcpkg-baseline-broken` issue, the nightly-broken pattern from nightly.yml,
+# and the next green run closes it. No merge discipline is attached: the
+# issue is a repair prompt.
+#
+# SCHEDULE RUNS MAIN'S COPY. A scheduled run uses this file as it is on the
+# default branch (`main`), so an edit here reaches the schedule only once it
+# is promoted to main; a dispatch from dev runs dev's copy.
 
 on:
   schedule:
@@ -32,9 +49,16 @@ on:
   workflow_dispatch:
 
 # Scorecard Token-Permissions hardening: least-privilege read at workflow
-# scope; the single job below exercises writes when it opens the PR.
+# scope. The PR itself is pushed and opened with VCPKG_BASELINE_PR_TOKEN, so
+# GITHUB_TOKEN writes only labels and issues (job-level grants below).
 permissions:
   contents: read
+
+# One run at a time: a scheduled run and a dispatch would otherwise race the
+# label removal and the force-push of the same branch.
+concurrency:
+  group: vcpkg-baseline-update
+  cancel-in-progress: false
 
 jobs:
   propose-bump:
@@ -42,11 +66,25 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
-      contents: write         # peter-evans/create-pull-request: commit + branch push
-      pull-requests: write    # peter-evans/create-pull-request: open/update PR
+      contents: read          # actions/checkout
+      pull-requests: write    # remove the opt-in label from the open bump PR
     steps:
+      # First, so a missing secret fails the run every month, also one with
+      # nothing to bump, and before anything is changed.
+      - name: Require the PR token
+        env:
+          HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
+        run: |
+          if [[ "$HAS_PR_TOKEN" != "true" ]]; then
+            echo "::error::Repository secret VCPKG_BASELINE_PR_TOKEN is not set. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission). Create it as described in docs/dependency-updates.md, 'The PR token'."
+            exit 1
+          fi
+
+      # Dependency PRs target dev (docs/dependency-updates.md "Base branch"),
+      # so the bump is made on dev's files, not the default branch's.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: dev
           persist-credentials: false
 
       - name: Resolve latest vcpkg master SHA
@@ -94,8 +132,12 @@ jobs:
           old="$CURRENT_SHA"
           new="$LATEST_SHA"
           # Every active tracked reference of the baseline SHA. Historical
-          # docs/reviews evidence is immutable. Keep this list covered by the
-          # hermetic toolchain-contract inventory test.
+          # docs/reviews evidence is immutable. When a new file pins the
+          # baseline, add it here and to the PR body below:
+          # tests/shell/test_vcpkg_baseline_bump.sh fails if a tracked file
+          # carries the current baseline SHA but is not listed here (outside
+          # docs/reviews/, governance.d/ and the changelog), or if the PR body
+          # lists a different set.
           files=(
             vcpkg.json
             vcpkg-configuration.json
@@ -125,17 +167,27 @@ jobs:
             exit 1
           fi
 
-      # Fail before the action, naming the secret, rather than letting the
-      # push die as a bare `git` exit 1 (see TOKEN in the header).
-      - name: Require the PR token
+      # The opt-in label covers the head it was added at. Remove it from the
+      # open bump PR BEFORE pushing a new bump, so the new upstream range
+      # never inherits last month's review (ci.yml's vcpkg_bump_optin step).
+      # Fail-closed: if the label cannot be checked or removed, nothing is
+      # pushed. Tested by tests/shell/test_vcpkg_baseline_bump.sh.
+      - name: Withdraw the self-hosted opt-in from the open bump PR
         if: steps.check.outputs.changed == 'true'
         env:
-          HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BUMP_BRANCH: deps/vcpkg-baseline-update
+          OPT_IN_LABEL: vcpkg-bump-reviewed
         run: |
-          if [[ "$HAS_PR_TOKEN" != "true" ]]; then
-            echo "::error::Repository secret VCPKG_BASELINE_PR_TOKEN is not set. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission). Create a fine-grained token for this repository with Contents, Pull requests and Workflows read/write and store it as VCPKG_BASELINE_PR_TOKEN."
-            exit 1
-          fi
+          set -euo pipefail
+          prs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" \
+                  -f state=open -f head="$GITHUB_REPOSITORY_OWNER:$BUMP_BRANCH" -f per_page=100 \
+                  --jq ".[] | select(any(.labels[]; .name == \"$OPT_IN_LABEL\")) | .number")
+          for pr in $prs; do
+            [[ "$pr" =~ ^[1-9][0-9]*$ ]] || { echo "::error::unexpected PR number '$pr'"; exit 1; }
+            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$OPT_IN_LABEL" > /dev/null
+            echo "Removed '$OPT_IN_LABEL' from PR #$pr before pushing the new bump."
+          done
 
       - name: Create pull request
         if: steps.check.outputs.changed == 'true'
@@ -144,23 +196,33 @@ jobs:
           # Not GITHUB_TOKEN: see TOKEN in the header.
           token: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
           commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
-          branch: "deps/vcpkg-baseline-${{ steps.latest.outputs.sha }}"
+          # One fixed branch: an open bump PR is updated in place, never
+          # duplicated (see SELF-HOSTED OPT-IN in the header).
+          branch: deps/vcpkg-baseline-update
+          base: dev
           delete-branch: true
           title: "build(deps): bump vcpkg baseline"
           body: |
             Automated monthly vcpkg baseline update — see
-            [docs/dependency-updates.md](../blob/main/docs/dependency-updates.md)
+            [docs/dependency-updates.md](../blob/dev/docs/dependency-updates.md)
             for the strategy.
 
             - Old: `${{ steps.current.outputs.sha }}`
             - New: `${{ steps.latest.outputs.sha }}`
+            - Upstream range: https://github.com/microsoft/vcpkg/compare/${{ steps.current.outputs.sha }}...${{ steps.latest.outputs.sha }}
+
+            **Self-hosted CI is held until a maintainer opts in.** This PR
+            builds an unreviewed upstream vcpkg range, so `Preflight (runner
+            health)` stays red and the self-hosted legs do not run until a
+            maintainer other than the token's owner has reviewed the range
+            above, added the `vcpkg-bump-reviewed` label and re-run the failed
+            jobs. A later bump removes the label again.
 
             Updates every active tracked reference of the baseline SHA
             (historical `docs/reviews/` evidence remains frozen):
             - `vcpkg.json` `builtin-baseline`
             - `vcpkg-configuration.json` default registry `baseline`
-            - `AGENTS.md` vcpkg documentation line
-            - `CLAUDE.md` vcpkg documentation line
+            - `docs/build-guide.md` vcpkg baseline references
             - `.github/workflows/ci.yml` `VCPKG_COMMIT`
             - `.github/workflows/fork-dynamic-review.yml` `VCPKG_COMMIT`
             - `.github/workflows/nightly.yml` `VCPKG_COMMIT`
@@ -172,6 +234,7 @@ jobs:
             - `deploy/docker/Dockerfile.ci` `VCPKG_COMMIT` ENV
             - `deploy/windows/Provision-Windows-Runner.ps1` `$VcpkgBaseline` param
             - `deploy/windows/toolchain-contract.json` `vcpkg_baseline` pin
+            - `deploy/macos/README.md` vcpkg baseline reference
 
             CI will re-resolve every vcpkg port against the new baseline. If
             any downstream port now fails to build, **revert this PR** and
@@ -210,12 +273,12 @@ jobs:
               ``,
               `Until this is fixed the vcpkg baseline is not being bumped automatically.`,
               `If the failing step is "Require the PR token", or "Create pull request"`,
-              `with \`git\` exiting 1, check the VCPKG_BASELINE_PR_TOKEN secret: it must`,
-              `exist, be unexpired, and hold Contents, Pull requests and Workflows`,
-              `read/write on this repository (header of the workflow file).`,
+              `with \`git\` exiting 1 or 128, check the VCPKG_BASELINE_PR_TOKEN secret: it`,
+              `must exist, be unexpired, and hold Contents, Pull requests and Workflows`,
+              `read/write on this repository (docs/dependency-updates.md, "The PR token").`,
               `Not a merge gate.`,
               ``,
-              `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; close after a green run.)`,
+              `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; closed automatically by the next green run.)`,
             ].join('\n');
 
             const existing = await github.rest.issues.listForRepo({
@@ -242,4 +305,59 @@ jobs:
                 body,
               });
               core.notice(`Opened vcpkg-baseline-broken issue #${created.data.number}`);
+            }
+
+  # Symmetric counterpart to `alert`, the close-on-green job from nightly.yml:
+  # closes every open `vcpkg-baseline-broken` issue once a run succeeds. A
+  # month with nothing to bump is green too; the token check runs every month,
+  # so a green run still means the secret is set.
+  close-on-green:
+    name: "Close vcpkg-baseline-broken on green"
+    needs: [propose-bump]
+    if: success()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      issues: write   # comment on and close the vcpkg-baseline-broken issue
+    steps:
+      - name: Close any open vcpkg-baseline-broken issue
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'vcpkg-baseline-broken';
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+            const body = [
+              `The vcpkg baseline bump ran green @ \`${context.sha.substring(0, 7)}\`.`,
+              ``,
+              `**Run:** ${runUrl}`,
+              ``,
+              `(auto-closed by .github/workflows/vcpkg-baseline-update.yml; re-opened by its alert job if a later run fails.)`,
+            ].join('\n');
+
+            const open = await github.rest.issues.listForRepo({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              labels: label,
+              state: 'open',
+              per_page: 100,
+            });
+            if (open.data.length === 0) {
+              core.notice('No open vcpkg-baseline-broken issues to close.');
+              return;
+            }
+            for (const issue of open.data) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                body,
+              });
+              await github.rest.issues.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: issue.number,
+                state: 'closed',
+                state_reason: 'completed',
+              });
+              core.notice(`Closed vcpkg-baseline-broken issue #${issue.number}`);
             }

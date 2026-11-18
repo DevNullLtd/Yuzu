@@ -189,31 +189,104 @@ runs at 10:00 UTC on the 1st of each month (and is
    baseline that was reviewed at the time. The workflow file keeps the
    authoritative active list and fails loudly if a listed file still has the
    old SHA after the sed.
-5. Opens a PR via `peter-evans/create-pull-request` with labels
-   `dependencies,ci`, authenticated with the repository secret
-   `VCPKG_BASELINE_PR_TOKEN`, never `GITHUB_TOKEN`. The bump rewrites files
-   under `.github/workflows/`, and GitHub refuses a push that changes a
-   workflow file unless the credential holds the `workflows` permission,
-   which `GITHUB_TOKEN` can never hold. That refusal is why every scheduled
-   run from May to November 2026 failed at "Create pull request" (`git`
-   exited 1) and no PR was ever opened. The token must be scoped to this
-   repository with Contents, Pull requests and Workflows read/write. A PR
-   opened with it also triggers CI; one opened by `GITHUB_TOKEN` would not.
-   If the secret is unset, the run fails before the bump with an error
-   naming it.
+5. Opens a PR against `dev` via `peter-evans/create-pull-request` with labels
+   `dependencies,ci`, from the fixed branch `deps/vcpkg-baseline-update`, so a
+   month's bump updates the open bump PR rather than opening a second one. It
+   is pushed and opened with the repository secret `VCPKG_BASELINE_PR_TOKEN`,
+   never `GITHUB_TOKEN`: the bump rewrites files under `.github/workflows/`,
+   and GitHub refuses a push that changes a workflow file unless the
+   credential holds the `workflows` permission, which `GITHUB_TOKEN` can never
+   hold. That refusal is why the scheduled runs from June to November 2026
+   failed at "Create pull request" (`git` exited 1) and no PR was ever opened;
+   the May run failed earlier, in job setup. A PR opened with the token also
+   triggers CI; one opened by `GITHUB_TOKEN` would not. The token check is
+   the run's first step, so an unset secret fails every month, also one with
+   nothing to bump, with an error naming it. See "The PR token" below.
 6. On any failure, opens (or comments on) a `vcpkg-baseline-broken` issue,
-   the `nightly-broken` pattern. It is a repair prompt, not a merge gate;
-   close it by hand after the next green run.
+   the `nightly-broken` pattern. It is a repair prompt, not a merge gate. The
+   next green run closes it automatically.
 
-CI on the PR re-resolves every downstream vcpkg port against the new
-baseline — if anything breaks, the PR is left open for manual
+**Schedule runs `main`'s copy.** A scheduled run uses the workflow file as it
+is on the default branch, `main`. A change to
+`.github/workflows/vcpkg-baseline-update.yml` therefore reaches the monthly
+schedule only once `dev` is promoted to `main`; until then the schedule keeps
+the old behaviour. A `workflow_dispatch` run from `dev` uses `dev`'s copy.
+
+**Self-hosted CI is held until a maintainer opts in.** The bump PR builds an
+unreviewed `microsoft/vcpkg` HEAD, opened by automation at a known time. The
+self-hosted runners are persistent and fill the caches that release builds
+read ([CI architecture](ci-architecture.md#release-build-environment-and-provenance)),
+so `ci.yml` does not run its self-hosted legs on a `deps/vcpkg-baseline-*`
+branch until the PR carries the `vcpkg-bump-reviewed` label at its current
+head. Until then `Preflight (runner health)` is red, the PR cannot merge, and
+only the GitHub-hosted jobs run. To opt in, a maintainer other than the
+token's owner:
+
+1. reviews the upstream range linked in the PR body (the port changes between
+   the old and new baseline), looking for anything unexpected in the ports
+   Yuzu uses;
+2. adds the `vcpkg-bump-reviewed` label;
+3. on the newest CI run of the PR, chooses "Re-run failed jobs" ("Re-run all
+   jobs" works too). The gate reads the labels live, so the re-run sees the
+   label.
+
+The label covers the head it was added at. The next bump removes it before
+it pushes, so each new range needs its own review; a re-run of the workflow
+removes it too, even when the range has not moved. That next bump also
+rebuilds the branch from `dev`, so a fix committed to the bump branch by hand
+is overwritten: merge or close the PR before the 1st of the month. A direct
+`workflow_dispatch` of `ci.yml` is not an opt-in route: it is accepted only on
+`dev` and `main`.
+
+CI on the PR, once opted in, re-resolves every downstream vcpkg port against
+the new baseline — if anything breaks, the PR is left open for manual
 investigation instead of silently merging a broken build.
 
 When adding a new active file that pins the vcpkg baseline SHA (e.g., a new CI
 workflow or Dockerfile), **add it to the `files` array in
-`.github/workflows/vcpkg-baseline-update.yml`**. Do not add immutable
-`docs/reviews/` evidence. The post-sed verifier checks listed files, while the
-toolchain-contract inventory test finds an unlisted active reference.
+`.github/workflows/vcpkg-baseline-update.yml`** and to the list in the PR body
+there. Do not add immutable `docs/reviews/` evidence. The post-sed verifier
+checks listed files; `tests/shell/test_vcpkg_baseline_bump.sh` (run in CI's
+preflight) fails if a tracked file carries the current baseline SHA without
+being listed, or if the PR body lists a different set.
+
+### The PR token
+
+`VCPKG_BASELINE_PR_TOKEN` does not exist yet. Until a maintainer creates it,
+every run fails at its first step and the `vcpkg-baseline-broken` issue stays
+open.
+
+- **Owner role:** the release manager (the maintainer who cuts releases with
+  the `/release` skill), who creates the token, records its expiry date (a
+  calendar reminder or a dated tracking issue) and rotates it.
+- **Identity.** A GitHub App installation token, or a token from a dedicated
+  bot account, is the preferred identity: the PR is then authored by the bot,
+  not by a person. Choosing and setting one up is the repository owner's
+  decision (Fraser); until then the token is a fine-grained personal access
+  token of the release manager's own account.
+- **Scope.** Fine-grained, resource owner `DevNullLtd`, repository access
+  "Only select repositories" with this repository alone. Repository
+  permissions: Contents, Pull requests and Workflows read and write; nothing
+  else. If the organization requires approval of fine-grained tokens, the
+  token works only once an organization owner approves it.
+- **Expiry:** 90 days or less.
+- **Attribution.** A PR opened with a personal token is authored by the
+  token's owner, so that person is not an independent reviewer of it: a
+  different maintainer reviews the upstream range, applies the opt-in label
+  and approves the merge.
+- **Create or rotate.** Create the new token with the settings above, store it
+  with `gh secret set VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` (or
+  Settings → Secrets and variables → Actions), run the workflow once with
+  `workflow_dispatch` on `dev` and confirm it ends green or opens/updates the
+  bump PR, then revoke the old token. Rotate before the expiry date; the
+  workflow only checks that the secret is present, so an expired token shows
+  up only as a failed "Create pull request" (typically `git` exiting 128) and
+  a `vcpkg-baseline-broken` issue.
+- **If it leaks.** Revoke it at once (the owner's Settings → Developer
+  settings → Personal access tokens, or an organization owner's token
+  review), then create and store a replacement as above. A leaked token can
+  push workflow files and tags to this repository; check the repository's
+  recent pushes and tags.
 
 ### Baseline bump 2026.10.16
 

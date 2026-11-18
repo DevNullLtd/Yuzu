@@ -1169,10 +1169,15 @@ slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, sign
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
 
-## Release build environment and provenance (S12)
+## Release build environment and provenance
 
 This states how a release is built today, as checked against `release.yml` on
 2026-11-17. It describes the pipeline; it is not a certification.
+
+**Owner role:** the release manager (the maintainer who cuts releases with the
+`/release` skill). Re-check this section against `release.yml` before each
+minor release, and in the same change as any edit to a release job's runner,
+cache or signing wiring.
 
 **Trigger.** `release.yml` runs on a `v*` tag push or a `workflow_dispatch` on
 a tag ref. Anyone with write access can push such a tag: the repository has
@@ -1198,7 +1203,15 @@ repository, so code from any write-access branch executes on the hosts that
 later build a release. On Big Tam and Wee Tam the four runner agents of a pool
 share one OS account. Fork pull requests do not run there unless a maintainer
 approves a revision through `trusted-fork-ci.yml`, which isolates its caches
-([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)).
+([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
+vcpkg baseline PR (branch `deps/vcpkg-baseline-*`, opened by
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer has
+reviewed its upstream range and added the `vcpkg-bump-reviewed` label: until
+then `preflight-gate` fails, its self-hosted legs are skipped and
+`Preflight (runner health)` is red
+([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
+maintainer opts in"). That limits when unreviewed upstream code reaches these
+hosts; it does not separate the caches below from release builds.
 
 **State that persists into a release build.** Release builds reuse local state
 left by earlier jobs on the same host; none of it comes from the GitHub
@@ -1238,8 +1251,9 @@ Actions cache service.
   secrets are set, and skip silently otherwise. On 2026-11-17 none of
   `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets
   exist in the repository, so the Windows and macOS installers ship unsigned
-  (#239; S7 makes a stable release refuse instead of skipping, held until
-  the secrets exist). Update this bullet when S7 lands.
+  (#239). Making a stable release refuse, rather than skip, unsigned
+  installers is planned but held until the secrets exist; update this bullet
+  when it lands.
 
 **SLSA Build level.** Provenance is generated and signed through GitHub's
 attestation service from the workflow's OIDC identity, and the build runs on
@@ -1252,6 +1266,24 @@ the job that holds the OIDC token used to sign the provenance, so they could
 mint an attestation themselves. Reaching L3 means isolated ephemeral runners
 for release builds with no shared caches, and provenance generated outside
 the build job (for example a reusable workflow on GitHub-hosted runners).
+
+**Open gaps.** Disclosed here, not yet fixed, and each needs a tracking
+issue:
+
+- **No tag ruleset.** Anyone with write access can push a `v*` tag, which
+  starts `release.yml`, and nothing checks that the tagged commit is on
+  `main`.
+- **Release builds read caches that CI can write.** CI jobs from any
+  write-access branch fill ccache, the Linux workspace's `vcpkg_installed/`
+  and the vcpkg binary caches that release jobs on the same host then read
+  (the macOS binary cache is the same
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos` directory in `ci.yml` and
+  `release.yml`). Only release jobs write the BuildKit layer cache through
+  BuildKit, but a CI job running as the same OS account (any job on the same
+  Big Tam or Wee Tam pool, or on the same runner agent) can write its
+  directory directly. The vcpkg baseline PR's opt-in label narrows
+  one unattended route into these caches; it does not close the gap, which
+  needs release builds that start from no cache a CI job can write.
 
 ## Self-hosted runner topology
 

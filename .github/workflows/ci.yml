@@ -350,7 +350,9 @@ jobs:
   # If the runner-control query is unavailable or a required pool is wholly
   # offline, preflight-gate fails red (and with it `preflight`). Required checks
   # must never disappear behind a successful skip merely because their
-  # control-plane evidence is missing.
+  # control-plane evidence is missing. It also fails red, by design, on an
+  # automated vcpkg baseline PR that no maintainer has opted in to the
+  # self-hosted runners (the `vcpkg_bump_optin` step below).
   preflight-gate:
     name: "Preflight (gate)"
     needs: [trusted_inputs]
@@ -400,6 +402,66 @@ jobs:
           repository: ${{ github.repository }}
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
+
+      # ── Automated vcpkg baseline PRs: self-hosted legs need an opt-in ───
+      # vcpkg-baseline-update.yml opens its monthly PR (branch
+      # deps/vcpkg-baseline-*) with a token that starts CI, at a public,
+      # predictable time, and the PR builds an unreviewed microsoft/vcpkg HEAD.
+      # Every self-hosted leg (proto-compat, linux, windows, macos) needs this
+      # job, and those runners are persistent and write the caches release
+      # builds read (docs/ci-architecture.md "Release build environment and
+      # provenance"). So this step FAILS the gate on such a PR until a
+      # maintainer has read the upstream range and applied the label below:
+      # the self-hosted legs are skipped, `Preflight (runner health)` goes red
+      # (a skipped leg would otherwise satisfy its required check), and the
+      # GitHub-hosted jobs, which do not need this job, still run. Opt in by
+      # adding the label, then "Re-run failed jobs" on the newest run: labels
+      # are read live from the API, never from the event payload, so a re-run
+      # sees the label. The label binds to the PR's current head: a run for an
+      # older head fails, and vcpkg-baseline-update.yml removes the label
+      # before it pushes a new bump. A direct dispatch of ci.yml is no opt-in
+      # route: trusted_inputs refuses any ref but dev and main. Fail-closed on
+      # any API or input defect. Tested by
+      # tests/shell/test_vcpkg_bump_selfhosted_gate.sh.
+      - name: Require maintainer opt-in for an automated vcpkg baseline PR
+        id: vcpkg_bump_optin
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          EVENT_NAME: ${{ github.event_name }}
+          HEAD_REF: ${{ github.head_ref }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          OPT_IN_LABEL: vcpkg-bump-reviewed
+        run: |
+          set -uo pipefail
+          if [[ "$EVENT_NAME" != "pull_request" || "$HEAD_REF" != deps/vcpkg-baseline* ]]; then
+            echo "Not an automated vcpkg baseline PR; no opt-in needed."
+            exit 0
+          fi
+          refuse() {
+            echo "::error::$1"
+            echo "Self-hosted legs not run: $1" >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+            exit 1
+          }
+          [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || refuse "malformed PR number '$PR_NUMBER' (failing closed)."
+          [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || refuse "malformed head SHA '$RUN_HEAD_SHA' (failing closed)."
+          if ! pr_json=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"); then
+            refuse "could not read PR #$PR_NUMBER (failing closed)."
+          fi
+          if ! live_head=$(jq -er '.head.sha' <<<"$pr_json"); then
+            refuse "could not read PR #$PR_NUMBER's head (failing closed)."
+          fi
+          if [[ "$live_head" != "$RUN_HEAD_SHA" ]]; then
+            refuse "this run is for head $RUN_HEAD_SHA, but PR #$PR_NUMBER is now at $live_head. Re-run the newest CI run instead."
+          fi
+          if ! labels=$(jq -er '[.labels[].name] | join("\n")' <<<"$pr_json"); then
+            refuse "could not read PR #$PR_NUMBER's labels (failing closed)."
+          fi
+          if grep -Fxq -- "$OPT_IN_LABEL" <<<"$labels"; then
+            echo "PR #$PR_NUMBER carries '$OPT_IN_LABEL' at head $RUN_HEAD_SHA: self-hosted legs may run."
+            exit 0
+          fi
+          refuse "automated vcpkg baseline PR #$PR_NUMBER has not been opted in to the self-hosted runners. A maintainer reviews the upstream vcpkg range, adds the '$OPT_IN_LABEL' label, then re-runs the failed jobs (docs/dependency-updates.md)."
 
       # ── Docs-only vs code gate (issue #1978, push arm #5320) ────────────
       # Decide whether the heavy build matrix runs for this PR or push. The
@@ -641,6 +703,7 @@ jobs:
           bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel/EXIT traps (~45 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
+          bash tests/shell/test_vcpkg_baseline_bump.sh           # vcpkg bump PR: self-hosted opt-in gate + label withdrawal
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
           bash tests/shell/test_integration_port_retry.sh        # integration-test.sh lost-port-race classifier + process-ownership guard (#7538)
           python3 tests/test_extract_run_block.py
