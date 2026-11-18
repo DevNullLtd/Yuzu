@@ -165,7 +165,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ### Where the data goes
 
 - **Instruction result only.** Rows travel the agent's mTLS gRPC channel as the command response into the ResponseStore (`response_retention_days`, default 90), queryable at `/api/responses/{id}`; the dashboard's generic result viewer renders `services` through its key/value fallback schema (`result_parsing.hpp`).
-- **Device pages "Get live info".** The `services` live-snapshot kind (`device.live.services` audit verb) dispatches `list` directly and re-parses the same 3-versus-4-field row shape to render the device card (`device_routes.cpp`, `device_ui.cpp`).
+- **Device pages "Get live info".** The `services` live-snapshot kind (`device.live.services` audit verb) dispatches `list` directly and re-parses the same 3-versus-4-field row shape to render the device card (`parse_services` in `live_model.cpp`, rendered via `device_routes.cpp` and `device_ui.cpp`).
 - **Not consumed by** daily-sync inventory, Echo, or DEX and metrics: nothing here runs on a schedule; the plugin executes only when dispatched.
 - **Sensitivity.** `name`/`display_name` rows name installed services and applications on the host. Windows service display names, macOS launchd labels and Linux unit names are an installed-software inventory by another route. `status`/`startup_type` carry nothing beyond that service's own state. Nothing in any row identifies a specific device or person.
 - **Siblings:** `agents/plugins/echo/src/echo_service_collector.cpp` performs its own, independently implemented service enumeration (the same three OS mechanisms) for Echo's diff-based change detection; it shares no code with this plugin.
