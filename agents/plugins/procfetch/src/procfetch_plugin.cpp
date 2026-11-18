@@ -98,6 +98,7 @@ using EvpCtx = std::unique_ptr<EVP_MD_CTX, EvpCtxDeleter>;
 constexpr std::uint64_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB, refused (not truncated)
 constexpr auto kPerImageBudget = std::chrono::seconds(30);
 constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
+constexpr int kMaxStuckHelpers = 4;                       // helpers left behind per action, at most
 
 // SHA-1 of an OPEN descriptor: a regular file of at most kMaxImageHashBytes, read within `deadline`
 // (cooperative; the caller bounds the call itself, see hash_image_bounded). Any failure, including
@@ -136,6 +137,17 @@ std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
     return hex;
 }
 
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
 // Hash one process image on a bounded helper: the open and the read of a file on a stalled
 // filesystem cannot hold the command worker past `budget` (bounded_wait.hpp; the helper owns its
 // descriptor and copies, and shares the identity-keyed cache). Linux opens /proc/<pid>/exe itself
@@ -147,9 +159,12 @@ std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
 std::string hash_image_bounded(int pid, const std::string& path,
                                const yuzu::shared::local_path::LocalPathGuard& guard,
                                const std::shared_ptr<yuzu::shared::ImageHashCache>& cache,
-                               std::chrono::steady_clock::time_point action_deadline) {
+                               std::chrono::steady_clock::time_point action_deadline, int& stuck_helpers) {
     const auto now = std::chrono::steady_clock::now();
-    if (now >= action_deadline)
+    // At most kMaxStuckHelpers helpers per action may be left behind (timed out, or refused at the
+    // process-wide ceiling): past that the remaining images read as not hashed WITHOUT starting
+    // another, so one dispatch cannot burn through the helper ceiling.
+    if (now >= action_deadline || stuck_helpers >= kMaxStuckHelpers)
         return {};
     const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
     const auto deadline = now + budget;
@@ -187,6 +202,8 @@ std::string hash_image_bounded(int pid, const std::string& path,
                 cache->put(key, hex);
             return hex;
         });
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed)
+        ++stuck_helpers;
     return result.status == yuzu::shared::BoundedCallStatus::Completed && result.value
                ? std::move(*result.value)
                : std::string{};
@@ -219,6 +236,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::error_code ec;
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+    int stuck_helpers = 0;
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (!entry.is_directory(ec))
@@ -242,7 +260,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         // on a bounded helper, regular files only, capped and deadline-bounded, cached by the
         // opened image's identity.
         if (!exe_path.empty())
-            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline);
+            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline, stuck_helpers);
 
         ctx.write_output(
             std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
@@ -268,6 +286,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+    int stuck_helpers = 0;
     char path_buf[PROC_PIDPATHINFO_MAXSIZE];
 
     for (size_t i = 0; i < pid_count; ++i) {
@@ -296,7 +315,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
         std::string sha1;
         if (!exe_path.empty())
-            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline);
+            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline, stuck_helpers);
 
         ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
                                      escape_pipes(exe_path), sha1));

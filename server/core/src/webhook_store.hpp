@@ -38,6 +38,7 @@
 /// boot. No move-aside: with nothing migrated, a `.migrated-<epoch>` rename would misdescribe
 /// what happened to the file, so the legacy file is left in place at its original path.
 
+#include "bounded_resolver.hpp" // net::LookupFn (test seam)
 #include "refusal_throttle.hpp"
 #include "store_worker_pool.hpp"
 
@@ -133,6 +134,10 @@ public:
                                                  const std::string& url_detail)>;
     void set_delivery_refused_sink(DeliveryRefusedFn fn) { refused_sink_ = std::move(fn); }
 
+    /// TEST SEAM: replaces the name lookup used to vet a delivery destination (the OIDC provider has
+    /// the same hook). Never set in production.
+    void set_lookup_for_test(net::LookupFn fn) { lookup_for_test_ = std::move(fn); }
+
     /// Stop accepting new deliveries and wait up to `timeout` for every
     /// queued/in-flight delivery to finish. Returns true if fully drained.
     /// The caller (ServerImpl::stop()) MUST NOT destroy this store — or the
@@ -209,6 +214,7 @@ private:
     bool open_{false};
     yuzu::MetricsRegistry* metrics_{nullptr};
     DeliveryRefusedFn refused_sink_;
+    net::LookupFn lookup_for_test_; // empty in production: the system resolver
     RefusalThrottle refusal_throttle_;
 
     /// Delivery-time view of one webhook: carries the still-ENCRYPTED

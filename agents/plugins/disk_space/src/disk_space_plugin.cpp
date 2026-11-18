@@ -159,6 +159,17 @@ Measured measure_volume(const std::string& path) {
     return m;
 }
 
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
 constexpr auto kQueryBudget = std::chrono::seconds(15);
 
 int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {

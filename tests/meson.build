@@ -1689,7 +1689,7 @@ if build_server
       'unit/server/test_oidc_provider.cpp',
       'unit/server/test_oidc_https.cpp', # #5692: discovery + JWKS over TLS, incl. the handler-thread leg
       'unit/server/test_egress_classifier_parity.cpp', # WP10: server oidc_egress_policy.hpp vs the agent twin outbound_address_policy.hpp over one address table
-      'unit/server/test_outbound_destination_guard.cpp', # WP10/F43 (#4816): pure webhook/offload destination-address guard (refused tier, resolve-once pin)
+      'unit/server/test_outbound_destination_guard.cpp', # (#4816): pure webhook/offload destination-address guard (refused tier, resolve-once pin)
       'unit/server/test_oidc_egress_policy.cpp', # #5692: pure address-class policy for OIDC fetches
       'unit/server/test_oidc_egress.cpp', # #5692: the policy applied to real fetches (pin, refusal, cross-host)
       'unit/server/test_bounded_resolver.cpp', # bounded resolver + resolver error classifier
@@ -3991,7 +3991,7 @@ test('filesystem exists no raw fallback',
   timeout: 10,
 )
 
-# disk_space `path` refuses a UNC / device spelling server-side (F39; the agent refuses it too).
+# disk_space `path` refuses a UNC / device spelling server-side (the agent refuses it too).
 test('disk_space definition path pattern',
   _python3_test,
   args: [files('test_disk_space_definition_pattern.py')],

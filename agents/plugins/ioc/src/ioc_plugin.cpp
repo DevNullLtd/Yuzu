@@ -449,7 +449,7 @@ bool check_dns_cache(std::string_view domain) {
 // Every file_paths entry is EXAMINED once per action by `examine_path`, which runs in a bounded call
 // (agents/shared/bounded_wait.hpp: the work happens on a detached helper thread and the command
 // worker gives up after the budget, so a stalled mount cannot pin the agent's command pool past the
-// deadline; at most 64 helpers are outstanding process-wide, further ones are reported `timeout`).
+// deadline; at most 64 helpers per plugin DSO, further ones are reported `timeout`).
 // The helper owns copies of everything it touches. A path that was NOT examined is never reported as
 // a clean absence: the `file`/`hash` rows keep their historical shape and every not-examined path
 // also gets a structured `coverage|<path>|not_examined|<cause>` row, with a closing
@@ -637,6 +637,17 @@ Examined examine_path_impl(const yuzu::shared::local_path::LocalPathGuard& guard
 #endif
 }
 
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
 /// examine_path_impl on a bounded helper: a stalled filesystem call cannot hold the command worker
 /// past `remaining`. A timeout or a refused helper (outstanding ceiling) is the cause `timeout`.
 Examined examine_path(const yuzu::shared::local_path::LocalPathGuard& guard, const std::string& path,

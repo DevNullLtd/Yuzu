@@ -785,7 +785,7 @@ TEST_CASE("OffloadTargetStore[pg]: deliveries past a full queue count reason=que
 }
 #endif // !YUZU_TSAN_BUILD
 
-// ── F43 (#4816, #3870): destination-address guard ─────────────────────────
+// ── (#4816, #3870): destination-address guard ─────────────────────────
 
 TEST_CASE("OffloadTargetStore[pg]: a literal link-local or metadata URL is refused at create",
           "[offload_store][pg][security]") {

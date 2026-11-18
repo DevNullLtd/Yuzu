@@ -15,6 +15,9 @@
 #include "test_helpers.hpp"
 
 #include <bounded_file_hash.hpp>
+#ifndef _WIN32
+#include <openssl/evp.h>
+#endif
 #include <bounded_wait.hpp>
 #ifndef _WIN32
 #include <image_hash_cache.hpp>
@@ -432,6 +435,36 @@ TEST_CASE("local_path: a rename-swap race never opens through the swapped-in lin
     INFO("opened_real=" << opened_real);
 }
 #endif
+
+namespace {
+std::string file_sha256(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    yuzu::shared::Sha256 h;
+    char buf[65536];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0)
+        h.update(buf, static_cast<std::size_t>(in.gcount()));
+    return h.hex_digest();
+}
+std::string file_sha1(const char* path) {
+    std::ifstream in(path, std::ios::binary);
+    EVP_MD_CTX* ctx = EVP_MD_CTX_new();
+    EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr);
+    char buf[65536];
+    while (in.read(buf, sizeof(buf)) || in.gcount() > 0)
+        EVP_DigestUpdate(ctx, buf, static_cast<std::size_t>(in.gcount()));
+    unsigned char out[EVP_MAX_MD_SIZE];
+    unsigned int n = 0;
+    EVP_DigestFinal_ex(ctx, out, &n);
+    EVP_MD_CTX_free(ctx);
+    static constexpr char kHex[] = "0123456789abcdef";
+    std::string hex;
+    for (unsigned i = 0; i < n; ++i) {
+        hex += kHex[out[i] >> 4];
+        hex += kHex[out[i] & 15];
+    }
+    return hex;
+}
+} // namespace
 
 namespace {
 // Run `fn` on a thread and fail (instead of wedging the suite) if it does not finish in `ms`.
@@ -1286,6 +1319,31 @@ TEST_CASE("disk_space plugin: a local path is still measured and a symlink into 
     CHECK(contains(r.captured, "disk|"));
 }
 
+TEST_CASE("windows_updates plugin: one dispatch deadline covers every target",
+          "[shared][outbound][windows_updates]") {
+    // 16 RFC 1918 targets that blackhole (connect times out) at timeout 1 s would take ~16 s without a
+    // dispatch deadline; with it the dispatch ends within the 60 s budget and nothing is dropped:
+    // every target is reported (probed or `skipped|dispatch_deadline_exceeded`).
+    auto plugin = load_or_fail("windows_updates");
+    std::string many;
+    for (int i = 0; i < 16; ++i)
+        many += (i ? ",http://10.255.255." : "http://10.255.255.") + std::to_string(i + 1) + ":9/";
+    std::vector<YuzuParam> params{{"targets", many.c_str()}, {"timeout_seconds", "1"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r = dispatcher.run(plugin.descriptor, "patch_connectivity", params);
+    const auto took = std::chrono::steady_clock::now() - t0;
+    CHECK(r.rc == 0);
+    CHECK(took < std::chrono::seconds(90));
+    CHECK(contains(r.captured, "summary|targets_tested|16|"));
+    // Over the cap is refused outright, with no probing.
+    std::string seventeen = many + ",http://10.255.255.17:9/";
+    std::vector<YuzuParam> p2{{"targets", seventeen.c_str()}, {"timeout_seconds", "1"}};
+    const auto r2 = dispatcher.run(plugin.descriptor, "patch_connectivity", p2);
+    CHECK(r2.rc == 1);
+    CHECK(contains(r2.captured, "error|too many targets"));
+}
+
 TEST_CASE("windows_updates plugin: the TCP probe path runs to completion (addrinfo freed once)",
           "[shared][outbound][windows_updates]") {
     // test_tcp owns its getaddrinfo list in an RAII guard. A second, manual freeaddrinfo at the end
@@ -1320,6 +1378,8 @@ TEST_CASE("procfetch plugin: this process's image is hashed through its exe link
     const std::string sha1 = row.substr(last + 1);
     CHECK(sha1.size() == 40);
     CHECK(sha1.find_first_not_of("0123456789abcdef") == std::string::npos);
+    // The VALUE, not the shape: the SHA-1 of this very executable, computed independently.
+    CHECK(sha1 == file_sha1("/proc/self/exe"));
 #else
     SUCCEED("Linux-only");
 #endif
@@ -1348,6 +1408,8 @@ TEST_CASE("processes plugin: list_hashed hashes this process's own image through
     REQUIRE(f.size() >= 5);
     CHECK(f[3].size() == 64);
     CHECK(f[3].find_first_not_of("0123456789abcdef") == std::string::npos);
+    // The VALUE, not the shape: it is the SHA-256 of this very executable, read independently.
+    CHECK(f[3] == file_sha256("/proc/self/exe"));
 #else
     SUCCEED("Linux-only: the exe-link hash path");
 #endif

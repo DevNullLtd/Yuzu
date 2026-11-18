@@ -272,11 +272,23 @@ using HashCache = std::unordered_map<std::string, std::string>;
 
 constexpr auto kPerImageBudget = std::chrono::seconds(30);
 constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
+constexpr int kMaxStuckHelpers = 4;                       // helpers left behind per action, at most
 
 #if defined(__linux__)
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
 // One image on a bounded helper (bounded_wait.hpp): an open or read of a file on a stalled
 // filesystem cannot hold the command worker past the budget (the helper owns its descriptor; at most
-// 64 helpers are outstanding process-wide and a refused or timed-out call reads as an empty hash).
+// 64 helpers per plugin DSO; a refused or timed-out call reads as an empty hash).
 // The identity key (dev:ino) comes back with the hash so a replaced binary is not conflated.
 struct ImageHash {
     std::string key;
@@ -321,19 +333,25 @@ using ActionCache = std::shared_ptr<yuzu::shared::ImageHashCache>;
 ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHashCache>(); }
 
 std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
-                               const ImageGuard&, std::chrono::steady_clock::time_point action_deadline) {
+                               const ImageGuard&, std::chrono::steady_clock::time_point action_deadline,
+                               int& stuck_helpers) {
     if (path.empty())
         return {};
     const auto now = std::chrono::steady_clock::now();
-    if (now >= action_deadline)
+    // At most kMaxStuckHelpers helpers per action may be left behind (timed out, or refused at the
+    // per-plugin helper ceiling): past that the remaining images read as not hashed without starting
+    // another, so one dispatch cannot burn through the ceiling.
+    if (now >= action_deadline || stuck_helpers >= kMaxStuckHelpers)
         return {};
     const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
     const auto deadline = now + budget;
     auto result = yuzu::shared::bounded_call_ex(
         std::chrono::duration_cast<std::chrono::milliseconds>(budget),
         [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
-    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value) {
+        ++stuck_helpers;
         return {};
+    }
     const auto& img = *result.value;
     return img.key.empty() ? std::string{} : img.hash;
 }
@@ -346,14 +364,15 @@ ActionCache make_action_cache() { return {}; }
 // a listed network mount) before anything opens it, and judge + hash run on a bounded helper.
 std::string hash_process_image(unsigned long, const std::string& path, ActionCache& cache,
                                const ImageGuard& guard,
-                               std::chrono::steady_clock::time_point action_deadline) {
+                               std::chrono::steady_clock::time_point action_deadline,
+                               int& stuck_helpers) {
     if (path.empty())
         return {};
     if (const auto it = cache.find(path); it != cache.end())
         return it->second;
     const auto now = std::chrono::steady_clock::now();
     std::string hash;
-    if (now < action_deadline) {
+    if (now < action_deadline && stuck_helpers < kMaxStuckHelpers) {
         const auto budget =
             std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
         auto result = yuzu::shared::bounded_call_ex(
@@ -364,6 +383,8 @@ std::string hash_process_image(unsigned long, const std::string& path, ActionCac
             });
         if (result.status == yuzu::shared::BoundedCallStatus::Completed && result.value)
             hash = std::move(*result.value);
+        else
+            ++stuck_helpers;
     }
     cache.emplace(path, hash);
     return hash;
@@ -480,9 +501,10 @@ private:
         auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+        int stuck_helpers = 0;
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, stuck_helpers);
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
@@ -499,9 +521,10 @@ private:
         auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+        int stuck_helpers = 0;
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, stuck_helpers);
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }

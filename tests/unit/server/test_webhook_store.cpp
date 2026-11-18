@@ -515,7 +515,7 @@ TEST_CASE("WebhookStore[pg]: deliveries past a full queue count reason=queue_ful
 }
 #endif // !YUZU_TSAN_BUILD
 
-// ── F43 (#4816): destination-address guard ────────────────────────────────
+// ── (#4816): destination-address guard ────────────────────────────────
 
 TEST_CASE("WebhookStore[pg]: a literal link-local or metadata URL is refused at create",
           "[webhook_store][pg][security]") {
@@ -579,4 +579,102 @@ TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never c
     CHECK(metrics.counter("yuzu_server_webhook_delivery_failed_total").value() == 0.0);
     CHECK(sink_calls == 1);
     CHECK(sink_cause == "destination_refused");
+}
+
+// ── no second POST once a request may have reached the receiver ─────────────
+
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+
+#include <atomic>
+
+namespace {
+// A raw TCP listener on `family` loopback. `reply_close`: accept, read the request bytes and close
+// without answering (the client sees a read error AFTER connecting); counts accepted connections.
+struct RawListener {
+    int fd{-1};
+    int port{0};
+    std::atomic<int> accepted{0};
+    std::atomic<bool> stop{false};
+    std::thread th;
+    bool open(int family, int want_port) {
+        fd = ::socket(family, SOCK_STREAM, 0);
+        if (fd < 0) return false;
+        int one = 1;
+        ::setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+        if (family == AF_INET) {
+            sockaddr_in a{};
+            a.sin_family = AF_INET;
+            a.sin_port = htons(static_cast<uint16_t>(want_port));
+            a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return false;
+            socklen_t len = sizeof(a);
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+            port = ntohs(a.sin_port);
+        } else {
+            int v6only = 1;
+            ::setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &v6only, sizeof(v6only));
+            sockaddr_in6 a{};
+            a.sin6_family = AF_INET6;
+            a.sin6_port = htons(static_cast<uint16_t>(want_port));
+            a.sin6_addr = in6addr_loopback;
+            if (::bind(fd, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0) return false;
+            socklen_t len = sizeof(a);
+            ::getsockname(fd, reinterpret_cast<sockaddr*>(&a), &len);
+            port = ntohs(a.sin6_port);
+        }
+        if (::listen(fd, 8) != 0) return false;
+        th = std::thread([this] {
+            while (!stop.load()) {
+                timeval tv{0, 100000};
+                fd_set fds;
+                FD_ZERO(&fds);
+                FD_SET(fd, &fds);
+                if (::select(fd + 1, &fds, nullptr, nullptr, &tv) <= 0) continue;
+                const int c = ::accept(fd, nullptr, nullptr);
+                if (c < 0) continue;
+                ++accepted;
+                char buf[4096];
+                (void)::read(c, buf, sizeof(buf)); // take the request, then drop the connection
+                ::close(c);
+            }
+        });
+        return true;
+    }
+    ~RawListener() {
+        stop = true;
+        if (th.joinable()) th.join();
+        if (fd >= 0) ::close(fd);
+    }
+};
+} // namespace
+
+TEST_CASE("WebhookStore[pg]: a name with two addresses is not POSTed to twice once the first connected",
+          "[webhook_store][pg][security]") {
+    WebhookStorePg store;
+    RawListener v4, v6;
+    if (!v4.open(AF_INET, 0) || !v6.open(AF_INET6, v4.port)) {
+        WARN("could not bind the same loopback port on IPv4 and IPv6 here: skipped");
+        return;
+    }
+    // The injected lookup answers 127.0.0.1 (tried first) and ::1. The IPv4 listener accepts the
+    // connection and drops it without answering: a READ error after connecting, so the request may
+    // have reached the receiver. The old loop then POSTed again to ::1 (the same event twice).
+    store->set_lookup_for_test([](const std::string&) {
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = {"::1", "127.0.0.1"}; // IPv4 is tried first whatever the order
+        return r;
+    });
+    auto id = store->create_webhook("http://multi.test:" + std::to_string(v4.port) + "/h",
+                                    "agent.registered", /*secret=*/"");
+    REQUIRE(id.has_value());
+    store->fire_event("agent.registered", R"({"k":"v"})");
+    auto deliveries = wait_for_deliveries(*store, *id, 1, std::chrono::seconds(20));
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
+    CHECK(v6.accepted.load() == 0); // no second POST
 }

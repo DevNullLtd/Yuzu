@@ -603,7 +603,7 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
     // addresses that were judged; an address in the never-allowed tier (link-local/metadata,
     // unspecified, multicast, reserved), an unresolvable name and a busy resolver all decline the
     // delivery, record why, and are counted under `refused_total{cause}` (NOT delivery_failed_total).
-    const VettedDestination vetted = vet_delivery_destination(wh.url);
+    const VettedDestination vetted = vet_delivery_destination(wh.url, std::chrono::seconds(3), lookup_for_test_);
     if (vetted.verdict != DestinationVerdict::Allow) {
         const char* cause = destination_cause(vetted.verdict);
         if (metrics_)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""F39: the disk_space `path` parameter refuses a UNC / device spelling server-side (a RE2 pattern in
+"""The disk_space `path` parameter refuses a UNC / device spelling server-side (a RE2 pattern in
 content/definitions/disk_space.yaml). The pattern is RE2 (no lookahead) and uses only constructs
 Python's `re` reads the same way, so it is exercised here against the shipped YAML.
 Runnable standalone: `python3 tests/test_disk_space_definition_pattern.py`."""

@@ -818,7 +818,7 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     // under `refused_total{cause}` (NOT delivery_failed_total). Loopback and private ranges are
     // deliberately NOT refused (outbound_destination_guard.hpp; the opt-in policy is #4816's
     // separate setting).
-    const VettedDestination vetted = vet_delivery_destination(tgt.url);
+    const VettedDestination vetted = vet_delivery_destination(tgt.url, std::chrono::seconds(3), lookup_for_test_);
     if (vetted.verdict != DestinationVerdict::Allow) {
         const char* cause = destination_cause(vetted.verdict);
         record_delivery(tgt.id, event_type, event_count, payload_body, 0, cause);
