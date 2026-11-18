@@ -58783,6 +58783,8 @@ TEST_CASE("MCP SAM-29: a lost generic row on any write serves the result flagged
     // The writes landed.
     CHECK(lifecycle.imported().empty());
     CHECK(curation.mcp_data("get_software_normalization_status")["queue_open"] == 0);
+}
+
 // ── SAM-21: query_installed_software (widened), query_software_components, get_software_sync_status,
 // sync_hardware_software (advertised) ──────────────────────────────────────────────────────────
 // The lookup tools answer from software_list::lookup_installs / lookup_components, the functions
