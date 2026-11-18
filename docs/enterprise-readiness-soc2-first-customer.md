@@ -1138,9 +1138,8 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
-  An approver may be the change's author: the `CODEOWNERS` entries for those paths will request a
-  review from a release owner once PR #8243 is merged (until then nothing requests one), they only
-  request it, and "Require review from Code Owners" is off on the protected branches by owner
+  An approver may be the change's author: the `CODEOWNERS` entries for those paths (PR #8243)
+  request a review from a release owner, they only request it, and "Require review from Code Owners" is off on the protected branches by owner
   decision, so any one approving review merges such a change and
   separation of duties is a practice, not an enforced control. Disclose it with the control.
 - *What the release's evidence can prove:* release assets are not immutable (GitHub's immutable
@@ -1180,8 +1179,8 @@ Dev and Protect Main, a deliberate break-glass route whose use is visible in the
 It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
 2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
 from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
-supply-chain CODEOWNERS entries proposed in #8243 (owners `@fjarvis` and `@Tr3kkR`) will
-request review once that pull request is merged, but will not require it, and both owners
+supply-chain CODEOWNERS entries added by #8243 (owners `@fjarvis` and `@Tr3kkR`) request
+review but do not require it, and both owners
 can bypass the rulesets as organisation admins. This is to be reviewed by 2027-05-18,
 tracked in #8228.
 

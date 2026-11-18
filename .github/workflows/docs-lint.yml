@@ -322,6 +322,15 @@ jobs:
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
 
+      # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py
+      # describes one shipped file with its vcpkg closure (agent or server),
+      # never test or helper ports, and its `check` refuses a checkout-scale
+      # SBOM, one listing a checkout/build/test-tree path and one whose artifact
+      # hash differs. syft, pkgutil and rpm2cpio are stubbed. Stdlib only (the
+      # `cbom-schema` job runs it again with jsonschema, validating the SBOMs).
+      - name: Per-artifact SBOM generator
+        run: python3 -I tests/test_artifact_sbom.py
+
       # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
       # server build or server installer in release.yml's Windows/macOS jobs,
       # no old archive name, and one set of archive names across release.yml,
@@ -381,29 +390,34 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Depth 2: the base is the merge commit's FIRST PARENT, which must be in
+      # the checkout (see the step below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Enforce README touch rule
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request) BASE="$BASE_SHA" ;;
-            *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
+            pull_request) ;;
+            *) echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
-            exit 0
-          fi
-          # A two-tree diff needs only the base commit itself, not the whole
-          # history (the changelog-fragments job above does the same).
-          git fetch --depth=1 origin "$BASE"
+          # The base is the merge commit's first parent (the target-branch tip
+          # GitHub merged this PR onto), never the event's base.sha, which can
+          # lag that tip and then blames this PR for the target branch's own
+          # changes (#8235). The helper fails closed unless HEAD is the merge of
+          # this PR's head; see its header. doc-coupling.yml takes the same base.
+          # The changelog-fragments job below still diffs from base.sha: a
+          # release promote landing in between reads as an allowed promote there.
+          bash scripts/ci/pr-merge-parent.sh --selftest
+          BASE="$(bash scripts/ci/pr-merge-parent.sh "$HEAD_SHA" "$PR_HEAD_SHA")"
           printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
           scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
@@ -439,8 +453,10 @@ jobs:
   # (tests/fixtures/cyclonedx/golden/, kept byte-equal to cbom_json by
   # test_crypto_cbom.cpp) against the vendored official schema. jsonschema is
   # hash-pinned in requirements-ci.txt. YUZU_REQUIRE_JSONSCHEMA=1 turns the
-  # test's local skip-without-jsonschema into a hard failure here. Its own job
-  # for the same PyPI-outage reason as definition-descriptions below.
+  # test's local skip-without-jsonschema into a hard failure here. The job also
+  # schema-validates the per-artifact SBOMs tests/test_artifact_sbom.py
+  # generates (CycloneDX 1.7 and SPDX 2.3). Its own job for the same
+  # PyPI-outage reason as definition-descriptions below.
   cbom-schema:
     name: CBOM schema
     runs-on: ubuntu-24.04
@@ -459,6 +475,17 @@ jobs:
         env:
           YUZU_REQUIRE_JSONSCHEMA: "1"
         run: python3 tests/test_cbom_schema.py
+
+      # The per-artifact SBOM suite again (docs-lint's "Per-artifact SBOM
+      # generator" step runs it without jsonschema), here validating every SBOM
+      # its tests generate (syft stubbed) against the vendored CycloneDX 1.7 and
+      # SPDX 2.3 schemas (tests/fixtures/cyclonedx, tests/fixtures/spdx).
+      # YUZU_REQUIRE_JSONSCHEMA=1 makes a missing jsonschema a failure. No -I:
+      # jsonschema is in the user site the step above installs into.
+      - name: Validate generated SBOMs against CycloneDX 1.7 and SPDX 2.3
+        env:
+          YUZU_REQUIRE_JSONSCHEMA: "1"
+        run: python3 tests/test_artifact_sbom.py
 
   # #5557: the self-test of the execution owner key tripwire that `changelog-order` runs. It mutates
   # the server sources in memory and proves each mutation is caught. ITS OWN JOB, deliberately,

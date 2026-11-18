@@ -641,9 +641,13 @@ resolver itself (about 30 seconds with default resolver settings; cpp-httplib's 
 system resolver timeout, about 30 s by default, past the caller's timeout; read as
 about 30 s from the start of the lookup, not measured) before the request fails, except the server's OIDC name lookups, which stop waiting at the per-operation timeout; see the upgrade note in `docs/user-manual/upgrading.md`.
 
-**SBOMs.** Unchanged mechanism: `.github/workflows/release.yml` generates them
-with Syft (`anchore/sbom-action`), scanning the build workspace and the pushed
-release images by digest.
+**SBOMs.** `.github/workflows/release.yml` makes one SBOM pair per release file
+with `scripts/ci/artifact-sbom.py` (syft v1.57.2 over the unpacked file, plus the
+vcpkg ports from the installed tree), and one per pushed image with
+`anchore/sbom-action` (the same syft version, by digest). A port version bump
+shows up in the next release's file SBOMs with no workflow change. (When this
+entry was written the platform SBOMs scanned the build workspace, `path: .`;
+supply-chain item S8 replaced that.)
 
 ## Rebar3 deps review checklist
 

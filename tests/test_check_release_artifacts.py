@@ -9,7 +9,9 @@ rc4 and rc6 published without some of those SBOMs and nothing went red.
 These tests read the script's own SBOM_BASES, check it names every chisel
 image, run the real script against a synthetic complete artifacts directory
 (it must pass), then remove each expected SBOM in turn (it must fail and name
-the file). Stdlib only; needs a POSIX bash, so it skips on Windows.
+the file). Since S8 every .deb/.rpm/.exe/.pkg also needs its own SBOM pair,
+and an SBOM that belongs to no artifact of the release is refused. Stdlib
+only; needs a POSIX bash, so it skips on Windows.
 """
 
 import json
@@ -83,11 +85,15 @@ def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanne
 def make_artifacts(d: Path) -> None:
     for name in ARCHIVES + PACKAGES:
         (d / name).write_bytes(b"x")
-    for base in script_sbom_bases():
+    for base in script_sbom_bases() + [package_stem(p) for p in PACKAGES]:
         for fmt in ("cdx.json", "spdx.json"):
             (d / f"{base}.{fmt}").write_text(json.dumps({"name": base}))
     for img in script_gate_report_images():
         write_reports(d, img, 1)
+
+
+def package_stem(name: str) -> str:
+    return name.rsplit(".", 1)[0]
 
 
 # Not on Windows: there `bash` resolves to the WSL stub, which refuses to run as
@@ -119,6 +125,34 @@ class CheckReleaseArtifacts(unittest.TestCase):
                     r = self.run_script(d)
                     self.assertNotEqual(r.returncode, 0, f"{base}.{fmt} missing but the gate passed")
                     self.assertIn(f"missing SBOM: {base}.{fmt}", r.stderr)
+
+    def test_each_missing_package_sbom_fails(self):
+        for pkg in PACKAGES:
+            for fmt in ("cdx.json", "spdx.json"):
+                sbom = f"{package_stem(pkg)}.{fmt}"
+                with self.subTest(sbom=sbom), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                    d = Path(t)
+                    make_artifacts(d)
+                    (d / sbom).unlink()
+                    r = self.run_script(d)
+                    self.assertNotEqual(r.returncode, 0, f"{sbom} missing but the gate passed")
+                    self.assertIn(f"missing SBOM for {pkg}: {sbom}", r.stderr)
+
+    def test_orphan_sbom_is_refused(self):
+        # An SBOM for a package this release does not carry (a leftover from an
+        # earlier build) would be signed into SHA256SUMS: refuse it.
+        # Both formats, and a stem of each package kind, so neither the
+        # *.spdx.json glob nor one extension's lookup can quietly drop out.
+        for orphan in ("yuzu-agent_0.14.0-rc8_amd64.cdx.json", "yuzu-agent_0.14.0-rc8_amd64.spdx.json",
+                       "yuzu-server-0.14.0-0.1.rc8.x86_64.spdx.json", "YuzuAgentSetup-0.14.0_rc8.cdx.json",
+                       "YuzuAgent-0.14.0_rc8-arm64.spdx.json"):
+            with self.subTest(orphan=orphan), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / orphan).write_text("{}")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, f"orphan SBOM {orphan} present but the gate passed")
+                self.assertIn(f"file={orphan}::SBOM describes no artifact of this release", r.stderr)
 
     def test_retired_assets_are_refused(self):
         # ADR-0035 step 2: a server installer or an old-name Windows/macOS

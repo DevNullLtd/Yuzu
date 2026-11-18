@@ -3591,6 +3591,21 @@ test('release artifact gate',
   timeout: 120,
 )
 
+# Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
+# stubbed. Pins the vcpkg closure (agent vs server, no test/helper/host ports),
+# the artifact hash and name on the SBOM root, every artifact kind (the macOS
+# .pkg in its shipped layout, the installer from its compiler's manifest), the
+# incompleteness mark, and the release check's bound and forbidden paths. The
+# generate tests skip on Windows (the stubs are #! scripts); the rest run. When
+# jsonschema is importable, every generated SBOM is also validated against the
+# vendored CycloneDX 1.7 and SPDX 2.3 schemas (YUZU_REQUIRE_JSONSCHEMA=1: required).
+test('per-artifact SBOM generator',
+  _python3_test,
+  args: [files('test_artifact_sbom.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
 # Windows/macOS jobs build no server and no server installer, the old archive
 # names are gone, and every place that names a platform archive agrees on one
@@ -4317,6 +4332,14 @@ if _bash_test.found()
     test('plugin readme touch-rule selftest',
       _bash_test,
       args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # The pull_request diff base (merge commit's first parent) shared by the
+    # README touch rule and the spawn scan; also pins both workflows to it.
+    test('pr merge-parent base selftest',
+      _bash_test,
+      args: [files('../scripts/ci/pr-merge-parent.sh'), '--selftest'],
       suite: 'docs',
       timeout: 60,
     )
