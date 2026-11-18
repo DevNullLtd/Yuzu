@@ -138,6 +138,43 @@ class GateReports(unittest.TestCase):
             (d / "trivy-yuzu-server.gate.txt").write_text("gate: FAIL: fixable CRITICAL\n")
             self.assertNotEqual(self.run_script(d).returncode, 0)
 
+    def test_any_failing_gate_line_fails_even_beside_a_pass(self):
+        # A second scanner's verdict appended to the same file, or its own
+        # file (grype-*), must be read: `gate: pass` alone is not enough.
+        for name, text in (
+                ("trivy-yuzu-server.gate.txt", "gate: pass\ngrype gate: FAIL: fixable CRITICAL\n"),
+                ("trivy-yuzu-server.gate.txt", "gate: pass\ngate: FAIL: fixable CRITICAL\n"),
+                ("trivy-yuzu-server.gate.txt", "gate: FAIL: x\ngate: pass\n"),
+                ("trivy-yuzu-server.gate.txt", "gate: pass\ngate: skipped\n"),
+                ("grype-yuzu-gateway.gate.txt", "gate: FAIL: fixable CRITICAL\n"),
+                ("grype-yuzu-gateway.gate.txt", "image: x\n")):
+            with self.subTest(name=name, text=text), \
+                    tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / name).write_text(text)
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(name, r.stderr)
+
+    def test_a_passing_second_scanner_report_is_accepted(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            (d / "grype-yuzu-gateway.gate.txt").write_text("image: yuzu-gateway\ngate: pass\n")
+            (d / "grype-yuzu-gateway.json").write_text("{}")
+            r = self.run_script(d)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_second_scanner_json_must_parse(self):
+        if shutil.which("jq") is None:
+            self.skipTest("jq not installed (the script skips the JSON check too)")
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+            d = Path(t)
+            make_artifacts(d)
+            (d / "grype-yuzu-gateway.json").write_text("{not json")
+            self.assertNotEqual(self.run_script(d).returncode, 0)
+
 
 if __name__ == "__main__":
     sys.exit(0 if unittest.main(exit=False).result.wasSuccessful() else 1)

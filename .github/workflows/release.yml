@@ -1544,6 +1544,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # cache-prune.yml prunes this runner's buildx cache (and its siblings')
+      # weekly; it skips a cache directory whose lock is held. Held from here,
+      # before the first build imports the cache, until the job ends (the
+      # runner reaps the holder), so no prune overlaps this job's import or
+      # export (WP15/S9, scripts/ci/buildcache-lock.sh).
+      - name: Hold the buildx cache lock
+        env:
+          CACHE_DIR: ${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}
+        run: scripts/ci/buildcache-lock.sh hold "$CACHE_DIR"
+
       # ── Healthcheck runtime invariants (#751) ──────────────────────────
       # Build WITHOUT pushing, verify the image still provides the tool its
       # compose healthcheck invokes (bash + /dev/tcp for server; busybox wget
@@ -1625,12 +1635,13 @@ jobs:
       # runners, #1871). Recovery: docs/ci-architecture.md "Release image
       # vulnerability gate".
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        id: gate
         env:
           NAME: yuzu-${{ matrix.image }}
           IMAGE: ${{ steps.built.outputs.id }}
         run: |
           rm -rf "$RUNNER_TEMP/image-vuln-gate"
-          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
+          scripts/ci/image-vuln-gate.sh --release --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -1766,12 +1777,18 @@ jobs:
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}.json (the full
         # Trivy report: image ID, layers, every package, the findings and the
-        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
-        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
+        # repository@digest and dates, image ID, coverage, advisory canary,
+        # result, verify-pushed). It runs whenever the gate ran, PASS OR FAIL
+        # (an explicit status function: a bare `if:` would be success() only,
+        # and a refusal, the control operating, would leave no record); the gate
+        # writes a .gate.txt for every image on every exit.
         # The release job attaches them to the GitHub Release, inside the
         # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
-        # 90 days (the repository's maximum retention) for a leg whose release
-        # never ran.
+        # 90 days (the repository's maximum retention), including for a leg
+        # whose gate refused the image (the release then never runs).
+        id: upload_gate
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yuzu-${{ matrix.image }}-image-vuln-gate
@@ -1871,6 +1888,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # cache-prune.yml prunes this runner's buildx cache (and its siblings')
+      # weekly; it skips a cache directory whose lock is held. Held from here,
+      # before the first build imports the cache, until the job ends (the
+      # runner reaps the holder), so no prune overlaps this job's import or
+      # export (WP15/S9, scripts/ci/buildcache-lock.sh).
+      - name: Hold the buildx cache lock
+        env:
+          CACHE_DIR: ${{ runner.tool_cache }}/yuzu-docker-buildcache/postgres
+        run: scripts/ci/buildcache-lock.sh hold "$CACHE_DIR"
+
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
       # Build WITHOUT pushing and scan before "Build and push", as in
       # docker-publish. No `cache-to`: this build shares the buildkitd
@@ -1904,12 +1931,13 @@ jobs:
         run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        id: gate
         env:
           NAME: yuzu-postgres
           IMAGE: ${{ steps.built.outputs.id }}
         run: |
           rm -rf "$RUNNER_TEMP/image-vuln-gate"
-          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
+          scripts/ci/image-vuln-gate.sh --release --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the scan image
         if: always()
@@ -2022,12 +2050,18 @@ jobs:
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-postgres.json (the full
         # Trivy report: image ID, layers, every package, the findings and the
-        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
-        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
+        # repository@digest and dates, image ID, coverage, advisory canary,
+        # result, verify-pushed). It runs whenever the gate ran, PASS OR FAIL
+        # (an explicit status function: a bare `if:` would be success() only,
+        # and a refusal, the control operating, would leave no record); the gate
+        # writes a .gate.txt for every image on every exit.
         # The release job attaches them to the GitHub Release, inside the
         # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
-        # 90 days (the repository's maximum retention) for a leg whose release
-        # never ran.
+        # 90 days (the repository's maximum retention), including for a leg
+        # whose gate refused the image (the release then never runs).
+        id: upload_gate
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yuzu-postgres-image-vuln-gate
@@ -2185,6 +2219,16 @@ jobs:
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.licenses=AGPL-3.0-or-later
 
+      # cache-prune.yml prunes this runner's buildx cache (and its siblings')
+      # weekly; it skips a cache directory whose lock is held. Held from here,
+      # before the first build imports the cache, until the job ends (the
+      # runner reaps the holder), so no prune overlaps this job's import or
+      # export (WP15/S9, scripts/ci/buildcache-lock.sh).
+      - name: Hold the buildx cache lock
+        env:
+          CACHE_DIR: ${{ runner.tool_cache }}/yuzu-docker-buildcache/${{ matrix.image }}-chisel
+        run: scripts/ci/buildcache-lock.sh hold "$CACHE_DIR"
+
       # ── Healthcheck runtime invariants (#751) ──────────────────────────
       # Same pre-push gate as docker-publish, and it matters MORE here: these
       # images are FROM scratch, so their healthcheck depends entirely on a
@@ -2231,12 +2275,13 @@ jobs:
       # reuses these layers rather than cutting again, and "Verify the pushed
       # image is the scanned one" proves it did.
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        id: gate
         env:
           NAME: yuzu-${{ matrix.image }}-chisel
           IMAGE: ${{ steps.built.outputs.id }}
         run: |
           rm -rf "$RUNNER_TEMP/image-vuln-gate"
-          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
+          scripts/ci/image-vuln-gate.sh --release --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -2364,12 +2409,18 @@ jobs:
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}-chisel.json (the full
         # Trivy report: image ID, layers, every package, the findings and the
-        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
-        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
+        # repository@digest and dates, image ID, coverage, advisory canary,
+        # result, verify-pushed). It runs whenever the gate ran, PASS OR FAIL
+        # (an explicit status function: a bare `if:` would be success() only,
+        # and a refusal, the control operating, would leave no record); the gate
+        # writes a .gate.txt for every image on every exit.
         # The release job attaches them to the GitHub Release, inside the
         # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
-        # 90 days (the repository's maximum retention) for a leg whose release
-        # never ran.
+        # 90 days (the repository's maximum retention), including for a leg
+        # whose gate refused the image (the release then never runs).
+        id: upload_gate
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yuzu-${{ matrix.image }}-chisel-image-vuln-gate
@@ -2411,6 +2462,10 @@ jobs:
     needs: [release-guard, release]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    outputs:
+      # "true" once this job's gate report is uploaded, pass or fail; read by
+      # attach-bundle-gate-report (job outputs survive a failed job).
+      gate_report: ${{ steps.gate_report_uploaded.outputs.value }}
     concurrency:
       group: agent-bundle-publish-${{ github.ref }}
       cancel-in-progress: true
@@ -2490,12 +2545,13 @@ jobs:
         run: scripts/ci/image-identity.sh pin "$IMAGE" >> "$GITHUB_OUTPUT"
 
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
+        id: gate
         env:
           NAME: yuzu-agent-bundle-chisel
           IMAGE: ${{ steps.built.outputs.id }}
         run: |
           rm -rf "$RUNNER_TEMP/image-vuln-gate"
-          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
+          scripts/ci/image-vuln-gate.sh --release --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
@@ -2579,11 +2635,18 @@ jobs:
       - name: Upload image vulnerability gate report
         # WP15/S9 evidence of the pre-push gate: trivy-yuzu-agent-bundle-chisel.json (the full
         # Trivy report: image ID, layers, every package, the findings and the
-        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
-        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
-        # This job runs after the release exists, so they are not a release
-        # asset (like this image's SBOM): this artifact, kept for 90 days (the
-        # repository's maximum retention), is the record.
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
+        # repository@digest and dates, image ID, coverage, advisory canary,
+        # result, verify-pushed). It runs whenever the gate ran, PASS OR FAIL
+        # (an explicit status function: a bare `if:` would be success() only,
+        # and a refusal, the control operating, would leave no record); the gate
+        # writes a .gate.txt for every image on every exit.
+        # This job runs after the release exists, so they are not inside its
+        # SHA256SUMS; attach-bundle-gate-report attaches them to the GitHub
+        # Release afterwards, with their own signed checksum list (also when
+        # this gate refused the image), and this artifact keeps them for 90 days.
+        id: upload_gate
+        if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: yuzu-agent-bundle-chisel-image-vuln-gate
@@ -2592,6 +2655,11 @@ jobs:
           retention-days: 90
           # A re-run attempt's report replaces the earlier attempt's.
           overwrite: true
+
+      - name: Record that the gate report was uploaded
+        id: gate_report_uploaded
+        if: always() && steps.upload_gate.outcome == 'success'
+        run: echo "value=true" >> "$GITHUB_OUTPUT"
 
       - name: Bundle summary
         env:
@@ -2606,6 +2674,68 @@ jobs:
             echo ""
             echo "Three triplets (linux-x64, windows-x64, macos-arm64); cosign keyless + SLSA provenance + SBOM."
           } >> "$GITHUB_STEP_SUMMARY"
+
+  # ── Attach the agent bundle's gate report to the release (WP15/S9) ──
+  # docker-publish-agent-bundle runs after the release is published, so its
+  # gate report cannot be inside the release's signed SHA256SUMS. This job
+  # attaches it to the release as assets anyway (a workflow artifact lasts 90
+  # days at most, shorter than a SOC 2 Type II observation window), with its
+  # own checksum list signed keyless by this workflow identity, exactly as
+  # SHA256SUMS is. It runs whether the bundle's gate passed or refused the
+  # image (the record of a refusal matters as much), and only once the report
+  # was uploaded. It adds new assets only (their names are in no SHA256SUMS);
+  # --clobber replaces this job's own assets from an earlier attempt. Kept out
+  # of the bundle job so contents: write is held by a job that builds nothing.
+  attach-bundle-gate-report:
+    name: "Attach agent-bundle gate report to the release"
+    needs: [release, docker-publish-agent-bundle]
+    if: always() && needs.release.result == 'success' && needs.docker-publish-agent-bundle.outputs.gate_report == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: write   # gh release upload
+      id-token: write   # cosign sign-blob keyless
+    steps:
+      - name: Download the bundle's gate report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: yuzu-agent-bundle-chisel-image-vuln-gate
+          path: bundle-gate
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+
+      - name: Sign and attach
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          SIGN_REPOSITORY: ${{ github.repository }}
+          SIGN_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          cd bundle-gate
+          shopt -s nullglob
+          # Every scanner's report for the bundle image (trivy-*, and grype-*
+          # once a second scanner is wired in), nothing else.
+          reports=(trivy-yuzu-agent-bundle-chisel.* grype-yuzu-agent-bundle-chisel.*)
+          shopt -u nullglob
+          if [[ ! -s trivy-yuzu-agent-bundle-chisel.gate.txt ]]; then
+            echo "::error::the bundle's gate report has no trivy-yuzu-agent-bundle-chisel.gate.txt"
+            exit 1
+          fi
+          for f in "${reports[@]}"; do
+            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::unexpected file name $f"; exit 1; }
+          done
+          sums=yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS
+          sha256sum "${reports[@]}" > "$sums"
+          cat "$sums"
+          cosign sign-blob --yes "$sums" --bundle "$sums.sigstore"
+          cosign verify-blob --bundle "$sums.sigstore" \
+            --certificate-identity "https://github.com/${SIGN_REPOSITORY}/.github/workflows/release.yml@${SIGN_REF}" \
+            --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+            "$sums"
+          gh release upload "${GITHUB_REF_NAME}" --clobber "${reports[@]}" "$sums" "$sums.sigstore"
+          echo "Attached ${#reports[@]} report file(s), $sums and its signature to ${GITHUB_REF_NAME}"
 
   # ── Create GitHub Release ────────────────────────────────────────────
   release:
@@ -2694,7 +2824,9 @@ jobs:
             -name '*.cdx.json' -o \
             -name '*.spdx.json' -o \
             -name 'trivy-*.json' -o \
-            -name 'trivy-*.txt' \
+            -name 'trivy-*.txt' -o \
+            -name 'grype-*.json' -o \
+            -name 'grype-*.txt' \
           \) -exec mv {} . \;
 
       - name: Verify release artifact completeness
@@ -2714,9 +2846,15 @@ jobs:
           # *.zip glob covers both yuzu-agent-windows-x64.zip and yuzu-compose-wizard-*.zip.
           # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
           # verify the SBOM they download matches the SBOM we shipped.
-          # trivy-* are the image vulnerability gate's reports (WP15/S9), the
-          # evidence of what each image was scanned with and found.
-          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json trivy-* > SHA256SUMS
+          # trivy-* (and grype-*, once a second scanner writes reports) are the
+          # image vulnerability gate's reports (WP15/S9), the evidence of what
+          # each image was scanned with and found. nullglob for that list only:
+          # a scanner with no reports adds nothing, while every other pattern
+          # here still fails loudly when it matches nothing.
+          shopt -s nullglob
+          gate_reports=(trivy-* grype-*)
+          shopt -u nullglob
+          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json "${gate_reports[@]}" > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
@@ -2771,7 +2909,9 @@ jobs:
           while IFS=' ' read -r digest name; do
             name="${name#\*}"
             case "$name" in
-              ''|*.cdx.json|*.spdx.json|yuzu-compose-wizard-*) continue ;;
+              # trivy-*/grype-* are gate reports, not build outputs: no
+              # attestation exists for them (one 404 and warning each).
+              ''|*.cdx.json|*.spdx.json|yuzu-compose-wizard-*|trivy-*|grype-*) continue ;;
             esac
             # gh api --jq does not apply on 4xx responses, so capture the
             # raw body and require a non-null bundle to materialise.
@@ -2962,8 +3102,10 @@ jobs:
           Each image was scanned for vulnerabilities before it was pushed; the
           reports are the \`trivy-yuzu-*\` assets (inside \`SHA256SUMS\`): the
           full Trivy JSON, a table, and a \`.gate.txt\` summary with the Trivy
-          version, the vulnerability DB date, the image ID and which images'
-          OS packages the scanner could not see. See
+          version, the vulnerability DB digest and date, the image ID and which
+          images' OS packages the scanner could not see. The agent-bundle
+          image's report is attached after the release, with its own signed
+          checksum list (\`yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS\`). See
           [\`docs/user-manual/release-verification.md\`](docs/user-manual/release-verification.md).
 
           See the [user manual](docs/user-manual/) for full setup instructions.
@@ -2991,6 +3133,12 @@ jobs:
           if ls artifacts/yuzu-compose-wizard-*.zip >/dev/null 2>&1; then
             WIZARD_ASSET+=(artifacts/yuzu-compose-wizard-*.zip)
           fi
+
+          # The image vulnerability gate's reports: every scanner's (trivy-*,
+          # grype-*), the same list SHA256SUMS hashed.
+          shopt -s nullglob
+          GATE_REPORTS=(artifacts/trivy-* artifacts/grype-*)
+          shopt -u nullglob
 
           # The release-guard job refused this run up front if a published
           # release already existed (#5282), so a release found here is either
@@ -3026,7 +3174,7 @@ jobs:
               artifacts/*.rpm \
               artifacts/*.cdx.json \
               artifacts/*.spdx.json \
-              artifacts/trivy-* \
+              "${GATE_REPORTS[@]}" \
               artifacts/*.intoto.jsonl \
               artifacts/SHA256SUMS \
               artifacts/SHA256SUMS.sigstore \

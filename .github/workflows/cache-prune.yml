@@ -39,7 +39,9 @@ jobs:
   prune-linux:
     name: "Prune Linux runner cache"
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
+    # Headroom for the #1367 sweep's worst-case per-instance psql timeouts,
+    # plus the buildx prune over four runners' caches (about 120 GB measured).
+    timeout-minutes: 30
     steps:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
@@ -118,26 +120,50 @@ jobs:
           # new blobs and replaces index.json but never deletes the blobs only
           # the old index named, and YUZU_PACKAGE_REFRESH makes the package
           # layer new on every run attempt, so the dirs grow without bound
-          # (one server dir measured 20 GB, 6.3 GB referenced). The script
+          # (one server dir measured 20 GB, 6.3 GB referenced).
+          #
+          # All four Big Tam runners' caches, every week: each runner has its
+          # own tool cache (/srv/ci/work-N/_tool), all four run as one OS
+          # identity, and this job lands on one runner, so it walks its
+          # siblings' too. A publish job holds a shared lock on <dir>.lock
+          # for its whole run (scripts/ci/buildcache-lock.sh); the script
+          # takes it exclusively without waiting and skips a dir in use. It
           # removes only blobs no index can reach and older than 24 h, skips a
-          # dir written in the last 3 h (a release may be using it) or one it
-          # cannot parse, and removes a whole dir rather than leave its index
-          # naming a removed blob (the next release then builds it cold).
-          bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
-          if [[ ! -d "$bc" ]]; then
-            echo "::notice::buildx cache dir $bc not present — skipping"
-            exit 0
+          # dir written in the last 3 h, removes a BROKEN dir whole (the next
+          # build runs cold instead of failing), and reports an ERROR, exit 1
+          # after the last dir, for a dir it cannot read. Recovery for a
+          # broken cache: docs/ci-architecture.md "Cache pruning + weekly
+          # maintenance".
+          tc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}"
+          roots=("$tc/yuzu-docker-buildcache")
+          if [[ "$tc" == */work-*/_tool ]]; then
+            for r in "${tc%/work-*/_tool}"/work-*/_tool/yuzu-docker-buildcache; do
+              [[ "$r" == "$tc/yuzu-docker-buildcache" ]] || roots+=("$r")
+            done
           fi
-          before=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           shopt -s nullglob
-          dirs=("$bc"/*/)
+          dirs=()
+          for r in "${roots[@]}"; do
+            if [[ ! -d "$r" || -L "$r" ]]; then
+              echo "buildx cache root $r: not present (or a symlink), skipped"
+              continue
+            fi
+            echo "buildx cache root $r: before=$(du -sh "$r" 2>/dev/null | awk '{print $1}' || echo '?')"
+            for d in "$r"/*/; do dirs+=("${d%/}"); done
+          done
+          rc=0
           if [[ ${#dirs[@]} -gt 0 ]]; then
-            python3 -I scripts/ci/prune-buildcache.py "${dirs[@]}"
+            python3 -I scripts/ci/prune-buildcache.py "${dirs[@]}" || rc=$?
           fi
-          after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
-          echo "buildx caches: before=${before} after=${after}"
+          for r in "${roots[@]}"; do
+            [[ -d "$r" ]] && echo "buildx cache root $r: after=$(du -sh "$r" 2>/dev/null | awk '{print $1}' || echo '?')"
+          done
+          exit "$rc"
 
       - name: Sweep leaked yuzu_test_* databases (#1367)
+        # Runs even when a prune step above failed: a prune error must not
+        # leave the leaked databases unswept until it is fixed.
+        if: success() || failure()
         run: bash scripts/ci/sweep-test-databases.sh
 
   prune-macos:

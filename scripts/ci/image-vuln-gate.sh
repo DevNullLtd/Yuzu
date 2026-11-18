@@ -8,30 +8,48 @@
 #
 # It also fails, before or instead of a pass, when the scan could not mean
 # anything:
-#   - the Trivy DB is older than 72 hours (or its age cannot be read): the DB
-#     is downloaded ONCE per run, its UpdatedAt printed, and every scan uses
-#     that DB (`--skip-db-update`);
+#   - the Trivy DB: it is downloaded ONCE per run into a fresh, empty cache
+#     directory this script creates (an inherited TRIVY_CACHE_DIR is never
+#     used), pinned by the manifest digest the registry reports for the tag,
+#     which is recorded; the gate fails when the DB is older than 72 hours,
+#     its age cannot be read, or it was not downloaded by this run. Every scan
+#     uses that DB (`--skip-db-update`). The DB is NOT signed upstream (no
+#     cosign signature or attestation on aquasecurity/trivy-db, checked
+#     2026-11-18): TLS to the registry and the recorded digest are the only
+#     evidence of what was used;
 #   - Trivy found no OS package in the image (a FROM-scratch or chiselled image
-#     has no package database it can read), unless the image is listed, with a
-#     reason, in scripts/ci/image-vuln-gate-not-covered.txt; a listed image is
+#     has no package database it can read), unless the image is listed, in
+#     force, in scripts/ci/image-vuln-gate-not-covered.txt; a listed image is
 #     printed as NOT COVERED on every run;
+#   - the image's OS release is one Trivy has no advisory data for: Trivy marks
+#     it end of service life, its family has no canary here, or a canary (a
+#     tiny root filesystem of the same OS release holding packages older than
+#     every fix) matches nothing against this run's DB (Debian testing/sid,
+#     Alpine edge, an Ubuntu devel series). A scan of such an image reads clean
+#     whatever it ships;
 #   - .trivyignore.yaml is not in the strict shape
-#     scripts/ci/image-vuln-gate-checks.py accepts (every entry: a scope, a
-#     statement, an expiry at most 92 days out, an approver).
+#     scripts/ci/image-vuln-gate-checks.py accepts (every entry: a concrete
+#     path or a full versioned purl, a statement, an expiry at most 92 days
+#     out, an approver and an approval record). Trivy never reads that file:
+#     it reads a copy the checker writes holding only the entries in force.
 #
 # Where it runs:
 #   - release.yml, on every published image, on the locally built image BEFORE
 #     the push (docker-publish, docker-publish-postgres, docker-publish-chisel,
-#     docker-publish-agent-bundle). A failure there stops that image from being
-#     pushed, and the release job, which needs every docker-publish job except
-#     the agent bundle, does not run. Each job keeps the reports (--report-dir)
-#     as evidence: see docs/ci-architecture.md "Release image vulnerability
-#     gate".
+#     docker-publish-agent-bundle), with --release. A failure there stops that
+#     image from being pushed, and the release job, which needs every
+#     docker-publish job except the agent bundle, does not run. Each job keeps
+#     the reports (--report-dir) as evidence, a refused image's included: see
+#     docs/ci-architecture.md "Release image vulnerability gate".
 #   - pre-release.yml security-scan, on the published tags, after the release.
 #     Detective only there: a new CVE disclosed after the push turns QA red.
 #
 # Usage:
-#   scripts/ci/image-vuln-gate.sh [--report-dir DIR] [NAME=]IMAGE [[NAME=]IMAGE...]
+#   scripts/ci/image-vuln-gate.sh [--release] [--report-dir DIR] [NAME=]IMAGE [[NAME=]IMAGE...]
+#
+# --release: an acceptance (an ignore entry or a not-covered listing) whose
+# approval_ref is `pending` is NOT honoured. Without it a pending one is
+# honoured and reported as pending.
 #
 # IMAGE must be in the local Docker daemon: a tag or, better, an image ID (see
 # scripts/ci/image-identity.sh). Every scan passes `--image-src docker`, so
@@ -40,34 +58,37 @@
 # passed. pre-release.yml `docker pull`s the published tags first.
 #
 # NAME is the published repository name (yuzu-server-chisel). It names the
-# reports and is what the not-covered list is matched against. Without it the
-# name is the tag's last path component without the tag (a bare image ID gets
-# `image-<first 12 hex>` and can never match the list). Two images with the
-# same name in one run are refused.
+# reports and is what the not-covered list is matched against (exactly).
+# Without it the name is the tag's last path component without the tag (a bare
+# image ID gets `image-<first 12 hex>` and can never match the list). Two
+# images with the same name in one run are refused.
 #
-# With --report-dir, three files per image: trivy-NAME.json (the full Trivy
-# report: image ID, layer diff IDs, OS, every package, HIGH+CRITICAL findings
-# and the accepted ones), trivy-NAME.txt (the same as a table) and
-# trivy-NAME.gate.txt (Trivy version, DB UpdatedAt, image ID, OS package count,
-# coverage and the gate result).
+# With --report-dir, per image: trivy-NAME.json (the full Trivy report: image
+# ID, layer diff IDs, OS, every package, HIGH+CRITICAL findings and the
+# accepted ones), trivy-NAME.txt (the same as a table) and trivy-NAME.gate.txt
+# (Trivy version, the DB's repository@digest and dates, image ID, OS, OS
+# package count, coverage, the advisory canary, the ignore file and the gate
+# result). A trivy-NAME.gate.txt is written for every image on EVERY exit,
+# with `gate: FAIL: <reason>` when the gate refused it or stopped early, so a
+# refusal leaves evidence too.
 #
-# Environment (every other TRIVY_* variable is cleared, so the environment
-# cannot change the DB source, the severities or what is ignored; Trivy also
-# gets an empty config file, so a trivy.yaml in the working directory is not
-# read):
-#   TRIVY_BIN        use this trivy binary instead of installing the pinned one
-#                    (local runs, tests). It must be TRIVY_VERSION.
-#   TRIVY_CACHE_DIR  Trivy's DB and layer cache. Default: a fresh per-run
-#                    directory. Never point it at a fixed shared path: the
-#                    self-hosted pools run four runners as ONE OS identity, so
-#                    $HOME/.cache/trivy would be shared by concurrent jobs
-#                    (#1871). The pinned binary is installed per run for the
-#                    same reason ($RUNNER_TEMP, else a mktemp directory).
-#   YUZU_TRIVYIGNORE ignore file (default: <repo>/.trivyignore.yaml).
+# Environment: every TRIVY_* variable is cleared, so the environment cannot
+# change the DB source, the cache, the severities or what is ignored; Trivy
+# also gets an empty config file, so a trivy.yaml in the working directory is
+# not read. Two inputs remain, for local runs and tests only:
+#   TRIVY_BIN        use this trivy binary instead of installing the pinned one.
+#                    It must be TRIVY_VERSION. Refused on GitHub Actions.
+#   YUZU_TRIVYIGNORE ignore file to validate (default: <repo>/.trivyignore.yaml).
+#                    It goes through the same parser; Trivy reads only the
+#                    checker's canonical YAML copy of it.
+# The pinned binary, the DB and Trivy's temporary files live in a per-run
+# directory ($RUNNER_TEMP, else $TMPDIR), never a fixed shared path: the
+# self-hosted pools run four runners as ONE OS identity (#1871).
 #
 # Exit status: 0 every image passed; 1 a fixable CRITICAL was found, a scan
-# failed, the DB was stale, an image was not covered, or the setup failed (fail
-# closed: a scan that did not complete is never a pass); 2 usage error.
+# failed, the DB was stale or unpinnable, an image was not covered or has no
+# advisory data, or the setup failed (fail closed: a scan that did not complete
+# is never a pass); 2 usage error.
 set -euo pipefail
 
 # Pinned Trivy. The sha256 values are from trivy_0.70.0_checksums.txt; the
@@ -79,19 +100,28 @@ TRIVY_VERSION="0.70.0"
 TRIVY_SHA256_LINUX_64BIT="8b4376d5d6befe5c24d503f10ff136d9e0c49f9127a4279fd110b727929a5aa9"
 TRIVY_SHA256_LINUX_ARM64="2f6bb988b553a1bbac6bdd1ce890f5e412439564e17522b88a4541b4f364fc8d"
 
+# The DB sources, tried in order: Trivy 0.70.0's defaults (the Google mirror of
+# Docker Hub's aquasec/trivy-db, then GitHub's), named explicitly. Each tag is
+# resolved to a manifest digest first and the download is pinned to it.
+DB_REPOS=("mirror.gcr.io/aquasec/trivy-db" "ghcr.io/aquasecurity/trivy-db")
+DB_TAG="2"
+
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IGNORE_FILE="${YUZU_TRIVYIGNORE:-$ROOT/.trivyignore.yaml}"
 CHECKS=(python3 -I "$ROOT/scripts/ci/image-vuln-gate-checks.py")
 NOT_COVERED="$ROOT/scripts/ci/image-vuln-gate-not-covered.txt"
 
-# Keep the two TRIVY_* variables this script reads, then clear every other one:
+# Keep the one TRIVY_* variable this script reads, then clear every other one:
 # Trivy maps every flag to a TRIVY_* variable (TRIVY_DB_REPOSITORY,
-# TRIVY_SEVERITY, TRIVY_IGNOREFILE, TRIVY_SKIP_FILES, TRIVY_INSECURE, ...), and
-# none of that may change what the gate scans or with which DB. The cache
-# directory reaches Trivy as --cache-dir, not through the environment.
+# TRIVY_SEVERITY, TRIVY_IGNOREFILE, TRIVY_CACHE_DIR, TRIVY_INSECURE, ...), and
+# none of that may change what the gate scans or with which DB.
 trivy_bin_env="${TRIVY_BIN:-}"
-trivy_cache_env="${TRIVY_CACHE_DIR:-}"
+inherited_cache="${TRIVY_CACHE_DIR:-}"
 while IFS= read -r v; do unset "$v"; done < <(compgen -e | grep '^TRIVY_' || true)
+# Test hook (no network): the DB digest to pin. Only with TRIVY_BIN, which is
+# itself refused on GitHub Actions below.
+test_db_digest="${YUZU_GATE_TEST_DB_DIGEST:-}"
+unset YUZU_GATE_TEST_DB_DIGEST
 
 err() {
     if [ -n "${GITHUB_ACTIONS:-}" ]; then echo "::error::$*"; else echo "ERROR: $*" >&2; fi
@@ -100,102 +130,26 @@ err() {
 usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0" >&2; exit 2; }
 
 REPORT_DIR=""
-IMAGES=()
+RELEASE=0
+ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --report-dir) [ $# -ge 2 ] || usage; REPORT_DIR="$2"; shift ;;
+        --release) RELEASE=1 ;;
         -h|--help) usage ;;
-        --) shift; IMAGES+=("$@"); break ;;
+        --) shift; ARGS+=("$@"); break ;;
         -*) err "unknown option: $1"; usage ;;
-        *) IMAGES+=("$1") ;;
+        *) ARGS+=("$1") ;;
     esac
     shift
 done
-[ "${#IMAGES[@]}" -gt 0 ] || usage
+[ "${#ARGS[@]}" -gt 0 ] || usage
 
-# ── The ignore file: present, and every entry well formed ──────────────────
-# Trivy itself accepts an entry with no reason, no expiry and no scope, so this
-# is the only place that keeps an acceptance from becoming permanent,
-# unexplained, unapproved or wider than one package. It is parsed, not
-# grepped: a flow-style entry or a decoy line inside a statement cannot pass.
-if [ ! -r "$IGNORE_FILE" ]; then
-    err "ignore file $IGNORE_FILE is missing or unreadable (the gate does not run without it)"
-    exit 1
-fi
-if ! "${CHECKS[@]}" ignore-file "$IGNORE_FILE"; then
-    err "$IGNORE_FILE is not in the shape the gate accepts (above): every entry needs \`paths\` or \`purls\`, a statement, an expired_at at most 92 days out and an approved_by login"
-    exit 1
-fi
-
-# ── Trivy ────────────────────────────────────────────────────────────────────
-WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/yuzu-image-vuln-gate.XXXXXX")"
-trap 'rm -rf "$WORK"' EXIT
-
-if [ -n "$trivy_bin_env" ]; then
-    TRIVY="$trivy_bin_env"
-else
-    case "$(uname -s)/$(uname -m)" in
-        Linux/x86_64)          asset="Linux-64bit"; want="$TRIVY_SHA256_LINUX_64BIT" ;;
-        Linux/aarch64|Linux/arm64) asset="Linux-ARM64"; want="$TRIVY_SHA256_LINUX_ARM64" ;;
-        *) err "no pinned Trivy for $(uname -s)/$(uname -m); set TRIVY_BIN"; exit 1 ;;
-    esac
-    tgz="trivy_${TRIVY_VERSION}_${asset}.tar.gz"
-    url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tgz}"
-    curl -fsSL --retry 3 --retry-delay 5 -o "$WORK/$tgz" "$url" \
-        || { err "could not download $url"; exit 1; }
-    echo "${want}  $WORK/$tgz" | sha256sum -c --quiet - \
-        || { err "$tgz does not match its pinned sha256; refusing to run it"; exit 1; }
-    tar -xzf "$WORK/$tgz" -C "$WORK" trivy
-    TRIVY="$WORK/trivy"
-fi
-"$TRIVY" --version 2>/dev/null | grep -qx "Version: ${TRIVY_VERSION}" \
-    || { err "$TRIVY is not Trivy ${TRIVY_VERSION}"; exit 1; }
-
-CACHE="${trivy_cache_env:-$WORK/cache}"
-# Trivy's own temporary files (image layers it extracts) go under WORK too, so
-# a killed run leaves nothing in the shared /tmp (the trap removes WORK).
-mkdir -p "$WORK/tmp"
-export TMPDIR="$WORK/tmp"
-: > "$WORK/trivy.yaml"
-# Every Trivy call: the empty config, the cache, and the default DB sources
-# named explicitly (they are Trivy 0.70.0's defaults: the Google mirror of
-# Docker Hub's aquasec/trivy-db, then GitHub's).
-COMMON=(--config "$WORK/trivy.yaml" --cache-dir "$CACHE")
-DB_REPOS="mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2"
-[ -z "$REPORT_DIR" ] || mkdir -p "$REPORT_DIR"
-
-# ── The DB: once per run, and fresh ──────────────────────────────────────────
-# Downloaded (or updated) once, here, with its log visible (it names the
-# repository it came from); every scan below then runs with --skip-db-update,
-# so all images are judged against the same DB, whose age is checked first.
-# The DB is not signed; its age is the check that a stale or replayed copy
-# cannot pass.
-echo "==> Trivy ${TRIVY_VERSION}: vulnerability DB"
-if ! "$TRIVY" image "${COMMON[@]}" --db-repository "$DB_REPOS" --download-db-only; then
-    err "could not download the Trivy vulnerability DB (treated as a failure)"
-    exit 1
-fi
-if ! db_info="$("${CHECKS[@]}" db-age "$CACHE/db/metadata.json")"; then
-    err "the Trivy vulnerability DB is stale or unreadable (above); re-run once the published DB is current"
-    exit 1
-fi
-printf '%s\n' "$db_info" | sed 's/^/    /'
-db_updated="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_updated_at=//p')"
-db_downloaded="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_downloaded_at=//p')"
-
-summary() {
-    [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
-    printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY" || true
-}
-summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB UpdatedAt ${db_updated})"
-summary ""
-summary "| Image | OS packages | Coverage | Result |"
-summary "|---|---|---|---|"
-
-# ── Scan ─────────────────────────────────────────────────────────────────────
-failed=0
+# ── Names first, so every exit path below can write each image's report ──────
+NAMES=()
+REFS=()
 declare -A seen_names=()
-for arg in "${IMAGES[@]}"; do
+for arg in "${ARGS[@]}"; do
     # NAME=IMAGE, or a bare IMAGE (an image reference cannot contain "=").
     case "$arg" in
         *=*) name="${arg%%=*}"; image="${arg#*=}" ;;
@@ -216,6 +170,223 @@ for arg in "${IMAGES[@]}"; do
         exit 2
     fi
     seen_names[$name]=1
+    NAMES+=("$name")
+    REFS+=("$image")
+done
+if [ -n "$REPORT_DIR" ]; then
+    mkdir -p "$REPORT_DIR" || { err "cannot create report directory $REPORT_DIR"; exit 1; }
+fi
+
+summary() {
+    [ -n "${GITHUB_STEP_SUMMARY:-}" ] || return 0
+    printf '%s\n' "$*" >> "$GITHUB_STEP_SUMMARY" || true
+}
+SUMMARY_HEADER=0
+summary_header() {
+    [ "$SUMMARY_HEADER" = 0 ] || return 0
+    SUMMARY_HEADER=1
+    summary "### Image vulnerability gate (Trivy ${TRIVY_VERSION}, DB ${DB_REF}, UpdatedAt ${db_updated})"
+    summary ""
+    summary "| Image | OS packages | Coverage | Result |"
+    summary "|---|---|---|---|"
+}
+
+# Facts recorded in every .gate.txt, filled in as the run gets to them.
+MODE="check"; [ "$RELEASE" = 0 ] || MODE="release (pending approvals not honoured)"
+DB_REF="(not downloaded)"
+db_updated="?"
+db_downloaded="?"
+ignore_desc="(not validated)"
+ABORT_REASON=""
+declare -A reported=()
+
+# write_gate_txt NAME IMAGE RESULT [extra lines...]
+write_gate_txt() {
+    [ -n "$REPORT_DIR" ] || return 0
+    local n="$1" img="$2" res="$3"
+    shift 3
+    {
+        echo "image: $n ($img)"
+        echo "mode: $MODE"
+        echo "trivy: $TRIVY_VERSION"
+        echo "trivy db: $DB_REF, UpdatedAt $db_updated, DownloadedAt $db_downloaded"
+        [ $# -eq 0 ] || printf '%s\n' "$@"
+        echo "ignore file: $ignore_desc"
+        echo "gate: $res"
+        echo "scanned at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    } > "$REPORT_DIR/trivy-${n}.gate.txt"
+    reported[$n]=1
+}
+
+die() {
+    ABORT_REASON="$*"
+    err "$*"
+    exit 1
+}
+
+WORK=""
+# shellcheck disable=SC2317 # run by the EXIT trap
+finish() {
+    local rc=$?
+    # A refusal must leave evidence: every image that has no report yet gets
+    # one recording why the gate stopped.
+    if [ "$rc" -ne 0 ]; then
+        local i
+        for i in "${!NAMES[@]}"; do
+            if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
+                write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" \
+                    "FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}" \
+                    || true
+                summary_header
+                summary "| ${NAMES[$i]} | ? | ? | FAIL: gate stopped (${ABORT_REASON:-exit $rc}) |"
+            fi
+        done
+    fi
+    [ -z "$WORK" ] || rm -rf "$WORK"
+    exit "$rc"
+}
+trap finish EXIT
+
+if [ -n "$trivy_bin_env" ] && [ -n "${GITHUB_ACTIONS:-}" ]; then
+    die "TRIVY_BIN is for local runs and tests; the gate on GitHub Actions installs its pinned Trivy itself"
+fi
+if [ -n "$test_db_digest" ] && [ -z "$trivy_bin_env" ]; then
+    die "YUZU_GATE_TEST_DB_DIGEST is a test hook and needs TRIVY_BIN"
+fi
+if [ -n "$inherited_cache" ]; then
+    echo "note: TRIVY_CACHE_DIR=$inherited_cache is ignored; the gate downloads its DB into a fresh directory"
+fi
+
+WORK="$(mktemp -d "${RUNNER_TEMP:-${TMPDIR:-/tmp}}/yuzu-image-vuln-gate.XXXXXX")"
+
+# ── The ignore file: present, every entry well formed, and only that read ────
+# Trivy itself accepts an entry with no reason, no expiry and no scope, so this
+# is the only place that keeps an acceptance from becoming permanent,
+# unexplained, unapproved or wider than one package. It is parsed, not
+# grepped: a flow-style entry or a decoy line inside a statement cannot pass.
+# Trivy then reads the checker's canonical copy of the entries in force (an
+# expired entry, and with --release a pending one, are left out), always as
+# YAML: a plain-format file or an entry the parser did not see cannot reach it.
+if [ ! -r "$IGNORE_FILE" ]; then
+    die "ignore file $IGNORE_FILE is missing or unreadable (the gate does not run without it)"
+fi
+ign_flags=(--emit "$WORK/trivyignore.yaml")
+nc_flags=()
+if [ "$RELEASE" = 1 ]; then ign_flags+=(--require-approved); nc_flags+=(--require-approved); fi
+if ! ign_out="$("${CHECKS[@]}" ignore-file "$IGNORE_FILE" "${ign_flags[@]}")"; then
+    printf '%s\n' "$ign_out"
+    die "$IGNORE_FILE is not in the shape the gate accepts (above): every entry needs a concrete \`paths\` item or a full versioned \`purls\` item, a statement, an expired_at at most 92 days out, approved_by, and approved_on with approval_ref (or approval_ref: pending)"
+fi
+printf '%s\n' "$ign_out" | grep -v -E '^(in_force|pending|pending_not_honoured)=' || true
+in_force="$(printf '%s\n' "$ign_out" | sed -n 's/^in_force=//p')"
+pending_all="$(printf '%s\n' "$ign_out" | sed -n 's/^pending=//p')"
+pending_out="$(printf '%s\n' "$ign_out" | sed -n 's/^pending_not_honoured=//p')"
+ignore_desc="$(sha256sum "$IGNORE_FILE" | cut -d' ' -f1), ${in_force} entry(ies) in force, ${pending_all} pending approval (${pending_out} not honoured)"
+TRIVY_IGNORE="$WORK/trivyignore.yaml"
+if ! nc_out="$("${CHECKS[@]}" not-covered "$NOT_COVERED" "${nc_flags[@]}")"; then
+    die "$NOT_COVERED is malformed (above)"
+fi
+printf '%s\n' "$nc_out"
+
+# ── Trivy ────────────────────────────────────────────────────────────────────
+if [ -n "$trivy_bin_env" ]; then
+    TRIVY="$trivy_bin_env"
+else
+    case "$(uname -s)/$(uname -m)" in
+        Linux/x86_64)          asset="Linux-64bit"; want="$TRIVY_SHA256_LINUX_64BIT" ;;
+        Linux/aarch64|Linux/arm64) asset="Linux-ARM64"; want="$TRIVY_SHA256_LINUX_ARM64" ;;
+        *) die "no pinned Trivy for $(uname -s)/$(uname -m); set TRIVY_BIN" ;;
+    esac
+    tgz="trivy_${TRIVY_VERSION}_${asset}.tar.gz"
+    url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tgz}"
+    curl -fsSL --retry 3 --retry-delay 5 -o "$WORK/$tgz" "$url" \
+        || die "could not download $url"
+    echo "${want}  $WORK/$tgz" | sha256sum -c --quiet - \
+        || die "$tgz does not match its pinned sha256; refusing to run it"
+    tar -xzf "$WORK/$tgz" -C "$WORK" trivy
+    TRIVY="$WORK/trivy"
+fi
+"$TRIVY" --version 2>/dev/null | grep -qx "Version: ${TRIVY_VERSION}" \
+    || die "$TRIVY is not Trivy ${TRIVY_VERSION}"
+
+# The DB and layer cache: always a fresh, empty directory of this run.
+CACHE="$WORK/cache"
+mkdir "$CACHE"
+# Trivy's own temporary files (image layers it extracts) go under WORK too, so
+# a killed run leaves nothing in the shared /tmp (the trap removes WORK).
+mkdir -p "$WORK/tmp"
+export TMPDIR="$WORK/tmp"
+: > "$WORK/trivy.yaml"
+# Every Trivy call: the empty config and this run's cache.
+COMMON=(--config "$WORK/trivy.yaml" --cache-dir "$CACHE")
+
+# ── The DB: once per run, pinned by digest, and fresh ────────────────────────
+# Each source's tag is resolved to its manifest digest and the download pinned
+# to repository@digest (Trivy verifies the manifest and layers against it), so
+# the digest recorded in every report is the DB that was used. Every scan below
+# then runs with --skip-db-update, so all images are judged against that DB,
+# whose age and download time are checked first.
+echo "==> Trivy ${TRIVY_VERSION}: vulnerability DB"
+start_epoch="$(date +%s)"
+for repo in "${DB_REPOS[@]}"; do
+    if [ -n "$test_db_digest" ]; then
+        digest="$test_db_digest"
+    elif ! digest="$("${CHECKS[@]}" resolve-digest "$repo:$DB_TAG")"; then
+        echo "    could not resolve $repo:$DB_TAG; trying the next source"
+        continue
+    fi
+    if ! [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+        echo "    $repo:$DB_TAG resolved to '$digest', not a digest; trying the next source"
+        continue
+    fi
+    echo "    $repo:$DB_TAG is $digest"
+    if "$TRIVY" image "${COMMON[@]}" --db-repository "$repo@$digest" --download-db-only; then
+        DB_REF="$repo@$digest"
+        break
+    fi
+    rm -rf "${CACHE:?}/db"
+done
+[ "$DB_REF" != "(not downloaded)" ] || die "could not download the Trivy vulnerability DB from any source (treated as a failure)"
+if ! db_info="$("${CHECKS[@]}" db-age "$CACHE/db/metadata.json" --downloaded-after "$start_epoch")"; then
+    die "the Trivy vulnerability DB is stale, unreadable or not this run's download (above); re-run once the published DB is current"
+fi
+printf '%s\n' "$db_info" | sed 's/^/    /'
+db_updated="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_updated_at=//p')"
+db_downloaded="$(printf '%s\n' "$db_info" | sed -n 's/^trivy_db_downloaded_at=//p')"
+
+summary_header
+
+# advisory_canary FAMILY OS_NAME: returns 0 when this run's DB holds advisories
+# for that OS release, and sets ADVISORY to a one-line description. Each
+# (family, release) is checked once per run. Not called in a subshell: it
+# caches its result.
+declare -A canary_result=()
+canary_n=0
+ADVISORY=""
+advisory_canary() {
+    local key="$1 $2" dir out msg
+    if [ -z "${canary_result[$key]:-}" ]; then
+        canary_n=$((canary_n + 1))
+        dir="$WORK/canary-$canary_n"
+        out="$WORK/canary-$canary_n.json"
+        if "${CHECKS[@]}" canary-rootfs "$dir" "$1" "$2" \
+            && "$TRIVY" rootfs "${COMMON[@]}" --quiet --skip-db-update --scanners vuln \
+                --format json --output "$out" "$dir" \
+            && msg="$("${CHECKS[@]}" canary-check "$out" "$1" "$2")"; then
+            canary_result[$key]="ok|$1 $2: $(printf '%s\n' "$msg" | sed -n 's/^canary_advisories=//p') advisories matched by the canary"
+        else
+            canary_result[$key]="fail|$1 $2: the DB holds no advisory data for it (canary matched nothing or could not run)"
+        fi
+    fi
+    ADVISORY="${canary_result[$key]#*|}"
+    [ "${canary_result[$key]%%|*}" = ok ]
+}
+
+# ── Scan ─────────────────────────────────────────────────────────────────────
+failed=0
+for idx in "${!NAMES[@]}"; do
+    name="${NAMES[$idx]}"
+    image="${REFS[$idx]}"
     echo "==> $name: $image"
     json="$WORK/trivy-${name}.json"
     table="$WORK/trivy-${name}.txt"
@@ -223,6 +394,7 @@ for arg in "${IMAGES[@]}"; do
     coverage="unknown"
     os_packages="?"
     os_desc="?"
+    advisory="not checked"
 
     # The record: HIGH and CRITICAL, fixed or not, and the accepted findings
     # (--show-suppressed), as JSON, which also lists every package (that is
@@ -230,51 +402,74 @@ for arg in "${IMAGES[@]}"; do
     # it detected and warns when it finds no OS package. Informational, but a
     # scan that cannot complete is a failure, not an empty report.
     if ! "$TRIVY" image "${COMMON[@]}" --skip-db-update --image-src docker --scanners vuln \
-            --severity HIGH,CRITICAL --show-suppressed --ignorefile "$IGNORE_FILE" \
+            --severity HIGH,CRITICAL --show-suppressed --ignorefile "$TRIVY_IGNORE" \
             --format json --output "$json" "$image" \
         || ! "$TRIVY" convert --quiet --format table --severity HIGH,CRITICAL --show-suppressed \
             --output "$table" "$json"; then
         err "$image: Trivy could not scan the image (treated as a failure)"
         failed=1
         summary "| $name | ? | ? | could not scan |"
+        [ -z "$REPORT_DIR" ] || [ ! -s "$json" ] || cp "$json" "$REPORT_DIR/"
+        write_gate_txt "$name" "$image" "FAIL: Trivy could not scan the image"
+        reported[$name]=1
         continue
     fi
     cat "$table"
 
-    # Coverage: an image whose OS packages Trivy could not see was not scanned.
-    if cov="$("${CHECKS[@]}" coverage "$json" "$name" "$NOT_COVERED")"; then
+    # Coverage (Trivy's JSON report, explicitly): an image whose OS packages
+    # Trivy could not see was not scanned, and one whose OS release has no
+    # advisory data was not judged.
+    cov_ok=0
+    cov="$("${CHECKS[@]}" coverage "$json" "$name" "$NOT_COVERED" "${nc_flags[@]}")" && cov_rc=0 || cov_rc=$?
+    verdict="$(printf '%s\n' "$cov" | sed -n 's/^verdict=//p')"
+    os_packages="$(printf '%s\n' "$cov" | sed -n 's/^os_packages=//p')"
+    os_desc="$(printf '%s\n' "$cov" | sed -n 's/^os=//p')"
+    os_family="$(printf '%s\n' "$cov" | sed -n 's/^os_family=//p')"
+    os_name="$(printf '%s\n' "$cov" | sed -n 's/^os_name=//p')"
+    printf '%s\n' "$cov" | grep '^warning:' || true
+    if [ "$cov_rc" = 0 ]; then
         coverage="$(printf '%s\n' "$cov" | sed -n 's/^coverage=//p')"
-        os_packages="$(printf '%s\n' "$cov" | sed -n 's/^os_packages=//p')"
-        os_desc="$(printf '%s\n' "$cov" | sed -n 's/^os=//p')"
         echo "    OS: $os_desc, $os_packages OS packages scanned"
-        printf '%s\n' "$cov" | grep '^warning:' || true
         if [ "$coverage" = "not-covered" ]; then
             reason="$(printf '%s\n' "$cov" | sed -n 's/^reason=//p')"
             echo "    NOT COVERED by OS package scanning (listed in scripts/ci/image-vuln-gate-not-covered.txt): $reason"
             [ -z "${GITHUB_ACTIONS:-}" ] || echo "::warning::$name: OS packages NOT scanned (Trivy sees none; listed as not covered)"
+            advisory="n/a (OS packages not scanned)"
+            cov_ok=1
+        elif advisory_canary "$os_family" "$os_name"; then
+            advisory="$ADVISORY"
+            echo "    advisory data: $advisory"
+            cov_ok=1
+        else
+            advisory="$ADVISORY"
+            err "$image: $advisory"
+            coverage="covered, NO ADVISORY DATA"
+            verdict="no-advisory-data"
         fi
-        cov_ok=1
     else
-        err "$image: OS packages not scanned (above)"
-        failed=1
-        coverage="not-covered (unlisted)"
-        cov_ok=0
+        err "$image: OS packages not scanned, or no advisory data for its OS (above)"
+        coverage="$verdict"
     fi
+    [ "$cov_ok" = 1 ] || failed=1
 
     # The gate. Exit code 3 means findings; anything else non-zero is a Trivy
     # error, which must not read as a pass either.
     rc=0
     "$TRIVY" image "${COMMON[@]}" --quiet --skip-db-update --image-src docker --scanners vuln \
-        --severity CRITICAL --ignore-unfixed --ignorefile "$IGNORE_FILE" \
+        --severity CRITICAL --ignore-unfixed --ignorefile "$TRIVY_IGNORE" \
         --exit-code 3 --format table "$image" || rc=$?
     case "$rc" in
         0) if [ "$cov_ok" = 1 ]; then
                result="pass"
                echo "    pass: no fixable CRITICAL vulnerability"
            else
-               result="FAIL: OS packages not scanned"
+               case "$verdict" in
+                   eosl) result="FAIL: OS release is end of service life" ;;
+                   unsupported-os|no-advisory-data) result="FAIL: no advisory data for the OS release" ;;
+                   *) result="FAIL: OS packages not scanned" ;;
+               esac
            fi ;;
-        3) err "$image has a fixable CRITICAL vulnerability (table above). Rebuild on current packages, or accept it in .trivyignore.yaml with a scope, a statement, an expiry and an approver."
+        3) err "$image has a fixable CRITICAL vulnerability (table above). Rebuild on current packages, or accept it in .trivyignore.yaml with a scope, a statement, an expiry and an approval."
            result="FAIL: fixable CRITICAL"
            failed=1 ;;
         *) err "$image: Trivy exited $rc during the gate scan (treated as a failure)"
@@ -286,19 +481,14 @@ for arg in "${IMAGES[@]}"; do
     if [ -n "$REPORT_DIR" ]; then
         cp "$json" "$table" "$REPORT_DIR/"
         image_id="$(python3 -I -c 'import json,sys; print((json.load(open(sys.argv[1])).get("Metadata") or {}).get("ImageID") or "?")' "$json" 2>/dev/null || echo '?')"
-        {
-            echo "image: $name ($image)"
-            echo "image id: $image_id"
-            echo "trivy: $TRIVY_VERSION"
-            echo "trivy db: UpdatedAt $db_updated, DownloadedAt $db_downloaded"
-            echo "os: $os_desc"
-            echo "os packages scanned: $os_packages"
-            echo "coverage: $coverage"
-            echo "ignore file: $(sha256sum "$IGNORE_FILE" | cut -d' ' -f1)"
-            echo "gate: $result"
-            echo "scanned at: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
-        } > "$REPORT_DIR/trivy-${name}.gate.txt"
+        write_gate_txt "$name" "$image" "$result" \
+            "image id: $image_id" \
+            "os: $os_desc" \
+            "os packages scanned: $os_packages" \
+            "coverage: $coverage" \
+            "advisory data: $advisory"
     fi
+    reported[$name]=1
 done
 
 exit "$failed"

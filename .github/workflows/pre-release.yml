@@ -1206,7 +1206,7 @@ jobs:
                      yuzu-gateway-chisel yuzu-agent-chisel yuzu-agent-bundle-chisel; do
             images+=("$REGISTRY/$img:$VERSION")
           done
-          # --report-dir . keeps the trivy-*.txt names the upload below expects.
+          # --report-dir . keeps the trivy-* names the upload below expects.
           scripts/ci/image-vuln-gate.sh --report-dir . "${images[@]}"
 
       - name: Upload scan results
@@ -1214,8 +1214,11 @@ jobs:
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-scan
+          # Every scanner's reports (trivy-*, and grype-* once a second scanner
+          # writes them): the JSON, the table and the .gate.txt verdict.
           path: |
-            trivy-*.txt
+            trivy-*
+            grype-*
           retention-days: 90
 
   # ── Soak test (10 min stability) ────────────────────────────────────

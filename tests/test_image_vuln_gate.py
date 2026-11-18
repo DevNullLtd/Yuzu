@@ -59,6 +59,15 @@ STUB = textwrap.dedent(
         sys.exit(0)
     def opt(name):
         return args[args.index(name) + 1] if name in args else ""
+    def report(target, family, name, pkgs, vulns, eosl=False):
+        os_ = {"Family": family, "Name": name}
+        if eosl:
+            os_["EOSL"] = True
+        return {"SchemaVersion": 2, "ArtifactName": target,
+                "Metadata": {"ImageID": "sha256:" + "9" * 64, "OS": os_},
+                "Results": [{"Target": target, "Class": "os-pkgs", "Type": family,
+                             "Packages": [{"Name": "p%d" % i} for i in range(pkgs)],
+                             "Vulnerabilities": [{"VulnerabilityID": "CVE-2000-%04d" % i} for i in range(vulns)]}]}
     if args[0] == "image" and "--download-db-only" in args:
         if mode == "db-error":
             sys.exit(1)
@@ -74,14 +83,34 @@ STUB = textwrap.dedent(
             open(meta, "w").write("not json")
             sys.exit(0)
         now = datetime.datetime.now(datetime.timezone.utc)
-        age = {"fresh": 2, "stale": 100, "future": -5}[state]
+        age = {"fresh": 2, "stale": 100, "future": -5, "predownloaded": 2}[state]
         t = (now - datetime.timedelta(hours=age)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
-        open(meta, "w").write(json.dumps({"Version": 2, "UpdatedAt": t, "DownloadedAt": t}))
+        dl = t if state == "predownloaded" else now.strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+        open(meta, "w").write(json.dumps({"Version": 2, "UpdatedAt": t, "DownloadedAt": dl}))
         sys.exit(0)
     if args[0] == "convert":
         if mode == "convert-error":
             sys.exit(1)
         open(opt("--output"), "w").write("table\\n")
+        sys.exit(0)
+    if args[0] == "rootfs":
+        # The advisory canary: detect the OS the way Trivy does from the files
+        # the checker wrote; STUB_CANARY=none means the DB has no advisories.
+        root = args[-1]
+        def read(rel):
+            p = os.path.join(root, rel)
+            return open(p).read() if os.path.exists(p) else None
+        fam, name = "", ""
+        if read("etc/debian_version") is not None:
+            fam, name = "debian", read("etc/debian_version").strip()
+        elif read("etc/lsb-release") is not None:
+            fam = "ubuntu"
+            name = [l.split("=", 1)[1] for l in read("etc/lsb-release").splitlines()
+                    if l.startswith("DISTRIB_RELEASE=")][0]
+        elif read("etc/alpine-release") is not None:
+            fam, name = "alpine", read("etc/alpine-release").strip()
+        n = 0 if os.environ.get("STUB_CANARY") == "none" else 3
+        open(opt("--output"), "w").write(json.dumps(report(root, fam, name, 2, n)))
         sys.exit(0)
     image = args[-1]
     gate = "--exit-code" in args
@@ -92,7 +121,11 @@ STUB = textwrap.dedent(
         sys.exit(1 if opt("--image-src") == "docker" else 0)
     bad = os.environ.get("STUB_BAD_IMAGE", "")
     is_bad = not bad or image == bad
-    if gate and is_bad and mode == "findings":
+    # A finding the ignore file Trivy is given accepts is suppressed.
+    fid = os.environ.get("STUB_FINDING_ID", "")
+    ign = opt("--ignorefile")
+    suppressed = bool(fid) and bool(ign) and ("- id: " + fid) in open(ign).read()
+    if gate and is_bad and mode == "findings" and not suppressed:
         print("CRITICAL finding table")
         sys.exit(3)
     if gate and is_bad and mode == "gate-error":
@@ -101,18 +134,17 @@ STUB = textwrap.dedent(
         sys.exit(1)
     if not gate:
         pkgs = os.environ.get("STUB_OS_PKGS", "5")
+        fam, _, name = os.environ.get("STUB_OS", "debian:12.15").partition(":")
         if pkgs == "none":
-            report = {"Metadata": {"ImageID": "sha256:" + "9" * 64}, "Results": []}
+            rep = {"SchemaVersion": 2, "ArtifactName": image,
+                   "Metadata": {"ImageID": "sha256:" + "9" * 64}, "Results": []}
         else:
-            report = {"Metadata": {"ImageID": "sha256:" + "9" * 64,
-                                   "OS": {"Family": "debian", "Name": "12.15"}},
-                      "Results": [{"Target": image, "Class": "os-pkgs", "Type": "debian",
-                                   "Packages": [{"Name": "p%d" % i} for i in range(int(pkgs))]}]}
-        open(opt("--output"), "w").write(json.dumps(report))
+            rep = report(image, fam, name, int(pkgs), 0, os.environ.get("STUB_EOSL") == "1")
+        open(opt("--output"), "w").write(json.dumps(rep))
     sys.exit(0)
     """
 )
-
+DB_DIGEST = "sha256:" + "d" * 64
 
 def have_bash():
     return os.name != "nt" and shutil.which("bash") is not None
@@ -125,17 +157,26 @@ def days(n):
 def entry(**over):
     """One well-formed ignore entry, as YAML lines at the file's indentation."""
     f = {"id": "CVE-2000-0001", "paths": ['"usr/bin/x"'], "statement": "not reachable",
-         "expired_at": days(30), "approved_by": "some-login"}
+         "expired_at": days(30), "approved_by": "some-login", "approved_on": days(-1),
+         "approval_ref": '"#1234"'}
     f.update(over)
     out = [f"  - id: {f['id']}"]
     for k in ("paths", "purls"):
         if f.get(k):
             out.append(f"    {k}:")
             out += [f"      - {v}" for v in f[k]]
-    for k in ("statement", "expired_at", "approved_by"):
+    for k in ("statement", "expired_at", "approved_by", "approved_on", "approval_ref"):
         if f.get(k) is not None:
             out.append(f"    {k}: {f[k]}")
     return "\n".join(out) + "\n"
+
+
+def nc_line(name="yuzu-server-chisel", by="some-login", on=None, ref="#1234", exp=None,
+            reason="chiselled FROM scratch, no package database"):
+    """One not-covered list line."""
+    on = days(-1) if on is None else on
+    exp = days(30) if exp is None else exp
+    return f"{name}: approved_by={by} approved_on={on} approval_ref={ref} expires={exp} reason={reason}\n"
 
 
 @unittest.skipUnless(have_bash(), "the gate is a bash script")
@@ -152,8 +193,10 @@ class GateBehaviour(unittest.TestCase):
                  db="fresh", os_pkgs="5", env_extra=None):
         env = dict(os.environ)
         for k in list(env):
-            if k.startswith("TRIVY_"):
+            if k.startswith("TRIVY_") or k.startswith("STUB_"):
                 del env[k]
+        env.pop("GITHUB_ACTIONS", None)
+        env.pop("GITHUB_STEP_SUMMARY", None)
         env.update(
             TRIVY_BIN=str(self.stub),
             STUB_LOG=str(self.log),
@@ -163,11 +206,13 @@ class GateBehaviour(unittest.TestCase):
             STUB_DB=db,
             STUB_OS_PKGS=os_pkgs,
             YUZU_TRIVYIGNORE=str(ignore),
+            YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST,
             RUNNER_TEMP=str(self.tmp),
         )
         env.update(env_extra or {})
-        env.pop("GITHUB_ACTIONS", None)
-        env.pop("GITHUB_STEP_SUMMARY", None)
+        for k, v in list(env.items()):
+            if v is None:
+                del env[k]
         return subprocess.run(
             ["bash", str(GATE), *extra, *images],
             env=env, capture_output=True, text=True, timeout=60,
@@ -180,6 +225,9 @@ class GateBehaviour(unittest.TestCase):
         """The image scans: not --version, not the DB download, not convert."""
         return [c.split() for c in self.calls()
                 if c.startswith("image ") and "--download-db-only" not in c]
+
+    def canaries(self):
+        return [c.split() for c in self.calls() if c.startswith("rootfs ")]
 
     def write_ignore(self, body):
         p = self.tmp / "ignore.yaml"
@@ -196,7 +244,10 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(g[g.index("--severity") + 1], "CRITICAL")
         self.assertIn("--ignore-unfixed", g)
         self.assertEqual(g[g.index("--exit-code") + 1], "3")
-        self.assertEqual(g[g.index("--ignorefile") + 1], str(IGNORE))
+        # Trivy reads the checker's canonical copy, never the repository file.
+        ign = g[g.index("--ignorefile") + 1]
+        self.assertNotEqual(ign, str(IGNORE))
+        self.assertTrue(ign.endswith("/trivyignore.yaml"), ign)
         self.assertEqual(g[-1], "img:1")
 
     def test_report_scan_covers_high_and_critical_with_accepted_findings(self):
@@ -213,8 +264,10 @@ class GateBehaviour(unittest.TestCase):
         for suffix in (".json", ".txt", ".gate.txt"):
             self.assertTrue((rep / f"trivy-img{suffix}").is_file(), suffix)
         gate_txt = (rep / "trivy-img.gate.txt").read_text(encoding="utf-8")
-        for field in ("image id: sha256:" + "9" * 64, "trivy: 0.70.0", "trivy db: UpdatedAt ",
-                      "os packages scanned: 5", "coverage: covered", "gate: pass"):
+        for field in ("image id: sha256:" + "9" * 64, "trivy: 0.70.0",
+                      "trivy db: mirror.gcr.io/aquasec/trivy-db@" + DB_DIGEST + ", UpdatedAt ",
+                      "os packages scanned: 5", "coverage: covered",
+                      "advisory data: debian 12.15: 3 advisories matched by the canary", "gate: pass"):
             self.assertIn(field, gate_txt)
 
     def test_every_scan_is_local_docker_only_and_uses_the_one_db(self):
@@ -227,8 +280,8 @@ class GateBehaviour(unittest.TestCase):
             self.assertIn("--skip-db-update", a)
         downloads = [c for c in self.calls() if "--download-db-only" in c]
         self.assertEqual(len(downloads), 1, self.calls())
-        self.assertIn("--db-repository mirror.gcr.io/aquasec/trivy-db:2,ghcr.io/aquasecurity/trivy-db:2",
-                      downloads[0])
+        # Pinned by digest: what is recorded is what was downloaded.
+        self.assertIn("--db-repository mirror.gcr.io/aquasec/trivy-db@" + DB_DIGEST, downloads[0])
 
     def test_missing_local_image_fails_not_scanned_from_a_registry(self):
         r = self.run_gate("yuzu-hc-verify/server:gone", missing="yuzu-hc-verify/server:gone")
@@ -350,19 +403,54 @@ class GateBehaviour(unittest.TestCase):
 
     # ── CH-ENV / UP-7: the environment cannot steer Trivy ──
     def test_inherited_trivy_variables_are_cleared(self):
-        cache = self.tmp / "mycache"
         r = self.run_gate("img:1", env_extra={
             "TRIVY_DB_REPOSITORY": "127.0.0.1:9/evil", "TRIVY_SEVERITY": "LOW",
             "TRIVY_INSECURE": "true", "TRIVY_IGNOREFILE": "/dev/null",
-            "TRIVY_SKIP_FILES": "usr/lib/*", "TRIVY_CACHE_DIR": str(cache)})
+            "TRIVY_SKIP_FILES": "usr/lib/*"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         envs = [json.loads(ln) for ln in Path(str(self.log) + ".env").read_text().splitlines()]
         for e in envs:
             self.assertEqual(e["trivy_env"], [], "Trivy saw an inherited TRIVY_* variable")
-        # TRIVY_CACHE_DIR is honoured, as --cache-dir.
-        for a in self.scans():
-            self.assertEqual(a[a.index("--cache-dir") + 1], str(cache))
-        self.assertTrue((cache / "db" / "metadata.json").is_file())
+
+    def test_inherited_cache_dir_is_ignored(self):
+        # SG-F3 / G8-SG-3: a preseeded cache (its metadata fresh, its DB
+        # anything) must never be scanned with: the gate downloads into a
+        # fresh directory of its own and leaves the inherited one alone.
+        cache = self.tmp / "preseeded"
+        (cache / "db").mkdir(parents=True)
+        meta = cache / "db" / "metadata.json"
+        stamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+        meta.write_text(json.dumps({"Version": 2, "UpdatedAt": stamp, "DownloadedAt": stamp,
+                                    "NextUpdate": "2999-01-01T00:00:00Z"}))
+        before = meta.read_bytes()
+        r = self.run_gate("img:1", env_extra={"TRIVY_CACHE_DIR": str(cache)})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("TRIVY_CACHE_DIR=" + str(cache) + " is ignored", r.stdout)
+        downloads = [c.split() for c in self.calls() if "--download-db-only" in c]
+        self.assertEqual(len(downloads), 1)
+        for a in downloads + self.scans() + self.canaries():
+            d = a[a.index("--cache-dir") + 1]
+            self.assertNotEqual(d, str(cache))
+            self.assertTrue(d.startswith(str(self.tmp / "yuzu-image-vuln-gate.")), d)
+        self.assertEqual(meta.read_bytes(), before)
+        self.assertEqual(sorted(os.listdir(cache)), ["db"])
+
+    def test_db_not_downloaded_by_this_run_is_refused(self):
+        r = self.run_gate("img:1", db="predownloaded")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("before this run started", r.stderr)
+        self.assertFalse(self.scans())
+
+    def test_trivy_bin_is_refused_on_github_actions(self):
+        r = self.run_gate("img:1", env_extra={"GITHUB_ACTIONS": "true"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("TRIVY_BIN is for local runs", r.stdout + r.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_test_db_digest_hook_needs_trivy_bin(self):
+        r = self.run_gate("img:1", env_extra={"TRIVY_BIN": None})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("test hook", r.stdout + r.stderr)
 
     def test_trivy_gets_an_empty_config_and_a_private_tmpdir(self):
         r = self.run_gate("img:1")
@@ -432,16 +520,18 @@ class GateBehaviour(unittest.TestCase):
 
     def test_complete_entries_are_accepted(self):
         body = ("# comment\nvulnerabilities:\n" + entry()
-                + "  - id: CVE-2000-0002\n    purls:\n      - \"pkg:golang/stdlib\"\n"
+                + "  - id: CVE-2000-0002\n    purls:\n      - \"pkg:golang/stdlib@1.24.6\"\n"
                   "    statement: >-\n      not reachable,\n      with evidence\n"
-                  "    expired_at: " + days(92) + "\n    approved_by: some-login\n")
+                  "    expired_at: " + days(92) + "\n    approved_by: some-login\n"
+                  "    approved_on: " + days(0) + "\n"
+                  "    approval_ref: https://github.com/o/r/pull/77\n")
         r = self.run_gate("img:1", ignore=self.write_ignore(body))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_expired_entry_is_valid_and_noted(self):
         r = self.run_gate("img:1", ignore=self.write_ignore("vulnerabilities:\n" + entry(expired_at=days(-1))))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
-        self.assertIn("no longer honours it", r.stdout)
+        self.assertIn("not in force", r.stdout)
 
     def test_entry_close_to_expiry_warns(self):
         r = self.run_gate("img:1", ignore=self.write_ignore("vulnerabilities:\n" + entry(expired_at=days(5))))
@@ -460,6 +550,374 @@ class GateBehaviour(unittest.TestCase):
         for n in names:
             self.assertIn(n, PUBLISHED, n)
             self.assertTrue(n.endswith("-chisel"), f"{n}: only FROM-scratch chisel images are expected here")
+
+
+    # ── G8-SG-1: an acceptance's scope must be concrete ──
+    def test_wildcard_or_empty_scope_is_refused(self):
+        # Trivy matches `paths` as doublestar globs and an OS package has an
+        # empty path, so each of these would hide the CVE in every package.
+        for shape in ('"**"', '"*"', '""', '"{,x}"', '"?"', '"[]"', '"/"', '"usr/**"',
+                      '"usr/local/bin/*"', '"usr/local/bin/gosu "', '" usr/local/bin/gosu"',
+                      '"usr//bin/gosu"', '"./usr/bin/gosu"', '"usr/../bin/gosu"',
+                      '"/usr/local/bin/gosu"', '"usr/local/bin/gosu/"', '"a b"', '"usr/bin/!x"',
+                      "''", "usr/bin/gosu\"x"):
+            with self.subTest(paths=shape):
+                self.log.unlink(missing_ok=True)
+                self.assert_refused("vulnerabilities:\n" + entry(paths=[shape]), shape)
+
+    def test_scope_refusals_name_the_reason(self):
+        # The glob and leading-slash checks are each stated, not only caught
+        # by the component allowlist behind them.
+        r = self.assert_refused("vulnerabilities:\n" + entry(paths=['"**"']))
+        self.assertIn("glob character", r.stderr)
+        self.log.unlink(missing_ok=True)
+        r = self.assert_refused("vulnerabilities:\n" + entry(paths=['"/usr/local/bin/gosu"']))
+        self.assertIn("starts with '/'", r.stderr)
+
+    def test_unversioned_or_wildcard_purl_is_refused(self):
+        for shape in ('"pkg:deb/debian/apt"', '"pkg:deb/debian"', '"pkg:deb/"', '"pkg:deb/debian/*"',
+                      '"pkg:deb/debian/apt@*"', '"pkg:deb/debian/apt@"', '"notapurl"', '""',
+                      '"pkg:deb/debian/apt@2.6.1#sub"', '"pkg:deb/debian/apt@2.6 .1"',
+                      '"pkg:deb/debian/[ap]t@2.6.1"', '"pkg:/apt@1"'):
+            with self.subTest(purls=shape):
+                self.log.unlink(missing_ok=True)
+                self.assert_refused("vulnerabilities:\n" + entry(paths=None, purls=[shape]), shape)
+
+    def test_concrete_scopes_are_accepted(self):
+        body = ("vulnerabilities:\n"
+                + entry(id="CVE-2000-0001", paths=['"usr/local/bin/gosu"', '"opt/app/lib/x-1.2.jar"'])
+                + entry(id="CVE-2000-0002", paths=None,
+                        purls=['"pkg:deb/debian/apt@2.6.1?arch=amd64"', '"pkg:golang/stdlib@1.24.6"',
+                               "pkg:npm/%40scope/name@1.0.0"]))
+        r = self.run_gate("img:1", ignore=self.write_ignore(body))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    # ── G8-SG-2 / G8-SG-4: Trivy reads only the validated canonical copy ──
+    def test_trivy_reads_only_the_canonical_copy_of_the_entries_in_force(self):
+        body = ("vulnerabilities:\n" + entry(id="CVE-2000-0001")
+                + entry(id="CVE-2000-0002", expired_at=days(-3)))
+        r = self.run_gate("img:1", ignore=self.write_ignore(body))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        src = str(self.tmp / "ignore.yaml")
+        for c in self.calls():
+            self.assertNotIn(src, c, "Trivy was given the source ignore file")
+        g = [c for c in self.scans() if "--exit-code" in c][0]
+        ign = Path(g[g.index("--ignorefile") + 1])
+        self.assertTrue(ign.name.endswith(".yaml"), ign)
+
+    def test_plain_format_ignore_file_is_refused(self):
+        # Trivy reads a non-YAML extension as one id per line, unscoped.
+        p = self.tmp / "ignore.txt"
+        p.write_text("CVE-2000-0001\n", encoding="utf-8")
+        self.assert_refused_path(p)
+        p.write_text("vulnerabilities:\n" + entry(), encoding="utf-8")
+        r = self.run_gate("img:1", ignore=p)  # a valid file is still only ever read via the copy
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        g = [c for c in self.scans() if "--exit-code" in c][0]
+        self.assertTrue(g[g.index("--ignorefile") + 1].endswith("trivyignore.yaml"))
+
+    def assert_refused_path(self, path):
+        r = self.run_gate("img:1", ignore=path)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual(self.calls(), [], "Trivy ran on a refused ignore file")
+
+    def test_quoted_dates_and_unquoted_hash_ref_are_refused(self):
+        self.assert_refused("vulnerabilities:\n" + entry(expired_at='"' + days(10) + '"'))
+        self.assert_refused("vulnerabilities:\n" + entry(approved_on="'" + days(-1) + "'"))
+        # YAML reads an unquoted #1234 as a comment, i.e. no value.
+        self.assert_refused("vulnerabilities:\n" + entry(approval_ref="#1234"))
+
+    # ── G8-CO-3: an approval names its date and pull request ──
+    def test_approval_record_is_required_and_well_formed(self):
+        for over in ({"approval_ref": None}, {"approved_on": None},
+                     {"approval_ref": '"#0"'}, {"approval_ref": '"#12a"'}, {"approval_ref": '"1234"'},
+                     {"approval_ref": "https://github.com/o/r/issues/1"},
+                     {"approval_ref": "http://github.com/o/r/pull/1"},
+                     {"approved_on": days(2)}, {"approved_on": "2026-13-01"},
+                     {"approval_ref": "pending"}):  # pending with an approved_on is contradictory
+            with self.subTest(**{k: str(v) for k, v in over.items()}):
+                self.log.unlink(missing_ok=True)
+                self.assert_refused("vulnerabilities:\n" + entry(**over), str(over))
+
+    def test_pending_acceptance_is_honoured_only_outside_a_release(self):
+        body = "vulnerabilities:\n" + entry(id="CVE-2000-0042", approved_on=None, approval_ref="pending")
+        ign = self.write_ignore(body)
+        env = {"STUB_FINDING_ID": "CVE-2000-0042"}
+        r = self.run_gate("img:1", ignore=ign, mode="findings", env_extra=env)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("approval_ref is pending; honoured here", r.stdout)
+        r = self.run_gate("img:1", ignore=ign, mode="findings", env_extra=env, extra=("--release",))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("NOT IN FORCE", r.stdout)
+        self.assertIn("fixable CRITICAL", r.stderr)
+
+    def test_approved_acceptance_is_honoured_by_a_release(self):
+        ign = self.write_ignore("vulnerabilities:\n" + entry(id="CVE-2000-0042"))
+        r = self.run_gate("img:1", ignore=ign, mode="findings", extra=("--release",),
+                          env_extra={"STUB_FINDING_ID": "CVE-2000-0042"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_expired_acceptance_is_not_honoured(self):
+        ign = self.write_ignore("vulnerabilities:\n" + entry(id="CVE-2000-0042", expired_at=days(-1)))
+        r = self.run_gate("img:1", ignore=ign, mode="findings", env_extra={"STUB_FINDING_ID": "CVE-2000-0042"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    # ── G8-UP-1: an OS release with no advisory data is not a pass ──
+    def test_end_of_service_life_os_fails(self):
+        r = self.run_gate("img:1", env_extra={"STUB_EOSL": "1"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("end of service life", r.stderr)
+
+    def test_os_family_without_a_canary_fails(self):
+        r = self.run_gate("img:1", env_extra={"STUB_OS": "redhat:9.4"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("not one the gate can prove has advisory data", r.stderr)
+
+    def test_os_release_with_no_advisories_fails(self):
+        # debian:sid-slim with real Trivy 0.70.0: 77 packages, 0 findings,
+        # "covered"; the canary of the same release matches nothing.
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", extra=("--report-dir", str(rep)),
+                          env_extra={"STUB_OS": "debian:forky/sid", "STUB_CANARY": "none"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("no advisory data", r.stderr)
+        gate_txt = (rep / "trivy-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: no advisory data for the OS release", gate_txt)
+        c = self.canaries()
+        self.assertEqual(len(c), 1)
+        self.assertIn("--skip-db-update", c[0])
+
+    def test_canary_runs_once_per_os_release_and_not_for_unscanned_images(self):
+        r = self.run_gate("a=img:1", "b=img:2", "yuzu-server-chisel=img:3",
+                          env_extra={"STUB_OS": "ubuntu:26.04"})
+        # yuzu-server-chisel has packages here, so it is covered and checked too.
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len(self.canaries()), 1, self.calls())
+        self.log.unlink()
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.canaries(), [])
+
+    # ── C2 / G8-RD-2: a refusal leaves a report ──
+    def assert_fail_reports(self, rep, names, why):
+        for n in names:
+            t = (rep / f"trivy-{n}.gate.txt").read_text(encoding="utf-8")
+            self.assertRegex(t, r"(?m)^gate: FAIL: ", n)
+            self.assertIn(why, t, n)
+
+    def test_refused_ignore_file_still_writes_a_failing_report_per_image(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("a=img:1", "b=img:2", extra=("--report-dir", str(rep)),
+                          ignore=self.write_ignore("vulnerabilities:\n" + entry(paths=['"**"'])))
+        self.assertEqual(r.returncode, 1)
+        self.assert_fail_reports(rep, ("a", "b"), "gate stopped before this image was judged")
+
+    def test_stale_db_and_download_failure_write_failing_reports(self):
+        for kw in ({"db": "stale"}, {"mode": "db-error"}, {"mode": "wrong-version"}):
+            with self.subTest(**kw):
+                rep = self.tmp / ("rep-" + "-".join(kw.values()))
+                r = self.run_gate("img:1", extra=("--report-dir", str(rep)), **kw)
+                self.assertEqual(r.returncode, 1)
+                self.assert_fail_reports(rep, ("img",), "gate stopped")
+
+    def test_image_level_failures_write_failing_reports(self):
+        for kw, why in (({"mode": "findings"}, "gate: FAIL: fixable CRITICAL"),
+                        ({"mode": "report-error"}, "gate: FAIL: Trivy could not scan the image"),
+                        ({"mode": "gate-error"}, "gate: FAIL: Trivy exited 1"),
+                        ({"os_pkgs": "0"}, "gate: FAIL: OS packages not scanned")):
+            with self.subTest(why=why):
+                rep = self.tmp / ("rep-" + str(abs(hash(why))))
+                r = self.run_gate("img:1", extra=("--report-dir", str(rep)), **kw)
+                self.assertEqual(r.returncode, 1)
+                self.assertIn(why, (rep / "trivy-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_release_mode_does_not_honour_a_pending_not_covered_listing(self):
+        # The repository's list is pending today: a release refuses the chisel
+        # images as unscanned until the approving pull request is recorded.
+        nc = NOT_COVERED.read_text(encoding="utf-8")
+        if "approval_ref=pending" not in nc:
+            self.skipTest("no pending listing in the repository list")
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", extra=("--release",))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("approval_ref is pending", r.stderr)
+
+
+@unittest.skipUnless(have_bash(), "uses the gate's checker the same way the gate does")
+class Checks(unittest.TestCase):
+    """image-vuln-gate-checks.py subcommands, called directly."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_vuln_checks_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def run_checks(self, *args):
+        return subprocess.run([sys.executable, "-I", str(CHECKS), *map(str, args)],
+                              capture_output=True, text=True, timeout=30)
+
+    def trivy_report(self, pkgs, family="ubuntu", name="26.04", eosl=False):
+        os_ = {"Family": family, "Name": name}
+        if eosl:
+            os_["EOSL"] = True
+        d = {"SchemaVersion": 2, "ArtifactName": "x", "Metadata": {"OS": os_},
+             "Results": [{"Class": "os-pkgs", "Packages": [{"Name": "p"}] * pkgs}]}
+        p = self.tmp / f"r{pkgs}.json"
+        p.write_text(json.dumps(d), encoding="utf-8")
+        return p
+
+    def nc(self, *lines):
+        p = self.tmp / "nc.txt"
+        p.write_text("# header\n" + "".join(lines), encoding="utf-8")
+        return p
+
+    # ── G8-QE-1: the not-covered lookup is an exact match ──
+    def test_not_covered_lookup_is_exact(self):
+        nc = self.nc(nc_line("yuzu-server-chisel"))
+        rep = self.trivy_report(0)
+        self.assertEqual(self.run_checks("coverage", rep, "yuzu-server-chisel", nc).returncode, 0)
+        for name in ("yuzu-server", "yuzu-server-chisel-x", "server-chisel", "chisel", "yuzu-server-chise",
+                     "xyuzu-server-chisel", "yuzu-server-chisel.", ""):
+            with self.subTest(name=name):
+                r = self.run_checks("coverage", rep, name, nc)
+                self.assertEqual(r.returncode, 1, f"{name!r} matched a listing: {r.stdout}")
+                self.assertIn("verdict=unscanned", r.stdout)
+
+    def test_not_covered_list_refuses_a_duplicate_line(self):
+        nc = self.nc(nc_line("yuzu-a"), nc_line("yuzu-a"))
+        r = self.run_checks("not-covered", nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("listed twice", r.stderr)
+
+    def test_not_covered_reason_has_a_minimum_length(self):
+        self.assertEqual(self.run_checks("not-covered", self.nc(nc_line(reason="x" * 19))).returncode, 1)
+        self.assertEqual(self.run_checks("not-covered", self.nc(nc_line(reason="x" * 20))).returncode, 0)
+
+    def test_not_covered_fields_are_validated(self):
+        for kw in ({"by": "two words"}, {"by": "-bad"}, {"ref": "#0"}, {"ref": "1234"},
+                   {"ref": "pending"},  # with an approved_on date
+                   {"on": "-"},  # no date on an approved listing
+                   {"on": days(3)}, {"exp": days(93)}, {"exp": "someday"}, {"name": "Yuzu-Server"}):
+            with self.subTest(**kw):
+                self.assertEqual(self.run_checks("not-covered", self.nc(nc_line(**kw))).returncode, 1, kw)
+        bad_order = "yuzu-a: approval_ref=#1 approved_by=x approved_on=2026-01-01 expires=2026-12-01 reason=" + "y" * 30 + "\n"
+        self.assertEqual(self.run_checks("not-covered", self.nc(bad_order)).returncode, 1)
+
+    def test_not_covered_listing_in_force_rules(self):
+        rep = self.trivy_report(0)
+        expired = self.nc(nc_line(exp=days(-1)))
+        r = self.run_checks("coverage", rep, "yuzu-server-chisel", expired)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("expired", r.stderr)
+        pending = self.nc(nc_line(on="-", ref="pending"))
+        self.assertEqual(self.run_checks("coverage", rep, "yuzu-server-chisel", pending).returncode, 0)
+        r = self.run_checks("coverage", rep, "yuzu-server-chisel", pending, "--require-approved")
+        self.assertEqual(r.returncode, 1)
+        approved = self.nc(nc_line())
+        self.assertEqual(self.run_checks("coverage", rep, "yuzu-server-chisel", approved,
+                                         "--require-approved").returncode, 0)
+
+    def test_vulnerability_id_format(self):
+        def body(i):
+            return "vulnerabilities:\n" + entry(id=i)
+        for good in ("CVE-2025-12345", "CVE-2025-1234", "GHSA-2v3c-4x5h-6m7p"):
+            p = self.tmp / "ok.yaml"
+            p.write_text(body(good), encoding="utf-8")
+            self.assertEqual(self.run_checks("ignore-file", p).returncode, 0, good)
+        for bad in ("CVE-2025-123", "cve-2025-12345", "CVE-25-12345", "GHSA-xxxx", "CVE-2025-1234x"):
+            p = self.tmp / "bad.yaml"
+            p.write_text(body(bad), encoding="utf-8")
+            self.assertEqual(self.run_checks("ignore-file", p).returncode, 1, bad)
+
+    def test_coverage_reads_only_a_trivy_report(self):
+        # A grype report (matches/source) must be refused, never read as "no
+        # OS packages" or as covered.
+        g = self.tmp / "grype.json"
+        g.write_text(json.dumps({"matches": [], "source": {"type": "image"}, "distro": {"name": "debian"}}))
+        r = self.run_checks("coverage", g, "x", self.nc(nc_line()))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("not a Trivy JSON report", r.stderr)
+        d = json.loads(self.trivy_report(5).read_text())
+        d["SchemaVersion"] = 1
+        old = self.tmp / "old.json"
+        old.write_text(json.dumps(d))
+        self.assertEqual(self.run_checks("coverage", old, "x", self.nc(nc_line())).returncode, 1)
+
+    def test_eosl_and_unknown_family_fail_coverage(self):
+        nc = self.nc(nc_line())
+        r = self.run_checks("coverage", self.trivy_report(5, "debian", "11.11", eosl=True), "x", nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("verdict=eosl", r.stdout)
+        r = self.run_checks("coverage", self.trivy_report(5, "rocky", "9.4"), "x", nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("verdict=unsupported-os", r.stdout)
+        r = self.run_checks("coverage", self.trivy_report(5, "debian", "12.15"), "x", nc)
+        self.assertEqual(r.returncode, 0)
+        self.assertIn("verdict=covered", r.stdout)
+
+    def test_canary_rootfs_has_the_files_trivy_detects(self):
+        # Checked with real Trivy 0.70.0 on 2026-11-18: these roots are
+        # detected as the named release; debian 12.15/13.7, ubuntu 24.04/26.04
+        # and alpine 3.22-3.24 match 73-306 advisories, while debian forky/sid,
+        # debian 99.1, ubuntu 99.10 and alpine 3.24_alpha20251016 match none.
+        expect = {"debian": ("etc/debian_version", "var/lib/dpkg/status"),
+                  "ubuntu": ("etc/lsb-release", "var/lib/dpkg/status"),
+                  "alpine": ("etc/alpine-release", "lib/apk/db/installed")}
+        for fam, files in expect.items():
+            with self.subTest(family=fam):
+                root = self.tmp / f"c-{fam}"
+                self.assertEqual(self.run_checks("canary-rootfs", root, fam, "1.2").returncode, 0)
+                for f in files:
+                    self.assertTrue((root / f).is_file(), f)
+                self.assertIn("openssl", (root / files[1]).read_text())
+                # an existing directory is never reused
+                self.assertEqual(self.run_checks("canary-rootfs", root, fam, "1.2").returncode, 1)
+        self.assertEqual(self.run_checks("canary-rootfs", self.tmp / "c-x", "rocky", "9").returncode, 1)
+        self.assertEqual(self.run_checks("canary-rootfs", self.tmp / "c-y", "debian", "1\n2").returncode, 1)
+
+    def test_canary_check(self):
+        def rep(fam, name, n):
+            p = self.tmp / f"c{n}.json"
+            p.write_text(json.dumps({"SchemaVersion": 2, "ArtifactName": "c",
+                                     "Metadata": {"OS": {"Family": fam, "Name": name}},
+                                     "Results": [{"Class": "os-pkgs", "Vulnerabilities": [{}] * n}]}))
+            return p
+        self.assertEqual(self.run_checks("canary-check", rep("debian", "12.15", 3), "debian", "12.15").returncode, 0)
+        self.assertEqual(self.run_checks("canary-check", rep("debian", "12.15", 0), "debian", "12.15").returncode, 1)
+        # The canary was detected as another release: not a proof.
+        self.assertEqual(self.run_checks("canary-check", rep("debian", "12", 3), "debian", "12.15").returncode, 1)
+
+    def test_db_age_refuses_a_db_downloaded_before_the_run(self):
+        now = datetime.datetime.now(datetime.timezone.utc)
+        t = (now - datetime.timedelta(hours=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+        m = self.tmp / "metadata.json"
+        m.write_text(json.dumps({"UpdatedAt": t, "DownloadedAt": t}))
+        self.assertEqual(self.run_checks("db-age", m).returncode, 0)
+        self.assertEqual(self.run_checks("db-age", m, "--downloaded-after", int(now.timestamp())).returncode, 1)
+        self.assertEqual(self.run_checks("db-age", m, "--downloaded-after",
+                                         int(now.timestamp()) - 7200).returncode, 0)
+        m.write_text(json.dumps({"UpdatedAt": t}))
+        self.assertEqual(self.run_checks("db-age", m, "--downloaded-after", 1).returncode, 1)
+
+    def test_resolve_digest_refuses_a_malformed_reference(self):
+        for ref in ("mirror.gcr.io/aquasec/trivy-db", "http://x/y:2", "a b/c:2"):
+            self.assertEqual(self.run_checks("resolve-digest", ref).returncode, 1, ref)
+
+    def test_emitted_copy_is_the_entries_in_force_only(self):
+        src = self.tmp / "src.yaml"
+        src.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0001")
+                       + entry(id="CVE-2000-0002", approved_on=None, approval_ref="pending")
+                       + entry(id="CVE-2000-0003", expired_at=days(-1)), encoding="utf-8")
+        out = self.tmp / "out.yaml"
+        r = self.run_checks("ignore-file", src, "--emit", out, "--require-approved")
+        self.assertEqual(r.returncode, 0, r.stderr)
+        text = out.read_text()
+        self.assertIn("- id: CVE-2000-0001", text)
+        self.assertNotIn("CVE-2000-0002", text)
+        self.assertNotIn("CVE-2000-0003", text)
+        self.assertIn("in_force=1", r.stdout)
+        self.assertIn("pending_not_honoured=1", r.stdout)
+        self.assertNotIn("approved_by", text)
+        r = self.run_checks("ignore-file", src, "--emit", out)
+        self.assertIn("- id: CVE-2000-0002", out.read_text())
 
 
 DOCKER_STUB = textwrap.dedent(
@@ -556,32 +1014,105 @@ class ImageIdentity(unittest.TestCase):
 
 
 def jobs_of(text):
-    """{job name: its steps text, comments removed} for every job of a workflow
-    (only under `jobs:`, so the `on:` keys are never mistaken for jobs)."""
-    body = text[text.index("\njobs:\n") + len("\njobs:\n"):]
-    names = re.findall(r"^  ([A-Za-z0-9_-]+):\n", body, re.M)
-    return {n: job_block(body, n) for n in names}
+    """{job name: its body text, comment lines removed} for every job under the
+    top-level `jobs:` key, whatever the jobs' indentation and with or without a
+    trailing comment on the job key (only under `jobs:`, so the `on:` keys are
+    never mistaken for jobs)."""
+    lines = text.splitlines()
+    try:
+        start = next(i for i, ln in enumerate(lines) if re.match(r"^jobs:\s*(#.*)?$", ln))
+    except StopIteration:
+        return {}
+    jobs, cur, indent = {}, None, None
+    for ln in lines[start + 1:]:
+        if not ln.strip() or ln.lstrip().startswith("#"):
+            continue  # comments are prose (they mention --push and the gate)
+        ind = len(ln) - len(ln.lstrip(" "))
+        if ind == 0:
+            break
+        if indent is None:
+            indent = ind
+        m = re.match(r"""^\s*["']?([A-Za-z0-9_-]+)["']?\s*:\s*(#.*)?$""", ln)
+        if ind == indent and m:
+            cur = m.group(1)
+            jobs[cur] = []
+        elif cur is not None:
+            jobs[cur].append(ln)
+    return {k: "\n".join(v) for k, v in jobs.items()}
 
 
 def job_block(text, job):
-    m = re.search(rf"^  {re.escape(job)}:\n(.*?)(?=^  [A-Za-z0-9_-]+:\n|\Z)", text, re.M | re.S)
-    if not m:
+    jobs = jobs_of(text)
+    if job not in jobs:
         raise AssertionError(f"job {job} not found")
-    # Comments are prose (they mention --push and the gate); only steps count.
-    return "\n".join(ln for ln in m.group(1).splitlines() if not ln.lstrip().startswith("#"))
+    return jobs[job]
 
 
 # What pushes an image to a registry, wherever it appears in a job's steps:
-# build-push-action's `push:` input set to anything but false, a `docker push`,
-# a buildx/bundle-script `--push`, or a registry-side copy or retag.
+# build-push-action's `push:` input set to anything but false; a docker,
+# podman, buildah or nerdctl push (manifest push included, and one reached
+# through a variable named for it: $DOCKER, ${CONTAINER_ENGINE}); a buildx/bundle-script `--push` (or
+# `--push=true`); an `--output`/`-o`/`outputs:` of type=registry or with
+# push=true; a registry-side copy or retag (imagetools create, crane, skopeo,
+# oras, regctl, cosign copy).
 PUSH_MARKERS = re.compile(
     r"^\s*push:\s*(?!false\b)\S"
-    r"|\bdocker\s+(?:image\s+)?push\b"
-    r"|(?:^|\s)--push(?:\s|$)"
+    r"|\b(?:docker|podman|buildah|nerdctl)\s+(?:image\s+|manifest\s+)?push\b"
+    r"|\$\{?(?i:[A-Za-z0-9_]*(?:docker|podman|buildah|nerdctl|engine|container)[A-Za-z0-9_]*)\}?\"?"
+    r"\s+(?:image\s+|manifest\s+)?push\b"
+    r"|(?:^|\s)--push(?:=(?!false\b)\S*)?(?=\s|$)"
+    r"|(?:(?:^|\s)-o|--output|\boutputs:)[=\s]*\S*\b(?:type=registry|push=true)\b"
     r"|\bimagetools\s+create\b"
-    r"|\b(?:crane|skopeo|oras|regctl)\s+(?:push|copy|cp|tag|image\s+copy)\b",
+    r"|\b(?:crane|skopeo|oras|regctl)\s+(?:push|copy|cp|tag|mutate|image\s+copy)\b"
+    r"|\bcosign\s+copy\b",
     re.M,
 )
+
+LOCAL_USES = re.compile(r"""^\s*(?:-\s+)?uses:\s*["']?(\./[^\s"'@]+)""", re.M)
+REMOTE_WORKFLOW = re.compile(r"""^\s*uses:\s*["']?[^./\s"'][^\s"']*/\.github/workflows/""", re.M)
+SCRIPT_REF = re.compile(r"""(?:^|[\s"'=])\.?/?(scripts/[A-Za-z0-9_./-]+\.(?:sh|bash|py))\b""", re.M)
+
+
+def _code_lines(text):
+    return "\n".join(ln for ln in text.splitlines() if not ln.lstrip().startswith("#"))
+
+
+def pushes(body, seen=None):
+    """Whether a job body pushes an image, following what it runs from this
+    repository: local composite actions (`uses: ./.github/actions/...`), local
+    reusable workflows (`uses: ./.github/workflows/x.yml`, any of whose jobs
+    pushes) and repository scripts it names. A REMOTE reusable workflow cannot
+    be read, so it counts as pushing (list the job if it does not)."""
+    seen = set() if seen is None else seen
+    if PUSH_MARKERS.search(body) or REMOTE_WORKFLOW.search(body):
+        return True
+    for ref in LOCAL_USES.findall(body):
+        path = (ROOT / ref).resolve()
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.is_dir():
+            cands = [path / "action.yml", path / "action.yaml"]
+        else:
+            cands = [path]
+        for c in cands:
+            if not c.is_file():
+                continue
+            text = c.read_text(encoding="utf-8")
+            if "/.github/workflows/" in str(c).replace("\\", "/"):
+                if any(pushes(b, seen) for b in jobs_of(text).values()):
+                    return True
+            elif pushes(_code_lines(text), seen):
+                return True
+    for ref in SCRIPT_REF.findall(body):
+        path = (ROOT / ref).resolve()
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        if pushes(_code_lines(path.read_text(encoding="utf-8", errors="replace")), seen):
+            return True
+    return False
+
 
 # Every job that pushes an image. release.yml's publish jobs must gate before
 # the push; anything else must be listed here with why it is not a release
@@ -607,7 +1138,7 @@ class WorkflowWiring(unittest.TestCase):
         found = set()
         for wf in sorted((ROOT / ".github" / "workflows").glob("*.y*ml")):
             for job, body in jobs_of(wf.read_text(encoding="utf-8")).items():
-                if PUSH_MARKERS.search(body):
+                if pushes(body):
                     found.add((wf.name, job))
         unknown = found - GATED_PUSH_JOBS - set(NOT_RELEASE_IMAGES)
         self.assertFalse(unknown, "a job pushes an image but is neither gated nor listed as "
@@ -619,10 +1150,48 @@ class WorkflowWiring(unittest.TestCase):
         for shape in ("          push: true", "          push: ${{ inputs.publish }}",
                       "          docker push \"$IMAGE\"", "            --push \\",
                       "  docker buildx imagetools create -t a:latest a:1",
-                      "  crane copy a b", "  skopeo copy docker://a docker://b"):
+                      "  crane copy a b", "  skopeo copy docker://a docker://b",
+                      # G8-QE-2: the shapes the first tripwire missed
+                      "  docker buildx build --push=true -t a .", "  docker buildx build -o type=registry .",
+                      "  docker buildx build --output=type=image,name=a,push=true .",
+                      "          outputs: type=image,push=true", "  docker manifest push a:1",
+                      "  podman push a:1", "  buildah push a:1", "  cosign copy a b",
+                      '  "$DOCKER" push a:1', "  ${DOCKER} push a:1", "  $docker image push a:1",
+                      "  $CONTAINER_ENGINE push a:1",
+                      "  nerdctl push a:1", "  regctl image copy a b"):
             self.assertTrue(PUSH_MARKERS.search(shape), shape)
-        for shape in ("          push: false", "  # nothing pushed", "  git push origin x"):
+        for shape in ("          push: false", "  # nothing pushed", "  git push origin x",
+                      "  docker buildx build --push=false .", "  cache-to: type=registry,ref=a",
+                      "  docker buildx build --load ."):
             self.assertFalse(PUSH_MARKERS.search(shape), shape)
+
+    def test_job_discovery_ignores_indentation_and_trailing_comments(self):
+        text = ("on: push\njobs:\n    a:   # first\n        steps:\n          - run: echo\n"
+                "    'b':\n        steps:\n          - run: docker push x\n")
+        jobs = jobs_of(text)
+        self.assertEqual(set(jobs), {"a", "b"})
+        self.assertFalse(pushes(jobs["a"]))
+        self.assertTrue(pushes(jobs["b"]))
+
+    def test_pushes_follows_local_actions_workflows_and_scripts(self):
+        tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_push_follow_", dir=ROOT / "tests"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        rel = tmp.relative_to(ROOT).as_posix()
+        (tmp / "act").mkdir()
+        (tmp / "act" / "action.yml").write_text("runs:\n  using: composite\n  steps:\n"
+                                                "    - run: docker push x\n      shell: bash\n")
+        (tmp / "wf.yml").write_text("on: workflow_call\njobs:\n  p:\n    steps:\n"
+                                    "      - uses: docker/build-push-action@abc\n        with:\n"
+                                    "          push: true\n")
+        (tmp / "quiet.sh").write_text("#!/bin/sh\n# docker push in a comment\necho hi\n")
+        self.assertTrue(pushes(f"      - uses: ./{rel}/act"))
+        self.assertTrue(pushes(f"    uses: ./{rel}/wf.yml"))
+        self.assertTrue(pushes("    uses: octo/repo/.github/workflows/publish.yml@v1"))
+        self.assertFalse(pushes("      - uses: actions/checkout@v4"))
+        # A repository script is followed: build-agent-bundle.sh pushes with --push.
+        self.assertTrue(pushes("        run: bash scripts/build-agent-bundle.sh"))
+        self.assertFalse(pushes('        run: bash scripts/ci/detect-code-change.sh "$PUSH_BEFORE_SHA" push'))
+        self.assertFalse(pushes(f"        run: bash ./{rel}/quiet.sh"))
 
     def test_every_publish_job_gates_before_its_push(self):
         jobs = jobs_of(RELEASE.read_text(encoding="utf-8"))
@@ -688,8 +1257,84 @@ class WorkflowWiring(unittest.TestCase):
             self.assertIn("if-no-files-found: error", up_step, job)
         rel = job_block(text, "release")
         self.assertIn("-name 'trivy-*.json'", rel)
-        self.assertIn("*.spdx.json trivy-* > SHA256SUMS", rel)
-        self.assertIn("artifacts/trivy-* \\", rel)
+        self.assertIn('*.spdx.json "${gate_reports[@]}" > SHA256SUMS', rel)
+        self.assertIn('"${GATE_REPORTS[@]}" \\', rel)
+
+    def test_release_gate_runs_in_release_mode_and_its_report_survives_a_refusal(self):
+        # C2 / G8-RD-2: the upload runs whenever the gate ran, pass or fail,
+        # behind an explicit status function (a bare `if:` is success() only).
+        text = RELEASE.read_text(encoding="utf-8")
+        cond = "if: always() && (steps.gate.outcome == 'success' || steps.gate.outcome == 'failure')"
+        for job in sorted(j for _, j in GATED_PUSH_JOBS):
+            body = job_block(text, job)
+            gate = body.find("scripts/ci/image-vuln-gate.sh")
+            gate_step = body[body.rfind("- name:", 0, gate):body.find("- name:", gate)]
+            self.assertIn("id: gate\n", gate_step, job)
+            self.assertIn("image-vuln-gate.sh --release ", gate_step, job)
+            up = body.find("- name: Upload image vulnerability gate report")
+            up_step = body[up:body.find("- name:", up + 1)]
+            self.assertIn(cond, up_step, job)
+            self.assertIn("id: upload_gate", up_step, job)
+        pre = job_block(PRE_RELEASE.read_text(encoding="utf-8"), "security-scan")
+        self.assertNotIn("--release", pre, "post-release QA is detective: it reports pending approvals")
+
+    def test_failure_path_conditions_lead_with_a_status_function(self):
+        # CLAUDE.md CI invariant: an `if:` testing a step outcome or job result
+        # with no status function has an implicit success() ANDed on.
+        for wf in (RELEASE, PRE_RELEASE, ROOT / ".github" / "workflows" / "cache-prune.yml"):
+            for m in re.finditer(r"^\s*if:\s*(.+)$", wf.read_text(encoding="utf-8"), re.M):
+                c = m.group(1)
+                if re.search(r"\.(outcome|result)\b", c) and re.search(r"'failure'|!= 'success'", c):
+                    self.assertRegex(c, r"^\$?\{?\{?\s*(always\(\)|failure\(\)|success\(\) \|\| failure\(\))",
+                                     f"{wf.name}: {c}")
+
+    def test_bundle_gate_report_is_attached_to_the_release(self):
+        # G8-CO-4: the bundle's report outlives the 90-day artifact.
+        text = RELEASE.read_text(encoding="utf-8")
+        bundle = job_block(text, "docker-publish-agent-bundle")
+        self.assertIn("gate_report: ${{ steps.gate_report_uploaded.outputs.value }}", bundle)
+        self.assertIn("if: always() && steps.upload_gate.outcome == 'success'", bundle)
+        att = job_block(text, "attach-bundle-gate-report")
+        self.assertIn("needs: [release, docker-publish-agent-bundle]", att)
+        self.assertIn("if: always() && needs.release.result == 'success' && "
+                      "needs.docker-publish-agent-bundle.outputs.gate_report == 'true'", att)
+        self.assertIn("contents: write", att)
+        self.assertIn("name: yuzu-agent-bundle-chisel-image-vuln-gate", att)
+        self.assertIn("reports=(trivy-yuzu-agent-bundle-chisel.* grype-yuzu-agent-bundle-chisel.*)", att)
+        for needle in ('cosign sign-blob --yes "$sums"', "cosign verify-blob", "--certificate-identity",
+                       'gh release upload "${GITHUB_REF_NAME}" --clobber'):
+            self.assertIn(needle, att)
+        self.assertNotRegex(att, r"\bdocker\s+(?:build|buildx|run|push)|actions/checkout",
+                            "the job that holds contents: write builds and checks out nothing")
+
+    def test_report_globs_take_every_scanners_reports(self):
+        # A second scanner's reports (grype-*) reach the release exactly like
+        # Trivy's: flattened, hashed into SHA256SUMS, uploaded, not attested.
+        rel = job_block(RELEASE.read_text(encoding="utf-8"), "release")
+        for needle in ("-name 'trivy-*.json'", "-name 'trivy-*.txt'", "-name 'grype-*.json'",
+                       "-name 'grype-*.txt'", "gate_reports=(trivy-* grype-*)",
+                       "GATE_REPORTS=(artifacts/trivy-* artifacts/grype-*)",
+                       "|trivy-*|grype-*) continue ;;"):
+            self.assertIn(needle, rel)
+        self.assertNotIn("artifacts/trivy-* \\", rel)
+        pre = PRE_RELEASE.read_text(encoding="utf-8")
+        up = pre[pre.index("- name: Upload scan results"):]
+        up = up[:up.index("retention-days")]
+        self.assertIn("trivy-*\n", up)
+        self.assertIn("grype-*\n", up)
+
+    def test_big_tam_publish_jobs_hold_the_cache_lock_before_any_build(self):
+        # G8-chaos-1: cache-prune skips a cache dir whose lock is held.
+        text = RELEASE.read_text(encoding="utf-8")
+        for job in ("docker-publish", "docker-publish-postgres", "docker-publish-chisel"):
+            body = job_block(text, job)
+            lock = body.find("scripts/ci/buildcache-lock.sh hold")
+            build = body.find("docker/build-push-action@")
+            self.assertTrue(-1 < lock < build, job)
+            lock_step = body[body.rfind("- name:", 0, lock):lock]
+            cache = re.search(r"CACHE_DIR: (\S.*)", lock_step).group(1)
+            self.assertIn(f"cache-from: type=local,src={cache}\n", body, job)
+            self.assertIn(f"cache-to: type=local,dest={cache},mode=max", body, job)
 
     def test_cached_publish_builds_refresh_packages_every_attempt(self):
         # The Big Tam publish jobs build with a persistent local cache; without

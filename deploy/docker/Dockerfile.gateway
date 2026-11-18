@@ -143,9 +143,10 @@ FROM alpine:3.23@sha256:469c9ea410b9215eaee7976ba6c0639039b444be8e5d638f7abbada1
 # (release.yml, scripts/ci/image-vuln-gate.sh).
 # YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
 # attempt, so the package step below re-runs instead of being served from the
-# runner's persistent build cache (cache-from type=local, never pruned for this
-# image), which would otherwise keep shipping the packages of whichever build
-# first populated it. Local builds leave it empty and cache as usual.
+# runner's persistent build cache (cache-from type=local; cache-prune.yml only
+# removes blobs no cache index references, so a referenced package layer stays
+# cached indefinitely), which would otherwise keep shipping the packages of
+# whichever build first populated it. Local builds leave it empty and cache as usual.
 ARG YUZU_PACKAGE_REFRESH=
 RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" && apk upgrade --no-cache
 

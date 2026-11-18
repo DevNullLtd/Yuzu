@@ -11,11 +11,15 @@ named under "blob", records under cache-key "digest"s that are not blobs) and
 layer blobs. Stdlib only.
 """
 
+import fcntl
 import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
+import signal
+import subprocess
 import tempfile
 import time
 import unittest
@@ -23,6 +27,8 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci" / "prune-buildcache.py"
+LOCK = ROOT / "scripts" / "ci" / "buildcache-lock.sh"
+CACHE_PRUNE = ROOT / ".github" / "workflows" / "cache-prune.yml"
 spec = importlib.util.spec_from_file_location("prune_buildcache", SCRIPT)
 pb = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(pb)
@@ -78,11 +84,15 @@ class PruneBuildcache(unittest.TestCase):
     def blobs(self):
         return set(os.listdir(self.cache / "blobs" / "sha256"))
 
+    def prune(self, *a, **kw):
+        ok, line = pb.prune(str(self.cache), *a, **kw)
+        return line
+
     def test_superseded_blobs_go_and_the_current_export_stays(self):
         old = export(self.cache, [b"base", b"pkgs-attempt-1"])
         current = export(self.cache, [b"base", b"pkgs-attempt-2"])
         age_all(self.cache, 2 * DAY)
-        out = pb.prune(str(self.cache))
+        out = self.prune()
         self.assertIn("removed", out)
         self.assertEqual(self.blobs(), current)
         self.assertTrue(old - current)
@@ -92,7 +102,7 @@ class PruneBuildcache(unittest.TestCase):
         export(self.cache, [b"a"])
         export(self.cache, [b"b"])
         before = self.blobs()
-        out = pb.prune(str(self.cache))
+        out = self.prune()
         self.assertIn("skipped", out)
         self.assertEqual(self.blobs(), before)
 
@@ -103,7 +113,7 @@ class PruneBuildcache(unittest.TestCase):
         young = put(self.cache, b"\x1f\x8bbeing-written")
         t = time.time() - 4 * 3600  # older than quiet-hours, younger than min-age
         os.utime(self.cache / "blobs" / "sha256" / young, (t, t))
-        pb.prune(str(self.cache))
+        self.prune()
         self.assertEqual(self.blobs(), current | {young})
 
     def test_dry_run_removes_nothing(self):
@@ -111,32 +121,156 @@ class PruneBuildcache(unittest.TestCase):
         export(self.cache, [b"b"])
         age_all(self.cache, 2 * DAY)
         before = self.blobs()
-        self.assertIn("would remove", pb.prune(str(self.cache), dry_run=True))
+        self.assertIn("would remove", self.prune(dry_run=True))
         self.assertEqual(self.blobs(), before)
 
-    def test_incoherent_cache_is_not_touched(self):
-        current = export(self.cache, [b"a"])
+    def test_broken_cache_is_removed_whole(self):
+        # G8-chaos-1: an index naming a missing layer fails the next import
+        # ("NotFound content") whatever happens, and skipping it forever left
+        # the runner broken until someone deleted it by hand.
+        export(self.cache, [b"a"])
         export(self.cache, [b"b"])  # current index now names b's blobs
         age_all(self.cache, 2 * DAY)
-        # Remove a layer the current index needs: the tree is already broken,
-        # so nothing is deleted from it.
         idx = json.loads((self.cache / "index.json").read_text())
         man = json.loads((self.cache / "blobs" / "sha256" /
                           idx["manifests"][0]["digest"][7:]).read_bytes())
         os.remove(self.cache / "blobs" / "sha256" / man["layers"][0]["digest"][7:])
-        before = self.blobs()
-        out = pb.prune(str(self.cache))
-        self.assertIn("skipped", out)
-        self.assertEqual(self.blobs(), before)
-        self.assertTrue(current)
+        ok, out = pb.prune(str(self.cache))
+        self.assertTrue(ok, out)
+        self.assertIn("REMOVED WHOLE DIRECTORY: broken", out)
+        self.assertFalse(self.cache.exists())
 
-    def test_unreadable_index_is_not_touched(self):
+    def test_broken_cache_is_only_reported_on_a_dry_run(self):
         export(self.cache, [b"a"])
         (self.cache / "index.json").write_text("{not json")
         age_all(self.cache, 2 * DAY)
         before = self.blobs()
-        self.assertIn("skipped", pb.prune(str(self.cache)))
+        self.assertIn("would remove whole directory", self.prune(dry_run=True))
         self.assertEqual(self.blobs(), before)
+
+    def test_unparseable_index_is_broken(self):
+        export(self.cache, [b"a"])
+        (self.cache / "index.json").write_text("{not json")
+        age_all(self.cache, 2 * DAY)
+        self.assertIn("REMOVED WHOLE DIRECTORY", self.prune())
+        self.assertFalse(self.cache.exists())
+
+    def test_recently_written_broken_cache_is_left_alone(self):
+        export(self.cache, [b"a"])
+        (self.cache / "index.json").write_text("{not json")
+        self.assertIn("skipped", self.prune())
+        self.assertTrue(self.cache.exists())
+
+    # ── G8-chaos-1: a cache in use (its lock held) is never touched ──
+    def test_cache_whose_lock_is_held_is_skipped(self):
+        export(self.cache, [b"a"])
+        current = export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        before = self.blobs()
+        fd = os.open(str(self.cache) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_SH)  # as buildcache-lock.sh holds it
+        ok, out = pb.prune(str(self.cache))
+        self.assertTrue(ok)
+        self.assertIn("in use", out)
+        self.assertEqual(self.blobs(), before)
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        self.prune()
+        self.assertEqual(self.blobs(), current)
+
+    def test_symlinked_cache_or_lock_is_refused(self):
+        export(self.cache, [b"a"])
+        export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        link = self.tmp / "link"
+        link.symlink_to(self.cache)
+        before = self.blobs()
+        ok, out = pb.prune(str(link))
+        self.assertFalse(ok)
+        self.assertIn("symlink", out)
+        (self.tmp / "elsewhere").write_text("")
+        Path(str(self.cache) + ".lock").symlink_to(self.tmp / "elsewhere")
+        ok, out = pb.prune(str(self.cache))
+        self.assertFalse(ok)
+        self.assertIn("lock file", out)
+        self.assertEqual(self.blobs(), before)
+
+    # ── G8-PRUNE-oserror-abort: an odd entry is an error, never an abort ──
+    def test_non_regular_entries_are_reported_not_removed(self):
+        export(self.cache, [b"a"])
+        current = export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        (self.cache / "blobs" / "sha256" / ("e" * 64)).mkdir()
+        os.mkfifo(self.cache / "blobs" / "sha256" / ("f" * 64))
+        t = time.time() - 2 * DAY
+        for n in ("e" * 64, "f" * 64):
+            os.utime(self.cache / "blobs" / "sha256" / n, (t, t))
+        ok, out = pb.prune(str(self.cache))
+        self.assertFalse(ok)
+        self.assertIn("ERROR on 2", out)
+        self.assertEqual(self.blobs(), current | {"e" * 64, "f" * 64})
+
+    def test_referenced_fifo_or_deep_json_skips_without_hanging(self):
+        old = export(self.cache, [b"a"])
+        export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        idx = json.loads((self.cache / "index.json").read_text())
+        man = idx["manifests"][0]["digest"][7:]
+        p = self.cache / "blobs" / "sha256" / man
+        p.unlink()
+        os.mkfifo(p)
+        os.utime(p, (time.time() - 2 * DAY,) * 2)
+        before = self.blobs()
+        ok, out = pb.prune(str(self.cache))  # a FIFO opened for reading would block
+        self.assertFalse(ok)
+        self.assertIn("nothing removed", out)
+        self.assertEqual(self.blobs(), before)
+        p.unlink()
+        p.write_bytes(b"[" * 100000 + b"]" * 100000)
+        os.utime(p, (time.time() - 2 * DAY,) * 2)
+        ok, out = pb.prune(str(self.cache))
+        self.assertFalse(ok)
+        self.assertIn("nested too deeply", out)
+        self.assertTrue(old <= self.blobs())
+
+    def test_a_failing_removal_is_reported_and_the_rest_still_go(self):
+        export(self.cache, [b"a"])
+        export(self.cache, [b"c"])
+        current = export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        victims = sorted(self.blobs() - current)
+        real = os.remove
+
+        def flaky(path, *a, **kw):
+            if os.path.basename(path) == victims[0]:
+                raise PermissionError(13, "Permission denied", path)
+            return real(path, *a, **kw)
+
+        pb.os.remove = flaky
+        try:
+            ok, out = pb.prune(str(self.cache))
+        finally:
+            pb.os.remove = real
+        self.assertFalse(ok)
+        self.assertIn("Permission denied", out)
+        self.assertEqual(self.blobs(), current | {victims[0]})
+
+    def test_cli_processes_every_directory_and_exits_1_on_an_error(self):
+        other = self.tmp / "gateway"
+        other.mkdir()
+        export(self.cache, [b"a"])
+        export(self.cache, [b"b"])
+        export(other, [b"x"])
+        cur_other = export(other, [b"y"])
+        age_all(self.cache, 2 * DAY)
+        age_all(other, 2 * DAY)
+        (self.cache / "blobs" / "sha256" / ("e" * 64)).mkdir()
+        os.utime(self.cache / "blobs" / "sha256" / ("e" * 64), (time.time() - 2 * DAY,) * 2)
+        r = subprocess.run(["python3", "-I", str(SCRIPT), str(self.cache), str(other)],
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("ERROR", r.stdout)
+        self.assertEqual(set(os.listdir(other / "blobs" / "sha256")), cur_other)
 
     def test_record_digests_and_diff_ids_are_not_required_blobs(self):
         current = export(self.cache, [b"a", b"b"])
@@ -157,7 +291,7 @@ class PruneBuildcache(unittest.TestCase):
                                   "digest": "sha256:" + gone, "size": 1}]}
             (self.cache / "index.json").write_text(json.dumps(idx))
 
-        out = pb.prune(str(self.cache), after_sweep=concurrent_export)
+        out = self.prune(after_sweep=concurrent_export)
         self.assertIn("REMOVED WHOLE DIRECTORY", out)
         self.assertFalse(self.cache.exists())
 
@@ -170,17 +304,97 @@ class PruneBuildcache(unittest.TestCase):
         def rewrite_same_content():
             (self.cache / "index.json").write_text(index + "\n")
 
-        out = pb.prune(str(self.cache), after_sweep=rewrite_same_content)
+        out = self.prune(after_sweep=rewrite_same_content)
         self.assertNotIn("REMOVED WHOLE DIRECTORY", out)
         self.assertEqual(self.blobs(), current)
 
     def test_non_cache_directory_is_skipped(self):
         (self.cache / "file").write_text("x")
-        self.assertIn("not a type=local cache", pb.prune(str(self.cache)))
+        self.assertIn("not a type=local cache", self.prune())
 
     def test_cli_refuses_unsafe_windows(self):
-        with self.assertRaises(SystemExit):
-            pb.main(["--quiet-hours", "1", str(self.cache)])
+        # The quiet window must exceed the longest publish job (120 min).
+        for hours in ("1", "2"):
+            with self.assertRaises(SystemExit):
+                pb.main(["--quiet-hours", hours, str(self.cache)])
+
+
+@unittest.skipUnless(shutil.which("flock") and shutil.which("bash"), "needs flock(1) and bash")
+class BuildcacheLock(unittest.TestCase):
+    """scripts/ci/buildcache-lock.sh against the pruner: a held lock makes the
+    prune skip the directory; killing the holder (as the runner's end-of-job
+    cleanup does) releases it."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_buildcache_lock_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.cache = self.tmp / "server"
+        self.cache.mkdir()
+
+    def test_held_lock_makes_the_prune_skip_and_kill_releases_it(self):
+        export(self.cache, [b"a"])
+        current = export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        env = dict(os.environ, RUNNER_TEMP=str(self.tmp), YUZU_BUILDCACHE_LOCK_HOLD="60",
+                   YUZU_BUILDCACHE_LOCK_WAIT="5")
+        r = subprocess.run(["bash", str(LOCK), "hold", str(self.cache)], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        holder = int(re.search(r"^holder=(\d+)$", r.stdout, re.M).group(1))
+        self.addCleanup(lambda: os.kill(holder, signal.SIGTERM) if _alive(holder) else None)
+        before = set(os.listdir(self.cache / "blobs" / "sha256"))
+        ok, out = pb.prune(str(self.cache))
+        self.assertIn("in use", out)
+        self.assertEqual(set(os.listdir(self.cache / "blobs" / "sha256")), before)
+        os.kill(holder, signal.SIGTERM)
+        for _ in range(50):
+            if not _alive(holder):
+                break
+            time.sleep(0.1)
+        ok, out = pb.prune(str(self.cache))
+        self.assertIn("removed", out)
+        self.assertEqual(set(os.listdir(self.cache / "blobs" / "sha256")), current)
+
+    def test_lock_wait_times_out_while_a_prune_holds_it(self):
+        fd = os.open(str(self.cache) + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        env = dict(os.environ, RUNNER_TEMP=str(self.tmp), YUZU_BUILDCACHE_LOCK_WAIT="1")
+        r = subprocess.run(["bash", str(LOCK), "hold", str(self.cache)], env=env,
+                           capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("could not take the lock", r.stderr)
+
+
+def _alive(pid):
+    try:
+        os.kill(pid, 0)
+    except OSError:
+        return False
+    try:  # a zombie child of this process counts as gone
+        return os.waitpid(pid, os.WNOHANG) == (0, 0)
+    except ChildProcessError:
+        return True
+
+
+class CachePruneWiring(unittest.TestCase):
+    """Lexical tripwires on cache-prune.yml (they read the YAML as text)."""
+
+    def test_db_sweep_runs_even_when_a_prune_step_fails(self):
+        text = CACHE_PRUNE.read_text(encoding="utf-8")
+        i = text.index("- name: Sweep leaked yuzu_test_* databases (#1367)\n")
+        step = text[i:text.index("\n\n", i)]
+        self.assertIn("if: success() || failure()", step)
+
+    def test_prune_walks_every_runners_cache(self):
+        # G8-BC-1: each Big Tam runner has its own tool cache; one weekly job
+        # must reach all four.
+        text = CACHE_PRUNE.read_text(encoding="utf-8")
+        i = text.index("- name: Prune unreferenced buildx cache blobs (WP15/S9)")
+        step = text[i:text.index("- name:", i + 10)]
+        self.assertIn('"${tc%/work-*/_tool}"/work-*/_tool/yuzu-docker-buildcache', step)
+        self.assertIn("python3 -I scripts/ci/prune-buildcache.py", step)
+        self.assertIn('exit "$rc"', step)
 
 
 if __name__ == "__main__":
