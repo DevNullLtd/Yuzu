@@ -31,7 +31,7 @@
       "definition_ids": [],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable",
           "mechanism": "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
           "rung": "1",
           "support": "supported"
@@ -55,7 +55,7 @@
       "definition_ids": [],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable",
           "mechanism": "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
           "rung": "1",
           "support": "supported"

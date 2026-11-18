@@ -610,7 +610,7 @@ implementation is.
 | netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
-| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
+| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable |
 | netstat | attribution | macos | supported | 1 | libproc | - |
 | netstat | attribution | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
@@ -715,10 +715,10 @@ implementation is.
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
-| processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable |
 | processes | list_hashed | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
-| processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable |
 | processes | list_tree | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | query | linux | supported | 1 | /proc enumeration | - |

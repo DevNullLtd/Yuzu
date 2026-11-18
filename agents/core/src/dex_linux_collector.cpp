@@ -470,7 +470,9 @@ private:
         if (untrusted != 0) {
             // WP13/F58: entries that matched a reliability id but failed the journald-stamped
             // sender check. A genuine mismatch (an unexpected coredump identity) would otherwise
-            // be silent; forged entries are expected to be counted here too.
+            // be silent. The journalctl match already keeps user-manager entries and other uids
+            // out (`_UID=0`, `_PID=1 _UID=0`), so those are filtered BEFORE this check and are
+            // not counted here.
             journal_untrusted_dropped_ += untrusted;
             // Throttled (WP13 N-WARN): a forger could otherwise turn every poll into a log line.
             // First drop, then at most once per hour with the running total.

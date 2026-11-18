@@ -115,8 +115,8 @@ jobs:
       - name: Execution owner key tripwire (#5557)
         run: python3 -I tests/test_execution_owner_key_tripwire.py
 
-      # WP13 (agent privilege and trust): installer grants (no file caps, wrapper-only systemctl,
-      # sudoers validates), plugin-allowlist refusal wiring, no brew as root, /proc refusal status.
+      # WP13 (agent privilege and trust): installer file capabilities (none set, any found are
+      # stripped, --check status), plugin-allowlist refusal wiring, no brew as root, /proc refusal status.
       - name: WP13 agent privilege lint
         run: |
           python3 -I tests/test_plugin_allowlist_wiring_lexical.py

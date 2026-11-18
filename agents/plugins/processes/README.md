@@ -35,6 +35,11 @@ flowchart LR
 | `list_hashed` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
 | `list_tree` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | ✅ supported · rung 1 · /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 |
 | `query` | ✅ supported · rung 1 · CreateToolhelp32Snapshot | ✅ supported · rung 1 · sysctl(KERN_PROC_ALL) | ✅ supported · rung 1 · /proc enumeration |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`list_hashed` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable
+- **`list_tree` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites

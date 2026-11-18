@@ -7,7 +7,7 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable",
           "mechanism": "/proc/net/* + /proc/[pid]/{comm,exe,fd}",
           "rung": "1",
           "support": "supported"

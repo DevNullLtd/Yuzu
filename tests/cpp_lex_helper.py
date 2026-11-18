@@ -1,6 +1,6 @@
 """Shared C++ source tokenizer for the WP13 lexical gates (helper, not a test).
 
-Adapted from the WP13c vuln_scan gate's lexer: strips comments WITHOUT being fooled by `//` or
+A comment-aware C++ tokenizer for source-text pins: strips comments WITHOUT being fooled by `//` or
 `/*` inside string literals, decodes simple escapes and joins adjacent string literals, so a
 token hidden in a comment or a string cannot satisfy a pin and a token split across adjacent
 literals is still seen. `code_only()` additionally replaces every string literal's CONTENT with

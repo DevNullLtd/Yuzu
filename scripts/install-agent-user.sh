@@ -134,7 +134,8 @@
 #   0  - install/check/uninstall succeeded
 #   1  - install/check/uninstall failed; details on stderr (an install that could not
 #        install a helper also exits 1, after removing the sudoers file)
-#   2  - argument or precondition error (not run as root, unsupported OS, unknown flag)
+#   2  - argument error (an unknown flag, an explicit --binary-path that is not a regular
+#        file) or an unsupported OS; not running as root is exit 1
 #   3  - sudoers file failed visudo validation; it was not installed and the
 #        installer removed any earlier file, so no old grant stays (another
 #        install failure of that file exits with that command's own status)

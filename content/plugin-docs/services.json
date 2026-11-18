@@ -424,6 +424,12 @@
     },
     {
       "completeness": "PARTIAL",
+      "provenance": "`services:start_mode_runtime_mask`",
+      "status": "`CONSTRAINED`",
+      "when": "Linux `set_start_mode` `automatic` or `manual` on a unit whose `systemctl is-enabled` state is `masked-runtime` (masked for this boot only): refused up front with rc 1 and nothing changed, because the helper's `unmask` removes a persistent mask only. Remove the runtime mask on the host (`systemctl unmask --runtime` as root) or reboot."
+    },
+    {
+      "completeness": "PARTIAL",
       "provenance": "`subprocess_runner:deadline`",
       "status": "`CONSTRAINED`",
       "when": "The 20 second runner deadline elapsed and the child was killed"

@@ -40,6 +40,10 @@ flowchart LR
 |---|---|---|---|
 | `attribution` | ✅ supported · rung 1 · IP Helper API + QueryFullProcessImageNameW | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · /proc/net/* + /proc/[pid]/{comm,exe,fd} |
 | `netstat_list` | ✅ supported · rung 1 · GetExtendedTcpTable/GetExtendedUdpTable | ✅ supported · rung 1 · libproc | ✅ supported · rung 1 · /proc/net/{tcp,udp}[6] |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`attribution` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites

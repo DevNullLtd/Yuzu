@@ -5,8 +5,12 @@
 /// EACCES. The /proc walkers (processes, procfetch, netstat) skipped those silently and still
 /// reported a clean result, so a dev/UAT agent that lost the file capability (or the packaged
 /// unit, which carries none) returned a partial list as `OK`. This tally lets each walker count
-/// the permission refusals (and ONLY those: ENOENT/ESRCH are ordinary process churn and kernel
-/// threads) so it can declare CONSTRAINED/PARTIAL honestly.
+/// the permission refusals (and ONLY those: ENOENT/ESRCH are ordinary process churn) so it can
+/// declare CONSTRAINED/PARTIAL honestly. Without CAP_SYS_PTRACE an unprivileged agent gets EACCES
+/// for nearly every /proc/<pid>/exe (kernel threads and root-owned processes included), so for
+/// such an agent CONSTRAINED/PARTIAL is the steady state, not an incident. A /proc mounted with
+/// hidepid=1|2 hides foreign pids from the listing altogether: nothing is refused, so the tally
+/// stays 0 and the result is a shorter list that this tally cannot flag.
 ///
 /// Pure + header-only; the single syscall helper is Linux-only.
 

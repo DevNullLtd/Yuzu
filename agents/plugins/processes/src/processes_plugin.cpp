@@ -210,7 +210,7 @@ std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::P
 #elif defined(__linux__)
 std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::ProcAccessTally& tally) {
     // WP13 UP14: the refusal (EACCES without CAP_SYS_PTRACE) is counted from the SAME readlink
-    // that failed; ENOENT/ESRCH (kernel threads, exited processes) are not counted.
+    // that failed; ENOENT/ESRCH (exited processes) are not counted.
     const std::string link = "/proc/" + std::to_string(pid) + "/exe";
     std::string path = yuzu::shared::readlink_noting(tally, link.c_str());
     if (path.empty())

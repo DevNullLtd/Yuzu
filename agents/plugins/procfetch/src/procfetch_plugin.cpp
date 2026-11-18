@@ -121,7 +121,7 @@ std::string read_first_line(const std::filesystem::path& path) {
 }
 
 // WP13 UP14: one readlink; a refusal (EACCES/EPERM, no CAP_SYS_PTRACE) is counted from that
-// same call's errno, ENOENT/ESRCH (exited process, kernel thread) is not.
+// same call's errno, ENOENT/ESRCH (an exited process) is not.
 std::string resolve_exe(const std::filesystem::path& link, yuzu::shared::ProcAccessTally& tally) {
     return yuzu::shared::readlink_noting(tally, link.c_str());
 }
