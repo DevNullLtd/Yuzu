@@ -525,8 +525,22 @@ verify_as_user_prereqs() {
     # the plugin dir), so refuse rather than launch it.
     if [ "$(uname -s)" = "Linux" ]; then
         if command -v getcap >/dev/null 2>&1; then
-            local launched_caps
-            launched_caps="$(getcap "$agent_bin" 2>/dev/null || true)"
+            local launched_caps getcap_err getcap_rc
+            # A real getcap can exit 0 with its error only on stderr: that is UNVERIFIABLE, never
+            # "no file capabilities".
+            getcap_err="$(mktemp "${TMPDIR:-/tmp}/yuzu-getcap.XXXXXX")" || getcap_err=""
+            if [ -z "$getcap_err" ]; then
+                fail "cannot create a temp file to read getcap's stderr for $agent_bin"
+                return 1
+            fi
+            launched_caps="$(getcap "$agent_bin" 2>"$getcap_err")"
+            getcap_rc=$?
+            if [ "$getcap_rc" -ne 0 ] || [ -s "$getcap_err" ]; then
+                fail "getcap could not read $agent_bin (exit $getcap_rc: $(cat "$getcap_err")): cannot verify it carries no file capability"
+                rm -f "$getcap_err"
+                return 1
+            fi
+            rm -f "$getcap_err"
             if [ -n "$launched_caps" ]; then
                 fail "$agent_bin carries file capabilities: $launched_caps"
                 info "  fix: sudo setcap -r \"$agent_bin\"   (the capability is granted to the process by setpriv)"

@@ -156,6 +156,7 @@ SUDOERS_FILE="/etc/sudoers.d/yuzu-agent"   # fixed: never read from the environm
 DRY_RUN=0
 ACCOUNT_NAME=""            # filled in based on platform if not specified
 BINARY_PATH=""             # filled in based on platform if not specified
+BINARY_PATH_EXPLICIT=0     # 1 when --binary-path was given
 SKIP_SUDOERS=0
 SKIP_SETCAP=0
 
@@ -227,7 +228,7 @@ while [[ $# -gt 0 ]]; do
         --check)          ACTION="check"; shift ;;
         --uninstall)      ACTION="uninstall"; shift ;;
         --account-name)   ACCOUNT_NAME="$2"; shift 2 ;;
-        --binary-path)    BINARY_PATH="$2"; shift 2 ;;
+        --binary-path)    BINARY_PATH="$2"; BINARY_PATH_EXPLICIT=1; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
         --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -237,6 +238,13 @@ done
 
 ACCOUNT_NAME="${ACCOUNT_NAME:-$DEFAULT_ACCOUNT}"
 BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY_PATH}"
+# An explicit --binary-path that is not a regular file is an argument error (exit 2): the
+# file-capability strip and check would otherwise silently have nothing to look at.
+if [[ "$BINARY_PATH_EXPLICIT" -eq 1 && "$PLATFORM" == "linux" && "$ACTION" != "uninstall" \
+      && "$SKIP_SETCAP" -eq 0 && ! -f "$BINARY_PATH" ]]; then
+    echo "--binary-path $BINARY_PATH is not a regular file" >&2
+    exit 2
+fi
 
 # ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -1713,6 +1721,21 @@ check_helpers() {
 # scripts/start-UAT.sh --as-user). This script never grants file capabilities. Each run removes
 # any file capability found on the binary at `--binary-path` (idempotent).
 
+# Reads the file capabilities of $BINARY_PATH into FILE_CAPS_OUT. Returns 0 only when getcap ran
+# cleanly: exit status 0 AND nothing on stderr (a real getcap can exit 0 with its error on stderr
+# alone). Any other outcome is UNVERIFIABLE (return 1), never "no file capabilities".
+FILE_CAPS_OUT=""
+read_file_caps() {
+    FILE_CAPS_OUT=""
+    local errf rc err
+    errf=$(mktemp "${TMPDIR:-/tmp}/yuzu-getcap.XXXXXX") || return 1
+    FILE_CAPS_OUT=$(getcap "$BINARY_PATH" 2>"$errf")
+    rc=$?
+    err=$(<"$errf")
+    rm -f "$errf"
+    [[ "$rc" -eq 0 && -z "$err" ]]
+}
+
 strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
     if [[ "$SKIP_SETCAP" -eq 1 ]]; then
@@ -1720,10 +1743,8 @@ strip_file_capabilities() {
         # Loud, on stderr: this flag can leave an exploitable file capability on a binary that
         # any local user can execute, and the install still exits 0.
         if [[ -f "$BINARY_PATH" ]] && command -v getcap >/dev/null 2>&1; then
-            local live
-            live=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-            if [[ -n "$live" ]]; then
-                warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $live"
+            if read_file_caps && [[ -n "$FILE_CAPS_OUT" ]]; then
+                warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $FILE_CAPS_OUT"
                 warn "  any local user can run that binary with them; remove with: setcap -r $BINARY_PATH"
             fi
         fi
@@ -1733,28 +1754,36 @@ strip_file_capabilities() {
         log "agent binary not found at $BINARY_PATH - no file capabilities to strip"
         return 0
     fi
-    local have_getcap=0 caps=""
+    local have_getcap=0
     if command -v getcap >/dev/null 2>&1; then
         have_getcap=1
-        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-        if [[ -z "$caps" ]]; then
-            log "no file capabilities on $BINARY_PATH (good)"
-            return 0
+        if read_file_caps; then
+            if [[ -z "$FILE_CAPS_OUT" ]]; then
+                log "no file capabilities on $BINARY_PATH (good)"
+                return 0
+            fi
+            log "stripping file capabilities from $BINARY_PATH: $FILE_CAPS_OUT"
+        else
+            # getcap failed or wrote to stderr: the capability state is UNKNOWN, so treat it as
+            # possibly live and strip anyway; the post-check below must then read cleanly.
+            warn "getcap could not read $BINARY_PATH (exit status or stderr): treating its file capabilities as possibly live"
         fi
-        log "stripping file capabilities from $BINARY_PATH: $caps"
     fi
     if ! command -v setcap >/dev/null 2>&1; then
         # FAIL (exit 5), never "skip": with the capability possibly still live the install is NOT
         # safe, and the caller must not report success.
         warn "setcap not installed - cannot strip file capabilities from $BINARY_PATH"
-        warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"
+        warn "  remove them by hand: setcap -r $BINARY_PATH   (needs libcap: apt libcap2-bin, dnf libcap)"
         return 5
     fi
     run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; return 5; }
     if [[ "$DRY_RUN" -eq 0 && "$have_getcap" -eq 1 ]]; then
-        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-        if [[ -n "$caps" ]]; then
-            warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $caps"
+        if ! read_file_caps; then
+            warn "getcap could not verify $BINARY_PATH after setcap -r: file capabilities may still be present"
+            return 5
+        fi
+        if [[ -n "$FILE_CAPS_OUT" ]]; then
+            warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $FILE_CAPS_OUT"
             return 5
         fi
     fi
@@ -1833,10 +1862,11 @@ check_install() {
         log "file-capability check skipped (--no-cap-cleanup): a pass does not prove the binary carries none"
     elif [[ "$PLATFORM" == "linux" && -f "$BINARY_PATH" ]]; then
         if command -v getcap >/dev/null 2>&1; then
-            local caps
-            caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-            if [[ -n "$caps" ]]; then
-                warn "file capabilities present on $BINARY_PATH: $caps (re-run this installer to strip them)"
+            if ! read_file_caps; then
+                warn "getcap could not read $BINARY_PATH (exit status or stderr): cannot verify that it carries no file capability"
+                ((errs++))
+            elif [[ -n "$FILE_CAPS_OUT" ]]; then
+                warn "file capabilities present on $BINARY_PATH: $FILE_CAPS_OUT (re-run this installer to strip them)"
                 ((errs++))
             fi
         else
@@ -1911,7 +1941,10 @@ case "$ACTION" in
         ;;
 
     check)
+        # The exit status IS the contract ("exits non-zero on any drift"): without this the case
+        # falls through to the trailing `exit 0` and --check can never fail.
         check_install
+        exit $?
         ;;
 
     uninstall)

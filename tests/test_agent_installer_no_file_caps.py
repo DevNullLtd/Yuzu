@@ -59,25 +59,34 @@ def _stub(d: pathlib.Path, name: str, body: str) -> None:
     p.chmod(0o755)
 
 
-def run_installer(script: pathlib.Path, args, *, caps: bool, setcap: bool, getcap: bool = True):
+def run_installer(script: pathlib.Path, args, *, caps: bool, setcap: bool, getcap=True, dry_run=True,
+                  binary_arg=True):
+    """getcap: True/False (present/absent) or "stderr" (exit 0, error only on stderr) or "rc1"
+    (exit 1, nothing on stderr)."""
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_caps_") as d:
         d = pathlib.Path(d)
         stubs = d / "stubs"
         stubs.mkdir()
-        if getcap:
+        if getcap == "stderr":
+            _stub(stubs, "getcap", 'echo "Failed to get capabilities of file $1" >&2; exit 0')
+        elif getcap == "rc1":
+            _stub(stubs, "getcap", "exit 1")
+        elif getcap:
             _stub(stubs, "getcap", 'echo "$1 cap_net_admin+eip"' if caps else "exit 0")
         if setcap:
             _stub(stubs, "setcap", "exit 0")
         binary = d / "yuzu-agent"
         binary.write_text("x")
         env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(d), "LC_ALL": "C"}
-        r = subprocess.run(["/bin/bash", str(script), "--dry-run", "--account-name", "yuzu_t",
-                            "--binary-path", str(binary), *args],
+        argv = ["/bin/bash", str(script)] + (["--dry-run"] if dry_run else []) + ["--account-name", "yuzu_t"]
+        if binary_arg:
+            argv += ["--binary-path", str(binary)]
+        r = subprocess.run(argv + list(args),
                            capture_output=True, text=True, env=env, timeout=120)
         return r
 
 
-def check(script: pathlib.Path) -> list[str]:
+def check(script: pathlib.Path, uat_text=None) -> list[str]:
     errs = []
     code = script.read_text()
     for v in setcap_violations(code):
@@ -88,6 +97,10 @@ def check(script: pathlib.Path) -> list[str]:
             l for l in code.splitlines() if not l.lstrip().startswith("#") and not _MSG_CMD.match(l))):
         errs.append("installer still names a capability set in code")
 
+    # start-UAT.sh step 4b (the binary actually launched) must read getcap the same way
+    uat = uat_text if uat_text is not None else (ROOT / "scripts/start-UAT.sh").read_text()
+    if '[ -s "$getcap_err" ]' not in uat or '"$getcap_rc" -ne 0' not in uat:
+        errs.append("start-UAT.sh step 4b must treat a getcap failure or stderr as unverifiable")
     r = run_installer(script, [], caps=True, setcap=True)
     out = r.stdout + r.stderr
     if r.returncode != 0 or not re.search(r"\[dry-run\] setcap -r ", out):
@@ -107,6 +120,42 @@ def check(script: pathlib.Path) -> list[str]:
     r = run_installer(script, ["--no-setcap"], caps=False, setcap=True)
     if r.returncode != 2 or "unknown arg" not in r.stderr:
         errs.append(f"--no-setcap must be an unknown argument (exit 2), got {r.returncode}")
+
+    # getcap that exits 0 with its error only on stderr (or exits non-zero) is UNVERIFIABLE, never
+    # "no file capabilities (good)": install (with setcap missing) exits 5.
+    for mode in ("stderr", "rc1"):
+        r = run_installer(script, [], caps=False, setcap=False, getcap=mode)
+        if r.returncode != 5 or "(good)" in r.stdout + r.stderr:
+            errs.append(f"getcap {mode}: install must not read it as clean; expected exit 5, got {r.returncode}")
+    # an explicit --binary-path that is not a regular file is an argument error
+    r = run_installer(script, ["--binary-path", "/nonexistent/yuzu-agent"], caps=False, setcap=True)
+    if r.returncode != 2:
+        errs.append(f"explicit --binary-path that is not a file: expected exit 2, got {r.returncode}")
+
+    # --check: the exit status is the contract. The sandbox has other drift (no such account), so
+    # the status is 1 on every run (a fall-through to `exit 0` would make it 0), and the capability
+    # finding is read from the issue count: one more than the clean baseline.
+    def issues(**kw):
+        r = run_installer(script, ["--check"] + kw.pop("args", []), dry_run=False, **kw)
+        m = re.search(r"check failed .{1,3} (\d+) issue", r.stdout + r.stderr)
+        return r, (int(m.group(1)) if m else None)
+    base_r, base_n = issues(caps=False, setcap=True)
+    if base_r.returncode != 1 or base_n is None:
+        errs.append(f"--check on a drifted host must exit 1 (got {base_r.returncode}) and report its issue count")
+    elif "file capabilities present" in base_r.stdout + base_r.stderr:
+        errs.append("--check reported a capability on a clean binary")
+    else:
+        for name, kw, needle in (("capability present", dict(caps=True, setcap=True), "file capabilities present"),
+                                 ("getcap missing", dict(caps=False, setcap=True, getcap=False), "getcap not installed"),
+                                 ("getcap stderr", dict(caps=False, setcap=True, getcap="stderr"), "getcap could not read"),
+                                 ("getcap rc 1", dict(caps=False, setcap=True, getcap="rc1"), "getcap could not read")):
+            r, n = issues(**kw)
+            if r.returncode != 1 or n != (base_n or 0) + 1 or needle not in r.stdout + r.stderr:
+                errs.append(f"--check {name}: expected exit 1, {base_n + 1} issues and {needle!r}; got rc {r.returncode}, "
+                            f"issues {n}")
+        r, n = issues(args=["--no-cap-cleanup"], caps=True, setcap=True)
+        if r.returncode != 1 or n != base_n or "file-capability check skipped" not in r.stdout + r.stderr:
+            errs.append(f"--check --no-cap-cleanup must skip the capability test and say so (rc {r.returncode}, issues {n})")
     return errs
 
 
@@ -118,17 +167,32 @@ def selftest() -> list[str]:
             '    run setcap -r "$BINARY_PATH" ||',
             '    run setcap "cap_net_raw+eip" "$BINARY_PATH" ||'),
         "exit 5 dropped": (
-            '        warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"\n        return 5',
-            '        warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"\n        return 0'),
+            '(needs libcap: apt libcap2-bin, dnf libcap)"\n        return 5',
+            '(needs libcap: apt libcap2-bin, dnf libcap)"\n        return 0'),
         "strip skipped": (
             "        strip_file_capabilities || cap_rc=$?", "        cap_rc=0"),
         "--no-setcap alias restored": (
             "        --no-cap-cleanup) SKIP_SETCAP=1; shift ;;",
             "        --no-cap-cleanup|--no-setcap) SKIP_SETCAP=1; shift ;;"),
+        "--check falls through to exit 0": (
+            "        check_install\n        exit $?\n", "        check_install\n"),
+        "getcap stderr ignored": (
+            '[[ "$rc" -eq 0 && -z "$err" ]]', '[[ "$rc" -eq 0 ]]'),
+        "getcap failure read as clean in --check": (
+            "            if ! read_file_caps; then\n                warn \"getcap could not read $BINARY_PATH (exit status or stderr): cannot verify",
+            "            if false; then\n                warn \"getcap could not read $BINARY_PATH (exit status or stderr): cannot verify"),
+        "explicit missing --binary-path accepted": (
+            "    echo \"--binary-path $BINARY_PATH is not a regular file\" >&2\n    exit 2\n", "    :\n"),
         "warning silenced": (
             'warn "--no-cap-cleanup: file capabilities are STILL LIVE', 'log "--no-cap-cleanup: file capabilities are STILL LIVE'),
     }
     errs = []
+    uat_src = (ROOT / "scripts/start-UAT.sh").read_text()
+    uat_mut = uat_src.replace('[ -s "$getcap_err" ]', "false", 1)
+    if uat_mut == uat_src:
+        errs.append("selftest 'start-UAT getcap stderr ignored': pattern no longer matches (stale)")
+    elif not check(SCRIPT, uat_text=uat_mut):
+        errs.append("selftest 'start-UAT getcap stderr ignored': mutation was NOT detected")
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_mut_") as d:
         for name, (a, b) in muts.items():
             if a not in src:
