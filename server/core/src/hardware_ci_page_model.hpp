@@ -248,7 +248,7 @@ enum class Surface { kRest, kMcp };
 ///  - `domain_audit_row`: the transport writes an `inventory.devices.ci` row (`audit_outcome`,
 ///    `audit_detail`). A refused cursor writes none. MCP also writes its generic row
 ///    (`audit_outcome`, `audit_detail`) on EVERY failure it answers, whatever `audit_detail`
-///    holds; REST writes only the domain row, and none when `domain_audit_row` is false.
+///    holds, except `kBusy`; REST writes only the domain row, and none when `domain_audit_row` is false.
 ///    `kBusy` is the one answer that is `unavailable` with `domain_audit_row` false and it writes
 ///    NO row on either transport (its `audit_outcome` and `audit_detail` are empty).
 ///  - `retry_after_header`: REST also sends `Retry-After` (whole seconds, `retry_after_ms`

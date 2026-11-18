@@ -5,8 +5,12 @@
 concurrent bulk reads (#7949), a byte bound on one response page (#7950) and the audit-outage read
 amplification note (#7951). Commits on `fix/hardware-ci-bulk-read-bounds`: `915454b74b` (the cap),
 `28e94b3b9a` (the byte bound), `547d449e1b` (audit rows, coverage and changelog), `eba2214145` (governance
-round 1 fix) and `cd9c5dea60` (round 2 fix; documentation, the triage and client guidance, and test hardening).
-**Status:** implemented and governed, with two fix rounds; not merged. The residuals below are recorded, not accepted.
+round 1 fix), `cd9c5dea60` (round 2 fix; documentation, the triage and client guidance, and test hardening),
+`22e73a667e` and `3a69da28d6` (round 2 follow-ups), `021f8f626d` (round 3: the slot is held through the audit
+write of a served bulk page, #7951) and the round 4 commit (an MCP busy refusal writes no row, the bound wording
+and hold-time figures corrected).
+**Status:** implemented and governed, with four fix rounds; not merged. The residuals below are recorded, not
+accepted; residual 3 also records the owner's adjudication of it as pre-existing and out of scope.
 
 **Supersession.** The subjects of `915454b74b` ("authz and audit keep a connection") and `28e94b3b9a`
 ("cannot grow without bound") overstate what the code does. The cap is not a reserve: it limits how many pool
@@ -24,7 +28,7 @@ REST route and the MCP tool, with a fixed 500 ms wait and a hard maximum of 8. U
 (boot refusal). It limits how many pool connections bulk reads can hold, so a burst of bulk pages cannot
 take more than half of the pool (the whole pool at pool size 1). It is not a reserve: at pool size 1 the cap is
 the whole pool, and other traffic can still exhaust the pool. A fleet read over the cap is a retryable `503`
-(REST: no audit row; MCP: one generic best-effort row); point reads (`agent_id`) take no slot.
+with no audit row on either transport (the busy counter is the record); point reads (`agent_id`) take no slot.
 
 ## What the byte bound does and does not do
 
@@ -33,7 +37,7 @@ least one row; `page_bytes_capped: true` and the audit token ` byte_capped=1` ap
 page. It bounds the response, not the work: all `limit`+1 rows (up to 1001, about 30 MB raw) are read and held
 before the page is cut.
 
-## Residuals recorded by this change (pending owner acceptance)
+## Residuals recorded by this change (owner adjudication noted where given)
 
 Recorded 2026-11-18. Each is a fact about the code as committed.
 
@@ -48,13 +52,14 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
    saturate the pool through them (a mechanism that predates this change), and at pool 1 or 2 (cap 1) one
    stalled audit write can leave authorization without a connection. A busy refusal writes no row on either
    transport. Owner adjudication: recorded as pre-existing and out of scope for this change (2026-11-18); the
-   class-wide follow-up is the audit-write-path issue.
+   class-wide follow-up is the audit-write-path issue (to be filed; its number will be recorded here and in the ledger).
 4. A slot is held for the whole store call and then the access-audit write(s). The store call: a pool acquire of up to 3 s
    (500 ms when the pool is saturated), up to 10 s to open a connection and the 5 s statement limit. Each audit
    write: a pool acquire of up to 4 s, up to 10 s to connect, the pool's 30 s statement limit and a 10 s lock
-   wait. A DSN with its own `options=` gets none of the injected limits, so a write parked on a lock holds its
-   slot until the lock ends. Against a database that stops answering rather than running slowly those limits
-   may not fire, so a hold can exceed those sums. Recovery is passive.
+   wait. A DSN with its own `options=` (or `PGOPTIONS`) loses the injected statement and lock timeouts (connect
+   timeout and keepalives are injected independently, and the store read keeps its own `SET LOCAL` 5 s limit), so
+   a write parked on a lock holds its slot until the lock ends. Against a database whose process is frozen but whose host still acknowledges packets (verified with a paused
+   container) no client-side limit fires at all, so a hold can exceed those sums. Recovery is passive.
 5. A read waiting for a slot occupies an HTTP worker for up to 500 ms; the cap bounds connections, not workers.
 6. The byte bound does not bound memory: a cap of 8 can transiently hold several hundred MB on one replica.
 7. Busy refusals are counter-only on both transports (`yuzu_hardware_ci_read_busy_total{surface}`): no principal is
@@ -65,6 +70,12 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
     replica with free slots.
 11. The chaos scenarios for an audit outage and a hung database were designed, not run.
 12. ThreadSanitizer was not run on the new concurrency tests; the timing-based tests give lower bounds only.
+13. A restart (SIGTERM) while a bulk read is parked in its audit write on a locked audit table can outlast the
+    server's 15 s listener grace and end in a forced exit; any audited handler has the same exposure, so it
+    predates this change and the slot hold does not lengthen the handler.
+14. The real REST and MCP handlers were not run against a really locked audit table (the Postgres tests drive
+    `read_page` plus `AuditStore::log`, and the handlers' release point is pinned with stub audit sinks); the
+    Postgres cases run at pool 4 only, pool 1 and 2 by arithmetic.
 
 ## Frozen by this change
 
