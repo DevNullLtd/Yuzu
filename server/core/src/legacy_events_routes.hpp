@@ -117,8 +117,16 @@ struct Deps {
                                            const std::string& securable_type,
                                            const std::string& operation)>;
 
+    /// Same shape as every sibling route's audit closure (`WorkflowRoutes::Deps::audit_fn`). Used
+    /// to record the refusal of an ADMITTED-but-scoped caller (the fleet-read gate audits its own
+    /// 401/403/503 refusals; this one is the route's own). Unwired: the refusal still stands.
+    using AuditFn = std::function<bool(const httplib::Request&, const std::string& action,
+                                       const std::string& result, const std::string& target_type,
+                                       const std::string& target_id, const std::string& detail)>;
+
     DenyServiceScopedFn deny_service_scoped_fn;
     FleetReadFn fleet_read_fn;
+    AuditFn audit_fn;
     ResolveSessionFn resolve_session_fn;
     /// `ServerImpl::event_bus_` (`detail::EventBus`, by-value member) — the
     /// legacy dashboard bus this route subscribes to. Never null in

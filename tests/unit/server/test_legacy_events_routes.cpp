@@ -77,6 +77,7 @@ struct Harness {
     int fleet_deny_status{403};
     yuzu::server::authz::VisibleSet fleet_scope{std::nullopt};
     std::vector<std::string> fleet_calls;
+    std::vector<std::string> audit_rows; // "<action>|<result>|<detail>"
 
     yuzu::server::test::TestRouteSink sink;
 
@@ -111,6 +112,12 @@ struct Harness {
                 }
                 return authz::FleetReadGate{.admitted = true, .scope = fleet_scope};
             };
+        deps.audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&, const std::string&,
+                               const std::string& detail) {
+            audit_rows.push_back(action + "|" + result + "|" + detail);
+            return true;
+        };
         deps.resolve_session_fn = [this](const httplib::Request&) { return session_to_return; };
         legacy_events::register_legacy_events_routes(sink, deps);
     }
@@ -190,6 +197,9 @@ TEST_CASE("legacy_events_routes: F11 a scoped (non-empty or deny-all) admit is r
     CHECK(res->status == 403);
     CHECK(res->body.find("Response:Read") != std::string::npos);
     CHECK(bus.listener_count() == 0);
+    // The refusal is audited like its siblings (the 403 never depends on the write).
+    REQUIRE(h.audit_rows.size() == 1);
+    CHECK(h.audit_rows[0].starts_with("events.stream.access_denied|denied|"));
 }
 
 TEST_CASE("legacy_events_routes: F11 an unwired fleet_read_fn fails CLOSED (503)",

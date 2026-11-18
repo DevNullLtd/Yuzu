@@ -70,6 +70,10 @@ void register_legacy_events_routes(HttpRouteSink& sink, Deps deps) {
             if (!gate.admitted)
                 return; // the gate rendered its own 401/403/503 and audit row
             if (gate.scope.has_value()) {
+                // Audited like every sibling refusal; the 403 does not depend on the write.
+                if (deps.audit_fn)
+                    (void)deps.audit_fn(req, "events.stream.access_denied", "denied", "", "",
+                                        std::string("reason=scoped_authority securable=") + type);
                 res.status = 403;
                 res.set_content(
                     detail::error_json_a4(
