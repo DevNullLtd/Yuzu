@@ -312,6 +312,13 @@ Type: files; Name: "{app}\plugins\tar.dll"
 ; The same rule applies: a stale quarantine.dll left in the plugin directory would be loaded by
 ; the glob beside firewall.dll and register the retired actions again.
 Type: files; Name: "{app}\plugins\quarantine.dll"
+; Agent self-update leftovers (agents/core/src/updater.cpp). The agent rolls back to
+; bin\yuzu-agent.old.exe at start when it exists without bin\.yuzu-update-verified, so an
+; install over a self-updated agent whose marker was never written would have the next start
+; replace the executable this installer just laid down with the older one. Both are deleted
+; before [Files] runs. Exact names only; the same two are in [UninstallDelete].
+Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
+Type: files; Name: "{app}\bin\.yuzu-update-verified"
 
 [UninstallDelete]
 ; Three files the installer does not install, deleted by exact name: the

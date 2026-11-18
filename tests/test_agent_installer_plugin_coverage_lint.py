@@ -217,6 +217,14 @@ def problems(iss: str, meson_text: str, read_plugin_meson, options: str, release
     for l in ud:
         if l.startswith("Type: files;") and re.search(r"[*?]", l):
             found.append(f"[UninstallDelete]: a files entry uses a wildcard: {l}")
+    # [InstallDelete]: the same self-update leftovers, so an install over a self-updated
+    # agent is not rolled back to the older executable at its next start.
+    idl = [l.strip() for l in section(iss, "InstallDelete").splitlines()
+           if l.strip() and not l.strip().startswith(";")]
+    for entry in OTA_LEFTOVERS:
+        if idl.count(entry) != 1:
+            found.append(f"[InstallDelete]: needs exactly one `{entry}` (else an install over a "
+                         f"self-updated agent can roll back to the older executable)")
     return found
 
 
@@ -266,9 +274,14 @@ class InstallerPluginCoverage(unittest.TestCase):
             "license_scan uninstall entry misnamed": ("iss", '{app}\\plugins\\license_scan.dll"\n', '{app}\\plugins\\licence_scan.dll"\n'),
             "license_scan uninstall entry commented out": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\n', '; Type: files; Name: "{app}\\plugins\\license_scan.dll"\n'),
             "a new exclusion without an uninstall entry": ("iss", netprobe, "; plugin-not-installed: netprobe: kept out of the installer on purpose\n"),
-            "old exe uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', ""),
-            "update marker uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\n', ""),
-            "a wildcard uninstall entry added": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\nType: files; Name: "{app}\\plugins\\*.dll"\n'),
+            # Anchored on the preceding entry: the same names appear in [InstallDelete] first.
+            "old exe uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\n'),
+            "update marker uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\nType: filesandordirs; Name: "{app}\\logs"', 'Type: filesandordirs; Name: "{app}\\logs"'),
+            "a wildcard uninstall entry added": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\nType: files; Name: "{app}\\plugins\\*.dll"\n'),
+            # [InstallDelete]: the first occurrence of each self-update name is the install-time one.
+            "old exe install-delete entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', ""),
+            "update marker install-delete entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\n', ""),
+            "install-delete section renamed": ("iss", "[InstallDelete]\n", "[InstallDeleted]\n"),
             "uninstall section renamed": ("iss", "[UninstallDelete]\n", "[UninstallDeleted]\n"),
             "release turns build_examples off": ("release", "            -Dbuild_tests=false `\n", "            -Dbuild_tests=false `\n            -Dbuild_examples=false `\n"),
         }

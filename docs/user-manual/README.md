@@ -147,7 +147,9 @@ uninstaller in the install directory) stops and removes the `YuzuAgent` service 
   which the installer does not install: `license_scan.dll` is in the release archive (see
   below), and the other two are left by agent self-update. The uninstaller of an agent
   installed with the 0.15.0 or an earlier installer does not remove these three; delete any of
-  them that remain after uninstalling;
+  them that remain after uninstalling (the installer itself also deletes the two self-update
+  files before it copies its own, because the agent switches back to `yuzu-agent.old.exe` at
+  start when that file exists without `.yuzu-update-verified`);
 - the enrollment token file `%ProgramData%\Yuzu\enrollment-token`, and the boot-time process
   trace setting with its file `%ProgramData%\Yuzu\procboot.etl`.
 

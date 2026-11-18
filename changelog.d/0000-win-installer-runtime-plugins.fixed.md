@@ -35,7 +35,9 @@
   plugins. Uninstalling now also removes `plugins\license_scan.dll` (copied in from the zip,
   if it was) and the `bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified` files agent
   self-update leaves, for an agent installed with this installer (an earlier installer's
-  uninstaller leaves them; delete them by hand). Uninstall still keeps the data directory
+  uninstaller leaves them; delete them by hand). The installer also deletes those two
+  self-update files before it copies its own, so the agent it installs is the one that starts
+  (the agent switches back to `yuzu-agent.old.exe` when that file exists without the marker). Uninstall still keeps the data directory
   `%ProgramData%\Yuzu` apart from the enrollment token file. A new docs lint (`tests/test_agent_installer_plugin_coverage_lint.py`) fails
   when a plugin built by `meson.build` has no installer line and no recorded
   `; plugin-not-installed:` reason, or when an excluded plugin's DLL or those two files have
