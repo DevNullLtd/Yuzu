@@ -10775,11 +10775,12 @@ tests:
         eval_time: 17m
         exp_samples: []
 
-  # ── YuzuServerMetricsScrapeDown (WP06 /metrics opt-in) ────────────────────
+  # ── YuzuServerMetricsScrapeDown (/metrics authentication) ────────────────────
   #
-  # CASE - a scrape that fails for 5 minutes fires (a job sending no credential reads 401, so
-  # `up` is 0). RED if the comparison is inverted, `for:` is dropped, or the job label drifts
-  # from the shipped prometheus.yml's `yuzu-server`.
+  # CASE - a scrape that fails for a long time fires (a job sending no credential reads 401, so
+  # `up` is 0). RED if the comparison is inverted or the job label drifts from the shipped
+  # prometheus.yml's `yuzu-server`. This case does NOT pin the `for:` clause (s1 is down for 9
+  # minutes at the check, which fires under any `for:` up to 8m); the next case does.
   - interval: 1m
     name: metrics scrape down - sustained up==0 fires
     input_series:
@@ -10820,4 +10821,84 @@ tests:
         eval_time: 10m
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuAgentPluginMetaDropped", alertstate="firing", field="name", severity="warning"}'
+            value: 1
+
+  # CASE - the `for: 5m` clause is pinned from both sides. s_short is down for 4 samples
+  # (t=4..7m, a 3m span): it must NOT be firing at 7m. s_long is down from t=4m to 12m: pending at
+  # 8m, firing at 10m. RED if `for:` is dropped or shortened to 1m (s_short fires at 7m) and RED if
+  # it is lengthened to 8m (s_long is not firing at 10m).
+  - interval: 1m
+    name: metrics scrape down - for 5m is pinned from both sides
+    input_series:
+      - series: 'up{job="yuzu-server",instance="s_short"}'
+        values: "1x3 0x4 1x10"
+      - series: 'up{job="yuzu-server",instance="s_long"}'
+        values: "1x3 0x9"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuServerMetricsScrapeDown", alertstate="firing", instance="s_long", job="yuzu-server", severity="critical"}'
+            value: 1
+
+  # ── YuzuPolicyInstructionPairMismatch ─────────────────────────────────────
+  # CASE - an increase fires per phase at once (no hold); a flat pre-seeded counter stays quiet.
+  # RED if `> 0` becomes `>= 0`, the `sum by (phase)` loses the label, or a `for:` is added that
+  # delays the first firing past 2m.
+  - interval: 1m
+    name: pair mismatch - an increase fires per phase, a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_server_policy_instruction_pair_mismatch_total{job="yuzu-server",instance="s1",phase="check"}'
+        values: "0x5 1x10"
+      - series: 'yuzu_server_policy_instruction_pair_mismatch_total{job="yuzu-server",instance="s1",phase="fix"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyInstructionPairMismatch", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyInstructionPairMismatch", alertstate="firing", phase="check", severity="warning"}'
+            value: 1
+
+  # ── YuzuPolicyInstructionMissing ──────────────────────────────────────────
+  - interval: 1m
+    name: policy instruction missing - an increase fires per phase, a flat counter stays quiet
+    input_series:
+      - series: 'yuzu_server_policy_instruction_missing_total{job="yuzu-server",instance="s1",phase="check"}'
+        values: "0x5 1x10"
+      - series: 'yuzu_server_policy_instruction_missing_total{job="yuzu-server",instance="s1",phase="verify"}'
+        values: "0x15"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyInstructionMissing", alertstate="firing"}'
+        eval_time: 7m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyInstructionMissing", alertstate="firing", phase="check", severity="warning"}'
+            value: 1
+
+  # ── YuzuScheduleArmingUnavailable / YuzuCommandOutboxArmingUnavailable ────
+  # CASE - `for: 15m` is pinned from both sides on a counter that increases every minute from
+  # t=1m (the condition is true from 1m, so the rule is pending from 1m and fires at 16m). Not
+  # firing at 10m, firing at 20m. RED if `for:` is dropped or shortened to 5m (firing at 10m) and
+  # RED if it is lengthened to 20m or more (not firing at 20m). A flat counter stays quiet.
+  - interval: 1m
+    name: arming unavailable - for 15m pinned, a steady fault fires and a flat counter does not
+    input_series:
+      - series: 'yuzu_schedule_arming_unavailable_total{job="yuzu-server",instance="s_steady"}'
+        values: "0+1x30"
+      - series: 'yuzu_schedule_arming_unavailable_total{job="yuzu-server",instance="s_flat"}'
+        values: "0x30"
+      - series: 'yuzu_server_command_outbox_deliver_arming_unavailable_total{job="yuzu-server",instance="s_steady"}'
+        values: "0+1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+      - expr: 'ALERTS{alertname=~"YuzuScheduleArmingUnavailable|YuzuCommandOutboxArmingUnavailable", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuScheduleArmingUnavailable", alertstate="firing", instance="s_steady", severity="warning"}'
+            value: 1
+          - labels: 'ALERTS{alertname="YuzuCommandOutboxArmingUnavailable", alertstate="firing", instance="s_steady", severity="warning"}'
             value: 1

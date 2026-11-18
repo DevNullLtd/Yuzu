@@ -859,9 +859,9 @@ cannot serve this right now" status, while `429` means the client is sending too
 **What to check.**
 
 1. `/readyz` on the server: it answers `503` with `pg_reachable` in `failed_stores` when Postgres is unreachable. A total outage may stop
-   the `/metrics` scrape too (a remote scrape resolves its token against Postgres), so
+   the `/metrics` scrape too (a scrape resolves its token against Postgres), so
    `YuzuScimGuardStoreUnavailable` and the Postgres alerts may be silent until recovery. The
-   honest backstops are `/readyz` and an operator-defined `up == 0` (scrape target down) alert.
+   honest backstops are `/readyz` and the shipped `YuzuServerMetricsScrapeDown` alert (`up == 0` on a job named `yuzu-server`).
    **Pool saturation with Postgres still reachable keeps `/readyz` green:** its `pg_reachable` and
    `pg_pool` rows go red on a connect failure, not on a saturated pool. For saturation read
    `yuzu_pg_pool_in_use` against the pool size, `yuzu_pg_acquire_wait_seconds`, and the guard counter

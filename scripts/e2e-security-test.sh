@@ -12,7 +12,7 @@
 # Prerequisites:
 #   - Yuzu server running with at least one admin user configured, started with
 #     --metrics-no-auth or --metrics-trust-loopback (the /metrics check below; the
-#     loopback exemption is opt-in since WP06 F57)
+#     loopback exemption is opt-in)
 #   - curl available
 
 set -euo pipefail
@@ -241,7 +241,7 @@ fi
 status=$(http_status "GET" "/health")
 assert_eq "GET /health → 200" "200" "$status"
 
-# /metrics → 200. WP06 F57: a loopback peer is no longer exempt by default (a same-host proxy
+# /metrics → 200. A loopback peer is no longer exempt by default (a same-host proxy
 # makes remote callers look like 127.0.0.1), so this holds only for a server started with
 # --metrics-no-auth (every shipped UAT launcher) or the opt-in --metrics-trust-loopback.
 status=$(http_status "GET" "/metrics")

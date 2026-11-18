@@ -102,10 +102,14 @@ JSON-RPC error responses from the denial paths (read-only mode, tier policy, app
 > Before ANY of the below — mint, dedup, recall lookup, consume — the
 > arguments must pass the #2405 input-schema validation (Security Model
 > above); a schema-invalid call answers `kInvalidParams` (-32602) with
-> nothing minted and nothing consumed.
+> nothing minted and nothing consumed. Arguments nested deeper than 64 levels
+> are the caller's own fault and answer `-32602` with error `data.reason`
+> `arguments_too_deep` (audited as `mcp.<tool>|denied`, `reason=arguments_too_deep`):
+> `retry_after_ms` is `null` (not retryable; flatten the arguments), and no
+> ticket is minted or consumed.
 > The **first** call mints an `ApprovalManager` approval (`definition_id =
 > "mcp.<tool>"`, `submitted_by` = the caller, `scope_expression` = the
-> canonical JSON of the tool arguments) and returns the envelope above. A person
+> canonical JSON of the tool arguments, with every `secret`, `grant_secret`, `grant_id` and `client_secret` value at any depth replaced by a `<redacted:sha256:...>` marker, so the approvals reads never return a secret and a recall with a different secret does not match) and returns the envelope above. A person
 > approves it (dashboard Approvals page / REST `POST /api/approvals/{id}/approve` on an
 > interactive session with an enrolled MFA factor and a fresh proof (#6079); an MCP or API token cannot approve;
 > the store requires the reviewer's account name to differ from the submitter's, which does not

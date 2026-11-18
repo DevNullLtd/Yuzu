@@ -8986,7 +8986,8 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md#get-metrics"
       - alert: YuzuAgentPluginMetaDropped
         # Registration dropped an agent-reported plugin name, version, description or action (or
-        # a plugin entry beyond the per-agent cap) because it fell outside its bound. A healthy
+        # a plugin entry beyond the per-agent cap, or an action beyond the per-plugin cap) because
+        # it fell outside its bound. A healthy
         # fleet reports nothing out of bounds, so any increase means an agent build or an endpoint
         # is reporting malformed plugin metadata.
         expr: |
@@ -8998,7 +8999,91 @@ groups:
           description: >-
             yuzu_server_agent_registry_plugin_meta_dropped_total{field="{{ $labels.field }}"}
             increased in the last hour: an agent's registration carried a plugin name, version,
-            description, action or plugin entry beyond its bound and it was dropped (never
-            truncated). The plugin catalogue is unaffected; find the agent in the server log
-            line "dropping".
+            description, action, plugin entry or action list beyond its bound and it was dropped.
+            A single name, version, description or action is dropped whole, never cut short; the
+            plugin and action LISTS are capped, so field="plugins" or field="actions" means entries
+            past the cap are missing from the served plugin catalogue for that agent. Find the
+            agent in the server log line "dropping".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+  - name: yuzu-authz-signals
+    # Counters that report a server-side refusal or a held decision that no other rule watches.
+    # Each is pre-seeded at 0 at boot (yuzu_server_policy_instruction_pair_mismatch_total per phase),
+    # so an increase is measurable from the first event.
+    rules:
+      - alert: YuzuPolicyInstructionPairMismatch
+        # The policy evaluator refused to dispatch an instruction whose plugin.action no longer
+        # matches the pair authorized when its fragment was stored (or the fragment carries no
+        # snapshot). Rare by construction: a healthy deployment never edits a stored instruction
+        # under a policy, so any increase is a signal. An increase over a window with no `for:`
+        # hold: one refusal is enough, and it resolves when the window passes.
+        expr: |
+          sum by (phase) (increase(yuzu_server_policy_instruction_pair_mismatch_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A policy {{ $labels.phase }} step was refused: its instruction no longer matches the authorized pair"
+          description: >-
+            yuzu_server_policy_instruction_pair_mismatch_total{phase="{{ $labels.phase }}"}
+            increased in the last hour: the policy evaluator did not dispatch a policy
+            instruction because its plugin.action differs from the pair authorized when the
+            policy fragment was stored, or the fragment has no stored snapshot. The affected
+            agents carry an error verdict (reason instruction_pair_mismatch). Find the policy and
+            fragment in the server log (policy_evaluator warning), then either restore the
+            instruction or re-save the fragment so it is authorized again.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
+      - alert: YuzuPolicyInstructionMissing
+        # The check, fix or verify instruction id of a policy no longer resolves to a definition
+        # (it was deleted). The check phase writes an explicit per-agent error verdict (reason
+        # instruction_missing) instead of leaving the last verdict standing. Any increase is a
+        # signal; no `for:` hold, the window supplies the memory.
+        expr: |
+          sum by (phase) (increase(yuzu_server_policy_instruction_missing_total[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A policy {{ $labels.phase }} step was skipped: its instruction no longer exists"
+          description: >-
+            yuzu_server_policy_instruction_missing_total{phase="{{ $labels.phase }}"} increased in
+            the last hour: the policy evaluator did not dispatch a policy instruction because
+            its instruction id no longer resolves to a definition. The affected agents carry an
+            error verdict (reason instruction_missing). Restore the instruction or point the
+            policy at an existing one.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
+      - alert: YuzuScheduleArmingUnavailable
+        # A due schedule was HELD (not advanced) because its creator's authority could not be
+        # determined: an auth-store fault. A single tick during a short blip is normal; 15 minutes
+        # of continuing increases means the fault is not clearing and scheduled work is not
+        # running. The window and the hold are both 15m, so a fault that clears inside the hold
+        # stays quiet.
+        expr: |
+          sum by (instance) (increase(yuzu_schedule_arming_unavailable_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Scheduled work is held on {{ $labels.instance }}: the auth store cannot answer"
+          description: >-
+            yuzu_schedule_arming_unavailable_total has kept increasing on {{ $labels.instance }}
+            for 15 minutes: due schedules are held, not advanced, because the creator's authority
+            cannot be read from the auth store. Nothing is denied and nothing is lost; the
+            schedules run when the store answers. Check Postgres reachability and the auth store
+            (YuzuServerPostgresUnreachable, the server ERROR log).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+      - alert: YuzuCommandOutboxArmingUnavailable
+        # The same fault at the command outbox's send-time re-authorization: the occurrence is
+        # rescheduled with back-off, not denied.
+        expr: |
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_arming_unavailable_total[15m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Command-outbox delivery is held on {{ $labels.instance }}: the auth store cannot answer"
+          description: >-
+            yuzu_server_command_outbox_deliver_arming_unavailable_total has kept increasing on
+            {{ $labels.instance }} for 15 minutes: scheduled command occurrences are rescheduled
+            with back-off because the send-time re-authorization cannot read the auth store. They
+            are not denied. Check Postgres reachability and the auth store.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"

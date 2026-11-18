@@ -1032,6 +1032,8 @@ of reading as NOT TESTED.
   crypto NIF needs OpenSSL SM4 symbols that Red Hat's OpenSSL lacks. The
   same defect is waiting behind #5143 on rockylinux:9.
 
+**Known nondeterministic test.** `tests/unit/test_echo_local_dispatcher.cpp`'s byte-budget rollup case (the `[budget]` test, `budget_evicted_raw_rows_total`) fails on one Linux workstation while CI passes; it is tracked as #7039 and is not a regression of the change under test. It is not in `tests/known-flaky.json`, so a red on it is not retried.
+
 **Gateway-upstream peer authorization and the rigs.** The server refuses to start with
 `--gateway-upstream` unless gateway peer authorization is configured or acknowledged as disabled
 (`--insecure-gateway-peer`, or `YUZU_INSECURE_GATEWAY_PEER=1`). The rigs that run the server from

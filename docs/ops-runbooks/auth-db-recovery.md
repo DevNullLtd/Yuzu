@@ -427,9 +427,20 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT store, version FROM public.schema_meta WHER
 
 # 3. The KEK resolved — this must be ZERO, or absent entirely. A non-zero
 #    kek_unresolvable count is the signature of a dump restored against the
-#    wrong keys directory. /metrics is on the same web port and is always
-#    unauthenticated over loopback.
-curl -fsS http://127.0.0.1:8080/metrics | grep secret_decrypt_failures_total
+#    wrong keys directory. /metrics requires a bearer token from EVERY peer,
+#    loopback included (docs/user-manual/metrics.md, "Scraping /metrics with
+#    a bearer token"), so a bare curl is answered 401 and its body matches
+#    nothing: that would read as "absent entirely", a false pass. This step
+#    therefore (a) sends the token, (b) requires HTTP 200, and (c) requires a
+#    series that exists on every healthy server (yuzu_server_uptime_seconds)
+#    before the zero check means anything. If any of the three fails, STOP:
+#    the check did not run.
+METRICS=$(curl -sS -o /tmp/yuzu-metrics.txt -w '%{http_code}' \
+  -H "Authorization: Bearer $YUZU_METRICS_TOKEN" http://127.0.0.1:8080/metrics)
+[ "$METRICS" = "200" ] || { echo "FAIL: /metrics answered $METRICS, not 200; the KEK check did not run"; false; }
+grep -q '^yuzu_server_uptime_seconds' /tmp/yuzu-metrics.txt \
+  || { echo "FAIL: no yuzu_server_uptime_seconds: the scrape is not a real /metrics"; false; }
+grep secret_decrypt_failures_total /tmp/yuzu-metrics.txt   # zero or absent: pass
 
 # 4. Both MFA binding triggers are in force: two rows, both with tgenabled = 'A'.
 #    Any other value means the server will refuse to start, or has already
@@ -439,7 +450,9 @@ psql "$YUZU_POSTGRES_DSN" -c "SELECT tgrelid::regclass AS tbl, tgname, tgenabled
      AND tgname IN ('users_mfa_factor_gen', 'sessions_mfa_rebind_guard');"
 
 # 5. The server's own view of the same fact: both series read 1.
-curl -fsS http://127.0.0.1:8080/metrics | grep yuzu_auth_mfa_binding_enforcement_ok
+#    Same rule as step 3: both series must be PRESENT with value 1; an empty
+#    result (a 401 body, a missing series) is a failure, not a pass.
+grep yuzu_auth_mfa_binding_enforcement_ok /tmp/yuzu-metrics.txt
 
 # 6. A real MFA login works end-to-end (not just "the page loads").
 ```

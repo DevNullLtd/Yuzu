@@ -132,7 +132,7 @@ start_all() {
     echo "[4/5] Starting Prometheus (:9090)..."
     if which prometheus >/dev/null 2>&1; then
         prometheus \
-            --config.file "$YUZU_ROOT/deploy/prometheus/prometheus.yml" \
+            --config.file "$YUZU_ROOT/deploy/prometheus/prometheus-rig.yml" \
             --storage.tsdb.path "C:/tmp/prometheus-data" \
             --web.listen-address=":9090" \
             2>&1 &

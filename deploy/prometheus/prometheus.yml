@@ -19,7 +19,10 @@ scrape_configs:
     # needs no permission) in this file, readable only by the Prometheus user:
     #   authorization: { type: Bearer, credentials_file: /etc/prometheus/yuzu-metrics-token }
     # Without a credential the scrape is answered 401, `up` is 0 and the YuzuServerMetricsScrapeDown
-    # alert fires. Remove this block only on a rig started with --metrics-no-auth.
+    # alert fires. The file is NOT shipped and must exist before Prometheus loads this configuration
+    # (`promtool check config` fails without it): mint the token and create it per docs/user-manual/metrics.md
+    # "Scraping /metrics with a bearer token". A rig started with --metrics-no-auth (scripts/start-stack.sh)
+    # uses prometheus-rig.yml instead, which has no authorization block.
     authorization:
       type: Bearer
       credentials_file: /etc/prometheus/yuzu-metrics-token

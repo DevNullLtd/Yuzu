@@ -565,7 +565,7 @@ apart.**
 - **`up` is 1.** The metric itself is missing. Either the server predates it (the
   rules file is a copy you apply yourself, so it routinely runs ahead of the
   servers it points at), or a scrape config is dropping it. Confirm with
-  `curl -s <server>/metrics | grep audit_retention_passes`, then check
+  `curl -sS -H "Authorization: Bearer $YUZU_METRICS_TOKEN" <server>/metrics | grep audit_retention_passes` (`/metrics` needs a bearer token; a bare `curl -s` prints a `401` body that matches nothing, which reads as "the metric is missing". Token recipe: `docs/user-manual/metrics.md`), then check
   `metric_relabel_configs`.
 
 It is **fleet-wide by construction**: `absent()` fires only when NO series exists

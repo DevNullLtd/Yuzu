@@ -48,6 +48,11 @@ services:
       # dev rig. Production deployments use docker-compose.reference.yml,
       # which REQUIRES distinct YUZU_POSTGRES_PASSWORD + YUZU_DB_PASSWORD.
       YUZU_POSTGRES_DSN: postgresql://yuzu:${YUZU_DB_PASSWORD:-yuzu-app}@postgres:5432/yuzu
+      # DEV-ONLY: /metrics requires authentication by default; this rig's Prometheus
+      # (prometheus-docker.yml) sends no credential, so the server is explicitly opted in to an
+      # unauthenticated /metrics on the published :8080. Production monitoring sends a bearer
+      # token instead: docs/user-manual/metrics.md "Scraping /metrics with a bearer token".
+      YUZU_METRICS_NO_AUTH: "true"
     volumes:
       - server-data:/var/lib/yuzu
       # The internal CA, the default certs and the secrets KEK
