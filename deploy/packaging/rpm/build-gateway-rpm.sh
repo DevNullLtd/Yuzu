@@ -34,6 +34,7 @@ cp -a "$REL_DIR"/* "$TOPDIR/SOURCES/yuzu_gw/"
 
 # Systemd service
 cp "$SCRIPT_DIR/../../../deploy/systemd/yuzu-gateway.service" "$TOPDIR/SOURCES/"
+cp "$SCRIPT_DIR/../../../deploy/docker/gateway-cookie-policy.sh" "$TOPDIR/SOURCES/"
 
 # Determine Release field
 if [[ -n "$PRERELEASE" ]]; then

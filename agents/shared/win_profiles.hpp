@@ -32,6 +32,7 @@
 #endif
 #include <windows.h>
 
+#include "list_walk.hpp"
 #include "user_profile_model.hpp"
 #include "value_enumeration.hpp"
 #include "win_hive_file_probe.hpp"
@@ -252,18 +253,40 @@ inline std::vector<yuzu::profiles::RawProfileRecord> enumerate_profile_records(
 // Subkey names directly under HKEY_USERS -- live-loaded hive roots, plus any
 // "<SID>_Classes" siblings. This is the input to
 // yuzu::profiles::classify_hive_state.
-inline std::vector<std::string> enumerate_hku_subkeys() {
-    std::vector<std::string> out;
+//
+// A CHECKED listing: `error` is empty exactly when the walk ended at the list's end (a
+// RegEnumKeyExW answer of ERROR_NO_MORE_ITEMS) AND two consecutive walks listed the same names.
+// Any other RegEnumKeyExW answer, or a list that never settled
+// (yuzu::shared::stable_walk, at most four walks), is a FAILED READ with no names -- never a
+// short list. A caller that acts on the names (hive-state classification, a sweep, a per-user
+// read) must refuse on a non-empty `error` and not treat the listing as "no one is logged on".
+// The names come back sorted; every consumer treats the list as a set.
+//
+// Accepted only when two consecutive walks list the same names (two walks on a quiet host). A
+// RegQueryInfoKeyW count-plus-last-write stamp is not used: its behaviour on a same-count swap
+// (one hive unloaded and another loaded between two reads) was not measured, and this rule does
+// not depend on it.
+inline yuzu::shared::ListWalk enumerate_hku_subkeys_checked() {
     constexpr DWORD kNameBufLen = 256;
-    wchar_t name_buf[kNameBufLen]{};
-    DWORD idx = 0;
-    DWORD name_len = kNameBufLen;
-    while (RegEnumKeyExW(HKEY_USERS, idx++, name_buf, &name_len, nullptr, nullptr, nullptr,
-                         nullptr) == ERROR_SUCCESS) {
-        out.push_back(from_wide(name_buf, static_cast<int>(name_len)));
-        name_len = kNameBufLen;
-    }
-    return out;
+    const auto walk_once = [] {
+        return yuzu::shared::walk_enumeration(
+            [](unsigned idx, std::string& name, std::string& err) {
+                wchar_t name_buf[kNameBufLen]{};
+                DWORD name_len = kNameBufLen;
+                const LSTATUS rc = RegEnumKeyExW(HKEY_USERS, idx, name_buf, &name_len, nullptr,
+                                                 nullptr, nullptr, nullptr);
+                if (rc == ERROR_SUCCESS) {
+                    name = from_wide(name_buf, static_cast<int>(name_len));
+                    return yuzu::shared::ListStep::Item;
+                }
+                if (rc == ERROR_NO_MORE_ITEMS)
+                    return yuzu::shared::ListStep::End;
+                err = "RegEnumKeyExW rc=" + std::to_string(rc);
+                return yuzu::shared::ListStep::Error;
+            });
+    };
+    constexpr unsigned kMaxWalks = 4;
+    return yuzu::shared::stable_walk(walk_once, kMaxWalks);
 }
 
 // Result of enumerate_value_names(): the names actually collected, plus
@@ -295,7 +318,7 @@ struct ValueNameEnumeration {
 // RegQueryInfoKeyW sizes the longest value name actually present so the
 // buffer is neither a truncating fixed guess (a value name here can be a
 // full filesystem path, unlike the short SID/profile key names
-// enumerate_profile_records/enumerate_hku_subkeys size for) nor an
+// enumerate_profile_records/enumerate_hku_subkeys_checked size for) nor an
 // unbounded allocation (kMaxValueNameChars caps it regardless of what the
 // key reports). Enumeration itself is bounded at kMaxEnumeratedValueNames
 // entries so a key stuffed with an unbounded number of values cannot pin
@@ -328,7 +351,7 @@ inline ValueNameEnumeration enumerate_value_names(HKEY key) {
         // RegEnumValueW's lpcchValueName is WCHAR count and MUST include
         // room for the terminator on input, even though the count it writes
         // back on success does not include it (mirrors RegEnumKeyExW's
-        // contract in enumerate_hku_subkeys above, just measured in the
+        // contract in enumerate_hku_subkeys_checked above, just measured in the
         // opposite unit from read_reg_value's byte-oriented RegQueryValueExW).
         DWORD name_len = static_cast<DWORD>(name_buf.size());
         const LSTATUS rc = RegEnumValueW(key, idx, name_buf.data(), &name_len, nullptr, nullptr,

@@ -20,6 +20,9 @@ Self-contained — includes embedded Erlang runtime.
 install -d %{buildroot}/opt/yuzu_gw
 cp -a %{_sourcedir}/yuzu_gw/* %{buildroot}/opt/yuzu_gw/
 
+# Cookie policy sourced by the unit's ExecStartPre (F24)
+install -m 0644 %{_sourcedir}/gateway-cookie-policy.sh %{buildroot}/opt/yuzu_gw/gateway-cookie-policy.sh
+
 # Systemd service
 install -D -m 0644 %{_sourcedir}/yuzu-gateway.service %{buildroot}%{_unitdir}/yuzu-gateway.service
 

@@ -2332,10 +2332,10 @@ const std::string& openapi_spec() {
     "/crypto/ca/stats": {"get":{"operationId": "getCryptoCaStats", "summary":"Counts of certificates issued by Yuzu's own CA, by fixed window","tags":["Crypto"],"description":"Yuzu's OWN internal-CA certificates only (never those on your devices), each count against as_of, the database clock (epoch seconds and as_of_iso). Facts only; the only built-in checks are these named windows: active; expiring_within_days 3/7/14/21/30/60 and expired_within_days 7/30/60/90, status active only (valid through notAfter, inclusive; a revoked certificate counts only in revoked_within_days); revoked_within_days 7/30/60/90 in three buckets (superseded, unpublished, other); issued_within_days 7 excluding unpublished; weeks: the last 52 ISO weeks (UTC, Monday start; the current week is partial), issued plus revoked per bucket. Every count carries rule_id, criterion, rule_set_version, as_of and threshold or week. Recompute any count from GET /ca/issued with the same kind/days/week/bucket/as_of (Security:Read). Requires Inventory:Read; a caller whose view is confined is refused 403 (no permission named), never given a narrowed count. Audited crypto.ca.stats.view (a withheld call as denied). Twin: MCP get_crypto_ca_stats.","responses":{"200":{"description":"{data:{scope:yuzu_issued,scope_note,window_edge_note,rule_set_version,as_of,as_of_iso,active{rule_id,criterion,rule_set_version,as_of,count},expiring_within_days[{...,threshold}],expired_within_days[],revoked_within_days[{...,threshold,bucket}],issued_within_days{},week_basis,weeks[{week,week_start,partial,issued{},revoked[{...,bucket}]}],audit_persisted?}, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/CryptoCaStats"}}}},"401":{"description":"Unauthenticated"},"403":{"description":"Caller lacks Inventory:Read (written by the permission check), or the caller's view is confined (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"CA store degraded or crypto reads busy: retry_after_ms 5000, never zeros. A Postgres pool too small to spare these reads (message names the --postgres-pool-size to restart with) is also a 503, with NO retry_after_ms: a retry fails identically until a restart (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
         // ADR-0070 R1 (slice 2b-1a): registered CRL sources. Own segment (MSVC C2026 16,380-byte cap).
         R"json(
-    "/crypto/revocation-sources": {"get":{"operationId": "getCryptoRevocationSources", "summary":"List the registered CRL sources","tags":["Crypto"],"description":"Every registered CA and the CRL URLs the server may fetch for it, with the confirmed address classes and per-URL fetch status. Registration only in this release: crl_status reads no_crl_fetched and fetch_status reads never_fetched until the fetcher ships, so a source here is NOT evidence that any certificate was checked. crl_past_next_update counts the registered CRL scopes whose held CRL (base or delta) is past its nextUpdate, not sources (0 until CRLs are held). Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Audited as crypto.revocation_source.list; a row that does not persist answers 503 with no data (Sec-Audit-Failed). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP list_revocation_sources.","responses":{"200":{"description":"{data:{sources[],total,max_sources,crl_past_next_update}, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceList"}}}},"401":{"description":"Unauthenticated"},"403":{"description":"Not an administrator, no RevocationSource:Read, a service-scoped token, or an MCP-tier bearer (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded, or the audit row could not be written (Sec-Audit-Failed): retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"post":{"operationId": "postCryptoRevocationSources", "summary":"Register a CA and its CRL URLs","tags":["Crypto"],"description":"Registers one CA (1..8 PEM certificates sharing one subject Name) and 1..8 CRL URLs. Each URL: http or https only, a host, no userinfo, no fragment, at most 2048 bytes, ASCII (internationalised hosts as punycode). The host is resolved at registration: loopback, link-local, cloud metadata, unspecified, multicast and reserved addresses and every address this server is bound to are refused with no override (an IPv6 address that embeds an IPv4 address, including NAT64 and 6to4 forms, is judged by the embedded one, using the well-known 64:ff9b::/96, 6to4, IPv4-mapped and the operator-declared prefixes (declared prefixes only at registration: no RFC 7050 discovery is done, so an address behind an undeclared prefix is judged as plain IPv6 here and re-judged when the source is fetched); if the server's own addresses cannot be determined or a lookup times out the request is a retryable 503 and registers nothing); any other class (public, private, carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes (a 400 names the classes the host resolves to, so resend with them). At most 64 sources, one per CA. Body capped at 192 KiB. No outbound proxy is used. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.register: an attempted row first (no audit row, no mutation: 503 and nothing is registered), then the outcome row (a lost outcome row keeps the 201 and sets Sec-Audit-Failed and audit_persisted false). Registers only: nothing is fetched yet. Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP register_revocation_source.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":128},"ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"PEM CERTIFICATE blocks of ONE CA (one subject Name); each must be a CA (basicConstraints cA=TRUE) with cRLSign if it has a key usage extension"},"crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]}}},"required":["url"],"additionalProperties":false}}},"required":["name","ca_certificates","crl_urls"],"additionalProperties":false}}}},"responses":{"201":{"description":"{data:source, meta}; Location names the new source","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceResult"}}}},"400":{"description":"Not JSON, an unknown key, or a field outside its rule; error.remediation names the parameter (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"409":{"description":"A source for this CA is already registered, or 64 sources exist; remediation names the existing source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"413":{"description":"Body over 192 KiB"},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), the outcome is unknown, this server's own addresses could not be determined, or a name lookup timed out: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/crypto/revocation-sources": {"get":{"operationId": "getCryptoRevocationSources", "summary":"List the registered CRL sources","tags":["Crypto"],"description":"Every registered CA and the CRL URLs the server may fetch for it, with the confirmed address classes and per-URL fetch status. Registration only in this release: crl_status reads no_crl_fetched and fetch_status reads never_fetched until the fetcher ships, so a source here is NOT evidence that any certificate was checked. crl_past_next_update counts the registered CRL scopes whose held CRL (base or delta) is past its nextUpdate, not sources (0 until CRLs are held). Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Audited as crypto.revocation_source.list; a row that does not persist answers 503 with no data (Sec-Audit-Failed). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP list_revocation_sources.","responses":{"200":{"description":"{data:{sources[],total,max_sources,crl_past_next_update}, meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceList"}}}},"401":{"description":"Unauthenticated"},"403":{"description":"Not an administrator, no RevocationSource:Read, a service-scoped token, or an MCP-tier bearer (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded, or the audit row could not be written (Sec-Audit-Failed): retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"post":{"operationId": "postCryptoRevocationSources", "summary":"Register a CA and its CRL URLs","tags":["Crypto"],"description":"Registers one CA (1..8 PEM certificates sharing one subject Name) and 1..8 CRL URLs. Each URL: http or https only, a host, no userinfo, no fragment, at most 2048 bytes, ASCII (internationalised hosts as punycode). The host is resolved at registration: loopback, link-local, cloud metadata, unspecified, multicast and reserved addresses and every address this server is bound to are refused with no override. An IPv6 address that embeds an IPv4 address is judged by the embedded one: the well-known NAT64 prefix 64:ff9b::/96, 6to4, IPv4-mapped and the operator-declared prefixes, and also SIIT and IPv4-compatible forms, which are never judged more open than non-global. A local-use NAT64 (64:ff9b:1::/48) address that no declared prefix covers is refused. Only declared prefixes are known at registration (no RFC 7050 discovery is done), so any other address behind an undeclared prefix is judged as plain IPv6 here and re-judged when the source is fetched. If the server's own addresses cannot be determined or a lookup times out, the request is a retryable 503 and registers nothing. Any other class (public, private, carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes (a 400 names the classes the host resolves to, so resend with them). At most 64 sources, one per CA. Body capped at 192 KiB. No outbound proxy is used. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.register: an attempted row first (no audit row, no mutation: 503 and nothing is registered), then the outcome row (a lost outcome row keeps the 201 and sets Sec-Audit-Failed and audit_persisted false). Registers only: nothing is fetched yet. Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP register_revocation_source.","requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"name":{"type":"string","minLength":1,"maxLength":128},"ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"PEM CERTIFICATE blocks of ONE CA (one subject Name); each must be a CA (basicConstraints cA=TRUE) with cRLSign if it has a key usage extension"},"crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]}}},"required":["url"],"additionalProperties":false}}},"required":["name","ca_certificates","crl_urls"],"additionalProperties":false}}}},"responses":{"201":{"description":"{data:source, meta}; Location names the new source","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceResult"}}}},"400":{"description":"Not JSON, an unknown key, or a field outside its rule; error.remediation names the parameter (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"409":{"description":"A source for this CA is already registered, or 64 sources exist; remediation names the existing source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"413":{"description":"Body over 192 KiB"},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), the outcome is unknown, this server's own addresses could not be determined, or a name lookup timed out: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},
 )json"
         R"json(
-    "/crypto/revocation-sources/{id}": {"get":{"operationId": "getCryptoRevocationSourcesById", "summary":"Show one registered CRL source","tags":["Crypto"],"description":"One source with its CA certificates (sha256, SKI, SPKI hash), CRL URLs, confirmed address classes and fetch status. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Audited as crypto.revocation_source.view (a row that does not persist answers 503 with no data). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP get_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"{data:source (including high_water{reset_at,pinned_crl_sha256}), meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceResult"}}}},"401":{"description":"Unauthenticated"},"403":{"description":"Not an administrator, no RevocationSource:Read, a service-scoped token, or an MCP-tier bearer (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded or the audit row could not be written: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"put":{"operationId": "putCryptoRevocationSourcesById", "summary":"Replace a CRL source's name, keys and URLs","tags":["Crypto"],"description":"A full replace (this is how a renewed CA key is added). The certificates must name the same subject as the registered source. A URL absent from the body is deleted with its fetch status and every held CRL fetched from it; a key absent from the body deletes every held CRL that verified only under it; the CA's anti-rollback marks are never touched. REQUIRED expected_config_version: if the configuration would change and the source has moved on since you read it the call is 409 and replaces nothing. Idempotent: a body equal to the current configuration changes nothing and does not bump config_version (changed false). Each URL: http or https only, a host, no userinfo, no fragment, at most 2048 bytes, ASCII (internationalised hosts as punycode). The host is resolved at registration: loopback, link-local, cloud metadata, unspecified, multicast and reserved addresses and every address this server is bound to are refused with no override (an IPv6 address that embeds an IPv4 address, including NAT64 and 6to4 forms, is judged by the embedded one, using the well-known 64:ff9b::/96, 6to4, IPv4-mapped and the operator-declared prefixes (declared prefixes only at registration: no RFC 7050 discovery is done, so an address behind an undeclared prefix is judged as plain IPv6 here and re-judged when the source is fetched); if the server's own addresses cannot be determined or a lookup times out the request is a retryable 503 and registers nothing); any other class (public, private, carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes (a 400 names the classes the host resolves to, so resend with them). At most 64 sources, one per CA. Body capped at 192 KiB. No outbound proxy is used. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.update (attempted row first). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP update_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"expected_config_version":{"type":"integer","minimum":1,"description":"The config_version as you last read it; a mismatch is 409 and replaces nothing"},"name":{"type":"string","minLength":1,"maxLength":128},"ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"PEM CERTIFICATE blocks of ONE CA (one subject Name); each must be a CA (basicConstraints cA=TRUE) with cRLSign if it has a key usage extension"},"crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]}}},"required":["url"],"additionalProperties":false}}},"required":["expected_config_version","name","ca_certificates","crl_urls"],"additionalProperties":false}}}},"responses":{"200":{"description":"{data:source plus changed, dropped_urls, dropped_ca_certificates, crls_deleted, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceUpdateResult"}}}},"400":{"description":"Not JSON, a field outside its rule, or a different CA subject (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"409":{"description":"expected_config_version is stale: the configuration would change and the source has moved on; error.remediation names the current config_version (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"413":{"description":"Body over 192 KiB"},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), the outcome is unknown, this server's own addresses could not be determined, or a name lookup timed out: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"delete":{"operationId": "deleteCryptoRevocationSourcesById", "summary":"Remove a registered CRL source","tags":["Crypto"],"description":"Removes the source with its URLs, held CRLs, entries and signature checks; certificates it covered then read 'issuer not registered'. The CA's anti-rollback marks SURVIVE, so remove-and-re-register cannot accept an older CRL. Removal is a Write (there is no separate Delete). Idempotent: a repeat answers 404. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.remove (attempted row first). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP remove_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"{data:{id, removed:true}, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceRemoved"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), or the outcome is unknown (read the source to check): retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},
+    "/crypto/revocation-sources/{id}": {"get":{"operationId": "getCryptoRevocationSourcesById", "summary":"Show one registered CRL source","tags":["Crypto"],"description":"One source with its CA certificates (sha256, SKI, SPKI hash), CRL URLs, confirmed address classes and fetch status. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Audited as crypto.revocation_source.view (a row that does not persist answers 503 with no data). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP get_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"{data:source (including high_water{reset_at,pinned_crl_sha256}), meta}", "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceResult"}}}},"401":{"description":"Unauthenticated"},"403":{"description":"Not an administrator, no RevocationSource:Read, a service-scoped token, or an MCP-tier bearer (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded or the audit row could not be written: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"put":{"operationId": "putCryptoRevocationSourcesById", "summary":"Replace a CRL source's name, keys and URLs","tags":["Crypto"],"description":"A full replace (this is how a renewed CA key is added). The certificates must name the same subject as the registered source. A URL absent from the body is deleted with its fetch status and every held CRL fetched from it; a key absent from the body deletes every held CRL that verified only under it; the CA's anti-rollback marks are never touched. REQUIRED expected_config_version: if the configuration would change and the source has moved on since you read it the call is 409 and replaces nothing. Idempotent: a body equal to the current configuration changes nothing and does not bump config_version (changed false). Each URL: http or https only, a host, no userinfo, no fragment, at most 2048 bytes, ASCII (internationalised hosts as punycode). The host is resolved at registration: loopback, link-local, cloud metadata, unspecified, multicast and reserved addresses and every address this server is bound to are refused with no override. An IPv6 address that embeds an IPv4 address is judged by the embedded one: the well-known NAT64 prefix 64:ff9b::/96, 6to4, IPv4-mapped and the operator-declared prefixes, and also SIIT and IPv4-compatible forms, which are never judged more open than non-global. A local-use NAT64 (64:ff9b:1::/48) address that no declared prefix covers is refused. Only declared prefixes are known at registration (no RFC 7050 discovery is done), so any other address behind an undeclared prefix is judged as plain IPv6 here and re-judged when the source is fetched. If the server's own addresses cannot be determined or a lookup times out, the request is a retryable 503 and registers nothing. Any other class (public, private, carrier-grade-nat, unique-local, non-global) must be named in confirmed_address_classes (a 400 names the classes the host resolves to, so resend with them). At most 64 sources, one per CA. Body capped at 192 KiB. No outbound proxy is used. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.update (attempted row first). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP update_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"requestBody":{"required":true,"content":{"application/json":{"schema":{"type":"object","properties":{"expected_config_version":{"type":"integer","minimum":1,"description":"The config_version as you last read it; a mismatch is 409 and replaces nothing"},"name":{"type":"string","minLength":1,"maxLength":128},"ca_certificates":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","maxLength":16384},"description":"PEM CERTIFICATE blocks of ONE CA (one subject Name); each must be a CA (basicConstraints cA=TRUE) with cRLSign if it has a key usage extension"},"crl_urls":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"object","properties":{"url":{"type":"string","maxLength":2048},"confirmed_address_classes":{"type":"array","maxItems":5,"items":{"type":"string","enum":["public","private","carrier-grade-nat","unique-local","non-global"]}}},"required":["url"],"additionalProperties":false}}},"required":["expected_config_version","name","ca_certificates","crl_urls"],"additionalProperties":false}}}},"responses":{"200":{"description":"{data:source plus changed, dropped_urls, dropped_ca_certificates, crls_deleted, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceUpdateResult"}}}},"400":{"description":"Not JSON, a field outside its rule, or a different CA subject (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"409":{"description":"expected_config_version is stale: the configuration would change and the source has moved on; error.remediation names the current config_version (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"413":{"description":"Body over 192 KiB"},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), the outcome is unknown, this server's own addresses could not be determined, or a name lookup timed out: retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}},"delete":{"operationId": "deleteCryptoRevocationSourcesById", "summary":"Remove a registered CRL source","tags":["Crypto"],"description":"Removes the source with its URLs, held CRLs, entries and signature checks; certificates it covered then read 'issuer not registered'. The CA's anti-rollback marks SURVIVE, so remove-and-re-register cannot accept an older CRL. Removal is a Write (there is no separate Delete). Idempotent: a repeat answers 404. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.remove (attempted row first). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP remove_revocation_source.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"responses":{"200":{"description":"{data:{id, removed:true}, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceRemoved"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), or the outcome is unknown (read the source to check): retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},
 )json"
         R"json(
     "/crypto/revocation-sources/{id}/reset-high-water": {"post":{"operationId": "postCryptoRevocationSourcesByIdResetHighWater", "summary":"Reset a CA's CRL anti-rollback marks","tags":["Crypto"],"description":"Sets reset_at on every anti-rollback mark of the source's CA and deletes the source's held CRLs. Use it only after confirming the CA's clock or CRL numbering moved backwards on purpose: until the next CRL is accepted the CA's certificates read 'revocation not checked', and the reset opens a replay window (a CRL that verifies and is dated at or after the reset is accepted whatever its number). Optional body {\"reset_at\": RFC 3339 UTC, no later than the server clock}: a value below the CA's current thisUpdate widens the window to everything since it. The response echoes the window opened; read the source afterwards (high_water.reset_at) to confirm a reset whose outcome was unknown. The reset also clears each scope's CRL number and thisUpdate and bumps config_version; pin_crl_sha256 names the only first CRL to accept. NOT idempotent: each call sets a new reset_at and deletes the held CRLs again. Requires the RevocationSource securable AND a durable Administrator role (the same check as the RBAC grant routes): admin-only in BOTH RBAC states and not grantable, so a custom role holding the securable is still refused. A service-scoped token and an MCP-tier bearer token are refused 403. Cookie sessions must be same-site; MFA step-up applies. Audited as crypto.revocation_source.reset_high_water (attempted row first, carrying reset_at). Facts only; the only built-in checks are D13's named rules and windows, each shown with its criterion. Twin: MCP reset_revocation_source_high_water.","parameters":[{"name":"id","in":"path","required":true,"schema":{"type":"integer","minimum":1}}],"requestBody":{"required":false,"content":{"application/json":{"schema":{"type":"object","properties":{"reset_at":{"type":"string","description":"A real RFC 3339 UTC time from 1970 on, no later than the server clock; default now"},"pin_crl_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$","description":"SHA-256 of the only first CRL to accept afterwards"}},"additionalProperties":false}}}},"responses":{"200":{"description":"{data:{reset_at, crls_deleted, replay_window_opens_at, pinned}, meta}","headers":{"Sec-Audit-Failed":{"schema":{"type":"string","enum":["true"]},"description":"Present when the outcome audit row did not persist (the body carries audit_persisted false)"}}, "content": {"application/json": {"schema": {"$ref": "#/components/schemas/RevocationSourceHighWaterReset"}}}},"400":{"description":"A body that is not an object, an unknown key, or a reset_at that is malformed or later than the server clock (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"401":{"description":"Unauthenticated, or MFA step-up required"},"403":{"description":"Not an administrator, no RevocationSource:Write, a service-scoped token, an MCP-tier bearer or a cross-site cookie write (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"404":{"description":"No such source (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"413":{"description":"Body over 192 KiB (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}},"503":{"description":"Store degraded, the attempted audit row could not be written (Sec-Audit-Failed; nothing changed), or the outcome is unknown (read the source to check): retry_after_ms 5000 (standard error envelope)","content":{"application/json":{"schema":{"$ref":"#/components/schemas/A4ErrorEnvelope"}}}}}}},)json"
@@ -12149,130 +12149,45 @@ void RestApiV1::register_routes(
         }
         return gate;
     };
-    auto lookup_facts_reads = [software_inventory_store, hostnames_fn]() {
-        software_list::FactsReads io;
-        io.last_seen = [software_inventory_store](const std::vector<std::string>& ids) {
-            return software_inventory_store->source_last_seen_bulk("installed_software", ids);
-        };
-        io.hostnames = hostnames_fn; // the device table's roster, not the connected-agent registry
-        return io;
-    };
-    auto lookup_totals_reads = [software_inventory_store]() {
-        software_list::TotalsReads io;
-        io.catalog_meta = [software_inventory_store] {
-            return software_inventory_store->catalog_rollup_meta();
-        };
-        io.component_meta = [software_inventory_store] {
-            return software_inventory_store->component_rollup_meta();
-        };
-        io.title_totals = [software_inventory_store](std::string_view name) {
-            return software_inventory_store->catalog_title_totals(name);
-        };
-        io.version_set_totals = [software_inventory_store](std::string_view name,
-                                                           const std::vector<std::string>& vs) {
-            return software_inventory_store->installed_software_version_set_totals(name, vs);
-        };
-        io.component_totals = [software_inventory_store](
-                                  std::string_view kind, std::string_view name,
-                                  const std::optional<std::vector<std::string>>& vs) {
-            return software_inventory_store->component_totals(kind, name, vs);
-        };
-        return io;
-    };
-    // The version-range step both lookup routes share (`rq.range` is engaged: version_min/version_max
-    // and `vers` are one range). `read_distinct` is a LIVE distinct-version
-    // read of the title or component (never an hourly rollup: a version first reported since the
-    // last refresh must be inside the range) OVER THE CALLER'S SCOPE (the gate's VisibleSet is
-    // pushed into it, swl::scope_ids; a global caller reads the fleet); it resolves to the exact
-    // version set under the catalogue comparator for EVERY caller, a SQL predicate only that never
-    // leaves the handler. Returns the set, or nullopt once the response is written: 503 on a
-    // degraded read, 400 when the read was cut at kCatalogRowCap and the range cannot be
-    // resolved. Because the read is scoped, that 400 is a fact about the caller's own rows: a
-    // confined caller is answered for a title with 2000 versions outside its scope exactly as for
-    // an unknown title, never a fleet-wide threshold it could not otherwise observe.
-    auto resolve_range = [sw_503](const httplib::Request& req, httplib::Response& res,
-                                  const std::string& cid, const char* verb,
-                                  const std::string& audit_key, auto&& read_distinct,
-                                  const auto& rq) -> std::optional<std::vector<std::string>> {
-        const auto distinct = read_distinct();
-        if (!distinct) {
-            sw_503(req, res, cid, verb, audit_key, "version read degraded",
-                   "software inventory store degraded — version range read failed");
-            return std::nullopt;
-        }
-        auto set = software_list::resolve_version_range(*distinct, *rq.range);
-        if (!set) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, set.error()), "application/json");
-            return std::nullopt;
-        }
-        return std::move(*set);
-    };
+    // The store reads, the version-range resolve, the device facts and the totals read of both
+    // lookup routes are software_list::lookup_installs / lookup_components (software_list_model.hpp,
+    // the same functions the MCP lookup tools call); a route binds its reads with
+    // software_list::bind_lookup_reads over the store pointer and hostnames_fn held here.
     // The per-route constants of the shared tail below.
     struct LookupShape {
         const char* noun;         // audit detail prefix of an export: "installs" | "components"
         const char* csv_filename; // Content-Disposition of the CSV export
         std::size_t csv_columns;  // width of the CSV truncation trailer
-        bool components;          // totals key: instances (true) | installs (false)
     };
-    // The tail both lookup routes share once their page is read: the cursor-400 / degraded-503
-    // split, the per-page device facts, the totals decision + read (JSON only; a degraded read is
-    // a 503, never a null), the set-and-proceed audit (`success` on EVERY call, continuation
-    // pages tagged page=continuation — the cursor is opaque but unauthenticated, so per-call
-    // audit keeps a forged cursor from walking the fleet unrecorded; a post-filter drop is
-    // audited distinctly as `denied`), then the CSV file (continuation in X-Next-Cursor, in-band
-    // trailer on a capped page) or the JSON body with totals / totals_omitted / audit_persisted.
-    // `read` is the model's page result, `query` the parsed store query, `read_totals`,
-    // `to_csv` and `to_json` the route's model functions.
-    auto serve_lookup_page = [audit_fn, sw_503, lookup_facts_reads, lookup_totals_reads](
-                                 const httplib::Request& req, httplib::Response& res,
-                                 const std::string& cid, const char* verb,
-                                 const std::string& audit_key, const std::string& format,
-                                 bool continuation, const auto& read, bool admit_all,
-                                 const auto& query, auto&& read_totals, auto&& to_csv,
-                                 auto&& to_json, const LookupShape& shape) {
+    // The tail both lookup routes share once their lookup core has answered: the 400 / 503 split
+    // of a LookupError (the core writes no audit row; a 503 is audited here), the set-and-proceed
+    // audit (`success` on EVERY call, continuation pages tagged page=continuation: the cursor is
+    // opaque but unauthenticated, so per-call audit keeps a forged cursor from walking the fleet
+    // unrecorded; a post-filter drop is audited distinctly as `denied`), then the CSV file
+    // (continuation in X-Next-Cursor, in-band trailer on a capped page) or the JSON body with
+    // totals / totals_omitted / audit_persisted. `lookup` is the core's result (totals are read
+    // for JSON only: the route passes want_totals = !csv), `to_csv` the route's model function.
+    auto serve_lookup_page = [audit_fn, sw_503](const httplib::Request& req, httplib::Response& res,
+                                                const std::string& cid, const char* verb,
+                                                const std::string& audit_key,
+                                                const std::string& format, bool continuation,
+                                                const auto& lookup, auto&& to_csv,
+                                                const LookupShape& shape) {
         namespace swc = software_catalogue;
         namespace swl = software_list;
         const bool csv = format == "csv";
         const bool export_mode = !format.empty();
-        if (!read) {
-            if (read.error()) {
+        if (!lookup) {
+            const auto& err = lookup.error();
+            if (err.fault == swl::LookupFault::kBadRequest) {
                 res.status = 400;
-                res.set_content(
-                    detail::a4_error(res, std::string(swc::cursor_error_message(*read.error()))),
-                    "application/json");
+                res.set_content(detail::a4_error(res, err.message), "application/json");
                 return;
             }
-            // Store degraded (pool/query failure) — surface it, NEVER an empty list. A silent
-            // empty reads as "installed nowhere" for a fleet vuln query (ADR-0016 §7
-            // authoritative reads; agentic-first A4 failure-vs-empty). Audit the degraded access
-            // (CC7.2) through the #1647 throw-safe kernel.
-            sw_503(req, res, cid, verb, audit_key, "store degraded",
-                   "software inventory store degraded — query failed");
+            sw_503(req, res, cid, verb, audit_key, err.audit_detail, err.message);
             return;
         }
-        const auto& page = *read;
-        const auto facts =
-            swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
-        if (!facts) {
-            sw_503(req, res, cid, verb, audit_key, "device facts degraded",
-                   "software inventory store degraded — last-poll read failed");
-            return;
-        }
-
-        // Totals (JSON only). The admission rule is the model's; the decision is the gate's:
-        // scope == nullopt is the unfiltered (AdmitAll) case, anything engaged gets rows and NO
-        // totals (a fleet rollup cannot be confined, ADR-0017).
-        const auto decision = swl::totals_decision(admit_all, query);
-        swl::TotalsOutcome totals;
-        if (!csv && decision.serve) {
-            totals = read_totals(lookup_totals_reads(), query);
-            if (totals.status == swl::TotalsStatus::kDegraded) {
-                sw_503(req, res, cid, verb, audit_key, "totals degraded",
-                       "software inventory store degraded — totals read failed");
-                return;
-            }
-        }
+        const auto& page = lookup->page;
 
         bool denied_ok = true;
         if (const auto denied = swc::denied_detail(page); !denied.empty())
@@ -12297,18 +12212,13 @@ void RestApiV1::register_routes(
                 res.set_header("X-Next-Cursor", page.next_cursor);
             if (!audit_ok)
                 res.set_header("Sec-Audit-Failed", "true");
-            auto body = to_csv(page.rows, *facts);
+            auto body = to_csv(page.rows, lookup->facts);
             if (page.hit_cap)
                 body += export_csv_truncation_row(ExportCut{.row_cap = true}, shape.csv_columns);
             res.set_content(std::move(body), "text/csv; charset=utf-8");
             return;
         }
-        auto body = to_json(page.rows, *facts, page.next_cursor, page.devices_omitted, page.hit_cap);
-        if (decision.serve && totals.status == swl::TotalsStatus::kServed)
-            swl::set_totals(body, totals, shape.components);
-        else
-            swl::set_totals_omitted(body,
-                                    decision.serve ? swl::kOmittedBuilding : decision.omitted);
+        auto body = swl::lookup_body(*lookup);
         if (!audit_ok)
             body["audit_persisted"] = false;
         res.set_content(ok_json(swc::dump_safe(body)), "application/json");
@@ -12316,7 +12226,7 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/inventory/software/components",
-        [software_inventory_store, lookup_admit, resolve_range,
+        [software_inventory_store, hostnames_fn, lookup_admit,
          serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
             namespace swc = software_catalogue;
             namespace swl = software_list;
@@ -12340,29 +12250,16 @@ void RestApiV1::register_routes(
                 export_mode ? "inventory.components.export" : "inventory.components.view";
             const std::string audit_key = swl::audit_target(rq);
 
-            if (rq.has_range()) {
-                auto set = resolve_range(
-                    req, res, cid, verb, audit_key,
-                    [&] {
-                        return software_inventory_store->component_versions(
-                            rq.query.kind, rq.query.name, swl::scope_ids(gate.scope));
-                    },
-                    rq);
-                if (!set)
-                    return;
-                rq.query.versions = std::move(*set);
-            }
-
-            const auto read = swl::read_components_page(
-                [software_inventory_store](const SoftwareComponentQuery& q) {
-                    return software_inventory_store->query_components(q);
-                },
-                rq, gate.scope);
-            serve_lookup_page(req, res, cid, verb, audit_key, rq.format, continuation, read,
-                              !gate.scope.has_value(), rq.query, &swl::read_component_totals,
-                              &swl::components_csv, &swl::components_response_json,
+            // The version-range resolve, the page, the facts and the totals (JSON only) are the
+            // lookup core's, the same function the MCP query_software_components tool calls.
+            const std::string format = rq.format;
+            const auto lookup = swl::lookup_components(
+                swl::bind_lookup_reads(*software_inventory_store, hostnames_fn), std::move(rq),
+                gate.scope, format != "csv");
+            serve_lookup_page(req, res, cid, verb, audit_key, format, continuation, lookup,
+                              &swl::components_csv,
                               LookupShape{"components", "software-components.csv",
-                                          swl::kComponentsCsvColumns, true});
+                                          swl::kComponentsCsvColumns});
         });
 
     sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
@@ -12514,7 +12411,7 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [fleet_read_fn, software_inventory_store, resolve_range,
+             [fleet_read_fn, software_inventory_store, hostnames_fn,
               serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
@@ -12569,33 +12466,20 @@ void RestApiV1::register_routes(
                      export_mode ? "inventory.software.export" : "inventory.software.query";
                  const std::string audit_key = swl::audit_target(rq);
 
-                 if (rq.has_range()) {
-                     auto set = resolve_range(
-                         req, res, cid, verb, audit_key,
-                         [&] {
-                             return software_inventory_store->installed_software_distinct_versions(
-                                 rq.base.query.name, swl::scope_ids(gate.scope));
-                         },
-                         rq);
-                     if (!set)
-                         return;
-                     rq.base.query.versions = std::move(*set);
-                 }
-
-                 // The model decodes the cursor, pushes the scope into SQL up to
-                 // kScopePushdownMaxIds (complete pages, nothing hidden) and post-filters only a
-                 // wider scope — the gate's own composed meet(management-group, service-scope)
-                 // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
-                 // filter (0 under push-down).
-                 const auto read =
-                     swl::read_list_page(swc::devices_reader(*software_inventory_store), rq,
-                                         gate.scope);
-                 serve_lookup_page(req, res, cid, verb, audit_key, rq.base.format, continuation,
-                                   read, !gate.scope.has_value(), rq.base.query,
-                                   &swl::read_application_totals, &swl::list_csv,
-                                   &swl::list_response_json,
+                 // The version-range resolve, the page (the model decodes the cursor, pushes the
+                 // scope into SQL up to kScopePushdownMaxIds and post-filters only a wider scope:
+                 // the gate's own composed meet(management-group, service-scope) VisibleSet,
+                 // #3290; `devices_omitted` is the devices hidden by that filter, 0 under
+                 // push-down), the facts and the totals (JSON only) are the lookup core's, the
+                 // same function the MCP query_installed_software tool calls.
+                 const std::string format = rq.base.format;
+                 const auto lookup = swl::lookup_installs(
+                     swl::bind_lookup_reads(*software_inventory_store, hostnames_fn),
+                     std::move(rq), gate.scope, format != "csv");
+                 serve_lookup_page(req, res, cid, verb, audit_key, format, continuation, lookup,
+                                   &swl::list_csv,
                                    LookupShape{"installs", "software-installs.csv",
-                                               swl::kListCsvColumns, false});
+                                               swl::kListCsvColumns});
              });
 
     // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────

@@ -2344,6 +2344,15 @@ jobs:
           YUZU_REQUIRE_PSQL: "1"
         run: bash tests/shell/test_gateway_peer_boot_refusal.sh
 
+      - name: Gateway entrypoint cookie refusal test
+        timeout-minutes: 3
+        env:
+          YUZU_REQUIRE_ALL_SHELLS: "1"
+        run: |
+          # the test needs dash and busybox sh as well as bash (it fails, not skips, without them)
+          command -v busybox >/dev/null 2>&1 || sudo apt-get -o DPkg::Lock::Timeout=300 install -y busybox-static
+          bash tests/shell/test_gateway_entrypoint_cookie.sh
+
       # Gateway real-wire gate (#5652, #5653): the REAL yuzu-server under test, the REAL gateway
       # release (`rebar3 as prod release`) and one REAL yuzu-agent, brought up by
       # scripts/integration-test.sh --tls, then gateway/apps/yuzu_gw/integration_test/
