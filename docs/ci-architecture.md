@@ -1508,7 +1508,7 @@ base digest, a list entry) cannot reach this release's bundle at all. So:
   release itself is complete and its other images are signed; say so in the release notes or
   announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
   Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,
-  Limit 1); it is an owner decision recorded in a tracking issue.
+  Limit 1); it is an owner-decided incident, recorded in a tracking issue opened for it and announced.
 
 A failed bundle job also leaves the Release run red, and Pre-release QA starts only on a
 successful Release run, so that version gets no post-release scan or QA at all; a manual dispatch

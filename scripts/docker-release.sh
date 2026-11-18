@@ -40,7 +40,7 @@ done
 
 if [[ -z "$VERSION" ]]; then
     echo "Usage: $0 [--dry-run|--build-only] <version-tag>"
-    echo "  e.g. $0 v0.8.0"
+    echo "  e.g. $0 --build-only v0.8.0   (a bare push is not a release procedure; see the header)"
     exit 1
 fi
 

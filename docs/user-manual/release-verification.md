@@ -233,13 +233,21 @@ Either of the following is an incident, not a registry fault to wait out; report
 [private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new):
 
 - **A release's `:X.Y.Z`, or a digest its journal names, stops resolving or changes without such an
-  announcement.** Do not adopt the new digest. Keep deploying the digest you already have only if it
-  still passes `cosign verify` for that release's tag (section 3); never replace it with an image
-  no release names.
+  announcement.** Do not adopt the new digest. Keep deploying the digest you already have only if
+  `cosign verify` still accepts THAT DIGEST for that release's tag (verify the digest, not the tag,
+  which may now name something else); never replace it with an image no release names:
+
+  ```bash
+  cosign verify \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "ghcr.io/${OWNER}/<image>@sha256:<the digest you deployed>"
+  ```
+
 - **You suspect a release digest itself is compromised.** Stop deploying that digest to new hosts,
   and handle the hosts already running it under your own incident process (isolating them if your
   process calls for it). Do not switch to an image no release names; move only to a digest a later
-  release announces and that passes `cosign verify` for that release's tag.
+  release announces and that `cosign verify` accepts, by digest as above, for that release's tag.
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
 afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and
