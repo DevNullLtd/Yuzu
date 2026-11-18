@@ -52,6 +52,28 @@ def main() -> int:
     if "contains_nul(p.string())" in b and "g_reserved_mu" in b:
         if b.index("contains_nul(p.string())") > b.index("g_reserved_mu"):
             problems.append("the NUL refusal must precede the reserved-set snapshot")
+    # Whole-statement pins: the call, its `return true`, and the exact argument spelling, so a
+    # weakened condition (`&&` for `||`, a dropped argument, `if (false && ...)`) is caught too.
+    flat = re.sub(r"\s+", " ", b)
+    R = r"yuzu::filesystem::reserved::"
+    pins = {
+        "nul literal": r"^\{ if \(" + R + r"contains_nul\(p\.string\(\)\)\) return true;",
+        "nul canonical": r"if \(" + R + r"contains_nul\(cs\)\) return true;",
+        "dev_fd": r"if \(\s*" + R + r"is_dev_fd_path\(cs\) \|\| " + R
+        + r"is_dev_fd_path\(path_bytes\(p\.lexically_normal\(\)\)\)\) return true;",
+        "vol": r"#ifdef __APPLE__ if \(" + R + r"is_apple_vol_path\(path_bytes\(p\.lexically_normal\(\)\)\) \|\| "
+        + R + r"is_apple_vol_path\(cs\)\) return true;",
+        "refresh": r"if \(!refresh\(snapshot\.files\) \|\| !refresh\(snapshot\.dirs\)\) return true;",
+        "eloop": r"too_many_symbolic_link_levels\) return false;",
+        "unresolved": r"if \(ok && !resolved\) return false;",
+    }
+    for name, rx in pins.items():
+        if not re.search(rx, flat):
+            problems.append(f"whole-statement pin {name!r} not found (condition weakened or removed)")
+    if re.search(r"if \(false|if \(0\b", flat):
+        problems.append("a disabled branch (`if (false` / `if (0`) in the decision")
+    if not re.search(r"constexpr int kMaxLinkHops = 40;", re.sub(r"\s+", " ", code)):
+        problems.append("kMaxLinkHops is not the pinned 40")
     for p in problems:
         print("FAIL:", p)
     if problems:

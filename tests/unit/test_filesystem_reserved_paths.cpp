@@ -533,7 +533,11 @@ TEST_CASE("filesystem plugin: a reserved name behind a link chain longer than th
           "[agent][filesystem_plugin][reserved][symlink]") {
     auto handle = load_fs_plugin();
     REQUIRE(handle);
-    for (const int hops : {41, 39}) {
+    // Kernel symlink-follow limits differ: Linux MAXSYMLINKS = 40, macOS (XNU) = 32 (and a macOS temp
+    // root sits under /var -> /private/var, one more hop). 28 resolves on both; 41 refuses on both (the
+    // kernel's ELOOP). Exactly 40 reaches the plugin's own kMaxLinkHops cap branch on Linux (on macOS
+    // the kernel refuses first: the assertion is the same, the branch differs).
+    for (const int hops : {41, 40, 28}) {
         yuzu::test::TempDir root{"yuzu_test_fs_reserved_chain_"};
         std::error_code dec;
         fs::create_directories(root.path, dec);
@@ -556,7 +560,7 @@ TEST_CASE("filesystem plugin: a reserved name behind a link chain longer than th
         auto run = make_runner(*handle);
         auto r = run("read", {{"path", ok.string()}});
         INFO("hops=" << hops);
-        if (hops > 40) {
+        if (hops >= 40) {
             CHECK(r.rc != 0); // an unresolved chain refuses rather than being skipped
         } else {
             CHECK(r.rc == 0);

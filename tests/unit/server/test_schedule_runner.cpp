@@ -35,6 +35,7 @@
 #include <catch2/generators/catch_generators.hpp>
 #include <libpq-fe.h>
 
+#include <algorithm>
 #include <chrono>
 #include <expected>
 #include <functional>
@@ -1872,8 +1873,9 @@ TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair 
           "still fires in bounded ticks (WP06 F53)",
           "[schedule][runner][d7][pg]") {
     int asked_held = 0;
-    // The check is keyed on the PAIR, as the real one is: a Read-class pair needs no store read and
-    // answers at once; every other pair needs the (failing) auth store.
+    // The harness check stands in for the real one and is keyed on the PAIR the way the real one
+    // is: a Read-class pair needs no store read and answers at once; every other pair needs the
+    // (failing) auth store. (The production arming function is covered in test_operator_surface_twins.)
     Harness h([&](const std::string&, const std::string& plugin, const std::string&)
                   -> std::expected<bool, std::string> {
         if (plugin == "ro")
@@ -1926,7 +1928,41 @@ TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair 
     }
     REQUIRE_FALSE(h.enqueues.empty());
     CHECK(h.enqueues[0].plugin == "ro");
-    CHECK(ticks <= 25);
+    CHECK(ticks <= 18); // ceil(50/3) + 1: the documented bound
+}
+
+TEST_CASE("ScheduleRunner: schedules due at the same instant are asked in id order (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    std::vector<std::string> asked;
+    Harness h([&](const std::string& principal, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        asked.push_back(principal);
+        return std::unexpected(std::string("auth store error"));
+    });
+    std::map<std::string, std::string> id_of; // principal -> schedule id
+    for (int i = 0; i < 6; ++i) {
+        InstructionSchedule s;
+        s.name = "tie-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "u" + std::to_string(i);
+        s.next_execution_at = 5; // identical for all six
+        auto id = h.engine.create_schedule(s);
+        REQUIRE(id.has_value());
+        id_of[s.created_by] = *id;
+    }
+    h.runner.tick(); // asks the first three in due order, then stops at the cap
+    REQUIRE(asked.size() == 3);
+    std::vector<std::string> by_id;
+    for (const auto& [principal, id] : id_of)
+        by_id.push_back(id);
+    std::sort(by_id.begin(), by_id.end());
+    std::vector<std::string> asked_ids;
+    for (const auto& p : asked)
+        asked_ids.push_back(id_of[p]);
+    CHECK(asked_ids == std::vector<std::string>(by_id.begin(), by_id.begin() + 3));
 }
 
 TEST_CASE("ScheduleRunner: the held gauge and deferred counter report the hold, a failed due read "

@@ -4691,8 +4691,6 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
-# The agent's reserved-path key list: every path-like `agent.*` key agent.cpp publishes to plugins
-# must be classified in agents/shared/agent_reserved_path_keys.hpp (source-text only, so Python).
 # The filesystem plugin's reserved-path decision keeps its NUL, /dev/fd, macOS /.vol/ and re-resolution
 # calls (not reachable through the plugin seam on Linux): source-text only, so Python.
 test('filesystem reserved path wiring lexical gate',
@@ -4701,6 +4699,8 @@ test('filesystem reserved path wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# The agent's reserved-path key list: every path-like `agent.*` key agent.cpp publishes to plugins
+# must be classified in agents/shared/agent_reserved_path_keys.hpp (source-text only, so Python).
 test('agent reserved path keys lexical gate',
   _python3_test,
   args: [files('test_agent_reserved_path_keys.py')],

@@ -31,6 +31,10 @@ namespace {
 
 constexpr const char* kStoreName = "policy_store";
 constexpr auto kAcquireTimeout = std::chrono::milliseconds(3000);
+// One WHOLE-CALL wall-clock budget for set_agents_error_status (every chunk and every retry): the
+// write runs on policy_eval_thread_, which also runs collect_ready and is joined (bare join) at
+// shutdown, so it must be bounded. Bounds shutdown at about twice this (one in-flight statement).
+constexpr auto kErrorVerdictBudget = std::chrono::seconds(30);
 constexpr auto kClaimTimeout = std::chrono::milliseconds(5000);
 constexpr int64_t kStalenessTtl = 24 * 3600; // fleet-compliance freshness window
 constexpr int kMaxFixAttempts = 3;
@@ -1219,7 +1223,8 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
 std::expected<std::size_t, std::string>
 PolicyStore::set_agents_error_status(const std::string& policy_id,
                                      const std::vector<std::string>& agent_ids,
-                                     const std::string& check_result, std::size_t* retries) {
+                                     const std::string& check_result, std::size_t* retries,
+                                     const std::function<bool()>& should_stop) {
     if (retries)
         *retries = 0;
     if (!open_)
@@ -1244,22 +1249,37 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
                 unique_ids.emplace_back(id);
     }
     // The pool validates a connection only when it is RETURNED, so after a Postgres restart every
-    // warm connection can be dead: a failed chunk is retried with a FRESH lease, up to one attempt
-    // per pooled connection plus one (bounded), so the dead ones are drained and a live one is
-    // reached. Every chunk is attempted whatever happened to the one before it: stopping at the
-    // first failure would leave the tail holding its previous (possibly compliant) verdict for the
-    // whole interval.
+    // warm connection can be dead: a CONNECTION-class failure is retried with a FRESH POOL LEASE, up
+    // to one attempt per pooled connection plus one, so the dead ones are drained and a live one is
+    // reached. A STATEMENT error (a timeout, a lock wait, a constraint) reuses the same healthy backend
+    // and would fail the same way, so it is NOT retried. The whole call (all chunks, all retries) shares
+    // one wall-clock budget, kErrorVerdictBudget. Every chunk is attempted whatever happened to the
+    // one before it: stopping at the first failure would leave the tail holding its previous (possibly
+    // compliant) verdict for the whole interval.
     const std::size_t max_attempts = pool_.size() + 1;
+    const auto budget = budget_for_test_.value_or(
+        std::chrono::duration_cast<std::chrono::milliseconds>(kErrorVerdictBudget));
+    const auto deadline = std::chrono::steady_clock::now() + budget;
+    bool logged_first_error = false;
+    bool budget_exhausted = false;
     for (std::size_t i = 0, idx = 0; i < unique_ids.size(); i += kChunk, ++idx) {
         const auto e = std::min(unique_ids.size(), i + kChunk);
         const std::vector<std::string_view> chunk(unique_ids.begin() + static_cast<std::ptrdiff_t>(i),
                                                   unique_ids.begin() + static_cast<std::ptrdiff_t>(e));
         bool done = false;
         for (std::size_t attempt = 0; attempt < max_attempts && !done; ++attempt) {
+            if (attempt > 0 && should_stop && should_stop())
+                break;
+            if (i > 0 || attempt > 0) { // the very first attempt of the call always runs
+                if (std::chrono::steady_clock::now() >= deadline) {
+                    budget_exhausted = true;
+                    break;
+                }
+            }
             if (attempt > 0)
                 ++retry_count;
             if (chunk_fault_hook_for_test_ && chunk_fault_hook_for_test_(idx))
-                continue;
+                continue; // simulated connection-class failure
             auto lease = pool_.try_acquire_for(kAcquireTimeout);
             if (!lease)
                 continue;
@@ -1278,9 +1298,25 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
                 "RETURNING policy_id",
                 std::vector<std::string>{policy_id, pg::to_text_array(chunk), cr});
             if (res.status() != PGRES_TUPLES_OK) {
-                spdlog::error("PolicyStore: write failed in set_agents_error_status "
-                              "(chunk {}, attempt {}): {}",
-                              idx, attempt, PQerrorMessage(lease.get()));
+                const char* sqlstate = PQresultErrorField(res.get(), PG_DIAG_SQLSTATE);
+                const std::string state = sqlstate ? sqlstate : "";
+                const bool connection_class =
+                    PQstatus(lease.get()) != CONNECTION_OK || state.starts_with("08") ||
+                    state == "57P01" || state == "57P02" || state == "57P03";
+                const std::string msg = PQerrorMessage(lease.get());
+                if (!logged_first_error) {
+                    logged_first_error = true;
+                    spdlog::error("PolicyStore: write failed in set_agents_error_status "
+                                  "(chunk {}, attempt {}, sqlstate '{}'{}): {}",
+                                  idx, attempt, state,
+                                  connection_class ? ", connection-class" : ", statement error, not retried",
+                                  msg);
+                } else {
+                    spdlog::warn("PolicyStore: set_agents_error_status chunk {} attempt {} failed: {}",
+                                 idx, attempt, msg);
+                }
+                if (!connection_class)
+                    break; // a statement error repeats on the same healthy backend: do not retry
                 continue;
             }
             written += static_cast<std::size_t>(PQntuples(res.get()));
@@ -1289,6 +1325,11 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
         if (!done)
             ++failed_chunks;
     }
+    if (failed_chunks > 0 || retry_count > 0)
+        spdlog::warn("PolicyStore: set_agents_error_status for policy {}: {} row(s) written, {} chunk(s) "
+                     "failed, {} retry attempt(s){}",
+                     policy_id, written, failed_chunks, retry_count,
+                     budget_exhausted ? ", call budget exhausted" : "");
     if (retries)
         *retries = retry_count;
     if (written > 0)

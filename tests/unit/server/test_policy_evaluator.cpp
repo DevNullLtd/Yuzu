@@ -37,7 +37,9 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <chrono>
 #include <libpq-fe.h>
+#include <thread>
 
 #include <map>
 #include <set>
@@ -768,6 +770,47 @@ TEST_CASE("policy store: backends killed mid-run are retried on fresh leases and
     CHECK(retries >= 3); // one retry per killed first attempt
     CHECK(h.status_of(pid, "agent-0") == "error");
     CHECK(h.status_of(pid, "agent-2499") == "error");
+}
+
+TEST_CASE("policy store: a statement error is NOT retried, and the call budget bounds the retries "
+          "(WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+    std::vector<std::string> targets{"agent-a", "agent-b", "agent-c"};
+
+    // (1) A healthy backend that refuses the statement (read-only transaction, SQLSTATE 25006):
+    // retrying cannot help, so exactly one attempt is made.
+    int hook_calls = 0;
+    h.ps.set_lease_hook_for_test([&](PGconn* conn, std::size_t, std::size_t) {
+        ++hook_calls;
+        PQclear(PQexec(conn, "SET default_transaction_read_only = on"));
+    });
+    std::size_t retries = 99;
+    auto r = h.ps.set_agents_error_status(pid, targets, "x", &retries);
+    h.ps.set_lease_hook_for_test({});
+    CHECK_FALSE(r.has_value());
+    CHECK(retries == 0);
+    CHECK(hook_calls == 1);
+
+    // (2) Connection-class failures ARE retried, but only inside the whole-call budget: each simulated
+    // failure takes 30 ms, the budget is 50 ms, so the 4 retries the pool size allows are cut short.
+    YUZU_REQUIRE_PG_DB_TPL(db2, responsestore_tpl);
+    PgPool pool2{{.conninfo = db2.dsn(), .size = 4}};
+    Harness h2(pool2);
+    auto pid2 = h2.author("result.hostname != ''");
+    h2.ps.set_error_verdict_budget_for_test(std::chrono::milliseconds(50));
+    h2.ps.set_chunk_fault_hook_for_test([](std::size_t) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+        return true;
+    });
+    std::size_t retries2 = 99;
+    auto r2 = h2.ps.set_agents_error_status(pid2, targets, "x", &retries2);
+    h2.ps.set_chunk_fault_hook_for_test({});
+    CHECK_FALSE(r2.has_value());
+    CHECK(retries2 >= 1);
+    CHECK(retries2 < 4); // unbounded retries would make all 4
 }
 
 TEST_CASE("policy evaluator: a lost error-verdict chunk is counted in the error_verdict_write phase "

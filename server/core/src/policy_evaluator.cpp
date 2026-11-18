@@ -509,7 +509,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // interval, so a skipped tail would keep a stale verdict as current.
     auto write_error_verdicts = [&](const char* reason_json) {
         std::size_t retries = 0;
-        auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json, &retries);
+        auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json, &retries, d_.should_stop);
         if (retries > 0 && d_.metrics)
             d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "error_verdict_retry"}})
                 .increment(static_cast<double>(retries));
