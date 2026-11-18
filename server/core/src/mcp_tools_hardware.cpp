@@ -234,8 +234,8 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // REST uses, held across the store call and this page's two audit rows (Page::hold); a point
     // read (agent_id) takes none. Null means no cap (tests only).
     auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
-                                                  deps->ci_collation_gate, deps->ci_read_slots,
-                                                  hardware_ci_page::kMcpRowBudgetBytes);
+                                            deps->ci_collation_gate, deps->ci_read_slots,
+                                            hardware_ci_page::kMcpRowBudgetBytes);
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
