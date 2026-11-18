@@ -22,7 +22,8 @@ branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstone
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
 The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see
-[Decisions](#decisions)); they land as the CRL store's migration v2 before 2b-1b.
+[Decisions](#decisions)); the changes they make land as the CRL store's migration v2 before 2b-1b
+(keeping the per-row `config_version` changes nothing).
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1356,8 +1357,9 @@ every later 2b PR.
 3. **Every host is classified through `oidc_egress_policy.hpp`** at registration, and the 2b-1b
    fetcher must classify it again on every fetch. The never-allowed tier, loopback and every
    address the server is bound to are refused with no override; an embedded-IPv4 form is judged
-   by the address it embeds; an undeclared local-use NAT64 address is refused; every other class
-   must be in `confirmed_address_classes`. Only registered URLs are fetched, never one a
+   by the address it embeds (an SIIT or IPv4-compatible form never as more open than
+   `non-global`); an undeclared local-use NAT64 address is refused; every other class must be in
+   `confirmed_address_classes`. Only registered URLs are fetched, never one a
    certificate names.
 4. **Anti-rollback marks survive a remove.** `rollback_high_water` is keyed by the CA, not the
    source; only the audited high-water reset clears it.
@@ -2050,7 +2052,8 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    R16 (decision 7) later superseded its predicate.
 
 **Decided by the owner, 2026-11-18** (the three CRL store contract questions of #6590, each as
-recommended; they land as the CRL store's migration v2, before 2b-1b accepts any CRL):
+recommended; the changes they make land as the CRL store's migration v2, before 2b-1b accepts any
+CRL, and keeping the per-row `config_version` changes nothing):
 
 - **Reset names the surviving keys by hash.** The high-water reset body (REST
   `POST .../reset-high-water` and MCP `reset_revocation_source_high_water`) gains a required,
