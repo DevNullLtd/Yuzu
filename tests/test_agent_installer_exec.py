@@ -141,13 +141,21 @@ else:
         fake = wd / "systemctl"
         fake.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
         fake.chmod(0o755)
-        if "SYSTEMCTL=/usr/bin/systemctl" not in snap.wrapper_text:
-            errs.append("installed wrapper does not pin SYSTEMCTL=/usr/bin/systemctl")
-        w = wd / "yuzu-systemctl"
-        w.write_text(snap.wrapper_text.replace("SYSTEMCTL=/usr/bin/systemctl", f"SYSTEMCTL={fake}"))
-        w.chmod(0o755)
+        # Without EXACTLY one pin to substitute, the wrapper would run the REAL systemctl (as
+        # root on a root runner): skip the behaviour runs instead of risking that.
+        pin_count = snap.wrapper_text.count("SYSTEMCTL=/usr/bin/systemctl")
+        if pin_count != 1:
+            errs.append(f"installed wrapper must contain exactly one SYSTEMCTL=/usr/bin/systemctl pin, "
+                        f"found {pin_count}; wrapper behaviour NOT exercised")
+            w = None
+        else:
+            w = wd / "yuzu-systemctl"
+            w.write_text(snap.wrapper_text.replace("SYSTEMCTL=/usr/bin/systemctl", f"SYSTEMCTL={fake}"))
+            w.chmod(0o755)
 
         def wrun(*args):
+            if w is None:
+                return None
             return subprocess.run([str(w), *args], capture_output=True, text=True).returncode
 
         for a in (("enable", "ssh.service"), ("disable", "a@b_c-d.service"), ("mask", "x"),

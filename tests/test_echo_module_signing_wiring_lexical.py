@@ -20,13 +20,17 @@ import re
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import cpp_lex_helper as lexh  # noqa: E402
+
 ROOT = Path(__file__).resolve().parent.parent
 SRC = ROOT / "agents" / "plugins" / "echo" / "src" / "echo_module_etw.cpp"
 HINT = " (if the $Module drain was legitimately restructured, update tests/test_echo_module_signing_wiring_lexical.py)"
 
 
 def normalise(src):
-    return re.sub(r"[ \t\n\r\f\v]+", " ", re.sub(r"//.*", "", src))
+    """Comments (line and block), `#if 0` blocks and string-literal contents are removed."""
+    return lexh.code_only(src)
 
 
 def problems(src):
@@ -46,7 +50,11 @@ def problems(src):
         if m_get.start() < m_stamp.start():
             out.append("sign_cache_.get runs BEFORE the stamp is read from the open image")
     drain = t[t.find("ModuleEtwCollector::drain"):] if "ModuleEtwCollector::drain" in t else t
-    for bad in (r"FileVersionStamp ?\{", r"\.usn ?=", r"\.available ?= ?true", r"\.mtime ?="):
+    # a default-built stamp: `FileVersionStamp{}` / `FileVersionStamp x{}` / `FileVersionStamp x;`
+    # / `FileVersionStamp x = {}` anywhere in the drain region (the read above is the only
+    # permitted source of a stamp).
+    for bad in (r"FileVersionStamp ?\{", r"FileVersionStamp \w+ ?\{", r"FileVersionStamp \w+ ?;",
+                r"FileVersionStamp \w+ ?= ?\{", r"\.usn ?=", r"\.available ?= ?true", r"\.mtime ?="):
         if re.search(bad, drain):
             out.append(f"drain region builds or edits a stamp by hand ({bad}); only read_image_version_stamp may")
     return out
@@ -64,6 +72,20 @@ def selftest(src):
          lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());", "", 1)
                     .replace("e.signed_state = v.state;",
                              "e.signed_state = v.state; const FileVersionStamp stamp = read_image_version_stamp(img.get());", 1)),
+        ("stamp hidden in a block comment",
+         lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());",
+                             "/* const FileVersionStamp stamp = read_image_version_stamp(img.get()); */"
+                             " const FileVersionStamp stamp{};", 1)),
+        ("stamp read moved into a string literal",
+         lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());",
+                             'const char* x = "const FileVersionStamp stamp = read_image_version_stamp(img.get());";'
+                             " const FileVersionStamp stamp{};", 1)),
+        ("stamp read under #if 0",
+         lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());",
+                             "\n#if 0\nconst FileVersionStamp stamp = read_image_version_stamp(img.get());\n#endif\n"
+                             "const FileVersionStamp stamp{};\n", 1)),
+        ("default-built stamp beside the read",
+         lambda s: s.replace("sign_cache_.get(full, stamp,", "FileVersionStamp other{}; sign_cache_.get(full, stamp,", 1)),
         ("usn forced",
          lambda s: s.replace("sign_cache_.get(full, stamp,", "x.usn = 1; sign_cache_.get(full, stamp,", 1)),
     ]

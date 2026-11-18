@@ -43,7 +43,7 @@ Safe workflow for `set_start_mode`:
 
 1. Run `list` and record the service's current `startup_type` (Windows and macOS only; Linux gives no startup type to record).
 2. Run `set_start_mode` with the target `name` and `mode`. The change takes effect at the next boot or login; a running service keeps running.
-3. Run `list` again and confirm the new `startup_type` (Windows and macOS). On Linux `set_start_mode` itself reads `systemctl is-enabled` back and fails if the state does not match the requested mode, so a success answer has already been checked; `list` gives no Linux `startup_type`, so for an independent look run `systemctl is-enabled` yourself.
+3. Run `list` again and confirm the new `startup_type` (Windows and macOS). On Linux `set_start_mode` itself reads `systemctl is-enabled` back and fails unless the state is in the accepted set for the requested mode (automatic: `enabled`, `static`, `indirect`, `alias`, `generated`; manual: `disabled`, `static`, `indirect`, `alias`, `generated`; disabled: `masked`), so a success answer has already been checked and carries a `state|` line (a `note|` line for `static`, `indirect`, `alias` and `generated` units, which `systemctl` cannot enable or disable); `list` gives no Linux `startup_type`, so for an independent look run `systemctl is-enabled` yourself.
 4. To undo, call `set_start_mode` with the value recorded in step 1. Windows `boot` and `system` start types cannot be restored, because the action only accepts `automatic`, `manual` and `disabled`.
 
 Target restrictions: `name` is 1 to 256 characters from letters, digits, `.`, `_`, `@` and `-`, so a Windows service name containing a space, or a systemd instance name with escaped characters, cannot be targeted. The action needs the `endpoint-admin` role and passes the `AdminOrApproval` gate.
@@ -288,6 +288,6 @@ error|missing required parameter: name
 - Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp`
 - Definitions: `content/definitions/services.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
-- Tests: `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
+- Tests: `tests/test_services_readback_wiring_lexical.py` · `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
 - Privilege row: `docs/agent-privilege-model.md`
 <!-- END GENERATED -->

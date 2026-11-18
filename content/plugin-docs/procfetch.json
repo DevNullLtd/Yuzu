@@ -32,7 +32,7 @@
     "**This plugin never sets a typed result status.** Both captured samples read `UNDECLARED / UNKNOWN /` regardless of whether any row's path/hash resolution failed — a caller cannot distinguish \"clean run\" from \"every row's hash silently failed\" without inspecting the rows themselves.",
     "**Protected Windows processes report name only.** `OpenProcess` is refused even running as SYSTEM for a handful of processes (`[System Process]`, `System`, `Secure System`, `Registry` in the sample); those rows carry empty `path` and `sha1` with no row-level error indicator.",
     "**SHA-1, not SHA-256.** The metadata description positions this action for \"security auditing\" and \"IOC matching\" (`content/definitions/procfetch.yaml:16-17`), but the hash is SHA-1 on every leg (`EVP_sha1()` / `BCRYPT_SHA1_ALGORITHM`), which is broken for collision resistance; it remains adequate for matching against a known-hash IOC list (a preimage property SHA-1 still holds) but not for detecting a deliberately-collided binary.",
-    "**Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe` (`procfetch_plugin.cpp:134-140`); the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there."
+    "**Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe`; the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there."
   ],
   "definitions": [
     {
@@ -146,7 +146,7 @@
     },
     {
       "grant": "`resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail",
-      "if_refused": "`std::filesystem::read_symlink` throws `filesystem_error`, caught and turned into an empty path, so `path` and `sha1` are empty and the row still emits (`procfetch_plugin.cpp:134-140`)",
+      "if_refused": "`resolve_exe` makes one `readlink` call through `readlink_noting`; a failure returns an empty path and an EACCES/EPERM refusal is counted, so `path` and `sha1` are empty and the row still emits",
       "measured": "2026-09-06, Debian 13 (trixie) aarch64 container, euid 0",
       "os": "Linux",
       "runs_as": "root (captured in a container; not measured unprivileged)"

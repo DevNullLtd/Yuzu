@@ -116,10 +116,13 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
 /// `indirect`, `disabled`, `generated`, `transient`, `bad`, `not-found`. `static`, `indirect`,
 /// `alias` and `generated` units have no [Install] enablement a verb can change, and
 /// `systemctl enable|disable` exits 0 for them, so they are the legitimate end state of either
-/// verb. `linked*` and `transient` are not end states of enable, disable or mask.
-///   automatic -> enabled, enabled-runtime, static, indirect, alias, generated
+/// verb. The verbs the wrapper runs (`enable`, `disable`, `mask`) are PERSISTENT, so after a real
+/// one the state is `enabled` / `disabled` / `masked`; a `-runtime` state (`enabled-runtime`,
+/// `masked-runtime`) lives under /run and means the wrapper did NOT act, so it never matches.
+/// `linked*` and `transient` are not end states of enable, disable or mask.
+///   automatic -> enabled, static, indirect, alias, generated
 ///   manual    -> disabled, static, indirect, alias, generated
-///   disabled  -> masked, masked-runtime
+///   disabled  -> masked
 [[nodiscard]] inline bool start_mode_took_effect(std::string_view mode, std::string_view state) {
     while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
         state.remove_suffix(1);
@@ -130,17 +133,28 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
     const bool unchangeable = state == "static" || state == "indirect" || state == "alias" ||
                               state == "generated";
     if (mode == "automatic")
-        return unchangeable || state == "enabled" || state == "enabled-runtime";
+        return unchangeable || state == "enabled";
     if (mode == "manual")
         return unchangeable || state == "disabled";
     if (mode == "disabled")
-        return state == "masked" || state == "masked-runtime";
+        return state == "masked";
     return false;
 }
 
 /// The read-back as a whole: the `is-enabled` command itself must have RUN to completion (a
 /// spawn failure, deadline, cancel or signal is not a match) and its state must match. Its exit
 /// code is not required to be 0: `is-enabled` exits non-zero for `disabled` and `masked`.
+/// True for the states no verb can change (`static`, `indirect`, `alias`, `generated`): a unit
+/// there is accepted for either mode but does NOT auto-start because of it, so the action
+/// reports the state back to the caller.
+[[nodiscard]] inline bool start_state_is_unchangeable(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "static" || state == "indirect" || state == "alias" || state == "generated";
+}
+
 [[nodiscard]] inline bool start_mode_readback_matches(std::string_view mode,
                                                       const yuzu::agent::SubprocessResult& res) {
     if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())

@@ -380,7 +380,8 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 /// the ABI4 result-status seam via yuzu::agent::forward_runner_failure --
 /// exactly the pattern network_actions_plugin.cpp's mutating call sites use.
 #if defined(__linux__) || defined(__APPLE__)
-yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) {
+yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv,
+                                         bool merge_stderr = true) {
     if (argv.empty() || argv.front().empty())
         return yuzu::agent::SubprocessResult{};
     // merge_stderr=true (matching network_actions_plugin.cpp's Linux
@@ -392,7 +393,7 @@ yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) 
     // outcome (services_parsers.hpp).
     return yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
-                                             .merge_stderr = true});
+                                             .merge_stderr = merge_stderr});
 }
 #endif
 
@@ -553,8 +554,15 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     // otherwise be reported as success. Read the unit's state back (no privilege needed) and
     // require it to match the requested mode; a readback that did not run, or any state outside
     // the closed set for the mode, is a failure.
+    std::string st_state;
     {
-        auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)});
+        // stderr is NOT merged: a SysV-only unit prints "X is not a native service, redirecting
+        // to systemd-sysv-install." on stderr before the state, and the first output line must be
+        // the state itself (the parser is deliberately not loosened to scan for one).
+        auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)},
+                              /*merge_stderr=*/false);
+        if (yuzu::agent::classify_runner_failure(st).has_value())
+            yuzu::agent::forward_runner_failure(ctx, st);
         if (!yuzu::services::start_mode_readback_matches(mode, st)) {
             ctx.write_output(std::format(
                 "error|set_start_mode reported success but '{}' is not in mode '{}' (is-enabled: "
@@ -562,11 +570,22 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
                 name, mode, st.output.substr(0, st.output.find('\n'))));
             return 1;
         }
+        st_state = st.output;
     }
 
     ctx.write_output("status|ok");
     ctx.write_output(std::format("service|{}", name));
     ctx.write_output(std::format("mode|{}", mode));
+    // The state the unit is actually in (first is-enabled line), so a caller can tell a unit
+    // that will auto-start from one that cannot be enabled or disabled.
+    {
+        const std::string state = st_state.substr(0, st_state.find('\n'));
+        ctx.write_output(std::format("state|{}", state));
+        if (yuzu::services::start_state_is_unchangeable(state))
+            ctx.write_output(std::format(
+                "note|'{}' is '{}': systemctl cannot enable or disable it, so the requested mode "
+                "does not change whether it starts at boot", name, state));
+    }
     return 0;
 }
 

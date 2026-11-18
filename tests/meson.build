@@ -4730,6 +4730,14 @@ test('proc access status lexical gate (WP13/UP14)',
   suite: 'docs',
   timeout: 30,
 )
+# WP13: pins that Linux set_start_mode judges the readback with start_mode_readback_matches, runs
+# it with stderr unmerged and reports the state (source-text only).
+test('services set_start_mode readback wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_services_readback_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # WP13: pins that the Echo $Module drain passes the real file-version stamp (read from the open
 # image) into SigningCache (source-text only; nothing builds the Windows leg here).
 test('echo module signing wiring lexical gate (WP13)',

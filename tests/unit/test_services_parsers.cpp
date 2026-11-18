@@ -384,13 +384,42 @@ TEST_CASE("start_mode_took_effect: error text and non-end states never match (cl
         CHECK_FALSE(start_mode_took_effect(mode, "linked\n"));
         CHECK_FALSE(start_mode_took_effect(mode, "Unit foo.service not found.\n"));
     }
-    for (const char* st : {"enabled", "enabled-runtime", "static", "indirect", "alias", "generated"})
+    for (const char* st : {"enabled", "static", "indirect", "alias", "generated"})
         CHECK(start_mode_took_effect("automatic", st));
     for (const char* st : {"disabled", "static", "indirect", "alias", "generated"})
         CHECK(start_mode_took_effect("manual", st));
     CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime"));
-    CHECK(start_mode_took_effect("disabled", "masked-runtime"));
     CHECK_FALSE(start_mode_took_effect("disabled", "static"));
+}
+
+TEST_CASE("start_mode_took_effect: a -runtime state means the persistent verb did not act",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    // enable/disable/mask are persistent: a /run-only state is what a no-op wrapper leaves.
+    CHECK_FALSE(start_mode_took_effect("automatic", "enabled-runtime\n"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "masked-runtime\n"));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime\n"));
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    CHECK(start_mode_took_effect("disabled", "masked\n"));
+}
+
+TEST_CASE("start_mode_readback: SysV redirect text is a stderr line, never part of the state",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    // With stderr NOT merged (the plugin's readback), a SysV-only unit's stdout is just the state.
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    // If that text ever reached the first line the parser must refuse, not scan for a state line.
+    CHECK_FALSE(start_mode_took_effect(
+        "automatic",
+        "crond is not a native service, redirecting to systemd-sysv-install.\nenabled\n"));
+}
+
+TEST_CASE("start_state_is_unchangeable: the states a verb cannot change", "[services][up11]") {
+    using yuzu::services::start_state_is_unchangeable;
+    for (const char* st : {"static\n", "indirect", "alias\n", "generated\r\n"})
+        CHECK(start_state_is_unchangeable(st));
+    for (const char* st : {"enabled", "disabled", "masked", "", "not-found"})
+        CHECK_FALSE(start_state_is_unchangeable(st));
 }
 
 TEST_CASE("start_mode_readback_matches: a readback that did not run is not a match",
