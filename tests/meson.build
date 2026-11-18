@@ -4691,6 +4691,14 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# The agent's reserved-path key list: every path-like `agent.*` key agent.cpp publishes to plugins
+# must be classified in agents/shared/agent_reserved_path_keys.hpp (source-text only, so Python).
+test('agent reserved path keys lexical gate',
+  _python3_test,
+  args: [files('test_agent_reserved_path_keys.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
 # its own in-file selftest mutates each pinned statement, so no separate selftest entry).
 test('sso-only runtime wiring lexical gate',

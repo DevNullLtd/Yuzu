@@ -390,6 +390,12 @@ struct WalkEnv {
     std::function<bool(const fs::path&)> can_enter = [](const fs::path&) {
         return true;
     };
+    /// WP06 F55: true = the entry is refused (a reserved agent path). Asked for EVERY visited entry
+    /// before anything is hashed, so the walk cannot be used as a content-hash oracle on one. A
+    /// refused directory is not descended into; a refused file is counted as unreadable.
+    std::function<bool(const fs::path&)> is_refused = [](const fs::path&) {
+        return false;
+    };
     /// Mount points whose subtrees are refused. Empty = no guard.
     std::vector<std::string> network_mounts;
     /// False when the mount table could not be read in full: the list above is then empty or
@@ -447,6 +453,17 @@ WalkOutcome walk_find_by_hash(const std::string& root, std::string_view target_l
 
         const fs::directory_entry& entry = *it;
         const fs::path& path = entry.path();
+
+        if (env.is_refused(path)) {
+            ++c.skipped_unreadable;
+            it.disable_recursion_pending();
+            it.increment(ec);
+            if (ec) {
+                ++c.skipped_unreadable;
+                break;
+            }
+            continue;
+        }
 
         // A mount point under a walked directory is refused BEFORE lstat can block on it. With no
         // mount list there is nothing to compare, so the path is not even converted to a string

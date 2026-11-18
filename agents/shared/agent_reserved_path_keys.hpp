@@ -24,7 +24,7 @@ inline constexpr std::array<std::string_view, 2> kReservedDirKeys = {
 
 /// Files: the file (and rotated siblings) is refused.
 inline constexpr std::array<std::string_view, 8> kReservedFileKeys = {
-    "agent.log_file",              // carried the session credential before WP06
+    "agent.log_file",              // the agent log (a session id may appear in it)
     "agent.tls_ca_cert",           // trust anchor
     "agent.tls_client_cert",       // mTLS identity
     "agent.tls_client_key",        // mTLS private key

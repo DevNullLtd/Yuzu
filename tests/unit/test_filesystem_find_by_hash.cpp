@@ -22,6 +22,7 @@
 #include <cerrno>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <set>
 #include <string>
@@ -1269,4 +1270,32 @@ TEST_CASE("find_by_hash walk: a directory that vanishes before it is entered is 
     const auto w = walk(t, 3, {}, env);
     CHECK(w.out.c.skipped_unreadable == 1);
     CHECK(w.out.constrained());
+}
+
+// WP06 F55: a refused entry is never hashed and a refused directory is never descended into, so
+// the walk cannot act as a content-hash oracle on a reserved file.
+TEST_CASE("find_by_hash walk: an entry the refusal predicate names is never hashed",
+          "[agent][filesystem_plugin][find_by_hash][reserved]") {
+    yuzu::test::TempDir root{"yuzu_test_fbh_refuse_"};
+    std::error_code ec;
+    fs::create_directories(root.path / "reserved_dir", ec);
+    for (const auto& f : {root.path / "ok.txt", root.path / "reserved_dir" / "inner.txt",
+                          root.path / "reserved_file.txt"}) {
+        std::ofstream o(f);
+        o << "x";
+    }
+    Probe probe;
+    auto env = fake_env(probe);
+    env.is_refused = [&](const fs::path& p) {
+        return p.filename() == "reserved_dir" || p.filename() == "reserved_file.txt";
+    };
+    std::vector<std::string> rows;
+    (void)fbh::walk_find_by_hash(root.path.string(), std::string{kTarget}, 5, fbh::WalkLimits{}, env,
+                                 [&](const std::string& r) { rows.push_back(r); });
+    for (const auto& h : probe.hashed) {
+        CHECK(h.filename() != "inner.txt");
+        CHECK(h.filename() != "reserved_file.txt");
+    }
+    CHECK(std::any_of(probe.hashed.begin(), probe.hashed.end(),
+                      [](const fs::path& h) { return h.filename() == "ok.txt"; }));
 }

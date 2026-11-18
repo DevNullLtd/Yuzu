@@ -127,12 +127,118 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
 // refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
+//
+// FAIL CLOSED: the set STARTS as a compiled-in baseline (the agent's default data directories) and
+// init() only ADDS to it; shutdown() does not clear it. A missing/empty `agent.data_dir`, a plugin
+// whose init never ran, and a call racing shutdown therefore all still refuse the defaults.
+yuzu::filesystem::reserved::Set baseline_reserved() {
+    yuzu::filesystem::reserved::Set set;
+    std::error_code ec;
+    auto add = [&](const fs::path& p) {
+        auto c = fs::weakly_canonical(p, ec);
+        set.dirs.push_back((ec ? p.lexically_normal() : c).string());
+        ec.clear();
+    };
+#ifdef _WIN32
+    if (const char* v = std::getenv("LOCALAPPDATA"); v && *v) add(fs::path{v} / "yuzu");
+    if (const char* v = std::getenv("ProgramData"); v && *v) add(fs::path{v} / "Yuzu");
+#else
+    if (const char* v = std::getenv("XDG_DATA_HOME"); v && *v) add(fs::path{v} / "yuzu");
+    if (const char* v = std::getenv("HOME"); v && *v) {
+#ifdef __APPLE__
+        add(fs::path{v} / "Library" / "Application Support" / "yuzu");
+#else
+        add(fs::path{v} / ".local" / "share" / "yuzu");
+#endif
+    }
+#ifdef __APPLE__
+    add("/Library/Application Support/Yuzu");
+#else
+    add("/var/lib/yuzu");
+#endif
+#endif
+    return set;
+}
+
 std::mutex g_reserved_mu;
-yuzu::filesystem::reserved::Set g_reserved;
+yuzu::filesystem::reserved::Set g_reserved = baseline_reserved();
+
+long own_pid() {
+#ifdef _WIN32
+    return 0;
+#else
+    return static_cast<long>(::getpid());
+#endif
+}
+
+// Decide by IDENTITY, not spelling (a hard link, a bind mount, `..`, a case or Unicode alias all
+// name the same object under a different string). `p` need not exist. Any error resolving it
+// REFUSES (fail closed). Best effort against a writer who controls a parent directory.
+bool path_is_reserved(const fs::path& p) {
+    std::error_code ec;
+    const fs::path canon = fs::weakly_canonical(p, ec);
+    if (ec)
+        return true;
+    const std::string cs = canon.string();
+    if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
+        return true;
+    yuzu::filesystem::reserved::Set snapshot;
+    {
+        std::lock_guard lk(g_reserved_mu);
+        snapshot = g_reserved;
+    }
+    if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
+        return true;
+    // Identity: the candidate (or an ancestor of it) IS a reserved object.
+    for (const auto& f : snapshot.files) {
+        std::error_code e2;
+        if (fs::exists(canon, e2) && !e2 && fs::exists(f, e2) && !e2 && fs::equivalent(canon, f, e2) && !e2)
+            return true;
+    }
+    // A HARD LINK to a file inside a reserved directory has no ancestor in it: it is the same
+    // object under another name. Only a regular file with more than one link can be one, so only
+    // then enumerate the reserved dirs (bounded) and compare identity. An enumeration that cannot
+    // be completed REFUSES (fail closed).
+    {
+        std::error_code e3;
+        if (fs::is_regular_file(canon, e3) && !e3) {
+            const auto links = fs::hard_link_count(canon, e3);
+            if (e3 || links > 1) {
+                constexpr std::size_t kMaxScan = 20000;
+                std::size_t seen = 0;
+                for (const auto& d : snapshot.dirs) {
+                    std::error_code e4;
+                    if (!fs::exists(d, e4) || e4)
+                        continue;
+                    fs::recursive_directory_iterator it{
+                        fs::path{d}, fs::directory_options::skip_permission_denied, e4};
+                    if (e4)
+                        return true;
+                    for (; it != fs::recursive_directory_iterator{}; it.increment(e4)) {
+                        if (e4 || ++seen > kMaxScan)
+                            return true;
+                        std::error_code e5;
+                        if (it->is_regular_file(e5) && !e5 && fs::equivalent(it->path(), canon, e5) && !e5)
+                            return true;
+                    }
+                }
+            }
+        }
+    }
+    for (fs::path a = canon; !a.empty(); a = a.parent_path()) {
+        for (const auto& d : snapshot.dirs) {
+            std::error_code e2;
+            if (fs::exists(a, e2) && !e2 && fs::exists(d, e2) && !e2 && fs::equivalent(a, d, e2) && !e2)
+                return true;
+        }
+        if (a == a.parent_path())
+            break;
+    }
+    return false;
+}
 
 bool is_reserved_canonical(const std::string& canonical) {
-    std::lock_guard lk(g_reserved_mu);
-    return yuzu::filesystem::reserved::is_agent_reserved_path(g_reserved, canonical);
+    return path_is_reserved(fs::path{canonical});
 }
 
 void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bool is_dir) {
@@ -767,7 +873,7 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         // WP06 F55: capture the agent's own paths once; an absent key simply reserves nothing.
-        yuzu::filesystem::reserved::Set set;
+        yuzu::filesystem::reserved::Set set = baseline_reserved(); // init only ADDS to the baseline
         // Derived from the ONE authoritative list (agent_reserved_path_keys.hpp).
         for (auto key : yuzu::shared::agent_paths::kReservedDirKeys)
             add_reserved(set, ctx.get_config(key), /*is_dir=*/true);
@@ -778,13 +884,9 @@ public:
         return {};
     }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
-        try {
-            std::lock_guard lk(g_reserved_mu);
-            g_reserved = {};
-        } catch (...) { // NOLINT(bugprone-empty-catch)
-        }
-    }
+    // The reserved set is deliberately NOT cleared here: nothing is safer for it to be empty, and a
+    // call racing shutdown must still refuse (fail closed).
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
         if (action == "exists") {
@@ -849,6 +951,13 @@ private:
         }
 
         auto base_dir = params.get("base_dir");
+
+        // WP06 F55: existence, type and size of the agent's own secrets are refused too (an empty
+        // base_dir would otherwise fall back to the raw path below).
+        if (path_is_reserved(fs::path{std::string{path}})) {
+            ctx.write_output("error|path is not accessible or outside allowed base directory");
+            return 1;
+        }
 
         // For exists check, use validate_path_or_parent (path may not exist)
         auto validated = validate_path_or_parent(path, base_dir);
@@ -1739,6 +1848,12 @@ private:
 
             const auto& entry = *it;
             auto entry_path = entry.path().string();
+            // WP06 F55: a reserved entry (and everything under a reserved dir) is neither listed
+            // nor descended into.
+            if (path_is_reserved(entry.path())) {
+                it.disable_recursion_pending();
+                continue;
+            }
             auto depth = std::count(entry_path.begin(), entry_path.end(), '/') +
                          std::count(entry_path.begin(), entry_path.end(), '\\') - base_depth;
             if (depth > max_depth) {
@@ -2466,6 +2581,7 @@ private:
         const DatalessMaterializationOff dataless_off; // restored when the walk returns
 #endif
         fbh::WalkEnv env;
+        env.is_refused = [](const fs::path& p) { return path_is_reserved(p); }; // WP06 F55
         env.cancelled = [] {
             return yuzu::agent::subprocess_cancel_requested();
         };

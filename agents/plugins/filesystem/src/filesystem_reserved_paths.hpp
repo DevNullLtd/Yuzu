@@ -74,4 +74,43 @@ struct Set {
     return false;
 }
 
+/// Linux: `/proc/<pid>/...` files that hold a process's secrets or let one be read around the path
+/// guard. A path whose canonical form is `/proc/<digits>/<name>` (or `/proc/<digits>/task/<tid>/<name>`)
+/// is refused when `<digits>` is `own_pid` (the agent: its environ carried the enrolment token) for
+/// EVERY name under it, and for any other pid when `<name>` is one of the secret-bearing files below.
+/// `/proc/self` and `/proc/thread-self` are symlinks, so a canonicalised path already names the pid;
+/// the literal spellings are refused as well for a caller that passes a non-canonical string.
+/// Pure; non-Linux callers never pass a /proc path (it simply does not match there).
+[[nodiscard]] inline bool is_proc_secret_path(std::string_view canonical_path, long own_pid) {
+    constexpr std::string_view kProc = "/proc/";
+    if (canonical_path.substr(0, kProc.size()) != kProc)
+        return false;
+    std::string_view rest = canonical_path.substr(kProc.size());
+    const auto slash = rest.find('/');
+    const std::string_view who = rest.substr(0, slash);
+    if (who == "self" || who == "thread-self")
+        return true;
+    if (who.empty() || who.find_first_not_of("0123456789") != std::string_view::npos)
+        return false;
+    const bool own = std::to_string(own_pid) == who;
+    if (own)
+        return true;
+    if (slash == std::string_view::npos)
+        return false;
+    std::string_view tail = rest.substr(slash + 1);
+    // /proc/<pid>/task/<tid>/<name> -> <name>
+    if (tail.substr(0, 5) == "task/") {
+        const auto s2 = tail.find('/', 5);
+        if (s2 == std::string_view::npos)
+            return false;
+        tail = tail.substr(s2 + 1);
+    }
+    const auto first = tail.substr(0, tail.find('/'));
+    for (std::string_view name : {"environ", "mem", "maps", "smaps", "smaps_rollup", "cmdline", "fd",
+                                  "fdinfo", "auxv", "stack", "syscall", "mountinfo", "cwd", "root", "exe"})
+        if (first == name)
+            return true;
+    return false;
+}
+
 } // namespace yuzu::filesystem::reserved

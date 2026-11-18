@@ -123,6 +123,11 @@ jobs:
       - name: Plugin init failed wiring gate self-test
         run: python3 -I tests/test_plugin_init_failed_wiring_lexical_selftest.py
 
+      # Every path-like agent.* key agent.cpp publishes to plugins is classified as reserved (the
+      # filesystem plugin refuses it) or allow-listed with a reason.
+      - name: Agent reserved path keys gate
+        run: python3 -I tests/test_agent_reserved_path_keys.py
+
       # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
       # no source or manual claims an absent command_id proves a step was never sent.
       - name: Workflow execute docs gate (#2146)

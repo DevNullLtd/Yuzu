@@ -176,16 +176,19 @@ namespace detail {
     const auto sep = key.find('\\');
     const std::string_view first = sep == std::string_view::npos ? key : key.substr(0, sep);
     if (first.empty()) return true;
-    const auto eq_ci = [&](std::string_view lit) {
-        return first.size() == lit.size() &&
-               std::equal(lit.begin(), lit.end(), first.begin(),
+    // Allocation-free (the function is noexcept): the base name, optionally followed by the
+    // literal `_classes` suffix, compared ASCII-case-insensitively.
+    constexpr std::string_view kSuffix = "_classes";
+    const auto starts_ci = [](std::string_view s, std::string_view lit) {
+        return s.size() >= lit.size() &&
+               std::equal(lit.begin(), lit.end(), s.begin(),
                           [](char p, char c) { return detail::lower_ascii(p) == detail::lower_ascii(c); });
     };
     for (const std::string_view base : {std::string_view{".default"}, std::string_view{"s-1-5-18"},
                                         std::string_view{"s-1-5-19"}, std::string_view{"s-1-5-20"}}) {
-        if (eq_ci(base)) return true;
-        const std::string with_classes = std::string{base} + "_classes";
-        if (eq_ci(with_classes)) return true;
+        if (!starts_ci(first, base)) continue;
+        const std::string_view rest = first.substr(base.size());
+        if (rest.empty() || (rest.size() == kSuffix.size() && starts_ci(rest, kSuffix))) return true;
     }
     return false;
 }
