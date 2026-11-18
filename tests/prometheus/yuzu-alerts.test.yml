@@ -11009,3 +11009,53 @@ tests:
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
       - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+
+  # WP01 Gate 8 pass 4: the new alerts, and the UnattestedGateway window.
+  - interval: 1m
+    name: unattested gateway - fires inside its 30m window, quiet after it (a 2h window would still fire)
+    input_series:
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="gateway_proxy",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x200"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x200"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}'
+        eval_time: 25m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+
+  - interval: 1m
+    name: token consumed but no leaf - fires at warning per instance, quiet after 15m, ignores other counters
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="a",reason="no_csr"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="b",reason="signer_threw"}', values: "0x70"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x10 1 1x60"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+
+  - interval: 1m
+    name: audit ids truncated - fires at warning, window 1h
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="a"}', values: "0x10 4700 4700x200"}
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="b"}', values: "0x210"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}'
+        eval_time: 30m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}', eval_time: 150m, exp_samples: []}
+
+  - interval: 1m
+    name: audit summary dropped - fires at warning, window 15m
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="queue_full"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="b",reason="shutdown"}', values: "0x70"}
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}'
+        eval_time: 20m
+        exp_samples:
+          - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}', eval_time: 40m, exp_samples: []}

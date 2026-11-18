@@ -3965,7 +3965,7 @@ groups:
             lookup_failed). Either a real agent would be locked out by --agent-reregistration-proof=enforce
             (a plaintext or non-witnessing gateway, a lost key), or this is the takeover the
             control exists to stop. Do not switch to enforce while this fires for real agents.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationwouldrefuse"
 
       - alert: YuzuAgentReregistrationUnattestedGateway
         expr: |
@@ -3978,7 +3978,7 @@ groups:
             A gateway-relayed re-registration reported gateway_attests_peer_cert=false: the gateway
             is plaintext, or its agent listener lacks witness_client_cert. Under
             --agent-reregistration-proof=enforce every leaf-holding agent behind it is refused.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationunattestedgateway"
 
       - alert: YuzuAgentReregistrationRefused
         expr: |
@@ -3992,7 +3992,7 @@ groups:
             unattested_gateway or revoked_identity). Either an agent cannot show its certificate or
             a single-use token (a lost key, a plaintext or non-witnessing gateway), or this is the
             takeover attempt the control stops. Check agent.reregistration_refused audit rows.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationrefused"
 
       - alert: YuzuAgentReregistrationLookupFailed
         expr: |
@@ -4004,7 +4004,7 @@ groups:
           description: >-
             Under enforce a ca_store read failure refuses every re-registration retryably. Agents
             keep retrying, but none can re-register until the CA store recovers.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationlookupfailed"
 
       - alert: YuzuAgentReenrolTokenRefusedBurst
         expr: |
@@ -4018,7 +4018,7 @@ groups:
             expired, revoked, already_consumed). An operator minted the wrong kind of token
             (re-enrolment needs max_uses 1), an agent is retrying a spent token, or someone is
             guessing tokens.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokenrefusedburst"
 
       - alert: YuzuAgentReregistrationAuditWriteFailed
         expr: |
@@ -4031,7 +4031,47 @@ groups:
             An agent.reregistration_unproven or agent.reregistration_refused audit row was not
             written (reason store_unavailable or write_failed). Absence of a row is not proof that
             nothing happened: the authoritative count is yuzu_register_reregistration_total.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditwritefailed"
+
+      - alert: YuzuAgentReenrolTokenNoLeaf
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reenrol_token_no_leaf_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A single-use token was consumed to re-enrol an agent but no leaf was issued"
+          description: >-
+            A re-enrolment consumed a single-use enrollment token for an agent id that holds a live
+            leaf, but the server issued no new leaf (reason no_csr: the agent sent no CSR, which
+            happens when it still holds a certificate file it believes is valid; no_signer;
+            signer_failed; signer_threw). The token is spent and the old leaf is not superseded.
+            Recovery: remove the agent's cert_dir, restart it and give it a fresh single-use token.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokennoleaf"
+
+      - alert: YuzuAgentReregistrationAuditIdsTruncated
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_audit_ids_truncated_total[1h])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "More than 20000 distinct dropped re-registration ids in one window were not named"
+          description: >-
+            The dropped-row summary names at most 20000 distinct dropped agent ids per 10 s window;
+            this counter counts the ids beyond that. For those ids the only record is the
+            unbudgeted yuzu_register_reregistration_total.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditidstruncated"
+
+      - alert: YuzuAgentReregistrationAuditSummaryDropped
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_audit_summary_dropped_total[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "A dropped-row summary chunk for re-registration audit rows was not written"
+          description: >-
+            A summary chunk was discarded (reason queue_full, write_failed or shutdown). The ids it
+            named are still counted by yuzu_register_reregistration_audit_dropped_total.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditsummarydropped"
 
       - alert: YuzuAgentLeafSupersedeFailed
         expr: |
@@ -4042,9 +4082,11 @@ groups:
           summary: "An agent's older certificate was NOT revoked after a token re-enrolment"
           description: >-
             After a single-use-token re-enrolment issued a fresh leaf, revoking the older live leaf
-            failed (ca.cert.supersede_failed audit row). The possibly lost or stolen leaf stays valid
-            until it expires or an operator revokes it. The re-enrolment itself succeeded.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+            failed, or threw. A failure writes a ca.cert.supersede_failed audit row; a THROW writes no
+            audit row, only a log line and this counter. Either way the possibly lost or stolen leaf
+            stays valid until it expires or an operator revokes it (see the runbook: find the older
+            serial and revoke it by hand). The re-enrolment itself succeeded.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentleafsupersedefailed"
 
       - alert: YuzuAgentReregistrationModeMixed
         expr: |
@@ -4057,7 +4099,7 @@ groups:
           description: >-
             The flag is per process. A fleet is only as enforced as its weakest replica; set the
             same --agent-reregistration-proof value on every replica.
-          runbook_url: "https://docs.yuzu.io/runbooks/agent-reregistration-proof"
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationmodemixed"
 
   # ── yuzu-response-store — LIVE as of the response store's Postgres migration
   # (ADR-0039) ──────────────────────────────────────────────────────────────
