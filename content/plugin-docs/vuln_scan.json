@@ -14,8 +14,8 @@
         },
         "macos": {
           "fallback": "output parsing unverified on macOS 13-15; unreadable tools report Unknown/UNREADABLE",
-          "mechanism": "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat)",
-          "rung": "3",
+          "mechanism": "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)",
+          "rung": "2",
           "support": "constrained"
         },
         "windows": {
@@ -92,8 +92,8 @@
         },
         "macos": {
           "fallback": "Homebrew formulae and casks are not scanned",
-          "mechanism": "argv(system_profiler+security-checks)+popen(ss/netstat)",
-          "rung": "3",
+          "mechanism": "argv(system_profiler+security-checks)",
+          "rung": "2",
           "support": "constrained"
         },
         "windows": {
@@ -118,8 +118,8 @@
         },
         "macos": {
           "fallback": "Homebrew formulae and casks are not scanned",
-          "mechanism": "argv(system_profiler+security-checks)+popen(ss/netstat)",
-          "rung": "3",
+          "mechanism": "argv(system_profiler+security-checks)",
+          "rung": "2",
           "support": "constrained"
         },
         "windows": {
@@ -136,7 +136,7 @@
     "**Substring matching produces false positives, and the version test is naive.** On macOS a backslash in an application name or version is shown as `/` (lossy by design until a versioned decoder change exists). A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, and `windows` matches .NET runtimes and Windows utilities; the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.",
     "**A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed Linux command returns empty output, and only the Linux file checks and the macOS status tools surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).",
     "**`summary` does not match its declared result columns.** It emits three pipe fields per row (`summary|<severity or TOTAL>|<count>`) against two declared columns, `severity` and `count`, and the `TOTAL` row's `count` cell is the string `<n> findings (<n> issues)` rather than the declared `int32`.",
-    "**Configuration checks are single-signal heuristics, not effective policy.** On macOS the six tools' expected output lines were verified on macOS 27.0.1 only (13 to 15 not measured; bad-state exit codes not measured), so a Mac whose tool prints something else reports `UNREADABLE`, not a verdict. Each reads one registry value, one command's text or one file, so a setting applied another way (an `Include`d SSH file, a managed firewall, a third-party antivirus) can read differently from the host's real state. There is no `docs/agent-privilege-model.md` row for this plugin, so the Privileges table records only what each capture measured."
+    "**Configuration checks are single-signal heuristics, not effective policy.** On macOS the six tools' expected output lines were verified on macOS 27.0.1 only (13 to 15 not measured; bad-state exit codes not measured), so a Mac whose tool prints something else reports `UNREADABLE`, not a verdict. The macOS open-port check does not exist (`ss` is absent and `netstat -tlnp` is not valid), so every Mac reports one `UNREADABLE` Open Ports row; it is a standing unavailability and does not raise the `config_unreadable` status. Each reads one registry value, one command's text or one file, so a setting applied another way (an `Include`d SSH file, a managed firewall, a third-party antivirus) can read differently from the host's real state. There is no `docs/agent-privilege-model.md` row for this plugin, so the Privileges table records only what each capture measured."
   ],
   "definitions": [
     {
@@ -188,7 +188,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Return the raw installed software inventory (name and version pairs) for server-side NVD matching. This is a lightweight alternative to client-side CVE scanning that enables the server to perform centralized vulnerability correlation against the full NVD database. On macOS the list is system_profiler applications only; Homebrew formulae and casks are not included (use pkg_inventory.packages), and a macOS run that read nothing returns no rows. The rows are pure name|version pairs with no coverage row, and the coverage status is visible only in the agent log (not in REST, MCP or the dashboard): treat the list as \"system_profiler applications only, Homebrew excluded\", and never read an empty macOS list as \"no software installed\". A backslash in an application name or version is shown as \"/\" (lossy by design until a versioned decoder change exists).",
+      "description": "Return the raw installed software inventory (name and version pairs) for server-side NVD matching. This is a lightweight alternative to client-side CVE scanning that enables the server to perform centralized vulnerability correlation against the full NVD database. On macOS the list is system_profiler applications only; Homebrew formulae and casks are not included (use pkg_inventory.packages), and a macOS run that read nothing returns no rows. The rows are pure name|version pairs with no coverage row, and the coverage status is visible only in the agent log (not in REST, MCP or the dashboard): treat the list as \"system_profiler applications only, Homebrew excluded\", and never read an empty macOS list as \"no software installed\" (an empty list means the read failed or nothing was found). A backslash in an application name or version is shown as \"/\" (lossy by design until a versioned decoder change exists).",
       "display_name": "Software Inventory for NVD Matching",
       "execute_roles": [
         "endpoint-admin",
@@ -251,14 +251,14 @@
     }
   ],
   "description": "Host vulnerability scanning — CVE matching and configuration compliance checks",
-  "how_it_works": "Every action is a read; nothing on the host is changed. `scan` first reads the installed-software list and matches it against a fixed table of 41 built-in CVE rules, then runs the fixed list of configuration checks for the operating system, and returns the CVE rows followed by the configuration rows (progress is reported at 0, 50, 90 and 100). `cve_scan` and `config_scan` are those two halves on their own. `summary` runs the same combined scan, throws the individual rows away and returns only a count per severity. `inventory` runs neither scan: it returns the raw installed-software `name|version` pairs and nothing else.\n\nThe CVE half is deliberately small and local. It is not a vulnerability feed: the rule table ships inside the plugin, each rule names a product by a short text (for example `openssl` or `git`), and a rule fires when an installed product's name contains that text, ignoring case, and its version compares lower than the rule's fixed version. The configuration half reads a handful of well-known hardening settings (registry values on Windows, command output and a few files on macOS and Linux) and reports every check it ran, passing ones as `INFO`. `inventory` exists so a caller can hand the raw software list to the server for a fuller match instead of relying on the built-in table.\n\n### What you can decide with it\n\n| Question | Action | What you get |\n|---|---|---|\n| Which known-bad versions of a short list of common products are installed? | `cve_scan` | Windows: from the registry Uninstall lists (machine-wide, 32-bit, and the agent account's own). macOS: apps from `system_profiler` only; Homebrew formulae and casks are not scanned (see `pkg_inventory.packages`). Linux: packages from the first package manager found (`dpkg-query`, else `rpm`, else `pacman`, else `apk`). |\n| Is this host's basic hardening in place? | `config_scan` | A fixed per-OS list of checks, listed below. Every check that ran is reported, passing ones as `INFO`. |\n| Both of the above in one call | `scan` | CVE rows, then configuration rows. |\n| How bad is it at a glance? | `summary` | `TOTAL` first, then a count for each of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `UNREADABLE`. `UNREADABLE` and `INFO` are not issues. On macOS the output ends with one `summary\\|COVERAGE\\|<text>` row per coverage cause (see Result status). |\n| What software is installed, for matching elsewhere? | `inventory` | Raw `name\\|version` pairs. No CVE or configuration logic. |\n\n**What a clean result means.** A scan with no `cve` rows says only that none of the 41 built-in rules matched the installed software. It does not say the host is patched. The table covers 21 product names (OpenSSL, curl, sudo, polkit, Log4j, Apache, OpenSSH, Python, Node.js, Chrome, Firefox, .NET, OpenJDK, Windows, nginx, PostgreSQL, Git, 7-Zip, WinRAR, PuTTY, PHP) with one to four rules each, and no rule is for a CVE newer than 2024. Software that is not in the software list the leg reads (per-user installs of other accounts on Windows, anything on Linux when none of the four package managers is present) is never examined. Operating-system patch level, kernel, firmware and distribution back-ports are not assessed at all. For a real patch-compliance answer use a patch-state source, not this plugin.\n\n**What a `cve` row means.** It is a lead to check, not a confirmed exposure. Matching is by substring of the product name and by a simple dotted-number version comparison, so some rows are false positives (see Caveat 2). The two Windows Print Spooler rules in particular compare an application's own version against a Windows build number and never read the real OS build or installed hotfixes, so they cannot tell you whether PrintNightmare is fixed; in the Windows sample every Print Spooler row names a .NET runtime, a Windows update package or a Windows utility, not the spooler itself.\n\n**Configuration checks by OS** (severity is fixed per check; a passing check is `INFO`):\n\n| OS | Checks that always report | Checks that report only in some cases | Known ways the answer can be wrong |\n|---|---|---|---|\n| Windows | UAC (`EnableLUA`), SMBv1 (`SMB1`), Auto-Logon, Defender real-time flag (`DisableRealtimeMonitoring`), Firewall for the Domain, Private and Public profiles | RDP Network Level Authentication, only when Remote Desktop is enabled | A missing SMBv1 value is read as enabled (`CRITICAL`); a missing Defender flag is read as enabled protection; the Defender row is one registry flag, not the live service state; an unreadable UAC or firewall value reads as disabled. |\n| macOS | Gatekeeper (`spctl`), FileVault (`fdesetup`), SIP (`csrutil`), Application Firewall (`socketfilterfw`), Remote Login (`systemsetup`), Automatic Software Updates (`defaults`) | none | A verdict needs the tool to have run to a clean exit 0 and its first output line to EQUAL the expected text (for example `FileVault is On.`, `assessments enabled`, `System Integrity Protection status: enabled.`, `Firewall is enabled. (State = 1)`, `Remote Login: Off`, `1`); anything else (a missing tool, a refused call, a localized message, `enabled (Custom Configuration).`) is an `UNREADABLE` row with detail `Unknown (read failed)`, never a finding and never a pass. The expected lines were verified on macOS 27.0.1 (one Apple Silicon host); macOS 13 to 15 were not measured, and exit 0 is required for every verdict. Measured on that host: `spctl --status`, `fdesetup status`, `csrutil status`, `socketfilterfw --getglobalstate` and `systemsetup -getremotelogin` exit 0 in the states captured, and `defaults read ... AutomaticCheckEnabled` exits 1 with the key absent. A tool's exit code in its bad state (for example `spctl --status` with Gatekeeper disabled) is not measured; if such a state exits non-zero the check reports `UNREADABLE` (Unknown) instead of a verdict, so a finding can be lost but a false pass cannot. On a default install `defaults read ... AutomaticCheckEnabled` prints `Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.`: an absent key is reported as `INFO` \"Automatic update check: not set (macOS default applies)\", not as unreadable and not as a finding (`0` is the disabled value). The risky-port check is not expected to produce rows: the plugin runs `ss -tlnH || netstat -tlnp` and discards errors, and `ss` is not present on macOS and `netstat -tlnp` is believed not to be valid there (inferred, not captured). |\n| Linux | ASLR (`randomize_va_space`), SUID core dumps (`suid_dumpable`), SSH Root Login, Firewall | SSH Password Authentication, only if `sshd_config` sets it (it also reports `INFO` \"not applicable\" when the file is absent and `UNREADABLE` when it cannot be read); `/tmp noexec`, only if `/tmp` is a separate mount; World-Writable PATH, only if the agent's own `PATH` has such a directory; Open Port rows for FTP 21, Telnet 23, SMB 445, RDP 3389, VNC 5900 bound on all interfaces | Only `/etc/ssh/sshd_config` is read (no `Include`d files, no `Match` blocks, no effective-config query); a plain `PermitRootLogin prohibit-password` reads as \"not explicitly set\". The firewall check reads `iptables`, `nft` and `ufw` output, which normally need root, so an unprivileged agent reports `No firewall rules detected` (`HIGH`) even on a protected host. |\n\nA Linux file the agent cannot read (SSH config, ASLR, `suid_dumpable`, the mount table) is reported as `UNREADABLE`, never as a weak setting. An absent `sshd_config` is `INFO`, \"not applicable\".\n\n### Diagrams\n\nThe CVE branch and the configuration branch are independent: neither can suppress the other, and `scan` simply concatenates them. A software entry with no version is skipped, so it can never match. The last two configuration branches are the important difference: a failed Linux file read is surfaced as `UNREADABLE`, while a failed registry or command read silently falls through to that check's default result.\n\n`summary` counts rows, not distinct problems. One installed product that matches two rules, or several installed products that match one rule, each add to the issue count, so the number is an upper bound on real exposures and is inflated by false-positive `cve` rows.",
+  "how_it_works": "Every action is a read; nothing on the host is changed. `scan` first reads the installed-software list and matches it against a fixed table of 41 built-in CVE rules, then runs the fixed list of configuration checks for the operating system, and returns the CVE rows followed by the configuration rows (progress is reported at 0, 50, 90 and 100). `cve_scan` and `config_scan` are those two halves on their own. `summary` runs the same combined scan, throws the individual rows away and returns only a count per severity. `inventory` runs neither scan: it returns the raw installed-software `name|version` pairs and nothing else.\n\nThe CVE half is deliberately small and local. It is not a vulnerability feed: the rule table ships inside the plugin, each rule names a product by a short text (for example `openssl` or `git`), and a rule fires when an installed product's name contains that text, ignoring case, and its version compares lower than the rule's fixed version. The configuration half reads a handful of well-known hardening settings (registry values on Windows, command output and a few files on macOS and Linux) and reports every check it ran, passing ones as `INFO`. `inventory` exists so a caller can hand the raw software list to the server for a fuller match instead of relying on the built-in table.\n\n### What you can decide with it\n\n| Question | Action | What you get |\n|---|---|---|\n| Which known-bad versions of a short list of common products are installed? | `cve_scan` | Windows: from the registry Uninstall lists (machine-wide, 32-bit, and the agent account's own). macOS: apps from `system_profiler` only; Homebrew formulae and casks are not scanned (see `pkg_inventory.packages`). Linux: packages from the first package manager found (`dpkg-query`, else `rpm`, else `pacman`, else `apk`). |\n| Is this host's basic hardening in place? | `config_scan` | A fixed per-OS list of checks, listed below. Every check that ran is reported, passing ones as `INFO`. |\n| Both of the above in one call | `scan` | CVE rows, then configuration rows. |\n| How bad is it at a glance? | `summary` | `TOTAL` first, then a count for each of `CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `UNREADABLE`. `UNREADABLE` and `INFO` are not issues. On macOS the output ends with one `summary\\|COVERAGE\\|<text>` row per coverage cause (see Result status). |\n| What software is installed, for matching elsewhere? | `inventory` | Raw `name\\|version` pairs. No CVE or configuration logic. |\n\n**What a clean result means.** A scan with no `cve` rows says only that none of the 41 built-in rules matched the installed software. It does not say the host is patched. The table covers 21 product names (OpenSSL, curl, sudo, polkit, Log4j, Apache, OpenSSH, Python, Node.js, Chrome, Firefox, .NET, OpenJDK, Windows, nginx, PostgreSQL, Git, 7-Zip, WinRAR, PuTTY, PHP) with one to four rules each, and no rule is for a CVE newer than 2024. Software that is not in the software list the leg reads (per-user installs of other accounts on Windows, anything on Linux when none of the four package managers is present) is never examined. Operating-system patch level, kernel, firmware and distribution back-ports are not assessed at all. For a real patch-compliance answer use a patch-state source, not this plugin.\n\n**What a `cve` row means.** It is a lead to check, not a confirmed exposure. Matching is by substring of the product name and by a simple dotted-number version comparison, so some rows are false positives (see Caveat 2). The two Windows Print Spooler rules in particular compare an application's own version against a Windows build number and never read the real OS build or installed hotfixes, so they cannot tell you whether PrintNightmare is fixed; in the Windows sample every Print Spooler row names a .NET runtime, a Windows update package or a Windows utility, not the spooler itself.\n\n**Configuration checks by OS** (severity is fixed per check; a passing check is `INFO`):\n\n| OS | Checks that always report | Checks that report only in some cases | Known ways the answer can be wrong |\n|---|---|---|---|\n| Windows | UAC (`EnableLUA`), SMBv1 (`SMB1`), Auto-Logon, Defender real-time flag (`DisableRealtimeMonitoring`), Firewall for the Domain, Private and Public profiles | RDP Network Level Authentication, only when Remote Desktop is enabled | A missing SMBv1 value is read as enabled (`CRITICAL`); a missing Defender flag is read as enabled protection; the Defender row is one registry flag, not the live service state; an unreadable UAC or firewall value reads as disabled. |\n| macOS | Gatekeeper (`spctl`), FileVault (`fdesetup`), SIP (`csrutil`), Application Firewall (`socketfilterfw`), Remote Login (`systemsetup`), Automatic update check (`defaults`) | Open Ports: always one `UNREADABLE` row, detail `open-port check is not available on macOS` | A GOOD verdict needs the tool to have exited 0 and its whole output to be exactly one non-empty line equal to the expected text (`FileVault is On.`, `assessments enabled`, `System Integrity Protection status: enabled.`, `Firewall is enabled. (State = 1)` or `2`, `Remote Login: Off`, `1`). A BAD line (`assessments disabled`, `FileVault is Off.`, `Firewall is disabled. (State = 0)`, `Remote Login: On`, `0`) is reported from any completed run and wins over any other line, whatever the exit code. Anything else (a missing tool, a refused call, a localized message, `enabled (Custom Configuration).`, a mismatched Firewall `State` digit, extra output lines) is an `UNREADABLE` row with detail `Unknown (read failed)`, not a finding and not a pass. Measured on macOS 27.0.1 (one Apple Silicon host; 13 to 15 not measured): the five status tools exit 0 in the states captured (including `Firewall is disabled. (State = 0)`), and `defaults read` exits 1 with the key absent. Not measured: any tool's exit code in its bad state, and the enabled Firewall `State` digits (1 and 2 are accepted from Apple's documentation, unverified); `systemsetup` was run via `sudo` interactively, not as the agent daemon. The update-check row reads `AutomaticCheckEnabled` through the bare domain `com.apple.SoftwareUpdate` (CFPreferences, so a managed value is seen); it covers the update CHECK only and says nothing about installation. With the key absent (the default install) it reports `INFO` \"Automatic update check: not set (macOS default applies)\", not unreadable and not a finding; `0` is the disabled value. The bare-domain absent-key text is matched exactly as measured; if a Mac prints a different line the row reads `UNREADABLE`. |\n| Linux | ASLR (`randomize_va_space`), SUID core dumps (`suid_dumpable`), SSH Root Login, Firewall | SSH Password Authentication, only if `sshd_config` sets it (it also reports `INFO` \"not applicable\" when the file is absent and `UNREADABLE` when it cannot be read); `/tmp noexec`, only if `/tmp` is a separate mount; World-Writable PATH, only if the agent's own `PATH` has such a directory; Open Port rows for FTP 21, Telnet 23, SMB 445, RDP 3389, VNC 5900 bound on all interfaces | Only `/etc/ssh/sshd_config` is read (no `Include`d files, no `Match` blocks, no effective-config query); a plain `PermitRootLogin prohibit-password` reads as \"not explicitly set\". The firewall check reads `iptables`, `nft` and `ufw` output, which normally need root, so an unprivileged agent reports `No firewall rules detected` (`HIGH`) even on a protected host. |\n\nA Linux file the agent cannot read (SSH config, ASLR, `suid_dumpable`, the mount table) is reported as `UNREADABLE`, never as a weak setting. An absent `sshd_config` is `INFO`, \"not applicable\".\n\n### Diagrams\n\nThe CVE branch and the configuration branch are independent: neither can suppress the other, and `scan` simply concatenates them. A software entry with no version is skipped, so it can never match. The last two configuration branches are the important difference: a failed Linux file read is surfaced as `UNREADABLE`, while a failed registry or command read silently falls through to that check's default result.\n\n`summary` counts rows, not distinct problems. One installed product that matches two rules, or several installed products that match one rule, each add to the issue count, so the number is an upper bound on real exposures and is inflated by false-positive `cve` rows.",
   "inputs": [],
   "kind": {
     "collector": true,
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "db8d675c5d12",
+  "leg_hash": "e452c8f620c9",
   "manifest_version": 1,
   "name": "vuln_scan",
   "outputs": [
@@ -284,7 +284,7 @@
           ]
         },
         {
-          "description": "Always \"config\" for this action; \"scan\" only on the placeholder row emitted when there is nothing to report.",
+          "description": "Always \"config\" for a check; \"scan\" on the placeholder row emitted when there is nothing to report and on the macOS Coverage row.",
           "example": "config",
           "name": "category",
           "platforms": [
@@ -299,7 +299,7 @@
           ]
         },
         {
-          "description": "The name of the compliance check, e.g. the setting it inspects. Values: free text.",
+          "description": "The name of the compliance check, e.g. the setting it inspects, or \"Coverage\" on the macOS Coverage row. Values: free text.",
           "example": "SMBv1 Protocol",
           "name": "title",
           "platforms": [
@@ -328,7 +328,7 @@
     {
       "columns": [
         {
-          "description": "Finding severity assigned by the CVE rule that matched.",
+          "description": "Finding severity assigned by the CVE rule that matched; INFO on the macOS Homebrew Coverage row and UNREADABLE on a macOS Coverage row saying the software list could not be read completely (not an issue, not a clean result).",
           "example": "HIGH",
           "name": "severity",
           "platforms": [
@@ -342,7 +342,8 @@
             "HIGH",
             "MEDIUM",
             "LOW",
-            "INFO"
+            "INFO",
+            "UNREADABLE"
           ]
         },
         {
@@ -483,7 +484,7 @@
     {
       "columns": [
         {
-          "description": "The severity this row counts, the literal \"TOTAL\" for the first row emitted by every run, or \"COVERAGE\" on the final row a macOS run adds (its count cell holds text).\n",
+          "description": "The severity this row counts, the literal \"TOTAL\" for the first row emitted by every run, or \"COVERAGE\" on the final rows a macOS run adds, one per coverage cause (its count cell holds text).\n",
           "example": "CRITICAL",
           "name": "severity",
           "platforms": [
@@ -535,7 +536,7 @@
     },
     {
       "grant": "`systemsetup -getremotelogin` needs administrator rights (root has them). No other grant. No row for this plugin",
-      "if_refused": "not observed for a denial; a refused or failed tool is an `UNREADABLE` row with detail `Unknown (read failed)` (Remote Login included), not a finding",
+      "if_refused": "not observed for a denial; a refused or failed tool is an `UNREADABLE` row with detail `Unknown (read failed)` (Remote Login included), not a finding; a tool that completes and prints a bad line is reported even with a non-zero exit",
       "measured": "2026-09-07, bare metal, as an unprivileged user (euid 501), not as root",
       "os": "macOS",
       "runs_as": "agent daemon; the shipped LaunchDaemon runs as root today (`docs/agent-privilege-model.md`)"
@@ -566,7 +567,7 @@
       "completeness": "`PARTIAL`",
       "provenance": "`macos:vuln_scan:system_profiler_unreadable`",
       "status": "`CONSTRAINED`",
-      "when": "the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. No application is returned to CVE matching or `inventory` from a run that did not finish cleanly (a partial list could read a truncated version as vulnerable or hide a real one). `cve_scan` and `scan` suppress the \"No vulnerabilities\" placeholder and end with `UNREADABLE|scan|Coverage|<text>`, `summary` with `summary|COVERAGE|<text>`, and `inventory` is empty. The text reads \"The macOS software list could not be read completely (system_profiler failed, timed out, exceeded the output cap or returned no applications); not a clean result\". The macOS commands run with a 60 s deadline and an 8 MB output cap (the process group is killed at the deadline); either one counts as unreadable"
+      "when": "the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. No application is returned to CVE matching or `inventory` from a run that did not finish cleanly (a partial list could read a truncated version as vulnerable or hide a real one). `cve_scan` and `scan` suppress the \"No vulnerabilities\" placeholder and end with `UNREADABLE|scan|Coverage|<text>`, `summary` with `summary|COVERAGE|<text>`, and `inventory` is empty. The text reads \"The macOS software list could not be read completely (system_profiler failed, timed out, exceeded the output cap or returned no applications); not a clean result\". `system_profiler` runs with a 60 s deadline and an 8 MB output cap (the process group is killed at the deadline), one at a time with its result (failures included) reused for 45 s, and a caller that waits behind an overdue run reads unreadable instead of blocking; a missed deadline or cap counts as unreadable. The tool names are English-only: if the `Version:` label is localized no app has a version, which also reads as unreadable"
     },
     {
       "completeness": "`PARTIAL`",
@@ -681,7 +682,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "db8d675c5d12",
+        "leg_hash": "e452c8f620c9",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -790,7 +791,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "db8d675c5d12",
+        "leg_hash": "e452c8f620c9",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -902,7 +903,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "db8d675c5d12",
+        "leg_hash": "e452c8f620c9",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
@@ -968,6 +969,7 @@
       "agents/plugins/vuln_scan/src/config_checks.hpp",
       "agents/plugins/vuln_scan/src/cve_rules.hpp",
       "agents/plugins/vuln_scan/src/macos_software.hpp",
+      "agents/plugins/vuln_scan/src/single_flight.hpp",
       "agents/plugins/vuln_scan/src/vuln_scan_plugin.cpp"
     ],
     "privilege_row": false,

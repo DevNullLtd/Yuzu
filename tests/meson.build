@@ -277,6 +277,7 @@ agent_test_exe = executable(
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_single_flight.cpp', # vuln_scan single-flight/cache helper cannot wedge (portable)
     'unit/test_vuln_macos_software.cpp', # WP13c: macOS enumeration status/abs-path contract (macos_software.hpp), portable
     'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',

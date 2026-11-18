@@ -679,7 +679,7 @@ summary = wait_for(exec_id, timeout=600)  # scans take longer
 print(f"Scanned {summary['agents_success']} machines")
 
 responses = get_responses("security.vuln_scan.scan", exec_id)
-critical = [r for r in responses if r["output"].get("severity") in ("critical", "high")]
+critical = [r for r in responses if r["output"].get("severity") in ("CRITICAL", "HIGH")]
 print(f"Found {len(critical)} critical/high vulnerabilities across fleet")
 ```
 
@@ -688,26 +688,22 @@ print(f"Found {len(critical)} critical/high vulnerabilities across fleet")
 Policy: no critical vulnerabilities allowed:
 
 ```cel
-result.severity != 'critical' && result.severity != 'high'
+result.severity != 'CRITICAL' && result.severity != 'HIGH'
 ```
 
-An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`, or, on macOS, a status tool that could not be read); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
+Severities are upper case (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `INFO`, `UNREADABLE`) and the comparison is case-sensitive.
+
+A policy expression is evaluated against the FIRST row of the result only. It therefore cannot assert that no `UNREADABLE` or Coverage row exists anywhere in a `scan`: an `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`, or, on macOS, a status tool that could not be read), and it appears wherever the plugin emits it. To find hosts that were not fully assessed, read all rows through REST or MCP and look for `severity == 'UNREADABLE'` rows (and, on macOS, `title == 'Coverage'` rows), or the `summary|UNREADABLE|<n>` count; do not rely on a policy to catch them.
 
 #### macOS Homebrew coverage
 
 On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned, so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
 
-The scan says so in its own output, and every coverage problem is an `UNREADABLE` row or an `INFO` Coverage row, so the `UNREADABLE` gate above covers the cases that mean "not assessed":
+The scan says so in its own output, and every coverage problem is an `UNREADABLE` row or an `INFO` Coverage row, so reading all rows (see above) finds the cases that mean "not assessed":
 
 - `cve_scan` and `scan` end with `INFO|scan|Coverage|Homebrew formulae and casks are not scanned` (a standing gap, present on every Mac), and `summary` ends with `summary|COVERAGE|<same text>`. `inventory` returns software rows only.
 - If `system_profiler` fails, times out (60 s), exceeds the 8 MB output cap or returns no applications, no application is matched or listed, the "No vulnerabilities" row is not printed, and the run ends with `UNREADABLE|scan|Coverage|The macOS software list could not be read completely ...` (`summary|COVERAGE|...` for `summary`).
 - A configuration check whose tool cannot be read (missing, refused, localized or unrecognised output) is `UNREADABLE|config|<check>|Unknown (read failed)`, counted in `summary|UNREADABLE|<n>`, and the run adds `UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read ...`.
-
-A gate that treats a Mac as assessed must therefore also require no row with `title == 'Coverage'` and `severity == 'UNREADABLE'`:
-
-```cel
-result.severity != 'UNREADABLE' && !(result.title == 'Coverage' && result.severity == 'UNREADABLE')
-```
 
 When the software list is empty or unreadable: do not read a macOS `cve_scan` with no rows as "no vulnerabilities" or an empty `inventory` as "no software"; do not run several macOS vulnerability actions on one host at once (the agent runs one `system_profiler` at a time and reuses its result for 45 s, so a second request inside that window repeats the same answer); retry after the window, and check that Spotlight and MDM are not holding `system_profiler`. Whether the agent needs a Full Disk Access or PPPC grant for any of these tools has not been measured. The agent also records `CONSTRAINED`/`PARTIAL` in its own log (provenance `macos:vuln_scan:homebrew_not_scanned`, `macos:vuln_scan:system_profiler_unreadable` or `macos:vuln_scan:config_unreadable`); REST, MCP and the dashboard do not show it, so the rows are what operators see.
 

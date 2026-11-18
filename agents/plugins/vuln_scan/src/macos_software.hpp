@@ -13,6 +13,7 @@
  * apps (failed, timed out, empty) is a different, worse condition and carries its own token.
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <string>
 #include <string_view>
@@ -34,8 +35,11 @@ inline const Argv kMacosCsrutilCmd = {"/usr/bin/csrutil", "status"};
 inline const Argv kMacosSocketfilterfwCmd = {"/usr/libexec/ApplicationFirewall/socketfilterfw",
                                              "--getglobalstate"};
 inline const Argv kMacosSystemsetupCmd = {"/usr/sbin/systemsetup", "-getremotelogin"};
-inline const Argv kMacosDefaultsCmd = {"/usr/bin/defaults", "read",
-                                       "/Library/Preferences/com.apple.SoftwareUpdate",
+// The BARE domain, not the /Library/Preferences path: a domain name goes through CFPreferences, which
+// also sees managed (MDM) values, and prints the absent-key line the check matches. The path form
+// reads only the system plist and would miss an MDM-forced value. The bare-domain absent line is
+// matched exactly as measured; if a Mac prints a different line the check reads UNREADABLE.
+inline const Argv kMacosDefaultsCmd = {"/usr/bin/defaults", "read", "com.apple.SoftwareUpdate",
                                        "AutomaticCheckEnabled"};
 
 inline std::vector<const Argv*> macos_commands() {
@@ -70,6 +74,10 @@ inline constexpr std::string_view kCoverageNoteConfig =
     "row, not as a finding";
 // Detail text of a config check whose read failed (severity UNREADABLE, never a verdict).
 inline constexpr std::string_view kConfigUnknownDetail = "Unknown (read failed)";
+// Detail of the macOS open-port row: the check does not exist there (a standing unavailability,
+// not a failed read, so it does not raise the config_unreadable status token).
+inline constexpr std::string_view kOpenPortUnavailableDetail =
+    "open-port check is not available on macOS";
 
 struct MacosApp {
     std::string name;
@@ -151,6 +159,12 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         }
     }
     flush();
+    // A localized or reshaped "Version:" label leaves every app without a version; the scan would
+    // then skip all CVE matching and read clean. English labels only are understood: when apps were
+    // found and NONE has a version, treat the read as unreadable.
+    if (!r.apps.empty() &&
+        std::none_of(r.apps.begin(), r.apps.end(), [](const MacosApp& a) { return !a.version.empty(); }))
+        r.apps.clear();
     if (!command_ok)
         r.apps.clear();
     r.readable = command_ok && !r.apps.empty();

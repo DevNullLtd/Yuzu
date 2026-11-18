@@ -35,9 +35,6 @@
 
 #ifdef __APPLE__
 #include <yuzu/agent/subprocess_runner.hpp>
-
-#include <condition_variable>
-#include <mutex>
 #endif
 
 #ifdef _WIN32
@@ -54,6 +51,7 @@
 #include "config_checks.hpp"
 #include "cve_rules.hpp"
 #include "macos_software.hpp"
+#include "single_flight.hpp"
 
 namespace {
 
@@ -326,41 +324,18 @@ yuzu::vuln::CommandRead macos_run(const yuzu::vuln::Argv& argv, bool merge_stder
 }
 
 // system_profiler: process-wide single flight plus a short result cache (failures included, so a
-// hung profiler is not retried by every queued action). A waiter reuses the flight's result.
+// hung profiler is not retried by every queued action). A waiter reuses the flight's result, or
+// reads unreadable once the leader is overdue (see single_flight.hpp: it cannot wedge).
 yuzu::vuln::CommandRead macos_profiler_read() {
-    struct Flight {
-        std::mutex mu;
-        std::condition_variable cv;
-        bool running = false;
-        bool have = false;
-        std::chrono::steady_clock::time_point at{};
-        yuzu::vuln::CommandRead result;
-    };
-    static Flight f;
-    const auto ttl = std::chrono::milliseconds(yuzu::vuln::kMacosProfilerCacheMs);
-    std::unique_lock lk(f.mu);
-    for (;;) {
-        if (f.have && std::chrono::steady_clock::now() - f.at < ttl)
-            return f.result;
-        if (!f.running)
-            break;
-        f.cv.wait(lk);
-    }
-    f.running = true;
-    lk.unlock();
-    yuzu::vuln::CommandRead r;
-    try {
-        r = macos_run_for(yuzu::vuln::kMacosSystemProfilerCmd, yuzu::vuln::kMacosCommandDeadlineMs);
-    } catch (...) {
-        // leave r as the failed default; never wedge the flight
-    }
-    lk.lock();
-    f.result = r;
-    f.have = true;
-    f.at = std::chrono::steady_clock::now();
-    f.running = false;
-    f.cv.notify_all();
-    return r;
+    static yuzu::vuln::SingleFlight<yuzu::vuln::CommandRead> flight;
+    return flight.get(
+        [] {
+            return macos_run_for(yuzu::vuln::kMacosSystemProfilerCmd,
+                                 yuzu::vuln::kMacosCommandDeadlineMs);
+        },
+        std::chrono::milliseconds(yuzu::vuln::kMacosProfilerCacheMs),
+        std::chrono::milliseconds(yuzu::vuln::kMacosCommandDeadlineMs + 15'000),
+        yuzu::vuln::CommandRead{});
 }
 
 std::vector<AppInfo> get_installed_apps(yuzu::vuln::CoverageState* cov) {
@@ -520,9 +495,9 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     actually exercised, so rung 3.
 //   - macOS: get_installed_apps and run_macos_checks run absolute-path argvs
 //     (/usr/sbin/system_profiler, spctl, fdesetup, csrutil, socketfilterfw, systemsetup, defaults)
-//     through yuzu::agent::run_bounded_subprocess — rung 2, with a 60 s deadline and an 8 MB cap.
-//     The cross-platform risky-ports check still runs `ss || netstat` through popen, so the actions
-//     that run config checks (scan, summary, config_scan) are rung 3; cve_scan/inventory are rung 2.
+//     through yuzu::agent::run_bounded_subprocess — rung 2, an 8 MB output cap, a 60 s deadline
+//     for system_profiler and 10 s for the status tools. There is no open-port check on macOS
+//     (reported as an UNREADABLE row), so no macOS leg uses popen.
 //     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never
 //     scanned (see macos_software.hpp), and the same actions report CONSTRAINED + PARTIAL at run
 //     time (declare_coverage) plus an in-band Coverage row (not inventory). config_scan reads no
@@ -531,7 +506,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "argv(system_profiler+security-checks)+popen(ss/netstat)",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "argv(system_profiler+security-checks)",
          "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
@@ -545,15 +520,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "config_scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(iptables/nft/ufw)+procfs", nullptr},
-        {YUZU_SUPPORT_CONSTRAINED, 3,
-         "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat)",
+        {YUZU_SUPPORT_CONSTRAINED, 2,
+         "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)",
          "output parsing unverified on macOS 13-15; unreadable tools report Unknown/UNREADABLE"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
         "summary",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(pkg-manager+iptables/nft/ufw)", nullptr},
-        {YUZU_SUPPORT_CONSTRAINED, 3, "argv(system_profiler+security-checks)+popen(ss/netstat)",
+        {YUZU_SUPPORT_CONSTRAINED, 2, "argv(system_profiler+security-checks)",
          "Homebrew formulae and casks are not scanned"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
@@ -594,8 +569,22 @@ public:
 
     void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
 
+    // One catch-all at the C ABI seam: nothing may unwind into the host.
     int execute(yuzu::CommandContext& ctx, std::string_view action,
-                [[maybe_unused]] yuzu::Params params) override {
+                yuzu::Params params) override {
+        try {
+            return execute_actions(ctx, action, params);
+        } catch (...) {
+            try {
+                ctx.write_output("error|vuln_scan|internal error");
+            } catch (...) {
+            }
+            return 1;
+        }
+    }
+
+    int execute_actions(yuzu::CommandContext& ctx, std::string_view action,
+                        [[maybe_unused]] yuzu::Params params) {
 
         if (action == "scan") {
             ctx.report_progress(0);

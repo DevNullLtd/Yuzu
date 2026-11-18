@@ -137,8 +137,8 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the CVE rule that matched.
-        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO]
+        description: Finding severity assigned by the CVE rule that matched; INFO on the macOS Homebrew Coverage row and UNREADABLE on a macOS Coverage row saying the software list could not be read completely (not an issue, not a clean result).
+        values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: HIGH
         platforms: [windows, linux, darwin]
       - name: category
@@ -222,13 +222,13 @@ spec:
         platforms: [windows, linux, darwin]
       - name: category
         type: string
-        description: Always "config" for this action; "scan" only on the placeholder row emitted when there is nothing to report.
+        description: Always "config" for a check; "scan" on the placeholder row emitted when there is nothing to report and on the macOS Coverage row.
         values: [config, scan]
         example: config
         platforms: [windows, linux, darwin]
       - name: title
         type: string
-        description: 'The name of the compliance check, e.g. the setting it inspects. Values: free text.'
+        description: 'The name of the compliance check, e.g. the setting it inspects, or "Coverage" on the macOS Coverage row. Values: free text.'
         example: "SMBv1 Protocol"
         platforms: [windows, linux, darwin]
       - name: detail
@@ -297,7 +297,7 @@ spec:
         type: string
         description: >
           The severity this row counts, the literal "TOTAL" for the first row emitted by
-          every run, or "COVERAGE" on the final row a macOS run adds (its count cell holds text).
+          every run, or "COVERAGE" on the final rows a macOS run adds, one per coverage cause (its count cell holds text).
         values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE, COVERAGE]
         example: CRITICAL
         platforms: [windows, linux, darwin]
@@ -345,7 +345,7 @@ metadata:
     coverage row, and the coverage status is visible only in the agent log (not
     in REST, MCP or the dashboard): treat the list as "system_profiler
     applications only, Homebrew excluded", and never read an empty macOS list
-    as "no software installed". A backslash in an application name or version
+    as "no software installed" (an empty list means the read failed or nothing was found). A backslash in an application name or version
     is shown as "/" (lossy by design until a versioned decoder change exists).
   tags: [security, vulnerability, inventory, software]
 

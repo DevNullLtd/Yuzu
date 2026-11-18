@@ -306,7 +306,7 @@ TEST_CASE("macos config table: one row per check, absolute argv, exit-zero polic
         INFO(sp.title);
         REQUIRE(sp.argv != nullptr);
         CHECK((*sp.argv)[0].front() == '/');
-        CHECK(sp.requires_exit_zero); // CURRENT behaviour, pending the Mac measurement
+        CHECK(sp.good_requires_exit_zero); // every measured good state exited 0
         CHECK(&macos_spec(sp.check) == &sp);
     }
 }
@@ -364,8 +364,8 @@ TEST_CASE("macos config: a failed or unrecognised read is UNREADABLE, never a ve
 
 TEST_CASE("macos config: near-miss lines are NOT accepted (prefix matches were the defect)",
           "[vuln][macos][config]") {
-    struct Near { MacosCheck c; const char* line; };
-    const Near near[] = {
+    struct NearMiss { MacosCheck c; const char* line; };
+    const NearMiss cases[] = {
         {MacosCheck::Sip, "System Integrity Protection status: enabled (Custom Configuration)."},
         {MacosCheck::Sip, "System Integrity Protection status: unknown (Custom Configuration)."},
         {MacosCheck::Sip, "System Integrity Protection status: enabled"},
@@ -377,26 +377,87 @@ TEST_CASE("macos config: near-miss lines are NOT accepted (prefix matches were t
         {MacosCheck::RemoteLogin, "Remote Login: Onward"},
         {MacosCheck::AutoUpdate, "10"},
     };
-    for (const auto& n : near) {
+    for (const auto& n : cases) {
         INFO(n.line);
         CHECK(macos_check_result(n.c, good(n.line)).severity == "UNREADABLE");
     }
 }
 
-TEST_CASE("macos config: only the first line is judged and it is trimmed", "[vuln][macos][config]") {
-    CHECK(macos_check_result(MacosCheck::FileVault, good("  FileVault is On.  \nextra\n")).passed);
-    CHECK(macos_check_result(MacosCheck::FileVault, good("extra\nFileVault is On.")).severity ==
-          "UNREADABLE");
+TEST_CASE("macos config: the WHOLE output is judged: one non-empty line for a good verdict",
+          "[vuln][macos][config]") {
+    const auto fv = [](const char* o) { return macos_check_result(MacosCheck::FileVault, good(o)); };
+    CHECK(fv("  FileVault is On.  \n").passed);
+    CHECK(fv("\n\nFileVault is On.\n\n").passed); // blank lines ignored
+    CHECK(fv("FileVault is On.\nextra").severity == "UNREADABLE");
+    CHECK(fv("extra\nFileVault is On.").severity == "UNREADABLE");
+    CHECK(fv("FileVault is On.\nFileVault is On.").severity == "UNREADABLE");
+    // any bad line wins over a good one (contradictory output is never a pass)
+    CHECK(fv("FileVault is On.\nFileVault is Off.").severity == "HIGH");
+    CHECK(fv("FileVault is Off.\nFileVault is On.").severity == "HIGH");
+    CHECK(macos_check_result(MacosCheck::Gatekeeper, good("assessments enabled\nassessments disabled"))
+              .severity == "HIGH");
+    CHECK(macos_check_result(MacosCheck::Sip,
+                             good("System Integrity Protection status: enabled.\n"
+                                  "System Integrity Protection status: disabled."))
+              .severity == "CRITICAL");
 }
 
-TEST_CASE("macos config: requires_exit_zero=false would accept a completed non-zero run "
-          "(policy seam pending the Mac measurement)",
+TEST_CASE("macos config: Firewall state digit must agree with the text", "[vuln][macos][config]") {
+    const auto fw = [](const char* l) { return macos_check_result(MacosCheck::Firewall, good(l)); };
+    CHECK(fw("Firewall is enabled. (State = 1)").passed);
+    CHECK(fw("Firewall is enabled. (State = 2)").passed); // enabled digits 1 and 2: UNVERIFIED
+    CHECK(fw("Firewall is disabled. (State = 0)").severity == "MEDIUM"); // measured pairing
+    CHECK(fw("Firewall is enabled. (State = 0)").severity == "UNREADABLE");
+    CHECK(fw("Firewall is enabled. (State = 3)").severity == "UNREADABLE");
+    CHECK(fw("Firewall is disabled. (State = 1)").severity == "UNREADABLE");
+    CHECK(fw("Firewall is disabled. (State = 2)").severity == "UNREADABLE");
+}
+
+TEST_CASE("macos config: a BAD line is judged from any completed run; GOOD needs exit 0",
           "[vuln][macos][config]") {
-    // The shipped table requires exit 0 for every tool. A bad-state exit code (spctl with
-    // Gatekeeper disabled) is NOT measured: if it is non-zero the check reads UNREADABLE, so a
-    // finding is lost but a false pass cannot occur. This pins that fail-closed behaviour.
-    const CommandRead ran_nonzero{"assessments disabled", false, true};
-    CHECK(macos_check_result(MacosCheck::Gatekeeper, ran_nonzero).severity == "UNREADABLE");
+    // Bad-state exit codes are NOT measured; a bad line is a finding whatever the exit code.
+    for (const auto& sp : kMacosCheckSpecs) {
+        INFO(sp.title);
+        auto bad = macos_check_result(sp.check, {std::string(sp.bad_line), false, true});
+        CHECK(bad.severity == sp.bad_severity);
+        CHECK_FALSE(bad.passed);
+        // a good line from a non-zero exit is unreadable, never a pass
+        auto g = macos_check_result(sp.check, {std::string(sp.good_line), false, true});
+        CHECK(g.severity == "UNREADABLE");
+        // a run that never completed judges nothing, even with a bad-looking line
+        CHECK(macos_check_result(sp.check, {std::string(sp.bad_line), false, false}).severity ==
+              "UNREADABLE");
+    }
+    CHECK(macos_check_result(MacosCheck::Gatekeeper, {"assessments disabled", false, true}).severity ==
+          "HIGH");
+}
+
+TEST_CASE("macos config: the shipped defaults argv reaches the absent-key INFO",
+          "[vuln][macos][config]") {
+    // An echoing reader that prints the absent-key line only when the read names the BARE domain.
+    const auto rows = run_macos_checks_table([](const Argv& a, bool) {
+        if (a.size() == 4 && a[2] == "com.apple.SoftwareUpdate")
+            return CommandRead{"Error: Could not find key 'AutomaticCheckEnabled' in domain "
+                               "'com.apple.SoftwareUpdate'.",
+                               false, true};
+        return CommandRead{};
+    });
+    const auto& r = rows[5];
+    CHECK(r.title == "Automatic update check");
+    CHECK(r.severity == "INFO");
+    CHECK(r.detail == "Automatic update check: not set (macOS default applies)");
+    CHECK(kMacosDefaultsCmd[2] == "com.apple.SoftwareUpdate"); // never the /Library/... path form
+    CHECK(macos_spec(MacosCheck::AutoUpdate).good_detail ==
+          "Enabled (check only; install not assessed)");
+}
+
+TEST_CASE("macos config: the standing open-port unavailability does not raise the config token",
+          "[vuln][macos][config]") {
+    std::vector<ConfigCheckResult> v;
+    v.push_back({"UNREADABLE", "Open Ports", std::string(kOpenPortUnavailableDetail), false});
+    CHECK_FALSE(any_config_unreadable(v)); // visible as an UNREADABLE row, not a CONSTRAINED token
+    v.push_back(macos_check_result(MacosCheck::Sip, {"", false, false}));
+    CHECK(any_config_unreadable(v));
 }
 
 TEST_CASE("macos config: a null reader fails closed", "[vuln][macos][config]") {
@@ -486,7 +547,7 @@ TEST_CASE("golden macOS 27.0.1: an absent AutomaticCheckEnabled key is INFO, not
                                   CommandRead{std::string(kDefaultsAbsent) + "\n", false, true}}) {
         auto res = macos_check_result(MacosCheck::AutoUpdate, rd);
         CHECK(res.severity == "INFO");
-        CHECK(res.title == "Automatic Software Updates");
+        CHECK(res.title == "Automatic update check");
         CHECK(res.detail == "Automatic update check: not set (macOS default applies)");
         CHECK(res.passed);
     }
@@ -538,4 +599,22 @@ TEST_CASE("golden macOS 27.0.1: the real system_profiler shape parses; property 
         CHECK(a.name != "Obtained from");
         CHECK(a.name != "Location");
     }
+}
+
+TEST_CASE("parse: a localized Version label leaves no versions, so the read is unreadable",
+          "[vuln][macos]") {
+    const char* const localized[] = {
+        "    Safari:\n\n      Version : 17.4\n    Mail:\n      Version : 16\n", // French spacing
+        "    Safari:\n\n      \xE3\x83\x90\xE3\x83\xBC\xE3\x82\xB8\xE3\x83\xA7\xE3\x83\xB3: 17.4\n", // Japanese label
+        "    Safari:\n\n      Versi\xC3\xB3n: 17.4\n",                                          // Spanish
+    };
+    for (const char* o : localized) {
+        auto e = parse_system_profiler_apps(o, true);
+        CHECK(e.apps.empty()); // never name-only rows feeding a clean scan
+        CHECK_FALSE(e.readable);
+    }
+    // one app with a version keeps the read readable
+    auto mixed = parse_system_profiler_apps("    A:\n    B:\n      Version: 1\n", true);
+    CHECK(mixed.readable);
+    CHECK(mixed.apps.size() == 2);
 }
