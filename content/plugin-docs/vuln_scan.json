@@ -39,10 +39,10 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "",
+          "fallback": "Homebrew formulae and casks are not scanned",
           "mechanism": "popen(system_profiler)",
           "rung": "3",
-          "support": "supported"
+          "support": "constrained"
         },
         "windows": {
           "fallback": "",
@@ -65,10 +65,10 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "",
+          "fallback": "Homebrew formulae and casks are not scanned",
           "mechanism": "popen(system_profiler)",
           "rung": "3",
-          "support": "supported"
+          "support": "constrained"
         },
         "windows": {
           "fallback": "",
@@ -91,10 +91,10 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "",
+          "fallback": "Homebrew formulae and casks are not scanned",
           "mechanism": "popen(system_profiler+security-checks)",
           "rung": "3",
-          "support": "supported"
+          "support": "constrained"
         },
         "windows": {
           "fallback": "",
@@ -117,10 +117,10 @@
           "support": "supported"
         },
         "macos": {
-          "fallback": "",
+          "fallback": "Homebrew formulae and casks are not scanned",
           "mechanism": "popen(system_profiler+security-checks)",
           "rung": "3",
-          "support": "supported"
+          "support": "constrained"
         },
         "windows": {
           "fallback": "",
@@ -258,7 +258,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "bf3f25896c30",
+  "leg_hash": "903a17509a71",
   "manifest_version": 1,
   "name": "vuln_scan",
   "outputs": [
@@ -674,7 +674,7 @@
       "stamp": {
         "date": "2026-09-06",
         "host_class": "container",
-        "leg_hash": "bf3f25896c30",
+        "leg_hash": "903a17509a71",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -783,7 +783,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "bf3f25896c30",
+        "leg_hash": "903a17509a71",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -895,7 +895,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "bf3f25896c30",
+        "leg_hash": "903a17509a71",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"

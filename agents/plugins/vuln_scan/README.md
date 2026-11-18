@@ -89,10 +89,17 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `config_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(spctl/fdesetup/csrutil/socketfilterfw) | ✅ supported · rung 3 · popen(iptables/nft/ufw)+procfs |
-| `cve_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `inventory` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
-| `summary` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `cve_scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `inventory` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `summary` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`cve_scan` / macOS** — Homebrew formulae and casks are not scanned
+- **`inventory` / macOS** — Homebrew formulae and casks are not scanned
+- **`scan` / macOS** — Homebrew formulae and casks are not scanned
+- **`summary` / macOS** — Homebrew formulae and casks are not scanned
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -182,7 +189,7 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash bf3f25896c30
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 903a17509a71
 
 ```
 == action=scan
@@ -254,7 +261,7 @@ Defraggler|2.22
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash bf3f25896c30
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 903a17509a71
 
 ```
 == action=scan
@@ -308,7 +315,7 @@ Find My|4.0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash bf3f25896c30
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 903a17509a71
 
 ```
 == action=scan
