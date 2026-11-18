@@ -879,15 +879,15 @@ TEST_CASE("bounded_file_hash: the stream core caps bytes and honours the deadlin
             return static_cast<long long>(n);
         };
     };
-    const auto far = sh::HashClock::now() + std::chrono::hours(1);
+    const auto deadline_far = sh::HashClock::now() + std::chrono::hours(1);
 
     std::size_t off = 0;
-    auto ok = sh::hash_stream_bounded(reader_for(off), data.size(), far);
+    auto ok = sh::hash_stream_bounded(reader_for(off), data.size(), deadline_far);
     CHECK(ok.status == sh::HashStatus::ok);
     CHECK(ok.hex == sh::sha256_hex(data));
 
     off = 0;
-    CHECK(sh::hash_stream_bounded(reader_for(off), data.size() - 1, far).status ==
+    CHECK(sh::hash_stream_bounded(reader_for(off), data.size() - 1, deadline_far).status ==
           sh::HashStatus::oversize);
 
     off = 0;
@@ -896,7 +896,7 @@ TEST_CASE("bounded_file_hash: the stream core caps bytes and honours the deadlin
               .status == sh::HashStatus::timeout);
 
     auto failing = [](unsigned char*, std::size_t) -> long long { return -1; };
-    CHECK(sh::hash_stream_bounded(failing, 1024, far).status == sh::HashStatus::unreadable);
+    CHECK(sh::hash_stream_bounded(failing, 1024, deadline_far).status == sh::HashStatus::unreadable);
 }
 
 #ifndef _WIN32
@@ -918,7 +918,7 @@ TEST_CASE("bounded_file_hash: a regular file hashes while a FIFO or a directory 
     namespace sh = yuzu::shared;
     yuzu::test::TempDir tmp{"yuzu_test_bfh_"};
     REQUIRE(fs::create_directory(tmp.path));
-    const auto far = sh::HashClock::now() + std::chrono::hours(1);
+    const auto deadline_far = sh::HashClock::now() + std::chrono::hours(1);
 
     const auto file = tmp.path / "f.bin";
     {
@@ -928,14 +928,14 @@ TEST_CASE("bounded_file_hash: a regular file hashes while a FIFO or a directory 
     {
         Fd f{open_nonblock(file)};
         REQUIRE(f.fd >= 0);
-        const auto r = sh::hash_fd_regular(f.fd, 1024, far);
+        const auto r = sh::hash_fd_regular(f.fd, 1024, deadline_far);
         CHECK(r.status == sh::HashStatus::ok);
         CHECK(r.hex == sh::sha256_hex("hello world"));
     }
     {
         Fd f{open_nonblock(file)};
         REQUIRE(f.fd >= 0);
-        CHECK(sh::hash_fd_regular(f.fd, 5, far).status == sh::HashStatus::oversize);
+        CHECK(sh::hash_fd_regular(f.fd, 5, deadline_far).status == sh::HashStatus::oversize);
     }
     // A FIFO opens O_NONBLOCK without a writer and must be refused by fstat, never read (a read
     // of the old unbounded ifstream path would block the worker forever).
@@ -944,12 +944,12 @@ TEST_CASE("bounded_file_hash: a regular file hashes while a FIFO or a directory 
     {
         Fd f{open_nonblock(fifo)};
         REQUIRE(f.fd >= 0);
-        CHECK(sh::hash_fd_regular(f.fd, 1024, far).status == sh::HashStatus::not_regular);
+        CHECK(sh::hash_fd_regular(f.fd, 1024, deadline_far).status == sh::HashStatus::not_regular);
     }
     {
         Fd f{open_nonblock(tmp.path)};
         REQUIRE(f.fd >= 0);
-        CHECK(sh::hash_fd_regular(f.fd, 1024, far).status == sh::HashStatus::not_regular);
+        CHECK(sh::hash_fd_regular(f.fd, 1024, deadline_far).status == sh::HashStatus::not_regular);
     }
 }
 
