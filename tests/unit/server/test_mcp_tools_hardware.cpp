@@ -2420,15 +2420,42 @@ void install_counting_hook(Twin& t, InFlight& f, std::chrono::milliseconds hold)
 template <class Send>
 std::vector<std::string> burst(int n, Send send) {
     std::vector<std::string> out(static_cast<std::size_t>(n));
-    std::latch go{n};
-    std::vector<std::thread> threads;
-    for (int i = 0; i < n; ++i)
-        threads.emplace_back([&, i] {
-            go.arrive_and_wait();
-            out[static_cast<std::size_t>(i)] = send();
-        });
-    for (auto& th : threads)
-        th.join();
+    std::atomic<int> thread_failures{0};
+    {
+        std::latch go{n};
+        std::vector<std::thread> threads;
+        threads.reserve(static_cast<std::size_t>(n));
+        int started = 0;
+        // Declared after `threads`, so it runs first on every exit path (including a failed
+        // thread start): release the latch for the threads that never started, then join.
+        struct JoinGuard {
+            std::latch& go;
+            std::vector<std::thread>& threads;
+            const int& started;
+            int n;
+            ~JoinGuard() {
+                go.count_down(n - started);
+                for (auto& th : threads)
+                    if (th.joinable())
+                        th.join();
+            }
+        } guard{go, threads, started, n};
+        for (int i = 0; i < n; ++i) {
+            threads.emplace_back([&, i] {
+                // No Catch2 assertion off the test thread: a throw becomes a marker body and a
+                // counter that the caller's thread checks after the join.
+                try {
+                    go.arrive_and_wait();
+                    out[static_cast<std::size_t>(i)] = send();
+                } catch (...) {
+                    out[static_cast<std::size_t>(i)] = "<burst thread threw>";
+                    thread_failures.fetch_add(1);
+                }
+            });
+            ++started;
+        }
+    }
+    CHECK(thread_failures.load() == 0);
     return out;
 }
 
@@ -2457,7 +2484,8 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable 503 with Retry-After on
     CHECK(body["error"]["remediation"].get<std::string>().find("one page at a time") != std::string::npos);
     CHECK(res->body.find("SN-a") == std::string::npos);
     CHECK(t.ci_store.reads == 0);
-    // Nothing was read, so nothing is audited: a busy refusal writes no row on REST (MCP writes one generic row, see the MCP test).
+    // Nothing was read, so nothing is audited: a busy refusal writes no row on REST (MCP writes
+    // one generic row, see the MCP test).
     CHECK(t.domain_rows.empty());
     CHECK(t.generic_rows.empty());
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
@@ -2564,9 +2592,13 @@ TEST_CASE("bulk read cap: REST and MCP draw on the one shared slot object",
     std::atomic<bool> parked{false};
     std::atomic<bool> release{false};
     t.ci_read_hook = [&](const DeviceCiKeysetQuery& q) {
-        parked = true;
-        while (!release.load())
-            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        // Only the FIRST read parks: if the two transports did not share one slot object, the MCP
+        // read would reach the store too, pass straight through here and fail the REQUIRE below
+        // instead of hanging on a release that has not been given yet.
+        if (!parked.exchange(true)) {
+            while (!release.load())
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        }
         return t.ci_store.read(q);
     };
     std::unique_ptr<httplib::Response> rest_res;
@@ -2620,6 +2652,8 @@ TEST_CASE("audit outage: concurrent bulk reads on REST never exceed the cap, ser
 
     const auto bodies = burst(kBurst, [&] {
         auto res = t.sink.Get("/api/v1/hardware-ci");
+        if (!res)
+            return std::string{"<null response>"};
         std::string s = std::to_string(res->status) + "|" + res->get_header_value("Sec-Audit-Failed") +
                         "|" + res->get_header_value("Retry-After") + "|" + res->body;
         return s;
@@ -2669,7 +2703,10 @@ TEST_CASE("audit outage: concurrent bulk reads on MCP never exceed the cap, serv
              {"id", 7},
              {"params", {{"name", "list_hardware_ci_records"}, {"arguments", json::object()}}}}
             .dump();
-    const auto bodies = burst(kBurst, [&] { return t.post(call_body)->body; });
+    const auto bodies = burst(kBurst, [&] {
+        auto res = t.post(call_body);
+        return res ? res->body : std::string{"<null response>"};
+    });
 
     CHECK(f.peak.load() >= 1);
     CHECK(f.peak.load() <= kCap);
@@ -2707,7 +2744,10 @@ TEST_CASE("audit outage [control]: with no cap the same burst reads concurrently
     t.domain_audit_ok = false;
     InFlight f;
     install_counting_hook(t, f, std::chrono::milliseconds{150});
-    (void)burst(12, [&] { return std::to_string(t.sink.Get("/api/v1/hardware-ci")->status); });
+    (void)burst(12, [&] {
+        auto res = t.sink.Get("/api/v1/hardware-ci");
+        return res ? std::to_string(res->status) : std::string{"<null response>"};
+    });
     CHECK(f.peak.load() > 2);
 }
 

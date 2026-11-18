@@ -3,9 +3,18 @@
 **Date:** 2026-11-18
 **Change:** `GET /api/v1/hardware-ci` and the MCP tool `list_hardware_ci_records`: a per-replica cap on
 concurrent bulk reads (#7949), a byte bound on one response page (#7950) and the audit-outage read
-amplification note (#7951). Three commits on `fix/hardware-ci-bulk-read-bounds`: `915454b74b` (the cap),
-`28e94b3b9a` (the byte bound) and `547d449e1b` (audit rows, coverage and changelog).
-**Status:** implemented and governed once; not merged. The residuals below are recorded, not accepted.
+amplification note (#7951). Commits on `fix/hardware-ci-bulk-read-bounds`: `915454b74b` (the cap),
+`28e94b3b9a` (the byte bound), `547d449e1b` (audit rows, coverage and changelog), `eba2214145` (governance
+round 1 fix) and the round 2 fix commit (documentation, the triage and client guidance, and test hardening).
+**Status:** implemented and governed, with two fix rounds; not merged. The residuals below are recorded, not accepted.
+
+**Supersession.** The subjects of `915454b74b` ("authz and audit keep a connection") and `28e94b3b9a`
+("cannot grow without bound") overstate what the code does. The cap is not a reserve: it limits how many pool
+connections bulk reads can hold, and authorization and the audit write can still be refused when other traffic
+exhausts the pool (at pool 4 with cap 2 a connection remained for them, which is a property of that
+configuration, not a guarantee). The byte bound limits the response, not the work: all `limit`+1 rows are read
+and held before the page is cut. This record and the operator manual are authoritative where a commit subject
+or an earlier changelog wording differs.
 
 ## What the cap does and does not do
 
@@ -13,7 +22,7 @@ amplification note (#7951). Three commits on `fix/hardware-ci-bulk-read-bounds`:
 REST route and the MCP tool, with a fixed 500 ms wait and a hard maximum of 8. Unset, the cap is
 `min(2, max(1, pool/4))`; an explicit value must be 1 to 8 (argument parsing) and at most `max(1, pool/2)`
 (boot refusal). It limits how many pool connections bulk reads can hold, so a burst of bulk pages cannot
-take the whole pool from authorization and the audit write. It is not a reserve: at pool size 1 the cap is
+take more than half of the pool (the whole pool at pool size 1). It is not a reserve: at pool size 1 the cap is
 the whole pool, and other traffic can still exhaust the pool. A fleet read over the cap is a retryable `503`
 (REST: no audit row; MCP: one generic best-effort row); point reads (`agent_id`) take no slot.
 

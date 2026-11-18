@@ -215,7 +215,9 @@ inline constexpr std::string_view kScopeTooWideRemediation =
 
 /// The A4 `remediation` hint for a `kBusy` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kBusyRemediation =
-    "wait retry_after_ms and call once more; read one page at a time, never several in parallel";
+    "wait retry_after_ms, then retry the same cursor with some jitter and back off on repeats "
+    "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read one "
+    "page at a time, never several in parallel";
 
 /// The A4 `remediation` hint for a `kOrderingUnverified` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kOrderingUnverifiedRemediation =

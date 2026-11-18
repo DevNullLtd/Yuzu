@@ -901,18 +901,23 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "collation state (see PostgreSQL collation version in server-admin.md)",
          60000, true},
         // Busy: nothing was read, so NO domain audit row on either transport (REST writes none;
-        // MCP writes one generic best-effort row); the 2000 ms hint is pinned here for both surfaces
-        // (the CI hint script only scans newly added tools).
+        // MCP writes one generic best-effort row); the 2000 ms hint is pinned here for both
+        // surfaces (the CI hint script only scans newly added tools).
         {hcp::ReadError::kBusy, true,
          "hardware CI bulk read capacity in use; retry after the hint", false, "failure",
          "hardware CI records (REST) state=read capacity in use",
          "hardware CI records (MCP) state=read capacity in use",
-         "wait retry_after_ms and call once more; read one page at a time, never several in parallel",
-         "wait retry_after_ms and call once more; read one page at a time, never several in parallel",
+         "wait retry_after_ms, then retry the same cursor with some jitter and back off on repeats "
+         "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read "
+         "one page at a time, never several in parallel",
+         "wait retry_after_ms, then retry the same cursor with some jitter and back off on repeats "
+         "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read "
+         "one page at a time, never several in parallel",
          2000, true},
     }};
     static_assert(table.size() == static_cast<std::size_t>(hcp::ReadError::kCount),
                   "a new ReadError needs a row in this table (and a case in describe_read_error)");
+    int unavailable_without_domain_row = 0;
     for (int v = 0; v < static_cast<int>(hcp::ReadError::kCount); ++v) {
         const auto e = static_cast<hcp::ReadError>(v);
         // an enumerator that is in neither switch answers the out-of-range text: refuse it
@@ -937,7 +942,16 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
         CHECK(mcp.audit_detail == it->mcp_detail);
         CHECK(rest.remediation == it->rest_remediation);
         CHECK(mcp.remediation == it->mcp_remediation);
+        // an unavailable answer that writes no domain audit row (nothing was read)
+        if (rest.unavailable && !rest.domain_audit_row) {
+            ++unavailable_without_domain_row;
+            CHECK(e == hcp::ReadError::kBusy);
+        }
     }
+    // MCP routes the busy answer on enumerator identity (ReadError::kBusy), not on this shape, so
+    // a NEW enumerator that is unavailable with no domain audit row must be decided here: either
+    // it is routed like kBusy on both transports or the shape is not allowed.
+    CHECK(unavailable_without_domain_row == 1);
     // the sentinel and an out-of-range value is a refusal with no domain audit row, an empty audit
     // detail and no retry (the MCP handler's generic `denied` row is not this function's)
     for (const auto v : {hcp::ReadError::kCount, static_cast<hcp::ReadError>(99)}) {

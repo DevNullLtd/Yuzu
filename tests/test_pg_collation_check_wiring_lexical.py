@@ -99,9 +99,13 @@ Invariants:
      hardware routes' Deps) and `tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn` (the MCP tools)
      each appear exactly once, and the closed two-value surface label
      `surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"` is present (a dropped wire
-     leaves `yuzu_hardware_ci_read_busy_total` flat while the 503s still flow). The label
-     check reads the RAW source, because normalisation blanks string literals; it is best effort
-     against a comment, which the structural half (blanked literals) still guards.
+     leaves `yuzu_hardware_ci_read_busy_total` flat while the 503s still flow). The lambda body
+     of `hw_ci_read_busy_fn` must also name the counter `yuzu_hardware_ci_read_busy_total` and
+     call `.increment()` (a lambda that is wired but never moves the counter is the same flat
+     gauge). The label and counter-name checks read the RAW source, because normalisation blanks
+     string literals; they strip comments from the lambda body first and are otherwise best
+     effort, while the structural half (blanked literals) still guards the wires and the
+     `.increment()` call.
 
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
@@ -613,6 +617,24 @@ MSG_BUSY_MCP_WIRE = ("the MCP ToolDeps is not handed `hw_ci_read_busy_fn` exactl
                      "`tool_deps.ci_read_busy_fn` (the busy counter would never move)")
 MSG_BUSY_LABEL = ("the busy counter's closed surface label ternary "
                   "`surface == hardware_ci_page::Surface::kMcp ? \"mcp\" : \"rest\"` is missing")
+BUSY_LAMBDA = re.compile(r"auto\s+hw_ci_read_busy_fn\s*=\s*\[[^\]]*\]\s*\([^)]*\)\s*\{")
+BUSY_COUNTER = "yuzu_hardware_ci_read_busy_total"
+MSG_BUSY_COUNTER_NAME = ("the `hw_ci_read_busy_fn` lambda body does not name the counter "
+                         "`yuzu_hardware_ci_read_busy_total` (the alerted series would never move)")
+MSG_BUSY_INCREMENT = ("the `hw_ci_read_busy_fn` lambda body does not call `.increment()` "
+                      "(a refusal would not move the busy counter)")
+
+
+def busy_lambda_body(text):
+    """The brace-balanced body of the `hw_ci_read_busy_fn` lambda in `text`, or None."""
+    m = BUSY_LAMBDA.search(text)
+    if not m:
+        return None
+    depth, i = 1, m.end()
+    while i < len(text) and depth:
+        depth += {"{": 1, "}": -1}.get(text[i], 0)
+        i += 1
+    return text[m.end():i - 1] if depth == 0 else None
 
 
 def busy_problems(src):
@@ -625,6 +647,15 @@ def busy_problems(src):
         out.append(MSG_BUSY_MCP_WIRE)
     if len(re.findall(re.escape(BUSY_LABEL_NORM), t)) != 1 or BUSY_LABEL_RAW not in src:
         out.append(MSG_BUSY_LABEL)
+    body = busy_lambda_body(t)
+    if body is None or ".increment()" not in body:
+        out.append(MSG_BUSY_INCREMENT)
+    raw = busy_lambda_body(src)
+    if raw is not None:
+        raw = re.sub(r"/\*.*?\*/", "", raw, flags=re.S)
+        raw = re.sub(r"//[^\n]*", "", raw)
+    if raw is None or BUSY_COUNTER not in raw:
+        out.append(MSG_BUSY_COUNTER_NAME)
     return out
 
 
@@ -657,6 +688,39 @@ class HardwareCiReadBusyWiring(unittest.TestCase):
         self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
         m = self.src.replace(BUSY_LABEL_RAW, "std::string{}", 1)
         self.assertIn(MSG_BUSY_LABEL, busy_problems(m))
+
+    def _mutate_in_lambda(self, old, new):
+        """Replace the first `old` after the lambda header only (the name occurs elsewhere)."""
+        h = BUSY_LAMBDA.search(self.src)
+        self.assertIsNotNone(h)
+        i = self.src.index(old, h.end())
+        return self.src[:i] + new + self.src[i + len(old):]
+
+    def test_counter_name_removed_or_commented_out(self):
+        m = self._mutate_in_lambda(BUSY_COUNTER, "yuzu_some_other_total")
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_COUNTER_NAME, got)
+        self.assertNotIn(MSG_BUSY_INCREMENT, got)
+        m = self._mutate_in_lambda(BUSY_COUNTER, "yuzu_some_other_total /* " + BUSY_COUNTER + " */")
+        self.assertIn(MSG_BUSY_COUNTER_NAME, busy_problems(m))
+
+    def test_increment_removed_or_commented_out(self):
+        m = self._mutate_in_lambda(".increment();", ";")
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_INCREMENT, got)
+        self.assertNotIn(MSG_BUSY_COUNTER_NAME, got)
+        m = self._mutate_in_lambda(".increment();", "; // .increment();")
+        self.assertIn(MSG_BUSY_INCREMENT, busy_problems(m))
+
+    def test_lambda_deleted_or_renamed(self):
+        m = self.src.replace("auto hw_ci_read_busy_fn = [this]",
+                             "auto hw_ci_read_busy_fn_x = [this]", 1)
+        self.assertNotEqual(m, self.src)
+        got = busy_problems(m)
+        self.assertIn(MSG_BUSY_INCREMENT, got)
+        self.assertIn(MSG_BUSY_COUNTER_NAME, got)
 
 
 class PgCollationCheckWiring(unittest.TestCase):

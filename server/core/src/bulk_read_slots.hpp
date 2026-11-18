@@ -139,8 +139,9 @@ resolve_bulk_read_cap(int configured, int pool_size) {
         return std::unexpected("--hardware-ci-read-concurrency " + std::to_string(configured) +
                                " is above " + std::to_string(ceiling) + ", half of the " +
                                std::to_string(pool) +
-                               "-connection Postgres pool (--postgres-pool-size): bulk reads may hold "
-                               "at most half of the pool; lower it or raise --postgres-pool-size");
+                               "-connection Postgres pool (--postgres-pool-size): bulk reads may "
+                               "hold at most half of the pool; lower it or raise "
+                               "--postgres-pool-size");
     return BulkReadCapResolution{configured, false};
 }
 

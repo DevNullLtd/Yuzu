@@ -2309,7 +2309,9 @@
       "changelog.d/2026-11-03-hardware-windows-estate.added.md",
       "changelog.d/2026-11-04-hardware-expanded-record.added.md",
       "changelog.d/7551-hardware-record-online-other-replica.fixed.md",
-      "changelog.d/7566-hardware-online-from-roster-read.fixed.md"
+      "changelog.d/7566-hardware-online-from-roster-read.fixed.md",
+      "changelog.d/7949-hardware-ci-read-concurrency-cap.added.md",
+      "changelog.d/7950-hardware-ci-page-byte-bound.changed.md"
     ],
     "definitions": [
       "content/definitions/hardware.yaml"
@@ -2330,6 +2332,7 @@
     "privilege_row": true,
     "tests": [
       "tests/test_hardware_definition.py",
+      "tests/unit/server/test_hardware_ci_read_cap_pg.cpp",
       "tests/unit/server/test_hardware_list_model.cpp",
       "tests/unit/server/test_hardware_routes.cpp",
       "tests/unit/server/test_hardware_sync_routes.cpp",

@@ -35,7 +35,8 @@ static_assert(!std::is_copy_constructible_v<BulkReadSlots::Slot>);
 static_assert(!std::is_copy_assignable_v<BulkReadSlots::Slot>);
 static_assert(std::is_nothrow_move_constructible_v<BulkReadSlots::Slot>);
 
-TEST_CASE("bulk read cap: the Config default is the resolver's unset sentinel", "[bulk_read_slots]") {
+TEST_CASE("bulk read cap: the Config default is the resolver's unset sentinel",
+          "[bulk_read_slots]") {
     // Config is not a literal type, so this cannot be a static_assert.
     CHECK(yuzu::server::Config{}.hardware_ci_read_concurrency == kBulkReadCapUnset);
 }

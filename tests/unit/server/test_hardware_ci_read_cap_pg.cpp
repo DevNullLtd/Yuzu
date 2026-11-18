@@ -155,7 +155,8 @@ TEST_CASE("bulk read cap [control]: with no cap, bulk readers equal to the pool 
         t.join();
 }
 
-TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization and the audit write",
+TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization and the audit write "
+          "(pool larger than the cap)",
           "[pg][hardware_ci][bulk_read_slots]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, cap_tpl);
     PgPool pool{{.conninfo = db_.dsn(), .size = kPool}};
@@ -176,10 +177,13 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
     std::vector<std::optional<hcp::ReadError>> outcome(kPool);
     std::vector<std::thread> threads;
     JoinGuard guard{readers, threads}; // after everything the reader threads touch
+    std::atomic<int> surplus_done{0}; // surplus readers that have returned (outcome is written)
     auto run_reader = [&](int i) {
         const auto page = hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         if (!page)
             outcome[static_cast<std::size_t>(i)] = page.error();
+        if (i >= resolved->cap)
+            surplus_done.fetch_add(1);
     };
     for (int i = 0; i < resolved->cap; ++i)
         threads.emplace_back(run_reader, i);
@@ -189,6 +193,14 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
     // The rest of a burst as large as the pool is refused as busy: no connection is taken for it.
     for (int i = resolved->cap; i < kPool; ++i)
         threads.emplace_back(run_reader, i);
+    // Wait for the surplus outcomes with a deadline: a cap regression would let a surplus reader
+    // park on the store instead of returning, and a bare join here would hang the suite. The
+    // guard releases the readers and joins when the REQUIRE fails.
+    const int surplus = kPool - resolved->cap;
+    const auto surplus_deadline = std::chrono::steady_clock::now() + 10s;
+    while (surplus_done.load() < surplus && std::chrono::steady_clock::now() < surplus_deadline)
+        std::this_thread::sleep_for(5ms);
+    REQUIRE(surplus_done.load() == surplus);
     for (int i = resolved->cap; i < kPool; ++i)
         threads[static_cast<std::size_t>(i)].join();
     for (int i = resolved->cap; i < kPool; ++i) {
