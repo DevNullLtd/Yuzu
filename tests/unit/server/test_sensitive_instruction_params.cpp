@@ -137,3 +137,20 @@ TEST_CASE("redact_tool_args_for_ticket fails closed past the depth bound",
         deep = nlohmann::json{{"k", deep}};
     CHECK_FALSE(redact_tool_args_for_ticket(deep).has_value());
 }
+
+TEST_CASE("redact_tool_args_for_ticket reports over-depth as a caller fault, and pins the "
+          "documented residual: a secret inside a string VALUE is not parsed",
+          "[server][sensitive_params]") {
+    nlohmann::json deep = "leaf";
+    for (int i = 0; i < kTicketRedactMaxDepth + 5; ++i)
+        deep = nlohmann::json{{"k", deep}};
+    bool over = false;
+    CHECK_FALSE(redact_tool_args_for_ticket(deep, &over).has_value());
+    CHECK(over);
+
+    // Residual (documented in the header): text embedded in a string value is not interpreted.
+    nlohmann::json embedded = {{"features_json", R"({"secret":"yuzu_test_embedded"})"}};
+    auto out = redact_tool_args_for_ticket(embedded);
+    REQUIRE(out.has_value());
+    CHECK(out->dump().find("yuzu_test_embedded") != std::string::npos);
+}

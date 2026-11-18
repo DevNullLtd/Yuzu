@@ -84,6 +84,23 @@ inline constexpr std::string_view kRedactedToolArgKeys[] = {"secret"};
 inline constexpr int kTicketRedactMaxDepth = 64;
 
 namespace detail {
+[[nodiscard]] inline bool ticket_depth_exceeded_impl(const nlohmann::json& node, int depth) {
+    if (depth > kTicketRedactMaxDepth)
+        return true;
+    if (node.is_object()) {
+        for (auto it = node.begin(); it != node.end(); ++it)
+            if (ticket_depth_exceeded_impl(it.value(), depth + 1))
+                return true;
+    } else if (node.is_array()) {
+        for (const auto& el : node)
+            if (ticket_depth_exceeded_impl(el, depth + 1))
+                return true;
+    }
+    return false;
+}
+[[nodiscard]] inline bool ticket_depth_exceeded(const nlohmann::json& node) {
+    return ticket_depth_exceeded_impl(node, 0);
+}
 [[nodiscard]] inline bool redact_ticket_node(nlohmann::json& node, int depth) {
     if (depth > kTicketRedactMaxDepth)
         return false;
@@ -110,11 +127,25 @@ namespace detail {
 } // namespace detail
 
 /// The persisted/bound form of MCP tool arguments for an approval ticket
-/// subject (WP06 F12). nullopt = could not be computed (over-depth or digest
-/// failure): refuse the mint, never fall back to the raw arguments.
-[[nodiscard]] inline std::optional<nlohmann::json> redact_tool_args_for_ticket(nlohmann::json args) {
-    if (!detail::redact_ticket_node(args, 0))
+/// subject. nullopt = could not be computed (over-depth or digest failure): refuse the
+/// mint, never fall back to the raw arguments. `*over_depth` (optional) is set when the cause is
+/// the caller's nesting (a request fault, not retryable) rather than a digest fault.
+///
+/// SCOPE OF THE REDACTION: keys are matched in the JSON structure. A secret embedded as text
+/// INSIDE a string value (a JSON or YAML document passed as one string argument) is NOT parsed:
+/// no approval-gated MCP tool takes such an argument that carries a credential today (the
+/// string-typed document arguments are `yaml_source`/`features_json`-style definitions, which hold
+/// no secret keys), and a NEW tool that does must pass the credential as its own key. This is a
+/// documented residual, pinned by tests/unit/server/test_sensitive_instruction_params.cpp.
+[[nodiscard]] inline std::optional<nlohmann::json> redact_tool_args_for_ticket(nlohmann::json args,
+                                                                               bool* over_depth = nullptr) {
+    if (over_depth)
+        *over_depth = false;
+    if (!detail::redact_ticket_node(args, 0)) {
+        if (over_depth)
+            *over_depth = detail::ticket_depth_exceeded(args);
         return std::nullopt;
+    }
     return args;
 }
 
