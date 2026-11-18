@@ -1058,6 +1058,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                     re.detail = "token_id=" + claim.token_id + " via=gateway_proxy";
                     enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
                 }
+            } else if (audit_store_) {
+                // A wired but closed store cannot record the enrolment (nor the re-enrolment row):
+                // that is the same dropped-evidence degradation as a failed write, never silence.
+                enroll_audit_ok = false;
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -1505,6 +1509,11 @@ gw_enrolled:
     // stops re-enrollment/re-issuance (checked above). The shared signer
     // (sign_agent_csr) carries the per-agent rate-limit + CSR-size cap, so both
     // paths share one issuance chokepoint and cannot drift.
+    std::string_view no_leaf_reason; // set only when NO new leaf is issued below
+    if (request->csr_pem().empty())
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoCsr;
+    else if (!agent_cert_signer_)
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoSigner;
     if (!request->csr_pem().empty() && agent_cert_signer_) {
         // #1273 B-2: the signer (sign_agent_csr) runs INSIDE this synchronous gRPC
         // handler and is now reachable over the one-way-TLS gateway edge. An
@@ -1516,9 +1525,11 @@ gw_enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::GatewayProxy);
         } catch (const std::exception& e) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("[gateway] ProxyRegister: signer threw for agent {}: {}", safe_agent_id,
                           e.what());
         } catch (...) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             // Non-std throw (foreign exception across a plugin/.so boundary, etc.)
             // must not escape the sync handler either (gov #1273 Hermes).
             spdlog::error("[gateway] ProxyRegister: signer threw a non-std exception for agent {}",
@@ -1548,7 +1559,16 @@ gw_enrolled:
         } else {
             spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
                          safe_agent_id);
+            if (no_leaf_reason.empty())
+                no_leaf_reason = yuzu::server::kReenrolNoLeafSignerFailed;
         }
+    }
+    // WP01: a single-use token was consumed to re-enrol a live-leaf id but NO leaf was issued: the
+    // token is spent and the old leaf stays. Count it (alert YuzuAgentReenrolTokenNoLeaf).
+    if (reenrolled_with_token && !no_leaf_reason.empty()) {
+        yuzu::server::count_reenrol_token_no_leaf(metrics_, no_leaf_reason);
+        spdlog::warn("[gateway] agent {}: re-enrolment token consumed but no leaf issued ({})", safe_agent_id,
+                     no_leaf_reason);
     }
 
     // Store session_id on the AgentSession so session-aware cleanup works.

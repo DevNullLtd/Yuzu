@@ -56,6 +56,7 @@
 #include "test_tracker_scope.hpp"
 #include "test_webhook_store_pg_helper.hpp"
 #include "typed_inventory_sources.hpp"
+#include "analytics_event_store.hpp"
 #include "update_registry.hpp"
 #include "webhook_store.hpp"
 #include <yuzu/metrics.hpp>
@@ -5173,4 +5174,229 @@ TEST_CASE("WP01: the gateway path writes its own audit row (result, path, source
     const auto sink = yuzu::server::make_reregistration_audit_sink(
         nullptr, "direct", "x", "1.2.3.4", nullptr, nullptr, &h.metrics);
     sink("agent.reregistration_refused", "denied", "no_proof", "enforce", {});
+}
+
+TEST_CASE("WP01: a single-use token consumed without a leaf issued is COUNTED, per cause, on both paths",
+          "[pg][agent_service][register][gateway][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::GatewayUpstreamServiceImpl gw{h.registry, h.bus, h.auth_mgr, h.auto_approve, &h.metrics};
+    wp01::HookProbe probe;
+    auto hooks = wp01::make_hooks(probe);
+    h.svc.set_require_client_identity(true);
+    h.svc.set_agent_identity_hooks(hooks);
+    h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    gw.set_agent_identity_hooks(hooks);
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    const auto no_leaf = [&](const char* reason) {
+        return h.metrics.counter("yuzu_register_reenrol_token_no_leaf_total", {{"reason", reason}})
+            .value();
+    };
+    int idn = 0;
+    // Direct path needs a presented-certificate-less caller (token route); the gateway path a
+    // witnessing listener that saw no certificate.
+    const auto run = [&](bool via_gateway, const std::string& csr) {
+        const std::string id = "noleaf-" + std::to_string(++idn);
+        wp01::enroll(h, id);
+        const auto token = mint_enrollment_token(h.auth_mgr, "recover", 1, std::chrono::hours(1));
+        auto req = wp01::request(id, token, csr);
+        apb::RegisterResponse resp;
+        if (via_gateway) {
+            req.set_gateway_attests_peer_cert(true);
+            REQUIRE(gw.ProxyRegister(nullptr, &req, &resp).ok());
+        } else {
+            REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
+        }
+        CHECK(resp.accepted());
+        return resp;
+    };
+    // An ordinary re-registration (no live leaf, no token, no CSR) consumed no token: it counts nothing.
+    {
+        probe.state = {.has_live = false, .has_revoked_unexpired = false};
+        const auto sum = [&] {
+            return no_leaf("no_csr") + no_leaf("no_signer") + no_leaf("signer_failed") +
+                   no_leaf("signer_threw");
+        };
+        const double before = sum();
+        wp01::enroll(h, "plain-1");
+        auto preq = wp01::request("plain-1");
+        apb::RegisterResponse presp;
+        REQUIRE(h.svc.Register(nullptr, &preq, &presp).ok());
+        wp01::enroll(h, "plain-2");
+        auto greq = wp01::request("plain-2");
+        greq.set_gateway_attests_peer_cert(true);
+        apb::RegisterResponse gresp;
+        REQUIRE(gw.ProxyRegister(nullptr, &greq, &gresp).ok());
+        CHECK(sum() == before);
+        probe.state = {.has_live = true, .has_revoked_unexpired = false};
+    }
+    for (const bool via_gateway : {false, true}) {
+        INFO(std::string(via_gateway ? "gateway" : "direct"));
+        const double base_no_csr = no_leaf("no_csr"), base_no_signer = no_leaf("no_signer"),
+                     base_failed = no_leaf("signer_failed"), base_threw = no_leaf("signer_threw");
+        const auto set_signer = [&](yuzu::server::detail::AgentServiceImpl::AgentCertSigner f) {
+            h.svc.set_agent_cert_signer(f);
+            gw.set_agent_cert_signer(f);
+        };
+        // no CSR (the agent still holds a certificate file it believes valid)
+        set_signer([](const std::string&, const std::string& id, yuzu::server::CertIssuanceSource)
+                       -> std::optional<std::pair<std::string, std::string>> {
+            return std::make_pair("LEAF-" + id, "CHAIN");
+        });
+        auto r = run(via_gateway, "");
+        CHECK(r.issued_certificate().empty());
+        CHECK(no_leaf("no_csr") == base_no_csr + 1.0);
+        // no signer wired
+        set_signer(nullptr);
+        r = run(via_gateway, "CSR");
+        CHECK(no_leaf("no_signer") == base_no_signer + 1.0);
+        // the signer answers nothing
+        set_signer([](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
+                       -> std::optional<std::pair<std::string, std::string>> { return std::nullopt; });
+        r = run(via_gateway, "CSR");
+        CHECK(no_leaf("signer_failed") == base_failed + 1.0);
+        // the signer throws
+        set_signer([](const std::string&, const std::string&, yuzu::server::CertIssuanceSource)
+                       -> std::optional<std::pair<std::string, std::string>> {
+            throw std::runtime_error("boom");
+        });
+        r = run(via_gateway, "CSR");
+        CHECK(no_leaf("signer_threw") == base_threw + 1.0);
+        // a leaf that IS issued counts nothing
+        set_signer([](const std::string&, const std::string& id, yuzu::server::CertIssuanceSource)
+                       -> std::optional<std::pair<std::string, std::string>> {
+            return std::make_pair("LEAF-" + id, "CHAIN");
+        });
+        const double before = no_leaf("no_csr") + no_leaf("no_signer") + no_leaf("signer_failed") +
+                              no_leaf("signer_threw");
+        r = run(via_gateway, "CSR");
+        CHECK_FALSE(r.issued_certificate().empty());
+        CHECK(no_leaf("no_csr") + no_leaf("no_signer") + no_leaf("signer_failed") +
+                  no_leaf("signer_threw") == before);
+    }
+}
+
+TEST_CASE("WP01: a wired but CLOSED audit store drops the enrolment evidence LOUDLY on both paths (analytics "
+          "agent.enrollment_audit_dropped), never silently",
+          "[pg][agent_service][register][gateway][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::GatewayUpstreamServiceImpl gw{h.registry, h.bus, h.auth_mgr, h.auto_approve, &h.metrics};
+    wp01::HookProbe probe;
+    int signed_count = 0;
+    auto hooks = wp01::make_hooks(probe);
+    h.svc.set_require_client_identity(true);
+    h.svc.set_agent_identity_hooks(hooks);
+    h.svc.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    h.svc.set_agent_cert_signer(wp01::counting_signer(signed_count));
+    gw.set_agent_identity_hooks(hooks);
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    gw.set_agent_cert_signer(wp01::counting_signer(signed_count));
+    // A store that never opened: a pool whose database is unreachable.
+    PgPool dead_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=none connect_timeout=1", .size = 1}};
+    yuzu::server::AuditStore closed{dead_pool};
+    REQUIRE_FALSE(closed.is_open());
+    auto analytics = std::make_shared<yuzu::server::AnalyticsEventStore>(*h.audit_pool);
+    REQUIRE(analytics->is_open());
+    h.svc.set_audit_store(&closed);
+    gw.set_audit_store(&closed);
+    h.svc.set_analytics_store(analytics);
+    gw.set_analytics_store(analytics);
+    const auto dropped_for = [&](const std::string& id) {
+        const auto ev = analytics->query_recent(50);
+        REQUIRE(ev.has_value());
+        for (const auto& e : *ev)
+            if (e.event_type == "agent.enrollment_audit_dropped" && e.agent_id == id)
+                return true;
+        return false;
+    };
+    SECTION("direct") {
+        wp01::enroll(h, "closed-1");
+        const auto token = mint_enrollment_token(h.auth_mgr, "recover", 1, std::chrono::hours(1));
+        auto req = wp01::request("closed-1", token, "CSR");
+        apb::RegisterResponse resp;
+        REQUIRE(h.svc.Register(nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        CHECK(dropped_for("closed-1"));
+    }
+    SECTION("gateway") {
+        wp01::enroll(h, "closed-2");
+        const auto token = mint_enrollment_token(h.auth_mgr, "recover", 1, std::chrono::hours(1));
+        auto req = wp01::request("closed-2", token, "CSR");
+        req.set_gateway_attests_peer_cert(true);
+        apb::RegisterResponse resp;
+        REQUIRE(gw.ProxyRegister(nullptr, &req, &resp).ok());
+        CHECK(resp.accepted());
+        CHECK(dropped_for("closed-2"));
+    }
+}
+
+TEST_CASE("WP01: the summary chunks reach the audit log through the health-tick flush only, in order, and a "
+          "deadline or a failing store keeps them queued",
+          "[pg][agent_service][wp01][reregistration][audit]") {
+    using yuzu::server::detail::UnprovenAuditBudget;
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    auto& budget = yuzu::server::detail::reregistration_unproven_budget();
+    while (budget.take_pending()) {
+    }
+    auto& skew = yuzu::server::detail::reregistration_audit_clock_skew_ms();
+    skew += 7'000'000;
+    const auto now = [] { return yuzu::server::detail::reregistration_audit_now_ms(); };
+    // Window A admits 300 ids (they become "recent"); window B: ONE source names them all again, 50
+    // get a row and 250 are dropped: two chunks (200 + 50 ids).
+    for (int i = 0; i < 300; ++i)
+        (void)budget.admit("fl-" + std::to_string(i), "seed-" + std::to_string(i / 40), now());
+    skew += UnprovenAuditBudget::kWindowMs + 1;
+    for (int i = 0; i < 300; ++i)
+        (void)budget.admit("fl-" + std::to_string(i), "one-gateway", now());
+    skew += UnprovenAuditBudget::kWindowMs + 1;
+    while (budget.take_pending()) { // a stale window an earlier test left open closed at the first admit
+    }
+    // Window B closes at the next admit: that queues the chunks but writes NOTHING (never on a
+    // request thread); only the flush writes.
+    (void)budget.admit("tick", "x", now());
+    CHECK(budget.pending_size() == 2);
+    auto count_rows = [&] {
+        auto rows = h.audit->query({});
+        REQUIRE(rows.has_value());
+        int n = 0;
+        for (const auto& ev : *rows)
+            if (ev.action == "agent.reregistration_unproven" &&
+                ev.detail.find("outcome=aggregate") != std::string::npos)
+                ++n;
+        return n;
+    };
+    CHECK(count_rows() == 0);
+    // A zero deadline writes nothing and keeps both chunks queued (never lost).
+    yuzu::server::flush_reregistration_audit_summary(h.audit.get(), &h.metrics, false, /*deadline_ms=*/0);
+    CHECK(count_rows() == 0);
+    CHECK(budget.pending_size() == 2);
+    // A closed store fails the first chunk (retried), nothing is written.
+    PgPool dead_pool{{.conninfo = "host=127.0.0.1 port=1 dbname=none connect_timeout=1", .size = 1}};
+    yuzu::server::AuditStore closed{dead_pool};
+    yuzu::server::flush_reregistration_audit_summary(&closed, &h.metrics, false);
+    CHECK(count_rows() == 0);
+    CHECK(budget.pending_size() == 2);
+    // The real flush writes both chunks, system principal, in drop order.
+    yuzu::server::flush_reregistration_audit_summary(h.audit.get(), &h.metrics, false);
+    CHECK(count_rows() == 2);
+    CHECK(budget.pending_size() == 0);
+    auto rows = h.audit->query({});
+    REQUIRE(rows.has_value());
+    int parts = 0;
+    for (const auto& ev : *rows)
+        if (ev.action == "agent.reregistration_unproven" &&
+            ev.detail.find("outcome=aggregate") != std::string::npos) {
+            CHECK(ev.principal == "system:reregistration-audit");
+            CHECK(ev.target_id == "*");
+            CHECK(ev.source_ip.empty());
+            CHECK(ev.detail.find("sources=one-gateway:250") != std::string::npos);
+            CHECK(ev.detail.find("part=") != std::string::npos);
+            ++parts;
+        }
+    CHECK(parts == 2);
 }

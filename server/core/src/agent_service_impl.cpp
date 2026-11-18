@@ -740,6 +740,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     re.detail = "token_id=" + claim.token_id + " via=direct";
                     enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
                 }
+            } else if (audit_store_) {
+                // A wired but closed store cannot record the enrolment (nor the re-enrolment row):
+                // that is the same dropped-evidence degradation as a failed write, never silence.
+                enroll_audit_ok = false;
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -997,6 +1001,11 @@ enrolled:
     // a per-agent client leaf bound to agent_id and return it; the agent persists
     // it and reconnects with mutual TLS. Signing failure is non-fatal — the agent
     // stays on the bootstrap (request-but-don't-require) posture and can retry.
+    std::string_view no_leaf_reason; // set only when NO new leaf is issued below
+    if (request->csr_pem().empty())
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoCsr;
+    else if (!agent_cert_signer_)
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoSigner;
     if (!request->csr_pem().empty() && agent_cert_signer_) {
         // #1273 B-2: contain any exception out of the signer — it runs in this sync
         // handler; a throw would terminate the server. Degrade to no-cert (the
@@ -1007,8 +1016,10 @@ enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw for agent {}: {}", safe_agent_id, e.what());
         } catch (...) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw a non-std exception for agent {}", safe_agent_id);
         }
         if (issued) {
@@ -1035,7 +1046,16 @@ enrolled:
             }
         } else {
             spdlog::warn("Register: client-cert signing failed for agent {}", safe_agent_id);
+            if (no_leaf_reason.empty())
+                no_leaf_reason = yuzu::server::kReenrolNoLeafSignerFailed;
         }
+    }
+    // WP01: a single-use token was consumed to re-enrol a live-leaf id but NO leaf was issued: the
+    // token is spent and the old leaf stays. Count it (alert YuzuAgentReenrolTokenNoLeaf).
+    if (reenrolled_with_token && !no_leaf_reason.empty()) {
+        yuzu::server::count_reenrol_token_no_leaf(&metrics_, no_leaf_reason);
+        spdlog::warn("agent {}: re-enrolment token consumed but no leaf issued ({})", safe_agent_id,
+                     no_leaf_reason);
     }
 
     PendingRegistration pending;

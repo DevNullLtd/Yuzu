@@ -1393,12 +1393,15 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
     bool survivor_inactive = false;
     // ONE transaction under a per-agent advisory lock (ADR-0012): the lock is taken BEFORE the
     // UPDATE's snapshot, so two concurrent re-enrolments of one id run strictly one after the
-    // other, and the second sees the first's committed leaf. The statement keeps exactly the
-    // NEWEST active unexpired agent leaf by (issued_at, serial_hex) and revokes every other one:
-    // it converges to one live leaf even on a same-second issued_at tie, and it can never leave
-    // the id with zero live leaves (the newest is always kept). `issued_at` is stamped from the
-    // DATABASE clock at issuance (sign_agent_csr uses db_now()), so a lagging replica clock cannot
-    // make its newer leaf look older.
+    // other, and the second sees the first's committed leaf. The statement revokes only leaves
+    // OLDER than the caller's own (the survivor, which must be active and unexpired) by
+    // (issued_at, serial_hex), so it never revokes the survivor and cannot leave the id with zero
+    // live leaves. RESIDUALS (best effort, #8254): `issued_at` has one-second resolution, so on a
+    // same-second tie whose caller serial is the LOWER one the other leaf is not older and both
+    // stay live until the next re-enrolment (reproduced in PG); there is no lock around ISSUANCE,
+    // only around this revoke. `issued_at` is stamped from the DATABASE clock at issuance
+    // (sign_agent_csr uses db_now()), so a lagging replica clock cannot make its newer leaf look
+    // older.
     const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
         pg::PgResult lock = pg::exec_params(
             conn, "SELECT pg_advisory_xact_lock(hashtextextended('ca_agent_leaf:' || $1, 0))",
