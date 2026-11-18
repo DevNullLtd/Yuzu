@@ -786,6 +786,45 @@ TEST_CASE("device live: physical-hardware generic-table kinds dispatch + render"
         CHECK(raw_pos != std::string::npos);
         CHECK(structured_pos < raw_pos); // structured rows render before raw rows
     }
+    SECTION("hw_processors: an escaped pipe in the CPU model stays in its cell and shifts no "
+            "column (#7040)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "cpu|0|Foo \\| Bar CPU|4|8|2800|-|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_processors&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>0</td><td>Foo | Bar CPU</td><td>4</td><td>8</td>"
+                           "<td>2800</td>") != std::string::npos);
+    }
+    SECTION("hw_memory: an escaped pipe in the DIMM slot stays in its cell (#7040)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "dimm|Bank\\|0 DIMM|8192|DDR4|3200|-|-|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_memory&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>Bank|0 DIMM</td><td>8192</td><td>DDR4</td><td>3200</td>") !=
+              std::string::npos);
+    }
+    SECTION("hw_disks keeps the raw split: its rows are not escaped at the source, so a backslash "
+            "before a separator must not swallow it (#7040 carve-out)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "disk|0|Model\\|931|SSD|NVMe", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=hardware-test"
+                            "&agent_id=a-1&kind=hw_disks&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>0</td><td>Model\\</td><td>931</td><td>SSD</td><td>NVMe</td>") !=
+              std::string::npos);
+    }
+    SECTION("volumes (another plugin) keeps the raw split: a mount point ending in a backslash "
+            "does not swallow the separator (#7040 carve-out)") {
+        LiveHarness h;
+        h.fake_rows = {{"a-1", 1, "volume|C:\\|C:\\|NTFS|100|-", ""}};
+        auto r = h.sink.Get("/fragments/device/live/result?command_id=disk_actions-test"
+                            "&agent_id=a-1&kind=volumes&n=1");
+        REQUIRE(r);
+        CHECK(r->body.find("<td>C:\\</td><td>C:\\</td><td>NTFS</td><td>100</td>") !=
+              std::string::npos);
+    }
     SECTION("thermal dispatches power_health/thermal, audited, polls power_health-<id>") {
         LiveHarness h;
         auto r = h.sink.Get("/fragments/device/live/run?id=a-1&kind=thermal");

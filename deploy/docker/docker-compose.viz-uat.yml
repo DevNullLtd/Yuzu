@@ -204,7 +204,7 @@ services:
       # See server.environment — same proxy-bypass rationale.
       NO_PROXY: "*"
       no_proxy: "*"
-      # #659: ephemeral viz-UAT stack — accept the default cookie (single gateway, no clustering).
+      # #659: ephemeral viz-UAT stack — single gateway, no clustering: the entrypoint uses a random per-boot cookie.
       YUZU_GW_ALLOW_DEFAULT_COOKIE: "1"
     ports:
       - "8081:8081"   # Health/readiness (operator-visible)
