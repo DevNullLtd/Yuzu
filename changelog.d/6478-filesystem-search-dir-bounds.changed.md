@@ -33,7 +33,7 @@
 - **Breaking - a result-set `matcher` over 64 KiB is refused (#6478).** Affected: a caller of
   `POST /api/v1/result-sets/from-instruction-result` or the MCP tool
   `create_result_set_from_instruction_result` that sends a `matcher` over 65,536 bytes of compact
-  JSON (about 970 SHA-256 values in a `value_set`). It was accepted before and is now refused with
+  JSON. It was accepted before and is now refused with
   `400` / `-32602` and `matcher exceeds 65536 bytes as compact JSON`, before anything is
   dispatched. To do: divide a longer value list over more than one result set. The limit bounds
   the cost of evaluating a large matcher.

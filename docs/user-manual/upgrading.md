@@ -23,7 +23,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 **In short.** Affected: a caller of `POST /api/v1/result-sets/from-instruction-result` or the MCP tool `create_result_set_from_instruction_result` that sends a `matcher` over 65,536 bytes of compact JSON. To do: send a shorter matcher; a value list too long for one matcher has to be divided over more than one result set.
 
-**What changed.** Such a matcher was accepted, up to the request body limit. It is now refused with `400` (REST) or `-32602` (MCP) and `RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON`, before anything is dispatched or stored. The size is that of the matcher as the server re-serialises it (no insignificant whitespace), and the whole object counts; about 970 SHA-256 values fit in a `value_set`. The limit bounds the cost of evaluating a large matcher. The dashboard's matcher fields (`column`, `op`, `value`) cannot reach it.
+**What changed.** Such a matcher was accepted, up to the request body limit. It is now refused with `400` (REST) or `-32602` (MCP) and `RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON`, before anything is dispatched or stored. The size is that of the matcher as the server re-serialises it (no insignificant whitespace), and the whole object counts. The limit bounds the cost of evaluating a large matcher. The dashboard's matcher fields (`column`, `op`, `value`) cannot reach it.
 
 ## ⚠️ Breaking: REST refuses a result-set `matcher` field over its bound (#6478)
 

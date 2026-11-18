@@ -5093,6 +5093,11 @@ TEST_CASE("materialise: the members read parses the matcher once, before the pag
     CHECK(matcher_src.find("ParsedMatcher::ParsedMatcher(") < entries_at);
     CHECK(entries_at < matcher_src.find("ParsedMatcher::~ParsedMatcher()"));
     CHECK(count_in(matcher_src, "in_set.contains(cell)") == 1);
+    // Every helper takes that set by const reference (a copy for each cell gives the same
+    // answers), and it is the ordered set: `in_set_` in the header says why.
+    CHECK(count_in(matcher_src, "const ValueSet& in_set") == 4);
+    CHECK(count_in(matcher_src, "ValueSet in_set") == 0);
+    CHECK(count_in(matcher_src, "using ValueSet = std::set<std::string_view>;") == 1);
 }
 
 TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",

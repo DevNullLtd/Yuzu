@@ -654,7 +654,7 @@ TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
     const auto over = validate_matcher_object(m);
     REQUIRE(over);
     CHECK(*over == "matcher exceeds 65536 bytes as compact JSON");
-    // value_set is the part that grows: 900 SHA-256-sized values pass, 1000 do not.
+    // value_set is the part that grows: its entries count together, however short each is.
     nlohmann::json set{{"column", "sha256"}, {"op", "in"}, {"value_set", nlohmann::json::array()}};
     for (int i = 0; i < 900; ++i)
         set["value_set"].push_back(std::string(64, 'a'));
@@ -756,6 +756,31 @@ TEST_CASE("matcher: one parsed matcher answers every row as the one-shot predica
     CHECK(members == 49);
     CHECK(lacking == 12);
     CHECK(unresolved == 1);
+}
+
+TEST_CASE("matcher: `in` matches a cell equal to a value_set entry byte for byte (#6478)",
+          "[result_set][matcher]") {
+    using namespace std::string_literals;
+    struct Row {
+        const char* value_set;
+        std::string cell;
+        bool member;
+    };
+    // A prefix is not a match either way; an empty entry matches an empty cell; an entry given
+    // twice is one entry; a NUL is a byte like any other, in an entry and in a cell.
+    for (const Row& r : {Row{R"(["xy"])", "x", false}, Row{R"(["x"])", "xy", false},
+                         Row{R"([""])", "", true}, Row{R"(["x","x"])", "x", true},
+                         Row{R"(["a\u0000b"])", "a\0b"s, true},
+                         Row{R"(["a\u0000b"])", "a", false}}) {
+        const std::string m = R"({"column":"c","op":"in","value_set":)"s + r.value_set + "}";
+        // The echo pipe shape (the cell is the first of two, so it may be empty) and the JSON one.
+        const std::string echo = "__schema__|c|d\n" + r.cell + "|d\n__total__|1";
+        const auto rows = nlohmann::json::array({nlohmann::json::object({{"c", r.cell}})});
+        for (const std::string& out : {echo, rows.dump()}) {
+            CAPTURE(r.value_set, out);
+            CHECK(response_matches(m, kOk, out) == r.member);
+        }
+    }
 }
 
 TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",

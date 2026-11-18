@@ -9,6 +9,7 @@
 #include <set>
 #include <string>
 #include <string_view>
+#include <type_traits>
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Result-set membership matcher (scope walking — design §3.2 / §6).
@@ -105,10 +106,20 @@ public:
 
 private:
     std::unique_ptr<const nlohmann::json> matcher_;
-    /// The string entries of `value_set`, put in one ordered set when the matcher is parsed: an
-    /// `in` test looks a cell up and never compares it with every entry. Views into `*matcher_`.
+    /// The string entries of `value_set`, put in one ordered set when the matcher is parsed, so an
+    /// `in` test is one lookup of the cell. Ordered, not hashed: the entries and the cells come
+    /// from outside the server and the standard string hash is fixed and unseeded, so keys chosen
+    /// there could all hash alike and turn each lookup into a walk of every entry; an ordered
+    /// set's lookup does not degrade with the keys it holds. Views into `*matcher_`.
     std::set<std::string_view> in_set_;
 };
+// A copied `in_set_` would point into the source's `*matcher_`, and a moved-from object would
+// have no `*matcher_` for its members to read: the class offers neither, and this keeps it so.
+static_assert(!std::is_copy_constructible_v<ParsedMatcher> &&
+                  !std::is_move_constructible_v<ParsedMatcher> &&
+                  !std::is_copy_assignable_v<ParsedMatcher> &&
+                  !std::is_move_assignable_v<ParsedMatcher>,
+              "ParsedMatcher holds views into its own *matcher_: not copyable, not movable");
 
 /// The largest caller matcher admission accepts: 64 KiB as compact JSON, the bound the same routes
 /// put on one `params` value. It bounds the cost of evaluating a large matcher. The server-authored

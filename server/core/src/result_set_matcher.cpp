@@ -61,7 +61,7 @@ std::vector<std::string_view> split_cells(std::string_view line) {
     return out;
 }
 
-// The string entries of a matcher's `value_set`, built once by ParsedMatcher (`in_set_`).
+// A matcher's `value_set` strings, built once by ParsedMatcher (`in_set_` says why ordered).
 using ValueSet = std::set<std::string_view>;
 
 bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher,
