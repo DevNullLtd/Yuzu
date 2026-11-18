@@ -130,7 +130,11 @@ FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f0
 # updates for the packages the base already carries (perl-base, libc, util-linux,
 # ...); the named installs below come from the same refreshed index. The release
 # scans this image for fixable CRITICAL vulnerabilities before pushing it
-# (release.yml, scripts/ci/image-vuln-gate.sh).
+# (release.yml, scripts/ci/image-vuln-gate.sh). `--error-on=any`: plain
+# `apt-get update` exits 0 when an index (the security pocket) cannot be
+# fetched, and the upgrade would then ship without its fixes from a green
+# build; with it the build fails (exit 100). The `apt-get -s upgrade` line logs
+# anything apt still keeps back (a fix that needs a new dependency).
 # YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
 # attempt, so the package step below re-runs instead of being served from the
 # runner's persistent build cache (cache-from type=local, never pruned for this
@@ -138,7 +142,8 @@ FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f0
 # first populated it. Local builds leave it empty and cache as usual.
 ARG YUZU_PACKAGE_REFRESH=
 RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" \
-    && apt-get update && apt-get upgrade -y --no-install-recommends \
+    && apt-get update --error-on=any && apt-get upgrade -y --no-install-recommends \
+    && apt-get -s upgrade | sed -n '/kept back:/,/^[^ ]/p' \
     && apt-get install -y --no-install-recommends \
     libssl3 libpq5 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \

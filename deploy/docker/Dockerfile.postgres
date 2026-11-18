@@ -103,27 +103,56 @@ FROM ${PG_BASE}
 # day upstream built it, and an upstream minor tag stops being rebuilt once the
 # next minor ships, so every release build applies the bookworm security and
 # point-release updates here. The PostgreSQL packages (PGDG, version contains
-# "pgdg") are held: PGDG carries only its newest minor, so an unheld upgrade
-# would silently move the server off the pinned minor. The final check fails
-# the build if the server package moved anyway. The release scans this image for
-# fixable CRITICAL vulnerabilities before pushing it (release.yml,
-# scripts/ci/image-vuln-gate.sh).
+# "pgdg") are held: PGDG serves newer minors than the pinned one, so an unheld
+# upgrade would silently move the server off the pinned minor. The final check
+# fails the build if the server package moved anyway. The release scans this
+# image for fixable CRITICAL vulnerabilities before pushing it (release.yml,
+# scripts/ci/image-vuln-gate.sh), but that scan cannot see PostgreSQL's own
+# CVEs (PGDG packages carry no Debian advisories), and the hold means this
+# image never takes a PostgreSQL fix: only a PG_BASE bump does. So the build
+# log names every held package that has a newer version available ("kept
+# back (held PGDG package)"), and whatever else apt still keeps back after the
+# upgrade, for the release engineer to read.
+#
+# `apt-get update --error-on=any`: plain `apt-get update` exits 0 when an
+# index cannot be fetched (it warns "Some index files failed to download"),
+# and the upgrade then runs without the security pocket and ships an
+# unpatched image from a green build. With the option it exits 100 instead.
+#
+# The collation guard: the server's collation check compares glibc's version
+# string ("2.36"), so libc6 must stay a 2.36 package and ICU a 72 one; the build
+# fails if the upgrade moved either (a change within 2.36 is not detectable
+# here or by the server: docs/user-manual/server-admin.md "PostgreSQL collation
+# version").
 # YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
 # attempt, so the package step below re-runs instead of being served from the
-# runner's persistent build cache (cache-from type=local, never pruned for this
-# image), which would otherwise keep shipping the packages of whichever build
-# first populated it. Local builds leave it empty and cache as usual.
+# runner's persistent build cache (cache-from type=local), which would otherwise
+# keep shipping the packages of whichever build first populated it. Local
+# builds leave it empty and cache as usual.
 ARG YUZU_PACKAGE_REFRESH=
 RUN set -eux; \
     : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
     pgdg="$(dpkg-query -W -f '${Package} ${Version}\n' | awk '$2 ~ /pgdg/ { print $1 }')"; \
     test -n "$pgdg"; \
     apt-mark hold $pgdg >/dev/null; \
-    apt-get update; \
+    apt-get update --error-on=any; \
+    set +x; \
+    for p in $pgdg; do \
+      inst="$(dpkg-query -W -f '${Version}' "$p")"; \
+      cand="$(apt-cache policy "$p" | awk '$1 == "Candidate:" { print $2 }')"; \
+      if [ "$cand" != "$inst" ]; then \
+        echo "kept back (held PGDG package): $p $inst installed, $cand available (not in this image; only a PG_BASE bump takes it)"; \
+      fi; \
+    done; \
+    set -x; \
     apt-get upgrade -y --no-install-recommends; \
+    apt-get -s upgrade | sed -n '/kept back:/,/^[^ ]/p'; \
     apt-mark unhold $pgdg >/dev/null; \
     rm -rf /var/lib/apt/lists/*; \
-    test "$(dpkg-query -W -f '${Version}' "postgresql-${PG_MAJOR}")" = "${PG_VERSION}"
+    test "$(dpkg-query -W -f '${Version}' "postgresql-${PG_MAJOR}")" = "${PG_VERSION}"; \
+    libc="$(dpkg-query -W -f '${Version}' libc6)"; \
+    case "$libc" in 2.36-*) ;; *) echo "FATAL: libc6 $libc is not glibc 2.36: the collation version of every existing volume changes (server-admin.md)"; exit 1 ;; esac; \
+    dpkg-query -W -f '${Package} ${Version}\n' libicu72 locales
 
 # vector.so + extension control/SQL files + LLVM bitcode (JIT inlining),
 # captured wholesale via DESTDIR so a pgvector layout change can't silently
