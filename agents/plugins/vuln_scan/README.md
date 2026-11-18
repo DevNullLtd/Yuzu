@@ -269,58 +269,75 @@ Defraggler|2.22
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash e452c8f620c9
+**macOS** — captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-18 · euid 501 (interactive user) · leg-hash e452c8f620c9
 
 ```
-== action=scan
-HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
-MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
-INFO|config|Gatekeeper|Enabled - only verified apps can run
-INFO|config|FileVault Disk Encryption|Enabled
-INFO|config|System Integrity Protection (SIP)|Enabled
-MEDIUM|config|Application Firewall|Disabled
-MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
-INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN
-
-== action=cve_scan
-HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
-MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
-[result_status] UNDECLARED / UNKNOWN
-
 == action=config_scan
 INFO|config|Gatekeeper|Enabled - only verified apps can run
 INFO|config|FileVault Disk Encryption|Enabled
 INFO|config|System Integrity Protection (SIP)|Enabled
 MEDIUM|config|Application Firewall|Disabled
-MEDIUM|config|Remote Login (SSH)|Enabled - SSH access is open
-INFO|config|Automatic Software Updates|Enabled
-[result_status] UNDECLARED / UNKNOWN
+UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
+INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
+UNREADABLE|config|Open Ports|open-port check is not available on macOS
+UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
 
-== action=summary
-summary|TOTAL|8 findings (4 issues)
-summary|CRITICAL|0
-summary|HIGH|1
-summary|MEDIUM|3
-summary|LOW|0
-summary|INFO|4
-[result_status] UNDECLARED / UNKNOWN
+== action=cve_scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+HIGH|cve|CVE-2023-44487: HTTP/2 Rapid Reset denial of service|NodeMCU PyFlasher 5.0.0 (fixed in 20.8.1)
+HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk extension|NodeMCU PyFlasher 5.0.0 (fixed in 20.11.1)
+CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
+CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
+INFO|scan|Coverage|Homebrew formulae and casks are not scanned
+UNREADABLE|scan|Coverage|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
 
 == action=inventory
 App Store|3.0
 Apps|1.0
 Automator|2.10
-Books|8.5
+Books|9.0
 Calculator|12.0
-Calendar|16.0
+Calendar|27.0
 Chess|3.18
 Clock|1.1
 Contacts|14.0
 Dictionary|2.3.0
 FaceTime|36
-Find My|4.0
-… 12 of 387 rows shown
-[result_status] UNDECLARED / UNKNOWN
+Find My|5.0
+… 12 of 529 rows shown
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+
+== action=scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+HIGH|cve|CVE-2023-44487: HTTP/2 Rapid Reset denial of service|NodeMCU PyFlasher 5.0.0 (fixed in 20.8.1)
+HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk extension|NodeMCU PyFlasher 5.0.0 (fixed in 20.11.1)
+CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
+CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
+INFO|config|Gatekeeper|Enabled - only verified apps can run
+INFO|config|FileVault Disk Encryption|Enabled
+INFO|config|System Integrity Protection (SIP)|Enabled
+MEDIUM|config|Application Firewall|Disabled
+UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
+INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
+… 12 of 16 rows shown
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+
+== action=summary
+summary|TOTAL|13 findings (7 issues)
+summary|CRITICAL|2
+summary|HIGH|3
+summary|MEDIUM|2
+summary|LOW|0
+summary|INFO|4
+summary|UNREADABLE|2
+summary|COVERAGE|Homebrew formulae and casks are not scanned
+summary|COVERAGE|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
+summary|COVERAGE|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
 ```
 
 **Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e452c8f620c9
@@ -385,7 +402,7 @@ bsdutils|1:2.41.5-0+deb13u1
 ## Caveats and known gaps
 
 1. **A clean scan is not "patched".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined. On macOS, Homebrew formulae and casks are never matched, so a clean macOS result is not evidence about them; use pkg_inventory.packages (which lists, not matches); restoring Homebrew CVE matching is tracked in #8256. Version ordering is a simple dotted-number comparison: a version with any non-numeric text in a segment (a pre-release or letter suffix such as `131.0b2`, `3.9rc1`, `1.9.9p1`, but also `0.9 (rc)`, `1e2`, `8,3,0` or a non-ASCII digit) is compared but may not be ordered correctly against a fixed version, so a vulnerable build can be missed; this is tracked in #8276. A NUL byte in a name or version is replaced with `?` and is not detected as a dropped line, and a name line lost together with other faults the parser cannot attribute can still hide an application. `cve_scan` and `scan` end with an `INFO|scan|Coverage|...` row and `summary` with `summary|COVERAGE|...`, in the same output as the `CONSTRAINED` result status; `inventory` returns software rows only (its status is declared, but it emits no row). The status itself reaches the agent log, not REST, MCP or the dashboard, so the in-band row is what an operator sees.
-2. **Substring matching produces false positives, and the version test is naive.** On macOS a backslash in an application name or version is shown as `/` (the owner accepted this lossy fold). A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, and `windows` matches .NET runtimes and Windows utilities; the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.
+2. **Substring matching produces false positives, and the version test is naive.** On macOS a backslash in an application name or version is shown as `/` (the owner accepted this lossy fold). A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, `windows` matches .NET runtimes and Windows utilities, and `node` matches any application whose name contains it (the macOS sample flags an Electron app named `NodeMCU PyFlasher` for two Node.js CVEs although its own version says nothing about the Node.js it bundles); the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.
 3. **A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed Linux command returns empty output, and only the Linux file checks and the macOS status tools surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).
 4. **`summary` does not match its declared result columns.** It emits three pipe fields per row (`summary|<severity or TOTAL>|<count>`) against two declared columns, `severity` and `count`, and the `TOTAL` row's `count` cell is the string `<n> findings (<n> issues)` rather than the declared `int32`.
 5. **Configuration checks are single-signal heuristics, not effective policy.** On macOS the five status tools' lines were measured on ONE macOS 27.0.1 host: `assessments enabled` (spctl, exit 0), `FileVault is On.` (fdesetup, exit 0), `System Integrity Protection status: enabled.` (csrutil, exit 0), `Firewall is disabled. (State = 0)` (socketfilterfw, exit 0; the DISABLED state, so the enabled line and its digit are unmeasured), `Remote Login: Off` (systemsetup, exit 0, via `sudo`), and the path-form `defaults` key-absent line (exit 1); unmeasured: the bare-domain `defaults` text, a system plist at 0, 1, absent or shadowed by a per-user or managed value as the LaunchDaemon account, bad-state exit codes, the enabled Firewall digit, `systemsetup` as a daemon, Full Disk Access or PPPC needs, and a non-English `system_profiler` (macOS 13 to 15 are not measured either). A Mac whose tool prints something else reports `UNREADABLE`, not a verdict. The macOS open-port check does not exist (`ss` is absent and `netstat -tlnp` is not valid), so every Mac reports one `UNREADABLE` Open Ports row; it is a standing unavailability and does not raise the `config_unreadable` status. Each reads one registry value, one command's text or one file, so a setting applied another way (an `Include`d SSH file, a managed firewall, a third-party antivirus) can read differently from the host's real state. There is no `docs/agent-privilege-model.md` row for this plugin, so the Privileges table records only what each capture measured.
