@@ -502,7 +502,7 @@ TEST_CASE("start_mode_should_remask: a failed change after an unmask restores th
     using yuzu::services::start_mode_should_remask;
     using yuzu::services::start_state_is_masked;
     CHECK(start_state_is_masked("masked\n"));
-    CHECK(start_state_is_masked("masked-runtime"));
+    CHECK_FALSE(start_state_is_masked("masked-runtime")); // a runtime mask is never re-created as a persistent one
     CHECK_FALSE(start_state_is_masked("disabled\n"));
     CHECK_FALSE(start_state_is_masked(""));
     CHECK_FALSE(start_state_is_masked("not-found"));
@@ -514,4 +514,20 @@ TEST_CASE("start_mode_should_remask: a failed change after an unmask restores th
     CHECK_FALSE(start_mode_should_remask("automatic", true, true));
     // disabled is the mask verb itself: nothing was unmasked
     CHECK_FALSE(start_mode_should_remask("disabled", true, false));
+}
+
+TEST_CASE("start_state_is_runtime_masked: only masked-runtime, which automatic and manual refuse",
+          "[services][unmask]") {
+    using yuzu::services::start_state_is_runtime_masked;
+    CHECK(start_state_is_runtime_masked("masked-runtime\n"));
+    CHECK(start_state_is_runtime_masked("masked-runtime\r\n"));
+    CHECK_FALSE(start_state_is_runtime_masked("masked\n"));
+    CHECK_FALSE(start_state_is_runtime_masked("enabled-runtime"));
+    CHECK_FALSE(start_state_is_runtime_masked(""));
+    CHECK_FALSE(start_state_is_runtime_masked("masked-runtime-x"));
+    // the two masked states never both route to a re-mask
+    using yuzu::services::start_mode_should_remask;
+    using yuzu::services::start_state_is_masked;
+    CHECK_FALSE(start_mode_should_remask("automatic", start_state_is_masked("masked-runtime"), false));
+    CHECK(start_mode_should_remask("manual", start_state_is_masked("masked"), false));
 }

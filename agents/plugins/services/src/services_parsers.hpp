@@ -141,13 +141,26 @@ inline bool is_safe_service_name(std::string_view name) {
     return mode == "automatic" || mode == "manual";
 }
 
-/// A prior `is-enabled` first line that shows the unit was masked.
+/// A prior `is-enabled` first line that shows the unit was masked PERSISTENTLY (exactly
+/// `masked`): the one state a failed change may restore with the helper's `mask`.
 [[nodiscard]] inline bool start_state_is_masked(std::string_view state) {
     while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
         state.remove_suffix(1);
     if (const auto nl = state.find('\n'); nl != std::string_view::npos)
         state = state.substr(0, nl);
-    return state == "masked" || state == "masked-runtime";
+    return state == "masked";
+}
+
+/// A prior state of `masked-runtime`: masked under /run for this boot only. The helper's `unmask`
+/// removes a PERSISTENT mask only, so `enable`/`disable` would fail on such a unit and a re-mask
+/// would write a persistent mask the unit never had; `automatic` and `manual` are refused up front
+/// (nothing is unmasked or re-masked) with a typed CONSTRAINED status.
+[[nodiscard]] inline bool start_state_is_runtime_masked(std::string_view state) {
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    return state == "masked-runtime";
 }
 
 /// Re-mask after a failed change: the unmask before `enable`/`disable` removed a restriction, so

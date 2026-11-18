@@ -124,7 +124,36 @@ def problems(src):
         out.append("both failure paths (change failed, readback mismatch) must call remask_after_failure()")
     if not re.search(r"start_mode_should_remask\( ?mode, was_masked,", code):
         out.append("remask_after_failure no longer consults start_mode_should_remask(mode, was_masked, ...)")
+    out += body_pins(live)
     return out + u2_problems(src)
+
+
+_BODY_PINS = {
+    "was_masked comes from the prior read that ran (tool_ran, not timed out) and start_state_is_masked":
+        r"was_masked\s*=\s*prior\.tool_ran\s*&&\s*!prior\.timed_out\s*&&\s*yuzu::services::start_state_is_masked\(\s*prior\.output\s*\)\s*;",
+    "the prior is-enabled read is unmerged and uses `--`":
+        r'const auto prior = run_command\(\{std::string\{systemctl_path\}, "is-enabled", "--",\s*std::string\(name\)\},\s*(?:/\*[^*]*\*/\s*)?false\)',
+    "the re-mask runs the helper's mask verb":
+        r'auto remask_after_failure = \[&\]\(\) \{[\s\S]{0,400}?const auto r = run_command\(build\("mask"\)\);',
+    "note|remasked is written only when the re-mask ran, did not time out and exited 0":
+        r'if \(r\.tool_ran && !r\.timed_out && r\.exit_code == 0\)\s*ctx\.write_output\(std::format\("note\|remasked:',
+    "remask_after_failure asks for a re-mask of a FAILED change":
+        r"start_mode_should_remask\(mode, was_masked,\s*(?:/\*[^*]*\*/\s*)?false\)",
+    "the readback is is-enabled with `--`, unmerged":
+        r'auto st = run_command\(\{std::string\{systemctl_path\}, "is-enabled", "--", std::string\(name\)\},\s*(?:/\*[^*]*\*/\s*)?false\)',
+    "the unmask call is the helper's unmask":
+        r'run_command\(build\("unmask"\)\);',
+    "masked-runtime is refused up front, before the unmask, with the typed CONSTRAINED token and rc 1":
+        r'start_state_is_runtime_masked\(\s*prior\.output\s*\)\)\s*\{[\s\S]{0,300}?set_result_status\(YUZU_RESULT_STATUS_CONSTRAINED,'
+        r'\s*YUZU_RESULT_COMPLETENESS_PARTIAL,\s*"services:start_mode_runtime_mask"\)[\s\S]{0,700}?return 1;\s*\}\s*run_command\(build\("unmask"\)\);',
+}
+
+
+def body_pins(live):
+    """Body-level pins over live_text() (comments and #if 0 gone, strings kept): the prior read,
+    the was_masked derivation, the re-mask verb and note, the readback verb, the unmask call and
+    the masked-runtime refusal. Each regex matches the current source; u2_body_mutations() kills them."""
+    return [f"body pin lost: {name}" for name, pat in _BODY_PINS.items() if not re.search(pat, live)]
 
 
 def u2_mutations(src):
@@ -190,6 +219,34 @@ def selftest(src):
     m2 = src[:idx] + src[idx + len("remask_after_failure();"):]
     if idx < 0 or not problems(m2):
         errs.append("selftest: dropping a remask_after_failure() call was NOT detected")
+    def rep(a_, b_):
+        if a_ not in src:
+            errs.append(f"selftest: body-mutation anchor not found (stale): {a_[:50]!r}")
+            return None
+        return src.replace(a_, b_, 1)
+    body_muts = {
+        "was_masked = true": rep("was_masked = prior.tool_ran && !prior.timed_out &&\n                     yuzu::services::start_state_is_masked(prior.output);", "was_masked = true;"),
+        "prior tool_ran dropped": rep("prior.tool_ran && !prior.timed_out &&\n                     ", "!prior.timed_out &&\n                     "),
+        "remask runs unmask": rep('const auto r = run_command(build("mask"));', 'const auto r = run_command(build("unmask"));'),
+        "remask runs disable": rep('const auto r = run_command(build("mask"));', 'const auto r = run_command(build("disable"));'),
+        "note remasked unconditional": rep("if (r.tool_ran && !r.timed_out && r.exit_code == 0)", "if (true)"),
+        "exit_code check dropped": rep("r.tool_ran && !r.timed_out && r.exit_code == 0", "r.tool_ran"),
+        "readback verb is-enabled -> status": rep('"is-enabled", "--", std::string(name)},\n                              /*merge_stderr=*/false);', '"status", "--", std::string(name)},\n                              /*merge_stderr=*/false);'),
+        "unmask removed": rep('run_command(build("unmask"));', ";"),
+        "prior merges stderr": rep('std::string(name)},\n                                       /*merge_stderr=*/false);', 'std::string(name)},\n                                       /*merge_stderr=*/true);'),
+        "change_succeeded true": rep("/*change_succeeded=*/false", "/*change_succeeded=*/true"),
+        "readback loses `--`": rep('"is-enabled", "--", std::string(name)},\n                              /*merge_stderr=*/false);', '"is-enabled", std::string(name)},\n                              /*merge_stderr=*/false);'),
+        "runtime-mask refusal removed": rep('services:start_mode_runtime_mask', 'services:other'),
+        "runtime-mask refusal does not return": src.replace("                name, mode));\n            return 1;\n        }\n        run_command(build(\"unmask\"));", "                name, mode));\n        }\n        run_command(build(\"unmask\"));", 1),
+        "unmask before the runtime-mask check": src.replace('        run_command(build("unmask"));\n    }', '    }', 1).replace("        if (prior.tool_ran && !prior.timed_out &&\n            yuzu::services::start_state_is_runtime_masked", '        run_command(build("unmask"));\n        if (prior.tool_ran && !prior.timed_out &&\n            yuzu::services::start_state_is_runtime_masked', 1),
+    }
+    for name, mutated in body_muts.items():
+        if mutated is None:
+            continue
+        if mutated == src:
+            errs.append(f"selftest: body mutation '{name}' did not change the source (stale)")
+        elif not problems(mutated):
+            errs.append(f"selftest: body mutation '{name}' was NOT detected")
     for name, mutated in u2_mutations(src).items():
         if not problems(mutated):
             errs.append(f"selftest: U2 mutation '{name}' was NOT detected")

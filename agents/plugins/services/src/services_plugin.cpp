@@ -511,6 +511,20 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
                                        /*merge_stderr=*/false);
         was_masked = prior.tool_ran && !prior.timed_out &&
                      yuzu::services::start_state_is_masked(prior.output);
+        if (prior.tool_ran && !prior.timed_out &&
+            yuzu::services::start_state_is_runtime_masked(prior.output)) {
+            // masked-runtime: `unmask` cannot remove a runtime mask and a re-mask would write a
+            // persistent one, so nothing is changed.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "services:start_mode_runtime_mask");
+            ctx.write_output(std::format(
+                "error|set_start_mode: '{}' is masked for this boot only (is-enabled: "
+                "masked-runtime); the privileged helper cannot remove a runtime mask, so mode "
+                "'{}' was not applied and nothing was changed. Remove it with `systemctl unmask "
+                "--runtime` as root, or reboot",
+                name, mode));
+            return 1;
+        }
         run_command(build("unmask"));
     }
     // A failed change after the unmask would leave the unit LESS restricted than it was found:
