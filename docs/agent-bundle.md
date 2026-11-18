@@ -68,6 +68,9 @@ bash scripts/build-agent-bundle.sh --version 0.11.0 --push
 bash scripts/build-agent-bundle.sh --multiarch --push
 ```
 
+`--push` at a release version bypasses the release image gate and the publish journal; releases
+are published by `release.yml` only (`docs/ci-architecture.md` "Release tag policy", Limit 1).
+
 The script first runs `cosign verify-blob` on the release's `SHA256SUMS`
 against `SHA256SUMS.sigstore` with the exact identity
 `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`

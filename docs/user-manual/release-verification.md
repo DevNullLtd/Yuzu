@@ -216,17 +216,24 @@ Candidates are left in place; nothing deletes them as routine cleanup. If you us
 automation that picks the newest tag, restrict it to release tags (`^[0-9]+\.[0-9]+\.[0-9]+$`, which
 excludes candidate and pre-release tags) or pin by digest, so it never selects a candidate.
 
-**Release images are not deleted, and release tags are not moved by hand.** The release process
-deletes no image. Deleting a GHCR package version is an owner-handled incident outside the release
-process, recorded in the release's tracking issue, and deleting a digest any published release ever
-announced (see that release's journals) is never done, so a deployment pinned to such a digest
-keeps pulling. A release tag moves only in the release workflow; a wrong or superseded release is
-fixed by a new patch release, never by moving a tag by hand. If a release image or tag ever had to
-stop being served, the project would announce it with the release. If a release's `:X.Y.Z`, or a
-digest its journal names, stops resolving or changes without such an announcement, treat it as an
-incident, not as a registry fault to wait out: keep running what you have, do not replace it with an
-image no release names, and report it through
-[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new).
+**Release images and release tags: what is enforced and what is practice.** Enforced by the
+release workflow: within it, a release tag is moved only by its "Tag the release" step, after the
+image is scanned, verified, signed and attested, and the workflow deletes no image. Practice, not
+enforced: a wrong or superseded release is fixed by a new patch release; deleting a published
+release or a GHCR package version, and moving a release tag outside the workflow, are
+owner-decided incidents, recorded in a tracking issue and announced. A patch release does not move
+the superseded release's own `:X.Y.Z` (a deployment pinned to that tag keeps pulling the image it
+names), and a patch on an older `X.Y` line moves `:latest` to that line until the next stable
+release on the newest line, so pin a version or a digest if that matters to you. Two older
+maintainer scripts (`scripts/docker-release.sh`, `scripts/build-agent-bundle.sh --push`) can push
+release tags outside the release workflow, bypassing its gate and journal; they are not used to
+publish a release, and an image they pushed is not one the release's signed records name. If a
+release image or tag ever had to stop being served, the project would announce it with the release.
+If you suspect a release digest is compromised, or a release's `:X.Y.Z`, or a digest its journal
+names, stops resolving or changes without such an announcement, treat it as an incident, not as a
+registry fault to wait out: report it through
+[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new), and
+keep running what you have meanwhile; do not replace it with an image no release names.
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
 afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and

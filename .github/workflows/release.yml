@@ -56,12 +56,8 @@ jobs:
   #
   # There is deliberately NO override input. A published release's assets and
   # signatures describe the images it shipped, so any re-push over it breaks
-  # verification. To redo a release, cut a new version. Deleting a PUBLISHED
-  # release is never the recovery for a failed job (that is "Re-run failed
-  # jobs" on the newest run); it is only for a release whose published content
-  # is itself wrong, an explicit, destructive step the release skill gates on
-  # operator confirmation, after which a fresh run recreates the release
-  # together with the images it pushes.
+  # verification. To redo a release, cut a new version. The guard cannot see a
+  # deleted release; see Release tag policy, Limit 2.
   #
   # Only a release tag may run: the ref must be a tag (a workflow_dispatch from
   # a branch is refused) shaped vX.Y.Z or vX.Y.Z-{alpha,beta,rc}N, the alphabet

@@ -411,10 +411,9 @@ each publishing job runs it once, before its first push.
 
 **There is no override.** A published release's assets and signatures describe
 the images it shipped, so any re-push over it breaks verification. To ship
-different images, cut a new version. To redo a release whose published content
-is itself wrong, delete the GitHub release first (destructive; the release
-skill requires operator confirmation), then start a fresh run, which recreates
-the release with a `SHA256SUMS` that matches its images.
+different images, cut a new version. Deleting a published release, or redoing
+one under its tag, is not a release procedure: see "Release tag policy" below
+(an owner-decided incident; Limit 2).
 
 Limits: the guard's read-only token cannot see a **draft** release — one made
 by hand, or one `gh release create` leaves behind when interrupted while
@@ -482,7 +481,7 @@ Either way the images are rebuilt and re-pushed under the same tags.
 
 If the release cannot be fixed promptly on a stable tag, `:latest` and `:X.Y`
 keep naming its unreleased images until it is fixed and re-tagged or a later
-release moves them: nobody moves a release tag by hand ("Release tag policy",
+release moves them; moving a release tag by hand is not a release procedure ("Release tag policy",
 below). The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
@@ -1135,13 +1134,16 @@ later passes' verdicts judged by it (passes 6 and 7) are rows of the governance 
 `governance.d/0000-wp15-images.UVdbCU.jsonl`. The enterprise-architect review itself is not a
 committed artifact, and the author and the owner are the same account, so the pull request's
 approving review is the independent confirmation. Review this decision if a publish job gains a registry
-write the journal does not announce; if a release tag starts moving anywhere other than
-`image-publish.sh tag` in a "Tag the release" step; or if any tool or documented procedure gains a
-way to delete a GHCR image or to move a release tag by hand. Amended twice on 2026-11-18: commit
+write the journal does not announce; if a release tag starts moving, within `release.yml`,
+anywhere other than `image-publish.sh tag` in a "Tag the release" step; or if a new tool or
+documented procedure gains a way to delete a GHCR image or to move a release tag by hand (the
+pre-existing hand push paths are Limit 1 of the "Release tag policy" below). Amended three times on 2026-11-18: commit
 `03bdfb9290` (Gate 8 round 7) added a hand tag-repair carve-out to the second condition, and the
 Gate 8 round 8 commit that adds "Release tag policy" below withdrew it, after round 8 found new
-defects in the hand procedure. Both amendments were made by the author account, so, as for the
-record itself, the pull request's approving review is their independent confirmation.
+defects in the hand procedure; the Gate 8 pass 9 commit that freezes the "Release tag policy"
+scoped the second condition to `release.yml` and the third to new paths. All three amendments were
+made by the author account, so, as for the record itself, the pull request's approving review is
+their independent confirmation.
 
 Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
 --prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
@@ -1176,24 +1178,26 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
   That holds only until the release exists. When a job is re-run, GitHub also re-runs every job
   that depends on it, but not the jobs it depends on ("Re-running workflows and jobs" in GitHub's
   Actions docs), so `release-guard` is not repeated and each re-run publish job passes its tag
-  re-check. Once the GitHub Release exists, never re-run a build or publish job:
+  re-check. Once the GitHub Release exists, do not re-run a build or publish job (a forbidden
+  re-run, "Release tag policy" below):
 
   | Re-run, after the GitHub Release exists | What runs | |
   |---|---|---|
   | "Re-run all jobs", or `release-guard` alone | `release-guard`, which refuses the existing release; every other job is skipped | safe, does nothing |
-  | `build-linux`, `build-gateway`, `build-windows` or `build-macos` | that build, then every publish job (all of them need all four builds): all six images move `:X.Y.Z` (and `:X.Y`, `:latest`) to new digests the release does not name; `release` fails `already PUBLISHED` | **never** |
-  | `docker-publish`, `docker-publish-postgres` or `docker-publish-chisel` | that job's images move the same way; `release` fails `already PUBLISHED` | **never** |
+  | `build-linux`, `build-gateway`, `build-windows` or `build-macos` | that build, then every publish job (all of them need all four builds): all six images move `:X.Y.Z` (and `:X.Y`, `:latest`) to new digests the release does not name; `release` fails `already PUBLISHED` | **forbidden** |
+  | `docker-publish`, `docker-publish-postgres` or `docker-publish-chisel` | that job's images move the same way; `release` fails `already PUBLISHED` | **forbidden** |
   | `release` | it refuses at `already PUBLISHED` before uploading; the bundle and attach jobs are skipped (#5479) | safe, does nothing |
   | `docker-publish-agent-bundle` that FAILED ("Re-run failed jobs") | it and the attach job; it builds from the release's own assets and its attempt joins the attached record | safe: the recovery |
-  | `docker-publish-agent-bundle` that SUCCEEDED | moves the announced `yuzu-agent-bundle-chisel:X.Y.Z` to a new digest | **never** |
+  | `docker-publish-agent-bundle` that SUCCEEDED | moves the announced `yuzu-agent-bundle-chisel:X.Y.Z` to a new digest | **forbidden** |
   | `attach-bundle-gate-report` | adds missing assets, replaces only an incomplete upload | safe |
 
   "Re-run failed jobs" is safe only when every failed job is `release`,
-  `docker-publish-agent-bundle` or `attach-bundle-gate-report`. A forbidden re-run is not undone
-  by hand ("Release tag policy" below): it is an owner-handled incident, announced and recorded in
-  the release's tracking issue, and the next patch release moves `:X.Y` and `:latest` on. The
-  re-run release's own `:X.Y.Z` keeps naming the re-run's digest, because no later release moves
-  it; the announcement gives the digest that release's journals record as published.
+  `docker-publish-agent-bundle` or `attach-bundle-gate-report`. Undoing a forbidden re-run by
+  hand is not a release procedure ("Release tag policy" below): it is an owner-decided incident,
+  recorded in a tracking issue opened for it and announced, and the next stable patch release
+  moves `:X.Y` and `:latest` on. The re-run release's own `:X.Y.Z` keeps naming the re-run's
+  digest, because no later release moves it, and no signed record shows which digest was first
+  announced (Limit 3).
 - **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
   `tagged` moves all of them again.
 - **Release assets can change after publication (G8P8-compliance-officer-3).** GitHub's immutable
@@ -1214,7 +1218,7 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
   `:candidate-<run id>-<attempt>` tags are left in place: they are not release tags, nothing pulls
   them by name, and each was gate-scanned before its push, so they hold no unscanned content.
   "Left in place" is a practice, not an enforced control: nothing technical stops a package admin
-  from deleting one. No tool deletes an image, and no deletion procedure is documented: an earlier
+  from deleting one. The release workflow deletes no image, and no deletion procedure is documented: an earlier
   deletion script was withdrawn after it was shown, against a real registry with a simulated
   lagging packages API, deleting a live release tag that the API had not listed
   (G8P7-security-guardian-1), and the hand check that replaced it was withdrawn after it was shown
@@ -1224,27 +1228,51 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
   what the release process does instead is "Release tag policy", below. GitHub lets a package admin restore a deleted version within 30 days ("Deleting and restoring a
   package" in GitHub's Packages docs); it does not say whether the version's tags come back with it.
 
-**Release tag policy (Gate 8 round 8, 2026-11-18).** A release tag (`:X.Y.Z`, `:X.Y` and `:latest`
-of the six release images, and the agent bundle's `:X.Y.Z`) moves only in `release.yml`'s "Tag the
-release" step (`scripts/ci/image-publish.sh tag`, behind the publish journal). Nobody runs `docker
-buildx imagetools create`, or moves a release tag any other way, against the release images by
-hand, and there is no documented hand procedure for it. If a published tag is wrong, or a release
-must be superseded, cut a new patch release (X.Y.Z+1): its tag-last publish moves `:X.Y.Z+1`,
-`:X.Y` and `:latest` through the journaled path. A tag that must stop being served is an
-owner-handled incident: it is announced (`docs/user-manual/release-verification.md`, "Release
-images are not deleted") and recorded in the release's tracking issue. The release process deletes
-no image. Deleting a GHCR package version is an owner-handled incident outside the release
-process, recorded in the release's tracking issue, and deleting a digest any published release
-ever announced (see that release's journals) is never done.
+**Release tag policy (frozen 2026-11-18).**
+
+**Controls (enforced by `release.yml`).** Within the release workflow, a release tag (`:X.Y.Z`,
+`:X.Y`, `:latest` of the six release images; the agent bundle's `:X.Y.Z`) is written only by the
+"Tag the release" step (`scripts/ci/image-publish.sh tag`), after the gate, verify, sign and attest
+steps and behind the publish journal. `release-guard` refuses a run for a tag that has a published
+release. The workflow deletes no image.
+
+**Practices (not enforced).** A wrong or superseded published release is fixed by a new patch
+release. Deleting a published GitHub release, redoing a release under its tag, moving a release tag
+outside the workflow, and deleting a GHCR package version are not release procedures: each is an
+owner-decided incident, recorded in a tracking issue opened for it and announced. First step for a
+suspected-compromised digest: open that issue and announce the digest; delete or move nothing until
+the owner decides.
+
+**Limits (disclosed).** (1) `scripts/docker-release.sh` and `scripts/build-agent-bundle.sh --push`
+predate the gate and can push release tags with maintainer credentials; they bypass the gate and the
+journal and are not used to publish a release. (2) Once a published release is deleted,
+`release-guard` passes a fresh run of its tag; that run destroys the release's signed `SHA256SUMS`,
+moves every tag including `:latest`, and leaves the earlier digests untagged with no signed record.
+(3) No signed record of "digests ever announced" exists. A journal records what each attempt
+published; it does not show which digest was first announced, nor whether a re-run was sanctioned,
+and releases up to v0.15.0 have no journals. (4) Nothing technical stops a package admin deleting a
+version or moving a tag.
+
+Frozen by the enterprise-architect ruling of 2026-11-18 (Gate 8 pass 9 non-convergence); adopted by
+the project owner via this pull request's review.
+
+**Future findings against this policy.** A finding against the Release tag policy is a defect only
+if (a) a statement under **Controls** is false against the code at HEAD; (b) a doc site states as
+enforced, or with "never / nobody / no tool / only", something not under Controls; (c) a site
+documents a procedure for an action listed under Practices as an incident; (d) this change creates a
+new path that moves a release tag or deletes an image, or worsens a listed Limit; or (e) a site
+contradicts the frozen text. Not defects: pre-existing behaviour listed under Limits and not
+worsened; a practice being unenforced; a missing runbook step for an owner incident; the absence of
+a signed announced-digest record. Those are follow-up issues, never blockers on this branch.
 
 Hand procedures were withdrawn because each round's version opened a new defect class: a deletion
 script trusted a lagging packages API (round 7); the hand deletion check that replaced it judged
 deletable a published digest whose tag had moved, and a hand tag-repair block accepted a release
 whose journal was missing, had no check for an in-flight run and could not download one release
 twice (round 8). Limits of the patch-release remedy: no later release moves the superseded
-release's own `:X.Y.Z`, so the incident announcement gives the digest that release's journals
-record as published; and `release.yml` moves `:latest` on every stable tag, so a patch to an
-older `X.Y` line moves `:latest` to that line until the next release on the newest line.
+release's own `:X.Y.Z`, and no signed record shows which of its digests was announced (Limit 3);
+and `release.yml` moves `:latest` on every stable tag, so a patch to an older `X.Y` line moves
+`:latest` to that line until the next stable release on the newest line.
 `release-guard` passes the new version: it refuses only a ref that is not a release tag or a tag
 that already has a published release, and checks no ordering between versions. The release skill
 carries the same policy, and its post-release check compares every image's `:X.Y.Z`, `:X.Y` and
@@ -1479,7 +1507,8 @@ base digest, a list entry) cannot reach this release's bundle at all. So:
 - **Anything that needs a commit**: this version ships without the agent-bundle image. The
   release itself is complete and its other images are signed; say so in the release notes or
   announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
-  Confirm with the operator before publishing a bundle any other way.
+  Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,
+  Limit 1); it is an owner decision recorded in a tracking issue.
 
 A failed bundle job also leaves the Release run red, and Pre-release QA starts only on a
 successful Release run, so that version gets no post-release scan or QA at all; a manual dispatch
@@ -1509,12 +1538,13 @@ published images (a tracked gap).
 job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
 BEFORE any SBOM, attestation or signature. The release tag moves only after verify, sign and
 attest, and the publish journal is write-ahead ("The publish journal" above): only
-`image-publish.sh` writes it, only `image-publish.sh tag` moves a release tag, every writing step
+`image-publish.sh` writes it, within `release.yml` only `image-publish.sh tag` moves a release tag, every writing step
 runs it with `exec` and it appends nothing after a SIGINT or SIGTERM, consumers read it only through
 `image-publish.sh state` or `published` (one reader), and accept only a legal prefix; the published
 image is the HIGHEST attempt ending `tagged`, and any higher attempt ending `tagging` fails both the
-release check and the attach job. No tool or documented procedure deletes a GHCR image or moves a
-release tag outside "Tag the release" ("Release tag policy" above). The gate fails closed:
+release check and the attach job. Within `release.yml` no step deletes an image or moves a release
+tag outside "Tag the release"; the pre-existing hand push paths bypass the gate, so never extend
+them or add another ("Release tag policy" above, Limit 1). The gate fails closed:
 a scan, DB, coverage or advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
 SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
 never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside

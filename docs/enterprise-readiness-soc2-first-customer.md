@@ -1153,17 +1153,22 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   missing or changed. An asset no signed list names proves nothing, and nothing signed lists the
   agent bundle's attempts, so removing one attempt's whole set is not detectable
   (`docs/ci-architecture.md` "What the journal does not cover").
-- *Image deletion and release tags:* the release process deletes no image. Deleting a GHCR package
-  version is an owner-handled incident outside the release process, recorded in the release's
-  tracking issue, and deleting a digest any published release ever announced (see that release's
-  journals) is never done. Untagged candidate digests and the bundle's candidate tags are left in
-  place (each was scanned before its push). A release tag moves only in `release.yml`'s "Tag the
-  release" step; no tool or documented procedure moves one by hand, a wrong or superseded release
-  is fixed by a new patch release, and a tag that must stop being served is an owner-handled
-  incident, announced (`docs/user-manual/release-verification.md`) and recorded in the release's
-  tracking issue (`docs/ci-architecture.md` "Release tag policy"). Both are practices, not
-  enforced controls: a package admin can delete a version, and a `packages: write` holder can move
-  a tag; the tracking-issue record is the evidence.
+- *Image deletion and release tags:* **Control (enforced by `release.yml`):** within the release
+  workflow a release tag is written only by the "Tag the release" step, after the gate, verify,
+  sign and attest steps and behind the publish journal; `release-guard` refuses a run for a tag
+  that has a published release; the workflow deletes no image. **Practice (not enforced):** a
+  wrong or superseded published release is fixed by a new patch release; deleting a published
+  release, redoing a release under its tag, moving a release tag outside the workflow, and
+  deleting a GHCR package version are owner-decided incidents, recorded in a tracking issue opened
+  for it and announced (`docs/ci-architecture.md` "Release tag policy"); untagged candidate
+  digests and the bundle's candidate tags are left in place (each was scanned before its push). A
+  package admin can delete a version, and a `packages: write` holder can move a tag; the
+  tracking-issue record is the evidence. A patch release does not move the superseded release's
+  own `:X.Y.Z`, and a patch on an older `X.Y` line moves `:latest` to that line until the next
+  stable release on the newest line. `scripts/docker-release.sh` and
+  `scripts/build-agent-bundle.sh --push` predate the gate and can push release tags with
+  maintainer credentials, bypassing the gate and the journal; they are not used to publish a
+  release (Limit 1 of the policy).
 - *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).

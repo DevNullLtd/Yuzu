@@ -8,6 +8,10 @@
 #
 # Requires: docker, gh (GitHub CLI, authenticated)
 # Designed for: Windows (Docker Desktop) + MSYS2 bash
+#
+# Pushing at a release version bypasses the release image gate and the publish
+# journal; releases are published by release.yml only (docs/ci-architecture.md,
+# "Release tag policy", Limit 1).
 
 set -euo pipefail
 
