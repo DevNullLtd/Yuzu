@@ -33,12 +33,9 @@ std::optional<BoundViolation> check_args(const nlohmann::json& args) {
         if (p.size() > kExecInstrParamCountMax)
             return BoundViolation{"param_count", std::format("params must have at most {} keys",
                                                              kExecInstrParamCountMax)};
+        if (auto bad = yuzu::server::check_params_key_shape(p))
+            return bad;
         for (const auto& [k, v] : p.items()) {
-            if (!yuzu::server::parameter_key_well_formed(k) ||
-                (v.is_string() && v.get_ref<const std::string&>().find('\0') != std::string::npos))
-                return BoundViolation{"param_key_invalid",
-                                      "a params key holds a control byte or invalid UTF-8, or a "
-                                      "value holds a NUL byte"};
             if (k.size() > kExecInstrParamKeyMaxLen)
                 return BoundViolation{"param_key_len", std::format("a params key exceeds {} bytes",
                                                                    kExecInstrParamKeyMaxLen)};

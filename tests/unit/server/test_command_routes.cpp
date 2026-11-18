@@ -1229,3 +1229,22 @@ TEST_CASE("/api/command: stagger and delay are strict integers; a bad value disp
     CHECK(h.last_delay == 0);
     CHECK(h.send_to_ids_called.size() == 2);
 }
+
+// sg10 / UP-1: the legacy route refuses a params key the agent would truncate with a 400 before
+// anything is built or sent (not the chokepoint's misleading "permission denied").
+TEST_CASE("/api/command: a params key with a NUL or control byte is refused 400 and dispatches nothing "
+          "(sg10)",
+          "[command_routes][security][sg10]") {
+    CommandHarness h;
+    for (const std::string& key : {std::string("targets\\u0000x"), std::string("a\\u0007b")}) {
+        const std::string body = std::string(R"({"plugin":"noop","action":"run","agent_ids":["dev-A"],)") +
+                                 R"("params":{")" + key + R"(":"10.0.0.1"}})";
+        auto res = h.sink.Post("/api/command", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        auto j = nlohmann::json::parse(res->body);
+        CHECK(j["error"]["reason"] == "param_key_invalid");
+    }
+    CHECK(h.send_to_ids_called.empty());
+    CHECK(h.last_stagger == -1);
+}

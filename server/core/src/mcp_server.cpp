@@ -22965,19 +22965,16 @@ McpServer::HandlerFn McpServer::build_handler(
                             too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
                             return;
                         }
+                        if (auto bad = yuzu::server::check_params_key_shape(p)) {
+                            too_large(bad->reason, bad->message);
+                            return;
+                        }
                         for (const auto& [k, v] : p.items()) {
                             // Key length is NOT expressible in the served schema
                             // (the subset has no propertyNames/maxProperties), so
                             // this bound and the count above exist only here.
                             // Borrowed from bundle_service.hpp so the two
                             // execute surfaces agree on what a param may be.
-                            if (!yuzu::server::parameter_key_well_formed(k) ||
-                                (v.is_string() &&
-                                 v.get_ref<const std::string&>().find('\0') != std::string::npos)) {
-                                too_large("param_key_invalid",
-                                          "a params key holds a control byte or invalid UTF-8, or a value holds a NUL byte");
-                                return;
-                            }
                             if (k.size() > kExecInstrParamKeyMaxLen) {
                                 too_large("param_key_len", std::format("a params key exceeds {} bytes", kExecInstrParamKeyMaxLen));
                                 return;

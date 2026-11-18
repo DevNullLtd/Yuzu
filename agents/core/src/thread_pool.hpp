@@ -19,8 +19,8 @@
 // with `yuzu::protective::is_protective_action`). A non-protective task is only STARTED while fewer
 // than `workers - reserved_protective` non-protective tasks are running, so N-1 stuck ordinary
 // commands (with one reserved slot) never leave a protective task without a worker while one is
-// free (no reserve between protective tasks, and the destructor still drains every queued task,
-// ADR-2005); protective tasks have
+// free. NOT covered (ADR-2005): no reserve between protective tasks (they may use any worker), and
+// the destructor runs every queued task and waits, unbounded, for every running one (#8247); protective tasks have
 // their own queue, taken first, and may use any worker. The invariant lives HERE, at the one place
 // a task is chosen to run, never at a caller.
 

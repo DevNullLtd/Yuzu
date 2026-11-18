@@ -347,11 +347,9 @@ std::string get_process_image_path(DWORD pid) {
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
     // The image path belongs to a process any standard user can start, so it can be a share
     // (`\\server\share\x.exe`). Opening it as the LocalSystem agent would authenticate the machine
-    // account to that host. Classify BEFORE any open (a refused path reads as an empty hash, the
-    // honest "not hashed" answer), then open handle-relative with no reparse point followed so a
-    // junction or symlink in the path cannot redirect the open either. An empty hash means "not
-    // hashed" for ANY reason (refused, could not be opened, read failure): this action's output has
-    // no column that could say which.
+    // account to that host. Classify BEFORE any open (a refused path reads `hash_unavailable:not_examined`), then open
+    // handle-relative with no reparse point followed so a junction or symlink in the path cannot
+    // redirect the open either.
     //
     // A hash that was not produced is a `hash_unavailable:<cause>` token in this column, never an
     // empty string (empty = no image path could be resolved for the process): `not_examined` (a

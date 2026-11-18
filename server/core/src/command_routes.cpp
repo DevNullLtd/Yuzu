@@ -554,6 +554,20 @@ void register_command_routes(HttpRouteSink& sink, Deps deps) {
         const std::int32_t stagger = *stagger_opt;
         const std::int32_t delay = *delay_opt;
 
+        // sg10 / UP-1: a parameter key the agent would truncate (control byte, NUL, invalid UTF-8)
+        // or a NUL value is a 400 BEFORE anything is minted or sent, not a misleading chokepoint
+        // "permission denied" later.
+        if (body.contains("params")) {
+            if (const auto bad = yuzu::server::check_params_key_shape(body["params"])) {
+                res.status = 400;
+                nlohmann::json err{{"error",
+                                    {{"code", 400}, {"reason", bad->reason}, {"message", bad->message}}},
+                                   {"meta", {{"api_version", "v1"}}}};
+                res.set_content(err.dump(), "application/json");
+                return;
+            }
+        }
+
         // ── #1788: per-device visibility on EVERY dispatch arm ──────────────
         // Everything above gates a possibly-GLOBAL Execution:Execute (or the
         // destructive-action securable) and, for the destructive list only,

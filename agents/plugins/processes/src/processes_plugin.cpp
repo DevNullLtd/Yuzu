@@ -20,6 +20,7 @@
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
 #include <helper_budget.hpp>      // HelperBudget + the hash_unavailable markers
+#include <image_path_cache.hpp>    // ImagePathCache / hash_row_cached: the pre-budget lookup
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #ifndef _WIN32
 #include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
@@ -290,7 +291,7 @@ constexpr int kMaxStuckHelpers = 2; // helpers left behind per action, at most (
 // Adjudication belongs to governance, not to this file.
 // One image on a bounded helper (bounded_wait.hpp): an open or read of a file on a stalled
 // filesystem cannot hold the command worker past the budget (the helper owns its descriptor; at most
-// 64 helpers per plugin DSO; a refused or timed-out call reads as an empty hash).
+// 64 helpers per plugin DSO; a refused or timed-out call reads `hash_unavailable:timeout`).
 // The identity key (dev:ino) comes back with the hash so a replaced binary is not conflated.
 struct ImageHash {
     std::string key;
@@ -319,6 +320,10 @@ ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_po
     if (r.status == yuzu::shared::HashStatus::ok) {
         out.hash = std::move(r.hex);
         cache->put(out.key, out.hash);
+    } else if (r.status == yuzu::shared::HashStatus::timeout) {
+        // The cooperative per-image deadline: the same marker a helper that did not finish reads,
+        // never an empty hash (which means unreadable, not a regular file or over the cap).
+        out.hash = yuzu::shared::kHashUnavailableTimeout;
     }
     return out;
 }
@@ -331,30 +336,46 @@ struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
 // helpers, gone when the action returns): an image replaced between two dispatches is always
 // re-hashed. Within an action it is keyed by the OPENED image's identity (dev, inode, size, mtime,
 // ctime), never by path text.
-using ActionCache = std::shared_ptr<yuzu::shared::ImageHashCache>;
-ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHashCache>(); }
+struct ActionCache {
+    std::shared_ptr<yuzu::shared::ImageHashCache> identity; // shared with the action's helpers
+    yuzu::shared::ImagePathCache by_path;                   // plugin thread only, consulted first
+};
+ActionCache make_action_cache() { return {std::make_shared<yuzu::shared::ImageHashCache>(), {}}; }
 
-std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
+// The mount namespace of a process, read from procfs (a link read, never the image): part of the
+// by-path key so two containers' identical path text never share a hash. Empty on any failure.
+std::string mount_ns_of(unsigned long pid) {
+    char buf[64];
+    const auto n = ::readlink(("/proc/" + std::to_string(pid) + "/ns/mnt").c_str(), buf, sizeof(buf) - 1);
+    return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
+}
+
+std::string hash_process_image(unsigned long pid, const std::string& path, ActionCache& cache,
                                const ImageGuard&, std::chrono::steady_clock::time_point action_deadline,
                                yuzu::shared::HelperBudget& budget) {
     if (path.empty())
         return {};
     const auto now = std::chrono::steady_clock::now();
-    // Once the per-action cap of helpers left behind (or the action budget) is reached no further
-    // helper is started: the row says so (`hash_unavailable:skipped`) instead of reading as an empty
-    // hash, and a dispatch cannot burn through the plugin's helper ceiling.
-    if (now >= action_deadline || !budget.may_start())
-        return yuzu::shared::kHashUnavailableSkipped;
-    const auto remaining = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
-    const auto deadline = now + remaining;
-    auto result = yuzu::shared::bounded_call_ex(
-        std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
-        [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
-    budget.note(result.status);
-    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
-        return yuzu::shared::kHashUnavailableTimeout;
-    const auto& img = *result.value;
-    return img.key.empty() ? std::string{} : img.hash;
+    // The by-path cache answers FIRST: once the per-action cap of helpers left behind (or the action
+    // budget) is reached no further helper is started and such a row says so
+    // (`hash_unavailable:skipped`), but a row whose image this action already hashed keeps its hash.
+    const auto key = yuzu::shared::ImagePathCache::make_key(mount_ns_of(pid), path);
+    return yuzu::shared::hash_row_cached(
+        cache.by_path, key, now < action_deadline && budget.may_start(), [&]() -> std::string {
+            const auto remaining =
+                std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+            const auto deadline = now + remaining;
+            auto result = yuzu::shared::bounded_call_ex(
+                std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
+                [pid, deadline, identity = cache.identity]() {
+                    return hash_linux_image(pid, deadline, identity);
+                });
+            budget.note(result.status);
+            if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
+                return std::string{yuzu::shared::kHashUnavailableTimeout};
+            const auto& img = *result.value;
+            return img.key.empty() ? std::string{} : img.hash;
+        });
 }
 #else
 using ImageGuard = yuzu::shared::local_path::LocalPathGuard;

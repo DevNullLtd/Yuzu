@@ -53,6 +53,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "hard_exit.hpp"                 // hard_exit / kOrphanDrainGrace: the detached-collector drain barrier
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
+#include "command_params.hpp"                    // command_params_have_nul (sg10 / UP-1)
 #include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -1534,6 +1535,11 @@ public:
             }
             if (!descriptor) {
                 spdlog::warn("Trigger dispatch: plugin '{}' not loaded — skipping action '{}'",
+                             plugin, action);
+                return;
+            }
+            if (command_params_have_nul(params)) {
+                spdlog::warn("Trigger dispatch: {}.{} refused: a parameter holds a NUL byte",
                              plugin, action);
                 return;
             }
@@ -3619,6 +3625,26 @@ public:
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
+                    // sg10 / UP-1: a parameter key or value with a NUL byte would be truncated by
+                    // `c_str()` and read by a plugin as a different name. Refused BEFORE the
+                    // dedup claim and the stagger sleep (no in-flight record, no held worker).
+                    if (command_params_have_nul(cmd.parameters())) {
+                        spdlog::warn("Command {} refused: a parameter key or value holds a NUL "
+                                     "byte",
+                                     cmd.command_id());
+                        pb::CommandResponse refused;
+                        refused.set_command_id(cmd.command_id());
+                        refused.set_status(pb::CommandResponse::REJECTED);
+                        refused.set_output("command refused: a parameter holds a NUL byte");
+                        refused.mutable_sent_at()->set_millis_epoch(
+                            std::chrono::duration_cast<std::chrono::milliseconds>(
+                                std::chrono::system_clock::now().time_since_epoch())
+                                .count());
+                        std::lock_guard lock(stream_write_mu_);
+                        stream->Write(refused, grpc::WriteOptions());
+                        continue;
+                    }
+
                     // True only when THIS delivery's claim() succeeded — gates the
                     // queue-full release so it never deletes a concurrent owner's row.
                     bool claimed_here = false;
@@ -4419,6 +4445,17 @@ private:
     // inside the lambda.
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
                               const std::shared_ptr<SubscribeStream>& stream) {
+        // Second copy of the NUL refusal (the read loop refuses first): nothing may reach the
+        // stagger sleep or the plugin with a truncatable parameter.
+        if (command_params_have_nul(cmd.parameters())) {
+            pb::CommandResponse refused;
+            refused.set_command_id(cmd.command_id());
+            refused.set_status(pb::CommandResponse::REJECTED);
+            refused.set_output("command refused: a parameter holds a NUL byte");
+            std::lock_guard lock(stream_write_mu_);
+            stream->Write(refused, grpc::WriteOptions());
+            return;
+        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
@@ -4482,28 +4519,6 @@ private:
         // Direct construction: single vector of YuzuParam pointing at proto map
         // entries (no intermediate string copies — proto owns the data).
         const auto& proto_params = cmd.parameters();
-        // Defence in depth (sg10 / UP-1): a key or value with an embedded NUL would be truncated by
-        // `c_str()` and read by a plugin as a different name (`targets\0x` as `targets`), which would
-        // step around a server gate keyed on the parameter name. The server refuses such a
-        // parameter at every ingress; the agent refuses it too, before any plugin sees it.
-        for (const auto& [k, v] : proto_params) {
-            if (k.find('\0') == std::string::npos && v.find('\0') == std::string::npos)
-                continue;
-            spdlog::warn("Command {} refused: a parameter key or value holds a NUL byte",
-                         cmd.command_id());
-            pb::CommandResponse refused;
-            refused.set_command_id(cmd.command_id());
-            refused.set_status(pb::CommandResponse::REJECTED);
-            refused.set_output("command refused: a parameter holds a NUL byte");
-            refused.mutable_sent_at()->set_millis_epoch(
-                std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::system_clock::now().time_since_epoch())
-                    .count());
-            record_command_terminal(cmd.command_id(), refused);
-            std::lock_guard lock(stream_write_mu_);
-            stream->Write(refused, grpc::WriteOptions());
-            return;
-        }
         std::vector<YuzuParam> params;
         params.reserve(proto_params.size());
         for (const auto& [k, v] : proto_params) {

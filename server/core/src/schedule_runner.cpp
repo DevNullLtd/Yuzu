@@ -122,7 +122,8 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
                      "principal='{}' target={}.{}",
                      s.name, s.id, s.created_by, def.plugin, def.action);
         audit(s, "instruction.schedule_fired", "denied",
-              "arming_check_denied schedule_id=" + s.id + " principal=" + s.created_by +
+              std::string(arming_params ? "arming_check_denied" : "arming_parameters_undecodable") +
+                  " schedule_id=" + s.id + " principal=" + s.created_by +
                   " plugin=" + def.plugin + " action=" + def.action);
         d_.schedule_engine->advance_schedule(s.id);
         return;

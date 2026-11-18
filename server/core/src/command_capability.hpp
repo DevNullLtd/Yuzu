@@ -123,8 +123,8 @@ struct CommandCapability {
 /// byte below 0x20 and no 0x7F and be valid UTF-8; a VALUE must hold no NUL. The agent hands every
 /// key to a plugin as a C string and the SDK compares C strings, so a key `targets\0x` is read by
 /// the plugin as `targets` while a server-side exact `find("targets")` misses it: a gate keyed on a
-/// parameter name would be silently bypassed. Rejecting (never truncating) such a key at every
-/// ingress and at the chokepoint closes that split. EXTEND this function; never fork a second one.
+/// parameter name would be silently bypassed. Rejecting (never truncating) such a key at the listed
+/// ingress surfaces (see `check_params_key_shape`'s list in dispatch_target_shape.hpp) and at the chokepoint closes that split; a path with no ingress check is refused at the chokepoint as a Forbidden denial. EXTEND this function; never fork a second one.
 [[nodiscard]] inline bool parameter_key_well_formed(std::string_view key) noexcept {
     std::size_t i = 0;
     const std::size_t n = key.size();

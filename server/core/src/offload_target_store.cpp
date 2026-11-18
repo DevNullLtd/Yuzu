@@ -915,9 +915,13 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         // in turn, every one of them judged above. A literal host has nothing to pin.
         std::vector<std::string> targets =
             vetted.pinned_ips.empty() ? std::vector<std::string>{std::string{}} : vetted.pinned_ips;
-        if (targets.size() > kMaxDeliveryConnectAddresses) // PERF-1: bounded fallback
+        if (targets.size() > kMaxDeliveryConnectAddresses) { // PERF-1: bounded fallback
+            spdlog::warn("OffloadTargetStore: {} vetted addresses for {}, trying the first {} only",
+                         targets.size(), url_log_host(tgt.url), kMaxDeliveryConnectAddresses);
+            if (metrics_)
+                metrics_->counter("yuzu_server_delivery_connect_addresses_truncated_total").increment();
             targets.resize(kMaxDeliveryConnectAddresses);
-        const auto connect_deadline = std::chrono::steady_clock::now() + kDeliveryConnectBudget;
+        }
         httplib::Result result;
         for (const auto& ip : targets) {
             httplib::Client cli(scheme + "://" + host_port);
@@ -936,8 +940,6 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             if (result.error() != httplib::Error::Connection &&
                 result.error() != httplib::Error::ConnectionTimeout)
                 break;
-            if (std::chrono::steady_clock::now() >= connect_deadline)
-                break; // total connect budget spent: no further address is tried
         }
         if (result) {
             status_code = result->status;

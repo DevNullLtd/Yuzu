@@ -1,4 +1,5 @@
 #include "bundle_service.hpp"
+#include "dispatch_target_shape.hpp" // check_params_key_shape (sg10 / UP-1)
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 
@@ -106,6 +107,8 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
             const auto& p = elem["params"];
             if (!p.is_object())
                 return std::unexpected(where + ": 'params' must be an object");
+            if (const auto bad = check_params_key_shape(p))
+                return std::unexpected(where + ": param_key_invalid: " + bad->message);
             if (p.size() > kMaxParamCountPerStep)
                 return std::unexpected(where + ": too many params (max " +
                                        std::to_string(kMaxParamCountPerStep) + ")");

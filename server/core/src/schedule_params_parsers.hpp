@@ -29,6 +29,8 @@
 /// this canonical string into the plan hash, so that determinism is load
 /// bearing, not cosmetic.
 
+#include "command_capability.hpp" // parameter_key_well_formed (sg10 / UP-1)
+
 #include <nlohmann/json.hpp>
 
 #include <cstddef>
@@ -61,6 +63,7 @@ enum class ScheduleParamsError {
     kTooManyKeys,    ///< key count exceeds kMaxScheduleParamKeys
     kTooLarge,       ///< canonical serialization exceeds kMaxScheduleParamsBytes
     kReservedKey,    ///< a key is empty or underscore-prefixed
+    kMalformedKey,   ///< a key holds a control byte, NUL or invalid UTF-8, or a string value a NUL
 };
 
 [[nodiscard]] constexpr std::string_view to_string(ScheduleParamsError e) {
@@ -77,6 +80,9 @@ enum class ScheduleParamsError {
         return "parameters exceed the size limit";
     case ScheduleParamsError::kReservedKey:
         return "parameter keys must not be empty or start with '_'";
+    case ScheduleParamsError::kMalformedKey:
+        return "param_key_invalid: a parameter key holds a control byte or invalid UTF-8, or a "
+               "value holds a NUL byte";
     }
     return "invalid parameters"; // unreachable — cases are exhaustive so -Wswitch flags enum drift
 }
@@ -117,6 +123,10 @@ validate_and_canonicalize_schedule_params(std::string_view raw_json) {
     for (const auto& [key, value] : parsed.items()) {
         if (is_reserved_schedule_param_key(key))
             return std::unexpected(ScheduleParamsError::kReservedKey);
+        // sg10 / UP-1: the ONE ingress shape rule (a key the agent would truncate).
+        if (!parameter_key_well_formed(key) ||
+            (value.is_string() && value.get_ref<const std::string&>().find('\0') != std::string::npos))
+            return std::unexpected(ScheduleParamsError::kMalformedKey);
         // Deliberately NOT `value.is_primitive()`: that predicate also
         // accepts `null`, which this validator rejects — a schedule
         // parameter has no meaningful "present but null" state, and letting

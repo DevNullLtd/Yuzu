@@ -2124,3 +2124,19 @@ TEST_CASE("PolicyStore: an explicit policy or fragment id must be a safe path se
     }
     CHECK(store.create_policy(make_policy_yaml(frag.value())).has_value());
 }
+
+// sg10 / UP-1: a fragment whose check/fix/postCheck parameter key holds a control byte is refused at
+// creation (the policy evaluator dispatches as a system caller, which the chokepoint also refuses).
+TEST_CASE("PolicyStore: create fragment refuses a parameter key with a control byte",
+          "[policy_store][pg][fragment][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    std::string yaml = kCheckOnlyFragment;
+    const auto pos = yaml.find("service_name");
+    REQUIRE(pos != std::string::npos);
+    yaml.replace(pos, std::string("service_name").size(), std::string("bad\x07key"));
+    auto result = store.create_fragment(yaml);
+    REQUIRE_FALSE(result.has_value());
+    CHECK(result.error().find("param_key_invalid") != std::string::npos);
+}

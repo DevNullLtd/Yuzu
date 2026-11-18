@@ -1610,3 +1610,19 @@ TEST_CASE("POST /api/v1/commands: a cancel that fails or throws after a recheck 
         }
     }
 }
+
+// sg10 / UP-1: a params key the agent would truncate is a 400 param_key_invalid and nothing is sent.
+TEST_CASE("command_v1: a params key with a NUL or control byte is refused 400 param_key_invalid",
+          "[server][command_v1][dispatch][security][sg10]") {
+    Rig rig;
+    rig.facts = {.legacy_open = true};
+    for (const std::string& key : {std::string("targets\0x", 9), std::string("a\tb")}) {
+        json body = kRead;
+        body["params"] = json::object();
+        body["params"][key] = "10.0.0.1";
+        const auto res = rig.post(body);
+        REQUIRE(res->status == 400);
+        CHECK(reason_of(res) == "param_key_invalid");
+    }
+    CHECK(rig.sent().empty());
+}

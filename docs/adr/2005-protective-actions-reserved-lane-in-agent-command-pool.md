@@ -41,13 +41,16 @@ must not be starvable by ordinary commands. The agent command pool therefore has
 
 ## What this does NOT establish
 
-- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool and drains every queued task (a task sleeping on a stagger or delay of up to 600 s included) before it reconnects, so a quarantine or `__guard__.push_rules` dispatched in that window is delivered only after the drain ends (tracked in #8247).
+- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: it runs every queued task and waits for every RUNNING task to return before it reconnects, with no bound; a command blocked in the kernel or sleeping a delay/stagger holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247).
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary
   commands. A protective command that itself blocks holds its worker; the reserve is one worker.
-- **No protective-versus-protective reserve.** The lane has one worker (more on a larger pool); several
-  stuck protective commands can occupy all of it.
+- **No protective-versus-protective reserve.** A protective task has its own queue, is taken first and
+  may use ANY worker, so `workers` stuck protective tasks leave no worker for a further protective task
+  or for an ordinary one (four stuck protective tasks on `ThreadPool(4, .., 1)` were verified to block
+  both). Capping protective running at `workers - 1`, or one in-flight protective task per
+  `(plugin, action)`, is a follow-up, not part of this change.
 - **A stagger or delay sleep runs on the worker.** A command carrying `stagger_seconds` or
   `delay_seconds` (up to 600 s) sleeps on its worker, protective commands included; the protective lane
   does not skip it.
@@ -55,7 +58,11 @@ must not be starvable by ordinary commands. The agent command pool therefore has
   every ordinary result.
 - **The `firewall` plugin has no plugin-level mutex**, so two protective commands can enter it together.
 - It does not bound a stall inside an ordinary command (that is the helper-thread work in the plugins)
-  and does not free a worker that is already stuck.
+  and does not free a worker that is already stuck: the lane guarantees a worker, not a bounded pool,
+  so a Linux/macOS `filesystem` stall can still hold ordinary workers. A bounded helper can itself stay
+  blocked in the kernel until the plugin is unloaded; the host drain barrier is tracked in #8204. A
+  `windows_updates.patch_connectivity` dispatch holds an ordinary worker for up to about 60 s. These
+  are accepted residuals.
 - A wedge is still visible only as commands that never finish; the tag above makes the pool state
   readable from the server, nothing more.
 

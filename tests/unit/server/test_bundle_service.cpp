@@ -312,3 +312,16 @@ TEST_CASE("aggregate_bundle demuxes duplicate (plugin,action) steps by command_i
     CHECK(agg.steps[1].output == "valB");
     CHECK(agg.received == 2);
 }
+
+// sg10 / UP-1: a bundle step whose params key the agent would truncate is refused at validation.
+TEST_CASE("validate_bundle_steps: a params key with a NUL or control byte is refused",
+          "[bundle_service][security][sg10]") {
+    nlohmann::json step = {{"plugin", "os_info"}, {"action", "os_version"}};
+    step["params"] = nlohmann::json::object();
+    step["params"][std::string("targets\0x", 9)] = "h";
+    auto r = yuzu::server::validate_bundle_steps(nlohmann::json::array({step}).dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().find("param_key_invalid") != std::string::npos);
+    nlohmann::json ok = {{"plugin", "os_info"}, {"action", "os_version"}, {"params", {{"targets", "h"}}}};
+    CHECK(yuzu::server::validate_bundle_steps(nlohmann::json::array({ok}).dump()).has_value());
+}

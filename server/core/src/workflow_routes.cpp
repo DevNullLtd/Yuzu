@@ -3609,6 +3609,15 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             }
             if (j.contains("scope") && j["scope"].is_string())
                 scope_expr = j["scope"].get<std::string>();
+            if (j.contains("params")) {
+                // sg10 / UP-1: the shared ingress check (never a second copy of the rule).
+                if (const auto bad = check_params_key_shape(j["params"])) {
+                    res.status = 400;
+                    res.set_content(detail::a4_error(res, std::string(bad->reason) + ": " + bad->message),
+                                    "application/json");
+                    return;
+                }
+            }
             if (j.contains("params") && j["params"].is_object()) {
                 for (auto& [k, v] : j["params"].items())
                     params[k] = v.is_string() ? v.get<std::string>() : v.dump();
