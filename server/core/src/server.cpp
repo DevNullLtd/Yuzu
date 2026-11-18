@@ -3034,10 +3034,11 @@ public:
                                   " deliveries declined before any connect, by cause: "
                                   "destination_refused (a resolved or literal address is link-local, "
                                   "cloud-metadata, unspecified, multicast or reserved) or "
-                                  "destination_unresolved (the name did not resolve, or the delivery "
-                                  "resolver pool was busy)",
+                                  "destination_unresolved (the name did not resolve) or "
+                                  "destination_resolver_busy (the delivery resolver pool was full)",
                               "counter");
-            for (const char* cause : {"destination_refused", "destination_unresolved"})
+            for (const char* cause : {"destination_refused", "destination_unresolved",
+                                      "destination_resolver_busy"})
                 metrics_.counter(name, {{"cause", cause}});
         }
         // The two drop counters (closed `reason` set) and the delivery pool gauges are described

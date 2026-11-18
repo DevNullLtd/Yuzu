@@ -926,6 +926,11 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             result = cli.Post(path, headers, payload_body, "application/json");
             if (result)
                 break;
+            // Move to the next vetted address ONLY when no connection was made: once the POST may
+            // have reached the receiver (a read error, a timeout after sending) a second POST to
+            // another address would deliver the event twice.
+            if (result.error() != httplib::Error::Connection)
+                break;
         }
         if (result) {
             status_code = result->status;

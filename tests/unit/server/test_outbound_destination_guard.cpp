@@ -40,7 +40,7 @@ TEST_CASE("destination guard: literal create-time refusal covers the never-allow
 
 TEST_CASE("destination guard: loopback, private and public literals and ordinary names pass create",
           "[outbound_destination_guard][security]") {
-    // Existing deployments (and tests) post to loopback and RFC 1918 receivers: not refused here.
+    // Loopback and RFC 1918 receivers are not refused by this guard (owner decision; #4816).
     for (const char* u : {"http://127.0.0.1:1/h", "http://localhost:8080/h", "http://10.1.2.3/h",
                           "https://192.168.1.5:8443/h", "http://172.16.0.9/h", "http://[::1]/h",
                           "https://hooks.example.com/h", "https://8.8.8.8/h", "http://[fd00::1]/h"}) {

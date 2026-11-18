@@ -65,7 +65,9 @@ namespace yuzu::server {
 enum class DestinationVerdict : std::uint8_t {
     Allow,
     Refused,    ///< a resolved address is in the never-allowed tier
-    Unresolved, ///< the name did not resolve (or the resolver was busy / timed out): fail closed
+    Unresolved, ///< the name did not resolve (or the lookup timed out): fail closed
+    ResolverBusy, ///< the delivery resolver pool was full or a worker could not start: a transient
+                  ///< condition of THIS server, not a statement about the destination
 };
 
 struct VettedDestination {
@@ -132,8 +134,8 @@ namespace detail {
     hints.ai_flags = AI_NUMERICHOST;
     struct addrinfo* raw = nullptr;
     const int rc = ::getaddrinfo(host.c_str(), nullptr, &hints, &raw);
-    if (raw != nullptr)
-        ::freeaddrinfo(raw);
+    // Owned from the moment getaddrinfo returns: freed exactly once on every path.
+    const std::unique_ptr<struct addrinfo, decltype(&::freeaddrinfo)> list(raw, &::freeaddrinfo);
     return rc == 0;
 }
 
@@ -141,7 +143,16 @@ namespace detail {
 
 /// The closed `cause` label set of the delivery-refused counter and the delivery-log error text.
 [[nodiscard]] constexpr const char* destination_cause(DestinationVerdict v) noexcept {
-    return v == DestinationVerdict::Refused ? "destination_refused" : "destination_unresolved";
+    switch (v) {
+    case DestinationVerdict::Refused:
+        return "destination_refused";
+    case DestinationVerdict::ResolverBusy:
+        return "destination_resolver_busy";
+    case DestinationVerdict::Allow: // not a declined delivery; never labelled
+    case DestinationVerdict::Unresolved:
+        break;
+    }
+    return "destination_unresolved";
 }
 
 /// Create-time check: true when the URL's host needs no DNS and is not acceptable: a CANONICAL
@@ -217,6 +228,10 @@ vet_delivery_destination(std::string_view url,
     const auto resolved =
         net::bounded_resolve(out.host, resolve_timeout, std::move(lookup),
                              pool ? std::move(pool) : delivery_resolver_pool());
+    if (resolved.status == net::ResolveStatus::kBusy) {
+        out.verdict = DestinationVerdict::ResolverBusy;
+        return out;
+    }
     if (resolved.status != net::ResolveStatus::kOk)
         return out; // Unresolved
     return vet_resolved_addresses(out.host, resolved.addresses);

@@ -559,7 +559,7 @@ TEST_CASE("WebhookStore[pg]: a stored row aimed at a metadata address is never c
     });
     auto id = store->create_webhook("http://127.0.0.1:1/h", "agent.registered", "");
     REQUIRE(id.has_value());
-    // A row that bypassed create (manual SQL, legacy data): delivery-time vetting must still refuse.
+    // A row written without going through create (direct SQL): delivery-time vetting must still refuse.
     {
         auto lease = store.pool().acquire();
         REQUIRE(lease);
