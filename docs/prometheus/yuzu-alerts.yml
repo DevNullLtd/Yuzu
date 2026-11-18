@@ -9001,8 +9001,8 @@ groups:
             increased in the last hour: an agent's registration carried a plugin name, version,
             description, action, plugin entry or action list beyond its bound and it was dropped.
             A single name, version, description or action is dropped whole, never cut short; the
-            plugin and action LISTS are capped, so field="plugins" or field="actions" means entries
-            past the cap are missing from the served plugin catalogue for that agent. Find the
+            plugin and action LISTS are capped (128 plugins per agent, 64 actions per plugin), so
+            field="plugins" or field="actions" means entries past the cap are missing from the served plugin catalogue for that agent. Find the
             agent in the server log line "dropping".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
   - name: yuzu-authz-signals
@@ -9034,7 +9034,7 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuPolicyInstructionMissing
         # The check, fix or verify instruction id of a policy no longer resolves to a definition
-        # (it was deleted). The check phase writes an explicit per-agent error verdict (reason
+        # (it was deleted). The check phase writes an explicit per-agent error verdict (result
         # instruction_missing) instead of leaving the last verdict standing. Any increase is a
         # signal; no `for:` hold, the window supplies the memory.
         expr: |
@@ -9047,8 +9047,9 @@ groups:
           description: >-
             yuzu_server_policy_instruction_missing_total{phase="{{ $labels.phase }}"} increased in
             the last hour: the policy evaluator did not dispatch a policy instruction because
-            its instruction id no longer resolves to a definition. The affected agents carry an
-            error verdict (reason instruction_missing). Restore the instruction or point the
+            its instruction id no longer resolves to a definition. In the check phase the affected
+            agents carry an error verdict (result instruction_missing); a fix or verify phase is
+            only skipped and counted. Restore the instruction or point the
             policy at an existing one.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuScheduleArmingUnavailable
