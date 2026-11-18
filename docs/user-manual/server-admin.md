@@ -5753,7 +5753,7 @@ The server applies retention policies to stored data to manage disk usage. Reten
 
 | Data Type | CLI Flag | Default TTL | Description |
 |---|---|---|---|
-| Instruction responses | `--response-retention-days` | 90 days | Results from executed instructions. Older responses are purged on a daily schedule. |
+| Instruction responses | `--response-retention-days` | 90 days | Results from executed instructions. Older responses are purged on a daily schedule. The quarantine reconciler's recurring status replies are kept 24 hours; with retention 0 they are kept like every other response. |
 | Audit log entries | `--audit-retention-days` | 365 days | Records of who did what, when, and on which devices. |
 | Guardian (Guaranteed State) events | `--guardian-event-retention-days` | 30 days | Guaranteed State drift events, remediation events, and agent-sync events written by the Guardian engine. See [Guaranteed State](guaranteed-state.md) for the feature context. |
 

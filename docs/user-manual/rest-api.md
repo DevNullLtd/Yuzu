@@ -2217,6 +2217,12 @@ costs neither a per-record permission check nor an audit row.
 
 **Permission:** `Security:Read`, resolved once through the fleet-read list gate. MCP twin: `list_quarantined_devices` (capped at 500 records per call; this route returns the complete list; see `docs/user-manual/mcp.md`).
 
+**Query parameter:** `include` (optional). `release_owed` also lists, after the active records, the records an
+operator ended by force (`DELETE ...?force=true`) whose device has not yet confirmed a release, so a device
+that may still be contained can be found after its record left the active list. The same scope, the same
+gate and the same `503` on a degraded read apply to them. **Any other value, an empty one included, is a
+`400`** (`include must be release_owed`), and nothing is read. Without it the body is unchanged.
+
 > **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
 > returns `503` (`"quarantine list unavailable — try again"`), never a
 > silently-empty list — a device could still be actively contained while the
@@ -2254,7 +2260,7 @@ costs neither a per-record permission check nor an audit row.
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
 > gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
-> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`) — but that read is the target
+> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`, or `status|active_unproven` when no probe target is stored, which is what the server's own applies return) — but that read is the target
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
@@ -2264,7 +2270,11 @@ costs neither a per-record permission check nor an audit row.
 > again.
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
-> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
+> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
+> except with `?include=release_owed`: those rows read `release_owed` and carry two more keys,
+> `released_at` (when the record was ended) and `release_owed_since` (when the device became owed a
+> release); an active or releasing row never has them. A `release_owed` row means the device **may still
+> be contained** and is released by the reconciler when it next connects.
 
 ---
 
@@ -2361,7 +2371,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400` (`whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32`), not written. |
+| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32, and at most 512 characters in total) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400`, not written: `whitelist exceeds 512 characters` when the list is too long, otherwise `whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32 and 512 characters in total`. |
 
 **Response (201):**
 
@@ -2374,7 +2384,7 @@ Quarantine a device.
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
 > missing `agent_id`, the device is already quarantined, or `whitelist` fails
-> server-edge validation) — retrying the identical request will not succeed,
+> server-edge validation, its length included) — retrying the identical request will not succeed,
 > and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
@@ -2571,9 +2581,24 @@ session-stamped audit rows are exactly as for `POST` above, with the audit verb
 
 `202` covers every outcome short of the device's `inactive`: the device is offline, the dispatch was
 refused or threw, no reply arrived in 5 seconds, or the reply was anything else (a privilege refusal
-such as `status|refused|privilege_unavailable`, a partial release). The wait shares the 4-slot live
-in-flight budget with the DEX live route; with no slot free the release is dispatched and the answer
-is `202` without waiting.
+such as `status|refused|privilege_unavailable`, a partial release). It is also the answer when the
+device did say `inactive` but the record could not end on that word: an apply reached, or was being
+sent to, the device after the observation, or an apply sent before the release has no reply read
+yet (after a reconciler apply, until its reply is read; after an MCP `quarantine_device` call that
+reached the device, for up to 120 seconds; the audit row's `detail` then ends `apply_in_flight=1`, or
+`fence_unread=1` when the check could not be read), or the store could not record the end. In those
+cases the record stays `releasing` and the server reads the device again, so a retry is not needed.
+The wait shares the 4-slot live in-flight budget with the DEX live route; with no slot free the
+release is dispatched and the answer is `202` without waiting.
+
+**How a `202` finishes.** There is no callback: the record leaves `GET /api/v1/quarantine` (its
+`status` reads `releasing` until then) when the device confirms. A `DELETE` repeated after that answers
+`400` (`device is not quarantined`), the same as for a device that was never quarantined, so poll the
+list, not the `DELETE`. A `202` within about two minutes of a quarantine call is the normal wait for
+that call's apply (the end lands once its claim window has passed and the next status read has run), so
+poll and do not repeat the `DELETE`. A device that never confirms stays `releasing`; once the record is
+still `releasing` after that window and a few reconciler passes, or the device refuses the release with
+`privilege_unavailable`, the way out is `?force=true`.
 
 **Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
 a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
@@ -2583,7 +2608,7 @@ call would answer `202` it ends the record at once:
 ```json
 {
   "data": {
-    "released": true, "state": "released", "forced": true, "device_confirmed": false,
+    "released": false, "state": "released", "forced": true, "device_confirmed": false,
     "message": "Record ended without the device's confirmation. The device may still be contained.",
     "command_id": "..."
   },
@@ -2591,10 +2616,14 @@ call would answer `202` it ends the record at once:
 }
 ```
 
+`released` is the device's word, so a forced end answers `false` even though `state` says the record
+ended; read `forced` and `device_confirmed` for the detail.
+
 A forced end **does not release the device**. The device may still be contained; the server stops
 refusing commands to it, so the operator has chosen to treat it as reachable; and the reconciler still
-owes it a release, which it reads and sends once per reconnect (`yuzu_server_quarantine_forced_release_owed`),
-and a `firewall.release` sent through any generic route reaches it at any time. A reachable device is
+owes it a release, which it reads and sends once per reconnect and once per server start
+(`yuzu_server_quarantine_forced_release_owed`), and a `firewall.release` sent through any generic route
+reaches it at any time. `GET /api/v1/quarantine?include=release_owed` lists the devices that still owe one. A reachable device is
 still released for real: if it answers `inactive` within the wait the answer says `forced: false,
 device_confirmed: true`. The authority is the release's own (the scoped `Security:Execute` gate, the
 same-principal check and the dispatch check for `firewall.release`); no new permission or approval
