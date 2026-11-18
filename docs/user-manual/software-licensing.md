@@ -194,7 +194,7 @@ enabling the SLE sources — deny-override wins).
   the cascade for a removed device (inventory, installed-software, device-CI, app-perf,
   detected-licence, app-usage, presence, fleet-certificate, Guardian compliance-census and
   management-group membership rows). The device is removed from every management group, but not
-  un-enrolled: the same agent id can reconnect and rejoins the All Devices group only.
+  un-enrolled: the same agent id can reconnect, and its next registration attempts (best effort) to add it back to the All Devices group only.
   For the Guardian store, `deleted` means the device's census rows and its per-agent emit-order
   row were erased and its pending census evidence retired; the Guardian event log and DEX observations are not erased by the
   decommission. They are kept until retention expires (30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire). Because it erases well beyond licences, it is gated on a

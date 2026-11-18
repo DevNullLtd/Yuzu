@@ -537,7 +537,7 @@ TEST_CASE("sle erase: the outcome row carries both .groups= and write_paused= in
             REQUIRE(g_tok != std::string::npos);
             REQUIRE(w_tok != std::string::npos);
             REQUIRE(counts != std::string::npos);
-            // The groups token follows its own outcome token directly.
+            // The groups token comes after its own outcome token.
             CHECK(g_tok > g_out);
             // write_paused= comes once, after every per-store token, before the counts.
             CHECK(w_tok > p_tok);

@@ -346,7 +346,10 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 if (paused.empty()) {
                     msg = "agent decommission incomplete — one or more stores failed (" +
                           std::to_string(r.failed) +
-                          " failed); re-issue the DELETE (the cascade is idempotent)";
+                          " failed); re-issue the DELETE (the cascade is idempotent; a caller whose "
+                          "Decommission:Delete grant is scoped to a management group is refused "
+                          "(403) once the device has left its groups, so use an Administrator "
+                          "or a global grant)";
                 } else {
                     msg = "agent decommission incomplete: the removal was not attempted for " +
                           paused.dump() +
@@ -355,8 +358,8 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                           "pause has lifted (the server rechecks about once a minute) will fail "
                           "the same way; re-issue the DELETE only AFTER the repair (the cascade "
                           "is idempotent). A caller whose Decommission:Delete grant is scoped to a "
-                          "management group is refused (403) when it re-issues, because this "
-                          "call has already removed the device from its groups; use an "
+                          "management group is refused (403) when it re-issues after this "
+                          "call has removed the device from its groups; use an "
                           "Administrator or a global grant.";
                     if (other_failed > 0)
                         msg += " " + std::to_string(other_failed) +
