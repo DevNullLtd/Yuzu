@@ -312,9 +312,12 @@ What this means in use:
   check** leaves the fix in place and moves the devices from `fixing` to `blocked` with
   phase `verify`; it is not counted as a failed evaluation (`error`).
 - `blocked` counts as **failing** in the "N failing" pill, the Failing checks readout and
-  the home page tile. A later dispatch that records a real result replaces it, and a
-  refusal that repeats on every interval rewrites nothing. The fleet figure applies its
-  24 hour freshness rule to `blocked` like every other status.
+  the home page tile. A later dispatch that records a real result replaces it. A
+  refusal that repeats on every interval changes no status and writes no audit row, but it
+  refreshes the time of the device's last check, so a refusal that still applies stays in
+  the failing figure. The fleet figure applies its 24 hour freshness rule to `blocked` like
+  every other status: a `blocked` row that nothing refreshes (the policy is disabled, the
+  device left its scope or was removed) counts as `unknown` after 24 hours.
 - Creating a fragment or a policy, and enabling a policy, checks each instruction the
   fragment names and answers `400` for a refused pair (and `503` when the lookup cannot be
   answered). The check is advisory: the dispatch check above is the control, and an
