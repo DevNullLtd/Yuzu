@@ -1198,6 +1198,17 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
         CHECK(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find("matcher") != std::string::npos);
     }
+    // A matcher over the size bound is refused with the one text the MCP twin also sends.
+    {
+        const std::string body = R"({"instruction_id":")" + iid +
+                                 R"(","matcher":{"column":"c","op":"in","value_set":[")" +
+                                 std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}})";
+        int status = 0;
+        auto j = h.post("/api/v1/result-sets/from-instruction-result", body, status);
+        CHECK(status == 400);
+        CHECK(j["error"]["message"] ==
+              "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+    }
     CHECK(h.calls.empty());
     CHECK(h.store->list_pending().empty());
 
@@ -5011,6 +5022,20 @@ std::size_t count_in(const std::string& text, const std::string& needle) {
     return n;
 }
 } // namespace
+
+TEST_CASE("materialise: the members read parses the matcher once, before the page loop (#6478)",
+          "[result_set][async][agents_failed]") {
+    // Parsing the matcher again for each row gives the same members, so no result can show it:
+    // this pins the statements. The text is read in one place, ahead of the loop over pages.
+    const auto src = normalised_source("result_set_members.hpp");
+    const auto parsed_at = src.find("const rs_matcher::ParsedMatcher matcher(pending.matcher);");
+    const auto loop_at = src.find("for (int read = 0;;) {");
+    REQUIRE(parsed_at != std::string::npos);
+    REQUIRE(loop_at != std::string::npos);
+    CHECK(parsed_at < loop_at);
+    CHECK(count_in(src, "pending.matcher") == 1);
+    CHECK(count_in(src, "ParsedMatcher") == 1);
+}
 
 TEST_CASE("materialise: the maintenance tick passes agents_failed and fails a truncated read closed",
           "[result_set][async][agents_failed]") {

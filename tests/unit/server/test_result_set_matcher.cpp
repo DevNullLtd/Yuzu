@@ -642,6 +642,71 @@ TEST_CASE("matcher: partialWhenConstrained is bound from the definition only and
     CHECK_FALSE(constrained_answer_is_unresolved(m.dump(), 4));
 }
 
+TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
+          "[result_set][matcher]") {
+    // The bound is on the compact JSON text the routes pass in: a matcher exactly at it passes.
+    nlohmann::json m{{"column", "c"}, {"op", "eq"}, {"value", ""}};
+    m["value"] = std::string(kMatcherMaxBytes - m.dump().size(), 'v');
+    REQUIRE(m.dump().size() == kMatcherMaxBytes);
+    CHECK_FALSE(validate_matcher_object(m));
+    m["value"] = m["value"].get<std::string>() + "v";
+    const auto over = validate_matcher_object(m);
+    REQUIRE(over);
+    CHECK(*over == "matcher exceeds 65536 bytes as compact JSON");
+    // value_set is the part that grows: 900 SHA-256-sized values pass, 1000 do not.
+    nlohmann::json set{{"column", "sha256"}, {"op", "in"}, {"value_set", nlohmann::json::array()}};
+    for (int i = 0; i < 900; ++i)
+        set["value_set"].push_back(std::string(64, 'a'));
+    CHECK_FALSE(validate_matcher_object(set));
+    for (int i = 0; i < 100; ++i)
+        set["value_set"].push_back(std::string(64, 'a'));
+    CHECK(validate_matcher_object(set));
+    // A key the matcher does not read counts too, and the text check refuses on length alone.
+    CHECK(validate_matcher_object(
+        {{"column", "c"}, {"op", "exists"}, {"note", std::string(kMatcherMaxBytes, 'n')}}));
+    CHECK(validate_matcher(std::string(kMatcherMaxBytes + 1, ' ')));
+}
+
+TEST_CASE("matcher: one parsed matcher answers every row as the one-shot predicates do (#6478)",
+          "[result_set][matcher]") {
+    nlohmann::json bound{{"column", "path"}, {"op", "eq"}, {"value", "/tmp/foo"}};
+    bind_declared_columns(bound, kSearchDir050Schema, "filesystem"); // the four stored keys
+    const std::vector<std::string> matchers{
+        "", "{}", "{", "[]", R"({"kind":"any_response"})", R"({"kind":"echo_rows_ge","n":2})",
+        R"({"kind":"echo_rows_ge","n":"2"})", R"({"kind":5})", R"({"column":"pid"})",
+        R"({"column":"pid","op":"exists"})", R"({"column":"pid","op":"eq","value":"1001"})",
+        R"({"column":"pid","op":"contains","value":"00"})",
+        R"({"column":"sha256","op":"in","value_set":["x",5,null]})",
+        R"({"column":"sha256","op":"in","value_set":[]})",
+        R"({"column":"sha256","op":"in","value_set":"x"})", bound.dump()};
+    const std::vector<std::string> outputs{
+        "", "error|boom", echo_rows(2), "__schema__|name\nx\n__total__|1", R"([{"sha256":"x"}])",
+        "result|/tmp/foo|file\ntotal_matches|1", "total_matches|0"};
+    int members = 0, lacking = 0, unresolved = 0;
+    for (const auto& text : matchers) {
+        const ParsedMatcher parsed(text); // built once, asked about every row below
+        for (const auto& out : outputs) {
+            CAPTURE(text, out);
+            for (int status : {0, kOk, kFail}) {
+                CHECK(parsed.response_matches(status, out) == response_matches(text, status, out));
+                members += parsed.response_matches(status, out);
+            }
+            CHECK(parsed.answer_lacks_matcher_column(out) ==
+                  answer_lacks_matcher_column(text, out));
+            lacking += parsed.answer_lacks_matcher_column(out);
+        }
+        for (int status = 0; status <= 5; ++status) {
+            CHECK(parsed.constrained_answer_is_unresolved(status) ==
+                  constrained_answer_is_unresolved(text, status));
+            unresolved += parsed.constrained_answer_is_unresolved(status);
+        }
+    }
+    // The table is not one-sided: each question is answered yes somewhere in it, and no elsewhere.
+    CHECK(members == 49);
+    CHECK(lacking == 12);
+    CHECK(unresolved == 1);
+}
+
 TEST_CASE("matcher: a stored find_by_hash 0.3.0 definition keeps the old never-match behaviour",
           "[result_set][matcher]") {
     // 0.3.0 declares path/size/matches_found and carries no discriminator, so `path eq match`

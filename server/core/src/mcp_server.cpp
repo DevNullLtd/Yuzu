@@ -1718,7 +1718,7 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647. At most 65536 bytes as compact JSON"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
      R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
@@ -18163,6 +18163,12 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (args.contains("matcher")) {
                         if (const auto bad =
                                 yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
+                            // A matcher over the size bound is an input bound like the fields
+                            // above: counted and audited by the same responder. One text with REST.
+                            if (*bad == yuzu::server::rs_matcher::kMatcherTooLargeMessage) {
+                                reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *bad);
+                                return;
+                            }
                             res.set_content(
                                 error_response(id, kInvalidParams,
                                                "RESULT_SET_BAD_REQUEST: " + *bad),

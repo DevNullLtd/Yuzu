@@ -67,18 +67,18 @@ bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann
     if (op == "eq") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell == matcher["value"].get<std::string>();
+        return cell == matcher["value"].get_ref<const std::string&>();
     }
     if (op == "contains") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell.find(matcher["value"].get<std::string>()) != std::string_view::npos;
+        return cell.find(matcher["value"].get_ref<const std::string&>()) != std::string_view::npos;
     }
     if (op == "in") {
         if (!matcher.contains("value_set") || !matcher["value_set"].is_array())
             return false;
         for (const auto& v : matcher["value_set"])
-            if (v.is_string() && cell == v.get<std::string>())
+            if (v.is_string() && cell == v.get_ref<const std::string&>())
                 return true;
         return false;
     }
@@ -292,6 +292,8 @@ bool flag_is_true(const nlohmann::json& j, const char* key) {
 std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     if (matcher_json.empty())
         return std::nullopt;
+    if (matcher_json.size() > kMatcherMaxBytes)
+        return std::string(kMatcherTooLargeMessage);
     const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
     if (m.is_discarded() || !m.is_object())
         return std::nullopt; // the unrecognised-shape default is unchanged
@@ -377,32 +379,34 @@ int echo_row_count(std::string_view output) {
     return n;
 }
 
-bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
-    if (matcher_json.empty())
-        return false;
-    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+// The one parse of a stored matcher. Text that does not parse, the empty default included, is
+// held as a discarded value, which every member below reads as the default matcher.
+ParsedMatcher::ParsedMatcher(std::string_view matcher_json)
+    : matcher_(std::make_unique<const nlohmann::json>(
+          nlohmann::json::parse(matcher_json, nullptr, false))) {}
+
+ParsedMatcher::~ParsedMatcher() = default;
+
+bool ParsedMatcher::answer_lacks_matcher_column(std::string_view output) const {
+    const auto& m = *matcher_;
     if (m.is_discarded() || !m.is_object() || m.contains("kind") || !m.contains("column") ||
         !m["column"].is_string())
         return false;
     return echo_schema_lacks_column(output, m["column"].get<std::string>());
 }
 
-bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status) {
-    if (plugin_result_status != kPluginResultConstrained || matcher_json.empty())
-        return false;
-    return flag_is_true(nlohmann::json::parse(matcher_json, nullptr, false),
-                        kPartialWhenConstrainedKey);
+bool ParsedMatcher::constrained_answer_is_unresolved(int plugin_result_status) const {
+    return plugin_result_status == kPluginResultConstrained &&
+           flag_is_true(*matcher_, kPartialWhenConstrainedKey);
 }
 
-bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+bool ParsedMatcher::response_matches(int status, std::string_view output) const {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
         return false;
 
-    // Empty matcher → default: any SUCCESS responder qualifies.
-    if (matcher_json.empty())
-        return true;
-    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    // Empty or unparseable matcher → default: any SUCCESS responder qualifies.
+    const auto& m = *matcher_;
     if (m.is_discarded() || !m.is_object() || m.empty())
         return true;
 
@@ -444,6 +448,18 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
     // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
+}
+
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
+    return ParsedMatcher(matcher_json).answer_lacks_matcher_column(output);
+}
+
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status) {
+    return ParsedMatcher(matcher_json).constrained_answer_is_unresolved(plugin_result_status);
+}
+
+bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+    return ParsedMatcher(matcher_json).response_matches(status, output);
 }
 
 bool references_raw_capture_table(std::string_view sql) {

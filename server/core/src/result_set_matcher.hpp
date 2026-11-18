@@ -2,7 +2,9 @@
 
 #include <nlohmann/json_fwd.hpp>
 
+#include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -85,6 +87,34 @@ inline constexpr int kPluginResultConstrained = 4;
 /// a stored search_dir 0.4.0) and a row with no typed status (an older agent) are unaffected.
 bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status);
 
+/// A stored matcher parsed once. The members read builds one per pending set and asks it about
+/// every stored row, so the matcher text is parsed once per read and not once per row. Each
+/// member answers what the function of the same name above answers for the same text (those
+/// are this class built and asked once); text that does not parse is the default matcher.
+class ParsedMatcher {
+public:
+    explicit ParsedMatcher(std::string_view matcher_json);
+    ParsedMatcher(const ParsedMatcher&) = delete;
+    ParsedMatcher& operator=(const ParsedMatcher&) = delete;
+    ~ParsedMatcher();
+
+    [[nodiscard]] bool response_matches(int status, std::string_view output) const;
+    [[nodiscard]] bool answer_lacks_matcher_column(std::string_view output) const;
+    [[nodiscard]] bool constrained_answer_is_unresolved(int plugin_result_status) const;
+
+private:
+    std::unique_ptr<const nlohmann::json> matcher_;
+};
+
+/// The largest caller matcher admission accepts: 64 KiB of compact JSON text (the form the
+/// routes pass to `validate_matcher`), the bound the same routes put on one `params` value. It
+/// bounds what a matcher can cost each stored row the members read evaluates.
+inline constexpr std::size_t kMatcherMaxBytes = 65536;
+/// The 400 / -32602 message for a matcher over that bound (REST and MCP share it).
+inline constexpr std::string_view kMatcherTooLargeMessage =
+    "matcher exceeds 65536 bytes as compact JSON";
+static_assert(kMatcherMaxBytes == 65536, "kMatcherTooLargeMessage states the bound");
+
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
 /// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
@@ -92,7 +122,8 @@ bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_
 /// CLOSED on a malformed `n` or `kind` already stored (including n < 1), so a bad value can never
 /// throw out of the maintenance tick nor admit every responder. A matcher that is present but not
 /// a JSON object is accepted here as the unrecognised-shape default (the serialized text may be
-/// anything): a route holding the parsed value calls `validate_matcher_object` instead.
+/// anything): a route holding the parsed value calls `validate_matcher_object` instead. Text over
+/// `kMatcherMaxBytes` is refused first, on its length, before it is parsed.
 std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// The admission check for a PRESENT caller `matcher` value (#4644): nullopt when acceptable,

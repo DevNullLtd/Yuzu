@@ -84,9 +84,8 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
     std::unordered_set<std::string> failed;
     ResponseQuery page;
     page.limit = page_rows;
-    // One parse of the matcher per read, not one per CONSTRAINED row: the opt-in is per set.
-    const bool counts_constrained = rs_matcher::constrained_answer_is_unresolved(
-        pending.matcher, rs_matcher::kPluginResultConstrained);
+    // The matcher is one text for the whole set: parsed once here, asked about every row below.
+    const rs_matcher::ParsedMatcher matcher(pending.matcher);
     for (int read = 0;;) {
         auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
         if (!rows)
@@ -97,11 +96,10 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
             break;
         }
         for (const auto& r : *rows) {
-            if (!rs_matcher::response_matches(pending.matcher, r.status, r.output)) {
+            if (!matcher.response_matches(r.status, r.output)) {
                 if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
-                    rs_matcher::answer_lacks_matcher_column(pending.matcher, r.output) ||
-                    (counts_constrained &&
-                     r.plugin_result_status == rs_matcher::kPluginResultConstrained))
+                    matcher.answer_lacks_matcher_column(r.output) ||
+                    matcher.constrained_answer_is_unresolved(r.plugin_result_status))
                     failed.insert(r.agent_id);
                 continue;
             }

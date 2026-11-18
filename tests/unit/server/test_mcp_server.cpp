@@ -40984,6 +40984,22 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             REQUIRE(body.contains("error"));
             CHECK(body["error"]["code"] == kInvalidParams);
         }
+        SECTION("the matcher as a whole: the one text the REST twin also sends, counted like "
+                "the fields above (#6478)") {
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","matcher":{"column":"c","op":"in","value_set":[")" +
+                std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
+        }
         SECTION("params value (Gate 2 MEDIUM finding: matches execute_instruction's "
                 "65536-byte params-value convention)") {
             const std::string big(65537, 'f');
