@@ -86,6 +86,10 @@ section is maintained manually; see `vcpkg.json` and
   HTMX (vendored) ....................... 0BSD
   htmx-ext-sse (vendored) ............... 0BSD
   Apache ECharts (vendored) ............. Apache-2.0
+  zrender (bundled in ECharts) .......... BSD-3-Clause
+      Copyright (c) 2013, Baidu Inc.
+  tslib (bundled in ECharts) ............ 0BSD
+      Copyright (c) Microsoft Corporation.
   CycloneDX JSON schemas (vendored) ..... Apache-2.0
   Three.js r168 (vendored) .............. MIT
   Three.js OrbitControls (vendored) ..... MIT
