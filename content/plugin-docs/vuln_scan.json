@@ -729,10 +729,10 @@
           "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
-            "provenance": "macos:vuln_scan:software_list_unrecognised",
+            "provenance": "macos:vuln_scan:homebrew_not_scanned",
             "status": "CONSTRAINED"
           },
-          "row_count": 8,
+          "row_count": 7,
           "rows": [
             "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)",
             "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)",
@@ -749,7 +749,7 @@
           "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
-            "provenance": "macos:vuln_scan:software_list_unrecognised",
+            "provenance": "macos:vuln_scan:homebrew_not_scanned",
             "status": "CONSTRAINED"
           },
           "row_count": 529,
@@ -769,10 +769,10 @@
           "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
-            "provenance": "macos:vuln_scan:software_list_unrecognised",
+            "provenance": "macos:vuln_scan:config_unreadable",
             "status": "CONSTRAINED"
           },
-          "row_count": 16,
+          "row_count": 15,
           "rows": [
             "HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)",
             "MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)",
@@ -789,10 +789,10 @@
           "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
-            "provenance": "macos:vuln_scan:software_list_unrecognised",
+            "provenance": "macos:vuln_scan:config_unreadable",
             "status": "CONSTRAINED"
           },
-          "row_count": 10,
+          "row_count": 9,
           "rows": [
             "summary|TOTAL|13 findings (7 issues)",
             "summary|CRITICAL|2",

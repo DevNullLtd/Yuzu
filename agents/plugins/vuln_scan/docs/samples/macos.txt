@@ -1,4 +1,4 @@
-captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-18 · euid 501 (interactive user) · leg-hash pending
+captured: macos macOS 27.0.1 arm64 · bare-metal · 2026-11-18 · euid 501 (interactive user) · leg-hash e452c8f620c9
 == action=config_scan
 INFO|config|Gatekeeper|Enabled - only verified apps can run
 INFO|config|FileVault Disk Encryption|Enabled

@@ -291,8 +291,7 @@ HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk e
 CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
 CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
 INFO|scan|Coverage|Homebrew formulae and casks are not scanned
-UNREADABLE|scan|Coverage|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
-[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:homebrew_not_scanned
 
 == action=inventory
 App Store|3.0
@@ -308,7 +307,7 @@ Dictionary|2.3.0
 FaceTime|36
 Find My|5.0
 … 12 of 529 rows shown
-[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:homebrew_not_scanned
 
 == action=scan
 HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
@@ -323,8 +322,8 @@ INFO|config|System Integrity Protection (SIP)|Enabled
 MEDIUM|config|Application Firewall|Disabled
 UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
 INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
-… 12 of 16 rows shown
-[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+… 12 of 15 rows shown
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
 
 == action=summary
 summary|TOTAL|13 findings (7 issues)
@@ -335,9 +334,8 @@ summary|LOW|0
 summary|INFO|4
 summary|UNREADABLE|2
 summary|COVERAGE|Homebrew formulae and casks are not scanned
-summary|COVERAGE|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
 summary|COVERAGE|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
-[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:config_unreadable
 ```
 
 **Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash e452c8f620c9
