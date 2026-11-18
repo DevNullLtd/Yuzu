@@ -320,8 +320,13 @@ list it as a direct dep in `rebar.config` and generate the lock with temporary o
 ]}.
 ```
 
-Append that to `rebar.config`, run `rm rebar.lock && rebar3 lock`, then **remove the overrides
-before commit** and confirm `rebar3 compile` leaves `rebar.lock` byte-identical.
+Append that to `rebar.config` and run:
+
+```sh
+rm rebar.lock && rebar3 lock
+```
+
+Then **remove the overrides before commit** and confirm `rebar3 compile` leaves `rebar.lock` byte-identical.
 
 **Refreshing the lock for an ordinary bump.** Pin an exact version (as every dep there is), and
 refresh `rebar.lock` with `rebar3 upgrade <dep>` so its package hashes cover the new tarball;

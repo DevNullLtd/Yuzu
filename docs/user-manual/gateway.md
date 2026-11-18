@@ -522,8 +522,9 @@ or a listener restart), each HTTP/2 connection sends a first `GOAWAY` with last 
 the real last stream id, and, if streams are still open (a `Subscribe` stream always is),
 waits up to `goaway_complete_timeout` (3 s) before closing. The two options are not set by
 the gateway, so these are Cowboy's defaults. When the connection finally closes, Cowboy shuts the
-socket's write side, waits up to `linger_timeout` (1 s) for the peer, and sets `{linger, {true, 0}}`
-on the socket, so the close releases the socket with a reset and discards unsent data; what an
+socket's write side, then sets `{linger, {true, 0}}` on the socket, then waits up to
+`linger_timeout` (1 s) for the peer; the close then releases the socket with a reset and discards
+unsent data; what an
 agent sees from that was not measured. The listeners are the last children of the
 supervision tree, so they stop first. The gateway's own 10 s wait for in-flight commands
 (`drain_pending`, in `yuzu_gw_app:stop/1`) runs after the tree is down (INFERRED from OTP,
@@ -1322,12 +1323,13 @@ peer that wants to hold connections, and this is what it does on each listener:
   one upstream connection across agents, one agent's refusals therefore kill the other agents'
   streams on it: such a proxy must not share one upstream connection across agents. The closure
   shows as `yuzu_gw_grpc_connections_closed_total{reason="enhance_your_calm"}`; a single
-  refusal has no counter. Measured bounds (a governance run of this change, not part of the test
-  suite): a flood of 200 connections x 8 streams x 90 headers x 4000 B peaked at 163 MB over a
+  refusal has no counter. Measured bounds (one-off runs, not part of the test suite): a flood of 200 connections x 8 streams x 90 headers x 4000 B peaked at 163 MB over a
   107 MB baseline with 0 handler calls, (a comparison run without the bound reached 713 MB and
-  1600 handler runs); `max_headers` (100) closes the connection at 98 to 101 headers; a header block
-  over 16 KB gets `FRAME_SIZE_ERROR`. The limit is deliberately not tunable:
-  `max_header_list_size` is refused by the `http2` allow-list, which fails safe.
+  1600 handler runs); `max_headers` (100) closes the connection at 98 to 101 headers (the count is
+  every decoded field, pseudo-headers included); a header block over 16384 octets gets
+  `FRAME_SIZE_ERROR`. The limit is deliberately not tunable: `max_header_list_size` is refused by
+  the `http2` allow-list, which fails safe (`max_headers` and `max_fragmented_header_block_size`
+  stay accepted keys; see the `http2` row).
 - *Management listener (`:50063`), 256.* The only peers that need it are the server's
   replicas, one connection each. Who can hold the other slots depends on how far the
   connection gets. **Before the TLS handshake**, anyone with layer-4 reach to the port can

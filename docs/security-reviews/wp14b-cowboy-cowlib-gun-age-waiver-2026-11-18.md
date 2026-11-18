@@ -34,9 +34,11 @@ HTTP/2 header-list size in cowlib `cow_http2_machine` enables HPACK amplificatio
 exhaustion"; CVSS v4 `AV:N/AC:L/AT:N/PR:N/UI:N/VA:H`; affected cowlib 2.7.0 up to but not
 including 2.22.0; advisory <https://cna.erlef.org/cves/CVE-2026-113431.html>, also
 <https://nvd.nist.gov/vuln/detail/CVE-2026-113431> and <https://osv.dev/vulnerability/EEF-CVE-2026-113431>,
-read through the OSV API on 2026-11-18; OSV records fix commits `a3b15e29` and `b461b119`
-(its affected-range data also lists `b92326f0`, the tagged commit, as a fixed event; the sibling-commit
-reading below rests on the git facts, not on the advisory); the behaviour is also verified empirically by the before/after regression pin below), so an unauthenticated peer on the agent-facing gateway listener can send an
+read through the OSV API on 2026-11-18). The EEF record lists fix `a3b15e29` (`b461b119` is its
+introduced commit); the OSV CVE-2026-113431 alias record (osv.dev/vulnerability/CVE-2026-113431)
+additionally lists `b92326f0`, the tagged commit, as fixed, and `b461b119` as both introduced and
+fixed; the sibling-commit reading below rests on the git facts, not on the advisory. The behaviour
+is also verified empirically by the before/after regression pin below. In short, an unauthenticated peer on the agent-facing gateway listener can send an
 HPACK header block that decodes to an unbounded header list. The fix exists only in cowlib 2.22.0
 (released 2026-11-09), and cowboy 2.21.0 requires cowlib >= 2.22.0. gun is included because gun
 2.5.0 cannot run on cowlib 2.22.0: cowlib's `cow_http2_machine:frame/2` can now return
