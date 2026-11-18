@@ -79,12 +79,13 @@ Bytes lc_uuid(std::endian o, std::uint8_t seed) {
 }
 
 Bytes lc_build_version(std::endian o, std::uint32_t platform, std::uint32_t minos,
-                       std::uint32_t sdk) {
+                       std::uint32_t sdk, std::uint32_t ntools = 0, std::size_t tool_bytes = 0) {
     Bytes p;
     put(p, platform, 4, o);
     put(p, minos, 4, o);
     put(p, sdk, 4, o);
-    put(p, 0, 4, o); // ntools
+    put(p, ntools, 4, o);
+    p.append(tool_bytes, '\0'); // the tool entries the command carries
     return cmd_padded(o, 0x32, p); // LC_BUILD_VERSION
 }
 
@@ -299,6 +300,23 @@ TEST_CASE("macho: thin 32-bit big-endian image yields exact fields and the versi
     CHECK(s.build_version->sdk == 0x000A0800);
 }
 
+TEST_CASE("macho: an LC_BUILD_VERSION whose tool count does not fit its command is malformed",
+          "[binary_header][macho]") {
+    ThinSpec fits;
+    fits.cmds = {lc_build_version(fits.order, 1, 5, 6, 1, 8)}; // one 8-byte tool entry, present
+    const auto ok = parse(thin(fits));
+    REQUIRE(ok.has_value());
+    CHECK(ok->slices[0].build_version->platform == 1);
+    for (const std::uint32_t ntools : {1u, 100u, 0xFFFFFFFFu}) {
+        ThinSpec s;
+        s.cmds = {lc_build_version(s.order, 1, 5, 6, ntools, 0)}; // the entries are missing
+        const auto r = parse(thin(s));
+        INFO("ntools " << ntools);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ParseError::malformed);
+    }
+}
+
 TEST_CASE("macho: each LC_VERSION_MIN_* maps to its platform and the first of LC_BUILD_VERSION / "
           "LC_VERSION_MIN_* wins",
           "[binary_header][macho]") {
@@ -475,11 +493,20 @@ TEST_CASE("macho: fat and command caps are refused past the limit and accepted a
           "[binary_header][macho]") {
     const MachoLimits def;
     SECTION("nfat_arch 0 and max+1") {
-        for (const std::uint32_t n : {0u, static_cast<std::uint32_t>(def.max_fat_archs + 1)}) {
-            const auto r = parse(fat_table(false, {}, n) + Bytes(20 * 20, '\0'));
-            REQUIRE_FALSE(r.has_value());
-            CHECK(r.error() == ParseError::not_this_format);
+        const auto zero = parse(fat_table(false, {}, 0) + Bytes(20 * 20, '\0'));
+        REQUIRE_FALSE(zero.has_value());
+        CHECK(zero.error() == ParseError::not_this_format);
+        // Over the cap but below the class-file word: a universal binary the caller will not read,
+        // reported as a limit, as the PE and ELF readers report theirs.
+        for (const std::uint32_t n : {static_cast<std::uint32_t>(def.max_fat_archs + 1), 44u}) {
+            const auto over = parse(fat_table(false, {}, n) + Bytes(64 * 20, '\0'));
+            REQUIRE_FALSE(over.has_value());
+            CHECK(over.error() == ParseError::limit_exceeded);
         }
+        // 45 and up is the class-file word, whatever the cap.
+        const auto java = parse(fat_table(false, {}, 45) + Bytes(64 * 20, '\0'), MachoLimits{.max_fat_archs = 64});
+        REQUIRE_FALSE(java.has_value());
+        CHECK(java.error() == ParseError::not_this_format);
         const auto huge = parse(fat_table(true, {}, kMaxU32) + Bytes(64, '\0'));
         REQUIRE_FALSE(huge.has_value());
         CHECK(huge.error() == ParseError::not_this_format);
@@ -491,7 +518,7 @@ TEST_CASE("macho: fat and command caps are refused past the limit and accepted a
         lim.max_fat_archs = 1;
         const auto r = parse(canon_fat(), lim);
         REQUIRE_FALSE(r.has_value());
-        CHECK(r.error() == ParseError::not_this_format);
+        CHECK(r.error() == ParseError::limit_exceeded);
         lim.max_fat_archs = 64; // 44 is the most any cap admits (45 is a class-file word)
         const auto top = parse(fat_table(false, {}, 44) + Bytes(44 * 20, '\0'), lim);
         REQUIRE(top.has_value());

@@ -133,7 +133,7 @@ public:
     }
 
     // Reads min(max_len, size - offset) bytes and returns them up to the first NUL (excluded).
-    // limit_exceeded when none of those bytes is a NUL.
+    // limit_exceeded when max_len bytes hold no NUL; truncated when the file ends first.
     [[nodiscard]] std::expected<std::string, ParseError> read_c_string(std::uint64_t offset,
                                                                        std::size_t max_len) {
         if (offset > src_.size)
@@ -145,7 +145,7 @@ public:
             return got;
         const auto nul = got->find('\0');
         if (nul == std::string::npos)
-            return std::unexpected(ParseError::limit_exceeded);
+            return std::unexpected(n < max_len ? ParseError::truncated : ParseError::limit_exceeded);
         got->resize(nul);
         return got;
     }

@@ -40,6 +40,7 @@ struct MachoLimits {
 };
 
 struct MachoDylibId {
+    // Not sanitised: the bytes of the file, as in PeStringTable.
     std::string name;
     std::uint32_t timestamp{0};
     std::uint32_t current_version{0};       // 16.8.8 packing, see format_dylib_version
@@ -212,6 +213,10 @@ parse_thin(Reader& r, std::uint64_t base, std::uint64_t size, std::string_view h
         case kLcBuildVersion: {
             if (csz < kMinBuildVersionCmd)
                 return std::unexpected(ParseError::malformed);
+            // ntools 8-byte tool entries follow the fixed part; a command too small for them is one
+            // the loader refuses.
+            if (static_cast<std::uint64_t>(u32(c, 20, o)) * 8 > csz - kMinBuildVersionCmd)
+                return std::unexpected(ParseError::malformed);
             if (!s.build_version)
                 s.build_version = MachoBuildVersion{u32(c, 8, o), u32(c, 12, o), u32(c, 16, o)};
             break;
@@ -276,8 +281,10 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
         return std::unexpected(ParseError::truncated);
     const bool is64 = magic == kFatMagic64;
     const std::uint32_t nfat = u32(head, 4, std::endian::big);
-    if (nfat == 0 || nfat > lim.max_fat_archs || nfat >= 45)
+    if (nfat == 0 || nfat >= 45)
         return std::unexpected(ParseError::not_this_format);
+    if (nfat > lim.max_fat_archs) // a real universal binary over the caller's cap, as PE and ELF report theirs
+        return std::unexpected(ParseError::limit_exceeded);
     const std::size_t entry = is64 ? kFatArch64Bytes : kFatArchBytes;
     const auto table_len = checked_mul(nfat, entry);
     if (!table_len)

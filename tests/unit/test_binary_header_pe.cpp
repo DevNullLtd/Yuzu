@@ -616,6 +616,18 @@ TEST_CASE("binary_header_pe: offsets and sizes near UINT32_MAX never read out of
         ParseError expect;
     };
     const std::uint32_t max32 = 0xFFFFFFFFu;
+    // A SizeOfOptionalHeader past the end of the file is truncated whether or not the image has a
+    // resource directory; with none, the early "no version" return must not hide it.
+    for (const bool rsrc : {false, true}) {
+        ImageSpec spec;
+        spec.rsrc = rsrc;
+        auto img = build_image(spec);
+        set16(img.bytes, img.L.coff + 16, 0xFFFF);
+        INFO("resource directory present: " << rsrc);
+        const auto r = parse(img.bytes);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ParseError::truncated);
+    }
     const std::vector<Case> cases = {
         {"e_lfanew", [&](Image& i) { set32(i.bytes, 0x3C, max32); }, ParseError::truncated},
         {"sections count", [&](Image& i) { set16(i.bytes, i.L.coff + 2, 0xFFFF); },

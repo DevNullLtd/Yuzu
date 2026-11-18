@@ -197,6 +197,13 @@ TEST_CASE("binary_header: read_c_string cuts at the first NUL", "[binary_header]
         REQUIRE(s.has_value());
         CHECK(s->empty());
     }
+    SECTION("the file ending before a NUL is truncated, not a limit") {
+        const std::string unterminated("abc", 3);
+        const auto* q = reinterpret_cast<const std::byte*>(unterminated.data());
+        Reader u(span_source({q, unterminated.size()}));
+        CHECK(u.read_c_string(0, 8).error() == ParseError::truncated);
+        CHECK(u.read_c_string(1, 2).error() == ParseError::limit_exceeded); // max_len bytes, no NUL: a limit
+    }
     SECTION("no NUL inside max_len is limit_exceeded") {
         CHECK(r.read_c_string(0, 3).error() == ParseError::limit_exceeded);
         CHECK(r.read_c_string(4, 3).error() == ParseError::limit_exceeded);
@@ -209,7 +216,7 @@ TEST_CASE("binary_header: read_c_string cuts at the first NUL", "[binary_header]
     }
     SECTION("offset past the size is truncated; at the size there is no NUL") {
         CHECK(r.read_c_string(9, 4).error() == ParseError::truncated);
-        CHECK(r.read_c_string(8, 4).error() == ParseError::limit_exceeded);
+        CHECK(r.read_c_string(8, 4).error() == ParseError::truncated);
     }
 }
 
