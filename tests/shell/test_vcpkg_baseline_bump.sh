@@ -40,7 +40,20 @@
 #   before anything changes.
 #   Rotation guard (vcpkg-baseline-update.yml): pushing proceeds only when every
 #   open bump PR was opened by the token's owner (GET /user with the PR token);
-#   another owner, an unreadable owner, or an API or parse failure refuses.
+#   another owner, an unreadable owner or login, or an API or parse failure
+#   refuses. On success it outputs the owner's id and the commit identity
+#   "<login> <id+login@users.noreply.github.com>", which Create pull request
+#   uses as author and committer; the gate then excludes the token owner as
+#   PR author and commit author alike.
+#   Attribution check: fails the run when the PR's author is not the token's
+#   owner, when any commit of the PR has an author or committer linked to no
+#   account (a deleted account), or when this run pushed a head not linked to
+#   the token's owner; re-reads a commit list that lags the push, at most six
+#   times; fails closed on any read, parse or input defect.
+#   Secret scoping: propose-bump runs in the vcpkg-baseline environment; no
+#   other job or workflow declares it or reads VCPKG_BASELINE_PR_TOKEN.
+#   Alert body names every refusing token/rotation/attribution step and the
+#   environment; every "see X in the header" pointer names a header section.
 #   Push record: `pushed` is true only when the branch head moved.
 #   Apply bump (vcpkg-baseline-update.yml), run on copies of the listed files:
 #   both the full SHA and its 12-character form move, and none of either
@@ -91,15 +104,20 @@ python3 "$EXTRACT" "$BUMP_YML" "$TMP/token.sh" --name "Require the PR token" || 
 python3 "$EXTRACT" "$BUMP_YML" "$TMP/apply.sh" --name "Apply bump" || exit 2
 python3 "$EXTRACT" "$BUMP_YML" "$TMP/owner.sh" --name "Refuse to push onto a bump PR another account opened" || exit 2
 python3 "$EXTRACT" "$BUMP_YML" "$TMP/pushed.sh" --name "Record whether this run pushed the bump branch" || exit 2
+python3 "$EXTRACT" "$BUMP_YML" "$TMP/attr.sh" --name "Check the bump PR can be approved" || exit 2
 
 # ── Hermetic gh ──────────────────────────────────────────────────────────────
 # GET .../pulls/<n>/reviews (--paginate --slurp) -> $GH_STUB_REVIEWS, verbatim
-# GET .../pulls/<n>/commits (--paginate --slurp) -> $GH_STUB_COMMITS, verbatim
+# GET .../pulls/<n>/commits (--paginate --slurp) -> $GH_STUB_COMMITS, verbatim;
+#     the first $GH_STUB_COMMITS_LAG reads (default 0) return
+#     $GH_STUB_COMMITS_EARLY instead (a commit list lagging a fresh push)
+# GET repos/<r>/pulls/<n>                        -> $GH_STUB_PR, verbatim
 # GET .../collaborators/<login>/permission       -> line "<login> <perm>" of
 #     $GH_STUB_PERMS; a login not listed is a 404 (exit 1), "<login> ERROR" a 502
 # GET repos/<r>/pulls?... (--paginate --slurp)   -> $GH_STUB_OPEN_PRS, verbatim
-# GET user                                       -> {"id": $GH_STUB_TOKEN_OWNER};
-#     unset or "ERROR" is a 502
+# GET user                                       -> {"id": $GH_STUB_TOKEN_OWNER,
+#     "login": $GH_STUB_TOKEN_LOGIN (a JSON value, default "tokenowner")};
+#     an owner unset or "ERROR" is a 502
 # GET repos/<r> (the token step)                 -> fails if $GH_STUB_AUTH_FAIL
 # A missing fixture, or one reading "ERROR", fails the call like an HTTP 502.
 # The list calls must carry --paginate and --slurp: without them they fail.
@@ -133,12 +151,21 @@ listed() { # listed <fixture>: a --paginate --slurp list read
 }
 case "$endpoint" in
   */pulls/*/reviews*) listed "${GH_STUB_REVIEWS:-}" ;;
-  */pulls/*/commits*) listed "${GH_STUB_COMMITS:-}" ;;
+  */pulls/*/commits*)
+    reads=$(( $(grep -c '/commits' "$GH_STUB_LOG") ))
+    if [ "$reads" -le "${GH_STUB_COMMITS_LAG:-0}" ]; then listed "${GH_STUB_COMMITS_EARLY:-}"
+    else listed "${GH_STUB_COMMITS:-}"; fi ;;
   repos/*/pulls\?*) listed "${GH_STUB_OPEN_PRS:-}" ;;
+  repos/*/pulls/[0-9]*)
+    f="${GH_STUB_PR:-}"
+    if [ -z "$f" ] || [ ! -f "$f" ] || [ "$(cat "$f")" = "ERROR" ]; then
+      echo "HTTP 502: Bad Gateway" >&2; exit 1
+    fi
+    emit < "$f" ;;
   user)
     case "${GH_STUB_TOKEN_OWNER:-ERROR}" in
       ERROR) echo "HTTP 502: Bad Gateway" >&2; exit 1 ;;
-      *) printf '{"id":%s}\n' "$GH_STUB_TOKEN_OWNER" | emit ;;
+      *) printf '{"id":%s,"login":%s}\n' "$GH_STUB_TOKEN_OWNER" "${GH_STUB_TOKEN_LOGIN-\"tokenowner\"}" | emit ;;
     esac ;;
   */collaborators/*/permission)
     login="${endpoint#*/collaborators/}"; login="${login%/permission}"
@@ -153,6 +180,9 @@ case "$endpoint" in
 esac
 EOF
 chmod +x "$TMP/bin/gh"
+# sleep: logged, never waits (the attribution check re-reads a lagging list).
+printf '#!/usr/bin/env bash\nprintf "sleep %%s\\n" "$*" >> "$GH_STUB_LOG"\n' > "$TMP/bin/sleep"
+chmod +x "$TMP/bin/sleep"
 
 HEAD_A=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
 HEAD_B=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
@@ -200,8 +230,13 @@ handpush write
 dispatcher write
 EOF
 # The default commit list: the bump commit at HEAD_A, as create-pull-request
-# makes it (author: whoever started the run; committer: github-actions[bot]).
-pages "$TMP/commits-default.json" "$(cm "$HEAD_A" "$DISPATCHER" "$BOT")"
+# makes it with the workflow's explicit identity (author and committer: the
+# token's owner, who is the PR's author).
+pages "$TMP/commits-default.json" "$(cm "$HEAD_A" "$AUTHOR_ID" "$AUTHOR_ID")"
+# A bump commit from a copy of the workflow that predates the explicit
+# identity (create-pull-request's default: author whoever started the run,
+# committer github-actions[bot]).
+pages "$TMP/commits-legacy.json" "$(cm "$HEAD_A" "$DISPATCHER" "$BOT")"
 
 # run_gate <event> <head_ref> <pr_number> <run_head> [reviews fixture] [author id] -> exit code
 # Invoked as GitHub runs a `run:` block (bash --noprofile --norc -eo pipefail).
@@ -303,8 +338,18 @@ check "head SHA in the wrong form FAILS even when a review names it" 1 \
 echo "== ci.yml gate step: the approver must be independent of the head (G8P3-SG-N1)"
 check "the commit list is read with --paginate --slurp" 1 \
   "$(gate_with ind-read "$(rv 1 APPROVED "$HEAD_A" 200 maint)" >/dev/null; grep -c -- '--paginate --slurp repos/o/r/pulls/42/commits' "$TMP/gh.log")"
-check "the run's dispatcher (bump commit author) cannot approve" 1 \
-  "$(gate_with dispatcher "$(rv 1 APPROVED "$HEAD_A" "$DISPATCHER" dispatcher)")"
+check "the token owner (PR author, bump commit author and committer) cannot approve" 1 \
+  "$(gate_with owner-self "$(rv 1 APPROVED "$HEAD_A" "$AUTHOR_ID" tokenowner)")"
+check "the PR author cannot approve even when on no commit (older workflow copy)" 1 \
+  "$(G_COMMITS="$TMP/commits-legacy.json" gate_with owner-legacy "$(rv 1 APPROVED "$HEAD_A" "$AUTHOR_ID" tokenowner)")"
+check "  ... while a maintainer on none of it may approve the same head" 0 \
+  "$(gate_with owner-other "$(rv 1 APPROVED "$HEAD_A" "$AUTHOR_ID" tokenowner),$(rv 2 APPROVED "$HEAD_A" 200 maint)")"
+check "older workflow copy: the run's dispatcher (bump commit author) cannot approve" 1 \
+  "$(G_COMMITS="$TMP/commits-legacy.json" gate_with dispatcher "$(rv 1 APPROVED "$HEAD_A" "$DISPATCHER" dispatcher)")"
+check "a bump commit by a deleted account (author unlinked) FAILS every approval (G8P4-SRE-N2)" 1 \
+  "$(G_COMMITS="$(commits deleted "$(cm "$HEAD_A" null "$BOT")")" gate_with deleted "$(rv 1 APPROVED "$HEAD_A" 200 maint)")"
+check "  ... and its recovery names a run from main, whose commit names the token's owner" 1 \
+  "$(grep -c "close the PR and run vcpkg-baseline-update.yml from main: its new PR's commit names the token's owner" "$TMP/log")"
 # A maintainer who pushed by hand: a first commit by the automation, then
 # handpush's commit at the head.
 HANDPUSH="$(commits handpush "$(cm "$HEAD_B" "$DISPATCHER" "$BOT"),$(cm "$HEAD_A" 203 203)")"
@@ -404,10 +449,13 @@ check "  ... without claiming to detect a token awaiting organization approval" 
   "$(grep -c 'expired, revoked, not yet approved' "$TMP/log")"
 
 # run_owner <token owner id|ERROR> <open-PR fixture> -> exit code of the rotation guard
+# The owner's login is $O_LOGIN (a JSON value) when set, else "tokenowner";
+# the step's outputs land in $TMP/owner.out.
 run_owner() {
-  : > "$TMP/gh.log"
+  : > "$TMP/gh.log"; : > "$TMP/owner.out"
   ( cd "$TMP" && env -u GH_TOKEN PATH="$TMP/bin:$PATH" GH_STUB_LOG="$TMP/gh.log" GH_STUB_EXPECT_TOKEN=tok \
-      GH_STUB_TOKEN_OWNER="$1" GH_STUB_OPEN_PRS="$2" GITHUB_REPOSITORY=o/r PR_TOKEN=tok \
+      GH_STUB_TOKEN_OWNER="$1" GH_STUB_TOKEN_LOGIN="${O_LOGIN-\"tokenowner\"}" GH_STUB_OPEN_PRS="$2" \
+      GITHUB_REPOSITORY=o/r PR_TOKEN=tok GITHUB_OUTPUT="$TMP/owner.out" \
       BUMP_BRANCH=deps/vcpkg-baseline-update \
       bash --noprofile --norc -eo pipefail "$TMP/owner.sh" ) > "$TMP/log" 2>&1
   echo $?
@@ -417,14 +465,18 @@ pages "$TMP/pr-a.json" "$(pr 42 "$AUTHOR_ID" tokenowner)"
 pages "$TMP/pr-none.json" ''
 echo "== vcpkg-baseline-update.yml rotation guard (refuse to push onto another account's bump PR)"
 check "token owner opened the open bump PR: may push" 0 "$(run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
-check "  ... reads the owner with the PR token (GET user)" 1 "$(grep -cx 'api user --jq .id' "$TMP/gh.log")"
+check "  ... reads the owner with the PR token (GET user)" 1 "$(grep -c '^api user --jq ' "$TMP/gh.log")"
+check "  ... and outputs the owner's id" "id=$AUTHOR_ID" "$(grep '^id=' "$TMP/owner.out")"
+check "  ... and the commit identity: login and linked no-reply address" \
+  "identity=tokenowner <$AUTHOR_ID+tokenowner@users.noreply.github.com>" "$(grep '^identity=' "$TMP/owner.out")"
 check "  ... and lists this branch's open PRs with --paginate --slurp" 1 \
   "$(grep -cF -- '--paginate --slurp repos/o/r/pulls?state=open&head=o:deps/vcpkg-baseline-update&per_page=100' "$TMP/gh.log")"
 check "no open bump PR: may push (the next PR is the new owner's)" 0 "$(run_owner 202 "$TMP/pr-none.json")"
 check "rotation: token now owned by B, open PR opened by A: REFUSED" 1 "$(run_owner 202 "$TMP/pr-a.json")"
 check "  ... naming the PR and telling the operator to close it" 1 \
   "$(grep -c '#42 (opened by tokenowner).*Close that PR' "$TMP/log")"
-check "  ... having made only reads" 0 "$(grep -vc '^api user --jq .id$\|^api --paginate --slurp repos/o/r/pulls?' "$TMP/gh.log")"
+check "  ... having made only reads" 0 "$(grep -vc '^api user --jq \|^api --paginate --slurp repos/o/r/pulls?' "$TMP/gh.log")"
+check "  ... and output no commit identity" 0 "$(grep -c '^identity=' "$TMP/owner.out")"
 pages "$TMP/pr-p2.json" "$(pr 41 "$AUTHOR_ID" tokenowner)" "$(pr 43 202 newowner)"
 check "another account's PR on a later page: REFUSED" 1 "$(run_owner "$AUTHOR_ID" "$TMP/pr-p2.json")"
 pages "$TMP/pr-nouser.json" '{"number":42,"user":null}'
@@ -432,10 +484,88 @@ check "an open PR with no readable author: REFUSED" 1 "$(run_owner 202 "$TMP/pr-
 check "token owner unreadable (GET user fails, or an App token): REFUSED" 1 "$(run_owner ERROR "$TMP/pr-a.json")"
 check "token owner id malformed: REFUSED" 1 "$(run_owner '"x"' "$TMP/pr-a.json")"
 check "  ... as an unreadable owner, not as a mismatch" 1 "$(grep -c 'Could not read which account owns' "$TMP/log")"
+check "token owner login missing: REFUSED" 1 "$(O_LOGIN=null run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
+check "  ... with no commit identity output" 0 "$(grep -c '^identity=' "$TMP/owner.out")"
+check "token owner login that would break the identity string: REFUSED" 1 \
+  "$(O_LOGIN='"x> <evil@example.com"' run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
+check "token owner login with a leading hyphen: REFUSED" 1 "$(O_LOGIN='"-x"' run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
+check "token owner login of 40 characters: REFUSED" 1 \
+  "$(O_LOGIN="\"$(printf 'a%.0s' $(seq 1 40))\"" run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
+check "token owner login of 39 characters with inner hyphens: may push" 0 \
+  "$(O_LOGIN="\"a-b$(printf 'c%.0s' $(seq 1 36))\"" run_owner "$AUTHOR_ID" "$TMP/pr-a.json")"
 echo ERROR > "$TMP/pr-error.json"
 check "open-PR listing fails: REFUSED" 1 "$(run_owner "$AUTHOR_ID" "$TMP/pr-error.json")"
 echo '{"message":"x"}' > "$TMP/pr-object.json"
 check "open-PR listing not a list of pages: REFUSED" 1 "$(run_owner "$AUTHOR_ID" "$TMP/pr-object.json")"
+
+# run_attr <PR fixture> <commits fixture> [pushed] -> exit code of "Check the bump
+# PR can be approved" for PR 42 at HEAD_A, token owner $AUTHOR_ID. A_LAG and
+# A_EARLY make the first reads of the commit list return another fixture;
+# A_OWNER, A_PR and A_HEAD override the step's inputs.
+run_attr() {
+  : > "$TMP/gh.log"
+  ( cd "$TMP" && env -u GH_TOKEN PATH="$TMP/bin:$PATH" GH_STUB_LOG="$TMP/gh.log" GH_STUB_EXPECT_TOKEN=tok \
+      GH_STUB_PR="$1" GH_STUB_COMMITS="$2" GH_STUB_COMMITS_LAG="${A_LAG:-0}" GH_STUB_COMMITS_EARLY="${A_EARLY:-}" \
+      GITHUB_REPOSITORY=o/r PR_TOKEN=tok OWNER_ID="${A_OWNER-$AUTHOR_ID}" PR_NUMBER="${A_PR-42}" \
+      HEAD_SHA="${A_HEAD-$HEAD_A}" PUSHED="${3:-true}" \
+      bash --noprofile --norc -eo pipefail "$TMP/attr.sh" ) > "$TMP/log" 2>&1
+  echo $?
+}
+printf '{"number":42,"user":{"id":%s,"login":"tokenowner"}}\n' "$AUTHOR_ID" > "$TMP/pr42-owner.json"
+printf '{"number":42,"user":{"id":202,"login":"newowner"}}\n' > "$TMP/pr42-other.json"
+printf '{"number":42,"user":null}\n' > "$TMP/pr42-nouser.json"
+echo ERROR > "$TMP/pr42-error.json"
+OWNED="$TMP/commits-default.json"
+echo "== vcpkg-baseline-update.yml attribution check (G8P4-SRE-N2 / G8P4-UP-N1 detection)"
+check "the token owner's PR, commit linked to the owner as author and committer: passes" 0 \
+  "$(run_attr "$TMP/pr42-owner.json" "$OWNED")"
+check "  ... reading the PR and its commits with the PR token" 2 \
+  "$(grep -c '^api repos/o/r/pulls/42 --jq \|^api --paginate --slurp repos/o/r/pulls/42/commits' "$TMP/gh.log")"
+check "  ... and making only those reads" 0 \
+  "$(grep -vc '^api repos/o/r/pulls/42 --jq \|^api --paginate --slurp repos/o/r/pulls/42/commits' "$TMP/gh.log")"
+check "a PR opened by another account than the token's owner FAILS" 1 \
+  "$(run_attr "$TMP/pr42-other.json" "$OWNED")"
+check "  ... naming the PR's author and the remedy" 1 \
+  "$(grep -c "opened by 'newowner' (id '202'), not by the token's owner (id $AUTHOR_ID).*Close the PR" "$TMP/log")"
+check "a PR with no readable author FAILS" 1 "$(run_attr "$TMP/pr42-nouser.json" "$OWNED")"
+check "PR read failure FAILS" 1 "$(run_attr "$TMP/pr42-error.json" "$OWNED")"
+check "  ... saying it could not read the PR" 1 "$(grep -c '::error::Could not read bump PR #42 (failing closed)' "$TMP/log")"
+check "the deleted-account case: a bump commit whose author links to no account FAILS" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$(commits a-unl "$(cm "$HEAD_A" null "$BOT")")" false)"
+check "  ... naming the commit, the gate's refusal and the run-from-main recovery" 1 \
+  "$(grep -c "Commit(s) ${HEAD_A:0:12} of bump PR #42 have an author or committer that GitHub links to no account.*run this workflow from main" "$TMP/log")"
+check "  ... and pointing at the docs' recovery section" 1 "$(grep -c "'If the bump PR cannot be approved'" "$TMP/log")"
+check "an unlinked committer FAILS (earlier run's head, nothing pushed)" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$(commits a-unlc "$(cm "$HEAD_A" "$AUTHOR_ID" null)")" false)"
+check "  ... as an unlinked identity" 1 "$(grep -c 'links to no account' "$TMP/log")"
+check "an unlinked earlier commit FAILS" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$(commits a-unle "$(cm "$HEAD_B" null null),$(cm "$HEAD_A" "$AUTHOR_ID" "$AUTHOR_ID")")")"
+check "  ... naming that commit" 1 "$(grep -c "Commit(s) ${HEAD_B:0:12} of bump PR #42" "$TMP/log")"
+check "this run pushed a head authored by another account FAILS" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$TMP/commits-legacy.json" true)"
+check "  ... saying the pushed commit is not linked to the token's owner" 1 \
+  "$(grep -c "The bump commit this run pushed at $HEAD_A is not linked to the token's owner" "$TMP/log")"
+check "this run pushed a head committed by another account FAILS" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$(commits a-com "$(cm "$HEAD_A" "$AUTHOR_ID" "$BOT")")" true)"
+check "an earlier run's head by another linked account, nothing pushed: passes" 0 \
+  "$(run_attr "$TMP/pr42-owner.json" "$TMP/commits-legacy.json" false)"
+check "the commit list lags the push twice, then holds the head: passes" 0 \
+  "$(A_LAG=2 A_EARLY="$(commits a-early "$(cm "$HEAD_B" "$AUTHOR_ID" "$AUTHOR_ID")")" run_attr "$TMP/pr42-owner.json" "$OWNED")"
+check "  ... after three reads and two waits" "3 2" \
+  "$(echo "$(grep -c '/commits' "$TMP/gh.log") $(grep -c '^sleep ' "$TMP/gh.log")")"
+check "a commit list that never holds the head FAILS after six reads" 1 \
+  "$(run_attr "$TMP/pr42-owner.json" "$(commits a-never "$(cm "$HEAD_B" "$AUTHOR_ID" "$AUTHOR_ID")")")"
+check "  ... six reads, five waits" "6 5" \
+  "$(echo "$(grep -c '/commits' "$TMP/gh.log") $(grep -c '^sleep ' "$TMP/gh.log")")"
+check "commits read failure FAILS" 1 "$(run_attr "$TMP/pr42-owner.json" "$TMP/cm-error.json")"
+check "commits not a list of pages FAIL" 1 "$(run_attr "$TMP/pr42-owner.json" "$TMP/cm-object.json")"
+check "a commit that is not an object FAILS" 1 "$(run_attr "$TMP/pr42-owner.json" "$TMP/cm-str.json")"
+check "no PR number from Create pull request FAILS" 1 "$(A_PR='' run_attr "$TMP/pr42-owner.json" "$OWNED")"
+check "  ... before any API call" "1 0" "$(echo "$(grep -c 'no usable PR number' "$TMP/log") $(wc -l < "$TMP/gh.log" | tr -d ' ')")"
+check "malformed head SHA FAILS" 1 "$(A_HEAD=zz run_attr "$TMP/pr42-owner.json" "$OWNED")"
+check "  ... before any API call" "1 0" "$(echo "$(grep -c 'no usable head SHA' "$TMP/log") $(wc -l < "$TMP/gh.log" | tr -d ' ')")"
+check "malformed token owner id FAILS" 1 "$(A_OWNER='' run_attr "$TMP/pr42-owner.json" "$OWNED")"
+check "  ... before any API call" "1 0" "$(echo "$(grep -c "token owner's id '' is malformed" "$TMP/log") $(wc -l < "$TMP/gh.log" | tr -d ' ')")"
 
 # run_pushed <before> <after> -> the step's `pushed` output
 run_pushed() {
@@ -579,6 +709,77 @@ need(None not in (pi, ci_idx) and pi > ci_idx
      and penv.get("BEFORE_SHA") == "${{ steps.before.outputs.sha }}"
      and penv.get("AFTER_SHA") == "${{ steps.cpr.outputs.pull-request-head-sha }}",
      "the push record compares the head before with Create pull request's head SHA")
+
+# Commit identity (G8P4-SRE-N2): the bump commit names the token's owner as
+# both author and committer, resolved by the rotation guard; never the
+# create-pull-request default (github.actor, whoever last edited the cron).
+need(owner.get("id") == "owner", "the rotation guard has id owner (its outputs name the commit identity)")
+need(w.get("author") == "${{ steps.owner.outputs.identity }}" and
+     w.get("committer") == "${{ steps.owner.outputs.identity }}",
+     "Create pull request sets author and committer to the token owner's identity")
+ai, attr = find(lambda s: s.get("name") == "Check the bump PR can be approved")
+aenv = attr.get("env") or {}
+need(None not in (ai, pi) and ai > pi and attr.get("if") == CHANGED
+     and not attr.get("continue-on-error"),
+     "the attribution check runs after the push record whenever there is a bump")
+need(aenv.get("PR_TOKEN") == "${{ secrets.VCPKG_BASELINE_PR_TOKEN }}"
+     and aenv.get("OWNER_ID") == "${{ steps.owner.outputs.id }}"
+     and aenv.get("PR_NUMBER") == "${{ steps.cpr.outputs.pull-request-number }}"
+     and aenv.get("HEAD_SHA") == "${{ steps.cpr.outputs.pull-request-head-sha }}"
+     and aenv.get("PUSHED") == "${{ steps.pushed.outputs.pushed }}",
+     "the attribution check reads the owner id, PR number, head and push record from their steps")
+
+# Secret scoping (G8P4-SG-N2): the PR token lives in the vcpkg-baseline
+# environment, which only propose-bump declares; no other job or workflow
+# names the environment or the secret.
+ENV = "vcpkg-baseline"
+SECRET = "VCPKG_BASELINE_PR_TOKEN"
+# A read of the secret: secrets.NAME or secrets['NAME'] / secrets["NAME"].
+# Prose naming it (a comment, the alert text) reads nothing.
+SECRET_READ = re.compile(r"secrets\s*(?:\.\s*" + SECRET + r"\b|\[\s*['\"]" + SECRET + r"['\"])")
+def env_name(job):
+    e = job.get("environment")
+    return e.get("name") if isinstance(e, dict) else e
+need(env_name(pb) == ENV, f"propose-bump runs in the {ENV} environment")
+for jname, job in bump["jobs"].items():
+    if jname == "propose-bump":
+        continue
+    need(env_name(job) != ENV, f"bump job {jname} does not declare the {ENV} environment")
+    need(not SECRET_READ.search(yaml.safe_dump(job, width=10**6)),
+         f"bump job {jname} does not read {SECRET}")
+others = sorted(p for p in (root / ".github").rglob("*")
+                if p.is_file() and p.suffix in (".yml", ".yaml")
+                and p.name != "vcpkg-baseline-update.yml")
+need(len(others) >= 20, f"the scan sees the other workflow and action files ({len(others)})")
+for p in others:
+    text = p.read_text(encoding="utf-8", errors="ignore")
+    rel = p.relative_to(root)
+    need(not SECRET_READ.search(text), f"{rel} does not read {SECRET}")
+    try:
+        doc = yaml.safe_load(text) or {}
+    except yaml.YAMLError:
+        doc = {}
+    for jname, job in ((doc.get("jobs") or {}) if isinstance(doc, dict) else {}).items():
+        if isinstance(job, dict) and env_name(job) == ENV:
+            need(False, f"{rel} job {jname} must not declare the {ENV} environment")
+
+# The alert names every step that refuses on a token, rotation or
+# attribution problem, and the environment (G8P4-SRE-N1).
+alert_script = (bump["jobs"]["alert"]["steps"][0].get("with") or {}).get("script", "")
+for named in ("Require the PR token", "Create pull request",
+              "Refuse to push onto a bump PR another account opened",
+              "Check the bump PR can be approved", f"\\`{ENV}\\` environment: the run was"):
+    need(named in alert_script, f"the alert body names {named!r}")
+    if not named.startswith("\\"):
+        need(find(lambda s: s.get("name") == named)[0] is not None,
+             f"{named!r} is a step of propose-bump")
+
+# Every "(see X in the header)" pointer names a section of the header
+# (G8P3-DW-N1).
+header_labels = set(re.findall(r"^# ([A-Z][A-Z' -]+)\.", bump_text, re.M))
+pointers = re.findall(r"see ([A-Z][A-Z' -]+) in the header", bump_text)
+need(len(pointers) > 0 and all(x in header_labels for x in pointers),
+     f"every 'see X in the header' pointer names a header section ({sorted(set(pointers))})")
 
 run = apply_.get("run", "")
 m = re.search(r"files=\(\n(.*?)\n\s*\)", run, re.S)
