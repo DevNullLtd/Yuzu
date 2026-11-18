@@ -1074,6 +1074,12 @@ public:
     /// Revoke by token_id. true = a row exists (idempotent), false = unknown id.
     std::expected<bool, StoreError> revoke_token(const std::string& token_id);
 
+    /// WP01 (F): give back ONE use of a token whose consume was followed by a failed leaf issuance
+    /// (the signer returned nothing: throttle, store blip), so a re-enrolment does not spend a
+    /// single-use token for a certificate that was never issued. `true` = a use was returned.
+    /// Only ever called by the handler that consumed the use in the same request.
+    std::expected<bool, StoreError> refund_token_use(const std::string& token_id);
+
     /// All tokens, newest first. `expires_at == time_point::max()` = never.
     std::expected<std::vector<auth::EnrollmentToken>, StoreError> list_tokens();
 

@@ -4295,3 +4295,22 @@ TEST_CASE("AuthDB consume_and_enroll(require_single_use): a multi-use token is r
     CHECK_FALSE(s2->not_single_use);
     CHECK(s2->token_error == EnrollmentTokenError::already_consumed);
 }
+
+TEST_CASE("AuthDB refund_token_use returns exactly one use and never goes below zero (WP01 F)",
+          "[pg][auth_db][enrollment][wp01]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto t = h.db.create_token("recover", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(t.has_value());
+    auto used = h.db.consume_and_enroll(t->raw_token, "agent-f", "h", "", "", "");
+    REQUIRE(used.has_value());
+    CHECK(used->kind == CEK::enrolled);
+    CHECK(h.db.refund_token_use(t->token_id).value());
+    CHECK(scalar(h.conn.get(), "SELECT use_count::text FROM auth.enrollment_tokens WHERE token_id = $1",
+                 {t->token_id}) == "0");
+    CHECK_FALSE(h.db.refund_token_use(t->token_id).value()); // nothing left to return
+    // The refunded single-use token can be consumed again.
+    auto again = h.db.consume_and_enroll(t->raw_token, "agent-f", "h", "", "", "");
+    REQUIRE(again.has_value());
+    CHECK(again->kind == CEK::enrolled);
+}

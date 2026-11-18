@@ -3704,6 +3704,14 @@ public:
             (void)metrics_.counter("yuzu_register_reregistration_audit_dropped_total",
                                    {{"action", action}});
         (void)metrics_.counter("yuzu_register_reregistration_audit_write_failures_total");
+        for (const char* r : {"refunded", "failed"})
+            (void)metrics_.counter("yuzu_register_reenrol_token_refunded_total", {{"result", r}});
+        metrics_.describe("yuzu_register_reenrol_token_refunded_total",
+                          "A re-enrolment consumed a single-use token but the leaf was NOT issued "
+                          "(signer throttle, store blip): the use was returned (result refunded) or "
+                          "the return itself failed (result failed: the token is spent without a "
+                          "certificate and an operator must mint another).",
+                          "counter");
         (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
         (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
         metrics_.describe("yuzu_register_reregistration_audit_dropped_total",

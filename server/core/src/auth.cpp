@@ -3344,6 +3344,11 @@ std::expected<bool, StoreError> AuthManager::revoke_enrollment_token(const std::
         "revoke_token", [&](yuzu::server::AuthDB& db) { return db.revoke_token(token_id); });
 }
 
+std::expected<bool, StoreError> AuthManager::refund_enrollment_token_use(const std::string& token_id) {
+    return enrollment_store_call<bool>(
+        "refund_token_use", [&](yuzu::server::AuthDB& db) { return db.refund_token_use(token_id); });
+}
+
 std::string pending_status_to_string(PendingStatus s) {
     switch (s) {
     case PendingStatus::pending:

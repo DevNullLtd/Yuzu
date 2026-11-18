@@ -1535,6 +1535,11 @@ public:
                        const std::string& arch, const std::string& agent_version,
                        bool enforce_new_id_charset = false, bool require_single_use = false);
 
+    /// WP01 (F): return one use of `token_id` after a re-enrolment consumed it but the leaf was not
+    /// issued. See `AuthDB::refund_token_use`.
+    [[nodiscard]] std::expected<bool, StoreError>
+    refund_enrollment_token_use(const std::string& token_id);
+
     /// All enrollment tokens, newest first (admin UI).
     [[nodiscard]] std::expected<std::vector<EnrollmentToken>, StoreError>
     list_enrollment_tokens();

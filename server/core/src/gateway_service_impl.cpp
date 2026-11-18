@@ -720,6 +720,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
     // below, as a re-enrolment (single-use token required, older leaf superseded). See
     // agent_reregistration_gate.hpp; this is the mirror of the direct Register path.
     bool reenrol_via_token = false;
+    std::string reenrol_token_id; // the token consumed by a re-enrolment (refunded if no leaf issues)
     bool reenrolled_with_token = false;
     // A gRPC status, NEVER accepted=false (a permanent rejection to the agent): the agent keeps
     // retrying until it holds a good token.
@@ -1022,6 +1023,7 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 if (claim.max_uses != 1)
                     return reenrol_token_refusal("multi_use_token");
                 reenrolled_with_token = true;
+                reenrol_token_id = claim.token_id;
             }
             spdlog::info("[gateway] Agent {} auto-enrolled via enrollment token id={} ({}/{})",
                          safe_agent_id, claim.token_id, claim.use_count_after,
@@ -1545,6 +1547,18 @@ gw_enrolled:
         } else {
             spdlog::warn("[gateway] ProxyRegister: client-cert signing failed for agent {}",
                          safe_agent_id);
+            // WP01 (F): consume and issue are one unit. The token use was counted before the signer
+            // ran; a re-enrolment that got NO leaf (throttle, store blip, key load) returns the use,
+            // so the agent's retry with the same token is a fresh attempt, not an already-consumed
+            // dead end. (A same-CSR retry is then simply the next attempt.)
+            if (reenrolled_with_token && !reenrol_token_id.empty()) {
+                auto refunded = auth_mgr_.refund_enrollment_token_use(reenrol_token_id);
+                if (metrics_)
+                    metrics_
+                        ->counter("yuzu_register_reenrol_token_refunded_total",
+                                  {{"result", (refunded && *refunded) ? "refunded" : "failed"}})
+                        .increment();
+            }
         }
     }
 
