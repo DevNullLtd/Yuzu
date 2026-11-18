@@ -38,13 +38,17 @@ def strip_comments(text: str) -> str:
 
 
 PINS = [
+    ("agent.cpp drop accounting (atomic first)",
+     "agents/core/src/agent.cpp",
+     r"ctx_impl\.flush_output\(\);\s*"
+     r"ctx_impl\.apply_output_drop\(\);\s*"
+     r"if \(ctx_impl\.output_dropped\.load\([^)]*\)\)\s*"
+     r"g_output_dropped_commands\.fetch_add\(1, [^)]*\);"),
     ("agent.cpp",
      "agents/core/src/agent.cpp",
-     r"ctx_impl\.apply_output_drop\(\);\s*"
      r"if \(ctx_impl\.output_dropped\.load\([^)]*\)\) \{\s*"
      r'metrics_\.counter\("yuzu_agent_plugin_output_dropped_total", '
      r'\{\{"plugin", cmd\.plugin\(\)\}\}\)\s*\.increment\(\);\s*'
-     r"g_output_dropped_commands\.fetch_add\(1, [^)]*\);\s*"
      r"spdlog::error\(.*?\);\s*\}\s*YuzuResultStatus effective_result_status"),
     ("server.cpp report_server_encoding",
      "server/core/src/server.cpp",

@@ -4679,6 +4679,11 @@ private:
 
         // Flush any buffered output before sending timing/status
         ctx_impl.flush_output();
+        // Account a lost output write FIRST (atomic bumps only): the timing frame and the
+        // labelled counter lookup below allocate, and must not run before the drop is counted.
+        ctx_impl.apply_output_drop();
+        if (ctx_impl.output_dropped.load(std::memory_order_relaxed))
+            g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
 
         auto end_time = std::chrono::steady_clock::now();
         auto exec_ms =
@@ -4701,11 +4706,9 @@ private:
         // for the operator log line below. It is a READ-TIME/PRESENTATION
         // derivation ONLY — see derive_effective_result_status(), unit-tested in
         // tests/unit/test_capability_descriptor.cpp.
-        ctx_impl.apply_output_drop();
         if (ctx_impl.output_dropped.load(std::memory_order_relaxed)) {
             metrics_.counter("yuzu_agent_plugin_output_dropped_total", {{"plugin", cmd.plugin()}})
                 .increment();
-            g_output_dropped_commands.fetch_add(1, std::memory_order_relaxed);
             // AFTER unwinding (the allocation failure is long gone): one loud line.
             spdlog::error("Command {} plugin {}: a plugin output write was lost to an allocation "
                           "failure; the result is reported constrained/partial",
