@@ -717,9 +717,12 @@ public:
         // Streamed installed-software export (SAM-36): every format x result and every rejection
         // reason exist from boot, so a first rejection reads as an increase from 0.
         metrics_.describe("yuzu_server_software_export_total",
-                          "Streamed installed-software exports that ended, by format (jsonl/csv) "
+                          "Streamed installed-software exports that ended, by format (jsonl/csv/xlsx) "
                           "and result (completed/degraded/deadline/aborted/limit); anything but "
-                          "completed is a transfer the client saw truncated; aborted covers a "
+                          "completed is a transfer the client saw truncated (xlsx is built before "
+                          "anything is sent, so there a limit is a 413 and a degraded read, the "
+                          "deadline or a closing server before the first byte is a 503; only a "
+                          "deadline or abort during delivery truncates); aborted covers a "
                           "client that went away and a server that began shutting down; limit is "
                           "a stream cut at --inventory-export-max-rows or "
                           "--inventory-export-max-bytes",
@@ -21821,6 +21824,7 @@ private:
                     .concurrency = cfg_.inventory_export_concurrency,
                     .limits = {.max_rows = cfg_.inventory_export_max_rows,
                                .max_bytes = cfg_.inventory_export_max_bytes},
+                    .xlsx_tmp_dir = cfg_.db_dir() / "export-tmp",
                 });
         }
 

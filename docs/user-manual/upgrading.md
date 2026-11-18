@@ -28,6 +28,22 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What to do.** Update log parsers and runbooks as above. No data migration.
 
+## Behaviour change: the installed-software export gains `format=xlsx`, a new build dependency and a directory under the data dir
+
+**In short.** Affected: anyone who builds the server from source, anyone who reads `GET /api/v1/inventory/software/export`, and anyone who sizes the server's data volume. To do: nothing is required to keep the JSONL and CSV exports working; read the disk figures below before enabling XLSX for large exports.
+
+**What changed.**
+
+- **New format.** `GET /api/v1/inventory/software/export?format=xlsx` returns the same rows as the JSONL and CSV export as a one-sheet workbook (the CSV's 23 columns, a bold frozen header, every cell text). Unlike JSONL and CSV it is built whole before the first byte and sent with a `Content-Length`, so a failure before the first byte is an ordinary error (`413` over a limit, `503` otherwise) and not a cut transfer. The `operationId` is unchanged, so the operation count does not move; the operation gains a `413` response and `xlsx` in the `format` enum. `format` still refuses any other value, and its two error texts now read "jsonl, csv or xlsx".
+- **Limits.** `--inventory-export-max-rows` and `--inventory-export-max-bytes` apply to XLSX as well; the bytes count the uncompressed sheet including its markup, not the cell text, and the sheet's own 1,048,575 data rows apply on top. The two flags' help text names this.
+- **New directory and disk use.** The server creates `<data dir>/export-tmp` (owner-only) at start-up and deletes every regular file in it, so nothing else may live there. An XLSX export holds at most 3 times its accounted sheet bytes of the data volume while it runs: at most 3 GiB per export at the default `--inventory-export-max-bytes` and 6 GiB at the default `--inventory-export-concurrency` of 2. An export is refused with a `503` when it could leave the data volume with under 1 GiB free. If the directory cannot be created, `format=xlsx` answers `503` "xlsx export is not configured on this server" and the other formats are unaffected.
+- **New build dependency.** The server build now needs the vcpkg port `libxlsxwriter` (1.2.4, with `minizip` 1.3.2 and the `zlib` already present), under the `server` feature of `vcpkg.json`. The agent-only install (Windows, macOS and the agent images) is unchanged. Because `vcpkg.json` changed, the first CI run after this change is one cold vcpkg build.
+- **New metric label value.** `yuzu_server_software_export_total{format="xlsx"}` exists from boot for every result.
+
+**Who is affected.** A server built from source on Linux needs the port; an operator who exports large inventories needs the disk headroom above on the data volume; a client that checks the `format` error text or the response codes sees the additions.
+
+**What to do.** Nothing for existing exports. Before relying on XLSX at scale, check that the data volume has the headroom, or lower `--inventory-export-max-bytes`.
+
 ## ⚠️ Breaking: regex `replace` is limited to 64 KiB files, regex `search` skips long lines, and `ioc.check` accepts at most 100 domains
 
 **In short.** Affected: any script, instruction or agentic worker that runs `filesystem.replace` with `regex=true` on a file over 64 KiB, relies on `filesystem.search` with `regex=true` seeing every line, sends more than 100 `domains` to `ioc.check`, or reads Windows `ioc.check` domain results as clean (they can now be constrained, meaning unknown). Agents on the new build refuse or skip these where the old build ran them.
