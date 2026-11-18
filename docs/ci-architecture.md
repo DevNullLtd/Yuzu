@@ -636,8 +636,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -660,8 +661,17 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
@@ -730,9 +740,9 @@ fixed by reviewing the edit, not by re-running the job.
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — seven parser families
-(six under `server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
