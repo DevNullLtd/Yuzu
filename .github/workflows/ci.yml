@@ -452,10 +452,11 @@ jobs:
       # OrganizationAdmin bypass on Protect Dev and Protect Main is a
       # deliberate break-glass route, accepted by fjarvis (project owner) on
       # 2026-11-18 (review by 2027-05-18, tracked in #8228), and its use is
-      # visible in the audit log. CLA_REPO_ACCESS_TOKEN is stored in the
-      # `cla` environment, which only the default branch may use, so a
-      # workflow on another branch cannot read it; the bump App's private key
-      # is kept the same way, in the `vcpkg-baseline` environment. That does
+      # visible in the audit log. CLA_REPO_ACCESS_TOKEN and the bump App's
+      # private key are to be stored in the `cla` and `vcpkg-baseline`
+      # environments, which only the default branch may use; until the owner
+      # has done that setup, a repository-level copy of either is readable
+      # from any branch (docs/dependency-updates.md). That does
       # not make the merge rule a control (docs/dependency-updates.md,
       # "Self-hosted CI is held until a maintainer approves the head").
       #

@@ -14,11 +14,11 @@ name: CLA Assistant
 # ─────────────────────────────────────────────────────────────────────────
 # Provisioning (in place):
 #   - Secret `CLA_REPO_ACCESS_TOKEN`: a token able to write the signatures
-#     store. CLA_REPO_ACCESS_TOKEN is stored in the `cla` environment, which
-#     only the default branch may use, so a workflow on another branch cannot
-#     read it. The environment and the secret's move into it are owner
-#     actions that land with this file's change on `main`
-#     (docs/dependency-updates.md, "The cla environment"). Only cla-check may
+#     store. It is to be stored in the `cla` environment, which only the
+#     default branch may use. Once the owner has moved it there and deleted
+#     the repository copy (docs/dependency-updates.md, "The cla environment"),
+#     a workflow on another branch cannot read it; until then it is still a
+#     repository secret. Only cla-check may
 #     declare the environment or read the secret
 #     (tests/shell/test_cla_environment.sh).
 #   - Signatures store: private repo `Tr3kkR/Yuzu-cla-signatures`, branch

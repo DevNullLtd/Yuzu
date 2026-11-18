@@ -48,9 +48,10 @@ name: vcpkg baseline update
 # OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
 # break-glass route, accepted by fjarvis (project owner) on 2026-11-18
 # (review by 2027-05-18, tracked in #8228), and its use is visible in the
-# audit log. CLA_REPO_ACCESS_TOKEN is stored in the `cla` environment, which
-# only the default branch may use, so a workflow on another branch cannot
-# read it. The `vcpkg-baseline` environment is an owner setting
+# audit log. CLA_REPO_ACCESS_TOKEN is to be stored in the `cla` environment,
+# which only the default branch may use; until the owner has moved it there
+# and deleted the repository copy it is still a repository secret
+# (docs/dependency-updates.md, "The cla environment"). The `vcpkg-baseline` environment is an owner setting
 # (docs/dependency-updates.md, "The bump App", "Where the credentials are
 # stored"); a dispatch of this workflow from any branch but `main` therefore
 # fails at job start. No other job, and no other workflow,

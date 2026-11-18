@@ -1118,16 +1118,19 @@ Dev and Protect Main, a deliberate break-glass route whose use is visible in the
 It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
 2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
 from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
-supply-chain CODEOWNERS entries (branch `fix/codeowners-supply-chain`, owners `@fjarvis`
+supply-chain CODEOWNERS entries (#8243, owners `@fjarvis`
 and `@Tr3kkR`) request review but do not require it, and both owners can bypass the
 rulesets as organisation admins. This is to be reviewed by 2027-05-18, tracked in #8228.
+
+Until the owner completes the `cla` environment setup ([Dependency updates](dependency-updates.md),
+"The cla environment"), `CLA_REPO_ACCESS_TOKEN` is still a repository secret that a workflow on
+any branch can read, and so a second route around the review rule. This interim state is
+tracked in #8228 and ends when the repository copy is deleted.
 
 A pull request merged through the bypass is not covered by the rulesets' review
 requirement, so the PR review records cited above are evidence of review only for merges
 that did not use it ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
-until a maintainer approves the head"). `CLA_REPO_ACCESS_TOKEN` is stored in the `cla`
-environment, which only the default branch may use, so a workflow on another branch cannot
-read it.
+until a maintainer approves the head").
 
 ---
 

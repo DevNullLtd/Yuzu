@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # test_cla_environment.sh — lexical pin on where CLA_REPO_ACCESS_TOKEN is read.
 #
-# WHY THIS EXISTS. CLA_REPO_ACCESS_TOKEN is stored in the `cla` environment,
-# which only the default branch may use, so a workflow on another branch
+# WHY THIS EXISTS. CLA_REPO_ACCESS_TOKEN is to be stored in the `cla`
+# environment, which only the default branch may use; once the owner has
+# moved it there and deleted the repository copy, a workflow on another branch
 # cannot read it (docs/dependency-updates.md, "The cla environment"). This
 # keeps the token's readers to the one job that needs it, cla.yml's
 # cla-check, in that environment: a reader without the environment gets no

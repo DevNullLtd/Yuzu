@@ -299,9 +299,11 @@ break-glass route, accepted by fjarvis (project owner) on 2026-11-18, to be
 reviewed by 2027-05-18 (tracked in #8228), and its use is visible in the
 audit log.
 
-`CLA_REPO_ACCESS_TOKEN` is stored in the `cla` environment, which only the
-default branch may use, so a workflow on another branch cannot read it (see
-"The cla environment"). The bump App's private key is stored the same way,
+`CLA_REPO_ACCESS_TOKEN` is to be stored in the `cla` environment, which only
+the default branch may use; once the owner has moved it there and deleted the
+repository copy, a workflow on another branch cannot read it, and until then it
+is still a repository secret (see "The cla environment"). The bump App's
+private key is to be stored the same way,
 in the `vcpkg-baseline` environment, which only `main` may use (see "Where
 the credentials are stored"). Neither makes the merge rule a control.
 
@@ -524,9 +526,10 @@ run fails at its first step and the `vcpkg-baseline-broken` issue stays open.
 
 ### The cla environment
 
-`CLA_REPO_ACCESS_TOKEN` is stored in the `cla` environment, which only the
-default branch may use, so a workflow on another branch cannot read it. The
-token lets `cla.yml` write the signatures store. Its `cla-check` job, the
+`CLA_REPO_ACCESS_TOKEN` is to be stored in the `cla` environment, which only
+the default branch may use. Once the setup below is complete, including
+deleting the repository copy, a workflow on another branch cannot read it;
+until then it is still a repository secret. The token lets `cla.yml` write the signatures store. Its `cla-check` job, the
 only job that reads the token, declares the environment:
 
 ```yaml
@@ -751,8 +754,8 @@ These are flat vendored files embedded into the server binary at build time — 
 `.github/CODEOWNERS` exists (#366). Code-owner entries for the release
 supply-chain paths, among them `/.github/workflows/`, `/vcpkg.json` and
 `/vcpkg-configuration.json` with owners `@fjarvis` and `@Tr3kkR`, are
-provided by the change that adds them to `.github/CODEOWNERS` (branch
-`fix/codeowners-supply-chain`), not by this document. Every vcpkg baseline
+provided by the change that adds them to `.github/CODEOWNERS` (#8243), not
+by this document. Every vcpkg baseline
 bump PR edits workflow files and both vcpkg manifests, so once that change is
 merged GitHub requests a review from those owners on it, as on any other pull
 request touching those paths, Dependabot's and a change to `cla.yml`'s

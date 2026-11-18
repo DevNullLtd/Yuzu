@@ -26,6 +26,9 @@
   **If you verify releases:** use GitHub CLI 2.102.0 or later. The page's
   end-to-end verification script now exits 1 on an older or unrecognised
   `gh` version instead of running the attestation check.
-- **`CLA_REPO_ACCESS_TOKEN` now lives in the `cla` environment.** The CLA
+- **`CLA_REPO_ACCESS_TOKEN` moves to the `cla` environment.** The CLA
   workflow's job declares that environment, which only the default branch may
-  use.
+  use. The token is protected once the owner has created the environment,
+  stored the token in it and deleted the repository copy (see "The cla
+  environment" in the dependency-updates guide); until then it is still a
+  repository secret.
