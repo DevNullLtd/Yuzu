@@ -150,15 +150,25 @@ The provenance records the exact workflow run, commit, builder, and
 inputs used to produce the artifact.
 
 ```bash
+# --signer-workflow and --source-ref pin the attestation to release.yml at
+# this release's tag; --repo alone accepts one from any workflow in the repo.
 # Binary archives / installers
-gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
-gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}"
-gh attestation verify yuzu-agent-macos-arm64.tar.gz --repo "${SIGNER_REPO}"
+gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+gh attestation verify yuzu-agent-macos-arm64.tar.gz --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
 
 # Docker images (by digest)
 gh attestation verify \
   oci://ghcr.io/${OWNER}/yuzu-server@sha256:<digest> \
-  --repo "${SIGNER_REPO}"
+  --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
 ```
 
 Success prints the attestation's predicate type
