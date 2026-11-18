@@ -12,40 +12,44 @@ name: vcpkg baseline update
 # granted that permission, so the scheduled runs from June to November 2026
 # failed at "Create pull request" with `git` exiting 1 (the branch push) and
 # never opened a PR (May's run failed earlier, in job setup). The PR is
-# therefore pushed and opened with the secret VCPKG_BASELINE_PR_TOKEN: a
-# fine-grained token, repository access limited to this repository, with
-# Contents, Pull requests and Workflows read/write and nothing else, expiring
-# in 90 days or less. Its owner role, the rotation procedure and the
-# preferred bot identity are in docs/dependency-updates.md ("The PR token").
+# therefore pushed and opened with an installation token of the bump App: a
+# GitHub App owned by the organisation and installed on this repository only.
+# Each run mints the token first (actions/create-github-app-token, from the
+# App's client ID in the variable VCPKG_BASELINE_APP_CLIENT_ID and its private
+# key in the secret VCPKG_BASELINE_APP_PRIVATE_KEY), scoped to this repository
+# with Contents, Pull requests and Workflows write and nothing else; the
+# action revokes it when the job ends. The App's setup, key rotation and CLA
+# coverage are in docs/dependency-updates.md ("The bump App").
 # Do NOT "fix" a failure by dropping the workflow files from the bump list:
 # VCPKG_COMMIT must move with builtin-baseline. A PR opened with that token
 # also triggers CI, which one opened by GITHUB_TOKEN would not, and it is
-# attributed to the token's owner, so a different maintainer reviews it. The
-# bump commit names the token's owner as author and committer too, so its
-# author is never whoever last edited the cron line. When the secret is unset
-# the run fails at its first step, before the bump, naming it, and the
-# `alert` job files the issue. A run whose token belongs to another account
-# than the open bump PR's author (the token was rotated to a new owner while
-# the PR was open) refuses to push onto that PR, so the new owner never
-# pushes a head they could then approve. Recovery: close the PR (do not
-# reopen it), then run vcpkg-baseline-update.yml from main or wait for the
-# next scheduled run (docs/dependency-updates.md, "If the bump PR cannot be
-# approved", which every error message and the alert issue point to).
+# authored by the App's bot account, `<app-slug>[bot]`, not by a person, so
+# any maintainer who did not push to it can review it. The bump commit names
+# that bot as author and committer too, so its author is never whoever last
+# edited the cron line. When the client ID or the key is unset the run fails
+# at its first step, before the bump, naming it, and the `alert` job files
+# the issue. A run whose bot is another account than the open bump PR's
+# author (the PR was opened by an earlier credential, or the App was
+# replaced while it was open) refuses to push onto that PR, so no account
+# pushes a head onto a PR it could then approve. Recovery: close the PR (do
+# not reopen it), then run vcpkg-baseline-update.yml from main or wait for
+# the next scheduled run (docs/dependency-updates.md, "If the bump PR cannot
+# be approved", which every error message and the alert issue point to).
 #
-# ENVIRONMENT. Only propose-bump uses the token, and it runs in the
-# `vcpkg-baseline` environment. The secret belongs in that environment, whose
-# deployment branches are limited to `main`, and NOT among the repository
-# secrets: a repository secret is readable by a workflow pushed to any branch,
-# and with it any maintainer could approve their own pull request as the
-# token's owner, one more way round the merge rulesets' review rule. That
-# rule does not hold against an organisation admin's ruleset bypass or the
-# repository secret CLA_REPO_ACCESS_TOKEN either, environment or not
-# (docs/dependency-updates.md, "Self-hosted CI is held until a maintainer
-# approves the head"). The
-# environment is an owner setting (docs/dependency-updates.md, "The PR
-# token", "Where the token is stored"); a dispatch of this workflow from any
-# branch but `main` therefore fails at job start. No other job, and no other
-# workflow, may name the secret or the environment
+# ENVIRONMENT. Only propose-bump uses the App's credentials, and it runs in
+# the `vcpkg-baseline` environment. The client ID and the key belong in that
+# environment, whose deployment branches are limited to `main`, and NOT among
+# the repository variables and secrets: a repository secret is readable by a
+# workflow pushed to any branch, and with the key any maintainer could mint a
+# token and act as the bot on any pull request, one more way round the merge
+# rulesets' review rule. That rule does not hold against an organisation
+# admin's ruleset bypass or the repository secret CLA_REPO_ACCESS_TOKEN
+# either, environment or not (docs/dependency-updates.md, "Self-hosted CI is
+# held until a maintainer approves the head"). The environment is an
+# owner setting (docs/dependency-updates.md, "The bump App", "Where the
+# credentials are stored"); a dispatch of this workflow from any branch but
+# `main` therefore fails at job start. No other job, and no other workflow,
+# may name the key, the client ID or the environment
 # (tests/shell/test_vcpkg_baseline_bump.sh).
 #
 # SELF-HOSTED APPROVAL. The PR builds an unreviewed microsoft/vcpkg HEAD.
@@ -77,8 +81,8 @@ on:
   workflow_dispatch:
 
 # Scorecard Token-Permissions hardening: least-privilege read at workflow
-# scope. The PR itself is pushed and opened with VCPKG_BASELINE_PR_TOKEN, so
-# GITHUB_TOKEN writes only issues (job-level grants below).
+# scope. The PR itself is pushed and opened with the bump App's installation
+# token, so GITHUB_TOKEN writes only issues (job-level grants below).
 permissions:
   contents: read
 
@@ -93,38 +97,59 @@ jobs:
     name: Propose vcpkg baseline bump
     runs-on: ubuntu-24.04
     timeout-minutes: 10
-    # The PR token lives in this environment, which only `main` may use (see
-    # ENVIRONMENT in the header). Never add it to another job.
+    # The bump App's client ID and private key live in this environment,
+    # which only `main` may use (see ENVIRONMENT in the header). Never add it
+    # to another job.
     environment: vcpkg-baseline
     permissions:
       contents: read          # actions/checkout
     outputs:
       # created / updated when this run created or updated the PR; pushed is
       # true only when it also moved the bump branch to a new head with the
-      # PR token. close-on-green closes the alert issue only on both.
+      # App's token. close-on-green closes the alert issue only on both.
       pr_operation: ${{ steps.cpr.outputs.pull-request-operation }}
       pushed: ${{ steps.pushed.outputs.pushed }}
     steps:
-      # First, so a missing, expired or revoked token fails the run every
-      # month, also one with nothing to bump, and before anything is changed.
-      # The authenticated read proves only that GitHub accepts the token. The
-      # repository is public, so a token still awaiting an organization
-      # owner's approval, or one whose permissions are short, likely passes
-      # this read too; its write permissions are proven only by the push in
-      # "Create pull request".
-      - name: Require the PR token
+      # First, so a missing client ID or key fails the run every month, also
+      # one with nothing to bump, and before anything is changed, with an
+      # error naming what is missing (the token action's own error would name
+      # only its input). Reads only whether each is set.
+      - name: Require the bump App's credentials
         env:
-          HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
-          PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
+          HAS_CLIENT_ID: ${{ vars.VCPKG_BASELINE_APP_CLIENT_ID != '' }}
+          HAS_PRIVATE_KEY: ${{ secrets.VCPKG_BASELINE_APP_PRIVATE_KEY != '' }}
         run: |
-          if [[ "$HAS_PR_TOKEN" != "true" ]]; then
-            echo "::error::Secret VCPKG_BASELINE_PR_TOKEN is not set in the vcpkg-baseline environment. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission). Create it as described in docs/dependency-updates.md, 'The PR token'."
+          missing="" verb="is"
+          [[ "$HAS_CLIENT_ID" == "true" ]] || missing="the variable VCPKG_BASELINE_APP_CLIENT_ID"
+          if [[ "$HAS_PRIVATE_KEY" != "true" ]]; then
+            [[ -z "$missing" ]] || verb="are"
+            missing="${missing:+$missing and }the secret VCPKG_BASELINE_APP_PRIVATE_KEY"
+          fi
+          if [[ -n "$missing" ]]; then
+            echo "::error::$missing $verb not set in the vcpkg-baseline environment. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission), so it is pushed with the bump App's installation token. Set the App up as described in docs/dependency-updates.md, 'The bump App'."
             exit 1
           fi
-          if ! GH_TOKEN="$PR_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq .full_name > /dev/null; then
-            echo "::error::GitHub did not accept VCPKG_BASELINE_PR_TOKEN for an authenticated read of this repository (it is expired or revoked, or the API is failing). Rotate it as described in docs/dependency-updates.md, 'The PR token', or re-run once the API recovers. A token GitHub accepts but whose permissions are short, or that awaits the organization's approval, passes this step and fails at 'Create pull request'."
-            exit 1
-          fi
+
+      # The installation token, scoped to this repository alone and to the
+      # three permissions the bump needs. GitHub refuses to mint it if the key
+      # or client ID is wrong, the App is not installed on this repository,
+      # or the installation lacks one of the three permissions, so those
+      # failures stop the run here, before the bump. The action revokes the
+      # token in its post step when the job ends. Only the rotation guard,
+      # Create pull request and the attribution check use it.
+      - name: Mint the bump App's installation token
+        id: app-token
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
+        with:
+          # client-id, not the deprecated app-id input.
+          client-id: ${{ vars.VCPKG_BASELINE_APP_CLIENT_ID }}
+          private-key: ${{ secrets.VCPKG_BASELINE_APP_PRIVATE_KEY }}
+          # This repository only (with no `owner` set, a `repositories`
+          # entry may carry this repository's owner).
+          repositories: ${{ github.repository }}
+          permission-contents: write
+          permission-pull-requests: write
+          permission-workflows: write
 
       # Dependency PRs target dev (docs/dependency-updates.md "Base branch"),
       # so the bump is made on dev's files, not the default branch's.
@@ -219,66 +244,78 @@ jobs:
             exit 1
           fi
 
-      # Rotation guard. The PR is attributed to the token's owner, and ci.yml's
-      # approval gate excludes the PR's author. If the token now belongs to
-      # another account than the open bump PR's author (rotated to a new owner
-      # while the PR was open), pushing would put a head on that PR that its
-      # pusher could approve, so the run refuses before the push and the alert
-      # issue opens. Recovery: close the PR (do not reopen it), then run
+      # Rotation guard. The PR is authored by the App's bot, and ci.yml's
+      # approval gate excludes the PR's author. If the open bump PR was opened
+      # by another account than this run's bot (an earlier credential opened
+      # it, or the App was replaced while it was open), pushing would put a
+      # head on that PR that its earlier author, not being the pusher, could
+      # approve, so the run refuses before the push and the alert issue
+      # opens. Recovery: close the PR (do not reopen it), then run
       # vcpkg-baseline-update.yml from main or wait for the next scheduled run
       # (docs/dependency-updates.md, "If the bump PR cannot be approved"); the
-      # new PR is attributed to the new owner. An API or
-      # parse failure refuses too. A GitHub App installation token cannot read
-      # /user: moving to an App identity needs this step changed first.
+      # new PR is the bot's. An API or parse failure refuses too.
       #
-      # The same read gives the bump commit's identity (outputs `id` and
-      # `identity`): the token owner's login and GitHub no-reply address
-      # `<id>+<login>@users.noreply.github.com`, which GitHub always links to
-      # that account. Create pull request names it as author and committer,
-      # so the commit is attributed to the PR's author, whom ci.yml's gate
-      # already excludes, and never to the account that last edited the cron
-      # line (create-pull-request's default author is github.actor).
+      # The bot is read, not assumed: an installation token cannot call
+      # GET /user, so the step takes the App's slug from the token action
+      # and reads the bot account `<app-slug>[bot]` from
+      # GET /users/<app-slug>%5Bbot%5D, which must answer with that exact
+      # login, type Bot and a numeric id. That gives the bump commit's
+      # identity (outputs `id` and `identity`): the bot's login and its
+      # no-reply address `<id>+<app-slug>[bot]@users.noreply.github.com`,
+      # which GitHub links to the bot. Create pull request names it as author
+      # and committer, so the commit is attributed to the PR's author, whom
+      # ci.yml's gate already excludes, and never to the account that last
+      # edited the cron line (create-pull-request's default author is
+      # github.actor).
       - name: Refuse to push onto a bump PR another account opened
         id: owner
         if: steps.check.outputs.changed == 'true'
         env:
-          PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          APP_SLUG: ${{ steps.app-token.outputs.app-slug }}
           # Must equal create-pull-request's `branch` below.
           BUMP_BRANCH: deps/vcpkg-baseline-update
         run: |
           set -uo pipefail
-          # A GitHub login: letters, digits and single inner hyphens, at most
-          # 39 characters, so nothing that could break the identity string.
-          if ! who=$(GH_TOKEN="$PR_TOKEN" gh api user --jq '"\(.id // "") \(.login // "")"'); then
-            who=""
-          fi
-          owner_id="${who%% *}"
-          owner_login="${who#* }"
-          if [[ ! "$owner_id" =~ ^[1-9][0-9]*$ || ${#owner_login} -gt 39 || ! "$owner_login" =~ ^[A-Za-z0-9]([A-Za-z0-9]|-[A-Za-z0-9])*$ ]]; then
-            echo "::error::Could not read which account owns VCPKG_BASELINE_PR_TOKEN (GET /user), so the run cannot show it may push onto the open bump PR, nor name the bump commit's author. Re-run once the API recovers; a GitHub App installation token needs this step changed first."
+          # An App slug: lowercase letters, digits and inner hyphens, so
+          # nothing that could break the identity string or the URL.
+          if [[ ! "$APP_SLUG" =~ ^[a-z0-9]([a-z0-9-]{0,62}[a-z0-9])?$ ]]; then
+            echo "::error::The token action reported no usable App slug ('$APP_SLUG') (failing closed), so the run cannot name the bump App's bot. Check the 'Mint the bump App's installation token' step."
             exit 1
           fi
-          if ! pages=$(GH_TOKEN="$PR_TOKEN" gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&head=${GITHUB_REPOSITORY%%/*}:$BUMP_BRANCH&per_page=100"); then
+          bot_login="${APP_SLUG}[bot]"
+          if ! who=$(GH_TOKEN="$APP_TOKEN" gh api "users/${APP_SLUG}%5Bbot%5D" --jq '"\((.id | numbers) // "") \(.type // "") \(.login // "")"'); then
+            who=""
+          fi
+          bot_id="${who%% *}"
+          rest="${who#* }"
+          bot_type="${rest%% *}"
+          read_login="${rest#* }"
+          if [[ ! "$bot_id" =~ ^[1-9][0-9]*$ || "$bot_type" != "Bot" || "$read_login" != "$bot_login" ]]; then
+            echo "::error::Could not read the bump App's bot account $bot_login (GET /users/${APP_SLUG}%5Bbot%5D), so the run cannot show it may push onto the open bump PR, nor name the bump commit's author (failing closed). Re-run once the API recovers."
+            exit 1
+          fi
+          if ! pages=$(GH_TOKEN="$APP_TOKEN" gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&head=${GITHUB_REPOSITORY%%/*}:$BUMP_BRANCH&per_page=100"); then
             echo "::error::Could not list the open bump PRs from $BUMP_BRANCH (failing closed). Re-run once the API recovers."
             exit 1
           fi
-          if ! others=$(jq -r --argjson owner "$owner_id" '
+          if ! others=$(jq -r --argjson bot "$bot_id" '
                 if type != "array" or any(.[]; type != "array") then error("not a list of pages") else . end
                 | add // []
-                | map(select((.user.id | type) != "number" or .user.id != $owner))
+                | map(select((.user.id | type) != "number" or .user.id != $bot))
                 | .[] | "#\(.number) (opened by \(.user.login // "an unknown account"))"' <<<"$pages"); then
             echo "::error::Could not parse the open bump PRs from $BUMP_BRANCH (failing closed). Re-run once the API recovers."
             exit 1
           fi
           if [[ -n "$others" ]]; then
-            echo "::error::The open bump PR $(echo "$others" | paste -sd' ' -) was opened by another account than the one that owns VCPKG_BASELINE_PR_TOKEN now. Pushing onto it would let the token's new owner approve their own push, so this run refuses. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run (docs/dependency-updates.md, 'If the bump PR cannot be approved')."
+            echo "::error::The open bump PR $(echo "$others" | paste -sd' ' -) was opened by another account than the bump App's bot, $bot_login. Pushing onto it would let that PR's author approve a head they did not push, so this run refuses. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run (docs/dependency-updates.md, 'If the bump PR cannot be approved')."
             exit 1
           fi
           echo "No open bump PR from $BUMP_BRANCH belongs to another account; the push may proceed."
-          echo "The bump commit names the token's owner, $owner_login (id $owner_id), as author and committer."
+          echo "The bump commit names the bump App's bot, $bot_login (id $bot_id), as author and committer."
           {
-            echo "id=$owner_id"
-            echo "identity=$owner_login <$owner_id+$owner_login@users.noreply.github.com>"
+            echo "id=$bot_id"
+            echo "identity=$bot_login <$bot_id+$bot_login@users.noreply.github.com>"
           } >> "$GITHUB_OUTPUT"
 
       # The bump branch's head before the push, so a later step can tell
@@ -298,8 +335,8 @@ jobs:
         uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
           # Not GITHUB_TOKEN: see TOKEN in the header.
-          token: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
-          # The token's owner, the PR's author (see the rotation guard above).
+          token: ${{ steps.app-token.outputs.token }}
+          # The App's bot, the PR's author (see the rotation guard above).
           # Never the default (github.actor): that is whoever last edited the
           # cron line, and if their account is deleted the commit links to no
           # account and ci.yml's gate refuses every approval.
@@ -377,24 +414,24 @@ jobs:
       # Attribution check, the detection signal for a bump PR nobody can
       # approve. ci.yml's gate refuses every approval when GitHub links a
       # commit of the PR to no account, and excludes the PR's author, which is
-      # the right account only while the PR's author is the token's owner.
+      # the right account only while the PR's author is the App's bot.
       # Either defect would otherwise leave this run green and the PR red with
       # no alert, so this step fails the run (and the alert issue opens) when
-      # the PR's author is not the token's owner, when any commit of the PR
-      # has an author or committer GitHub links to no account, or when this
-      # run pushed a head whose author and committer are not linked to the
-      # token's owner. Like ci.yml's gate, it also fails on a commit list of
-      # 250 or more, which GitHub may have truncated. Reads only, with the PR
-      # token. The PR's commit list can lag a just-pushed head by a few
-      # seconds, so it is read up to six times. It does not check that the
-      # token's owner is covered by the CLA: if not, this run stays green while
-      # the CLA check fails on the PR (docs/dependency-updates.md, "The PR
-      # token", CLA coverage).
+      # the PR's author is not the bot the rotation guard read, when any
+      # commit of the PR has an author or committer GitHub links to no
+      # account, or when this run pushed a head whose author and committer are
+      # not linked to the bot. Like ci.yml's gate, it also fails on a commit
+      # list of 250 or more, which GitHub may have truncated. Reads only, with
+      # the App's token. The PR's commit list can lag a just-pushed head by a
+      # few seconds, so it is read up to six times. It does not check that the
+      # bot is covered by the CLA: if not, this run stays green while the CLA
+      # check fails on the PR (docs/dependency-updates.md, "The bump App",
+      # CLA coverage).
       - name: Check the bump PR can be approved
         if: steps.check.outputs.changed == 'true'
         env:
-          PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
-          OWNER_ID: ${{ steps.owner.outputs.id }}
+          APP_TOKEN: ${{ steps.app-token.outputs.token }}
+          BOT_ID: ${{ steps.owner.outputs.id }}
           PR_NUMBER: ${{ steps.cpr.outputs.pull-request-number }}
           HEAD_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
           PUSHED: ${{ steps.pushed.outputs.pushed }}
@@ -404,22 +441,22 @@ jobs:
             echo "::error::$1 ci.yml's approval gate could not be satisfied on this PR, so this run fails instead (docs/dependency-updates.md, 'If the bump PR cannot be approved')."
             exit 1
           }
-          [[ "$OWNER_ID" =~ ^[1-9][0-9]*$ ]] || refuse "The token owner's id '$OWNER_ID' is malformed (failing closed)."
+          [[ "$BOT_ID" =~ ^[1-9][0-9]*$ ]] || refuse "The bump App's bot id '$BOT_ID' is malformed (failing closed)."
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || refuse "Create pull request reported no usable PR number ('$PR_NUMBER') (failing closed)."
           [[ "$HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || refuse "Create pull request reported no usable head SHA ('$HEAD_SHA') (failing closed)."
-          if ! pr_author=$(GH_TOKEN="$PR_TOKEN" gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '"\(.user.id // "") \(.user.login // "")"'); then
+          if ! pr_author=$(GH_TOKEN="$APP_TOKEN" gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER" --jq '"\(.user.id // "") \(.user.login // "")"'); then
             refuse "Could not read bump PR #$PR_NUMBER (failing closed). Re-run once the API recovers."
           fi
-          if [[ "${pr_author%% *}" != "$OWNER_ID" ]]; then
-            refuse "Bump PR #$PR_NUMBER was opened by '${pr_author#* }' (id '${pr_author%% *}'), not by the token's owner (id $OWNER_ID), so the gate would exclude the wrong account. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run."
+          if [[ "${pr_author%% *}" != "$BOT_ID" ]]; then
+            refuse "Bump PR #$PR_NUMBER was opened by '${pr_author#* }' (id '${pr_author%% *}'), not by the bump App's bot (id $BOT_ID), so the gate would exclude the wrong account. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run."
           fi
           commit_check=""
           for attempt in 1 2 3 4 5 6; do
-            if ! pages=$(GH_TOKEN="$PR_TOKEN" gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100"); then
+            if ! pages=$(GH_TOKEN="$APP_TOKEN" gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100"); then
               refuse "Could not read bump PR #$PR_NUMBER's commits (failing closed). Re-run once the API recovers."
             fi
             # The same "linked" test as ci.yml's gate.
-            if ! commit_check=$(jq -r --arg head "$HEAD_SHA" --argjson owner "$OWNER_ID" '
+            if ! commit_check=$(jq -r --arg head "$HEAD_SHA" --argjson bot "$BOT_ID" '
                   def linked($who): (.[$who] | type) == "object" and (.[$who].id | type) == "number";
                   if type != "array" or any(.[]; type != "array") then error("not a list of pages") else . end
                   | add // []
@@ -429,7 +466,7 @@ jobs:
                     elif any(.[]; (linked("author") and linked("committer")) | not) then
                       "unlinked " + ([.[] | select((linked("author") and linked("committer")) | not)
                                       | .sha | tostring | .[0:12]] | join(","))
-                    elif any(.[]; .sha == $head and (.author.id != $owner or .committer.id != $owner)) then
+                    elif any(.[]; .sha == $head and (.author.id != $bot or .committer.id != $bot)) then
                       "foreign " + ([.[] | select(.sha == $head) | "author \(.author.login), committer \(.committer.login)"] | first)
                     else "ok" end' <<<"$pages"); then
               refuse "Could not parse bump PR #$PR_NUMBER's commits (failing closed). Re-run once the API recovers."
@@ -438,15 +475,15 @@ jobs:
             sleep 10
           done
           case "$commit_check" in
-            ok) echo "Bump PR #$PR_NUMBER is the token owner's and every commit is linked to an account: another maintainer can approve it." ;;
+            ok) echo "Bump PR #$PR_NUMBER is the bump App's bot's and every commit is linked to an account: any maintainer on none of its commits can approve it." ;;
             truncated) refuse "Bump PR #$PR_NUMBER has 250 or more commits, more than GitHub lists, so the gate refuses every approval as possibly truncated. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run." ;;
             absent) refuse "Bump PR #$PR_NUMBER's commit list still does not contain head $HEAD_SHA after six reads (failing closed). Re-run; if it persists, check the PR." ;;
-            "unlinked "*) refuse "Commit(s) ${commit_check#unlinked } of bump PR #$PR_NUMBER have an author or committer that GitHub links to no account, so the gate refuses every approval. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run: the new PR's commit names the token's owner. If the unlinked commit is the one this run just pushed, the token owner's no-reply address did not link: check that account." ;;
+            "unlinked "*) refuse "Commit(s) ${commit_check#unlinked } of bump PR #$PR_NUMBER have an author or committer that GitHub links to no account, so the gate refuses every approval. Recovery: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run: the new PR's commit names the bump App's bot. If the unlinked commit is the one this run just pushed, the bot's no-reply address did not link: check the App." ;;
             "foreign "*)
               if [[ "$PUSHED" == "true" ]]; then
-                refuse "The bump commit this run pushed at $HEAD_SHA is not linked to the token's owner (id $OWNER_ID) as both author and committer (${commit_check#foreign }). Check the token owner's account and the author/committer inputs of Create pull request."
+                refuse "The bump commit this run pushed at $HEAD_SHA is not linked to the bump App's bot (id $BOT_ID) as both author and committer (${commit_check#foreign }). Check the App and the author/committer inputs of Create pull request."
               fi
-              echo "Bump PR #$PR_NUMBER's head was pushed by an earlier run (${commit_check#foreign }); every commit is linked to an account, so another maintainer can approve it." ;;
+              echo "Bump PR #$PR_NUMBER's head was pushed by an earlier run (${commit_check#foreign }); every commit is linked to an account, so a maintainer on none of its commits can approve it." ;;
             *) refuse "Unexpected result '$commit_check' checking bump PR #$PR_NUMBER (failing closed)." ;;
           esac
 
@@ -482,21 +519,25 @@ jobs:
               ``,
               `- The job never started, refused by the \`vcpkg-baseline\` environment: the run was`,
               `  not on \`main\` (the environment admits only \`main\`), or a reviewer rejected it.`,
-              `- "Require the PR token", or "Create pull request" with \`git\` exiting 1 or 128:`,
-              `  check the VCPKG_BASELINE_PR_TOKEN secret in the \`vcpkg-baseline\` environment. It`,
-              `  must exist, be unexpired, and hold Contents, Pull requests and Workflows`,
-              `  read/write on this repository.`,
+              `- "Require the bump App's credentials": the variable VCPKG_BASELINE_APP_CLIENT_ID or`,
+              `  the secret VCPKG_BASELINE_APP_PRIVATE_KEY is not set in the \`vcpkg-baseline\``,
+              `  environment.`,
+              `- "Mint the bump App's installation token": GitHub refused the token. The client ID`,
+              `  or private key is wrong (or the key was deleted), the App is not installed on this`,
+              `  repository, or the installation lacks Contents, Pull requests or Workflows write.`,
+              `- "Create pull request" with \`git\` exiting 1 or 128: the push or the PR call failed;`,
+              `  check the App's permissions and installation as above.`,
               `- "Refuse to push onto a bump PR another account opened": the rotation guard. Either`,
-              `  GitHub could not say who owns the token (GET /user; re-run), or the open bump PR`,
-              `  was opened by another account than the token's owner: use the recovery below.`,
+              `  GitHub could not say who the App's bot is (GET /users/<app-slug>[bot]; re-run), or`,
+              `  the open bump PR was opened by another account than the bot: use the recovery below.`,
               `- "Check the bump PR can be approved": a commit of the bump PR has an author or`,
               `  committer GitHub links to no account, the PR has 250 or more commits, or the PR's`,
-              `  author or this run's bump commit is not the token's owner, so ci.yml's approval`,
+              `  author or this run's bump commit is not the App's bot, so ci.yml's approval`,
               `  gate would refuse every approval. The error names the cause and the fix.`,
               ``,
               `Recovery, where the error names it: close the PR (do not reopen it), then run vcpkg-baseline-update.yml from main or wait for the next scheduled run.`,
               ``,
-              `Details: docs/dependency-updates.md, "The PR token" and "If the bump PR cannot be`,
+              `Details: docs/dependency-updates.md, "The bump App" and "If the bump PR cannot be`,
               `approved". Not a merge gate.`,
               ``,
               `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; closed automatically by the next green run of main's copy that pushes the bump PR.)`,
@@ -532,7 +573,7 @@ jobs:
   # closes the open `vcpkg-baseline-broken` issues only on a run that proved
   # the whole path works: the scheduled copy on main (a dispatch of a dev or
   # feature-branch copy proves nothing about the schedule), and a run that
-  # moved the bump branch to a new head with the PR token and created or
+  # moved the bump branch to a new head with the App's token and created or
   # updated the PR. A green month with nothing to bump, or one whose branch
   # already held this bump (nothing new to push, even when the run opened a
   # PR on it and reports `created`), has not exercised the push, so it leaves
@@ -553,7 +594,7 @@ jobs:
             const label = 'vcpkg-baseline-broken';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
-              `The vcpkg baseline bump ran green on main's copy and pushed a new bump branch head with the PR token @ \`${context.sha.substring(0, 7)}\`.`,
+              `The vcpkg baseline bump ran green on main's copy and pushed a new bump branch head with the bump App's token @ \`${context.sha.substring(0, 7)}\`.`,
               ``,
               `**Run:** ${runUrl}`,
               ``,

@@ -192,19 +192,25 @@ runs at 10:00 UTC on the 1st of each month (and is
 5. Opens a PR against `dev` via `peter-evans/create-pull-request` with labels
    `dependencies,ci`, from the fixed branch `deps/vcpkg-baseline-update`, so a
    month's bump updates the open bump PR rather than opening a second one. It
-   is pushed and opened with the secret `VCPKG_BASELINE_PR_TOKEN`, stored in
-   the `vcpkg-baseline` environment, never `GITHUB_TOKEN`: the bump rewrites files under `.github/workflows/`,
+   is pushed and opened with an installation token of the bump App, a GitHub
+   App owned by the organisation and installed on this repository only, never
+   with `GITHUB_TOKEN`: the bump rewrites files under `.github/workflows/`,
    and GitHub refuses a push that changes a workflow file unless the
    credential holds the `workflows` permission, which `GITHUB_TOKEN` can never
    hold. That refusal is why the scheduled runs from June to November 2026
    failed at "Create pull request" (`git` exited 1) and no PR was ever opened;
-   the May run failed earlier, in job setup. A PR opened with the token also
-   triggers CI; one opened by `GITHUB_TOKEN` would not. The token check is
-   the run's first step, so an unset secret fails every month, also one with
-   nothing to bump, with an error naming it. The bump commit names the
-   token's owner as author and committer. A last step, "Check the bump PR can
-   be approved", fails the run if `ci.yml`'s approval gate could not be
-   satisfied on the PR. See "The PR token" below.
+   the May run failed earlier, in job setup. Each run mints the token with
+   `actions/create-github-app-token` from the App's client ID and private key,
+   stored in the `vcpkg-baseline` environment, scoped to this repository and
+   to Contents, Pull requests and Workflows write; the action revokes it when
+   the job ends. A PR opened with the token also triggers CI; one opened by
+   `GITHUB_TOKEN` would not. The credentials check is the run's first step, so
+   an unset client ID or key fails every month, also one with nothing to bump,
+   with an error naming it. The PR is authored by the App's bot account,
+   `<app-slug>[bot]`, and the bump commit names that bot as author and
+   committer. A last step, "Check the bump PR can be approved", fails the run
+   if `ci.yml`'s approval gate could not be satisfied on the PR. See "The bump
+   App" below.
 6. On any failure, opens (or comments on) a `vcpkg-baseline-broken` issue,
    the `nightly-broken` pattern. It is a repair prompt, not a merge gate. It
    is closed automatically only by a green run that proves the whole path
@@ -221,7 +227,7 @@ is on the default branch, `main`. A change to
 schedule only once `dev` is promoted to `main`; until then the schedule keeps
 the old behaviour. A `workflow_dispatch` run from `dev` would use `dev`'s
 copy, but the `vcpkg-baseline` environment admits only `main`, so it fails at
-job start (see "Where the token is stored").
+job start (see "Where the credentials are stored").
 
 **Self-hosted CI is held until a maintainer approves the head.** The bump PR
 builds an unreviewed `microsoft/vcpkg` HEAD, opened by automation at a known
@@ -254,17 +260,18 @@ from a person, not a bot, with write or admin access to the repository (the
 repository is public, so anyone can leave an approving review), who is none
 of these:
 
-- the PR's author (the token's owner, see "The PR token");
+- the PR's author (the bump App's bot, see "The bump App");
 - on a CI run started by a push, the account that pushed that head;
 - an account GitHub links to any commit of the PR as its author or committer.
   That covers a maintainer who pushed a commit to the bump branch by hand and
   whoever pressed "Update branch". Each of those needs another maintainer to
-  approve. The bump commit itself names the token's owner as author and
-  committer (their `<id>+<login>@users.noreply.github.com` address, which
-  GitHub always links to their account), so it adds no one beyond the PR's
-  author. Until this change reaches `main`, the scheduled run's copy names the
-  account that last edited the workflow's cron line instead, and a dispatched
-  run's copy names the dispatcher.
+  approve. The bump commit itself names the App's bot as author and committer
+  (its `<id>+<app-slug>[bot]@users.noreply.github.com` address, which GitHub
+  links to the bot), so it adds no one beyond the PR's author, and on a bump
+  PR nobody has pushed to by hand no maintainer is excluded. Until this
+  change reaches `main`, the scheduled run's copy names the account that last
+  edited the workflow's cron line instead, and a dispatched run's copy names
+  the dispatcher.
 
 A commit whose author or committer GitHub links to no account (an e-mail
 address no GitHub account has verified, or a deleted account) fails the gate
@@ -296,35 +303,34 @@ admin can bypass it:
   token's owner, and merge with no independent review;
 - the rulesets let organisation admins bypass the merge rule.
 
-The PR token is stored in the `vcpkg-baseline` environment, which only `main`
-may use (see "Where the token is stored"), so that it does not add another
-such route. That does not make the merge rule a control; scoping or replacing
-`CLA_REPO_ACCESS_TOKEN` and the admin bypass are owner decisions.
+The bump App's private key is stored in the `vcpkg-baseline` environment,
+which only `main` may use (see "Where the credentials are stored"), so that it
+does not add another such route. That does not make the merge rule a
+control; scoping or replacing `CLA_REPO_ACCESS_TOKEN` and the admin bypass
+are owner decisions.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
 `vcpkg-baseline-broken` issue, when the PR it just created or updated could
 not pass the gate: a commit of the PR has an author or committer that GitHub
 links to no account, the PR has 250 or more commits (more than GitHub lists),
-the PR's author is not the token's owner, or the commit the run pushed is not
-linked to the token's owner as both author and committer. The error names
-which.
+the PR's author is not the bump App's bot, or the commit the run pushed is not
+linked to the bot as both author and committer. The error names which.
 
 **The recovery**, the one every error message, the workflow's comments and
 the alert issue point to: close the PR (do not reopen it), then run
 vcpkg-baseline-update.yml from `main` (Actions → vcpkg baseline update → Run
 workflow, branch `main`) or wait for the next scheduled run. The new PR is
-opened by the token's owner and its commit names them. It applies to an
+opened by the App's bot and its commit names the bot. It applies to an
 unlinked commit, a PR of 250 or more commits, and a PR opened by another
-account (including after the token moved to a new owner: see "Rotating to a
-different owner"). A fix pushed to the bump branch by hand is overwritten by
-the next bump either way.
+account (including a PR opened before the bump moved to the App, or by a
+replaced App: see "Replacing the App"). A fix pushed to the bump branch by
+hand is overwritten by the next bump either way.
 
-It does not apply when the commit the run pushed is not linked to the token's
-owner: the token owner's account cannot be linked from its no-reply address
-(check the account still exists and is the one the token belongs to), or the
-step's identity inputs were changed. Fix that first; closing the PR alone does
-not help.
+It does not apply when the commit the run pushed is not linked to the bot:
+the bot cannot be linked from its no-reply address (check the App still
+exists and is the one whose key is stored), or the step's identity inputs
+were changed. Fix that first; closing the PR alone does not help.
 
 Before this change reached `main`, the bump commit named the account that last
 edited the cron line, so if that account was deleted every scheduled bump
@@ -364,80 +370,116 @@ without being listed, if a short form has another length, or if the PR body
 lists a different set. A bump record of the form "moved from `<old>` to
 `<new>`", like the one below, is history and exempt.
 
-### The PR token
+### The bump App
 
-On 2026-11-18 `VCPKG_BASELINE_PR_TOKEN` did not exist. Until a maintainer
-creates it, every run fails at its first step and the `vcpkg-baseline-broken`
-issue stays open.
+On 2026-11-18 the bump App did not exist. Until the owner sets it up, every
+run fails at its first step and the `vcpkg-baseline-broken` issue stays open.
 
 - **Owner role:** the release manager (the maintainer who cuts releases with
-  the `/release` skill), who creates the token, records its expiry date (a
-  calendar reminder or a dated tracking issue) and rotates it.
-- **Identity.** A GitHub App installation token, or a token from a dedicated
-  bot account, is the preferred identity: the PR is then authored by the bot,
-  not by a person. Choosing and setting one up is the repository owner's
-  decision (Fraser); until then the token is a fine-grained personal access
-  token of the release manager's own account. An App installation token
-  cannot read `/user`, which the workflow's rotation guard ("Refuse to push
-  onto a bump PR another account opened") uses to learn the token's owner, so
-  switching to an App means changing that step in the same change.
-- **Scope.** Fine-grained, resource owner `DevNullLtd`, repository access
-  "Only select repositories" with this repository alone. Repository
-  permissions: Contents, Pull requests and Workflows read and write; nothing
-  else. If the organization requires approval of fine-grained tokens, the
-  token works only once an organization owner approves it.
-- **Expiry:** 90 days or less.
-- **Attribution.** A PR opened with a personal token is authored by the
-  token's owner, so that person is not an independent reviewer of it, and
-  GitHub does not let an author approve their own PR. A different maintainer
-  reviews the upstream range and approves the PR, which both releases the
-  self-hosted legs for that head and counts towards the merge. The gate
-  excludes the PR's author, so this holds only while the token's owner is the
-  PR's author: the workflow refuses to push onto an open bump PR that another
-  account opened (see "Rotating to a different owner"). The bump commit names
-  the token's owner as author and committer too, so it excludes no one else.
+  the `/release` skill), who sets the App up, rotates its key and records each
+  rotation (a dated tracking issue or a calendar entry). Changing the App's
+  settings or keys needs an owner of the DevNullLtd organisation, or a GitHub
+  App manager an organisation owner appoints for this App.
+- **Identity.** The PR is authored by the App's bot account,
+  `<app-slug>[bot]` (the slug is the App's URL name, derived from its name),
+  not by a person. The workflow does not hard-code the bot. An installation
+  token cannot call `GET /user`, so each run takes the slug from the token
+  action's `app-slug` output and reads the bot from
+  `GET /users/<app-slug>%5Bbot%5D`, and refuses unless GitHub answers with
+  that exact login, type `Bot` and a numeric id. The bump commit's author and
+  committer are `<app-slug>[bot] <<id>+<app-slug>[bot]@users.noreply.github.com>`,
+  which GitHub links to the bot.
+- **Scope.** The App has the repository permissions Contents, Pull requests
+  and Workflows, read and write, plus the mandatory Metadata read, and nothing
+  else: no organisation or account permissions, no webhook and no event
+  subscriptions. It is installed on DevNullLtd/Yuzu only. Each run asks for
+  exactly Contents, Pull requests and Workflows write on this repository
+  (`repositories` and the three `permission-*` inputs of
+  `actions/create-github-app-token`). GitHub refuses to mint a token with a
+  permission the installation does not hold, so an App that is short of one,
+  or not installed on this repository, fails at "Mint the bump App's
+  installation token", before the bump. An installation token expires after
+  an hour, and the action revokes it when the job ends.
+- **Setup.** Owner actions, once, in this order:
+  1. Create the App, owned by the organisation: DevNullLtd → Settings →
+     Developer settings → GitHub Apps → New GitHub App. Its name fixes its
+     slug, and so its bot's login. Set the homepage URL to this repository,
+     clear "Active" under Webhook, set the repository permissions above,
+     leave every other permission at "No access", and under "Where can this
+     GitHub App be installed?" choose "Only on this account".
+  2. On the App's General page, note the Client ID. Under "Private keys",
+     choose "Generate a private key", which downloads a `.pem` file.
+  3. Install the App: the App's page → Install App → DevNullLtd → "Only
+     select repositories" → DevNullLtd/Yuzu.
+  4. Set up the `vcpkg-baseline` environment and store the client ID and the
+     key there, as described under "Where the credentials are stored". Then
+     delete the downloaded `.pem` file: nobody keeps a copy.
+  5. Add the App's bot, `<app-slug>[bot]`, to `cla.yml`'s `allowlist` (see
+     "CLA coverage"). That is an edit to `cla.yml`, made by the repository
+     owner, not by this workflow's change.
+  6. Do not add the App to any ruleset's bypass list.
+  7. Once this workflow's App version is on `main`, run it once from `main`
+     (Actions → vcpkg baseline update → Run workflow, branch `main`) and
+     confirm that it ends green or opens or updates the bump PR, authored by
+     `<app-slug>[bot]`.
+- **Attribution.** The PR's author is the App's bot, which no maintainer is,
+  so no maintainer is excluded as its author. A maintainer who pushes to the
+  bump branch, presses "Update branch" or is otherwise on one of its commits
+  is excluded as usual. The gate excludes the PR's author, so this holds only
+  while the bot is the PR's author: the workflow refuses to push onto an open
+  bump PR that another account opened (see "Replacing the App").
 - **CLA coverage.** `cla.yml` requires every commit author of a pull request
   to have signed the Contributor License Agreement unless the account is on
-  its allowlist. The bump commit's author is the token's owner, so that
-  account must have signed the CLA or be on `cla.yml`'s `allowlist`, or the
-  CLA check fails on every bump PR. Adding an account to the allowlist is the
-  repository owner's decision; a dedicated bot account or App needs the same.
-  The bump workflow does not check this: with an uncovered token owner the
-  bump run stays green and opens no `vcpkg-baseline-broken` issue, while the
-  CLA check fails on every bump PR. Look on the bump PR itself: its checks
-  list shows the `CLA Assistant` workflow's `cla-check` job failing, and the
-  CLA bot comments on the PR asking the author to sign. Once the token's owner
-  has signed or been added to the allowlist, comment `recheck` on the PR to
-  re-run the check.
-- **Where the token is stored.** In the `vcpkg-baseline` environment, never
-  as a repository secret. A repository secret can be read by a workflow pushed
-  to any branch, and with this token a maintainer could approve their own pull
-  request as the token's owner and merge it with no independent review (the
-  paragraph on the merge rule under "Self-hosted CI is held until a
-  maintainer approves the head" above). The `propose-bump` job declares
+  its allowlist. The bump commit's author is the App's bot, so
+  `<app-slug>[bot]` must be on `cla.yml`'s `allowlist`, as `dependabot[bot]`
+  is, or the CLA check fails on every bump PR. The bump workflow does not
+  check this: with the bot missing from the allowlist the bump run stays
+  green and opens no `vcpkg-baseline-broken` issue, while the CLA check fails
+  on every bump PR. Look on the bump PR itself: its checks list shows the
+  `CLA Assistant` workflow's `cla-check` job failing, and the CLA bot comments
+  on the PR asking the author to sign. Once the bot is on the allowlist,
+  comment `recheck` on the PR to re-run the check.
+- **Where the credentials are stored.** In the `vcpkg-baseline` environment:
+  the client ID as the environment variable `VCPKG_BASELINE_APP_CLIENT_ID`
+  and the private key as the environment secret
+  `VCPKG_BASELINE_APP_PRIVATE_KEY`, never as repository or organisation
+  variables or secrets. A repository secret can be read by a workflow pushed
+  to any branch, and with the key a maintainer could mint a token and act as
+  the bot on any pull request (the paragraph on the merge rule under
+  "Self-hosted CI is held until a maintainer approves the head" above). The
+  client ID is not secret; it is kept beside the key so that a run that
+  cannot use the environment has neither. The `propose-bump` job declares
   `environment: vcpkg-baseline`, and no other job or workflow names the
-  environment or the secret (`tests/shell/test_vcpkg_baseline_bump.sh` checks both in this
-  tree). The environment's settings are the repository owner's to make, once,
-  under Settings → Environments:
+  environment, the key or the client ID
+  (`tests/shell/test_vcpkg_baseline_bump.sh` checks this in this tree). The
+  environment's settings are the repository owner's to make, once, under
+  Settings → Environments:
   1. create the environment `vcpkg-baseline` (a run creates it on first use
      too, but then with no restrictions, so create it first);
   2. under "Deployment branches and tags" choose "Selected branches and tags"
      and add a rule of ref type Branch for `main` only (not a tag rule);
-  3. add the secret `VCPKG_BASELINE_PR_TOKEN` under the environment's
-     "Environment secrets", or `gh secret set VCPKG_BASELINE_PR_TOKEN --env
-     vcpkg-baseline --repo DevNullLtd/Yuzu`;
-  4. make sure there is no repository or organisation secret of that name.
-     `gh secret list --repo DevNullLtd/Yuzu` must not list it (delete it with
-     `gh secret delete VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` if it
-     does), and `gh api --paginate repos/DevNullLtd/Yuzu/actions/organization-secrets
+  3. add the variable `VCPKG_BASELINE_APP_CLIENT_ID` under "Environment
+     variables" and the secret `VCPKG_BASELINE_APP_PRIVATE_KEY` under
+     "Environment secrets", or run `gh variable set
+     VCPKG_BASELINE_APP_CLIENT_ID --env vcpkg-baseline --repo DevNullLtd/Yuzu
+     --body <client-id>` and `gh secret set VCPKG_BASELINE_APP_PRIVATE_KEY
+     --env vcpkg-baseline --repo DevNullLtd/Yuzu < <downloaded-key>.pem`;
+  4. make sure there is no repository or organisation secret named
+     `VCPKG_BASELINE_APP_PRIVATE_KEY`. `gh secret list --repo DevNullLtd/Yuzu`
+     must not list it (delete it with `gh secret delete
+     VCPKG_BASELINE_APP_PRIVATE_KEY --repo DevNullLtd/Yuzu` if it does), and
+     `gh api --paginate repos/DevNullLtd/Yuzu/actions/organization-secrets
      --jq '.secrets[].name'`, the organisation secrets shared with this
-     repository, must not list it either (an organisation owner removes it);
+     repository, must not list it either (an organisation owner removes it).
+     The personal-token secret `VCPKG_BASELINE_PR_TOKEN` of an earlier design
+     of this workflow is no longer read: if it was ever created, delete it
+     wherever it is and revoke the token;
   5. required reviewers are optional. With them, every run, the monthly one
      included, waits until a reviewer approves the deployment and fails if
      nobody does within 30 days.
 
   The workflow does not check these settings, so an unrestricted environment,
-  or a repository or organisation copy of the token, still runs green. The
+  or a repository or organisation copy of the key, still runs green. The
   settings can be read through the API; check them after setting up or
   changing the environment: `gh api
   repos/DevNullLtd/Yuzu/environments/vcpkg-baseline` (its
@@ -445,37 +487,44 @@ issue stays open.
   repos/DevNullLtd/Yuzu/environments/vcpkg-baseline/deployment-branch-policies`
   (exactly one policy, with `"name": "main"` and `"type": "branch"`; a policy
   of `"type": "tag"` named `main` would admit a tag of that name instead of
-  the branch), and the two secret listings in step 4. Because only `main` may
-  use the environment, a `workflow_dispatch` of the workflow from any other
-  branch fails at job start and opens the `vcpkg-baseline-broken` issue.
-- **Create or rotate.** Create the new token with the settings above, store it
-  in the `vcpkg-baseline` environment as described in the previous bullet,
-  run the workflow once with `workflow_dispatch` on `main` and confirm it
-  ends green or opens/updates the bump PR, then revoke the old token. Rotate
-  before the expiry date. The
-  workflow's first step makes an authenticated read with the token, so an
-  expired or revoked token fails every run there and opens a
-  `vcpkg-baseline-broken` issue; a token GitHub accepts but whose permissions
-  are short, or that still awaits an organization owner's approval, fails
-  only at "Create pull request" (typically `git` exiting 1 or 128).
-- **Rotating to a different owner.** If the new token belongs to another
-  account than the old one and a bump PR is open, apply the recovery under "If
-  the bump PR cannot be approved" first: close the PR (do not reopen it), then
-  run vcpkg-baseline-update.yml from `main` or wait for the next scheduled
-  run. The new PR is attributed to the new owner. (Unlike the 30-day re-run
-  recovery above, which reopens a PR nobody else has pushed to, this PR is not
-  reopened.) Otherwise the next run that has a bump to push refuses at
-  "Refuse to push onto a bump PR another account opened" and opens a
-  `vcpkg-baseline-broken` issue, rather than push a head onto the old owner's
-  PR that the new owner, not being its author, could then approve. A rotation
-  that keeps the same owner needs none of this. The guard runs only in the
+  the branch), `gh variable list --env vcpkg-baseline --repo DevNullLtd/Yuzu`
+  and `gh secret list --env vcpkg-baseline --repo DevNullLtd/Yuzu` (each lists
+  its one name), and the two secret listings in step 4. Because only `main`
+  may use the environment, a `workflow_dispatch` of the workflow from any
+  other branch fails at job start and opens the `vcpkg-baseline-broken`
+  issue.
+- **Rotating the key.** App private keys do not expire, so nothing fails if a
+  key is never rotated: the release manager sets the rotation schedule and
+  rotates at once if the key may have been exposed. On the App's page, under
+  "Private keys", generate a new key (an App can hold more than one, so the
+  old key keeps working meanwhile), store it in the environment as in step 3
+  above, delete the downloaded `.pem` file, run the workflow once from `main`
+  and confirm that it ends green or opens or updates the bump PR, then delete
+  the old key on the App's page. A key rotation keeps the same App and bot,
+  so an open bump PR needs nothing.
+- **Replacing the App.** A new App has a new bot. If a bump PR is open, apply
+  the recovery under "If the bump PR cannot be approved" first: close the PR
+  (do not reopen it), then run vcpkg-baseline-update.yml from `main` or wait
+  for the next scheduled run. The new PR is the new bot's. (Unlike the 30-day
+  re-run recovery above, which reopens a PR nobody else has pushed to, this
+  PR is not reopened.) Otherwise the next run that has a bump to push refuses
+  at "Refuse to push onto a bump PR another account opened" and opens a
+  `vcpkg-baseline-broken` issue, rather than push a head onto a PR whose
+  author, not having pushed it, could then approve it. The same holds for a
+  bump PR opened before the bump moved to the App. Put the new bot on
+  `cla.yml`'s allowlist and take the old one off. The guard runs only in the
   copy of the workflow that runs: a scheduled run uses `main`'s copy, so it
   protects the schedule only once it is on `main`.
-- **If it leaks.** Revoke it at once (the owner's Settings → Developer
-  settings → Personal access tokens, or an organization owner's token
-  review), then create and store a replacement as above. A leaked token can
-  push workflow files and tags to this repository; check the repository's
-  recent pushes and tags.
+- **If the key leaks.** On the App's page, under "Private keys", generate a
+  replacement key first, so the App always holds a working key, then delete
+  the leaked key at once; a deleted key mints no further tokens. A token already
+  minted with it stays valid until it expires, within an hour; to cut it off
+  sooner, an organisation owner suspends the App's installation (DevNullLtd →
+  Settings → GitHub Apps → the App → Configure → Suspend) and unsuspends it
+  once the leaked key is deleted. Store the replacement as under "Rotating
+  the key". A leaked key can mint tokens that push workflow files and tags to this
+  repository and open pull requests; check the repository's recent pushes,
+  tags and pull requests by the bot.
 
 ### Baseline bump 2026.10.16
 
