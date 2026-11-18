@@ -5680,7 +5680,7 @@ requested.
 **Response (404):** policy not found. **Response (409):** the fix names an action
 that policy evaluation does not run (a refused dispatch, with the same error body
 as `/evaluate` above; the targets become `blocked` and their claims are released;
-this is decided before any other business rejection), the fragment defines no
+this is decided at dispatch, after the no-fix-instruction, no-agents and claim rejections below, which answer first), the fragment defines no
 `fix` instruction, there are no non-compliant agents to remediate, or a target
 could not be claimed — either it is already claimed for remediation (a durable
 per-`(policy, agent)` claim in `PolicyStore`, safe across replicas, HA WS-3
