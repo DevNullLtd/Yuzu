@@ -799,7 +799,7 @@ The `202` body carries counts only (`requested`, `agents_reached`, `skipped_offl
 
 #### `GET /api/v1/hardware/sync/{execution_id}`
 
-Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
+Reports how an on-demand software sync run is going, by the `execution_id` that `POST /api/v1/hardware/sync` answered with. MCP twin: `get_software_sync_status` (see [mcp.md](mcp.md)). **Permission:** `Execution:Execute`, checked as a global grant, like the POST. A caller reads the runs it started, or any sync run when its `Execution:Execute` is unfiltered; an unknown id, another operator's run and an execution that is not a sync run all answer the same `404`, so the route does not reveal which ids exist. The `200` body carries `execution_id`, `state` (the execution record's state), `targeted` (the frames the server's sessions accepted), `acknowledged` (agents that armed the sync), `failed` (agents that answered with a failure, for example because their daily-sync scheduler is not running), `dispatched_at`, `delay_max_s` and `estimated_completion_at`. An agent answers when it **arms** the sync, not when its report lands, so `acknowledged` counts requests taken up, not reports received; a count of reports per run is not reported. `delay_max_s` and `estimated_completion_at` are estimates (see above). An execution record that cannot be read is a `503` with `retry_after_ms`, never an empty `200`; a server with no execution tracking answers `503` too. No audit row is written for a read.
 
 ---
 
@@ -9013,7 +9013,7 @@ Fleet-wide read of the typed installed-software inventory (ADR-0016, `SoftwareIn
 | `cursor` | string | No | Opaque `next_cursor` from the previous page (see below) |
 | `format` | `json` \| `csv` | No | Selects **export mode**: a single response of up to 10000 rows |
 
-`q`, `kind`, `ecosystem`, `source`, `match`, `version_min`, `version_max`, `vers`, `purl` and `status`, and every lookup field and the `totals` block below, are **REST-only** on this route until its MCP twin catches up: its MCP twin `query_installed_software` takes `name`, `agent_id`, `version`, `limit` and `cursor` only (see [mcp.md](mcp.md)).
+`q`, `kind`, `ecosystem`, `source`, `match`, `version_min`, `version_max`, `vers`, `purl` and `status`, and every lookup field and the `totals` block below, are served on this route and by its MCP twin `query_installed_software` (see [mcp.md](mcp.md)), which takes every parameter above except `vers`, `purl` and `format`, which stay REST-only, and returns the same rows and `totals` block from one shared function.
 
 Omit `name` and `agent_id` for a fleet-wide scan. A parameter that is not valid UTF-8 or contains a NUL byte, an `agent_id`/`kind`/`ecosystem`/`source` over 256 bytes, a `name`/`version` over 1024 bytes, a non-integer `limit`, an unknown `format` or a refused `cursor` is a `400` (never a retryable `503`). An unknown `kind` or `ecosystem` value is not refused: it matches nothing and returns an empty `200` (the OpenAPI enum is descriptive, not enforced).
 
@@ -9108,7 +9108,7 @@ On a `503` the store (or the confinement check itself) could not be read; do **n
 
 #### `GET /api/v1/inventory/software/components`
 
-Looks up **components**: libraries and similar artefacts found inside an application, one row per (device, component path), from the component inventory of the typed store. No agent reports components yet, so an empty answer is expected until the component producer ships.
+Looks up **components**: libraries and similar artefacts found inside an application, one row per (device, component path), from the component inventory of the typed store. No agent reports components yet, so an empty answer is expected until the component producer ships. MCP twin: `query_software_components` (see [mcp.md](mcp.md)).
 
 **Permission and scope:** exactly the raw installs route above: `Inventory:Read` through `require_fleet_read` as the sole gate, rows confined to the caller's management groups and service tag on every page, a denied named `agent_id` answered with an empty page and a `denied` audit row.
 

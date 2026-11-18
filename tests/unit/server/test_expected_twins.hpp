@@ -226,6 +226,13 @@ inline constexpr TwinRow kExpectedTwins[] = {
     {"get_software_collection_settings", "ManagementGroup", "Read", true},
     {"set_software_collection_settings", "ManagementGroup", "Write", false},
     {"get_software_host_collection_settings", "Inventory", "Read", true},
+    // SAM-21: the components lookup twin, pinned against GET /api/v1/inventory/software/components
+    // (rest_api_v1.cpp: fleet_read_fn Inventory:Read), and the sync status twin, pinned against
+    // GET /api/v1/hardware/sync/{execution_id} (hardware_routes.cpp). The status row is a READ
+    // (Execution:Read: the tier, the approval rule and the readOnlyHint see a read) while the
+    // handler runs perm_fn(Execution, Execute), the REST route's own RBAC gate.
+    {"query_software_components", "Inventory", "Read", true},
+    {"get_software_sync_status", "Execution", "Read", true},
     // /crypto slice 1 twins, pinned against GET /api/v1/crypto/libraries{,/devices}
     // (crypto_routes.cpp): the same Inventory:Read gate through fleet_read_fn.
     {"get_crypto_libraries", "Inventory", "Read", true},
