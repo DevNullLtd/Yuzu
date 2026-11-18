@@ -154,3 +154,38 @@ TEST_CASE("redact_tool_args_for_ticket reports over-depth as a caller fault, and
     REQUIRE(out.has_value());
     CHECK(out->dump().find("yuzu_test_embedded") != std::string::npos);
 }
+
+TEST_CASE("redact_tool_args_for_ticket: the string \"5\" and the number 5 bind different markers; "
+          "invalid UTF-8 in a secret does not throw",
+          "[server][sensitive_params]") {
+    nlohmann::json as_string = {{"secret", "5"}}, as_number = {{"secret", 5}},
+                   as_string2 = {{"secret", "5"}};
+    CHECK(redact_tool_args_for_ticket(as_string)->dump() !=
+          redact_tool_args_for_ticket(as_number)->dump());
+    CHECK(redact_tool_args_for_ticket(as_string)->dump() ==
+          redact_tool_args_for_ticket(as_string2)->dump());
+    // A non-string secret holding an invalid-UTF-8 string: dump() must not raise type_error 316.
+    nlohmann::json bad = {{"secret", {{"k", std::string("\xff\xfe bad")}}}};
+    CHECK_NOTHROW(redact_tool_args_for_ticket(bad));
+}
+
+TEST_CASE("redact_tool_args_for_ticket: a url's userinfo never reaches the ticket subject, the rest "
+          "of the url stays and a different userinfo binds a different subject (WP06 F12)",
+          "[server][sensitive_params]") {
+    const std::string kCred = "yuzu_test_user:yuzu_test_pw";
+    nlohmann::json a = {{"crl_urls", nlohmann::json::array({{{"url", "https://" + kCred + "@crl.example.test:8443/a.crl?x=1"}}})}};
+    nlohmann::json b = {{"crl_urls", nlohmann::json::array({{{"url", "https://other:cred@crl.example.test:8443/a.crl?x=1"}}})}};
+    auto ra = redact_tool_args_for_ticket(a);
+    auto rb = redact_tool_args_for_ticket(b);
+    REQUIRE(ra.has_value());
+    REQUIRE(rb.has_value());
+    const std::string da = ra->dump();
+    CHECK(da.find("yuzu_test_pw") == std::string::npos);
+    CHECK(da.find("yuzu_test_user") == std::string::npos);
+    CHECK(da.find("@crl.example.test:8443/a.crl?x=1") != std::string::npos); // the rest stays readable
+    CHECK(da.find("<redacted:sha256:") != std::string::npos);
+    CHECK(da != rb->dump());
+    // A url without userinfo (including an '@' in its path or query) is untouched.
+    nlohmann::json plain = {{"url", "https://crl.example.test/a@b?c=d@e"}};
+    CHECK(redact_tool_args_for_ticket(plain)->dump() == plain.dump());
+}

@@ -45,6 +45,15 @@
 /// secret recalls exactly, with no key custody (stable across restarts and
 /// replicas, ADR-0010 posture: never a plain secret column). Fails CLOSED
 /// (nullopt) on over-depth or a digest failure: the caller refuses the mint.
+///
+/// ACCEPTED DESIGN TRADE-OFFS (recorded, not defects): the marker is UNKEYED, so a low-entropy
+/// value (a short `grant_id`, a guessable secret) could be confirmed offline by someone who can
+/// read `approvals.scope_expression` (Approval:Read) - `grant_id` is the lookup key of a
+/// single-redemption credential and `secret` is a high-entropy bearer value, and a keyed digest
+/// would need key custody that survives restarts and replicas for no gain on those values; and
+/// the marker of a typed value hashes its JSON text, so the same secret sent as a string and as
+/// a number binds two different markers (a recall must repeat the original argument exactly). A
+/// `url` string value has only its userinfo (`user:pass@`) replaced by the same kind of marker.
 
 #include "sha256_hex.hpp"
 
@@ -106,9 +115,33 @@ namespace detail {
         return false;
     if (node.is_object()) {
         for (auto it = node.begin(); it != node.end(); ++it) {
-            if (is_redacted_tool_arg_key(it.key())) {
+            if (it.key() == "url" && it.value().is_string()) {
+                // A destination URL may embed credentials (`https://user:pass@host/..`). The
+                // userinfo is replaced by a SHA-256 marker (the rest stays readable), so an
+                // approvals read never returns it and a recall with different userinfo still
+                // mismatches.
+                const std::string url = it.value().get<std::string>();
+                const auto scheme = url.find("://");
+                if (scheme != std::string::npos) {
+                    const auto auth_begin = scheme + 3;
+                    const auto auth_end = url.find_first_of("/?#", auth_begin);
+                    const auto authority = url.substr(
+                        auth_begin, auth_end == std::string::npos ? std::string::npos : auth_end - auth_begin);
+                    if (const auto at = authority.rfind('@'); at != std::string::npos) {
+                        auto h = sha256_hex(std::string("yuzu-ticket-arg-v1\0", 19) + authority.substr(0, at));
+                        if (!h)
+                            return false;
+                        it.value() = url.substr(0, auth_begin) + "<redacted:sha256:" + *h + ">@" +
+                                     authority.substr(at + 1) +
+                                     (auth_end == std::string::npos ? std::string{} : url.substr(auth_end));
+                    }
+                }
+            } else if (is_redacted_tool_arg_key(it.key())) {
+                // The TYPED JSON text, for strings too: the string "5" and the number 5 are
+                // different arguments and must bind different markers. `replace` keeps invalid
+                // UTF-8 from throwing out of the handler.
                 const std::string raw =
-                    it.value().is_string() ? it.value().get<std::string>() : it.value().dump();
+                    it.value().dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 auto h = sha256_hex(std::string("yuzu-ticket-arg-v1\0", 19) + raw);
                 if (!h)
                     return false;
