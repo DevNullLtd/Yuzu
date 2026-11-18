@@ -660,7 +660,9 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded. Both scripts carry a fixture self-test that the `docs`
 suite also runs (the touch-rule one off Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard

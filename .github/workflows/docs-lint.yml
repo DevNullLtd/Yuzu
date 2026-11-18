@@ -400,13 +400,15 @@ jobs:
             pull_request) ;;
             *) echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
-          # The base is the merge commit's first parent: the dev tip GitHub
-          # merged this PR onto, so the diff is exactly the PR's own change.
-          # NOT github.event.pull_request.base.sha: GitHub leaves that at the
-          # base tip from when the PR was opened (a push to the PR does not
-          # move it), while the merge commit is rebuilt on the current tip, so
-          # a two-tree diff against it also reported every plugin change dev
-          # merged in between as this PR's (#8235).
+          # The base is the merge commit's first parent: the target-branch tip
+          # GitHub merged this PR onto, so the diff is exactly the PR's own
+          # change. NOT github.event.pull_request.base.sha: it can lag the tip
+          # the merge commit was built on (on #8235 it was the tip from when
+          # the PR was opened, 82 commits behind), and a two-tree diff against
+          # it then reports every plugin change the target branch gained in
+          # between as this PR's. The changelog-fragments job above still
+          # diffs from base.sha; a release promote landing in between reads as
+          # an allowed promote there, not a false red.
           # Fail closed unless HEAD is the merge of the PR head onto one base.
           if [ "$(git rev-list --parents -n1 "$HEAD_SHA" | wc -w)" -ne 3 ] \
              || [ "$(git rev-parse "${HEAD_SHA}^2")" != "$PR_HEAD_SHA" ]; then
