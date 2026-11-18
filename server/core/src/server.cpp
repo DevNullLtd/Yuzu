@@ -3709,6 +3709,32 @@ public:
                                    {{"reason", reason}});
         (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
         (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
+        (void)metrics_.counter("yuzu_register_reregistration_audit_ids_truncated_total");
+        for (const char* reason : {"queue_full", "write_failed", "shutdown"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_summary_dropped_total",
+                                   {{"reason", reason}});
+        for (const char* reason : {"no_csr", "no_signer", "signer_failed", "signer_threw"})
+            (void)metrics_.counter("yuzu_register_reenrol_token_no_leaf_total",
+                                   {{"reason", reason}});
+        metrics_.describe("yuzu_register_reregistration_audit_ids_truncated_total",
+                          "Distinct dropped agent ids that could NOT be named in the per-window "
+                          "dropped-row summary (more than 20000 distinct dropped ids in one 10 s "
+                          "window). Non-zero means the audit-mode evidence for those ids is only "
+                          "the unbudgeted decision counter.",
+                          "counter");
+        metrics_.describe("yuzu_register_reregistration_audit_summary_dropped_total",
+                          "Dropped-row summary chunks that were NOT written (reason: queue_full = "
+                          "the 128-row pending queue overflowed, write_failed = the audit write "
+                          "failed three times, shutdown = still queued when the server stopped).",
+                          "counter");
+        metrics_.describe("yuzu_register_reenrol_token_no_leaf_total",
+                          "A single-use enrollment token was CONSUMED to re-enrol an agent id that "
+                          "holds a live leaf, but no new leaf was issued (reason: no_csr = the agent "
+                          "sent no CSR, no_signer = no signer wired, signer_failed = the signer "
+                          "answered nothing, signer_threw = it threw). The token is spent and the "
+                          "old leaf stays; recovery is a fresh single-use token after removing the "
+                          "agent's cert_dir.",
+                          "counter");
         metrics_.describe("yuzu_register_reregistration_audit_dropped_total",
                           "Re-registration audit rows NOT written because the per-id audit budget "
                           "was spent (per-source, global or per-id caps). The decision counter still "
@@ -10827,9 +10853,6 @@ public:
                 // #4828 AC4 (this is what makes the self-heal wiring actually unit-testable) and
                 // the WS-3 two-planes rule this split preserves. This site keeps ONLY the two
                 // gate checks below; CrlPublisher itself never touches the leader elector.
-                // WP01: flush the closed window's dropped-audit-row summary by time (not only when a
-                // later admit opens the next window). Per-process state, so NOT leader-gated.
-                flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/false);
                 if (crl_publisher_) {
                     const auto now_steady = std::chrono::steady_clock::now();
                     YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
@@ -10905,6 +10928,18 @@ public:
                             }
                         }
                     }
+                }
+                // WP01: flush the closed windows' dropped-audit-row summary chunks (the ONLY writer
+                // besides stop()). Placed AFTER the revocation sweep so a slow audit store can never
+                // delay stream teardown; time-bounded (1 s) and contained. Per-process state, so
+                // NOT leader-gated (ReplicaSafe).
+                try {
+                    YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
+                    flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/false);
+                } catch (const std::exception& e) {
+                    spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
+                } catch (...) {
+                    spdlog::warn("Re-registration audit summary flush failed: unknown exception");
                 }
                 // Publish cert reload counters to Prometheus
                 if (cert_reloader_) {
@@ -12218,7 +12253,11 @@ public:
         agent_service_.set_peer_cert_recognizer(nullptr);
         agent_service_.set_agent_identity_hooks(nullptr);
         // WP01: shutdown flush of the dropped-audit-row summary (the audit store is still open).
-        flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true);
+        try {
+            flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true);
+        } catch (...) {
+            spdlog::warn("Re-registration audit summary shutdown flush failed");
+        }
         if (gateway_service_) {
             gateway_service_->set_agent_cert_signer(nullptr);
             gateway_service_->set_agent_identity_hooks(nullptr);

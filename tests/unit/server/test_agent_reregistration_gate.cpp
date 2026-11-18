@@ -6,7 +6,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <cstdio>
 #include <set>
+#include <string>
+#include <vector>
 
 #include <yuzu/server/server.hpp>
 
@@ -27,6 +30,27 @@ ReregistrationOutcome decide(const AgentLeafState& s, bool cert, bool token, boo
         ReregistrationEvidence{.cert_proves_identity = cert,
                                .token_presented = token,
                                .transport_can_prove = can_prove});
+}
+
+std::string join_rows(const std::vector<std::string>& rows) {
+    std::string out;
+    for (const auto& r : rows)
+        out += r + "\n";
+    return out;
+}
+std::size_t count_of(const std::string& hay, const std::string& needle) {
+    std::size_t n = 0;
+    for (auto at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+/// Number of ids listed in ONE chunk row (the text after `ids=`).
+std::size_t ids_in_row(const std::string& row) {
+    const auto at = row.find(" ids=");
+    if (at == std::string::npos)
+        return 0;
+    const auto list = row.substr(at + 5);
+    return list.empty() ? 0 : count_of(list, ",") + 1;
 }
 } // namespace
 
@@ -150,7 +174,7 @@ TEST_CASE("unproven audit budget: exact numbers - per-source sub-cap, reserved b
     // Time-based flush: the closed window's summary is available WITHOUT a later admit.
     CHECK(b.poll_closed(t + 1, /*force=*/false).empty()); // still open
     t += B::kWindowMs + 1;
-    const std::string summary = b.poll_closed(t, /*force=*/false);
+    const std::string summary = join_rows(b.poll_closed(t, /*force=*/false));
     CHECK(summary.find("dropped_rows=") != std::string::npos);
     CHECK(summary.find("distinct_dropped_ids=") != std::string::npos);
     CHECK(summary.find("sources=") != std::string::npos);
@@ -170,7 +194,7 @@ TEST_CASE("unproven audit budget: a legitimate restart storm, the shutdown flush
         admitted += b.admit("storm-" + std::to_string(i), "s" + std::to_string(i), t).admitted ? 1 : 0;
     CHECK(admitted == static_cast<int>(B::kReservedRows + B::kGeneralRows));
     // Shutdown flush closes the OPEN window and reports it (otherwise lost on exit).
-    const std::string summary = b.poll_closed(t + 1, /*force=*/true);
+    const std::string summary = join_rows(b.poll_closed(t + 1, /*force=*/true));
     CHECK(summary.find("dropped_rows=750") != std::string::npos);
     CHECK(summary.find("distinct_dropped_ids=750") != std::string::npos);
     CHECK(b.poll_closed(t + 2, true).empty());
@@ -215,8 +239,8 @@ TEST_CASE("reregistration audit sink path: the aggregate row is a system row wit
               .value() == 97.0);
     // The summary is flushed by TIME (the server's tick), not by a later admit.
     detail::reregistration_audit_clock_skew_ms() += 11'000;
-    const auto summary = detail::reregistration_unproven_budget().poll_closed(
-        detail::reregistration_audit_now_ms(), false);
+    const auto summary = join_rows(detail::reregistration_unproven_budget().poll_closed(
+        detail::reregistration_audit_now_ms(), false));
     CHECK(summary.find("dropped_rows=97") != std::string::npos);
     CHECK(summary.find("9.9.9.9:97") != std::string::npos);
     CHECK(summary.find("victim-loop") != std::string::npos);
@@ -234,4 +258,259 @@ TEST_CASE("reregistration audit sink path: the aggregate row is a system row wit
     }
     CHECK(refusal_rows > 0);
     CHECK(refusal_rows <= static_cast<int>(kDefaultAuditMaxRows));
+}
+
+// ---- WP01 Gate 8 pass 4 (N3): every dropped id stays on record, in chunked rows --------------
+
+namespace {
+/// Admits `ids` from `src_of(i)` in the CURRENT window so they become "recent" (non-first-ever).
+void seed_recent(detail::UnprovenAuditBudget& b, std::int64_t& t, int first, int last) {
+    using B = detail::UnprovenAuditBudget;
+    for (int i = first; i < last; ++i)
+        REQUIRE(b.admit("live-" + std::to_string(i), "seed-" + std::to_string(i / 40), t).admitted);
+    t += B::kWindowMs + 1;
+}
+} // namespace
+
+TEST_CASE("unproven audit budget: ONE source naming 300 distinct live-leaf ids - every dropped id is "
+          "on record (chunked, drop order)",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 9'000'000;
+    seed_recent(b, t, 0, 400); // 400 ids are now recent: the reserved bucket no longer shelters them
+    int admitted = 0;
+    for (int i = 0; i < 300; ++i)
+        admitted += b.admit("live-" + std::to_string(i), "attacker", t).admitted ? 1 : 0;
+    CHECK(admitted == static_cast<int>(B::kRowsPerSource));
+    // A victim naming a recent id from ANOTHER source still gets a row.
+    CHECK(b.admit("live-399", "victim-src", t).admitted);
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(rows.size() == 2); // 250 dropped ids: 200 + 50
+    for (const auto& r : rows)
+        CHECK(r.find("ids_truncated=0") != std::string::npos);
+    CHECK(ids_in_row(rows[0]) == B::kSummaryIds);
+    CHECK(ids_in_row(rows[1]) == 250 - B::kSummaryIds);
+    const auto all = join_rows(rows);
+    for (int i = static_cast<int>(B::kRowsPerSource); i < 300; ++i) // dropped, in DROP order
+        CHECK((all.find("live-" + std::to_string(i) + ",") != std::string::npos ||
+               all.find("live-" + std::to_string(i) + "\n") != std::string::npos));
+    CHECK(rows[0].find("part=1/2") != std::string::npos);
+    CHECK(rows[1].find("part=2/2") != std::string::npos);
+    CHECK(rows[0].find(" ids=live-50,live-51,") != std::string::npos); // drop order, not sorted order
+}
+
+TEST_CASE("unproven audit budget: a restart storm behind one origin-less gateway shares ONE source",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 12'000'000;
+    seed_recent(b, t, 0, 300);
+    for (int i = 0; i < 300; ++i)
+        (void)b.admit("live-" + std::to_string(i), "10.1.2.3", t); // the gateway's IP for all of them
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].find("dropped_rows=250") != std::string::npos);
+    CHECK(rows[0].find("sources=10.1.2.3:250") != std::string::npos);
+    CHECK(rows[0].find("distinct_dropped_ids=250") != std::string::npos);
+    // Nothing the old 200-id cut dropped is missing: the last dropped id is named.
+    CHECK(join_rows(rows).find("live-299") != std::string::npos);
+}
+
+TEST_CASE("unproven audit budget: 2000 rotating sources - the source table is bounded and every id is "
+          "named",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 15'000'000;
+    seed_recent(b, t, 0, 1000);
+    seed_recent(b, t, 1000, 2000);
+    int admitted = 0;
+    for (int i = 0; i < 2000; ++i)
+        admitted += b.admit("live-" + std::to_string(i), "rot-" + std::to_string(i), t).admitted ? 1 : 0;
+    CHECK(admitted == static_cast<int>(B::kGeneralRows));
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(rows.size() == 5); // 1000 dropped ids, 200 per chunk
+    const auto all = join_rows(rows);
+    for (int i = 1000; i < 2000; ++i)
+        CHECK(all.find("live-" + std::to_string(i)) != std::string::npos);
+    // The tracked source set is capped at kMaxSources; the rest share `other`.
+    CHECK(all.find("other:") != std::string::npos);
+    for (const auto& r : rows)
+        CHECK(r.size() < 8192);
+}
+
+TEST_CASE("unproven audit budget: beyond 20000 distinct dropped ids the excess is COUNTED on every chunk, "
+          "never silent",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 20'000'000;
+    (void)b.admit("opener", "x", t);
+    for (int i = 0; i < 25'000; ++i)
+        (void)b.admit("flood-" + std::to_string(i), "atk", t);
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    // "opener" took one reserved slot; of the 25000 first-ever flood ids the other kReservedRows-1
+    // reserved slots and kRowsPerSource source slots are admitted, the rest dropped.
+    const std::size_t dropped = 25'000 - (B::kReservedRows - 1) - B::kRowsPerSource;
+    REQUIRE(rows.size() == B::kMaxDroppedIds / B::kSummaryIds);
+    const auto trunc = std::to_string(dropped - B::kMaxDroppedIds);
+    for (const auto& r : rows) {
+        CHECK(r.find(" ids_truncated=" + trunc + " ") != std::string::npos);
+        CHECK(ids_in_row(r) <= B::kSummaryIds);
+    }
+    CHECK(rows[0].find("distinct_dropped_ids=" + std::to_string(dropped)) != std::string::npos);
+    CHECK(b.take_ids_truncated() == dropped - B::kMaxDroppedIds);
+    CHECK(b.take_ids_truncated() == 0);
+}
+
+TEST_CASE("unproven audit budget: the pending queue is bounded and a failing write is retried then counted",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 30'000'000;
+    for (int w = 0; w < 2; ++w) { // two full windows: 2 x 100 chunks into a 128-row queue
+        (void)b.admit("opener", "x", t);
+        for (int i = 0; i < 25'000; ++i)
+            (void)b.admit("w" + std::to_string(w) + "-" + std::to_string(i), "atk", t);
+        t += B::kWindowMs + 1;
+        (void)b.poll_closed(t, false);
+    }
+    CHECK(b.pending_size() == B::kMaxPendingRows);
+    CHECK(b.take_queue_full_dropped() == 200 - B::kMaxPendingRows);
+    // A chunk that keeps failing is handed back kMaxWriteAttempts-1 times, then dropped.
+    auto row = b.take_pending();
+    REQUIRE(row.has_value());
+    int requeued = 0;
+    while (b.requeue_front(*row)) {
+        ++requeued;
+        row = b.take_pending();
+        REQUIRE(row.has_value());
+    }
+    CHECK(requeued == B::kMaxWriteAttempts - 1);
+    CHECK(b.discard_pending() == B::kMaxPendingRows - 1);
+}
+
+TEST_CASE("flush_reregistration_audit_summary: a closed/absent audit store is retried then counted, never "
+          "silent; the shutdown flush drops the rest with a reason",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    yuzu::MetricsRegistry metrics;
+    auto& budget = detail::reregistration_unproven_budget();
+    while (budget.take_pending()) {
+    }
+    (void)budget.take_ids_truncated();
+    (void)budget.take_queue_full_dropped();
+    detail::reregistration_audit_clock_skew_ms() += 5'000'000;
+    (void)budget.admit("a", "s", detail::reregistration_audit_now_ms());
+    while (budget.take_pending()) { // a stale window an earlier test left open closes here
+    }
+    for (int i = 0; i < 5; ++i)
+        (void)budget.admit("recent-" + std::to_string(i), "s", detail::reregistration_audit_now_ms());
+    detail::reregistration_audit_clock_skew_ms() += 11'000;
+    // Make a window with drops: repeats of one id.
+    for (int i = 0; i < 10; ++i)
+        (void)budget.admit("rep", "s2", detail::reregistration_audit_now_ms());
+    detail::reregistration_audit_clock_skew_ms() += 11'000;
+    flush_reregistration_audit_summary(nullptr, &metrics, /*force=*/false);
+    CHECK(budget.pending_size() == 1); // retried, not lost
+    flush_reregistration_audit_summary(nullptr, &metrics, false);
+    flush_reregistration_audit_summary(nullptr, &metrics, false); // third failed attempt: dropped
+    CHECK(budget.pending_size() == 0);
+    CHECK(metrics.counter("yuzu_register_reregistration_audit_summary_dropped_total",
+                          {{"reason", "write_failed"}})
+              .value() == 1.0);
+}
+
+TEST_CASE("unproven audit budget: the summary names the TOP 10 sources by count and neutralises ids",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 40'000'000;
+    char name[16];
+    for (int k = 0; k < 12; ++k) { // source k drops k+1 repeats of its own id
+        std::snprintf(name, sizeof name, "src-%02d", k);
+        for (int i = 0; i < 4 + k; ++i)
+            (void)b.admit("rep-" + std::to_string(k), name, t);
+    }
+    for (int i = 0; i < 5; ++i)
+        (void)b.admit("a b/c-and-a-very-long-identifier-0123456789", "src-00", t);
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(rows.size() == 1);
+    const auto& r = rows[0];
+    CHECK(r.find("sources=src-11:12,src-10:11,") != std::string::npos); // descending
+    CHECK(r.find("src-02:3") != std::string::npos);
+    CHECK(r.find("src-01") == std::string::npos); // the 11th and 12th source are cut
+    CHECK(r.find("src-00") == std::string::npos);
+    CHECK(r.find(" ids_truncated=0 part=1/1 ids=") != std::string::npos);
+    CHECK(count_of(r, "rep-11") == 1); // a dropped id is named ONCE however often it was dropped
+    CHECK(r.find("a?b?c-and-a-very-long-id") != std::string::npos); // 24 chars, '?' for the rest
+    CHECK(r.find("a?b?c-and-a-very-long-ide") == std::string::npos);    // cut at 24
+}
+
+TEST_CASE("unproven audit budget: the recent-id window is FIFO-bounded (an evicted id is first-ever again)",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 50'000'000;
+    for (int w = 0; w < 7; ++w) { // 7 x 1250 admissions > kRecentIds
+        for (int i = 0; i < 1250; ++i)
+            REQUIRE(b.admit("w" + std::to_string(w) + "-" + std::to_string(i),
+                            "s" + std::to_string(i / 40), t)
+                        .admitted);
+        t += B::kWindowMs + 1;
+    }
+    // New window: "atk" spends its per-source slots on RECENT ids...
+    int admitted = 0;
+    for (int i = 0; i < 60; ++i)
+        admitted += b.admit("w6-" + std::to_string(i), "atk", t).admitted ? 1 : 0;
+    CHECK(admitted == static_cast<int>(B::kRowsPerSource));
+    // ...a still-recent id is now dropped, an EVICTED one (oldest) is first-ever and uses the reserved bucket.
+    CHECK_FALSE(b.admit("w6-100", "atk", t).admitted);
+    CHECK(b.admit("w0-0", "atk", t).admitted);
+}
+
+TEST_CASE("unproven audit budget: the documented constants are pinned (docs and alerts quote them)",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    CHECK(B::kRepeatRowsPerId == 3);
+    CHECK(B::kReservedRows == 250);
+    CHECK(B::kRowsPerSource == 50);
+    CHECK(B::kGeneralRows == 1000);
+    CHECK(B::kRecentIds == 8192);
+    CHECK(B::kSummaryIds == 200);
+    CHECK(B::kMaxSources == 1024);
+    CHECK(B::kMaxDroppedIds == 20000);
+    CHECK(B::kSummarySources == 10);
+    CHECK(B::kMaxPendingRows == 128);
+    CHECK(B::kMaxWriteAttempts == 3);
+    CHECK(B::kWindowMs == 10'000);
+    // A full window of dropped ids always fits the pending queue.
+    CHECK(B::kMaxDroppedIds / B::kSummaryIds <= B::kMaxPendingRows);
+}
+
+TEST_CASE("unproven audit budget: sources past the table cap share ONE uncapped-per-source `other` bucket "
+          "(still bounded by the global slot)",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 60'000'000;
+    seed_recent(b, t, 0, 400);
+    // Fill the source table with DROP-only sources (one id repeated from 1100 different sources).
+    for (int i = 0; i < 1100; ++i)
+        (void)b.admit("spam", "sp-" + std::to_string(i), t);
+    // 100 recent ids from 100 NEW sources: past the cap they share `other`, which has no per-source
+    // slot limit, so all 100 are admitted (a per-source cap of 50 on `other` would admit 50).
+    int admitted = 0;
+    for (int i = 0; i < 100; ++i)
+        admitted += b.admit("live-" + std::to_string(i), "new-" + std::to_string(i), t).admitted ? 1 : 0;
+    CHECK(admitted == 100);
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(!rows.empty());
+    CHECK(rows[0].find("other:") != std::string::npos);
 }
