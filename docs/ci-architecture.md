@@ -467,8 +467,10 @@ release when:
   `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
   ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
   caught only by the bound);
-- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, or lacks
-  the incomplete marker its image calls for: each image-publish job runs
+- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, lacks
+  the incomplete marker its image calls for or carries only part of it, or is
+  named as a release image (`yuzu-server-image`, ...) without that image's
+  title label, on which the marker it needs is decided: each image-publish job runs
   `artifact-sbom.py mark-image` on its pair after signing, which marks an image
   holding `yuzu-server`, `yuzu-agent`, the Erlang emulator or the source-built
   pgvector (what syft cannot list there), and the same step refuses a pair

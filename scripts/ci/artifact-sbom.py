@@ -46,8 +46,10 @@ CycloneDX composition with `aggregate: incomplete` on the root (SPDX 2.3 has no
 such field: the root gets a `CONTAINS NOASSERTION` relationship, SPDX's way of
 saying no assertion is made that the listed elements are all it contains), and
 says why: `yuzu:sbom:incomplete-reasons` holds tokens from the closed set
-INCOMPLETE_REASONS and `yuzu:sbom:incomplete` the prose (CycloneDX metadata
-properties; SPDX: the root's comment). Libraries a binary loads from the
+INCOMPLETE_REASONS and `yuzu:sbom:incomplete` the prose. Every note has ONE
+key, `yuzu:sbom:<name>`, in both formats: a CycloneDX metadata property of that
+name, and in SPDX a line `yuzu:sbom:<name>: <value>` of the described package's
+comment (one note per line; see NOTE_PREFIX). Libraries a binary loads from the
 operating system at run time are not in the file, so they are not a reason.
 
 `mark-image` adds the same marker to a syft scan of a published container
@@ -163,6 +165,31 @@ class SbomError(Exception):
     pass
 
 
+# The key of every note this script writes on an SBOM root, in both formats:
+# CycloneDX `metadata.properties[].name` is `yuzu:sbom:<name>`, and the SPDX
+# described package's `comment` holds one line `yuzu:sbom:<name>: <value>` per
+# note, so a script reads the same key from either format (in SPDX: the line
+# starting with `<key>: `). docs/user-manual/release-verification.md gives the
+# extraction recipe for each format and tests/test_artifact_sbom.py runs it.
+NOTE_PREFIX = "yuzu:sbom:"
+
+
+def spdx_notes_comment(notes: dict) -> str:
+    """The SPDX root comment for `notes`: one `yuzu:sbom:<name>: <value>` line
+    each. A value holding a line break would end its line early and could
+    start a line that reads as another note, so it is refused."""
+    for k, v in notes.items():
+        if re.search(r"[\r\n\x0b\x0c\x1c-\x1e\x85\u2028\u2029]", f"{k}{v}"):
+            raise SbomError(f"note {k!r}: a value with a line break cannot be one line of the SPDX root comment")
+    return "\n".join(f"{NOTE_PREFIX}{k}: {v}" for k, v in notes.items())
+
+
+def spdx_note(comment, name: str):
+    """The value of note `name` in an SPDX root comment, or None."""
+    m = re.search(rf"^{re.escape(NOTE_PREFIX + name)}: (.*)$", comment or "", re.M)
+    return m.group(1) if m else None
+
+
 # ── Artifacts ────────────────────────────────────────────────────────────────
 
 def artifact_stem(name: str) -> str:
@@ -273,18 +300,27 @@ def extract(path: Path, dest: Path) -> None:
         rpm2cpio, cpio = shutil.which("rpm2cpio"), shutil.which("cpio")
         if not rpm2cpio or not cpio:
             raise SbomError("rpm2cpio and cpio are needed to unpack an .rpm")
-        p1 = subprocess.Popen([rpm2cpio, str(path)], stdout=subprocess.PIPE)
-        try:
-            p2 = subprocess.run([cpio, "-idm", "--quiet", "--no-absolute-filenames"],
-                                stdin=p1.stdout, cwd=dest, capture_output=True, timeout=UNPACK_TIMEOUT)
-            p1.stdout.close()
-            rc1 = p1.wait(timeout=UNPACK_TIMEOUT)
-        except subprocess.TimeoutExpired as e:
-            p1.kill()
-            p1.wait()
-            raise _timeout_error(["rpm2cpio | cpio"], UNPACK_TIMEOUT) from e
-        if rc1 != 0 or p2.returncode != 0:
-            raise SbomError(f"{name}: rpm2cpio|cpio failed: {p2.stderr.decode(errors='replace')[:500]}")
+        # rpm2cpio's stderr goes to a file, not a pipe nobody reads while it runs.
+        with tempfile.TemporaryFile() as err1:
+            p1 = subprocess.Popen([rpm2cpio, str(path)], stdout=subprocess.PIPE, stderr=err1)
+            try:
+                p2 = subprocess.run([cpio, "-idm", "--quiet", "--no-absolute-filenames"],
+                                    stdin=p1.stdout, cwd=dest, capture_output=True, timeout=UNPACK_TIMEOUT)
+                p1.stdout.close()
+                rc1 = p1.wait(timeout=UNPACK_TIMEOUT)
+            except subprocess.TimeoutExpired as e:
+                p1.kill()
+                p1.wait()
+                p1.stdout.close()
+                raise _timeout_error(["rpm2cpio | cpio"], UNPACK_TIMEOUT) from e
+            # Either side failing is a refusal: a truncated .rpm can make
+            # rpm2cpio fail while cpio exits 0 over the part it was given.
+            if rc1 != 0 or p2.returncode != 0:
+                err1.seek(0)
+                why = " ".join(t for t in (err1.read(500).decode(errors="replace").strip(),
+                                           p2.stderr.decode(errors="replace").strip()[:500]) if t)
+                raise SbomError(f"{name}: rpm2cpio|cpio failed (rpm2cpio exited {rc1}, cpio exited "
+                                f"{p2.returncode}){': ' + why if why else ''}")
     elif name.endswith(".pkg"):
         # pkgutil wants a directory that does not exist yet.
         _run(["pkgutil", "--expand-full", str(path), str(dest / "pkg")])
@@ -329,43 +365,84 @@ def count_files(root: Path) -> int:
 
 # ── InnoSetup installer contents ─────────────────────────────────────────────
 
-ISS_ENTRY = re.compile(r'\s*([A-Za-z]+)\s*:\s*("(?:[^"]|"")*"|[^;]*)\s*(?:;|$)')
+ISS_ENTRY = re.compile(r'[ \t]*([A-Za-z]+)[ \t]*:[ \t]*("(?:[^"]|"")*"|[^;]*)[ \t]*(?:;|$)')
 
 # An ISPP (Inno Setup preprocessor) directive: `#` then a name. A Pascal
 # character constant in [Code] (`#13#10`, `#$0D`) is `#` then a digit or `$`.
-ISPP_DIRECTIVE = re.compile(r"^#\s*[A-Za-z_]")
+ISPP_DIRECTIVE = re.compile(r"^#[ \t]*[A-Za-z_]")
 # The only directives allowed, and only before the first section: a default for
 # a name the command line can override, as yuzu-agent.iss's header has:
 #   #ifndef BuildDir / #define BuildDir "..\..\..\build-windows" / #endif
 # Anything else (#include, #if, #pragma, a #define with an expression, any
 # directive inside a section) could add or change [Files] lines this parser
-# would then not see, so it is refused rather than evaluated.
-ISPP_HEADER_LINE = re.compile(r'^#\s*(?:ifndef\s+[A-Za-z_]\w*|define\s+[A-Za-z_]\w*\s+"[^"{}]*"|endif)\s*$')
+# would then not see, so it is refused rather than evaluated. A default holds
+# no `;`, so expanding it cannot start another [Files] parameter.
+ISPP_HEADER_LINE = re.compile(r'^#[ \t]*(?:ifndef[ \t]+[A-Za-z_]\w*|define[ \t]+[A-Za-z_]\w*[ \t]+"[^"{};]*"|endif)[ \t]*$')
 # A Source basename this maps the same way Windows' FindFirstFile (which Inno
 # Setup uses) does: a literal name, or one `*` directly before a literal
 # extension (`*.dll`). `?` and `*.*` (which on Windows also matches a name with
-# no dot) are refused. Residual: FindFirstFile also matches a file's 8.3 short
-# name, so on a volume that keeps them `*.dll` would match `x.dllx` too.
+# no dot) are refused, and so is a dotted extension after the `*` (`*.a.b`).
+# Residual: FindFirstFile also matches a file's 8.3 short name, so on a volume
+# that keeps them `*.dll` would match `x.dllx` too.
 ISS_SOURCE_NAME = re.compile(r"^(?:[^*?]+|[^*?]*\*\.[^*?.]+)$")
+# [Files] flags whose entry is not installed from the build output the way this
+# maps it: `external` (and Inno Setup 6.5's `download`, `extractarchive`) take
+# the file from elsewhere at install time, `dontcopy` never installs it, and
+# `recursesubdirs` (with `createallsubdirs`) installs a tree.
+ISS_UNMAPPED_FLAGS = {"recursesubdirs", "createallsubdirs", "external", "download", "extractarchive", "dontcopy"}
+# [Files] parameters that change which files or names an entry installs.
+ISS_UNMAPPED_PARAMS = {"destname", "excludes"}
 
-# Bytes Python's cp1252 leaves undefined; Windows' code page 1252 maps each to
-# the C1 control of the same value.
-_CP1252_UNDEFINED = re.compile("[\udc80-\udcff]")
+UTF8_BOM = b"\xef\xbb\xbf"
 
 
-def read_iss(iss: Path) -> str:
-    """The script's text as the Inno Setup compiler reads it: UTF-8 when the
-    file starts with a UTF-8 byte order mark, otherwise the system's ANSI code
-    page (1252 on the release's Windows runner). A BOM-less script with a byte
-    such as a cp1252 copyright sign (0xA9) is therefore read, not refused."""
+def iss_lines(iss: Path) -> tuple[list[str], bool]:
+    """(lines, has_bom): the script split the way the Inno Setup compiler
+    splits it, at CR, LF or CR LF bytes (TTextFileReader, which splits before
+    it decodes). Any other control byte, a form feed or vertical tab among
+    them, is refused on every line: Python would split a line there, and the
+    compiler would not, so a line could read differently to the two.
+
+    Decoding, as Inno Setup 6.3.0 and later read a script (the release runner
+    ran 6.7.3 for v0.15.0; jrsoftware/issrc tag is-6_7_3,
+    Projects/Src/Shared.FileClass.pas, and the 6.3.0 release notes): UTF-8
+    when it starts with a UTF-8 byte order mark; without one, UTF-8 when the
+    whole file is valid UTF-8, otherwise the build machine's ANSI code page.
+    A compiler before 6.3 reads every BOM-less script as ANSI. The release does
+    not pin the compiler (winget installs the current one) and this script
+    cannot know the build machine's code page, so with no BOM the lines this
+    parser maps must be ASCII (iss_file_entries refuses any other byte there),
+    which every one of those rules reads the same way; other lines are decoded
+    as Latin-1, byte for byte, and only looked at for a section header or a
+    directive. With a BOM the script must be UTF-8 throughout, and a Unicode
+    control character or a whitespace character other than space and tab is
+    refused on every line."""
     data = iss.read_bytes()
-    if data.startswith(b"\xef\xbb\xbf"):
+    bom = data.startswith(UTF8_BOM)
+    if bom:
+        data = data[len(UTF8_BOM):]
+    raw_lines = re.split(rb"\r\n|\r|\n", data)
+    if raw_lines and raw_lines[-1] == b"":
+        raw_lines.pop()
+    lines = []
+    for lineno, raw in enumerate(raw_lines, 1):
+        where = f"{iss.name}:{lineno}"
+        bad = re.search(rb"[\x00-\x08\x0b-\x1f\x7f]", raw)
+        if bad:
+            raise SbomError(f"{where}: control byte 0x{bad.group()[0]:02x}: only space and tab may separate the "
+                            f"parts of a line (the Inno Setup compiler and this parser would read it differently)")
+        if not bom:
+            lines.append(raw.decode("latin-1"))
+            continue
         try:
-            return data[3:].decode("utf-8")
+            line = raw.decode("utf-8")
         except UnicodeDecodeError as e:
-            raise SbomError(f"{iss.name}: starts with a UTF-8 byte order mark but is not UTF-8 ({e})") from e
-    text = data.decode("cp1252", errors="surrogateescape")
-    return _CP1252_UNDEFINED.sub(lambda m: chr(ord(m.group()) - 0xDC00), text)
+            raise SbomError(f"{where}: the script starts with a UTF-8 byte order mark but is not UTF-8 ({e})") from e
+        odd = next((c for c in line if ("\x80" <= c <= "\x9f") or (c.isspace() and c not in " \t")), None)
+        if odd is not None:
+            raise SbomError(f"{where}: character U+{ord(odd):04X}: only space and tab may separate the parts of a line")
+        lines.append(line)
+    return lines, bom
 
 
 def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
@@ -373,52 +450,78 @@ def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
     the [Files] section of an InnoSetup script, e.g.
       Source: "{#BuildDir}\\agents\\plugins\\x\\x.dll"; DestDir: "{app}\\plugins"
     -> ("plugins", "x.dll"). Fails on anything this cannot map onto the
-    archive layout without guessing: a preprocessor directive other than the
-    header defaults (ISPP_HEADER_LINE), an ISPP expansion in a Source name or a
-    DestDir, a DestDir outside {app}, a recursive or DestName entry, a Source
-    name with a wildcard other than `*.<ext>`."""
+    archive layout without guessing: a line iss_lines() refuses; a non-ASCII
+    byte on a line this maps (a section header, a directive, a [Files] entry)
+    of a script without a byte order mark; a line ending in a backslash (ISPP
+    joins it with the next); a preprocessor directive other than the header
+    defaults (ISPP_HEADER_LINE); an ISPP expansion anywhere in a [Files] entry
+    but the directory of a quoted Source; a DestDir outside {app}, with a `.`
+    or `..` part or with a constant below {app}; a flag in ISS_UNMAPPED_FLAGS
+    or a parameter in ISS_UNMAPPED_PARAMS; an unterminated quoted value; a
+    Source name with a wildcard other than `*.<ext>`."""
+    lines, bom = iss_lines(iss)
     entries, section = [], None
-    for lineno, raw in enumerate(read_iss(iss).splitlines(), 1):
-        line = raw.strip()
+    for lineno, raw in enumerate(lines, 1):
+        line = raw.strip(" \t")
         where = f"{iss.name}:{lineno}"
-        if ISPP_DIRECTIVE.match(line):
+        if line.endswith("\\"):
+            raise SbomError(f"{where}: a line ending in a backslash: the preprocessor joins it with the next "
+                            f"line, which this script does not do")
+        directive = bool(ISPP_DIRECTIVE.match(line))
+        header = line.startswith("[") and line.endswith("]")
+        entry = section == "files" and not directive and not header and bool(line) and not line.startswith(";")
+        if not bom and (directive or header or entry) and not line.isascii():
+            raise SbomError(f"{where}: a non-ASCII character in a line this maps, in a script with no UTF-8 byte "
+                            f"order mark: Inno Setup reads that line as UTF-8 or in the build machine's ANSI code "
+                            f"page depending on its version and the rest of the file; save the script as UTF-8 with "
+                            f"a byte order mark, or keep the line ASCII")
+        if directive:
             if section is not None or not ISPP_HEADER_LINE.match(line):
                 raise SbomError(f"{where}: preprocessor directive {line!r}: this script evaluates no ISPP, "
                                 f"and only a #ifndef/#define \"literal\"/#endif default before the first "
                                 f"section cannot change the [Files] lines")
             continue
-        if line.startswith("[") and line.endswith("]"):
-            section = line[1:-1].strip().lower()
+        if header:
+            section = line[1:-1].strip(" \t").lower()
             continue
-        if section != "files" or not line or line.startswith(";"):
+        if not entry:
             continue
-        fields = {}
+        fields, quoted = {}, set()
         pos = 0
         while pos < len(line):
             m = ISS_ENTRY.match(line, pos)
             if not m or m.end() == pos:
                 raise SbomError(f"{where}: cannot parse [Files] line {line!r}")
-            val = m.group(2).strip()
-            if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+            key, val = m.group(1).lower(), m.group(2).strip(" \t")
+            if val.startswith('"'):
+                if len(val) < 2 or not val.endswith('"'):
+                    raise SbomError(f"{where}: unterminated quoted value for {m.group(1)} in {line!r}")
                 val = val[1:-1].replace('""', '"')
-            fields[m.group(1).lower()] = val
+                quoted.add(key)
+            fields[key] = val
             pos = m.end()
         if "source" not in fields:
             raise SbomError(f"{where}: [Files] line without Source: {line!r}")
-        flags = fields.get("flags", "").lower().split()
-        if "recursesubdirs" in flags or "destname" in fields:
-            raise SbomError(f"{where}: recursesubdirs/DestName entries are not mapped onto the archive")
+        unmapped = sorted(set(fields.get("flags", "").lower().split()) & ISS_UNMAPPED_FLAGS)
+        unmapped += sorted(set(fields) & ISS_UNMAPPED_PARAMS)
+        if unmapped:
+            raise SbomError(f"{where}: {', '.join(unmapped)}: such an entry is not mapped onto the archive")
+        source = fields["source"].replace("/", "\\")
+        name = source.rsplit("\\", 1)[-1]
+        if "{#" in name or ("{#" in source and "source" not in quoted) or any(
+                "{#" in v for k, v in fields.items() if k != "source"):
+            raise SbomError(f"{where}: an ISPP expansion outside a quoted Source's directory is not evaluated here")
         dest = fields.get("destdir", "").replace("/", "\\")
         if dest.lower() != "{app}" and not dest.lower().startswith("{app}\\"):
             raise SbomError(f"{where}: DestDir {dest!r} is not under {{app}}")
-        name = fields["source"].replace("/", "\\").rsplit("\\", 1)[-1]
-        if "{#" in dest or "{#" in name:
-            raise SbomError(f"{where}: an ISPP expansion in the Source name or DestDir is not evaluated here")
+        parts = [p for p in dest[len("{app}"):].split("\\") if p]
+        if any(p in (".", "..") or "{" in p or "}" in p for p in parts):
+            raise SbomError(f"{where}: DestDir {dest!r}: a `.`, `..` or constant below {{app}} is not mapped "
+                            f"onto the archive")
         if not ISS_SOURCE_NAME.match(name):
             raise SbomError(f"{where}: Source name {name!r}: only a literal name or `*.<ext>` is mapped "
                             f"onto the archive the way Inno Setup resolves it")
-        sub = "/".join(p for p in dest[len("{app}"):].split("\\") if p)
-        entries.append((sub, name))
+        entries.append(("/".join(parts), name))
     if not entries:
         raise SbomError(f"{iss.name}: no Source: lines in a [Files] section")
     return entries
@@ -640,7 +743,7 @@ def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
                  "hashes": [{"alg": "SHA-256", "content": sha}]})
     root.setdefault("bom-ref", "artifact")
     meta["properties"] = meta.get("properties", []) + [
-        {"name": f"yuzu:sbom:{k}", "value": v} for k, v in notes.items()]
+        {"name": NOTE_PREFIX + k, "value": v} for k, v in notes.items()]
     if incomplete:
         # The artifact holds components this SBOM does not list (notes say
         # which kind): machine-readable, not only prose.
@@ -693,7 +796,7 @@ def merge_spdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
     root = _spdx_root(doc)
     root.update({"name": artifact, "versionInfo": version,
                  "checksums": [{"algorithm": "SHA256", "checksumValue": sha}],
-                 "comment": "; ".join(f"{k}: {v}" for k, v in notes.items())})
+                 "comment": spdx_notes_comment(notes)})
     if incomplete:
         _spdx_mark_incomplete(doc, root)
     for p in doc.get("packages", []):
@@ -760,7 +863,7 @@ def inspect(doc: dict):
         root = meta.get("component") or {}
         sha = next((h.get("content") for h in root.get("hashes", []) or [] if h.get("alg") == "SHA-256"), None)
         unpacked = next((_unpacked_files(p.get("value")) for p in meta.get("properties", []) or []
-                         if p.get("name") == "yuzu:sbom:unpacked-files"), 0)
+                         if p.get("name") == NOTE_PREFIX + "unpacked-files"), 0)
         return "cdx", len(comps), paths, root.get("name"), sha, unpacked
     if "spdxVersion" in doc:
         root = _spdx_root(doc)
@@ -773,8 +876,8 @@ def inspect(doc: dict):
             w for p in pkgs for w in re.split(r"[\s,]+", p.get("sourceInfo") or "") if "/" in w or "\\" in w]
         sha = next((c.get("checksumValue") for c in root.get("checksums", []) or []
                     if c.get("algorithm") == "SHA256"), None)
-        m = re.search(r"(?:^|; )unpacked-files: (\d+)(?:;|$)", root.get("comment") or "")
-        return "spdx", len(pkgs) + len(files), paths, root.get("name"), sha, _unpacked_files(m and m.group(1))
+        unpacked = spdx_note(root.get("comment"), "unpacked-files")
+        return "spdx", len(pkgs) + len(files), paths, root.get("name"), sha, _unpacked_files(unpacked)
     raise SbomError("neither a CycloneDX nor an SPDX JSON document")
 
 
@@ -848,6 +951,13 @@ def _image_roots(cdx: dict, spdx: dict) -> tuple[dict, dict]:
     return croot, sroot
 
 
+def image_title(cdx: dict) -> str:
+    """The OCI title label syft recorded on a CycloneDX image SBOM ("" if none)."""
+    meta = cdx.get("metadata") or {}
+    return next((p.get("value", "") for p in ((meta.get("component") or {}).get("properties") or []) +
+                 (meta.get("properties") or []) if p.get("name") == IMAGE_TITLE_PROPERTY), "")
+
+
 def image_incomplete_reasons(cdx: dict, spdx: dict) -> list[tuple[str, str]]:
     """[(token, detail)] for what an image holds that its syft scan cannot list:
     Yuzu C++ binaries (their static vcpkg libraries), the Erlang emulator
@@ -864,8 +974,7 @@ def image_incomplete_reasons(cdx: dict, spdx: dict) -> list[tuple[str, str]]:
     cpp = [p for p in paths if base(p) in SERVER_NAMES or base(p) in AGENT_NAMES or base(p).startswith(AGENT_PREFIXES)]
     erts = [p for p in paths if base(p) == ERTS_EMULATOR]
     pgvector = [p for p in paths if base(p) == "vector.so" and "/postgresql/" in p]
-    title = next((p.get("value", "") for p in (croot.get("properties") or []) +
-                  ((cdx.get("metadata") or {}).get("properties") or []) if p.get("name") == IMAGE_TITLE_PROPERTY), "")
+    title = image_title(cdx)
     m = YUZU_IMAGE_TITLE.match(title)
     if m:
         want = {"server": ("yuzu-server", server), "agent": ("yuzu-agent", cpp),
@@ -890,26 +999,50 @@ def _reason_tokens(value) -> list[str]:
     return [t.strip() for t in (value or "").split(",") if t.strip()]
 
 
+# image_marker()'s state for a document that carries only some parts of the
+# marker (the composition or relationship without the reason tokens, or the
+# tokens without it): never a complete marker, so mark_image and the release
+# check both refuse it rather than treat it as marked.
+PARTIAL = "partial"
+
+
 def image_marker(cdx: dict, spdx: dict):
-    """(cdx_tokens, spdx_tokens): the incomplete-reason tokens each document
-    carries, or None where it carries no incompleteness marker at all."""
+    """(cdx_state, spdx_state). Each is the list of incomplete-reason tokens
+    when the document carries the whole marker (CycloneDX: the incomplete
+    composition on the root AND a non-empty `yuzu:sbom:incomplete-reasons`
+    property; SPDX: the root's `CONTAINS NOASSERTION` AND a non-empty
+    `yuzu:sbom:incomplete-reasons` comment line), None when it carries no part
+    of it, and PARTIAL otherwise."""
     croot, sroot = _image_roots(cdx, spdx)
     cmarked = any(c.get("aggregate") == "incomplete" and croot.get("bom-ref") in (c.get("assemblies") or [])
                   for c in cdx.get("compositions") or [])
     ctok = next((p.get("value") for p in (cdx.get("metadata") or {}).get("properties") or []
-                 if p.get("name") == "yuzu:sbom:incomplete-reasons"), None)
+                 if p.get("name") == NOTE_PREFIX + "incomplete-reasons"), None)
     smarked = any(r.get("spdxElementId") == sroot.get("SPDXID") and r.get("relationshipType") == "CONTAINS"
                   and r.get("relatedSpdxElement") == "NOASSERTION" for r in spdx.get("relationships") or [])
-    m = re.search(r"(?:^|; )incomplete-reasons: ([^;]*)(?:;|$)", sroot.get("comment") or "")
-    return (_reason_tokens(ctok) if cmarked or ctok is not None else None,
-            _reason_tokens(m and m.group(1)) if smarked or m else None)
+    stok = spdx_note(sroot.get("comment"), "incomplete-reasons")
+
+    def state(marked, tokens):
+        if not marked and tokens is None:
+            return None
+        return _reason_tokens(tokens) if marked and _reason_tokens(tokens) else PARTIAL
+    return state(cmarked, ctok), state(smarked, stok)
+
+
+def _marker_label(state) -> str:
+    if state is None:
+        return "unmarked"
+    if state == PARTIAL:
+        return "only in part (its composition or relationship, or its reason tokens, missing)"
+    return ", ".join(state)
 
 
 def mark_image(cdx: dict, spdx: dict) -> tuple[list[str], bool]:
     """Mark an image SBOM pair incomplete, in place, for what
     image_incomplete_reasons() finds. Returns (tokens, changed). Idempotent: a
-    pair already carrying exactly those tokens (marker included) is left as it
-    is. Any other existing marker, on either document, is refused."""
+    pair whose two documents each carry the whole marker with exactly those
+    tokens is left as it is. Any other existing marker or part of one, on
+    either document, is refused."""
     reasons = image_incomplete_reasons(cdx, spdx)
     notes = incomplete_notes(reasons)
     want = _reason_tokens(notes.get("incomplete-reasons"))
@@ -920,22 +1053,25 @@ def mark_image(cdx: dict, spdx: dict) -> tuple[list[str], bool]:
     elif have == (want, want) and want:
         return want, False
     else:
-        raise SbomError(f"the pair is already marked {have[0]} (CycloneDX) / {have[1]} (SPDX), not {want}: "
+        raise SbomError(f"the pair is already marked: {_marker_label(have[0])} (CycloneDX) / "
+                        f"{_marker_label(have[1])} (SPDX), not {', '.join(want) or 'unmarked'}: "
                         f"mark a fresh syft scan")
     croot, sroot = _image_roots(cdx, spdx)
     croot.setdefault("bom-ref", "image")
     _cdx_mark_incomplete(cdx, croot)
     meta = cdx.setdefault("metadata", {})
     meta["properties"] = (meta.get("properties") or []) + [
-        {"name": f"yuzu:sbom:{k}", "value": v} for k, v in notes.items()]
+        {"name": NOTE_PREFIX + k, "value": v} for k, v in notes.items()]
     _spdx_mark_incomplete(spdx, sroot)
-    sroot["comment"] = "; ".join([c for c in [sroot.get("comment")] if c] + [f"{k}: {v}" for k, v in notes.items()])
+    sroot["comment"] = "\n".join([c for c in [sroot.get("comment")] if c] + [spdx_notes_comment(notes)])
     return want, True
 
 
 def image_pair_errors(adir: Path) -> list[str]:
     """The release gate for image SBOMs in `adir`: each `<stem>-image.cdx.json`
-    has its SPDX partner, and the pair carries the marker mark-image adds."""
+    has its SPDX partner, a pair named as one of the release's images
+    (`<title>-image`, YUZU_IMAGE_TITLE) carries that image's title label, and
+    the pair carries exactly the marker mark-image adds."""
     stems: dict = {}
     for p in sorted(adir.iterdir()):
         if is_image_sbom(p.name):
@@ -953,12 +1089,23 @@ def image_pair_errors(adir: Path) -> list[str]:
         except (OSError, ValueError, SbomError) as e:
             errs.append(f"{stem}-image: {e}")
             continue
+        # The marker a release image needs is keyed on its title label: a pair
+        # named as a release image whose label is missing or another image's
+        # would otherwise be held to nothing.
+        title = image_title(cdx)
+        if YUZU_IMAGE_TITLE.match(stem) and title != stem:
+            label = f"its title label is {title!r}" if title else "it carries no title label"
+            errs.append(f"{stem}-image: named as the release's {stem} image, but {label}, so the marker "
+                        f"it needs cannot be decided")
+            continue
         if want and have != (want, want):
-            marked = "carries no marker" if have == (None, None) else f"is marked {have[0]} / {have[1]}"
+            marked = ("carries no marker" if have == (None, None) else
+                      f"is marked {_marker_label(have[0])} / {_marker_label(have[1])}")
             errs.append(f"{stem}-image: the image holds what its SBOM cannot list ({', '.join(want)}), but the pair "
                         f"{marked}: run `artifact-sbom.py mark-image` on a fresh scan")
         elif not want and have != (None, None):
-            errs.append(f"{stem}-image: marked incomplete ({have[0]} / {have[1]}) for nothing the image is seen to hold")
+            errs.append(f"{stem}-image: marked incomplete ({_marker_label(have[0])} / {_marker_label(have[1])}) "
+                        f"for nothing the image is seen to hold")
     return errs
 
 
@@ -971,8 +1118,8 @@ INSTALLER_UNLISTED = "the installer's own InnoSetup runtime (setup loader and un
 
 # Why an SBOM says it is incomplete: a CLOSED set. An SBOM carrying the marker
 # names its reasons by these tokens, comma-separated, in
-# `yuzu:sbom:incomplete-reasons` (CycloneDX metadata property; SPDX: the root's
-# comment), and the prose (each entry below, with any detail after a colon) in
+# `yuzu:sbom:incomplete-reasons` (CycloneDX metadata property; SPDX: that key's
+# line of the root's comment, NOTE_PREFIX), and the prose (each entry below, with any detail after a colon) in
 # `yuzu:sbom:incomplete`, joined by " | ". A consumer may rely on the tokens;
 # the prose may change. docs/user-manual/release-verification.md documents the
 # same set and tests/test_artifact_sbom.py fails if the two differ. A new

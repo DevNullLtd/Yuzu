@@ -174,8 +174,9 @@ with `gh attestation download <file> --repo "$SIGNER_REPO" -o
 ## 5. Inspect the SBOM
 
 Every binary archive (all but the Compose Wizard zip), `.deb`, `.rpm`, Windows
-installer and macOS `.pkg`, and every Docker image, has its own SBOM in both
-CycloneDX and SPDX formats. Use
+installer and macOS `.pkg`, and every Docker image the release publishes (see
+"Docker image SBOMs" below), has its own SBOM in both CycloneDX and SPDX
+formats. Use
 whichever your procurement or SCA tool consumes. A file's SBOM has the file's
 name with `.cdx.json` or `.spdx.json` in place of `.tar.gz`, `.zip`, `.deb`,
 `.rpm`, `.exe` or `.pkg`, and records the file's name and SHA-256 on its root
@@ -202,7 +203,8 @@ in it:
   a binary ends up not using; it does not omit a vcpkg library the binary
   uses. A library whose vcpkg record gives no licence is listed without one
   (`NOASSERTION` in SPDX), and the SBOM names those libraries in its
-  `yuzu:sbom:licence-noassertion` property (CycloneDX) or root comment (SPDX).
+  `yuzu:sbom:licence-noassertion` note (see "Reading the `yuzu:sbom:` notes"
+  below).
 - **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
   `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
 - **Anything else a scanner recognises in the unpacked file.**
@@ -211,9 +213,8 @@ The Windows installer is not unpacked by the release: its SBOM lists the files
 of `yuzu-agent-windows-x64.zip` (built from the same output) that the
 installer's script, `yuzu-agent.iss`, installs, and leaves out any file of the
 archive the installer does not install. The SBOM says so in its
-`yuzu:sbom:contents` property (CycloneDX `metadata.properties`; in SPDX, the
-comment on the described package), while its root names the installer and
-its SHA-256.
+`yuzu:sbom:contents` note, while its root names the installer and its
+SHA-256.
 
 Not listed yet, though the file holds it: code vendored into the source tree
 and compiled into `yuzu-server` (qrcodegen, and the web assets it embeds: htmx,
@@ -225,11 +226,18 @@ MD5 implementation taken from OpenSSL; the SBOM lists the runtime as one
 so in the data: a CycloneDX `compositions` entry with `aggregate: incomplete`
 for its root, and in SPDX (which has no such field) a `CONTAINS NOASSERTION`
 relationship on the described package. The `yuzu:sbom:incomplete-reasons`
-property (CycloneDX `metadata.properties`; in SPDX, the comment on the
-described package) names why, by the tokens below, and `yuzu:sbom:incomplete`
-says it in prose. Today that is every SBOM of a file holding `yuzu-server`, the
-installer's, and every gateway SBOM; of the files, only the agent's archives,
-`.deb`, `.rpm` and `.pkg` carry no marker. Image SBOMs are marked too (below).
+note names why, by the tokens below, and the `yuzu:sbom:incomplete` note says
+it in prose. The marker follows what a file holds, not its name: every SBOM of
+a file holding `yuzu-server` is marked (`server-vendored`), as are the
+installer's and every gateway SBOM. Today the files holding `yuzu-server` are
+the Linux archive and the server `.deb` and `.rpm`, so the agent's files (the
+Windows and macOS archives, the agent `.deb`, `.rpm` and `.pkg`) carry no
+marker: no release after 0.15.0 puts `yuzu-server.exe` or a macOS `yuzu-server`
+in them, and the Windows release job refuses an agent archive holding
+`yuzu-server.exe`. (v0.15.0 and earlier shipped the server in
+`yuzu-windows-x64.zip` and `yuzu-macos-arm64.tar.gz`; their SBOMs predate this
+change and carry no marker at all, so their silence says nothing about
+completeness.) Image SBOMs are marked too (below).
 
 Libraries the binaries load from the operating system at run time (glibc,
 `libsystemd`, the MSVC runtime, and the host OpenSSL `libcrypto` the gateway's
@@ -239,7 +247,7 @@ without it can still depend on operating-system libraries.
 
 ### Why an SBOM says it is incomplete
 
-`yuzu:sbom:incomplete-reasons` holds one or more of these tokens,
+The `yuzu:sbom:incomplete-reasons` note holds one or more of these tokens,
 comma-separated. The set is closed: a new reason gets a new token, and an
 existing token keeps its meaning. Read the tokens, not the prose, in a script.
 
@@ -256,8 +264,8 @@ existing token keeps its meaning. Read the tokens, not the prose, in a script.
 **Your scanner may not show the marker.** Neither a CycloneDX `compositions`
 entry nor an SPDX `CONTAINS NOASSERTION` relationship is a finding: grype (checked
 with grype 0.122.0 on a marked gateway SBOM) reports matches and says nothing
-about completeness, and we have not seen Dependency-Track display either (not
-checked on a live instance). No finding for a file is not evidence that it
+about completeness. How Dependency-Track presents either has not been checked
+on a live instance. No finding for a file is not evidence that it
 holds no vulnerable component: read the marker yourself, as below.
 
 **The SBOM is not an attribution source yet.** Every vcpkg library carries the
@@ -288,13 +296,46 @@ Dependency-Track or a similar tool, expect:
   components of the file; the SBOM does not record which library depends on
   which.
 
+### Reading the `yuzu:sbom:` notes
+
+The release writes its notes on an SBOM's root under one key per note, spelled
+the same in both formats: `yuzu:sbom:incomplete-reasons`,
+`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`
+and the others. In CycloneDX each note is a `metadata.properties` entry whose
+`name` is the key. SPDX has no properties, so each note is one line of the
+described package's `comment`, the key, a colon and a space, then the value:
+
+```text
+yuzu:sbom:artifact: yuzu-gateway-linux-x64.tar.gz
+yuzu:sbom:incomplete-reasons: erts-static
+```
+
+A note that is absent means the SBOM does not carry it (no
+`yuzu:sbom:incomplete-reasons` note: no marker). To read one note from either
+format (set `KEY` to the note you want, and the file names to your SBOMs):
+
 ```bash
-# What a file's SBOM says it does not list, and the libraries without a licence
+KEY=yuzu:sbom:incomplete-reasons
+# CycloneDX: the metadata property named KEY
+jq -r --arg k "$KEY" '.metadata.properties[]? | select(.name == $k) | .value' yuzu-gateway-linux-x64.cdx.json
+# SPDX: the line of the described package's comment that starts with "KEY: "
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
+  yuzu-gateway-linux-x64.spdx.json | sed -n "s/^$KEY: //p"
+```
+
+```bash
+# Every note, and the CycloneDX marker itself
 jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-linux-x64.cdx.json
 jq '.compositions' yuzu-linux-x64.cdx.json
-# Just the reason tokens (empty: no marker)
-jq -r '.metadata.properties[]? | select(.name == "yuzu:sbom:incomplete-reasons") | .value' yuzu-gateway-linux-x64.cdx.json
+# Every note, and the SPDX marker itself (the CONTAINS NOASSERTION relationship)
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
+  yuzu-linux-x64.spdx.json | grep '^yuzu:sbom:'
+jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-linux-x64.spdx.json
 ```
+
+### CycloneDX
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
@@ -325,19 +366,33 @@ sha256sum yuzu-linux-x64.tar.gz
 
 ### Docker image SBOMs
 
-An image SBOM is a syft scan (v1.57.2, the same version as the file SBOMs) of
-the image as published. It lists the operating-system packages and what syft
-recognises in the image's files, so it does not list the C++ libraries linked
-statically into `yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and
-the `yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the
-gateway image's Erlang emulator vendors. The release marks each such image SBOM
-incomplete the same way as a file SBOM: the server images
-`server-vendored, image-static-cpp`, the agent image `image-static-cpp`, the
-gateway images `erts-static`, and the `yuzu-postgres` image `pgvector-source`.
-Beyond those, an image SBOM lists what syft recognises and no more. The
-release's SBOM scope check does not hold image SBOMs to the file rules
-(entry bound, forbidden paths), but it refuses an image SBOM pair that should
-carry the marker and does not.
+The release publishes six images, each with an SBOM pair among the release
+assets: `yuzu-server`, `yuzu-gateway` and `yuzu-postgres`
+(`yuzu-<name>-image.{cdx,spdx}.json`), and `yuzu-server-chisel`,
+`yuzu-gateway-chisel` and `yuzu-agent-chisel`
+(`yuzu-<name>-chisel-image.{cdx,spdx}.json`). Each is a syft scan (v1.57.2, the
+same version as the file SBOMs) of the image by its digest
+(`ghcr.io/<owner>/<image>@sha256:...`), the digest the release signs and
+attests, so the SBOM describes that exact image, not whatever a tag points at
+later. It lists the operating-system packages and what syft recognises in the
+image's files, so it does not list the C++ libraries linked statically into
+`yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and the
+`yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
+images' Erlang emulator vendors, nor the `yuzu-postgres` image's pgvector. The
+release marks each of the six incomplete the same way as a file SBOM: the two
+server images `server-vendored, image-static-cpp`, the agent image
+`image-static-cpp`, the two gateway images `erts-static`, and the
+`yuzu-postgres` image `pgvector-source`. Beyond those, an image SBOM lists what
+syft recognises and no more. The release's SBOM scope check does not hold image
+SBOMs to the file rules (entry bound, forbidden paths), but it refuses an image
+SBOM pair that should carry the marker and does not, one carrying only part of
+it, and one named as a release image that lacks that image's title label.
+
+The agent-bundle image (`yuzu-agent-bundle-chisel`) is not a release image: it
+is built from the published release afterwards, by a separate job. Its syft
+SBOM pair is kept only as a three-day workflow artifact, is not a release
+asset and is not marked, although the image holds `yuzu-agent`: the agent
+package SBOMs inside the release list that binary's libraries.
 
 ```bash
 jq '.components | length' yuzu-server-image.cdx.json
