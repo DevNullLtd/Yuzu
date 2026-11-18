@@ -1488,7 +1488,9 @@ echo_test_exe = executable(
 # folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
 # run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
 # third test() too. Together the three filters cover every case exactly once.
-test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
+# 300 s like the two echo targets below: a loaded Windows CI runner measured 218 s here, past the former
+# 180 s limit, with every assertion passing when the case was re-run on its own.
+test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 300)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 
@@ -3577,11 +3579,13 @@ test('server feature option lint',
   timeout: 300,
 )
 
+# 90 s: the selftest takes about 19 s on an idle Windows runner and exceeded the former 30 s limit on
+# a loaded one, twice in a row on PRs #8205 and #8206 (#8207).
 test('local test runner platform selftest',
   _python3_test,
   args: [files('test_run_tests_platform.py')],
   suite: 'platform',
-  timeout: 30,
+  timeout: 90,
 )
 
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
