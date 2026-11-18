@@ -1613,7 +1613,8 @@ is the scanned one" pushed an untagged digest: see that paragraph and the releas
 legs are `fail-fast: false`, so they may already have moved `:X.Y.Z` (and, on a stable tag,
 `:X.Y` and `:latest`, leaving those tags on a mix of this release and the previous one), and the
 release job does not run (same state as any other publish failure; the release skill's Recovery
-covers it, including moving `:latest` back). Read the step log first. For every publish job
+covers it; `:latest` and `:X.Y` keep naming the unreleased digests until the release is finished,
+re-tagged or superseded, and moving them by hand is not a release procedure: Release tag policy). Read the step log first. For every publish job
 except the agent bundle:
 
 - **A distro package with a fix**: the fix usually landed after the run started. "Re-run failed
