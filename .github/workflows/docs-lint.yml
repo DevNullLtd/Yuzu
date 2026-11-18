@@ -381,29 +381,39 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Depth 2: the base is the merge commit's FIRST PARENT, which must be in
+      # the checkout (see the step below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Enforce README touch rule
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request) BASE="$BASE_SHA" ;;
-            *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
+            pull_request) ;;
+            *) echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
-            exit 0
+          # The base is the merge commit's first parent: the dev tip GitHub
+          # merged this PR onto, so the diff is exactly the PR's own change.
+          # NOT github.event.pull_request.base.sha: GitHub leaves that at the
+          # base tip from when the PR was opened (a push to the PR does not
+          # move it), while the merge commit is rebuilt on the current tip, so
+          # a two-tree diff against it also reported every plugin change dev
+          # merged in between as this PR's (#8235).
+          # Fail closed unless HEAD is the merge of the PR head onto one base.
+          if [ "$(git rev-list --parents -n1 "$HEAD_SHA" | wc -w)" -ne 3 ] \
+             || [ "$(git rev-parse "${HEAD_SHA}^2")" != "$PR_HEAD_SHA" ]; then
+            echo "check-plugin-readme-touch: $HEAD_SHA is not the merge of the PR head $PR_HEAD_SHA -- cannot evaluate, failing closed" >&2
+            exit 1
           fi
-          # A two-tree diff needs only the base commit itself, not the whole
-          # history (the changelog-fragments job above does the same).
-          git fetch --depth=1 origin "$BASE"
+          BASE="$(git rev-parse "${HEAD_SHA}^1")"
           printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
           scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
