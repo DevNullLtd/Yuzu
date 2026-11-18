@@ -23,6 +23,8 @@
 
 #include <yuzu/plugin.hpp>
 
+#include "procfetch_row.hpp"
+
 #include <cstdio>
 #include <filesystem>
 #include <format>
@@ -59,20 +61,6 @@
 #endif
 
 namespace {
-
-// Escape pipe characters in strings so they don't break the delimiter.
-std::string escape_pipes(std::string_view sv) {
-    std::string out;
-    out.reserve(sv.size());
-    for (char c : sv) {
-        if (c == '|') {
-            out += "\\|";
-        } else {
-            out += c;
-        }
-    }
-    return out;
-}
 
 // -- POSIX (Linux + macOS) shared SHA-1 ---------------------------------------
 #if defined(__linux__) || defined(__APPLE__)
@@ -175,7 +163,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         }
 
         ctx.write_output(
-            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+            yuzu::procfetch::format_row(pid, name, exe_path, sha1));
     }
 }
 
@@ -236,8 +224,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             }
         }
 
-        ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
-                                     escape_pipes(exe_path), sha1));
+        ctx.write_output(yuzu::procfetch::format_row(static_cast<int>(pid), name, exe_path, sha1));
     }
 }
 
@@ -342,7 +329,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         }
 
         ctx.write_output(
-            std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
+            yuzu::procfetch::format_row(pid, name, exe_path, sha1));
     } while (Process32NextW(snap, &pe));
 
     BCryptCloseAlgorithmProvider(alg, 0);

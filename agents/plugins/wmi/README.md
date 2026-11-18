@@ -62,7 +62,7 @@ No external binaries and no subprocesses — the Windows leg talks to the local 
 
 ### Outputs
 
-Both actions emit pipe-delimited lines, not the two-column `property`/`value` shape the definition YAML's `result.columns` implies on its own: `query` writes one `row<N>|<property>|<value>` line per returned property (`wmi_plugin.cpp:159-160`) followed by a terminal `rows|<count>` line (`wmi_plugin.cpp:168`) and, if the shared helper's row cap was hit, an `error|row_cap_exceeded` line before it (`wmi_plugin.cpp:163-168`); `get_instance` writes one `property|<name>|<value>` line per property of the single matched instance, with no trailing count line (`wmi_plugin.cpp:201-203`). A property is omitted from either action's output entirely — never emitted with an empty value — when its VARIANT type isn't one `variant_to_string` knows how to stringify, including `VT_NULL`/`VT_EMPTY` (`variant_to_string` / `extract_row` in `wmi_bounded.hpp`).
+Both actions emit pipe-delimited lines (the property name and the value are each escaped: `|` becomes `\|`, CR and LF become a space, interior backslashes are kept and a trailing backslash becomes `/`, so a WMI string cannot add columns or rows), not the two-column `property`/`value` shape the definition YAML's `result.columns` implies on its own: `query` writes one `row<N>|<property>|<value>` line per returned property (`wmi_plugin.cpp:159-160`) followed by a terminal `rows|<count>` line (`wmi_plugin.cpp:168`) and, if the shared helper's row cap was hit, an `error|row_cap_exceeded` line before it (`wmi_plugin.cpp:163-168`); `get_instance` writes one `property|<name>|<value>` line per property of the single matched instance, with no trailing count line (`wmi_plugin.cpp:201-203`). A property is omitted from either action's output entirely — never emitted with an empty value — when its VARIANT type isn't one `variant_to_string` knows how to stringify, including `VT_NULL`/`VT_EMPTY` (`variant_to_string` / `extract_row` in `wmi_bounded.hpp`).
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`windows.wmi.get_instance` — `property|value`**
@@ -155,12 +155,12 @@ error|WMI not available on this platform
 2. **`get_instance` never reports truncation.** `query` surfaces `error|row_cap_exceeded` when the shared helper's row cap is hit (`wmi_plugin.cpp:163-167`), but `get_instance` sets `row_cap = 1` deliberately (`wmi_plugin.cpp:192-195`) and never inspects `qres.truncated`, so a class with more properties than the helper can enumerate before its own cap looks identical to a class that genuinely has one property.
 3. **This plugin never sets a typed result status.** Every capture shows `UNDECLARED / UNKNOWN /` regardless of success or failure (`docs/samples/windows.txt:5,62`); a consumer must parse the `error|` row and exit code, not the status field, to tell success from failure.
 4. **Method invocation is dormant, not exposed.** `agents/shared/wmi_bounded.hpp` ships `exec_object_method` for calling a WMI instance method, whose only production caller (`bitlocker`, fixed method names, no action input) predates this gate, with an explicit warning that the first caller must add its own namespace/method allow-list (the `exec_object_method` doc comment in `wmi_bounded.hpp`) — do not wire it into this plugin without adding that gate.
-5. **No row-index or discriminator column in the definition schema.** `query`'s real output is `row<N>|property|value`, but `content/definitions/wmi.yaml`'s `result.columns` only declares `property`/`value` for both actions — the row index is not modeled as a column.
+5. **No row-index or discriminator column in the definition schema.** `query`'s real output is `row<N>|property|value`, but `content/definitions/wmi.yaml`'s `result.columns` only declares `property`/`value` for both actions — the row index is not modeled as a column. A property value that ends in a backslash reads `/` in its last position (the row escape folds a trailing backslash so it cannot glue onto the delimiter); interior backslashes are kept.
 
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/wmi/src/wmi_plugin.cpp`
+- Plugin: `agents/plugins/wmi/src/wmi_plugin.cpp` · `agents/plugins/wmi/src/wmi_rows.hpp`
 - Definitions: `content/definitions/wmi.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_wmi_bounded.cpp` · `tests/unit/test_wmi_error_token.cpp` · `tests/unit/test_wmi_local_dispatcher.cpp`
