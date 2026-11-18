@@ -114,41 +114,40 @@ native packages to an older baseline is not part of 0.15.0; it is planned under 
 ### Windows agent: Visual C++ runtime
 
 The Windows agent, its plugins and its bundled libraries are built with Microsoft Visual C++
-and need its C++ runtime (`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll` and, for
-`yuzu-agent.exe`, `msvcp140_atomic_wait.dll`). From 0.16.0 the release archive
-(`yuzu-agent-windows-x64.zip`) and the installer (`YuzuAgentSetup-<version>.exe`) carry these
-DLLs in the agent's own `bin` directory, next to `yuzu-agent.exe`, so a Windows 10 or later
-x64 machine needs no Visual C++ Redistributable installed first. The agent uses that copy even
-when the machine also has the Visual C++ Redistributable installed, and Windows Update does
-not service it. Each release builds the agent with one pinned Visual C++ toolset and ships the
-runtime of that toolset; the release job records the DLLs and their file versions in its step
-summary.
+and need the Visual C++ runtime, the DLLs `vcruntime140.dll`, `vcruntime140_1.dll`,
+`msvcp140.dll` and, for `yuzu-agent.exe`, `msvcp140_atomic_wait.dll`. Microsoft's Visual C++
+2015-2022 Redistributable (x64), "the Redistributable" below, is the package that installs
+that runtime into `System32`. From 0.16.0 the release archive (`yuzu-agent-windows-x64.zip`)
+and the installer (`YuzuAgentSetup-<version>.exe`) carry the runtime in the agent's own `bin`
+directory, next to `yuzu-agent.exe`, so a Windows 10 or later x64 machine needs no
+Redistributable installed first. The agent uses that copy even when the machine also has the
+Redistributable installed, and Windows Update does not service it. Each release builds the
+agent with one pinned Visual C++ toolset and ships the runtime of that toolset; the release job
+records the DLLs and their file versions in its step summary.
 
-**Only the installer or the archive brings the runtime.** Running a newer installer, or
-unpacking a newer archive over the agent's directory, replaces the runtime with the one that
-release ships. Agent self-update (OTA), the usual way a Windows agent takes a new build,
-replaces `yuzu-agent.exe` only: it neither installs nor refreshes the runtime, and it installs
-no plugin the device does not already have (#8219, #8218). A device kept current by OTA alone
-keeps the runtime its installer or archive brought, and so do the components that load inside
-the agent process (next paragraph).
+**Each release's installer and archive carry that release's runtime and plugins.** Deploy a
+Windows agent from the installer or archive of a single release. Agent self-update (OTA)
+replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin
+(#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported configuration (see
+"Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): reprovision it from the
+installer or archive of the release you run.
 
 **Code loaded into the agent uses the same copy.** A third-party component that runs inside
 the agent process, for example the Configuration Manager client objects the `sccm` plugin
-creates in-process, also binds to the agent's copy of the runtime, not to the one installed in
-`System32`. That copy is refreshed only by the installer or the archive, as above.
+creates in-process, also binds to the agent's copy of the runtime, not to the one the
+Redistributable installs in `System32`. That copy is the one the installer or archive of the
+release brought.
 
-**If an agent stops reporting after an OTA update.** Repair it on the device: install the
-current Visual C++ 2015-2022 Redistributable (x64) from Microsoft, or run the installer again,
-or unpack the archive of the same release over the agent's directory. Until then the Windows
-service manager restarts the service at 60-second intervals and each start fails the same
-way.
+**If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service
+manager restarts the service every 60 seconds and each start fails the same way. Reprovision
+the device from the installer or archive of one release.
 
 Releases up to and including 0.15.0 did not carry the runtime. On a machine without the
-current Visual C++ 2015-2022 Redistributable (x64), 14.44 or later (0.15.0 was built with the
-14.44 toolset), `yuzu-agent.exe` either does not start and Windows reports a missing
-`VCRUNTIME140.dll` or `MSVCP140.dll`, or, with an older Redistributable installed, stops with an
-access violation in `msvcp140.dll`. A 0.15.0 device needs that Redistributable installed. The
-0.15.0 installer also left out six plugins that the archive carried. The 0.16.0 installer adds
+Redistributable 14.44 or later (0.15.0 was built with the 14.44 toolset), the 0.15.0
+`yuzu-agent.exe` either does not start and Windows reports a missing `VCRUNTIME140.dll` or
+`MSVCP140.dll`, or, with an older Redistributable installed, stops with an access violation in
+`msvcp140.dll`. Reprovision such a device from a 0.16.0 installer or archive. The 0.15.0
+installer also left out six plugins that the archive carried. The 0.16.0 installer installs
 five of them, with these components: System (`browser_inventory`, `printing`,
 `privacy_permissions`), Network (`netprobe`) and Windows (`rdp_control`). It deliberately does
 not install `license_scan`: installing it starts the agent's daily software-licensing

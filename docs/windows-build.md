@@ -167,8 +167,10 @@ runtime app-local in `bin`: `release.yml`'s "Package archive" step runs
 `vcruntime140_1.dll`, `msvcp140.dll` and `msvcp140_atomic_wait.dll` are
 required) from the build machine's Visual Studio redistributable directory
 into the zip's `bin` and into `build-windows\msvc-runtime`, which
-`yuzu-agent.iss` installs into `{app}\bin`, after first removing any
-`vcruntime140*.dll` or `msvcp140*.dll` already there. The directory comes from
+`yuzu-agent.iss` installs into `{app}\bin`. Before copying, it removes any
+`vcruntime140*.dll` or `msvcp140*.dll` already in those two staging
+directories; the installer does not remove runtime DLLs from `{app}\bin`. The
+redistributable directory comes from
 `VCToolsRedistDir` (set by `ilammy/msvc-dev-cmd`) or else from `vswhere`; the
 script never runs `vcvars64.bat`, and on Windows it refuses a DLL that is not
 validly signed by Microsoft. It also refuses a release whose toolset
@@ -177,8 +179,8 @@ validly signed by Microsoft. It also refuses a release whose toolset
 above): agent self-update replaces only `yuzu-agent.exe`, never the runtime
 already on a device (#8219), so the release toolset moves only by a reviewed
 change to that file, whose comment says what such a change must announce.
-Without `VCToolsVersion` (a local build outside an MSVC environment) the pin
-is skipped with a warning. The staged DLLs and their file versions are
+Without `VCToolsVersion` the script fails in GitHub Actions; in a local build
+outside an MSVC environment the pin is skipped with a warning. The staged DLLs and their file versions are
 written to the job's step summary.
 
 Two steps later, after "Verify the agent runs from the packaged archive",

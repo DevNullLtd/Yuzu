@@ -248,12 +248,12 @@ refuses an archive that carries the DLLs of `libpq`, `drogon` or `xmlsec`, and d
 given release's SBOM lists beyond the archive is not asserted here: inspect the
 SBOM of the release you verify.
 
-The Windows agent archive and installer also carry Microsoft's Visual C++
-runtime in the agent's `bin` directory, unmodified and signed by Microsoft:
-`vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
+From 0.16.0, the Windows agent archive and installer also carry Microsoft's
+Visual C++ runtime in the agent's `bin` directory, unmodified and signed by
+Microsoft: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
 `msvcp140_atomic_wait.dll` and any other `vcruntime140_*.dll` or
 `msvcp140_*.dll` the build machine's Visual Studio redistributable directory
-holds (from 0.16.0). The Windows SBOM is not generated to list them: treat them
+holds. The Windows SBOM is not generated to list them: treat them
 as absent from it. Each release records the DLLs it shipped and their file
 versions in the step summary of its `Build Windows x64` job, and the version
 follows the Visual C++ toolset the release is pinned to

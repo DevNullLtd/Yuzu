@@ -5,13 +5,14 @@
 # Why it is pinned: the Windows agent carries the Visual C++ runtime app-local
 # in its bin directory, and agent self-update (OTA) replaces only
 # yuzu-agent.exe, never that runtime (#8219, decision #8218). An executable
-# built by a newer toolset can need runtime exports the copy already on a
-# device lacks, and then does not start. Holding the toolset fixed keeps every
-# OTA-delivered executable within the runtime that devices already have.
+# built by a newer toolset can need runtime exports an older copy lacks, and
+# then does not start. A device whose agent was updated by OTA mixes builds and
+# is outside the hard-cutover deployment contract (docs/user-manual/upgrading.md,
+# "Deployment contract (hard cutover)"); the pin does not make it supported.
 #
 # Bumping it is a deliberate, reviewed change. Its changelog fragment and
-# release notes must say that devices updated by OTA across the bump also need
-# the new installer or zip (which refreshes the runtime), until #8219/#8218
-# change what OTA delivers. Keep docs/windows-build.md's toolchain table and
-# the Wee Tam runner (deploy/windows/README.md) on the same toolset.
+# release notes must state that agent self-update does not carry the new
+# runtime, until #8219/#8218 change what OTA delivers. Keep
+# docs/windows-build.md's toolchain table and the Wee Tam runner
+# (deploy/windows/README.md) on the same toolset.
 14.44

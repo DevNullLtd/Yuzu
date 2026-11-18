@@ -15,17 +15,17 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
 
-**In short.** Affected: every Windows device that runs the agent. To do: deploy Windows agents with the 0.16.0 installer or archive, and know that agent self-update (OTA) does not bring the runtime or new plugins.
+**In short.** Affected: every Windows device that runs the agent. To do: deploy each Windows agent from the 0.16.0 installer or archive. Agent self-update (OTA) does not carry the runtime or any plugin.
 
 **What changed.**
 
-- **The Visual C++ runtime ships with the agent.** `yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe` carry `vcruntime140*.dll` and `msvcp140*.dll` in the agent's `bin` directory, so a Windows device needs no Visual C++ Redistributable installed first. The agent uses this copy even where a Redistributable is installed, and Windows Update does not service it. See [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime).
+- **The Visual C++ runtime ships with the agent.** `yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe` carry `vcruntime140*.dll` and `msvcp140*.dll` in the agent's `bin` directory, so a Windows device needs no Visual C++ 2015-2022 Redistributable (Microsoft's package that installs the runtime into `System32`) installed first. The agent uses this copy even where the Redistributable is installed, and Windows Update does not service it. See [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime).
 - **The installer installs five more plugins.** System: `browser_inventory`, `printing`, `privacy_permissions`. Network: `netprobe`. Windows: `rdp_control`. `browser_inventory` and `privacy_permissions` stay behind their server-side kill switch (off until an operator turns it on; where it is already on, a device installed with this installer answers them at once). `rdp_control`'s `set_state` can turn Remote Desktop on and open its firewall rule group (Mutating, Irreversible, admin or approval).
 - **`license_scan` is not installed by the installer.** Installing it starts the agent's daily software-licensing collection on the device with no operator action, and under ADR-3006 (decision D10) no release adds a unit that runs by default until the fleet-level setting for additions exists. The release archive still carries it.
 
-**The installer and the archive are the only routes that carry the runtime and plugins.** Agent self-update (OTA) replaces `yuzu-agent.exe` only. It neither installs nor refreshes the app-local runtime and installs no new plugin (#8219, #8218). Running the installer again, or unpacking the archive over the agent's directory, brings both.
+**Each release's installer and archive carry that release's runtime and plugins.** Deploy a Windows agent from the installer or archive of a single release. Agent self-update (OTA) replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin (#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported configuration: reprovision it from the installer or archive of the release you run.
 
-**If an agent stops reporting after an OTA update.** Repair it on the device: install the current Visual C++ 2015-2022 Redistributable (x64), or run the installer again, or unpack the archive of the same release. Until then the Windows service manager restarts the service at 60-second intervals and each start fails the same way.
+**If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service manager restarts the service every 60 seconds and each start fails the same way. Reprovision the device from the installer or archive of one release.
 
 ## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
 

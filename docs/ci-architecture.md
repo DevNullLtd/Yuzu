@@ -505,10 +505,10 @@ yet, and the PR-time coverage is the `docs`-suite tests named below
   `VCToolsVersion`'s major.minor differs from
   `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
   replaces only `yuzu-agent.exe`, never the app-local runtime (#8219,
-  decision #8218), so an executable built by a newer toolset could need
-  runtime exports the copy on a device lacks and fail to start. Moving the
-  pin is a reviewed change that must say devices updated by OTA across it
-  also need the new installer or zip. Wee Tam's MSVC is otherwise observed,
+  decision #8218), and an executable built by a newer toolset can need
+  runtime exports an older copy lacks and then does not start. Moving the
+  pin is a reviewed change whose release notes must state that agent
+  self-update does not carry the new runtime. Wee Tam's MSVC is otherwise observed,
   not pinned, by `deploy/windows/toolchain-contract.json`.
 - **Import closure.** "Check the DLL import closure of both payloads", after
   "Verify the agent runs from the packaged archive" and before the installer
