@@ -274,6 +274,24 @@ path, value name, data type, data, data size, the previous type, data and size, 
 -- never `ts`, `actor_pid`, `actor_image` or `detail`. An empty or NUL-bearing `record_key`
 refuses the batch.
 
+The cursor driver (`collect_slow_impl`, `echo_plugin.cpp`) backs off a source whose ticks keep
+failing (`CursorRetry`, `echo_cursor.hpp`). After the n-th consecutive failed tick (a cursor read
+failure, `IncompleteCaptureError` or any other exception) the source is next attempted
+`slow_interval x min(2^(n-1), 12)` later, less half a tick of slack so jitter cannot cost a whole
+extra tick. The order per source is enable gate, backoff check, cursor read, collect. A skipped
+tick writes `echo|collect_<src>|0|retry_backoff`, adds the source to `skipped_sources`, and is NOT
+recorded in the health ledger; `status` shows `config|<src>_next_retry_at|<epoch>` for as long as
+it lasts. Any tick that returns ends the backoff, `CursorLost` included (the source has committed a
+re-baseline and there is nothing to re-read). The enable gate drops the record, and so does a real
+enable/disable edge in `do_configure` (under `collect_mu_`), so two toggles between slow ticks
+cannot inherit one. The state is in memory: a restart retries at once. A failed commit itself loses
+nothing for the log-based sources, which replay from an unchanged cursor, but a longer wait widens
+two limits: the subscription legs' `BoundedPendingQueue` drops its oldest entry at 4096 (rule 6)
+and an OS log can wrap past the cursor (rule 2); both are counted and written as a `capture_gap`
+row on the next tick that completes. `registry` re-derives its loss accounting, so its next
+committed tick after commit failures also writes one `gap:commit_stalled` row whose key carries the
+window (rule 3b), unless a restart intervened.
+
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
 bucket only age-based eviction removes. The one refusal is a stamp outside 0001-01-01 ..
@@ -819,20 +837,35 @@ cursor.** What it adds to the pattern:
   `purge_source("registry")` erases the tiers, the replay ring, the cursor row and every
   `registry:%` baseline in one transaction.
 - **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
-  derived only from Complete and Absent reads; an Unreadable read changes
-  nothing and a Capped one only adds and updates, so a partial read can never
-  fabricate a deletion. Unreadable means the root, or any key beneath it other
-  than an access-denied child, could not be read (an open, a query or an
-  enumeration failure there makes the whole root Unreadable). Only an
-  access-denied child is isolated: it is listed in the read's `skipped` set, the
-  rest of the root is read as usual, and the diff keeps what the baseline holds
-  beneath the denied key. That holds for up to `kSkippedCap` (32) children per
-  read; the 33rd makes the read Capped, which derives no deletion in that root.
-  A root going Unreadable, or the denied set gaining a member, writes one
-  `gap:unreadable:<root>` row; the set is kept in the cursor so a steady state,
-  a shrink or a clear writes nothing. A Capped read's list is partial, so it can
-  add to the stored set but never shrinks it, and the stored set is clamped to
-  `kSkippedCap` names so a root that stays Capped cannot grow the cursor row.
+  derived only from Complete and Absent reads that left no child unnamed; an
+  Unreadable read changes nothing and a Capped one only adds and updates, so a
+  partial read can never fabricate a deletion. Unreadable means the root, or any
+  key beneath it other than an access-denied child, could not be read (an open,
+  a query or an enumeration failure there makes the whole root Unreadable). Only
+  an access-denied child is isolated: it is listed in the read's `skipped` set,
+  the rest of the root is read as usual, and the diff keeps what the baseline
+  holds beneath the denied key. A child whose name holds U+0000 takes the same
+  path without being opened (`RegOpenKeyExW` would stop at the NUL and open a
+  different key). `read_key` names up to `kSkippedCap` (32) such children per
+  read; the 33rd and later are counted in `SubtreeRead::skipped_overflow` while
+  the walk goes on, so every later sibling is still read and its adds and
+  changes land. A read with a non-zero overflow ends Capped, and the diff checks
+  the count itself and derives no deletion, because an unnamed child's baseline
+  cannot be protected by name. Every child that takes the skip path is charged
+  to the key budget and the deadline, like a key the walk enters, so a key with a
+  huge number of unopenable children still ends at a cap. Key and value names
+  are stored through `registry_name_utf8` (injective: a lone surrogate is U+FFFD
+  plus four hex digits and a literal U+FFFD is doubled), never the lossy
+  `from_wide`; the ETW callback builds its value name through the same function,
+  so a candidate and its writer compare equal, except for a value name holding U+0000: the ETW name is cut at its first NUL while the snapshot name keeps it, so that value is not matched to its own writer and its prefix can match a sibling value (a lead, never proof). A name already present in a key
+  keeps the first entry and ends the read Capped.
+  A root going Unreadable, the denied set gaining a member, or the overflow count
+  growing writes one `gap:unreadable:<root>` row; the set and the count are kept
+  in the cursor (`skipped`, `skipped_overflow`) so a steady state, a shrink or a
+  clear writes nothing. A Capped read's list is partial, so it can add to the
+  stored set and raise the count but never shrinks either, and the stored set is
+  clamped to `kSkippedCap` names so a root that stays Capped cannot grow the
+  cursor row.
   Keys are opened with `REG_OPTION_OPEN_LINK`, so a watched key that is itself a
   symbolic link is recorded as the link (its `SymbolicLinkValue`) and its target
   is never followed: following it would let a user point this agent's SYSTEM
@@ -990,9 +1023,16 @@ cursor.** What it adds to the pattern:
     warning names the mounts), through the same gate and bounded worker as a mount. A sweep
     whose worker did not return (`sweep_pending`: gate closed, call rejected or timed out) runs
     before the first offline mount that finds the gate open. Every other outcome completes it,
-    so it is one attempt per start: a refused unload, a missing privilege, a partial HKU
-    listing (`enumerate_hku_subkeys` has no error channel) or an exception is not retried this
-    run, and what it missed waits for the next start or `reg unload`. It is process-wide, so a
+    so it is one attempt per start: a refused unload, a missing privilege or an exception is not
+    retried this run, and what it missed waits for the next start or `reg unload`. The one
+    exception is the HKU listing: the sweep lists through `enumerate_hku_subkeys_checked`
+    (`agents/shared/win_profiles.hpp`), which reports a failed or unstable walk instead of a
+    short list, and a sweep that could not list (`HiveSweepResult::listing_error`, the cause;
+    nothing offered to the unload) stays pending for exactly one retry, before the next offline
+    mount, then completes (`settle_sweep`). Each failed listing logs one `hku_list_incomplete`
+    warning naming the cause, so the second one completes the sweep; a host that never mounts a
+    logged-off hive does not retry, and what the sweep missed waits for the next start or
+    `reg unload`. It is process-wide, so a
     sibling plugin's leftover goes too; a mount of a second agent process in its handle-less
     window could also be unloaded: an out-of-process mount is unguarded (`win_reg_handle.hpp`),
     and that is the default shape on the shared CI pools.
