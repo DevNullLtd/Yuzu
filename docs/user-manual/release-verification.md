@@ -351,8 +351,9 @@ holds no vulnerable component: read the marker yourself, as below.
 **The SBOM is not an attribution source yet.** Every vcpkg library carries the
 licence vcpkg records, but its copyright text (SPDX `copyrightText`) is
 `NOASSERTION`, because vcpkg's records hold none; the release would carry one
-over if they did. Third-party attribution for the release is in `NOTICE`, which
-is not generated from these SBOMs.
+over if they did. Third-party attribution for the release is in the source
+repository's `NOTICE` and the per-component `*-NOTICE.txt` files, which are not
+yet packaged with the release artefacts and are not generated from these SBOMs.
 
 SBOMs of releases before this change were a scan of the whole build workspace
 and list thousands of components (the vcpkg ports catalogue among them) that

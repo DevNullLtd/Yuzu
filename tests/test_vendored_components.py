@@ -160,20 +160,28 @@ class ScratchCopy(unittest.TestCase):
             c["notice"] = (c.get("notice") or []) + [rel]
         self.edit_manifest(add)
 
+    def unname_notice(self, cid, rel):
+        def drop(m):
+            c = next(c for c in m["components"] if c["id"] == cid)
+            c["notice"] = [n for n in c.get("notice") or [] if n != rel]
+            if not c["notice"]:
+                del c["notice"]
+        self.edit_manifest(drop)
+
     def test_notice_with_its_components_hash_passes(self):
-        # A NOTICE beside a vendored file (as #8257 adds for Cytoscape) is
-        # accepted when the component it attributes names it and every hash it
-        # records is one of that component's files.
-        (self.tmp / "server/core/static/cytoscape-NOTICE.txt").write_text(
-            f"SHA-256: {self.CYTOSCAPE_SHA}\nSPDX-License-Identifier: MIT\n", encoding="utf-8")
-        self.name_notice("cytoscape", "server/core/static/cytoscape-NOTICE.txt")
+        # A NOTICE beside a vendored file (#8257's Cytoscape NOTICE, which the
+        # manifest names) is accepted when the component it attributes names it
+        # and every hash it records is one of that component's files.
+        p = self.tmp / "server/core/static/cytoscape-NOTICE.txt"
+        self.assertIn(self.CYTOSCAPE_SHA, p.read_text(encoding="utf-8"))
+        self.assertTrue(any(c["id"] == "cytoscape" and "server/core/static/cytoscape-NOTICE.txt" in c.get("notice", [])
+                            for c in json.loads((self.tmp / MANIFEST).read_text(encoding="utf-8"))["components"]))
         self.assertPasses()
 
     def test_notice_no_component_names_fails(self):
         # An attribution-named file is exempt from listing only as some
         # component's `notice`: otherwise any file could be named *-NOTICE.txt.
-        (self.tmp / "server/core/static/cytoscape-NOTICE.txt").write_text(
-            f"SHA-256: {self.CYTOSCAPE_SHA}\nSPDX-License-Identifier: MIT\n", encoding="utf-8")
+        self.unname_notice("cytoscape", "server/core/static/cytoscape-NOTICE.txt")
         self.assertFails("server/core/static/cytoscape-NOTICE.txt: an attribution file no component in "
                          "vendored-components.json names as its `notice`")
         (self.tmp / "server/core/vendor/qrcodegen/sub").mkdir()

@@ -136,11 +136,12 @@
       "type": "library",
       "version": "3.33.3",
       "version_status": "resolved",
-      "version_source": "The file ends with Wh.version=\"3.33.3\" (it has no banner). Byte-identical to npm cytoscape@3.33.3 dist/cytoscape.esm.min.mjs (checked 2026-11-18). It inlines three small MIT-licensed fragments with their own banners (a Promises/A+ thenable by Ralf S. Engelschall, a Bezier easing generator by Gaetan Renaudeau, a spring generator adapted from Framer.js by Koen Bok); they have no package of their own and are not listed separately.",
+      "version_source": "The file ends with Wh.version=\"3.33.3\" (it has no banner) and server/core/static/cytoscape-NOTICE.txt names release 3.33.3. Byte-identical to npm cytoscape@3.33.3 dist/cytoscape.esm.min.mjs (checked 2026-11-18). It inlines three small MIT-licensed fragments with their own banners (a Promises/A+ thenable by Ralf S. Engelschall, a Bezier easing generator by Gaetan Renaudeau, a spring generator adapted from Framer.js by Koen Bok); they have no package of their own and are not listed separately.",
       "license": "MIT",
       "upstream": "https://github.com/cytoscape/cytoscape.js",
       "download": "https://registry.npmjs.org/cytoscape/-/cytoscape-3.33.3.tgz",
       "purl": "pkg:npm/cytoscape@3.33.3",
+      "notice": ["server/core/static/cytoscape-NOTICE.txt"],
       "files": [
         {
           "path": "server/core/static/cytoscape.min.js",
