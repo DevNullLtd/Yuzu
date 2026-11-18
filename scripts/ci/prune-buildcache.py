@@ -22,7 +22,10 @@ fails the next build that imports it ("NotFound content"). So:
   - As defence in depth against a writer that does not take the lock (a tag
     cut before the lock existed, a hand-run build), a directory with any file
     modified in the last --quiet-hours (default 3, above the longest publish
-    job's 120-minute timeout) is skipped too.
+    job's 120-minute timeout) is skipped too. A file dated more than
+    FUTURE_SLACK_S ahead of the clock (a clock that stepped back, or a forward-
+    dated file) would make that window never end, so it is an ERROR (exit 1,
+    reported), not a silent skip every week.
   - The referenced set is every sha256 digest found anywhere in index.json and,
     recursively, in every referenced blob that parses as JSON (OCI indexes and
     manifests, image configs, the BuildKit cache config, which names layers
@@ -34,8 +37,11 @@ fails the next build that imports it ("NotFound content"). So:
     whatever this script does, so, under the lock and outside the quiet window,
     it is removed whole: the next build runs cold instead of failing.
   - A directory this script cannot reason about (an entry it cannot read, a
-    JSON blob nested too deeply to parse, a non-regular entry under blobs/) is
-    skipped and reported as an ERROR; nothing in it is removed.
+    JSON blob nested too deeply to parse, a blob that starts like JSON but is
+    larger than MAX_JSON_BLOB, a non-regular entry under blobs/) is skipped and
+    reported as an ERROR; nothing in it is removed. (Treating an oversize JSON
+    blob as a layer would lose the references it holds, and remove blobs a
+    manifest still needs.)
   - A symlinked cache directory or lock file is refused (skipped as an error).
 
 Clock-guard disposition (docs/clock-guarded-retention.md register,
@@ -65,6 +71,9 @@ import time
 DIGEST = re.compile(r"\Asha256:[0-9a-f]{64}\Z")
 HEXNAME = re.compile(r"\A[0-9a-f]{64}\Z")
 MAX_JSON_BLOB = 64 * 1024 * 1024
+# How far ahead of the clock a file's mtime may be before the clock or the file
+# is treated as wrong (an ERROR) rather than as a write in progress.
+FUTURE_SLACK_S = 3600
 
 
 class Broken(Exception):
@@ -112,13 +121,14 @@ def load_json_blob(path):
         st = os.lstat(path)
         if not stat.S_ISREG(st.st_mode):
             raise Unknown(f"blob {os.path.basename(path)[:12]} is not a regular file")
-        if st.st_size > MAX_JSON_BLOB:
-            return None
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
         with os.fdopen(fd, "rb") as f:
             head = f.read(1)
             if head not in (b"{", b"["):
                 return None
+            if st.st_size > MAX_JSON_BLOB:
+                raise Unknown(f"blob {os.path.basename(path)[:12]} starts like JSON but is larger than "
+                              f"{MAX_JSON_BLOB // 2**20} MiB; its references cannot be read")
             data = head + f.read()
     except OSError as e:
         raise Unknown(f"cannot read blob {os.path.basename(path)[:12]} ({e})")
@@ -216,7 +226,12 @@ def prune(cache, min_age_h=24.0, quiet_h=3.0, dry_run=False, now=None, after_swe
 
 def _prune_locked(cache, min_age_h, quiet_h, dry_run, now, after_sweep):
     now = time.time() if now is None else now
-    if now - newest_mtime(cache) < quiet_h * 3600:
+    newest = newest_mtime(cache)
+    if newest - now > FUTURE_SLACK_S:
+        return False, (f"{cache}: ERROR: skipped, nothing removed (a file is dated "
+                       f"{(newest - now) / 3600:.1f} h in the future: the clock or that file's time is wrong, "
+                       f"and the quiet window would never end)")
+    if now - newest < quiet_h * 3600:
         return True, f"{cache}: skipped (written in the last {quiet_h:g} h; a build may be using it)"
     try:
         with open(os.path.join(cache, "index.json"), "rb") as f:

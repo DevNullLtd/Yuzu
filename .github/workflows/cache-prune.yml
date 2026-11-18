@@ -70,13 +70,25 @@ jobs:
           # genuinely stale (no release used it). Within a dir that IS used,
           # superseded blobs pile up: the next step removes those. Linux-only
           # (the chisel C++ builds run on the self-hosted Big Tam Linux runner).
+          # Each removal takes the directory's lock exclusively without waiting
+          # (the same <dir>.lock the publish jobs hold shared,
+          # scripts/ci/buildcache-lock.sh), so a directory a publish job is
+          # using is skipped, never removed under it.
           bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
           if [[ ! -d "$bc" ]]; then
             echo "::notice::buildx cache dir $bc not present — skipping"
             exit 0
           fi
           before=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
-          find "$bc" -maxdepth 1 -type d -name '*-chisel' -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+          while IFS= read -r -d '' d; do
+            rc=0
+            flock --exclusive --nonblock --conflict-exit-code 75 "$d.lock" rm -rf -- "$d" || rc=$?
+            case "$rc" in
+              0) echo "removed stale $d" ;;
+              75) echo "::notice::$d skipped: in use (a publish job holds $d.lock)" ;;
+              *) echo "::warning::$d: could not lock or remove it (exit $rc)" ;;
+            esac
+          done < <(find "$bc" -maxdepth 1 -type d -name '*-chisel' -mtime +30 -print0)
           after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           echo "buildx chisel cache: before=${before} after=${after}"
 

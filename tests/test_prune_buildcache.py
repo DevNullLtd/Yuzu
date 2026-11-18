@@ -116,6 +116,60 @@ class PruneBuildcache(unittest.TestCase):
         self.prune()
         self.assertEqual(self.blobs(), current | {young})
 
+    # ── G8P3-cpp-safety-1: a future mtime is an error, not a silent skip ──
+    def test_file_dated_in_the_future_is_an_error_not_a_silent_skip(self):
+        export(self.cache, [b"a"])
+        export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        before = self.blobs()
+        f = self.cache / "blobs" / "sha256" / sorted(before)[0]
+        t = time.time() + 2 * 3600
+        os.utime(f, (t, t))
+        ok, line = pb.prune(str(self.cache))
+        self.assertFalse(ok, line)
+        self.assertIn("dated", line)
+        self.assertIn("in the future", line)
+        self.assertEqual(self.blobs(), before)
+        # Within the slack it is a write in progress: skipped quietly.
+        t = time.time() + 600
+        os.utime(f, (t, t))
+        ok, line = pb.prune(str(self.cache))
+        self.assertTrue(ok, line)
+        self.assertIn("written in the last", line)
+
+    # ── G8P3-cpp-safety-2: an oversize JSON blob is not read as a layer ──
+    def test_oversize_json_blob_skips_the_directory(self):
+        export(self.cache, [b"a"])
+        current = export(self.cache, [b"b"])
+        age_all(self.cache, 2 * DAY)
+        before = self.blobs()
+        orig = pb.MAX_JSON_BLOB
+        pb.MAX_JSON_BLOB = 100  # the manifests and config here are larger
+        self.addCleanup(setattr, pb, "MAX_JSON_BLOB", orig)
+        ok, line = pb.prune(str(self.cache))
+        self.assertFalse(ok, line)
+        self.assertIn("starts like JSON but is larger than", line)
+        self.assertEqual(self.blobs(), before)
+        pb.MAX_JSON_BLOB = orig
+        self.assertTrue(pb.prune(str(self.cache))[0])
+        self.assertEqual(self.blobs(), current)
+
+    def test_oversize_layer_is_still_a_layer(self):
+        # Over the cap but not JSON (gzip magic): read as a layer, as before.
+        export(self.cache, [b"a"])
+        current = export(self.cache, [b"b" * 5000])
+        age_all(self.cache, 2 * DAY)
+        sizes = {h: os.path.getsize(self.cache / "blobs" / "sha256" / h) for h in current}
+        json_max = max(n for h, n in sizes.items()
+                       if (self.cache / "blobs" / "sha256" / h).read_bytes()[:1] in (b"{", b"["))
+        self.assertGreater(max(sizes.values()), json_max)
+        orig = pb.MAX_JSON_BLOB
+        pb.MAX_JSON_BLOB = json_max
+        self.addCleanup(setattr, pb, "MAX_JSON_BLOB", orig)
+        ok, line = pb.prune(str(self.cache))
+        self.assertTrue(ok, line)
+        self.assertEqual(self.blobs(), current)
+
     def test_dry_run_removes_nothing(self):
         export(self.cache, [b"a"])
         export(self.cache, [b"b"])
@@ -395,6 +449,36 @@ class CachePruneWiring(unittest.TestCase):
         self.assertIn('"${tc%/work-*/_tool}"/work-*/_tool/yuzu-docker-buildcache', step)
         self.assertIn("python3 -I scripts/ci/prune-buildcache.py", step)
         self.assertIn('exit "$rc"', step)
+
+    @unittest.skipUnless(shutil.which("flock") and shutil.which("bash"), "needs flock(1) and bash")
+    def test_stale_chisel_sweep_skips_a_locked_directory(self):
+        # G8P3-cpp-safety-3: the 30-day chisel sweep removed a directory whole
+        # with `rm -rf`, ignoring the lock a publish job holds on it. Run the
+        # step's own script against a scratch tool cache.
+        text = CACHE_PRUNE.read_text(encoding="utf-8")
+        i = text.index("- name: Prune buildx chisel local cache older than 30 days")
+        step = text[i:text.index("\n      - ", i + 10)]
+        body = step[step.index("run: |\n") + len("run: |\n"):]
+        script = "\n".join(ln[10:] for ln in body.splitlines())
+        tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_chisel_sweep_"))
+        self.addCleanup(shutil.rmtree, tmp, ignore_errors=True)
+        bc = tmp / "yuzu-docker-buildcache"
+        old = time.time() - 40 * DAY
+        for name in ("server-chisel", "agent-chisel", "gateway-chisel", "server"):
+            (bc / name / "blobs").mkdir(parents=True)
+            os.utime(bc / name, (old, old))
+        os.utime(bc / "gateway-chisel", None)  # used recently: not stale
+        fd = os.open(str(bc / "agent-chisel") + ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+        self.addCleanup(os.close, fd)
+        fcntl.flock(fd, fcntl.LOCK_SH)  # a publish job is using agent-chisel
+        r = subprocess.run(["bash", "-c", script], env=dict(os.environ, RUNNER_TOOL_CACHE=str(tmp)),
+                           capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertFalse((bc / "server-chisel").exists(), r.stdout)
+        self.assertTrue((bc / "agent-chisel" / "blobs").is_dir(), "a locked directory was removed")
+        self.assertIn("agent-chisel skipped: in use", r.stdout)
+        self.assertTrue((bc / "gateway-chisel").is_dir())
+        self.assertTrue((bc / "server").is_dir())
 
 
 if __name__ == "__main__":
