@@ -21,7 +21,7 @@ branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstone
 `feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
-Issue #6590 holds three open owner rulings on the CRL store contract that 2b-1b depends on.
+Issue #6590 holds three open questions on the CRL store contract that the owner must settle before 2b-1b.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1339,6 +1339,32 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 **Decided (ADR-0070 §D5 as amended by R1; §D12 "Registered-CRL revocation
 (R1)"):** everything R1 requires is binding. This section designs it.
 
+### Standing invariants
+
+The routed-concern row for this surface (`.claude/routed-concerns-security-posture.md`) is the
+review trigger; these are the invariants it routes to. Each holds for 2b-1a as shipped and binds
+every later 2b PR.
+
+1. **Admin-only in both RBAC states, not grantable.** Every route and MCP tool passes
+   `revocation_source_admin_gate.hpp` (the `is_rbac_administrator` predicate, extended never
+   forked, with the regime re-check on writes) as well as the `RevocationSource` securable. A
+   custom role holding the securable is refused: the URL list and fetch status would make the
+   fetcher a request-forgery and port-scan oracle.
+2. **A registered CA certificate is data, never a trust anchor.** A CRL is checked against it; the
+   surface never touches `ca_store` or any PKI decision path (ADR-0070 D6).
+3. **Every host is classified through `oidc_egress_policy.hpp`** at registration, and the 2b-1b
+   fetcher must classify it again on every fetch. The never-allowed tier, loopback and every
+   address the server is bound to are refused with no override; an embedded-IPv4 form is judged
+   by the address it embeds; an undeclared local-use NAT64 address is refused; every other class
+   must be in `confirmed_address_classes`. Only registered URLs are fetched, never one a
+   certificate names.
+4. **Anti-rollback marks survive a remove.** `rollback_high_water` is keyed by the CA, not the
+   source; only the audited high-water reset clears it.
+5. **Audit first.** Every mutation writes its `attempted` audit row before the store call and
+   changes nothing when that row cannot be stored.
+
+Open before the fetcher: the three CRL store contract questions in #6590.
+
 ### Registration
 
 **Decided:**
@@ -1515,8 +1541,8 @@ review, as a new egress surface.
   high-water reset (`revocation_source_store.cpp`), not the global sequence
   (`revocation_source.config_seq`) this design first proposed. Because ids are never reused, a
   `DELETE` followed by a re-register still cannot reproduce an earlier (source id,
-  `config_version`) pair. Whether the design or the code changes to match is one of the #6590
-  rulings, settled before 2b-1b. Before a fetch, the
+  `config_version`) pair. Whether the design or the code changes to match is one of the open #6590
+  questions, settled before 2b-1b. Before a fetch, the
   job snapshots the source's `config_version`, the URL and the key set. The acceptance transaction
   locks the `source` row (`FOR UPDATE`) and stores the CRL only if `config_version` is unchanged and
   the URL is still registered; otherwise it discards the CRL, records cause `config_changed`,

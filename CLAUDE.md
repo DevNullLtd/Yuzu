@@ -84,8 +84,9 @@ One row per concern — catastrophic-if-violated invariants, routed doc, loading
 four files solely for the per-file ceiling: the first holds platform/product/data/observability
 concerns, the second auth, access-control, and request-admission chokepoints, the third the
 read-only security-posture plugin rows, the gateway rows (upstream peer authorization, origin
-trust), the same-site write-gate row and the registered-CRL-source row, the fourth Forensics / per-user-software-data concerns
-(the third and fourth are the Wave 8 and Wave 10 splits). Same authority as this file.
+trust), the same-site write-gate row and the registered-CRL-source row, the fourth Forensics /
+per-user-software-data concerns (the third and fourth are the Wave 8 and Wave 10 splits). Same
+authority as this file.
 
 @.claude/routed-concerns.md
 @.claude/routed-concerns-access-control.md

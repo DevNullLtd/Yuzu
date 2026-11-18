@@ -10,9 +10,10 @@
 /// CHECKS a CRL against; it is never a trust anchor, an issuer, or a TLS root for any Yuzu
 /// decision path.
 ///
-/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates every table
-/// the design names; whether the fetcher (2b-1b) needs a migration (the `crl` table's `scope_key`
-/// encoding and uniqueness, canonical URLs) waits on the #6590 rulings. `fetch_status`, `crl`,
+/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables the
+/// fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. Whether
+/// 2b-1b still needs a migration (the `crl` table's `scope_key` encoding and uniqueness, canonical
+/// URLs) depends on the open #6590 questions. `fetch_status`, `crl`,
 /// `crl_entry` and
 /// `rollback_high_water` exist, are READ here (a source's fetch status, its held-CRL count) and
 /// are deleted with their source / URL / key, but nothing in this PR inserts into `crl` or
