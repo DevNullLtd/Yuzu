@@ -392,10 +392,10 @@ groups:
             no server identity: read yuzu_server_identity_uri_present on the
             server; 0 means the in-place re-issue was skipped or failed (see
             YuzuServerIdentityUriAbsent: fix the cause and restart the server,
-            which needs no gateway restart); absent means the server runs a
-            build that does not mint the identity or is not being scraped
-            (every server and gateway runs the same build; run the server
-            from the gateway's build). (2) The server uses its own
+            which needs no gateway restart); absent means the server is not
+            being scraped (restore its scrape target and re-read it) or runs
+            a build that does not mint the identity (every server and gateway
+            runs the same build; run the server from the gateway's build). (2) The server uses its own
             certificates (bring-your-own, --no-default-certs, or its own
             --cert/--key), which carry no identity: set {yuzu_gw,
             mgmt_peer_auth_mode} to pin with that certificate's pin. That

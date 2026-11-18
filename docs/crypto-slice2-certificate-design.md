@@ -1613,8 +1613,9 @@ review, as a new egress surface.
 - The **last good CRL** is kept on every failure. A failure, including `over_size_bound`, updates
   only the URL's fetch status. A certificate reads `over_size_bound` only when no verified CRL is
   held for its scope; otherwise it is judged on the held CRL, with that CRL's `nextUpdate` shown.
-- **The cost of a replace.** A new CRL for a scope is written in one transaction that inserts the
-  new entries before deleting the old, so a scope never reads with no entries. It runs only in the
+- **The cost of a replace.** A new CRL for a scope replaces the held one by delete-then-insert
+  (the owner's #6590 ruling) in one transaction, so a reader sees either the old CRL or the new
+  one and a scope never reads with no entries. It runs only in the
   refresh job, off every request path, under its own statement timeout. An unchanged CRL (a 304, or
   the same number and bytes) writes nothing, so a large, stable CRL costs one conditional GET per
   cadence. A CA that reissues a 1M-entry CRL hourly costs a 1M-row insert and delete per hour; the
