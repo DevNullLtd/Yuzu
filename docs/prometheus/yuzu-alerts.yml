@@ -392,9 +392,10 @@ groups:
             no server identity: read yuzu_server_identity_uri_present on the
             server; 0 means the in-place re-issue was skipped or failed (see
             YuzuServerIdentityUriAbsent: fix the cause and restart the server,
-            which needs no gateway restart); absent means the server runs a
-            release that does not mint the identity or is not being scraped
-            (upgrade the server first). (2) The server uses its own
+            which needs no gateway restart); absent means the server is not
+            being scraped (restore its scrape target and re-read it) or runs
+            a build that does not mint the identity (every server and gateway
+            runs the same build; run the server from the gateway's build). (2) The server uses its own
             certificates (bring-your-own, --no-default-certs, or its own
             --cert/--key), which carry no identity: set {yuzu_gw,
             mgmt_peer_auth_mode} to pin with that certificate's pin. That
@@ -6574,8 +6575,8 @@ groups:
         # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
         # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
         # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
-        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
-        # upgrade ahead of the server) is stuck.
+        # freezes and nothing else shows it. Sustained = a device (or a fleet of agents on a
+        # different build from the server, outside the deployment contract) is stuck.
         # increase over a day with NO hold: a single device refused once a day is enough, and a
         # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
         expr: |
@@ -6589,8 +6590,10 @@ groups:
           description: >-
             yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
             error/budget_exceeded) increased in the last day. The affected devices'
-            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
-            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent on a
+            different build from the server, outside the deployment contract
+            (every agent and server runs the same build; reprovision the agent
+            from the server's build); bad_header / over_cap / blob_too_large = a
             malformed or oversize report - find the agent in the warn log line
             "certificate_inventory: blob from agent=... refused".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
