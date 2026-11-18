@@ -579,6 +579,24 @@ TEST_CASE("walk_ordered: unknown identities never trigger other_device; a known 
         CHECK(res.restarted);
         CHECK(r.visits == Strs{"/r/a/x"}); // from its first entry: the resume point "x" is not skipped
     }
+    SECTION("per half: a recorded file id that reads unknown is a change even when the device matches") {
+        r.ids["/r/a"] = {1, 0}; // device reported and equal, file id now unreported
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 9}}, "x"}, one);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a/x"});
+    }
+    SECTION("per half: a recorded file id alone (device never known) that reads unknown is a change") {
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 0, 9}}, "x"}, one);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a/x"});
+    }
+    SECTION("per half: a half the record left unknown and the listing now reports is refinement") {
+        r.ids["/r/a"] = {1, 9};
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 0}}, "x"}, one);
+        CHECK(!res.restarted);
+        CHECK(r.visits == Strs{"/r/a/y"});
+        CHECK(res.position.dirs == std::vector<fsr::Frame>{{"a", 1, 9}}); // the reading is learned
+    }
     SECTION("recorded root known, listing unknown: a change, the whole root starts again") {
         const auto res = slice(r, fsr::Position{4, 4, {{"a", 0, 0}}, "x"}, one);
         CHECK(res.restarted);
