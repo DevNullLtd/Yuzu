@@ -16,7 +16,8 @@ The unit tests drive the pure formatters directly, so a plugin leg reverted to a
   * wmi_plugin.cpp: format_row_line once and format_property_line once, no raw row/property row;
   * filesystem_plugin.cpp: row_field on list_dir's entry name and the Windows version-info value;
     filesystem_search_dir.hpp: search_dir's `result|` row is built in one place, format_result_row,
-    which passes the path through row_field, and the walk emits only through it (#6478).
+    which passes the path through row_field, and the walk emits only through it; the plugin calls
+    that walk once and writes each row it is handed unchanged (#6478).
 
 A tripwire, not proof: it counts spellings in comment-stripped source. Self-checks run in
 memory against deliberately broken copies.
@@ -82,6 +83,9 @@ def check(files: dict) -> list:
             errs.append(f"filesystem_search_dir.hpp: expected {needle} once")
     if (fsx + sdh).count('"result|') != 1:
         errs.append('filesystem: a "result|" row is built outside format_result_row')
+    passthrough = r"sd::walk_search_dir\([^;]*\[&\]\(const std::string& row\)\s*\{\s*ctx\.write_output\(row\);\s*\}\);"
+    if fsx.count("sd::walk_search_dir(") != 1 or not re.search(passthrough, fsx):
+        errs.append("filesystem_plugin.cpp: expected one sd::walk_search_dir call that writes each row unchanged")
     return errs
 
 
@@ -129,6 +133,9 @@ def main() -> int:
     bad = dict(files)
     bad["filesystem"] = files["filesystem"] + 'ctx.write_output(std::format("result|{}|{}", entry_path, type_str));'
     assert check(bad), "self-check: raw search_dir row in the plugin not caught"
+    bad = dict(files)
+    bad["filesystem"] = files["filesystem"].replace("sd::walk_search_dir(", "walk_by_hand(", 1)
+    assert check(bad), "self-check: search_dir bypassing the walk not caught"
     # dead code and the fmt:: spelling: a call site in `#if 0` does not count, and a raw
     # fmt::format("proxy_address|...") is as bad as the std:: one
     dead = strip_comments("#if 0\nyuzu::network_config::format_proxy_address_row(x);\n#endif\nint y;")

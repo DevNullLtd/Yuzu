@@ -228,7 +228,7 @@ TEST_CASE("filesystem search_dir: regex mode matches, and a nested-quantifier re
 
 TEST_CASE("filesystem search_dir: a regex lookahead is refused before it reaches the engine",
           "[filesystem][search_dir][dispatcher]") {
-    // Nesting depth 3 at most: unrefused it returns at once (rc 0, total_matches|0),
+    // Nesting depth 3 at most: unrefused, each pattern returns at once without the refusal row,
     // so a missing check FAILS this case and never hangs it. Deeper shapes are pinned on the pure
     // predicate (test_filesystem_search_dir.cpp) and never executed.
     auto plugin = load_or_fail();
