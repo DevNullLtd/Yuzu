@@ -4681,7 +4681,10 @@ groups:
             "no free connection slots" (slot exhaustion, the #4943 shape) or "no
             writable host" (read-only or standby only)), never libpq's connect text,
             which can quote part of a DSN password; for a failed probe query it
-            carries the failing step plus the first line of libpq's message. Probe
+            carries the failing step plus the first line of libpq's message (the libpq
+            portion is folded and capped at 120 bytes, the step name is added to it),
+            and a failure matching no fixed cause logs the step followed by
+            "(libpq details withheld)". Probe
             from the server host with psql against the same DSN for more detail, check the
             database, and the network or proxy path to it.
             read_only means the probe reached a server that refuses writes: a
