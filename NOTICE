@@ -40,8 +40,9 @@ Third-party attributions
 ------------------------
 This distribution incorporates or links the following third-party
 libraries. Their individual licenses, copyrights and notices apply to
-those components and are retained within the distributed artefacts. This
-section is maintained manually; see `vcpkg.json` and
+those components. This file and the per-component `*-NOTICE.txt` files
+are kept in the source repository; they are not yet packaged with the
+release artefacts. This section is maintained manually; see `vcpkg.json` and
 `gateway/rebar.config` for the authoritative dependency lists.
 
   gRPC .................................. Apache-2.0
