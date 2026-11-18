@@ -25,7 +25,10 @@ class ExistsNoRawFallback(unittest.TestCase):
         b = self.body()
         i = b.index("path_refusal(path)")
         branch = b[i - 40:b.index("validate_path_or_parent(")]
-        self.assertIn("yuzu::shared::local_path::refused(refusal)", branch)
+        # The EXACT condition: any extra clause (`; false && ...`) or a different test fails here.
+        self.assertIn(
+            "if (const auto refusal = path_refusal(path); yuzu::shared::local_path::refused(refusal)) {",
+            branch)
         self.assertNotRegex(branch, r"if\s*\(\s*(false|0)\b")
         self.assertIn("return 1;", branch)
         self.assertIn('"error|{}"', branch)

@@ -15,6 +15,7 @@
 #include "test_helpers.hpp"
 
 #include <bounded_file_hash.hpp>
+#include <bounded_wait.hpp>
 #ifndef _WIN32
 #include <image_hash_cache.hpp>
 #endif
@@ -155,6 +156,32 @@ TEST_CASE("network_fstype: network-capable FUSE clients and the legacy network t
     for (const char* t : {"ext4", "xfs", "btrfs", "tmpfs", "overlay", "fuse", "fuse.portal",
                           "fuse.lxcfs", "fuse.gvfsd-fuse", "proc", "sysfs"})
         CHECK_FALSE(yuzu::shared::is_network_fstype(t));
+}
+
+TEST_CASE("network_fstype: every listed network FUSE suffix and every known-local FUSE suffix",
+          "[shared][network_fstype]") {
+    for (const char* sfx : {"sshfs", "s3fs", "davfs", "rclone", "cephfs", "glusterfs", "nfs", "smb",
+                            "ceph-fuse", "vmhgfs-fuse", "prl_fsd", "gcsfuse", "goofys", "blobfuse",
+                            "blobfuse2", "ossfs", "obsfs", "cosfs", "juicefs", "mfsmount", "moosefs",
+                            "lizardfs", "seaweedfs", "weed", "curlftpfs", "httpfs2", "s3ql", "onedrive",
+                            "google-drive-ocamlfuse", "davfs2", "fuse-nfs"}) {
+        INFO(sfx);
+        CHECK(yuzu::shared::is_network_fstype(std::string("fuse.") + sfx));
+    }
+    // The ten known-local subtypes: never reported by the strict reading, and the lax one never
+    // lists them either.
+    const std::vector<std::string> local = {"portal", "gvfsd-fuse", "lxcfs", "snapfuse", "squashfuse",
+                                            "ntfs-3g", "ntfs3g", "fuseiso", "archivemount", "encfs"};
+    std::string text;
+    int id = 40;
+    for (const auto& l : local) {
+        CHECK(yuzu::shared::is_known_local_fuse_suffix(l));
+        text += std::to_string(id++) + " 22 0:9 / /mnt/" + l + " rw - fuse." + l + " src rw\n";
+    }
+    CHECK(yuzu::shared::network_mount_points(text, /*strict=*/true).empty());
+    CHECK(yuzu::shared::network_mount_points(text, /*strict=*/false).empty());
+    CHECK_FALSE(yuzu::shared::is_known_local_fuse_suffix("sshfs"));
+    CHECK_FALSE(yuzu::shared::is_known_local_fuse_suffix(""));
 }
 
 TEST_CASE("network_fstype: the strict reading adds unlisted FUSE and overlays over network mounts",
@@ -503,6 +530,7 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     const auto key1 = yuzu::shared::image_identity_key(a);
 
     // The SAME path text now names different content (rewritten in place: same inode): a different key.
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
     { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "a different, longer image"; }
     REQUIRE(::stat(exe.c_str(), &b) == 0);
     CHECK(a.st_ino == b.st_ino);
@@ -519,6 +547,9 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
 
     // The forgery the key must survive: replace the contents in place with the SAME size and put the
     // old mtime back with utimensat(). mtime and size are the file owner's to forge; ctime is not.
+    // Kernels before 6.13 stamp ctime at jiffy granularity (up to 10 ms): let the clock move first so
+    // the rewrite below cannot share the previous ctime tick.
+    std::this_thread::sleep_for(std::chrono::milliseconds(40));
     { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "z DIFFERENT, LONGER IMAGE"; }
     struct timespec back[2] = {{c.st_atim.tv_sec, c.st_atim.tv_nsec}, {c.st_mtim.tv_sec, c.st_mtim.tv_nsec}};
     REQUIRE(::utimensat(AT_FDCWD, exe.c_str(), back, 0) == 0);
@@ -528,7 +559,13 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     CHECK(d.st_size == c.st_size);
     CHECK(d.st_mtim.tv_sec == c.st_mtim.tv_sec);
     CHECK(d.st_mtim.tv_nsec == c.st_mtim.tv_nsec);
-    CHECK(yuzu::shared::image_identity_key(c) != yuzu::shared::image_identity_key(d)); // ctime moved
+    if (c.st_ctim.tv_sec == d.st_ctim.tv_sec && c.st_ctim.tv_nsec == d.st_ctim.tv_nsec) {
+        // A filesystem whose ctime did not advance in 40 ms (a coarse-ctime kernel or a mount with no
+        // sub-second ctime): the forgery cannot be distinguished here. Never red on that.
+        WARN("ctime did not advance on this filesystem/kernel: the forgery assertion is skipped");
+    } else {
+        CHECK(yuzu::shared::image_identity_key(c) != yuzu::shared::image_identity_key(d)); // ctime moved
+    }
 
     // The cache returns what was stored under a key and nothing for another.
     yuzu::shared::ImageHashCache cache;
@@ -542,6 +579,57 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
         bounded.put("k" + std::to_string(i), "h");
     CHECK_FALSE(bounded.get("k0").has_value());
     CHECK(bounded.get("k8199").has_value());
+}
+
+#ifdef __linux__
+TEST_CASE("local_path: the open-time filesystem check refuses network, FUSE and pseudo types",
+          "[shared][local_path]") {
+    namespace d = lp::detail;
+    using R = lp::Refusal;
+    for (const unsigned long t : {0x6969ul /*NFS*/, 0x517Bul /*SMB*/, 0xFE534D42ul /*SMB2*/,
+                                  0xFF534D42ul /*CIFS*/, 0x00C36400ul /*CEPH*/, 0x65735546ul /*FUSE*/,
+                                  0x01021997ul /*9P*/, 0x5346414Ful /*AFS*/, 0x73757245ul /*CODA*/,
+                                  0x564Cul /*NCP*/, 0x0BD00BD0ul /*LUSTRE*/, 0x47504653ul /*GPFS*/,
+                                  0x7461636ful /*OCFS2*/, 0x01161970ul /*GFS2*/}) {
+        INFO(std::hex << t);
+        CHECK(d::refusal_for_fs_type(t) == R::network_or_device);
+    }
+    for (const unsigned long t : {0x9fa0ul /*proc*/, 0x62656572ul /*sysfs*/, 0x64626720ul /*debugfs*/,
+                                  0x27e0ebul /*cgroup*/, 0x63677270ul /*cgroup2*/, 0x73636673ul /*securityfs*/,
+                                  0x74726163ul /*tracefs*/, 0xcafe4a11ul /*bpf*/}) {
+        INFO(std::hex << t);
+        CHECK(d::refusal_for_fs_type(t) == R::pseudo_filesystem);
+    }
+    for (const unsigned long t : {0xEF53ul /*ext4*/, 0x01021994ul /*tmpfs*/, 0x9123683Eul /*btrfs*/,
+                                  0x58465342ul /*xfs*/, 0x794c7630ul /*overlayfs*/})
+        CHECK(d::refusal_for_fs_type(t) == R::none);
+}
+#endif
+
+TEST_CASE("bounded_wait: a helper slot is released by the worker, completed or timed out",
+          "[shared][bounded_wait]") {
+    namespace sh = yuzu::shared;
+    const auto settled = [](int want) {
+        for (int i = 0; i < 400; ++i) {
+            if (sh::detail::g_outstanding_bounded_calls.load() == want)
+                return true;
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return false;
+    };
+    const int base = sh::detail::g_outstanding_bounded_calls.load();
+    // Completed: the slot is released.
+    auto done = sh::bounded_call_ex(std::chrono::seconds(5), [] { return 7; });
+    CHECK(done.status == sh::BoundedCallStatus::Completed);
+    CHECK(settled(base));
+    // Timed out: the caller returns, the worker still holds the slot, and RELEASES it when it ends.
+    auto slow = sh::bounded_call_ex(std::chrono::milliseconds(30), [] {
+        std::this_thread::sleep_for(std::chrono::milliseconds(400));
+        return 1;
+    });
+    CHECK(slow.status == sh::BoundedCallStatus::TimedOut);
+    CHECK(sh::detail::g_outstanding_bounded_calls.load() == base + 1); // still held by the worker
+    CHECK(settled(base));                                               // released by the worker
 }
 
 TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
@@ -646,9 +734,14 @@ TEST_CASE("outbound: IPv6 classes including the embedded-IPv4 forms", "[shared][
     CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 169, 254, 169, 254}) ==
           ob::AddressClass::LinkLocal);
     CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 8, 8, 8, 8}) == ob::AddressClass::Public);
-    // IPv4-compatible ::a.b.c.d (deprecated) is never public.
+    // IPv4-compatible ::a.b.c.d (deprecated) is classified by the embedded address, never public.
     CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 8, 8, 8, 8}) == ob::AddressClass::OtherNonGlobal);
-    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1}) == ob::AddressClass::OtherNonGlobal);
+    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1}) == ob::AddressClass::Loopback);
+    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254}) == ob::AddressClass::LinkLocal);
+    // SIIT ::ffff:0:a.b.c.d: the same.
+    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 169, 254, 169, 254}) == ob::AddressClass::LinkLocal);
+    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 8, 8, 8, 8}) == ob::AddressClass::OtherNonGlobal);
+    CHECK(v6({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 10, 0, 0, 5}) == ob::AddressClass::Private);
     // NAT64 well-known prefix 64:ff9b::/96: embedded IPv4 decides; local-use 64:ff9b:1::/48 refuses.
     CHECK(v6({0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1}) ==
           ob::AddressClass::Loopback);

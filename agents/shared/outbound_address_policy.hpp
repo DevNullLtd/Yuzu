@@ -84,6 +84,9 @@ enum class AddressClass : std::uint8_t {
     const auto embedded = [&b](std::size_t off) {
         return classify_ipv4(Ipv4{b[off], b[off + 1], b[off + 2], b[off + 3]});
     };
+    const auto narrow_to_non_global = [](AddressClass c) {
+        return c == AddressClass::Public ? AddressClass::OtherNonGlobal : c;
+    };
     bool first12_zero = true;
     for (std::size_t i = 0; i < 12; ++i)
         first12_zero = first12_zero && b[i] == 0;
@@ -93,13 +96,25 @@ enum class AddressClass : std::uint8_t {
             return AddressClass::Unspecified; // ::
         if (b[12] == 0 && b[13] == 0 && b[14] == 0 && b[15] == 1)
             return AddressClass::Loopback; // ::1
-        return AddressClass::OtherNonGlobal; // IPv4-compatible (deprecated)
+        // IPv4-compatible ::/96 (deprecated by RFC 4291): a host stack or translator may still
+        // deliver it to the embedded IPv4 address, so it takes that address's class, never wider
+        // than "non-global" (an embedded public address stays non-global).
+        return narrow_to_non_global(embedded(12));
     }
     bool mapped = true; // ::ffff:0:0/96
     for (std::size_t i = 0; i < 10; ++i)
         mapped = mapped && b[i] == 0;
     if (mapped && b[10] == 0xff && b[11] == 0xff)
         return embedded(12);
+    // ::ffff:0:0:0/96 (SIIT, RFC 2765 IPv4-translated): classified by the embedded address too, never
+    // wider than non-global (the server twin decodes it the same way).
+    {
+        bool first8_zero = true;
+        for (std::size_t i = 0; i < 8; ++i)
+            first8_zero = first8_zero && b[i] == 0;
+        if (first8_zero && b[8] == 0xff && b[9] == 0xff && b[10] == 0 && b[11] == 0)
+            return narrow_to_non_global(embedded(12));
+    }
     if (b[0] == 0x00 && b[1] == 0x64 && b[2] == 0xff && b[3] == 0x9b) { // 64:ff9b::/32
         bool well_known = true; // 64:ff9b::/96
         for (std::size_t i = 4; i < 12; ++i)

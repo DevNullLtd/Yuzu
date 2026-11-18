@@ -128,6 +128,20 @@ TEST_CASE("egress parity: IPv6 prefixes, embedded-IPv4 forms and the AWS IMDS ad
     add({0x20, 0x01, 0, 0x20, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});    // ORCHIDv2 (Public)
     add({0x20, 0x01, 0, 0x02, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});    // benchmarking (non-global)
     add({0x10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1});
+    // SIIT (::ffff:0:a.b.c.d) and IPv4-compatible (::a.b.c.d) addresses: the agent twin decodes the
+    // embedded address (never wider than non-global). The server header decodes them from the
+    // revision that added `no_wider_than_non_global`; where it does not yet, these rows are asserted
+    // agent-side only (test_local_path_policy.cpp) and activate here once the server twin has the decode.
+    const bool server_decodes_siit =
+        srv::classify_ipv6({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254}) ==
+        srv::AddressClass::LinkLocal;
+    if (server_decodes_siit) {
+        add({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 169, 254, 169, 254});       // ::a9fe:a9fe
+        add({0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 127, 0, 0, 1});             // ::7f00:1
+        add({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 169, 254, 169, 254}); // SIIT ::ffff:0:a9fe:a9fe
+        add({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 8, 8, 8, 8});         // SIIT public embedded
+        add({0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 0, 0, 10, 0, 0, 5});        // SIIT private embedded
+    }
     for (const auto& a : table)
         agree_v6(a);
     CHECK(agt::classify_ipv6(table[13]) == agt::AddressClass::Private); // fc00::1
