@@ -338,16 +338,30 @@ struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
 // ctime), never by path text.
 struct ActionCache {
     std::shared_ptr<yuzu::shared::ImageHashCache> identity; // shared with the action's helpers
-    yuzu::shared::ImagePathCache by_path;                   // plugin thread only, consulted first
+    yuzu::shared::ImagePathCache by_path;                   // identity-keyed, plugin thread only, consulted first
 };
 ActionCache make_action_cache() { return {std::make_shared<yuzu::shared::ImageHashCache>(), {}}; }
 
 // The mount namespace of a process, read from procfs (a link read, never the image): part of the
-// by-path key so two containers' identical path text never share a hash. Empty on any failure.
+// cache key so two containers' identical images never share a hash. Empty on any failure.
 std::string mount_ns_of(unsigned long pid) {
     char buf[64];
     const auto n = ::readlink(("/proc/" + std::to_string(pid) + "/ns/mnt").c_str(), buf, sizeof(buf) - 1);
     return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
+}
+
+// `<dev>:<inode>` of the process's executable mapping, read from /proc/<pid>/maps (procfs only: no
+// access to the image's filesystem, so it cannot stall on a hung mount). Empty on any failure
+// (permission, vanished process, no matching mapping).
+std::string image_identity_of(unsigned long pid, const std::string& path) {
+    yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/maps").c_str(), O_RDONLY | O_CLOEXEC)};
+    if (!fd.valid())
+        return {};
+    char buf[8192];
+    const auto n = ::read(fd.fd(), buf, sizeof(buf));
+    if (n <= 0)
+        return {};
+    return yuzu::shared::ImagePathCache::maps_identity(std::string_view(buf, static_cast<std::size_t>(n)), path);
 }
 
 std::string hash_process_image(unsigned long pid, const std::string& path, ActionCache& cache,
@@ -356,10 +370,11 @@ std::string hash_process_image(unsigned long pid, const std::string& path, Actio
     if (path.empty())
         return {};
     const auto now = std::chrono::steady_clock::now();
-    // The by-path cache answers FIRST: once the per-action cap of helpers left behind (or the action
+    // The identity cache (mount namespace + maps device/inode, never path text) answers FIRST: once the per-action cap of helpers left behind (or the action
     // budget) is reached no further helper is started and such a row says so
     // (`hash_unavailable:skipped`), but a row whose image this action already hashed keeps its hash.
-    const auto key = yuzu::shared::ImagePathCache::make_key(mount_ns_of(pid), path);
+    const auto key = yuzu::shared::ImagePathCache::make_key(mount_ns_of(pid),
+                                                            image_identity_of(pid, path));
     return yuzu::shared::hash_row_cached(
         cache.by_path, key, now < action_deadline && budget.may_start(), [&]() -> std::string {
             const auto remaining =
