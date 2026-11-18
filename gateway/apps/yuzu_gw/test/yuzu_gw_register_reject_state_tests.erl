@@ -54,7 +54,7 @@ rejected_with_sid() ->
 
 accepted_empty_sid() ->
     answer(#{session_id => <<>>, accepted => true}),
-    ?assertMatch({grpc_error, {_, _}}, register_agent(<<"rej-3">>)),
+    ?assertMatch({grpc_error, {13, _}}, register_agent(<<"rej-3">>)),
     ?assertEqual([], pending_rows()),
     ?assertEqual(undefined, yuzu_gw_registry:take_pending(<<>>)).
 

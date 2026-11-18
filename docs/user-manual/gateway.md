@@ -3400,7 +3400,8 @@ script loop forever.)
 - **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
   The release tarball ships it (and `yuzu-gateway.service`) inside its single
   top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
-  `tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  `mkdir -p /opt/yuzu_gw && tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  and install the bundled unit to `/etc/systemd/system/` (then `systemctl daemon-reload`)
   (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
   `/opt/yuzu_gw/`). If it is missing the unit fails with
   `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)

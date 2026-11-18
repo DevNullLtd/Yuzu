@@ -197,13 +197,24 @@ chk .github/workflows/release.yml '^[[:space:]]*cp deploy/systemd/yuzu-gateway\.
 
 # V: the empty `-setcookie` that vm.args.src leaves when YUZU_GW_COOKIE is unset is accepted by
 # a real BEAM, which then uses its own per-host random ~/.erlang.cookie (20 chars, created with
-# an isolated HOME here). Skipped when no erl is on PATH. (The in-VM guard then refuses that
-# short cookie unless the dev/CI override is set; the entrypoint-less chisel demo relies on it.)
+# an isolated HOME here). The VM only creates the cookie file once distribution is on (a node
+# without -name never touches it), so the node is named, with a name SALTED per run (the shipped
+# fixed yuzu_gw@127.0.0.1 would collide between concurrent CI jobs sharing one OS identity and
+# one epmd; #1871). It deregisters when the VM halts; an epmd this test had to start itself is
+# killed afterwards, one that was already running is left alone. Without erl on
+# PATH this is a skip locally and a failure under YUZU_REQUIRE_ALL_SHELLS=1 (the CI job builds the
+# gateway, so it always has erl). (The in-VM guard then refuses that short cookie unless the
+# dev/CI override is set; the entrypoint-less chisel demo relies on it.)
 if command -v erl >/dev/null 2>&1; then
     vhome="$work/erlhome"; mkdir -p "$vhome"
-    grep -E '^-(name|setcookie)' "$repo/gateway/config/vm.args.src" | sed 's/\${YUZU_GW_COOKIE:-}//; s/@\${YUZU_GW_ADVERTISE_ADDR:-127.0.0.1}/@127.0.0.1/' > "$work/vm.args"
+    grep -E '^-setcookie' "$repo/gateway/config/vm.args.src" | sed 's/\${YUZU_GW_COOKIE:-}//' > "$work/vm.args"
+    printf -- '-name yuzu_gw_t%s_%s@127.0.0.1\n' "$$" "$RANDOM" >> "$work/vm.args"
+    epmd_was_up=""; epmd -names >/dev/null 2>&1 && epmd_was_up=1
     vout="$(cd "$work" && env -i PATH="$PATH" HOME="$vhome" timeout 60 erl -noshell -args_file "$work/vm.args" -eval 'C=atom_to_list(erlang:get_cookie()), {ok,F}=file:read_file(filename:join(os:getenv("HOME"),".erlang.cookie")), io:format("V len=~p filematch=~p~n",[length(C), binary_to_list(F)=:=C]), halt().' 2>&1)"
+    [ -z "$epmd_was_up" ] && epmd -kill >/dev/null 2>&1
     printf '%s' "$vout" | grep -q "^V len=20 filematch=true" && pass "V empty -setcookie uses ~/.erlang.cookie" || bad "V empty -setcookie" "$vout"
+elif [ "${YUZU_REQUIRE_ALL_SHELLS:-}" = "1" ]; then
+    bad V "no erl on PATH (required under YUZU_REQUIRE_ALL_SHELLS=1)"
 else
     echo "SKIP V: no erl on PATH"
 fi
