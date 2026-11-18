@@ -95,7 +95,9 @@ plaintext_test_() ->
          {"the unary key equals the bidi key on the same connection",
           fun() -> conn_key_unary_vs_bidi(State) end},
          {"the connection ending while a handler sends ends the handler quietly",
-          {timeout, 20, fun() -> send_after_disconnect(State) end}}]
+          {timeout, 20, fun() -> send_after_disconnect(State) end}},
+         {"an over-limit request header list is refused with a stream error and the connection serves the next request",
+          {timeout, 20, fun() -> header_list_over_limit(State) end}}]
      end}.
 
 plain_setup() ->
@@ -116,6 +118,32 @@ plain_cleanup(#{listener := Pid, chans := Chans}) ->
     _ = logger:remove_handler(?MODULE),
     [yuzu_gw_test_listener:stop_channel(C) || C <- Chans],
     yuzu_gw_test_listener:stop(Pid).
+
+%% CVE-2026-113431 on a REAL listener (see yuzu_grpc_listener_tests:
+%% http2_header_list_bound_test_/0): a request whose decoded header list is over
+%% cowlib's default 32768-octet bound (nine copies of one 4000-octet user-agent:
+%% HPACK sends the first as an indexed literal and the other eight as one-octet
+%% table references, so the block is about 2.5 KB on the wire and the frame-size
+%% and fragmented-block limits do not catch it) is refused with RST_STREAM
+%% enhance_your_calm, the handler never runs, and the SAME connection then
+%% serves an ordinary request (an unknown method answers a gRPC status, HTTP 200).
+header_list_over_limit(#{port := Port}) ->
+    yuzu_grpc_stub_svc:reset(),
+    {ok, Conn} = gun:open("localhost", Port, #{protocols => [http2], retry => 0}),
+    try
+        {ok, http2} = gun:await_up(Conn, 5000),
+        Base = [{<<"content-type">>, <<"application/grpc">>}, {<<"te">>, <<"trailers">>}],
+        Big = gun:post(Conn, ?HEARTBEAT,
+                       lists:duplicate(9, {<<"user-agent">>, binary:copy(<<$a>>, 4000)}) ++ Base, <<0, 0:32>>),
+        ?assertMatch({error, {stream_error, {stream_error, enhance_your_calm, _}}},
+                     gun:await(Conn, Big, 5000)),
+        ?assertEqual(0, yuzu_grpc_stub_svc:calls()),
+        Ok = gun:post(Conn, <<"/yuzu.agent.v1.AgentService/NoSuchMethod">>, Base, <<0, 0:32>>),
+        ?assertMatch({response, _, 200, Headers} when is_list(Headers), gun:await(Conn, Ok, 5000)),
+        ?assert(is_pid(Conn) andalso is_process_alive(Conn))
+    after
+        gun:close(Conn)
+    end.
 
 %%--------------------------------------------------------------------
 %% Unary

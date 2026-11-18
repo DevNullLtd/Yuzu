@@ -113,8 +113,8 @@ yuzu_gateway/
 ```erlang
 %% rebar.config
 {deps, [
-    {cowboy,    "2.19.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); brings ranch
-    {gun,       "2.5.0"},      % HTTP/2 client under the gateway-to-server gRPC client (yuzu_grpc_client)
+    {cowboy,    "2.21.0"},     % HTTP/2 server under the gateway's own gRPC listeners (yuzu_grpc*); brings ranch
+    {gun,       "2.8.0"},      % HTTP/2 client under the gateway-to-server gRPC client (yuzu_grpc_client)
     {ctx,       "0.6.0"},      % request-context type of the yuzu_grpc* layer
     {gpb,       "4.21.7"},     % Protobuf compiler/runtime
     {telemetry,  "1.3.0"},     % Metrics event API
