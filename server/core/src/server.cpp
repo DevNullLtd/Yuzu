@@ -21553,6 +21553,19 @@ private:
                 return std::nullopt;
             return quarantine_store_->list_quarantined_in(ids, limit);
         };
+        // The sync-run status read and the "may this caller read every sync run" answer: named so
+        // GET /api/v1/hardware/sync/{execution_id} (HardwareRoutes::Deps) and the MCP tool
+        // get_software_sync_status (set_software_sync_status_fns) get the SAME two closures.
+        const software_sync::StatusReadFn sync_status_read_fn =
+            [this](const std::string& execution_id)
+            -> std::expected<std::optional<Execution>, std::string> {
+            if (!execution_tracker_)
+                return std::unexpected(std::string("no execution tracker"));
+            return execution_tracker_->get_execution_checked(execution_id);
+        };
+        const software_sync::UnfilteredFn sync_unfiltered_fn = [this](const auth::Session& sess) {
+            return !derive_exec_visible(sess).has_value();
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -21681,17 +21694,8 @@ private:
                              // GET /api/v1/hardware/sync/{execution_id}: the tracker row, and
                              // whether the caller may read every sync run (an unfiltered
                              // Execution:Execute) rather than only its own.
-                             .sync_status_fn =
-                                 [this](const std::string& execution_id)
-                                     -> std::expected<std::optional<Execution>, std::string> {
-                                     if (!execution_tracker_)
-                                         return std::unexpected(std::string("no execution tracker"));
-                                     return execution_tracker_->get_execution_checked(execution_id);
-                                 },
-                             .sync_unfiltered_fn =
-                                 [this](const auth::Session& sess) {
-                                     return !derive_exec_visible(sess).has_value();
-                                 },
+                             .sync_status_fn = sync_status_read_fn,
+                             .sync_unfiltered_fn = sync_unfiltered_fn,
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                              .forensics_visibility_fn = forensics_visibility_fn,
                              .forensics_plugins = forensics_plugins(),
@@ -24634,6 +24638,14 @@ private:
             // gets pushed or to whom.
             mcp_server_->set_guardian_push_fn(guardian_push_fn_);
             mcp_server_->set_software_sync_runner(software_sync_runner());
+            // SAM-21 twins: the SAME sync-run status closures GET /api/v1/hardware/sync/{id} is
+            // given, and one more binding of the lookup reads over the SAME store and the SAME
+            // device-table roster the REST lookup routes use, so both surfaces answer from the one
+            // core (software_list::lookup_installs / lookup_components, sync_status).
+            mcp_server_->set_software_sync_status_fns(sync_status_read_fn, sync_unfiltered_fn);
+            if (software_inventory_store_)
+                mcp_server_->set_software_lookup_reads(
+                    software_list::bind_lookup_reads(*software_inventory_store_, hw_hostnames_fn));
             // SAM-35 twins: the SAME read sources and settings stores the REST routes above are
             // given, so the two surfaces answer from one body.
             mcp_server_->set_software_read_ctx(software_read_api::make_ctx(

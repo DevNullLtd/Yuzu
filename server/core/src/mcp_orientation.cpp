@@ -104,7 +104,9 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "list_software_curation_queue",
                                            "curate_software_alias",
                                            "reject_software_curation",
-                                           "replace_software_normalization_pack"};
+                                           "replace_software_normalization_pack",
+                                           // SAM-21: the components lookup twin.
+                                           "query_software_components"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -144,7 +146,8 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
                                            "execute_bundle", "get_bundle_result",
-                                           "sync_hardware_software"};
+                                           "sync_hardware_software",
+                                           "get_software_sync_status"}; // SAM-21
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
