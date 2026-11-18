@@ -785,10 +785,11 @@ http2_header_list_bound_test_() ->
      {"the allow-list refuses max_header_list_size (not tunable: fails safe)",
       ?_assertMatch({error, {unknown_keys, http2, [max_header_list_size], {allowed, _}}},
                     refused(#{http2 => #{max_header_list_size => 16#ffffffff}}))},
-     {"max_headers is left at Cowboy's default (100) on both roles",
+     {"max_headers and max_fragmented_header_block_size are left unset (Cowboy's defaults) on both roles",
       fun() ->
-          ?assertNot(maps:is_key(max_headers, yuzu_grpc_listener:http2_opts(entry()))),
-          ?assertNot(maps:is_key(max_headers, yuzu_grpc_listener:http2_opts(mgmt_entry())))
+          [?assertNot(maps:is_key(K, yuzu_grpc_listener:http2_opts(E)))
+           || K <- [max_headers, max_fragmented_header_block_size],
+              E <- [entry(), mgmt_entry()]]
       end},
      {"the server preface advertises SETTINGS_MAX_HEADER_LIST_SIZE = 32768, on both roles",
       fun() ->

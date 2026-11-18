@@ -34,8 +34,9 @@ HTTP/2 header-list size in cowlib `cow_http2_machine` enables HPACK amplificatio
 exhaustion"; CVSS v4 `AV:N/AC:L/AT:N/PR:N/UI:N/VA:H`; affected cowlib 2.7.0 up to but not
 including 2.22.0; advisory <https://cna.erlef.org/cves/CVE-2026-113431.html>, also
 <https://nvd.nist.gov/vuln/detail/CVE-2026-113431> and <https://osv.dev/vulnerability/EEF-CVE-2026-113431>,
-read through the OSV API on 2026-11-18; the advisory's fix commits include the tag commit
-`b92326f0`; the behaviour is also verified empirically by the before/after regression pin below), so an unauthenticated peer on the agent-facing gateway listener can send an
+read through the OSV API on 2026-11-18; OSV records fix commits `a3b15e29` and `b461b119`
+(its affected-range data also lists `b92326f0`, the tagged commit, as a fixed event; the sibling-commit
+reading below rests on the git facts, not on the advisory); the behaviour is also verified empirically by the before/after regression pin below), so an unauthenticated peer on the agent-facing gateway listener can send an
 HPACK header block that decodes to an unbounded header list. The fix exists only in cowlib 2.22.0
 (released 2026-11-09), and cowboy 2.21.0 requires cowlib >= 2.22.0. gun is included because gun
 2.5.0 cannot run on cowlib 2.22.0: cowlib's `cow_http2_machine:frame/2` can now return
@@ -98,7 +99,7 @@ directory, extracted only there, and never executed; scripts ran with `python3 -
    - cowlib 2.22.0 enforces `max_header_list_size`, default 32768 when unset (this is the fix).
      The listeners set nothing; `yuzu_grpc_listener_tests:http2_header_list_bound_test_` pins it.
      The check runs after the whole HPACK block is decoded, so decode itself is bounded only by
-     `max_fragmented_header_block_size` and the table size; that is not tested here, so `http2.max_headers` (Cowboy's count limit, 100 headers) and `max_fragmented_header_block_size` must stay at their defaults: they are the other half of the bound.
+     `max_fragmented_header_block_size` and the table size; that is not tested here. `http2.max_headers` (Cowboy's count limit, 100 headers) and `http2.max_fragmented_header_block_size` are accepted keys that no shipped config sets; they must stay unset, because they are the other half of the bound. The listener's unset defaults of both are pinned by test; an operator setting either is not prevented.
    - `cow_http2:frame/0` gains a 5-tuple DATA form and `settings/0` is widened; dialyzer is clean.
    - gun 2.8.0: handles `window_changed`; rejects CR/LF/NUL in method, path and header names/values
      and an invalid `content-length` on the request side (the gateway sends neither); stricter

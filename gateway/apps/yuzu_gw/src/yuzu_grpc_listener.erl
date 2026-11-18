@@ -165,7 +165,8 @@
 %% cowboy 2.21.0). cowlib bounds the decoded request header list at 32768 octets
 %% by default (CVE-2026-113431); a tunable could only weaken that, and an unknown
 %% key is refused, so it fails safe. max_headers (count, 100) and
-%% max_fragmented_header_block_size stay at their defaults for the same reason.
+%% max_fragmented_header_block_size are ACCEPTED keys (below) that no shipped
+%% config sets; they must stay unset, as the other half of the bound.
 %% Pinned by yuzu_grpc_listener_tests:http2_header_list_bound_test_/0.
 -define(HTTP2_KEYS,
         [active_n, compress_buffering, compress_threshold, connection_window_margin_size,
