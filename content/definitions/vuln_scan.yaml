@@ -17,7 +17,10 @@ metadata:
     checks verify security hardening settings (firewall state, password
     policy, remote desktop config, etc.). Each finding is classified by
     severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check
-    could not run; not an issue). Reports progress at
+    could not run; not an issue). On macOS, Homebrew formulae and casks are
+    not scanned (use pkg_inventory.packages); the run ends with an INFO row
+    titled "Coverage" saying so, and a result with no CVE rows means only that
+    no built-in rule matched the software enumerated. Reports progress at
     0%, 50%, 90%, 100%.
   tags: [security, vulnerability, cve, compliance, audit]
 
@@ -44,14 +47,14 @@ spec:
         platforms: [windows, linux, darwin]
       - name: category
         type: string
-        description: Which half of the scan produced this row.
+        description: Which half of the scan produced this row; "scan" marks the placeholder and Coverage rows.
         values: [cve, config, scan]
         example: cve
         platforms: [windows, linux, darwin]
       - name: title
         type: string
         description: >-
-          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text.
+          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing; "Coverage" on the INFO row a macOS run adds when part of the host was not scanned. Values: free text.
         example: "CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler"
         platforms: [windows, linux, darwin]
       - name: detail
@@ -110,8 +113,9 @@ metadata:
     use pkg_inventory.packages) and compares versions against the
     built-in CVE database. Returns only CVE findings, not configuration
     checks. A result with no CVE rows means only that no built-in rule
-    matched the software enumerated above. Use the full "scan" action for
-    combined results.
+    matched the software enumerated above; on macOS the run ends with an INFO
+    row titled "Coverage" saying so. Use the full "scan" action for combined
+    results.
   tags: [security, vulnerability, cve, compliance]
 
 spec:
@@ -137,14 +141,14 @@ spec:
         platforms: [windows, linux, darwin]
       - name: category
         type: string
-        description: Always "cve" for a match; "scan" on the single placeholder row emitted when nothing matches.
+        description: Always "cve" for a match; "scan" on the placeholder row emitted when nothing matches and on the macOS Coverage row.
         values: [cve, scan]
         example: cve
         platforms: [windows, linux, darwin]
       - name: title
         type: string
         description: >-
-          "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the placeholder row. Values: free text.
+          "<CVE-ID>: <description>" from the matched rule, "No vulnerabilities" on the placeholder row, or "Coverage" on the macOS coverage row. Values: free text.
         example: "CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace"
         platforms: [windows, linux, darwin]
       - name: detail
@@ -187,7 +191,10 @@ metadata:
     Verifies settings such as firewall state, password policy,
     remote desktop configuration, and other hardening baselines.
     Returns findings classified by severity. Does not include CVE
-    matching; use the full "scan" action for combined results.
+    matching; use the full "scan" action for combined results. On macOS a
+    check whose system tool could not be read (missing, failed, no
+    permission, unrecognised output) is reported as an INFO row with detail
+    "Unknown (read failed)", never as a finding.
   tags: [security, compliance, configuration, hardening]
 
 spec:
@@ -263,7 +270,10 @@ metadata:
     the endpoint's security posture without the full finding details.
     Returns total findings, total issues, and per-severity counts
     (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check
-    could not run and is not counted as an issue).
+    could not run and is not counted as an issue). On macOS, Homebrew formulae
+    and casks are not scanned (use pkg_inventory.packages), and the output ends
+    with a summary|COVERAGE|<text> row saying so; the counts cover only the
+    software enumerated.
   tags: [security, vulnerability, compliance, dashboard]
 
 spec:
@@ -284,9 +294,9 @@ spec:
       - name: severity
         type: string
         description: >
-          The severity this row counts, or the literal "TOTAL" for the first row emitted by
-          every run.
-        values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
+          The severity this row counts, the literal "TOTAL" for the first row emitted by
+          every run, or "COVERAGE" on the final row a macOS run adds (its count cell holds text).
+        values: [TOTAL, CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE, COVERAGE]
         example: CRITICAL
         platforms: [windows, linux, darwin]
       - name: count
@@ -326,7 +336,11 @@ metadata:
     Return the raw installed software inventory (name and version pairs)
     for server-side NVD matching. This is a lightweight alternative to
     client-side CVE scanning that enables the server to perform
-    centralized vulnerability correlation against the full NVD database.
+    centralized vulnerability correlation against the full NVD database. On
+    macOS the list is system_profiler applications only; Homebrew formulae and
+    casks are not included (use pkg_inventory.packages), and a macOS run that
+    read nothing returns no rows. The rows are pure name|version pairs; the
+    coverage limit is reported in the result status, never as a row.
   tags: [security, vulnerability, inventory, software]
 
 spec:

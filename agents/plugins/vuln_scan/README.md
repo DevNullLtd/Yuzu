@@ -88,11 +88,11 @@ flowchart LR
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
-| `config_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · popen(spctl/fdesetup/csrutil/socketfilterfw) | ✅ supported · rung 3 · popen(iptables/nft/ufw)+procfs |
-| `cve_scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `inventory` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
-| `scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
-| `summary` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · popen(system_profiler+security-checks) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `config_scan` | ✅ supported · rung 1 · win32_registry | ✅ supported · rung 3 · argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat) | ✅ supported · rung 3 · popen(iptables/nft/ufw)+procfs |
+| `cve_scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 2 · argv(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `inventory` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 2 · argv(system_profiler) | ✅ supported · rung 3 · popen(dpkg-query/rpm/pacman/apk) |
+| `scan` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · argv(system_profiler+security-checks)+popen(ss/netstat) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
+| `summary` | ✅ supported · rung 1 · win32_registry | 🟡 constrained · rung 3 · argv(system_profiler+security-checks)+popen(ss/netstat) | ✅ supported · rung 3 · popen(pkg-manager+iptables/nft/ufw) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
@@ -110,7 +110,7 @@ flowchart LR
 | macOS | agent daemon; the shipped LaunchDaemon runs as root today (`docs/agent-privilege-model.md`) | `systemsetup -getremotelogin` needs administrator rights (root has them). No other grant. No row for this plugin | 2026-09-07, bare metal, as an unprivileged user (euid 501), not as root | not observed for a denial; a failed command returns empty or error text, which each check parses as its negative or disabled branch (Remote Login reads `Enabled` when `systemsetup` is refused) |
 | Linux | agent daemon, dedicated unprivileged account by design (`docs/agent-privilege-model.md`) | None for the package list, `/proc` or world-readable files. `iptables`, `nft` and `ufw status` normally need root or `CAP_NET_ADMIN`; a mode-0600 `sshd_config` (the RHEL-family default) needs read access. No row for this plugin | 2026-09-06, container, euid 0 | a failed file read is `UNREADABLE` (both SSH checks on a 0600 `sshd_config`); a failed firewall command returns empty output, read as "no firewall rules detected" |
 
-Windows uses no subprocess: software enumeration and every Windows check are in-process registry calls. Linux and macOS run commands through `popen` and `system()` with fixed strings and no caller input: Linux `dpkg-query`, `rpm`, `pacman`, `apk` (the first one present), `iptables`, `nft`, `ufw`, `ss` or `netstat`; macOS `system_profiler`, `spctl`, `fdesetup`, `csrutil`, `socketfilterfw`, `systemsetup`, `defaults`. There is no network access; the firewall and listener commands read local state only.
+Windows uses no subprocess: software enumeration and every Windows check are in-process registry calls. Linux runs shell command strings through `popen` and `system()`; macOS runs pre-split argvs with absolute-path executables through the agent's bounded subprocess runner (no shell, no `PATH` search, a 60 s deadline and an 8 MB output cap), except the cross-platform listening-ports check, which still uses `popen` (`ss`, then `netstat`). All are fixed commands with no caller input: Linux `dpkg-query`, `rpm`, `pacman`, `apk` (the first one present), `iptables`, `nft`, `ufw`, `ss` or `netstat`; macOS `system_profiler`, `spctl`, `fdesetup`, `csrutil`, `socketfilterfw`, `systemsetup`, `defaults`. There is no network access; the firewall and listener commands read local state only.
 
 ## Data contract
 
@@ -141,8 +141,8 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` | Windows, Linux, macOS | `HIGH` | Finding severity assigned by the CVE rule that matched. |
-| `category` | string | `cve` `scan` | Windows, Linux, macOS | `cve` | Always "cve" for a match; "scan" on the single placeholder row emitted when nothing matches. |
-| `title` | string | - | Windows, Linux, macOS | `CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace` | "<CVE-ID>: <description>" from the matched rule, or "No vulnerabilities" on the placeholder row. Values: free text. |
+| `category` | string | `cve` `scan` | Windows, Linux, macOS | `cve` | Always "cve" for a match; "scan" on the placeholder row emitted when nothing matches and on the macOS Coverage row. |
+| `title` | string | - | Windows, Linux, macOS | `CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace` | "<CVE-ID>: <description>" from the matched rule, "No vulnerabilities" on the placeholder row, or "Coverage" on the macOS coverage row. Values: free text. |
 | `detail` | string | - | Windows, Linux, macOS | `Python 3.9.6 (fixed in 3.11.4)` | <installed product> <version> (fixed in <fixed_ver>). Values: free text. |
 
 **`security.vuln_scan.inventory` — `name|version`**
@@ -157,15 +157,15 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
 | `severity` | string | `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` | Windows, Linux, macOS | `CRITICAL` | Finding severity assigned by the check that produced this row. UNREADABLE means the check could not run; not an issue. |
-| `category` | string | `cve` `config` `scan` | Windows, Linux, macOS | `cve` | Which half of the scan produced this row. |
-| `title` | string | - | Windows, Linux, macOS | `CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler` | For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing. Values: free text. |
+| `category` | string | `cve` `config` `scan` | Windows, Linux, macOS | `cve` | Which half of the scan produced this row; "scan" marks the placeholder and Coverage rows. |
+| `title` | string | - | Windows, Linux, macOS | `CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler` | For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing; "Coverage" on the INFO row a macOS run adds when part of the host was not scanned. Values: free text. |
 | `detail` | string | - | Windows, Linux, macOS | `Microsoft Windows Desktop Runtime - 6.0.11 (x64) 6.0.11.31823 (fixed in KB5004945)` | For a cve row, "<installed product> <version> (fixed in <fixed_ver>)"; for a config row, the check's human-readable result text. Values: free text. |
 
 **`security.vuln_scan.summary` — `severity|count`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` | Windows, Linux, macOS | `CRITICAL` | The severity this row counts, or the literal "TOTAL" for the first row emitted by every run. |
+| `severity` | string | `TOTAL` `CRITICAL` `HIGH` `MEDIUM` `LOW` `INFO` `UNREADABLE` `COVERAGE` | Windows, Linux, macOS | `CRITICAL` | The severity this row counts, the literal "TOTAL" for the first row emitted by every run, or "COVERAGE" on the final row a macOS run adds (its count cell holds text). |
 | `count` | int32 | - | Windows, Linux, macOS | `17` | The number of findings at this severity. The TOTAL row is an exception: despite the declared int32 type, that row's cell holds the formatted string "<n> findings (<n> issues)", not an integer. Values: integer, except a formatted string on the TOTAL row. |
 <!-- END GENERATED -->
 
@@ -173,9 +173,10 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 
 | Status | Completeness | Provenance | When |
 |---|---|---|---|
-| `UNDECLARED` | `UNKNOWN` | (empty) | every action on Windows and Linux, and macOS `config_scan`: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding |
-| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:homebrew_not_scanned` | macOS `cve_scan`, `scan`, `summary` and `inventory` when `system_profiler` returned applications. Homebrew formulae and casks are never read, so a result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed |
-| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:system_profiler_unreadable` | the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. The rows then describe an empty software list (`TOTAL` 0 or an empty `inventory`), not a clean host |
+| `UNDECLARED` | `UNKNOWN` | (empty) | every action on Windows and Linux, and macOS `config_scan` when every check read cleanly: the plugin does not set a typed result status, so a consumer must read the rows. A failed read is therefore never visible in the status; it shows only as an `UNREADABLE` row (Linux file checks) or as a default-branch finding |
+| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:homebrew_not_scanned` | macOS `cve_scan`, `scan`, `summary` and `inventory` when `system_profiler` returned applications. `cve_scan` and `scan` also emit `INFO\|scan\|Coverage\|Homebrew formulae and casks are not scanned`, and `summary` emits `summary\|COVERAGE\|<same text>`; `inventory` emits no such row. Homebrew formulae and casks are never read, so a result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed |
+| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:system_profiler_unreadable` | the same four macOS actions when the `system_profiler` command failed to run, exited non-zero, or returned no applications. The rows then describe an empty software list (`TOTAL` 0 or an empty `inventory`), not a clean host; the Coverage row reads "The software list is empty because system_profiler returned no applications; this is not a clean result". The macOS commands run with a 60 s deadline and an 8 MB output cap (the process group is killed at the deadline); either one counts as unreadable |
+| `CONSTRAINED` | `PARTIAL` | `macos:vuln_scan:config_unreadable` | macOS `config_scan`, `scan` and `summary` when a configuration check's system tool could not be read (missing, non-zero exit, no output, permission message, or text that is not the tool's expected line, such as a localized message). That check emits `INFO\|config\|<check>\|Unknown (read failed)` instead of a finding. A software-list token outranks this one when both apply |
 
 ### Where the data goes
 
@@ -189,7 +190,7 @@ A Linux config check whose file read fails (EACCES, EIO, ...) emits `UNREADABLE|
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 903a17509a71
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash a704e3929a66
 
 ```
 == action=scan
@@ -261,7 +262,7 @@ Defraggler|2.22
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 903a17509a71
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash a704e3929a66
 
 ```
 == action=scan
@@ -315,7 +316,7 @@ Find My|4.0
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 903a17509a71
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash a704e3929a66
 
 ```
 == action=scan
@@ -376,9 +377,9 @@ bsdutils|1:2.41.5-0+deb13u1
 
 ## Caveats and known gaps
 
-1. **A clean scan is not "patched".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined. On macOS, Homebrew formulae and casks are never matched, so a clean macOS result is not evidence about them; use pkg_inventory.packages (which lists, not matches). The four macOS software-consuming actions say so in their result status (see Result status).
+1. **A clean scan is not "patched".** CVE matching uses a fixed, built-in table of 41 rules over 21 product names, and nothing outside it is reported: other products, CVEs after 2024, operating-system patches, kernels and distribution back-ports. Software the leg cannot list (other accounts' per-user installs on Windows, any host with none of the four Linux package managers) is not examined. On macOS, Homebrew formulae and casks are never matched, so a clean macOS result is not evidence about them; use pkg_inventory.packages (which lists, not matches). `cve_scan` and `scan` end with an `INFO|scan|Coverage|...` row and `summary` with `summary|COVERAGE|...`, in the same output as the `CONSTRAINED` result status; `inventory` returns software rows only. The status itself reaches the agent log, not REST, MCP or the dashboard, so the in-band row is what an operator sees.
 2. **Substring matching produces false positives, and the version test is naive.** A rule fires on any installed name that contains its product text, so `python` matches `python3-wheel`, `git` matches `git-man`, and `windows` matches .NET runtimes and Windows utilities; the version is compared as dotted numbers, and a Debian epoch such as `1:2.47.3` is compared as text and reads as lower than `2.45.1`. The samples show all three, so some `cve` rows are not exposures, and the issue count in `summary` is inflated by them.
-3. **A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed `popen` command returns empty output, and only the Linux file checks surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).
+3. **A failed read usually becomes the check's default result, not an error.** Windows registry reads fall back to a default (a missing SMBv1 value reads as enabled; an unreadable UAC or firewall value reads as disabled), a failed command returns empty output, and only the Linux file checks surface `UNREADABLE`. No capture observed a real permission denial, so this is read from the code, not measured; the World-Writable PATH walk also skips an entry whose `stat()` fails (#5515).
 4. **`summary` does not match its declared result columns.** It emits three pipe fields per row (`summary|<severity or TOTAL>|<count>`) against two declared columns, `severity` and `count`, and the `TOTAL` row's `count` cell is the string `<n> findings (<n> issues)` rather than the declared `int32`.
 5. **Configuration checks are single-signal heuristics, not effective policy.** Each reads one registry value, one command's text or one file, so a setting applied another way (an `Include`d SSH file, a managed firewall, a third-party antivirus) can read differently from the host's real state. There is no `docs/agent-privilege-model.md` row for this plugin, so the Privileges table records only what each capture measured.
 

@@ -46,6 +46,37 @@ RED = [
     ("absolute homebrew path", "extra.cpp", 'const char* p = "/opt/homebrew/bin/brew";\n'),
     ("intel homebrew prefix", "extra.cpp", 'const char* p = "/usr/local/Homebrew/bin/x";\n'),
     ("brew as bare identifier", "extra.cpp", "void brew();\n"),
+    ("line continuation inside a literal", "extra.cpp",
+     'void f(){ run_command("br\\\new list"); }\n'),
+    ("L-prefixed literal join", "extra.cpp", 'void f(){ run_command("br" L"ew list"); }\n'),
+    ("u8-prefixed literal join", "extra.cpp", 'void f(){ run_command("br" u8"ew list"); }\n'),
+    ("u-prefixed literal join", "extra.cpp", 'void f(){ run_command(u"br" "ew list"); }\n'),
+    ("unicode escape", "extra.cpp", 'void f(){ run_command("\\u0062rew list"); }\n'),
+    ("long unicode escape", "extra.cpp", 'void f(){ run_command("\\U00000062rew list"); }\n'),
+    ("shell quoting b''rew", "extra.cpp", 'void f(){ run_command("b\'\'rew list"); }\n'),
+    ("shell quoting b\"\"rew", "extra.cpp", 'void f(){ run_command("b\\"\\"rew list"); }\n'),
+    ("prefixed raw string", "extra.cpp", 'void f(){ run_command(LR"x(brew list)x"); }\n'),
+]
+
+# Structural pins: (name, file, old text, new text) applied to the real source; each must go RED.
+PIN_MUTATIONS = [
+    ("pin a: bare tool literal", "config_checks.hpp", "macos_check_result(MacosCheck::Gatekeeper, read(kMacosSpctlCmd))",
+     'macos_check_result(MacosCheck::Gatekeeper, read({"spctl", "--status"}))'),
+    ("pin a: bare system_profiler literal", "vuln_scan_plugin.cpp", "macos_run(yuzu::vuln::kMacosSystemProfilerCmd)",
+     'macos_run({"system_profiler", "SPApplicationsDataType"})'),
+    ("pin b: constant unused", "config_checks.hpp", "read(kMacosFdesetupCmd)", 'read({"/usr/bin/fdesetup", "status"})'),
+    ("pin c: declare_coverage dropped from cve_scan", "vuln_scan_plugin.cpp",
+     "            output_findings(ctx, findings);\n            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"config_scan\")",
+     "            output_findings(ctx, findings);\n            emit_coverage_row(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"config_scan\")"),
+    ("pin c: declare_coverage dropped from config_scan", "vuln_scan_plugin.cpp",
+     "            auto findings = do_config_scan_impl(&cov);\n            output_findings(ctx, findings);\n            declare_coverage(ctx, cov);",
+     "            auto findings = do_config_scan_impl(&cov);\n            output_findings(ctx, findings);"),
+    ("pin c: coverage row added to inventory", "vuln_scan_plugin.cpp",
+     "            declare_coverage(ctx, cov);\n            return 0;\n        }\n\n        if (action == \"summary\")",
+     "            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            return 0;\n        }\n\n        if (action == \"summary\")"),
+    ("pin c: summary row emitter dropped", "vuln_scan_plugin.cpp", "            emit_coverage_summary_row(ctx, cov);\n", ""),
+    ("pin c: scan row emitter dropped", "vuln_scan_plugin.cpp",
+     "            output_findings(ctx, all);\n            emit_coverage_row(ctx, cov);", "            output_findings(ctx, all);"),
 ]
 
 # Texts that must stay GREEN (no false positive on the shipped wording).
@@ -53,6 +84,7 @@ GREEN_TEXT = [
     ("brew only in a line comment", "// brew is never run\nint x;\n"),
     ("brew only in a block comment", "/* brew list */ int x;\n"),
     ("status token", 'const char* t = "macos:vuln_scan:homebrew_not_scanned";\n'),
+    ("brew after a spliced // comment is still a comment (C++ phase 2)", "// note \\\nrun(\"brew\");\n"),
     ("prose Homebrew in a string", 'const char* t = "Homebrew formulae and casks are not scanned";\n'),
 ]
 
@@ -72,6 +104,16 @@ def main() -> int:
             with open(target, "a", encoding="utf-8") as fh:
                 fh.write(text)
             expect(g.scan_tree(root) != [], f"RED expected, gate stayed green: {name}")
+
+    for name, rel, old, new in PIN_MUTATIONS:
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_vuln_brew_") as tmp:
+            root = pathlib.Path(tmp) / "src"
+            shutil.copytree(g.PLUGIN, root)
+            target = root / rel
+            text = target.read_text()
+            expect(text.count(old) == 1, f"pin mutation text not found exactly once (stale selftest): {name}")
+            target.write_text(text.replace(old, new))
+            expect(g.scan_tree(root) != [], f"RED expected, pin stayed green: {name}")
 
     with tempfile.TemporaryDirectory(prefix="yuzu_test_vuln_brew_") as tmp:
         expect(g.scan_tree(pathlib.Path(tmp)) != [], "an empty tree must fail, not pass vacuously")

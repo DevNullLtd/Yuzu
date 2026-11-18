@@ -911,19 +911,19 @@ implementation is.
 | virtualization | runtime_posture | macos | unsupported | - | - | Linux-only: container-runtime posture is read from Linux paths and a unix socket |
 | virtualization | runtime_posture | windows | unsupported | - | - | Linux-only: container-runtime posture is read from Linux paths and a unix socket |
 | vuln_scan | scan | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
-| vuln_scan | scan | macos | constrained | 3 | popen(system_profiler+security-checks) | Homebrew formulae and casks are not scanned |
+| vuln_scan | scan | macos | constrained | 3 | argv(system_profiler+security-checks)+popen(ss/netstat) | Homebrew formulae and casks are not scanned |
 | vuln_scan | scan | windows | supported | 1 | win32_registry | - |
 | vuln_scan | cve_scan | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
-| vuln_scan | cve_scan | macos | constrained | 3 | popen(system_profiler) | Homebrew formulae and casks are not scanned |
+| vuln_scan | cve_scan | macos | constrained | 2 | argv(system_profiler) | Homebrew formulae and casks are not scanned |
 | vuln_scan | cve_scan | windows | supported | 1 | win32_registry | - |
 | vuln_scan | config_scan | linux | supported | 3 | popen(iptables/nft/ufw)+procfs | - |
-| vuln_scan | config_scan | macos | supported | 3 | popen(spctl/fdesetup/csrutil/socketfilterfw) | - |
+| vuln_scan | config_scan | macos | supported | 3 | argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat) | - |
 | vuln_scan | config_scan | windows | supported | 1 | win32_registry | - |
 | vuln_scan | summary | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
-| vuln_scan | summary | macos | constrained | 3 | popen(system_profiler+security-checks) | Homebrew formulae and casks are not scanned |
+| vuln_scan | summary | macos | constrained | 3 | argv(system_profiler+security-checks)+popen(ss/netstat) | Homebrew formulae and casks are not scanned |
 | vuln_scan | summary | windows | supported | 1 | win32_registry | - |
 | vuln_scan | inventory | linux | supported | 3 | popen(dpkg-query/rpm/pacman/apk) | - |
-| vuln_scan | inventory | macos | constrained | 3 | popen(system_profiler) | Homebrew formulae and casks are not scanned |
+| vuln_scan | inventory | macos | constrained | 2 | argv(system_profiler) | Homebrew formulae and casks are not scanned |
 | vuln_scan | inventory | windows | supported | 1 | win32_registry | - |
 | wifi | list_networks | linux | constrained | 1 | NetworkManager D-Bus (sd-bus) | reads NetworkManager's cached AccessPoints and does not itself initiate a scan (falls through to nmcli, which rescans, when NM reports no finished scan); then falls back to nmcli via the argv runner (rung 2), then an iw/iwlist text dump. Not yet exercised against a real Wi-Fi radio |
 | wifi | list_networks | macos | constrained | 2 | airport -s / system_profiler via argv runner | airport was removed in macOS 14 (Sonoma); the system_profiler SPAirPortDataType fallback needs Location Services authorisation a background daemon may lack, so an unauthorised modern host yields no networks and an honest wifi\|info sentinel |
