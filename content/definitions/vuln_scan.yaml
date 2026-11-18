@@ -22,8 +22,8 @@ metadata:
     #8256); the run ends with a row titled
     "Coverage" saying so (INFO, or UNREADABLE when the software list could not
     be read completely, a profiler line was not recognised, an application
-    matching a built-in rule had no usable version (empty, not starting with a
-    digit, or a numeric segment of more than 18 digits), or a configuration read
+    matching a built-in rule had no usable version (on macOS: empty, not starting
+    with a digit, or a numeric segment of more than 18 digits), or a configuration read
     failed), and a result with no CVE rows means only that
     no built-in rule matched the software enumerated. Reports progress at
     0%, 50%, 90%, 100%.
@@ -124,7 +124,8 @@ metadata:
     application matching a built-in rule has no usable version, or a profiler line was
     not recognised. Versions are compared as dotted numbers, so a version with a
     non-numeric text in a segment (a pre-release or letter suffix, "0.9 (rc)", "1e2") may not be ordered
-    correctly (tracked in #8276); a numeric segment of more than 18 digits counts as an unusable version.
+    correctly (tracked in #8276); on macOS a numeric segment of more than 18 digits counts as an
+    unusable version (Linux and Windows saturate such a segment silently).
     Use the full "scan" action for combined
     results.
   tags: [security, vulnerability, cve, compliance]

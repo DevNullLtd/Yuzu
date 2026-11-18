@@ -1089,3 +1089,35 @@ TEST_CASE("reshaped lines: boundary rows that earlier rounds left unpinned", "[v
     CHECK(usable_version("1.999999999999999999"));
     CHECK_FALSE(usable_version("1.1000000000000000000"));
 }
+
+// ── round 10: three independent faults, and unreadable companions ───────────────────────────────
+
+TEST_CASE("lost name: a 3-space property line after a blank that follows no name is counted",
+          "[vuln][macos][reshaped]") {
+    // the name and Version lines are lost and `Obtained from:` is re-indented to exactly 3 spaces
+    const auto e = parse_system_profiler_apps(
+        healthy_report(10) + "   Obtained from: Apple\n      Kind: x\n\n", true);
+    CHECK(e.suspect_lines >= 1); // the report ends with a blank line: the 3-space line follows it
+    const auto after_blank = parse_system_profiler_apps(
+        healthy_report(10) + "\n   Obtained from: Apple\n\n    Next:\n\n      Version: 2\n", true);
+    CHECK(after_blank.suspect_lines >= 1);
+    // directly after a name line, a 3-space property is not flagged by the blank rule
+    const auto after_name = parse_system_profiler_apps("    A:\n\n   Obtained from: Apple\n", true);
+    CHECK(after_name.suspect_lines == 0);
+}
+
+TEST_CASE("lost name: tiny reports with the lost-name shapes are unreadable, not readable",
+          "[vuln][macos][reshaped]") {
+    // class X in a 1-app report: 1 suspect of 2 total is not MORE than half, so still readable ...
+    const auto x1 = parse_system_profiler_apps(healthy_report(1) + "\n   Version: 7.7\n", true);
+    CHECK(x1.suspect_lines >= 1);
+    // ... but with the majority lost the read is unreadable and returns no apps
+    const auto lost = parse_system_profiler_apps("\n   Version: 7.7\n   Version: 8\n   Kind: x\n    A:\n", true);
+    CHECK_FALSE(lost.readable);
+    CHECK(lost.apps.empty());
+    // class Y majority: unversioned app plus orphaned Versions
+    const auto y = parse_system_profiler_apps(
+        "    Bare:\n\n      Obtained from: Apple\n      Version: 5.5\n      Version: 6\n", true);
+    CHECK(y.suspect_lines >= 1);
+    CHECK_FALSE(y.readable); // the one app is unversioned (its Version is not directly after the name)
+}

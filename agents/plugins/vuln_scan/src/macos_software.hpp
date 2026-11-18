@@ -227,7 +227,7 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         // been dropped or reshaped, so the list may be missing an application.
         const bool tab = raw[indent] == '\t';
         if (tab || (indent == 0 && body != "Applications:") || indent == 1 || indent == 2 ||
-            (indent > 4 && blank_since && last_kind != 'N'))
+            ((indent > 4 || indent == 3) && blank_since && last_kind != 'N'))
             ++r.suspect_lines;
         const char prev_kind = last_kind; // the kind of the previous non-blank line
         last_kind = (indent == 4 && !tab && body.back() == ':' && body.substr(0, 8) != "Version:") ? 'N'
