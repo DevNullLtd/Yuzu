@@ -484,8 +484,11 @@ release when:
   release triplet; the Windows installer's SBOM lists the archive files
   `yuzu-agent.iss` installs. Each `generate` command runs with a timeout, and
   `tests/test_artifact_sbom.py` (Docs Lint, every PR) parses the real
-  `yuzu-agent.iss`, so an installer-script edit the script cannot map fails
-  there rather than at the release's Windows SBOM step;
+  `yuzu-agent.iss` under the installer-script contract below, so an
+  installer-script edit outside it fails there rather than at the release's
+  Windows SBOM step (the `CBOM schema` job runs the same suite with
+  `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
+  vendored CycloneDX 1.7 and SPDX 2.3 schemas);
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
@@ -511,9 +514,55 @@ again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
 
 If the release cannot be fixed promptly on a stable tag, move `:latest` back
-to the previous release's images. The gate has no override; the naming forms
-it checks are a second copy of the builders' naming, and its header lists
-where each lives.
+to the previous release's images (the release skill's Recovery gives the
+commands, and the `X.Y.0` case where no earlier `:X.Y` exists). The gate has
+no override; the naming forms it checks are a second copy of the builders'
+naming, and its header lists where each lives.
+
+#### The installer-script contract (`yuzu-agent.iss`)
+
+The Windows installer's SBOM lists the archive files the `[Files]` section of
+`deploy/packaging/windows/yuzu-agent.iss` installs. `scripts/ci/artifact-sbom.py`
+does not emulate the Inno Setup preprocessor (ISPP) or compiler (ISCC) to read
+it. It accepts one fixed shape, the script's shape today, and refuses every
+line outside it with an error naming the line, so the release fails loudly
+instead of listing the wrong files. The contract, stated in full at the top of
+the parser's `.iss` section:
+
+1. Lines split at CR, LF or CR LF; any other control byte is refused. With a
+   UTF-8 byte order mark the script is UTF-8 with no C1 control and no
+   whitespace but space and tab; without one, a mapped line (a `#` line, a
+   section header, a `[Files]` entry) is ASCII.
+2. A line whose first non-blank character is `#` is accepted only before the
+   first section, and only as the block `#ifndef <Name>` /
+   `#define <Name> "<literal>"` / `#endif` on consecutive lines, one space
+   between the parts, `<Name>` one of `AppVersion` and `BuildDir` (each once),
+   the literal made of letters, digits, `.`, `_`, `-` and `\`. Every other `#`
+   line is refused wherever it is, including `#include`, the one-character
+   forms (`#+`, `#=`, `#:`, `#?`) and a Pascal `#13` that starts a `[Code]`
+   line.
+3. `{#` is accepted only as exactly `{#AppVersion}` or `{#BuildDir}`, and in
+   `[Files]` only in the directory part of a quoted `Source`; every other `{#`
+   is refused, on any line, comments included.
+4. A line whose first non-blank character is `[` must be exactly one of the
+   script's eleven section headers as written (`[Setup]`, `[Files]`, ...):
+   `[ Files ]`, `[FILES]`, `[/Files]` or a section the script does not use
+   are refused. Before the first section only blank lines, `;` comments and
+   the header blocks are accepted.
+5. A line ending in a backslash is refused.
+6. In `[Files]`, an entry maps only when its `DestDir` is `{app}` or a literal
+   path below it, its `Source` name is a literal name or `*.<ext>`, and it uses
+   no flag or parameter that installs a tree, renames or takes the file from
+   elsewhere (`recursesubdirs`, `external`, `dontcopy`, `DestName`, `Excludes`,
+   ...).
+
+It assumes ISCC runs with the preprocessor's defaults, as `release.yml` runs it
+(only `/DAppVersion` and `/DBuildDir`). `test_the_real_iss_parses` pins that
+the allowlists are exactly the names and sections the script uses, and
+`ISS_REFUSED` in the test lists every refused form found so far. **Extend the
+allowlist deliberately; never emulate more ISPP.** A script change that needs
+a new header name, section or form is a change to the contract, the test and
+this section together.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 

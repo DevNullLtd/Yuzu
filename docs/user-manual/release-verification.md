@@ -311,7 +311,11 @@ yuzu:sbom:incomplete-reasons: erts-static
 ```
 
 A note that is absent means the SBOM does not carry it (no
-`yuzu:sbom:incomplete-reasons` note: no marker). To read one note from either
+`yuzu:sbom:incomplete-reasons` note: no marker). The release writes each note
+once: treat a file that carries two copies of one as altered. The release
+check refuses a second copy of the notes it reads (`yuzu:sbom:unpacked-files`
+on a file SBOM, `yuzu:sbom:incomplete-reasons` on an image SBOM pair); it does
+not read the others. To read one note from either
 format (set `KEY` to the note you want, and the file names to your SBOMs):
 
 ```bash
