@@ -22,12 +22,18 @@ name: vcpkg baseline update
 # with that token also triggers CI, which one opened by GITHUB_TOKEN would
 # not, and it is attributed to the token's owner, so a different maintainer
 # reviews it. When the secret is unset the run fails at its first step,
-# before the bump, naming it, and the `alert` job files the issue.
+# before the bump, naming it, and the `alert` job files the issue. A run
+# whose token belongs to another account than the open bump PR's author (the
+# token was rotated to a new owner while the PR was open) refuses to push
+# onto that PR, so the new owner never pushes a head they could then approve:
+# close the PR and the next run opens a new one (docs/dependency-updates.md,
+# "The PR token", rotation).
 #
 # SELF-HOSTED APPROVAL. The PR builds an unreviewed microsoft/vcpkg HEAD.
-# ci.yml skips its self-hosted legs on a deps/vcpkg-baseline-* branch, and
-# keeps `Preflight (runner health)` red, until a maintainer other than the
-# PR's author has APPROVED the PR at the head the CI run builds (ci.yml's
+# ci.yml skips its self-hosted legs on a deps/vcpkg-baseline* branch, and
+# keeps `Preflight (runner health)` red, until a maintainer who is not the
+# PR's author, did not push the head and is on none of its commits has
+# APPROVED the PR at the head the CI run builds (ci.yml's
 # vcpkg_bump_approval step). The PR is always on the one branch below, so
 # each month's bump updates the open PR instead of opening another; the new
 # head carries no approval, so a review of last month's range never covers
@@ -36,8 +42,8 @@ name: vcpkg baseline update
 # FAILURE SIGNAL. A scheduled run's failure notification goes only to the
 # user who last edited the cron line, so any failure opens (or comments on) a
 # `vcpkg-baseline-broken` issue, the nightly-broken pattern from nightly.yml,
-# and the next green run of main's copy that pushes the bump closes it
-# (close-on-green). No merge discipline is attached: the
+# and the next green run of main's copy that pushes a new bump branch head
+# closes it (close-on-green). No merge discipline is attached: the
 # issue is a repair prompt.
 #
 # SCHEDULE RUNS MAIN'S COPY. A scheduled run uses this file as it is on the
@@ -70,14 +76,19 @@ jobs:
     permissions:
       contents: read          # actions/checkout
     outputs:
-      # created / updated when this run pushed the bump branch with the PR
-      # token; close-on-green closes the alert issue only then.
+      # created / updated when this run created or updated the PR; pushed is
+      # true only when it also moved the bump branch to a new head with the
+      # PR token. close-on-green closes the alert issue only on both.
       pr_operation: ${{ steps.cpr.outputs.pull-request-operation }}
+      pushed: ${{ steps.pushed.outputs.pushed }}
     steps:
       # First, so a missing, expired or revoked token fails the run every
       # month, also one with nothing to bump, and before anything is changed.
-      # The authenticated read proves only that GitHub accepts the token; its
-      # write permissions are proven only by the push in "Create pull request".
+      # The authenticated read proves only that GitHub accepts the token. The
+      # repository is public, so a token still awaiting an organization
+      # owner's approval, or one whose permissions are short, likely passes
+      # this read too; its write permissions are proven only by the push in
+      # "Create pull request".
       - name: Require the PR token
         env:
           HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
@@ -88,7 +99,7 @@ jobs:
             exit 1
           fi
           if ! GH_TOKEN="$PR_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq .full_name > /dev/null; then
-            echo "::error::GitHub did not accept VCPKG_BASELINE_PR_TOKEN for an authenticated read of this repository (expired, revoked, not yet approved by the organization, or an API outage). Rotate it as described in docs/dependency-updates.md, 'The PR token', or re-run once the API recovers."
+            echo "::error::GitHub did not accept VCPKG_BASELINE_PR_TOKEN for an authenticated read of this repository (it is expired or revoked, or the API is failing). Rotate it as described in docs/dependency-updates.md, 'The PR token', or re-run once the API recovers. A token GitHub accepts but whose permissions are short, or that awaits the organization's approval, passes this step and fails at 'Create pull request'."
             exit 1
           fi
 
@@ -185,6 +196,56 @@ jobs:
             exit 1
           fi
 
+      # Rotation guard. The PR is attributed to the token's owner, and ci.yml's
+      # approval gate excludes the PR's author. If the token now belongs to
+      # another account than the open bump PR's author (rotated to a new owner
+      # while the PR was open), pushing would put a head on that PR that its
+      # pusher could approve, so the run refuses before the push and the alert
+      # issue opens. Close the PR (docs/dependency-updates.md, "The PR token");
+      # the next run opens a new PR attributed to the new owner. An API or
+      # parse failure refuses too. A GitHub App installation token cannot read
+      # /user: moving to an App identity needs this step changed first.
+      - name: Refuse to push onto a bump PR another account opened
+        if: steps.check.outputs.changed == 'true'
+        env:
+          PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
+          # Must equal create-pull-request's `branch` below.
+          BUMP_BRANCH: deps/vcpkg-baseline-update
+        run: |
+          set -uo pipefail
+          if ! owner_id=$(GH_TOKEN="$PR_TOKEN" gh api user --jq .id) || [[ ! "$owner_id" =~ ^[1-9][0-9]*$ ]]; then
+            echo "::error::Could not read which account owns VCPKG_BASELINE_PR_TOKEN (GET /user), so the run cannot show it may push onto the open bump PR. Re-run once the API recovers; a GitHub App installation token needs this step changed first."
+            exit 1
+          fi
+          if ! pages=$(GH_TOKEN="$PR_TOKEN" gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls?state=open&head=${GITHUB_REPOSITORY%%/*}:$BUMP_BRANCH&per_page=100"); then
+            echo "::error::Could not list the open bump PRs from $BUMP_BRANCH (failing closed). Re-run once the API recovers."
+            exit 1
+          fi
+          if ! others=$(jq -r --argjson owner "$owner_id" '
+                if type != "array" or any(.[]; type != "array") then error("not a list of pages") else . end
+                | add // []
+                | map(select((.user.id | type) != "number" or .user.id != $owner))
+                | .[] | "#\(.number) (opened by \(.user.login // "an unknown account"))"' <<<"$pages"); then
+            echo "::error::Could not parse the open bump PRs from $BUMP_BRANCH (failing closed). Re-run once the API recovers."
+            exit 1
+          fi
+          if [[ -n "$others" ]]; then
+            echo "::error::The open bump PR $(echo "$others" | paste -sd' ' -) was opened by another account than the one that owns VCPKG_BASELINE_PR_TOKEN now. Pushing onto it would let the token's new owner approve their own push, so this run refuses. Close that PR (do not reopen it); the next run opens a new one (docs/dependency-updates.md, 'The PR token')."
+            exit 1
+          fi
+          echo "No open bump PR from $BUMP_BRANCH belongs to another account; the push may proceed."
+
+      # The bump branch's head before the push, so a later step can tell
+      # whether this run moved it (create-pull-request can report `created`
+      # for a PR it opened on a branch that already held this bump).
+      - name: Record the bump branch head before the push
+        id: before
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          set -euo pipefail
+          sha=$(git ls-remote "https://github.com/$GITHUB_REPOSITORY.git" refs/heads/deps/vcpkg-baseline-update | awk '{print $1}')
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+
       - name: Create pull request
         id: cpr
         if: steps.check.outputs.changed == 'true'
@@ -194,7 +255,7 @@ jobs:
           token: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
           commit-message: "build(deps): bump vcpkg baseline to ${{ steps.latest.outputs.sha }}"
           # One fixed branch: an open bump PR is updated in place, never
-          # duplicated (see SELF-HOSTED OPT-IN in the header).
+          # duplicated (see SELF-HOSTED APPROVAL in the header).
           branch: deps/vcpkg-baseline-update
           base: dev
           delete-branch: true
@@ -211,10 +272,12 @@ jobs:
             **Self-hosted CI is held until a maintainer approves this head.**
             This PR builds an unreviewed upstream vcpkg range, so `Preflight
             (runner health)` stays red and the self-hosted legs do not run
-            until a maintainer other than this PR's author has reviewed the
-            diff and the range above, approved the PR at its current head, and
-            chosen "Re-run failed jobs" on the CI run for that head. A later
-            push, including next month's bump, needs a new approval.
+            until a maintainer who is not this PR's author, did not push its
+            head and is not the author or committer of any of its commits has
+            reviewed the diff and the range above, approved the PR at its
+            current head, and chosen "Re-run failed jobs" on the CI run for
+            that head. A later push, including next month's bump, needs a new
+            approval.
 
             Updates every active tracked reference of the baseline SHA
             (historical `docs/reviews/` evidence remains frozen):
@@ -242,6 +305,22 @@ jobs:
           labels: |
             dependencies
             ci
+
+      # True only when this run moved the bump branch to a new head: the
+      # branch was absent or at another commit before the push.
+      - name: Record whether this run pushed the bump branch
+        id: pushed
+        if: steps.check.outputs.changed == 'true'
+        env:
+          BEFORE_SHA: ${{ steps.before.outputs.sha }}
+          AFTER_SHA: ${{ steps.cpr.outputs.pull-request-head-sha }}
+        run: |
+          if [[ "$AFTER_SHA" =~ ^[0-9a-f]{40}$ && "$AFTER_SHA" != "$BEFORE_SHA" ]]; then
+            echo "pushed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Bump branch head unchanged ($AFTER_SHA): this run pushed nothing."
+            echo "pushed=false" >> "$GITHUB_OUTPUT"
+          fi
 
   # Opens or comments on a `vcpkg-baseline-broken` issue when the bump job
   # fails, or ends cancelled (its timeout) while the run itself was not
@@ -310,14 +389,15 @@ jobs:
   # closes the open `vcpkg-baseline-broken` issues only on a run that proved
   # the whole path works: the scheduled copy on main (a dispatch of a dev or
   # feature-branch copy proves nothing about the schedule), and a run that
-  # pushed the bump branch with the PR token (created or updated the PR). A
-  # green month with nothing to bump, or with nothing new to push, has not
-  # exercised the push, so it leaves the issue open; the next pushing run
-  # closes it.
+  # moved the bump branch to a new head with the PR token and created or
+  # updated the PR. A green month with nothing to bump, or one whose branch
+  # already held this bump (nothing new to push, even when the run opened a
+  # PR on it and reports `created`), has not exercised the push, so it leaves
+  # the issue open; the next pushing run closes it.
   close-on-green:
     name: "Close vcpkg-baseline-broken on green"
     needs: [propose-bump]
-    if: ${{ success() && github.ref == 'refs/heads/main' && (needs.propose-bump.outputs.pr_operation == 'created' || needs.propose-bump.outputs.pr_operation == 'updated') }}
+    if: ${{ success() && github.ref == 'refs/heads/main' && needs.propose-bump.outputs.pushed == 'true' && (needs.propose-bump.outputs.pr_operation == 'created' || needs.propose-bump.outputs.pr_operation == 'updated') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -330,7 +410,7 @@ jobs:
             const label = 'vcpkg-baseline-broken';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
-              `The vcpkg baseline bump ran green on main's copy and pushed the bump PR with the PR token @ \`${context.sha.substring(0, 7)}\`.`,
+              `The vcpkg baseline bump ran green on main's copy and pushed a new bump branch head with the PR token @ \`${context.sha.substring(0, 7)}\`.`,
               ``,
               `**Run:** ${runUrl}`,
               ``,

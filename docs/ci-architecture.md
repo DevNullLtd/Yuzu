@@ -1204,10 +1204,11 @@ later build a release. On Big Tam and Wee Tam the four runner agents of a pool
 share one OS account. Fork pull requests do not run there unless a maintainer
 approves a revision through `trusted-fork-ci.yml`, which isolates its caches
 ([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
-vcpkg baseline PR (branch `deps/vcpkg-baseline-*`, opened by
-`vcpkg-baseline-update.yml`) does not run there either until a maintainer
-other than its author has reviewed its upstream range and approved the PR at
-the head the CI run builds: until then `preflight-gate` fails, its self-hosted
+vcpkg baseline PR (branch `deps/vcpkg-baseline*`, opened by
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer who
+is not its author, did not push its head and is on none of its commits has
+reviewed its upstream range and approved the PR at the head the CI run
+builds: until then `preflight-gate` fails, its self-hosted
 legs are skipped and `Preflight (runner health)` is red
 ([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
 maintainer approves the head"). That limits when unreviewed upstream code reaches these

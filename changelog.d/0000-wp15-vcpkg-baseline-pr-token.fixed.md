@@ -9,10 +9,11 @@
   targets `dev`, and each month's bump updates the one open bump PR instead of
   opening another. Because the PR builds an unreviewed upstream vcpkg revision,
   `ci.yml` keeps its self-hosted legs off it, and `Preflight (runner health)`
-  red, until a maintainer other than the PR's author, with write access, has
-  approved the PR at the exact head the CI run builds; a new push needs a new
-  approval. A run without the secret, or with a token GitHub rejects, fails at
-  its first step with an error naming it; any failure opens or comments on a
-  `vcpkg-baseline-broken` issue, which only a green run of `main`'s copy that
-  pushed the bump closes. The secret does not exist yet, and the scheduled run
-  picks up these changes only once they reach `main`.
+  red, until a maintainer with write access who is not the PR's author, did
+  not push its head and is not the author or committer of any of its commits
+  has approved the PR at the exact head the CI run builds; a new push needs a
+  new approval. A run whose token now belongs to another account than the
+  open bump PR's author refuses to push onto it. A run without the secret, or
+  with a token GitHub rejects, fails at its first step with an error naming
+  it; any failure opens or comments on a `vcpkg-baseline-broken` issue, which
+  only a green run of `main`'s copy that pushed a new bump closes.

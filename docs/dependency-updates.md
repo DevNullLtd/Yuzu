@@ -206,8 +206,10 @@ runs at 10:00 UTC on the 1st of each month (and is
    the `nightly-broken` pattern. It is a repair prompt, not a merge gate. It
    is closed automatically only by a green run that proves the whole path
    works: a run of `main`'s copy (the scheduled one, or a dispatch from
-   `main`) that pushed the bump and created or updated the PR. A green run
-   with nothing to bump, or a dispatch from `dev`, leaves it open.
+   `main`) that moved the bump branch to a new head and created or updated
+   the PR. A green run with nothing to bump, a run whose bump branch already
+   held this month's bump (nothing new to push, even when the run opens a PR
+   on that branch), or a dispatch from `dev`, leaves it open.
 
 **Schedule runs `main`'s copy.** A scheduled run uses the workflow file as it
 is on the default branch, `main`. A change to
@@ -224,7 +226,8 @@ branch until a maintainer has approved the PR at exactly the head that CI run
 builds. Until then `Preflight (runner health)` is red, so the PR cannot merge
 (short of an administrator's ruleset bypass, after which the push CI on `dev`
 runs the self-hosted legs), and only the GitHub-hosted jobs run. To approve, a
-maintainer other than the PR's author:
+maintainer who is independent of the head (see the list below: not the PR's
+author, not its pusher, not on any of its commits):
 
 1. reviews the PR's diff and the upstream range linked in the PR body (the
    port changes between the old and new baseline), looking for anything
@@ -233,16 +236,46 @@ maintainer other than the PR's author:
    that head;
 3. on the CI run for that head, chooses "Re-run failed jobs" ("Re-run all
    jobs" works too). Submitting a review starts no CI run; the gate reads the
-   reviews live, so the re-run sees the approval.
+   reviews live, so the re-run sees the approval. GitHub allows a re-run only
+   for 30 days after a run's first attempt. After that, close and reopen the
+   PR: that starts a new CI run for the same head, and the approval still
+   covers it.
 
 `ci.yml`'s `vcpkg_bump_approval` step counts an approval only if it is the
 reviewer's latest approve, request-changes or dismissed review (a comment-only
 review changes nothing), was submitted on the commit the run builds, and comes
-from a person, not a bot or the PR's author, with write or admin access to the
-repository (the repository is public, so anyone can leave an approving
-review). A later "Request changes" from that reviewer, or a dismissal,
-withdraws it. Any push to the branch, including next month's bump, makes a
-new head that carries no approval, so each new range needs its own review. If
+from a person, not a bot, with write or admin access to the repository (the
+repository is public, so anyone can leave an approving review), who is none
+of these:
+
+- the PR's author (the token's owner, see "The PR token");
+- on a CI run started by a push, the account that pushed that head;
+- an account GitHub links to any commit of the PR as its author or committer.
+  That covers a maintainer who pushed a commit to the bump branch by hand,
+  whoever pressed "Update branch", and the account that started the bump run,
+  whom the bump commit names as its author (for a `workflow_dispatch`, the
+  dispatcher). Each of those needs another maintainer to approve.
+
+A commit whose author or committer GitHub links to no account (an e-mail
+address no GitHub account has verified) fails the gate outright: the gate
+cannot show that the approver is not that person. Push the change again from
+an address linked to an account, or close the PR and let the next bump open a
+new one. The gate also fails if the PR's commit list no longer contains the
+run's head (the PR has moved on) or may be truncated (GitHub lists at most 250
+commits).
+
+These identities are the ones a pusher writes into their commits, so the check
+keeps an honest maintainer from approving their own push; it is not a defence
+against a maintainer who sets out to defeat it, who can run self-hosted CI
+from any branch of this repository anyway. Pushed with forged commit
+identities and then re-run from a reopened PR, a maintainer's own approval
+would pass this gate. What still stops it counting towards a merge is the
+`dev` ruleset, which requires the most recent push to be approved by someone
+other than its pusher.
+
+A later "Request changes" from that reviewer, or a dismissal, withdraws an
+approval. Any push to the branch, including next month's bump, makes a new
+head that carries no approval, so each new range needs its own review. If
 the gate refuses with the PR already at a newer head, review and approve that
 head and re-run its newest CI run. The next bump also rebuilds the branch from
 `dev`, so a fix committed to the bump branch by hand is overwritten: merge or
@@ -275,9 +308,9 @@ lists a different set. A bump record of the form "moved from `<old>` to
 
 ### The PR token
 
-`VCPKG_BASELINE_PR_TOKEN` does not exist yet. Until a maintainer creates it,
-every run fails at its first step and the `vcpkg-baseline-broken` issue stays
-open.
+On 2026-11-18 `VCPKG_BASELINE_PR_TOKEN` did not exist. Until a maintainer
+creates it, every run fails at its first step and the `vcpkg-baseline-broken`
+issue stays open.
 
 - **Owner role:** the release manager (the maintainer who cuts releases with
   the `/release` skill), who creates the token, records its expiry date (a
@@ -286,7 +319,10 @@ open.
   bot account, is the preferred identity: the PR is then authored by the bot,
   not by a person. Choosing and setting one up is the repository owner's
   decision (Fraser); until then the token is a fine-grained personal access
-  token of the release manager's own account.
+  token of the release manager's own account. An App installation token
+  cannot read `/user`, which the workflow's rotation guard ("Refuse to push
+  onto a bump PR another account opened") uses to learn the token's owner, so
+  switching to an App means changing that step in the same change.
 - **Scope.** Fine-grained, resource owner `DevNullLtd`, repository access
   "Only select repositories" with this repository alone. Repository
   permissions: Contents, Pull requests and Workflows read and write; nothing
@@ -297,7 +333,10 @@ open.
   token's owner, so that person is not an independent reviewer of it, and
   GitHub does not let an author approve their own PR. A different maintainer
   reviews the upstream range and approves the PR, which both releases the
-  self-hosted legs for that head and counts towards the merge.
+  self-hosted legs for that head and counts towards the merge. The gate
+  excludes the PR's author, so this holds only while the token's owner is the
+  PR's author: the workflow refuses to push onto an open bump PR that another
+  account opened (see the next bullet).
 - **Create or rotate.** Create the new token with the settings above, store it
   with `gh secret set VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` (or
   Settings → Secrets and variables → Actions), run the workflow once with
@@ -306,8 +345,19 @@ open.
   workflow's first step makes an authenticated read with the token, so an
   expired or revoked token fails every run there and opens a
   `vcpkg-baseline-broken` issue; a token GitHub accepts but whose permissions
-  are short fails only at "Create pull request" (typically `git` exiting 1 or
-  128).
+  are short, or that still awaits an organization owner's approval, fails
+  only at "Create pull request" (typically `git` exiting 1 or 128).
+- **Rotating to a different owner.** If the new token belongs to another
+  account than the old one and a bump PR is open, close that PR first, and do
+  not reopen it (unlike the 30-day re-run recovery above, which reopens a PR
+  nobody else has pushed to). Otherwise the next run that has a bump to push refuses at
+  "Refuse to push onto a bump PR another account opened" and opens a
+  `vcpkg-baseline-broken` issue, rather than push a head onto the old owner's
+  PR that the new owner, not being its author, could then approve. After the
+  close, the next run opens a new PR attributed to the new owner. A rotation
+  that keeps the same owner needs none of this. The guard runs only in the
+  copy of the workflow that runs: a scheduled run uses `main`'s copy, so it
+  protects the schedule only once it is on `main`.
 - **If it leaks.** Revoke it at once (the owner's Settings → Developer
   settings → Personal access tokens, or an organization owner's token
   review), then create and store a replacement as above. A leaked token can

@@ -405,7 +405,7 @@ jobs:
 
       # ── Automated vcpkg baseline PRs: self-hosted legs need an approval ─
       # vcpkg-baseline-update.yml opens its monthly PR (branch
-      # deps/vcpkg-baseline-*) with a token that starts CI, at a public,
+      # deps/vcpkg-baseline*) with a token that starts CI, at a public,
       # predictable time, and the PR builds an unreviewed microsoft/vcpkg HEAD.
       # Every self-hosted leg (proto-compat, linux, windows, macos) needs this
       # job, and those runners are persistent and write the caches release
@@ -418,26 +418,50 @@ jobs:
       # The step passes only if some reviewer's latest APPROVED,
       # CHANGES_REQUESTED or DISMISSED review (a COMMENTED review changes
       # nothing, as on GitHub) is APPROVED, was submitted on commit_id ==
-      # this run's head SHA, and comes from a User account (never a bot) that
-      # is not the PR's author (the bump token's owner) and holds write or
-      # admin access (the repository is public, so anyone may leave an
-      # approving review). A later CHANGES_REQUESTED review, or a dismissal,
-      # withdraws it. The approval is therefore bound to the reviewed head: a
-      # new push needs a new approval, whatever happened to the old one, and
+      # this run's head SHA, and comes from a User account (never a bot) with
+      # write or admin access (the repository is public, so anyone may leave
+      # an approving review) that is none of these accounts:
+      #   - the PR's author (the bump token's owner: vcpkg-baseline-update.yml
+      #     refuses to push onto an open bump PR another account opened, in
+      #     the copy that runs, which for the schedule is main's);
+      #   - on a `synchronize` run, the event's sender: the account whose push
+      #     made this head (a re-run keeps the payload);
+      #   - any account GitHub links to a commit of the PR, as its author or
+      #     committer (a hand-pushed commit, an "Update branch" merge, and the
+      #     account that started the bump run, which create-pull-request
+      #     records as the bump commit's author).
+      # A commit whose author or committer GitHub links to no account fails
+      # the step: the approver cannot be shown to be someone else. So does a
+      # commit list that does not contain this head (the PR has moved on) or
+      # may be truncated (GitHub lists at most 250 commits). Commit identities
+      # are what the pusher wrote, so this keeps an honest maintainer from
+      # approving their own push; it is no defence against one who sets out to
+      # defeat it, who could run self-hosted CI from any branch of this
+      # repository anyway. GitHub's own merge rule (the dev ruleset requires
+      # approval of the most recent push by someone other than its pusher) is
+      # what keeps such an approval from counting towards a merge.
+      #
+      # A later CHANGES_REQUESTED review, or a dismissal, withdraws an
+      # approval. The approval is therefore bound to the reviewed head: a new
+      # push needs a new approval, whatever happened to the old one, and
       # GitHub keeps the review (reviewer, time, commit) as the record.
-      # Reviews and permissions are read live from the API, so "Re-run failed
-      # jobs" on the run for the approved head sees the approval; submitting a
-      # review starts no run. A direct dispatch of ci.yml is no route around
-      # this: trusted_inputs refuses any ref but dev and main. Fail-closed on
-      # any API or input defect. Tested by tests/shell/test_vcpkg_baseline_bump.sh.
+      # Reviews, commits and permissions are read live from the API, so
+      # "Re-run failed jobs" on the run for the approved head sees the
+      # approval (GitHub allows a re-run for 30 days after a run's first
+      # attempt); submitting a review starts no run. A direct dispatch of
+      # ci.yml is no route around this: trusted_inputs refuses any ref but dev
+      # and main. Fail-closed on any API or input defect. Tested by
+      # tests/shell/test_vcpkg_baseline_bump.sh.
       - name: Require a maintainer approval at this head for an automated vcpkg baseline PR
         id: vcpkg_bump_approval
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
+          EVENT_ACTION: ${{ github.event.action }}
           HEAD_REF: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
+          SENDER_ID: ${{ github.event.sender.id }}
           RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -uo pipefail
@@ -453,14 +477,52 @@ jobs:
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || refuse "malformed PR number '$PR_NUMBER' (failing closed)."
           [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || refuse "malformed head SHA '$RUN_HEAD_SHA' (failing closed)."
           [[ "$PR_AUTHOR_ID" =~ ^[1-9][0-9]*$ ]] || refuse "malformed PR author id '$PR_AUTHOR_ID' (failing closed)."
-          procedure="A maintainer other than the PR's author reviews the PR's diff and the upstream vcpkg range at head $RUN_HEAD_SHA, approves the PR at that head, then chooses \"Re-run failed jobs\" on this run (docs/dependency-updates.md). If the PR has moved on, do that on the newest run instead: an approval covers only the head it was submitted at."
+          # Accounts that may not approve: the PR's author and, on a push
+          # (synchronize) run, the account that pushed this head.
+          excluded="[$PR_AUTHOR_ID]"
+          if [[ "$EVENT_ACTION" == "synchronize" ]]; then
+            [[ "$SENDER_ID" =~ ^[1-9][0-9]*$ ]] || refuse "malformed sender id '$SENDER_ID' on a push run (failing closed)."
+            excluded="[$PR_AUTHOR_ID,$SENDER_ID]"
+          fi
+          procedure="A maintainer who is not the PR's author, did not push this head, and is not the author or committer of any of its commits reviews the PR's diff and the upstream vcpkg range at head $RUN_HEAD_SHA, approves the PR at that head, then chooses \"Re-run failed jobs\" on this run (docs/dependency-updates.md). If the PR has moved on, do that on the newest run instead: an approval covers only the head it was submitted at. GitHub refuses a re-run 30 days after a run's first attempt; then close and reopen the PR, which starts a new run for the same head."
+          if ! commit_pages=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/commits?per_page=100"); then
+            refuse "could not read PR #$PR_NUMBER's commits (failing closed)."
+          fi
+          # Every account GitHub links to a commit of the PR, as its author or
+          # committer, as a JSON list after "ok". The list must contain this
+          # run's head (else it describes another head), may not be truncated
+          # (GitHub lists at most 250 commits), and every author and committer
+          # must resolve to an account.
+          if ! commit_check=$(jq -r --arg head "$RUN_HEAD_SHA" '
+                def linked($who): (.[$who] | type) == "object" and (.[$who].id | type) == "number";
+                if type != "array" or any(.[]; type != "array") then error("commits are not a list of pages") else . end
+                | add // []
+                | if any(.[]; type != "object") then error("a commit is not an object")
+                  elif length == 0 then "empty"
+                  elif length >= 250 then "truncated"
+                  elif all(.[]; .sha != $head) then "moved"
+                  elif any(.[]; (linked("author") and linked("committer")) | not) then
+                    "unlinked " + ([.[] | select((linked("author") and linked("committer")) | not)
+                                    | .sha | tostring | .[0:12]] | join(","))
+                  else "ok " + ([.[] | .author.id, .committer.id] | unique | tojson)
+                  end' <<<"$commit_pages"); then
+            refuse "could not parse PR #$PR_NUMBER's commits (failing closed)."
+          fi
+          case "$commit_check" in
+            "ok ["*) contributors="${commit_check#ok }" ;;
+            moved) refuse "PR #$PR_NUMBER is no longer at head $RUN_HEAD_SHA, so this run's head cannot be approved (failing closed). Review, approve and re-run the newest run." ;;
+            truncated) refuse "PR #$PR_NUMBER has 250 or more commits, more than GitHub lists, so their authors cannot all be checked (failing closed). Close it; the next bump opens a new PR." ;;
+            "unlinked "*) refuse "commit(s) ${commit_check#unlinked } of PR #$PR_NUMBER have an author or committer that GitHub links to no account, so no approver can be shown to be someone else (failing closed). Push the change again from an account-linked e-mail address, or close the PR; the next bump opens a new one." ;;
+            *) refuse "PR #$PR_NUMBER lists no usable commits (failing closed)." ;;
+          esac
           if ! pages=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100"); then
             refuse "could not read PR #$PR_NUMBER's reviews (failing closed)."
           fi
           # One row per reviewer: that reviewer's latest decisive review (by
           # review id, which GitHub assigns in submission order), kept only if
-          # it approves this exact head and is not the author's or a bot's.
-          if ! candidates=$(jq -r --arg head "$RUN_HEAD_SHA" --argjson author "$PR_AUTHOR_ID" '
+          # it approves this exact head and is not a bot's or an excluded
+          # account's.
+          if ! candidates=$(jq -r --arg head "$RUN_HEAD_SHA" --argjson excluded "$excluded" --argjson contributors "$contributors" '
                 if type != "array" or any(.[]; type != "array") then error("reviews are not a list of pages") else . end
                 | add // []
                 | map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED"))
@@ -471,12 +533,12 @@ jobs:
                              and .commit_id == $head
                              and .user.type == "User"
                              and (.user.login | type) == "string"
-                             and .user.id != $author))
+                             and (.user.id as $u | ($excluded + $contributors) | any(. == $u) | not)))
                 | .[].user.login' <<<"$pages"); then
             refuse "could not parse PR #$PR_NUMBER's reviews (failing closed)."
           fi
           if [[ -z "$candidates" ]]; then
-            refuse "automated vcpkg baseline PR #$PR_NUMBER has no maintainer approval at head $RUN_HEAD_SHA, so the self-hosted runners are not used. $procedure"
+            refuse "automated vcpkg baseline PR #$PR_NUMBER has no approval at head $RUN_HEAD_SHA from a maintainer independent of it, so the self-hosted runners are not used. $procedure"
           fi
           unverified=0
           while IFS= read -r login; do
@@ -484,12 +546,13 @@ jobs:
             if [[ ! "$login" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
               unverified=1; continue
             fi
-            # 404 (not a collaborator) and any API failure both count as "no".
+            # Not a collaborator reads as "read" (public repository) or 404;
+            # that and any API failure both count as "no".
             if ! perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$login/permission" --jq '.permission'); then
               unverified=1; continue
             fi
             if [[ "$perm" == "admin" || "$perm" == "write" ]]; then
-              echo "PR #$PR_NUMBER is approved at head $RUN_HEAD_SHA by $login ($perm access), not its author: self-hosted legs may run."
+              echo "PR #$PR_NUMBER is approved at head $RUN_HEAD_SHA by $login ($perm access), who is not its author, its pusher or on its commits: self-hosted legs may run."
               exit 0
             fi
           done <<<"$candidates"
