@@ -2010,16 +2010,14 @@ TEST_CASE("Echo #2361: a rolled-back retention pass does not discard another wri
     // yield() hands the CPU on without throttling the burst the ~1-in-5 detection
     // above depends on (a per-write sleep would, at Windows' timer granularity; the
     // effect of yield() on that detection is not measured on Windows);
-    // kMaxProbeWrites stops the writer re-taking mu_ past a ceiling retention never
-    // needs, so it can never be starved indefinitely.
+    // kMaxProbeWrites ends the writer at a ceiling retention never needs (it exits rather
+    // than idling), so it can never be starved indefinitely.
     constexpr int kMaxProbeWrites = 50000;
     std::thread writer([&] {
         int n = 0;
         while (!stop.load(std::memory_order_relaxed)) {
-            if (n >= kMaxProbeWrites) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(1));
-                continue;
-            }
+            if (n >= kMaxProbeWrites)
+                break; // the ceiling ends the writer; the Joiner below still joins it
             const int mine = ++n;
             if (f.db->set_config(std::format("collector_probe_{}", mine), std::to_string(mine))) {
                 std::lock_guard lk(ack_mu);
