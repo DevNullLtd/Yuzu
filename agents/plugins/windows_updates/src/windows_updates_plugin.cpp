@@ -920,8 +920,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     close(sock);
 #endif
 
-    freeaddrinfo(res);
-    return r;
+    return r; // `list` frees the addrinfo exactly once
 }
 
 std::vector<std::string> get_default_patch_targets() {

@@ -849,6 +849,21 @@ TEST_CASE("disk_space plugin: a local path is still measured and a symlink into 
     CHECK(contains(r.captured, "disk|"));
 }
 
+TEST_CASE("windows_updates plugin: the TCP probe path runs to completion (addrinfo freed once)",
+          "[shared][outbound][windows_updates]") {
+    // test_tcp owns its getaddrinfo list in an RAII guard. A second, manual freeaddrinfo at the end
+    // of the function was a double free (glibc: 'free(): double free detected', abort). An RFC 1918
+    // target passes the address-class refusal and reaches test_tcp; the 1 s probe timeout bounds it.
+    auto plugin = load_or_fail("windows_updates");
+    std::vector<YuzuParam> params{{"targets", "http://10.255.255.1:9/"}, {"timeout_seconds", "1"}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "patch_connectivity", params);
+    CHECK(r.rc == 0);
+    CHECK(contains(r.captured, "target|http://10.255.255.1:9/|dns_ok|true"));
+    CHECK(contains(r.captured, "tcp_ok|"));
+    CHECK(contains(r.captured, "summary|targets_tested|1|"));
+}
+
 TEST_CASE("processes plugin: list_hashed hashes this process's own image through the exe link",
           "[shared][local_path][processes]") {
 #ifdef __linux__
