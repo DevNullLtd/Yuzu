@@ -94,7 +94,7 @@ TEST_CASE("reregistration proof mode: exact spellings only, a typo never weakens
     CHECK(parse_reregistration_proof_mode("enforce") == ReregistrationProofMode::Enforce);
     for (const char* bad : {"", "Enforce", "ENFORCE", "enforced", "on", "true", " audit", "audit "})
         CHECK_FALSE(parse_reregistration_proof_mode(bad).has_value());
-    // The compiled-in default is audit for the first release (owner decision D3).
+    // The compiled-in default is audit (owner decision D3).
     Config cfg;
     CHECK(cfg.agent_reregistration_proof == "audit");
     CHECK(parse_reregistration_proof_mode(cfg.agent_reregistration_proof) ==
@@ -107,17 +107,82 @@ TEST_CASE("reregistration refusal message does not name the reason", "[reregistr
         CHECK(m.find(leak) == std::string::npos);
 }
 
-TEST_CASE("reregistration audit budget: a first admit always leaves its row (even with the key table "
-          "full), repeats are cut, ONE system-attributed aggregate row per closed window, new-id rows "
-          "are globally capped and counted",
+TEST_CASE("unproven audit budget: exact numbers - per-source sub-cap, reserved bucket for first-ever "
+          "ids, global backstop, distinct counts, time flush",
+          "[reregistration_gate][wp01][audit_budget]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 1'000'000;
+    const auto admit = [&](const std::string& id, const std::string& src) {
+        return b.admit(id, src, t).admitted;
+    };
+
+    // W0: 300 ids, each from its OWN source: all admitted (reserved 250 + 50 general), and every id
+    // becomes "recent" (no longer first-ever).
+    for (int i = 0; i < 300; ++i)
+        CHECK(admit("pre-" + std::to_string(i), "src-" + std::to_string(i)));
+    t += B::kWindowMs + 1;
+
+    // W1, per-SOURCE sub-cap: one attacker source naming 200 already-known (non-first-ever) ids is
+    // cut to exactly kRowsPerSource rows.
+    int admitted = 0;
+    for (int i = 0; i < 200; ++i)
+        admitted += admit("pre-" + std::to_string(i), "attacker") ? 1 : 0;
+    CHECK(admitted == static_cast<int>(B::kRowsPerSource));
+    // The reserved bucket: a first-ever victim id from ANOTHER source is admitted regardless.
+    CHECK(admit("victim-first-ever", "victim-src"));
+
+    // The attacker spends the GENERAL budget from 25 more sources (50 each... capped at the global
+    // backstop); the reserved bucket still admits first-ever ids until its own cap.
+    t += B::kWindowMs + 1;
+    int general = 0;
+    for (int srcn = 0; srcn < 30; ++srcn)
+        for (int i = 0; i < 50; ++i)
+            general += admit("pre-" + std::to_string((srcn * 50 + i) % 300), "bot-" + std::to_string(srcn)) ? 1 : 0;
+    CHECK(general <= static_cast<int>(B::kGeneralRows));
+    CHECK(admit("victim-2", "victim-src")); // first-ever: reserved bucket, not starved
+    // Per-id repeats: exactly kRepeatRowsPerId rows.
+    int repeats = 0;
+    for (int i = 0; i < 10; ++i)
+        repeats += admit("victim-2", "victim-src") ? 1 : 0;
+    CHECK(repeats == static_cast<int>(B::kRepeatRowsPerId) - 1); // the first admit above was row 1
+
+    // Time-based flush: the closed window's summary is available WITHOUT a later admit.
+    CHECK(b.poll_closed(t + 1, /*force=*/false).empty()); // still open
+    t += B::kWindowMs + 1;
+    const std::string summary = b.poll_closed(t, /*force=*/false);
+    CHECK(summary.find("dropped_rows=") != std::string::npos);
+    CHECK(summary.find("distinct_dropped_ids=") != std::string::npos);
+    CHECK(summary.find("sources=") != std::string::npos);
+    CHECK(summary.find("bot-") != std::string::npos); // per-source counts, not a caller identity
+    CHECK(b.poll_closed(t, false).empty());           // delivered once
+}
+
+TEST_CASE("unproven audit budget: a legitimate restart storm, the shutdown flush and the global backstop",
+          "[reregistration_gate][wp01][audit_budget]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 5'000'000;
+    // 2000 distinct first-ever ids from 2000 sources in one window: kReservedRows + kGeneralRows
+    // are written, the rest dropped and COUNTED as distinct ids.
+    int admitted = 0;
+    for (int i = 0; i < 2000; ++i)
+        admitted += b.admit("storm-" + std::to_string(i), "s" + std::to_string(i), t).admitted ? 1 : 0;
+    CHECK(admitted == static_cast<int>(B::kReservedRows + B::kGeneralRows));
+    // Shutdown flush closes the OPEN window and reports it (otherwise lost on exit).
+    const std::string summary = b.poll_closed(t + 1, /*force=*/true);
+    CHECK(summary.find("dropped_rows=750") != std::string::npos);
+    CHECK(summary.find("distinct_dropped_ids=750") != std::string::npos);
+    CHECK(b.poll_closed(t + 2, true).empty());
+}
+
+TEST_CASE("reregistration audit sink path: the aggregate row is a system row with no caller identity",
           "[reregistration_gate][wp01]") {
     const std::expected<AgentLeafState, std::string> live{AgentLeafState{.has_live = true}};
     AgentIdentityHooks hooks;
     hooks.leaf_state = [&](const std::string&) { return live; };
     int refusal_rows = 0, unproven_rows = 0, aggregate_rows = 0;
     std::string aggregate_extra;
-    std::set<std::string> admitted_ids;
-    std::string current_id;
     const ReregistrationAuditSink sink = [&](std::string_view action, std::string_view,
                                              std::string_view outcome, std::string_view,
                                              std::string_view extra) {
@@ -126,78 +191,40 @@ TEST_CASE("reregistration audit budget: a first admit always leaves its row (eve
             aggregate_extra = std::string(extra);
         } else if (action == kAuditActionReregistrationUnproven) {
             ++unproven_rows;
-            admitted_ids.insert(current_id);
         } else {
             ++refusal_rows;
         }
     };
     yuzu::MetricsRegistry metrics;
     const ReregistrationEvidence ev{};
-    auto audit_attempt = [&](const std::string& id) {
-        current_id = id;
+    auto audit_attempt = [&](const std::string& id, const std::string& src) {
         (void)apply_reregistration_gate(ReregistrationProofMode::Audit, &hooks, "direct", id, id, ev,
-                                        &metrics, sink);
+                                        &metrics, sink, src);
     };
-    auto new_window = [&] {
-        detail::reregistration_audit_clock_skew_ms() += 11'000;
-        audit_attempt("window-opener");
-    };
-    // Start from a fresh window regardless of what earlier cases in this process did.
-    new_window();
-    new_window();
+    detail::reregistration_audit_clock_skew_ms() += 1'000'000;
+    audit_attempt("window-reset", "x");
+    detail::reregistration_audit_clock_skew_ms() += 11'000;
+    audit_attempt("window-reset2", "x");
     unproven_rows = aggregate_rows = 0;
-    admitted_ids.clear();
-
-    // (iii) A flood of 700 NEW ids in one window: exactly the global cap of 500 rows is written,
-    // the other 200 are dropped, counted and summarised.
-    for (int i = 0; i < 700; ++i)
-        audit_attempt("flood-id-" + std::to_string(i));
-    // (The window's opener already took one of the 500 rows, so 499 of the flood fit.)
-    CHECK(unproven_rows ==
-          static_cast<int>(detail::UnprovenAuditBudget::kNewIdRowsPerWindow) - 1);
+    // 100 repeats of one id from one source: 3 rows, 97 dropped and counted.
+    for (int i = 0; i < 100; ++i)
+        audit_attempt("victim-loop", "9.9.9.9");
+    CHECK(unproven_rows == static_cast<int>(detail::UnprovenAuditBudget::kRepeatRowsPerId));
     CHECK(metrics.counter("yuzu_register_reregistration_audit_dropped_total",
                           {{"action", std::string(kAuditActionReregistrationUnproven)}})
-              .value() == 201.0);
-
-    // The window reopens: the closed window's summary is written ONCE, and the opener (a NEW id)
-    // gets its own first row again.
-    aggregate_rows = 0;
+              .value() == 97.0);
+    // The summary is flushed by TIME (the server's tick), not by a later admit.
     detail::reregistration_audit_clock_skew_ms() += 11'000;
-    audit_attempt("victim-first");
-    CHECK(aggregate_rows == 1);
-    CHECK(aggregate_extra.find("dropped_new_ids=201") != std::string::npos);
-    CHECK(aggregate_extra.find("sample_ids=") != std::string::npos);
-    CHECK(admitted_ids.count("victim-first") == 1);
-
-    // (i) The tracked-id table is cleared every window and the global new-id cap (500) is far below
-    // its size (4096), so an attacker cannot fill the table: the only way to starve a victim's FIRST
-    // row is to spend the global cap in the SAME window (documented residual: that row is dropped,
-    // counted and summarised). In the next window the victim's first admit is written again.
-    new_window();
-    for (int i = 0; i < 500; ++i)
-        audit_attempt("fill-" + std::to_string(i));
-    admitted_ids.clear();
-    audit_attempt("victim-same-window");
-    CHECK(admitted_ids.count("victim-same-window") == 0); // cap spent: dropped (and counted)
-    detail::reregistration_audit_clock_skew_ms() += 11'000;
-    audit_attempt("victim-2");
-    CHECK(admitted_ids.count("victim-2") == 1);
-
-    // (ii) Repeats of one id: cut to the per-id budget (3), summarised in the aggregate.
-    new_window();
-    unproven_rows = 0;
-    for (int i = 0; i < 100; ++i)
-        audit_attempt("victim-loop");
-    CHECK(unproven_rows == static_cast<int>(detail::UnprovenAuditBudget::kRepeatRowsPerId));
-    aggregate_rows = 0;
-    new_window();
-    CHECK(aggregate_rows == 1);
-    CHECK(aggregate_extra.find("suppressed_repeats=97") != std::string::npos);
-    CHECK(aggregate_extra.find("victim-loop") != std::string::npos); // bounded sample of the ids
+    const auto summary = detail::reregistration_unproven_budget().poll_closed(
+        detail::reregistration_audit_now_ms(), false);
+    CHECK(summary.find("dropped_rows=97") != std::string::npos);
+    CHECK(summary.find("9.9.9.9:97") != std::string::npos);
+    CHECK(summary.find("victim-loop") != std::string::npos);
     // The decision counter is NOT sampled: every attempt above was counted.
     CHECK(metrics.counter("yuzu_register_reregistration_total",
                           {{"path", "direct"}, {"outcome", "no_proof"}, {"mode", "audit"}})
-              .value() > 1000.0);
+              .value() >= 102.0);
+    CHECK(aggregate_rows == 0); // no later admit was needed to flush
 
     // enforce: a flood on ONE id is bounded to the refusal budget, still refused each time.
     for (int i = 0; i < 100; ++i) {

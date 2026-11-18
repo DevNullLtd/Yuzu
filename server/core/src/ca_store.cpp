@@ -540,12 +540,12 @@ std::expected<void, std::string> CaStore::record_issued(const IssuedCertRecord& 
         "INSERT INTO ca_store.ca_issued (serial_hex, subject, san, purpose, not_after, status, "
         "revocation_reason, revoked_at, issued_at, issued_by, enrollment_request_id, cert_pem, "
         "issuer_fingerprint, issuer_key_id) "
-        "VALUES ($1,$2,$3,$4,$5::bigint,$6,$7,$8::bigint,$9::bigint,$10,$11,$12,$13,$14)",
+        "VALUES ($1,$2,$3,$4,$5::bigint,$6,$7,$8::bigint,COALESCE(NULLIF($9::bigint, 0), floor(extract(epoch FROM now()))::bigint),$10,$11,$12,$13,$14)",
         std::vector<std::string>{
             *serial, sanitize_pg_text(rec.subject), sanitize_pg_text(rec.san),
             sanitize_pg_text(rec.purpose), std::to_string(rec.not_after),
             cert_status_to_string(rec.status), sanitize_pg_text(rec.revocation_reason),
-            std::to_string(rec.revoked_at), std::to_string(rec.issued_at ? rec.issued_at : now_epoch()),
+            std::to_string(rec.revoked_at), std::to_string(rec.issued_at),
             sanitize_pg_text(rec.issued_by), sanitize_pg_text(rec.enrollment_request_id),
             sanitize_pg_text(rec.cert_pem), rec.issuer_fingerprint, rec.issuer_key_id});
     if (res.status() != PGRES_COMMAND_OK) {
@@ -1390,6 +1390,7 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
     std::vector<std::string> out;
     std::string failure;
+    bool survivor_inactive = false;
     // ONE transaction under a per-agent advisory lock (ADR-0012): the lock is taken BEFORE the
     // UPDATE's snapshot, so two concurrent re-enrolments of one id run strictly one after the
     // other, and the second sees the first's committed leaf. The statement keeps exactly the
@@ -1406,23 +1407,39 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
             failure = PQerrorMessage(conn);
             return false;
         }
+        // The survivor is the caller's OWN new leaf and it must be ACTIVE and unexpired: otherwise
+        // (operator-revoked in between, never recorded) NOTHING is revoked and the call reports
+        // failure, so an older, possibly stolen leaf is never "superseded" by a leaf that is not
+        // live. Only leaves OLDER than the survivor by (issued_at, serial_hex) are revoked, so two
+        // concurrent re-enrolments can never revoke each other's (or the caller's own) fresh
+        // leaf. issued_at is stamped by the INSERT from the database clock. revoked_at is the
+        // database clock too.
+        pg::PgResult live = pg::exec_params(
+            conn,
+            "SELECT 1 FROM ca_store.ca_issued WHERE serial_hex = $2 AND purpose = 'agent' "
+            "AND subject = $1 AND status = 'active' "
+            "AND not_after > extract(epoch FROM now())::bigint",
+            std::vector<std::string>{sanitize_pg_text(agent_id), *keep});
+        if (live.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        if (PQntuples(live.get()) != 1) {
+            survivor_inactive = true;
+            return true; // nothing revoked; reported below
+        }
         pg::PgResult res = pg::exec_params(
             conn,
             "UPDATE ca_store.ca_issued o SET status = 'revoked', revocation_reason = $3, "
-            "revoked_at = $4::bigint "
-            "WHERE o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
+            "revoked_at = floor(extract(epoch FROM now()))::bigint "
+            "FROM ca_store.ca_issued k "
+            "WHERE k.serial_hex = $2 AND k.purpose = 'agent' AND k.subject = $1 "
+            "AND o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
             "AND o.not_after > extract(epoch FROM now())::bigint "
-            "AND EXISTS (SELECT 1 FROM ca_store.ca_issued k WHERE k.serial_hex = $2 "
-            "           AND k.purpose = 'agent' AND k.subject = $1) "
-            "AND o.serial_hex <> (SELECT n.serial_hex FROM ca_store.ca_issued n "
-            "                     WHERE n.purpose = 'agent' AND n.subject = $1 "
-            "                     AND n.status = 'active' "
-            "                     AND n.not_after > extract(epoch FROM now())::bigint "
-            "                     ORDER BY n.issued_at DESC, n.serial_hex DESC LIMIT 1) "
+            "AND (o.issued_at, o.serial_hex) < (k.issued_at, k.serial_hex) "
             "RETURNING o.serial_hex",
             std::vector<std::string>{sanitize_pg_text(agent_id), *keep,
-                                     std::string(kRevokeReasonReenrolled),
-                                     std::to_string(now_epoch())});
+                                     std::string(kRevokeReasonReenrolled)});
         if (res.status() != PGRES_TUPLES_OK) {
             failure = PQerrorMessage(conn);
             return false;
@@ -1435,6 +1452,9 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
     if (!ok)
         return std::unexpected(std::string(kCaDbErrorPrefix) +
                                "revoke_older_agent_leaves failed: " + failure);
+    if (survivor_inactive)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "the new leaf is not an active agent leaf: nothing revoked");
     return out;
 }
 

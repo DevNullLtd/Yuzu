@@ -9,7 +9,10 @@
 
 #include <atomic>
 #include <cctype>
+#include <algorithm>
+#include <deque>
 #include <map>
+#include <set>
 #include <mutex>
 #include <vector>
 #include <chrono>
@@ -78,26 +81,34 @@ inline DenialAuditBudget& reregistration_audit_budget() {
 }
 /// Budget for the ADMITTED row of audit mode (`agent.reregistration_unproven`, result success): the
 /// evidence that makes a takeover reconstructable (CC7.2), and a row an unauthenticated caller can
-/// provoke. The design, and what it cannot do:
-///  - a FIRST admit for an id in a window ALWAYS leaves its row, whatever else the window holds
-///    (the table of seen ids filling up does not suppress a new id: it only stops tracking its
-///    repeats), up to a GLOBAL cap of `kNewIdRowsPerWindow` such rows per window;
-///  - REPEATS of an id already seen in the window are cut to `kRepeatRowsPerId` rows;
-///  - everything cut (repeats, and new ids past the global cap) is counted per window and
-///    summarised by ONE aggregate row when the next window opens, written under a SYSTEM
-///    principal (never the opening caller's identity) with the totals and a bounded sample of the
-///    suppressed ids, and by `yuzu_register_reregistration_audit_dropped_total`.
-/// RESIDUAL: the global cap bounds bytes (500 new-id rows / 10 s is about 1.4 GB/day at ~330 B, versus
-/// ~28 GB/day uncapped at 1000/s), so an attacker who can name more than 500 live-leaf ids inside one
-/// window can push a victim's FIRST row past the cap: that row is dropped, counted and summarised,
-/// not written. `yuzu_register_reregistration_total{outcome=...}` is NOT budgeted and is the
-/// authoritative count of every decision; the unproven-rows alert fires on it.
+/// provoke. HONEST CLAIM: rows can be DROPPED under load or attack, so the absence of a row is NOT
+/// proof that a re-registration did not happen; the authoritative count is the unbudgeted
+/// `yuzu_register_reregistration_total{outcome=...}`, and every dropped row is counted
+/// (`yuzu_register_reregistration_audit_dropped_total`) and summarised.
+///
+/// Per 10 s window, per server PROCESS (N replicas = N times these numbers):
+///  - repeats of an id seen in the window: `kRepeatRowsPerId` rows, then cut;
+///  - a RESERVED bucket (`kReservedRows`) for ids not seen in the last `kRecentIds` admissions
+///    (first-ever / long-quiet ids): written regardless of source, so a flood from one source or
+///    an exhausted general budget cannot starve a victim whose id is new to the window history;
+///  - every other new-id row needs BOTH a per-source slot (`kRowsPerSource`: one peer IP or gateway
+///    observed origin cannot spend the window) and a global slot (`kGeneralRows`, the byte backstop).
+/// Dropped rows are summarised by ONE aggregate row per closed window, written under a SYSTEM
+/// principal with per-source counts, the number of DISTINCT dropped ids and a bounded id list. The
+/// summary is flushed by time (`poll_closed`, called from the server's health tick) and at shutdown,
+/// not only lazily by a later admit.
+/// RESIDUAL: an attacker able to name more than `kReservedRows` brand-new live-leaf ids from many
+/// sources inside one window can still drop a victim's row; the count is not lost.
 class UnprovenAuditBudget {
 public:
-    static constexpr std::size_t kNewIdRowsPerWindow = 500;
     static constexpr std::size_t kRepeatRowsPerId = 3;
+    static constexpr std::size_t kReservedRows = 250;
+    static constexpr std::size_t kRowsPerSource = 50;
+    static constexpr std::size_t kGeneralRows = 1000;
+    static constexpr std::size_t kRecentIds = 8192;
     static constexpr std::size_t kMaxTrackedIds = 4096;
-    static constexpr std::size_t kSampleIds = 5;
+    static constexpr std::size_t kSummaryIds = 200;
+    static constexpr std::size_t kSummarySources = 10;
     static constexpr std::int64_t kWindowMs = 10'000;
 
     struct Decision {
@@ -106,41 +117,88 @@ public:
         std::string closed_summary;
     };
 
-    [[nodiscard]] Decision admit(const std::string& agent_id, std::int64_t now_ms) {
+    [[nodiscard]] Decision admit(const std::string& agent_id, const std::string& source,
+                                 std::int64_t now_ms) {
         std::lock_guard lk(mu_);
         Decision d;
-        if (!open_ || now_ms >= start_ms_ + kWindowMs) {
-            if (open_ && (suppressed_repeats_ > 0 || dropped_new_ > 0))
-                d.closed_summary = summary_locked();
-            open_ = true;
-            start_ms_ = now_ms;
-            seen_.clear();
-            window_new_rows_ = 0;
-            suppressed_repeats_ = dropped_new_ = 0;
-            sample_.clear();
-        }
+        d.closed_summary = roll_locked(now_ms, /*force=*/false);
         if (const auto it = seen_.find(agent_id); it != seen_.end()) {
             if (++it->second <= kRepeatRowsPerId) {
                 d.admitted = true;
             } else {
-                ++suppressed_repeats_;
-                note_sample_locked(agent_id);
+                drop_locked(agent_id, source);
             }
             return d;
         }
-        if (window_new_rows_ >= kNewIdRowsPerWindow) {
-            ++dropped_new_;
-            note_sample_locked(agent_id);
+        const bool first_ever = recent_.find(agent_id) == recent_.end();
+        bool ok = false;
+        if (first_ever && reserved_rows_ < kReservedRows) {
+            ++reserved_rows_;
+            ok = true;
+        } else if (source_rows_[source] < kRowsPerSource && general_rows_ < kGeneralRows) {
+            ++source_rows_[source];
+            ++general_rows_;
+            ok = true;
+        }
+        if (!ok) {
+            drop_locked(agent_id, source);
             return d;
         }
-        ++window_new_rows_;
         if (seen_.size() < kMaxTrackedIds)
             seen_.emplace(agent_id, 1);
+        remember_locked(agent_id);
         d.admitted = true;
         return d;
     }
 
+    /// Time-based flush: the closed window's summary (empty if the window is still open or nothing
+    /// was dropped). `force` closes the open window too (shutdown).
+    [[nodiscard]] std::string poll_closed(std::int64_t now_ms, bool force) {
+        std::lock_guard lk(mu_);
+        return roll_locked(now_ms, force);
+    }
+
 private:
+    std::string roll_locked(std::int64_t now_ms, bool force) {
+        std::string out;
+        if (open_ && (force || now_ms >= start_ms_ + kWindowMs)) {
+            if (dropped_rows_ > 0)
+                out = summary_locked();
+            open_ = false;
+            reset_window_locked();
+        }
+        if (!open_ && !force) {
+            open_ = true;
+            start_ms_ = now_ms;
+        }
+        return out;
+    }
+    void reset_window_locked() {
+        seen_.clear();
+        source_rows_.clear();
+        general_rows_ = reserved_rows_ = 0;
+        dropped_rows_ = 0;
+        dropped_by_source_.clear();
+        dropped_ids_.clear();
+        dropped_ids_overflow_ = 0;
+    }
+    void drop_locked(const std::string& id, const std::string& source) {
+        ++dropped_rows_;
+        ++dropped_by_source_[source.substr(0, 45)];
+        if (dropped_ids_.size() < kMaxTrackedIds)
+            dropped_ids_.insert(id);
+        else if (dropped_ids_.find(id) == dropped_ids_.end())
+            ++dropped_ids_overflow_;
+    }
+    void remember_locked(const std::string& id) {
+        if (recent_.insert(id).second) {
+            recent_order_.push_back(id);
+            if (recent_order_.size() > kRecentIds) {
+                recent_.erase(recent_order_.front());
+                recent_order_.pop_front();
+            }
+        }
+    }
     static std::string neutralise(const std::string& id) {
         std::string out;
         for (const char c : id.substr(0, 24))
@@ -150,25 +208,39 @@ private:
                               : '?');
         return out;
     }
-    void note_sample_locked(const std::string& id) {
-        if (sample_.size() < kSampleIds)
-            sample_.push_back(neutralise(id));
-    }
     std::string summary_locked() const {
-        std::string s = "suppressed_repeats=" + std::to_string(suppressed_repeats_) +
-                        " dropped_new_ids=" + std::to_string(dropped_new_) + " sample_ids=";
-        for (std::size_t i = 0; i < sample_.size(); ++i)
-            s += (i ? "," : "") + sample_[i];
+        std::string s = "dropped_rows=" + std::to_string(dropped_rows_) +
+                        " distinct_dropped_ids=" +
+                        std::to_string(dropped_ids_.size() + dropped_ids_overflow_) +
+                        " sources=";
+        std::vector<std::pair<std::size_t, std::string>> by;
+        for (const auto& [src, n] : dropped_by_source_)
+            by.emplace_back(n, src);
+        std::sort(by.rbegin(), by.rend());
+        for (std::size_t i = 0; i < by.size() && i < kSummarySources; ++i)
+            s += (i ? "," : "") + neutralise(by[i].second) + ":" + std::to_string(by[i].first);
+        s += " ids=";
+        std::size_t n = 0;
+        for (const auto& id : dropped_ids_) {
+            if (n++ >= kSummaryIds)
+                break;
+            s += (n > 1 ? "," : "") + neutralise(id);
+        }
         return s;
     }
     std::mutex mu_;
     bool open_{false};
     std::int64_t start_ms_{0};
     std::map<std::string, std::size_t> seen_;
-    std::size_t window_new_rows_{0};
-    std::uint64_t suppressed_repeats_{0};
-    std::uint64_t dropped_new_{0};
-    std::vector<std::string> sample_;
+    std::map<std::string, std::size_t> source_rows_;
+    std::size_t general_rows_{0};
+    std::size_t reserved_rows_{0};
+    std::uint64_t dropped_rows_{0};
+    std::map<std::string, std::size_t> dropped_by_source_;
+    std::set<std::string> dropped_ids_;
+    std::uint64_t dropped_ids_overflow_{0};
+    std::set<std::string> recent_;
+    std::deque<std::string> recent_order_;
 };
 inline UnprovenAuditBudget& reregistration_unproven_budget() {
     static UnprovenAuditBudget b;
@@ -194,8 +266,20 @@ inline DenialAuditBudget& reregistration_log_budget() {
             source_ip = std::move(source_ip)](std::string_view action, std::string_view result,
                                                std::string_view outcome, std::string_view mode,
                                                std::string_view extra) {
-        if (!store || !store->is_open())
+        if (!store || !store->is_open()) {
+            // A budget slot was spent for a row that cannot be written: count it and say so (rate
+            // limited), never silently.
+            if (metrics)
+                metrics
+                    ->counter("yuzu_register_reregistration_audit_write_failures_total",
+                              {{"reason", "store_unavailable"}})
+                    .increment();
+            if (detail::reregistration_log_budget().try_admit("audit-store-unavailable").admitted)
+                spdlog::warn("Re-registration audit row NOT written: the audit store is not open "
+                             "(action {})",
+                             action);
             return;
+        }
         AuditEvent ev;
         ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
                            std::chrono::system_clock::now().time_since_epoch())
@@ -219,11 +303,27 @@ inline DenialAuditBudget& reregistration_log_budget() {
         ev.result = std::string(result);
         if (!store->log(ev)) {
             if (metrics)
-                metrics->counter("yuzu_register_reregistration_audit_write_failures_total").increment();
+                metrics
+                    ->counter("yuzu_register_reregistration_audit_write_failures_total",
+                              {{"reason", "write_failed"}})
+                    .increment();
             if (on_write_failure)
                 on_write_failure();
         }
     };
+}
+
+/// Time-based / shutdown flush of the closed window's dropped-row summary (see
+/// UnprovenAuditBudget): called from the server's periodic tick and at stop(), so the summary is
+/// not lost when no later admit opens the next window. `store` may be null (counted, not written).
+inline void flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsRegistry* metrics,
+                                               bool force) {
+    const auto summary =
+        detail::reregistration_unproven_budget().poll_closed(detail::reregistration_audit_now_ms(), force);
+    if (summary.empty())
+        return;
+    const auto sink = make_reregistration_audit_sink(store, "server", "*", "", nullptr, nullptr, metrics);
+    sink(kAuditActionReregistrationUnproven, "success", "aggregate", "audit", summary);
 }
 
 /// `path` is the metric label ("direct" | "gateway_proxy"). `hooks` may be null (no CA of our own:
@@ -233,7 +333,8 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
                           std::string_view path, const std::string& agent_id,
                           const std::string& safe_agent_id, const ReregistrationEvidence& ev,
                           yuzu::MetricsRegistry* metrics,
-                          const ReregistrationAuditSink& audit = {}) {
+                          const ReregistrationAuditSink& audit = {},
+                          std::string_view source = {}) {
     if (mode == ReregistrationProofMode::Off || hooks == nullptr || !hooks->leaf_state)
         return {};
 
@@ -276,7 +377,7 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
             return;
         if (result == "success") {
             const auto r = detail::reregistration_unproven_budget().admit(
-                agent_id, detail::reregistration_audit_now_ms());
+                agent_id, std::string(source), detail::reregistration_audit_now_ms());
             // The closed window's summary: ONE row under a system principal (the sink keys on
             // outcome "aggregate"), never stamped with this (opening) caller's identity.
             if (!r.closed_summary.empty())

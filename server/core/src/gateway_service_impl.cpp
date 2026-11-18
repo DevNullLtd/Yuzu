@@ -737,9 +737,9 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                             std::string(yuzu::server::kReregistrationRefusalPublicMessage));
     };
 
-    // Both fields are gateway-authoritative (overwritten unconditionally by an upgraded gateway),
+    // Both fields are gateway-authoritative (overwritten unconditionally by the gateway),
     // so they are read ONLY here; the direct Register ignores them. `attests` is true only when
-    // the gateway's listener can witness a client certificate; an old gateway, a plaintext
+    // the gateway's listener can witness a client certificate; a plaintext
     // listener and TLS without witness_client_cert all report false (no proof can exist).
     const auto run_reregistration_gate = [&]() {
         const bool attests = request->gateway_attests_peer_cert();
@@ -764,7 +764,8 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
             yuzu::server::make_reregistration_audit_sink(
                 audit_store_, "gateway_proxy", info.agent_id(), agent_source_ip,
                 [&](std::string& d) { append_origin_detail(d); /* #1064 */ },
-                [&] { signal_grpc_audit_failed(context); }, metrics_));
+                /*on_write_failure=*/nullptr, metrics_),
+            agent_source_ip);
     };
 
     // Fast path: agent already enrolled from a prior connection
@@ -1542,6 +1543,8 @@ gw_enrolled:
                     spdlog::error("[gateway] ProxyRegister: superseding older leaves threw for "
                                   "agent {}",
                                   safe_agent_id);
+                    if (metrics_)
+                        metrics_->counter("yuzu_server_ca_supersede_failed_total").increment();
                 }
             }
         } else {

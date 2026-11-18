@@ -411,7 +411,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             yuzu::server::make_reregistration_audit_sink(
                 audit_store_, "direct", info.agent_id(),
                 context ? extract_peer_ip(context->peer()) : std::string{}, nullptr,
-                [&] { signal_grpc_audit_failed(context); }, &metrics_));
+                [&] { signal_grpc_audit_failed(context); }, &metrics_),
+            context ? extract_peer_ip(context->peer()) : std::string{});
     };
 
     // Fast path: agent already enrolled from a prior connection — skip enrollment
@@ -1042,6 +1043,7 @@ enrolled:
                 } catch (...) {
                     spdlog::error("Register: superseding older leaves threw for agent {}",
                                   safe_agent_id);
+                    metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
                 }
             }
         } else {

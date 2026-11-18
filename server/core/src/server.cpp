@@ -348,6 +348,7 @@
 #include "event_bus.hpp"
 #include "agent_registry.hpp"
 #include "agent_service_impl.hpp"
+#include "agent_reregistration_apply.hpp"
 #include "agent_witnessed_leaf.hpp"
 #include "cidr_match.hpp"
 #include "gateway_forward_guard.hpp"
@@ -3703,7 +3704,9 @@ public:
         for (const char* action : {"agent.reregistration_unproven", "agent.reregistration_refused"})
             (void)metrics_.counter("yuzu_register_reregistration_audit_dropped_total",
                                    {{"action", action}});
-        (void)metrics_.counter("yuzu_register_reregistration_audit_write_failures_total");
+        for (const char* reason : {"store_unavailable", "write_failed"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_write_failures_total",
+                                   {{"reason", reason}});
         for (const char* r : {"refunded", "failed"})
             (void)metrics_.counter("yuzu_register_reenrol_token_refunded_total", {{"result", r}});
         metrics_.describe("yuzu_register_reenrol_token_refunded_total",
@@ -3716,8 +3719,9 @@ public:
         (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
         metrics_.describe("yuzu_register_reregistration_audit_dropped_total",
                           "Re-registration audit rows NOT written because the per-id audit budget "
-                          "was spent (a flood on one id). The decision counter still counts every "
-                          "attempt; one aggregate row (suppressed=N) is written per closed window.",
+                          "was spent (per-source, global or per-id caps). The decision counter still "
+                          "counts every attempt; one aggregate summary row is written per closed "
+                          "window.",
                           "counter");
         metrics_.describe("yuzu_register_reregistration_audit_write_failures_total",
                           "Re-registration audit rows whose write FAILED (audit store error).",
@@ -10840,6 +10844,9 @@ public:
                 // #4828 AC4 (this is what makes the self-heal wiring actually unit-testable) and
                 // the WS-3 two-planes rule this split preserves. This site keeps ONLY the two
                 // gate checks below; CrlPublisher itself never touches the leader elector.
+                // WP01: flush the closed window's dropped-audit-row summary by time (not only when a
+                // later admit opens the next window). Per-process state, so NOT leader-gated.
+                flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/false);
                 if (crl_publisher_) {
                     const auto now_steady = std::chrono::steady_clock::now();
                     YUZU_ASSERT_BACKGROUND_JOB("ca.publish_crl"); // WS-10 FencedLeaderOnly
@@ -12228,6 +12235,8 @@ public:
         agent_service_.set_peer_cert_recognizer(nullptr);
         agent_service_.set_agent_identity_hooks(nullptr);
         agent_service_.set_superseded_checker(nullptr);
+        // WP01: shutdown flush of the dropped-audit-row summary (the audit store is still open).
+        flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true);
         if (gateway_service_) {
             gateway_service_->set_agent_cert_signer(nullptr);
             gateway_service_->set_agent_identity_hooks(nullptr);
@@ -13452,17 +13461,10 @@ private:
         rec.purpose = "agent";
         rec.not_after =
             std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
-        // WP01 (UP-1 / D): `issued_at` orders an agent's leaves for the newest-leaf supersede, so it
-        // is stamped from the DATABASE clock (one clock for every replica), never this replica's
-        // system_clock: a lagging replica's newer leaf must not look older and get revoked.
-        // Fail closed: an unreadable database clock means no issuance (the agent retries).
-        if (auto db_now = ca_store_->db_now(); db_now) {
-            rec.issued_at = *db_now;
-        } else {
-            spdlog::error("PKI: cannot read the database clock - agent cert not issued: {}",
-                          ::yuzu::log_key_token(db_now.error()));
-            return std::nullopt;
-        }
+        // WP01 (UP-1 / D): `issued_at` orders an agent's leaves for the supersede, so it is stamped
+        // by record_issued's INSERT from the DATABASE clock (rec.issued_at = 0), never this
+        // replica's system_clock: a lagging replica's newer leaf must not look older.
+        rec.issued_at = 0;
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;

@@ -164,6 +164,11 @@ void wire(Harness& h, const Ca& our_ca, std::shared_ptr<yuzu::server::AgentIdent
         return yuzu::server::AgentLeafState{.has_live = true, .has_revoked_unexpired = false};
     };
     hooks->supersede_older_leaves = [](const std::string&, const std::string&) { return true; };
+    h.svc.set_agent_cert_signer([](const std::string&, const std::string& id,
+                                   yuzu::server::CertIssuanceSource)
+                                    -> std::optional<std::pair<std::string, std::string>> {
+        return std::make_pair("LEAF-" + id, "CHAIN");
+    });
     h.svc.set_agent_identity_hooks(hooks);
     h.svc.set_reregistration_proof_mode(yuzu::server::ReregistrationProofMode::Enforce);
 }
@@ -243,6 +248,44 @@ TEST_CASE("WP01 direct path over real mTLS: only a real, unrevoked, CN-matching 
         auto o = register_as(*stub, "agent-real", created->raw_token);
         CHECK(o.status.ok());
         CHECK(o.resp.accepted());
+        // The TOKEN path really ran (kills a mutant that lets the revoked presenter count as
+        // proof: it would be admitted by the leaf and never consume the token or issue a leaf).
+        auto toks = h.auth_mgr.list_enrollment_tokens();
+        REQUIRE(toks.has_value());
+        REQUIRE(toks->size() == 1);
+        CHECK((*toks)[0].use_count == 1);
+        CHECK(o.resp.issued_certificate().empty()); // no CSR was sent: nothing issued...
+    }
+    SECTION("option 2: with a CSR the token path issues a new leaf") {
+        const Leaf leaf = make_leaf(ours, "agent-real");
+        h.revoked_pems.insert(leaf.cert);
+        h.superseded_pems.insert(leaf.cert);
+        auto created = h.auth_mgr.create_enrollment_token("recover", 1, std::chrono::hours(1), "test-admin");
+        REQUIRE(created.has_value());
+        auto stub = h.connect(ours, &leaf);
+        apb::RegisterRequest req;
+        req.mutable_info()->set_agent_id("agent-real");
+        req.mutable_info()->set_hostname("h");
+        req.set_enrollment_token(created->raw_token);
+        req.set_csr_pem("CSR");
+        apb::RegisterResponse resp;
+        grpc::ClientContext ctx;
+        REQUIRE(stub->Register(&ctx, req, &resp).ok());
+        CHECK(resp.accepted());
+        CHECK(resp.issued_certificate() == "LEAF-agent-real");
+        auto toks = h.auth_mgr.list_enrollment_tokens();
+        REQUIRE(toks.has_value());
+        CHECK((*toks)[0].use_count == 1);
+    }
+    SECTION("option 2: a superseded leaf + a BOGUS token is refused (not admitted on the leaf)") {
+        const Leaf leaf = make_leaf(ours, "agent-real");
+        h.revoked_pems.insert(leaf.cert);
+        h.superseded_pems.insert(leaf.cert);
+        auto stub = h.connect(ours, &leaf);
+        auto o = register_as(*stub, "agent-real", std::string(64, 'f'));
+        CHECK(o.status.error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        CHECK_FALSE(o.resp.accepted());
+        CHECK(h.registry.agent_count() == 0);
     }
     SECTION("option 2: a superseded leaf WITHOUT a token stays refused") {
         const Leaf leaf = make_leaf(ours, "agent-real");

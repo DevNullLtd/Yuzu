@@ -2423,8 +2423,9 @@ TEST_CASE("CaStore::revoke_older_agent_leaves revokes only OLDER leaves, so conc
         auto b = store.revoke_older_agent_leaves("agent-c", "D2");
         REQUIRE(b.has_value());
         auto a = store.revoke_older_agent_leaves("agent-c", "D1");
-        REQUIRE(a.has_value());
-        CHECK(a->empty()); // nothing older than A is still live
+        // D1 was already revoked by B's supersede (it is older): the LATE caller's survivor is
+        // not live, so it revokes nothing and reports failure; B is never touched.
+        CHECK_FALSE(a.has_value());
         auto st = store.agent_leaf_state("agent-c");
         REQUIRE(st.has_value());
         CHECK(st->has_live); // B survives: the id is NOT left with no live leaf
@@ -2454,11 +2455,27 @@ TEST_CASE("CaStore::revoke_older_agent_leaves revokes only OLDER leaves, so conc
         CHECK(*other == std::vector<std::string>{"D3"});
         CHECK_FALSE(store.is_revoked("D4"));
     }
-    SECTION("an unknown or non-hex keep serial revokes nothing / fails closed") {
-        auto none = store.revoke_older_agent_leaves("agent-c", "FFFF");
-        REQUIRE(none.has_value());
-        CHECK(none->empty()); // keep serial not on record: the join matches nothing
+    SECTION("an unknown, non-hex or INACTIVE keep serial revokes nothing and reports failure") {
+        CHECK_FALSE(store.revoke_older_agent_leaves("agent-c", "FFFF").has_value()); // not on record
         CHECK_FALSE(store.revoke_older_agent_leaves("agent-c", "zz").has_value());
+        // The caller's own new leaf was operator-revoked in between: the older leaves must stay
+        // live (they are not "superseded" by a leaf that is not live).
+        REQUIRE(store.revoke("D2", "compromised").value_or(false));
+        CHECK_FALSE(store.revoke_older_agent_leaves("agent-c", "D2").has_value());
+        auto live = store.live_agent_serials("agent-c");
+        REQUIRE(live.has_value());
+        std::sort(live->begin(), live->end());
+        CHECK(*live == std::vector<std::string>{"D0", "D1"});
+    }
+    SECTION("the survivor is the CALLER's leaf: a concurrent NEWER leaf stays live, the caller's own "
+            "is never revoked (deterministic sequential row)") {
+        auto r = store.revoke_older_agent_leaves("agent-c", "D1"); // D2 is newer than D1
+        REQUIRE(r.has_value());
+        CHECK(*r == std::vector<std::string>{"D0"});
+        auto live = store.live_agent_serials("agent-c");
+        REQUIRE(live.has_value());
+        std::sort(live->begin(), live->end());
+        CHECK(*live == std::vector<std::string>{"D1", "D2"}); // keep=D1 survives, newer D2 untouched
     }
 }
 

@@ -28,7 +28,7 @@
 /// plain-TLS without a client CA, and agents carrying operator-CA certificates (no `ca_issued` agent
 /// leaf for the id). Those get NO protection from it; `docs/pki-architecture.md` says so in writing.
 ///
-/// ROLLOUT. `off | audit | enforce` (`--agent-reregistration-proof`). `audit` (the default) decides
+/// MODES. `off | audit | enforce` (`--agent-reregistration-proof`). `audit` (the default) decides
 /// and counts exactly as `enforce` would but admits as before; `enforce` refuses. The refusal is a
 /// gRPC status (`UNAUTHENTICATED`, uniform message, no oracle for "this id has a leaf"), NEVER
 /// `accepted=false` - that is a permanent rejection to the agent (`agent.cpp` returns from `run()`),

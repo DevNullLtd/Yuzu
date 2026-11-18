@@ -4579,8 +4579,8 @@ TEST_CASE("WP01 Register: a certificate-less re-registration of an id with a liv
     CHECK(old_resp.issued_certificate() == "LEAF-victim-1");
 }
 
-TEST_CASE("WP01 ProxyRegister: no witnessed proof, a cert for another id, and an un-upgraded "
-          "gateway are all refused (F3, F22)",
+TEST_CASE("WP01 ProxyRegister: no witnessed proof, a cert for another id, and a listener that "
+          "cannot witness are all refused (F3, F22)",
           "[pg][agent_service][register][gateway][wp01][reregistration]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -4598,7 +4598,7 @@ TEST_CASE("WP01 ProxyRegister: no witnessed proof, a cert for another id, and an
     });
     wp01::enroll(h, "victim-2");
 
-    SECTION("upgraded gateway, agent presented NO certificate") {
+    SECTION("witnessing listener, agent presented NO certificate") {
         auto req = wp01::request("victim-2", {}, "CSR");
         req.set_gateway_attests_peer_cert(true); // the gateway saw none: the PEM is empty
         apb::RegisterResponse resp;
@@ -4619,7 +4619,7 @@ TEST_CASE("WP01 ProxyRegister: no witnessed proof, a cert for another id, and an
         REQUIRE(probe.witnessed_pems.size() == 1);
         CHECK(probe.witnessed_pems[0] == "OTHER-AGENT-LEAF"); // the witnessed PEM was what got checked
     }
-    SECTION("a gateway too old to witness: no proof can exist, so it is refused in enforce") {
+    SECTION("a listener that cannot witness: no proof can exist, so it is refused in enforce") {
         auto req = wp01::request("victim-2", {}, "CSR"); // gateway_attests_peer_cert unset
         apb::RegisterResponse resp;
         const auto st = gw.ProxyRegister(nullptr, &req, &resp);
@@ -4917,7 +4917,7 @@ TEST_CASE("WP01: audit mode decides and counts exactly as enforce would, but adm
     gw.set_agent_identity_hooks(hooks);
     wp01::enroll(h, "audit-1");
 
-    // The compiled-in default is `audit`: never silently enforce on upgrade.
+    // The compiled-in default is `audit`: never silently enforce.
     {
         auto req = wp01::request("audit-1");
         apb::RegisterResponse resp;
