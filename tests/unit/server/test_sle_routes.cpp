@@ -488,6 +488,71 @@ TEST_CASE("sle erase: the outcome audit row carries the groups the device left",
     CHECK_FALSE(contains(res->body, ".groups="));
 }
 
+// The merge of the device-CI write pause (`write_paused=`) with the group evidence (`.groups=`)
+// made one outcome row able to carry both token families. Pin the exact order: every
+// `<store>=<outcome>` token (each followed by its own `.groups=` token), then `write_paused=`
+// ONCE after the loop, then the counts. Both orderings of the two stores are covered so a regression
+// that rewrites the breakdown, drops `.groups=` beside a pause, or emits `write_paused=` inside
+// the loop fails here.
+TEST_CASE("sle erase: the outcome row carries both .groups= and write_paused= in a fixed order",
+          "[sle_routes]") {
+    for (const bool paused_first : {true, false}) {
+        SECTION(paused_first ? "paused store listed first" : "paused store listed last") {
+            SleHarness h;
+            h.allow_scoped_all = true;
+            DecommissionResult r;
+            r.agent_id = "agent-1";
+            const DecommissionStoreResult paused{"device_inventory", DecommissionOutcome::Failed,
+                                                 "paused", /*write_paused=*/true};
+            const DecommissionStoreResult groups{"management_group_memberships",
+                                                 DecommissionOutcome::Deleted, "",
+                                                 /*write_paused=*/false,
+                                                 "2:000000000000,a1b2c3d4e5f6"};
+            if (paused_first) {
+                r.stores.push_back(paused);
+                r.stores.push_back(groups);
+            } else {
+                r.stores.push_back(groups);
+                r.stores.push_back(paused);
+            }
+            r.deleted = 1;
+            r.failed = 1;
+            h.decommission_result = r;
+
+            auto res = h.sink.Delete("/api/v1/sle/agents/agent-1");
+            REQUIRE(res);
+            CHECK(res->status == 500);
+            REQUIRE(h.audit_detail.size() == 2);
+            const auto& outcome = h.audit_detail.back();
+            CHECK(h.audited("sle.agent.decommission|partial"));
+
+            const auto p_tok = outcome.find("device_inventory=failed ");
+            const auto g_out = outcome.find("management_group_memberships=deleted ");
+            const auto g_tok =
+                outcome.find("management_group_memberships.groups=2:000000000000,a1b2c3d4e5f6 ");
+            const auto w_tok = outcome.find("write_paused=device_inventory, ");
+            const auto counts = outcome.find("deleted=1 skipped=0 failed=1 ");
+            REQUIRE(p_tok != std::string::npos);
+            REQUIRE(g_out != std::string::npos);
+            REQUIRE(g_tok != std::string::npos);
+            REQUIRE(w_tok != std::string::npos);
+            REQUIRE(counts != std::string::npos);
+            // The groups token follows its own outcome token directly.
+            CHECK(g_tok > g_out);
+            // write_paused= comes once, after every per-store token, before the counts.
+            CHECK(w_tok > p_tok);
+            CHECK(w_tok > g_tok);
+            CHECK(counts > w_tok);
+            CHECK(outcome.find("write_paused=", w_tok + 1) == std::string::npos);
+            // The paused store never carries a groups token, and the evidence stays audit-only.
+            CHECK_FALSE(contains(outcome, "device_inventory.groups="));
+            CHECK_FALSE(contains(res->body, ".groups="));
+            const auto j = json::parse(res->body);
+            CHECK(j["error"]["details"]["write_paused"] == json::array({"device_inventory"}));
+        }
+    }
+}
+
 // End to end with the REAL cascade and a real Postgres store behind the route: the audit evidence is
 // produced by `ManagementGroupStore::delete_agent` -> `AgentDecommission` -> the route, not by an
 // injected result, so a break in any of the three links shows here.
@@ -558,6 +623,10 @@ TEST_CASE("sle erase: a paused device_inventory removal gets a distinct 500 reas
         CHECK(j["error"]["retry_after_ms"] ==
               yuzu::server::device_ci_read_gate::kOrderingRetryAfterMs);
         CHECK(contains(j["error"]["message"].get<std::string>(), "AFTER the repair"));
+        // A group-scoped holder cannot re-issue (the first call already removed the device from
+        // its groups, D4): the text names the grant that can.
+        CHECK(contains(j["error"]["message"].get<std::string>(),
+                       "Administrator or a global grant"));
         CHECK(contains(j["error"]["remediation"].get<std::string>(), "after the PostgreSQL "
                                                                      "collation repair"));
         CHECK_FALSE(contains(res->body, "retry the request"));

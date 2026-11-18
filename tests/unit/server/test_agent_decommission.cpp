@@ -263,6 +263,10 @@ TEST_CASE("AgentDecommission null-store constructor registers every store as Ski
     CHECK(result.deleted == 0);
     CHECK(result.failed == 0);
     CHECK(result.skipped == 10);
+    // The membership store is registered LAST: its point-in-time removal runs after every store
+    // that can fail earlier, and the audit row lists it last.
+    REQUIRE(result.stores.size() == 10);
+    CHECK(result.stores.back().store == "management_group_memberships");
     // The Decision-11 store is present in the audit even when unconfigured.
     const auto* sl = find_store(result, "software_licensing");
     REQUIRE(sl != nullptr);
