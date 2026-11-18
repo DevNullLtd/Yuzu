@@ -15,46 +15,72 @@ machine-independent, and keeping a test honest about the host it ran on.
    migration DDL and per-test fsyncs are what pushed the Windows leg past its limits (f6bfa1f4d4,
    b85549dbb3).
 2. **Seed cheaply.** Insert fixtures with a recursive CTE or in memory, not row-by-row through the
-   store's public write path, unless the write path is what is under test.
+   store's public write path, unless the write path is what is under test. Seeding through raw
+   autocommit statements was most of the v10 split's 10,774 fsyncs (f6bfa1f4d4); `insert_tier_rows`
+   (`tests/unit/test_echo_aggregator.cpp`) puts N rows in with one recursive-CTE statement.
 3. **No real clock, sleep or socket wait in a unit test; inject the boundary.** Take the clock
    (`EchoFold::NowFn`, `echo_fold.hpp`), the open path (`OpenSeams`, `echo_db.hpp`) and any OS reader
    as a parameter and feed fixtures. Wait on a future, `std::latch`, condition variable or callback,
    never `sleep_for` and poll. Two real-time waits are allowed, each with a reason: a **bounded
    negative wait** (a "did not happen" can only be seen by waiting, and a slow host can make it pass
    vacuously, never fail), and a **real-OS case** that exists to touch the real socket or process
-   table, with its reason stated in the case comment.
+   table, with its reason stated in the case comment. The CLOSE_WAIT dispatcher case read a real
+   loopback socket with no receive timeout, so a missing FIN hung it until the shard timeout (#8211);
+   `wait_for_peer_fin` (`tests/unit/test_echo_local_dispatcher.cpp`) now bounds the read at 5 s. The
+   only `sleep_for` the Echo tests had, an idle loop in the concurrent writer of the retention-pass
+   case in `test_echo_aggregator.cpp`, became a `break`.
 4. **Every wait is bounded, and the thread it waits on is joined by a guard.** A failed `REQUIRE`
    unwinds; the unwind destroys what the thread captured. Declare the guard (`yuzu::test::ScopeExit`,
    `tests/unit/test_helpers.hpp`, or the local `Joiner` in `test_echo_aggregator.cpp`) after what it
    releases, so it runs first. The raw-thread rule: a `std::thread` with no throwing assertion and no
    blocking wait between its start and its join needs no guard, because nothing can unwind past it;
-   add one the moment either appears.
+   add one the moment either appears. Evidence: a failed `REQUIRE(fut.wait_for(...))` unwound into a
+   `std::async` future destructor that blocked on the stuck worker, hanging the run to the meson
+   timeout (#8210); `test_echo_open_retry.cpp` and `test_echo_local_dispatcher.cpp` carried four such
+   sites, and the GC/fold case in `test_echo_fold.cpp` now releases and joins its workers through a
+   `ScopeExit`.
    - A call whose **return** is under test (`OpenRetryLoop::stop()`, a plugin's `shutdown()`) goes
      through `yuzu::test::must_return_within` (`tests/unit/test_bounded_return.hpp`), never
      `std::async` plus `wait_for`: the future's destructor blocks in the same hung call.
 5. **A `CHECK` on a size that guards an index is a `REQUIRE`.** `CHECK(rows.size() == 1)` followed by
    `rows[0]` carries on into an out-of-range read when the size is wrong. (`.at()` throws, a clean
-   failure.)
+   failure.) Found at `test_echo_store.cpp` (`rows[0]` after a size `CHECK`) and
+   `test_echo_netqual_nstat.cpp` (`kept[1]`) (#8212); the sweep found the same shape twice in
+   `tests/unit/server/test_echo_process_tree.cpp`.
 
 ## Host dependence and honesty
 
 6. **Name the cause, or fail.** A case that depends on ETW, the registry or a real socket classifies
    the environment failure (`etw_skip_reason`, `require_etw_or_skip`, `test_echo_registry_source.cpp`)
    and `SKIP`s only on a named cause; any other failure fails with the OS code (47f816f27c,
-   ab3e2a2cf4, fb818a2e19; #7580, #7763).
+   ab3e2a2cf4, fb818a2e19; #7580, #7763). The opposite shape is a failed probe read as a clean
+   answer: a Windows cleanup that took a failed HKU listing for "no mount", and an `is_elevated()`
+   that returned false when the token query itself failed (#8129). #8012 shows what an unnamed cause
+   costs: seven Instructions commands, three of them Echo's, report `FAILURE` on a Linux lane and the
+   issue records no cause.
 7. **Keep real-OS cases off the shared critical path; share no global session.** The agent suite's
    shards are the bottleneck. A real-OS case lives where its cost is already budgeted, and none
    holds a session another case reads. Salt every fixed name, port or path (CLAUDE.md, "Test
-   conventions").
+   conventions"). The 13 `echo plugin:*` dispatcher cases run in agent shard C (#8244), the slowest
+   agent shard, whose limit already had to be doubled (#7177). A real-time ETW session outlives its
+   test process, and the four runner agents share one OS identity, so a killed test leaves state the
+   next job inherits (#7175).
 8. **Restore the plugin singleton on unwind, and pass under `--order rand`.** The loaded plugin is a
    process singleton. `EchoSession` (`tests/unit/test_echo_local_dispatcher.cpp`) owns init and
    shutdown, restores any source a case paused, and bounds its shutdown on every path, the
    destructor after a failed `REQUIRE` included. Run a new case with `--order rand` and several seeds
-   before pushing.
+   before pushing. Evidence: several dispatcher cases started and shut the plugin down by hand, so a
+   failed `REQUIRE` left it initialised or a source paused for the cases after it, and one case
+   depended on declaration order (#8213). `EchoSession` now owns init and shutdown for all 13 cases;
+   the source-health ledger reset the issue also asks for needs a production line and stays open there.
 9. **Every timeout and bound cites a recorded measurement.** A limit is set from data and raised only
    with a new measurement recorded beside it. `tests/meson.build` carries the Echo limits with their
    figures; #8234 tracks CI keeping no per-case timing, and `must_return_within` prints the real
-   elapsed seconds of every bounded call to the test log so bounds can be re-derived.
+   elapsed seconds of every bounded call to the test log so bounds can be re-derived. Both
+   directions are on record: 187cf77e83 moved the v10 migration cases into their own entry, from
+   per-case times, rather than raise the 90 s limit that would also have hidden a real slowdown, and
+   3fc601419b raised the echo limit to 180 s and the agent shards to 480 s from measured runs,
+   writing each figure beside its `timeout:`.
 10. **New Echo tests follow this standard, and the gate checks the lexical half.** The PR template
     carries the checklist line; the gate is [below](#the-gate).
 
@@ -63,11 +89,12 @@ machine-independent, and keeping a test honest about the host it ran on.
 `yuzu::test::kReturnBound` is **120 s**, derived and not guessed. The slowest single Catch2 leaf of
 the 13 `echo plugin:*` dispatcher cases on native Windows MSVC Debug (a Windows host, 5 runs, a WSL
 VM active, CPU 12-31%) was **38.7 s**. A shutdown happens inside a leaf, so that is an upper bound on
-any shutdown. Shared CI amplifies I/O 3-6x; at the lower end, 3 x 38.7 s = 116.1 s, rounded up to
-**120 s**. On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown case 0.007 s.
-120 s is below agent shard C's 480 s limit, so a hang still gets a named message before the meson
-timeout. The Windows figure is itself under investigation (#8244). Revise the constant only with a new
-recorded measurement.
+any shutdown. Shared CI amplifies I/O 3-6x (the "Budget rule" in
+[unit-test-conventions.md](unit-test-conventions.md)); at the lower end, 3 x 38.7 s = 116.1 s,
+rounded up to **120 s**. On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown
+case 0.007 s. 120 s is below agent shard C's 480 s limit, so a hang still gets a named message
+before the meson timeout. The Windows figure is itself under investigation (#8244). Revise the
+constant only with a new recorded measurement.
 
 One case is tighter on purpose. The real-plugin offline case ("a failed v10 migration loads Echo
 offline ... shuts down promptly") bounds its shutdown by **half of `yuzu::echo::open_retry_delay(1)`**

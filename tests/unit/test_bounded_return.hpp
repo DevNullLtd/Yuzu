@@ -43,8 +43,9 @@ namespace yuzu::test {
 /// Derivation (measured 2026-11-18, no guess): the slowest single Catch2 leaf of the 13
 /// "echo plugin:*" dispatcher cases on native Windows MSVC Debug (a Windows host, origin/dev
 /// f4cc683af1, 5 runs, a WSL VM active, CPU 12-31%) took 38.7 s. A shutdown happens inside a
-/// leaf, so that is an upper bound on any shutdown. Shared CI amplifies I/O 3-6x (CLAUDE.md
-/// test-efficiency discipline); at the lower end, 3 x 38.7 s = 116.1 s, rounded up to 120 s.
+/// leaf, so that is an upper bound on any shutdown. Shared CI amplifies I/O 3-6x (the "Budget
+/// rule" in docs/testing/unit-test-conventions.md); at the lower end, 3 x 38.7 s = 116.1 s,
+/// rounded up to 120 s.
 /// On macOS (5 runs) the slowest case took 1.331 s and the offline-shutdown case 0.007 s.
 /// 120 s is below agent shard C's 480 s limit, so a hang still gets a named message before
 /// the meson timeout. Revise it only with a recorded measurement; the elapsed times this
