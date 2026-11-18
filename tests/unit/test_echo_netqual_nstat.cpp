@@ -944,7 +944,7 @@ TEST_CASE("nstat_dedupe_closing_opens: the key is process plus remote address pl
         close, close,                                    // closes: never filtered
     };
     const auto kept = nstat_dedupe_closing_opens(std::move(batch), seen);
-    CHECK(kept.size() == 8);
+    REQUIRE(kept.size() == 8);
     // Order is preserved: the first four are the distinct closing opens.
     CHECK(kept[1].remote_port == 8443);
     CHECK(kept[2].process_name == "wget");

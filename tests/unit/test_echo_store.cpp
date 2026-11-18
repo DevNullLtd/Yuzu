@@ -757,7 +757,7 @@ TEST_CASE("EchoDatabase: purge old records via execute_sql_range", "[echo][store
 
     auto remaining = t.db.execute_query("SELECT hour_ts FROM process_hourly ORDER BY hour_ts");
     REQUIRE(remaining.has_value());
-    CHECK(remaining->rows.size() == 5);
+    REQUIRE(remaining->rows.size() == 5);
     CHECK(remaining->rows[0][0] == "18000");
 }
 
