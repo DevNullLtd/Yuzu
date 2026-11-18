@@ -15,8 +15,6 @@ struct CveRule {
     std::string_view description;
 };
 
-// ── Version comparison ─────────────────────────────────────────────────────
-
 /// True when a '.'/'-'-separated, all-digit segment of `v` has more digits than a long long holds
 /// (more than 18 after leading zeros), so compare_versions would saturate it.
 inline bool version_has_overflowing_segment(std::string_view v) {
@@ -32,6 +30,8 @@ inline bool version_has_overflowing_segment(std::string_view v) {
     }
     return false;
 }
+
+// ── Version comparison ─────────────────────────────────────────────────────
 // Returns <0 if a<b, 0 if a==b, >0 if a>b.
 // Splits on '.' and '-', compares each segment numerically where possible.
 

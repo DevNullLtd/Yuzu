@@ -17,6 +17,7 @@
 #include <cstddef>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "cve_rules.hpp"
@@ -179,8 +180,9 @@ inline std::string fold_backslashes(std::string_view v) {
 ///   - a VERSION line is a "Version:" line indented DEEPER than four spaces, and counts only after
 ///     a name (the first one per app wins).
 /// Lines that do not fit (a name without ':' or at an odd indent, a leading tab, a second Version in
-/// a block, a Version before any name, indent 0 other than the "Applications:" header, indent 1-2,
-/// and a property-indent line after a blank that does not follow a name) are counted in
+/// a block, a Version before any name or not directly after its name line, indent 0 other than the
+/// "Applications:" header, indent 1-2, and a property-indent line after a blank that does not follow
+/// a name) are counted in
 /// `suspect_lines`; they never become apps. `command_ok` is false when the command did not run to a clean end
 /// (failed, timed out, over the output cap): the apps are then DROPPED, never returned as a partial
 /// list that would feed CVE matching or inventory.
@@ -227,6 +229,7 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         if (tab || (indent == 0 && body != "Applications:") || indent == 1 || indent == 2 ||
             (indent > 4 && blank_since && last_kind != 'N'))
             ++r.suspect_lines;
+        const char prev_kind = last_kind; // the kind of the previous non-blank line
         last_kind = (indent == 4 && !tab && body.back() == ':' && body.substr(0, 8) != "Version:") ? 'N'
                     : indent == 0                                                                   ? 'H'
                                                                                                     : 'P';
@@ -249,13 +252,18 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
                 if (!value.empty()) { // an empty value must not consume the app's one version
                     current_version = std::string(value);
                     have_version = true;
+                    // The first Version must directly follow its name line (the measured shape). A
+                    // Version after another property means the name line (and its own Version) may
+                    // have been lost and this one belongs to the previous application.
+                    if (prev_kind != 'N')
+                        ++r.suspect_lines;
                 }
             } else {
                 ++r.suspect_lines; // a second Version line in one block: a name line was dropped
             }
         } else if (indent == 3 || indent == 5 || (indent == 4 && body.back() != ':')) {
             // a name or property line at an indent the real output never uses
-            if (body.back() == ':' || indent == 4)
+            if (body.back() == ':' || indent == 4 || body.substr(0, 8) == "Version:")
                 ++r.suspect_lines;
         }
     }

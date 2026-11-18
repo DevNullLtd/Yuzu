@@ -259,9 +259,12 @@ TEST_CASE("parse: structural name and version lines", "[vuln][macos]") {
 }
 
 TEST_CASE("parse: a four-space Version line is not a version", "[vuln][macos]") {
-    auto e = parse_system_profiler_apps("    Git:\n    Version: 1.0\n      Version: 2.50.1\n", true);
-    REQUIRE(e.apps.size() == 1);
-    CHECK(e.apps[0].version == "2.50.1");
+    const std::string pad = "    P1:\n      Version: 1\n    P2:\n      Version: 1\n    P3:\n      Version: 1\n"
+                            "    P4:\n      Version: 1\n    P5:\n      Version: 1\n    P6:\n      Version: 1\n";
+    auto e = parse_system_profiler_apps(pad + "    Git:\n    Version: 1.0\n      Version: 2.50.1\n", true);
+    REQUIRE(e.apps.size() == 7);
+    CHECK(e.apps[6].version == "2.50.1");
+    CHECK(e.suspect_lines >= 1);
 }
 
 TEST_CASE("parse: only a four-space-indent line ending in ':' is a name", "[vuln][macos]") {
@@ -1043,4 +1046,46 @@ TEST_CASE("parse: a tab after the four-space indent is suspect and never a name"
     CHECK(t.apps.size() == 1);
     CHECK(t.apps[0].name == "A");
     CHECK(t.suspect_lines == 1);
+}
+
+// ── round 9: a name line lost TOGETHER with another reshape must not attach a Version to the
+//    wrong application ───────────────────────────────────────────────────────────────────────
+
+TEST_CASE("lost name: class X, the orphaned Version at indent 3, is counted", "[vuln][macos][reshaped]") {
+    // the name line of app N is lost and its Version line sits at indent 3
+    const auto e = parse_system_profiler_apps(
+        healthy_report(10) + "\n   Version: 7.7\n\n    Next:\n\n      Version: 2\n\n", true);
+    CHECK(e.suspect_lines >= 1);
+    CHECK(e.readable);
+}
+
+TEST_CASE("lost name: class Y, an unversioned previous app plus lost blank/name/blank lines, is counted",
+          "[vuln][macos][reshaped]") {
+    // `Bare` has no Version; the blank, name and blank lines of the next app are lost, so its Version
+    // would attach to Bare. The Version is not directly after a name line.
+    const auto e = parse_system_profiler_apps(
+        healthy_report(10) + "    Bare:\n\n      Obtained from: Apple\n      Version: 5.5\n\n", true);
+    CHECK(e.suspect_lines >= 1);
+    CHECK(e.readable);
+    // the shape of a Version directly after its name is not suspect (control)
+    const auto ok = parse_system_profiler_apps(healthy_report(10) + "    Fine:\n\n      Version: 5.5\n\n", true);
+    CHECK(ok.suspect_lines == 0);
+}
+
+TEST_CASE("lost name: an indent-3 Version line and a first Version after another property are each counted once",
+          "[vuln][macos][reshaped]") {
+    const std::string ok = "    A:\n      Version: 1\n";
+    CHECK(parse_system_profiler_apps("   Version: 9\n" + ok, true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("    B:\n      Kind: x\n      Version: 2\n", true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("    B:\n      Version: 2\n      Kind: x\n", true).suspect_lines == 0);
+}
+
+TEST_CASE("reshaped lines: boundary rows that earlier rounds left unpinned", "[vuln][macos][reshaped]") {
+    // an indent-5 property after a blank that follows a name: not suspect; after a non-name: suspect
+    const std::string pre = "    A:\n";
+    CHECK(parse_system_profiler_apps(pre + "\n     Kind: x\n", true).suspect_lines == 0);
+    CHECK(parse_system_profiler_apps(pre + "      Kind: y\n\n     Kind: x\n", true).suspect_lines == 1);
+    // 18 digits fit, 19 do not (saturation boundary)
+    CHECK(usable_version("1.999999999999999999"));
+    CHECK_FALSE(usable_version("1.1000000000000000000"));
 }

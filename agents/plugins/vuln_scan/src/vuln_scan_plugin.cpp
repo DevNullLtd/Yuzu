@@ -457,8 +457,9 @@ void emit_coverage_summary_row(yuzu::CommandContext& ctx, const yuzu::vuln::Cove
         ctx.write_output(yuzu::vuln::coverage_summary_row(note));
 }
 
-// The "No vulnerabilities" placeholder is a claim of a clean scan: it is suppressed when the
-// software list could not be read (the UNREADABLE Coverage row follows instead).
+// The "No vulnerabilities" placeholder is a claim of a clean scan: want_clean_placeholder() withholds
+// it when the software list could not be read, a CVE input was unusable or a profiler line was not
+// recognised (an UNREADABLE Coverage row follows instead).
 void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings,
                      const yuzu::vuln::CoverageState& cov = {}) {
     if (findings.empty()) {

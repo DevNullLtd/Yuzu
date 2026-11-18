@@ -22,7 +22,8 @@ metadata:
     #8256); the run ends with a row titled
     "Coverage" saying so (INFO, or UNREADABLE when the software list could not
     be read completely, a profiler line was not recognised, an application
-    matching a built-in rule had no usable version, or a configuration read
+    matching a built-in rule had no usable version (empty, not starting with a
+    digit, or a numeric segment of more than 18 digits), or a configuration read
     failed), and a result with no CVE rows means only that
     no built-in rule matched the software enumerated. Reports progress at
     0%, 50%, 90%, 100%.
@@ -122,7 +123,8 @@ metadata:
     vulnerabilities" row) when system_profiler could not be read completely or an
     application matching a built-in rule has no usable version, or a profiler line was
     not recognised. Versions are compared as dotted numbers, so a version with a
-    pre-release or letter suffix may not be ordered correctly (tracked in #8276).
+    non-numeric text in a segment (a pre-release or letter suffix, "0.9 (rc)", "1e2") may not be ordered
+    correctly (tracked in #8276); a numeric segment of more than 18 digits counts as an unusable version.
     Use the full "scan" action for combined
     results.
   tags: [security, vulnerability, cve, compliance]
@@ -284,7 +286,7 @@ metadata:
     with summary|COVERAGE|<text> rows saying so (one per cause: an unreadable
     software list, an unrecognised profiler line, an application matching a
     rule with no usable version, an unreadable configuration read, or the
-    Homebrew gap). Monitor the COVERAGE rows, not the UNREADABLE count: the
+    Homebrew gap). Monitor the COVERAGE rows other than the standing Homebrew text (which every healthy Mac emits), not the UNREADABLE count: the
     UNREADABLE count includes the standing Open Ports row and excludes the
     software-list and CVE-input causes. The counts cover only the
     software enumerated. On macOS the UNREADABLE count is at least 1 on a
