@@ -2944,7 +2944,8 @@ jobs:
   # relies on), so each run of this job converges on every attempt's files
   # being on the release. Each attempt's files are its gate reports and its
   # publish journal (publish-yuzu-agent-bundle-chisel.attempt-N.txt), which
-  # says how far that attempt got: no journal (nothing pushed), or a prefix of
+  # says how far that attempt got: no journal (no record: the gate refused, the
+  # job stopped first, or the upload failed), or a prefix of
   # none, push-started, verified, signed-attested, tagging, tagged. A journal
   # that is not a legal prefix, or one beside a gate report that does not
   # record `gate: pass`, is refused before anything is uploaded. The
@@ -3017,6 +3018,7 @@ jobs:
           name=yuzu-agent-bundle-chisel
           scratch="$(mktemp -d "$RUNNER_TEMP/yuzu-attach.XXXXXX")"
           trap 'rm -rf "$scratch"' EXIT
+          mkdir -p bundle-gate   # absent when no attempt uploaded anything
           cd bundle-gate
           shopt -s nullglob
           all=(*)

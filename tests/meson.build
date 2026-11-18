@@ -3553,17 +3553,6 @@ test('image publish journal',
   timeout: 600,
 )
 
-# WP15/S9 (G8P6-release-deploy-1): scripts/ci/image-candidate-delete.sh deletes
-# a leftover candidate digest from GHCR only when no release tag names it,
-# resolved in the registry at delete time; it only checks unless --delete.
-# Stub gh/docker, real jq; mutants must be killed. Bash + jq, no Docker.
-test('image candidate delete',
-  _python3_test,
-  args: [files('test_image_candidate_delete.py')],
-  suite: 'docs',
-  timeout: 180,
-)
-
 # WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
 # release publish jobs' buildx type=local caches, removes only unreferenced
 # blobs and never leaves an index naming a removed blob. Synthetic layout.

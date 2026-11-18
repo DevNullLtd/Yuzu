@@ -90,7 +90,7 @@
 # A step summary is not a consumer: job outputs carry no publish state.
 # Contract and the residuals (a SIGKILL or a failed upload before the evidence
 # is kept, a re-run moving the tag to a new digest, non-atomic multi-tag moves,
-# leftover candidate digests, deleted only via image-candidate-delete.sh):
+# leftover candidate digests, which no tool deletes):
 # docs/ci-architecture.md "Release image vulnerability gate", "The publish
 # journal". Tests: tests/test_image_publish.py.
 #

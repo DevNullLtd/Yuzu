@@ -171,7 +171,10 @@ def have_bash():
 
 
 def days(n):
-    return (datetime.date.today() + datetime.timedelta(days=n)).isoformat()
+    # UTC, as the checker reads it (G8P5-unhappy-path-7: a local date is a day
+    # off in a timezone far from UTC).
+    today = datetime.datetime.now(datetime.timezone.utc).date()
+    return (today + datetime.timedelta(days=n)).isoformat()
 
 
 def entry(**over):
@@ -2192,6 +2195,9 @@ class WorkflowWiring(unittest.TestCase):
             "raised to 1600": lines[i].replace("--budget 1200", "--budget 1600"),
             "dropped": lines[i].replace("--budget 1200 ", ""),
             "1600 on a continuation line": lines[i].replace("--budget 1200 ", "\\\n" + indent + "  --budget 1600 "),
+            # G8P6-build-ci-3: a budget the check cannot read.
+            "a variable": lines[i].replace("--budget 1200", '--budget "$B"'),
+            "a variable with =": lines[i].replace("--budget 1200", "--budget=$B"),
         }
         others = {RELEASE.name: RELEASE.read_text(encoding="utf-8")}
         for label, mutated in mutants.items():
@@ -2201,6 +2207,27 @@ class WorkflowWiring(unittest.TestCase):
                 violations, _ = gate_budget_violations({**others, PRE_RELEASE.name: copy}, default)
                 self.assertTrue([v for v in violations if v.startswith("pre-release.yml:security-scan")],
                                 f"mutant '{label}' of pre-release.yml line {i + 1} survived")
+
+
+    def test_budget_check_reads_a_step_level_timeout(self):
+        # G8P6-build-ci-3: a step-level timeout-minutes tighter than the job's
+        # bounds the gate too; a mutant adding one to each gate step must fail.
+        default = gate_default_budget()
+        texts = {p.name: p.read_text(encoding="utf-8") for p in (RELEASE, PRE_RELEASE)}
+        hit = 0
+        for wf, text in texts.items():
+            lines = text.split("\n")
+            for i, ln in enumerate(lines):
+                if "image-vuln-gate.sh" not in ln or ln.lstrip().startswith("#"):
+                    continue
+                step = max(j for j in range(i) if lines[j].startswith("      - "))
+                for label, extra in (("5", "        timeout-minutes: 5"), ("an expression", "        timeout-minutes: ${{ inputs.t }}")):
+                    with self.subTest(workflow=wf, line=i + 1, timeout=label):
+                        copy = "\n".join(lines[:step + 1] + [extra] + lines[step + 1:])
+                        violations, _ = gate_budget_violations({**texts, wf: copy}, default)
+                        self.assertTrue(violations, f"a step timeout of {label} on {wf} line {i + 1} survived")
+                hit += 1
+        self.assertEqual(hit, 5, "expected the gate called once per publish job and once in pre-release.yml")
 
 
 # The time the job needs besides the gate's budget: on pre-release.yml the
@@ -2216,21 +2243,36 @@ def gate_default_budget():
 def gate_budget_violations(texts, default):
     """[violation], [job] over {workflow name: text}: every image-vuln-gate.sh
     call, its shell continuation lines joined, must have its --budget (or the
-    script's default) plus BUDGET_MARGIN within its job's timeout-minutes."""
+    script's default) plus BUDGET_MARGIN within the tighter of its job's and its
+    step's timeout-minutes, and a --budget must be a literal number (a variable
+    cannot be checked; G8P6-build-ci-3)."""
     violations, checked = [], []
     for wf, text in texts.items():
         for job, body in jobs_of(text).items():
-            code = re.sub(r"\\\n\s*", " ", _code_lines(body))
-            calls = re.findall(r"image-vuln-gate\.sh([^\n]*)", code)
-            if not calls:
+            if "image-vuln-gate.sh" not in _code_lines(body):
                 continue
             checked.append(job)
-            minutes = int(re.search(r"^    timeout-minutes: (\d+)", body, re.M).group(1))
-            for c in calls:
-                m = re.search(r"--budget (\d+)", c)
-                budget = int(m.group(1)) if m else default
-                if budget + BUDGET_MARGIN > minutes * 60:
-                    violations.append(f"{wf}:{job}: budget {budget}s + {BUDGET_MARGIN}s > timeout {minutes} min")
+            job_minutes = int(re.search(r"^    timeout-minutes: (\d+)", body, re.M).group(1))
+            for step in re.split(r"(?m)^      - ", body)[1:]:
+                code = re.sub(r"\\\n\s*", " ", _code_lines(step))
+                calls = re.findall(r"image-vuln-gate\.sh([^\n]*)", code)
+                if not calls:
+                    continue
+                minutes = job_minutes
+                sm = re.search(r"^(?:        )?timeout-minutes:\s*(\S+)", step, re.M)
+                if sm:
+                    if not sm.group(1).isdigit():
+                        violations.append(f"{wf}:{job}: step timeout-minutes {sm.group(1)} is not a number")
+                        continue
+                    minutes = min(minutes, int(sm.group(1)))
+                for c in calls:
+                    m = re.search(r"--budget(?:=|\s+)(\S+)", c)
+                    if m and not m.group(1).isdigit():
+                        violations.append(f"{wf}:{job}: --budget {m.group(1)} is not a literal number")
+                        continue
+                    budget = int(m.group(1)) if m else default
+                    if budget + BUDGET_MARGIN > minutes * 60:
+                        violations.append(f"{wf}:{job}: budget {budget}s + {BUDGET_MARGIN}s > timeout {minutes} min")
     return violations, checked
 
 if __name__ == "__main__":
