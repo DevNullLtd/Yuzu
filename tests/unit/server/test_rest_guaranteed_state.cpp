@@ -3720,6 +3720,35 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
               .value() == 0.0);
 }
 
+// QE-1: a dashboard-only kind (a REAL row of the live kind table that the REST view does not
+// admit) must be refused exactly like an unknown token: 400, no dispatch, metric label
+// `unknown`. This is what fails if the route's resolver is ever swapped from resolve_rest_kind
+// to resolve_dashboard_kind. The route is POST only (it dispatches a command).
+TEST_CASE("REST dex/devices/{id}/live: dashboard-only kind → 400, no dispatch, label unknown",
+          "[pg][rest][dex][device][live]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    const std::vector<std::string> dashboard_only = {"process_tree", "services", "hw_disks"};
+    for (const auto& kind : dashboard_only) {
+        CAPTURE(kind);
+        auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=" + kind, "");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.last_live_plugin.empty()); // never dispatched
+        // Not counted under its own name: the label set is {uptime, processes, unknown}.
+        CHECK(h.metrics
+                  .counter("yuzu_server_live_requests_total", {{"kind", kind}, {"outcome", "400"}})
+                  .value() == 0.0);
+    }
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
+              .value() == static_cast<double>(dashboard_only.size()));
+    // Nothing was audited for a refused kind (no audit row without a dispatchable kind).
+    for (const auto& a : h.audit_log)
+        CHECK(a.action.rfind("device.live.", 0) != 0);
+}
+
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
           "[pg][rest][dex][device][live][scope]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);

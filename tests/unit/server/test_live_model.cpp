@@ -7,8 +7,11 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <functional>
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 using namespace yuzu::server;
@@ -50,11 +53,77 @@ TEST_CASE("live kind table: one table, 22 dashboard kinds", "[live][model]") {
     CHECK(seen_pairs.size() == 22);
 }
 
+// CO-2: the 22 `device.live.<kind>` audit verbs, written out as literals. The works-council
+// access-audit posture counts each kind separately, so a renamed token must not rename its
+// verb silently: this list is compared to the table both as a set and per token.
+TEST_CASE("live kind table: the 22 audit verbs are pinned as literals", "[live][model][audit]") {
+    const std::vector<std::pair<std::string, std::string>> expected = {
+        {"uptime", "device.live.uptime"},
+        {"processes", "device.live.processes"},
+        {"process_tree", "device.live.process_tree"},
+        {"services", "device.live.services"},
+        {"users", "device.live.users"},
+        {"netconfig", "device.live.netconfig"},
+        {"arp", "device.live.arp"},
+        {"dns_cache", "device.live.dns_cache"},
+        {"listening", "device.live.listening"},
+        {"connections", "device.live.connections"},
+        {"capture_sources", "device.live.capture_sources"},
+        {"disk", "device.live.disk"},
+        {"hw_disks", "device.live.hw_disks"},
+        {"hw_memory", "device.live.hw_memory"},
+        {"hw_processors", "device.live.hw_processors"},
+        {"hw_drivers", "device.live.hw_drivers"},
+        {"battery", "device.live.battery"},
+        {"thermal", "device.live.thermal"},
+        {"smart", "device.live.smart"},
+        {"volumes", "device.live.volumes"},
+        {"adapters", "device.live.adapters"},
+        {"wifi", "device.live.wifi"}};
+    REQUIRE(expected.size() == 22);
+    std::set<std::string> expected_verbs;
+    std::set<std::string> table_verbs;
+    for (const auto& [token, verb] : expected) {
+        CAPTURE(token);
+        expected_verbs.insert(verb);
+        const auto lk = live::resolve_dashboard_kind(token);
+        REQUIRE(lk);
+        CHECK(lk->audit_action == verb);
+        table_verbs.insert(lk->audit_action);
+    }
+    CHECK(expected_verbs.size() == 22);
+    CHECK(table_verbs == expected_verbs);
+}
+
+// QE-4: the table has exactly the 22 pinned rows. The table is private, so the check runs
+// through the public resolvers: every pinned token resolves, and made-up neighbours of the
+// pinned tokens (a plausible 23rd kind, the DEX perf names, singular/plural and case
+// variants) do not.
+TEST_CASE("live kind table: exactly the 22 pinned tokens resolve", "[live][model]") {
+    std::size_t resolved = 0;
+    for (const auto& k : all_kinds())
+        if (live::resolve_dashboard_kind(k))
+            ++resolved;
+    CHECK(resolved == 22);
+    for (const char* k : {"hw_battery", "hw_thermal", "hw_smart", "hw_volumes", "hw_wifi",
+                          "hw_adapters", "service", "user", "disks", "process", "connection",
+                          "listen", "dns", "capture", "perf", "perf_hourly", "uptime2", "Disk",
+                          "WIFI", "hw_"}) {
+        CAPTURE(k);
+        CHECK_FALSE(live::resolve_dashboard_kind(k));
+        CHECK_FALSE(live::resolve_rest_kind(k));
+    }
+}
+
 TEST_CASE("live kind table: REST subset is exactly uptime + processes", "[live][model]") {
     std::set<std::string> rest;
     for (const auto& k : all_kinds())
         if (live::resolve_rest_kind(k))
             rest.insert(k);
+    // This exact-set pin is the tripwire for a positional mis-port of the in-flight #8122's
+    // `bool escaped_rows` into LiveKind: a positional `true` after `columns` would silently
+    // bind to `rest_v1` and widen the REST surface to a dashboard-only kind, which this
+    // check turns into a failure. Do not loosen it to a subset check.
     CHECK(rest == std::set<std::string>{"uptime", "processes"});
     // The REST view is the SAME row as the dashboard view, not a second table.
     for (const char* k : {"uptime", "processes"}) {
@@ -164,6 +233,46 @@ TEST_CASE("live parsers: services shapes follow the device OS, then the sniff", 
         CHECK(s.rows[2].display == "desc");
         CHECK(s.running == 2);
     }
+    // QE-2: the OS and the pid-column sniff disagree. A known OS wins over the sniff, so the
+    // result differs from what the unknown-OS sniff would give for the same row.
+    SECTION("known Linux, 4-field row with a numeric column 2: the Linux shape wins over the sniff") {
+        // The sniff alone would call `12` a macOS pid (status=running, display empty).
+        const auto s = live::parse_services("svc|a|12|running\n", "linux");
+        REQUIRE(s.rows.size() == 1);
+        CHECK(s.rows[0].name == "a");
+        CHECK(s.rows[0].status == "12");      // Linux svc|name|status|description
+        CHECK(s.rows[0].display == "running"); // the description column
+        CHECK(s.rows[0].startup.empty());
+        CHECK(s.running == 0); // "12" does not contain "run"
+    }
+    SECTION("known macOS, 4-field row: macOS shape even for an OS string in another case") {
+        for (const char* os : {"darwin", "macos", "Darwin", "MacOS"}) {
+            CAPTURE(os);
+            const auto s = live::parse_services("svc|com.a|1234|running\n", os);
+            REQUIRE(s.rows.size() == 1);
+            CHECK(s.rows[0].name == "com.a");
+            CHECK(s.rows[0].status == "running"); // svc|label|pid|status
+            CHECK(s.rows[0].display.empty());
+            CHECK(s.running == 1);
+        }
+    }
+    SECTION("known macOS, 4-field row whose pid column is a non-numeric word") {
+        // The sniff would read `word` as a Linux status; the known OS says macOS.
+        const auto s = live::parse_services("svc|com.b|word|stopped\n", "darwin");
+        REQUIRE(s.rows.size() == 1);
+        CHECK(s.rows[0].status == "stopped");
+        CHECK(s.rows[0].display.empty());
+        CHECK(s.running == 0);
+    }
+    SECTION("unknown OS, 5-field row with a numeric column 2 defaults to the Windows shape (UP-5/UP-6)") {
+        const auto s = live::parse_services("svc|x|123|Stopped|Manual\n", "");
+        REQUIRE(s.rows.size() == 1);
+        CHECK(s.rows[0].name == "x");
+        CHECK(s.rows[0].display == "123"); // not misread as a macOS pid
+        CHECK(s.rows[0].status == "Stopped");
+        CHECK(s.rows[0].startup == "Manual");
+        CHECK(s.running == 0);
+    }
     SECTION("rows of the wrong arity are skipped; a longer row keeps the leading shape") {
         CHECK(live::parse_services("svc|only\nsvc|a|b\nother|x\n", "").rows.empty());
     }
@@ -235,7 +344,7 @@ TEST_CASE("live parsers: generic rows pad, trim and preserve foreign lines", "[l
     CHECK(g.raw_rows[0] == "warning|odd line");
 }
 
-TEST_CASE("live parsers: row bound is shared between rows and raw rows", "[live][model][security]") {
+TEST_CASE("live parsers: generic rows and users stop at kMaxLiveRows", "[live][model][security]") {
     const auto lk = live::resolve_dashboard_kind("hw_memory");
     REQUIRE(lk);
     std::string big;
@@ -246,4 +355,98 @@ TEST_CASE("live parsers: row bound is shared between rows and raw rows", "[live]
     for (std::size_t i = 0; i < live::kMaxLiveRows + 50; ++i)
         big_users += "user|u\n";
     CHECK(live::parse_users(big_users).size() == live::kMaxLiveRows);
+}
+
+// QE-3: every parser that applies kMaxLiveRows, at cap-1, cap and cap+1 input rows. The
+// boundary rows catch a `>=` that became `>` (one row too many) or a cap that stopped one
+// short. parse_processes and parse_capture_sources are NOT capped by kMaxLiveRows (bounded by
+// the ingest size cap instead), so they are not in this table.
+TEST_CASE("live parsers: each capped parser holds the kMaxLiveRows boundary", "[live][model][security]") {
+    struct Capped {
+        const char* name;
+        const char* line; // one valid row, newline-terminated
+        std::function<std::size_t(const std::string&)> parse;
+    };
+    const auto hw = live::resolve_dashboard_kind("hw_memory");
+    REQUIRE(hw);
+    const std::vector<Capped> table = {
+        {"services", "svc|n|d|running|auto\n",
+         [](const std::string& o) { return live::parse_services(o, "windows").rows.size(); }},
+        {"disk", "disk|C:|100|50|50\n",
+         [](const std::string& o) { return live::parse_disk(o).rows.size(); }},
+        {"connections", "conn|tcp|1.1.1.1|1|2.2.2.2|2|9\n",
+         [](const std::string& o) { return live::parse_connections(o).size(); }},
+        {"process_conns", "conn|tcp|1.1.1.1|1|2.2.2.2|2|9\n",
+         [](const std::string& o) { return live::parse_process_conns(o).size(); }},
+        {"process_tree", "proc|4|0|n|h|p\n",
+         [](const std::string& o) { return live::parse_process_tree(o).size(); }},
+        {"users", "user|u|h|t|s\n",
+         [](const std::string& o) { return live::parse_users(o).size(); }},
+        {"netconfig", "ip|eth0|10.0.0.5|24|10.0.0.1\n",
+         [](const std::string& o) { return live::parse_netconfig(o).size(); }},
+        {"arp", "arp|eth0|10.0.0.2|aa:bb|dynamic\n",
+         [](const std::string& o) { return live::parse_arp(o).size(); }},
+        {"dns_cache", "cache_entry|a.example|A\n",
+         [](const std::string& o) { return live::parse_dns_cache(o).size(); }},
+        {"listening", "listen|tcp|0.0.0.0|22|100\n",
+         [](const std::string& o) { return live::parse_listening(o).size(); }},
+        {"generic rows", "dimm|0|1|DDR4|1\n",
+         [&hw](const std::string& o) { return live::parse_generic_rows(*hw, o).rows.size(); }},
+    };
+    for (const auto& c : table) {
+        CAPTURE(c.name);
+        for (const std::size_t n : {live::kMaxLiveRows - 1, live::kMaxLiveRows, live::kMaxLiveRows + 1}) {
+            CAPTURE(n);
+            std::string input;
+            input.reserve(n * 40);
+            for (std::size_t i = 0; i < n; ++i)
+                input += c.line;
+            CHECK(c.parse(input) == std::min(n, live::kMaxLiveRows));
+        }
+    }
+}
+
+// What parse_generic_rows ACTUALLY does with its two bounds (the code applies two checks, not
+// one shared cap): a raw (foreign-prefix) line is kept only while rows + raw_rows is below
+// kMaxLiveRows, and a data row is kept until rows alone reaches kMaxLiveRows, then parsing
+// stops. So the combined total can reach 2 x kMaxLiveRows. This records the current
+// behaviour (the comments in live_model.{hpp,cpp} state the same); it is not a design claim.
+TEST_CASE("live parsers: generic rows bound rows and raw rows by two separate checks",
+          "[live][model][security]") {
+    const auto lk = live::resolve_dashboard_kind("hw_memory");
+    REQUIRE(lk);
+    constexpr std::size_t kCap = live::kMaxLiveRows;
+    const auto repeat = [](const char* line, std::size_t n) {
+        std::string s;
+        for (std::size_t i = 0; i < n; ++i)
+            s += line;
+        return s;
+    };
+    SECTION("raw lines alone stop at the cap") {
+        for (const std::size_t n : {kCap - 1, kCap, kCap + 1}) {
+            CAPTURE(n);
+            const auto g = live::parse_generic_rows(*lk, repeat("warning|x\n", n));
+            CHECK(g.rows.empty());
+            CHECK(g.raw_rows.size() == std::min(n, kCap));
+        }
+    }
+    SECTION("a full raw set does not stop the data rows: the total reaches 2 x cap") {
+        const auto g = live::parse_generic_rows(
+            *lk, repeat("warning|x\n", kCap + 10) + repeat("dimm|0|1|DDR4|1\n", kCap + 10));
+        CHECK(g.raw_rows.size() == kCap);
+        CHECK(g.rows.size() == kCap);
+        CHECK(g.rows.size() + g.raw_rows.size() == 2 * kCap);
+    }
+    SECTION("data rows first leave no room for raw lines once rows reach the cap") {
+        const auto g = live::parse_generic_rows(
+            *lk, repeat("dimm|0|1|DDR4|1\n", kCap) + repeat("warning|x\n", 10));
+        CHECK(g.rows.size() == kCap);
+        CHECK(g.raw_rows.empty()); // parsing stopped at the cap, the trailing raw lines were not read
+    }
+    SECTION("raw lines are admitted only while the combined count is below the cap") {
+        const auto g = live::parse_generic_rows(
+            *lk, repeat("dimm|0|1|DDR4|1\n", kCap - 5) + repeat("warning|x\n", 20));
+        CHECK(g.rows.size() == kCap - 5);
+        CHECK(g.raw_rows.size() == 5); // (kCap - 5) + 5 == kCap, the 6th raw line is dropped
+    }
 }
