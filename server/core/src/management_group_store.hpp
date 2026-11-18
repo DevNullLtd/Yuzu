@@ -168,7 +168,7 @@ public:
     /// can insert the id again after this statement has committed, with no race needed.
     ///
     /// The statement is `DELETE ... WHERE agent_id = $1 RETURNING group_id` (no `source` filter). When
-    /// `removed_group_ids` is non-null it is cleared and filled, on success only, with the ids of the
+    /// `removed_group_ids` is non-null it is cleared and, when the copy succeeds, filled, on success only, with the ids of the
     /// groups the agent was removed from, so the caller can record WHICH scopes the device left (the
     /// decommission audit evidence); on any failure it is left empty. A failure is logged at warn
     /// level with the reason.

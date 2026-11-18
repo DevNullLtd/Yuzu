@@ -54,7 +54,7 @@
 ///     nothing is granted; removal narrows reach and also ends group-targeted compliance policy,
 ///     Guardian and collection-settings coverage of the device, which the owner accepted. Tags stay
 ///     outside the cascade. The outcome audit row records the groups the device left
-///     (`management_group_memberships.groups=<n>:<ids>`).
+///     (`management_group_memberships.groups=<n>:<ids>`, or `<n>:unrecorded` when the ids could not be copied after the delete committed).
 ///     This was originally a
 ///     hand-maintained conjunction over the per-store securables (rejected as of
 ///     Decision 9's reversal — see the ADR): it stopped scaling once a fourth

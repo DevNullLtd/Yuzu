@@ -128,8 +128,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                 try {
                     detail = format_group_evidence(std::move(removed), count);
                     // Also in the server log, so the group set survives a lost outcome audit row.
-                    spdlog::info("AgentDecommission: agent={} left management groups {}",
-                                 ::yuzu::log_id_token(id), detail);
+                    // Its own guard: a failure while logging must not discard the evidence above.
+                    try {
+                        spdlog::info("AgentDecommission: agent={} left management groups {}",
+                                     ::yuzu::log_id_token(id), detail);
+                    } catch (...) {
+                    }
                 } catch (...) {
                     try {
                         detail = std::to_string(count) + ":unrecorded";

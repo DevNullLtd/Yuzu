@@ -587,13 +587,21 @@ bool ManagementGroupStore::delete_agent(std::string_view agent_id,
             *removed_group_ids = std::move(ids);
         } catch (...) {
             removed_group_ids->clear();
-            spdlog::warn("ManagementGroupStore::delete_agent: agent {} removed from {} group(s) but "
-                         "the group ids could not be copied (out of memory)",
-                         ::yuzu::log_id_token(agent_id), rows);
+            // Logging builds a token string (it can allocate), so it is guarded too: no post-commit
+            // statement in this function may let an exception escape.
+            try {
+                spdlog::warn("ManagementGroupStore::delete_agent: agent {} removed from {} "
+                             "group(s) but the group ids could not be copied (out of memory)",
+                             ::yuzu::log_id_token(agent_id), rows);
+            } catch (...) {
+            }
         }
     }
-    spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
-                 ::yuzu::log_id_token(agent_id), rows);
+    try {
+        spdlog::info("ManagementGroupStore::delete_agent: agent {} removed from {} group(s)",
+                     ::yuzu::log_id_token(agent_id), rows);
+    } catch (...) {
+    }
     return true;
 }
 

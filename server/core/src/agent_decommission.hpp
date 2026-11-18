@@ -92,8 +92,11 @@ enum class DecommissionOutcome {
              ///< merely "invoked".
     Skipped, ///< the store was not configured on this deployment (null pointer).
     Failed,  ///< delete_agent reported failure (returned false — e.g. a transient
-             ///< PG outage rolled the DELETE back) OR threw. Either way the delete
-             ///< did NOT commit; every OTHER store was still attempted.
+             ///< PG outage rolled the DELETE back) OR threw before reporting.
+             ///< The delete did NOT commit, except for a store that documents
+             ///< otherwise (the membership store reports a committed delete as
+             ///< `Deleted` even if its evidence could not be built); every OTHER
+             ///< store was still attempted.
 };
 
 /// `<n>:<id>,<id>,...` evidence text for the groups a decommission removed an agent from: the ids
@@ -116,9 +119,10 @@ struct DecommissionStoreResult {
     std::string store; ///< store name, for the audit trail / logs
     DecommissionOutcome outcome{DecommissionOutcome::Skipped};
     std::string error; ///< populated iff outcome == Failed
-    /// Optional evidence the store reports about what it removed (empty = none). Recorded in the
+    /// Optional evidence the store reports about what it removed (empty = none, or, after a
+    /// committed delete, lost: the last-resort fallback when even `<n>:unrecorded` could not be built). Recorded in the
     /// outcome audit row next to the outcome; today only `management_group_memberships` sets it, to
-    /// `<n>:<group id>,<group id>,...` (see `format_group_evidence`).
+    /// `<n>:<group id>,<group id>,...` or `<n>:unrecorded` (see `format_group_evidence`).
     std::string detail{};
 };
 

@@ -505,7 +505,7 @@ Decision numbers are stable, since other documents cite them.
     the retired device and nothing is granted; removal narrows what anyone can reach. It also ends
     group-targeted compliance policy, Guardian and collection-settings coverage of the device, a loss the owner
     accepted. Tags stay outside the cascade. Because the removal changes confinement input, the outcome audit
-    row records the groups the device left (`management_group_memberships.groups=<n>:<ids>`). A group-scoped
+    row records the groups the device left (`management_group_memberships.groups=<n>:<ids>`, or `<n>:unrecorded` when the ids could not be copied after the delete committed). A group-scoped
     holder, if one could exist, cannot re-issue a partial decommission once the memberships are gone; a
     tag-confined token is not affected by that, because tags survive.)*
     There is **no row-level erasure API**, a stated gap. The cascade's
