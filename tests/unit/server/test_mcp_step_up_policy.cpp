@@ -109,8 +109,9 @@ TEST_CASE("mcp step-up policy: every kExempt reason is from the named class list
           "[stepup][mcp][policy]") {
     // The closed list: 7 reasons before #2146 batch C added kContentAuthoring for the instruction
     // authoring writes, and SAM-35 added kCollectionSettings for set_software_collection_settings
-    // (a new reason is a reviewed addition, never a quiet one).
-    CHECK(step_up_mcp_detail::kMcpExemptReasons.size() == 9);
+    // (a new reason is a reviewed addition, never a quiet one). SAM-29 added kLifecycleRules and
+    // kReferenceDataReplace, the REST twins' own reasons, for the lifecycle-rule and curation writes.
+    CHECK(step_up_mcp_detail::kMcpExemptReasons.size() == 11);
     for (const auto& e : kMcpStepUpPolicy) {
         INFO("tool: " << std::string(e.tool) << " reason: " << std::string(e.reason));
         if (e.cls == StepUpClass::kExempt) {
@@ -272,19 +273,50 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     CHECK(pending_rows() == 50);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // The MCP table shape: 83 rows, 33 exempt, 50 pending (#6087 added the two DEX score policy
+    // The MCP table shape: 88 rows, 38 exempt, 50 pending (#6087 added the two DEX score policy
     // write twins, both exempt kOperationalData; #2146 batch B added the two
     // execution twins, both exempt: cancel_execution kCancelsRecord, record_execution_rerun
     // kCreatesRerunRecord; and execute_instruction_definition and execute_workflow, both exempt
     // kExecutionDispatch; ADR-0070 R1 added the four revocation-source mutations, all pending;
     // #2146 batch C added the seven instruction-definition / instruction-set authoring writes,
     // all exempt kContentAuthoring; SAM-35 added set_software_collection_settings, exempt
-    // kCollectionSettings).
-    CHECK(std::size(kMcpStepUpPolicy) == 83);
+    // kCollectionSettings; SAM-29 added the five lifecycle-rule and curation writes, all exempt, each
+    // with its REST twin's reason).
+    CHECK(std::size(kMcpStepUpPolicy) == 88);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
-    CHECK(exempt == 33);
+    CHECK(exempt == 38);
+}
+
+TEST_CASE("mcp step-up policy: the SAM-29 writes are exempt with their REST twin's reason and pattern",
+          "[stepup][mcp][policy]") {
+    struct Expected {
+        std::string_view tool;
+        std::string_view reason;
+        std::string_view method;
+        std::string_view pattern;
+    };
+    const Expected expected[] = {
+        {"import_software_lifecycle_rules", step_up_detail::kLifecycleRules, "POST",
+         R"(/api/v1/inventory/software/lifecycle/rules)"},
+        {"delete_software_lifecycle_rules", step_up_detail::kLifecycleRules, "DELETE",
+         R"(/api/v1/inventory/software/lifecycle/rules)"},
+        {"curate_software_alias", step_up_detail::kReferenceDataReplace, "POST",
+         R"(/api/v1/inventory/software/normalization/aliases)"},
+        {"reject_software_curation", step_up_detail::kOperationalData, "POST",
+         R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)"},
+        {"replace_software_normalization_pack", step_up_detail::kReferenceDataReplace, "POST",
+         R"(/api/v1/inventory/software/normalization/pack)"}};
+    for (const auto& want : expected) {
+        INFO("tool: " << std::string(want.tool));
+        const auto* row = mcp_step_up_policy_for(want.tool);
+        REQUIRE(row != nullptr);
+        CHECK(row->cls == StepUpClass::kExempt);
+        CHECK(row->reason == want.reason);
+        CHECK(row->rest_method == want.method);
+        CHECK(row->rest_pattern == want.pattern);
+    }
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",

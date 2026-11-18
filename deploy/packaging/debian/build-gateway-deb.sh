@@ -38,6 +38,9 @@ mkdir -p "$PKG/var/log/yuzu"
 # Copy the entire Erlang release (self-contained with embedded ERTS)
 cp -a "$REL_DIR"/* "$PKG/opt/yuzu_gw/"
 
+# Cookie policy sourced by the unit's ExecStartPre (F24)
+install -m 0644 "$DEPLOY_DIR/deploy/docker/gateway-cookie-policy.sh" "$PKG/opt/yuzu_gw/gateway-cookie-policy.sh"
+
 # Systemd service
 cp "$DEPLOY_DIR/deploy/systemd/yuzu-gateway.service" "$PKG/usr/lib/systemd/system/"
 

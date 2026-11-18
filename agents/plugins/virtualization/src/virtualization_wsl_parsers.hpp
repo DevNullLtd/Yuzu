@@ -77,6 +77,11 @@ inline constexpr std::uint32_t kRegDword = 4;
 // -- bounds ------------------------------------------------------------------------------------
 
 inline constexpr std::size_t kMaxValueBytes = 4096;
+// A registry value is scanned in full by looks_like_email_address (a hostile `@(` run is its
+// quadratic input; the test pins that the value-sized worst case is emitted as is). Past the
+// scan's own cap the verdict would become "address", so keep this within it.
+static_assert(kMaxValueBytes <= yuzu::shared::kEmailScanMaxBytes,
+              "WSL value cap must stay within the e-mail scan cap (email_redaction.hpp)");
 inline constexpr std::size_t kMaxPackageVersionBytes = 64;
 inline constexpr std::size_t kDefaultMaxRows = 1024;
 inline constexpr std::size_t kDefaultMaxBytes = 256 * 1024;

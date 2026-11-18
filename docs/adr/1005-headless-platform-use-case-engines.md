@@ -551,7 +551,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        reachability via `execute_instruction`, unaffected by this row.
      - The fleet/group/scope fan-out route `POST /api/v1/hardware/sync` has its MCP twin
        `sync_hardware_software` (owner ruling 2026-10-15: the twin is required, not an
-       exception), sharing the route's cooldown and single in-flight run. Scoping and building
+       exception), sharing the route's run keys, cooldown and pacing budget. Scoping and building
        the list/detail/per-device-sync MCP twins is out of scope for this PR; tracked as
        **#4456**. Until it lands, this row stands as the open exception for those routes.
      - Full design record: the round-3 hardware-ci-view plan
@@ -625,6 +625,8 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        stays `twinned` on the paged shape and the gap is recorded in
        `docs/api-parity-ledger.md`. **Revisit by 2026-11-07** (lapsed; absorbed
        by the 2026-11-09 SAM-17 entry below, whose revisit date now governs).
+       **Retired 2026-11-17 (SAM-21):** `query_installed_software` takes these
+       four filters; only the export stays REST-only (above).
      - **The exception relaxes no control.** The fleet view is gated on a
        global `Inventory:Read` (the per-device view is admitted in scope),
        denies service-scoped tokens on the catalogue fleet view (the raw route
@@ -1422,6 +1424,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      a recorded exception).** The five
      `/api/v1/inventory/software/normalization/` routes (`GET status`, `GET queue`,
      `POST aliases`, `POST queue/{key}/reject`, `POST pack`) have no MCP tool.
+     - **Retired 2026-11-17.** The five twins landed under SAM-29
+       (`get_software_normalization_status`, `list_software_curation_queue`,
+       `curate_software_alias`, `reject_software_curation`,
+       `replace_software_normalization_pack`). Each calls the same function as its
+       REST route (`software_curation_api.cpp`), under the same global
+       `Inventory:Read` / `Inventory:Write` grant and the same audit-before-write
+       rows. The step-up class of the three writes mirrors the REST rows, which are
+       exempt pending an owner ruling. The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked
        as roadmap row **4.3-mcp** in the software estate roadmap (executed inside
        delivery row SAM-29, the MCP twins of rule import, catalogue identity and
@@ -1652,6 +1663,19 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      and the page are separate follow-up changes).** The three routes
      `POST`, `GET` and `DELETE /api/v1/inventory/software/lifecycle/rules` have
      no MCP tool and no dashboard page.
+     - **MCP twin retired 2026-11-17; the page remains open.** The three twins
+       landed under SAM-29 (`list_software_lifecycle_rules`,
+       `import_software_lifecycle_rules`, `delete_software_lifecycle_rules`). Each
+       calls the same function as its REST route (`software_lifecycle_api.cpp`),
+       under the same global `Inventory` grant, the same limits and the same
+       `requested` and outcome audit rows; the step-up class of the two writes
+       mirrors the REST rows (exempt pending an owner ruling). The catalogue
+       identity and `package_id` half of the lifecycle surface is held with #6090
+       and is not built; roadmap row SAM.9-mcp stays open for it. Over MCP the
+       whole JSON-RPC request is capped at 4 MiB before routing, so an import file
+       whose JSON-escaped form plus the envelope passes that cap is refused by the
+       transport where REST accepts up to 4 MiB of raw body. The paragraphs below
+       are the record of the exception while it stood.
      - **No MCP twin and no page - tracked follow-ups, not permanent
        exceptions.** Tracked as roadmap row **SAM.7** (rule import) in the
        software estate roadmap and as issue #8009; **revisit by 2026-12-31**. The MCP twin and the
@@ -1703,6 +1727,14 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      the component inventory the same way. None of this is reachable over MCP:
      `query_installed_software` keeps its 14 fields and five arguments, and the
      components route has no tool.
+     - **Retired 2026-11-17 (SAM-21, issue #7396).** `query_installed_software`
+       takes the `q`, `kind`, `ecosystem`, `source`, `match`, `status`,
+       `version_min` and `version_max` filters and returns the eight lookup
+       fields, `purl`, `count` and the `totals` block; the new tool
+       `query_software_components` is the twin of the components route. Both call
+       the functions the REST routes call (`software_list::lookup_installs` and
+       `lookup_components`), so the body is one. The paragraphs below are the
+       record of the exception while it stood.
      - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked as
        delivery row **SAM-21** of the software estate roadmap (the MCP twin of
        the lookup fields, filters, totals and the components route); the
@@ -1741,14 +1773,15 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      lookup routes (`GET /api/v1/inventory/software` and
      `GET /api/v1/inventory/software/components`) gain a `vers` filter (a
      `vers:<scheme>/...` range resolved by the same evaluator as `version_min`
-     and `version_max`). None of this is reachable over MCP:
-     `query_installed_software` keeps its 14 fields and five arguments, and the
-     components route has no tool.
-     - **No MCP twin - tracked follow-up, not a permanent exception.** Tracked by
-       issue **#7749**, which rides with the SAM-17 twin (#7396, delivery row
-       SAM-21): the twin takes the same pure model (`software_list_model.hpp`,
+     and `version_max`). Over MCP only the `purl` row field is reachable
+     (`query_installed_software` rows carry it, 2026-11-17, SAM-21): the `purl`
+     and `vers` filters are not accepted by `query_installed_software`, and
+     `query_software_components` takes no `vers`.
+     - **No MCP twin of the filters - tracked follow-up, not a permanent
+       exception.** Tracked by issue **#7749** (delivery row SAM-44): the
+       filters take the same pure model (`software_list_model.hpp`,
        `vers_range.hpp`), so no second copy of any rule is created. **Revisit by
-       2026-12-31.** This entry retires when the twin merges. The parity ledger
+       2026-12-31.** This entry retires when the filters are twinned. The parity ledger
        (`docs/api-parity-ledger.md`, "Known asymmetry on purl and vers") points
        here.
      - **The exception relaxes no control.** Both routes keep the SAM-17
@@ -1772,6 +1805,13 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
      schema, description and output schema do not name `confirm` or
      `last_synced_before` or the new result fields, and there is no tool for the
      status route.
+     - **Retired 2026-11-17 (SAM-21, issue #7984).** `sync_hardware_software`
+       advertises `confirm` and `last_synced_before` and the five result fields,
+       writes a whole-fleet run's pre-dispatch row under
+       `software_estate.sync.fleet_wide` as REST does, and the new tool
+       `get_software_sync_status` is the twin of the status route (both call
+       `software_sync::sync_status`). The paragraphs below are the record of the
+       exception while it stood.
      - **No MCP twin of the new surface - tracked follow-up, not a permanent
        exception.** Delivery row **SAM-21** of the software estate roadmap, tracked
        as issue #7984 (the tool's schema and wording, the two arguments, a status
@@ -1975,6 +2015,32 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        ahead of the change. The flag adds no authority of its own. Wire reference:
        `docs/user-manual/rest-api.md` (the quarantine section) and
        `docs/user-manual/security-hardening.md` "Device Quarantine".
+     - Recorded by the change author; ADR-owner acceptance pending.
+
+   - **2026-11-17 - fleet application usage (`GET /api/v1/dex/apps/usage`) is
+     REST only for now; its MCP twin is owed and recorded as an exception.**
+     The route serves, for each application on the Apps list, the devices that
+     ran it, its run time and launches over a 30-day basis and its crashes and
+     hangs per hour of use, in the cells of a chosen slice. The routed
+     invariant is "REST and MCP, or a recorded ledger exception", so the absent
+     tool is recorded rather than left implicit.
+     - **A dated exception, not a permanent absence.** Recorded by the
+       v1-keyed `exception:#8096 revisit:2026-12-31` row
+       `get.api-v1-dex-apps-usage` in `scripts/ci/api-parity/dex.json`, pinned
+       in `STRICT_EXCEPTION_PINS` (tracking issue **#8096**), which is why
+       `BASELINE_UNTWINNED` rose by one (196 to 197). The row is retired, and
+       the baseline lowered, when the MCP tool lands; the tool reuses
+       `dex_apps_usage_json` and the `DexApi` `apps_usage` seam, not a second
+       copy of the model.
+     - **The exception relaxes no control.** The route is gated by
+       `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
+       fail-closed as `dex.apps.usage.view` before the read; the usage figures
+       are computed over the caller's visible devices only (the application
+       list is the fleet list `GuaranteedState:Read` already serves, and the
+       filter is inert for every caller admitted today). The parity ledger
+       carries the matching paragraph (`docs/api-parity-ledger.md`, "New REST
+       route with its MCP twin pending (fleet application usage)"). Wire reference: `docs/user-manual/rest-api.md`, "GET
+       /api/v1/dex/apps/usage"; audit row: `docs/user-manual/audit-log.md`.
      - Recorded by the change author; ADR-owner acceptance pending.
 
 ## Interim rules (until the named follow-ups ship)
