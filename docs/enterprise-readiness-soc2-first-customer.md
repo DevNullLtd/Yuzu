@@ -1112,6 +1112,30 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
+**Accepted risks — the merge rulesets' review rule (CC8.1), 2026-11-18.**
+The only accepted route around the review rule is the OrganizationAdmin bypass on Protect
+Dev and Protect Main, a deliberate break-glass route whose use is visible in the audit log.
+It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
+2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
+from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
+supply-chain CODEOWNERS entries proposed in #8243 (owners `@fjarvis` and `@Tr3kkR`) will
+request review once that pull request is merged, but will not require it, and both owners
+can bypass the rulesets as organisation admins. This is to be reviewed by 2027-05-18,
+tracked in #8228.
+
+Until the owner completes the `cla` environment setup ([Dependency updates](dependency-updates.md),
+"The cla environment"), `CLA_REPO_ACCESS_TOKEN` is still a repository secret that a workflow on
+any branch can read, and so a second route around the review rule. A merge that used it
+cannot be told apart in the audit log from the token owner's own actions, so for that
+period review records are evidence of review only for merges the token's owner did not
+approve. This interim state is tracked in #8228 and ends when the repository copy is
+deleted.
+
+A pull request merged through the bypass is not covered by the rulesets' review
+requirement, so the PR review records cited above are evidence of review only for merges
+that did not use it ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
+until a maintainer approves the head").
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)

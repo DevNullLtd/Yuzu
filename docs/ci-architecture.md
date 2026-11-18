@@ -636,8 +636,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -660,8 +661,17 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
@@ -730,9 +740,9 @@ fixed by reviewing the edit, not by re-running the job.
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — seven parser families
-(six under `server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -1168,6 +1178,126 @@ The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host 
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
+
+## Release build environment and provenance
+
+This states how a release is built today, as checked against `release.yml` on
+2026-11-17. It describes the pipeline; it is not a certification.
+
+**Owner role:** the release manager (the maintainer who cuts releases with the
+`/release` skill). Re-check this section against `release.yml` before each
+minor release, and in the same change as any edit to a release job's runner,
+cache or signing wiring.
+
+**Trigger.** `release.yml` runs on a `v*` tag push or a `workflow_dispatch` on
+a tag ref. Anyone with write access can push such a tag: the repository has
+branch rulesets for `dev` and `main` but no tag ruleset, and nothing checks
+that the tagged commit is on `main`. The `release-guard` job refuses a non-tag
+ref, a malformed tag and a tag that already has a published release
+(see [Release re-publish guard](#release-re-publish-guard-release-guard-5282)).
+
+**Where each job runs.**
+
+| Job | Runner |
+|---|---|
+| `release-guard`, `release` (assembles, checksums and signs the release), `docker-publish-agent-bundle` | GitHub-hosted `ubuntu-24.04` (fresh VM per job) |
+| `build-linux`, `build-gateway`, `docker-publish`, `docker-publish-postgres`, `docker-publish-chisel` | self-hosted `yuzu-bigtam-linux` (Big Tam) |
+| `build-windows` | self-hosted `yuzu-weetam-windows` (Wee Tam) |
+| `build-macos` | self-hosted `yuzu-bigmags-macos` (BigMags) |
+
+The self-hosted runners are persistent (not ephemeral or just-in-time; #1595
+tracks that for Windows) and are the same runner agents that run `ci.yml`,
+`nightly.yml`, `sanitizer-tests.yml` and `codeql.yml` (table below). `ci.yml`
+runs on every pull request to `dev` or `main` from a branch in this
+repository, so code from any write-access branch executes on the hosts that
+later build a release. On Big Tam and Wee Tam the four runner agents of a pool
+share one OS account. Fork pull requests do not run there unless a maintainer
+approves a revision through `trusted-fork-ci.yml`, which isolates its caches
+([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
+vcpkg baseline PR (branch `deps/vcpkg-baseline*`, opened by
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer who
+is not its author, did not push its head and is on none of its commits has
+reviewed its upstream range and approved the PR at the head the CI run
+builds: until then `preflight-gate` fails, its self-hosted
+legs are skipped and `Preflight (runner health)` is red
+([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
+maintainer approves the head"). That limits when unreviewed upstream code reaches these
+hosts; it does not separate the caches below from release builds.
+
+**State that persists into a release build.** Release builds reuse local state
+left by earlier jobs on the same host; none of it comes from the GitHub
+Actions cache service.
+
+- ccache, on all three build platforms, in the same directory the CI jobs on
+  that runner use: per runner agent on Big Tam (each agent has its own
+  `HOME`, [`deploy/linux/`](../deploy/linux/README.md)), one machine-wide
+  `CCACHE_DIR` shared by all four agents on Wee Tam
+  ([`deploy/windows/`](../deploy/windows/README.md)), and the runner's
+  ccache on BigMags.
+- `build-linux` checks out with `clean: false` and deletes only `build-linux/`,
+  so `vcpkg_installed/` survives in the workspace between jobs (validated by
+  the [vcpkg sentinel](#universal-vcpkg-cache-key-contract)). `build-windows`
+  and `build-macos` check out clean and reinstall `vcpkg_installed/`, from
+  vcpkg's default binary cache for the runner account (Windows) or from
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos`, which the `ci.yml` macOS
+  leg also fills (macOS).
+- The image jobs read and write a BuildKit layer cache under
+  `runner.tool_cache/yuzu-docker-buildcache/`. Base images are pinned by
+  digest.
+
+**Provenance and signing.**
+
+- Every build job runs `actions/attest-build-provenance` on its own artifacts,
+  inside the same job as the build steps, with `id-token: write` granted to
+  the whole job. The attested assets are the platform archives, the native
+  installers and the images; each attested archive and installer also ships
+  its provenance bundle as `<asset>.intoto.jsonl`. The SBOMs, `SHA256SUMS`
+  and the Compose Wizard zip are not attested; the signed `SHA256SUMS`
+  covers the SBOMs and the zip.
+- Every published image is cosign-signed keyless by digest and attested
+  (`push-to-registry: true`). BuildKit's own provenance is turned off
+  (`provenance: false`) in favour of those.
+- `SHA256SUMS` lists every asset, is cosign-signed keyless in the hosted
+  `release` job and is verified there against the exact tag-bound
+  `release.yml` identity before the release is created.
+- Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+- Authenticode and Apple signing and notarization run only when their
+  secrets are set, and skip silently otherwise. On 2026-11-17 none of
+  `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets
+  exist in the repository, so the Windows and macOS installers ship unsigned
+  (#239). Making a stable release refuse, rather than skip, unsigned
+  installers is planned but held until the secrets exist; update this bullet
+  when it lands.
+
+**SLSA Build level.** Provenance is generated and signed through GitHub's
+attestation service from the workflow's OIDC identity, and the build runs on
+CI infrastructure rather than a developer machine. That is roughly SLSA Build
+L2, and L2 is the most that should be claimed. The pipeline does not meet L3:
+the runners are persistent and shared with CI that runs code from any
+write-access branch; release builds consume caches (ccache, vcpkg, BuildKit,
+the Linux workspace) that those jobs can write; and the build steps run in
+the job that holds the OIDC token used to sign the provenance, so they could
+mint an attestation themselves. Reaching L3 means isolated ephemeral runners
+for release builds with no shared caches, and provenance generated outside
+the build job (for example a reusable workflow on GitHub-hosted runners).
+
+**Open gaps.** Disclosed here, not yet fixed, and each needs a tracking
+issue:
+
+- **No tag ruleset.** Anyone with write access can push a `v*` tag, which
+  starts `release.yml`, and nothing checks that the tagged commit is on
+  `main`.
+- **Release builds read caches that CI can write.** CI jobs from any
+  write-access branch fill ccache, the Linux workspace's `vcpkg_installed/`
+  and the vcpkg binary caches that release jobs on the same host then read
+  (the macOS binary cache is the same
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos` directory in `ci.yml` and
+  `release.yml`). Only release jobs write the BuildKit layer cache through
+  BuildKit, but a CI job running as the same OS account (any job on the same
+  Big Tam or Wee Tam pool, or on the same runner agent) can write its
+  directory directly. The vcpkg baseline PR's approval gate narrows
+  one unattended route into these caches; it does not close the gap, which
+  needs release builds that start from no cache a CI job can write.
 
 ## Self-hosted runner topology
 
