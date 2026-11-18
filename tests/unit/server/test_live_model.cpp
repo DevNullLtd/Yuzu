@@ -444,6 +444,15 @@ TEST_CASE("parse_generic_rows: escaped_rows kinds split on an unescaped pipe, ot
     CHECK(g.rows[0][0] == "0");
     CHECK(g.rows[0][1] == "Intel|X");
     CHECK(g.rows[0][4] == "3000");
+    // hw_memory is the other escaped kind: a pipe in the DIMM slot stays in its cell.
+    const auto mem = live::resolve_dashboard_kind("hw_memory");
+    REQUIRE(mem);
+    const auto m = live::parse_generic_rows(*mem, "dimm|Bank\\|0|8192|DDR4|3200\n");
+    REQUIRE(m.rows.size() == 1);
+    REQUIRE(m.rows[0].size() == 4);
+    CHECK(m.rows[0][0] == "Bank|0");
+    CHECK(m.rows[0][1] == "8192");
+    CHECK(m.rows[0][3] == "3200");
     // hw_disks keeps the raw split: a field ending in a backslash must NOT swallow the separator.
     const auto disk = live::resolve_dashboard_kind("hw_disks");
     REQUIRE(disk);

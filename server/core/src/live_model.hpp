@@ -120,11 +120,13 @@ struct LiveKind {
     /// the rows that rest_api_v1.cpp's live_result_json can render; widening the REST
     /// surface means flipping this flag AND teaching that function the kind.
     bool rest_v1{false};
-    /// True only for a kind whose producing action writes a literal pipe as `\|` and folds a
-    /// literal backslash to `/` for EVERY field of the row (yuzu::util::safe_output_field), so
-    /// parse_generic_rows() may split it on an UNESCAPED pipe and unescape (#7040). Leave it
-    /// false for any kind whose action writes raw text: a field ending in a backslash would then
-    /// swallow the next separator. Set BY NAME in the kind table, beside each kind.
+    /// True only for a kind whose producing action writes every free-text field of the row through
+    /// yuzu::util::safe_output_field (a literal pipe becomes `\|`, a literal backslash is folded to
+    /// `/`; the remaining columns are numbers, a fixed enum, or pre-cleaned identity fields), so
+    /// parse_generic_rows() may split it on an UNESCAPED pipe and unescape (#7040). Leave it false
+    /// for any kind whose action writes raw text: a field ending in a backslash would then swallow
+    /// the next separator. Set BY NAME beside each kind in the table. A kind whose producing action
+    /// changes (hw_drivers moving to the `drivers_inventory` action, say) must flip this with it.
     bool escaped_rows{false};
 };
 
