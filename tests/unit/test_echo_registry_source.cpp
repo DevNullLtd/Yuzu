@@ -13,6 +13,7 @@
 
 #include "echo_cursor.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_registry_parsers.hpp"
 #include "echo_registry_source.hpp"
@@ -54,7 +55,7 @@
 #include <regex>
 #include <evntrace.h> // ControlTraceW QUERY: no session may outlive stop()
 #include <sddl.h>
-#include <win_profiles.hpp> // enumerate_hku_subkeys, PrivilegeScope: the offline-hive cases
+#include <win_profiles.hpp> // enumerate_hku_subkeys_checked, PrivilegeScope: the offline-hive cases
 #include <win_str.hpp>
 #include "echo_hive_mount_gate.hpp"  // g_mount_workers_in_flight
 #include "echo_win_process_name.hpp" // process_basename_for_pid
@@ -401,6 +402,190 @@ TEST_CASE("diff_registry_snapshot: added/changed/removed values and the four rea
     }
 }
 
+namespace {
+
+// The test-side inverse of registry_name_utf8 (production has no decoder: nothing needs one).
+// Reading left to right a U+FFFD is followed by a second U+FFFD (a literal one) or by four hex
+// digits that start with `D` (a lone surrogate).
+std::u16string decode_registry_name(const std::string& s) {
+    std::u16string out;
+    const auto cp_at = [&](std::size_t& i) {
+        const auto b0 = static_cast<unsigned char>(s[i]);
+        const std::size_t n = b0 < 0x80 ? 1 : b0 < 0xE0 ? 2 : b0 < 0xF0 ? 3 : 4;
+        char32_t cp = n == 1 ? b0 : (b0 & (0xFF >> (n + 1)));
+        for (std::size_t k = 1; k < n; ++k)
+            cp = (cp << 6) | (static_cast<unsigned char>(s[i + k]) & 0x3F);
+        i += n;
+        return cp;
+    };
+    for (std::size_t i = 0; i < s.size();) {
+        const char32_t cp = cp_at(i);
+        if (cp == 0xFFFD) {
+            if (i < s.size() && static_cast<unsigned char>(s[i]) == 0xEF) { // a second U+FFFD
+                cp_at(i);
+                out += static_cast<char16_t>(0xFFFD);
+            } else { // four hex digits: a lone surrogate
+                out += static_cast<char16_t>(std::stoi(s.substr(i, 4), nullptr, 16));
+                i += 4;
+            }
+        } else if (cp >= 0x10000) {
+            out += static_cast<char16_t>(0xD800 + ((cp - 0x10000) >> 10));
+            out += static_cast<char16_t>(0xDC00 + ((cp - 0x10000) & 0x3FF));
+        } else {
+            out += static_cast<char16_t>(cp);
+        }
+    }
+    return out;
+}
+
+const std::vector<std::u16string>& registry_name_table() {
+    static const std::vector<std::u16string> t{
+       u"Run",                        // valid BMP text
+       u"caf\u00E9 \u4E2D",           // non-ASCII BMP
+       u"x\U0001F600y",               // a surrogate pair
+       std::u16string{u'a', char16_t(0xD800)},                          // a lone high
+       std::u16string{u'a', char16_t(0xDC00)},                          // a lone low
+       std::u16string{char16_t(0xD800), u'D', u'8', u'0', u'0'},        // a lone high then the text D800
+       std::u16string{char16_t(0xD800)},                                // a lone high alone
+       u"\uFFFD",                     // a literal replacement character
+       u"\uFFFD" u"D800",             // a literal one followed by the text D800
+       u"\uFFFD\uFFFD",               // two literal ones
+       u"\\uD800",                    // the valid name spelt backslash-u-D800
+       std::u16string{u'n', char16_t(0), u'm'}, // a name with U+0000
+       std::u16string{char16_t(0xDC00), char16_t(0xD800)}, // low then high: both lone
+    };
+    return t;
+}
+
+} // namespace
+
+TEST_CASE("registry names: valid UTF-16 without a replacement character converts to the same UTF-8 as before",
+          "[echo][registry][pure]") {
+    CHECK(registry_name_utf8(u"Run") == "Run");
+    CHECK(registry_name_utf8(u"caf\u00E9 \u4E2D") == "caf\xC3\xA9 \xE4\xB8\xAD");
+    CHECK(registry_name_utf8(u"x\U0001F600y") == "x\xF0\x9F\x98\x80y");
+    CHECK(registry_name_utf8(u"\\uD800") == "\\uD800"); // a backslash is just a backslash
+    CHECK(registry_name_utf8(std::u16string{u'n', char16_t(0), u'm'}) == std::string("n\0m", 3));
+}
+
+TEST_CASE("registry names: a lone surrogate and a literal replacement character and the spelled-out escape text all encode differently",
+          "[echo][registry][pure]") {
+    const auto& t = registry_name_table();
+    std::set<std::string> seen;
+    for (const auto& n : t)
+        CHECK(seen.insert(registry_name_utf8(n)).second); // pairwise distinct
+    CHECK(seen.size() == t.size());
+    CHECK(registry_name_utf8(std::u16string{char16_t(0xD800)}) == "\xEF\xBF\xBD" "D800");
+    CHECK(registry_name_utf8(u"\uFFFD") == "\xEF\xBF\xBD\xEF\xBF\xBD");
+}
+
+TEST_CASE("registry names: every encoded name decodes back to the name it came from", "[echo][registry][pure]") {
+    for (const auto& n : registry_name_table())
+        CHECK(decode_registry_name(registry_name_utf8(n)) == n);
+}
+
+TEST_CASE("registry diff: a value replaced by one whose name differs only in a lone surrogate is reported removed and added",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string spelt = registry_name_utf8(u"\\uD800");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(spelt != lone);
+    const auto base_read = complete({{root + "\\A", {{spelt, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto now = complete({{root + "\\A", {{lone, vread(P::kRegDword, dword(1))}}}});
+    const auto d = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    std::set<std::string> got;
+    for (const auto& c : d.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + spelt, "added:" + lone});
+}
+
+TEST_CASE("registry diff: unnamed skipped children make a read non-authoritative whatever its status",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string a = root + "\\A", b = root + "\\B";
+    const auto base_read = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}},
+                                     {b, {{"v", vread(P::kRegDword, dword(2))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    const auto actions = [&](const DiffResult& d) {
+        std::set<std::string> got;
+        for (const auto& c : d.candidates)
+            got.insert(c.action + ":" + c.key.substr(root.size() + 1) + ":" + c.value);
+        return got;
+    };
+
+    // B is missing from the read, and it may be one of the unnamed children. The status says
+    // Complete on purpose: the guard is where removals are derived, not only in the shell.
+    auto now = complete({{a, {{"v", vread(P::kRegDword, dword(1))}}}});
+    now.skipped_overflow = 3;
+    const auto held = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    CHECK(held.candidates.empty()); // no removed row and no key_removed row
+    CHECK(held.baseline.keys.contains(b));
+
+    now.skipped_overflow = 0; // the same read without unnamed children proves B is gone
+    CHECK(actions(diff_registry_snapshot(base, now, root, "reconcile", win, 20)) ==
+          std::set<std::string>{"removed:B:v", "key_removed:B:"});
+}
+
+TEST_CASE("registry diff: a legacy single-U+FFFD name is replaced on a Complete read and only added beside on a Capped one",
+          "[echo][registry][pure]") {
+    namespace P = yuzu::profiles;
+    const std::string root = "HKLM\\SOFTWARE\\r";
+    const RegistryWindow win{10, 20};
+    const std::string key = root + "\\A";
+    // What the lossy conversion stored for a lone surrogate, against what the encoder writes now.
+    const std::string legacy = "\xEF\xBF\xBD";
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    REQUIRE(lone == "\xEF\xBF\xBD" "D800");
+    const auto base_read = complete({{key, {{legacy, vread(P::kRegDword, dword(1))}}}});
+    const auto base = diff_registry_snapshot({}, base_read, root, "reconcile", win, 20, /*suppress=*/true).baseline;
+    auto now = complete({{key, {{lone, vread(P::kRegDword, dword(1))}}}});
+
+    std::set<std::string> got;
+    for (const auto& c : diff_registry_snapshot(base, now, root, "reconcile", win, 20).candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"removed:" + legacy, "added:" + lone});
+
+    now.status = RegistryReadStatus::Capped; // a root that stays partial: only adds appear
+    const auto partial = diff_registry_snapshot(base, now, root, "reconcile", win, 20);
+    got.clear();
+    for (const auto& c : partial.candidates)
+        got.insert(c.action + ":" + c.value);
+    CHECK(got == std::set<std::string>{"added:" + lone});
+    CHECK(partial.baseline.keys.at(key).contains(legacy)); // the old stored form lingers
+}
+
+TEST_CASE("registry read: a name already present in the key marks the read partial and keeps the first",
+          "[echo][registry][pure]") {
+    std::map<std::string, RegistryValueRead> values;
+    CHECK(record_registry_name(values, "Same", vread(4, dword(1))));
+    CHECK_FALSE(record_registry_name(values, "Same", vread(4, dword(2)))); // the caller marks the read Capped
+    CHECK(values.size() == 1);
+    CHECK(values.at("Same").bytes == dword(1)); // the first entry is kept, never overwritten
+}
+
+TEST_CASE("registry read budget: a skipped child is charged like a visited key and a passed deadline refuses it",
+          "[echo][registry][pure]") {
+    {
+        RegistryReadBudget b;
+        bool all_admitted = true;
+        for (std::size_t i = 0; i < kBaselineKeyCap; ++i)
+            all_admitted = b.admit_key_by(100, 200) && all_admitted;
+        CHECK(all_admitted);
+        CHECK_FALSE(b.admit_key_by(100, 200)); // the key budget ends a run of skipped children
+    }
+    {
+        RegistryReadBudget b;
+        CHECK(b.admit_key_by(199, 200));
+        CHECK_FALSE(b.admit_key_by(200, 200)); // at the deadline
+        CHECK_FALSE(b.admit_key_by(201, 200)); // past it
+    }
+}
+
 TEST_CASE("RegistryReadBudget caps keys and values and bytes (R9)", "[echo][registry][pure]") {
     {
         RegistryReadBudget b;
@@ -530,6 +715,47 @@ TEST_CASE("attribute_candidate: correlation on value name, type, size and window
         CHECK(attribute_candidate(kr, {ev(150, 9, RegistryEtwOp::DeleteKey, "", 0, 0, "x.exe"),
                                        ev(150, 9, RegistryEtwOp::DeleteValue, "", 0, 0, "x.exe")})
                  .kind == AttributionKind::None);
+    }
+}
+
+TEST_CASE("attribute_candidate: names built with the one identity correlate (pure; the ETW read is a live case)",
+          "[echo][registry][pure]") {
+    // The Windows shell builds both sides through registry_name_utf8: the reader stores a name
+    // through name_identity and the ETW callback hands the event's ValueName through the same
+    // function before value_name_key, so a candidate and the event that wrote it compare equal.
+    const std::string fffd = registry_name_utf8(u"\uFFFD");
+    const std::string lone = registry_name_utf8(std::u16string{char16_t(0xD800)});
+    const std::string fffd_d800 = registry_name_utf8(u"\uFFFD" u"D800");
+    REQUIRE(lone != fffd_d800);
+
+    SECTION("a name holding a literal U+FFFD is correlated to its writer") {
+        const auto a = attribute_candidate(cand("changed", fffd, 4, 4, 100, 200),
+                                           {ev(150, 31, RegistryEtwOp::Set, fffd, 4, 4, "w.exe")});
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 31);
+        CHECK(a.image == "w.exe");
+    }
+    SECTION("a lone surrogate and a literal U+FFFD followed by D800 each name their own writer") {
+        // Same type, size and window; written by two processes. Neither is Ambiguous or swapped.
+        const std::vector<RegistryEtwEvent> events{
+           ev(150, 11, RegistryEtwOp::Set, lone, 4, 4, "a.exe"),
+           ev(160, 22, RegistryEtwOp::Set, fffd_d800, 4, 4, "b.exe")};
+        const auto a = attribute_candidate(cand("changed", lone, 4, 4, 100, 200), events);
+        CHECK(a.kind == AttributionKind::Corr);
+        CHECK(a.pid == 11);
+        CHECK(a.image == "a.exe");
+        const auto b = attribute_candidate(cand("changed", fffd_d800, 4, 4, 100, 200), events);
+        CHECK(b.kind == AttributionKind::Corr);
+        CHECK(b.pid == 22);
+        CHECK(b.image == "b.exe");
+    }
+    SECTION("an ASCII name is unchanged") {
+        const std::string start = registry_name_utf8(u"Start");
+        CHECK(start == "Start");
+        CHECK(value_name_key(start) == value_name_key("Start"));
+        CHECK(attribute_candidate(cand("changed", start, 4, 4, 100, 200),
+                                  {ev(150, 1, RegistryEtwOp::Set, registry_name_utf8(u"START"))})
+                 .kind == AttributionKind::Corr); // the ASCII fold still applies
     }
 }
 
@@ -1355,6 +1581,38 @@ TEST_CASE("select_stale_hive_mounts: a prefix only narrows the set; one that is 
     CHECK(select_stale_hive_mounts(hku, "YUZU_").empty());
 }
 
+TEST_CASE("registry sweep: an incomplete HKU listing stays pending for one retry and then completes with one warning",
+          "[echo][registry][pure]") {
+    bool retried = false;
+    HiveSweepResult listed; // the listing was complete (whatever it found)
+    HiveSweepResult unlisted;
+    unlisted.listing_error = "index 3 (RegEnumKeyExW rc=5)";
+
+    // A complete listing settles at once and never spends the retry.
+    auto settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK_FALSE(retried);
+
+    // The first incomplete listing keeps the sweep pending, silently, for exactly one retry.
+    settle = settle_sweep(unlisted, retried);
+    CHECK(settle.pending);
+    CHECK_FALSE(settle.warn);
+    CHECK(retried);
+
+    // The second one completes it with the one warning: a deterministic failure is not retried
+    // every tick.
+    settle = settle_sweep(unlisted, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK(settle.warn);
+
+    // A retry that does list completes without a warning.
+    retried = true;
+    settle = settle_sweep(listed, retried);
+    CHECK_FALSE(settle.pending);
+    CHECK_FALSE(settle.warn);
+}
+
 TEST_CASE("sweep_hive_mounts: each name is offered once in order; a refusal is retained and the rest are still attempted",
           "[echo][registry][pure]") {
     const std::vector<std::string> names{"YUZU_HIVE_a_0000000000000000_0",
@@ -1440,7 +1698,7 @@ void record_committed(const std::vector<RegistryEvent>& rows) {
 TestDb make_db() {
     committed_rows().clear();
     auto tmp = yuzu::test::unique_temp_path("yuzu_test_echo_registry_");
-    auto r = EchoDatabase::open(tmp);
+    auto r = yuzu::test::open_echo_db(tmp);
     REQUIRE(r.has_value());
     return TestDb{std::move(*r), tmp};
 }
@@ -2756,6 +3014,166 @@ TEST_CASE("registry source: the denied child set writes a gap only when it gains
     }
 }
 
+TEST_CASE("registry read: more than 32 denied children are counted and the gap row says how many are not named",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        r.skipped.push_back(std::format("{}\\D{:03}", kRoot, i));
+    r.skipped_overflow = 5;
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = last_gap();
+    CHECK_THAT(detail, ContainsSubstring("(37 child key(s) denied read access"));
+    CHECK_THAT(detail, ContainsSubstring("; and 5 more not named"));
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped.size() == kSkippedCap); // the stored set stays bounded
+}
+
+TEST_CASE("registry source: a larger count of unnamed denied children writes one gap row; a steady, lower or cleared count writes none",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    std::vector<std::string> named;
+    for (std::size_t i = 0; i < kSkippedCap; ++i)
+        named.push_back(std::format("{}\\D{:03}", kRoot, i));
+    auto gap_count = [&] {
+        return std::stoll(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:unreadable:%'")
+                             .rows.at(0).at(0));
+    };
+    auto last_gap = [&] {
+        return ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    };
+    auto stored = [&] { return read_cursor(t.db).roots.at(kRoot).skipped_overflow; };
+    // One tick over an unchanged root: the same 32 named children, `overflow` more beyond them.
+    auto next_tick = [&](RegistryReadStatus status, std::size_t overflow) {
+        auto r = svc(1);
+        r.status = status;
+        r.skipped = named;
+        r.skipped_overflow = overflow;
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick(t.db, *src);
+    };
+    using S = RegistryReadStatus;
+
+    // 32 denied children and no more: all named, a Complete read, one gap row.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 1);
+    CHECK(gap_count() == 1);
+    CHECK(stored() == 0);
+
+    // The 33rd: every named child is one the stored set already holds, only the count is new.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 2);
+    CHECK_THAT(last_gap(), ContainsSubstring("(33 child key(s) denied read access"));
+    CHECK(last_gap().ends_with("; and 1 more not named"));
+    CHECK(stored() == 1);
+
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0); // steady: nothing new
+    CHECK(gap_count() == 2);
+
+    CHECK(next_tick(S::Capped, 2).events_emitted == 1); // the 34th
+    CHECK(gap_count() == 3);
+    CHECK(last_gap().ends_with("; and 2 more not named"));
+    CHECK(stored() == 2);
+
+    // A Capped read may add but never shrinks, like the named set: a lower count writes nothing
+    // and is not remembered, so the same 2 again is not a gain.
+    CHECK(next_tick(S::Capped, 1).events_emitted == 0);
+    CHECK(stored() == 2);
+    CHECK(next_tick(S::Capped, 2).events_emitted == 0);
+    CHECK(gap_count() == 3);
+
+    // A Complete read clears the count (nothing to report), and a count that comes back is new.
+    CHECK(next_tick(S::Complete, 0).events_emitted == 0);
+    CHECK(stored() == 0);
+    CHECK(gap_count() == 3);
+    CHECK(next_tick(S::Capped, 1).events_emitted == 1);
+    CHECK(gap_count() == 4);
+}
+
+TEST_CASE("registry cursor: the unnamed skipped count is written only when set and decodes to 0 when absent",
+          "[echo][registry][pure]") {
+    RegistryCursor cur;
+    cur.present = true;
+    cur.tick = 3;
+    cur.roots["HKLM\\R"] = RegistryRootState{true, 100, 110, 120, "capped", false, {"HKLM\\R\\D"}};
+    const auto plain = encode_registry_cursor(cur);
+    // Unset: the row has no such field, so it is byte-identical to one an earlier build wrote.
+    CHECK_FALSE(nlohmann::json::parse(plain).at("roots").at("HKLM\\R").contains("skipped_overflow"));
+    const auto absent = decode_registry_cursor(plain);
+    CHECK_FALSE(absent.malformed);
+    CHECK(absent.roots.at("HKLM\\R").skipped_overflow == 0);
+    CHECK(absent.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+
+    cur.roots["HKLM\\R"].skipped_overflow = 7;
+    const auto set = encode_registry_cursor(cur);
+    CHECK(nlohmann::json::parse(set).at("roots").at("HKLM\\R").at("skipped_overflow").get<std::size_t>() == 7);
+    const auto back = decode_registry_cursor(set);
+    CHECK_FALSE(back.malformed);
+    CHECK(back.roots.at("HKLM\\R").skipped_overflow == 7);
+    CHECK(back.roots.at("HKLM\\R") == cur.roots.at("HKLM\\R"));
+    CHECK(encode_registry_cursor(back) == set);
+}
+
+TEST_CASE("registry read: a read with uncounted denied children derives adds for later siblings and no removals",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    const std::string a = kRoot + "\\A", b = kRoot + "\\B", c = kRoot + "\\C";
+    auto step = [&](SubtreeRead r) {
+        f.reads[kRoot] = std::move(r);
+        f.clock += 100 * SEC;
+        f.dirty->mark(kRoot, f.clock);
+        return tick_settled(t.db, f, *src);
+    };
+    step(complete({{a, {{"v", vread(4, dword(1))}}}, {b, {{"v", vread(4, dword(2))}}}}));
+    // B is gone from this read (it may be one of the unnamed denied children); C is a later sibling.
+    auto r = complete({{a, {{"v", vread(4, dword(1))}}}, {c, {{"v", vread(4, dword(3))}}}});
+    r.status = RegistryReadStatus::Capped;
+    r.skipped_overflow = 3;
+    step(std::move(r));
+    const auto rows = ql("SELECT action, key_path FROM registry_live WHERE action IN ('added','removed','key_removed')");
+    REQUIRE_FALSE(rows.rows.empty());
+    int added_c = 0;
+    for (const auto& row : rows.rows) {
+        CHECK(row.at(0) == "added"); // no removed and no key_removed row
+        added_c += row.at(1).ends_with("\\C");
+    }
+    CHECK(added_c == 1);
+}
+
+TEST_CASE("registry names: a NUL is escaped in the gap detail only", "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    auto r = svc(1);
+    r.status = RegistryReadStatus::Capped;
+    r.skipped = {kRoot + std::string{'\\', 'a', '\0', 'b'}}; // the identity path keeps the NUL
+    f.reads[kRoot] = std::move(r);
+    f.clock += 100 * SEC;
+    f.dirty->mark(kRoot, f.clock);
+    tick(t.db, *src);
+    const std::string detail = ql("SELECT detail FROM registry_live WHERE record_key LIKE 'gap:unreadable:%' "
+                                  "ORDER BY id DESC LIMIT 1").rows.at(0).at(0);
+    CHECK_THAT(detail, ContainsSubstring("\\a<NUL>b"));
+    CHECK(detail.find('\0') == std::string::npos);
+    CHECK(read_cursor(t.db).roots.at(kRoot).skipped ==
+          std::vector<std::string>{kRoot + std::string{'\\', 'a', '\0', 'b'}}); // identity unchanged
+}
+
 TEST_CASE("registry source: with a budget admitting one root per tick every root is read within n ticks (R15)",
           "[echo][registry][lifecycle]") {
     auto t = make_db();
@@ -3223,6 +3641,77 @@ TEST_CASE("registry source: a failed HKEY_USERS enumeration keeps the cursor and
     tick(r.t.db, *r.src);
     CHECK(r.f.loaded_sids_calls == enumerations + 1);
     CHECK(*r.t.db.get_cursor("registry").value() != cursor_before);
+}
+
+TEST_CASE("registry source: a commit that fails for three ticks then succeeds records one commit "
+          "stalled gap with the window in its key",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+
+    const std::string lost_before = t.db.get_config("registry_etw_lost", "");
+    const auto kept = count_rows(t.db); // what the warehouse held before the failures
+
+    // Three ticks whose commit is refused. Each has a loss row, so it has a row to fail on.
+    std::int64_t first_failure = 0;
+    {
+        InsertTrap trap(t.path);
+        for (int i = 0; i < 3; ++i) {
+            f.clock += 10 * SEC;
+            f.loss.events_lost += 1;
+            if (i == 0)
+                first_failure = f.clock + 1000; // the fake clock steps 1000 per read; `now` is the first
+            CHECK_THROWS_AS(tick(t.db, *src), IncompleteCaptureError);
+        }
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0"); // nothing was committed while it failed
+    CHECK(count_rows(t.db) == kept);
+
+    // The trap is gone: the next tick commits the loss it re-derived and the stall window.
+    f.clock += 10 * SEC;
+    const std::int64_t recovered = f.clock + 1000;
+    CHECK(t.db.get_config("registry_etw_lost", "") == lost_before); // still nothing committed
+    const auto before = read_cursor(t.db).tick;
+    tick(t.db, *src);
+    CHECK(read_cursor(t.db).tick == before + 1); // the status keys and cursor moved again
+    CHECK(t.db.get_config("registry_etw_lost", "") == "3"); // the three losses, committed now
+    const auto stalled =
+        ql("SELECT record_key FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'");
+    REQUIRE(stalled.rows.size() == 1);
+    CHECK(stalled.rows[0][0] ==
+          std::format("gap:commit_stalled:commit:{}:{}", first_failure, recovered));
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "2"); // the loss row and the stall row
+    CHECK(count_rows(t.db) == kept + 2); // and the warehouse kept both, in the one commit
+
+    // The window is consumed: a later commit adds no second stall row.
+    f.clock += 10 * SEC;
+    tick(t.db, *src);
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "1");
+    CHECK(count_rows(t.db) == kept + 2);
+}
+
+TEST_CASE("registry source: a commit that never failed records no commit stalled gap",
+          "[echo][registry][lifecycle]") {
+    auto t = make_db();
+    Fake f;
+    auto src = make_registry_cursor_source(scope1(), f.reader());
+    f.reads[kRoot] = svc(1);
+    REQUIRE(tick(t.db, *src).outcome == CursorOutcome::Baseline);
+    for (int i = 0; i < 3; ++i) {
+        f.clock += 10 * SEC;
+        f.loss.events_lost += 1;
+        tick(t.db, *src);
+    }
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE action = 'capture_gap'")
+              .rows.at(0).at(0) == "3"); // the three loss rows
+    CHECK(ql("SELECT COUNT(*) FROM registry_live WHERE record_key LIKE 'gap:commit_stalled:%'")
+              .rows.at(0).at(0) == "0");
 }
 
 TEST_CASE("walk_enumeration: only the end of the list completes a walk and an error is a failed "
@@ -5424,6 +5913,32 @@ TEST_CASE("registry source: a failed cursor rewrite at start() changes nothing a
 }
 
 
+// The named environment causes that stop the Kernel-Registry ETW session opening, as a SKIP
+// reason; nullopt for anything else, which the caller FAILs with the code (#7173). Win32 1450
+// (ERROR_NO_SYSTEM_RESOURCES) is the system trace-session limit; Win32 5 (ERROR_ACCESS_DENIED)
+// is a missing elevation, a cause only on a token that is not elevated.
+namespace {
+std::optional<std::string> etw_skip_reason(unsigned long start_rc, bool elevated) {
+    if (start_rc == 1450)
+        return "ETW session unavailable: the system trace-session limit is reached (Win32 1450)";
+    if (start_rc == 5 && !elevated)
+        return "ETW session unavailable: not elevated (Win32 5)";
+    return std::nullopt;
+}
+} // namespace
+
+TEST_CASE("registry live: the ETW skip reason names the session limit and the missing elevation and nothing else",
+          "[echo][registry]") {
+    CHECK(etw_skip_reason(1450, true).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(1450, false).value_or("").find("trace-session limit") != std::string::npos);
+    CHECK(etw_skip_reason(5, false).value_or("").find("not elevated") != std::string::npos);
+    CHECK_FALSE(etw_skip_reason(5, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, true).has_value());
+    CHECK_FALSE(etw_skip_reason(87, false).has_value());
+    CHECK_FALSE(etw_skip_reason(0, true).has_value());
+    CHECK_FALSE(etw_skip_reason(0, false).has_value());
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // [windows] live cases: the real key watch and the real Kernel-Registry ETW session.
 // Writing HKLM and opening the session need an elevated token; each case SKIPs with a
@@ -5439,17 +5954,39 @@ namespace {
 // window_base or read stamp ever carries the offset; it is reset straight after.
 std::atomic<std::int64_t> g_clock_offset{0};
 
-// Is this process's token elevated? The ETW cases SKIP when it is not, and FAIL when it is and
-// the session still did not open, so a broken session can never pass as "not elevated".
-bool is_elevated() {
+// Is this process's token elevated? nullopt, with the Win32 code in `error`, when the token query
+// itself fails: an unestablished elevation is never "not elevated". It feeds etw_skip_reason
+// through require_etw_or_skip: a start failure is a SKIP only for a named environment cause, so a
+// broken session can never pass as "not elevated".
+std::optional<bool> is_elevated(unsigned long& error) {
     HANDLE token = nullptr;
-    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
-        return false;
+    if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token)) {
+        error = GetLastError();
+        return std::nullopt;
+    }
     TOKEN_ELEVATION e{};
     DWORD len = 0;
     const bool ok = GetTokenInformation(token, TokenElevation, &e, sizeof(e), &len) != 0;
+    if (!ok)
+        error = GetLastError();
     CloseHandle(token);
-    return ok && e.TokenIsElevated != 0;
+    if (!ok)
+        return std::nullopt;
+    return e.TokenIsElevated != 0;
+}
+
+// The session did not open: SKIP when the reader's start error is a named environment cause,
+// FAIL with the code otherwise, so a broken session can never pass as "not elevated". A Win32 5
+// start failure with no established elevation FAILs naming the token-query code.
+void require_etw_or_skip(unsigned long start_rc, const std::string& detail) {
+    unsigned long token_error = 0;
+    const auto elevated = is_elevated(token_error);
+    if (start_rc == 5 && !elevated)
+        FAIL("the ETW session did not open (Win32 5) and elevation could not be established "
+             "(token query Win32 " << token_error << "): " << detail);
+    if (const auto reason = etw_skip_reason(start_rc, elevated.value_or(true)))
+        SKIP(*reason);
+    FAIL("the ETW session did not open (Win32 " << start_rc << "): " << detail);
 }
 
 std::string salt() { return std::to_string(::GetCurrentProcessId()) + "_" + std::to_string(::GetTickCount64()); }
@@ -5572,6 +6109,7 @@ struct LiveRun {
     TestDb t = make_db();
     std::shared_ptr<RegistryDirtyTable> dirty;
     std::function<bool()> etw_running; // the reader's own answer: is the session delivering?
+    std::function<unsigned long()> etw_start_error; // why it did not open (0 = no error recorded)
     // The session's own loss counters; the failure message of a missed ETW event reads them (#7135).
     std::function<SessionLoss()> session_loss;
     std::string root;                  // the watched root, as the dirty table names it
@@ -5585,6 +6123,7 @@ struct LiveRun {
         }
         dirty = reader.dirty;
         etw_running = reader.etw_running;
+        etw_start_error = reader.etw_start_error;
         session_loss = reader.session_loss;
         src = make_registry_cursor_source(RegistryScope{{hklm_root}, {}}, std::move(reader));
         src->start(t.db);
@@ -5691,10 +6230,8 @@ TEST_CASE("registry live: set, change and delete through a pre-opened handle are
     if (std::stoi(run.t.db.get_config("registry_watch_roots", "0")) == 0)
         FAIL("the watch did not arm");
     if (const auto method = run.t.db.get_config("registry_capture_method", ""); method != "notify+etw") {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open: registry_capture_method="
-                 << method);
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(run.etw_start_error ? run.etw_start_error() : 0,
+                            "registry_capture_method=" + method);
     }
 
     DWORD one = 1, two = 2;
@@ -5772,13 +6309,12 @@ TEST_CASE("registry live: stop leaves no ETW session behind", "[echo][registry][
     g_clock_offset = 0;
     auto reader = live_reader();
     auto etw_running = reader.etw_running;
+    auto start_error = reader.etw_start_error;
     auto src = make_registry_cursor_source(RegistryScope{{"SOFTWARE\\yuzu_test_reg_none"}, {}}, std::move(reader));
     TestDb t = make_db();
     src->start(t.db); // ~RegistryCursorSource() stops the session even if a REQUIRE below throws
     if (!etw_running()) {
-        if (is_elevated())
-            FAIL("the token is elevated but the ETW session did not open");
-        SKIP("ETW session unavailable (not elevated)");
+        require_etw_or_skip(start_error ? start_error() : 0, "etw_running is false after start");
     }
     REQUIRE(session_exists()); // the positive control: the lookup does find a running session
     // A collect samples the session's loss (ControlTraceW QUERY), which writes into the block the
@@ -5943,6 +6479,167 @@ TEST_CASE("registry live: a symbolic-link key is read as the link and never foll
     REQUIRE(link_key.remove() == 0);
 }
 
+namespace {
+
+// Restores an allow-all DACL on denied test children before the owning TestKey deletes the tree
+// (RegDeleteTreeW cannot delete a key this token may not open). Declare it AFTER the TestKey.
+struct DeniedChildrenGuard {
+    HKEY parent;
+    std::vector<std::wstring> names;
+    explicit DeniedChildrenGuard(HKEY p) : parent(p) {}
+    DeniedChildrenGuard(const DeniedChildrenGuard&) = delete;
+    DeniedChildrenGuard& operator=(const DeniedChildrenGuard&) = delete;
+    ~DeniedChildrenGuard() {
+        PSECURITY_DESCRIPTOR allow = nullptr;
+        if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(A;;KA;;;WD)", SDDL_REVISION_1,
+                                                                   &allow, nullptr))
+            return;
+        for (const auto& n : names) {
+            HKEY h = nullptr;
+            if (RegOpenKeyExW(parent, n.c_str(), 0, WRITE_DAC, &h) == ERROR_SUCCESS) {
+                RegSetKeySecurity(h, DACL_SECURITY_INFORMATION, allow);
+                RegCloseKey(h);
+            }
+        }
+        LocalFree(allow);
+    }
+};
+
+// A key whose name holds U+0000: only the native API can create or delete one. The handle stays
+// open until the destructor deletes the key through it, so every exit path removes it. Declare
+// it AFTER the TestKey that owns `parent`.
+struct NulNamedKey {
+    using Fn = LONG(NTAPI*)(PHANDLE, ACCESS_MASK, void*, ULONG, void*, ULONG, PULONG);
+    struct Unicode {
+        USHORT Length, MaximumLength;
+        PWSTR Buffer;
+    };
+    struct ObjAttr {
+        ULONG Length;
+        HANDLE RootDirectory;
+        Unicode* ObjectName;
+        ULONG Attributes;
+        PVOID SecurityDescriptor, SecurityQualityOfService;
+    };
+    HANDLE h{nullptr};
+
+    // 0 on success, else the NTSTATUS (or ERROR_PROC_NOT_FOUND).
+    LONG create(HKEY parent, std::wstring name) {
+        const auto fn = reinterpret_cast<Fn>(
+            reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtCreateKey")));
+        if (fn == nullptr)
+            return ERROR_PROC_NOT_FOUND;
+        Unicode u{static_cast<USHORT>(name.size() * sizeof(wchar_t)),
+                  static_cast<USHORT>(name.size() * sizeof(wchar_t)), name.data()};
+        ObjAttr oa{sizeof(ObjAttr), parent, &u, 0x40 /*OBJ_CASE_INSENSITIVE*/, nullptr, nullptr};
+        return fn(&h, KEY_ALL_ACCESS, &oa, 0, nullptr, 0, nullptr);
+    }
+    ~NulNamedKey() {
+        if (h == nullptr)
+            return;
+        using DelFn = LONG(NTAPI*)(HANDLE);
+        if (const auto del = reinterpret_cast<DelFn>(
+               reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtDeleteKey"))))
+            del(h);
+        RegCloseKey(static_cast<HKEY>(h));
+    }
+};
+
+} // namespace
+
+TEST_CASE("registry live: 33 denied children do not stop a later sibling being read",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    DeniedChildrenGuard guard(key.h);
+    PSECURITY_DESCRIPTOR deny = nullptr;
+    REQUIRE(ConvertStringSecurityDescriptorToSecurityDescriptorW(L"D:PAI(D;;KR;;;WD)(A;;KA;;;SY)(A;;KA;;;BA)",
+                                                                  SDDL_REVISION_1, &deny, nullptr));
+    for (std::size_t i = 0; i < kSkippedCap + 1; ++i) {
+        const std::wstring name = L"Denied" + std::to_wstring(1000 + i);
+        guard.names.push_back(name);
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, name.c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegSetKeySecurity(k, DACL_SECURITY_INFORMATION, deny);
+        RegCloseKey(k);
+    }
+    LocalFree(deny);
+    HKEY later = nullptr; // sorts after every denied child
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    DWORD seen = 9;
+    RegSetValueExW(later, L"Seen", 0, REG_DWORD, reinterpret_cast<BYTE*>(&seen), 4);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Capped); // an unnamed denied child: no removals derived
+    CHECK(r.skipped.size() == kSkippedCap);
+    CHECK(r.skipped_overflow == 1);
+    REQUIRE(r.keys.contains(root + "\\zz_later")); // the sibling after the 33rd denied child is read
+    CHECK(r.keys.at(root + "\\zz_later").contains("Seen"));
+}
+
+TEST_CASE("registry live: value and subkey pairs that differ only in a lone surrogate are both captured",
+          "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    // Both convert to "p" + U+FFFD through the lossy path; as identities they must stay apart.
+    const std::wstring n1{L'p', static_cast<wchar_t>(0xD800)}, n2{L'p', static_cast<wchar_t>(0xD801)};
+    DWORD one = 1, two = 2;
+    REQUIRE(RegSetValueExW(key.h, n1.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&one), 4) == ERROR_SUCCESS);
+    REQUIRE(RegSetValueExW(key.h, n2.c_str(), 0, REG_DWORD, reinterpret_cast<BYTE*>(&two), 4) == ERROR_SUCCESS);
+    for (const auto* n : {&n1, &n2}) {
+        HKEY k = nullptr;
+        REQUIRE(RegCreateKeyExW(key.h, n->c_str(), 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &k, nullptr) ==
+                ERROR_SUCCESS);
+        RegCloseKey(k);
+    }
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    REQUIRE(r.status == RegistryReadStatus::Complete);
+    const std::string e1 = registry_name_utf8(std::u16string{u'p', char16_t(0xD800)});
+    const std::string e2 = registry_name_utf8(std::u16string{u'p', char16_t(0xD801)});
+    REQUIRE(e1 != e2);
+    CHECK(r.keys.at(root).size() == 2);
+    CHECK(r.keys.at(root).contains(e1));
+    CHECK(r.keys.at(root).contains(e2));
+    CHECK(r.keys.contains(root + "\\" + e1));
+    CHECK(r.keys.contains(root + "\\" + e2));
+}
+
+TEST_CASE("registry live: a NUL-named child is reported as skipped", "[echo][registry][windows]") {
+    const std::string leaf = "yuzu_test_reg_" + salt();
+    TestKey key(leaf);
+    if (key.create() != ERROR_SUCCESS)
+        SKIP("cannot write HKLM (not elevated)");
+    NulNamedKey nul_key; // after `key`: destroyed first
+    // HKLM is writable here, so a failure to build the test subject is a broken test, not an
+    // environment cause: it must be red, never a skip that leaves the NUL path unproven.
+    const LONG nul_st = nul_key.create(key.h, std::wstring{L'n', L'\0', L'm'});
+    INFO("NtCreateKey NTSTATUS " << nul_st);
+    REQUIRE(nul_st == 0);
+    HKEY later = nullptr;
+    REQUIRE(RegCreateKeyExW(key.h, L"zz_later", 0, nullptr, 0, KEY_ALL_ACCESS, nullptr, &later, nullptr) ==
+            ERROR_SUCCESS);
+    RegCloseKey(later);
+
+    auto reader = make_windows_registry_reader();
+    const std::string root = "HKLM\\SOFTWARE\\" + leaf;
+    const auto r = reader.read_subtree(root, reader.now_ts() + kSnapshotBudget100ns);
+    CHECK(r.status == RegistryReadStatus::Complete);
+    CHECK(r.skipped == std::vector<std::string>{root + "\\" + std::string("n\0m", 3)});
+    CHECK_FALSE(r.keys.contains(root + "\\" + std::string("n\0m", 3)));
+    CHECK(r.keys.contains(root + "\\zz_later")); // the siblings are still read
+}
+
 TEST_CASE("registry live: stop is idempotent and destruction after stop is clean",
           "[echo][registry][windows]") {
     {
@@ -5992,25 +6689,57 @@ const std::string& offline_fake_sid() {
     return sid;
 }
 
-// Any HKEY_USERS subkey CONTAINING the fake sid: the mount name is salted
-// (unique_hive_mount_name), so an exact-name check would never see a leak.
+// The HKEY_USERS subkeys CONTAINING the fake sid: the mount name is salted
+// (unique_hive_mount_name), so an exact-name check would never see a leak. A failed listing is
+// retried; one that never succeeds is recorded as a failure and reports listed=false, so it is
+// never read as "no mount".
+struct OfflineMounts {
+    std::vector<std::string> names;
+    bool listed{false};
+};
+
+OfflineMounts offline_fake_mounts() {
+    constexpr int kAttempts = 3;
+    for (int attempt = 1; attempt <= kAttempts; ++attempt) {
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (hku.error.empty()) {
+            OfflineMounts m;
+            m.listed = true;
+            for (const auto& n : hku.names)
+                if (n.find(offline_fake_sid()) != std::string::npos)
+                    m.names.push_back(n);
+            return m;
+        }
+        if (attempt == kAttempts)
+            FAIL_CHECK("the HKEY_USERS listing failed " << kAttempts
+                                                         << " times: " << hku.error);
+    }
+    return {};
+}
+
+// True when a mount is present or the listing could not say (that failure is already recorded).
 bool offline_fake_mount_present() {
-    for (const auto& n : yuzu::win::enumerate_hku_subkeys())
-        if (n.find(offline_fake_sid()) != std::string::npos)
-            return true;
-    return false;
+    const auto m = offline_fake_mounts();
+    return !m.listed || !m.names.empty();
 }
 
 // Unconditional on every exit path: the shared box must never keep a mount of ours.
 struct OfflineMountSweep {
     ~OfflineMountSweep() {
-        if (!offline_fake_mount_present())
-            return;
-        const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
-        const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
-        for (const auto& n : yuzu::win::enumerate_hku_subkeys())
-            if (n.find(offline_fake_sid()) != std::string::npos)
+        constexpr int kPasses = 3;
+        for (int pass = 0; pass < kPasses; ++pass) {
+            const auto m = offline_fake_mounts();
+            if (!m.listed || m.names.empty())
+                return;
+            const yuzu::win::PrivilegeScope restore(L"SeRestorePrivilege");
+            const yuzu::win::PrivilegeScope backup(L"SeBackupPrivilege");
+            for (const auto& n : m.names)
                 RegUnLoadKeyW(HKEY_USERS, yuzu::win::to_wide(n).c_str());
+        }
+        const auto left = offline_fake_mounts();
+        if (left.listed && !left.names.empty())
+            FAIL_CHECK("a salted YUZU_HIVE mount of this process is still loaded after "
+                       << kPasses << " unload passes: " << left.names.front());
     }
 };
 
@@ -6214,6 +6943,15 @@ TEST_CASE("registry live: the start-up sweep unloads a leaked YUZU_HIVE_ mount a
     }
 }
 
+TEST_CASE("registry live: the checked HKU listing is complete and holds this process's loaded hives",
+          "[echo][registry][windows]") {
+    const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+    INFO("error=" << listing.error);
+    CHECK(listing.error.empty());
+    // .DEFAULT is always loaded, so an empty answer is a failed listing read as complete.
+    CHECK(std::find(listing.names.begin(), listing.names.end(), ".DEFAULT") != listing.names.end());
+}
+
 TEST_CASE("registry live: a root under an HKU hive that is not mounted reads Unreadable (hive_unloaded), never Absent",
           "[echo][registry][windows]") {
     // A user who logs off after collect() took its HKU snapshot leaves its root pointing at a hive
@@ -6264,7 +7002,7 @@ TEST_CASE("registry live: the production profile discovery lists unloaded SID-na
           "[echo][registry][windows]") {
     auto reader = make_windows_registry_reader();
     const ReaderStop stop{reader};
-    const auto loaded = yuzu::win::enumerate_hku_subkeys();
+    const auto loaded = yuzu::win::enumerate_hku_subkeys_checked().names;
     const auto d = reader.offline_profiles(loaded);
     INFO("profiles=" << d.profiles.size() << " partial=" << d.partial.size());
     CHECK(d.complete); // a healthy host's ProfileList walk is complete

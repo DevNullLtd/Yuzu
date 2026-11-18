@@ -443,6 +443,11 @@ TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render di
     CHECK(deg.find("CI record unavailable") != std::string::npos);
     CHECK(deg.find("hw-degrade") != std::string::npos);
     CHECK(deg.find("No CI record synced") == std::string::npos);
+    // The degrade has two causes (a failed store read, or the collation gate not being Trusted):
+    // the banner names both and points at the collation section, never only "pool degraded".
+    CHECK(deg.find("collation check has not verified") != std::string::npos);
+    CHECK(deg.find("PostgreSQL collation version") != std::string::npos);
+    CHECK(deg.find("Postgres pool or query degraded") != std::string::npos);
 
     HardwareCiDetail absent;
     absent.ci = std::optional<DeviceCiRecord>{}; // read fine, device has not synced yet
@@ -651,6 +656,10 @@ TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once
         CHECK(count_occurrences(html, tags_banner) == 1);
         CHECK(html.find(ci_banner) > open);
         CHECK(html.find(tags_banner) > open);
+        // The CI degrade has two causes (a failed store read, or the collation gate not being
+        // Trusted): the banner names both and points at the collation section.
+        CHECK(html.find("collation check has not verified") != std::string::npos);
+        CHECK(html.find("PostgreSQL collation version") != std::string::npos);
     }
     SECTION("results_only: Tags banner survives the refresh") {
         const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,

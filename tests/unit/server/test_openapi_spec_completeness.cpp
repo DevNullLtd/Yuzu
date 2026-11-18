@@ -381,6 +381,30 @@ TEST_CASE("openapi_spec_json(): info.description states the cookie-session same-
                            "server state") != std::string::npos);
 }
 
+// #7730: the collation gate's client-visible rules are in the spec, not only the manual. Kills a
+// description edit that drops the restart-the-walk rule, the refused confirm read, or the
+// `details.write_paused` of the paused-decommission 500.
+TEST_CASE("openapi_spec_json(): GET /hardware-ci and DELETE /sle/agents state the collation gate rules",
+          "[openapi]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    const json& get = spec["paths"]["/hardware-ci"]["get"];
+    const std::string d = get["description"].get<std::string>();
+    CHECK(d.find("RESTART the walk from the first page once the read is served again") !=
+          std::string::npos);
+    CHECK(d.find("do not resume the old cursor") != std::string::npos);
+    CHECK(d.find("the ?agent_id=<id> confirm read too") != std::string::npos);
+    const std::string r503 = get["responses"]["503"]["description"].get<std::string>();
+    CHECK(r503.find("restart the walk from the first page") != std::string::npos);
+    CHECK(r503.find("confirm read is refused with this same 503") != std::string::npos);
+
+    const std::string r500 =
+        spec["paths"]["/sle/agents/{agent_id}"]["delete"]["responses"]["500"]["description"]
+            .get<std::string>();
+    CHECK(r500.find("error.details.write_paused") != std::string::npos);
+    CHECK(r500.find("retry_after_ms is 60000") != std::string::npos);
+}
+
 TEST_CASE("openapi_spec_json(): the strict instruction create requests are closed schemas",
           "[openapi]") {
     // The routes refuse an unknown key (build_*_from_*_body), so a schema that omits
@@ -823,6 +847,61 @@ std::set<std::string> object_keys(const json& obj) {
     return keys;
 }
 } // namespace
+
+TEST_CASE("openapi_spec_json(): /dex/apps/usage documents its six parameters and its audit, floor and "
+          "sustained-timeout posture",
+          "[openapi][dex]") {
+    json spec = json::parse(yuzu::server::openapi_spec_json(), nullptr, /*allow_exceptions=*/false);
+    REQUIRE_FALSE(spec.is_discarded());
+    REQUIRE(spec["paths"].contains("/dex/apps/usage"));
+    const auto& op = spec["paths"]["/dex/apps/usage"]["get"];
+    CHECK(op["operationId"] == "getDexAppsUsage");
+    REQUIRE(op.contains("parameters"));
+
+    std::map<std::string, const json*> params;
+    for (const auto& p : op["parameters"])
+        params[p.value("name", "")] = &p;
+    REQUIRE(params.size() == 6);
+    for (const char* name : {"window", "platform", "slice", "group", "tag_key", "floor"}) {
+        INFO("parameter: " << name);
+        REQUIRE(params.contains(name));
+        CHECK((*params[name])["in"] == "query");
+        CHECK((*params[name])["required"] == false);
+    }
+    const auto schema = [&](const char* name) { return (*params.at(name))["schema"]; };
+    CHECK(schema("window")["enum"] == json::array({"24h", "7d", "30d", "all"}));
+    CHECK(schema("window")["default"] == "7d");
+    CHECK(schema("platform")["enum"] == json::array({"all", "windows", "macos", "linux"}));
+    CHECK(schema("platform")["default"] == "all");
+    CHECK(schema("slice")["enum"] == json::array({"fleet", "platform", "group", "tag"}));
+    CHECK(schema("slice")["default"] == "fleet");
+    CHECK(schema("group")["maxLength"] == 256);
+    CHECK(schema("tag_key")["maxLength"] == 64);
+    CHECK(schema("floor")["minimum"] == 1);
+    CHECK(schema("floor")["maximum"] == 10000);
+    CHECK(schema("floor")["default"] == 1);
+
+    const std::string desc = op.value("description", "");
+    for (const char* needle : {"Forensics:Read", "GuaranteedState:Read", "dex.apps.usage.view",
+                               "THE FLOOR APPLIES PER TABLE", "fleet_too_large", "freshness_window_hours",
+                               "unknown group", "RAW, not capped per device"}) {
+        INFO("description names: " << needle);
+        CHECK(desc.find(needle) != std::string::npos);
+    }
+    CHECK(op["responses"].contains("400"));
+    CHECK(op["responses"].contains("403"));
+    CHECK(op["responses"]["503"]["headers"].contains("Sec-Audit-Failed"));
+
+    // The schema is a closed vocabulary the serializer keeps: the cell kinds and the states.
+    REQUIRE(spec["components"]["schemas"].contains("DexAppsUsage"));
+    const auto& usage = spec["components"]["schemas"]["DexAppsUsage"];
+    CHECK(schema_at(usage, "/properties/apps/items/properties/state/enum") ==
+          json::array({"matched", "no_usage", "ambiguous_name"}));
+    CHECK(schema_at(usage, "/properties/apps/items/properties/cells/items/properties/kind/enum") ==
+          json::array({"named", "untagged", "other"}));
+    // An ambiguous name withholds its device count as null, so the schema says devices can be null.
+    CHECK(schema_at(usage, "/properties/apps/items/properties/devices/nullable") == true);
+}
 
 TEST_CASE("openapi_spec_json(): DexAppsList covers every population basis and the coverage the "
           "/dex/apps builder can emit",
@@ -1990,7 +2069,7 @@ TEST_CASE("openapi documents: every operation has a unique, well-formed and pinn
     // docs/user-manual/upgrading.md and in the change's changelog fragment. The count is
     // derived from the document (it is the number of operations); the one hand-kept number
     // for it lives in the typed-response test's exclusion list, not here.
-    static const std::string kOperationIdChecksum = "\"fd2d38d7aedcfd32\"";
+    static const std::string kOperationIdChecksum = "\"99bd30518cc89f26\"";
     static const std::regex kShape("^[a-z][A-Za-z0-9]*$");
     for (const bool with_guides : {false, true}) {
         INFO("form: " << form_name(with_guides));
@@ -2286,6 +2365,17 @@ TEST_CASE("openapi documents: the corrected success schemas match their handlers
          true,
          "guards",
          {"rule_id", "name", "status", "updated_at", "order_uncertain", "projection_pending"}},
+        // dex_apps_usage_json (dex_usage_json.cpp) through ok_json: the model's top-level keys, and
+        // per application the keys below.
+        {"/dex/apps/usage",
+         kOne,
+         false,
+         {"window", "platform_scope", "slice", "as_of", "basis", "freshness_window_hours", "floor",
+          "floor_scope", "population", "reporting_devices", "stale_devices", "apps"},
+         true,
+         "apps",
+         {"subject", "state", "devices", "run_seconds_30d", "launches_30d", "cells", "exposure_rate",
+          "rate_withheld"}},
     };
 
     // The properties a response can carry: writeOnly ones are input-only and never in a response.
@@ -2448,8 +2538,8 @@ TEST_CASE("openapi_spec_json(): the #7217 per-device summary properties are type
 }
 
 // UP-14 server PR A5a: the stored per-agent ordering state. The key sets are pinned above; this
-// pins each new property's type, nullability and bound, and that the description says the pair is
-// stored and counted, not yet compared.
+// pins each new property's type, nullability and bound, and that the description says the server
+// orders a census verdict by the pair (the pre-B "not yet compared" wording is gone).
 TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bounded and described",
           "[openapi][guardian][ordering][pair]") {
     for (const bool with_guides : {false, true}) {
@@ -2478,7 +2568,8 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         CHECK(ids["items"].value("type", "") == "string");
         const std::string sdesc = sget.value("description", "");
         CHECK(sdesc.find("unordered_agents") != std::string::npos);
-        CHECK(sdesc.find("not yet compared") != std::string::npos);
+        CHECK(sdesc.find("orders a census verdict by the emit-order pair") != std::string::npos);
+        CHECK(sdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
 
         // Per-device all-guards read.
         const json& gget = spec["paths"].at("/guaranteed-state/agents/{agent_id}/rules").at("get");
@@ -2519,8 +2610,10 @@ TEST_CASE("openapi_spec_json(): the per-agent ordering properties are typed, bou
         }
         const std::string gdesc = gget.value("description", "");
         CHECK(gdesc.find("ordering") != std::string::npos);
-        CHECK(gdesc.find("not yet compared") != std::string::npos);
-        CHECK(p["pair_duplicates"].value("description", "").find("0 until") != std::string::npos);
+        CHECK(gdesc.find("classify each census-bearing first delivery") != std::string::npos);
+        CHECK(gdesc.find("not yet compared") == std::string::npos); // the pre-B wording is gone
+        CHECK(p["pair_duplicates"].value("description", "").find("Equal pairs refused") !=
+              std::string::npos);
         const std::string g200 = gget.at("responses").at("200").value("description", "");
         CHECK(g200.find("ordering") != std::string::npos);
     }

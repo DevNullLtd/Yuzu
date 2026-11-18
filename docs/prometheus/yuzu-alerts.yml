@@ -3073,7 +3073,7 @@ groups:
             when nobody asked the store would under-enforce against a healthy
             one. The firewall plugin's four containment actions stay
             reachable throughout - releasing a device does not depend on this
-            read - as do the four system-reserved internal pushes
+            read - as do the five system-reserved internal pushes
             (yuzu_server_system_reserved_push_total). BE PRECISE ABOUT for: 2m:
             it delays the page by two minutes, it does NOT require a sustained
             episode. increase()[5m] stays true for ~5 minutes after a single
@@ -4652,9 +4652,9 @@ groups:
   # These alerts carry `for:` windows and are for paging/escalation — they fire
   # AFTER the LB has already reacted, not before. The pool metrics come from
   # the pool's Observer feed; the reachability metrics from the probe.
-  # The three YuzuPgCollation* alerts are the exception: they are not load-balancer or
-  # readiness related (the collation check never changes /readyz), they read the
-  # collation-check series.
+  # The three YuzuPgCollation* alerts and YuzuDeviceCiWritesPaused are the exception: they are
+  # not load-balancer or readiness related (the collation check never changes /readyz), they
+  # read the collation-check series and the device_ci write-pause counter.
   - name: yuzu-postgres
     rules:
       - alert: YuzuServerPostgresUnreachable
@@ -4759,9 +4759,10 @@ groups:
             The database's recorded collation version is not the version the operating
             system of the PostgreSQL server reports, so text-keyed indexes may be ordered
             under the old rules. Ordered reads of a text key, such as a keyset page walk,
-            can then skip or repeat rows without any error. The server does not stop or change
-            anything because of this signal: it keeps serving, and the gauge and the log line
-            are the whole report.
+            can then skip or repeat rows without any error. The server keeps running and changes
+            nothing in the database, but on a replica that has seen the mismatch it pauses
+            device-CI writes (agents are told to resend later; see YuzuDeviceCiWritesPaused) and
+            refuses the bulk CI read; the text-keyed indexes of other stores are not gated.
             The mismatch is one shared database fact, so this is one alert for the Yuzu server
             job {{ $labels.job }}: any replica's gauge at 1 fires it, and it clears when every
             replica's gauge is 0 or absent (within about a minute of the repair). The gauges are
@@ -4775,8 +4776,10 @@ groups:
             is serving traffic, or REINDEX DATABASE "<name>" with the Yuzu servers
             stopped); only when the reindex has finished for every index, run ALTER DATABASE
             "<name>" REFRESH COLLATION VERSION (it records the version and rebuilds nothing,
-            so it clears this alert whether or not the reindex worked; the check compares
-            version strings only, so the reindex is what makes the result certain). The server
+            so it clears this alert whether or not the reindex worked, with one exception: it
+            does not clear while an INVALID index exists in the schema device_inventory_store,
+            for example the leftover of a failed REINDEX ... CONCURRENTLY; the check otherwise
+            compares version strings only, so the reindex is what makes the result certain). The server
             rechecks every minute while the mismatch stands, so this clears within about a
             minute and without a restart. If the reindex fails on a duplicate key, stop the
             servers and resolve the duplicates by hand first (see the runbook). A database
@@ -4850,16 +4853,22 @@ groups:
             at that cadence this takes about five to six failures, which depends on the
             Prometheus version and the scrape interval; do not rely on the exact count), so
             yuzu_pg_collation_version_mismatch is stale and says nothing about the database: a
-            mismatch could be present and unreported.
+            mismatch could be present and unreported. A replica that has had no conclusive
+            check since it started also refuses the bulk CI read (its collation gate
+            reads Unproven) while its device-CI writes are still accepted.
             Causes: PostgreSQL is down or unreachable, the pool is saturated (a lease cannot be had
-            in time), a catalog read is not allowed, or the database records a collation version
+            in time), a catalog read is not allowed, an INVALID index exists in the schema
+            device_inventory_store while the versions are equal (including a REINDEX ...
+            CONCURRENTLY that is still running), or the database records a collation version
             while the PostgreSQL host reports none (for example after a base image change under
             an existing data volume). In that last case the check is permanently unreadable
             and this alert does not clear: ALTER DATABASE ... REFRESH COLLATION VERSION fails
             with "invalid collation version change" (measured on PostgreSQL 18.4 only, on a
             C-locale database with a forced recorded value that has the same facts), so the
-            reindex-then-refresh way out does not apply; see the exits in the runbook. Meanwhile
-            silence this alert for that instance, with an expiry, rather than fleet-wide.
+            reindex-then-refresh way out does not apply; see the exits in the runbook. An
+            invalid index clears when it is dropped or rebuilt (and the original index is
+            reindexed). Meanwhile silence this alert for that instance, with an expiry, rather
+            than fleet-wide.
             Look for the "[PG] could not check the database collation version" WARN line in
             the server log. Check that PostgreSQL is reachable from this replica, and that
             pg_database_collation_actual_version() returns a value for the database.
@@ -4921,6 +4930,65 @@ groups:
             check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
             Each replica exports its own series, so one database problem raises one alert per
             replica: group the notifications by alertname and job. Runbook:
+            docs/user-manual/server-admin.md, "PostgreSQL collation version".
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
+
+      - alert: YuzuDeviceCiWritesPaused
+        # device_ci writes are being REFUSED on this replica because its collation gate reads
+        # Mismatch (DeviceInventoryStore::writes_deferred, device_ci_ingestion.cpp): every refused
+        # ingest and every refused decommission removal increments
+        # yuzu_device_ci_writes_deferred_total{op}, so a rise means data is being turned away
+        # now, which the mismatch gauge alone does not say (the gauge is per check, this counter
+        # is per refused write, and a replica whose gate has not flipped yet still accepts).
+        # Why [20m] and `for: 10m`, reasoned from the agent code and NOT measured: a refused
+        # device resends after a backoff that starts at 30 s, doubles per consecutive refusal up
+        # to 10 min, and carries up to 5 min of per-device jitter (agents/core/src/
+        # sync_scheduler.cpp), so a connected device is refused again within 15 min at the
+        # latest and a 20 min window keeps at least one refusal in it while that device stays
+        # paused (a 15 min window has no margin and can drop to 0 between two refusals of a
+        # one-device fleet, resetting the hold). The 10 m hold keeps a short pause from paging
+        # (the gate rechecks every minute, so a repair done within minutes never reaches it).
+        # `and on (job, instance) yuzu_pg_collation_version_mismatch == 1` ties the alert to the
+        # CAUSE on the same instance. The join is narrowed with `on (job, instance)` because the
+        # left side is reduced to exactly those two labels while the gauge keeps every target
+        # label, and the shipped scrape configs (deploy/prometheus/*.yml) add a `component`
+        # label to the server targets: a plain `and` matches on the whole label set and would
+        # never match there, so the alert could never fire (the promtool cases carry the extra
+        # label for that reason). The write gate reads
+        # Mismatch exactly while that gauge is 1 (the gate is derived from the same
+        # last-conclusive state, pg_collation_check.cpp), so without the conjunct a range window
+        # would keep the alert true for up to 20 m AFTER the repair and
+        # page on a database that is already fixed. A replica with no connected device and no
+        # decommission in the window sees no refusal and does not fire:
+        # YuzuPgCollationVersionMismatch covers that case. The counter is pre-seeded at 0 on
+        # every replica, so increase() has a first sample. Per replica (each replica has its own
+        # gate and counter), so it stays per instance.
+        expr: |
+          sum by (job, instance) (increase(yuzu_device_ci_writes_deferred_total[20m])) > 0
+          and on (job, instance)
+          yuzu_pg_collation_version_mismatch == 1
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Yuzu server {{ $labels.instance }}: device-CI writes have been paused for at least 10 minutes by a PostgreSQL collation mismatch"
+          description: >-
+            This replica has been refusing device-CI writes (agent ingest and decommission
+            removals) for at least 10 minutes because the PostgreSQL collation version of the
+            database differs from the operating system's. Nothing is stored for the refused
+            reports: ci.last_seen of the affected devices stops advancing, each device resends
+            its full CI record on the agent's backoff (up to about 15 minutes), and a
+            decommission of such a device answers 500 with details.write_paused and is not
+            complete until it is re-issued after the repair. The bulk CI read is refused (503)
+            and the per-device CI reads are degraded on this replica meanwhile. Writes and
+            reads resume on their own, with no restart, when the next collation check finds the
+            versions equal and no invalid index remains in the schema device_inventory_store
+            (every minute while the gate is not Trusted). Not covered: other
+            stores' text-keyed unique indexes (for example endpoint_state) and agent
+            registration are not gated, and a replica that has not yet seen the mismatch (up to
+            an hour) still accepts writes. Per replica: with N replicas one mismatch can raise
+            up to N of these; group the notifications by alertname and job. Remedy: reindex and
+            then refresh the recorded version, as in YuzuPgCollationVersionMismatch. Runbook:
             docs/user-manual/server-admin.md, "PostgreSQL collation version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
@@ -5236,20 +5304,22 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # Five sources on the SAME counter (guardian_census, #5690, covers the
       # two census gauge reads, the pending-evidence count and the
       # unordered-agents count: they serve no empty result, each gauge
       # keeps its last value; guardian_census_device, #7217, covers the
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
-      # does not touch either gauge), each
+      # does not touch either gauge; dex_usage covers the fleet application usage
+      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
+      # figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
       # statement_timeout on guardian_census_device for a read that ran past its
       # 5 s budget, most likely because of a large retained pending backlog, and
       # on guardian_state for an Apps read cancelled at the 30 s statement
-      # timeout): "guardian_state"
+      # timeout, and on dex_usage for a usage read cancelled at its 10 s bound): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -5325,6 +5395,22 @@ groups:
             list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
+            source="dex_usage" means the fleet application usage read behind
+            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
+            request is a 503 naming the reason, never a 200 with zero figures.
+            reason="concurrency_budget" is the same in-flight budget refusal
+            (four at once, retryable). reason="statement_timeout" is the read
+            running past its 10 s bound; three in a row spanning two minutes with
+            no success make the route answer fleet_too_large (503 with no retry
+            hint), which a retry does not clear. Measured on one test host over a
+            synthetic dataset of about 205 usage rows per device, the read cost
+            4.1 s at 60,000 online devices and reaches the 10 s bound near
+            150,000 by extrapolation (not a guaranteed ceiling); an index on the
+            executable key did not change the plan. Only platform= narrows the
+            read, there is no operator-side fix today, the state clears on the
+            first successful read, and the other DEX routes are unaffected. Runbook:
+            docs/dex/app-usage.md#runbook-fleet_too_large (check
+            yuzu_pg_pool_in_use and yuzu_pg_acquire_wait_seconds as well).
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
@@ -5386,6 +5472,36 @@ groups:
             agents are retried on later heartbeats, so no operator action is needed
             once the store recovers.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#4-push-to-agents"
+
+      # Collection settings are delivered by the heartbeat reconcile: an agent that reports a
+      # settings version other than the one that applies to it is sent the document once, and
+      # not again inside the 300 s re-push gap. After a settings change each agent therefore
+      # produces one result="sent" and then reports the new version. A sustained high rate means
+      # agents keep reporting a different version after a send: a delivery fault (the frame is
+      # accepted but never applied, for example a gateway queue that does not drain, or an
+      # agent refusing the document) or an effective version that is not stable between
+      # resolves. The threshold is a starting point for a mid-sized fleet; a very large fleet
+      # converging on a change can sit above it for a while, so tune it to the fleet size.
+      - alert: YuzuInventorySettingsPushLoop
+        expr: sum(rate(yuzu_server_inventory_settings_push_total{result="sent"}[30m])) > 0.2
+        for: 2h
+        labels:
+          severity: warning
+        annotations:
+          summary: "Collection settings are being re-sent to agents continuously"
+          description: >-
+            yuzu_server_inventory_settings_push_total{result="sent"} has stayed above
+            0.2 per second for two hours. A settings change is normally sent to each
+            agent once; a rate that does not fall means agents keep reporting a
+            settings version other than the one sent. Check whether the agent refuses
+            the document (its reply to the `__sync__` `settings` command begins
+            "invalid settings" and it keeps what it had), the gateway queue for gateway-attached agents, and
+            whether the effective settings of an affected device change between reads
+            (GET /api/v1/inventory/software/hosts/{agent_id}/collection-settings).
+            result="undelivered" and yuzu_server_inventory_settings_push_degrade_total
+            are the separate signals for a frame that was not accepted and a store
+            read that failed.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/inventory.md#how-saved-settings-reach-machines"
 
       # yuzu_server_guardian_agent_generation_ahead_total flags an agent that reports a
       # policy generation ABOVE the server's, usually because the Guardian state store
@@ -5471,6 +5587,9 @@ groups:
             which audit as inventory.devices, inventory.device.ci and inventory.devices.ci,
             fail closed instead: they withhold the data and answer a retryable -32603), and only the /crypto (crypto.libraries.*) pages
             also show an on-page "Audit not recorded" notice.
+            The Settings MFA disable (mfa.disabled) answers 503 with Sec-Audit-Failed
+            when the "attempted" row or the in-transaction outcome row cannot be stored,
+            and nothing is cleared; the CLI --mfa-reset exits 1 for the same condition.
             Check audit_store health (/healthz
             stores.audit) and free disk / connection saturation on the PostgreSQL
             server (ADR-0040 — audit is Postgres-backed, not a local file). Note: a bad_alloc-class
@@ -6175,9 +6294,15 @@ groups:
             to grep for names "v3 ingest ... failed".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryHighNeedFullRatio
+        # The denominator leaves out outcome="deferred": a paused device_ci write
+        # (YuzuDeviceCiWritesPaused) counts one deferred per refused report, and a paused
+        # fleet resends on the agent backoff far more often than it syncs normally, so keeping
+        # those in the denominator would dilute a real need_full surge on another source for the
+        # length of the pause. The deferral is answered need_full on the wire but is not hash
+        # drift, so it stays out of the numerator too (it has its own outcome label).
         expr: |
           sum(rate(yuzu_inventory_ingest_total{outcome="need_full"}[15m]))
-          / clamp_min(sum(rate(yuzu_inventory_ingest_total[15m])), 0.0001) > 0.2
+          / clamp_min(sum(rate(yuzu_inventory_ingest_total{outcome!="deferred"}[15m])), 0.0001) > 0.2
         for: 15m
         labels:
           severity: warning
@@ -7264,6 +7389,73 @@ groups:
             affected agents' warn logs for "SparkEngine: instantiation failed"; a restart
             after resolving host pressure clears the posture within one sweep.
           runbook_url: "https://docs.yuzu.io/runbooks/spark-boot-failed"
+      # YuzuGuardianBaselineUnpersisted (#5605). yuzu_fleet_guardian_baseline_unpersisted is the
+      # fleet SUM of Spark baseline-on-arm captures staged on an agent and not yet written to its
+      # local KV store: a CURRENT, re-statable value (it falls as captures are written), unlike
+      # the latching counter-sums commented out below, so a bare `> 0` is sound for it. It is
+      # absent fleet-wide until an agent runs with prefer_spark (every released agent today), so
+      # the rule is dormant in production and is exercised only by the promtool cases (#2553).
+      #
+      # The expression copies YuzuDedupStoreDegraded: AgentHealthStore::upsert replaces an
+      # agent's whole tag map on every heartbeat and the 90 s staleness prune drops an absent
+      # agent, so a missed heartbeat or a failover to another core replica is a GAP in the
+      # series that would reset a bare `for:`. max_over_time[5m] bridges the gap and
+      # `sum by (job)` drops the per-replica `instance` label from the alert identity. Measured
+      # width: a backlog spanning 10 minutes does not fire, one spanning 11 does (cases T27a and
+      # T27b), so "15 minutes" below is the evaluation clock, not the minimum backlog age.
+      # The value is summed across core replicas, so a failover can count one agent twice for a
+      # few minutes. Same `job` caveat as the dedup rule above.
+      #
+      # severity=warning, deliberately NOT critical: agent-self-reported inside the heartbeat
+      # trust boundary, so ONE forged or buggy agent can keep the alert up (same reasoning as
+      # YuzuSparkBootFailed). Fleet-scale caveat: a sum of current counts stays above 0 while ANY
+      # agent has a slow or failing store, so at ten thousand agents one flapping endpoint keeps
+      # it firing and an operator may silence the group. The threshold and window are not
+      # derived from fleet data: revisit them at the F14 flip (docs/spark-flip-gate.md).
+      - alert: YuzuGuardianBaselineUnpersisted
+        expr: |
+          sum by (job) (max_over_time(yuzu_fleet_guardian_baseline_unpersisted[5m])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "A Spark baseline persistence backlog of about {{ $value }} capture(s) has persisted across at least 15 minutes of evaluations"
+          description: >-
+            Across the fleet, about {{ $value }} captured file-hash-equals baseline(s) (summed
+            across core replicas, so a failover can count one agent twice for a few minutes)
+            are staged on their agents and not yet written to the agent's local KV store
+            (kv_store.db), and the sum has stayed above 0 across 15 minutes of evaluations. It
+            does not mean any one capture waited that long: an 11 minute backlog fires, and a
+            stream of short backlogs from different agents can keep the sum above 0. This is a
+            persistence BACKLOG, not proof that a write failed: a failing or slow local store, a
+            write pass that ran out of its budget and a worker pass that yielded to a policy
+            push all leave captures staged. It detects a staged-but-unwritten backlog on a live
+            agent and cannot show that a loss happened. It does NOT see a retarget followed by a
+            crash, a capture that was never staged, a Malformed or unreadable baseline record
+            that was re-baselined at boot, or a crash that removes the agent's series (the
+            capture is lost with it). The figure is agent-self-reported, hence a warning. The 5
+            minute window and the sum across replicas exist because a missed heartbeat or a
+            failover to another core replica would otherwise reset the 15 minute clock. The
+            alert clears up to about 5 minutes after the backlog drains (the window is
+            left-open). No per-device view of the underlying tag exists: this gauge is a fleet
+            sum and the alert cannot name the affected endpoints. If you ship agent logs to a
+            central store, search them for "failed to persist captured baseline" and for the
+            ERROR lines logged at stop; otherwise check the logs on the affected hosts. Fix the
+            store first (a full or read-only data directory, permissions, a locked
+            kv_store.db). A graceful restart while the store is still failing loses the staged
+            capture, because the stop-time flush uses the same store. After the store is
+            healthy, the worker retries without a restart (backoff 5 s up to 60 s). A crash
+            or a forced kill loses the capture regardless; the next boot then captures
+            whatever the file holds at that moment, which is the gap this alert exists to
+            expose. An agent whose log shows "Failed to open KV store" at boot arms no
+            Guardian rules at all, so it cannot raise this alert; that is a separate fault:
+            repair the agent data directory and restart the agent. This covers the Spark path
+            only: persist failures on the legacy detection path are logged and are not counted.
+            Read a quiet graph together with yuzu_fleet_guardian_baseline_reporting: while that
+            is 0 (every released agent today) the alert cannot fire for any reason. The 15
+            minute clock and the 5 minute window are not tuned against fleet data; revisit them
+            at the Spark flip.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/guaranteed-state.md#fleet-monitoring-of-baseline-persistence"
   # MASS-ABSENT META-ALERT — COMMENTED until the fleet is past staged rollout (gov UP-12).
   # absent() on yuzu_fleet_spark_reporting would catch "every spark-reporting agent went
   # dark at once" (fleet-wide agent outage / gateway partition) — real alert blindness,
@@ -7674,14 +7866,17 @@ groups:
             also counted as `validate`: session validation is unaffected, but that one
             local MFA binding read is refused 503 `mfa_proof_unavailable` and retried on
             the next read; `create`/`elevate`/`mark_mfa`/`invalidate`/
-            `invalidate_user` degrades fail the privileged op closed, except an
-            `invalidate_user` after an MFA clear that already committed (Settings MFA
-            disable), which leaves the clear in place and ends `partial`;
+            `invalidate_user` degrades fail the privileged op closed
+            (`DELETE /api/v1/sessions` and the deprovision paths; look for
+            deprovision rows with `result=partial, db_error=true`). The Settings MFA
+            disable and the CLI `--mfa-reset` no longer call `invalidate_user`, so
+            they are not counted here: their failures are 503 / `result=error`
+            audit rows (docs/ops-runbooks/auth-db-recovery.md, "There is no partial
+            result");
             `account_state` (the read of `auth.users` that gates a durable local
             session) fails the request closed (401), and the failing store for
             that op is the account store, not session_store; a single
-            event does not hold this alert's 10m condition, so look for
-            `mfa.disabled` rows with result `partial` in the audit log; a sustained
+            event does not hold this alert's 10m condition; a sustained
             `generation_refresh` degrade drops the validate cache past the
             stale-serve bound. `op=rebind_guard` means the session rebind guard is
             not in force: local MFA proofs are refused with `mfa_proof_unavailable`
@@ -8455,12 +8650,52 @@ groups:
             the rename (including a sidecar present under both names) and a corrupt echo.db that
             could not be moved aside; the upgrade notes cover adoption under 'Two cases the
             agent refuses, and what to do', and the corrupt-database case is under
-            Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
-            of free space is not counted here (#7290). The value and the plugin label are
+            Corrupt-database quarantine in the Echo manual. An Echo that loads offline (for lack
+            of free space, or after a failed v10 migration) is not counted here; see
+            YuzuEchoStorageOffline (#7290). The value and the plugin label are
             agent-self-reported: the server bounds the label to its catalogue, so an agent
             cannot displace a real plugin, but it can still report a real plugin's name as
             failed, or not report a failure, so the signal is not authoritative.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
+
+      # Echo loaded OFFLINE because its database could not be opened (a failed v10 roll-up
+      # migration, or too little free disk for it) and is retrying in the background (#7290). Such
+      # an agent no longer fails the plugin's init, so it is NOT in yuzu_fleet_plugin_init_failed:
+      # this rule is what replaces that signal. The family has a fixed label set (free_space,
+      # migration_failed, open_failed, unknown) published every sweep, 0 included, so `> 0`
+      # selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
+      # (max_over_time[5m] rides over a replica restart's one absent sample, `sum by` drops
+      # `instance` so an agent moving replicas does not reset the clock).
+      #
+      # `for: 30m` is a DESIGN value derived from the agent's retry schedule (1, 5 and 15 minutes,
+      # then hourly; the three quick retries finish about 21 minutes after the start), so a
+      # transient condition such as a briefly full disk or a held lock has had its quick retries
+      # before anyone is told. It is not fitted to fleet data. Warning, not critical: the agent
+      # keeps retrying on its own (bar a collection-start failure, which needs an agent restart)
+      # and the value is agent-self-reported.
+      - alert: YuzuEchoStorageOffline
+        expr: |
+          sum by (job, reason) (max_over_time(yuzu_fleet_echo_storage_offline[5m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} agent(s) have Echo storage offline ({{ $labels.reason }})"
+          description: >-
+            For more than 25 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that their Echo
+            database could not be opened and Echo is offline (heartbeat tag
+            yuzu.plugin.echo.storage_offline), reason {{ $labels.reason }}: free_space is too
+            little free disk for the v10 roll-up migration, migration_failed is a migration that
+            failed or ran past its deadline and was rolled back with the old data intact,
+            open_failed is any other failure on a retry. reason="unknown" sums values the server
+            does not recognise. Nothing is collected on an affected endpoint, but the agent keeps
+            retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is
+            gone, except an open_failed where the database opened but collection failed to start:
+            that is not retried and needs an agent restart. The agent log and `echo status` on
+            the device name the cause. The value and the reason are agent-self-reported, so the
+            signal is not authoritative.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
 
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate

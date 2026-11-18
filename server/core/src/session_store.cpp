@@ -83,7 +83,8 @@ std::uint64_t to_u64(const char* s) {
 }
 
 // The durable write-generation bump lives in session_store_sql_helpers.hpp (one
-// copy, shared with the ADR-0012 §3 CredentialChangeOwner, #5342).
+// copy, shared with the ADR-0012 §3 CredentialChangeOwner, #5342, and MfaDisableOwner,
+// #6079 PR 2c).
 using session_sql::bump_generation_in_txn;
 
 SessionRow row_from(PGresult* res, int i) {
@@ -474,8 +475,8 @@ SessionStore::invalidate_user(const std::string& username) {
     int count = 0;
     std::string err;
     // The ONE "revoke every session of a user" statement pair
-    // (session_store_sql_helpers.hpp, #5342); CredentialChangeOwner runs the
-    // same two statements split around its audit INSERT (bump last, T1′).
+    // (session_store_sql_helpers.hpp, #5342); CredentialChangeOwner and MfaDisableOwner
+    // run the same two statements split around their audit INSERT (bump last, T1′).
     const bool ok = pool_.with_txn_for(kWriteTimeout, [&](PGconn* c) -> bool {
         const auto deleted = session_sql::invalidate_user_in_txn(c, username, err);
         if (!deleted)

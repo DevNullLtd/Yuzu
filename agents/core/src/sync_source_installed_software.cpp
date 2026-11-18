@@ -52,8 +52,9 @@ template <class Fn> void for_each_line(const std::string& out, Fn&& fn) {
 
 // Split on '|' into at most `max` tokens; anything past the max-th token is dropped.
 // `escaped` additionally treats `\|` as field text, not a separator (the wire form
-// yuzu::util::safe_output_field gives a literal pipe; a literal backslash is never emitted, it
-// is replaced by '/'). Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
+// yuzu::util::safe_output_field gives a literal pipe). That is the `inv|` daily-sync row's own
+// escape: it never emits a literal backslash (replaced by '/'). The `list` rows use the
+// backslash-preserving yuzu::shared::row_field and are not parsed here. Tokens stay views of the raw line, so an escaped pipe keeps its `\`.
 std::vector<std::string_view> split_tokens(std::string_view line, std::size_t max,
                                            bool escaped = false) {
     std::vector<std::string_view> tok;
@@ -775,6 +776,7 @@ struct CollectorState {
     SyncScheduler::KvGetFn kv_get;
     SyncScheduler::KvSetFn kv_set;
     std::shared_ptr<CollectorWorkers> workers;
+    std::shared_ptr<CollectorEnabledSet> enabled; // null = every collector on
     CollectorClock clock;
     std::chrono::milliseconds time_limit_override{0};
     CollectorRunner runner;
@@ -965,7 +967,8 @@ struct CollectorState {
 SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::KvGetFn kv_get,
                                           SyncScheduler::KvSetFn kv_set,
                                           std::shared_ptr<CollectorWorkers> workers,
-                                          CollectorTuning tuning) {
+                                          CollectorTuning tuning,
+                                          std::shared_ptr<CollectorEnabledSet> enabled) {
     SyncSource src;
     src.name = "installed_software";
     src.interval = std::chrono::hours{24};
@@ -973,8 +976,10 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
     // longer matches is refused, answered `installed_software:<facet>` and resent in full) heal a
     // diverged facet on their own.
     src.no_full_floor = true;
-    // Nightly maintenance window, 01:00-05:00 machine-local time (a compile-time default:
-    // no settings channel exists yet). Each agent keeps a stable moment inside it.
+    // Nightly maintenance window, 01:00-05:00 machine-local time: the default until fleet
+    // settings arrive (agent.cpp then sets interval and window from the stored pair before the
+    // scheduler is published, and the scheduler's apply_settings changes them live). Each agent
+    // keeps a stable moment inside the window.
     src.window = SyncWindow{60, 300};
 
     auto st = std::make_shared<CollectorState>();
@@ -982,6 +987,7 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
     st->kv_get = std::move(kv_get);
     st->kv_set = std::move(kv_set);
     st->workers = std::move(workers);
+    st->enabled = std::move(enabled);
     st->clock = tuning.clock ? std::move(tuning.clock)
                              : CollectorClock{[] { return std::chrono::steady_clock::now(); }};
     st->time_limit_override = tuning.time_limit;
@@ -1069,7 +1075,15 @@ SyncSource make_installed_software_source(SyncPluginMap plugins, SyncScheduler::
             // else dispatches; a timeout is never cached (it must see the worker's state afresh).
             std::optional<Collected> local;
             const Collected* c = nullptr;
-            if (f.cache && now - f.cache_at < kPassCooldown) {
+            if (st->enabled && !st->enabled->enabled(kInventoryActions[i].plugin)) {
+                // Switched off by the fleet settings: nothing is dispatched, and nothing is
+                // cached, so a switch back on collects afresh instead of serving old rows.
+                f.cache.reset();
+                local.emplace();
+                local->status = V3Status::disabled;
+                local->token = "switched_off";
+                c = &*local;
+            } else if (f.cache && now - f.cache_at < kPassCooldown) {
                 c = &*f.cache;
             } else {
                 local = st->dispatch(i);

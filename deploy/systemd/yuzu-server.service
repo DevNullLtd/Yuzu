@@ -111,11 +111,11 @@ RestartSec=5
 # join has no self-armed watchdog, so a stalled log sink leaves it bounded ONLY by a second
 # SIGTERM or this deadline — see guardian_ingest.hpp's own header banner.
 # One more wait joins late in stop(), just before the PostgreSQL pool is reset: the
-# collation-version recheck, about 15s in practice for a check in flight (about 35s on a network
+# collation-version recheck, about 20s in practice for a check in flight (about 40s on a network
 # that drops packets, no bound against a backend that never answers); it overlaps the earlier
-# stages, so these are upper bounds. On the documented figures it fits (about 145s with the
-# ~130s stacked waits) but 205s to 225s on top of the ~190s thread-exhaustion fallback path
-# leaves 5s or exceeds 210s: raise TimeoutStopSec to 240 or more if your network drops packets
+# stages, so these are upper bounds. On the documented figures it fits (about 150s with the
+# ~130s stacked waits) but 210s to 230s on top of the ~190s thread-exhaustion fallback path
+# leaves no margin or exceeds 210s: raise TimeoutStopSec to 240 or more if your network drops packets
 # or you expect that path. See docs/user-manual/upgrading.md.
 TimeoutStopSec=210
 

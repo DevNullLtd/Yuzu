@@ -138,6 +138,12 @@ jobs:
       - name: Workflow execute docs gate (#2146)
         run: python3 -I tests/test_workflow_execute_docs_lexical.py
 
+      # WP11: endpoint-derived plugin result rows (processes, procfetch, wmi, filesystem,
+      # installed_apps, network_config proxy_address/bypass) are built by the neutralising
+      # formatters at every call site. Best-effort lexical tripwire, self-checked in memory.
+      - name: Plugin row formatters wiring gate (WP11)
+        run: python3 -I tests/test_plugin_row_formatters_wiring_lexical.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
