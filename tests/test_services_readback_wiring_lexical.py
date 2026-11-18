@@ -143,6 +143,10 @@ _BODY_PINS = {
         r"start_mode_should_remask\(mode, was_masked,\s*(?:/\*[^*]*\*/\s*)?false\)",
     "the readback is is-enabled with `--`, unmerged":
         r'auto st = run_command\(\{std::string\{systemctl_path\}, "is-enabled", "--", std::string\(name\)\},\s*(?:/\*[^*]*\*/\s*)?false\)',
+    "the readback-mismatch branch re-masks BEFORE its return":
+        r"name, mode, st\.output\.substr\(0, st\.output\.find\([^)]*\)\)\)\);\s*remask_after_failure\(\);\s*return 1;\s*\}\s*st_state = st\.output;",
+    "the failed-change branch re-masks BEFORE its return":
+        r"ctx\.write_output\(outcome\.message\);\s*remask_after_failure\(\);\s*return 1;\s*\}",
     "the unmask call is the helper's unmask":
         r'run_command\(build\("unmask"\)\);',
     "masked-runtime is refused up front, before the unmask, with the typed CONSTRAINED token and rc 1":
@@ -234,6 +238,7 @@ def selftest(src):
         "note remasked unconditional": rep("if (r.tool_ran && !r.timed_out && r.exit_code == 0)", "if (true)"),
         "exit_code check dropped": rep("r.tool_ran && !r.timed_out && r.exit_code == 0", "r.tool_ran"),
         "readback verb is-enabled -> status": rep('"is-enabled", "--", std::string(name)},\n                              /*merge_stderr=*/false);', '"status", "--", std::string(name)},\n                              /*merge_stderr=*/false);'),
+        "mismatch branch: remask after its return": src.replace("            remask_after_failure();\n            return 1;\n        }\n        st_state","            return 1;\n            remask_after_failure();\n        }\n        st_state",1),
         "unmask removed": rep('run_command(build("unmask"));', ";"),
         "prior merges stderr": rep('std::string(name)},\n                                       /*merge_stderr=*/false);', 'std::string(name)},\n                                       /*merge_stderr=*/true);'),
         "change_succeeded true": rep("/*change_succeeded=*/false", "/*change_succeeded=*/true"),

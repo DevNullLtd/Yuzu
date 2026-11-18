@@ -597,13 +597,17 @@ struct FakeSystemctl {
     }
 };
 
-int drive(FakeCtx& ctx, FakeSystemctl& sys, std::string_view mode, std::string_view name = "ssh.service") {
+// Drives the body as a root agent. `forwarded`, when given, receives how many runner failures
+// were forwarded through the typed-status seam.
+int drive(FakeCtx& ctx, FakeSystemctl& sys, std::string_view mode, std::string_view name = "ssh.service",
+          std::size_t* forwarded_out = nullptr) {
     std::size_t forwarded = 0;
     const int rc = yuzu::services::set_start_mode_linux(
         ctx, [&sys](const std::vector<std::string>& a, bool m = true) { return sys(a, m); },
         [&forwarded](const SubprocessResult&) { ++forwarded; }, "/usr/bin/systemctl", name, mode,
         /*euid_is_root=*/true);
-    (void)forwarded;
+    if (forwarded_out)
+        *forwarded_out = forwarded;
     return rc;
 }
 
@@ -738,7 +742,7 @@ TEST_CASE("set_start_mode_linux: a readback that did not run is a failure", "[se
     CHECK_FALSE(ctx.has("status|ok"));
 }
 
-TEST_CASE("set_start_mode_linux: a failed change is an error and forwards a runner failure",
+TEST_CASE("set_start_mode_linux: a failed change is an error",
           "[services][setmode]") {
     FakeCtx ctx;
     FakeSystemctl sys;
@@ -770,7 +774,7 @@ TEST_CASE("set_start_mode_linux: an invalid mode runs nothing", "[services][setm
     CHECK(ctx.has("error|invalid mode"));
 }
 
-TEST_CASE("set_start_mode_linux: a non-root agent calls the helper, never systemctl, for the change",
+TEST_CASE("set_start_mode_linux: a non-root agent calls the helper, never systemctl, for every change",
           "[services][setmode]") {
     FakeCtx ctx;
     std::vector<std::vector<std::string>> argvs;
@@ -792,12 +796,22 @@ TEST_CASE("set_start_mode_linux: a non-root agent calls the helper, never system
         [](const SubprocessResult&) {}, "/usr/bin/systemctl", "ssh.service", "automatic",
         /*euid_is_root=*/false);
     CHECK(rc == 0);
-    bool saw_helper = false;
-    for (const auto& a : argvs)
-        for (const auto& t : a)
-            if (t.find("yuzu-svc-helper") != std::string::npos)
-                saw_helper = true;
-    CHECK(saw_helper);
+    // every call except the unprivileged is-enabled reads is `sudo -n -- <helper> systemctl <verb> <name>`
+    const std::vector<std::string> prefix{"-n", "--", "/usr/local/sbin/yuzu-svc-helper", "systemctl"};
+    std::size_t helper_calls = 0, reads = 0;
+    for (const auto& a : argvs) {
+        if (a.size() > 1 && a[1] == "is-enabled") {
+            CHECK(a[0] == "/usr/bin/systemctl"); // the readback never goes through sudo
+            ++reads;
+            continue;
+        }
+        REQUIRE(a.size() > prefix.size());
+        CHECK((a[0] == "sudo" || a[0].ends_with("/sudo"))); // sudo_wrap resolves the absolute path
+        CHECK(std::vector<std::string>(a.begin() + 1, a.begin() + 1 + static_cast<std::ptrdiff_t>(prefix.size())) == prefix);
+        ++helper_calls;
+    }
+    CHECK(helper_calls == 2); // unmask, then enable
+    CHECK(reads == 2);        // the prior read, then the readback
 }
 
 TEST_CASE("set_start_mode_linux: a masked unmaskable-state unit says it was unmasked", "[services][setmode]") {
@@ -811,4 +825,74 @@ TEST_CASE("set_start_mode_linux: a masked unmaskable-state unit says it was unma
             said = true;
     CHECK(said);
     CHECK(joined(sys.calls) == "is-enabled,unmask,enable,is-enabled");
+}
+
+TEST_CASE("set_start_mode_linux: a masked unit whose readback does not match is masked again",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    FakeSystemctl sys;
+    sys.is_enabled_out = {"masked\n", "disabled\n"}; // the helper exited 0, the unit is not enabled
+    CHECK(drive(ctx, sys, "automatic") == 1);
+    CHECK(joined(sys.calls) == "is-enabled,unmask,enable,is-enabled,mask");
+    CHECK(ctx.has("error|"));
+    CHECK(ctx.has("note|remasked:"));
+    CHECK_FALSE(ctx.has("status|ok"));
+}
+
+TEST_CASE("set_start_mode_linux: a runner failure of the change is forwarded once", "[services][setmode]") {
+    FakeCtx ctx;
+    std::size_t forwarded = 0;
+    const int rc = yuzu::services::set_start_mode_linux(
+        ctx,
+        [](const std::vector<std::string>& a, bool = true) {
+            SubprocessResult r;
+            r.tool_ran = true;
+            r.termination_reason = TerminationReason::exited;
+            r.exit_code = 0;
+            if (a.at(1) == "is-enabled") {
+                r.output = "disabled\n";
+                r.exit_code = 1;
+                return r;
+            }
+            if (a.at(1) == "enable") { // the 20 s deadline elapsed
+                r.timed_out = true;
+                r.termination_reason = TerminationReason::deadline;
+                r.exit_code = -1;
+            }
+            return r;
+        },
+        [&forwarded](const SubprocessResult&) { ++forwarded; }, "/usr/bin/systemctl", "ssh.service",
+        "automatic", true);
+    CHECK(rc == 1);
+    CHECK(forwarded == 1);
+    CHECK_FALSE(ctx.has("status|ok"));
+}
+
+TEST_CASE("set_start_mode_linux: a runner failure of the readback is forwarded once", "[services][setmode]") {
+    FakeCtx ctx;
+    std::size_t forwarded = 0;
+    int reads = 0;
+    const int rc = yuzu::services::set_start_mode_linux(
+        ctx,
+        [&reads](const std::vector<std::string>& a, bool = true) {
+            SubprocessResult r;
+            r.tool_ran = true;
+            r.termination_reason = TerminationReason::exited;
+            r.exit_code = 0;
+            if (a.at(1) == "is-enabled") {
+                if (++reads == 2) { // the readback itself could not be started
+                    r.tool_ran = false;
+                    r.termination_reason = TerminationReason::spawn_error;
+                    return r;
+                }
+                r.output = "disabled\n";
+                r.exit_code = 1;
+            }
+            return r;
+        },
+        [&forwarded](const SubprocessResult&) { ++forwarded; }, "/usr/bin/systemctl", "ssh.service",
+        "automatic", true);
+    CHECK(rc == 1);
+    CHECK(forwarded == 1);
+    CHECK_FALSE(ctx.has("status|ok"));
 }
