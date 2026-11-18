@@ -1932,7 +1932,7 @@ five that say the request itself was wrong. `INVALID_ARGUMENT`, `NOT_FOUND`,
 `ALREADY_EXISTS`, `FAILED_PRECONDITION` and `OUT_OF_RANGE` are the server answering
 correctly, so they leave the breaker as it is: not a failure, and not a success either
 (they do not reset the run of consecutive failures or close a half-open breaker).
-`PERMISSION_DENIED`, `UNAUTHENTICATED` and `RESOURCE_EXHAUSTED` are counted;
+One more answer is neutral in the same way: the server's uniform refusal of a re-registration that shows no proof of the agent's identity (`--agent-reregistration-proof=enforce`: `UNAUTHENTICATED` with the exact message `re-registration requires proof of the agent identity`). It is one caller's refusal from a healthy server, so refusals of that kind, however many, never open the breaker for the whole gateway and a refused half-open probe leaves it half open. Any other `UNAUTHENTICATED` answer (for example the server's gateway-peer guard refusing this gateway) is still counted. `PERMISSION_DENIED`, other `UNAUTHENTICATED` answers and `RESOURCE_EXHAUSTED` are counted;
 `RESOURCE_EXHAUSTED` because it is the only brake the gateway has until the server sends
 explicit backpressure.
 
