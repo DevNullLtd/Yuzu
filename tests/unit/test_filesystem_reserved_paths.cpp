@@ -84,7 +84,7 @@ TEST_CASE("is_apple_vol_path / contains_nul: pure decisions", "[agent][filesyste
     CHECK(rsv::is_apple_vol_path("/.VOL/1/2"));
     CHECK(rsv::is_apple_vol_path("/.vol"));
     CHECK_FALSE(rsv::is_apple_vol_path("/.volume/1"));
-    CHECK_FALSE(rsv::is_apple_vol_path("/home/.vol/x"));
+    CHECK_FALSE(rsv::is_apple_vol_path("/data/.vol/x"));
     CHECK(rsv::contains_nul(std::string_view("/var/lib/yuzu\0/x", 16)));
     CHECK_FALSE(rsv::contains_nul("/var/lib/yuzu/x"));
 }
