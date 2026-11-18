@@ -311,6 +311,11 @@ What this means in use:
   become `blocked` with phase `fix`; the claim on them is released. A **refused post-fix
   check** leaves the fix in place and moves the devices from `fixing` to `blocked` with
   phase `verify`; it is not counted as a failed evaluation (`error`).
+  A `blocked` status from a refused fix is not kept: the next check of an allowed
+  instruction records the device's own result in its place. The lasting record of a
+  refused fix is the `policy.dispatch` audit row, the
+  `yuzu_server_policy_dispatch_denied_total` counter and the `409` that every retry of the
+  remediate receives.
 - `blocked` counts as **failing** in the "N failing" pill, the Failing checks readout and
   the home page tile. A later dispatch that records a real result replaces it. A
   refusal that repeats on every interval changes no status and writes no audit row, but it
@@ -318,6 +323,9 @@ What this means in use:
   the failing figure. The fleet figure applies its 24 hour freshness rule to `blocked` like
   every other status: a `blocked` row that nothing refreshes (the policy is disabled, the
   device left its scope or was removed) counts as `unknown` after 24 hours.
+  The first refusal after a row went stale refreshes it at once, but the fleet figure is
+  cached for 60 seconds, so that device can still show as `unknown` for up to 60 seconds,
+  once.
 - Creating a fragment or a policy, and enabling a policy, checks each instruction the
   fragment names and answers `400` for a refused pair (and `503` when the lookup cannot be
   answered). The check is advisory: the dispatch check above is the control, and an
