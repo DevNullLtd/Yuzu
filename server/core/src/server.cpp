@@ -12365,14 +12365,16 @@ public:
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
-        // destruct-before-pool). Nothing borrows it long-lived (its writer is the UCE
-        // module's evaluator, out-of-server), so no unwire step precedes the reset.
+        // destruct-before-pool). Its only long-lived borrower is McpServer's raw pointer for the
+        // SAM-29 curation tools, which the same drains quiesce before this reset (the writer of
+        // the registry rows is the UCE module's evaluator, out-of-server).
         product_registry_store_.reset();
         // SAM-34 collection settings store: its routes capture it and are served only until
         // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
         software_collection_settings_store_.reset();
-        // SAM-23 lifecycle store: only /readyz borrows it (HealthRoutes deps), and that server is
-        // stopped above; drop it ahead of the pool.
+        // SAM-23 lifecycle store: /readyz borrows it (HealthRoutes deps) and McpServer holds a raw
+        // pointer for the SAM-29 lifecycle tools; both servers are stopped above; drop it ahead of
+        // the pool.
         software_lifecycle_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -21551,6 +21553,19 @@ private:
                 return std::nullopt;
             return quarantine_store_->list_quarantined_in(ids, limit);
         };
+        // The sync-run status read and the "may this caller read every sync run" answer: named so
+        // GET /api/v1/hardware/sync/{execution_id} (HardwareRoutes::Deps) and the MCP tool
+        // get_software_sync_status (set_software_sync_status_fns) get the SAME two closures.
+        const software_sync::StatusReadFn sync_status_read_fn =
+            [this](const std::string& execution_id)
+            -> std::expected<std::optional<Execution>, std::string> {
+            if (!execution_tracker_)
+                return std::unexpected(std::string("no execution tracker"));
+            return execution_tracker_->get_execution_checked(execution_id);
+        };
+        const software_sync::UnfilteredFn sync_unfiltered_fn = [this](const auth::Session& sess) {
+            return !derive_exec_visible(sess).has_value();
+        };
         hardware_routes_ = std::make_unique<HardwareRoutes>();
         hardware_routes_->register_routes(
             *web_server_, HardwareRoutes::Deps{
@@ -21679,17 +21694,8 @@ private:
                              // GET /api/v1/hardware/sync/{execution_id}: the tracker row, and
                              // whether the caller may read every sync run (an unfiltered
                              // Execution:Execute) rather than only its own.
-                             .sync_status_fn =
-                                 [this](const std::string& execution_id)
-                                     -> std::expected<std::optional<Execution>, std::string> {
-                                     if (!execution_tracker_)
-                                         return std::unexpected(std::string("no execution tracker"));
-                                     return execution_tracker_->get_execution_checked(execution_id);
-                                 },
-                             .sync_unfiltered_fn =
-                                 [this](const auth::Session& sess) {
-                                     return !derive_exec_visible(sess).has_value();
-                                 },
+                             .sync_status_fn = sync_status_read_fn,
+                             .sync_unfiltered_fn = sync_unfiltered_fn,
                              .write_gate = WriteGate{resolve_session_fn, cfg_.csrf_trusted_origins},
                              .forensics_visibility_fn = forensics_visibility_fn,
                              .forensics_plugins = forensics_plugins(),
@@ -21697,7 +21703,8 @@ private:
 
         // Software normalisation curation REST (queue, curated aliases, pack replace). The
         // routes borrow product_registry_store_ and are served only until web_server_->stop(),
-        // which precedes the store reset in stop(); the class holds no state of its own.
+        // which precedes the store reset in stop(); the class holds no state of its own. The
+        // MCP curation tools borrow the same store through McpServer's raw pointer.
         {
             HttplibRouteSink curation_sink{*web_server_};
             SoftwareCurationRoutes{}.register_routes(
@@ -21741,7 +21748,8 @@ private:
         // Imported software lifecycle rules REST (SAM-24): import, list and clear. Registered
         // here, ahead of rest_api_v1_->register_routes, for the same reason as the routes above
         // (the generic GET /api/v1/inventory/{a}/{b} would take the bare path's neighbours). The
-        // routes borrow software_lifecycle_store_ only; stop() joins the web thread ahead of
+        // routes borrow software_lifecycle_store_ only (the MCP lifecycle tools borrow it through
+        // McpServer's raw pointer); stop() joins the web thread ahead of
         // resetting it, and the class holds no state of its own. A null or closed store answers
         // 503 on every route.
         {
@@ -24630,6 +24638,14 @@ private:
             // gets pushed or to whom.
             mcp_server_->set_guardian_push_fn(guardian_push_fn_);
             mcp_server_->set_software_sync_runner(software_sync_runner());
+            // SAM-21 twins: the SAME sync-run status closures GET /api/v1/hardware/sync/{id} is
+            // given, and one more binding of the lookup reads over the SAME store and the SAME
+            // device-table roster the REST lookup routes use, so both surfaces answer from the one
+            // core (software_list::lookup_installs / lookup_components, sync_status).
+            mcp_server_->set_software_sync_status_fns(sync_status_read_fn, sync_unfiltered_fn);
+            if (software_inventory_store_)
+                mcp_server_->set_software_lookup_reads(
+                    software_list::bind_lookup_reads(*software_inventory_store_, hw_hostnames_fn));
             // SAM-35 twins: the SAME read sources and settings stores the REST routes above are
             // given, so the two surfaces answer from one body.
             mcp_server_->set_software_read_ctx(software_read_api::make_ctx(
@@ -24640,6 +24656,9 @@ private:
                                                          mgmt_group_store_.get(),
                                                          plugin_config_store_.get()},
                 collection_settings_probe_fn);
+            // SAM-29 twins: the SAME stores SoftwareLifecycleRoutes and SoftwareCurationRoutes borrow.
+            mcp_server_->set_software_lifecycle_store(software_lifecycle_store_.get());
+            mcp_server_->set_product_registry_store(product_registry_store_.get());
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.
