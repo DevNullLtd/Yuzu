@@ -19,13 +19,23 @@ at a time. These tests pin what that means:
     `.yuzu-agent.incoming` and `.libyuzu_agent_core.incoming.dylib`), and the
     Windows installer, whose SBOM lists only the archive files its .iss
     installs; rc-named packages pass `check` under their own names;
-  - an SBOM for a file holding yuzu-server, and an installer's SBOM, say they
-    are incomplete (CycloneDX composition, SPDX CONTAINS NOASSERTION);
+  - an SBOM for a file holding yuzu-server, an installer's SBOM and a
+    gateway SBOM (the Erlang emulator, beam.smp, vendors code) say they are
+    incomplete (CycloneDX composition, SPDX CONTAINS NOASSERTION) and why, by
+    tokens from a closed set that release-verification.md documents exactly;
+  - `mark-image` marks an image SBOM pair whose image holds a Yuzu C++ binary
+    or the Erlang emulator, idempotently, refuses a mismatched pair, and the
+    release check refuses an image pair left unmarked;
+  - the real deploy/packaging/windows/yuzu-agent.iss parses, read the way
+    Inno Setup reads it (UTF-8 with a BOM, else code page 1252), and a script
+    construct that could change [Files] unseen is refused; the .pkg's staged
+    names are the ones deploy/packaging/macos/build-pkg.sh stages;
   - unsafe input is refused: a tar or zip member that escapes the extraction
     directory (with and without tarfile's data filter, including a link
-    chain), a binary with no vcpkg tree, a stalled command (timeout), and an
+    chain), a device or FIFO member, a binary with no vcpkg tree, a stalled
+    command (syft, and rpm2cpio | cpio: timeout), a failing syft, and an
     unexpected error is one `::error::` line, not a traceback;
-  - `check` refuses an SBOM over the entry bound, one listing a path under
+  - `check` refuses an SBOM over the entry bound (400 passes, 401 fails), one listing a path under
     vcpkg/, vcpkg_installed/, build-*/, _build*/, site/, tests/, .git/ or
     .github/ wherever syft records a path (CycloneDX file names, location
     properties and evidence; SPDX file names and package sourceInfo), one
@@ -43,6 +53,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import secrets
 import shutil
 import stat
@@ -286,7 +297,42 @@ WIN_ZIP = {
 }
 
 
-def make_vcpkg_tree(root: Path, drop_spdx: str = "", no_licence: str = "") -> Path:
+def make_image_pair(title: str, files: list, version: str = "1.2.3", owned: tuple = ()) -> tuple:
+    """A syft 1.57.2 image scan pair, in the shape of the release's real ones
+    (v0.14.x chisel and server images): a `container` CycloneDX root with the
+    OCI title label as a metadata property; an SPDX root with purpose CONTAINER
+    and every file in `files`; CycloneDX lists a file only when a package owns
+    it (`owned`, as syft's erlang classifier owns beam.smp), so an unpackaged
+    yuzu-server appears in SPDX only."""
+    name = f"ghcr.io/example/{title}"
+    cdx = {"bomFormat": "CycloneDX", "specVersion": "1.7",
+           "metadata": {"component": {"bom-ref": "daa5fd985d9b5998", "type": "container", "name": name,
+                                      "version": version},
+                        "properties": [{"name": "syft:image:labels:org.opencontainers.image.title",
+                                        "value": title}]},
+           "components": [{"bom-ref": "os", "type": "operating-system", "name": "ubuntu", "version": "26.04"}] +
+                         [{"bom-ref": f"f{i}", "type": "file", "name": "/" + f} for i, f in enumerate(owned)]}
+    root_id = "SPDXRef-DocumentRoot-Image-" + name.replace("/", "-")
+    spdx = {"spdxVersion": "SPDX-2.3", "SPDXID": "SPDXRef-DOCUMENT", "name": name,
+            "packages": [{"name": name, "SPDXID": root_id, "versionInfo": version, "downloadLocation": "NOASSERTION",
+                          "copyrightText": "NOASSERTION", "primaryPackagePurpose": "CONTAINER"}],
+            "files": [{"fileName": f, "SPDXID": f"SPDXRef-File-{i}"} for i, f in enumerate(files)],
+            "relationships": [{"spdxElementId": "SPDXRef-DOCUMENT", "relatedSpdxElement": root_id,
+                               "relationshipType": "DESCRIBES"}]}
+    return cdx, spdx
+
+
+SERVER_IMAGE_FILES = ["usr/bin/busybox", "usr/lib/x86_64-linux-gnu/libc.so.6", "usr/local/bin/yuzu-server"]
+AGENT_IMAGE_FILES = ["usr/bin/busybox", "usr/local/bin/yuzu-agent", "usr/local/lib/libyuzu_agent_core.so",
+                     "usr/lib/yuzu/plugins/status/status.so"]
+GATEWAY_IMAGE_FILES = ["opt/yuzu_gw/erts-16.4.0.7/bin/beam.smp", "opt/yuzu_gw/erts-16.4.0.7/bin/erlexec",
+                       "usr/bin/busybox"]
+# syft 1.57.2 on ghcr.io/devnullltd/yuzu-postgres:0.14.1 (2026-11-18): vector.so
+# is a file with no package (pgvector is built from source).
+POSTGRES_IMAGE_FILES = ["usr/lib/postgresql/18/bin/postgres", "usr/lib/postgresql/18/lib/vector.so"]
+
+
+def make_vcpkg_tree(root: Path, drop_spdx: str = "", no_licence: str = "", copyright_port: str = "") -> Path:
     inst = root / "vcpkg_installed"
     (inst / "vcpkg").mkdir(parents=True)
     (inst / "vcpkg" / "status").write_text(STATUS)
@@ -295,9 +341,12 @@ def make_vcpkg_tree(root: Path, drop_spdx: str = "", no_licence: str = "") -> Pa
             continue
         share = inst / TRIPLET / "share" / port
         share.mkdir(parents=True)
+        # vcpkg writes copyrightText NOASSERTION on every port today.
         port_pkg = {"SPDXID": "SPDXRef-port", "name": port, "licenseConcluded": lic,
-                    "homepage": f"https://example.invalid/{port}",
+                    "homepage": f"https://example.invalid/{port}", "copyrightText": "NOASSERTION",
                     "externalRefs": [{"referenceType": "purl", "referenceLocator": f"pkg:vcpkg/{port}@x"}]}
+        if port == copyright_port:
+            port_pkg["copyrightText"] = f"Copyright (c) The {port} authors"
         if port == no_licence:
             port_pkg["licenseConcluded"] = "NOASSERTION"
         spdx = {"packages": [port_pkg,
@@ -382,12 +431,188 @@ class Units(unittest.TestCase):
             "destname": '[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"; DestName: "b.dll"\n',
             "empty": '[Setup]\nAppName=x\n',
         }
+        ok = '[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"\n'
+        cases.update({
+            # An #include anywhere could add [Files] lines this parser never sees.
+            "include before [Files]": '#include "more.iss"\n' + ok,
+            "include in another section": '[Setup]\n#include "more.iss"\n' + ok,
+            "directive in [Code]": ok + '[Code]\n#define Extra "x"\n',
+            "conditional header": '#if Ver > 1\n#define BuildDir "x"\n#endif\n' + ok,
+            "expression define": '#define BuildDir GetEnv("X")\n' + ok,
+            "pragma": '#pragma option -v+\n' + ok,
+            "spaced include": '#  include "more.iss"\n' + ok,
+            # Windows' FindFirstFile semantics that fnmatch does not share.
+            "star dot star": '[Files]\nSource: "x\\*.*"; DestDir: "{app}\\bin"\n',
+            "question mark": '[Files]\nSource: "x\\a?.dll"; DestDir: "{app}\\bin"\n',
+            "two stars": '[Files]\nSource: "x\\*core*.dll"; DestDir: "{app}\\bin"\n',
+            "ispp in name": '[Files]\nSource: "x\\{#Name}.dll"; DestDir: "{app}\\bin"\n',
+            "ispp in destdir": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\{#Sub}"\n',
+        })
         for what, text in cases.items():
             with self.subTest(what=what):
                 iss = self.tmp / "x.iss"
                 iss.write_text(text)
                 with self.assertRaises(self.mod.SbomError):
                     self.mod.iss_file_entries(iss)
+        # Accepted: the header defaults and Pascal character constants in [Code].
+        iss = self.tmp / "x.iss"
+        iss.write_text('#ifndef BuildDir\n  #define BuildDir "..\\build-windows"\n#endif\n' + ok +
+                       "[Code]\nconst CRLF = #13#10;\n  #$0D + 'x';\n")
+        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "a.dll")])
+
+    def test_iss_is_read_as_inno_setup_reads_it(self):
+        # Inno Setup reads a script as UTF-8 only when it starts with a UTF-8
+        # byte order mark; otherwise as the system's ANSI code page (1252 on
+        # the release's Windows runner). A cp1252 byte anywhere must not break
+        # the release (it raised UnicodeDecodeError before).
+        body = '[Files]\nSource: "x\\café.dll"; DestDir: "{app}\\bin"\n'
+        iss = self.tmp / "x.iss"
+        iss.write_bytes(b"[Setup]\nAppCopyright=\xa9 Yuzu \x81\x8d\n" + body.encode("cp1252"))
+        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "café.dll")])
+        self.assertIn("© Yuzu \x81\x8d", self.mod.read_iss(iss))
+        iss.write_bytes(b"\xef\xbb\xbf" + ("[Setup]\nAppCopyright=© Yuzu\n" + body).encode("utf-8"))
+        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "café.dll")])
+        # Without a BOM, UTF-8 bytes are read as cp1252, as Inno Setup does: the
+        # name no longer matches the archive's file, which keep_installed then
+        # reports as an entry the archive does not hold (not silently dropped).
+        iss.write_bytes(body.encode("utf-8"))
+        self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "cafÃ©.dll")])
+        iss.write_bytes(b"\xef\xbb\xbf[Files]\nSource: \"\xff.dll\"; DestDir: \"{app}\"\n")
+        with self.assertRaises(self.mod.SbomError) as cm:
+            self.mod.iss_file_entries(iss)
+        self.assertIn("byte order mark but is not UTF-8", str(cm.exception))
+
+    def test_the_real_iss_parses(self):
+        # The installer's script itself, so an edit the parser refuses fails in
+        # PR CI, not at the release's Windows SBOM step after a full build.
+        iss = ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss"
+        entries = self.mod.iss_file_entries(iss)
+        text = iss.read_text(encoding="utf-8-sig", errors="replace")
+        files_section = text.split("[Files]", 1)[1].split("\n[", 1)[0]
+        sources = [ln for ln in files_section.splitlines() if ln.strip().lower().startswith("source:")]
+        self.assertEqual(len(entries), len(sources))
+        self.assertIn(("bin", "yuzu-agent.exe"), entries)
+        self.assertIn(("bin", "*.dll"), entries)
+        self.assertEqual({sub for sub, _ in entries}, {"bin", "plugins"})
+        self.assertGreater(sum(1 for sub, _ in entries if sub == "plugins"), 40)
+
+    def test_pkg_staged_names_are_the_ones_build_pkg_stages(self):
+        # The .pkg's payload names come from deploy/packaging/macos/build-pkg.sh,
+        # not from pkgutil (which keeps payload names as they are), so the
+        # fixture is checked against the script: each loose binary it stages
+        # maps back to its installed name, counts as the agent, and is in the
+        # fixture at the same payload path.
+        script = (ROOT / "deploy" / "packaging" / "macos" / "build-pkg.sh").read_text(encoding="utf-8")
+        staged = re.findall(r'record_loose_binary "\$\{STAGING\}/([^"]+)" (\S+)', script)
+        self.assertEqual(len(staged), 2, staged)
+        for rel, installed in staged:
+            with self.subTest(rel=rel):
+                base = rel.rsplit("/", 1)[-1]
+                self.assertEqual(self.mod.installed_name(base), installed)
+                self.assertTrue(installed in self.mod.AGENT_NAMES or installed.startswith(self.mod.AGENT_PREFIXES))
+                self.assertIn(f"yuzu-agent-component.pkg/Payload/{rel}", PKG_EXPANDED)
+        # Detection reads basenames only, so the directory layout pkgutil
+        # writes cannot hide the agent.
+        root = self.tmp / "anywhere"
+        (root / "a" / "b").mkdir(parents=True)
+        (root / "a" / "b" / staged[0][0].rsplit("/", 1)[-1]).write_bytes(b"x")
+        self.assertEqual(self.mod.yuzu_binaries(root), (True, False))
+
+    def test_reason_vocabulary_is_closed_and_documented(self):
+        m = self.mod
+        self.assertEqual(m.incomplete_notes([]), {})
+        notes = m.incomplete_notes([("installer-runtime", ""), ("installer-file-missing", "a.iss installs x")])
+        self.assertEqual(notes["incomplete-reasons"], "installer-runtime, installer-file-missing")
+        self.assertIn(": a.iss installs x", notes["incomplete"])
+        with self.assertRaises(m.SbomError):
+            m.incomplete_notes([("something-new", "")])
+        for token, prose in m.INCOMPLETE_REASONS.items():
+            self.assertRegex(token, r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
+            self.assertNotIn(";", prose)  # the SPDX root comment separates notes with "; "
+        doc = (ROOT / "docs" / "user-manual" / "release-verification.md").read_text(encoding="utf-8")
+        section = doc.split("\n### Why an SBOM says it is incomplete\n", 1)[1].split("\n#", 1)[0]
+        documented = re.findall(r"^\| `([a-z0-9-]+)` \|", section, re.M)
+        self.assertEqual(sorted(documented), sorted(m.INCOMPLETE_REASONS))
+
+    def test_tar_device_or_fifo_member_is_refused(self):
+        for kind in (tarfile.FIFOTYPE, tarfile.CHRTYPE, tarfile.BLKTYPE):
+            for data_filter in (True, False):
+                with self.subTest(kind=kind, data_filter=data_filter):
+                    art = self.tmp / "dev.tar.gz"
+                    with tarfile.open(art, "w:gz") as tf:
+                        tf.addfile(tarfile.TarInfo("y/bin/yuzu-agent"), io.BytesIO(b""))
+                        info = tarfile.TarInfo("y/pipe")
+                        info.type = kind
+                        tf.addfile(info)
+                    with self.assertRaises(self.mod.SbomError):
+                        dest = self._extract(art, data_filter)
+                    self.assertEqual(list(self.tmp.glob("d*/y/pipe")), [])
+
+    def test_mark_image(self):
+        m = self.mod
+        cases = {
+            "yuzu-server": (SERVER_IMAGE_FILES, (), ["server-vendored", "image-static-cpp"]),
+            "yuzu-server-chisel": (SERVER_IMAGE_FILES, (), ["server-vendored", "image-static-cpp"]),
+            "yuzu-agent-chisel": (AGENT_IMAGE_FILES, (), ["image-static-cpp"]),
+            "yuzu-gateway": (GATEWAY_IMAGE_FILES, (GATEWAY_IMAGE_FILES[0],), ["erts-static"]),
+            "yuzu-postgres": (POSTGRES_IMAGE_FILES, (), ["pgvector-source"]),
+            # Not one of the release's labelled images, holding nothing known: untouched.
+            "yuzu-agent-bundle": (["opt/yuzu-agents/yuzu-agent_1.2.3_amd64.deb"], (), []),
+        }
+        for title, (files, owned, want) in cases.items():
+            with self.subTest(title=title):
+                cdx, spdx = make_image_pair(title, files, owned=owned)
+                tokens, changed = m.mark_image(cdx, spdx)
+                self.assertEqual((tokens, changed), (want, bool(want)))
+                root = cdx["metadata"]["component"]
+                sroot = spdx["packages"][0]
+                if want:
+                    self.assertEqual(cdx["compositions"], [{"aggregate": "incomplete", "assemblies": [root["bom-ref"]]}])
+                    props = {p["name"]: p["value"] for p in cdx["metadata"]["properties"]}
+                    self.assertEqual(props["yuzu:sbom:incomplete-reasons"], ", ".join(want))
+                    self.assertIn({"spdxElementId": sroot["SPDXID"], "relationshipType": "CONTAINS",
+                                   "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
+                    self.assertIn(f"incomplete-reasons: {', '.join(want)}", sroot["comment"])
+                    self.assertEqual(m.image_marker(cdx, spdx), (want, want))
+                else:
+                    self.assertNotIn("compositions", cdx)
+                    self.assertNotIn("comment", sroot)
+                # Idempotent: a second run changes nothing.
+                before = json.dumps([cdx, spdx])
+                self.assertEqual(m.mark_image(cdx, spdx), (want, False))
+                self.assertEqual(json.dumps([cdx, spdx]), before)
+
+    def test_mark_image_refuses(self):
+        m = self.mod
+        cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
+        _, other = make_image_pair("yuzu-server", SERVER_IMAGE_FILES, version="9.9.9")
+        _, gateway = make_image_pair("yuzu-gateway", GATEWAY_IMAGE_FILES)
+        unlabelled_server = make_image_pair("yuzu-server", ["usr/bin/busybox"])
+        unlabelled_gateway = make_image_pair("yuzu-gateway-chisel", ["usr/bin/busybox"])
+        unlabelled_postgres = make_image_pair("yuzu-postgres", ["usr/lib/postgresql/18/bin/postgres"])
+        half = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
+        m.mark_image(*half)
+        cases = {
+            "different versions": (cdx, other),
+            "different images": (make_image_pair("yuzu-gateway", GATEWAY_IMAGE_FILES)[0], spdx),
+            "server title, no yuzu-server": unlabelled_server,
+            "gateway title, no beam.smp": unlabelled_gateway,
+            "postgres title, no vector.so": unlabelled_postgres,
+            "only the CycloneDX marked": (half[0], make_image_pair("yuzu-server", SERVER_IMAGE_FILES)[1]),
+            "only the SPDX marked": (make_image_pair("yuzu-server", SERVER_IMAGE_FILES)[0], half[1]),
+            "an artifact SBOM": ({"bomFormat": "CycloneDX", "metadata": {"component": {"type": "application"}}},
+                                 spdx),
+        }
+        for what, (c, s) in cases.items():
+            with self.subTest(what=what):
+                with self.assertRaises(m.SbomError):
+                    m.mark_image(c, s)
+        # Marked for other reasons: refused, not re-marked.
+        c, s = make_image_pair("yuzu-agent", AGENT_IMAGE_FILES)
+        m.mark_image(c, s)
+        s["files"].append({"fileName": "usr/local/bin/yuzu-server", "SPDXID": "SPDXRef-File-x"})
+        with self.assertRaises(m.SbomError):
+            m.mark_image(c, s)
 
     def test_installer_keeps_only_what_the_iss_installs(self):
         iss = self.tmp / "agent.iss"
@@ -558,6 +783,115 @@ class Check(unittest.TestCase):
                             self.assertNotEqual(r.returncode, 0, r.stdout)
                             self.assertIn("1 path(s) under", r.stderr)
 
+    def test_check_entry_bound_boundary(self):
+        # The default bound, at its edge, in both formats: 400 entries pass and
+        # 401 fail. The real v0.15.0 Windows archive, the largest asset,
+        # measured 212.
+        self.assertEqual(load_script().MAX_COMPONENTS, 400)
+        for n, ok in ((212, True), (400, True), (401, False)):
+            with self.subTest(n=n, fmt="cdx"):
+                f = self.tmp / "yuzu-linux-x64.cdx.json"
+                f.write_text(json.dumps({"bomFormat": "CycloneDX", "components": [
+                    {"type": "library", "name": f"p{i}", "version": "1"} for i in range(n)]}))
+                r = run_script("check", f)
+                self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+                self.assertEqual("more than the bound of 400" in r.stderr, not ok)
+            with self.subTest(n=n, fmt="spdx"):
+                # SPDX counts packages and files, the described root excluded.
+                g = self.tmp / "yuzu-linux-x64.spdx.json"
+                root = {"name": "a", "SPDXID": "SPDXRef-R"}
+                pkgs = [{"name": f"p{i}", "SPDXID": f"SPDXRef-P{i}"} for i in range(n // 2)]
+                files = [{"fileName": f"y/f{i}", "SPDXID": f"SPDXRef-F{i}"} for i in range(n - n // 2)]
+                g.write_text(json.dumps({"spdxVersion": "SPDX-2.3", "packages": [root] + pkgs, "files": files,
+                                         "relationships": [{"spdxElementId": "SPDXRef-DOCUMENT",
+                                                            "relationshipType": "DESCRIBES",
+                                                            "relatedSpdxElement": "SPDXRef-R"}]}))
+                r = run_script("check", g)
+                self.assertEqual(r.returncode == 0, ok, r.stdout + r.stderr)
+
+    def test_mark_image_command(self):
+        cdx, spdx = make_image_pair("yuzu-server-chisel", SERVER_IMAGE_FILES)
+        c = self.tmp / "yuzu-server-chisel-image.cdx.json"
+        s = self.tmp / "yuzu-server-chisel-image.spdx.json"
+        c.write_text(json.dumps(cdx))
+        s.write_text(json.dumps(spdx))
+        r = run_script("mark-image", "--cdx", c, "--spdx", s)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("marked incomplete (server-vendored, image-static-cpp)", r.stdout)
+        once = (c.read_bytes(), s.read_bytes())
+        r = run_script("mark-image", "--cdx", c, "--spdx", s)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("already marked", r.stdout)
+        self.assertEqual((c.read_bytes(), s.read_bytes()), once)
+        # A mismatched pair fails closed and leaves both files as they were.
+        _, other = make_image_pair("yuzu-server-chisel", SERVER_IMAGE_FILES, version="9.9.9")
+        s2 = self.tmp / "x-image.spdx.json"
+        s2.write_text(json.dumps(other))
+        c2 = self.tmp / "x-image.cdx.json"
+        c2.write_text(json.dumps(make_image_pair("yuzu-server-chisel", SERVER_IMAGE_FILES)[0]))
+        before = (c2.read_bytes(), s2.read_bytes())
+        r = run_script("mark-image", "--cdx", c2, "--spdx", s2)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("describe different images", r.stderr)
+        self.assertEqual((c2.read_bytes(), s2.read_bytes()), before)
+        r = run_script("mark-image", "--cdx", c, "--spdx", s2)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("are not one image's pair", r.stderr)
+        r = run_script("mark-image", "--cdx", self.tmp / "yuzu-linux-x64.cdx.json", "--spdx", s)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(list(self.tmp.glob("*.mark.tmp")), [])
+
+    def test_check_dir_gates_image_markers(self):
+        # Every image pair in the release directory must carry the marker
+        # mark-image would add: a dropped mark-image step fails the release.
+        pairs = {"yuzu-server-image": make_image_pair("yuzu-server", SERVER_IMAGE_FILES),
+                 "yuzu-gateway-chisel-image": make_image_pair("yuzu-gateway-chisel", GATEWAY_IMAGE_FILES,
+                                                              owned=(GATEWAY_IMAGE_FILES[0],)),
+                 "yuzu-postgres-image": make_image_pair("yuzu-postgres", POSTGRES_IMAGE_FILES),
+                 "yuzu-other-image": make_image_pair("yuzu-other", ["usr/bin/busybox"])}
+
+        def write(mark):
+            for stem, (cdx, spdx) in pairs.items():
+                cdx, spdx = json.loads(json.dumps(cdx)), json.loads(json.dumps(spdx))
+                if mark:
+                    load_script().mark_image(cdx, spdx)
+                (self.tmp / f"{stem}.cdx.json").write_text(json.dumps(cdx))
+                (self.tmp / f"{stem}.spdx.json").write_text(json.dumps(spdx))
+
+        # One artifact and its SBOM, so the run reaches the image gate.
+        art = self.tmp / "yuzu-plugins-linux-x64.tar.gz"
+        art.write_bytes(b"plugins")
+        (self.tmp / "yuzu-plugins-linux-x64.cdx.json").write_text(json.dumps({
+            "bomFormat": "CycloneDX", "components": [], "metadata": {
+                "component": {"name": art.name, "hashes": [{"alg": "SHA-256",
+                                                            "content": hashlib.sha256(b"plugins").hexdigest()}]},
+                "properties": [{"name": "yuzu:sbom:unpacked-files", "value": "2"}]}}))
+        write(mark=True)
+        r = run_script("check", "--artifacts-dir", self.tmp)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("4 image SBOM pair(s), OK", r.stdout)
+        write(mark=False)
+        r = run_script("check", "--artifacts-dir", self.tmp)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("yuzu-server-image: the image holds what its SBOM cannot list "
+                      "(server-vendored, image-static-cpp)", r.stderr)
+        self.assertIn("yuzu-gateway-chisel-image: the image holds what its SBOM cannot list (erts-static)", r.stderr)
+        self.assertIn("yuzu-postgres-image: the image holds what its SBOM cannot list (pgvector-source)", r.stderr)
+        self.assertNotIn("yuzu-other-image:", r.stderr)
+        (self.tmp / "yuzu-other-image.spdx.json").unlink()
+        r = run_script("check", "--artifacts-dir", self.tmp)
+        self.assertIn("yuzu-other-image: only cdx.json", r.stderr)
+
+    def test_release_marks_every_yuzu_image_sbom(self):
+        # release.yml runs mark-image on the image SBOM pair of each job that
+        # publishes a release image (the release check above is the backstop;
+        # this fails in PR CI instead).
+        wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        for stem in ("yuzu-${{ matrix.image }}-image", "yuzu-postgres-image", "yuzu-${{ matrix.image }}-chisel-image"):
+            with self.subTest(stem=stem):
+                self.assertIn(f"SBOM: {stem}\n        run: python3 scripts/ci/artifact-sbom.py mark-image "
+                              f'--cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"', wf)
+
     def test_check_refuses_empty(self):
         f = self.tmp / "yuzu-linux-x64.cdx.json"
         f.write_text(json.dumps({"bomFormat": "CycloneDX", "components": []}))
@@ -653,6 +987,22 @@ class ArtifactSbom(unittest.TestCase):
         self.assertNotIn("compositions", cdx)
         self.assertNotIn("NOASSERTION", contained)
         self.assertEqual(self.props(cdx)["yuzu:sbom:unpacked-files"], "2")
+        self.assertNotIn("yuzu:sbom:incomplete-reasons", self.props(cdx))
+        # vcpkg records no copyright text: NOASSERTION, never a made-up one.
+        self.assertNotIn("copyright", by["openssl"])
+        ssl = next(p for p in spdx["packages"] if p["name"] == "openssl")
+        self.assertEqual(ssl["copyrightText"], "NOASSERTION")
+
+    def test_copyright_text_is_carried_from_vcpkg(self):
+        make_vcpkg_tree(self.tmp, copyright_port="zlib")
+        art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-agent": b"x"})
+        r = self.generate(art)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cdx, spdx = self.load("yuzu-linux-x64")
+        self.assertEqual(next(c for c in cdx["components"] if c["name"] == "zlib")["copyright"],
+                         "Copyright (c) The zlib authors")
+        self.assertEqual(next(p for p in spdx["packages"] if p["name"] == "zlib")["copyrightText"],
+                         "Copyright (c) The zlib authors")
 
     def test_server_package_adds_server_feature_and_is_marked_incomplete(self):
         make_vcpkg_tree(self.tmp)
@@ -672,6 +1022,33 @@ class ArtifactSbom(unittest.TestCase):
         self.assertIn({"spdxElementId": root_pkg["SPDXID"], "relationshipType": "CONTAINS",
                        "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
         self.assertIn("incomplete: yuzu-server compiles in vendored C++", root_pkg["comment"])
+        self.assertEqual(self.props(cdx)["yuzu:sbom:incomplete-reasons"], "server-vendored")
+        self.assertIn("incomplete-reasons: server-vendored", root_pkg["comment"])
+
+    def test_gateway_is_marked_incomplete_for_the_erlang_runtime(self):
+        # The gateway bundles ERTS; its emulator beam.smp links in code it
+        # vendors (PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5) that syft, listing
+        # one `erlang` component, does not list. Checked on the v0.15.0
+        # gateway tarball's erts-16.4.0.7/bin/beam.smp on 2026-11-18.
+        art = make_tar(self.tmp / "yuzu-gateway-linux-x64.tar.gz",
+                       {"g/erts-16.4.0.7/bin/beam.smp": b"\x7fELF", "g/erts-16.4.0.7/bin/erlexec": b"\x7fELF",
+                        "g/lib/kernel-10.6/ebin/kernel.app": b"x"})
+        r = self.generate(art, vcpkg=False)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        cdx, spdx = self.load("yuzu-gateway-linux-x64")
+        root_ref = cdx["metadata"]["component"]["bom-ref"]
+        self.assertEqual(cdx["compositions"], [{"aggregate": "incomplete", "assemblies": [root_ref]}])
+        props = self.props(cdx)
+        self.assertEqual(props["yuzu:sbom:incomplete-reasons"], "erts-static")
+        for vendored in ("PCRE2", "asmjit", "zstd", "Ryu"):
+            self.assertIn(vendored, props["yuzu:sbom:incomplete"])
+        self.assertIn("g/erts-16.4.0.7/bin/beam.smp", props["yuzu:sbom:incomplete"])
+        root_pkg = next(p for p in spdx["packages"] if p["SPDXID"].startswith("SPDXRef-DocumentRoot"))
+        self.assertIn({"spdxElementId": root_pkg["SPDXID"], "relationshipType": "CONTAINS",
+                       "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
+        self.assertIn("incomplete-reasons: erts-static", root_pkg["comment"])
+        r = self.check_dir(art)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_port_without_licence_is_warned_and_noted(self):
         make_vcpkg_tree(self.tmp, no_licence="zlib")
@@ -850,6 +1227,10 @@ class ArtifactSbom(unittest.TestCase):
         self.assertIn("left out: plugins/omitted.dll", props["yuzu:sbom:contents"])
         self.assertEqual(cdx["compositions"][0]["aggregate"], "incomplete")
         self.assertIn("InnoSetup runtime", props["yuzu:sbom:incomplete"])
+        # The `*.dll` entry is resolved against the archive, not the build
+        # directory the installer took it from: said, not hidden.
+        self.assertEqual(props["yuzu:sbom:incomplete-reasons"], "installer-runtime, installer-wildcard")
+        self.assertIn("{app}\\bin\\*.dll", props["yuzu:sbom:incomplete"])
         r = self.check_dir(exe)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         # ...and without --contents-from or --iss an installer is refused, not guessed.
@@ -876,6 +1257,33 @@ class ArtifactSbom(unittest.TestCase):
         with mock.patch.object(mod, "UNPACK_TIMEOUT", 1), self.assertRaises(mod.SbomError) as cm:
             mod._run([str(sleeper)])
         self.assertIn("did not finish within 1 s", str(cm.exception))
+
+    def test_rpm_unpack_timeout(self):
+        # rpm2cpio | cpio stalling (a hung pipe) is cut off, both processes
+        # ended, and reported, not waited on until the job's limit.
+        mod = load_script()
+        stubs = self.tmp / "bin"
+        stubs.mkdir()
+        write_exe(stubs / "rpm2cpio", f"#!{sys.executable}\nimport time; time.sleep(30)\n")
+        write_exe(stubs / "cpio", f"#!{sys.executable}\nimport sys; sys.stdin.read()\n")
+        rpm = self.tmp / "yuzu-agent-1.2.3-1.x86_64.rpm"
+        rpm.write_bytes(b"x")
+        dest = self.tmp / "dest"
+        dest.mkdir()
+        with mock.patch.dict(os.environ, {"PATH": str(stubs)}), mock.patch.object(mod, "UNPACK_TIMEOUT", 1), \
+                self.assertRaises(mod.SbomError) as cm:
+            mod.extract(rpm, dest)
+        self.assertIn("rpm2cpio | cpio did not finish within 1 s", str(cm.exception))
+
+    def test_syft_failure_fails_the_run(self):
+        make_vcpkg_tree(self.tmp)
+        art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-agent": b"x"})
+        self.syft = write_exe(self.tmp / "syft-fails", f"#!{sys.executable}\nimport sys\n"
+                                                        f"sys.stderr.write('cataloger exploded\\n'); sys.exit(3)\n")
+        r = self.generate(art)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("::error::syft exited 3: cataloger exploded", r.stderr)
+        self.assertFalse(self.out.exists() and any(self.out.iterdir()))
 
     def test_unexpected_error_is_one_error_line(self):
         make_vcpkg_tree(self.tmp)
@@ -924,12 +1332,17 @@ class ArtifactSbom(unittest.TestCase):
 
     def test_check_dir_passes_and_skips_images(self):
         self._good_pair()
-        # An image SBOM legitimately lists /usr/share/.../tests paths and many packages.
-        (self.tmp / "yuzu-server-image.cdx.json").write_text(json.dumps(
-            {"bomFormat": "CycloneDX", "components": [{"type": "file", "name": "/usr/lib/x/tests/y"}] * 1000}))
+        # An image SBOM legitimately lists /usr/share/.../tests paths and many
+        # packages: it is not held to the artifact rules, only to the marker.
+        cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
+        cdx["components"] += [{"type": "file", "name": "/usr/lib/x/tests/y"}] * 1000
+        load_script().mark_image(cdx, spdx)
+        (self.tmp / "yuzu-server-image.cdx.json").write_text(json.dumps(cdx))
+        (self.tmp / "yuzu-server-image.spdx.json").write_text(json.dumps(spdx))
         r = run_script("check", "--artifacts-dir", self.tmp)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn("2 file(s), OK", r.stdout)
+        self.assertIn("1 image SBOM pair(s), OK", r.stdout)
 
     def test_check_refuses_changed_artifact(self):
         art = self._good_pair()

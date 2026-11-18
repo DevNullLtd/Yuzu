@@ -37,13 +37,27 @@ sees nothing in them. This script makes one SBOM per shipped file instead.
      `<stem>.cdx.json` and `<stem>.spdx.json`, and run the `check` below on both.
 
 Not every component is listed. Code vendored into the source tree (for
-yuzu-server, server/core/vendor: qrcodegen and the embedded web assets) and an
-installer's own runtime (InnoSetup's setup loader and uninstaller) are not, so
-an SBOM for a file holding yuzu-server, and an installer's SBOM, carry a
+yuzu-server, server/core/vendor: qrcodegen and the embedded web assets), an
+installer's own runtime (InnoSetup's setup loader and uninstaller), and the code
+the bundled Erlang runtime's emulator (beam.smp) vendors and links statically
+(PCRE2, asmjit, zstd, Ryu, an MD5 taken from OpenSSL; syft lists the runtime as
+one `erlang` component) are not. An SBOM whose file holds any of them carries a
 CycloneDX composition with `aggregate: incomplete` on the root (SPDX 2.3 has no
 such field: the root gets a `CONTAINS NOASSERTION` relationship, SPDX's way of
-saying no assertion is made that the listed elements are all it contains, and
-the reason in the root's comment).
+saying no assertion is made that the listed elements are all it contains), and
+says why: `yuzu:sbom:incomplete-reasons` holds tokens from the closed set
+INCOMPLETE_REASONS and `yuzu:sbom:incomplete` the prose (CycloneDX metadata
+properties; SPDX: the root's comment). Libraries a binary loads from the
+operating system at run time are not in the file, so they are not a reason.
+
+`mark-image` adds the same marker to a syft scan of a published container
+image, given as its CycloneDX and SPDX pair and rewritten in place, when syft
+lists a statically linked Yuzu C++ binary (whose vcpkg libraries an image scan
+cannot see), the Erlang emulator or the source-built pgvector in it. It refuses
+a pair that does not describe one image, an image labelled as the release's
+server, agent, gateway or postgres image in which syft lists no such file, and
+a pair already marked differently; a pair already marked the same way is left
+as it is.
 
 `check` is the release gate: an artifact SBOM fails when it has more than
 MAX_COMPONENTS entries, has none and does not record that its file was
@@ -51,9 +65,11 @@ unpacked and held files, lists a path with one of the FORBIDDEN_SEGMENTS (a
 checkout, vcpkg or build tree, the docs site or a test tree, the paths a scan of
 the wrong directory lists; a path elsewhere is not detected), or (with
 --artifacts-dir) names an artifact that is absent or whose SHA-256 differs.
-Image SBOMs (`*-image.*`) are not artifact SBOMs and are not checked.
+Image SBOMs (`*-image.*`) are not artifact SBOMs and are not checked against
+those rules; with --artifacts-dir, each image pair must carry the marker
+`mark-image` would add (so a dropped `mark-image` step fails the release).
 
-Stdlib only (Python 3.9+, the macOS runner's); needs syft for `generate`, plus
+Stdlib only (Python 3.9+); needs syft for `generate`, plus
 dpkg-deb (.deb), rpm2cpio and cpio (.rpm) or pkgutil (.pkg) for those formats.
 Every external command runs with a timeout. Pinned by
 tests/test_artifact_sbom.py.
@@ -181,8 +197,10 @@ def _extract_tar(path: Path, dest: Path) -> None:
 
 
 # Python 3.12+ (and 3.8.17+/3.9.17+/3.10.12+/3.11.4+) has tarfile's "data"
-# extraction filter. The macOS runner's Apple python3 (3.9.6) does not, so the
-# fallback below is live there. A module flag so the tests can force it.
+# extraction filter. An older python3 (Apple's /usr/bin/python3 is 3.9.6) does
+# not and takes the fallback below; the v0.15.0 macOS release job ran Homebrew's
+# python3 3.14, so the fallback is not known to run in a release today. A
+# module flag so the tests can force it.
 HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
 
 
@@ -295,6 +313,16 @@ def yuzu_binaries(root: Path) -> tuple[bool, bool]:
     return agent, server
 
 
+# The Erlang runtime's emulator, as relx bundles it (erts-<vsn>/bin/beam.smp).
+ERTS_EMULATOR = "beam.smp"
+
+
+def erts_emulators(root: Path) -> list[str]:
+    """Paths (relative, /-separated) of the Erlang emulators in an unpacked tree."""
+    return sorted(Path(d, f).relative_to(root).as_posix()
+                  for d, _dirs, files in os.walk(root) for f in files if f == ERTS_EMULATOR)
+
+
 def count_files(root: Path) -> int:
     return sum(len(files) for _d, _s, files in os.walk(root))
 
@@ -303,25 +331,67 @@ def count_files(root: Path) -> int:
 
 ISS_ENTRY = re.compile(r'\s*([A-Za-z]+)\s*:\s*("(?:[^"]|"")*"|[^;]*)\s*(?:;|$)')
 
+# An ISPP (Inno Setup preprocessor) directive: `#` then a name. A Pascal
+# character constant in [Code] (`#13#10`, `#$0D`) is `#` then a digit or `$`.
+ISPP_DIRECTIVE = re.compile(r"^#\s*[A-Za-z_]")
+# The only directives allowed, and only before the first section: a default for
+# a name the command line can override, as yuzu-agent.iss's header has:
+#   #ifndef BuildDir / #define BuildDir "..\..\..\build-windows" / #endif
+# Anything else (#include, #if, #pragma, a #define with an expression, any
+# directive inside a section) could add or change [Files] lines this parser
+# would then not see, so it is refused rather than evaluated.
+ISPP_HEADER_LINE = re.compile(r'^#\s*(?:ifndef\s+[A-Za-z_]\w*|define\s+[A-Za-z_]\w*\s+"[^"{}]*"|endif)\s*$')
+# A Source basename this maps the same way Windows' FindFirstFile (which Inno
+# Setup uses) does: a literal name, or one `*` directly before a literal
+# extension (`*.dll`). `?` and `*.*` (which on Windows also matches a name with
+# no dot) are refused. Residual: FindFirstFile also matches a file's 8.3 short
+# name, so on a volume that keeps them `*.dll` would match `x.dllx` too.
+ISS_SOURCE_NAME = re.compile(r"^(?:[^*?]+|[^*?]*\*\.[^*?.]+)$")
+
+# Bytes Python's cp1252 leaves undefined; Windows' code page 1252 maps each to
+# the C1 control of the same value.
+_CP1252_UNDEFINED = re.compile("[\udc80-\udcff]")
+
+
+def read_iss(iss: Path) -> str:
+    """The script's text as the Inno Setup compiler reads it: UTF-8 when the
+    file starts with a UTF-8 byte order mark, otherwise the system's ANSI code
+    page (1252 on the release's Windows runner). A BOM-less script with a byte
+    such as a cp1252 copyright sign (0xA9) is therefore read, not refused."""
+    data = iss.read_bytes()
+    if data.startswith(b"\xef\xbb\xbf"):
+        try:
+            return data[3:].decode("utf-8")
+        except UnicodeDecodeError as e:
+            raise SbomError(f"{iss.name}: starts with a UTF-8 byte order mark but is not UTF-8 ({e})") from e
+    text = data.decode("cp1252", errors="surrogateescape")
+    return _CP1252_UNDEFINED.sub(lambda m: chr(ord(m.group()) - 0xDC00), text)
+
 
 def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
     """[(dest_dir_below_app, source_basename_glob)] for each `Source:` line of
     the [Files] section of an InnoSetup script, e.g.
       Source: "{#BuildDir}\\agents\\plugins\\x\\x.dll"; DestDir: "{app}\\plugins"
     -> ("plugins", "x.dll"). Fails on anything this cannot map onto the
-    archive layout without guessing: a preprocessor directive inside [Files],
-    a DestDir outside {app}, a recursive or DestName entry."""
+    archive layout without guessing: a preprocessor directive other than the
+    header defaults (ISPP_HEADER_LINE), an ISPP expansion in a Source name or a
+    DestDir, a DestDir outside {app}, a recursive or DestName entry, a Source
+    name with a wildcard other than `*.<ext>`."""
     entries, section = [], None
-    for lineno, raw in enumerate(iss.read_text(encoding="utf-8-sig").splitlines(), 1):
+    for lineno, raw in enumerate(read_iss(iss).splitlines(), 1):
         line = raw.strip()
+        where = f"{iss.name}:{lineno}"
+        if ISPP_DIRECTIVE.match(line):
+            if section is not None or not ISPP_HEADER_LINE.match(line):
+                raise SbomError(f"{where}: preprocessor directive {line!r}: this script evaluates no ISPP, "
+                                f"and only a #ifndef/#define \"literal\"/#endif default before the first "
+                                f"section cannot change the [Files] lines")
+            continue
         if line.startswith("[") and line.endswith("]"):
             section = line[1:-1].strip().lower()
             continue
         if section != "files" or not line or line.startswith(";"):
             continue
-        where = f"{iss.name}:{lineno}"
-        if line.startswith("#"):
-            raise SbomError(f"{where}: preprocessor directive inside [Files]; this script does not evaluate ISPP")
         fields = {}
         pos = 0
         while pos < len(line):
@@ -341,8 +411,14 @@ def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
         dest = fields.get("destdir", "").replace("/", "\\")
         if dest.lower() != "{app}" and not dest.lower().startswith("{app}\\"):
             raise SbomError(f"{where}: DestDir {dest!r} is not under {{app}}")
+        name = fields["source"].replace("/", "\\").rsplit("\\", 1)[-1]
+        if "{#" in dest or "{#" in name:
+            raise SbomError(f"{where}: an ISPP expansion in the Source name or DestDir is not evaluated here")
+        if not ISS_SOURCE_NAME.match(name):
+            raise SbomError(f"{where}: Source name {name!r}: only a literal name or `*.<ext>` is mapped "
+                            f"onto the archive the way Inno Setup resolves it")
         sub = "/".join(p for p in dest[len("{app}"):].split("\\") if p)
-        entries.append((sub, fields["source"].replace("/", "\\").rsplit("\\", 1)[-1]))
+        entries.append((sub, name))
     if not entries:
         raise SbomError(f"{iss.name}: no Source: lines in a [Files] section")
     return entries
@@ -371,9 +447,14 @@ def keep_installed(contents: Path, entries: list[tuple[str, str]]):
             else:
                 dropped.append(rel)
                 os.remove(os.path.join(dirpath, f))
-    unmatched = [f"{{app}}\\{sub.replace('/', chr(92))}\\{pat}" if sub else f"{{app}}\\{pat}"
-                 for i, (sub, pat) in enumerate(entries) if i not in used]
+    unmatched = [app_path(sub, pat) for i, (sub, pat) in enumerate(entries) if i not in used]
     return sorted(kept), sorted(dropped), unmatched
+
+
+def app_path(sub: str, pat: str) -> str:
+    """An iss_file_entries() entry as the script names it: ("plugins", "x.dll")
+    -> {app}\\plugins\\x.dll."""
+    return "\\".join(["{app}"] + [p for p in sub.split("/") if p] + [pat])
 
 
 # ── vcpkg ────────────────────────────────────────────────────────────────────
@@ -505,13 +586,18 @@ def vcpkg_components(installed: Path, triplet: str, names: list[str], ports: dic
         lic = port_pkg.get("licenseConcluded") or "NOASSERTION"
         if lic in ("NOASSERTION", "NONE"):
             lic = port_pkg.get("licenseDeclared") or "NOASSERTION"
+        # vcpkg's own SPDX file records no copyright text today (NOASSERTION
+        # on every port checked, 2026-11-18); one that does is carried over.
+        copyright_text = port_pkg.get("copyrightText")
+        if copyright_text in (None, "", "NOASSERTION", "NONE"):
+            copyright_text = None
         cpe = None
         if port in NVD_CPE:
             cpe_version = re.sub(r"([^A-Za-z0-9._-])", r"\\\1", version)  # CPE 2.3 quoting
             cpe = f"cpe:2.3:a:{NVD_CPE[port]}:{cpe_version}:*:*:*:*:*:*:*"
         out.append({
             "port": port, "version": version, "port_version": ports[port]["port_version"], "cpe": cpe,
-            "license": None if lic in ("NOASSERTION", "NONE") else lic,
+            "license": None if lic in ("NOASSERTION", "NONE") else lic, "copyright": copyright_text,
             "homepage": port_pkg.get("homepage"), "download": download, "vcs": vcs,
             "purl": purl, "vcpkg_purl": vcpkg_purl, "triplet": triplet,
         })
@@ -534,6 +620,18 @@ def _hex_purl(purl: str, hexmap: dict):
 
 # ── Merging ──────────────────────────────────────────────────────────────────
 
+def _cdx_mark_incomplete(doc: dict, root: dict) -> None:
+    doc["compositions"] = (doc.get("compositions") or []) + [
+        {"aggregate": "incomplete", "assemblies": [root["bom-ref"]]}]
+
+
+def _spdx_mark_incomplete(doc: dict, root: dict) -> None:
+    # SPDX 2.3 has no completeness field; NOASSERTION as the related element
+    # says no assertion is made that the listed ones are all the root holds.
+    doc.setdefault("relationships", []).append(
+        {"spdxElementId": root["SPDXID"], "relationshipType": "CONTAINS", "relatedSpdxElement": "NOASSERTION"})
+
+
 def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
               vcomps: list[dict], hexmap: dict, incomplete: bool = False) -> dict:
     meta = doc.setdefault("metadata", {})
@@ -546,8 +644,7 @@ def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
     if incomplete:
         # The artifact holds components this SBOM does not list (notes say
         # which kind): machine-readable, not only prose.
-        doc["compositions"] = (doc.get("compositions") or []) + [
-            {"aggregate": "incomplete", "assemblies": [root["bom-ref"]]}]
+        _cdx_mark_incomplete(doc, root)
     comps = doc.setdefault("components", [])
     for c in comps:
         new = _hex_purl(c.get("purl"), hexmap)
@@ -561,6 +658,8 @@ def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
             c["cpe"] = v["cpe"]
         if v["license"]:
             c["licenses"] = [{"expression": v["license"]}]
+        if v["copyright"]:
+            c["copyright"] = v["copyright"]
         refs = []
         if v["vcs"]:
             refs.append({"type": "vcs", "url": v["vcs"]})
@@ -596,11 +695,7 @@ def merge_spdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
                  "checksums": [{"algorithm": "SHA256", "checksumValue": sha}],
                  "comment": "; ".join(f"{k}: {v}" for k, v in notes.items())})
     if incomplete:
-        # SPDX 2.3 has no completeness field; NOASSERTION as the related
-        # element says no assertion is made that the listed ones are all.
-        doc.setdefault("relationships", []).append(
-            {"spdxElementId": root["SPDXID"], "relationshipType": "CONTAINS",
-             "relatedSpdxElement": "NOASSERTION"})
+        _spdx_mark_incomplete(doc, root)
     for p in doc.get("packages", []):
         for ref in p.get("externalRefs", []) or []:
             if ref.get("referenceType") == "purl":
@@ -618,7 +713,7 @@ def merge_spdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
                              f"triplet {v['triplet']}, built into the binaries this artifact ships",
                "licenseConcluded": "NOASSERTION",
                "licenseDeclared": v["license"] or "NOASSERTION",
-               "copyrightText": "NOASSERTION",
+               "copyrightText": v["copyright"] or "NOASSERTION",
                "externalRefs": [{"referenceCategory": "PACKAGE-MANAGER", "referenceType": "purl",
                                  "referenceLocator": v["purl"]}]}
         if v["cpe"]:
@@ -725,12 +820,196 @@ def is_image_sbom(name: str) -> bool:
     return name.endswith(("-image.cdx.json", "-image.spdx.json"))
 
 
+# ── Image SBOMs ──────────────────────────────────────────────────────────────
+
+# The OCI title label the release workflow sets on every image it publishes, as
+# syft records it on a CycloneDX image SBOM.
+IMAGE_TITLE_PROPERTY = "syft:image:labels:org.opencontainers.image.title"
+# Titles of the release's Yuzu images (docker-publish: yuzu-<image>;
+# docker-publish-chisel: yuzu-<image>-chisel). Such an image must show syft
+# listing what its title promises, or the marker would silently not be added.
+YUZU_IMAGE_TITLE = re.compile(r"^yuzu-(server|agent|gateway|postgres)(?:-chisel)?$")
+
+
+def _image_roots(cdx: dict, spdx: dict) -> tuple[dict, dict]:
+    """The described image in each document, after checking that both are a
+    syft scan of ONE container image (not an artifact SBOM, not a mixed pair)."""
+    if cdx.get("bomFormat") != "CycloneDX":
+        raise SbomError("--cdx is not a CycloneDX JSON document")
+    if "spdxVersion" not in spdx:
+        raise SbomError("--spdx is not an SPDX JSON document")
+    croot = (cdx.get("metadata") or {}).get("component") or {}
+    sroot = _spdx_root(spdx)
+    if croot.get("type") != "container" or sroot.get("primaryPackagePurpose") != "CONTAINER":
+        raise SbomError("not an image SBOM: the described root is not a container image")
+    if (croot.get("name"), croot.get("version")) != (sroot.get("name"), sroot.get("versionInfo")):
+        raise SbomError(f"the two SBOMs describe different images: {croot.get('name')}@{croot.get('version')} "
+                        f"(CycloneDX), {sroot.get('name')}@{sroot.get('versionInfo')} (SPDX)")
+    return croot, sroot
+
+
+def image_incomplete_reasons(cdx: dict, spdx: dict) -> list[tuple[str, str]]:
+    """[(token, detail)] for what an image holds that its syft scan cannot list:
+    Yuzu C++ binaries (their static vcpkg libraries), the Erlang emulator
+    (what it vendors) and the source-built pgvector. syft 1.57 records an unpackaged binary as an SPDX file
+    only, not as a CycloneDX component, so both documents are read."""
+    croot, _sroot = _image_roots(cdx, spdx)
+    listed = [c.get("name", "") for c in _cdx_components(cdx.get("components")) if c.get("type") == "file"]
+    listed += [f.get("fileName", "") for f in spdx.get("files", []) or []]
+    paths = sorted({"/" + p.replace("\\", "/").lstrip("/") for p in listed if p})
+
+    def base(p):
+        return installed_name(p.rsplit("/", 1)[-1])
+    server = [p for p in paths if base(p) in SERVER_NAMES]
+    cpp = [p for p in paths if base(p) in SERVER_NAMES or base(p) in AGENT_NAMES or base(p).startswith(AGENT_PREFIXES)]
+    erts = [p for p in paths if base(p) == ERTS_EMULATOR]
+    pgvector = [p for p in paths if base(p) == "vector.so" and "/postgresql/" in p]
+    title = next((p.get("value", "") for p in (croot.get("properties") or []) +
+                  ((cdx.get("metadata") or {}).get("properties") or []) if p.get("name") == IMAGE_TITLE_PROPERTY), "")
+    m = YUZU_IMAGE_TITLE.match(title)
+    if m:
+        want = {"server": ("yuzu-server", server), "agent": ("yuzu-agent", cpp),
+                "gateway": ("the Erlang emulator (beam.smp)", erts),
+                "postgres": ("pgvector (vector.so)", pgvector)}[m.group(1)]
+        if not want[1]:
+            raise SbomError(f"image {croot.get('name')} is labelled {title}, but syft lists no {want[0]} in it: "
+                            f"refusing to leave its SBOM unmarked (did syft stop listing unpackaged files?)")
+    reasons: list[tuple[str, str]] = []
+    if server:
+        reasons.append(("server-vendored", ""))
+    if cpp:
+        reasons.append(("image-static-cpp", ", ".join(cpp)))
+    if erts:
+        reasons.append(("erts-static", ", ".join(erts)))
+    if pgvector:
+        reasons.append(("pgvector-source", ", ".join(pgvector)))
+    return reasons
+
+
+def _reason_tokens(value) -> list[str]:
+    return [t.strip() for t in (value or "").split(",") if t.strip()]
+
+
+def image_marker(cdx: dict, spdx: dict):
+    """(cdx_tokens, spdx_tokens): the incomplete-reason tokens each document
+    carries, or None where it carries no incompleteness marker at all."""
+    croot, sroot = _image_roots(cdx, spdx)
+    cmarked = any(c.get("aggregate") == "incomplete" and croot.get("bom-ref") in (c.get("assemblies") or [])
+                  for c in cdx.get("compositions") or [])
+    ctok = next((p.get("value") for p in (cdx.get("metadata") or {}).get("properties") or []
+                 if p.get("name") == "yuzu:sbom:incomplete-reasons"), None)
+    smarked = any(r.get("spdxElementId") == sroot.get("SPDXID") and r.get("relationshipType") == "CONTAINS"
+                  and r.get("relatedSpdxElement") == "NOASSERTION" for r in spdx.get("relationships") or [])
+    m = re.search(r"(?:^|; )incomplete-reasons: ([^;]*)(?:;|$)", sroot.get("comment") or "")
+    return (_reason_tokens(ctok) if cmarked or ctok is not None else None,
+            _reason_tokens(m and m.group(1)) if smarked or m else None)
+
+
+def mark_image(cdx: dict, spdx: dict) -> tuple[list[str], bool]:
+    """Mark an image SBOM pair incomplete, in place, for what
+    image_incomplete_reasons() finds. Returns (tokens, changed). Idempotent: a
+    pair already carrying exactly those tokens (marker included) is left as it
+    is. Any other existing marker, on either document, is refused."""
+    reasons = image_incomplete_reasons(cdx, spdx)
+    notes = incomplete_notes(reasons)
+    want = _reason_tokens(notes.get("incomplete-reasons"))
+    have = image_marker(cdx, spdx)
+    if have == (None, None):
+        if not want:
+            return [], False
+    elif have == (want, want) and want:
+        return want, False
+    else:
+        raise SbomError(f"the pair is already marked {have[0]} (CycloneDX) / {have[1]} (SPDX), not {want}: "
+                        f"mark a fresh syft scan")
+    croot, sroot = _image_roots(cdx, spdx)
+    croot.setdefault("bom-ref", "image")
+    _cdx_mark_incomplete(cdx, croot)
+    meta = cdx.setdefault("metadata", {})
+    meta["properties"] = (meta.get("properties") or []) + [
+        {"name": f"yuzu:sbom:{k}", "value": v} for k, v in notes.items()]
+    _spdx_mark_incomplete(spdx, sroot)
+    sroot["comment"] = "; ".join([c for c in [sroot.get("comment")] if c] + [f"{k}: {v}" for k, v in notes.items()])
+    return want, True
+
+
+def image_pair_errors(adir: Path) -> list[str]:
+    """The release gate for image SBOMs in `adir`: each `<stem>-image.cdx.json`
+    has its SPDX partner, and the pair carries the marker mark-image adds."""
+    stems: dict = {}
+    for p in sorted(adir.iterdir()):
+        if is_image_sbom(p.name):
+            stem, _, fmt = p.name.rpartition("-image.")
+            stems.setdefault(stem, {})[fmt] = p
+    errs = []
+    for stem, pair in sorted(stems.items()):
+        if set(pair) != {"cdx.json", "spdx.json"}:
+            errs.append(f"{stem}-image: only {', '.join(sorted(pair))}; an image SBOM is a CycloneDX and SPDX pair")
+            continue
+        try:
+            cdx, spdx = (json.loads(pair[f].read_text(encoding="utf-8")) for f in ("cdx.json", "spdx.json"))
+            want = _reason_tokens(incomplete_notes(image_incomplete_reasons(cdx, spdx)).get("incomplete-reasons"))
+            have = image_marker(cdx, spdx)
+        except (OSError, ValueError, SbomError) as e:
+            errs.append(f"{stem}-image: {e}")
+            continue
+        if want and have != (want, want):
+            marked = "carries no marker" if have == (None, None) else f"is marked {have[0]} / {have[1]}"
+            errs.append(f"{stem}-image: the image holds what its SBOM cannot list ({', '.join(want)}), but the pair "
+                        f"{marked}: run `artifact-sbom.py mark-image` on a fresh scan")
+        elif not want and have != (None, None):
+            errs.append(f"{stem}-image: marked incomplete ({have[0]} / {have[1]}) for nothing the image is seen to hold")
+    return errs
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 # What a file holding yuzu-server carries that no SBOM lists yet.
 SERVER_UNLISTED = ("yuzu-server compiles in vendored C++ (server/core/vendor: qrcodegen) and embeds web "
                    "assets (htmx, ECharts, three.js, Cytoscape, IBM Plex fonts) that this SBOM does not list")
 INSTALLER_UNLISTED = "the installer's own InnoSetup runtime (setup loader and uninstaller) is not listed"
+
+# Why an SBOM says it is incomplete: a CLOSED set. An SBOM carrying the marker
+# names its reasons by these tokens, comma-separated, in
+# `yuzu:sbom:incomplete-reasons` (CycloneDX metadata property; SPDX: the root's
+# comment), and the prose (each entry below, with any detail after a colon) in
+# `yuzu:sbom:incomplete`, joined by " | ". A consumer may rely on the tokens;
+# the prose may change. docs/user-manual/release-verification.md documents the
+# same set and tests/test_artifact_sbom.py fails if the two differ. A new
+# reason is a new token here and a new row there; never reuse one for another
+# meaning.
+INCOMPLETE_REASONS = {
+    "server-vendored": SERVER_UNLISTED,
+    "installer-runtime": INSTALLER_UNLISTED,
+    "installer-wildcard": ("the installer's script installs a wildcard Source (a `*.dll` from the build directory), "
+                           "listed here as the archive's matching files, so a file the build directory held "
+                           "beyond the archive's would not be listed"),
+    "installer-file-missing": ("the installer's script installs a file the archive this SBOM is made from does "
+                               "not hold, so it is not listed"),
+    "erts-static": ("the bundled Erlang runtime is listed as one component (erlang), but its emulator beam.smp "
+                    "links in code it vendors (PCRE2, asmjit, zstd, Ryu, an MD5 taken from OpenSSL) that this "
+                    "SBOM does not list"),
+    "image-static-cpp": ("the image holds Yuzu C++ binaries whose vcpkg libraries are linked statically, which an "
+                         "image scan cannot see: the SBOM of the matching package or archive lists them"),
+    "pgvector-source": ("the image's pgvector extension is built from source (deploy/docker/Dockerfile.postgres) "
+                        "and has no package record, so the image scan does not list it"),
+}
+
+
+def incomplete_notes(reasons: list[tuple[str, str]]) -> dict:
+    """{"incomplete": prose, "incomplete-reasons": tokens} for [(token, detail)];
+    {} for none. A token outside INCOMPLETE_REASONS is a bug, not a new reason."""
+    tokens: list[str] = []
+    prose: list[str] = []
+    for token, detail in reasons:
+        if token not in INCOMPLETE_REASONS:
+            raise SbomError(f"internal: {token!r} is not an incomplete reason (INCOMPLETE_REASONS)")
+        if token not in tokens:
+            tokens.append(token)
+        prose.append(INCOMPLETE_REASONS[token] + (f": {detail}" if detail else ""))
+    if not tokens:
+        return {}
+    return {"incomplete": " | ".join(prose), "incomplete-reasons": ", ".join(tokens)}
 
 
 def _syft(a, contents: Path, artifact: Path, syft_cdx: Path, syft_spdx: Path) -> None:
@@ -752,12 +1031,13 @@ def _describe(a, artifact: Path, tmp: Path):
     contents.mkdir()
     source = Path(a.contents_from) if a.contents_from else artifact
     extract(source, contents)
-    incomplete: list[str] = []
+    incomplete: list[tuple[str, str]] = []
     if a.contents_from is None:
         notes = {"artifact": artifact.name, "contents": f"unpacked from {source.name}"}
     else:
         iss = Path(a.iss)
-        kept, dropped, unmatched = keep_installed(contents, iss_file_entries(iss))
+        entries = iss_file_entries(iss)
+        kept, dropped, unmatched = keep_installed(contents, entries)
         contents_note = (f"{artifact.name} is not unpacked here; its contents are the {len(kept)} file(s) of "
                          f"{source.name}, built from the same output, that {iss.name} installs (its [Files] "
                          f"Source: lines, resolved against the archive's layout)")
@@ -767,10 +1047,13 @@ def _describe(a, artifact: Path, tmp: Path):
             print(f"::warning::{artifact.name}: {len(dropped)} file(s) of {source.name} are not installed by "
                   f"{iss.name} and are left out of its SBOM: {shown}", file=sys.stderr)
         notes = {"artifact": artifact.name, "contents": contents_note}
-        incomplete.append(INSTALLER_UNLISTED)
+        incomplete.append(("installer-runtime", ""))
+        wild = [app_path(sub, pat) for sub, pat in entries if "*" in pat]
+        if wild:
+            incomplete.append(("installer-wildcard", ", ".join(wild)))
         if unmatched:
-            incomplete.append(f"{iss.name} installs {', '.join(unmatched)}, which {source.name} does not hold, "
-                              f"so it is not listed")
+            incomplete.append(("installer-file-missing", f"{iss.name} installs {', '.join(unmatched)}, "
+                                                         f"which {source.name} does not hold"))
             print(f"::warning::{artifact.name}: {iss.name} installs {', '.join(unmatched)}, which {source.name} "
                   f"does not hold; not listed", file=sys.stderr)
     files = count_files(contents)
@@ -797,9 +1080,11 @@ def _describe(a, artifact: Path, tmp: Path):
     elif a.vcpkg_installed:
         raise SbomError(f"{artifact.name}: --vcpkg-installed given but no Yuzu C++ binary found in it")
     if server:
-        incomplete.insert(0, SERVER_UNLISTED)
-    if incomplete:
-        notes["incomplete"] = " | ".join(incomplete)
+        incomplete.insert(0, ("server-vendored", ""))
+    erts = erts_emulators(contents)
+    if erts:
+        incomplete.append(("erts-static", ", ".join(erts)))
+    notes.update(incomplete_notes(incomplete))
     hexmap = hex_packages(Path(a.rebar_lock)) if a.rebar_lock else {}
     syft_cdx, syft_spdx = tmp / "syft.cdx.json", tmp / "syft.spdx.json"
     _syft(a, contents, artifact, syft_cdx, syft_spdx)
@@ -821,7 +1106,7 @@ def cmd_generate(a) -> int:
     # mkdtemp + a cleanup that cannot fail the run: on Windows an indexer or
     # Defender handle on an unpacked DLL makes removal raise PermissionError
     # after the SBOMs are already made (and TemporaryDirectory's
-    # ignore_cleanup_errors needs Python 3.10; the macOS runner has 3.9).
+    # ignore_cleanup_errors needs Python 3.10, and this script supports 3.9).
     tmp = Path(tempfile.mkdtemp(prefix="yuzu_sbom_", dir=os.environ.get("RUNNER_TEMP") or None))
     try:
         cdx, spdx, vcomps = _describe(a, artifact, tmp)
@@ -856,11 +1141,51 @@ def cmd_check(a) -> int:
         if not files:
             raise SbomError(f"no artifact SBOMs in {adir}")
     errs = [e for f in files for e in check_file(f, adir, a.max_components)]
+    images = ""
+    if adir is not None and not a.sboms:
+        image_errs = image_pair_errors(adir)
+        errs += image_errs
+        n = len({p.name.rpartition("-image.")[0] for p in adir.iterdir() if is_image_sbom(p.name)})
+        images = f"; {n} image SBOM pair(s), {'FAILED' if image_errs else 'OK'}"
     for e in errs:
         print(f"::error::{e}", file=sys.stderr)
     print(f"artifact SBOM check: {len(files)} file(s), {'FAILED' if errs else 'OK'} "
-          f"(bound {a.max_components} entries; no path under {FORBIDDEN_LABEL})")
+          f"(bound {a.max_components} entries; no path under {FORBIDDEN_LABEL}){images}")
     return 1 if errs else 0
+
+
+def cmd_mark_image(a) -> int:
+    paths = [Path(a.cdx), Path(a.spdx)]
+    for p, suffix in zip(paths, ("-image.cdx.json", "-image.spdx.json")):
+        if not p.name.endswith(suffix):
+            raise SbomError(f"{p.name}: an image SBOM is named *{suffix} (the release's artifact SBOM check "
+                            f"treats only those as image SBOMs)")
+    if paths[0].name[: -len("-image.cdx.json")] != paths[1].name[: -len("-image.spdx.json")]:
+        raise SbomError(f"{paths[0].name} and {paths[1].name} are not one image's pair")
+    try:
+        cdx, spdx = (json.loads(p.read_text(encoding="utf-8")) for p in paths)
+    except (OSError, ValueError) as e:
+        raise SbomError(str(e)) from e
+    tokens, changed = mark_image(cdx, spdx)
+    label = f"{paths[0].name}, {paths[1].name}"
+    if not changed:
+        print(f"{label}: {'already marked incomplete (' + ', '.join(tokens) + ')' if tokens else 'nothing the scan cannot list; left unchanged'}")
+        return 0
+    # Both files are written out before either is replaced, so a failed write
+    # leaves the syft pair as it was rather than one file marked.
+    tmps = [p.with_name(p.name + ".mark.tmp") for p in paths]
+    try:
+        for t, doc in zip(tmps, (cdx, spdx)):
+            with open(t, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(doc, indent=2) + "\n")
+        for t, p in zip(tmps, paths):
+            os.replace(t, p)
+    finally:
+        for t in tmps:
+            if t.exists():
+                t.unlink()
+    print(f"{label}: marked incomplete ({', '.join(tokens)})")
+    return 0
 
 
 def main(argv=None) -> int:
@@ -883,8 +1208,13 @@ def main(argv=None) -> int:
     c.add_argument("--artifacts-dir")
     c.add_argument("--max-components", type=int, default=MAX_COMPONENTS)
     c.add_argument("sboms", nargs="*")
+    mi = sub.add_parser("mark-image", help="mark a syft image SBOM pair incomplete where the image holds what the "
+                                           "scan cannot list, in place")
+    mi.add_argument("--cdx", required=True, help="the image's CycloneDX SBOM (*-image.cdx.json)")
+    mi.add_argument("--spdx", required=True, help="the same image's SPDX SBOM (*-image.spdx.json)")
     a = ap.parse_args(argv)
-    label = Path(a.artifact).name if a.cmd == "generate" else "artifact SBOM check"
+    label = {"generate": lambda: Path(a.artifact).name, "mark-image": lambda: Path(a.cdx).name}.get(
+        a.cmd, lambda: "artifact SBOM check")()
     try:
         if a.cmd == "generate":
             if a.vcpkg_installed and not (a.triplet and a.manifest):
@@ -893,6 +1223,8 @@ def main(argv=None) -> int:
                 raise SbomError("--contents-from and --iss go together: the installer's SBOM lists only "
                                 "the archive files its script installs")
             return cmd_generate(a)
+        if a.cmd == "mark-image":
+            return cmd_mark_image(a)
         return cmd_check(a)
     except SbomError as e:
         print(f"::error::{e}", file=sys.stderr)
