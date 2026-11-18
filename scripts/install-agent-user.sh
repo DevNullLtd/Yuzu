@@ -228,8 +228,10 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         --check)          ACTION="check"; shift ;;
         --uninstall)      ACTION="uninstall"; shift ;;
-        --account-name)   ACCOUNT_NAME="$2"; shift 2 ;;
-        --binary-path)    BINARY_PATH="$2"; BINARY_PATH_EXPLICIT=1; shift 2 ;;
+        --account-name)   [[ $# -ge 2 ]] || { echo "--account-name needs a value; use --help for usage." >&2; exit 2; }
+                          ACCOUNT_NAME="$2"; shift 2 ;;
+        --binary-path)    [[ $# -ge 2 ]] || { echo "--binary-path needs a value; use --help for usage." >&2; exit 2; }
+                          BINARY_PATH="$2"; BINARY_PATH_EXPLICIT=1; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
         --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
@@ -1744,10 +1746,14 @@ strip_file_capabilities() {
         # Loud, on stderr: this flag can leave an exploitable file capability on a binary that
         # any local user can execute, and the install still exits 0.
         if [[ -f "$BINARY_PATH" ]] && command -v getcap >/dev/null 2>&1; then
-            if read_file_caps && [[ -n "$FILE_CAPS_OUT" ]]; then
+            if ! read_file_caps; then
+                warn "--no-cap-cleanup: getcap could not read $BINARY_PATH: cannot tell whether it carries file capabilities"
+            elif [[ -n "$FILE_CAPS_OUT" ]]; then
                 warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $FILE_CAPS_OUT"
                 warn "  any local user can run that binary with them; remove with: setcap -r $BINARY_PATH"
             fi
+        elif [[ -f "$BINARY_PATH" ]]; then
+            warn "--no-cap-cleanup: getcap not found on PATH: cannot tell whether $BINARY_PATH carries file capabilities"
         fi
         return 0
     fi
@@ -1871,9 +1877,13 @@ check_install() {
                 ((errs++))
             fi
         else
-            warn "getcap not installed: cannot verify that $BINARY_PATH carries no file capability"
+            warn "getcap not found on PATH: cannot verify that $BINARY_PATH carries no file capability"
             ((errs++))
         fi
+    elif [[ "$PLATFORM" == "linux" ]]; then
+        # Only reachable with the DEFAULT path (an explicit --binary-path that is not a file
+        # exits 2 earlier): a host that runs the agent from a build tree has nothing at the default.
+        log "file-capability check skipped: no binary at $BINARY_PATH (default path); pass --binary-path to check a binary. A pass does not prove any agent binary is capability-free"
     fi
 
     if [[ "$errs" -eq 0 ]]; then

@@ -1981,7 +1981,7 @@
       "if_refused": "Not observed in this capture.",
       "measured": "2026-09-06, container, captured at **euid 0 (root)** — broader than the deployed unprivileged account.",
       "os": "Linux",
-      "runs_as": "Agent account (`yuzu-agent` on the packaged unit); not root. The `echo.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` set on the binary by `scripts/install-agent-user.sh`"
+      "runs_as": "Agent account (`yuzu-agent` on the packaged unit); not root. The `echo.*` row of `docs/agent-privilege-model.md` assumes `cap_dac_read_search` granted ambiently by the packaged unit (or by `start-UAT.sh --as-user` via `setpriv`); the install script sets no file capability"
     }
   ],
   "readme": "agents/plugins/echo/README.md",

@@ -73,8 +73,9 @@ def run_installer(script: pathlib.Path, args, *, caps: bool, setcap: bool, getca
             _stub(stubs, "getcap", "exit 1")
         elif getcap:
             _stub(stubs, "getcap", 'echo "$1 cap_net_admin+eip"' if caps else "exit 0")
+        calls = d / "setcap.calls"
         if setcap:
-            _stub(stubs, "setcap", "exit 0")
+            _stub(stubs, "setcap", f'echo "$@" >> "{calls}"; exit 0')
         binary = d / "yuzu-agent"
         binary.write_text("x")
         env = {"PATH": f"{stubs}:/usr/bin:/bin", "HOME": str(d), "LC_ALL": "C"}
@@ -83,7 +84,71 @@ def run_installer(script: pathlib.Path, args, *, caps: bool, setcap: bool, getca
             argv += ["--binary-path", str(binary)]
         r = subprocess.run(argv + list(args),
                            capture_output=True, text=True, env=env, timeout=120)
+        r.setcap_calls = calls.read_text().splitlines() if calls.exists() else []
         return r
+
+
+def strip_block(script_text: str) -> str:
+    """The read_file_caps + strip_file_capabilities functions, extracted verbatim."""
+    i = script_text.index("# Reads the file capabilities of $BINARY_PATH")
+    j = script_text.index("# ── verification ──")
+    return script_text[i:j]
+
+
+def run_strip(block: str, scenario: str):
+    """Runs the extracted functions NON-dry with tool stubs (the --dry-run cases never reach the
+    post-strip checks). scenario: sticky | setcap_fails | post_stderr | bad_tmpdir | clean.
+    Returns (rc, setcap_argvs, leftover_tmp_files)."""
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_strip_") as d:
+        d = pathlib.Path(d)
+        stubs, tmp = d / "stubs", d / "tmp"
+        stubs.mkdir()
+        tmp.mkdir()
+        counter = d / "getcap.n"
+        calls = d / "setcap.calls"
+        if scenario == "clean":
+            _stub(stubs, "getcap", "exit 0")
+        elif scenario == "setcap_fails":
+            # caps on the first read, none on the second: only the failed `setcap -r` can fail the run
+            _stub(stubs, "getcap", f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"; '
+                  'if [ "$n" -eq 1 ]; then echo "$1 cap_net_admin+eip"; fi')
+        elif scenario == "post_stderr":
+            _stub(stubs, "getcap", f'n=$(cat "{counter}" 2>/dev/null || echo 0); n=$((n+1)); echo $n > "{counter}"; '
+                  'if [ "$n" -eq 1 ]; then echo "$1 cap_net_admin+eip"; else echo "boom" >&2; fi')
+        else:
+            _stub(stubs, "getcap", 'echo "$1 cap_net_admin+eip"')
+        _stub(stubs, "setcap", f'echo "$@" >> "{calls}"; ' + ("exit 1" if scenario == "setcap_fails" else "exit 0"))
+        binary = d / "yuzu-agent"
+        binary.write_text("x")
+        driver = (f'PLATFORM=linux SKIP_SETCAP=0 DRY_RUN=0 BINARY_PATH="{binary}"\n'
+                  'log() { :; }\nwarn() { echo "$*" >&2; }\nrun() { "$@"; }\n' + block +
+                  '\nstrip_file_capabilities\necho "RC=$?"\n')
+        tmpdir = "/nonexistent-dir" if scenario == "bad_tmpdir" else str(tmp)
+        env = {"PATH": f"{stubs}:/usr/bin:/bin", "TMPDIR": tmpdir, "HOME": str(d), "LC_ALL": "C"}
+        r = subprocess.run(["/bin/bash", "-c", driver], capture_output=True, text=True, env=env, timeout=60)
+        m = re.search(r"RC=(\d+)", r.stdout)
+        return (int(m.group(1)) if m else None,
+                calls.read_text().splitlines() if calls.exists() else [],
+                [p.name for p in tmp.iterdir()])
+
+
+def check_strip(script_text: str) -> list[str]:
+    errs = []
+    block = strip_block(script_text)
+    for scenario, want_rc in (("sticky", 5), ("setcap_fails", 5), ("post_stderr", 5), ("bad_tmpdir", 5),
+                              ("clean", 0)):
+        rc, setcaps, left = run_strip(block, scenario)
+        if rc != want_rc:
+            errs.append(f"strip ({scenario}): expected rc {want_rc}, got {rc}")
+        if left:
+            errs.append(f"strip ({scenario}): temp files left behind: {left}")
+        if scenario == "clean" and setcaps:
+            errs.append(f"strip (clean): setcap must not be called on a clean binary, got {setcaps}")
+        if scenario in ("sticky", "post_stderr") and not any(c.startswith("-r ") for c in setcaps):
+            errs.append(f"strip ({scenario}): expected a `setcap -r <path>` call, got {setcaps}")
+        if any(not c.startswith("-r ") for c in setcaps):
+            errs.append(f"strip ({scenario}): a setcap call other than `-r <path>`: {setcaps}")
+    return errs
 
 
 def check(script: pathlib.Path, uat_text=None) -> list[str]:
@@ -101,8 +166,11 @@ def check(script: pathlib.Path, uat_text=None) -> list[str]:
     uat = uat_text if uat_text is not None else (ROOT / "scripts/start-UAT.sh").read_text()
     if '[ -s "$getcap_err" ]' not in uat or '"$getcap_rc" -ne 0' not in uat:
         errs.append("start-UAT.sh step 4b must treat a getcap failure or stderr as unverifiable")
+    errs += check_strip(code)
     r = run_installer(script, [], caps=True, setcap=True)
     out = r.stdout + r.stderr
+    if r.setcap_calls:
+        errs.append(f"--dry-run must not execute setcap, got {r.setcap_calls}")
     if r.returncode != 0 or not re.search(r"\[dry-run\] setcap -r ", out):
         errs.append(f"caps found: expected exit 0 and one `setcap -r` (rc {r.returncode})")
     if re.search(r"\[dry-run\] setcap(?! -r)", out):
@@ -117,6 +185,20 @@ def check(script: pathlib.Path, uat_text=None) -> list[str]:
     if r.returncode != 0 or "STILL LIVE" not in r.stderr or re.search(r"\[dry-run\] setcap", r.stdout + r.stderr):
         errs.append(f"--no-cap-cleanup with live caps: expected exit 0, a STILL LIVE warning, no setcap call "
                     f"(rc {r.returncode})")
+    # --no-cap-cleanup says so when getcap cannot tell (missing or failing), not only when it sees caps
+    for mode in (False, "stderr"):
+        r = run_installer(script, ["--no-cap-cleanup"], caps=False, setcap=True, getcap=mode)
+        if r.returncode != 0 or "cannot tell whether" not in r.stderr:
+            errs.append(f"--no-cap-cleanup with getcap {mode!r}: expected exit 0 and a 'cannot tell whether' warning")
+    # --check with the DEFAULT binary path and nothing there skips the capability test OUT LOUD
+    r = run_installer(script, ["--check"], caps=False, setcap=True, dry_run=False, binary_arg=False)
+    if "file-capability check skipped: no binary at" not in r.stdout + r.stderr:
+        errs.append("--check with no binary at the default path must say the capability check was skipped")
+    # a flag with no value is an argument error (exit 2), not bash's unbound-variable failure
+    for flag in ("--binary-path", "--account-name"):
+        r = run_installer(script, [flag], caps=False, setcap=True, binary_arg=False)
+        if r.returncode != 2 or "needs a value" not in r.stderr:
+            errs.append(f"{flag} with no value: expected exit 2 and a usage message, got {r.returncode}")
     r = run_installer(script, ["--no-setcap"], caps=False, setcap=True)
     if r.returncode != 2 or "unknown arg" not in r.stderr:
         errs.append(f"--no-setcap must be an unknown argument (exit 2), got {r.returncode}")
@@ -146,7 +228,7 @@ def check(script: pathlib.Path, uat_text=None) -> list[str]:
         errs.append("--check reported a capability on a clean binary")
     else:
         for name, kw, needle in (("capability present", dict(caps=True, setcap=True), "file capabilities present"),
-                                 ("getcap missing", dict(caps=False, setcap=True, getcap=False), "getcap not installed"),
+                                 ("getcap missing", dict(caps=False, setcap=True, getcap=False), "getcap not found on PATH"),
                                  ("getcap stderr", dict(caps=False, setcap=True, getcap="stderr"), "getcap could not read"),
                                  ("getcap rc 1", dict(caps=False, setcap=True, getcap="rc1"), "getcap could not read")):
             r, n = issues(**kw)
@@ -183,6 +265,22 @@ def selftest() -> list[str]:
             "            if false; then\n                warn \"getcap could not read $BINARY_PATH (exit status or stderr): cannot verify"),
         "explicit missing --binary-path accepted": (
             "    echo \"--binary-path $BINARY_PATH is not a regular file\" >&2\n    exit 2\n", "    :\n"),
+        "post-check unreadable getcap returns 0": (
+            'warn "getcap could not verify $BINARY_PATH after setcap -r: file capabilities may still be present"\n            return 5',
+            'warn "getcap could not verify $BINARY_PATH after setcap -r: file capabilities may still be present"\n            return 0'),
+        "setcap -r failure not fatal": (
+            'run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; return 5; }',
+            'run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; }'),
+        "sticky capability after strip returns 0": (
+            'warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $FILE_CAPS_OUT"\n            return 5',
+            'warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $FILE_CAPS_OUT"\n            return 0'),
+        "setcap called outside -r inside a command substitution": (
+            '    run setcap -r "$BINARY_PATH" ||',
+            '    log "$(setcap cap_net_raw+ep "$BINARY_PATH")"\n    run setcap -r "$BINARY_PATH" ||'),
+        "no-binary check silent": (
+            'log "file-capability check skipped: no binary at $BINARY_PATH', 'true "file-capability check skipped: no binary at $BINARY_PATH'),
+        "missing flag value unbound": (
+            "--binary-path)    [[ $# -ge 2 ]] || { echo \"--binary-path needs a value; use --help for usage.\" >&2; exit 2; }", "--binary-path) "),
         "warning silenced": (
             'warn "--no-cap-cleanup: file capabilities are STILL LIVE', 'log "--no-cap-cleanup: file capabilities are STILL LIVE'),
     }

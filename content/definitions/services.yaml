@@ -247,19 +247,7 @@ spec:
       - name: note
         type: string
         description: >-
-          Linux only, written only when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot. The result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. Values: free text naming the unit and its state.
-        example: "-"
-        platforms: [linux]
-      - name: state
-        type: string
-        description: >-
-          Linux only, on a successful mode change: the unit's state read back with `systemctl is-enabled` (the first line). Values: enabled, disabled, masked, static, indirect, alias, generated (the only states that can follow a successful change).
-        example: enabled
-        platforms: [linux]
-      - name: note
-        type: string
-        description: >-
-          Linux only, written only when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot. The result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. Values: free text naming the unit and its state.
+          Linux only; a free-text line that can follow either outcome. On success it is written when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot, and the result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. After a failed change it is `note|remasked: ...` (a unit found masked was masked again) or `note|remask_failed: ...` (it could not be masked again; the unit may be left unmasked), written after the `error|` line. Values: free text naming the unit.
         example: "-"
         platforms: [linux]
 

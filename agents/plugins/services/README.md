@@ -70,7 +70,7 @@ sequenceDiagram
   P-->>S: status ok, service, mode (Linux adds state, and note for some units)  or  one error line
 ```
 
-The plugin validates input first, then makes exactly one start-setting change per call (Linux `automatic` and `manual` add a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces a single `error|` line instead of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|`, plus `note|` for a unit that cannot be enabled or disabled). On Linux, when `automatic` or `manual` found the unit masked, unmasked it and the change then failed, the plugin puts the mask back and writes a `note|remasked: ...` line after the `error|` line (or `note|remask_failed: ...` if the mask could not be restored, in which case the unit may be left unmasked), so a failed call does not leave a masked unit less restricted.
+The plugin validates input first, then makes exactly one start-setting change per call (Linux `automatic` and `manual` add a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces one `error|` line and none of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|` and, for a unit that cannot be enabled or disabled, `note|`). On Linux that `error|` line can be followed by one `note|` line: when `automatic` or `manual` found the unit masked, unmasked it and the change then failed, the plugin puts the mask back and writes `note|remasked: ...` (or `note|remask_failed: ...` if the mask could not be restored, in which case the unit may be left unmasked), so a failed call does not leave a masked unit less restricted.
 
 ```mermaid
 flowchart TD
@@ -123,7 +123,7 @@ Binaries and network: Linux runs `systemctl` (`list-units` for reads; `enable`, 
 <!-- END GENERATED -->
 
 ### Outputs
-Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** differs by OS, not just the values: Windows and macOS emit the four fields the schema names (`name|display_name|status|startup_type`, where macOS puts the PID in the second slot), but Linux emits only **three** (`name|status|description`), because that leg never derives a startup type. A consumer must branch on OS before indexing a row (the server's own device-page parser does). `set_start_mode` never writes a `svc|` row: on success it writes `status|ok`, `service|<name>` and `mode|<mode>` on every OS, and on Linux also `state|<state>` (the unit's `systemctl is-enabled` state) and, for a `static`, `indirect`, `alias` or `generated` unit, a `note|<text>` line with a typed `CONSTRAINED`/`PARTIAL` result (`services:start_mode_unchangeable`) and return code 0. `status|ok` means the command completed: an unchangeable unit completes without the mode being applied, so a Linux caller reads `state|` and the typed status, not `status|ok` alone. On any failure it writes one `error|<message>` line and none of the success lines, with return code 1. There is no placeholder-row convention for the reads. On Windows an enumeration failure returns zero rows with no status; on Linux and macOS a degraded run sets a typed `UNAVAILABLE` or `CONSTRAINED` status before whatever rows were parsed and returns code 1. On macOS the row cap (512) ends the list with a `svc|__truncated__|-|<total>|-` sentinel row.
+Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** differs by OS, not just the values: Windows and macOS emit the four fields the schema names (`name|display_name|status|startup_type`, where macOS puts the PID in the second slot), but Linux emits only **three** (`name|status|description`), because that leg never derives a startup type. A consumer must branch on OS before indexing a row (the server's own device-page parser does). `set_start_mode` never writes a `svc|` row: on success it writes `status|ok`, `service|<name>` and `mode|<mode>` on every OS, and on Linux also `state|<state>` (the unit's `systemctl is-enabled` state) and, for a `static`, `indirect`, `alias` or `generated` unit, a `note|<text>` line with a typed `CONSTRAINED`/`PARTIAL` result (`services:start_mode_unchangeable`) and return code 0. `status|ok` means the command completed: an unchangeable unit completes without the mode being applied, so a Linux caller reads `state|` and the typed status, not `status|ok` alone. On any failure it writes one `error|<message>` line and none of the success lines, with return code 1; on Linux a `note|remasked: ...` or `note|remask_failed: ...` line can follow it. There is no placeholder-row convention for the reads. On Windows an enumeration failure returns zero rows with no status; on Linux and macOS a degraded run sets a typed `UNAVAILABLE` or `CONSTRAINED` status before whatever rows were parsed and returns code 1. On macOS the row cap (512) ends the list with a `svc|__truncated__|-|<total>|-` sentinel row.
 
 <!-- BEGIN GENERATED: plugin-doc-gen outputs -->
 **`crossplatform.service.list` — `name|display_name|status|startup_type`**
@@ -144,7 +144,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `status` | string | - | Windows, Linux, macOS | `running (windows) · 0 (darwin)` | Column 3, whose meaning is OS-specific. On Windows it is the service's current SCM state (always "running" for this action's filtered result). On Linux it is systemd's SUB state from `systemctl list-units --state=running`. On macOS it is launchctl's raw last-exit-status code for the job -- an integer as a string, NOT a running/stopped word; this action's own running-filter is applied on the PID column, not this one. Values: running (windows, this action always filters to it) · free text systemd SUB state (linux) · integer exit-status code as a string (darwin). |
 | `startup_type` | string | - | Windows, macOS | `automatic (windows) · unknown (darwin)` | Column 4: the service's configured startup type. On Windows this is the SCM's 5-state taxonomy. On macOS it is an honest 3-value read derived from a bulk `launchctl print-disabled` join -- a label with no explicit override reports "unknown" rather than a guessed default. It is NOT emitted on Linux at all (no 4th column on the wire), because the systemctl leg does not derive a startup type. Values: automatic, boot, manual, disabled, system, unknown (windows) · automatic, disabled, unknown (darwin) · field absent (linux). |
 
-**`crossplatform.service.set_start_mode` — `status|service|mode|state|note|state|note`**
+**`crossplatform.service.set_start_mode` — `status|service|mode|state|note`**
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
@@ -152,9 +152,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `service` | string | - | Windows, Linux, macOS | `-` | The `name` parameter echoed back unmodified, on a successful mode change only. Values: free text — echoes the name parameter. |
 | `mode` | string | - | Windows, Linux, macOS | `-` | The `mode` parameter echoed back unmodified, on a successful mode change only. Values: automatic, disabled (all OS) · manual additionally on windows/linux (darwin rejects it before this row is ever written). |
 | `state` | string | - | Linux | `enabled` | Linux only, on a successful mode change: the unit's state read back with `systemctl is-enabled` (the first line). Values: enabled, disabled, masked, static, indirect, alias, generated (the only states that can follow a successful change). |
-| `note` | string | - | Linux | `-` | Linux only, written only when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot. The result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. Values: free text naming the unit and its state. |
-| `state` | string | - | Linux | `enabled` | Linux only, on a successful mode change: the unit's state read back with `systemctl is-enabled` (the first line). Values: enabled, disabled, masked, static, indirect, alias, generated (the only states that can follow a successful change). |
-| `note` | string | - | Linux | `-` | Linux only, written only when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot. The result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. Values: free text naming the unit and its state. |
+| `note` | string | - | Linux | `-` | Linux only; a free-text line that can follow either outcome. On success it is written when `state` is static, indirect, alias or generated: those units cannot be enabled or disabled, so the requested mode does not change whether they start at boot, and the result status is then CONSTRAINED/PARTIAL (`services:start_mode_unchangeable`) while the exit code stays 0. After a failed change it is `note\|remasked: ...` (a unit found masked was masked again) or `note\|remask_failed: ...` (it could not be masked again; the unit may be left unmasked), written after the `error\|` line. Values: free text naming the unit. |
 <!-- END GENERATED -->
 
 ### Result status
@@ -183,7 +181,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 45cbf4f7c261
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2429cf4b9745
 
 ```
 == action=list
@@ -224,7 +222,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 45cbf4f7c261
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2429cf4b9745
 
 ```
 == action=list
@@ -294,7 +292,7 @@ error|missing required parameter: name
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp`
+- Plugin: `agents/plugins/services/src/services_macos_launchd.hpp` · `agents/plugins/services/src/services_parsers.hpp` · `agents/plugins/services/src/services_plugin.cpp` · `agents/plugins/services/src/services_set_start_mode.hpp`
 - Definitions: `content/definitions/services.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/test_services_readback_wiring_lexical.py` · `tests/unit/agent/test_services_macos.cpp` · `tests/unit/test_services_parsers.cpp`
