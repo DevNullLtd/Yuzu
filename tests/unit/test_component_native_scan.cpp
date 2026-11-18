@@ -6,8 +6,8 @@
  * directory and runs the real filesystem leg and the real parsers over it.
  *
  * Most cases use a parse function that reads no bytes (the real name rules over a file name), so the
- * scan's own decisions are tested apart from the parsers, which test_component_native_parsers.cpp
- * covers byte by byte.
+ * scan's own decisions are tested apart from the adapter, which test_component_native_parsers.cpp
+ * covers (the readers themselves are the shared binary_header readers).
  *
  * MUTATION NOTES (each assertion below FAILS if the named wiring is removed):
  *  - kind: writing `java` for every row fails the wire-row case.
@@ -29,6 +29,7 @@
 #include <chrono>
 #include <cstdint>
 #include <string>
+#include <stdexcept>
 #include <string_view>
 #include <utility>
 #include <vector>
@@ -335,9 +336,9 @@ void put(std::string& b, std::size_t pos, std::uint64_t v, unsigned n, bool big)
         b[pos + i] = static_cast<char>((v >> (big ? 8 * (n - 1 - i) : 8 * i)) & 0xFF);
 }
 
-/// A minimal little-endian ELF64 shared object whose DT_SONAME is `soname`.
+/// A minimal little-endian ELF64 shared object whose DT_SONAME is `soname` (DT_NULL-terminated).
 std::string minimal_elf64(const std::string& soname) {
-    const std::size_t dyn_off = 64 + 2 * 56, dyn_size = 3 * 16, str_off = dyn_off + dyn_size;
+    const std::size_t dyn_off = 64 + 2 * 56, dyn_size = 4 * 16, str_off = dyn_off + dyn_size;
     const std::string strtab = std::string(1, '\0') + soname + '\0';
     std::string b(str_off + strtab.size(), '\0');
     b.replace(0, 4, "\x7f" "ELF");
@@ -451,6 +452,66 @@ TEST_CASE("native scan: through the real POSIX leg and the real parsers over a m
     REQUIRE(mac != nullptr);
     CHECK(mac->version == "2.0.1");
     CHECK(mac->version_source == "macho");
+}
+
+TEST_CASE("native scan: the deadline holds inside a parse, and a hostile SONAME reaches a row sanitised",
+          "[runtime][component_native_scan][posix][component_inventory]") {
+    SECTION("a read after the deadline answers nullopt: the library is a name-only row, unreadable") {
+        MemTree tree;
+        tree.add_file("/opt/app/libx.so", minimal_elf64("libx.so.7"));
+        tree.open_step = 46s; // the open alone uses the whole 45 s budget
+        std::optional<std::string> late{"unset"};
+        const NativeParse probe = [&late](std::string_view leaf, const ReadAt& rd, std::uint64_t size) {
+            late = rd(0, 4);
+            return describe_linux_file(leaf, rd, size);
+        };
+        const auto r = run(tree, linux_policy(), probe);
+        CHECK_FALSE(late.has_value());
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "libx");
+        CHECK(r.rows[0].version.empty()); // the SONAME's version was never read
+        CHECK(r.rows[0].version_source == "unreadable");
+        CHECK(r.stop == Stop::budget_time);
+    }
+    SECTION("before the deadline the same file is read and its SONAME version used") {
+        MemTree tree;
+        tree.add_file("/opt/app/libx.so", minimal_elf64("libx.so.7"));
+        const auto r = run(tree, linux_policy(), describe_linux_file);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].version == "7");
+        CHECK(r.rows[0].version_source == "elf");
+    }
+    SECTION("control bytes and high bytes in a SONAME never reach the row name") {
+        MemTree tree;
+        tree.add_file("/opt/app/libx.so", minimal_elf64(std::string("lib\x01\xff|x.so.1")));
+        const auto r = run(tree, linux_policy(), describe_linux_file);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "lib??|x");
+    }
+    SECTION("a read that throws is a name-only row, not an abort") {
+        MemTree tree;
+        tree.add_file("/opt/app/libx.so.2", minimal_elf64("libx.so.2"));
+        const NativeParse throwing = [](std::string_view leaf, const ReadAt& rd, std::uint64_t size) {
+            const ReadAt bad = [&rd](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
+                if (off != 0)
+                    throw std::runtime_error("boom");
+                return rd(off, len);
+            };
+            return describe_linux_file(leaf, bad, size);
+        };
+        const auto r = run(tree, linux_policy(), throwing);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "libx");
+        CHECK(r.rows[0].version == "2");
+        CHECK(r.rows[0].version_source == "filename");
+    }
+    SECTION("a file changed during a real parse is still the changed cause") {
+        MemTree tree;
+        tree.add_file("/opt/app/libx.so.2", minimal_elf64("libx.so.2"));
+        tree.changed.insert("/opt/app/libx.so.2");
+        const auto r = run(tree, linux_policy(), describe_linux_file);
+        CHECK(r.stop == Stop::archive_changed);
+    }
 }
 
 TEST_CASE("native legs: the roots and the excluded trees per OS", "[runtime][component_native_scan][posix][component_inventory]") {

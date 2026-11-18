@@ -14,7 +14,7 @@
 # EXACT repo-name case — CFLite mounts the checkout at $SRC/Yuzu (see the
 # Dockerfile comment).
 SRC_DIR="$SRC/Yuzu"
-INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
+INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/agents/shared -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
 STD="-std=c++23"
 
 build_target() {

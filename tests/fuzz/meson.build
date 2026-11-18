@@ -21,7 +21,7 @@ endif
 
 fuzz_args = ['-fsanitize=fuzzer,address,undefined', '-fno-sanitize-recover=all']
 
-server_src_inc = include_directories('../../server/core/src')
+server_src_inc = include_directories('../../server/core/src', '../../agents/shared')
 
 fuzz_targets = {
   'fuzz_preflight_parse': {

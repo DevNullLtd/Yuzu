@@ -3,7 +3,7 @@
  * libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped inside applications.
  *
  * Portable: no OS header. Like scan() it goes through the FsOps seam, so the unit test drives it over
- * an in-memory tree and a fake clock; the readers themselves are component_native_parsers.hpp.
+ * an in-memory tree and a fake clock; the adapter over the shared readers (agents/shared/binary_header_*.hpp) is component_native_parsers.hpp.
  *
  * SAME DISCIPLINE AS scan() (component_scan.hpp): one deadline computed once and checked between
  * files and once more at the end; one open per candidate, every byte read through that FileView;
@@ -93,7 +93,14 @@ using NativeParse =
         if (const auto fv = fs.open_file(c.path)) {
             row.size = fv->size;
             row.mtime = fv->mtime;
-            desc = parse(leaf, fv->read_at, fv->size);
+            // The deadline holds inside a parse: a read after it answers nullopt, which the shared
+            // readers report as io (unreadable). A read in flight still is not interrupted.
+            const ReadAt bounded = [&fs, &fv, deadline](std::uint64_t off, std::size_t len) -> std::optional<std::string> {
+                if (fs.now() >= deadline)
+                    return std::nullopt;
+                return fv->read_at(off, len);
+            };
+            desc = parse(leaf, bounded, fv->size);
             if (!fv->unchanged())
                 record(Stop::archive_changed);
         } else {
