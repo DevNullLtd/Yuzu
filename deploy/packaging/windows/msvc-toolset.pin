@@ -10,12 +10,16 @@
 # is outside the hard-cutover deployment contract (docs/user-manual/upgrading.md,
 # "Deployment contract (hard cutover)"); the pin does not make it supported.
 #
-# Bumping it is a deliberate, reviewed change. Its changelog fragment and
+# Bumping it is a deliberate, reviewed change. Its changelog fragment (a
+# changelog.d/<PR>-<slug>.changed.md, see changelog.d/README.md) and the
 # release notes must state that agent self-update does not carry the new
 # runtime, until #8219/#8218 change what OTA delivers. Keep
 # docs/windows-build.md's toolchain table and the Wee Tam runner
-# (deploy/windows/README.md) on the same toolset. The release skill's preflight
-# checks every release for a newer toolset to bump to; why the runtime is
-# app-local, and the residual that leaves: docs/windows-build.md, "Decision
-# record: app-local Visual C++ runtime (2026-11-18)".
+# (deploy/windows/README.md) on the same toolset. Before each release the
+# release skill (Phase 0) has the release manager check, by hand, for a newer
+# toolset of the Visual Studio on Wee Tam; release-preflight.sh does not check
+# it. Wee Tam's Visual Studio 2022 offers nothing past 14.44, so moving past it
+# needs Wee Tam's Visual Studio upgraded first, a separate reviewed change. Why
+# the runtime is app-local, and the residual that leaves: docs/windows-build.md,
+# "Decision record: app-local Visual C++ runtime (2026-11-18)".
 14.44

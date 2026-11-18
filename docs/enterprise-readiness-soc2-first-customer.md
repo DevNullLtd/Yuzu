@@ -1136,6 +1136,22 @@ requirement, so the PR review records cited above are evidence of review only fo
 that did not use it ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
 until a maintainer approves the head").
 
+**Accepted risk: third-party code shares the Windows agent's Visual C++ runtime (CC9.2),
+2026-11-18.** Risk-register entry. From 0.16.0 the Windows agent carries the Visual C++
+runtime app-local in its `bin` directory, and every DLL loaded into the agent process binds
+to that copy, including vendor code such as the Configuration Manager client the `sccm`
+plugin creates in-process. A vendor DLL built with a newer Visual C++ toolset than the
+release's can fail to load in the agent or misbehave there, up to stopping the agent on
+that device. Likelihood: not measured (the ConfigMgr client DLL's imports have not been
+inspected). Mitigation: one pinned toolset per release, and a manual step before each
+release to bump it, which nothing enforces and which can reach only the newest toolset of
+the Visual Studio on the release builder (Visual Studio 2022, which offers nothing past the
+pinned 14.44), so today it does not narrow the gap. Accepted by fjarvis (project owner,
+who is also the change's author) on 2026-11-18; to be reviewed by 2027-05-18. Follow-ups:
+#8311 (run the ConfigMgr client outside the agent process), #8219 and decision #8218
+(refresh the runtime through agent self-update). Decision record: `docs/windows-build.md`,
+"Decision record: app-local Visual C++ runtime (2026-11-18)".
+
 ---
 
 ## 3.7 Workstream G — Customer Assurance Package (Enterprise Sales Enablement)

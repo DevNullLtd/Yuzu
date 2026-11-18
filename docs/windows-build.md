@@ -227,17 +227,34 @@ The ConfigMgr client DLL's own imports have not been inspected. The owner
 accepted this residual in the same ruling. The user manual discloses it
 (`docs/user-manual/README.md`, "Windows agent: Visual C++ runtime").
 
-**Mitigation.** The release builds with one pinned MSVC toolset
-(`deploy/packaging/windows/msvc-toolset.pin`, introduced in commit
+**Mitigation, and its limits.** The release builds with one pinned MSVC
+toolset (`deploy/packaging/windows/msvc-toolset.pin`, introduced in commit
 0f23a273e4; the release fails on any other), so the runtime a release ships
-is known. The release skill's preflight (`.claude/skills/release/SKILL.md`
-and `.codex/skills/release/SKILL.md`, Phase 0) has a step to bump the
-toolset, and with it the runtime, to the newest available before each
-release. This narrows the gap between the runtime the agent carries and the
-toolset a vendor DLL was built with; it does not close it. A vendor DLL built
-after a release can still need a newer runtime, and agent self-update does
-not replace the runtime on a device (#8219).
+is known. Before each release, a step in the release skill
+(`.claude/skills/release/SKILL.md` and `.codex/skills/release/SKILL.md`,
+Phase 0) has the release manager compare the pin with the newest toolset of
+the Visual Studio installed on Wee Tam, the runner that builds the release,
+and bump to it. The step is manual: `release-preflight.sh` does not check it
+and nothing enforces it. It can reach only the newest toolset of the Visual
+Studio on Wee Tam, which is Visual Studio 2022 Build Tools (the cl.exe row
+of the toolchain table above). The pinned 14.44 is the toolset of Visual
+Studio 2022 17.14, and later toolsets ship with Visual Studio 2026 (this is
+Microsoft's release cadence; nothing in the repository checks it). So while
+Wee Tam has Visual Studio 2022 the step finds nothing newer, and the bump
+does not narrow the gap: the mitigation is then only that the shipped
+runtime is known. Moving past 14.44 means upgrading Wee Tam's Visual Studio
+(`deploy/windows/README.md`), a separate, reviewed change that this decision
+does not make. Even a bump narrows the gap and does not close it: a vendor
+DLL built after a release can still need a newer runtime, and agent
+self-update does not replace the runtime on a device (#8219). How much the
+mitigation is worth has not been measured, because the ConfigMgr client
+DLL's imports have not been inspected.
 
-**Not decided here.** Running the `sccm` plugin's ConfigMgr calls out of the
-agent process, and refreshing the runtime through agent self-update (#8219),
-are possible follow-ups.
+**Review and follow-ups.** The acceptance is to be reviewed by 2027-05-18,
+the review date of the project's other acceptances of 2026-11-18 (#8228
+tracks those, not this one). The owner who accepted it is also the change's
+author. Running the `sccm` plugin's ConfigMgr calls outside the agent
+process is #8311; refreshing the runtime through agent self-update is #8219
+(decision #8218). The SOC 2 plan records it as a risk-register entry
+(`docs/enterprise-readiness-soc2-first-customer.md`, "Accepted risk: third-party
+code shares the Windows agent's Visual C++ runtime (CC9.2)").
