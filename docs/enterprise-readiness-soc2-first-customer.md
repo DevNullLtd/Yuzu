@@ -1112,18 +1112,22 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
-**Accepted risks — routes around the merge rulesets' review rule (CC8.1), 2026-11-18.**
-Both were accepted by the project owner on 2026-11-18 and are to be reviewed by 2027-05-18:
+**Accepted risks — the merge rulesets' review rule (CC8.1), 2026-11-18.**
+The only accepted route around the review rule is the OrganizationAdmin bypass on Protect
+Dev and Protect Main, a deliberate break-glass route whose use is visible in the audit log.
+It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
+2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
+from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
+supply-chain CODEOWNERS entries (branch `fix/codeowners-supply-chain`, owners `@fjarvis`
+and `@Tr3kkR`) request review but do not require it, and both owners can bypass the
+rulesets as organisation admins. This is to be reviewed by 2027-05-18, tracked in #8228.
 
-- the OrganizationAdmin bypass on Protect Dev and Protect Main, a deliberate break-glass
-  route whose use is visible in the audit log;
-- `CLA_REPO_ACCESS_TOKEN`, a repository-wide token that can push or approve as its owner,
-  accepted pending replacement of the archived CLA action (#8230).
-
-A pull request merged through either route is not covered by the rulesets' review
+A pull request merged through the bypass is not covered by the rulesets' review
 requirement, so the PR review records cited above are evidence of review only for merges
-that used neither ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
-until a maintainer approves the head").
+that did not use it ([Dependency updates](dependency-updates.md), "Self-hosted CI is held
+until a maintainer approves the head"). `CLA_REPO_ACCESS_TOKEN` is stored in the `cla`
+environment, which only the default branch may use, so a workflow on another branch cannot
+read it.
 
 ---
 

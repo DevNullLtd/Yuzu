@@ -293,25 +293,17 @@ maintainer's own approval would pass this gate. It would not count towards a
 merge under the `dev` ruleset, which requires the most recent push to be
 approved by someone other than its pusher, and GitHub does not let a PR's
 author approve it. That merge rule is a review rule, not a security control
-for the gate. Today a write collaborator can defeat it, and an organisation
-admin can bypass it:
+for the gate. The rulesets let organisation admins bypass it: the
+OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
+break-glass route, accepted by fjarvis (project owner) on 2026-11-18, to be
+reviewed by 2027-05-18 (tracked in #8228), and its use is visible in the
+audit log.
 
-- `CLA_REPO_ACCESS_TOKEN` (see `cla.yml`) is a classic `repo`-scope personal
-  access token kept as a repository secret, which a workflow pushed to any
-  branch can read. With it, anyone who can push a branch can push a head as
-  the token's owner and approve it, or approve any pull request as the
-  token's owner, and merge with no independent review. This is accepted by
-  the project owner on 2026-11-18 pending replacement of the archived CLA
-  action (#8230), to be reviewed by 2027-05-18;
-- the rulesets let organisation admins bypass the merge rule. The
-  OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
-  break-glass route, accepted by the project owner on 2026-11-18 (to be
-  reviewed by 2027-05-18), and its use is visible in the audit log.
-
-The bump App's private key is stored in the `vcpkg-baseline` environment,
-which only `main` may use (see "Where the credentials are stored"), so that it
-does not add another such route. That does not make the merge rule a
-control.
+`CLA_REPO_ACCESS_TOKEN` is stored in the `cla` environment, which only the
+default branch may use, so a workflow on another branch cannot read it (see
+"The cla environment"). The bump App's private key is stored the same way,
+in the `vcpkg-baseline` environment, which only `main` may use (see "Where
+the credentials are stored"). Neither makes the merge rule a control.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
@@ -529,6 +521,68 @@ run fails at its first step and the `vcpkg-baseline-broken` issue stays open.
   the key". A leaked key can mint tokens that push workflow files and tags to this
   repository and open pull requests; check the repository's recent pushes,
   tags and pull requests by the bot.
+
+### The cla environment
+
+`CLA_REPO_ACCESS_TOKEN` is stored in the `cla` environment, which only the
+default branch may use, so a workflow on another branch cannot read it. The
+token lets `cla.yml` write the signatures store. Its `cla-check` job, the
+only job that reads the token, declares the environment:
+
+```yaml
+environment:
+  name: cla
+  deployment: false
+```
+
+No other job or workflow may name the environment or read the secret
+(`tests/shell/test_cla_environment.sh` checks this in this tree).
+
+Both of `cla.yml`'s triggers, `pull_request_target` and `issue_comment`, run
+the copy of the workflow on the default branch (`main`) with `GITHUB_REF`
+set to the default branch, and an environment's deployment-branch rule is
+matched against `GITHUB_REF`. So the job passes a `main` branch rule on every
+pull request, from a fork too.
+
+`deployment: false` stops GitHub creating a deployment object, with its
+deployment statuses, each time the job runs, which is on every pull request
+event and every comment on an issue or pull request. Without it the
+environment's deployment history would gain an entry for each. The
+environment's branch rule still applies.
+
+**Setup**, owner actions, in this order: steps 1 to 3 before this change
+reaches `main`, step 4 after it. The workflow change and this setup land
+together. A job that names an environment still reads a repository
+secret of the same name when the environment has none, so until step 4 the
+job reads the repository copy. After step 4 it reads only the environment's,
+and if the environment does not hold the token the job fails, and the CLA
+check is red on every pull request.
+
+1. Create the environment `cla` under Settings → Environments. A run creates it on first use too, but then with
+   no restrictions, so create it first.
+2. Under "Deployment branches and tags" choose "Selected branches and tags"
+   and add a rule of ref type Branch for `main` only (not a tag rule).
+3. Add `CLA_REPO_ACCESS_TOKEN` under "Environment secrets", or run `gh
+   secret set CLA_REPO_ACCESS_TOKEN --env cla --repo DevNullLtd/Yuzu`.
+   GitHub does not show a stored secret's value, so set it from the token
+   itself (or from a newly generated replacement).
+4. Once the change is on `main` and a `cla-check` run has passed, delete the
+   repository copy: `gh secret delete CLA_REPO_ACCESS_TOKEN --repo
+   DevNullLtd/Yuzu`. `gh secret list --repo DevNullLtd/Yuzu` must no longer
+   list it.
+5. Check that no organisation secret of that name is shared with this
+   repository: `gh api --paginate
+   repos/DevNullLtd/Yuzu/actions/organization-secrets --jq
+   '.secrets[].name'` must not list `CLA_REPO_ACCESS_TOKEN` (an organisation
+   owner removes it if it does).
+
+The workflow does not check these settings. Check them after setting up or
+changing the environment: `gh api repos/DevNullLtd/Yuzu/environments/cla`
+(its `deployment_branch_policy` must not be `null`), `gh api
+repos/DevNullLtd/Yuzu/environments/cla/deployment-branch-policies` (exactly
+one policy, with `"name": "main"` and `"type": "branch"`), `gh secret list
+--env cla --repo DevNullLtd/Yuzu` (it lists `CLA_REPO_ACCESS_TOKEN`), and
+the two listings in steps 4 and 5.
 
 ### Baseline bump 2026.10.16
 
