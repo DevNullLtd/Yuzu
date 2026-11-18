@@ -78,10 +78,9 @@ Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan)"; T
 ; msvc-runtime folder from the build machine's Visual Studio redistributable
 ; directory (stage-msvc-runtime.ps1 in this folder). No skipifsourcedoesntexist:
 ; a build that did not stage them fails to compile rather than ship without them.
-; This line comes BEFORE yuzu-agent.exe on purpose: Setup copies [Files] in
-; order, so an install that stops part-way leaves the new runtime under the old
-; executable (which runs: the runtime is backward compatible), never a new
-; executable over an older runtime or none (which may not start).
+; Setup copies [Files] in order, so the runtime is placed before
+; yuzu-agent.exe; an install that stops part-way never leaves the executable
+; without its runtime.
 ; tests/test_windows_payload_imports.py pins the order.
 Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion

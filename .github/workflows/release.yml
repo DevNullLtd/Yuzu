@@ -965,7 +965,7 @@ jobs:
             --iss deploy/packaging/windows/yuzu-agent.iss `
             --build-dir build-windows `
             --system-dir "$env:SystemRoot\System32"
-          if ($LASTEXITCODE -ne 0) { Write-Error "a shipped binary imports a DLL its payload does not carry"; exit 1 }
+          if ($LASTEXITCODE -ne 0) { Write-Error "check-windows-payload-imports.py failed (exit $LASTEXITCODE); see the errors above"; exit 1 }
 
       - name: Build Windows installers (InnoSetup)
         shell: pwsh

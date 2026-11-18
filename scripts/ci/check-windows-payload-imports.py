@@ -373,10 +373,11 @@ def main(argv=None):
     if args.zip:
         try:
             payloads.append(load_zip(args.zip))
-        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, OSError) as e:
+        except (zipfile.BadZipFile, zlib.error, EOFError, NotImplementedError, OSError, ValueError) as e:
             # A damaged archive or member (bad central directory, a corrupt
             # deflate stream, a CRC mismatch, a truncated member, a compression
-            # method zipfile cannot read) is a finding, not a crash.
+            # method zipfile cannot read, a member name flagged UTF-8 that is
+            # not: UnicodeDecodeError, a ValueError) is a finding, not a crash.
             print(f"::error::zip {os.path.basename(args.zip)}: not a readable zip archive "
                   f"({type(e).__name__}: {e})")
             print("check-windows-payload-imports: FAILED: a payload could not be read")

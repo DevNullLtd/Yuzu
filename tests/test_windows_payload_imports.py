@@ -463,16 +463,22 @@ class CheckerUsage(_Tmp):
         self.assertNotIn("Traceback", out)
 
     def test_unreadable_zip_member_fails_without_traceback(self):
-        """A readable central directory over a damaged member: a corrupt deflate
-        stream (zlib.error) and a CRC mismatch (BadZipFile) both fail as findings."""
+        """A damaged member: a corrupt deflate stream (zlib.error), a CRC mismatch
+        (BadZipFile) and a member name flagged UTF-8 that is not valid UTF-8
+        (UnicodeDecodeError, a ValueError) all fail as findings."""
         payload = b"MZ" + bytes(range(256)) * 64
-        for name, damage, kind in (
-            ("corrupt deflate stream", lambda data, off, n: data[:off] + b"\xff" * n + data[off + n:], "(error: "),
-            ("crc mismatch", None, "(BadZipFile: "),
+        utf8_name = "yuzu-agent/bin/\u00e9.exe"
+        for name, member, damage, kind in (
+            ("corrupt deflate stream", "yuzu-agent/bin/yuzu-agent.exe",
+             lambda data, off, n: data[:off] + b"\xff" * n + data[off + n:], "(error: "),
+            ("crc mismatch", "yuzu-agent/bin/yuzu-agent.exe", None, "(BadZipFile: "),
+            # zipfile sets the UTF-8 flag for a non-ASCII name; make every copy
+            # of the name's bytes invalid UTF-8 (a lone continuation byte).
+            ("invalid UTF-8 member name", utf8_name,
+             lambda data, off, n: data.replace("\u00e9".encode("utf-8"), b"\xa9\xa9"), "(UnicodeDecodeError: "),
         ):
             with self.subTest(name):
                 zp = self.tmp / (re.sub(r"\W+", "_", name) + ".zip")
-                member = "yuzu-agent/bin/yuzu-agent.exe"
                 with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
                     z.writestr(member, payload)
                 data = bytearray(zp.read_bytes())
@@ -684,7 +690,7 @@ class Wiring(unittest.TestCase):
             "check step conditional": ("release", f"      - name: {CHECK_STEP}\n        shell: pwsh\n", f"      - name: {CHECK_STEP}\n        if: ${{{{ false }}}}\n        shell: pwsh\n"),
             "check step loses the zip": ("release", "            --zip yuzu-agent-windows-x64.zip `\n", ""),
             "check step loses the installer payload": ("release", "            --iss deploy/packaging/windows/yuzu-agent.iss `\n", ""),
-            "check step exit unchecked": ("release", 'if ($LASTEXITCODE -ne 0) { Write-Error "a shipped binary', 'if ($false) { Write-Error "a shipped binary'),
+            "check step exit unchecked": ("release", 'if ($LASTEXITCODE -ne 0) { Write-Error "check-windows-payload-imports.py failed', 'if ($false) { Write-Error "check-windows-payload-imports.py failed'),
             "check step after the installer": ("release", "      - name: Sign installers (Authenticode)\n", f"      - name: Sign installers (Authenticode)\n        run: echo\n\n      - name: {CHECK_STEP}\n"),
             "ISCC BuildDir moved": ("release", '"/DBuildDir=${{ github.workspace }}\\build-windows"', '"/DBuildDir=${{ github.workspace }}\\build-win"'),
             "iss runtime line dropped": ("iss", RUNTIME_LINE, "; removed"),
@@ -841,6 +847,13 @@ class StageScriptBehaviour(_Tmp):
                                                  ("toolset version unknown", "pin and the redistributable/toolset comparison are skipped")),
             "unknown toolset in GitHub Actions fails": ("14.44.35112", None, "14.44", False,
                                                         ("toolset version unknown (VCToolsVersion is not set) in GitHub Actions",)),
+            "unparseable toolset warns with its value and passes": (
+                "14.44.35112", "vNext", "14.44", True,
+                ("toolset version unknown (VCToolsVersion is 'vNext', not a version)",
+                 "pin and the redistributable/toolset comparison are skipped")),
+            "unparseable toolset in GitHub Actions fails with its value": (
+                "14.44.35112", "vNext", "14.44", False,
+                ("toolset version unknown (VCToolsVersion is 'vNext', not a version) in GitHub Actions",)),
             "GITHUB_ACTIONS not 'true' warns and passes": ("14.44.35112", None, "14.44", True,
                                                           ("pin and the redistributable/toolset comparison are skipped",)),
             "malformed pin": ("14.44.35112", "14.44.35207", "14.44\n14.45", False, ("exactly one major.minor line",)),
@@ -863,7 +876,7 @@ class StageScriptBehaviour(_Tmp):
                     env = {"VCToolsRedistDir": str(vdir)}
                     if tools:
                         env["VCToolsVersion"] = tools
-                    if name.startswith("unknown toolset in GitHub Actions"):
+                    if " in GitHub Actions " in name:
                         env["GITHUB_ACTIONS"] = "true"
                     elif name.startswith("GITHUB_ACTIONS not"):
                         env["GITHUB_ACTIONS"] = "false"
@@ -872,6 +885,8 @@ class StageScriptBehaviour(_Tmp):
                     self.tmp = old_tmp
                 for msg in msgs:
                     self.assertIn(msg, out)
+                if tools is None:
+                    self.assertIn("VCToolsVersion is not set", out)
                 if ok:
                     self.assertEqual(code, 0, out)
                     self.assertTrue((dest / "msvcp140.dll").is_file(), out)
@@ -910,6 +925,21 @@ class StageScriptBehaviour(_Tmp):
         for n in REQUIRED_CRT + ("msvcp140_1.dll", "vcruntime140_threads.dll"):
             self.assertIn(f"| {n} |", text)
         self.assertNotIn("concrt140.dll", text)
+
+    def test_step_summary_write_failure_only_warns(self):
+        """The DLLs are staged before the summary is written; a summary that
+        cannot be written (here a directory) warns and the step still passes."""
+        vdir = self.redist()
+        dest = self.tmp / "out"
+        not_a_file = self.tmp / "summary-dir"
+        not_a_file.mkdir()
+        code, out = self.run_stage({"dest": [str(dest)], "extra": f"-RedistDir '{vdir}'"},
+                                   {"GITHUB_STEP_SUMMARY": str(not_a_file), "VCToolsVersion": "14.44.35207"},
+                                   wrapper=True)
+        self.assertEqual(code, 0, out)
+        self.assertIn("AFTER-STAGE", out)
+        self.assertIn("could not write the step summary", out)
+        self.assertTrue((dest / "msvcp140.dll").is_file(), out)
 
     def test_single_destination_by_file_as_build_installer_does(self):
         vdir = self.redist()

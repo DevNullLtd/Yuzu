@@ -37,8 +37,10 @@
     Before copying, it removes every vcruntime140*.dll and msvcp140*.dll
     already in a destination, so a reused directory cannot ship a stale one.
     When $env:GITHUB_STEP_SUMMARY is set (a GitHub Actions step), it appends
-    the staged DLL names and file versions to the step summary, which records
-    the runtime each release shipped.
+    the staged DLL names and file versions to the step summary, which covers
+    that workflow run only and is kept only as long as the run is; the
+    shipped version is the file version of the Microsoft-signed DLLs in the
+    payload. A failed summary write is a warning: the DLLs are already staged.
 
 .PARAMETER Destination
     One or more directories to copy the DLLs into (created if absent).
@@ -52,10 +54,11 @@
     $env:VCToolsVersion. When known, its major.minor must equal the pin in
     -PinFile, and the redistributable's major.minor must be at least the
     toolset's: a newer toolset can need runtime exports an older
-    redistributable lacks. When unknown, the script fails in GitHub Actions
-    ($env:GITHUB_ACTIONS is 'true'), where a release build always sets it;
-    in a local build outside an MSVC environment both comparisons are skipped
-    with a warning.
+    redistributable lacks. When unset or not a version, the script fails in
+    GitHub Actions ($env:GITHUB_ACTIONS is 'true'), where a release build
+    always sets it. Outside GitHub Actions both comparisons are skipped with a
+    warning whenever it is unset (or not a version), including under
+    setup_msvc_env.sh, which does not export it.
 
 .PARAMETER PinFile
     The file holding the pinned toolset major.minor (msvc-toolset.pin next to
@@ -179,11 +182,13 @@ if ($toolsMajorMinor) {
                "$toolsMajorMinor that built the binaries")
     }
     Write-Host "Redistributable $redistVersion, toolset $toolsMajorMinor"
-} elseif ($env:GITHUB_ACTIONS -eq 'true') {
-    throw ("stage-msvc-runtime: toolset version unknown (VCToolsVersion is not set) in GitHub Actions; " +
-           "the release build must run in an MSVC environment so the toolset pin can be checked")
 } else {
-    Write-Warning ("stage-msvc-runtime: toolset version unknown (VCToolsVersion is not set); the toolset pin " +
+    $why = if ($ToolsVersion) { "VCToolsVersion is '$ToolsVersion', not a version" } else { 'VCToolsVersion is not set' }
+    if ($env:GITHUB_ACTIONS -eq 'true') {
+        throw ("stage-msvc-runtime: toolset version unknown ($why) in GitHub Actions; " +
+               "the release build must run in an MSVC environment so the toolset pin can be checked")
+    }
+    Write-Warning ("stage-msvc-runtime: toolset version unknown ($why); the toolset pin " +
                    "and the redistributable/toolset comparison are skipped. A release build always sets it.")
 }
 
@@ -234,6 +239,13 @@ if ($env:GITHUB_STEP_SUMMARY) {
         $v = $dll.VersionInfo.FileVersion
         $summary += "| $($dll.Name) | $(if ($v) { $v } else { 'none recorded' }) |"
     }
-    Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary + '') -Encoding utf8
+    # The DLLs are staged by now; a summary that cannot be written only loses
+    # this run's listing, so it warns rather than failing the release.
+    try {
+        Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary + '') -Encoding utf8
+    } catch {
+        Write-Warning ("stage-msvc-runtime: could not write the step summary " +
+                       "'$($env:GITHUB_STEP_SUMMARY)': $($_.Exception.Message)")
+    }
 }
 exit 0
