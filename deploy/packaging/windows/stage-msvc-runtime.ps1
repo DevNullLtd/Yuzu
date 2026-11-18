@@ -52,8 +52,10 @@
     $env:VCToolsVersion. When known, its major.minor must equal the pin in
     -PinFile, and the redistributable's major.minor must be at least the
     toolset's: a newer toolset can need runtime exports an older
-    redistributable lacks. When unknown (a local build outside an MSVC
-    environment), both comparisons are skipped with a warning.
+    redistributable lacks. When unknown, the script fails in GitHub Actions
+    ($env:GITHUB_ACTIONS is 'true'), where a release build always sets it;
+    in a local build outside an MSVC environment both comparisons are skipped
+    with a warning.
 
 .PARAMETER PinFile
     The file holding the pinned toolset major.minor (msvc-toolset.pin next to
@@ -177,6 +179,9 @@ if ($toolsMajorMinor) {
                "$toolsMajorMinor that built the binaries")
     }
     Write-Host "Redistributable $redistVersion, toolset $toolsMajorMinor"
+} elseif ($env:GITHUB_ACTIONS -eq 'true') {
+    throw ("stage-msvc-runtime: toolset version unknown (VCToolsVersion is not set) in GitHub Actions; " +
+           "the release build must run in an MSVC environment so the toolset pin can be checked")
 } else {
     Write-Warning ("stage-msvc-runtime: toolset version unknown (VCToolsVersion is not set); the toolset pin " +
                    "and the redistributable/toolset comparison are skipped. A release build always sets it.")

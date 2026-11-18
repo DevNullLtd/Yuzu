@@ -43,7 +43,8 @@ def copy_newer(src, dst_dir):
     onto the destination (os.replace), so a copy that fails part-way (a full
     disk) leaves the destination as it was, never a truncated DLL with a newer
     mtime that no later run would replace. The temporary file is removed on
-    failure.
+    any failure, including an exception that is not an OSError (an interrupt),
+    which is then re-raised.
     """
     os.makedirs(dst_dir, exist_ok=True)
     dst = os.path.join(dst_dir, os.path.basename(src))
@@ -57,15 +58,16 @@ def copy_newer(src, dst_dir):
         os.replace(tmp, dst)
         tmp = None
     except OSError as e:
-        if tmp is not None:
-            with contextlib.suppress(OSError):
-                os.remove(tmp)
         # A DLL locked by a running process (PermissionError) used to be
         # swallowed here whether or not an older copy existed, so a copy that
         # never happened left the build tree without the DLL and nothing said
         # so. Record it instead; main() decides how loud to be.
         stale = isinstance(e, PermissionError) and os.path.isfile(dst)
         (STALE if stale else MISSING).append((src, dst, e))
+    finally:
+        if tmp is not None:
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
 
 
 def find_vcpkg_dll_dir(explicit_bin, triplet, debug):

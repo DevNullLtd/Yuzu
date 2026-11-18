@@ -56,7 +56,7 @@ class DeployBuildDlls(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def run_main(self, fail_names=(), extra=(), enospc_names=(), fallback_roots=None):
+    def run_main(self, fail_names=(), extra=(), enospc_names=(), fallback_roots=None, interrupt_names=()):
         mod = load()
         real_copy2 = shutil.copy2
 
@@ -68,6 +68,11 @@ class DeployBuildDlls(unittest.TestCase):
                 with open(dst, "wb") as f:
                     f.write(b"trunc")
                 raise OSError(errno.ENOSPC, "No space left on device", dst)
+            if os.path.basename(src) in interrupt_names:
+                # Part of the file is written, then the build is interrupted.
+                with open(dst, "wb") as f:
+                    f.write(b"trunc")
+                raise KeyboardInterrupt
             return real_copy2(src, dst, *a, **kw)
 
         argv = ["deploy_build_dlls.py", "--build-root", str(self.build), "--vcpkg-bin", str(self.bin), *extra]
@@ -133,6 +138,13 @@ class DeployBuildDlls(unittest.TestCase):
             self.assertEqual((self.build / d / "fmt.dll").read_bytes(), b"fmt.dll", d)
         self.assertEqual(self.leftovers(), [], "a temporary file was left behind")
         self.assertFalse(stamp.exists(), "stamp written for an incomplete copy")
+
+    def test_interrupt_leaves_no_temporary_file_and_propagates(self):
+        with self.assertRaises(KeyboardInterrupt):
+            self.run_main(interrupt_names=("spdlog.dll",))
+        self.assertEqual(self.leftovers(), [], "a temporary file was left behind")
+        self.assertFalse((self.build / "agents" / "core" / "spdlog.dll").exists())
+        self.assertFalse((self.build / ".dlls_deployed").exists(), "stamp written for an interrupted copy")
 
     def test_full_disk_with_no_older_copy_fails(self):
         code, err = self.run_main(enospc_names=("zlib1.dll",))

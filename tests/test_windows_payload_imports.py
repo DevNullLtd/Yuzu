@@ -462,6 +462,39 @@ class CheckerUsage(_Tmp):
         self.assertIn("not a readable zip archive", out)
         self.assertNotIn("Traceback", out)
 
+    def test_unreadable_zip_member_fails_without_traceback(self):
+        """A readable central directory over a damaged member: a corrupt deflate
+        stream (zlib.error) and a CRC mismatch (BadZipFile) both fail as findings."""
+        payload = b"MZ" + bytes(range(256)) * 64
+        for name, damage, kind in (
+            ("corrupt deflate stream", lambda data, off, n: data[:off] + b"\xff" * n + data[off + n:], "(error: "),
+            ("crc mismatch", None, "(BadZipFile: "),
+        ):
+            with self.subTest(name):
+                zp = self.tmp / (re.sub(r"\W+", "_", name) + ".zip")
+                member = "yuzu-agent/bin/yuzu-agent.exe"
+                with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as z:
+                    z.writestr(member, payload)
+                data = bytearray(zp.read_bytes())
+                # Local header: 30 bytes, then the name and the extra field.
+                name_len, extra_len = struct.unpack_from("<HH", data, 26)
+                off = 30 + name_len + extra_len
+                comp_size = struct.unpack_from("<I", data, 18)[0]
+                if damage is not None:
+                    data = bytearray(damage(bytes(data), off, comp_size))
+                else:
+                    # Flip the stored CRC in the local header and the central directory.
+                    central = bytes(data).index(b"PK\x01\x02")
+                    for at in (14, central + 16):
+                        data[at:at + 4] = bytes(b ^ 0xFF for b in data[at:at + 4])
+                zp.write_bytes(bytes(data))
+                code, out = self.run_check("--zip", str(zp))
+                self.assertEqual(code, 1, out)
+                self.assertIn("::error::zip", out)
+                self.assertIn("not a readable zip archive", out)
+                self.assertIn(kind, out)
+                self.assertNotIn("Traceback", out)
+
 
 class CheckerIss(_Tmp):
     """The .iss mode, against the REAL yuzu-agent.iss over a synthetic build tree."""
@@ -718,7 +751,7 @@ class StageScriptBehaviour(_Tmp):
 
     def run_stage(self, args, env_extra=None, wrapper=False):
         env = {k: v for k, v in os.environ.items()
-               if k not in ("VCToolsRedistDir", "VCToolsVersion", "GITHUB_STEP_SUMMARY")}
+               if k not in ("VCToolsRedistDir", "VCToolsVersion", "GITHUB_STEP_SUMMARY", "GITHUB_ACTIONS")}
         env.update(env_extra or {})
         if wrapper:
             # As release.yml calls it: a pwsh step (stop on error) that runs the
@@ -793,7 +826,8 @@ class StageScriptBehaviour(_Tmp):
         return path
 
     def test_toolset_pin(self):
-        """msvc-toolset.pin: a known toolset must match it; an unknown one warns and passes."""
+        """msvc-toolset.pin: a known toolset must match it; an unknown one warns and passes
+        locally and fails in GitHub Actions."""
         cases = {
             # name: (redist version, VCToolsVersion or None, pin text or None for the tracked file, ok, messages)
             "match (the tracked pin file)": ("14.44.35112", "14.44.35207", None, True,
@@ -805,6 +839,10 @@ class StageScriptBehaviour(_Tmp):
                                            ("built by MSVC toolset 14.43.34808 (14.43)", "pins 14.44")),
             "unknown toolset warns and passes": ("14.44.35112", None, "not a version", True,
                                                  ("toolset version unknown", "pin and the redistributable/toolset comparison are skipped")),
+            "unknown toolset in GitHub Actions fails": ("14.44.35112", None, "14.44", False,
+                                                        ("toolset version unknown (VCToolsVersion is not set) in GitHub Actions",)),
+            "GITHUB_ACTIONS not 'true' warns and passes": ("14.44.35112", None, "14.44", True,
+                                                          ("pin and the redistributable/toolset comparison are skipped",)),
             "malformed pin": ("14.44.35112", "14.44.35207", "14.44\n14.45", False, ("exactly one major.minor line",)),
             "missing pin file": ("14.44.35112", "14.44.35207", "", False, ("is missing",)),
         }
@@ -825,6 +863,10 @@ class StageScriptBehaviour(_Tmp):
                     env = {"VCToolsRedistDir": str(vdir)}
                     if tools:
                         env["VCToolsVersion"] = tools
+                    if name.startswith("unknown toolset in GitHub Actions"):
+                        env["GITHUB_ACTIONS"] = "true"
+                    elif name.startswith("GITHUB_ACTIONS not"):
+                        env["GITHUB_ACTIONS"] = "false"
                     code, out = self.run_stage({"dest": [str(dest)], "extra": extra}, env, wrapper=True)
                 finally:
                     self.tmp = old_tmp
