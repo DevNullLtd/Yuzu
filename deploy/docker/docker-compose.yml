@@ -35,7 +35,7 @@ services:
       context: ../..
       dockerfile: deploy/docker/Dockerfile.server
     ports:
-      - "8080:8080"     # Web dashboard + REST API
+      - "127.0.0.1:8080:8080" # Web dashboard + REST API: plain HTTP (YUZU_NO_HTTPS below), so loopback only
       - "50051:50051"   # gRPC (agent connections)
       - "50052:50052"   # gRPC (management)
     environment:
@@ -54,8 +54,10 @@ services:
       # token instead: docs/user-manual/metrics.md "Scraping /metrics with a bearer token".
       YUZU_METRICS_NO_AUTH: "true"
       # DEV-ONLY: with HTTPS on (the default) the published :8080 is only the redirect listener and
-      # does NOT serve /metrics (it is on :8443), so this rig serves plain HTTP on :8080, which is
-      # what its dashboard URL, its published port and prometheus-docker.yml all assume.
+      # does NOT serve /metrics (it is on :8443), so this DEV-ONLY rig serves plain HTTP on :8080 (what its
+      # dashboard URL and prometheus-docker.yml, which scrapes server:8080 on the compose network, assume).
+      # The published port is bound to 127.0.0.1 so cleartext credentials and metrics never leave the
+      # host. Never copy this to a deployment: docker-compose.reference.yml keeps HTTPS.
       YUZU_NO_HTTPS: "true"
     volumes:
       - server-data:/var/lib/yuzu
