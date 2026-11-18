@@ -20,6 +20,8 @@
 #include <yuzu/plugin.h>          // YuzuResultStatus / YuzuResultCompleteness (portable, C ABI)
 #include <yuzu/string_utils.hpp>  // yuzu::util::safe_output_field (BR-07)
 
+#include <algorithm>
+#include <chrono>
 #include <format>
 #include <optional>
 #include <string>
@@ -27,6 +29,29 @@
 #include <vector>
 
 namespace yuzu::windows_updates {
+
+/// What to do with one more patch_connectivity target against ONE dispatch deadline (pure: the
+/// caller passes both clock readings, so a fake clock tests every branch). `skip` is true once the
+/// deadline has been reached; otherwise `timeout_s` is the requested per-target timeout clamped to
+/// what is left of the dispatch (whole seconds, at least 1). Called twice per target: before the
+/// name lookup and again AFTER it, so a slow lookup shortens the connect that follows and the
+/// dispatch ends by its deadline.
+struct TargetPlan {
+    bool skip{false};
+    int timeout_s{0};
+};
+
+[[nodiscard]] inline TargetPlan plan_target(std::chrono::steady_clock::time_point deadline,
+                                            std::chrono::steady_clock::time_point now,
+                                            int requested_timeout_s) {
+    if (now >= deadline)
+        return {true, 0};
+    const auto left = std::chrono::duration_cast<std::chrono::seconds>(deadline - now).count();
+    if (left <= 0)
+        return {true, 0}; // under a second left: nothing useful fits
+    const auto clamped = std::min<long long>(requested_timeout_s, left);
+    return {false, static_cast<int>(clamped < 1 ? 1 : clamped)};
+}
 
 using yuzu::util::safe_output_field;
 

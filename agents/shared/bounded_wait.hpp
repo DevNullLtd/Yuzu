@@ -151,7 +151,8 @@ private:
 enum class BoundedCallStatus {
     Completed, ///< fn() ran and returned within the timeout.
     TimedOut,  ///< fn() is still running on a detached thread. Assume it is
-               ///< still using anything it captured.
+               ///< still using anything it captured. ALSO the status when fn()
+               ///< threw (no value): that case returns at once, not after the timeout.
     Rejected,  ///< the ceiling refused the call. fn() was NEVER invoked and no
                ///< thread exists; anything it would have captured is untouched.
 };
@@ -176,6 +177,7 @@ auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallRes
         std::mutex mtx;
         std::condition_variable cv;
         bool done = false;
+        bool threw = false;
         Result value{};
     };
     // Setting the call UP can itself throw: make_shared under memory pressure,
@@ -204,8 +206,11 @@ auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallRes
             state->value = std::move(v);
             state->done = true;
         } catch (...) {
-            // fn() throwing must not std::terminate() a detached thread.
-            // Leave `done` false — a still-waiting caller simply times out.
+            // fn() throwing must not std::terminate() a detached thread. Tell the waiting caller
+            // NOW (it reads TimedOut, no value) instead of leaving it to wait out the whole timeout.
+            std::lock_guard<std::mutex> lock(state->mtx);
+            state->threw = true;
+            state->done = true;
         }
             state->cv.notify_all();
             // `guard` (captured by move) is destroyed with this lambda at the
@@ -221,8 +226,11 @@ auto bounded_call_ex(std::chrono::milliseconds timeout, Fn fn) -> BoundedCallRes
     }
 
     std::unique_lock<std::mutex> lock(state->mtx);
-    if (state->cv.wait_for(lock, timeout, [&] { return state->done; }))
+    if (state->cv.wait_for(lock, timeout, [&] { return state->done; })) {
+        if (state->threw)
+            return {std::nullopt, BoundedCallStatus::TimedOut}; // threw: ended at once, no value
         return {std::move(state->value), BoundedCallStatus::Completed};
+    }
     return {std::nullopt, BoundedCallStatus::TimedOut}; // the detached thread finishes on its own time
 }
 

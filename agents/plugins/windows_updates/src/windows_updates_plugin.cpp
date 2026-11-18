@@ -1036,8 +1036,10 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     // ONE deadline for the whole dispatch (the default targets included): per-target timeouts
     // alone multiplied by the target count held a command worker for minutes (16 targets at a 3 s
-    // timeout took ~48 s; the 60 s default maximum extrapolates to ~16 min). A target reached after
-    // the deadline is reported skipped, never silently dropped.
+    // timeout took ~48 s; the 60 s default maximum extrapolates to ~16 min). The deadline bounds
+    // both the name lookup and the connect (each is clamped to what is left, see plan_target), so
+    // a dispatch ends by 60 s plus the poll granularity. A target reached after the deadline is
+    // reported skipped, never silently dropped.
 // RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
 // same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
 // DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
@@ -1048,28 +1050,28 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
 // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
 // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
-// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
     constexpr auto kDispatchBudget = std::chrono::seconds(60);
     const auto dispatch_deadline = std::chrono::steady_clock::now() + kDispatchBudget;
 
     for (const auto& url : targets) {
         auto target = parse_url(url);
 
-        const auto left = std::chrono::duration_cast<std::chrono::seconds>(
-            dispatch_deadline - std::chrono::steady_clock::now());
-        if (left.count() <= 0) {
+        const auto plan = yuzu::windows_updates::plan_target(dispatch_deadline,
+                                                             std::chrono::steady_clock::now(), timeout_s);
+        if (plan.skip) {
             ctx.write_output(std::format("target|{}|skipped|dispatch_deadline_exceeded", url));
             ++failed;
             continue;
         }
-        const int target_timeout_s = static_cast<int>(std::min<long long>(timeout_s, left.count()));
 
         // DNS test: getaddrinfo has no timeout of its own, so the lookup runs on a bounded helper
         // (bounded_wait.hpp) and a name that does not answer in time is a failed lookup instead of a
         // command worker held for the resolver's own timeout. (The helper itself may stay blocked
         // until the resolver gives up; it holds a helper slot, never the command worker.)
         auto bounded_dns = yuzu::shared::bounded_call_ex(
-            std::chrono::seconds(target_timeout_s), [host = target.host]() { return test_dns(host); });
+            std::chrono::seconds(plan.timeout_s), [host = target.host]() { return test_dns(host); });
         DnsResult dns;
         if (bounded_dns.status == yuzu::shared::BoundedCallStatus::Completed && bounded_dns.value) {
             dns = std::move(*bounded_dns.value);
@@ -1089,10 +1091,18 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
         if (!dns.ok) { ++failed; continue; }
 
-        // TCP test
+        // TCP test: the connect timeout is recomputed AFTER the lookup against the same dispatch
+        // deadline, so a slow lookup shortens the connect and the dispatch ends by the deadline.
+        const auto connect_plan = yuzu::windows_updates::plan_target(
+            dispatch_deadline, std::chrono::steady_clock::now(), timeout_s);
+        if (connect_plan.skip) {
+            ctx.write_output(std::format("target|{}|skipped|dispatch_deadline_exceeded", url));
+            ++failed;
+            continue;
+        }
         // Connect to the address that was just classified, not to the name: a second lookup of
         // the same name is a rebinding window past the check above.
-        auto tcp = test_tcp(dns.ip, target.port, target_timeout_s);
+        auto tcp = test_tcp(dns.ip, target.port, connect_plan.timeout_s);
         ctx.write_output(std::format("target|{}|tcp_ok|{}|tcp_ms|{}",
             url, tcp.ok ? "true" : "false", tcp.ms));
 

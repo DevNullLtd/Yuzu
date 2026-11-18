@@ -19,6 +19,7 @@
 #include <yuzu/plugin.hpp>
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
+#include <helper_budget.hpp>      // HelperBudget + the hash_unavailable markers
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #ifndef _WIN32
 #include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
@@ -272,7 +273,7 @@ using HashCache = std::unordered_map<std::string, std::string>;
 
 constexpr auto kPerImageBudget = std::chrono::seconds(30);
 constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
-constexpr int kMaxStuckHelpers = 4;                       // helpers left behind per action, at most
+constexpr int kMaxStuckHelpers = 2; // helpers left behind per action, at most (2 x 30 s < the 120 s budget)
 
 #if defined(__linux__)
 // RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
@@ -285,7 +286,8 @@ constexpr int kMaxStuckHelpers = 4;                       // helpers left behind
 // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
 // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
 // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
-// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
 // One image on a bounded helper (bounded_wait.hpp): an open or read of a file on a stalled
 // filesystem cannot hold the command worker past the budget (the helper owns its descriptor; at most
 // 64 helpers per plugin DSO; a refused or timed-out call reads as an empty hash).
@@ -334,24 +336,23 @@ ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHas
 
 std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
                                const ImageGuard&, std::chrono::steady_clock::time_point action_deadline,
-                               int& stuck_helpers) {
+                               yuzu::shared::HelperBudget& budget) {
     if (path.empty())
         return {};
     const auto now = std::chrono::steady_clock::now();
-    // At most kMaxStuckHelpers helpers per action may be left behind (timed out, or refused at the
-    // per-plugin helper ceiling): past that the remaining images read as not hashed without starting
-    // another, so one dispatch cannot burn through the ceiling.
-    if (now >= action_deadline || stuck_helpers >= kMaxStuckHelpers)
-        return {};
-    const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
-    const auto deadline = now + budget;
+    // Once the per-action cap of helpers left behind (or the action budget) is reached no further
+    // helper is started: the row says so (`hash_unavailable:skipped`) instead of reading as an empty
+    // hash, and a dispatch cannot burn through the plugin's helper ceiling.
+    if (now >= action_deadline || !budget.may_start())
+        return yuzu::shared::kHashUnavailableSkipped;
+    const auto remaining = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+    const auto deadline = now + remaining;
     auto result = yuzu::shared::bounded_call_ex(
-        std::chrono::duration_cast<std::chrono::milliseconds>(budget),
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
         [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
-    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value) {
-        ++stuck_helpers;
-        return {};
-    }
+    budget.note(result.status);
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
+        return yuzu::shared::kHashUnavailableTimeout;
     const auto& img = *result.value;
     return img.key.empty() ? std::string{} : img.hash;
 }
@@ -365,26 +366,26 @@ ActionCache make_action_cache() { return {}; }
 std::string hash_process_image(unsigned long, const std::string& path, ActionCache& cache,
                                const ImageGuard& guard,
                                std::chrono::steady_clock::time_point action_deadline,
-                               int& stuck_helpers) {
+                               yuzu::shared::HelperBudget& budget) {
     if (path.empty())
         return {};
     if (const auto it = cache.find(path); it != cache.end())
         return it->second;
     const auto now = std::chrono::steady_clock::now();
     std::string hash;
-    if (now < action_deadline && stuck_helpers < kMaxStuckHelpers) {
-        const auto budget =
+    if (now >= action_deadline || !budget.may_start()) {
+        hash = yuzu::shared::kHashUnavailableSkipped;
+    } else {
+        const auto allowed =
             std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
         auto result = yuzu::shared::bounded_call_ex(
-            std::chrono::duration_cast<std::chrono::milliseconds>(budget), [path, guard]() -> std::string {
+            std::chrono::duration_cast<std::chrono::milliseconds>(allowed), [path, guard]() -> std::string {
                 if (yuzu::shared::local_path::refused(guard.refusal(path)))
                     return {};
                 return yuzu::agent::sha256_file(path, kMaxImageHashBytes);
             });
-        if (result.status == yuzu::shared::BoundedCallStatus::Completed && result.value)
-            hash = std::move(*result.value);
-        else
-            ++stuck_helpers;
+        budget.note(result.status);
+        hash = yuzu::shared::hash_field_for(result.status, result.value ? std::move(*result.value) : std::string{});
     }
     cache.emplace(path, hash);
     return hash;
@@ -501,10 +502,10 @@ private:
         auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
-        int stuck_helpers = 0;
+        yuzu::shared::HelperBudget budget{kMaxStuckHelpers};
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, stuck_helpers);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
@@ -521,10 +522,10 @@ private:
         auto hash_cache = make_action_cache(); // one action only
         const ImageGuard guard;
         const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
-        int stuck_helpers = 0;
+        yuzu::shared::HelperBudget budget{kMaxStuckHelpers};
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
-            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, stuck_helpers);
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }

@@ -19,6 +19,10 @@
 #include <openssl/evp.h>
 #endif
 #include <bounded_wait.hpp>
+#include <helper_budget.hpp>
+#include <ioc_examined.hpp>
+#include <windows_updates_parsers.hpp>
+#include <stdexcept>
 #ifndef _WIN32
 #include <image_hash_cache.hpp>
 #endif
@@ -497,28 +501,33 @@ TEST_CASE("local_path: a FIFO or a /dev/zero symlink is refused promptly, on bot
     // path_flag O_RDONLY forces the macOS (no O_PATH) code path on Linux.
     for (const int path_flag : {lp::kPathFlag, static_cast<int>(O_RDONLY)}) {
         INFO("path_flag=" << path_flag);
-        bool fifo_refused = false, zero_refused = false, ok_opens = false;
-        const bool prompt = finishes_within(std::chrono::seconds(5), [&] {
-            auto f = lp::posix_open_checked(fifo.string(), O_RDONLY, /*require_regular=*/true, path_flag);
-            fifo_refused = !f.opened() && f.not_regular;
+        // Shared state captured BY VALUE: a hung helper that is detached must never write to a dead
+        // stack frame.
+        struct Seen { std::atomic<bool> fifo_refused{false}, zero_refused{false}, ok_opens{false}; };
+        auto seen = std::make_shared<Seen>();
+        const std::string fifo_s = fifo.string(), zero_s = (base / "zero_link").string(),
+                          ok_s = (base / "ok.txt").string();
+        const bool prompt = finishes_within(std::chrono::seconds(5), [seen, fifo_s, zero_s, ok_s, path_flag] {
+            auto f = lp::posix_open_checked(fifo_s, O_RDONLY, /*require_regular=*/true, path_flag);
+            seen->fifo_refused = !f.opened() && f.not_regular;
             // /dev/zero behind a symlink: the leaf is a link, refused without being followed.
-            auto z = lp::posix_open_checked((base / "zero_link").string(), O_RDONLY, true, path_flag);
-            zero_refused = !z.opened();
-            auto o = lp::posix_open_checked((base / "ok.txt").string(), O_RDONLY, true, path_flag);
-            ok_opens = o.opened();
+            auto z = lp::posix_open_checked(zero_s, O_RDONLY, true, path_flag);
+            seen->zero_refused = !z.opened();
+            auto o = lp::posix_open_checked(ok_s, O_RDONLY, true, path_flag);
+            seen->ok_opens = o.opened();
         });
         REQUIRE(prompt); // not hung
-        CHECK(fifo_refused);
-        CHECK(zero_refused);
-        CHECK(ok_opens);
+        CHECK(seen->fifo_refused.load());
+        CHECK(seen->zero_refused.load());
+        CHECK(seen->ok_opens.load());
     }
     // /dev/zero itself (a device node, not a link) is refused as not regular.
-    bool dev_refused = false;
-    REQUIRE(finishes_within(std::chrono::seconds(5), [&] {
+    auto dev_refused = std::make_shared<std::atomic<bool>>(false);
+    REQUIRE(finishes_within(std::chrono::seconds(5), [dev_refused] {
         auto d = lp::posix_open_checked("/dev/zero", O_RDONLY, true, O_RDONLY);
-        dev_refused = !d.opened();
+        *dev_refused = !d.opened();
     }));
-    CHECK(dev_refused);
+    CHECK(dev_refused->load());
 }
 
 TEST_CASE("local_path: the hop limit and errno handling of the resolving judge", "[shared][local_path]") {
@@ -578,27 +587,21 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     CHECK(b.st_size == c.st_size);
     CHECK(key2 != yuzu::shared::image_identity_key(c));
 
-    // The forgery the key must survive: replace the contents in place with the SAME size and put the
-    // old mtime back with utimensat(). mtime and size are the file owner's to forge; ctime is not.
-    // Kernels before 6.13 stamp ctime at jiffy granularity (up to 10 ms): let the clock move first so
-    // the rewrite below cannot share the previous ctime tick.
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-    { std::ofstream(exe, std::ios::binary | std::ios::trunc) << "z DIFFERENT, LONGER IMAGE"; }
-    struct timespec back[2] = {{c.st_atim.tv_sec, c.st_atim.tv_nsec}, {c.st_mtim.tv_sec, c.st_mtim.tv_nsec}};
-    REQUIRE(::utimensat(AT_FDCWD, exe.c_str(), back, 0) == 0);
-    struct stat d{};
-    REQUIRE(::stat(exe.c_str(), &d) == 0);
-    CHECK(d.st_ino == c.st_ino);
-    CHECK(d.st_size == c.st_size);
-    CHECK(d.st_mtim.tv_sec == c.st_mtim.tv_sec);
-    CHECK(d.st_mtim.tv_nsec == c.st_mtim.tv_nsec);
-    if (c.st_ctim.tv_sec == d.st_ctim.tv_sec && c.st_ctim.tv_nsec == d.st_ctim.tv_nsec) {
-        // A filesystem whose ctime did not advance in 40 ms (a coarse-ctime kernel or a mount with no
-        // sub-second ctime): the forgery cannot be distinguished here. Never red on that.
-        WARN("ctime did not advance on this filesystem/kernel: the forgery assertion is skipped");
-    } else {
-        CHECK(yuzu::shared::image_identity_key(c) != yuzu::shared::image_identity_key(d)); // ctime moved
-    }
+    // Every component of the identity matters, asserted on SYNTHETIC stat values so the result never
+    // depends on the filesystem's timestamp granularity: a same-size rewrite whose mtime was put back
+    // with utimensat() still moves ctime (the owner cannot set it), so ctime alone must change the key.
+    struct stat s0{};
+    s0.st_dev = 7; s0.st_ino = 11; s0.st_size = 100;
+    s0.st_mtim = {1000, 5}; s0.st_ctim = {2000, 9};
+    const auto base_key = yuzu::shared::image_identity_key(s0);
+    CHECK(yuzu::shared::image_identity_key(s0) == base_key); // deterministic
+    { auto v = s0; v.st_dev = 8;            CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_ino = 12;           CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_size = 101;         CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_mtim.tv_sec = 1001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_mtim.tv_nsec = 6;   CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_ctim.tv_sec = 2001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    { auto v = s0; v.st_ctim.tv_nsec = 10;  CHECK(yuzu::shared::image_identity_key(v) != base_key); } // ctime only
 
     // The cache returns what was stored under a key and nothing for another.
     yuzu::shared::ImageHashCache cache;
@@ -1321,9 +1324,8 @@ TEST_CASE("disk_space plugin: a local path is still measured and a symlink into 
 
 TEST_CASE("windows_updates plugin: one dispatch deadline covers every target",
           "[shared][outbound][windows_updates]") {
-    // 16 RFC 1918 targets that blackhole (connect times out) at timeout 1 s would take ~16 s without a
-    // dispatch deadline; with it the dispatch ends within the 60 s budget and nothing is dropped:
-    // every target is reported (probed or `skipped|dispatch_deadline_exceeded`).
+    // Round trip only: 16 RFC 1918 targets at timeout 1 s finish and every target is reported. The
+    // deadline arithmetic itself (both branches, a fake clock) is the plan_target test below.
     auto plugin = load_or_fail("windows_updates");
     std::string many;
     for (int i = 0; i < 16; ++i)
@@ -1416,3 +1418,99 @@ TEST_CASE("processes plugin: list_hashed hashes this process's own image through
 }
 
 #endif // !_WIN32
+
+TEST_CASE("windows_updates: plan_target clamps to what is left of the dispatch and skips at the deadline",
+          "[shared][windows_updates]") {
+    using clock = std::chrono::steady_clock;
+    using yuzu::windows_updates::plan_target;
+    const auto t0 = clock::time_point{} + std::chrono::hours(1); // a fake clock reading
+    const auto deadline = t0 + std::chrono::seconds(60);
+
+    // Plenty left: the requested timeout stands.
+    auto p = plan_target(deadline, t0, 5);
+    CHECK_FALSE(p.skip);
+    CHECK(p.timeout_s == 5);
+    // The requested timeout (60) is clamped to what is left (40): the AFTER-lookup call is what makes
+    // a slow lookup shorten the connect that follows.
+    p = plan_target(deadline, t0 + std::chrono::seconds(20), 60);
+    CHECK_FALSE(p.skip);
+    CHECK(p.timeout_s == 40);
+    // Under a second left: nothing useful fits, skipped.
+    CHECK(plan_target(deadline, deadline - std::chrono::milliseconds(500), 5).skip);
+    // At and past the deadline: skipped.
+    CHECK(plan_target(deadline, deadline, 5).skip);
+    CHECK(plan_target(deadline, deadline + std::chrono::seconds(3), 5).skip);
+    // Exactly one second left: a 1 s timeout, never 0.
+    p = plan_target(deadline, deadline - std::chrono::seconds(1), 30);
+    CHECK_FALSE(p.skip);
+    CHECK(p.timeout_s == 1);
+    // Worst case end to end: lookup 58 s, then the connect is clamped to the 2 s that remain, so the
+    // whole target ends at 60 s, not 58 + 60.
+    const auto after_lookup = t0 + std::chrono::seconds(58);
+    p = plan_target(deadline, after_lookup, 60);
+    CHECK(p.timeout_s == 2);
+}
+
+TEST_CASE("bounded_wait: a throwing fn ends the call at once instead of waiting out the timeout",
+          "[shared][bounded_wait]") {
+    const auto t0 = std::chrono::steady_clock::now();
+    auto r = yuzu::shared::bounded_call_ex(std::chrono::seconds(20), []() -> int { throw std::runtime_error("x"); });
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+    CHECK(r.status == yuzu::shared::BoundedCallStatus::TimedOut);
+    CHECK_FALSE(r.value.has_value());
+}
+
+TEST_CASE("helper budget: a stuck helper counts, the cap is reached, and a skipped hash is a marker not an empty string",
+          "[shared][bounded_wait]") {
+    using yuzu::shared::BoundedCallStatus;
+    yuzu::shared::HelperBudget b{2};
+    CHECK(b.may_start());
+    b.note(BoundedCallStatus::Completed); // a completed call costs nothing
+    CHECK(b.may_start());
+    b.note(BoundedCallStatus::TimedOut);
+    CHECK(b.may_start());
+    b.note(BoundedCallStatus::Rejected);
+    CHECK_FALSE(b.may_start()); // two helpers left behind: no third is started
+    CHECK(b.stuck() == 2);
+    // The row field: a hash and a genuine empty stay as they are; a timeout or refusal is the marker.
+    CHECK(yuzu::shared::hash_field_for(BoundedCallStatus::Completed, "abc") == "abc");
+    CHECK(yuzu::shared::hash_field_for(BoundedCallStatus::Completed, "").empty());
+    CHECK(yuzu::shared::hash_field_for(BoundedCallStatus::TimedOut, "") == "hash_unavailable:timeout");
+    CHECK(yuzu::shared::hash_field_for(BoundedCallStatus::Rejected, "") == "hash_unavailable:timeout");
+    CHECK(std::string{yuzu::shared::kHashUnavailableSkipped} == "hash_unavailable:skipped");
+    // The Windows procfetch leg builds its causes through the same helper.
+    CHECK(yuzu::shared::hash_unavailable("not_examined") == "hash_unavailable:not_examined");
+    CHECK(yuzu::shared::hash_unavailable("unreadable") == "hash_unavailable:unreadable");
+    CHECK(yuzu::shared::hash_unavailable("not_regular").rfind(yuzu::shared::kHashUnavailablePrefix, 0) == 0);
+    // The cap sits below action budget / per-image budget, or it could never trip first (2 x 30 s < 120 s).
+    static_assert(2 * 30 < 120);
+}
+
+TEST_CASE("ioc: a timeout (which includes a throwing helper) and a refused helper are never examined and never absent",
+          "[shared][ioc]") {
+    using yuzu::shared::BoundedCallStatus;
+    yuzu::ioc::Examined ok;
+    ok.path = "/p"; ok.exists = true; ok.size = 3;
+    for (const auto st : {BoundedCallStatus::TimedOut, BoundedCallStatus::Rejected}) {
+        const auto e = yuzu::ioc::examined_from_call("/p", st, ok); // a value present is still not trusted
+        CHECK(e.cause == "timeout");
+        CHECK_FALSE(e.absent);
+        CHECK_FALSE(e.exists);
+        CHECK(e.path == "/p");
+    }
+    CHECK(yuzu::ioc::examined_from_call("/p", BoundedCallStatus::Completed, std::nullopt).cause == "timeout");
+    const auto good = yuzu::ioc::examined_from_call("/p", BoundedCallStatus::Completed, ok);
+    CHECK(good.cause.empty());
+    CHECK(good.exists);
+}
+
+TEST_CASE("local_path: a guard built from a mountinfo table refuses a path under a network mount",
+          "[shared][local_path][disk_space]") {
+    // The deterministic form of the disk_space refusal: the plugin refuses before any statvfs.
+    const lp::LocalPathGuard guard{std::string{
+        "30 1 0:27 / / rw - ext4 /dev/sda1 rw\n41 30 0:38 / /mnt/share rw - nfs4 srv:/export rw\n"}};
+    CHECK(lp::refused(guard.refusal("/mnt/share")));
+    CHECK(lp::refused(guard.refusal("/mnt/share/deep/file")));
+    CHECK_FALSE(lp::refused(guard.refusal("/mnt/sharex")));
+    CHECK_FALSE(lp::refused(guard.refusal("/")));
+}

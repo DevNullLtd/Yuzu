@@ -1,4 +1,4 @@
-captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 4c1360bf4eef
+captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2be3916eae08
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
 type|value|matched|detail
 ip|127.0.0.1|true|Active connection - ESTABLISHED (pid 6436)

@@ -43,6 +43,7 @@
 #include <unistd.h>
 
 #include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
+#include <helper_budget.hpp>      // HelperBudget + hash_unavailable markers
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #include <local_path_policy.hpp> // posix_open_checked / the path guard (macOS image path)
 #endif
@@ -65,6 +66,7 @@
 #include <bcrypt.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <local_path_policy.hpp>   // refuse UNC / device / non-fixed-drive image paths
+#include <helper_budget.hpp>      // hash_unavailable:<cause> tokens
 #include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open
 #pragma comment(lib, "bcrypt.lib")
 #include <charconv>
@@ -98,7 +100,7 @@ using EvpCtx = std::unique_ptr<EVP_MD_CTX, EvpCtxDeleter>;
 constexpr std::uint64_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB, refused (not truncated)
 constexpr auto kPerImageBudget = std::chrono::seconds(30);
 constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
-constexpr int kMaxStuckHelpers = 4;                       // helpers left behind per action, at most
+constexpr int kMaxStuckHelpers = 2; // helpers left behind per action, at most (2 x 30 s < the 120 s budget)
 
 // SHA-1 of an OPEN descriptor: a regular file of at most kMaxImageHashBytes, read within `deadline`
 // (cooperative; the caller bounds the call itself, see hash_image_bounded). Any failure, including
@@ -147,7 +149,8 @@ std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
 // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
 // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
 // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
-// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
 // Hash one process image on a bounded helper: the open and the read of a file on a stalled
 // filesystem cannot hold the command worker past `budget` (bounded_wait.hpp; the helper owns its
 // descriptor and copies, and shares the identity-keyed cache). Linux opens /proc/<pid>/exe itself
@@ -159,13 +162,13 @@ std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
 std::string hash_image_bounded(int pid, const std::string& path,
                                const yuzu::shared::local_path::LocalPathGuard& guard,
                                const std::shared_ptr<yuzu::shared::ImageHashCache>& cache,
-                               std::chrono::steady_clock::time_point action_deadline, int& stuck_helpers) {
+                               std::chrono::steady_clock::time_point action_deadline, yuzu::shared::HelperBudget& helpers) {
     const auto now = std::chrono::steady_clock::now();
     // At most kMaxStuckHelpers helpers per action may be left behind (timed out, or refused at the
     // process-wide ceiling): past that the remaining images read as not hashed WITHOUT starting
     // another, so one dispatch cannot burn through the helper ceiling.
-    if (now >= action_deadline || stuck_helpers >= kMaxStuckHelpers)
-        return {};
+    if (now >= action_deadline || !helpers.may_start())
+        return yuzu::shared::kHashUnavailableSkipped; // a marker, never an empty hash
     const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
     const auto deadline = now + budget;
     auto result = yuzu::shared::bounded_call_ex(
@@ -202,11 +205,8 @@ std::string hash_image_bounded(int pid, const std::string& path,
                 cache->put(key, hex);
             return hex;
         });
-    if (result.status != yuzu::shared::BoundedCallStatus::Completed)
-        ++stuck_helpers;
-    return result.status == yuzu::shared::BoundedCallStatus::Completed && result.value
-               ? std::move(*result.value)
-               : std::string{};
+    helpers.note(result.status);
+    return yuzu::shared::hash_field_for(result.status, result.value ? std::move(*result.value) : std::string{});
 }
 
 #endif // POSIX
@@ -236,7 +236,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     std::error_code ec;
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
-    int stuck_helpers = 0;
+    yuzu::shared::HelperBudget helpers{kMaxStuckHelpers};
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
         if (!entry.is_directory(ec))
@@ -260,7 +260,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         // on a bounded helper, regular files only, capped and deadline-bounded, cached by the
         // opened image's identity.
         if (!exe_path.empty())
-            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline, stuck_helpers);
+            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline, helpers);
 
         ctx.write_output(
             std::format("{}|{}|{}|{}", pid, escape_pipes(name), escape_pipes(exe_path), sha1));
@@ -286,7 +286,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
     const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
     const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
     const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
-    int stuck_helpers = 0;
+    yuzu::shared::HelperBudget helpers{kMaxStuckHelpers};
     char path_buf[PROC_PIDPATHINFO_MAXSIZE];
 
     for (size_t i = 0; i < pid_count; ++i) {
@@ -315,7 +315,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
         std::string sha1;
         if (!exe_path.empty())
-            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline, stuck_helpers);
+            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline, helpers);
 
         ctx.write_output(std::format("{}|{}|{}|{}", static_cast<int>(pid), escape_pipes(name),
                                      escape_pipes(exe_path), sha1));
@@ -352,14 +352,22 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
     // junction or symlink in the path cannot redirect the open either. An empty hash means "not
     // hashed" for ANY reason (refused, could not be opened, read failure): this action's output has
     // no column that could say which.
+    //
+    // A hash that was not produced is a `hash_unavailable:<cause>` token in this column, never an
+    // empty string (empty = no image path could be resolved for the process): `not_examined` (a
+    // network, device or non-fixed-drive path, refused before any open), `unreadable` (the open
+    // failed: gone, a reparse point, access denied: the shared opener does not say which, so
+    // `access_denied` is not emitted), `not_regular` (not a disk file) and `unreadable` for a hash
+    // or read failure. `timeout` and `too_large` do not occur here: this leg has no helper, byte cap
+    // or deadline.
     if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path)))
-        return {};
+        return yuzu::shared::hash_unavailable("not_examined");
     const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(path));
     if (opened.status != yuzu::win::NoReparseOpen::ok)
-        return {};
+        return yuzu::shared::hash_unavailable("unreadable");
     const HANDLE file = opened.file.get(); // owned by `opened`; closed on every exit path
     if (::GetFileType(file) != FILE_TYPE_DISK)
-        return {};
+        return yuzu::shared::hash_unavailable("not_regular");
 
     // The hash handle is owned from creation: every return below destroys it exactly once.
     struct BcryptHash {
@@ -372,7 +380,7 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
     BCRYPT_HASH_HANDLE& hash_handle = hash_guard.h;
     NTSTATUS status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
     if (status != 0)
-        return {};
+        return yuzu::shared::hash_unavailable("unreadable");
 
     // A read error or a hash failure part-way through must NOT finish the digest: that would
     // return the SHA-1 of a truncated prefix as if it were the image's hash. Any failure is "not
@@ -392,13 +400,13 @@ std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
             break;
     }
     if (!complete)
-        return {};
+        return yuzu::shared::hash_unavailable("unreadable");
 
     unsigned char hash[20]; // SHA-1 is 20 bytes
     status = BCryptFinishHash(hash_handle, hash, sizeof(hash), 0);
 
     if (status != 0)
-        return {};
+        return yuzu::shared::hash_unavailable("unreadable");
 
     std::string hex;
     hex.reserve(40);

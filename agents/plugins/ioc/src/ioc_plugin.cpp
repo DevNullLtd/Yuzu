@@ -70,6 +70,7 @@
 // After the platform headers: local_path_policy.hpp pulls <windows.h> on Windows, which must follow
 // <winsock2.h> (included above).
 #include <bounded_file_hash.hpp> // regular-file-only, capped, deadline-bounded SHA-256
+#include "ioc_examined.hpp"    // Examined + examined_from_call (pure mapper of a bounded call outcome)
 #include <bounded_wait.hpp>      // bounded_call_ex: the stalled-filesystem bound
 #include <local_path_policy.hpp> // refuse UNC / device / network-mount paths before any open
 
@@ -502,16 +503,7 @@ std::string hash_cause(yuzu::shared::HashStatus st) {
     return "unreadable";
 }
 
-/// What examining one path produced. Plain value type (it crosses the helper-thread boundary).
-struct Examined {
-    std::string path;
-    std::string cause;      ///< non-empty: the path was NOT examined (or not hashed), and why
-    bool absent{false};     ///< a definitive "no such file" (never a coverage gap)
-    bool exists{false};
-    std::uint64_t size{0};
-    bool hashed{false};
-    std::string hex;        ///< sha256, only when hashed
-};
+using yuzu::ioc::Examined;
 
 #ifdef _WIN32
 // True when the path has no drive letter (relative, or rooted at the current drive).
@@ -647,7 +639,8 @@ Examined examine_path_impl(const yuzu::shared::local_path::LocalPathGuard& guard
 // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
 // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
 // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
-// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
 /// examine_path_impl on a bounded helper: a stalled filesystem call cannot hold the command worker
 /// past `remaining`. A timeout or a refused helper (outstanding ceiling) is the cause `timeout`.
 Examined examine_path(const yuzu::shared::local_path::LocalPathGuard& guard, const std::string& path,
@@ -663,9 +656,7 @@ Examined examine_path(const yuzu::shared::local_path::LocalPathGuard& guard, con
         return timed_out;
     auto result = yuzu::shared::bounded_call_ex(
         remaining, [guard, path, want_hash, deadline]() { return examine_path_impl(guard, path, want_hash, deadline); });
-    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
-        return timed_out;
-    return std::move(*result.value);
+    return yuzu::ioc::examined_from_call(path, result.status, std::move(result.value));
 }
 
 // ── IOC check implementations ────────────────────────────────────────────────

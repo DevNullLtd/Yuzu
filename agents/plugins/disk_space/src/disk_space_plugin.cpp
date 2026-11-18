@@ -169,7 +169,8 @@ Measured measure_volume(const std::string& path) {
 // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
 // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
 // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
-// bounded resource residue instead"). Adjudication belongs to governance, not to this file.
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
 constexpr auto kQueryBudget = std::chrono::seconds(15);
 
 int do_free(yuzu::CommandContext& ctx, yuzu::Params params) {

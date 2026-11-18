@@ -130,7 +130,7 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 // find_by_hash applies the same drive-type rule to its root) judges the LEXICAL spelling BEFORE any
 // filesystem call, and again on the canonical result. RESIDUAL: the Windows decision is lexical, so
 // a junction or directory symlink to a share is followed by the canonicalising call itself before
-// the re-check can refuse it; this plugin does not open handle-relative. POSIX: no mount-table
+// the re-check can refuse it (follow-up: #8208); this plugin does not open handle-relative. POSIX: no mount-table
 // check here -- validate_path runs several times per action and operators legitimately read NFS
 // paths; find_by_hash keeps its own mount guard.
 [[nodiscard]] yuzu::shared::local_path::Refusal path_refusal([[maybe_unused]] std::string_view p) {

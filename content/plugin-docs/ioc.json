@@ -112,7 +112,7 @@
     "gathered": true,
     "mutating": false
   },
-  "leg_hash": "4c1360bf4eef",
+  "leg_hash": "2be3916eae08",
   "manifest_version": 1,
   "name": "ioc",
   "outputs": [
@@ -151,7 +151,7 @@
           "values": null
         },
         {
-          "description": "Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.",
+          "description": "For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial.",
           "example": "true",
           "name": "matched",
           "platforms": [
@@ -159,8 +159,14 @@
             "linux",
             "darwin"
           ],
-          "type": "bool",
-          "values": null
+          "type": "string",
+          "values": [
+            "true",
+            "false",
+            "not_examined",
+            "complete",
+            "partial"
+          ]
         },
         {
           "description": "Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text.",
@@ -235,7 +241,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "container",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -266,7 +272,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "macos",
         "os_version": "macOS 26.6.2 arm64",
         "privilege": "euid 501 (jsmith)"
@@ -297,7 +303,7 @@
       "stamp": {
         "date": "2026-09-07",
         "host_class": "bare-metal",
-        "leg_hash": "4c1360bf4eef",
+        "leg_hash": "2be3916eae08",
         "os": "windows",
         "os_version": "Microsoft Windows NT 10.0.26200.0 x64",
         "privilege": "SYSTEM"
@@ -324,6 +330,7 @@
       "content/definitions/ioc.yaml"
     ],
     "plugin": [
+      "agents/plugins/ioc/src/ioc_examined.hpp",
       "agents/plugins/ioc/src/ioc_plugin.cpp"
     ],
     "privilege_row": false,

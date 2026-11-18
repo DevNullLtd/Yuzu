@@ -106,9 +106,10 @@ spec:
         example: "127.0.0.1"
         platforms: [windows, linux, darwin]
       - name: matched
-        type: bool
+        type: string
         description: >-
-          Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.
+          For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial.
+        values: ['true', 'false', not_examined, complete, partial]
         example: "true"
         platforms: [windows, linux, darwin]
       - name: detail

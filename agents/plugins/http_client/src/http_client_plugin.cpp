@@ -268,8 +268,10 @@ httplib::Result try_vetted(const ParsedUrl& parsed, const std::vector<std::strin
         res = run_pinned(parsed, ip, read_timeout_s, left, identity_encoding, https_unsupported, request);
         if (res || https_unsupported)
             break;
-        if (res.error() != httplib::Error::Connection)
-            break; // the request may have been sent: do not try another address
+        // Only a failed or timed-out CONNECT moves on (nothing was sent); a read or write error may
+        // have reached the server, so no other address is tried.
+        if (res.error() != httplib::Error::Connection && res.error() != httplib::Error::ConnectionTimeout)
+            break;
     }
     return res;
 }

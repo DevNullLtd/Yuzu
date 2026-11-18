@@ -33,6 +33,7 @@
 
 #include "../test_helpers.hpp"
 #include "test_blocking_http_sink.hpp"
+#include "test_raw_listener.hpp"
 
 #include <chrono>
 #include <string>
@@ -845,4 +846,74 @@ TEST_CASE("OffloadTargetStore[pg]: a stored row aimed at a metadata address is n
                           {{"cause", "destination_refused"}}).value() == 1.0);
     CHECK(metrics.counter("yuzu_server_offload_delivery_failed_total").value() == 0.0);
     CHECK(sink_calls == 1);
+}
+
+// ── delivery to a name with several vetted addresses ─────────────────────────
+
+namespace {
+// Create a target for `multi.test:port` whose lookup answers `addrs` in that order, fire one event and
+// wait for its delivery row. The listener(s) accept and drop the request.
+std::vector<OffloadDelivery> offload_fire_with_lookup(OffloadTargetStorePg& store,
+                                                      std::vector<std::string> addrs, int port) {
+    store->set_lookup_for_test([addrs](const std::string&) {
+        net::ResolveResult r;
+        r.status = net::ResolveStatus::kOk;
+        r.addresses = addrs;
+        return r;
+    });
+    auto id = store->create_target("multi", "http://multi.test:" + std::to_string(port) + "/h",
+                                   OffloadAuthType::None, "", "*");
+    REQUIRE(id.has_value());
+    store->fire_event("execution.completed", R"({"k":"v"})");
+    std::vector<OffloadDelivery> deliveries;
+    const auto start = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start < std::chrono::seconds(30)) {
+        deliveries = store->get_deliveries(*id);
+        if (!deliveries.empty())
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    return deliveries;
+}
+} // namespace
+
+TEST_CASE("OffloadTargetStore[pg]: a name with two addresses is not POSTed to twice once the first connected",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    auto pair = yuzu::test::open_dual_stack_pair();
+    if (!pair) {
+        SKIP("no IPv4+IPv6 loopback listener pair could be bound on one port in this environment");
+    }
+    // IPv4 is tried first; its listener drops the connection without answering (a read error after
+    // connecting), so a second POST to ::1 would deliver the event twice.
+    auto deliveries = offload_fire_with_lookup(store, {"::1", "127.0.0.1"}, pair->v4->port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(pair->v4->accepted.load() == 1);
+    CHECK(pair->v6->accepted.load() == 0);
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a connect that FAILS moves on to the next address and the POST arrives once",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    auto deliveries = offload_fire_with_lookup(store, {"127.0.0.2", "127.0.0.1"}, v4.port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
+}
+
+TEST_CASE("OffloadTargetStore[pg]: a connect that TIMES OUT also moves on, and still delivers once",
+          "[offload_store][pg][security]") {
+    OffloadTargetStorePg store;
+    yuzu::test::RawListener v4;
+    REQUIRE(v4.open(AF_INET, 0));
+    // A non-routable private address: the connect times out or is refused depending on the network
+    // (a sandbox may refuse at once). Either way no connection was made, so the request goes to the
+    // listener at 127.0.0.1 exactly once.
+    auto deliveries = offload_fire_with_lookup(store, {"10.255.255.1", "127.0.0.1"}, v4.port);
+    REQUIRE(deliveries.size() == 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK(v4.accepted.load() == 1);
 }

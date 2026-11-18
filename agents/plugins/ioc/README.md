@@ -75,7 +75,7 @@ Pipe-delimited rows, `type|value|matched|detail` (`ioc_plugin.cpp:809`). Unlike 
 |---|---|---|---|---|---|
 | `type` | string | `ip` `domain` `hash` `file` `port` `coverage` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears in place of all rows when no IOC parameter was provided at all, or when more than 64 file_paths or 256 file_hashes were given. `coverage` rows (only when file_paths was given) say what was NOT examined: one `coverage\|<path>\|not_examined\|<cause>` row per unexamined path (cause: network_or_device, non_fixed_drive, mount_table_unreadable, unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file, not_regular, too_large, timeout, unreadable) and a closing `coverage\|*\|complete\|...` or `coverage\|*\|partial\|...` row. |
 | `value` | string | - | Windows, Linux, macOS | `127.0.0.1` | The IOC value that was checked, copied from the input parameter with any literal `\|` escaped to `\\|`. Values: free text. |
-| `matched` | bool | - | Windows, Linux, macOS | `true` | Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false. |
+| `matched` | string | `true` `false` `not_examined` `complete` `partial` | Windows, Linux, macOS | `true` | For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage\|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial. |
 | `detail` | string | - | Windows, Linux, macOS | `Found in /etc/hosts` | Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text. |
 <!-- END GENERATED -->
 
@@ -94,7 +94,7 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 4c1360bf4eef
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -105,7 +105,7 @@ port|22|true|Listening (pid 5148)
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4c1360bf4eef
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -116,7 +116,7 @@ port|22|false|No listening service on this port
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4c1360bf4eef
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -139,7 +139,7 @@ port|22|false|No listening service on this port
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/ioc/src/ioc_plugin.cpp`
+- Plugin: `agents/plugins/ioc/src/ioc_examined.hpp` · `agents/plugins/ioc/src/ioc_plugin.cpp`
 - Definitions: `content/definitions/ioc.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: none found by name

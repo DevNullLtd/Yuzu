@@ -12,7 +12,7 @@ metadata:
   description: >
     Deep process enumeration that returns PID, process name, full
     executable path, and SHA-1 hash of each executable binary.
-    Hashes are cached per path to avoid re-hashing duplicate
+    Hashes are cached for one dispatch to avoid re-hashing duplicate
     executables (e.g. svchost.exe). Useful for security auditing,
     IOC matching, and software inventory validation.
     Supported on Windows (CreateToolhelp32Snapshot + BCrypt),
@@ -55,7 +55,7 @@ spec:
       - name: sha1
         type: string
         description: >-
-          Lowercase hex SHA-1 of the executable file's contents, cached per path so a binary shared by several processes is hashed once; empty when the file was not hashed for ANY reason: the path could not be resolved, it is a network or device path or not a fixed local drive (refused), it could not be opened, or a read failed part-way (a truncated prefix is never hashed). The row cannot say which. Values: 40-char lowercase hex or empty.
+          Lowercase hex SHA-1 of the executable file's contents, cached for one dispatch so a binary shared by several processes is hashed once (Linux and macOS key the cache by the opened image's identity, Windows by path text); a hash that was not produced is never the SHA-1 of a truncated prefix. On Windows it reads `hash_unavailable:not_examined` (a network, device or non-fixed-drive path, refused before any open), `hash_unavailable:unreadable` (the open, hash or read failed; the opener does not say whether access was denied) or `hash_unavailable:not_regular`; on Linux and macOS a hash that timed out reads `hash_unavailable:timeout` and one not started (two stuck helpers, or the 120 s used) reads `hash_unavailable:skipped`. Empty means no image path could be resolved for the process, and on Linux and macOS also a refused, unopenable, non-regular or oversize image (those causes are not yet told apart there). Values: 40-char lowercase hex, empty, or `hash_unavailable:<cause>`.
         example: "e5355187cbd952a5bc9dfca430d10383f0f8750c"
         platforms: [windows, linux, darwin]
     aggregation:

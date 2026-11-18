@@ -23,6 +23,9 @@
 // (no NAT64 operator prefixes, no literal parser): the classes and the address blocks they cover
 // must agree, and tests/unit/server/test_egress_classifier_parity.cpp pins server vs agent over
 // one table so a change to either side that is not mirrored fails there.
+//
+// PLACEMENT DECISION (owner, 2026-11-18; #4816): both copies stay, with the parity test. The pure
+// classifier moves to common/include/yuzu/ only when a THIRD consumer appears; no code moves before.
 #pragma once
 
 #include <array>

@@ -33,7 +33,7 @@
 //     checked (network, FUSE and pseudo filesystems are refused whatever the path text said).
 //
 // WHAT IT DOES NOT DECIDE (residuals, stated so no caller or document claims more):
-//   * Windows link traversal. A junction or directory symlink to a share is FOLLOWED by a path-
+//   * Windows link traversal (follow-up: #8208). A junction or directory symlink to a share is FOLLOWED by a path-
 //     resolving open; the Windows decision is lexical and the plugins that re-judge a canonical
 //     result do so AFTER the canonicalising call has already touched the link. Only a caller that
 //     opens handle-relative with no reparse point (win_no_reparse_open.hpp: ioc, procfetch) never
@@ -612,6 +612,14 @@ public:
             mounts_ = *mounts;
 #endif
     }
+
+#if defined(__linux__) || defined(__APPLE__)
+    /// Test seam: judge against a GIVEN mountinfo-format table instead of reading the host's, so a
+    /// refusal can be asserted deterministically without a real network mount. Same strict reading
+    /// as the default constructor.
+    explicit LocalPathGuard(std::string_view mountinfo_text)
+        : table_ok_(true), mounts_(yuzu::shared::network_mount_points(mountinfo_text, /*strict=*/true)) {}
+#endif
 
 #if defined(_WIN32)
     [[nodiscard]] Refusal refusal(std::string_view path) const {

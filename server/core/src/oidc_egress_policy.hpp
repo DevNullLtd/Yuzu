@@ -22,6 +22,11 @@
 // 2002::/16) is classified by the embedded IPv4 address, so `::ffff:169.254.169.254` is
 // link-local, not "public IPv6". A public embedded address stays public.
 //
+// PLACEMENT DECISION (owner, 2026-11-18; #4816): this file and the agent twin
+// agents/shared/outbound_address_policy.hpp both stay, pinned by
+// tests/unit/server/test_egress_classifier_parity.cpp. The pure classifier moves to
+// common/include/yuzu/ only when a THIRD consumer appears; no code moves before.
+//
 // Third rule, on the TRANSPORT rather than the address: plain http (`cleartext`) to a PUBLIC
 // address is refused outright, with no switch. That is the realistic internet man-in-the-middle
 // case (anyone on the path forges the discovery document, the JWKS or the token response); https

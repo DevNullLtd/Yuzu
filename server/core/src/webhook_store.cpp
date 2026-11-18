@@ -687,10 +687,12 @@ void WebhookStore::deliver_single(const WebhookDeliveryTarget& wh, const std::st
             result = cli.Post(path, headers, payload_json, "application/json");
             if (result)
                 break;
-            // Move to the next vetted address ONLY when no connection was made: once the POST may
-            // have reached the receiver (a read error, a timeout after sending) a second POST to
-            // another address would deliver the event twice.
-            if (result.error() != httplib::Error::Connection)
+            // Move to the next vetted address ONLY when no connection was made (the connect failed or
+            // the CONNECT timed out: nothing was sent): once the POST may have reached the receiver
+            // (a read or write error or timeout) a second POST to another address would deliver the
+            // event twice.
+            if (result.error() != httplib::Error::Connection &&
+                result.error() != httplib::Error::ConnectionTimeout)
                 break;
         }
         if (result) {
