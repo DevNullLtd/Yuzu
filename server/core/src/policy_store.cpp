@@ -1219,7 +1219,9 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
 std::expected<std::size_t, std::string>
 PolicyStore::set_agents_error_status(const std::string& policy_id,
                                      const std::vector<std::string>& agent_ids,
-                                     const std::string& check_result) {
+                                     const std::string& check_result, std::size_t* retries) {
+    if (retries)
+        *retries = 0;
     if (!open_)
         return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
     if (policy_id.empty())
@@ -1230,49 +1232,65 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
     constexpr std::size_t kChunk = 1000;
     std::size_t written = 0;
     std::size_t failed_chunks = 0;
+    std::size_t retry_count = 0;
     const std::string cr = sanitize_pg_text(check_result);
-    // Every chunk is attempted whatever happened to the one before it: stopping at the first failure
-    // would leave the tail holding its previous (possibly compliant) verdict for the whole interval,
-    // which the per-target code this replaced never did (it lost only the failing row). A fresh lease
-    // per chunk, so a connection killed by one failure is not reused for the rest.
-    for (std::size_t i = 0, idx = 0; i < agent_ids.size(); i += kChunk, ++idx) {
-        const auto e = std::min(agent_ids.size(), i + kChunk);
-        std::vector<std::string_view> chunk;
-        chunk.reserve(e - i);
-        for (std::size_t j = i; j < e; ++j)
-            if (!agent_ids[j].empty())
-                chunk.emplace_back(agent_ids[j]);
-        if (chunk.empty())
-            continue;
-        if (chunk_fault_hook_for_test_ && chunk_fault_hook_for_test_(idx)) {
-            ++failed_chunks;
-            continue;
-        }
-        auto lease = pool_.try_acquire_for(kAcquireTimeout);
-        if (!lease) {
-            ++failed_chunks;
-            continue;
-        }
-        pg::PgResult res = pg::exec_params(
-            lease.get(),
-            "INSERT INTO policy_store.policy_status "
-            "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
-            " fix_attempt_count) "
-            "SELECT DISTINCT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
-            "FROM unnest($2::text[]) AS a "
-            "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
-            "  status = 'error', last_check_at = EXCLUDED.last_check_at, "
-            "  check_result = EXCLUDED.check_result "
-            "RETURNING policy_id",
-            std::vector<std::string>{policy_id, pg::to_text_array(chunk), cr});
-        if (res.status() != PGRES_TUPLES_OK) {
-            spdlog::error("PolicyStore: write failed in set_agents_error_status: {}",
-                          PQerrorMessage(lease.get()));
-            ++failed_chunks;
-            continue;
-        }
-        written += static_cast<std::size_t>(PQntuples(res.get()));
+    // An id repeated across chunks would be counted once per chunk; write each id once.
+    std::vector<std::string_view> unique_ids;
+    unique_ids.reserve(agent_ids.size());
+    {
+        std::unordered_set<std::string_view> seen;
+        for (const auto& id : agent_ids)
+            if (!id.empty() && seen.insert(id).second)
+                unique_ids.emplace_back(id);
     }
+    // The pool validates a connection only when it is RETURNED, so after a Postgres restart every
+    // warm connection can be dead: a failed chunk is retried with a FRESH lease, up to one attempt
+    // per pooled connection plus one (bounded), so the dead ones are drained and a live one is
+    // reached. Every chunk is attempted whatever happened to the one before it: stopping at the
+    // first failure would leave the tail holding its previous (possibly compliant) verdict for the
+    // whole interval.
+    const std::size_t max_attempts = pool_.size() + 1;
+    for (std::size_t i = 0, idx = 0; i < unique_ids.size(); i += kChunk, ++idx) {
+        const auto e = std::min(unique_ids.size(), i + kChunk);
+        const std::vector<std::string_view> chunk(unique_ids.begin() + static_cast<std::ptrdiff_t>(i),
+                                                  unique_ids.begin() + static_cast<std::ptrdiff_t>(e));
+        bool done = false;
+        for (std::size_t attempt = 0; attempt < max_attempts && !done; ++attempt) {
+            if (attempt > 0)
+                ++retry_count;
+            if (chunk_fault_hook_for_test_ && chunk_fault_hook_for_test_(idx))
+                continue;
+            auto lease = pool_.try_acquire_for(kAcquireTimeout);
+            if (!lease)
+                continue;
+            if (lease_hook_for_test_)
+                lease_hook_for_test_(lease.get(), idx, attempt);
+            pg::PgResult res = pg::exec_params(
+                lease.get(),
+                "INSERT INTO policy_store.policy_status "
+                "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+                " fix_attempt_count) "
+                "SELECT DISTINCT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
+                "FROM unnest($2::text[]) AS a "
+                "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+                "  status = 'error', last_check_at = EXCLUDED.last_check_at, "
+                "  check_result = EXCLUDED.check_result "
+                "RETURNING policy_id",
+                std::vector<std::string>{policy_id, pg::to_text_array(chunk), cr});
+            if (res.status() != PGRES_TUPLES_OK) {
+                spdlog::error("PolicyStore: write failed in set_agents_error_status "
+                              "(chunk {}, attempt {}): {}",
+                              idx, attempt, PQerrorMessage(lease.get()));
+                continue;
+            }
+            written += static_cast<std::size_t>(PQntuples(res.get()));
+            done = true;
+        }
+        if (!done)
+            ++failed_chunks;
+    }
+    if (retries)
+        *retries = retry_count;
     if (written > 0)
         invalidate_fleet_compliance_cache();
     if (failed_chunks > 0)

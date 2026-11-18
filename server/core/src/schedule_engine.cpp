@@ -531,7 +531,7 @@ std::expected<std::vector<InstructionSchedule>, std::string> ScheduleEngine::eva
                       " FROM schedule_engine.schedules WHERE enabled = TRUE"
                       " AND next_execution_at > 0"
                       " AND next_execution_at <= $1"
-                      " ORDER BY next_execution_at ASC";
+                      " ORDER BY next_execution_at ASC, id ASC";
 
     pg::PgResult res =
         pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{std::to_string(now)});

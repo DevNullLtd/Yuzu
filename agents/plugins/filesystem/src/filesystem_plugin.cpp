@@ -190,9 +190,13 @@ bool absent_error(const std::error_code& e) {
 
 // CandidateUnknown: the candidate's own stat failed, so what it is cannot be told: REFUSE.
 // ReservedUnknown: the RESERVED object cannot be stat'ed (e.g. under a directory this uid cannot
-// search). That alone says nothing about the candidate: a candidate that is not a possible hard
-// link to it (a single-link file, a directory) can only be it by PATH, which the string and
-// re-canonicalised comparisons already decided. It must not deny every unrelated path.
+// search). That alone says nothing about the candidate: a candidate that cannot be a hard link to
+// it (a single-link file, a directory) is matched to it by PATH, which the string and
+// re-canonicalised comparisons already decided; a bind mount or other alias that reaches it by
+// neither is not detected (best effort, as everywhere in this guard). It must not deny every
+// unrelated path.
+constexpr int kMaxLinkHops = 40;
+
 enum class Ident { Different, Same, CandidateUnknown, ReservedUnknown };
 
 Ident identity_of(const fs::path& a, const fs::path& b) {
@@ -251,7 +255,9 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     // Re-canonicalise every reserved path NOW: a symlink created after the snapshot at a reserved
     // name that did not exist then would otherwise hide the real target.
     {
-        auto refresh = [](std::vector<std::string>& v) {
+        // Returns false when a link chain does not resolve within the hop cap: the decision then
+        // REFUSES (an unresolved link is a reserved name that may lead anywhere).
+        auto refresh = [](std::vector<std::string>& v) -> bool {
             const auto n = v.size();
             for (std::size_t i = 0; i < n; ++i) {
                 // weakly_canonical does not follow a DANGLING link at the leaf (the link's target
@@ -259,16 +265,21 @@ bool path_is_reserved_unguarded(const fs::path& p) {
                 // bounded, so a link planted at a not-yet-existing reserved name reaches its target.
                 fs::path cur{v[i]};
                 bool ok = true;
-                for (int hop = 0; hop < 40 && ok; ++hop) {
+                bool resolved = false;
+                for (int hop = 0; hop < kMaxLinkHops && ok; ++hop) {
                     std::error_code rec;
                     cur = fs::weakly_canonical(cur, rec);
+                    if (rec == std::errc::too_many_symbolic_link_levels)
+                        return false; // the kernel's own hop cap: an unresolvable link chain refuses
                     if (rec) {
-                        ok = false;
+                        ok = false; // any other failure (e.g. an unsearchable parent) skips this entry
                         break;
                     }
                     const auto st = fs::symlink_status(cur, rec);
-                    if (rec || !fs::is_symlink(st))
+                    if (rec || !fs::is_symlink(st)) {
+                        resolved = true;
                         break;
+                    }
                     auto t = fs::read_symlink(cur, rec);
                     if (rec) {
                         ok = false;
@@ -276,15 +287,18 @@ bool path_is_reserved_unguarded(const fs::path& p) {
                     }
                     cur = t.is_relative() ? cur.parent_path() / t : t;
                 }
+                if (ok && !resolved)
+                    return false; // the cap was hit on a link: do not push an unresolved path
                 if (ok) {
                     auto cstr = path_bytes(cur);
                     if (cstr != v[i])
                         v.push_back(std::move(cstr));
                 }
             }
+            return true;
         };
-        refresh(snapshot.files);
-        refresh(snapshot.dirs);
+        if (!refresh(snapshot.files) || !refresh(snapshot.dirs))
+            return true;
     }
     if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
         return true;

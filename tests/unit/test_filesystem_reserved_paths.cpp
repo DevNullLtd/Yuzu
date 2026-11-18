@@ -313,6 +313,19 @@ TEST_CASE("filesystem plugin: a hard link to a file in an UNREADABLE reserved su
 }
 
 namespace {
+// Restores owner_all on every path it was given when it goes out of scope (an assertion or an
+// exception must not leave a 000 directory behind for the TempDir cleanup).
+struct PermGuard {
+    std::vector<fs::path> paths;
+    explicit PermGuard(std::vector<fs::path> p) : paths(std::move(p)) {}
+    ~PermGuard() {
+        for (const auto& q : paths) {
+            std::error_code ec;
+            fs::permissions(q, fs::perms::owner_all, ec);
+        }
+    }
+};
+
 // Plants a hard link to a reserved key, applies a permission change that hides the reserved tree
 // from THIS non-root process after init, reads the link, restores permissions.
 // The link's own name and parent are innocent; only the identity scan can refuse it.
@@ -340,6 +353,7 @@ void run_hardlink_shape(const char* label, bool key_in_subdir, fs::perms data_di
 
     yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
     REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    PermGuard guard{{parent, data_dir, sub}};
     if (key_in_subdir)
         fs::permissions(sub, subdir_perms, ec);
     fs::permissions(data_dir, data_dir_perms, ec);
@@ -503,6 +517,7 @@ TEST_CASE("filesystem plugin: a reserved path the agent cannot stat does not den
     }
     yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
     REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    PermGuard guard{{parent}};
     fs::permissions(parent, fs::perms::none, ec);
     auto run = make_runner(*handle);
     auto r = run("read", {{"path", ok.string()}});
@@ -511,6 +526,43 @@ TEST_CASE("filesystem plugin: a reserved path the agent cannot stat does not den
     CHECK(r.rc == 0);
     CHECK(r.captured.find("fine") != std::string::npos);
     handle->descriptor()->shutdown(ctx.get());
+}
+
+TEST_CASE("filesystem plugin: a reserved name behind a link chain longer than the hop cap refuses; a "
+          "shorter chain resolves (WP06 F55)",
+          "[agent][filesystem_plugin][reserved][symlink]") {
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    for (const int hops : {41, 39}) {
+        yuzu::test::TempDir root{"yuzu_test_fs_reserved_chain_"};
+        std::error_code dec;
+        fs::create_directories(root.path, dec);
+        const auto ok = root.path / "ok.txt";
+        {
+            std::ofstream o(ok);
+            o << "fine\n";
+        }
+        const auto reserved_name = root.path / "chain-0";
+        yuzu::agent::StandalonePluginContext ctx{
+            "filesystem", {{"agent.tls_client_key", reserved_name.string()}}};
+        REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+        // chain-0 -> chain-1 -> ... -> chain-<hops> -> nothing (dangling), planted after init
+        for (int i = 0; i < hops; ++i) {
+            std::error_code lec;
+            fs::create_symlink(root.path / ("chain-" + std::to_string(i + 1)),
+                               root.path / ("chain-" + std::to_string(i)), lec);
+            REQUIRE_FALSE(lec);
+        }
+        auto run = make_runner(*handle);
+        auto r = run("read", {{"path", ok.string()}});
+        INFO("hops=" << hops);
+        if (hops > 40) {
+            CHECK(r.rc != 0); // an unresolved chain refuses rather than being skipped
+        } else {
+            CHECK(r.rc == 0);
+        }
+        handle->descriptor()->shutdown(ctx.get());
+    }
 }
 
 #endif // !_WIN32

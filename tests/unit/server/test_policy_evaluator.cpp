@@ -745,6 +745,57 @@ TEST_CASE("policy store: a failed chunk does not strand the remaining targets on
     CHECK(h.status_of(pid, "agent-2499") == "error");       // ...and so was the tail
 }
 
+TEST_CASE("policy store: backends killed mid-run are retried on fresh leases and every chunk lands "
+          "(WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+    std::vector<std::string> targets;
+    for (int i = 0; i < 2500; ++i)
+        targets.push_back("agent-" + std::to_string(i));
+    // The first attempt of EVERY chunk is made on a connection whose backend has died while idle in
+    // the pool (the pool only validates on release, so this is what a Postgres restart looks like).
+    h.ps.set_lease_hook_for_test([](PGconn* conn, std::size_t, std::size_t attempt) {
+        if (attempt == 0)
+            PQclear(PQexec(conn, "SELECT pg_terminate_backend(pg_backend_pid())"));
+    });
+    std::size_t retries = 0;
+    auto r = h.ps.set_agents_error_status(pid, targets, R"({"phase":"check","result":"x"})", &retries);
+    h.ps.set_lease_hook_for_test({});
+    REQUIRE(r.has_value());
+    CHECK(*r == 2500);
+    CHECK(retries >= 3); // one retry per killed first attempt
+    CHECK(h.status_of(pid, "agent-0") == "error");
+    CHECK(h.status_of(pid, "agent-2499") == "error");
+}
+
+TEST_CASE("policy evaluator: a lost error-verdict chunk is counted in the error_verdict_write phase "
+          "(WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "a")};
+    auto pid = h.author("result.hostname != ''");
+    yuzu::MetricsRegistry metrics;
+    auto d = h.deps();
+    d.metrics = &metrics;
+    PolicyEvaluator ev(d);
+    REQUIRE_FALSE(ev.evaluate_now(pid).value_or("").empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.is.delete_definition("test.check"));
+    h.fake_now += 4000;
+    h.ps.set_chunk_fault_hook_for_test([](std::size_t) { return true; }); // every attempt fails
+    auto refused = ev.evaluate_now(pid);
+    h.ps.set_chunk_fault_hook_for_test({});
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "error_verdict_write"}})
+              .value() == 1.0);
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "error_verdict_retry"}})
+              .value() >= 1.0);
+}
+
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

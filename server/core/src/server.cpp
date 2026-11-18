@@ -5685,6 +5685,18 @@ public:
                           "plugin.action no longer matches the pair authorized when its fragment "
                           "was stored. Zero means no stored fragment was refused.",
                           "counter");
+        // Pre-seeded for every phase the evaluator increments, so the first failure is an increase
+        // from 0 that increase() can see (an unseeded series is born at 1 and increase() misses it).
+        for (const char* phase : {"claim", "dispatch", "check", "fix", "verify", "remediate_claim",
+                                  "error_verdict_write", "error_verdict_retry"})
+            metrics_.counter("yuzu_server_policy_eval_errors_total", {{"phase", phase}});
+        metrics_.describe("yuzu_server_policy_eval_errors_total",
+                          "Policy evaluator failures by phase: claim (the due-policy claim), "
+                          "dispatch, check, fix, verify, remediate_claim, and error_verdict_write "
+                          "(a chunk of the per-agent error verdict write failed, retries "
+                          "exhausted), and error_verdict_retry (one per retried chunk attempt, "
+                          "not itself a failure). Zero means none of that phase.",
+                          "counter");
         for (const char* phase : {"check", "fix", "verify"})
             metrics_.counter("yuzu_server_policy_instruction_missing_total", {{"phase", phase}});
         metrics_.describe("yuzu_server_policy_instruction_missing_total",

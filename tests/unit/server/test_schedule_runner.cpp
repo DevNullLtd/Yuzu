@@ -1872,14 +1872,26 @@ TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair 
           "still fires in bounded ticks (WP06 F53)",
           "[schedule][runner][d7][pg]") {
     int asked_held = 0;
-    Harness h([&](const std::string& principal, const std::string&, const std::string&)
+    // The check is keyed on the PAIR, as the real one is: a Read-class pair needs no store read and
+    // answers at once; every other pair needs the (failing) auth store.
+    Harness h([&](const std::string&, const std::string& plugin, const std::string&)
                   -> std::expected<bool, std::string> {
-        if (principal == "admin") {
-            ++asked_held;
-            return std::unexpected(std::string("auth store error"));
-        }
-        return true;
+        if (plugin == "ro")
+            return true;
+        ++asked_held;
+        return std::unexpected(std::string("auth store error"));
     });
+    {
+        InstructionDefinition d;
+        d.id = "read.def";
+        d.name = "read.def";
+        d.version = "1.0.0";
+        d.type = "question";
+        d.plugin = "ro";
+        d.action = "list";
+        d.enabled = true;
+        REQUIRE(h.is.create_definition(d).has_value());
+    }
     std::int64_t clock = 1'000'000;
     h.now_hook = [&] { return clock; };
     for (int i = 0; i < 50; ++i) {
@@ -1895,7 +1907,7 @@ TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair 
     }
     InstructionSchedule tail;
     tail.name = "tail-read-pair";
-    tail.definition_id = "test.def";
+    tail.definition_id = "read.def";
     tail.frequency_type = "interval";
     tail.interval_minutes = 60;
     tail.enabled = true;
@@ -1913,7 +1925,7 @@ TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair 
         ++ticks;
     }
     REQUIRE_FALSE(h.enqueues.empty());
-    CHECK(h.enqueues[0].principal == "reader");
+    CHECK(h.enqueues[0].plugin == "ro");
     CHECK(ticks <= 25);
 }
 

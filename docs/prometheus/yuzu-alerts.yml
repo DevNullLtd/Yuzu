@@ -9048,6 +9048,25 @@ groups:
             only skipped and counted. Restore the instruction or point the
             policy at an existing one.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
+      - alert: YuzuPolicyErrorVerdictWriteFailed
+        # The evaluator could not write the per-agent `error` verdict for a policy whose check
+        # instruction is gone or whose pair no longer matches (a chunk failed after its retries).
+        # The affected agents keep their PREVIOUS verdict, which may read compliant, until the next
+        # evaluation. The series is pre-seeded at 0, so a first failure is an increase.
+        expr: |
+          sum by (instance) (increase(yuzu_server_policy_eval_errors_total{phase="error_verdict_write"}[1h])) > 0
+        for: 0m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy error verdicts were not written on {{ $labels.instance }}"
+          description: >-
+            yuzu_server_policy_eval_errors_total{phase="error_verdict_write"} increased in the
+            last hour: a policy check was refused (deleted instruction or mismatched pair) but the
+            per-agent error verdict could not be written for at least one chunk of targets, so
+            those agents still show their previous verdict. Check Postgres reachability and the
+            policy store, then re-run POST /api/policies/{id}/evaluate.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuScheduleArmingUnavailable
         # A due schedule was HELD (not advanced) because its creator's authority could not be
         # determined: an auth-store fault. A single tick during a short blip is normal. The 5m

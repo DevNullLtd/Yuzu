@@ -508,7 +508,11 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // summary warn. A should_stop break is deliberately NOT added: the claim already stamped the
     // interval, so a skipped tail would keep a stale verdict as current.
     auto write_error_verdicts = [&](const char* reason_json) {
-        auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json);
+        std::size_t retries = 0;
+        auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json, &retries);
+        if (retries > 0 && d_.metrics)
+            d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "error_verdict_retry"}})
+                .increment(static_cast<double>(retries));
         if (!r) {
             spdlog::warn("policy_evaluator: error-verdict write failed for policy {} ({} target(s)): {}",
                          p.id, targets.size(), r.error());
