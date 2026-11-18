@@ -481,7 +481,7 @@ dispatch. See `docs/user-manual/instructions.md` "Execution semantics" and
 | `yuzu_schedule_arming_deferred_total` | counter | A due schedule was skipped, without being asked, because an earlier arming check for it was unavailable and its 90-second hold had not lapsed. Not a denial; pre-seeded at 0. |
 | `yuzu_schedule_due_held` | gauge | Schedules on the arming hold as of the last scheduler tick (0 = none). The `YuzuScheduleDueHeld` alert fires when it stays above zero for 10 minutes. |
 | `yuzu_server_agent_registry_plugin_meta_dropped_total` | counter, `field` (`name`, `version`, `description`, `actions`, `action`, `plugins`) | An agent-reported plugin name, version, description, action, or a plugin entry beyond the per-agent cap (128 plugin entries, `kMaxPluginsPerAgent` in `plugin_meta_rules.hpp`; the served catalogue separately holds at most 512 plugins), was dropped at registration because it fell outside its bound. A name, version, description or single action is dropped whole, never cut short; the plugin list and the per-plugin action list are capped, so an agent that reports more plugins or actions than the cap loses the entries past it from the served catalogue (the `plugins` and `actions` series move): the catalogue is not unaffected by the cap. Pre-seeded at 0 per field; the `YuzuAgentPluginMetaDropped` alert fires on an increase. |
-| `yuzu_server_policy_eval_errors_total` | counter, `phase` (`claim`, `dispatch`, `check`, `fix`, `verify`, `remediate_claim`, `error_verdict_write`, `error_verdict_retry`) | HELP: `Policy evaluator failures by phase: claim (the due-policy claim), dispatch, check, fix, verify, remediate_claim, and error_verdict_write (a chunk of the per-agent error verdict write failed, retries exhausted), and error_verdict_retry (one per retried chunk attempt, not itself a failure). Zero means none of that phase.` Pre-seeded at 0 per phase. `error_verdict_retry` counts retried chunk attempts (each with a fresh connection, up to the pool size plus one per chunk) and is not a failure. `error_verdict_write` counts one per policy evaluation whose per-agent `error` verdict write lost at least one chunk (the affected agents keep their previous verdict); `YuzuPolicyErrorVerdictWriteFailed` fires on an increase over 1h. |
+| `yuzu_server_policy_eval_errors_total` | counter, `phase` (`claim`, `dispatch`, `check`, `fix`, `verify`, `remediate_claim`, `error_verdict_write`, `error_verdict_retry`) | HELP: `Policy evaluator failures by phase: claim (the due-policy claim), dispatch, check, fix, verify, remediate_claim, and error_verdict_write (a chunk of the per-agent error verdict write failed: a statement error, or connection-class retries or the 30 s budget used up), and error_verdict_retry (one per retried chunk attempt on a fresh pool lease, not itself a failure). Zero means none of that phase.` Pre-seeded at 0 per phase. `error_verdict_retry` counts retried chunk attempts (each on a fresh pool lease, connection-class failures only, up to the pool size plus one per chunk, all inside one 30 s budget for the whole write) and is not a failure; a statement error (a lock wait, a timeout) is not retried. `error_verdict_write` counts one per policy evaluation whose per-agent `error` verdict write lost at least one chunk (the affected agents keep their previous verdict); `YuzuPolicyErrorVerdictWriteFailed` fires on an increase over 1h. |
 | `yuzu_server_policy_instruction_missing_total` | counter, `phase` (`check`, `fix`, `verify`) | HELP: `Policy instruction dispatches skipped because the check, fix or verify instruction id no longer resolves to a definition (deleted). A check writes an explicit per-agent error verdict.` The evaluator did not dispatch a policy instruction because its instruction id no longer resolves (the definition was deleted). In the `check` phase every target gets an `error` verdict (`{"phase":"check","result":"instruction_missing"}`, also counted in `yuzu_server_policy_eval_errors_total{phase="check"}`) and `POST /api/policies/{id}/evaluate` answers `409`; the `fix` and `verify` phases count and skip the dispatch without a verdict write. Pre-seeded at 0 per phase; the `YuzuPolicyInstructionMissing` alert fires on an increase over 1h. |
 | `yuzu_server_policy_instruction_pair_mismatch_total` | counter, `phase` (`check`, `fix`, `verify`) | The evaluator refused to dispatch a policy instruction whose `plugin.action` no longer matches the pair authorized when its fragment was stored (or whose fragment carries no snapshot). The `check` phase also writes a per-agent error verdict (`result` `instruction_pair_mismatch`), `POST /api/policies/{id}/evaluate` answers `409`, and the remediate route answers `409` when the fix pair differs from the authorized one. Pre-seeded at 0 per phase; the `YuzuPolicyInstructionPairMismatch` alert fires on an increase over 1h. |
 | `yuzu_server_command_outbox_deliver_retry_total` | counter | Delivery deferred with back-off because the dispatch-gate read was systemically unreadable (e.g. containment status), a transient condition — the occurrence stays `pending` and is re-driven. A sustained climb means the gate dependency, not the schedule, is unhealthy. |
@@ -1819,46 +1819,61 @@ the server with `--metrics-no-auth` (any source) or `--metrics-trust-loopback`
 
 This is the one worked recipe; other pages link here.
 
-0. **Prerequisite: RBAC enforcement ON.** The `ApiTokenManager` grant below is
-   consulted only when RBAC is enforced (with it off, a non-administrator cannot
-   mint a token at all, and an administrator's token carries administrator
-   authority); turn it on first (`PUT /api/v1/rbac/enforcement`, see
-   [RBAC](rbac.md)). Create the dedicated local account too (Settings, User
-   Management, or **Add user**), named `prometheus-scrape` here, and sign in as it
-   once so you can obtain its credential for step 1.
+0. **Prerequisites.** `$YUZU_URL` is the server's HTTPS base URL, for example
+   `https://yuzu.example.com:8443`. Turn RBAC enforcement on first (`PUT
+   /api/v1/rbac/enforcement`, see [RBAC](rbac.md)): the `ApiTokenManager` grant
+   below is consulted only when RBAC is enforced (with it off, a non-administrator
+   cannot mint a token). Create a dedicated local account named
+   `prometheus-scrape` (Settings, User Management, or **Add user**) and give it NO
+   role. Do not add it to any group and do not provision it through SSO or SCIM:
+   a group's role reaches its token. `$ADMIN_TOKEN` is the API token of an
+   administrator, used only to grant and remove the role (an API token is never
+   challenged for MFA; a cookie session is).
 1. **Mint the token.** `/metrics` accepts the token of ANY principal and checks no
-   permission, so mint it from a dedicated local account that holds no other
-   access. Minting needs `ApiToken:Write`; give the account the `ApiTokenManager`
-   role for this one step and remove it afterwards (the grant-mint-remove pattern
-   of the CMDB recipe in [REST API](rest-api.md)). With RBAC enforcement off a
-   token carries its creator's authority, so use RBAC (the account then holds
-   only what you assign). `$ADMIN_TOKEN` below is the API token of an
-   administrator, used only to assign and remove the role (those routes are
-   step-up routes: an API token is never challenged, a cookie session is):
+   permission. The token also carries that account's authority everywhere else,
+   resolved live from the account. With RBAC enforcement ON that is only what RBAC
+   grants the account: nothing for a fresh local user, so create it with no role.
+   With RBAC OFF (the default) every authenticated principal reads every
+   Read-class route fleet-wide except the topology-floor set (audit log,
+   forensics, access reviews, RBAC and TLS configuration). Treat the token as a
+   bearer credential on the Prometheus host; if an administrator later switches
+   RBAC enforcement off, or the account is promoted, it widens silently: revoke
+   it. Safer alternatives: `--metrics-trust-loopback` for a co-located scraper,
+   or a network allow-list with `--metrics-no-auth`.
+
+   Minting needs `ApiToken:Write`, so grant `ApiTokenManager` to the account for
+   this one step and remove it afterwards (the grant-mint-remove pattern of the
+   CMDB recipe in [REST API](rest-api.md)). The cookie is used ONCE, to mint
+   the token; Prometheus then scrapes with the token alone, with no session.
+   Get the account's session cookie by signing in as it (`POST /login` with form
+   fields `username` and `password` answers `Set-Cookie: yuzu_session=<value>`),
+   and send it back as the literal `yuzu_session=<value>`. A cookie write must
+   carry an `Origin` header naming this site. An MFA-enrolled account cannot do
+   this with curl: mint the token in the dashboard (Settings, API Tokens, which
+   calls `POST /api/settings/api-tokens` with the same permission and the same
+   step-up proof) and skip to step 2. `date -d '+90 days' +%s` is GNU; on macOS
+   use `date -v+90d +%s`. Run the grant, the mint and the removal as one guarded
+   sequence, so the removal is skipped if the mint failed:
 
    ```bash
-   curl -sS -X POST "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments" \
+   export YUZU_URL=https://yuzu.example.com:8443
+   curl -sSfk -X POST "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments" \
      -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
      -d '{"principal_type":"user","principal_id":"prometheus-scrape"}'
+   SCRAPE_COOKIE="yuzu_session=<value from POST /login>"
+   if curl -sSfk -X POST "$YUZU_URL/api/v1/tokens" \
+        -b "$SCRAPE_COOKIE" -H "Origin: $YUZU_URL" -H 'Content-Type: application/json' \
+        -d '{"name":"prometheus-scrape","expires_at":'$(date -d '+90 days' +%s)'}' ; then
+     curl -sSfk -X DELETE "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments/prometheus-scrape" \
+       -H "Authorization: Bearer $ADMIN_TOKEN"
+   else
+     echo "mint failed: the ApiTokenManager grant is still in place; fix and rerun the mint" >&2
+   fi
    ```
 
-   Then sign in as that account on the dashboard and call `POST /api/v1/tokens` from that
-   session (`$SCRAPE_COOKIE` below is its session cookie; a cookie call must send an `Origin`
-   naming this site and, for an MFA-enrolled account, a fresh MFA proof; see
-   [REST API](rest-api.md)), give the token an
-   `expires_at` (a Unix epoch; a token with none never expires) and put the renewal
-   date in your calendar. `date -d '+90 days' +%s` is GNU; on macOS use
-   `date -v+90d +%s`:
-
-   ```bash
-   curl -sS -X POST "$YUZU_URL/api/v1/tokens" \
-     -b "$SCRAPE_COOKIE" -H "Origin: $YUZU_URL" -H 'Content-Type: application/json' \
-     -d '{"name":"prometheus-scrape","expires_at":'$(date -d '+90 days' +%s)'}'
-   curl -sS -X DELETE "$YUZU_URL/api/v1/rbac/roles/ApiTokenManager/assignments/prometheus-scrape" \
-     -H "Authorization: Bearer $ADMIN_TOKEN"
-   ```
-
-   The raw token is in the response and is never shown again.
+   (`-k` is for the self-signed default certificate; use `--cacert` otherwise.)
+   Give the token an `expires_at` (a token with none never expires). The raw
+   token is in the response and is never shown again.
 2. **Store the raw token** (only the token string, no `Bearer ` prefix, no
    quotes, no trailing newline needed) in the file Prometheus reads, owned by
    the Prometheus user and not readable by anyone else (mode `0600`, or `0640`
@@ -1902,17 +1917,18 @@ This is the one worked recipe; other pages link here.
    file`, and a Prometheus started or reloaded with the file missing refuses the
    configuration. Prometheus re-reads `credentials_file` on every scrape, so
    rotation needs no restart.
-4. **Rotate** by minting a new token (step 1), overwriting the file, then
-   revoking the old one (`DELETE /api/v1/tokens/{token_id}`). Do this before
-   `expires_at`.
+4. **Renew before `expires_at`: renewal is manual.** Nothing renews the token. Repeat
+   the grant, mint and removal of step 1, overwrite the file and revoke the old
+   token (`DELETE /api/v1/tokens/{token_id}`), or call
+   `POST /api/v1/tokens/{token_id}/rotate` with `overlap_secs` to keep the old
+   token valid for an overlap window (see [REST API](rest-api.md)). A missed
+   renewal is a silent `401`: `up{job="yuzu-server"}` goes to 0 and
+   `YuzuServerMetricsScrapeDown` fires after 5 minutes, which is the only
+   expiry control, so route that alert. The `/metrics` token is accepted for
+   any principal; whether deprovisioning the account revokes it is not
+   something this page promises, so revoke it yourself when the account goes.
 
-Which principal's token to use: `/metrics` accepts the API token of ANY
-principal; the handler checks no permission, only that the request resolves to a
-session. So the token authenticates, it does not authorize, and whatever the
-token's account may otherwise do, the token may do too. Mint it from a dedicated
-account with no more access than the narrowest role your deployment allows,
-never from an administrator, and do not reuse a human operator's token. A
-scraper that cannot read the file or sends a wrong token is answered `401`,
+A scraper that cannot read the file or sends a wrong token is answered `401`,
 `up{job="yuzu-server"}` is 0 and `YuzuServerMetricsScrapeDown` fires. Verify:
 `curl -sS -o /dev/null -w '%{http_code}\n' -H "Authorization: Bearer $(cat /etc/prometheus/yuzu-metrics-token)" https://yuzu.example.com:8443/metrics`
 must print `200` (add `--cacert <ca>` for a verified connection, or `-k` for a self-signed lab certificate).
@@ -1966,7 +1982,7 @@ curl -s 'http://localhost:9090/api/v1/query?query=yuzu_agents_connected' | jq .
 
 ### GET /events
 
-The server exposes a Server-Sent Events (SSE) endpoint for real-time updates.
+The server exposes a Server-Sent Events (SSE) endpoint for real-time updates. The route, its grant requirement and its open-stream limits are specified under `GET /events` in [REST API](rest-api.md).
 The dashboard uses this for live agent status, but any SSE client can consume
 it. This endpoint requires authentication (a session cookie or an API token) and a
 fleet-wide read grant: a management-group-confined or service-scoped caller is refused `403`

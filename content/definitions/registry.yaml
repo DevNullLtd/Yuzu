@@ -241,11 +241,7 @@ metadata:
     itself a link, therefore fails as key_is_link. The previous and new values
     are recorded in a `registry.write` audit row (hex, capped at 256 bytes; they can
     contain secrets: the product owner accepted this risk on 2026-10-20 and masking
-    is a planned later change). Needs registry 2.0.0 on the agent: an agent still
-    running registry 1.x writes an EMPTY REG_SZ for a data_hex-only write, stores
-    REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as REG_SZ text and
-    follows a write under HKLM\SYSTEM\CurrentControlSet, all answering `status|ok`,
-    so upgrade the agents first. Windows-only.
+    is a planned later change). Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -307,20 +303,13 @@ spec:
           most 1 MiB of data (2,097,152 hex characters), but MCP
           `execute_instruction` and the result-set execute routes limit every
           parameter value to 64 KiB, so through them it carries at most 32 KiB
-          of data; the direct command route is not under that cap. Needs
-          registry 2.0.0 on the agent: registry 1.x ignores it and writes an
-          EMPTY REG_SZ over the value, answering `status|ok` (with
-          type=REG_DWORD and data_hex only, 1.x throws and writes nothing).
+          of data; the direct command route is not under that cap.
         validation:
           maxLength: 2097152
       type:
         type: string
         description: >
           Registry value type to write. Defaults to REG_SZ when omitted.
-          Mixed fleets: an agent still running registry 1.x stores
-          REG_QWORD, REG_MULTI_SZ, REG_EXPAND_SZ and REG_BINARY values as
-          REG_SZ text and answers `status|ok`, so upgrade the agents to
-          registry 2.0.0 before using them.
         validation:
           enum: ["REG_SZ", "REG_EXPAND_SZ", "REG_BINARY", "REG_DWORD", "REG_MULTI_SZ", "REG_QWORD"]
   result:
@@ -482,13 +471,10 @@ metadata:
     could not finish is refused as tree_too_large with nothing deleted (delete it in parts). On a dry run or a
     refusal the counts are what the vet counted; on a real run they are what the delete removed (exact when it
     succeeds, the partial total when it stopped), so they can exceed a dry run's. A non-recursive delete of a key
-    holding more than 10,000 values removes only that key and its own values. MIXED FLEETS: an agent running
-    registry 1.x or 2.0.x (every agent released before 2.1.0, v0.14.1 included) reads neither `recursive` nor
-    `dry_run`: sent dry_run=true it DELETES a key that has no subkeys (a key with subkeys is refused), and a bare
-    `status|ok` or a `dry_run|0` row in answer to dry_run=true means the key was deleted. The server does not
-    compare plugin versions at dispatch (#6484), so upgrade the server, then the agents to registry 2.1.0 before
-    using either flag, scope any preview to a tag that marks devices verified at 2.1.0, and until then use the
-    delete_key kill switch as the stop-gap. Windows-only.
+    holding more than 10,000 values removes only that key and its own values. An earlier registry agent
+    (1.x or 2.0.x) is unsupported: reprovision it. It ignores `dry_run` and `recursive`, so a `delete_key` with
+    `dry_run=true` sent to it deletes a childless key. The server does not compare plugin versions (#6484).
+    Windows-only.
   tags: [registry, windows, configuration]
 spec:
   type: action
@@ -521,8 +507,7 @@ spec:
           that has subkeys. The tree is vetted first (at most 10,000 keys and values and 600 levels, else
           tree_too_large with nothing deleted; a registry link inside it is refused as key_is_link), and the
           counts of a dry run are a snapshot. Any other spelling is refused as invalid_data (the direct command
-          route, which has no enum, also accepts 1 and 0). Needs registry 2.1.0 on the agent: registry 1.x and
-          2.0.x ignore it.
+          route, which has no enum, also accepts 1 and 0).
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -532,8 +517,7 @@ spec:
         description: >
           "true" counts what a real run would remove (with `recursive`, the vetted tree) and deletes nothing;
           "false" (the default) deletes. Any other spelling is refused as invalid_data (the direct command route
-          also accepts 1 and 0). Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x ignores this
-          flag and DELETES a key that has no subkeys, so upgrade agents first (docs/user-manual/upgrading.md).
+          also accepts 1 and 0).
         default: "false"
         validation:
           enum: ["true", "false"]
@@ -707,8 +691,7 @@ metadata:
     set_value. A `registry.write` audit row records the previous and new values (hex, capped at 256 bytes;
     they can contain secrets: the product owner accepted this risk on 2026-10-20 and masking is a planned
     later change), and the `value` and
-    `data_hex` parameters are stored unredacted in the execution's parameter_values. Needs registry 2.1.0 on the
-    agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
+    `data_hex` parameters are stored unredacted in the execution's parameter_values. Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: action
@@ -803,7 +786,7 @@ metadata:
     Delete a registry value from a specific user's hive; the key itself is left in place. Same profile
     resolution, live-or-offline hive path, hive-file guard, read-back verification, flush and audit row as
     set_user_value (the deleted value's previous data is in that row and in the response). Needs registry 2.1.0
-    on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown action`. Windows-only.
+    Windows-only.
   tags: [registry, windows, per-user, configuration]
 spec:
   type: action
@@ -918,8 +901,7 @@ metadata:
     agent per minute and the later rows are suppressed), its `item` row and, for a deleted key, its `undo` rows,
     then a closing `summary`. The plan parameter, with every value in it, is stored unredacted in the
     execution's parameter_values, and the reply holds previous values (secrets included) for Response:Read
-    holders. Needs registry 2.1.0 on the agent: an agent at registry 1.x or 2.0.x answers `error|unknown
-    action`. Windows-only.
+    holders. Windows-only.
   tags: [registry, windows, configuration, bulk]
 spec:
   type: action
@@ -943,7 +925,7 @@ spec:
           captured empty value round-trip. delete_value takes key and name; create_key and delete_key take key
           only (delete_key is NOT recursive and refuses a link). A set_value or create_key item whose first key
           component does not already exist directly under the hive is refused root_level_create, in a dry run and
-          a real run alike. An agent still on registry 1.x or 2.0.x answers `error|unknown action`.
+          a real run alike.
         validation:
           maxLength: 65536
       dry_run:
