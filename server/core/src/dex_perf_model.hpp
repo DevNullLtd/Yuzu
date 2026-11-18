@@ -11,6 +11,13 @@
 /// from dex_perf_rules.hpp, shared with the Prometheus rollup, so the fleet
 /// cards and the `yuzu_fleet_perf_*` gauges can never disagree.
 ///
+/// One exception to the heartbeat-only description: the two sections at the end of this
+/// header ("A4: device perf sparklines" and "F2a PR2: device drill perf extensions") hold
+/// the DexPerfPoint and DexProcPerfRow parsers, which parse the per-device Echo
+/// `echo.sql` output, and the canned SQL strings that produce it. They are still pure
+/// functions over strings (no I/O, no store); the query itself is dispatched by
+/// dex_routes.cpp.
+///
 /// Honesty rules: a metric nobody reported is ABSENT (std::nullopt), never 0;
 /// every aggregate carries its reporting population; cohorts below
 /// kDexCohortFloor (one device: only an empty cohort) are suppressed ("n too
@@ -240,7 +247,7 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
                                                    int limit);
 
 // ── A4: device perf sparklines (federated Echo query) — hoisted from dex_routes
-//    (#2146 PR A) so the dashboard fragments and any REST/MCP twin share ONE copy of
+//    (#2146) so the dashboard fragments and a future REST/MCP twin share ONE copy of
 //    the canned SQL and the defensive parsers ──────────────────────────────────
 
 /// One parsed hourly perf point out of the device's Echo edge warehouse

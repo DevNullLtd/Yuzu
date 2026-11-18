@@ -455,7 +455,7 @@ FAMILIES = {
             "server/core/src/device_lens_routes.hpp",
             # live_model.{hpp,cpp} — the pure live-read kind table, typed row
             # models and plugin-output parsers hoisted out of device_routes.cpp
-            # (#2146 PR A); shared with the REST v1 live route.
+            # (#2146); shared with the REST v1 live route.
             "server/core/src/live_model.cpp",
             "server/core/src/live_model.hpp",
         ],

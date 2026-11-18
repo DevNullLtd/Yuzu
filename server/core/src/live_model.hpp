@@ -19,14 +19,15 @@
 /// ONE table, two views. All 22 kinds the dashboard offers are rows of the table; the
 /// REST route accepts only the rows flagged `rest_v1` (today `uptime` and `processes`).
 /// resolve_dashboard_kind() and resolve_rest_kind() are the only two ways to look a
-/// kind up, so widening the REST surface is a one-flag change on the row, never a
-/// second table.
+/// kind up, so widening the REST surface never needs a second table. It is NOT a
+/// one-flag change, though: it takes flipping `rest_v1` on the row AND teaching
+/// live_result_json (rest_api_v1.cpp) the kind, because that function renders every
+/// kind other than `uptime` as the processes shape.
 
 #include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <string>
-#include <utility>
 #include <vector>
 
 // ── Typed row models (shared with the device_ui.cpp renderers) ───────────────────
@@ -92,6 +93,12 @@ inline constexpr std::size_t kMaxLiveRows = 20000;
 /// NOW. `kind` is an ALLOWLIST token; each kind carries its own audit verb so a
 /// usage-class read (what processes a person runs) stays separately countable from a
 /// machine-health read (uptime), the works-council access-audit posture.
+///
+/// Set new fields BY NAME (designated initialisers or an assignment after
+/// construction), never positionally: a positional bool added after `columns` would
+/// silently bind to `rest_v1` (a positional bool port was the hazard raised in review
+/// of the in-flight #8122, which adds `bool escaped_rows`). The `rest == {uptime,
+/// processes}` pin in test_live_model.cpp is the tripwire for such a mis-port.
 struct LiveKind {
     std::string plugin;
     std::string action;
@@ -116,6 +123,14 @@ struct LiveKind {
 };
 
 /// Any of the 22 dashboard kinds (the closed allowlist the dashboard routes accept).
+///
+/// Invariant (carried over from the deleted resolve_live_kind): the caller's `kind` string
+/// is an ALLOWLIST token and must be resolved here (or by resolve_rest_kind) BEFORE it
+/// drives any dispatch or reaches markup. device_routes.cpp's render_live_result
+/// interpolates the raw `kind` into the markup id `ls-cnt-<kind>` for the generic
+/// physical-kit kinds; that is safe only because its sole caller, the live result route,
+/// answers 400 on an unresolved kind first (the live run route resolves first too, before
+/// it dispatches). Never call it with an unresolved kind.
 std::optional<LiveKind> resolve_dashboard_kind(const std::string& kind);
 
 /// The REST v1 subset: only rows flagged `rest_v1` (uptime, processes).
@@ -201,8 +216,12 @@ struct LiveGenericRows {
 };
 
 /// The ten physical-kit kinds: flat `<row_prefix>|field...` rows per `kind.columns`. A line
-/// under any other prefix is kept verbatim in `raw_rows`; rows and raw_rows share ONE
-/// kMaxLiveRows bound.
+/// under any other prefix is kept verbatim in `raw_rows`. Bounds: `rows` never exceeds
+/// kMaxLiveRows (parsing stops once it reaches it), and a raw line is kept only while
+/// rows.size() + raw_rows.size() is still below kMaxLiveRows. The two bounds are
+/// therefore NOT one combined cap: raw lines arriving before the data rows can fill
+/// raw_rows to kMaxLiveRows and rows can then still grow to kMaxLiveRows, so the
+/// combined total can reach 2 x kMaxLiveRows.
 LiveGenericRows parse_generic_rows(const LiveKind& kind, const std::string& output);
 
 } // namespace yuzu::server::live

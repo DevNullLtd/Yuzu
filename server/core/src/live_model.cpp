@@ -6,6 +6,7 @@
 #include <algorithm>
 #include <cctype>
 #include <unordered_map>
+#include <utility>
 
 namespace yuzu::server::live {
 
@@ -561,8 +562,10 @@ LiveGenericRows parse_generic_rows(const LiveKind& kind, const std::string& outp
     LiveGenericRows out;
     // A line under any OTHER prefix (e.g. a plugin-emitted "warning|..." or "error|..."
     // diagnostic alongside its data rows) is preserved verbatim as an honest raw/diagnostic
-    // row rather than silently dropped. Bounded by the SAME kMaxLiveRows cap, shared across
-    // rows and raw_rows combined (one output-size bound, not two).
+    // row rather than silently dropped. Two checks, both against kMaxLiveRows: a raw line is
+    // kept only while rows + raw_rows is below it, while a data row is kept until rows alone
+    // reaches it (then parsing stops). So the combined total is NOT held to one cap: raw lines
+    // first, then data rows, can reach 2 x kMaxLiveRows (rows and raw_rows each at the cap).
     const std::string prefix = kind.row_prefix + "|";
     for (const auto& l : split_lines(output)) {
         if (!l.starts_with(prefix)) {

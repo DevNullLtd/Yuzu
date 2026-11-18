@@ -949,10 +949,11 @@ std::string render_device_live_disk(const std::vector<LiveDiskVolume>& rows) {
 /// Generic table renderer backing the 10 round-3 item 11 "physical-kit" live-info
 /// kinds (disks, memory, processors, drivers, battery, thermal, disk health,
 /// volumes, network adapters, Wi-Fi) added via a data-only LiveKind.columns /
-/// .row_prefix extension in live_model.cpp — no per-kind bespoke renderer needed
-/// since the wire shape is uniform pipe-delimited rows whose field order already
-/// matches the declared column order. Parsing/prefix filtering happens in
-/// device_routes.cpp's render_live_result, NOT here — this function is pure over
+/// .row_prefix extension (the kinds are declared in live_model.{hpp,cpp}); no per-kind
+/// bespoke renderer is needed since the wire shape is uniform pipe-delimited rows whose
+/// field order already matches the declared column order. Parsing/prefix filtering
+/// happens in live::parse_generic_rows (live_model.cpp), called from device_routes.cpp's
+/// render_live_result, NOT here; this function is pure over
 /// already-parsed rows, matching every other render_device_live_* function in
 /// this file. `raw_rows` are lines that did NOT match the kind's row_prefix
 /// (e.g. a plugin-emitted "warning|..."/"error|..." diagnostic alongside its

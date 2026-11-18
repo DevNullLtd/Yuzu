@@ -188,7 +188,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& obs);
 /// header for the doc comment).
 
 // `DexPerfPoint`, `kDexPerfSql`, `dex_procperf_sql()`, `parse_dex_perf_output` and
-// `parse_dex_procperf_output` live in the pure `dex_perf_model.hpp` (#2146 PR A);
+// `parse_dex_procperf_output` live in the pure `dex_perf_model.hpp` (hoisted out of dex_routes.cpp, #2146);
 // re-exported here transitively (it is already included above), so every existing
 // caller of THIS header is unaffected.
 

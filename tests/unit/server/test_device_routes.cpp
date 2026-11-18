@@ -1052,7 +1052,7 @@ TEST_CASE("device routes: /devices + /device redirect to Hardware CI",
     }
 }
 
-// Behaviour-neutrality pin for the live-result render path (#2146, PR A). Each case
+// Behaviour-neutrality pin for the live-result render path (the #2146 live_model hoist). Each case
 // feeds one fixed agent output through the REAL /fragments/device/live/result route
 // and pins a 64-bit FNV-1a hash of the full response body (rendered card + OOB
 // count/KPI spans). The hashes were recorded against the code BEFORE the kind table

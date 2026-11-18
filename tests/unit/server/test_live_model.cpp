@@ -1,6 +1,6 @@
 /// @file test_live_model.cpp
 /// Pure-unit tests for live_model.{hpp,cpp}: the ONE live-read kind table and the
-/// plugin-output parsers hoisted out of device_routes.cpp (#2146 PR A). The route-level
+/// plugin-output parsers hoisted out of device_routes.cpp (#2146). The route-level
 /// render pins live in test_device_routes.cpp; these pin the pure functions directly.
 
 #include "live_model.hpp"

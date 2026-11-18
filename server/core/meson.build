@@ -856,7 +856,7 @@ yuzu_server_core_lib = static_library(
     'src/license_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/software_deployment_model.cpp', # #2146 Batch B5 -- shared REST+MCP builder (Rule 1)
     'src/dex_perf_model.cpp',
-    'src/live_model.cpp', # #2146 PR A -- live-read kind table + parsers (pure, device seam family)
+    'src/live_model.cpp', # #2146 -- live-read kind table + parsers hoisted out of device_routes.cpp (pure, device seam family)
     'src/dex_app_perf_model.cpp',
     'src/network_perf_model.cpp',
     'src/network_api.cpp', # ADR-0031 WS-A4: the first per-family in-process API seam pilot

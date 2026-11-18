@@ -1819,7 +1819,7 @@ if build_server
       'unit/server/test_echo_timeline_page.cpp', # Echo timeline page: shell pins, flag default, escaping, script pins
       'unit/server/test_echo_tree_routes.cpp',
       'unit/server/test_dex_perf_model.cpp',
-      'unit/server/test_live_model.cpp', # #2146 PR A: pure live-read kind table + parsers
+      'unit/server/test_live_model.cpp', # #2146: pure live-read kind table + parsers (live_model)
       # #1845 registry tripwire: pins detail::dex_perf_os_collects to the echo plugin's
       # capture_sources() perf row. Registry TU compiled in here; NO echo include dir
       # (see the include-path constraint below) - the test includes the header by

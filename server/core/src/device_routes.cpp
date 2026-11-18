@@ -16,7 +16,6 @@
 
 #include <algorithm>
 #include <cctype>
-#include <cstdint>
 #include <optional>
 #include <string>
 #include <unordered_set>
@@ -168,6 +167,8 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
     if (!lk.columns.empty()) {
         const auto g = live::parse_generic_rows(lk, output);
         std::string body = render_device_live_generic(lk.columns, g.rows, g.raw_rows);
+        // `kind` is interpolated raw into a markup id: safe only because the callers resolved
+        // it against the allowlist first (see live_model.hpp resolve_dashboard_kind).
         body += oob("ls-cnt-" + kind, "ls-cnt", std::to_string(g.rows.size() + g.raw_rows.size()));
         return body;
     }

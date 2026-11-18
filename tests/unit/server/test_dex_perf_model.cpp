@@ -1504,7 +1504,7 @@ TEST_CASE("REST /dex/perf/cohort-diff: deltas, required params, missing cohort",
     }
 }
 
-// ── #2146 PR A: the canned device-perf SQL builders, hoisted out of dex_routes.cpp ──
+// ── #2146: the canned device-perf SQL builders, hoisted out of dex_routes.cpp ──
 // The text is the contract with the agent's read-only echo.sql chokepoint and with the
 // column names the parsers locate by name, so it is pinned verbatim.
 TEST_CASE("dex perf canned SQL: warehouse queries are pinned verbatim", "[dex][perf][sql]") {

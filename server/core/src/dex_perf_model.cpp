@@ -380,7 +380,9 @@ std::vector<DexPerfDeviceRow> dex_perf_device_list(const DexPerfSnapshot& snap, 
 }
 
 // ── A4: device perf sparklines (federated Echo query) — hoisted from dex_routes.cpp
-//    (#2146 PR A); the bodies are unchanged ──────────────────────────────────────
+//    (#2146). The parser bodies are unchanged; dex_procperf_sql() is now a thin wrapper
+//    over dex_procperf_sql_at() (which takes the clock reading as an argument) and emits
+//    identical text ───────────────────────────────────────────────────────────────
 
 namespace {
 
