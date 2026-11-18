@@ -850,9 +850,10 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const hardware_ci_page::Request& rq = *parsed;
         // `deps_.ci_collation_gate` is the collation gate (device_ci_read_gate.hpp): not Trusted
         // refuses the page before the store is asked. Null means no gate was wired (tests only).
-        // `deps_.ci_read_slots` is the bulk-read concurrency cap (bulk_read_slots.hpp), held only
-        // around the store call; a point read (agent_id) takes none. Null means no cap (tests only).
-        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
+        // `deps_.ci_read_slots` is the bulk-read concurrency cap (bulk_read_slots.hpp), held across
+        // the store call and this page's access-audit write (Page::hold); a point read (agent_id)
+        // takes none. Null means no cap (tests only).
+        auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
                                                       deps_.ci_collation_gate, deps_.ci_read_slots,
                                                       hardware_ci_page::kRestRowBudgetBytes);
         if (!read) {
@@ -884,7 +885,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, std::string(f.message), opts), "application/json");
             return;
         }
-        const hardware_ci_page::Page& page = *read;
+        hardware_ci_page::Page& page = *read;
 
         // A confined caller never receives an out-of-scope row, id or count: the scope is applied
         // in SQL, so no row is filtered after the read and neither the body, the cursor nor the
@@ -898,6 +899,9 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
             page.target_denied ? hardware_ci_page::audit_detail_target_denied("REST")
                                : hardware_ci_page::audit_detail(page, rq, "REST", confined));
+        // The bulk-read slot was held through the audit write above (#7951); free it now, before
+        // the response is built.
+        page.release_slot();
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",

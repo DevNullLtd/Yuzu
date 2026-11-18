@@ -40,6 +40,7 @@
 #include <latch>
 #include <map>
 #include <memory>
+#include <condition_variable>
 #include <mutex>
 #include <optional>
 #include <set>
@@ -169,6 +170,9 @@ struct Twin {
     std::vector<std::string> domain_details; // detail, parallel
     // Generic mcp.<tool> sink (McpServer's own audit_fn).
     bool generic_audit_ok = true;
+    // Called inside each audit sink (outside `mu`), for a test that observes or blocks the write.
+    std::function<void()> on_domain_audit;
+    std::function<void()> on_generic_audit;
     std::vector<std::string> generic_rows; // action|result
     std::vector<std::string> generic_details;
 
@@ -243,9 +247,13 @@ struct Twin {
                                                       const std::string& r, const std::string& tt,
                                                       const std::string& tid,
                                                       const std::string& detail) {
-            std::lock_guard lk(mu);
-            domain_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
-            domain_details.push_back(detail);
+            {
+                std::lock_guard lk(mu);
+                domain_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
+                domain_details.push_back(detail);
+            }
+            if (on_domain_audit)
+                on_domain_audit();
             return domain_audit_ok;
         };
 
@@ -314,9 +322,13 @@ struct Twin {
         };
         auto generic_audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                     const std::string&, const std::string&, const std::string& detail) {
-            std::lock_guard lk(mu);
-            generic_rows.push_back(a + "|" + r);
-            generic_details.push_back(detail);
+            {
+                std::lock_guard lk(mu);
+                generic_rows.push_back(a + "|" + r);
+                generic_details.push_back(detail);
+            }
+            if (on_generic_audit)
+                on_generic_audit();
             return generic_audit_ok;
         };
         auto agents_fn = []() { return json::array(); };
@@ -2948,3 +2960,148 @@ TEST_CASE("byte bound: the published schemas and descriptions name page_bytes_ca
     CHECK(d.find("1 MiB") != std::string::npos);
     CHECK(d.find("a short page never means the walk is done") != std::string::npos);
 }
+
+// ───────────────── the slot is held through the access-audit writes (#7951) ─────────────────────
+
+TEST_CASE("bulk read cap: REST holds the slot through the audit write and frees it before the response",
+          "[hardware][route][rest][ci_page][bulk_read_slots]") {
+    Twin t(capped(2));
+    seed(t, {"a", "b"});
+    int in_use_during_audit = -1;
+    t.on_domain_audit = [&] { in_use_during_audit = t.ci_slots->in_use(); };
+    const auto res = t.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(in_use_during_audit == 1); // the read finished, its audit write still counts against the cap
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("bulk read cap: MCP holds the slot through both audit rows and frees it after them",
+          "[mcp][hardware][ci_page][bulk_read_slots]") {
+    Twin t(capped(2));
+    seed(t, {"a", "b"});
+    int in_use_domain = -1;
+    int in_use_generic = -1;
+    t.on_domain_audit = [&] { in_use_domain = t.ci_slots->in_use(); };
+    t.on_generic_audit = [&] { in_use_generic = t.ci_slots->in_use(); };
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE(r.contains("result"));
+    CHECK(in_use_domain == 1);
+    CHECK(in_use_generic == 1);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("bulk read cap: a point read and a refused page hold no slot during their audit write",
+          "[hardware][route][rest][ci_page][bulk_read_slots]") {
+    Twin t(capped(2));
+    seed(t, {"a", "b"});
+    int in_use_during_audit = -1;
+    t.on_domain_audit = [&] { in_use_during_audit = t.ci_slots->in_use(); };
+    const auto res = t.sink.Get("/api/v1/hardware-ci?agent_id=a");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(in_use_during_audit == 0);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("audit outage: a stalled audit write holds its slot, so the cap refuses the rest on REST",
+          "[hardware][route][rest][ci_page][bulk_read_slots][security]") {
+    // One slot. The first read's audit write blocks (a locked audit table): while it does, a second
+    // bulk read is refused as busy instead of starting another read and another audit write.
+    Twin t(capped(1));
+    seed(t, {"a", "b"});
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool audit_entered = false;
+    bool let_go = false;
+    t.on_domain_audit = [&] {
+        std::unique_lock lk(gate_mu);
+        audit_entered = true;
+        gate_cv.notify_all();
+        gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return let_go; });
+    };
+    std::atomic<int> first_status{0};
+    std::thread first([&] {
+        const auto r = t.sink.Get("/api/v1/hardware-ci");
+        first_status = r ? r->status : -1;
+    });
+    // Release the stalled audit write and join on every exit path, so a failed REQUIRE below cannot
+    // leave a joinable thread behind.
+    struct Finish {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& go;
+        std::thread& th;
+        ~Finish() {
+            {
+                std::lock_guard lk(mu);
+                go = true;
+            }
+            cv.notify_all();
+            if (th.joinable())
+                th.join();
+        }
+    } finish{gate_mu, gate_cv, let_go, first};
+    {
+        std::unique_lock lk(gate_mu);
+        REQUIRE(gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return audit_entered; }));
+    }
+    CHECK(t.ci_slots->in_use() == 1); // the read is done; the stalled audit write holds the slot
+    const int reads_before = t.ci_store.reads;
+    const auto second = t.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(second);
+    CHECK(second->status == 503);
+    CHECK(second->get_header_value("Retry-After") == "2");
+    CHECK(t.ci_store.reads == reads_before); // refused before any read
+    // (the second request's own audit hook never runs: a busy refusal writes no REST row)
+}
+
+TEST_CASE("audit outage: concurrent MCP busy refusals write at most one generic row at a time",
+          "[mcp][hardware][ci_page][bulk_read_slots][security]") {
+    Twin t(capped(1));
+    seed(t, {"a", "b"});
+    auto held = t.ci_slots->try_acquire(); // every call is refused as busy
+    REQUIRE(held.has_value());
+    std::mutex gate_mu;
+    std::condition_variable gate_cv;
+    bool entered = false;
+    bool let_go = false;
+    t.on_generic_audit = [&] {
+        std::unique_lock lk(gate_mu);
+        entered = true;
+        gate_cv.notify_all();
+        gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return let_go; });
+    };
+    json first_reply;
+    std::thread first([&] { first_reply = t.call("list_hardware_ci_records"); });
+    struct Finish {
+        std::mutex& mu;
+        std::condition_variable& cv;
+        bool& go;
+        std::thread& th;
+        ~Finish() {
+            {
+                std::lock_guard lk(mu);
+                go = true;
+            }
+            cv.notify_all();
+            if (th.joinable())
+                th.join();
+        }
+    } finish{gate_mu, gate_cv, let_go, first};
+    {
+        std::unique_lock lk(gate_mu);
+        REQUIRE(gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return entered; }));
+    }
+    // The first refusal's row write is stalled. A second refusal answers the same busy error but
+    // writes no row and says so.
+    const json second = t.call("list_hardware_ci_records");
+    REQUIRE(second.contains("error"));
+    CHECK(second["error"]["message"] == kBusyMessage);
+    CHECK(second["error"]["data"]["audit_persisted"] == false);
+    {
+        std::lock_guard lk(t.mu);
+        CHECK(t.generic_rows.size() == 1); // only the stalled first row was attempted
+    }
+}
+

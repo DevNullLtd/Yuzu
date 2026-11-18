@@ -3,7 +3,7 @@
 // AuditStore and the "bulk readers" (a Reader that holds a real leased connection until the test
 // lets it go), exactly as production shares them.
 //
-// Two cases share one rig shape. The CONTROL has no cap: readers equal to the pool size starve the
+// Three cases share one rig shape. The CONTROL has no cap: readers equal to the pool size starve the
 // authorization read and the audit write (the defect). The CAPPED case holds the same pool under
 // the same reader burst with the cap in place: the surplus readers are refused as busy, and an
 // unrelated authorised read and its audit write still obtain a connection.
@@ -13,16 +13,21 @@
 #include "audit_store.hpp"
 #include "bulk_read_slots.hpp"
 #include "hardware_ci_page_model.hpp"
+#include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 #include "rbac_store.hpp"
 
 #include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <libpq-fe.h>
+
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -224,3 +229,126 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
         CHECK_FALSE(outcome[static_cast<std::size_t>(i)].has_value()); // the held readers were served
     CHECK(slots.in_use() == 0);
 }
+
+// #7951: an audit table that is locked (migration DDL, VACUUM FULL) makes every served read's audit
+// INSERT wait while it holds a pooled connection. The slot is held through that write, so only `cap`
+// such writers can pile up and the rest of the pool stays usable. The CONTROL gives the slot back
+// right after the read (the earlier behaviour): the same burst then parks one audit writer per
+// pooled connection and authorization loses its connection.
+namespace {
+
+struct AuditLockRun {
+    bool authz_ok{false};
+    int audit_writers_parked{0}; // served reads whose audit INSERT was still waiting on the lock
+    int busy{0};
+    int served{0};
+    int audit_ok{0};
+};
+
+AuditLockRun run_with_locked_audit_table(const std::string& dsn, int cap, bool hold_slot_through_audit) {
+    PgPool pool{{.conninfo = dsn, .size = kPool}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    AuditStore audit{pool};
+    REQUIRE(rbac.is_open());
+    REQUIRE(audit.is_open());
+    BulkReadSlots slots{cap, 100ms};
+
+    // A session OUTSIDE the pool takes the audit table lock, the way migration DDL would.
+    pg::PgConn locker{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(), "LOCK TABLE audit_store.audit_events IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    bool locked = true;
+    auto unlock = [&] {
+        if (locked) {
+            (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+            locked = false;
+        }
+    };
+
+    std::atomic<int> parked{0}, busy{0}, served{0}, audit_ok{0};
+    std::vector<std::thread> threads;
+    // Declared after `threads` and the atomics they touch: on any exit path the lock is released
+    // first (the stalled INSERTs then finish), then every thread is joined.
+    struct Cleanup {
+        std::function<void()>& unlock;
+        std::vector<std::thread>& threads;
+        ~Cleanup() {
+            unlock();
+            for (auto& t : threads)
+                if (t.joinable())
+                    t.join();
+        }
+    };
+    std::function<void()> unlock_fn = unlock;
+    Cleanup cleanup{unlock_fn, threads};
+
+    const hcp::Reader instant = [](const DeviceCiKeysetQuery&) -> std::optional<std::vector<DeviceCiRecord>> {
+        return std::vector<DeviceCiRecord>{};
+    };
+    for (int i = 0; i < kPool; ++i)
+        threads.emplace_back([&] {
+            auto page = hcp::read_page(instant, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
+            if (!page) {
+                busy.fetch_add(1);
+                return;
+            }
+            served.fetch_add(1);
+            if (!hold_slot_through_audit)
+                page->release_slot(); // the earlier behaviour: the slot is gone before the audit write
+            parked.fetch_add(1);
+            if (audit.log(a_row()))
+                audit_ok.fetch_add(1);
+            page->release_slot();
+        });
+
+    // Wait for the burst to settle: every thread has either been refused or is waiting on the lock.
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (busy.load() + parked.load() < kPool && std::chrono::steady_clock::now() < deadline)
+        std::this_thread::sleep_for(5ms);
+    std::this_thread::sleep_for(300ms); // let the audit INSERTs reach the lock wait
+
+    AuditLockRun out;
+    out.authz_ok = rbac.user_rbac_group_names_checked("tester").has_value();
+    out.audit_writers_parked = parked.load();
+    out.busy = busy.load();
+    out.served = served.load();
+
+    unlock();
+    for (auto& t : threads)
+        t.join();
+    out.audit_ok = audit_ok.load();
+    CHECK(slots.in_use() == 0);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("bulk read cap [control]: giving the slot back before the audit write lets a locked audit "
+          "table park a writer per pooled connection and starve authorization",
+          "[pg][hardware_ci][bulk_read_slots][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, cap_tpl);
+    const auto r = run_with_locked_audit_table(db_.dsn(), /*cap=*/2, /*hold_slot_through_audit=*/false);
+    CHECK(r.served == kPool);
+    CHECK(r.busy == 0);
+    CHECK_FALSE(r.authz_ok); // every pooled connection is parked in an audit INSERT
+    CHECK(r.audit_ok == kPool); // the writes complete once the lock is released
+}
+
+TEST_CASE("bulk read cap: a locked audit table parks at most `cap` audit writers, so authorization "
+          "keeps a connection",
+          "[pg][hardware_ci][bulk_read_slots][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, cap_tpl);
+    const auto resolved = resolve_bulk_read_cap(2, kPool);
+    REQUIRE(resolved.has_value());
+    const auto r = run_with_locked_audit_table(db_.dsn(), resolved->cap, /*hold_slot_through_audit=*/true);
+    CHECK(r.served == resolved->cap);
+    CHECK(r.busy == kPool - resolved->cap); // the rest were refused: no read, no audit write
+    CHECK(r.audit_writers_parked == resolved->cap);
+    CHECK(r.authz_ok);
+    CHECK(r.audit_ok == resolved->cap);
+}
+

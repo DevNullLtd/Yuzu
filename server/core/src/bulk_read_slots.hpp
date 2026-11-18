@@ -15,14 +15,18 @@
 ///
 /// The same cap is the bound on an audit outage (#7951). The route reads BEFORE it writes its
 /// access row, so while the audit store is down every attempt still performs its read and then
-/// discards the page. At most `cap` such reads run at once per replica, whatever the client's
-/// retry rate. It is a CONCURRENCY bound only: retries are not rate-limited, and the cap is per
-/// replica, so the fleet-wide ceiling is replicas x cap.
+/// discards the page, and while the audit table is locked (migration DDL, VACUUM FULL) every
+/// served read's audit INSERT waits on the lock holding a pooled connection. The slot is held
+/// across the read AND that route's own access-audit write (`hardware_ci_page::Page::hold`,
+/// released by the transport right after the audit write), so at most `cap` reads-or-audit-writes
+/// of this route hold a connection at once per replica, whatever the client's retry rate. It is a
+/// CONCURRENCY bound only: retries are not rate-limited, and the cap is per replica, so the
+/// fleet-wide ceiling is replicas x cap. It bounds this route's audit writes only; every other
+/// route's audit write is uncapped.
 ///
 /// ONE instance, owned by `ServerImpl`, shared by REST and MCP (a second instance would double
-/// the cap). The slot is held ONLY around the store call (`hardware_ci_page::read_page`), so it is
-/// released before the audit write needs its own connection. A request that names an `agent_id`
-/// (a point read) takes no slot, so confirm-before-retire is never refused during a walk.
+/// the cap). A request that names an `agent_id` (a point read) takes no slot, so
+/// confirm-before-retire is never refused during a walk.
 ///
 /// The shape follows `containment_read_slots_` in server.cpp: a bounded `std::counting_semaphore`,
 /// an RAII release, and a wait that is shorter than the read it guards. This header is store-free

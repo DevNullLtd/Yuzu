@@ -1,8 +1,8 @@
 // The bulk device-CI read's concurrency cap (#7949, #7951): the slots type
 // (bulk_read_slots.hpp), the boot arithmetic for the effective cap, and how
-// `hardware_ci_page::read_page` takes and releases a slot. Hermetic: no Postgres, no sockets. The
+// `hardware_ci_page::read_page` takes a slot and hands it back in `Page::hold`. Hermetic: no Postgres, no sockets. The
 // store is the in-memory fake; a slot is observed through `BulkReadSlots::in_use()` from inside a
-// hand-written Reader, so "held ONLY around the store call" is asserted, not assumed.
+// hand-written Reader, so "held across the store call and handed back in Page::hold" is asserted, not assumed.
 // The REST and MCP transports are covered beside their other tests (test_mcp_tools_hardware.cpp,
 // tag [bulk_read_slots]); the real-pool proof is test_hardware_ci_read_cap_pg.cpp.
 
@@ -212,7 +212,7 @@ TEST_CASE("bulk read cap: an explicit value must be in 1..8 and at most max(1, p
 
 // ── read_page and the slot ────────────────────────────────────────────────────
 
-TEST_CASE("read_page: the slot is held ONLY around the store call and gone before it returns",
+TEST_CASE("read_page: the slot is held across the store call and handed back in Page::hold",
           "[bulk_read_slots][hardware_ci_page]") {
     BulkReadSlots slots{1, kShortWait};
     auto store = seeded({"a", "b", "c"});
@@ -225,12 +225,49 @@ TEST_CASE("read_page: the slot is held ONLY around the store call and gone befor
         return store.read(q);
     };
     CHECK(slots.in_use() == 0);
-    const auto page = hcp::read_page(reader, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
+    auto page = hcp::read_page(reader, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
     REQUIRE(page.has_value());
     CHECK(page->rows.size() == 3);
     CHECK(in_use_inside == 1);
     CHECK(second_refused_inside);
-    CHECK(slots.in_use() == 0); // released before read_page returned (before any audit write)
+    // Still held on return: the caller's access-audit write counts against the cap (#7951).
+    CHECK(page->hold.has_value());
+    CHECK(slots.in_use() == 1);
+    CHECK_FALSE(slots.try_acquire().has_value());
+    page->release_slot();
+    CHECK(slots.in_use() == 0);
+    page->release_slot(); // idempotent
+    CHECK(slots.in_use() == 0);
+}
+
+TEST_CASE("read_page: dropping the served Page releases the slot on every exit path",
+          "[bulk_read_slots][hardware_ci_page]") {
+    BulkReadSlots slots{1, kShortWait};
+    auto store = seeded({"a"});
+    {
+        auto page = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, &slots,
+                                   hcp::kRestRowBudgetBytes);
+        REQUIRE(page.has_value());
+        CHECK(slots.in_use() == 1);
+    }
+    CHECK(slots.in_use() == 0);
+}
+
+TEST_CASE("read_page: a point read and a null cap hand back no slot",
+          "[bulk_read_slots][hardware_ci_page]") {
+    BulkReadSlots slots{1, kShortWait};
+    auto store = seeded({"a", "b"});
+    hcp::Request point;
+    point.agent_id = "a";
+    const auto p = hcp::read_page(store.reader(), point, std::nullopt, nullptr, &slots,
+                                  hcp::kRestRowBudgetBytes);
+    REQUIRE(p.has_value());
+    CHECK_FALSE(p->hold.has_value());
+    CHECK(slots.in_use() == 0);
+    const auto n = hcp::read_page(store.reader(), {}, std::nullopt, nullptr, /*slots=*/nullptr,
+                                  hcp::kRestRowBudgetBytes);
+    REQUIRE(n.has_value());
+    CHECK_FALSE(n->hold.has_value());
 }
 
 TEST_CASE("read_page: a store failure and a throwing reader both release the slot",

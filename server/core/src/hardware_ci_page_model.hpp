@@ -162,6 +162,13 @@ struct Page {
     /// next page, so `next_cursor` is non-empty and a page can be shorter than `limit`. Served as
     /// `page_bytes_capped: true` and `byte_capped=1` in the audit detail, only when set.
     bool byte_capped{false};
+    /// The bulk-read slot (`bulk_read_slots.hpp`), still HELD when `read_page` returns a served
+    /// page. Empty for a point read, a refused page and a null cap. The transport keeps it through
+    /// the access-audit writes of this page and calls `release_slot()` right after them, so the
+    /// cap bounds the pool connections the read AND its audit write hold (#7951), not the read
+    /// alone. Dropping the `Page` releases it too, on every exit path. Move-only for that reason.
+    std::optional<BulkReadSlots::Slot> hold;
+    void release_slot() noexcept { hold.reset(); }
 };
 
 /// Why a page could not be produced.
@@ -178,10 +185,11 @@ struct Page {
 ///  - `kBusy`: every bulk-read slot (`bulk_read_slots.hpp`) was taken for the whole bounded wait.
 ///    A 503 with `retry_after_ms` `kBusyRetryAfterMs` and a `Retry-After` header, never an empty
 ///    page and not `kDegraded` (the store is fine, this replica is at its read cap). Nothing was
-///    read, so it writes NO domain audit row. REST writes no row at all; MCP writes exactly one
-///    generic best-effort row per refused call, so a busy refusal is cheaper than a served read
-///    but is not free on the audit path. The `yuzu_hardware_ci_read_busy_total` counter is the
-///    evidence.
+///    read, so it writes NO domain audit row. REST writes no row at all; MCP writes one generic
+///    best-effort row per refused call, but at most one such row write at a time per replica (a
+///    refusal that finds it taken writes none and answers `audit_persisted: false`), so a busy
+///    refusal is cheaper than a served read and cannot pile up on the audit path. The
+///    `yuzu_hardware_ci_read_busy_total` counter counts every refusal, written or not.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
@@ -278,9 +286,12 @@ struct ReadFailure {
 /// their own answers, and before the one store call.
 /// `slots` is the bulk-read concurrency cap (`bulk_read_slots.hpp`) and, like `gate`, has NO
 /// default: every caller states it. A slot is taken after every refusal above (they take none)
-/// and held ONLY around the one `read(rq)` call, then released before this returns, so it is gone
-/// before the caller's audit write needs a connection. A request that names an `agent_id` (a point
-/// read) takes none. When no slot frees within `kBulkReadSlotWait` the answer is
+/// and held across the one `read(rq)` call. On a served page it is handed to the caller in
+/// `Page::hold` and must stay held through the caller's access-audit writes (`release_slot()`
+/// afterwards): a pool connection is then held by this route either for the read or for its audit
+/// write, never more than `cap` at once, so an audit write that stalls on a locked audit table
+/// cannot pile up (#7951). On every refusal and on a failed read the slot is released before this
+/// returns. A request that names an `agent_id` (a point read) takes none. When no slot frees within `kBulkReadSlotWait` the answer is
 /// `ReadError::kBusy` and nothing is read. Null means "no cap" and the read is served (a unit test
 /// that deliberately models no cap passes an explicit `nullptr`; production passes the one
 /// `hardware_ci_read_slots_` through `Deps::ci_read_slots` / `ToolDeps::ci_read_slots`, pinned by

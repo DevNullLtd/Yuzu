@@ -357,10 +357,10 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
     const int want = std::clamp(rq.limit, 1, static_cast<int>(kPageMax));
     q.limit = want + 1;
 
-    // The concurrency cap, taken after every refusal above (they take no slot) and held ONLY
-    // around the store call: the slot is released before the cursor is minted and long before the
-    // caller's audit write asks for its own connection. A point read (`agent_id`) takes none, so
-    // confirm-before-retire never gets a busy answer during a walk.
+    // The concurrency cap, taken after every refusal above (they take no slot). It is held across
+    // the store call and then handed to the caller in `Page::hold`, to be kept through the caller's
+    // access-audit writes (#7951); a failed read releases it here. A point read (`agent_id`) takes
+    // none, so confirm-before-retire never gets a busy answer during a walk.
     std::optional<BulkReadSlots::Slot> slot;
     if (slots != nullptr && rq.agent_id.empty()) {
         slot = slots->try_acquire();
@@ -368,9 +368,9 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
             return std::unexpected(ReadError::kBusy);
     }
     auto rows = read(q);
-    slot.reset();
     if (!rows)
-        return std::unexpected(ReadError::kDegraded);
+        return std::unexpected(ReadError::kDegraded); // `slot` is released on this return
+    out.hold = std::move(slot);
     const auto limit = static_cast<std::size_t>(want);
     // Rows left over for a later page: by the count (the extra row was seen) or by the byte budget.
     bool more = false;

@@ -42,6 +42,7 @@
 
 #include <nlohmann/json.hpp>
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <span>
@@ -98,12 +99,27 @@ void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, cons
 
 // The bulk read was refused as busy (hardware_ci_page::ReadError::kBusy): this replica is at its
 // bulk-read cap and nothing was read. It writes ONLY the generic mcp.<tool> row, never the domain
-// row and never the two-row answer_store_unreadable. REST writes no audit row for a busy refusal;
-// MCP writes exactly one generic best-effort row per refused call and no domain row, so a busy
-// refusal is cheaper than a served read but is not free on the audit path (the counter is the
-// evidence). The error is retryable with the failure table's hint.
+// row and never the two-row answer_store_unreadable. REST writes no audit row for a busy refusal.
+// MCP writes ONE generic best-effort row per refused call, but never more than
+// kMaxBusyAuditRowsInFlight at a time on this replica: a refusal holds no bulk-read slot, so
+// without this bound a flood of refusals during an audit-table lock would each park a pool
+// connection in an INSERT (#7951). A refusal that finds the gate taken writes no row and answers
+// `audit_persisted: false`; the busy counter still counts it, so the counter minus the rows is the
+// number skipped. The error is retryable with the failure table's hint.
+constexpr int kMaxBusyAuditRowsInFlight = 1;
+std::atomic<int> g_busy_audit_rows_in_flight{0};
+
+struct BusyAuditGate {
+    bool admitted;
+    BusyAuditGate() : admitted(g_busy_audit_rows_in_flight.fetch_add(1) < kMaxBusyAuditRowsInFlight) {}
+    ~BusyAuditGate() { g_busy_audit_rows_in_flight.fetch_sub(1); }
+    BusyAuditGate(const BusyAuditGate&) = delete;
+    BusyAuditGate& operator=(const BusyAuditGate&) = delete;
+};
+
 void answer_read_busy(const ToolCallContext& ctx, const hardware_ci_page::ReadFailure& f) {
-    const bool generic_ok = ctx.audit(std::string(f.audit_outcome), f.audit_detail);
+    const BusyAuditGate gate;
+    const bool generic_ok = gate.admitted && ctx.audit(std::string(f.audit_outcome), f.audit_detail);
     answer(ctx, ctx.a4_error(kInternalError, std::string(f.message), std::string(f.remediation),
                              f.retry_after_ms, {}, generic_ok));
 }
@@ -232,9 +248,9 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     // deps->ci_collation_gate: the collation gate (device_ci_read_gate.hpp); not Trusted refuses
     // the page before the store is asked. Null means no gate was wired (tests only).
     // deps->ci_read_slots: the bulk-read concurrency cap (bulk_read_slots.hpp), the same instance
-    // REST uses, held only around the store call; a point read (agent_id) takes none. Null means no
-    // cap (tests only).
-    const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
+    // REST uses, held across the store call and this page's two audit rows (Page::hold); a point
+    // read (agent_id) takes none. Null means no cap (tests only).
+    auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
                                                   deps->ci_collation_gate, deps->ci_read_slots,
                                                   hardware_ci_page::kMcpRowBudgetBytes);
     if (!read) {
@@ -270,7 +286,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
                                  {}, domain_ok && generic_ok));
         return;
     }
-    const hardware_ci_page::Page& page = *read;
+    hardware_ci_page::Page& page = *read;
 
     // Both rows are attempted (no short-circuit) so a drop of one never hides the other. A
     // confined caller never receives an out-of-scope row, id or count: the scope is applied in SQL,
@@ -288,6 +304,8 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
         deps->audit_fn, ctx.req, "inventory.devices.ci", outcome,
         hardware_ci_page::audit_target_type(*rq), hardware_ci_page::audit_target_id(*rq), detail_text);
     const bool generic_ok = ctx.audit(outcome, detail_text);
+    // The bulk-read slot was held through both audit writes above (#7951); free it now.
+    page.release_slot();
     if (!domain_ok || !generic_ok) {
         answer_audit_withheld(ctx);
         return;

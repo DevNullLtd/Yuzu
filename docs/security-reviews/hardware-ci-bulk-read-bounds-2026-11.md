@@ -40,10 +40,14 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
 1. One caller can hold every slot, and the semaphore wait is not first-in-first-out, so a low-privilege
    `Inventory:Read` caller can starve the CMDB sync's bulk read. A per-principal limit is a follow-up.
 2. Point reads (`agent_id`) are uncapped.
-3. There is no audit-liveness breaker. #7951 is bounded for the read phase only: the slot is released before
-   the audit write and audit writers are not capped, so an audit-table lock held by migration DDL or
-   `VACUUM FULL` can still saturate the pool (a mechanism that predates this change).
-4. A slot is held for the whole store call: a pool acquire of up to 3 s (500 ms when the pool is saturated),
+3. There is no audit-liveness breaker. The slot is held through the route's own access-audit write, so a locked
+   audit table (migration DDL, `VACUUM FULL`) parks at most `cap` bulk-read audit writers (proved on a real
+   pool in `test_hardware_ci_read_cap_pg.cpp`, with a control). Every OTHER audited route's audit write is
+   uncapped and the same lock can still saturate the pool through them (a mechanism that predates this
+   change), and the refusals that write an audit row without reading (a malformed cursor, a scope too wide)
+   hold no slot. MCP busy refusals write one generic row each, never more than one such write at a time per
+   replica; a refusal that finds that write taken writes no row and answers `audit_persisted: false`.
+4. A slot is held for the whole store call and then the access-audit write(s): for each, a pool acquire of up to 3 s (500 ms when the pool is saturated),
    up to 10 s to open a connection and the 5 s statement limit. Against a database that stops answering
    rather than running slowly those limits may not fire, so a hold can exceed that sum. Recovery is passive.
 5. A read waiting for a slot occupies an HTTP worker for up to 500 ms; the cap bounds connections, not workers.
