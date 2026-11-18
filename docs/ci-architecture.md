@@ -460,8 +460,9 @@ release when:
   archive, package or image of the release (supply-chain S8);
 - an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
   in the release or whose SHA-256 differs, has more entries than the bound in
-  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 58 for the
-  Linux files and 212 for v0.15.0's Windows archive, the largest), has no entries and no record
+  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 63 for the
+  Linux files, the server's with the 10 vendored entries below, and 212 for
+  v0.15.0's Windows archive, the largest), has no entries and no record
   that its file was unpacked and held files, or lists a path under `vcpkg/`,
   `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
   `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
@@ -483,8 +484,14 @@ release when:
   ports its binaries are built from are added from the installed tree for the
   release triplet; the Windows installer's SBOM lists the files the Inno
   Setup compiler's own manifest says it packed, each checked against the
-  build directory by SHA-256 (the installer manifest contract below). Each
-  `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  build directory by SHA-256 (the installer manifest contract below). An
+  artifact holding `yuzu-server` also gets the third-party files compiled
+  into it (web assets, the QR-code library) from
+  `server/core/vendored-components.json`, and generation fails if that
+  manifest does not match the source tree. The docs-lint step "Vendored
+  components manifest" (`tests/test_vendored_components.py`) fails a PR that
+  adds or changes a file under `server/core/vendor/` or `server/core/static/`
+  without its entry. Each `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
   (Docs Lint, every PR) pins that contract against a fixture in the
   compiler's format; the `CBOM schema` job runs the same suite with
   `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the

@@ -14,6 +14,12 @@ at a time. These tests pin what that means:
     ports with an upstream purl (and a CPE where NVD has one), a Hex package
     gets a pkg:hex purl from rebar.lock (by its Hex name, which can differ from
     the application's), and a port with no licence is named in a warning;
+  - an artifact holding yuzu-server also lists the third-party components
+    compiled into it (server/core/vendored-components.json: web assets and the
+    QR-code library) in both formats, with their purls, licences and hashes, an
+    unresolved version left blank, and ZRender/tslib inside ECharts; an agent
+    artifact lists none, and a manifest that disagrees with the source tree
+    fails the run;
   - every artifact kind is unpacked and described: archives, a .deb, an .rpm,
     the macOS .pkg in the layout v0.15.0 shipped (its binaries staged as
     `.yuzu-agent.incoming` and `.libyuzu_agent_core.incoming.dylib`), and the
@@ -21,10 +27,11 @@ at a time. These tests pin what that means:
     own manifest (OutputManifestFile) lists, each read from the build
     directory with the SHA-256 the compiler recorded; rc-named packages pass
     `check` under their own names;
-  - an SBOM for a file holding yuzu-server, an installer's SBOM and a
-    gateway SBOM (the Erlang emulator, beam.smp, vendors code) say they are
-    incomplete (CycloneDX composition, SPDX CONTAINS NOASSERTION) and why, by
-    tokens from a closed set that release-verification.md documents exactly;
+  - an installer's SBOM and a gateway SBOM (the Erlang emulator, beam.smp,
+    vendors code) say they are incomplete (CycloneDX composition, SPDX
+    CONTAINS NOASSERTION) and why, by tokens from a closed set that
+    release-verification.md documents exactly; an SBOM for a file holding
+    yuzu-server, which lists the vendored components, does not;
   - `mark-image` marks an image SBOM pair whose image holds a Yuzu C++ binary
     or the Erlang emulator, idempotently, refuses a mismatched or partly
     marked pair, and the release check refuses an image pair left unmarked,
@@ -92,6 +99,7 @@ from unittest import mock
 
 ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = ROOT / "scripts" / "ci" / "artifact-sbom.py"
+VENDORED = ROOT / "server" / "core" / "vendored-components.json"
 TRIPLET = "x64-linux-static"
 POSIX_STUBS = os.name != "nt"
 # Where an absolute tar member would land if extraction let it escape; salted,
@@ -1421,6 +1429,9 @@ class ArtifactSbom(unittest.TestCase):
                 self.assertFalse(errs, f"{stem}.{fmt} fails its schema: {errs[:5] if errs else errs}")
         return r
 
+    def vendored(self, cdx):
+        return {c["bom-ref"]: c for c in cdx["components"] if c.get("bom-ref", "").startswith("vendored-")}
+
     def vcpkg_names(self, cdx):
         return sorted(c["name"] for c in cdx["components"]
                       if any(p["name"] == "yuzu:vcpkg:port" for p in c.get("properties", [])))
@@ -1474,6 +1485,10 @@ class ArtifactSbom(unittest.TestCase):
         ssl = next(p for p in spdx["packages"] if p["name"] == "openssl")
         self.assertEqual(ssl["copyrightText"], "NOASSERTION")
 
+        # The server's vendored web assets are not the agent's.
+        self.assertEqual(self.vendored(cdx), {})
+        self.assertFalse(any(p["SPDXID"].startswith("SPDXRef-Package-vendored-") for p in spdx["packages"]))
+
     def test_copyright_text_is_carried_from_vcpkg(self):
         make_vcpkg_tree(self.tmp, copyright_port="zlib")
         art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-agent": b"x"})
@@ -1485,7 +1500,7 @@ class ArtifactSbom(unittest.TestCase):
         self.assertEqual(next(p for p in spdx["packages"] if p["name"] == "zlib")["copyrightText"],
                          "Copyright (c) The zlib authors")
 
-    def test_server_package_adds_server_feature_and_is_marked_incomplete(self):
+    def test_server_package_adds_server_feature_and_vendored_components(self):
         make_vcpkg_tree(self.tmp)
         art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz",
                        {"y/bin/yuzu-server": b"x", "y/bin/libyuzu_agent_core.so": b"x"})
@@ -1495,16 +1510,54 @@ class ArtifactSbom(unittest.TestCase):
         self.assertEqual(self.vcpkg_names(cdx), SERVER_PORTS)
         libpq = next(c for c in cdx["components"] if c["name"] == "libpq")
         self.assertTrue(libpq["purl"].startswith("pkg:generic/libpq@18.4?download_url="), libpq["purl"])
-        # yuzu-server compiles in vendored code no SBOM lists yet: say so in the data.
-        root_ref = cdx["metadata"]["component"]["bom-ref"]
-        self.assertEqual(cdx["compositions"], [{"aggregate": "incomplete", "assemblies": [root_ref]}])
-        self.assertIn("qrcodegen", self.props(cdx)["yuzu:sbom:incomplete"])
+        # yuzu-server's vendored code is listed (below), so nothing it holds is
+        # known to be unlisted: no incompleteness mark in either format.
+        self.assertNotIn("compositions", cdx)
+        self.assertNotIn("yuzu:sbom:incomplete", self.props(cdx))
+        self.assertNotIn("yuzu:sbom:incomplete-reasons", self.props(cdx))
+        self.assertIn("from server/core/vendored-components.json", self.props(cdx)["yuzu:sbom:vendored"])
         root_pkg = next(p for p in spdx["packages"] if p["SPDXID"].startswith("SPDXRef-DocumentRoot"))
-        self.assertIn({"spdxElementId": root_pkg["SPDXID"], "relationshipType": "CONTAINS",
-                       "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
-        self.assertIn("\nyuzu:sbom:incomplete: yuzu-server compiles in vendored C++", root_pkg["comment"])
-        self.assertEqual(self.props(cdx)["yuzu:sbom:incomplete-reasons"], "server-vendored")
-        self.assertIn("yuzu:sbom:incomplete-reasons: server-vendored", root_pkg["comment"].split("\n"))
+        self.assertNotIn({"spdxElementId": root_pkg["SPDXID"], "relationshipType": "CONTAINS",
+                          "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
+        mod = load_script()
+        self.assertIsNone(mod.spdx_note(root_pkg["comment"], "incomplete"))
+        self.assertIsNone(mod.spdx_note(root_pkg["comment"], "incomplete-reasons"))
+        self.assertEqual(mod.spdx_note(root_pkg["comment"], "vendored"), self.props(cdx)["yuzu:sbom:vendored"])
+
+        # The vendored components, from the checkout's manifest.
+        manifest = json.loads(VENDORED.read_text(encoding="utf-8"))
+        top = {c["id"]: c for c in manifest["components"] if "part_of" not in c}
+        got = self.vendored(cdx)
+        self.assertEqual(set(got), {f"vendored-{i}" for i in top})
+        cyto = got["vendored-cytoscape"]
+        self.assertEqual((cyto["name"], cyto["version"], cyto["purl"]),
+                         ("cytoscape", "3.33.3", "pkg:npm/cytoscape@3.33.3"))
+        self.assertEqual(cyto["licenses"], [{"license": {"id": "MIT"}}])
+        self.assertEqual(cyto["hashes"], [{"alg": "SHA-256", "content": hashlib.sha256(
+            (ROOT / "server/core/static/cytoscape.min.js").read_bytes()).hexdigest()}])
+        sse = got["vendored-htmx-ext-sse"]
+        self.assertNotIn("version", sse)  # unresolved: never guessed
+        self.assertEqual(sse["purl"], "pkg:npm/htmx-ext-sse")
+        self.assertTrue(any(p["name"] == "yuzu:vendored:version" and p["value"].startswith("unresolved")
+                            for p in sse["properties"]))
+        self.assertEqual(sorted(c["name"] for c in got["vendored-echarts"]["components"]), ["tslib", "zrender"])
+        plex = got["vendored-ibm-plex-sans"]
+        self.assertEqual((plex["group"], plex["purl"], plex["type"]),
+                         ("@ibm", "pkg:npm/%40ibm/plex-sans@1.1.0", "file"))
+        self.assertNotIn("hashes", plex)  # three files: one hash each, as properties
+        self.assertEqual(sum(p["name"] == "yuzu:vendored:file" for p in plex["properties"]), 3)
+        # SPDX: one package per component, the bundled two inside ECharts.
+        spdx = json.loads((self.out / "yuzu-linux-x64.spdx.json").read_text())
+        pkgs = {p["SPDXID"]: p for p in spdx["packages"] if p["SPDXID"].startswith("SPDXRef-Package-vendored-")}
+        self.assertEqual(len(pkgs), len(manifest["components"]))
+        self.assertEqual(pkgs["SPDXRef-Package-vendored-htmx"]["versionInfo"], "2.0.4")
+        self.assertNotIn("versionInfo", pkgs["SPDXRef-Package-vendored-tslib"])
+        rels = {(r["spdxElementId"], r["relatedSpdxElement"]) for r in spdx["relationships"]
+                if r["relationshipType"] == "CONTAINS"}
+        root_id = next(p["SPDXID"] for p in spdx["packages"] if p["SPDXID"].startswith("SPDXRef-DocumentRoot"))
+        self.assertIn((root_id, "SPDXRef-Package-vendored-qrcodegen"), rels)
+        self.assertIn(("SPDXRef-Package-vendored-echarts", "SPDXRef-Package-vendored-zrender"), rels)
+        self.assertEqual(pkgs["SPDXRef-Package-vendored-zrender"]["licenseDeclared"], "BSD-3-Clause")
 
     def test_gateway_is_marked_incomplete_for_the_erlang_runtime(self):
         # The gateway bundles ERTS; its emulator beam.smp links in code it
@@ -1544,6 +1597,24 @@ class ArtifactSbom(unittest.TestCase):
         self.assertNotIn("licenses", zlib)
         pkg = next(p for p in spdx["packages"] if p["name"] == "zlib")
         self.assertEqual(pkg["licenseDeclared"], "NOASSERTION")
+
+    def test_server_with_drifted_vendored_file_fails(self):
+        # A source tree whose vendored bytes differ from the manifest must not
+        # produce an SBOM that names the manifest's hashes.
+        make_vcpkg_tree(self.tmp)
+        src = self.tmp / "src"
+        for rel in ("server/core/static", "server/core/vendor"):
+            shutil.copytree(ROOT / rel, src / rel)
+        (src / "server/core/src").mkdir(parents=True)
+        shutil.copy2(ROOT / "server/core/src/static_js_bundle.cpp", src / "server/core/src")
+        shutil.copy2(VENDORED, src / "server/core")
+        (src / "server/core/vendor/echarts.min.js").write_bytes(b"/* not echarts */")
+        art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-server": b"x"})
+        r = self.generate(art, extra=("--source-root", src))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not match the source tree", r.stderr)
+        self.assertIn("echarts.min.js", r.stderr)
+        self.assertFalse((self.out / "yuzu-linux-x64.cdx.json").exists())
 
     def test_hex_purl_for_gateway(self):
         lock = self.tmp / "rebar.lock"
@@ -1841,8 +1912,15 @@ class ArtifactSbom(unittest.TestCase):
                       f"OutputManifestFile) lists", props["yuzu:sbom:contents"])
         self.assertIn("at its path below the build directory, not the path it is installed to",
                       props["yuzu:sbom:contents"])
-        self.assertEqual(cdx["compositions"][0]["aggregate"], "incomplete")
+        # The installer holds what no SBOM lists (its InnoSetup runtime), and
+        # only that: it stays marked incomplete in both formats, for that alone.
+        root_ref = cdx["metadata"]["component"]["bom-ref"]
+        self.assertEqual(cdx["compositions"], [{"aggregate": "incomplete", "assemblies": [root_ref]}])
         self.assertEqual(props["yuzu:sbom:incomplete-reasons"], "installer-runtime")
+        root_pkg = next(p for p in spdx["packages"] if p["SPDXID"].startswith("SPDXRef-DocumentRoot"))
+        self.assertIn({"spdxElementId": root_pkg["SPDXID"], "relationshipType": "CONTAINS",
+                       "relatedSpdxElement": "NOASSERTION"}, spdx["relationships"])
+        self.assertIn("yuzu:sbom:incomplete-reasons: installer-runtime", root_pkg["comment"].split("\n"))
         self.assertIn("licence text, icon, compiled [Code] script", props["yuzu:sbom:incomplete"])
         r = self.check_dir(exe)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)

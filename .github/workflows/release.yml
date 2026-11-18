@@ -390,6 +390,9 @@ jobs:
       # the binaries are static). It never scans the checkout: the old
       # `path: .` scan listed the vcpkg ports catalogue and test tooling
       # (40,853 components on v0.15.0) and none of the shipped libraries.
+      # An artifact holding yuzu-server also lists the web assets and QR-code
+      # library compiled into it, from server/core/vendored-components.json in
+      # this checkout (the run fails if the manifest and the files disagree).
       # Each SBOM is named after its artifact (yuzu-linux-x64.cdx.json for the
       # archive, <package without .deb/.rpm>.cdx.json for a package) and
       # records its SHA-256; the release job checks both.
@@ -2736,23 +2739,25 @@ jobs:
           Each binary archive, package and installer has its own CycloneDX and SPDX SBOM,
           named after the file (\`<name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg>.{cdx,spdx}.json\`).
           It lists what is inside that file: the vcpkg libraries its C++ binaries
-          are built with (from the installed vcpkg tree), for the gateway the
-          Erlang/OTP release, and anything else syft recognises in it. The
+          are built with (from the installed vcpkg tree), for a file holding
+          \`yuzu-server\` the third-party code compiled into it (qrcodegen, and
+          the web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
+          fonts; the Docker image SBOMs do not list these yet), for the gateway
+          the Erlang/OTP release, and anything else syft recognises in it. The
           Windows installer's SBOM lists the files of
           \`yuzu-agent-windows-x64.zip\` that the installer installs.
-          Not listed yet, though the file holds it: code vendored into the
-          source tree and compiled into \`yuzu-server\` (qrcodegen, and the
-          web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
-          fonts), the Windows installer's own InnoSetup runtime, and what the
-          gateway's Erlang emulator (\`beam.smp\`) vendors (PCRE2, asmjit,
-          zstd, Ryu, OpenSSL's MD5). An SBOM whose file or image holds
-          something it does not list says so: a CycloneDX composition with
+          Not listed yet, though the file holds it: the Windows installer's
+          own InnoSetup runtime, and what the gateway's Erlang emulator
+          (\`beam.smp\`) vendors (PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5).
+          An SBOM whose file or image holds something it does not list says
+          so: a CycloneDX composition with
           \`aggregate: incomplete\`, in SPDX a \`CONTAINS NOASSERTION\`
           relationship on its root, and the reason tokens in the
           \`yuzu:sbom:incomplete-reasons\` note (a CycloneDX property; in SPDX
           a line of the root's comment). The release's six image SBOMs are
           marked too: an image scan cannot see the vcpkg libraries linked into
-          \`yuzu-server\` and \`yuzu-agent\`, what the gateway's Erlang
+          \`yuzu-server\` and \`yuzu-agent\`, the third-party files compiled
+          into \`yuzu-server\`, what the gateway's Erlang
           emulator vendors, nor pgvector, which the \`yuzu-postgres\` image
           builds from source. A scanner such as
           grype reports nothing for the marker, so read it yourself
@@ -2811,8 +2816,9 @@ jobs:
           \`yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json\`: a syft
           v1.57.2 scan of the image by the digest this release signs). An image
           scan does not see the C++ libraries linked statically into
-          \`yuzu-server\` and \`yuzu-agent\` (the \`yuzu-linux-x64\`, server
-          and agent package SBOMs list them), what the gateway's Erlang emulator vendors,
+          \`yuzu-server\` and \`yuzu-agent\` or the third-party files compiled
+          into \`yuzu-server\` (the \`yuzu-linux-x64\`, server and agent
+          package SBOMs list them), what the gateway's Erlang emulator vendors,
           or the \`yuzu-postgres\` image's source-built pgvector, so each of
           the six image SBOMs is marked incomplete with its reasons
           (server: \`server-vendored, image-static-cpp\`; agent:

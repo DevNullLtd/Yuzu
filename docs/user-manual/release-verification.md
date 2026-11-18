@@ -265,6 +265,20 @@ in it:
   (`NOASSERTION` in SPDX), and the SBOM names those libraries in its
   `yuzu:sbom:licence-noassertion` note (see "Reading the `yuzu:sbom:` notes"
   below).
+- **The third-party files compiled into `yuzu-server`**, on every file that
+  holds it: the web assets the dashboard serves (htmx and its SSE extension,
+  Apache ECharts with the ZRender and tslib code bundled inside it, three.js,
+  Cytoscape.js, the IBM Plex fonts) and the QR-code library (qrcodegen) behind
+  MFA enrolment. No scanner can see them inside the binary, so they come from
+  `server/core/vendored-components.json` in the source tree, which records
+  each one's version, licence, upstream and SHA-256, and which the release
+  checks against the files it built from. They carry `pkg:npm` purls
+  (`pkg:github` for the QR-code library) and a `yuzu:vendored:*` property
+  naming the source file and hash; the bundled ZRender and tslib appear inside
+  ECharts. A version the vendored file does not state is left blank rather
+  than guessed: today the htmx SSE extension (its bytes match both 2.2.2 and
+  2.2.3) and tslib. The SBOM's `yuzu:sbom:vendored` note says how many it
+  lists and from which manifest.
 - **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
   `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
 - **Anything else a scanner recognises in the unpacked file.**
@@ -281,9 +295,7 @@ file the installer holds, whichever components an installation selects, and
 does not record which component installs each one. The SBOM says this in its
 `yuzu:sbom:contents` note, and its root names the installer and its SHA-256.
 
-Not listed yet, though the file holds it: code vendored into the source tree
-and compiled into `yuzu-server` (qrcodegen, and the web assets it embeds: htmx,
-ECharts, three.js, Cytoscape, IBM Plex fonts; see `NOTICE`), the Windows
+Not listed yet, though the file holds it: the Windows
 installer's own InnoSetup runtime and what the compiler embeds beside the
 packed files (the licence text, the icon and the installer's compiled script),
 and the code the gateway's bundled Erlang
@@ -294,17 +306,18 @@ so in the data: a CycloneDX `compositions` entry with `aggregate: incomplete`
 for its root, and in SPDX (which has no such field) a `CONTAINS NOASSERTION`
 relationship on the described package. The `yuzu:sbom:incomplete-reasons`
 note names why, by the tokens below, and the `yuzu:sbom:incomplete` note says
-it in prose. The marker follows what a file holds, not its name: every SBOM of
-a file holding `yuzu-server` is marked (`server-vendored`), as are the
-installer's and every gateway SBOM. Today the files holding `yuzu-server` are
-the Linux archive and the server `.deb` and `.rpm`, so the agent's files (the
-Windows and macOS archives, the agent `.deb`, `.rpm` and `.pkg`) carry no
-marker: no release after 0.15.0 puts `yuzu-server.exe` or a macOS `yuzu-server`
-in them, and the Windows release job refuses an agent archive holding
-`yuzu-server.exe`. (v0.15.0 and earlier shipped the server in
-`yuzu-windows-x64.zip` and `yuzu-macos-arm64.tar.gz`; their SBOMs predate this
-change and carry no marker at all, so their silence says nothing about
-completeness.) Image SBOMs are marked too (below).
+it in prose. The marker follows what a file holds, not its name: the
+installer's SBOM and every gateway SBOM are marked. An SBOM of a file holding
+`yuzu-server` lists the third-party files compiled into it (above) and is not
+marked for them. Today the files holding `yuzu-server` are the Linux archive
+and the server `.deb` and `.rpm`; no release after 0.15.0 puts
+`yuzu-server.exe` or a macOS `yuzu-server` in the agent's files (the Windows
+and macOS archives, the agent `.deb`, `.rpm` and `.pkg`), and the Windows
+release job refuses an agent archive holding `yuzu-server.exe`. (v0.15.0 and
+earlier shipped the server in `yuzu-windows-x64.zip` and
+`yuzu-macos-arm64.tar.gz`; their SBOMs predate this change and carry no marker
+at all, so their silence says nothing about completeness.) Image SBOMs are
+marked too (below).
 
 Libraries the binaries load from the operating system at run time (glibc,
 `libsystemd`, the MSVC runtime, and the host OpenSSL `libcrypto` the gateway's
@@ -320,7 +333,7 @@ existing token keeps its meaning. Read the tokens, not the prose, in a script.
 
 | Token | On | What the SBOM does not list |
 |---|---|---|
-| `server-vendored` | a file or image holding `yuzu-server` | qrcodegen and the web assets compiled into it |
+| `server-vendored` | an image holding `yuzu-server` | qrcodegen and the web assets compiled into it, which the image scan cannot see (the SBOM of a file holding `yuzu-server` lists them) |
 | `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller, and the licence text, icon and compiled installer script the compiler embeds |
 | `erts-static` | a gateway file or image | what the Erlang emulator `beam.smp` vendors: PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5 |
 | `image-static-cpp` | a server or agent image | the vcpkg libraries linked statically into `yuzu-server` or `yuzu-agent`, which the image scan cannot see (the matching package's SBOM lists them) |
@@ -395,13 +408,13 @@ jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .rela
 
 ```bash
 # Every note, and the CycloneDX marker itself
-jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-linux-x64.cdx.json
-jq '.compositions' yuzu-linux-x64.cdx.json
+jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-gateway-linux-x64.cdx.json
+jq '.compositions' yuzu-gateway-linux-x64.cdx.json
 # Every note, and the SPDX marker itself (the CONTAINS NOASSERTION relationship)
 jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
         | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
-  yuzu-linux-x64.spdx.json | grep '^yuzu:sbom:'
-jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-linux-x64.spdx.json
+  yuzu-gateway-linux-x64.spdx.json | grep '^yuzu:sbom:'
+jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-gateway-linux-x64.spdx.json
 ```
 
 ### CycloneDX
@@ -415,6 +428,11 @@ cyclonedx validate --input-file yuzu-linux-x64.cdx.json
 
 # Count components
 jq '.components | length' yuzu-linux-x64.cdx.json
+
+# The third-party files compiled into yuzu-server (ZRender and tslib are
+# nested under ECharts, in its .components)
+jq -r '.components[] | select(."bom-ref" // "" | startswith("vendored-"))
+       | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-linux-x64.cdx.json
 
 # Find all dependencies declaring a specific license
 jq -r '.components[] | select(.licenses[]? | (.license.id // .expression) == "MIT") | .name' \
@@ -445,9 +463,11 @@ same version as the file SBOMs) of the image by its digest
 attests, so the SBOM describes that exact image, not whatever a tag points at
 later. It lists the operating-system packages and what syft recognises in the
 image's files, so it does not list the C++ libraries linked statically into
-`yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and the
-`yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
-images' Erlang emulator vendors, nor the `yuzu-postgres` image's pgvector. The
+`yuzu-server` or `yuzu-agent`, nor the third-party files compiled into
+`yuzu-server` (the web assets and qrcodegen; the `yuzu-linux-x64` archive and
+the `yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the
+gateway images' Erlang emulator vendors, nor the `yuzu-postgres` image's
+pgvector. The
 release marks each of the six incomplete the same way as a file SBOM: the two
 server images `server-vendored, image-static-cpp`, the agent image
 `image-static-cpp`, the two gateway images `erts-static`, and the

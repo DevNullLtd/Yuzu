@@ -331,6 +331,15 @@ jobs:
       - name: Per-artifact SBOM generator
         run: python3 -I tests/test_artifact_sbom.py
 
+      # The third-party components compiled into yuzu-server (web assets and
+      # the QR-code library) that the server SBOMs list come from
+      # server/core/vendored-components.json. Fails when a file under
+      # server/core/vendor/ or server/core/static/ (or the htmx literals in
+      # static_js_bundle.cpp) is added or changed without a matching entry, or
+      # a NOTICE records a hash or licence the manifest does not. Stdlib only.
+      - name: Vendored components manifest
+        run: python3 -I tests/test_vendored_components.py
+
       # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
       # server build or server installer in release.yml's Windows/macOS jobs,
       # no old archive name, and one set of archive names across release.yml,
