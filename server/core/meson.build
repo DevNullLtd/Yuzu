@@ -892,6 +892,7 @@ yuzu_server_core_lib = static_library(
     'src/software_plugin_health_model.cpp',
     'src/software_read_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
     'src/software_collection_settings_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_lifecycle_api.cpp', # SAM-29: transport-neutral body shared by the REST routes and the MCP twins
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
@@ -1075,6 +1076,7 @@ yuzu_server_routes_lib = static_library(
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
+    'src/software_curation_api.cpp', # SAM-29: shared body of the curation routes and the MCP twins; routes lib because it calls the curation_keys codecs defined in software_curation_routes.cpp
     'src/software_collection_settings_routes.cpp',
     'src/software_lifecycle_routes.cpp',
     'src/software_read_routes.cpp',
