@@ -1077,7 +1077,7 @@ SSE-based streaming to dashboard. gRPC streaming for programmatic access.
 
 ### 20.5 CSV / Data Export :white_check_mark: `T2`
 
-CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV. The response export is **buffered in memory under a byte cap**, not chunk-streamed: when the cap cuts the result it appends an in-band truncation trailer row and sets `X-Result-Truncated-By-Cap` (`server/core/src/response_routes.cpp`). Generic JSON-to-CSV conversion (`POST /api/export/json-to-csv`).
+CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV. The response export is **buffered in memory under a byte cap**, not chunk-streamed: when the cap cuts the result it appends an in-band truncation trailer row and sets `X-Result-Truncated-By-Cap` (`server/core/src/response_routes.cpp`). Generic JSON-to-CSV conversion (`POST /api/export/json-to-csv`). The installed-software inventory has its own export, `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` (`server/core/src/software_export_routes.cpp`): JSONL and CSV are chunk-streamed under `--inventory-export-max-rows` and `--inventory-export-max-bytes`, and XLSX is a one-sheet workbook built whole in constant memory before it is sent, refused with a `413` past the sheet's 1,048,575 rows or a size limit, and bounded on disk (at most 3 times its accounted sheet bytes, never leaving the data volume under 1 GiB free); PDF is not offered.
 
 ### 20.6 Response Templates :white_check_mark: `T2`
 

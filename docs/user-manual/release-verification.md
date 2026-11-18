@@ -198,7 +198,7 @@ in it:
   the licence, a `pkg:github` (or `pkg:generic`) purl naming the upstream
   source, and a CPE where NVD has a product for the library. The agent's files
   list the agent's libraries; a file holding `yuzu-server` also lists the
-  server's (`libpq`, `xmlsec`, `drogon` and what they need). The list is every
+  server's (`libpq`, `xmlsec`, `drogon`, `libxlsxwriter` and what they need). The list is every
   vcpkg library the build installs for that component, so it can include one
   a binary ends up not using; it does not omit a vcpkg library the binary
   uses. A library whose vcpkg record gives no licence is listed without one

@@ -11,8 +11,10 @@
 #include "software_list_model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -826,6 +828,79 @@ TEST_CASE("CSV: 23-column installs header; quoting; the components header", "[se
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
+}
+
+TEST_CASE("list_row_cells: the one column projection, equal to the CSV row after unescaping",
+          "[server][software_list_model]") {
+    auto r = fleet_row("My \"App\", Pro\nEdition", "a1", 7);
+    r.entry.version = "2.5";
+    r.entry.publisher = "Acme, Inc";
+    r.entry.install_date = "20260101";
+    r.entry.kind = "app";
+    r.entry.ecosystem = "deb";
+    r.entry.epoch = "1";
+    r.entry.release = "3";
+    r.entry.arch = "x86_64";
+    r.entry.signature_status = "signed";
+    r.entry.distro_id = "debian";
+    r.entry.distro_version = "12";
+    r.entry.install_type = "msi";
+    r.entry.install_scope = "machine";
+    r.entry.install_location = "C:\\Program Files\\App";
+    r.entry.instance_key = "inst-1";
+    r.entry.purl = "pkg:deb/debian/app@2.5";
+    r.last_confirmed_at = 1'700'000'000;
+    DeviceFacts facts;
+    facts.hostname["a1"] = "host-one";
+    facts.last_seen["a1"] = 1'699'000'000;
+
+    const auto cells = list_row_cells(r, facts);
+    STATIC_REQUIRE(std::tuple_size_v<std::remove_cvref_t<decltype(cells)>> == kListCsvColumns);
+    // Positions follow kListCsvHeader.
+    CHECK(cells[0] == "a1");
+    CHECK(cells[1] == "My \"App\", Pro\nEdition");
+    CHECK(cells[2] == "2.5");
+    CHECK(cells[3] == "Acme, Inc");
+    CHECK(cells[14] == "host-one");
+    CHECK(cells[15] == "1699000000");
+    CHECK(cells[17] == "1700000000");
+    CHECK(cells[22] == "pkg:deb/debian/app@2.5");
+    CHECK(list_row_cells(fleet_row("n", "unknown-agent", 1), DeviceFacts{})[14].empty());
+
+    // Read the CSV row back (RFC 4180) and compare cell for cell.
+    const auto csv = list_csv({r}, facts);
+    const auto body = csv.substr(kListCsvHeader.size() + 1);
+    std::vector<std::string> back;
+    std::string cell;
+    bool quoted = false;
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        const char c = body[i];
+        if (quoted) {
+            if (c == '"' && i + 1 < body.size() && body[i + 1] == '"') {
+                cell += '"';
+                ++i;
+            } else if (c == '"') {
+                quoted = false;
+            } else {
+                cell += c;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == ',') {
+            back.push_back(cell);
+            cell.clear();
+        } else if (c == '\n') {
+            back.push_back(cell);
+            cell.clear();
+        } else {
+            cell += c;
+        }
+    }
+    REQUIRE(back.size() == kListCsvColumns);
+    for (std::size_t i = 0; i < kListCsvColumns; ++i) {
+        CAPTURE(i);
+        CHECK(back[i] == cells[i]);
+    }
 }
 
 TEST_CASE("CSV: every agent- or device-influenced cell of both exports is formula-neutralised (CWE-1236)",
