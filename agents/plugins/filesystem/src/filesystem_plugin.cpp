@@ -188,35 +188,48 @@ bool absent_error(const std::error_code& e) {
     return e == std::errc::no_such_file_or_directory || e == std::errc::not_a_directory;
 }
 
-enum class Ident { Different, Same, Unknown };
+// CandidateUnknown: the candidate's own stat failed, so what it is cannot be told: REFUSE.
+// ReservedUnknown: the RESERVED object cannot be stat'ed (e.g. under a directory this uid cannot
+// search). That alone says nothing about the candidate: a candidate that is not a possible hard
+// link to it (a single-link file, a directory) can only be it by PATH, which the string and
+// re-canonicalised comparisons already decided. It must not deny every unrelated path.
+enum class Ident { Different, Same, CandidateUnknown, ReservedUnknown };
 
 Ident identity_of(const fs::path& a, const fs::path& b) {
     std::error_code e;
     const bool ea = fs::exists(a, e);
     if (e)
-        return Ident::Unknown;
+        return Ident::CandidateUnknown;
     if (!ea)
         return Ident::Different;
     const bool eb = fs::exists(b, e);
     if (e)
-        return Ident::Unknown;
+        return Ident::ReservedUnknown;
     if (!eb)
         return Ident::Different;
     const bool same = fs::equivalent(a, b, e);
     if (e)
-        return absent_error(e) ? Ident::Different : Ident::Unknown;
+        return absent_error(e) ? Ident::Different : Ident::CandidateUnknown;
     return same ? Ident::Same : Ident::Different;
 }
 
 // Decide by IDENTITY, not spelling (a hard link, a bind mount, `..`, a case or Unicode alias all
-// name the same object under a different string). `p` need not exist. Any error resolving it
-// REFUSES (fail closed). Best effort against a writer who controls a parent directory.
+// name the same object under a different string). `p` need not exist. Any error resolving the
+// CANDIDATE refuses (fail closed). Best effort against a writer who controls a parent directory.
+//
+// A reserved path that does not exist yet is compared by STRING (its canonical spelling), not by
+// identity: there is no object to compare. It is re-canonicalised at every decision so a symlink
+// planted at it after the snapshot is followed.
 bool path_is_reserved_unguarded(const fs::path& p) {
+    if (yuzu::filesystem::reserved::contains_nul(p.string()))
+        return true;
     std::error_code ec;
     const fs::path canon = fs::weakly_canonical(p, ec);
     if (ec)
         return true;
     const std::string cs = path_bytes(canon);
+    if (yuzu::filesystem::reserved::contains_nul(cs))
+        return true;
     if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
         return true;
 #ifndef _WIN32
@@ -224,24 +237,61 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     if (yuzu::filesystem::reserved::is_dev_fd_path(cs) ||
         yuzu::filesystem::reserved::is_dev_fd_path(path_bytes(p.lexically_normal())))
         return true;
+#ifdef __APPLE__
+    if (yuzu::filesystem::reserved::is_apple_vol_path(path_bytes(p.lexically_normal())) ||
+        yuzu::filesystem::reserved::is_apple_vol_path(cs))
+        return true;
+#endif
 #endif
     yuzu::filesystem::reserved::Set snapshot;
     {
         std::lock_guard lk(g_reserved_mu);
         snapshot = g_reserved_set();
     }
+    // Re-canonicalise every reserved path NOW: a symlink created after the snapshot at a reserved
+    // name that did not exist then would otherwise hide the real target.
+    {
+        auto refresh = [](std::vector<std::string>& v) {
+            const auto n = v.size();
+            for (std::size_t i = 0; i < n; ++i) {
+                // weakly_canonical does not follow a DANGLING link at the leaf (the link's target
+                // does not exist, so it treats the name as a plain missing one): follow it by hand,
+                // bounded, so a link planted at a not-yet-existing reserved name reaches its target.
+                fs::path cur{v[i]};
+                bool ok = true;
+                for (int hop = 0; hop < 40 && ok; ++hop) {
+                    std::error_code rec;
+                    cur = fs::weakly_canonical(cur, rec);
+                    if (rec) {
+                        ok = false;
+                        break;
+                    }
+                    const auto st = fs::symlink_status(cur, rec);
+                    if (rec || !fs::is_symlink(st))
+                        break;
+                    auto t = fs::read_symlink(cur, rec);
+                    if (rec) {
+                        ok = false;
+                        break;
+                    }
+                    cur = t.is_relative() ? cur.parent_path() / t : t;
+                }
+                if (ok) {
+                    auto cstr = path_bytes(cur);
+                    if (cstr != v[i])
+                        v.push_back(std::move(cstr));
+                }
+            }
+        };
+        refresh(snapshot.files);
+        refresh(snapshot.dirs);
+    }
     if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
         return true;
-    // Identity: the candidate (or an ancestor of it) IS a reserved object. A stat that FAILS for any
-    // reason other than "no such file" is Unknown and REFUSES: an unreadable parent or an
-    // unstattable entry must never read as "different object" (that was the fail-open).
-    for (const auto& f : snapshot.files)
-        if (identity_of(canon, fs::path{f}) != Ident::Different)
-            return true;
-    // A HARD LINK to a file inside a reserved directory has no ancestor in it: it is the same
-    // object under another name. Only a regular file with more than one link can be one, so only
-    // then enumerate the reserved dirs (bounded) and compare identity. EVERY error other than
-    // "no such file" (on the directory, on an entry, on the identity probe) REFUSES.
+
+    // Can the candidate be a hard link to a reserved object? Only a regular file with more than one
+    // link (or one whose link count cannot be read) can be one under another name.
+    bool may_be_hard_link = false;
     {
         std::error_code e3;
         const bool regular = fs::is_regular_file(canon, e3);
@@ -249,49 +299,64 @@ bool path_is_reserved_unguarded(const fs::path& p) {
             return true;
         if (regular) {
             const auto links = fs::hard_link_count(canon, e3);
-            if (e3 || links > 1) {
-                constexpr std::size_t kMaxScan = 20000;
-                std::size_t seen = 0;
-                for (const auto& d : snapshot.dirs) {
-                    std::error_code e4;
-                    const bool dir_exists = fs::exists(fs::path{d}, e4);
-                    if (e4)
+            may_be_hard_link = e3 || links > 1;
+        }
+    }
+
+    // Identity: the candidate (or an ancestor of it) IS a reserved object. A candidate-side stat
+    // failure REFUSES; a reserved-side one refuses only a candidate that could be a hard link to it.
+    for (const auto& f : snapshot.files) {
+        const auto id = identity_of(canon, fs::path{f});
+        if (id == Ident::Same || id == Ident::CandidateUnknown ||
+            (id == Ident::ReservedUnknown && may_be_hard_link))
+            return true;
+    }
+    // A HARD LINK to a file inside a reserved directory has no ancestor in it: enumerate the reserved
+    // dirs (bounded) and compare identity. EVERY error other than "no such file" refuses.
+    if (may_be_hard_link) {
+        constexpr std::size_t kMaxScan = 20000;
+        std::size_t seen = 0;
+        for (const auto& d : snapshot.dirs) {
+            std::error_code e4;
+            const bool dir_exists = fs::exists(fs::path{d}, e4);
+            if (e4)
+                return true;
+            if (!dir_exists)
+                continue;
+            // No skip_permission_denied: a subdirectory this process cannot read may hold the very
+            // file this candidate links to, so an unreadable entry REFUSES.
+            fs::recursive_directory_iterator it{fs::path{d}, fs::directory_options::none, e4};
+            if (e4)
+                return true;
+            const fs::recursive_directory_iterator end{};
+            while (it != end) {
+                if (++seen > kMaxScan)
+                    return true;
+                std::error_code e5;
+                const bool reg = it->is_regular_file(e5);
+                if (e5 && !absent_error(e5))
+                    return true;
+                if (reg && !e5) {
+                    std::error_code e6;
+                    const bool same = fs::equivalent(it->path(), canon, e6);
+                    if (e6 && !absent_error(e6))
                         return true;
-                    if (!dir_exists)
-                        continue;
-                    // No skip_permission_denied: a subdirectory this process cannot read may hold the
-                    // very file this candidate links to, so an unreadable entry REFUSES.
-                    fs::recursive_directory_iterator it{fs::path{d}, fs::directory_options::none, e4};
-                    if (e4)
+                    if (same && !e6)
                         return true;
-                    const fs::recursive_directory_iterator end{};
-                    while (it != end) {
-                        if (++seen > kMaxScan)
-                            return true;
-                        std::error_code e5;
-                        const bool reg = it->is_regular_file(e5);
-                        if (e5 && !absent_error(e5))
-                            return true;
-                        if (reg && !e5) {
-                            std::error_code e6;
-                            const bool same = fs::equivalent(it->path(), canon, e6);
-                            if (e6 && !absent_error(e6))
-                                return true;
-                            if (same && !e6)
-                                return true;
-                        }
-                        it.increment(e4);
-                        if (e4)
-                            return true;
-                    }
                 }
+                it.increment(e4);
+                if (e4)
+                    return true;
             }
         }
     }
     for (fs::path a = canon; !a.empty(); a = a.parent_path()) {
-        for (const auto& d : snapshot.dirs)
-            if (identity_of(a, fs::path{d}) != Ident::Different)
+        for (const auto& d : snapshot.dirs) {
+            const auto id = identity_of(a, fs::path{d});
+            if (id == Ident::Same || id == Ident::CandidateUnknown ||
+                (id == Ident::ReservedUnknown && may_be_hard_link))
                 return true;
+        }
         if (a == a.parent_path())
             break;
     }

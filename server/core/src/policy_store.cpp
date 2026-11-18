@@ -1227,14 +1227,15 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
     if (agent_ids.empty())
         return std::size_t{0};
 
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease)
-        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
-                               "database unavailable — try again");
     constexpr std::size_t kChunk = 1000;
     std::size_t written = 0;
+    std::size_t failed_chunks = 0;
     const std::string cr = sanitize_pg_text(check_result);
-    for (std::size_t i = 0; i < agent_ids.size(); i += kChunk) {
+    // Every chunk is attempted whatever happened to the one before it: stopping at the first failure
+    // would leave the tail holding its previous (possibly compliant) verdict for the whole interval,
+    // which the per-target code this replaced never did (it lost only the failing row). A fresh lease
+    // per chunk, so a connection killed by one failure is not reused for the rest.
+    for (std::size_t i = 0, idx = 0; i < agent_ids.size(); i += kChunk, ++idx) {
         const auto e = std::min(agent_ids.size(), i + kChunk);
         std::vector<std::string_view> chunk;
         chunk.reserve(e - i);
@@ -1243,12 +1244,21 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
                 chunk.emplace_back(agent_ids[j]);
         if (chunk.empty())
             continue;
+        if (chunk_fault_hook_for_test_ && chunk_fault_hook_for_test_(idx)) {
+            ++failed_chunks;
+            continue;
+        }
+        auto lease = pool_.try_acquire_for(kAcquireTimeout);
+        if (!lease) {
+            ++failed_chunks;
+            continue;
+        }
         pg::PgResult res = pg::exec_params(
             lease.get(),
             "INSERT INTO policy_store.policy_status "
             "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
             " fix_attempt_count) "
-            "SELECT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
+            "SELECT DISTINCT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
             "FROM unnest($2::text[]) AS a "
             "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
             "  status = 'error', last_check_at = EXCLUDED.last_check_at, "
@@ -1258,14 +1268,18 @@ PolicyStore::set_agents_error_status(const std::string& policy_id,
         if (res.status() != PGRES_TUPLES_OK) {
             spdlog::error("PolicyStore: write failed in set_agents_error_status: {}",
                           PQerrorMessage(lease.get()));
-            if (written > 0)
-                invalidate_fleet_compliance_cache();
-            return std::unexpected(std::string(kPolicyDbErrorPrefix) +
-                                   "failed to update compliance status");
+            ++failed_chunks;
+            continue;
         }
         written += static_cast<std::size_t>(PQntuples(res.get()));
     }
-    invalidate_fleet_compliance_cache();
+    if (written > 0)
+        invalidate_fleet_compliance_cache();
+    if (failed_chunks > 0)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "failed to update compliance status for " +
+                               std::to_string(failed_chunks) + " chunk(s); " +
+                               std::to_string(written) + " row(s) written");
     return written;
 }
 

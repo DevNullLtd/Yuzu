@@ -509,9 +509,14 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     // interval, so a skipped tail would keep a stale verdict as current.
     auto write_error_verdicts = [&](const char* reason_json) {
         auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json);
-        if (!r)
+        if (!r) {
             spdlog::warn("policy_evaluator: error-verdict write failed for policy {} ({} target(s)): {}",
                          p.id, targets.size(), r.error());
+            if (d_.metrics)
+                d_.metrics->counter("yuzu_server_policy_eval_errors_total",
+                                    {{"phase", "error_verdict_write"}})
+                    .increment();
+        }
     };
     if (dispatch_result->pair_mismatch) {
         // WP06 F4: the verdict is an explicit per-agent `error` (never a stale compliant), with a

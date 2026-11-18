@@ -141,6 +141,9 @@ public:
     bool set_enabled(const std::string& id, bool enabled, const std::string& created_by);
 
     std::vector<InstructionSchedule> evaluate_due() const;
+    /// Same read, but a store failure is an error and NOT an empty list: a caller that keeps
+    /// per-schedule state (the runner's arming holds) must not read a failed query as "nothing due".
+    [[nodiscard]] std::expected<std::vector<InstructionSchedule>, std::string> evaluate_due_checked() const;
     void advance_schedule(const std::string& id);
 
 private:

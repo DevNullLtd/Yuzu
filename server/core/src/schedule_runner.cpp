@@ -51,7 +51,13 @@ void ScheduleRunner::tick() {
         return;
 
     arming_unavailable_this_tick_ = 0;
-    const auto due = d_.schedule_engine->evaluate_due();
+    auto due_res = d_.schedule_engine->evaluate_due_checked();
+    if (!due_res) {
+        // A failed read is NOT "nothing due": leave the holds and the gauge exactly as they were.
+        spdlog::warn("schedule_runner: due read failed ({}); holds left as they were", due_res.error());
+        return;
+    }
+    auto due = std::move(*due_res);
     const std::int64_t now = now_secs();
     // Forget holds for schedules that are no longer due (fired, deleted, disabled) or have lapsed.
     if (!arming_held_until_.empty()) {
@@ -65,6 +71,17 @@ void ScheduleRunner::tick() {
                 ++it;
         }
     }
+    // Start after the last schedule asked unavailable (round-robin), so a lapsed hold at the head
+    // cannot keep pre-empting the tail.
+    if (!arming_cursor_.empty()) {
+        const auto pos = std::find_if(due.begin(), due.end(),
+                                      [&](const InstructionSchedule& s) { return s.id == arming_cursor_; });
+        if (pos != due.end())
+            std::rotate(due.begin(), std::next(pos), due.end());
+        else
+            arming_cursor_.clear();
+    }
+    bool cap_hit = false;
     for (const auto& s : due) {
         // A schedule held on an UNAVAILABLE arming answer is skipped WITHOUT asking and WITHOUT
         // counting against the cap: the schedules behind it must still get their turn.
@@ -73,11 +90,12 @@ void ScheduleRunner::tick() {
             continue;
         }
         // The arming read is evidently failing: stop spending the shared tick thread on it. The
-        // rest stay due; the ones not held are asked on the next tick.
+        // rest stay due and the cursor resumes after the last one asked.
         if (arming_unavailable_this_tick_ >= kMaxArmingUnavailablePerTick) {
             spdlog::warn("schedule_runner: {} arming checks unavailable this tick - remaining "
                          "due schedule(s) deferred to the next tick",
                          arming_unavailable_this_tick_);
+            cap_hit = true;
             break;
         }
         // #3495: bounds how many MORE schedules a single tick() call fires
@@ -101,10 +119,19 @@ void ScheduleRunner::tick() {
             d_.schedule_engine->advance_schedule(s.id);
         }
     }
+    if (!cap_hit)
+        arming_cursor_.clear(); // a full pass: start from the head again
     // How much scheduled work is parked on the arming hold right now (0 when nothing is).
     if (d_.metrics) {
         d_.metrics->gauge("yuzu_schedule_due_held").set(static_cast<double>(arming_held_until_.size()));
     }
+}
+
+void ScheduleRunner::on_demoted() {
+    arming_held_until_.clear();
+    arming_cursor_.clear();
+    if (d_.metrics)
+        d_.metrics->gauge("yuzu_schedule_due_held").set(0.0);
 }
 
 std::int64_t ScheduleRunner::now_secs() const {
@@ -163,6 +190,7 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
         count("yuzu_schedule_arming_unavailable_total");
         ++arming_unavailable_this_tick_;
         arming_held_until_[s.id] = now_secs() + kArmingHoldSeconds;
+        arming_cursor_ = s.id;
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check unavailable ({}); "
                      "holding, not advancing",
                      s.name, s.id, ::yuzu::log_token(arming.error()));

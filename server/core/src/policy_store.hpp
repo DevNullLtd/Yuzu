@@ -196,6 +196,11 @@ public:
     [[nodiscard]] std::expected<std::size_t, std::string>
     set_agents_error_status(const std::string& policy_id, const std::vector<std::string>& agent_ids,
                             const std::string& check_result);
+    /// Test seam: when set, a chunk index for which it returns true is treated as a failed write
+    /// (models a connection killed mid-batch). Unset in production.
+    void set_chunk_fault_hook_for_test(std::function<bool(std::size_t)> hook) {
+        chunk_fault_hook_for_test_ = std::move(hook);
+    }
     [[nodiscard]] std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
     get_agent_status(const std::string& policy_id, const std::string& agent_id) const;
     [[nodiscard]] std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>
@@ -339,6 +344,7 @@ public:
                               const std::vector<std::string>& agent_ids, int64_t generation);
 
 private:
+    std::function<bool(std::size_t)> chunk_fault_hook_for_test_;
     pg::PgPool& pool_;
     bool open_{false};
 

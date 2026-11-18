@@ -1868,6 +1868,86 @@ TEST_CASE("ScheduleRunner: held schedules do not starve a healthy one behind the
         CHECK(h.get(id).next_execution_at < 100); // never advanced, never lost
 }
 
+TEST_CASE("ScheduleRunner: with 50 held schedules and lapsing holds a Read-pair schedule at the tail "
+          "still fires in bounded ticks (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked_held = 0;
+    Harness h([&](const std::string& principal, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        if (principal == "admin") {
+            ++asked_held;
+            return std::unexpected(std::string("auth store error"));
+        }
+        return true;
+    });
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    for (int i = 0; i < 50; ++i) {
+        InstructionSchedule s;
+        s.name = "held-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "admin";
+        s.next_execution_at = 1 + i;
+        REQUIRE(h.engine.create_schedule(s).has_value());
+    }
+    InstructionSchedule tail;
+    tail.name = "tail-read-pair";
+    tail.definition_id = "test.def";
+    tail.frequency_type = "interval";
+    tail.interval_minutes = 60;
+    tail.enabled = true;
+    tail.created_by = "reader";
+    tail.next_execution_at = 1000; // position 51 of 51
+    REQUIRE(h.engine.create_schedule(tail).has_value());
+
+    // A tick every 30 s of the (fake) clock: a hold lapses after 90 s, i.e. every third tick, so
+    // without a rotating start the first three schedules would be asked again before the tail is
+    // ever reached.
+    int ticks = 0;
+    while (h.enqueues.empty() && ticks < 40) {
+        h.runner.tick();
+        clock += 30;
+        ++ticks;
+    }
+    REQUIRE_FALSE(h.enqueues.empty());
+    CHECK(h.enqueues[0].principal == "reader");
+    CHECK(ticks <= 25);
+}
+
+TEST_CASE("ScheduleRunner: the held gauge and deferred counter report the hold, a failed due read "
+          "keeps it, and a demotion clears it (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    yuzu::MetricsRegistry metrics;
+    Harness h([](const std::string&, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        return std::unexpected(std::string("auth store error"));
+    },
+              nullptr, &metrics);
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    for (int i = 0; i < 2; ++i)
+        (void)h.make_due("test.def", "interval");
+    h.runner.tick();
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 2.0);
+    h.runner.tick(); // both held: skipped, counted as deferred
+    CHECK(metrics.counter("yuzu_schedule_arming_deferred_total").value() == 2.0);
+
+    // The due read fails: the holds and the gauge must not be wiped.
+    h.exec_sql("ALTER TABLE schedule_engine.schedules RENAME TO schedules_hidden");
+    h.runner.tick();
+    h.exec_sql("ALTER TABLE schedule_engine.schedules_hidden RENAME TO schedules");
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 2.0);
+    const double deferred = metrics.counter("yuzu_schedule_arming_deferred_total").value();
+    h.runner.tick(); // still inside the hold: both skipped unasked, so the holds survived the failure
+    CHECK(metrics.counter("yuzu_schedule_arming_deferred_total").value() == deferred + 2.0);
+
+    h.runner.on_demoted();
+    CHECK(metrics.gauge("yuzu_schedule_due_held").value() == 0.0);
+}
+
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
           "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });

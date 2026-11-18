@@ -20,6 +20,7 @@
 #include <memory>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 #ifndef _WIN32
@@ -73,6 +74,19 @@ TEST_CASE("is_dev_fd_path: /dev/fd/N and the stdio aliases are refused (macOS ha
     CHECK_FALSE(rsv::is_dev_fd_path("/dev/null"));
     CHECK_FALSE(rsv::is_dev_fd_path("/dev/fdx/3"));
     CHECK_FALSE(rsv::is_dev_fd_path("/home/u/dev/fd/3"));
+    // macOS volumes are case-insensitive by default.
+    CHECK(rsv::is_dev_fd_path("/DEV/FD/3"));
+    CHECK(rsv::is_dev_fd_path("/Dev/Stdin"));
+}
+
+TEST_CASE("is_apple_vol_path / contains_nul: pure decisions", "[agent][filesystem_plugin][reserved]") {
+    CHECK(rsv::is_apple_vol_path("/.vol/16777220/12345"));
+    CHECK(rsv::is_apple_vol_path("/.VOL/1/2"));
+    CHECK(rsv::is_apple_vol_path("/.vol"));
+    CHECK_FALSE(rsv::is_apple_vol_path("/.volume/1"));
+    CHECK_FALSE(rsv::is_apple_vol_path("/home/.vol/x"));
+    CHECK(rsv::contains_nul(std::string_view("/var/lib/yuzu\0/x", 16)));
+    CHECK_FALSE(rsv::contains_nul("/var/lib/yuzu/x"));
 }
 
 TEST_CASE("is_proc_secret_path: the agent's own /proc entries and any pid's secret files are refused",
@@ -372,6 +386,9 @@ TEST_CASE("filesystem plugin: a hard link into a reserved dir whose PARENT canno
     run_hardlink_shape("parent 0000", false, fs::perms::owner_all, fs::perms::all, true);
 }
 
+// NOTE: on Linux these refuse through the /proc rule (the aliases are symlinks into /proc/self), so
+// this runtime case does not discriminate the /dev/fd rule itself: that is pinned by the pure
+// is_dev_fd_path cases above. It exercises the macOS spelling end to end where a macOS run is owed.
 TEST_CASE("filesystem plugin: /dev/fd, /dev/stdin and friends are refused on POSIX",
           "[agent][filesystem_plugin][reserved]") {
     auto handle = load_fs_plugin();
@@ -434,6 +451,65 @@ TEST_CASE("filesystem plugin: write_content refuses a dangling symlink leaf; lis
     auto ls2 = run("list_dir", {{"path", root.path.string()}});
     CHECK(ls2.captured.find("entry|data|") == std::string::npos);
     CHECK(ls2.captured.find("entry|other|") != std::string::npos);
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+TEST_CASE("filesystem plugin: a reserved path that did not exist at init is followed through a symlink "
+          "planted afterwards (WP06 F55)",
+          "[agent][filesystem_plugin][reserved][symlink]") {
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_late_"};
+    std::error_code ec;
+    const auto other = root.path / "other";
+    fs::create_directories(other, ec);
+    const auto target = other / "planted.pem"; // does not exist: the reserved name will dangle to it
+    const auto reserved_name = root.path / "elsewhere.key"; // does not exist at init
+    yuzu::agent::StandalonePluginContext ctx{
+        "filesystem", {{"agent.tls_client_key", reserved_name.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    std::error_code lec;
+    fs::create_symlink(target, reserved_name, lec); // planted AFTER the reserved set was built
+    REQUIRE_FALSE(lec);
+    auto run = make_runner(*handle);
+    // The candidate does not exist, so there is no object to compare: only the re-resolved reserved
+    // path (elsewhere.key -> planted.pem) can refuse it. A write would plant the agent's own key file.
+    auto w = run("write_content", {{"path", target.string()}, {"content", "EVIL"}, {"create", "true"}});
+    CHECK(w.rc != 0);
+    CHECK_FALSE(fs::exists(target));
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+TEST_CASE("filesystem plugin: a reserved path the agent cannot stat does not deny unrelated paths "
+          "(WP06 F55)",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    if (::geteuid() == 0)
+        SKIP("running as root: chmod does not hide a directory from root");
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_unrel_"};
+    std::error_code ec;
+    const auto parent = root.path / "parent";
+    const auto data_dir = parent / "data";
+    fs::create_directories(data_dir, ec);
+    {
+        std::ofstream o(data_dir / "agent-client.key");
+        o << "SECRET-SENTINEL\n";
+    }
+    const auto ok = root.path / "ok.txt";
+    {
+        std::ofstream o(ok);
+        o << "fine\n";
+    }
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    fs::permissions(parent, fs::perms::none, ec);
+    auto run = make_runner(*handle);
+    auto r = run("read", {{"path", ok.string()}});
+    std::error_code rec;
+    fs::permissions(parent, fs::perms::owner_all, rec);
+    CHECK(r.rc == 0);
+    CHECK(r.captured.find("fine") != std::string::npos);
     handle->descriptor()->shutdown(ctx.get());
 }
 

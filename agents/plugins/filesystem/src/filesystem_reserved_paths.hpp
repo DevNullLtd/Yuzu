@@ -117,13 +117,36 @@ struct Set {
 /// agent's own open descriptors (an inherited secret file, the log). macOS has no `/proc`, so
 /// `is_proc_secret_path` cannot see them; on Linux the same names are symlinks into `/proc/self`.
 /// Refused as a literal or canonical spelling. Pure; never true for a Windows path.
-[[nodiscard]] inline bool is_dev_fd_path(std::string_view path) {
+[[nodiscard]] inline bool is_dev_fd_path(std::string_view path_in) {
+    // ASCII case is folded: the default macOS volume is case-insensitive, so `/DEV/FD/3` is the same
+    // object as `/dev/fd/3`.
+    std::string path(path_in);
+    for (char& c : path)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
     constexpr std::string_view kDev = "/dev/";
-    if (path.substr(0, kDev.size()) != kDev)
+    if (std::string_view{path}.substr(0, kDev.size()) != kDev)
         return false;
-    const std::string_view rest = path.substr(kDev.size());
+    const std::string_view rest = std::string_view{path}.substr(kDev.size());
     const std::string_view first = rest.substr(0, rest.find('/'));
     return first == "fd" || first == "stdin" || first == "stdout" || first == "stderr";
+}
+
+/// macOS: `/.vol/<dev>/<ino>` opens any file by inode number, so a literal `/.vol/` path names a
+/// reserved file without spelling its path. Refused as a literal (ASCII case folded). Pure; the
+/// plugin applies it on `__APPLE__` only.
+[[nodiscard]] inline bool is_apple_vol_path(std::string_view path_in) {
+    std::string path(path_in);
+    for (char& c : path)
+        if (c >= 'A' && c <= 'Z')
+            c = static_cast<char>(c - 'A' + 'a');
+    return std::string_view{path}.substr(0, 6) == "/.vol/" || path == "/.vol";
+}
+
+/// A path containing a NUL byte names no single file: every C-string consumer truncates it, so the
+/// decision and the open can disagree. Refused outright.
+[[nodiscard]] inline bool contains_nul(std::string_view path) {
+    return path.find('\0') != std::string_view::npos;
 }
 
 } // namespace yuzu::filesystem::reserved

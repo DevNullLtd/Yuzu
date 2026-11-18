@@ -154,7 +154,16 @@ public:
     /// (logged + counted) so one bad schedule cannot starve the rest.
     void tick();
 
+    /// Called by the owner's loop on a tick it is NOT the leader for: drops every arming hold and
+    /// zeroes `yuzu_schedule_due_held` so a demoted replica does not keep reporting held work it is
+    /// no longer responsible for. Same thread as tick().
+    void on_demoted();
+
 private:
+    // Round-robin start for the next tick: the id of the last schedule asked UNAVAILABLE. Holds lapse
+    // after kArmingHoldSeconds, so without a cursor the head of the due order is asked again before
+    // the tail is ever reached.
+    std::string arming_cursor_;
     // UNAVAILABLE arming answers spent by the current tick (reset at the top of tick(); the
     // runner's tick is single-threaded). See kMaxArmingUnavailablePerTick.
     int arming_unavailable_this_tick_{0};

@@ -724,6 +724,27 @@ TEST_CASE("policy store: set_agents_error_status writes every target in batched 
     CHECK(*none == 0);
 }
 
+TEST_CASE("policy store: a failed chunk does not strand the remaining targets on a stale verdict "
+          "(WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+    std::vector<std::string> targets;
+    for (int i = 0; i < 2500; ++i) {
+        targets.push_back("agent-" + std::to_string(i));
+        REQUIRE(h.ps.update_agent_status(pid, targets.back(), "compliant").has_value());
+    }
+    targets.push_back("agent-2400"); // a duplicate id in one chunk must not abort it
+    h.ps.set_chunk_fault_hook_for_test([](std::size_t idx) { return idx == 0; });
+    auto r = h.ps.set_agents_error_status(pid, targets, R"({"phase":"check","result":"x"})");
+    h.ps.set_chunk_fault_hook_for_test({});
+    CHECK_FALSE(r.has_value()); // the failure is reported...
+    CHECK(h.status_of(pid, "agent-5") == "compliant");      // ...the failed chunk keeps its old row
+    CHECK(h.status_of(pid, "agent-1000") == "error");       // ...but chunk 2 was still written
+    CHECK(h.status_of(pid, "agent-2499") == "error");       // ...and so was the tail
+}
+
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

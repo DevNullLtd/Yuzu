@@ -19778,6 +19778,8 @@ private:
                         if (leader_gate_permits<background_job_class("schedule_runner.tick")>(
                                 leader_elector_.get()))
                             schedule_runner_->tick();
+                        else
+                            schedule_runner_->on_demoted();
                     } catch (const std::exception& e) {
                         metrics_.counter("yuzu_schedule_tick_errors_total").increment();
                         spdlog::error("schedule_runner: tick threw ({}) — thread continuing",
