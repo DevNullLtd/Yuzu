@@ -36,7 +36,7 @@ at a time. These tests pin what that means:
     command (syft, and rpm2cpio | cpio: timeout), a failing syft, and an
     unexpected error is one `::error::` line, not a traceback;
   - `check` refuses an SBOM over the entry bound (400 passes, 401 fails), one listing a path under
-    vcpkg/, vcpkg_installed/, build-*/, _build*/, site/, tests/, .git/ or
+    vcpkg/, vcpkg_installed/, build-*/, _build/, _build_*/, site/, tests/, .git/ or
     .github/ wherever syft records a path (CycloneDX file names, location
     properties and evidence; SPDX file names and package sourceInfo), one
     with no components and no record of unpacked files, and one whose SHA-256
