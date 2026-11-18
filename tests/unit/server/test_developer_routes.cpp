@@ -50,6 +50,7 @@ struct DeveloperHarness {
 
     explicit DeveloperHarness(bool with_registry = true, RbacStore* rbac = nullptr,
                               bool with_probe = true) {
+        registry.set_catalogue_filter([](std::string_view, std::string_view) { return true; });
         developer::Deps deps;
         deps.admin_fn = [this](const httplib::Request&, httplib::Response& res) {
             ++admin_calls;

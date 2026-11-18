@@ -109,6 +109,9 @@ struct DiscoverHarness {
     // null store/registry pointer, exercising the 503 degrade branch.
     explicit DiscoverHarness(bool wire_rbac = true, bool wire_instr = true,
                              bool wire_registry = true, bool grant_instr_read = false) {
+        // WP06 F31: the served catalogue is filtered by the capability catalogue in production;
+        // these route tests register arbitrary plugin names, so the filter admits everything.
+        registry.set_catalogue_filter([](std::string_view, std::string_view) { return true; });
         // Manual equivalent of YUZU_REQUIRE_PG_DB_TPL (test_helpers.hpp) — the
         // macro declares a local, non-movable PostgresTestDb, so it can't be
         // used directly to populate a data member; emplace() constructs
@@ -1145,6 +1148,7 @@ TEST_CASE("CROSS-CHECK: scope_kind_catalog entries are honored by evaluate_scope
     EventBus bus;
     yuzu::MetricsRegistry metrics;
     AgentRegistry registry(bus, metrics);
+    registry.set_catalogue_filter([](std::string_view, std::string_view) { return true; });
     auto info = make_agent_info("agent-1", "windows", "WIN-TESTBOX");
     (*info.mutable_scopable_tags())["department"] = "finance";
     (void)registry.register_agent(info);

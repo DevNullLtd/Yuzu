@@ -6,11 +6,13 @@
 /// stored verbatim, merged fleet-wide by `AgentRegistry::help_json` and served to LLM clients
 /// (`discover_plugins`), i.e. a prompt-injection channel from any enrolled endpoint.
 ///
-/// Rules (pure, no I/O): a field outside its bound is DROPPED, never truncated into something
-/// misleading, and counted by the caller. Applies ONLY to the `PluginMeta` copy used for the
+/// Rules (pure, no I/O): a field outside its bound is DROPPED (a name, version, description or
+/// action is never cut short into something misleading; an entry beyond the per-agent cap is
+/// dropped whole) and counted by the caller. Applies ONLY to the `PluginMeta` copy used for the
 /// served catalogue; `AgentSession::plugin_names` (Echo gating, heartbeat logic) is untouched.
 /// The agent-reported `description` is bounded here but is deliberately NOT served by
-/// `help_json`/`help_html` (owner decision: endpoint free text is not catalogue documentation).
+/// `help_json`/`help_html`; plugins and actions the server's capability catalogue does not recognise are
+/// omitted at serving time (`AgentRegistry::set_catalogue_filter`) (owner decision: endpoint free text is not catalogue documentation).
 
 #include <cstddef>
 #include <string>
@@ -22,6 +24,7 @@ inline constexpr std::size_t kMaxNameLen = 64;
 inline constexpr std::size_t kMaxVersionLen = 32;
 inline constexpr std::size_t kMaxDescriptionLen = 200;
 inline constexpr std::size_t kMaxActions = 64;
+inline constexpr std::size_t kMaxPluginsPerAgent = 64; ///< PluginInfo entries kept per agent
 inline constexpr std::size_t kMaxActionLen = 64;
 
 [[nodiscard]] inline bool is_ident_char(char c) noexcept {

@@ -942,6 +942,13 @@ public:
     // Per-action description map: "plugin.action" -> human-readable description.
     static const std::unordered_map<std::string, std::string>& action_descriptions();
 
+    /// WP06 F31: the predicate that decides which agent-reported (plugin, action) pairs may appear
+    /// in the served plugin catalogue (`help_json` and the dashboard help): the server's
+    /// capability catalogue (`CommandCapabilityRegistry::classify`). UNSET = nothing agent-reported
+    /// is served (fail closed). Does not touch `plugin_names` (Echo gating, heartbeat logic).
+    using CatalogueFilterFn = std::function<bool(std::string_view plugin, std::string_view action)>;
+    void set_catalogue_filter(CatalogueFilterFn fn);
+
     // Build help catalog: deduplicated plugin metadata across all agents.
     std::string help_json() const;
 
@@ -1292,6 +1299,12 @@ public:
 private:
     mutable std::mutex mu_;
     std::unordered_map<std::string, std::shared_ptr<AgentSession>> agents_;
+    // The served plugin catalogue (WP06 F31), recomputed only when `catalogue_gen_` moved.
+    std::function<bool(std::string_view, std::string_view)> catalogue_filter_;
+    std::uint64_t catalogue_gen_{0};
+    mutable std::uint64_t catalogue_cache_gen_{~std::uint64_t{0}};
+    mutable std::vector<PluginMeta> catalogue_cache_;
+    [[nodiscard]] const std::vector<PluginMeta>& catalogue_locked() const;
     std::unordered_map<std::string, std::string> session_to_agent_;
     EventBus& bus_;
     yuzu::MetricsRegistry& metrics_;
