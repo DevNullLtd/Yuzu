@@ -1,9 +1,12 @@
 # Release Verification
 
-Every Yuzu release ships a verifiable supply-chain bundle: cryptographic
+Yuzu releases ship a verifiable supply-chain bundle: cryptographic
 signatures, SLSA build provenance, and Software Bill of Materials (SBOM)
-documents in both CycloneDX and SPDX formats. This page documents the
-commands an operator or procurement reviewer runs to verify each piece.
+documents in both CycloneDX and SPDX formats. Not every release, and not
+every asset of a release, carries every piece: older releases lack some of
+them, and provenance covers only the build outputs (section 4 says which).
+This page documents the commands an operator or procurement reviewer runs to
+verify each piece.
 
 All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
@@ -47,7 +50,7 @@ release. `ghcr.io/tr3kkr/` is retained read-only for anything already pinned to
 it. Only the SIGNING IDENTITY is era-dependent, because it is fixed in the
 certificate at build time and cannot be restamped.
 
-## What ships with every release
+## What a release ships
 
 | Asset type | Files | Verified with |
 |------------|-------|---------------|
@@ -55,18 +58,19 @@ certificate at build time and cannot be restamped.
 | Native installers | `*.deb`, `*.rpm`, `YuzuAgentSetup-*.exe`, `YuzuAgent-*.pkg` (`YuzuServerSetup-*.exe` was discontinued: the server runs on Linux only, ADR-0035) | `sha256sum -c SHA256SUMS` |
 | Checksum manifest | `SHA256SUMS` | `cosign verify-blob` against `SHA256SUMS.sigstore` |
 | Cosign bundle | `SHA256SUMS.sigstore` (legacy filename `SHA256SUMS.bundle`: the only name on v0.7.x; v0.11.0-rc1 to v0.11.0 carry both) | Sigstore OIDC identity |
-| CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
-| SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
-| SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
+| CycloneDX SBOMs | One per binary archive, package and installer (the Compose Wizard zip, first-party HTML and JavaScript, has none), named after the file without its extension (`yuzu-linux-x64.cdx.json`, `yuzu-agent_X.Y.Z_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z.cdx.json`, ...), and one per image: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
+| SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
+| SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
 
 ## Prerequisites
 
 ```bash
-# GitHub CLI for attestation verification
-#   Ubuntu/Debian: sudo apt install gh
-#   macOS:         brew install gh
-#   Windows:       winget install --id GitHub.cli
+# GitHub CLI 2.102.0 or later, for attestation verification (check: gh --version)
+#   Linux:   GitHub's official packages, https://github.com/cli/cli/blob/trunk/docs/install_linux.md
+#            (a distribution's own gh package is often older than 2.102.0)
+#   macOS:   brew install gh
+#   Windows: winget install --id GitHub.cli
 
 # cosign v2.6.2 or later, for Sigstore signature verification
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
@@ -144,21 +148,55 @@ docker inspect --format='{{index .RepoDigests 0}}' ghcr.io/${OWNER}/yuzu-server:
 
 ## 4. Verify SLSA build provenance (GitHub attestations)
 
-Every binary archive, installer, and Docker image has a SLSA v1.0 build
-provenance attestation stored in GitHub's native attestation registry.
-The provenance records the exact workflow run, commit, builder, and
-inputs used to produce the artifact.
+Which assets have a SLSA v1.0 build provenance attestation depends on the
+release:
+
+| Releases | Attested assets | Where the attestation is |
+|---|---|---|
+| v0.14.0-rc2 and later (built as `DevNullLtd/Yuzu`) | every platform archive, native installer and Docker image | GitHub's attestation registry; the archives and installers also ship it as `<asset>.intoto.jsonl` |
+| v0.11.0-rc2 to v0.13.0 (built as `Tr3kkR/Yuzu`) | every platform archive and native installer (this page gives no way to verify these releases' Docker image provenance) | the `<asset>.intoto.jsonl` release asset. On 2026-11-18 GitHub's attestation API returned no attestation for the Linux archive of v0.11.0, v0.12.0 or v0.13.0, so verify these from the asset with `--bundle` (the offline procedure below) |
+| v0.11.0-rc1 and earlier | none | — |
+
+The worked example on this page, v0.11.0, is in the second row: add
+`--bundle <asset>.intoto.jsonl` to the commands below (for example
+`--bundle yuzu-linux-x64.tar.gz.intoto.jsonl`), having downloaded that asset
+with the archive.
+
+In no release are the SBOMs, `SHA256SUMS`, its `.sigstore` bundle or the
+Compose Wizard zip attested: the SBOMs and the wizard zip are covered by
+`SHA256SUMS` (section 1), and `SHA256SUMS` by its cosign signature
+(section 2). An asset with no attestation fails `gh attestation verify`; it
+never passes it. The provenance records the exact workflow run, commit,
+builder, and inputs used to produce the artifact.
+
+**Use gh 2.102.0 or later.** Every command below pins the attestation to
+`release.yml` at this release's tag with `--signer-workflow` and
+`--source-ref`; `--repo` alone accepts an attestation from any workflow in the
+repository. Older gh versions do not enforce those two flags as written:
+before 2.68.0 `--source-ref` does not exist; before 2.97.0 the
+`--signer-workflow` value is used as an unescaped regular expression; and
+before 2.102.0 it is matched only against the start of the certificate's
+identity, and `--source-ref` is compared case-insensitively (GitHub CLI
+advisories GHSA-mm27-mwq9-fr5g, GHSA-wjmr-j3rp-mh2g and GHSA-4mq3-hpgx-9cx8).
 
 ```bash
 # Binary archives / installers
-gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
-gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}"
-gh attestation verify yuzu-agent-macos-arm64.tar.gz --repo "${SIGNER_REPO}"
+gh attestation verify yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+gh attestation verify YuzuAgentSetup-0.11.0.exe --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+gh attestation verify yuzu-agent-macos-arm64.tar.gz --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
 
 # Docker images (by digest)
 gh attestation verify \
   oci://ghcr.io/${OWNER}/yuzu-server@sha256:<digest> \
-  --repo "${SIGNER_REPO}"
+  --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
 ```
 
 Success prints the attestation's predicate type
@@ -166,40 +204,220 @@ Success prints the attestation's predicate type
 (`https://github.com/actions/runner`), and the source repository +
 commit SHA that produced the artifact.
 
-**Offline / air-gapped verification.** Download the attestation bundle
-with `gh attestation download <file> --repo "$SIGNER_REPO" -o
-<file>.jsonl`, then verify offline with
-`gh attestation verify --bundle <file>.jsonl <file>`.
+**Offline / air-gapped verification.** On a machine with network access,
+fetch the attestation bundle and the Sigstore trusted root:
+
+```bash
+gh attestation download yuzu-linux-x64.tar.gz --repo "${SIGNER_REPO}"
+#   writes sha256:<digest>.jsonl to the current directory (sha256-<digest>.jsonl on Windows)
+gh attestation trusted-root > trusted_root.jsonl
+```
+
+The platform archives and installers of v0.11.0-rc2 and later also ship the
+same bundle as `<asset>.intoto.jsonl` (the table above); for v0.11.0-rc2 to
+v0.13.0 that asset is the only source, so pass it as `--bundle` instead of
+downloading. Copy the bundle and `trusted_root.jsonl` to the offline machine,
+then run the same pinned check against the local files:
+
+```bash
+gh attestation verify yuzu-linux-x64.tar.gz \
+  --bundle "sha256:$(sha256sum yuzu-linux-x64.tar.gz | cut -d' ' -f1).jsonl" \
+  --custom-trusted-root trusted_root.jsonl \
+  --repo "${SIGNER_REPO}" \
+  --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+  --source-ref "refs/tags/${TAG}"
+```
+
+With `--bundle`, gh compares `--repo` only with the repository name recorded
+in the signing certificate when the release was built.
 
 ## 5. Inspect the SBOM
 
-Each platform archive and Docker image ships SBOMs in both CycloneDX
-and SPDX formats. Use whichever your procurement or SCA tool consumes.
+Every binary archive (all but the Compose Wizard zip), `.deb`, `.rpm`, Windows
+installer and macOS `.pkg`, and every Docker image the release publishes (see
+"Docker image SBOMs" below), has its own SBOM in both CycloneDX and SPDX
+formats. Use
+whichever your procurement or SCA tool consumes. A file's SBOM has the file's
+name with `.cdx.json` or `.spdx.json` in place of `.tar.gz`, `.zip`, `.deb`,
+`.rpm`, `.exe` or `.pkg`, and records the file's name and SHA-256 on its root
+(`metadata.component` in CycloneDX, the described package in SPDX), so you can
+check that an SBOM belongs to the file you hold:
 
-**Known limitations of the platform SBOMs.** They are generated from the whole
-build workspace (the vcpkg ports tree and build trees included), not from the
-archive alone, so they can list components the archive does not ship or load.
-A finding in a component the archive does not contain does not apply to it.
-Since ADR-0035 step 3 the Windows and macOS builds install only the agent's
-dependencies, so the server's dependencies (`libpq`, `drogon`, `xmlsec`, `libxlsxwriter`) are no
-longer installed on those build machines and the Windows agent archive carries
-none of their DLLs (the Windows release build's "Verify the agent runs from the packaged archive" step
-refuses an archive that carries the DLLs of `libpq`, `drogon` or `xmlsec`, and does not yet check those of `libxlsxwriter`; it has not yet run on a real release tag). What a
-given release's SBOM lists beyond the archive is not asserted here: inspect the
-SBOM of the release you verify.
+```bash
+jq -r '.metadata.component | "\(.name) \(.hashes[0].content)"' yuzu-agent_X.Y.Z_amd64.cdx.json
+sha256sum yuzu-agent_X.Y.Z_amd64.deb
+```
+
+**What a file's SBOM lists.** The release unpacks each file and lists what is
+in it:
+
+- **The vcpkg libraries its C++ binaries are built with.** They are linked
+  statically (on Windows most ship as DLLs next to the agent instead), and a
+  scanner identifies neither, so the release takes them from the vcpkg
+  installation it built with, with the installed version,
+  the licence, a `pkg:github` (or `pkg:generic`) purl naming the upstream
+  source, and a CPE where NVD has a product for the library. The agent's files
+  list the agent's libraries; a file holding `yuzu-server` also lists the
+  server's (`libpq`, `xmlsec`, `drogon`, `libxlsxwriter` and what they need). The list is every
+  vcpkg library the build installs for that component, so it can include one
+  a binary ends up not using; it does not omit a vcpkg library the binary
+  uses. A library whose vcpkg record gives no licence is listed without one
+  (`NOASSERTION` in SPDX), and the SBOM names those libraries in its
+  `yuzu:sbom:licence-noassertion` note (see "Reading the `yuzu:sbom:` notes"
+  below).
+- **The gateway's Erlang/OTP release:** its applications (Hex packages carry a
+  `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
+- **Anything else a scanner recognises in the unpacked file.**
+
+The Windows installer is not unpacked by the release. When the Inno Setup
+compiler builds it, the compiler also writes a manifest: the list of files it
+packed into the installer, with the SHA-256 of each. The installer's SBOM
+lists those files. Each one is read from the build directory and must match
+the SHA-256 the compiler recorded, or the release fails. The files are listed
+at their paths in the build directory (for example
+`agents/plugins/status/status.dll`), not at the paths the installer puts them
+(`plugins\status.dll` under the install directory). The SBOM lists every
+file the installer holds, whichever components an installation selects, and
+does not record which component installs each one. The SBOM says this in its
+`yuzu:sbom:contents` note, and its root names the installer and its SHA-256.
+
+Not listed yet, though the file holds it: code vendored into the source tree
+and compiled into `yuzu-server` (qrcodegen, and the web assets it embeds: htmx,
+ECharts, three.js, Cytoscape, IBM Plex fonts; see `NOTICE`), the Windows
+installer's own InnoSetup runtime and what the compiler embeds beside the
+packed files (the licence text, the icon and the installer's compiled script),
+and the code the gateway's bundled Erlang
+runtime links into its emulator, `beam.smp` (PCRE2, asmjit, zstd, Ryu and an
+MD5 implementation taken from OpenSSL; the SBOM lists the runtime as one
+`erlang` component). An SBOM whose file holds something it does not list says
+so in the data: a CycloneDX `compositions` entry with `aggregate: incomplete`
+for its root, and in SPDX (which has no such field) a `CONTAINS NOASSERTION`
+relationship on the described package. The `yuzu:sbom:incomplete-reasons`
+note names why, by the tokens below, and the `yuzu:sbom:incomplete` note says
+it in prose. The marker follows what a file holds, not its name: every SBOM of
+a file holding `yuzu-server` is marked (`server-vendored`), as are the
+installer's and every gateway SBOM. Today the files holding `yuzu-server` are
+the Linux archive and the server `.deb` and `.rpm`, so the agent's files (the
+Windows and macOS archives, the agent `.deb`, `.rpm` and `.pkg`) carry no
+marker: no release after 0.15.0 puts `yuzu-server.exe` or a macOS `yuzu-server`
+in them, and the Windows release job refuses an agent archive holding
+`yuzu-server.exe`. (v0.15.0 and earlier shipped the server in
+`yuzu-windows-x64.zip` and `yuzu-macos-arm64.tar.gz`; their SBOMs predate this
+change and carry no marker at all, so their silence says nothing about
+completeness.) Image SBOMs are marked too (below).
+
+Libraries the binaries load from the operating system at run time (glibc,
+`libsystemd`, the MSVC runtime, and the host OpenSSL `libcrypto` the gateway's
+`crypto` application loads) are not in the file and are not listed. They are
+not a reason for the marker, which is about what the file holds: an SBOM
+without it can still depend on operating-system libraries.
+
+### Why an SBOM says it is incomplete
+
+The `yuzu:sbom:incomplete-reasons` note holds one or more of these tokens,
+comma-separated. The set is closed: a new reason gets a new token, and an
+existing token keeps its meaning. Read the tokens, not the prose, in a script.
+
+| Token | On | What the SBOM does not list |
+|---|---|---|
+| `server-vendored` | a file or image holding `yuzu-server` | qrcodegen and the web assets compiled into it |
+| `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller, and the licence text, icon and compiled installer script the compiler embeds |
+| `erts-static` | a gateway file or image | what the Erlang emulator `beam.smp` vendors: PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5 |
+| `image-static-cpp` | a server or agent image | the vcpkg libraries linked statically into `yuzu-server` or `yuzu-agent`, which the image scan cannot see (the matching package's SBOM lists them) |
+| `pgvector-source` | the `yuzu-postgres` image | pgvector, which the image builds from source, so it has no package record for the scan to read |
+
+**Your scanner may not show the marker.** Neither a CycloneDX `compositions`
+entry nor an SPDX `CONTAINS NOASSERTION` relationship is a finding: grype (checked
+with grype 0.122.0 on a marked gateway SBOM) reports matches and says nothing
+about completeness. How Dependency-Track presents either has not been checked
+on a live instance. No finding for a file is not evidence that it
+holds no vulnerable component: read the marker yourself, as below.
+
+**The SBOM is not an attribution source yet.** Every vcpkg library carries the
+licence vcpkg records, but its copyright text (SPDX `copyrightText`) is
+`NOASSERTION`, because vcpkg's records hold none; the release would carry one
+over if they did. Third-party attribution for the release is in `NOTICE`, which
+is not generated from these SBOMs.
+
+SBOMs of releases before this change were a scan of the whole build workspace
+and list thousands of components (the vcpkg ports catalogue among them) that
+the release does not ship.
+
+**What to expect from a dependency scanner.** Feeding these SBOMs to grype,
+Dependency-Track or a similar tool, expect:
+
+- **No CVE match for libraries without a CPE.** NVD has no product for `re2`,
+  `jsoncpp`, `nlohmann-json`, `cli11`, `libuuid`, `trantor` or `utf8-range`
+  under the names tried, so those are listed with a purl only and a
+  CPE-matching scanner reports nothing for them, whatever their state.
+- **Matches that do not apply.** `libpq` carries PostgreSQL's CPE, so server
+  CVEs in PostgreSQL are reported against it although only the client library
+  ships; triage each against the libpq client.
+- **Duplicates.** A library can appear twice: once from the vcpkg record and
+  once where the scanner recognises the same library in a file (a DLL on
+  Windows, for example). `utf8-range` carries protobuf's source purl, because
+  vcpkg builds it from the protobuf repository.
+- **No dependency graph for the vcpkg libraries.** They are listed as
+  components of the file; the SBOM does not record which library depends on
+  which.
+
+### Reading the `yuzu:sbom:` notes
+
+The release writes its notes on an SBOM's root under one key per note, spelled
+the same in both formats: `yuzu:sbom:incomplete-reasons`,
+`yuzu:sbom:incomplete`, `yuzu:sbom:contents`, `yuzu:sbom:licence-noassertion`
+and the others. In CycloneDX each note is a `metadata.properties` entry whose
+`name` is the key. SPDX has no properties, so each note is one line of the
+described package's `comment`, the key, a colon and a space, then the value:
+
+```text
+yuzu:sbom:artifact: yuzu-gateway-linux-x64.tar.gz
+yuzu:sbom:incomplete-reasons: erts-static
+```
+
+A note that is absent means the SBOM does not carry it (no
+`yuzu:sbom:incomplete-reasons` note: no marker). The release writes each note
+once: treat a file that carries two copies of one as altered. The release
+check refuses a second copy of the notes it reads (`yuzu:sbom:unpacked-files`
+on a file SBOM, `yuzu:sbom:incomplete-reasons` on an image SBOM pair); it does
+not read the others. To read one note from either
+format (set `KEY` to the note you want, and the file names to your SBOMs):
+
+```bash
+KEY=yuzu:sbom:incomplete-reasons
+# CycloneDX: the metadata property named KEY
+jq -r --arg k "$KEY" '.metadata.properties[]? | select(.name == $k) | .value' yuzu-gateway-linux-x64.cdx.json
+# SPDX: the line of the described package's comment that starts with "KEY: "
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
+  yuzu-gateway-linux-x64.spdx.json | sed -n "s/^$KEY: //p"
+```
+
+```bash
+# Every note, and the CycloneDX marker itself
+jq -r '.metadata.properties[] | select(.name | startswith("yuzu:sbom:")) | "\(.name): \(.value)"' yuzu-linux-x64.cdx.json
+jq '.compositions' yuzu-linux-x64.cdx.json
+# Every note, and the SPDX marker itself (the CONTAINS NOASSERTION relationship)
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root) | .comment // empty' \
+  yuzu-linux-x64.spdx.json | grep '^yuzu:sbom:'
+jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxElement == "NOASSERTION")' yuzu-linux-x64.spdx.json
+```
+
+### CycloneDX
 
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
-jq -r '.components[] | "\(.name)\t\(.version)"' yuzu-linux-x64.cdx.json | column -t
+jq -r '.components[] | "\(.name)\t\(.version)\t\(.purl // "")"' yuzu-linux-x64.cdx.json | column -t
 
-# Validate CycloneDX 1.6 schema
+# Validate the CycloneDX schema
 cyclonedx validate --input-file yuzu-linux-x64.cdx.json
 
 # Count components
 jq '.components | length' yuzu-linux-x64.cdx.json
 
 # Find all dependencies declaring a specific license
-jq -r '.components[] | select(.licenses[]?.license.id == "MIT") | .name' \
+jq -r '.components[] | select(.licenses[]? | (.license.id // .expression) == "MIT") | .name' \
   yuzu-linux-x64.cdx.json
 ```
 
@@ -207,9 +425,43 @@ jq -r '.components[] | select(.licenses[]?.license.id == "MIT") | .name' \
 
 ```bash
 jq -r '.packages[] | "\(.name)\t\(.versionInfo)"' yuzu-linux-x64.spdx.json | column -t
+
+# Check the SPDX SBOM belongs to the file you hold: name and SHA-256 of the described package
+jq -r '(.relationships[] | select(.spdxElementId == "SPDXRef-DOCUMENT" and .relationshipType == "DESCRIBES")
+        | .relatedSpdxElement) as $root | .packages[] | select(.SPDXID == $root)
+        | "\(.name) \(.checksums[] | select(.algorithm == "SHA256") | .checksumValue)"' yuzu-linux-x64.spdx.json
+sha256sum yuzu-linux-x64.tar.gz
 ```
 
 ### Docker image SBOMs
+
+The release publishes six images, each with an SBOM pair among the release
+assets: `yuzu-server`, `yuzu-gateway` and `yuzu-postgres`
+(`yuzu-<name>-image.{cdx,spdx}.json`), and `yuzu-server-chisel`,
+`yuzu-gateway-chisel` and `yuzu-agent-chisel`
+(`yuzu-<name>-chisel-image.{cdx,spdx}.json`). Each is a syft scan (v1.57.2, the
+same version as the file SBOMs) of the image by its digest
+(`ghcr.io/<owner>/<image>@sha256:...`), the digest the release signs and
+attests, so the SBOM describes that exact image, not whatever a tag points at
+later. It lists the operating-system packages and what syft recognises in the
+image's files, so it does not list the C++ libraries linked statically into
+`yuzu-server` or `yuzu-agent` (the `yuzu-linux-x64` archive and the
+`yuzu-server` and `yuzu-agent` package SBOMs list those), nor what the gateway
+images' Erlang emulator vendors, nor the `yuzu-postgres` image's pgvector. The
+release marks each of the six incomplete the same way as a file SBOM: the two
+server images `server-vendored, image-static-cpp`, the agent image
+`image-static-cpp`, the two gateway images `erts-static`, and the
+`yuzu-postgres` image `pgvector-source`. Beyond those, an image SBOM lists what
+syft recognises and no more. The release's SBOM scope check does not hold image
+SBOMs to the file rules (entry bound, forbidden paths), but it refuses an image
+SBOM pair that should carry the marker and does not, one carrying only part of
+it, and one named as a release image that lacks that image's title label.
+
+The agent-bundle image (`yuzu-agent-bundle-chisel`) is not a release image: it
+is built from the published release afterwards, by a separate job. Its syft
+SBOM pair is kept only as a three-day workflow artifact, is not a release
+asset and is not marked, although the image holds `yuzu-agent`: the agent
+package SBOMs inside the release list that binary's libraries.
 
 ```bash
 jq '.components | length' yuzu-server-image.cdx.json
@@ -232,8 +484,18 @@ VERSION="${1:?usage: verify.sh <version, e.g. 0.11.0>}"
 OWNER="${OWNER:-tr3kkr}"                   # devnullltd for releases after 2026-09-28
 SIGNER_REPO="${SIGNER_REPO:-Tr3kkR/Yuzu}"  # DevNullLtd/Yuzu for the same
 
-IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/v${VERSION#v}"
+TAG="v${VERSION#v}"
+IDENTITY="https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
+
+# The pinned attestation check below needs gh 2.102.0 or later (section 4).
+# A version that is not plain X.Y.Z (a development build) is refused too.
+GH_VERSION="$(gh --version | awk 'NR==1 {print $3}')"
+if [[ ! "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+   || [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" != 2.102.0 ]]; then
+  echo "gh ${GH_VERSION:-(unknown)} is not a release at or above 2.102.0; install 2.102.0 or later first" >&2
+  exit 1
+fi
 
 echo "→ sha256sum -c SHA256SUMS"
 sha256sum -c SHA256SUMS
@@ -256,7 +518,14 @@ done
 
 echo "→ gh attestation verify (binary archives)"
 for f in yuzu-linux-x64.tar.gz yuzu-gateway-linux-x64.tar.gz; do
-  [[ -f "$f" ]] && gh attestation verify "$f" --repo "${SIGNER_REPO}"
+  [[ -f "$f" ]] || continue
+  # Use the shipped <asset>.intoto.jsonl when it was downloaded too: for
+  # v0.11.0-rc2 to v0.13.0 it is the only source (section 4).
+  bundle=()
+  [[ -f "$f.intoto.jsonl" ]] && bundle=(--bundle "$f.intoto.jsonl")
+  gh attestation verify "$f" ${bundle[@]+"${bundle[@]}"} --repo "${SIGNER_REPO}" \
+    --signer-workflow "${SIGNER_REPO}/.github/workflows/release.yml" \
+    --source-ref "refs/tags/${TAG}"
 done
 
 echo "✓ all checks passed for v${VERSION}"
@@ -267,12 +536,21 @@ echo "✓ all checks passed for v${VERSION}"
 | Framework / ask | Covered by |
 |-----------------|------------|
 | SOC 2 CC6.8 (integrity of software) | cosign image + blob signatures |
-| SOC 2 CC7.1 (change management traceability) | SLSA provenance attestation |
+| SOC 2 CC7.1 (change management traceability) | SLSA provenance attestation, for the attested assets and releases only (section 4) |
 | NIST SSDF PW.5 (archive / protect) | SHA256SUMS + signed manifest |
-| NIST SSDF PS.3 (provide provenance) | SLSA v1.0 attestation |
+| NIST SSDF PS.3 (provide provenance) | SLSA v1.0 attestation (roughly SLSA Build level 2, not 3), for the attested assets and releases only (section 4) |
 | Executive Order 14028 (SBOM for federal sales) | CycloneDX + SPDX SBOMs per artifact |
 | ISO/IEC 5962 (SPDX conformance) | SPDX 2.3 SBOMs |
-| EU CRA Annex V | Provenance + SBOM + signed artefact bundle |
+| EU CRA Annex V | Provenance + SBOM + signed artefact bundle (provenance as in section 4) |
+
+The table names the evidence each item points to; it is not a statement that
+a control is met. In particular, the provenance is roughly SLSA Build level 2,
+not level 3: release builds run on persistent self-hosted runners that also
+run CI and share its caches, the build steps run in the job that holds the
+signing identity, and no tag ruleset limits who can start a release
+([CI architecture](../ci-architecture.md#release-build-environment-and-provenance)).
+Releases before v0.11.0-rc2 carry no provenance, and the SBOMs, `SHA256SUMS`
+and the Compose Wizard zip are never attested.
 
 ## Troubleshooting
 
@@ -305,7 +583,8 @@ first; the GitHub CLI must be able to query
 rate-limited and can return empty lists.
 
 **`cyclonedx validate: unable to parse`** — the CycloneDX CLI pins to
-CycloneDX 1.5 by default; Yuzu ships CycloneDX 1.6. Upgrade the CLI
+CycloneDX 1.5 by default; Yuzu's SBOMs are CycloneDX 1.7 (syft v1.57.2; earlier
+releases shipped 1.6). Upgrade the CLI
 (`npm i -g @cyclonedx/cyclonedx-cli@latest`) or use `jq` for structural
 validation (`jq empty yuzu-linux-x64.cdx.json`).
 
