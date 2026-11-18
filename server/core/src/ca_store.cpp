@@ -1438,6 +1438,26 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
     return out;
 }
 
+std::expected<bool, std::string> CaStore::is_reenrolled_revoked(const std::string& serial_hex) {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    const auto serial = normalize_serial_hex(serial_hex);
+    if (!serial)
+        return false;
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "SELECT 1 FROM ca_store.ca_issued WHERE serial_hex = $1 AND purpose = 'agent' "
+        "AND status = 'revoked' AND revocation_reason = $2",
+        std::vector<std::string>{*serial, std::string(kRevokeReasonReenrolled)});
+    if (res.status() != PGRES_TUPLES_OK)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "is_reenrolled_revoked failed: " + PQerrorMessage(lease.get()));
+    return PQntuples(res.get()) > 0;
+}
+
 std::expected<std::int64_t, std::string> CaStore::db_now() {
     if (!open_)
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");

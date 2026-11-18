@@ -90,6 +90,7 @@ struct Harness {
     std::unique_ptr<grpc::Server> server;
     int port = 0;
     std::set<std::string> revoked_pems;
+    std::set<std::string> superseded_pems; // revoked pems the SERVER superseded (reenrolled)
 
     Harness() { auth_mgr.set_auth_db(auth_db.get()); }
 
@@ -156,6 +157,8 @@ void wire(Harness& h, const Ca& our_ca, std::shared_ptr<yuzu::server::AgentIdent
     });
     h.svc.set_revocation_checker(
         [&h](const std::string& pem) { return h.revoked_pems.count(pem) != 0; });
+    h.svc.set_superseded_checker(
+        [&h](const std::string& pem) { return h.superseded_pems.count(pem) != 0; });
     hooks = std::make_shared<yuzu::server::AgentIdentityHooks>();
     hooks->leaf_state = [](const std::string&) -> std::expected<yuzu::server::AgentLeafState, std::string> {
         return yuzu::server::AgentLeafState{.has_live = true, .has_revoked_unexpired = false};
@@ -228,5 +231,36 @@ TEST_CASE("WP01 direct path over real mTLS: only a real, unrevoked, CN-matching 
         auto o = register_as(*stub, "agent-real", created->raw_token);
         CHECK(o.status.ok());
         CHECK(o.resp.accepted());
+    }
+    SECTION("option 2: a leaf the SERVER superseded + a fresh single-use token re-enrols (the replaced "
+            "agent is not wedged)") {
+        const Leaf leaf = make_leaf(ours, "agent-real");
+        h.revoked_pems.insert(leaf.cert);
+        h.superseded_pems.insert(leaf.cert);
+        auto created = h.auth_mgr.create_enrollment_token("recover", 1, std::chrono::hours(1), "test-admin");
+        REQUIRE(created.has_value());
+        auto stub = h.connect(ours, &leaf);
+        auto o = register_as(*stub, "agent-real", created->raw_token);
+        CHECK(o.status.ok());
+        CHECK(o.resp.accepted());
+    }
+    SECTION("option 2: a superseded leaf WITHOUT a token stays refused") {
+        const Leaf leaf = make_leaf(ours, "agent-real");
+        h.revoked_pems.insert(leaf.cert);
+        h.superseded_pems.insert(leaf.cert);
+        auto stub = h.connect(ours, &leaf);
+        auto o = register_as(*stub, "agent-real");
+        CHECK(o.status.error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        CHECK(h.registry.agent_count() == 0);
+    }
+    SECTION("option 2: an OPERATOR-revoked leaf stays refused even with a single-use token") {
+        const Leaf leaf = make_leaf(ours, "agent-real");
+        h.revoked_pems.insert(leaf.cert); // revoked, NOT superseded
+        auto created = h.auth_mgr.create_enrollment_token("recover", 1, std::chrono::hours(1), "test-admin");
+        REQUIRE(created.has_value());
+        auto stub = h.connect(ours, &leaf);
+        auto o = register_as(*stub, "agent-real", created->raw_token);
+        CHECK(o.status.error_code() == grpc::StatusCode::UNAUTHENTICATED);
+        CHECK(h.registry.agent_count() == 0);
     }
 }

@@ -18,6 +18,7 @@ MUTATIONS = [
     ("server", "agent_service_.set_agent_identity_hooks(hooks)", "wire hooks into the direct service"),
     ("server", "gateway_service_->set_reregistration_proof_mode(proof_mode)", "set the mode on the gateway"),
     ("server", "agent_service_.set_agent_identity_hooks(nullptr)", "clear the hooks at shutdown"),
+    ("server", "agent_service_.set_superseded_checker(nullptr)", "clear the superseded checker at shutdown"),
     ("server", "rev.revocation_reason != kRevokeReasonReenrolled", "HIGH-2 reenrolled exemption"),
     ("direct", "apply_reregistration_gate(", "direct handler applies the gate"),
     ("gateway", "apply_reregistration_gate(", "gateway handler applies the gate"),

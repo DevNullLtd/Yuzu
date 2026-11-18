@@ -2528,3 +2528,21 @@ TEST_CASE("CaStore::revoke_older_agent_leaves converges to ONE live leaf under r
         CHECK(live->size() == 1); // never zero, never two
     }
 }
+
+TEST_CASE("CaStore::is_reenrolled_revoked: only a server-superseded agent leaf, never an operator revoke",
+          "[ca_store][pg][wp01]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+    const auto future = now_s() + 86400;
+    REQUIRE(store.record_issued(agent_leaf("C7", "agent-r", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("C8", "agent-r", future)).has_value());
+    REQUIRE(store.record_issued(agent_leaf("C9", "agent-r", future)).has_value());
+    REQUIRE(store.revoke_system("C7", kRevokeReasonReenrolled).value_or(false));
+    REQUIRE(store.revoke("C8", "reenrolled").value_or(false)); // operator-typed: stored qualified
+    CHECK(store.is_reenrolled_revoked("C7").value_or(false));
+    CHECK_FALSE(store.is_reenrolled_revoked("C8").value_or(true));
+    CHECK_FALSE(store.is_reenrolled_revoked("C9").value_or(true)); // active
+    CHECK_FALSE(store.is_reenrolled_revoked("nothex").value_or(true));
+}

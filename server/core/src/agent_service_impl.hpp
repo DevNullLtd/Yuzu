@@ -382,6 +382,15 @@ public:
         agent_identity_hooks_ = std::move(hooks);
     }
     void set_reregistration_proof_mode(ReregistrationProofMode m) { reregistration_mode_ = m; }
+    /// WP01 (option 2): true iff a presented, REVOKED client leaf is one the server superseded
+    /// (`reenrolled`) rather than one an operator revoked. The replaced agent keeps presenting its
+    /// superseded leaf; with a fresh enrollment token it is then treated as presenting NO proof
+    /// (so the single-use token path runs) instead of being refused "client certificate is
+    /// revoked" before the token is read. Without a token, and for an operator-revoked leaf, the
+    /// refusal is unchanged. Wired with the revocation checker; null = always refuse.
+    void set_superseded_checker(std::function<bool(const std::string& peer_cert_pem)> c) {
+        superseded_checker_ = std::move(c);
+    }
     /// TEST SEAM (empty in production, like `override_command_record_lookup`): a unit test cannot
     /// build a gRPC auth context carrying a peer certificate, so it supplies the verdict "the
     /// presented client certificate proves this agent id" directly.
@@ -712,6 +721,7 @@ private:
     std::shared_ptr<const AgentIdentityHooks> agent_identity_hooks_;
     ReregistrationProofMode reregistration_mode_{ReregistrationProofMode::Audit};
     std::function<bool(const std::string&)> cert_proof_override_for_test_;
+    std::function<bool(const std::string&)> superseded_checker_;
     std::function<bool(const std::string&)> revocation_checker_;
     std::function<bool(const std::string&)> peer_cert_recognizer_;
 

@@ -72,6 +72,8 @@ def run(texts):
     check(server.count("agent_service_.set_reregistration_proof_mode(proof_mode)") == 1
           and server.count("gateway_service_->set_reregistration_proof_mode(proof_mode)") == 1,
           "server.cpp must set the proof mode on BOTH services")
+    check(server.count("agent_service_.set_superseded_checker(") == 2,
+          "server.cpp must wire the superseded-leaf checker and clear it at shutdown")
     check(server.count("agent_service_.set_agent_identity_hooks(nullptr)") == 1
           and server.count("gateway_service_->set_agent_identity_hooks(nullptr)") == 1,
           "server.cpp must clear the hooks on both services at shutdown")

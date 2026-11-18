@@ -338,17 +338,28 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "agent_id must match client certificate identity (CN/SAN)");
                 }
+                bool revoked_presenter = false;
                 if (revocation_checker_ && !peer_pem.empty() && revocation_checker_(peer_pem)) {
-                    spdlog::warn("Register rejected: revoked client cert for agent {}",
-                                 safe_agent_id);
-                    return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
-                                        "client certificate is revoked");
+                    // A leaf the SERVER superseded (reenrolled) presented together with a fresh
+                    // enrollment token is "no proof", not a refusal: the replaced agent must be
+                    // able to re-enrol. Anything else revoked (an operator revoke, or no token)
+                    // is refused exactly as before.
+                    if (superseded_checker_ && !request->enrollment_token().empty() &&
+                        superseded_checker_(peer_pem)) {
+                        revoked_presenter = true;
+                    } else {
+                        spdlog::warn("Register rejected: revoked client cert for agent {}",
+                                     safe_agent_id);
+                        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                                            "client certificate is revoked");
+                    }
                 }
                 // With a recognizer wired (our own CA is active) reaching here means the leaf
                 // chains to OUR CA, names this agent and is unrevoked. Without one this is the
                 // legacy operator-CA posture, which has no ca_issued leaf and so no gate (the
-                // hooks are only wired together with the recognizer).
-                cert_proves_identity = peer_cert_recognizer_ != nullptr;
+                // hooks are only wired together with the recognizer). A superseded presenter
+                // proves nothing: it continues as a certificate-less caller with a token.
+                cert_proves_identity = peer_cert_recognizer_ != nullptr && !revoked_presenter;
             }
         }
     }
