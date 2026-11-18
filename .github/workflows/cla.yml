@@ -39,7 +39,7 @@ name: CLA Assistant
 # a signed CLA, so it is AGPL-only and cannot be relicensed commercially.
 # See CONTRIBUTING.md.
 
-# zizmor dangerous-triggers is ignored on both triggers below (S11, reviewed
+# zizmor dangerous-triggers is ignored on both triggers below (reviewed
 # 2026-11-17). The CLA bot must comment on and set statuses for FORK pull
 # requests, which a plain `pull_request` run cannot (read-only token, no
 # secrets). The job never checks out or executes pull-request code: it runs
@@ -47,9 +47,9 @@ name: CLA Assistant
 # that remains is the PAT this job hands that action (see KNOWN POSTURE DEBT
 # above), not code execution from the pull request.
 on:
-  issue_comment:  # zizmor: ignore[dangerous-triggers]
+  issue_comment:  # zizmor: ignore[dangerous-triggers] approver: pending, revisit: 2027-05-18
     types: [created]
-  pull_request_target:  # zizmor: ignore[dangerous-triggers]
+  pull_request_target:  # zizmor: ignore[dangerous-triggers] approver: pending, revisit: 2027-05-18
     types: [opened, synchronize, closed]
 
 permissions:
@@ -68,12 +68,12 @@ jobs:
     steps:
       - name: CLA Assistant
         if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
-        # zizmor archived-uses ignored (S11, reviewed 2026-11-17): upstream
+        # zizmor archived-uses ignored (reviewed 2026-11-17): upstream
         # archived this repository, so it gets no security fixes. It stays
         # SHA-pinned until the maintainers choose a replacement CLA bot that
         # can keep reading the existing signatures store; that is an owner
         # decision, not a CI fix.
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1 # zizmor: ignore[archived-uses]
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1 # zizmor: ignore[archived-uses] approver: pending, revisit: 2027-05-18
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with `repo` scope; required because GITHUB_TOKEN cannot write

@@ -7,4 +7,4 @@
   `issue_comment` in `cla.yml`, `workflow_run` in `pre-release.yml`), the archived
   CLA action and the local reusable-workflow call in `trusted-fork-ci.yml` carry
   inline ignores that state why each is accepted. The audit is still not a
-  required check; that is a branch-protection setting (S11).
+  required check; that is a branch-protection setting.

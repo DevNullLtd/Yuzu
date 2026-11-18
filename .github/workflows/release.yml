@@ -2217,7 +2217,7 @@ jobs:
         run: echo "value=$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
       # Step outputs reach the shell through env, never `${{ }}` in the run
-      # body (zizmor template-injection, S11).
+      # body (zizmor template-injection).
       - name: Compute version + image ref
         id: ref
         env:

@@ -119,13 +119,13 @@ jobs:
   trusted-gate:
     name: Run trusted full CI gate
     needs: [validate-approval]
-    # zizmor self-repository ignored (S11, reviewed 2026-11-17). A job-level
+    # zizmor self-repository ignored (reviewed 2026-11-17). A job-level
     # reusable-workflow reference is resolved from this run's commit when the
     # run is loaded, not from the runner's filesystem, so the runtime-clone
     # risk the audit names does not apply here. GitHub's `$/` syntax (July
     # 2026) is rejected by actionlint 1.7.12; revisit when the tooling
     # accepts it or when the repository turns on SHA-pinning enforcement.
-    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository]
+    uses: ./.github/workflows/ci.yml  # zizmor: ignore[self-repository] approver: pending, revisit: 2027-05-18
     with:
       pr_number: ${{ needs.validate-approval.outputs.pr_number }}
       head_sha: ${{ needs.validate-approval.outputs.head_sha }}
