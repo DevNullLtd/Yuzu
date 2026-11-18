@@ -73,6 +73,7 @@ on:
       - 'server/core/src/guardian_schema_registry*'
       - 'agents/plugins/component_inventory/src/zip_directory*'
       - 'agents/plugins/component_inventory/src/component_native_parsers*'
+      - 'agents/shared/binary_header_*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-batch.yml'

@@ -36,16 +36,32 @@ std::string baseline_collector(const std::string& root) { return "registry:" + r
 // The gap row text for child keys that denied read access: names the first few. The names
 // are key names a local user chose under their own hive, so each goes through log_key_token
 // (control bytes and line separators folded) before it lands in the stored row.
-std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied) {
+// `overflow` counts the children past kSkippedCap that are skipped but cannot be named. A child
+// whose name holds U+0000 (never opened) shows the NUL as `<NUL>`: log_key_token would fold it to
+// an underscore, which reads as a different name, and a backslash escape would read as a path
+// separator (`a\0b` looks like key `0b` under `a`). The row text is lossy by design; the exact
+// identity stays in the cursor.
+std::string denied_children_detail(const std::string& root, const std::vector<std::string>& denied,
+                                   std::size_t overflow = 0) {
     constexpr std::size_t kShown = 3;
-    std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access; their values "
-                                "and anything beneath them are not read, and deletions beneath them "
-                                "are not derived, until they can be): ",
-                                root, denied.size());
-    for (std::size_t i = 0; i < denied.size() && i < kShown; ++i)
-        d += (i == 0 ? "" : "; ") + yuzu::log_key_token(denied[i]);
+    std::string d = std::format("gap:unreadable:{} ({} child key(s) denied read access or not "
+                                "openable; their values and anything beneath them are not read, and "
+                                "deletions beneath them are not derived, until they can be): ",
+                                root, denied.size() + overflow);
+    for (std::size_t i = 0; i < denied.size() && i < kShown; ++i) {
+        std::string name;
+        for (const char c : denied[i]) {
+            if (c == '\0')
+                name += "<NUL>";
+            else
+                name += c;
+        }
+        d += (i == 0 ? "" : "; ") + yuzu::log_key_token(name);
+    }
     if (denied.size() > kShown)
         d += std::format("; +{} more", denied.size() - kShown);
+    if (overflow > 0)
+        d += std::format("; and {} more not named", overflow);
     return d;
 }
 
@@ -366,9 +382,9 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
 
             // A root that could not be read, or child keys that deny access, are a blind
             // spot the operator must be able to see: one gap row when the root becomes
-            // unreadable or a child key is newly denied, none while it holds steady, shrinks
-            // or clears. The cursor commits with the row, so a replay cannot lose or
-            // duplicate it.
+            // unreadable, a child key is newly denied or the count of denied children past
+            // kSkippedCap grows, none while it holds steady, shrinks or clears. The cursor
+            // commits with the row, so a replay cannot lose or duplicate it.
             if (rd.status == RegistryReadStatus::Unreadable) {
                 if (st.status != "unreadable") {
                     std::string detail = "gap:unreadable:" + root +
@@ -389,7 +405,9 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                 // and report an unchanged set again. (The diff above was given the read's own
                 // list: its Capped handling already keeps the unvisited keys.)
                 std::set<std::string> known(st.skipped.begin(), st.skipped.end());
-                bool gained = false;
+                // A larger count of children skipped past kSkippedCap is a gain too: the blind
+                // area grew although every named child is one the stored set already holds.
+                bool gained = rd.skipped_overflow > st.skipped_overflow;
                 for (const auto& sk : rd.skipped)
                     if (known.insert(sk).second)
                         gained = true;
@@ -403,14 +421,18 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
                     st.skipped.assign(known.begin(), known.end());
                     if (st.skipped.size() > kSkippedCap)
                         st.skipped.resize(kSkippedCap);
+                    // The count is persisted with the set (the cursor commits with the row, so a
+                    // replay cannot duplicate it) and, like the set, a Capped read never lowers it.
+                    st.skipped_overflow = std::max(st.skipped_overflow, rd.skipped_overflow);
                 } else {
                     st.skipped = std::move(rd.skipped);
+                    st.skipped_overflow = rd.skipped_overflow; // 0: an overflow read is Capped
                 }
                 if (gained)
-                    rows.push_back(registry_gap_row("unreadable",
-                                                    root + ":" + std::to_string(read_end),
-                                                    denied_children_detail(root, st.skipped), now,
-                                                    snapshot_id));
+                    rows.push_back(registry_gap_row(
+                       "unreadable", root + ":" + std::to_string(read_end),
+                       denied_children_detail(root, st.skipped, st.skipped_overflow), now,
+                       snapshot_id));
             }
 
             st.read_start = read_start;
@@ -620,14 +642,29 @@ CursorCollectResult RegistryCursorSource::collect(EchoDatabase& db,
         age_loss_epochs(epochs, floor);
         cur.loss = std::move(epochs);
 
+        // The commit failed on an earlier tick: log-based sources replay from an unchanged
+        // cursor and lose nothing, but this source's loss accounting and held candidates are
+        // re-derived, so record the window it was stuck for. The window is in the key (cursor
+        // rule 3b), so a replay of this same commit stays the same row.
+        if (commit_failing_since_)
+            rows.push_back(registry_gap_row(
+               "commit_stalled", std::format("commit:{}:{}", *commit_failing_since_, now),
+               "gap:commit_stalled: the registry event/cursor commit failed on earlier ticks; "
+               "changes made in the window were read late and their writers may not have been "
+               "observed",
+               now, snapshot_id));
+
         const std::string new_cursor = encode_registry_cursor(cur);
         if (auto ins = db.insert_registry_events_and_cursor(rows, new_cursor, state_writes); !ins) {
             if (ins.error() == EchoDatabase::CursorInsertError::KeyCollision)
                 spdlog::critical("Echo registry: record_key COLLISION -- a persisted field is "
                                  "not deterministically re-derivable (echo_cursor.hpp rule 3a). "
                                  "Capture is STUCK and retrying cannot clear it.");
+            if (!commit_failing_since_)
+                commit_failing_since_ = now;
             throw IncompleteCaptureError("Echo registry: event/cursor commit failed");
         }
+        commit_failing_since_.reset();
         rb.active = false; // committed: the dirty flags stay consumed
         if (reader_.committed)
             reader_.committed(rows);
@@ -744,6 +781,7 @@ std::unique_ptr<RegistryCursorSource> make_registry_cursor_source(RegistryScope 
 #include "echo_win_process_name.hpp" // process_basename_for_pid
 
 #include <atomic>
+#include <cwchar> // wcsnlen: the ETW ValueName is cut at its first NUL
 #include <thread>
 #include <unordered_map>
 
@@ -797,6 +835,22 @@ bool prop_u32(EVENT_RECORD* rec, const wchar_t* name, std::uint32_t& out) {
     return true;
 }
 
+// A registry name as the identity string: the wide characters go through registry_name_utf8
+// (injective, lone surrogates and all), never the lossy from_wide. The ONE identity: the reader
+// stores names through it and the ETW callback hashes the same string, so a snapshot candidate
+// and the event that wrote it compare equal.
+//
+// The reinterpret_cast below rests on this: the translation unit is Windows-only and built with
+// MSVC, where wchar_t and char16_t are both unsigned 16-bit UTF-16 code units of equal size and
+// alignment (asserted below) and the compiler performs no type-based alias analysis. The view is
+// read-only and does not outlive this call: the caller owns the n code units at `p` for its
+// duration.
+std::string name_identity(const wchar_t* p, std::size_t n) {
+    static_assert(sizeof(wchar_t) == sizeof(char16_t));
+    static_assert(alignof(wchar_t) == alignof(char16_t));
+    return registry_name_utf8(std::u16string_view(reinterpret_cast<const char16_t*>(p), n));
+}
+
 // ValueName; the default value ("") is a legitimate 2-byte (NUL only) property.
 bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     PROPERTY_DATA_DESCRIPTOR pdd{};
@@ -817,7 +871,10 @@ bool prop_string(EVENT_RECORD* rec, const wchar_t* name, std::string& out) {
     if (TdhGetProperty(rec, 0, nullptr, 1, &pdd, size, reinterpret_cast<PBYTE>(buf.data())) !=
         ERROR_SUCCESS)
         return false;
-    out = yuzu::win::from_wide(buf.data());
+    // The ETW ValueName is NUL-terminated, so the identity is taken up to the first NUL: a name
+    // holding U+0000 arrives cut here while its snapshot name keeps the NUL, so it does not match
+    // its own value; the cut prefix can match a sibling value with the same prefix (a lead).
+    out = name_identity(buf.data(), wcsnlen(buf.data(), size / sizeof(wchar_t)));
     return true;
 }
 
@@ -887,6 +944,7 @@ struct WinEtw {
     std::wstring session_name;
     std::shared_ptr<RegistryEtwBuffer> buffer;
     std::atomic<bool> running{false};
+    std::atomic<ULONG> last_start_rc{0}; // what the last start() ended with (tests name the cause)
     std::atomic<std::uint64_t> decode_failed{0};
     std::unordered_map<std::uint32_t, std::string> pid_name; // ProcessTrace thread only
     std::int64_t pid_name_flushed{0};                        // ProcessTrace thread only
@@ -1286,11 +1344,17 @@ LONG query_key(HKEY key, KeyInfo& out) {
                             &out.n_val, nullptr, &out.max_data, nullptr, &out.written);
 }
 
+// The one key-budget-and-deadline check: every key the walk enters AND every child it skips is
+// charged here, so the two cannot drift (the decision itself is RegistryReadBudget::admit_key_by,
+// which the unit suite runs).
+bool admit_visit(ReadCtx& ctx) {
+    return ctx.budget.admit_key_by(filetime_now(), ctx.deadline);
+}
+
 void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth) {
     if (ctx.capped || ctx.unreadable)
         return;
-    if (!RegistryReadBudget::depth_ok(depth) || !ctx.budget.admit_key() ||
-        filetime_now() >= ctx.deadline) {
+    if (!RegistryReadBudget::depth_ok(depth) || !admit_visit(ctx)) {
         ctx.capped = true;
         return;
     }
@@ -1339,7 +1403,10 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.capped = true;
             return;
         }
-        values[yuzu::win::from_wide(ctx.name.data(), static_cast<int>(nlen))] = std::move(v);
+        // The first entry under a name is kept: a repeat (not expected, the encoding is
+        // injective) makes the read partial instead of overwriting.
+        if (!record_registry_name(values, name_identity(ctx.name.data(), nlen), std::move(v)))
+            ctx.capped = true;
     }
     if (ctx.capped)
         return; // a value was left unread: the read is partial, do not walk on
@@ -1354,27 +1421,41 @@ void read_key(ReadCtx& ctx, HKEY key, const std::string& full, std::size_t depth
             ctx.unreadable = true;
             return;
         }
-        const std::string child_path =
-           full + "\\" + yuzu::win::from_wide(sub.data(), static_cast<int>(slen));
+        const std::string child_path = full + "\\" + name_identity(sub.data(), slen);
         // Not configuration (see registry_path_excluded): never opened, so its constant writes
         // cannot disturb the read of the rest of the root.
         if (registry_path_excluded(child_path))
             continue;
+        if (ctx.out->keys.contains(child_path)) {
+            ctx.capped = true; // a repeat of a key already read: keep the first, the read is partial
+            return;
+        }
+        // A name holding U+0000 cannot be passed to RegOpenKeyExW (it stops at the NUL and would
+        // open a different key): it is never opened, only reported as a child that was not read.
+        const bool has_nul = std::find(sub.data(), sub.data() + slen, L'\0') != sub.data() + slen;
         yuzu::win::RegKey child;
-        // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
-        // SymbolicLinkValue), never followed into whatever it points at.
-        const LONG orc = RegOpenKeyExW(key, sub.data(), REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY,
-                                       child.put());
-        if (orc == ERROR_FILE_NOT_FOUND || orc == ERROR_KEY_DELETED)
-            continue; // deleted between enumerate and open: the next read sees it gone
-        if (orc == ERROR_ACCESS_DENIED) {
+        LONG orc = ERROR_SUCCESS;
+        if (!has_nul) {
+            // OPEN_LINK: a child that is a symbolic-link key is read as the link (its own
+            // SymbolicLinkValue), never followed into whatever it points at.
+            orc = RegOpenKeyExW(key, sub.data(), REG_OPTION_OPEN_LINK, KEY_READ | KEY_WOW64_64KEY,
+                                child.put());
+            if (orc == ERROR_FILE_NOT_FOUND || orc == ERROR_KEY_DELETED)
+                continue; // deleted between enumerate and open: the next read sees it gone
+        }
+        if (has_nul || orc == ERROR_ACCESS_DENIED) {
             // A child this agent may not read hides only itself: record it and read on. The
             // diff keeps what the baseline holds beneath it, and collect() reports the gap.
-            if (ctx.out->skipped.size() >= kSkippedCap) {
-                ctx.capped = true; // too many to track: a partial read, so no removals
+            // Skipping is charged like a visit, so a key with a huge number of unopenable
+            // children still ends at the budget or the deadline.
+            if (!admit_visit(ctx)) {
+                ctx.capped = true;
                 return;
             }
-            ctx.out->skipped.push_back(child_path);
+            if (ctx.out->skipped.size() < kSkippedCap)
+                ctx.out->skipped.push_back(child_path);
+            else
+                ++ctx.out->skipped_overflow; // counted, not named: the read ends Capped (no removals)
             continue;
         }
         if (orc != ERROR_SUCCESS) {
@@ -1418,14 +1499,19 @@ SubtreeRead read_root_at(HKEY key, const std::string& label, std::int64_t deadli
             out.keys.clear();
             out.written.clear();
             out.skipped.clear();
+            out.skipped_overflow = 0;
             out.status = RegistryReadStatus::Unreadable;
         } else {
-            out.status = ctx.capped ? RegistryReadStatus::Capped : RegistryReadStatus::Complete;
+            // Unnamed skipped children: their baseline cannot be protected by name, so no
+            // removal may be derived from this read.
+            out.status = (ctx.capped || out.skipped_overflow > 0) ? RegistryReadStatus::Capped
+                                                                  : RegistryReadStatus::Complete;
         }
     } catch (...) {
         out.keys.clear();
         out.written.clear();
         out.skipped.clear();
+        out.skipped_overflow = 0;
         out.status = RegistryReadStatus::Unreadable;
     }
     return out;
@@ -1470,6 +1556,7 @@ SubtreeRead read_root(const std::string& root, std::int64_t deadline) noexcept {
     } catch (...) {
         out.keys.clear();
         out.skipped.clear();
+        out.skipped_overflow = 0;
         out.status = RegistryReadStatus::Unreadable;
     }
     return out;
@@ -1500,6 +1587,8 @@ std::vector<std::string> enumerate_hku() {
         const LONG rc =
             RegEnumKeyExW(HKEY_USERS, i, buf, &len, nullptr, nullptr, nullptr, nullptr);
         if (rc == ERROR_SUCCESS) {
+            // Deliberately the lossy from_wide: these are loaded-user SID strings (ASCII, so no
+            // loss), root names for scope_.roots_for, not value or key identities.
             name = yuzu::win::from_wide(buf, static_cast<int>(len));
             return ListStep::Item;
         }
@@ -1560,6 +1649,8 @@ struct OfflineMountTick {
     // The start-up sweep of leftover YUZU_HIVE_* mounts has not completed (see
     // run_pending_hive_sweep). Cleared only when its worker returned.
     bool sweep_pending{true};
+    // A completed sweep that could not list HKEY_USERS has used its one retry (settle_sweep).
+    bool sweep_listing_retried{false};
 };
 
 // Runs the start-up sweep of leftover `YUZU_HIVE_*` mounts once, through the same gate and bounded
@@ -1582,7 +1673,17 @@ void run_pending_hive_sweep(OfflineMountTick& tick) {
         return yuzu::echo::sweep_leftover_hive_mounts();
     });
     if (bounded.status == yuzu::shared::BoundedCallStatus::Completed) {
-        tick.sweep_pending = false;
+        // A listing that failed or never settled keeps the sweep pending for exactly one retry
+        // (before the next offline mount), then completes. Each failed listing logs one warning
+        // naming the cause. (The lock the worker held is already released.)
+        const auto settle = yuzu::echo::settle_sweep(*bounded.value, tick.sweep_listing_retried);
+        tick.sweep_pending = settle.pending;
+        if (settle.pending || settle.warn)
+            spdlog::warn("Echo registry: hku_list_incomplete ({}) -- leftover hive mounts were not "
+                         "swept; {}",
+                         bounded.value->listing_error,
+                         settle.pending ? "one retry before the next offline mount"
+                                        : "not retried this start");
         return;
     }
     const auto decision = yuzu::echo::decide_mount_call(
@@ -1745,7 +1846,14 @@ HiveSweepResult sweep_leftover_hive_mounts(std::string_view prefix) {
         // before it unloads) can be unloaded here; an out-of-process mount is unguarded
         // (win_reg_handle.hpp), and that is the default shape on the shared CI pools.
         const yuzu::agent::ScopedOfflineHiveLock offline_lock("echo_registry_sweep");
-        stale = select_stale_hive_mounts(yuzu::win::enumerate_hku_subkeys(), prefix);
+        // A failed or unstable listing is not "no mounts are left": nothing is offered to the unload
+        // and the result says so (listing_error), so the caller does not settle on it.
+        const auto listing = yuzu::win::enumerate_hku_subkeys_checked();
+        if (!listing.error.empty()) {
+            r.listing_error = listing.error;
+            return r;
+        }
+        stale = select_stale_hive_mounts(listing.names, prefix);
         if (stale.empty())
             return r;
         // RegUnLoadKeyW needs SeRestorePrivilege, which the agent account already holds
@@ -1827,6 +1935,7 @@ RegistryReader make_windows_registry_reader() {
     };
     r.now_ts = [] { return filetime_now(); };
     r.etw_running = [etw] { return etw->running.load(); };
+    r.etw_start_error = [etw] { return static_cast<unsigned long>(etw->last_start_rc.load()); };
     r.session_loss = [etw] { return etw->loss(); };
     r.current_control_set = [] { return read_current_control_set(); };
     r.watch_roots = [watcher](const std::vector<std::string>& roots) { watcher->watch(roots); };
@@ -1839,7 +1948,9 @@ RegistryReader make_windows_registry_reader() {
         // profile's NTUSER.DAT locked, so it must not outlive the restart that could release it.
         // Bounded and gated like a mount; a sweep it cannot run here waits for the first offline read.
         run_pending_hive_sweep(*tick);
-        if (const ULONG rc = etw->start(); rc != ERROR_SUCCESS)
+        const ULONG rc = etw->start();
+        etw->last_start_rc.store(rc);
+        if (rc != ERROR_SUCCESS)
             spdlog::warn("Echo registry: Kernel-Registry ETW session unavailable (Win32 error {}; "
                          "5 = the agent is not elevated) -- the key watch still runs, rows will "
                          "carry attr:off",

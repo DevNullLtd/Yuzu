@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-73 of 73 plugins document themselves this way; the rest are described in the prose below until their README lands.
+74 of 74 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -62,6 +62,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |
 | `privacy_permissions` | 🟡 🟡 🟡 | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) | [README](../../agents/plugins/privacy_permissions/README.md) |
+| `process_introspect` | 🟡 🟡 🟡 | Per-process introspection of one pid, one facet per request: resource limits, signal masks, capabilities, seccomp, OOM and scheduling; numbers and masks only | [README](../../agents/plugins/process_introspect/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |

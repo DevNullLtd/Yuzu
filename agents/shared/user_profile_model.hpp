@@ -133,7 +133,7 @@ inline void remove_backup_entries(std::vector<ProfileInfo>& list) {
 }
 
 /// Classifies a SID's hive reachability from the live HKEY_USERS subkey list
-/// (as returned by win_profiles.hpp's enumerate_hku_subkeys). `hku_subkeys`
+/// (the `names` of win_profiles.hpp's enumerate_hku_subkeys_checked). `hku_subkeys`
 /// holds exactly the subkey names under HKEY_USERS, e.g. {"S-1-5-21-...-1001",
 /// "S-1-5-21-...-1001_Classes", ...}. The real hive outranks a Classes-only
 /// sighting of the same SID.

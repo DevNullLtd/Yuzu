@@ -44,8 +44,8 @@ Each capability is rated on two axes:
 > outside its own domain, and each entry counts once against its `T1`/`T2`/`T3` tier label.
 > Reproduce with:
 > `awk '/^### [0-9]+\.[0-9]+/ { if ($0 ~ /:white_check_mark:/) d++; else if ($0 ~ /:large_orange_diamond:/) p++; else if ($0 ~ /:x:/) n++ } END { print d, p, n, d+p+n }' docs/capability-map.md`
-> → `223 49 51 323`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
-> awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` `` → T1 `55 2 2 59`, T2 `156 34 28 218`,
+> → `223 50 51 324`. Tier tallies (`Foundation`=T1, `Advanced`=T2, `Future`=T3) add the same
+> awk pattern filtered on `` `T1` ``/`` `T2` ``/`` `T3` `` → T1 `55 2 2 59`, T2 `156 35 28 219`,
 > T3 `12 13 21 46`.
 > **v4.1 re-verification (2026-11-14).** A row-by-row audit of this file against the code (taken
 > at dev @ 54c5c2b37, 2026-11-13) was applied here and its claims re-checked against the code at
@@ -67,10 +67,10 @@ Each capability is rated on two axes:
 
 ```
 Foundation   [==============================--]  55/59 done  (93%) (2 partial)
-Advanced     [=======================---------]  156/218 done  (72%) (34 partial)
+Advanced     [=======================---------]  156/219 done  (71%) (35 partial)
 Future       [========------------------------]  12/46 done  (26%) (13 partial)
 ─────────────────────────────────────────────────────────────────
-Overall      [======================----------]  223/323 done  (69%) (49 partial)
+Overall      [======================----------]  223/324 done  (69%) (50 partial)
 ```
 
 | Domain | Total | Done | Partial | Not Started |
@@ -117,8 +117,8 @@ Overall      [======================----------]  223/323 done  (69%) (49 partial
 | **Subtotal (domains 1–39)** | **300** | **217** | **40** | **43** |
 | 40. Reflex — Agent-Local Automated Response | 4 | 0 | 0 | 4 |
 | 41. Cryptographic Asset Inventory | 8 | 2 | 2 | 4 |
-| 42. Endpoint Security Posture | 11 | 4 | 7 | 0 |
-| **TOTAL** | **323** | **223** | **49** | **51** |
+| 42. Endpoint Security Posture | 12 | 4 | 8 | 0 |
+| **TOTAL** | **324** | **223** | **50** | **51** |
 
 > **Scaffolded vs production-quality.** The percentages above measure feature presence, not enterprise hardening. "Done" means "implemented and functional" — not "hardened, observable, and proven at large-fleet scale" on every domain. Known gaps at the §-level (e.g. configurable heartbeat in §1.2, unified diagnostics bundle in §1.3, runtime plugin install in §1.5) remain even where a domain is marked Done. The `docs/capability-agentic-audit-2026-05.md` audit (figures as of 2026-05 — its counts predate this v4.1 tally) is the source for the production-quality dimension; subsequent reviews should keep it current.
 
@@ -1009,7 +1009,7 @@ Token rotation: `POST /api/v1/tokens/{id}/rotate` and its confirm step (`ApiToke
 
 ### 18.17 Plugin Configuration, Secrets and Kill Switches :white_check_mark: `T2` *(new row, v4.1)*
 
-`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
+`/api/v1/plugin-config` (list, get, set per key, and the per-plugin `kill-switch` with optional `action`/`os`) on the `PluginConfig` and `PluginSecret` securables, with MCP twins `list_plugin_config`, `get_plugin_config`, `set_plugin_config`, `delete_plugin_config`, `set_plugin_secret`, `delete_plugin_secret`, `get_plugin_kill_switch` and `set_plugin_kill_switch`. The Forensics-tier plugins (`browser_inventory`, `execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`) are seeded default-off. *(Evidence: `server/core/src/plugin_config_parsers.hpp`, `PluginConfigStore::seed_kill_switch_default_off`.)*
 
 ### 18.18 KEK Rotation and Secrets Rewrap :white_check_mark: `T2` *(new row, v4.1)*
 
@@ -1077,7 +1077,7 @@ SSE-based streaming to dashboard. gRPC streaming for programmatic access.
 
 ### 20.5 CSV / Data Export :white_check_mark: `T2`
 
-CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV. The response export is **buffered in memory under a byte cap**, not chunk-streamed: when the cap cuts the result it appends an in-band truncation trailer row and sets `X-Result-Truncated-By-Cap` (`server/core/src/response_routes.cpp`). Generic JSON-to-CSV conversion (`POST /api/export/json-to-csv`).
+CSV and JSON export endpoints for responses, audit, and inventory data. RFC 4180-compliant CSV. The response export is **buffered in memory under a byte cap**, not chunk-streamed: when the cap cuts the result it appends an in-band truncation trailer row and sets `X-Result-Truncated-By-Cap` (`server/core/src/response_routes.cpp`). Generic JSON-to-CSV conversion (`POST /api/export/json-to-csv`). The installed-software inventory has its own export, `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` (`server/core/src/software_export_routes.cpp`): JSONL and CSV are chunk-streamed under `--inventory-export-max-rows` and `--inventory-export-max-bytes`, and XLSX is a one-sheet workbook built whole in constant memory before it is sent, refused with a `413` past the sheet's 1,048,575 rows or a size limit, and bounded on disk (at most 3 times its accounted sheet bytes, never leaving the data volume under 1 GiB free); PDF is not offered.
 
 ### 20.6 Response Templates :white_check_mark: `T2`
 
@@ -1307,7 +1307,7 @@ Partial. `ProductRegistryStore` (`server/core/src/product_registry_store.{hpp,cp
 
 ### 27.2 Software Usage Tracking :large_orange_diamond: `T2` *(verified 2026-11-14)*
 
-**Regraded 2026-11-14: Not Started → Partial.** Shipped: the `app_usage` agent plugin (`summary`, `last_used`, `foreground`; Windows and Linux supported, macOS constrained), which reads Echo's `usage` fold read-only and is **machine-scope** (no pid, command line or user name); the ADR-0016 daily-sync source `app_usage` (`agents/core/src/sync_source_app_usage.{hpp,cpp}`) feeding the server `AppUsageStore` (§35.6); and the Forensics-gated read `GET /api/v1/forensics/agents/{id}/app-usage` plus MCP `get_agent_app_usage` (`Forensics:Read` scoped to the device, per-open `app_usage.agent.view` audit that fails closed, 503 on a degraded store). **Collected by default, not opt-in** *(verified 2026-11-14)*: Echo's `usage` source ships `default_enabled = true` (`agents/plugins/echo/src/echo_schema_registry.cpp`, every source on by default since PR #6360), the daily-sync source pushes it every 24 hours, and `app_usage` is not among the four plugins `server.cpp` seeds kill-switched off (`seed_kill_switch_default_off`: `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit`). The opt-out is the Echo `usage` source switch (`usage_enabled=false` via `echo.configure`). The Forensics gate controls who can READ the data, not whether it is collected: the plugin's actions are `Forensics` Read with an `AdminOrApproval` dispatch gate, its stored responses are served only to `Forensics:Read` holders, and the server read is the audited route above. The formerly cited `--usage-sync-enable` flag does not exist. **Still missing:** the Used / Rarely / Unused / Unreported categorisation and the reclamation verdicts derived from it, which are SAM use-case-engine work (ADR-0024 "Placement under ADR-1005"). *(Evidence: `agents/plugins/app_usage/README.md`, `server/core/src/app_usage_routes.hpp`, `app_usage_store.*`.)*
+**Regraded 2026-11-14: Not Started → Partial.** Shipped: the `app_usage` agent plugin (`summary`, `last_used`, `foreground`; Windows and Linux supported, macOS constrained), which reads Echo's `usage` fold read-only and is **machine-scope** (no pid, command line or user name); the ADR-0016 daily-sync source `app_usage` (`agents/core/src/sync_source_app_usage.{hpp,cpp}`) feeding the server `AppUsageStore` (§35.6); and the Forensics-gated read `GET /api/v1/forensics/agents/{id}/app-usage` plus MCP `get_agent_app_usage` (`Forensics:Read` scoped to the device, per-open `app_usage.agent.view` audit that fails closed, 503 on a degraded store); and the fleet aggregate per Apps application `GET /api/v1/dex/apps/usage` (REST only: no MCP tool and no dashboard view yet; `Forensics:Read` and `GuaranteedState:Read`, audited `dex.apps.usage.view` once parameters validate, fails closed). **Collected by default, not opt-in** *(verified 2026-11-14)*: Echo's `usage` source ships `default_enabled = true` (`agents/plugins/echo/src/echo_schema_registry.cpp`, every source on by default since PR #6360), the daily-sync source pushes it every 24 hours, and `app_usage` is not among the five plugins `server.cpp` seeds kill-switched off (`seed_kill_switch_default_off`: `execution_artifacts`, `browser_inventory`, `privacy_permissions`, `remote_access_audit`, `process_introspect`). The opt-out is the Echo `usage` source switch (`usage_enabled=false` via `echo.configure`). The Forensics gate controls who can READ the data, not whether it is collected: the plugin's actions are `Forensics` Read with an `AdminOrApproval` dispatch gate, its stored responses are served only to `Forensics:Read` holders, and the server read is the audited route above. The formerly cited `--usage-sync-enable` flag does not exist. **Still missing:** the Used / Rarely / Unused / Unreported categorisation and the reclamation verdicts derived from it, which are SAM use-case-engine work (ADR-0024 "Placement under ADR-1005"). *(Evidence: `agents/plugins/app_usage/README.md`, `server/core/src/app_usage_routes.hpp`, `app_usage_store.*`.)*
 
 ### 27.3 License Entitlements & Compliance :x: `T2`
 
@@ -1586,7 +1586,7 @@ Other typed sources: the server's one `kTypedInventorySources` list (`server/cor
 
 ### 35.6 App-Usage Inventory Source :white_check_mark: `T2` *(new row, v4.1)*
 
-ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
+ADR-0016 source `app_usage`: `agents/core/src/sync_source_app_usage.{hpp,cpp}` reads the `app_usage` plugin's machine-scope fold of Echo's usage data and pushes it daily to the server `AppUsageStore` (`server/core/src/app_usage_store.{hpp,cpp}`). It is a typed source, excluded from generic-store writes and from every generic read. The only per-device read is the Forensics-gated `GET /api/v1/forensics/agents/{id}/app-usage` / MCP `get_agent_app_usage`, with a per-open audit that fails closed (§27.2). The fleet aggregate per Apps application is `GET /api/v1/dex/apps/usage` (REST only, no MCP tool and no dashboard view yet; `Forensics:Read` and `GuaranteedState:Read`, audited `dex.apps.usage.view`, fails closed). *(Evidence: `docs/user-manual/inventory.md`; `docs/adr/0016-agent-daily-sync-framework.md` 2026-09-17 update.)*
 
 ---
 
@@ -1835,6 +1835,10 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 
 `filesystem_posture` plugin: `mounts`, per-mount `quotas` subsystem state and snapshot-capable volumes (`snapshots`), read-only (`Inventory:Read`). macOS supported; Windows and Linux constrained. *(Evidence: `agents/plugins/filesystem_posture/README.md`.)*
 
+### 42.12 Process Introspection :large_orange_diamond: `T2` *(new row, 2026-11-16)*
+
+`process_introspect` plugin `inspect`: one pid and one facet per request (`resource_limits`, `sigmasks`, `caps`, `seccomp`, `oom`, `sched`) as numbers, masks and fixed tokens — never file or memory contents, environment values, socket payloads or command-line arguments. Forensics securable, default-off, AdminOrApproval, single-target. Linux constrained, macOS and Windows planned. *(Evidence: `agents/plugins/process_introspect/README.md`.)*
+
 ---
 
 ## Appendix A: Plugin Coverage Matrix
@@ -1908,6 +1912,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | update_source_trust | - | Y | - | Security |
 | mgmt_posture | - | 🟡 | Y | Security |
 | remote_access_audit | - | 🟡 | Y | Security |
+| process_introspect | - | 🟡 | - | Security |
 | shares | Y | Y | Y | Network |
 | virtualization | 🟡 | Y | Y | System Info |
 | agent_logging | Y | Y | Y | Agent Mgmt |
@@ -1917,7 +1922,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**73 plugin directories: 71 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 73 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**74 plugin directories: 72 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 74 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status

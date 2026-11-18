@@ -252,8 +252,9 @@ TEST_CASE("privacy_permissions: the real Windows dispatch derives its typed stat
     // fail here. HKLM's own rows are unqualified, so only a profile-name prefix proves a walk. Only
     // plain names are compared (the wire sanitizer rewrites anything else). "Any", not "every": a
     // slow host's cooperative deadline may legitimately stop the run after the first profiles.
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
     const auto profiles = yuzu::profiles::build_profile_list(
-        yuzu::win::enumerate_profile_list().records, yuzu::win::enumerate_hku_subkeys());
+        yuzu::win::enumerate_profile_list().records, hku.names);
     const auto plain = [](const std::string& n) {
         return std::all_of(n.begin(), n.end(), [](char c) {
             return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
