@@ -28,12 +28,14 @@ at a time. These tests pin what that means:
     marked pair, and the release check refuses an image pair left unmarked,
     partly marked, marked for nothing, or named as a release image without
     that image's title label;
-  - the real deploy/packaging/windows/yuzu-agent.iss parses; a script is
-    split into lines where Inno Setup splits it (CR, LF, CR LF), a control
-    byte is refused, a BOM-less script keeps the lines that are mapped ASCII
-    (Inno Setup 6.3+ reads it as UTF-8 or ANSI depending on the file, and
-    earlier versions as ANSI), and a script construct that could change
-    [Files] unseen is refused; the .pkg's staged names are the ones
+  - the real deploy/packaging/windows/yuzu-agent.iss parses under the
+    frozen .iss contract (artifact-sbom.py), whose allowlists are exactly the
+    script's own header names and sections; a script is split into lines
+    where Inno Setup splits it (CR, LF, CR LF), a control byte is refused, a
+    BOM-less script keeps the lines that are mapped ASCII (Inno Setup 6.3+
+    reads it as UTF-8 or ANSI depending on the file, and earlier versions as
+    ANSI), and every form outside the contract found so far (ISS_REFUSED) is
+    refused; the .pkg's staged names are the ones
     deploy/packaging/macos/build-pkg.sh stages;
   - every `yuzu:sbom:` note the docs name is written under the same key in
     both formats (a CycloneDX property; a line of the SPDX root's comment),
@@ -43,8 +45,12 @@ at a time. These tests pin what that means:
     directory (with and without tarfile's data filter, including a link
     chain), a device or FIFO member, a binary with no vcpkg tree, a stalled
     command (syft, and rpm2cpio | cpio: timeout), a failing syft, an
-    rpm2cpio that fails after writing part of the payload, and an
-    unexpected error is one `::error::` line, not a traceback;
+    rpm2cpio that fails after writing part of the payload, a cpio that
+    fails, a note written twice, and an unexpected error is one `::error::`
+    line, not a traceback;
+  - every SBOM pair `generate` writes here validates against the vendored
+    CycloneDX 1.7 and SPDX 2.3 schemas when jsonschema is importable, and
+    YUZU_REQUIRE_JSONSCHEMA=1 makes its absence a failure;
   - `check` refuses an SBOM over the entry bound (400 passes, 401 fails), one listing a path under
     vcpkg/, vcpkg_installed/, build-*/, _build/, _build_*/, site/, tests/, .git/ or
     .github/ wherever syft records a path (CycloneDX file names, location
@@ -53,7 +59,8 @@ at a time. These tests pin what that means:
     or name does not match its artifact, and skips the image SBOMs.
 
 syft (and pkgutil, rpm2cpio for those formats) is replaced by a small stub, so
-the test needs no network and no syft. Stdlib only. The `generate` tests skip
+the test needs no network and no syft. Stdlib only, plus jsonschema for the
+schema validation when it is importable. The `generate` tests skip
 on Windows (the stubs are #! scripts); the unit and `check` tests run there.
 """
 
@@ -94,13 +101,66 @@ def load_script():
     return mod
 
 
+# Schema validation of every SBOM `generate` writes in these tests: CycloneDX
+# 1.7 (tests/fixtures/cyclonedx, the schemas test_cbom_schema.py uses) and SPDX
+# 2.3 (tests/fixtures/spdx). It runs whenever jsonschema (>= 4.18, with
+# `referencing`) is importable; YUZU_REQUIRE_JSONSCHEMA=1 makes its absence a
+# failure (docs-lint's `CBOM schema` job sets it). syft is stubbed here, so this
+# checks this script's merge into a syft-shaped document, not real syft output;
+# format keywords (date-time, iri-reference) are not checked.
+REQUIRE_JSONSCHEMA = os.environ.get("YUZU_REQUIRE_JSONSCHEMA") == "1"
+CDX_SCHEMA_DIR = ROOT / "tests" / "fixtures" / "cyclonedx"
+SPDX_SCHEMA = ROOT / "tests" / "fixtures" / "spdx" / "spdx-schema-2.3.json"
+_VALIDATORS: list = []
+
+
+def sbom_validators():
+    """(cyclonedx, spdx) Draft-7 validators, or None when jsonschema is not
+    importable and YUZU_REQUIRE_JSONSCHEMA is not 1 (then: AssertionError)."""
+    if not _VALIDATORS:
+        try:
+            import jsonschema
+            from referencing import Registry, Resource
+            from referencing.jsonschema import DRAFT7
+        except ImportError as exc:
+            if REQUIRE_JSONSCHEMA:
+                raise AssertionError(f"YUZU_REQUIRE_JSONSCHEMA=1 but jsonschema/referencing is not importable "
+                                     f"({exc}): the generated SBOMs cannot be schema-validated") from exc
+            _VALIDATORS.append(None)
+        else:
+            registry = Registry()
+            for name in ("bom-1.7.schema.json", "cryptography-defs.schema.json", "jsf-0.82.schema.json",
+                         "spdx.schema.json"):
+                res = Resource.from_contents(json.loads((CDX_SCHEMA_DIR / name).read_text(encoding="utf-8")),
+                                             default_specification=DRAFT7)
+                registry = registry.with_resource(f"http://cyclonedx.org/schema/{name}", res).with_resource(name, res)
+            cdx = registry.contents("bom-1.7.schema.json")
+            spdx = json.loads(SPDX_SCHEMA.read_text(encoding="utf-8"))
+            _VALIDATORS.append((jsonschema.Draft7Validator(cdx, registry=registry),
+                                jsonschema.Draft7Validator(spdx)))
+    return _VALIDATORS[0]
+
+
+def schema_errors(doc: dict) -> list:
+    """Schema errors of a CycloneDX or SPDX document ([] when valid); None
+    when validation is unavailable (see sbom_validators)."""
+    validators = sbom_validators()
+    if validators is None:
+        return None
+    v = validators[0] if doc.get("bomFormat") == "CycloneDX" else validators[1]
+    return [f"{'/'.join(map(str, e.absolute_path))}: {e.message[:200]}"
+            for e in sorted(v.iter_errors(doc), key=lambda e: list(map(str, e.absolute_path)))]
+
+
 STUB_SYFT = textwrap.dedent('''\
     #!PYTHON
     """Stand-in for `syft scan dir:X --source-name N --source-version V -o fmt=path ...`.
     Reports the Erlang applications it finds (as syft does), and with
     STUB_SYFT_FILES=1 every file as an SPDX file entry (syft's shape: no
-    leading slash)."""
-    import json, os, sys
+    leading slash, SHA-1 and SHA-256 checksums). Writes the document-level
+    fields syft 1.57.2 writes, so the output is valid CycloneDX 1.7 and SPDX 2.3
+    before artifact-sbom.py merges into it."""
+    import hashlib, json, os, sys, uuid
     args = sys.argv[1:]
     root = args[args.index("scan") + 1][len("dir:"):]
     name = args[args.index("--source-name") + 1]
@@ -112,7 +172,11 @@ STUB_SYFT = textwrap.dedent('''\
         for f in fs:
             rel = "/" + os.path.relpath(os.path.join(dirpath, f), root).replace(os.sep, "/")
             if os.environ.get("STUB_SYFT_FILES"):
-                files.append({"fileName": rel[1:], "SPDXID": "SPDXRef-File-" + str(len(files))})
+                data = open(os.path.join(dirpath, f), "rb").read()
+                files.append({"fileName": rel[1:], "SPDXID": "SPDXRef-File-" + str(len(files)),
+                              "checksums": [{"algorithm": "SHA1", "checksumValue": hashlib.sha1(data).hexdigest()},
+                                            {"algorithm": "SHA256",
+                                             "checksumValue": hashlib.sha256(data).hexdigest()}]})
             if f.endswith(".app") and "/ebin/" in rel:
                 app, vsn = rel.split("/")[-3].rsplit("-", 1)
                 comps.append({"bom-ref": app, "type": "library", "name": app, "version": vsn,
@@ -130,10 +194,18 @@ STUB_SYFT = textwrap.dedent('''\
     for p in pkgs:
         rels.append({"spdxElementId": root_id, "relationshipType": "CONTAINS", "relatedSpdxElement": p["SPDXID"]})
     rels.append({"spdxElementId": "SPDXRef-DOCUMENT", "relationshipType": "DESCRIBES", "relatedSpdxElement": root_id})
-    cdx = {"bomFormat": "CycloneDX", "specVersion": "1.6",
-           "metadata": {"component": {"bom-ref": "root", "type": "file", "name": name, "version": version}},
+    cdx = {"$schema": "http://cyclonedx.org/schema/bom-1.7.schema.json", "bomFormat": "CycloneDX",
+           "specVersion": "1.7", "serialNumber": f"urn:uuid:{uuid.uuid4()}", "version": 1,
+           "metadata": {"timestamp": "2026-11-18T00:00:00Z",
+                        "tools": {"components": [{"type": "application", "author": "anchore", "name": "syft",
+                                                  "version": "1.57.2"}]},
+                        "component": {"bom-ref": "root", "type": "file", "name": name, "version": version}},
            "components": comps}
-    spdx = {"spdxVersion": "SPDX-2.3", "SPDXID": "SPDXRef-DOCUMENT", "name": name,
+    spdx = {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT", "name": name,
+            "documentNamespace": f"https://anchore.com/syft/dir/{name}-{uuid.uuid4()}",
+            "creationInfo": {"licenseListVersion": "3.29", "creators": ["Organization: Anchore, Inc",
+                                                                         "Tool: syft-1.57.2"],
+                             "created": "2026-11-18T00:00:00Z"},
             "packages": [{"name": name, "SPDXID": root_id, "versionInfo": version,
                           "downloadLocation": "NOASSERTION"}] + pkgs,
             "files": files, "relationships": rels}
@@ -297,6 +369,124 @@ ISS = textwrap.dedent(r'''
     Name: "{app}\logs"
 ''')
 
+def _iss(*lines) -> str:
+    return "\n".join(lines) + "\n"
+
+
+_OK = r'Source: "a.dll"; DestDir: "{app}\bin"'
+_OK2 = r'Source: "b.dll"; DestDir: "{app}\bin"'
+_HEADER = ("#ifndef BuildDir", '#define BuildDir "x"', "#endif")
+# Every .iss form refused so far, across all review passes, tagged with the
+# finding (or pass) that found it. The parser is a frozen contract (the header
+# of the .iss section in artifact-sbom.py), not an emulation of the Inno Setup
+# preprocessor or compiler: a new form found to be mis-mapped is added here and
+# must fail. Mutation-tested on scratch copies of the script.
+ISS_REFUSED = [
+    # pass 1-2 (g8-bci-1): what the parser could never map.
+    ("g8-bci-1", "#ifdef in [Files]", _iss("[Files]", "#ifdef X", _OK, "#endif")),
+    ("g8-bci-1", "DestDir outside {app}", _iss("[Files]", r'Source: "a.dll"; DestDir: "{sys}"')),
+    ("g8-bci-1", "recursesubdirs", _iss("[Files]", r'Source: "x\*"; DestDir: "{app}\bin"; Flags: recursesubdirs')),
+    ("g8-bci-1", "DestName", _iss("[Files]", _OK + '; DestName: "b.dll"')),
+    ("g8-bci-1", "unparseable line", _iss("[Files]", r'Source "a.dll" DestDir "{app}\bin"')),
+    ("g8-bci-1", "no [Files] section", _iss("[Setup]", "AppName=x")),
+    # g8-sec-1: #include anywhere, FindFirstFile wildcards fnmatch reads differently.
+    ("g8-sec-1", "#include before the first section", _iss('#include "more.iss"', "[Files]", _OK)),
+    ("g8-sec-1", "#include in another section", _iss("[Setup]", '#include "more.iss"', "[Files]", _OK)),
+    ("g8-sec-1", "*.*", _iss("[Files]", r'Source: "x\*.*"; DestDir: "{app}\bin"')),
+    ("g8-sec-1", "?", _iss("[Files]", r'Source: "x\a?.dll"; DestDir: "{app}\bin"')),
+    ("g8-sec-1", "two stars", _iss("[Files]", r'Source: "x\*core*.dll"; DestDir: "{app}\bin"')),
+    ("pass 2", "directive in [Code]", _iss("[Files]", _OK, "[Code]", '#define Extra "x"')),
+    ("pass 2", "conditional header", _iss("#if Ver > 1", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
+    ("pass 2", "expression define", _iss("#ifndef BuildDir", '#define BuildDir GetEnv("X")', "#endif", "[Files]", _OK)),
+    ("pass 2", "#pragma", _iss("#pragma option -v+", "[Files]", _OK)),
+    ("pass 2", "spaced #include", _iss('#  include "more.iss"', "[Files]", _OK)),
+    ("pass 2", "{#} in the Source name", _iss("[Files]", r'Source: "x\{#BuildDir}.dll"; DestDir: "{app}\bin"')),
+    ("pass 2", "{#} in DestDir", _iss(*_HEADER, "[Files]", r'Source: "x\a.dll"; DestDir: "{app}\{#BuildDir}"')),
+    ("pass 2", "{#} in another parameter",
+     _iss(*_HEADER, "[Files]", r'Source: "x\a.dll"; DestDir: "{app}\bin"; Components: {#BuildDir}')),
+    ("pass 2", "{#} in an unquoted Source", _iss(*_HEADER, "[Files]", r'Source: {#BuildDir}\a.dll; DestDir: "{app}\bin"')),
+    ("pass 2", "header literal with a semicolon",
+     _iss("#ifndef BuildDir", '#define BuildDir "x; Flags: recursesubdirs"', "#endif", "[Files]", _OK)),
+    ("pass 2", "line continuation",
+     _iss("[Files]", _OK + r"; Components: core \\", "; Flags: recursesubdirs")),
+    ("pass 2", "external", _iss("[Files]", r'Source: "{src}\a.dll"; DestDir: "{app}\bin"; Flags: external')),
+    ("pass 2", "createallsubdirs", _iss("[Files]", _OK + "; Flags: createallsubdirs")),
+    ("pass 2", "download", _iss("[Files]", r'Source: "https://x/a.dll"; DestDir: "{app}\bin"; Flags: external download')),
+    ("pass 2", "extractarchive", _iss("[Files]", r'Source: "x\a.zip"; DestDir: "{app}\bin"; Flags: external extractarchive')),
+    ("pass 2", "Excludes", _iss("[Files]", r'Source: "x\*.dll"; DestDir: "{app}\bin"; Excludes: "a.dll"')),
+    ("pass 2", "DestDir with ..", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\..\win"')),
+    # p3-up-2: control bytes before a parameter, flags and DestDir forms.
+    ("p3-up-2", "form feed before Flags", (_iss("[Files]", _OK) [:-1] + "\x0c; Flags: recursesubdirs\n").encode()),
+    ("p3-up-2", "vertical tab before Flags", (_iss("[Files]", _OK)[:-1] + "\x0b; Flags: recursesubdirs\n").encode()),
+    ("p3-up-2", "0x1c before Flags", (_iss("[Files]", _OK)[:-1] + "\x1c; Flags: recursesubdirs\n").encode()),
+    ("p3-up-2", "dontcopy", _iss("[Files]", _OK + "; Flags: ignoreversion dontcopy")),
+    ("p3-up-2", "{#F} in Flags", _iss("#ifndef F", '#define F "recursesubdirs"', "#endif", "[Files]", _OK + "; Flags: {#F}")),
+    ("p3-up-2", r"DestDir {app}\.\bin", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\.\bin"')),
+    ("p3-up-2", r"DestDir {app}\{code:X}", _iss("[Files]", r'Source: "x\a.dll"; DestDir: "{app}\{code:Sub}"')),
+    # p3-qe-2: a dotted extension after the `*`.
+    ("p3-qe-2", "*.a.b", _iss("[Files]", r'Source: "x\*.dll.bak"; DestDir: "{app}\bin"')),
+    # p3-sg-2 / UP2-1 / p3-qe-1: non-ASCII on a mapped line with no byte order mark.
+    ("p3-sg-2", "cp1252 Source name", b'[Files]\nSource: "x\\caf\xe9.dll"; DestDir: "{app}\\bin"\n'),
+    ("p3-qe-1", "utf-8 DestDir", b'[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\b\xc3\xa9n"\n'),
+    # p4-sre-1: an unterminated quoted value.
+    ("p4-sre-1", "unterminated quote", _iss("[Files]", r'Source: "x\a.dll; DestDir: "{app}\bin"')),
+    # p4-qe-2 (s5): `*.` (FindFirstFile also matches a name with no extension).
+    ("p4-qe-2", "*.", _iss("[Files]", r'Source: "x\*."; DestDir: "{app}\bin"')),
+    # p4-sg-1: ISPP's one-character directives and {#...} outside [Files].
+    ("p4-sg-1", "#+ (include)", _iss('#+ "more.iss"', "[Files]", _OK)),
+    ("p4-sg-1", "#= (emit)", _iss('#= "[Files]"', "[Files]", _OK)),
+    ("p4-sg-1", "#: (define)", _iss('#: BuildDir "x"', "[Files]", _OK)),
+    ("p4-sg-1", "#? (if)", _iss("#? 1", "[Files]", _OK, "#endif")),
+    ("p4-sg-1", "#emit", _iss('#emit "Source: evil.dll"', "[Files]", _OK)),
+    ("p4-sg-1", "#+ in [Setup]", _iss("[Setup]", '#+ "more.iss"', "[Files]", _OK)),
+    ("p4-sg-1", "{#NewLine} in [Setup]",
+     _iss("[Setup]", r'AppName=X{#NewLine}[Files]{#NewLine}Source: "evil.dll"; DestDir: "{app}\bin"', "[Files]", _OK)),
+    ("p4-sg-1", "{#} in the header comment", _iss("; {#Emit}", "[Files]", _OK)),
+    ("p4-sg-1", "{#expr} in a quoted Source directory",
+     _iss(*_HEADER, "[Files]", r'Source: "{#BuildDir + "\x"}\a.dll"; DestDir: "{app}\bin"')),
+    ("p4-sg-1", "{#function} in a quoted Source directory",
+     _iss(*_HEADER, "[Files]", r'Source: "{#Upper(BuildDir)}\a.dll"; DestDir: "{app}\bin"')),
+    ("p4-sg-1", "{# Name} with a space", _iss(*_HEADER, "[Files]", r'Source: "{# BuildDir}\a.dll"; DestDir: "{app}\bin"')),
+    ("p4-sg-1", "{#=Name}", _iss(*_HEADER, "[Files]", r'Source: "{#=BuildDir}\a.dll"; DestDir: "{app}\bin"')),
+    ("p4-sg-1", "{#} of a name that is not a header name", _iss("[Setup]", "AppName={#Other}", "[Files]", _OK)),
+    ("p4-sg-1", "{#} in [Code]", _iss("[Files]", _OK, "[Code]", "{#Emit}")),
+    # p4-xp-1: section headers ISCC reads differently (it compares the
+    # untrimmed name, case-insensitively, and ignores an unknown section).
+    # Each follows a valid [Files] section, so only the header rule can
+    # refuse it (not the "no Source: lines" check).
+    ("p4-xp-1", "[ Files ]", _iss("[Files]", _OK, "[ Files ]", _OK2)),
+    ("p4-xp-1", "[\\tFILES]", _iss("[Files]", _OK, "[\tFILES]", _OK2)),
+    ("p4-xp-1", "[FILES]", _iss("[Files]", _OK, "[FILES]", _OK2)),
+    ("p4-xp-1", "[files]", _iss("[Files]", _OK, "[files]", _OK2)),
+    ("p4-xp-1", "[/Files] end tag", _iss("[Files]", _OK, "[/Files]")),
+    ("p4-xp-1", "a section this script does not use", _iss("[Files]", _OK, "[Registry]")),
+    ("p4-xp-1", "text after the closing bracket", _iss("[Files]", _OK, "[Files] ; core", _OK2)),
+    ("p4-xp-1", "no closing bracket", _iss("[Files]", _OK, "[Files", _OK2)),
+    # Pass 5 (the frozen contract itself): the header block's exact shape.
+    ("contract", "a header name not in the allowlist", _iss("#ifndef Other", '#define Other "x"', "#endif", "[Files]", _OK)),
+    ("contract", "#define of another name", _iss("#ifndef BuildDir", '#define AppVersion "x"', "#endif", "[Files]", _OK)),
+    ("contract", "#define without #ifndef", _iss('#define BuildDir "x"', "[Files]", _OK)),
+    ("contract", "a header block twice", _iss(*_HEADER, *_HEADER, "[Files]", _OK)),
+    ("contract", "a header block after the first section", _iss("[Setup]", *_HEADER, "[Files]", _OK)),
+    ("contract", "a header block with no #endif", _iss("#ifndef BuildDir", '#define BuildDir "x"', "[Files]", _OK)),
+    ("contract", "a header block the script ends inside", _iss("#ifndef BuildDir")),
+    ("contract", "a blank line inside a header block", _iss("#ifndef BuildDir", "", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
+    ("contract", "text after the #ifndef name", _iss("#ifndef BuildDir x", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
+    ("contract", "text after the #define literal", _iss("#ifndef BuildDir", '#define BuildDir "x" y', "#endif", "[Files]", _OK)),
+    ("contract", "two spaces in #ifndef", _iss("#ifndef  BuildDir", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
+    ("contract", "a tab after #", _iss("#\tifndef BuildDir", '#define BuildDir "x"', "#endif", "[Files]", _OK)),
+    ("contract", "#endif with a comment", _iss("#ifndef BuildDir", '#define BuildDir "x"', "#endif // x", "[Files]", _OK)),
+    ("contract", "header literal with a space", _iss("#ifndef BuildDir", '#define BuildDir "a b"', "#endif", "[Files]", _OK)),
+    ("contract", "header literal with [", _iss("#ifndef BuildDir", '#define BuildDir "[Files]"', "#endif", "[Files]", _OK)),
+    ("contract", "header literal with {", _iss("#ifndef BuildDir", '#define BuildDir "{app}"', "#endif", "[Files]", _OK)),
+    ("contract", "an unquoted header literal", _iss("#ifndef BuildDir", "#define BuildDir x", "#endif", "[Files]", _OK)),
+    ("contract", "text before the first section", _iss("AppName=x", "[Files]", _OK)),
+    ("contract", "a Pascal #13 starting a [Code] line", _iss("[Files]", _OK, "[Code]", "  #13#10 + 'x';")),
+    ("contract", "a Pascal #$0D starting a [Code] line", _iss("[Files]", _OK, "[Code]", "#$0D + 'x';")),
+    ("contract", "a bare #", _iss("#", "[Files]", _OK)),
+]
+
+
 WIN_ZIP = {
     "yuzu-agent-1.2.3-windows-x64/bin/yuzu-agent.exe": b"MZ",
     "yuzu-agent-1.2.3-windows-x64/bin/yuzu_agent_core.dll": b"MZ",
@@ -449,62 +639,41 @@ class Units(unittest.TestCase):
         self.assertEqual(entries, [("bin", "yuzu-agent.exe"), ("bin", "*.dll"),
                                    ("plugins", "status.dll"), ("plugins", "echo.dll")])
 
-    def test_iss_refuses_what_it_cannot_map(self):
-        cases = {
-            "preprocessor": '[Files]\n#ifdef X\nSource: "a.dll"; DestDir: "{app}\\bin"\n#endif\n',
-            "outside app": '[Files]\nSource: "a.dll"; DestDir: "{sys}"\n',
-            "recursive": '[Files]\nSource: "x\\*"; DestDir: "{app}\\bin"; Flags: recursesubdirs\n',
-            "destname": '[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"; DestName: "b.dll"\n',
-            "empty": '[Setup]\nAppName=x\n',
-        }
-        ok = '[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"\n'
-        cases.update({
-            # An #include anywhere could add [Files] lines this parser never sees.
-            "include before [Files]": '#include "more.iss"\n' + ok,
-            "include in another section": '[Setup]\n#include "more.iss"\n' + ok,
-            "directive in [Code]": ok + '[Code]\n#define Extra "x"\n',
-            "conditional header": '#if Ver > 1\n#define BuildDir "x"\n#endif\n' + ok,
-            "expression define": '#define BuildDir GetEnv("X")\n' + ok,
-            "pragma": '#pragma option -v+\n' + ok,
-            "spaced include": '#  include "more.iss"\n' + ok,
-            # Windows' FindFirstFile semantics that fnmatch does not share.
-            "star dot star": '[Files]\nSource: "x\\*.*"; DestDir: "{app}\\bin"\n',
-            "question mark": '[Files]\nSource: "x\\a?.dll"; DestDir: "{app}\\bin"\n',
-            "two stars": '[Files]\nSource: "x\\*core*.dll"; DestDir: "{app}\\bin"\n',
-            "ispp in name": '[Files]\nSource: "x\\{#Name}.dll"; DestDir: "{app}\\bin"\n',
-            "ispp in destdir": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\{#Sub}"\n',
-            # A dotted extension after the `*` is not the `*.<ext>` form.
-            "star dot two extensions": '[Files]\nSource: "x\\*.dll.bak"; DestDir: "{app}\\bin"\n',
-            # ISPP joins a line ending in a backslash with the next: here a
-            # comment that turns into `Flags: recursesubdirs`.
-            "line continuation": '[Files]\nSource: "a.dll"; DestDir: "{app}\\bin"; Components: core \\\n'
-                                 '; Flags: recursesubdirs\n',
-            "ispp in flags": '#ifndef F\n#define F "recursesubdirs"\n#endif\n'
-                             '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\bin"; Flags: {#F}\n',
-            "ispp in another parameter": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\bin"; Components: {#C}\n',
-            "ispp in an unquoted source": '[Files]\nSource: {#BuildDir}\\a.dll; DestDir: "{app}\\bin"\n',
-            "header default with a semicolon": '#define BuildDir "x; Flags: recursesubdirs"\n' + ok,
-            "external": '[Files]\nSource: "{src}\\a.dll"; DestDir: "{app}\\bin"; Flags: external\n',
-            "dontcopy": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\bin"; Flags: ignoreversion dontcopy\n',
-            "download": '[Files]\nSource: "https://x/a.dll"; DestDir: "{app}\\bin"; Flags: external download\n',
-            "extractarchive": '[Files]\nSource: "x\\a.zip"; DestDir: "{app}\\bin"; Flags: external extractarchive\n',
-            "createallsubdirs": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\bin"; Flags: createallsubdirs\n',
-            "excludes": '[Files]\nSource: "x\\*.dll"; DestDir: "{app}\\bin"; Excludes: "a.dll"\n',
-            "dotdot destdir": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\..\\win"\n',
-            "dot destdir": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\.\\bin"\n',
-            "constant below app": '[Files]\nSource: "x\\a.dll"; DestDir: "{app}\\{code:Sub}"\n',
-            "unterminated quote": '[Files]\nSource: "x\\a.dll; DestDir: "{app}\\bin"\n',
-        })
-        for what, text in cases.items():
-            with self.subTest(what=what):
+    def test_iss_refuses_every_form_outside_the_contract(self):
+        # One row per refused form found so far (ISS_REFUSED, each tagged with
+        # the finding or pass that found it): every one must fail, naming its
+        # line, and none may reach the [Files] mapping.
+        for tag, what, text in ISS_REFUSED:
+            with self.subTest(tag=tag, what=what):
                 iss = self.tmp / "x.iss"
-                iss.write_text(text)
-                with self.assertRaises(self.mod.SbomError):
+                if isinstance(text, bytes):
+                    iss.write_bytes(text)
+                else:
+                    iss.write_text(text, encoding="utf-8")
+                with self.assertRaises(self.mod.SbomError) as cm:
                     self.mod.iss_file_entries(iss)
-        # Accepted: the header defaults and Pascal character constants in [Code].
+                self.assertRegex(str(cm.exception), r"^x\.iss(:\d+)?: ")
+        # A script that ends inside a header block says so (it has no [Files]
+        # either, so the message is what tells the two apart).
+        iss.write_text(_iss("; x", "#ifndef BuildDir", '#define BuildDir "x"'), encoding="utf-8")
+        with self.assertRaises(self.mod.SbomError) as cm:
+            self.mod.iss_file_entries(iss)
+        self.assertIn("the #ifndef BuildDir block is not finished", str(cm.exception))
+
+    def test_iss_accepts_the_contract_shape(self):
+        # What the contract does accept: the header blocks (indented #define,
+        # trailing blanks), {#Name} of a header name outside [Files] and in a
+        # quoted Source directory, comments and blank lines before the first
+        # section, a `#` that does not start a [Code] line, and every section
+        # header in ISS_SECTIONS.
+        sections = "".join(f"[{s}]\n" for s in self.mod.ISS_SECTIONS if s not in ("Files", "Code"))
         iss = self.tmp / "x.iss"
-        iss.write_text('#ifndef BuildDir\n  #define BuildDir "..\\build-windows"\n#endif\n' + ok +
-                       "[Code]\nconst CRLF = #13#10;\n  #$0D + 'x';\n")
+        iss.write_text("; comment\n\n#ifndef AppVersion\n  #define AppVersion \"0.7.0\"\n#endif  \n\n"
+                       "#ifndef BuildDir\n\t#define BuildDir \"..\\..\\build-windows\"\n#endif\n"
+                       "[Setup]\nAppVersion={#AppVersion}\nAppVerName=Yuzu {#AppVersion}\n" + sections +
+                       "[Files]\n; {#BuildDir} is expanded in a comment too\n"
+                       "Source: \"{#BuildDir}\\agents\\a.dll\"; DestDir: \"{app}\\bin\"\n"
+                       "[Code]\nconst CRLF = #13#10;\n")
         self.assertEqual(self.mod.iss_file_entries(iss), [("bin", "a.dll")])
 
     def test_iss_is_read_as_inno_setup_reads_it(self):
@@ -541,12 +710,23 @@ class Units(unittest.TestCase):
         iss.write_bytes(bom + "[Setup]\nAppCopyright=© Yuzu\n[Files]\n"
                               "Source: \"x\\café.dll\"; DestDir: \"{app}\\bin\"\n".encode("utf-8"))
         self.assertEqual(m.iss_file_entries(iss), [("bin", "café.dll")])
+        # The byte order mark is not part of the first line: a header block or
+        # a section header right after it is read as one.
+        for first in (b"[Files]\n", b'#ifndef BuildDir\n#define BuildDir "x"\n#endif\n[Files]\n'):
+            with self.subTest(first=first):
+                iss.write_bytes(bom + first + b'Source: "x\\a.dll"; DestDir: "{app}\\bin"\n')
+                self.assertEqual(m.iss_file_entries(iss), [("bin", "a.dll")])
         for what, data, msg in (("not utf-8", b'[Files]\nSource: "\xff.dll"; DestDir: "{app}"\n',
                                  "byte order mark but is not UTF-8"),
                                 ("no-break space", '[Files]\nSource: "a.dll";\u00a0DestDir: "{app}"\n'.encode(),
                                  "U+00A0"),
                                 ("line separator", '; a\u2028[Files]\n'.encode() + body, "U+2028"),
-                                ("C1 control", '; a\u0085b\n'.encode() + body, "U+0085")):
+                                ("C1 control", '; a\u0085b\n'.encode() + body, "U+0085"),
+                                # Every C1 control, not only the one that is a line break.
+                                ("C1 control U+0080", '; a\u0080b\n'.encode() + body, "U+0080"),
+                                ("C1 control U+0090", '[Files]\nSource: "a\u0090.dll"; DestDir: "{app}"\n'.encode(),
+                                 "U+0090"),
+                                ("C1 control U+009F", '; a\u009fb\n'.encode() + body, "U+009F")):
             with self.subTest(what=what):
                 iss.write_bytes(bom + data)
                 with self.assertRaises(m.SbomError) as cm:
@@ -592,6 +772,13 @@ class Units(unittest.TestCase):
         self.assertIn(("bin", "*.dll"), entries)
         self.assertEqual({sub for sub, _ in entries}, {"bin", "plugins"})
         self.assertGreater(sum(1 for sub, _ in entries if sub == "plugins"), 40)
+        # The contract's allowlists are the script's own shape, no wider: every
+        # header name is one the script defines, and every section one it has.
+        # Widening either is a deliberate edit here and in the script.
+        lines = [ln.strip(" \t") for ln in text.splitlines()]
+        self.assertEqual(sorted(ln.split()[1] for ln in lines if ln.startswith("#ifndef ")),
+                         sorted(self.mod.ISS_HEADER_NAMES))
+        self.assertEqual([ln[1:-1] for ln in lines if ln.startswith("[")], list(self.mod.ISS_SECTIONS))
 
     def test_pkg_staged_names_are_the_ones_build_pkg_stages(self):
         # The .pkg's payload names come from deploy/packaging/macos/build-pkg.sh,
@@ -716,12 +903,102 @@ class Units(unittest.TestCase):
                 with self.assertRaises(m.SbomError) as cm:
                     m.mark_image(c, s)
                 self.assertIn("only in part", str(cm.exception))
+        # Part of a marker on a pair that needs none: refused, not left as it is.
+        for part in full:
+            with self.subTest(nothing_to_mark=part):
+                c, s = force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "server-vendored", (part,))
+                with self.assertRaises(m.SbomError) as cm:
+                    m.mark_image(c, s)
+                self.assertIn("only in part", str(cm.exception))
         # Marked for other reasons: refused, not re-marked.
         c, s = make_image_pair("yuzu-agent", AGENT_IMAGE_FILES)
         m.mark_image(c, s)
         s["files"].append({"fileName": "usr/local/bin/yuzu-server", "SPDXID": "SPDXRef-File-x"})
         with self.assertRaises(m.SbomError):
             m.mark_image(c, s)
+
+    def test_mark_image_keeps_the_scans_own_spdx_comment(self):
+        # syft may write a comment on the image root; the marker's note lines
+        # are added after it, never written over it (p4-qe-2, w3).
+        m = self.mod
+        cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
+        spdx["packages"][0]["comment"] = "scanned by syft"
+        m.mark_image(cdx, spdx)
+        lines = spdx["packages"][0]["comment"].split("\n")
+        self.assertEqual(lines[0], "scanned by syft")
+        self.assertIn("yuzu:sbom:incomplete-reasons: server-vendored, image-static-cpp", lines[1:])
+        self.assertEqual(m.image_marker(cdx, spdx), (["server-vendored", "image-static-cpp"],) * 2)
+
+    def test_a_note_written_twice_is_refused(self):
+        # The script writes each note once; a second copy is ambiguous (the
+        # documented recipe prints both), so every reader refuses it rather
+        # than pick one (p4-qe-2, r3).
+        m = self.mod
+        with self.assertRaises(m.SbomError):
+            m.spdx_note("yuzu:sbom:incomplete-reasons: a\nyuzu:sbom:incomplete-reasons: b", "incomplete-reasons")
+        with self.assertRaises(m.SbomError):
+            m.cdx_note({"properties": [{"name": "yuzu:sbom:unpacked-files", "value": "1"},
+                                       {"name": "yuzu:sbom:unpacked-files", "value": "2"}]}, "unpacked-files")
+        self.assertEqual(m.cdx_note({"properties": [{"name": "yuzu:sbom:unpacked-files", "value": "2"}]},
+                                    "unpacked-files"), "2")
+        self.assertIsNone(m.cdx_note({}, "unpacked-files"))
+        # Through the release gate and mark-image: a duplicated reason line
+        # or property fails, whichever copy would have matched.
+        for dup in ("cdx", "spdx"):
+            with self.subTest(dup=dup):
+                cdx, spdx = make_image_pair("yuzu-server", SERVER_IMAGE_FILES)
+                m.mark_image(cdx, spdx)
+                if dup == "cdx":
+                    cdx["metadata"]["properties"].append({"name": "yuzu:sbom:incomplete-reasons",
+                                                          "value": "server-vendored, image-static-cpp"})
+                else:
+                    spdx["packages"][0]["comment"] += "\nyuzu:sbom:incomplete-reasons: server-vendored, image-static-cpp"
+                with self.assertRaises(m.SbomError) as cm:
+                    m.image_marker(cdx, spdx)
+                self.assertIn("appears 2 times", str(cm.exception))
+                adir = self.tmp / f"dup-{dup}"
+                adir.mkdir()
+                (adir / "yuzu-server-image.cdx.json").write_text(json.dumps(cdx))
+                (adir / "yuzu-server-image.spdx.json").write_text(json.dumps(spdx))
+                errs = m.image_pair_errors(adir)
+                self.assertEqual(len(errs), 1, errs)
+                self.assertIn("appears 2 times", errs[0])
+        doc = {"bomFormat": "CycloneDX", "components": [{"type": "library", "name": "x"}],
+               "metadata": {"component": {"name": "a.tar.gz"},
+                            "properties": [{"name": "yuzu:sbom:unpacked-files", "value": "1"}] * 2}}
+        path = self.tmp / "a.cdx.json"
+        path.write_text(json.dumps(doc))
+        self.assertEqual(m.check_file(path, None, 400),
+                         ["a.cdx.json: note yuzu:sbom:unpacked-files appears 2 times in the CycloneDX metadata "
+                          "properties"])
+
+    def test_schema_validation_is_not_vacuous(self):
+        # The validators the generate tests use are the vendored CycloneDX 1.7
+        # and SPDX 2.3 schemas, and they reject what those schemas forbid.
+        if schema_errors({"bomFormat": "CycloneDX"}) is None:
+            self.skipTest("jsonschema is not importable (YUZU_REQUIRE_JSONSCHEMA=1 makes this a failure)")
+        cdx_v, spdx_v = sbom_validators()
+        self.assertEqual(cdx_v.schema["$id"], "http://cyclonedx.org/schema/bom-1.7.schema.json")
+        self.assertEqual(spdx_v.schema["title"], "SPDX 2.3")
+        good_cdx = {"bomFormat": "CycloneDX", "specVersion": "1.7", "version": 1,
+                    "metadata": {"component": {"bom-ref": "a", "type": "application", "name": "a.tar.gz"}},
+                    "compositions": [{"aggregate": "incomplete", "assemblies": ["a"]}]}
+        good_spdx = {"spdxVersion": "SPDX-2.3", "dataLicense": "CC0-1.0", "SPDXID": "SPDXRef-DOCUMENT", "name": "a",
+                     "creationInfo": {"created": "2026-11-18T00:00:00Z", "creators": ["Tool: x"]},
+                     "packages": [{"SPDXID": "SPDXRef-a", "name": "a", "downloadLocation": "NOASSERTION"}]}
+        self.assertEqual(schema_errors(good_cdx), [])
+        self.assertEqual(schema_errors(good_spdx), [])
+        bad = {
+            "cdx: unknown aggregate": dict(good_cdx, compositions=[{"aggregate": "mostly"}]),
+            "cdx: component without a name": dict(good_cdx, components=[{"type": "library"}]),
+            "spdx: no creationInfo": {k: v for k, v in good_spdx.items() if k != "creationInfo"},
+            "spdx: file without checksums": dict(good_spdx, files=[{"SPDXID": "SPDXRef-f", "fileName": "f"}]),
+            "spdx: unknown relationship": dict(good_spdx, relationships=[
+                {"spdxElementId": "SPDXRef-a", "relationshipType": "HOLDS", "relatedSpdxElement": "NOASSERTION"}]),
+        }
+        for what, doc in bad.items():
+            with self.subTest(what=what):
+                self.assertTrue(schema_errors(doc))
 
     def test_spdx_notes_are_one_line_each(self):
         m = self.mod
@@ -1035,6 +1312,12 @@ class Check(unittest.TestCase):
             # Marked for something the image is not seen to hold.
             "yuzu-other": (force_mark(*make_image_pair("yuzu-other", ["usr/bin/busybox"]), "server-vendored"),
                            "marked incomplete (server-vendored / server-vendored) for nothing the image is seen"),
+            # Part of a marker on an image that needs none (p4-qe-2, p5): still
+            # "marked for nothing", never read as unmarked.
+            **{f"yuzu-other-{part}": (force_mark(*make_image_pair(f"yuzu-other-{part}", ["usr/bin/busybox"]),
+                                                 "server-vendored", (part,)),
+                                      "for nothing the image is seen to hold")
+               for part in ("composition", "property", "relationship", "comment")},
             # Every part but one: the reason tokens without the composition.
             "yuzu-server": (force_mark(*make_image_pair("yuzu-server", SERVER_IMAGE_FILES), tokens,
                                        ("property", "relationship", "comment")), "is marked only in part"),
@@ -1123,7 +1406,15 @@ class ArtifactSbom(unittest.TestCase):
         if vcpkg:
             args += ["--vcpkg-installed", self.tmp / "vcpkg_installed", "--triplet", TRIPLET,
                      "--manifest", self.tmp / "vcpkg.json"]
-        return run_script(*args, *extra, env=env)
+        r = run_script(*args, *extra, env=env)
+        if r.returncode == 0:
+            # Every SBOM pair generate writes is valid CycloneDX 1.7 and SPDX 2.3.
+            stem = load_script().artifact_stem(Path(artifact).name)
+            for fmt in ("cdx.json", "spdx.json"):
+                doc = json.loads((self.out / f"{stem}.{fmt}").read_text(encoding="utf-8"))
+                errs = schema_errors(doc)
+                self.assertFalse(errs, f"{stem}.{fmt} fails its schema: {errs[:5] if errs else errs}")
+        return r
 
     def vcpkg_names(self, cdx):
         return sorted(c["name"] for c in cdx["components"]
@@ -1367,6 +1658,25 @@ class ArtifactSbom(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("::error::yuzu-server-1.2.3-1.x86_64.rpm: rpm2cpio|cpio failed (rpm2cpio exited 1, cpio exited 0): "
                       "rpm2cpio: payload truncated", r.stderr)
+        self.assertFalse(self.out.exists() and any(self.out.iterdir()))
+
+    def test_cpio_failure_fails_the_run(self):
+        # The other side of the pipe (p4-qe-1): rpm2cpio succeeds, cpio exits
+        # non-zero (a corrupt payload, a full disk). Its exit code alone must
+        # fail the run.
+        make_vcpkg_tree(self.tmp)
+        stubs = self.tmp / "bin"
+        stubs.mkdir()
+        write_exe(stubs / "rpm2cpio", '#!/bin/sh\nexec cat "$1"\n')
+        write_exe(stubs / "cpio", '#!/bin/sh\ncat >/dev/null\necho "cpio: premature end of archive" >&2\nexit 2\n')
+        rel = self.tmp / "rel"
+        rel.mkdir()
+        rpm = rel / "yuzu-server-1.2.3-1.x86_64.rpm"
+        rpm.write_bytes(b"not a cpio archive")
+        r = self.generate(rpm, env={"PATH": f"{stubs}{os.pathsep}{os.environ.get('PATH', '')}"})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("::error::yuzu-server-1.2.3-1.x86_64.rpm: rpm2cpio|cpio failed (rpm2cpio exited 0, cpio exited 2): "
+                      "cpio: premature end of archive", r.stderr)
         self.assertFalse(self.out.exists() and any(self.out.iterdir()))
 
     def test_every_documented_note_reads_the_same_from_both_formats(self):

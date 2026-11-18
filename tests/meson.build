@@ -3544,7 +3544,9 @@ test('release artifact gate',
 # the artifact hash and name on the SBOM root, every artifact kind (the macOS
 # .pkg in its shipped layout, the installer filtered by its .iss), the
 # incompleteness mark, and the release check's bound and forbidden paths. The
-# generate tests skip on Windows (the stubs are #! scripts); the rest run.
+# generate tests skip on Windows (the stubs are #! scripts); the rest run. When
+# jsonschema is importable, every generated SBOM is also validated against the
+# vendored CycloneDX 1.7 and SPDX 2.3 schemas (YUZU_REQUIRE_JSONSCHEMA=1: required).
 test('per-artifact SBOM generator',
   _python3_test,
   args: [files('test_artifact_sbom.py')],

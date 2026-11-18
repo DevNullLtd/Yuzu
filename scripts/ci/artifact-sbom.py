@@ -185,9 +185,22 @@ def spdx_notes_comment(notes: dict) -> str:
 
 
 def spdx_note(comment, name: str):
-    """The value of note `name` in an SPDX root comment, or None."""
-    m = re.search(rf"^{re.escape(NOTE_PREFIX + name)}: (.*)$", comment or "", re.M)
-    return m.group(1) if m else None
+    """The value of note `name` in an SPDX root comment, or None. A note this
+    script writes once is ambiguous when it appears twice (the documented jq
+    recipe prints both lines), so a duplicate is refused, not resolved."""
+    found = re.findall(rf"^{re.escape(NOTE_PREFIX + name)}: (.*)$", comment or "", re.M)
+    if len(found) > 1:
+        raise SbomError(f"note {NOTE_PREFIX}{name} appears {len(found)} times in the SPDX root comment")
+    return found[0] if found else None
+
+
+def cdx_note(meta, name: str):
+    """The value of note `name` among CycloneDX metadata properties, or None;
+    a duplicate is refused, as in spdx_note()."""
+    found = [p.get("value") for p in (meta or {}).get("properties") or [] if p.get("name") == NOTE_PREFIX + name]
+    if len(found) > 1:
+        raise SbomError(f"note {NOTE_PREFIX}{name} appears {len(found)} times in the CycloneDX metadata properties")
+    return found[0] if found else None
 
 
 # ── Artifacts ────────────────────────────────────────────────────────────────
@@ -364,20 +377,65 @@ def count_files(root: Path) -> int:
 
 
 # ── InnoSetup installer contents ─────────────────────────────────────────────
+#
+# THE .iss CONTRACT (frozen). The installer SBOM lists the archive files that
+# deploy/packaging/windows/yuzu-agent.iss's [Files] section installs. This
+# parser does NOT emulate the Inno Setup preprocessor (ISPP) or compiler
+# (ISCC). It accepts one small, fixed shape, the shape that script has today,
+# and refuses every line outside it with an error naming the line, so an .iss
+# edit that steps outside the contract fails `generate` (and, before that,
+# docs-lint's test_the_real_iss_parses on the pull request) instead of being
+# mapped silently wrong. Extend the allowlists deliberately; never emulate more
+# ISPP. The contract (docs/ci-architecture.md states the same):
+#
+#  1. Lines split at CR, LF or CR LF; any other control byte is refused. With a
+#     UTF-8 byte order mark the script must be UTF-8 with no C1 control and no
+#     whitespace but space and tab; without one, a line this maps (a `#` line, a
+#     section header, a [Files] entry) must be ASCII (iss_lines()).
+#  2. Preprocessor lines. A line whose first non-blank character is `#` is
+#     accepted only before the first section, and only as the three-line block
+#         #ifndef <Name>
+#         #define <Name> "<literal>"
+#         #endif
+#     on consecutive lines, one space between the parts (leading and trailing
+#     blanks allowed), <Name> one of ISS_HEADER_NAMES and each defined once,
+#     <literal> made of ISS_HEADER_LITERAL's characters only. Every other `#`
+#     line is refused wherever it is: #include, #if, #pragma, #emit, the
+#     one-character forms (#+, #=, #:, #?, ...), and a Pascal `#13` that starts
+#     a [Code] line (ISPP would read it as a directive too).
+#  3. Inline expansions. `{#` is accepted only as exactly `{#<Name>}` with
+#     <Name> one of ISS_HEADER_NAMES, on any line (yuzu-agent.iss's [Setup] uses
+#     {#AppVersion}); inside [Files], only in the directory part of a quoted
+#     Source. Every other `{#` is refused, on any line, comments included. A
+#     header literal holds no `"`, `;`, `[`, `{` or line break, so its expansion
+#     cannot close a quoted value, start a [Files] parameter or a section, or
+#     expand again. ISPP reads that literal as written: its default
+#     Pascal-style strings have no escape sequences (ISPP.Preprocess.pas,
+#     DefaultOptions, issrc is-6_7_3), and only a `#pragma` could change that.
+#     The contract assumes ISCC runs with ISPP's defaults, as release.yml runs
+#     it (only /DAppVersion=<the tag's version> and /DBuildDir=<the build
+#     directory>); an ISPP switch on that command line (/{#, /$, /P, ...) is
+#     outside it.
+#  4. Section headers. A line whose first non-blank character is `[` must be
+#     exactly one of ISS_SECTIONS as written there: never `[ Files ]`,
+#     `[FILES]` (ISCC compares section names case-insensitively; this does
+#     not), `[/Files]` or a section the script does not use today. Before the
+#     first section only blank lines, `;` comments and the header blocks.
+#  5. A line ending in a backslash is refused. ISPP joins such a line with the
+#     next only once a `#pragma spansymbol` turns line spanning on (it is off
+#     by default: SpanSymbol #0, ISPP.Preprocess.pas), which rule 2 refuses;
+#     the refusal keeps the contract from depending on that.
+#  6. [Files] entries: see iss_file_entries().
+ISS_HEADER_NAMES = ("AppVersion", "BuildDir")
+ISS_SECTIONS = ("Setup", "Languages", "Types", "Components", "Files", "Dirs", "Run", "UninstallRun",
+                "InstallDelete", "UninstallDelete", "Code")
+ISS_HEADER_IFNDEF = re.compile(r"#ifndef ([A-Za-z_]\w*)")
+ISS_HEADER_LITERAL = r"[A-Za-z0-9._\\-]*"
+ISS_HEADER_DEFINE = re.compile(rf'#define ([A-Za-z_]\w*) "({ISS_HEADER_LITERAL})"')
+ISS_HEADER_ENDIF = "#endif"
+ISS_INLINE = re.compile(r"\{#([A-Za-z_]\w*)\}")
 
 ISS_ENTRY = re.compile(r'[ \t]*([A-Za-z]+)[ \t]*:[ \t]*("(?:[^"]|"")*"|[^;]*)[ \t]*(?:;|$)')
-
-# An ISPP (Inno Setup preprocessor) directive: `#` then a name. A Pascal
-# character constant in [Code] (`#13#10`, `#$0D`) is `#` then a digit or `$`.
-ISPP_DIRECTIVE = re.compile(r"^#[ \t]*[A-Za-z_]")
-# The only directives allowed, and only before the first section: a default for
-# a name the command line can override, as yuzu-agent.iss's header has:
-#   #ifndef BuildDir / #define BuildDir "..\..\..\build-windows" / #endif
-# Anything else (#include, #if, #pragma, a #define with an expression, any
-# directive inside a section) could add or change [Files] lines this parser
-# would then not see, so it is refused rather than evaluated. A default holds
-# no `;`, so expanding it cannot start another [Files] parameter.
-ISPP_HEADER_LINE = re.compile(r'^#[ \t]*(?:ifndef[ \t]+[A-Za-z_]\w*|define[ \t]+[A-Za-z_]\w*[ \t]+"[^"{};]*"|endif)[ \t]*$')
 # A Source basename this maps the same way Windows' FindFirstFile (which Inno
 # Setup uses) does: a literal name, or one `*` directly before a literal
 # extension (`*.dll`). `?` and `*.*` (which on Windows also matches a name with
@@ -409,14 +467,19 @@ def iss_lines(iss: Path) -> tuple[list[str], bool]:
     when it starts with a UTF-8 byte order mark; without one, UTF-8 when the
     whole file is valid UTF-8, otherwise the build machine's ANSI code page.
     A compiler before 6.3 reads every BOM-less script as ANSI. The release does
-    not pin the compiler (winget installs the current one) and this script
-    cannot know the build machine's code page, so with no BOM the lines this
-    parser maps must be ASCII (iss_file_entries refuses any other byte there),
-    which every one of those rules reads the same way; other lines are decoded
-    as Latin-1, byte for byte, and only looked at for a section header or a
-    directive. With a BOM the script must be UTF-8 throughout, and a Unicode
-    control character or a whitespace character other than space and tab is
-    refused on every line."""
+    not pin the compiler (release.yml uses whichever Inno Setup 6 the runner
+    already has, and installs the current one with winget only when it finds
+    none; v0.15.0 used a per-user 6.7.3 install) and this script cannot know
+    the build machine's code page, so with no BOM the lines this parser maps
+    must be ASCII (iss_file_entries refuses any other byte there), which every
+    one of those rules reads the same way; other lines are decoded as Latin-1,
+    byte for byte, and only looked at for a section header, a `#` line or a
+    `{#`: a `[` or `#` byte that starts a line is that character in every
+    encoding, and a `{#` byte pair that a double-byte code page would read as
+    part of another character is refused all the same (over-refusal only).
+    With a BOM the script must be UTF-8 throughout, and a Unicode control
+    character or a whitespace character other than space and tab is refused
+    on every line."""
     data = iss.read_bytes()
     bom = data.startswith(UTF8_BOM)
     if bom:
@@ -449,41 +512,74 @@ def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
     """[(dest_dir_below_app, source_basename_glob)] for each `Source:` line of
     the [Files] section of an InnoSetup script, e.g.
       Source: "{#BuildDir}\\agents\\plugins\\x\\x.dll"; DestDir: "{app}\\plugins"
-    -> ("plugins", "x.dll"). Fails on anything this cannot map onto the
-    archive layout without guessing: a line iss_lines() refuses; a non-ASCII
-    byte on a line this maps (a section header, a directive, a [Files] entry)
-    of a script without a byte order mark; a line ending in a backslash (ISPP
-    joins it with the next); a preprocessor directive other than the header
-    defaults (ISPP_HEADER_LINE); an ISPP expansion anywhere in a [Files] entry
-    but the directory of a quoted Source; a DestDir outside {app}, with a `.`
-    or `..` part or with a constant below {app}; a flag in ISS_UNMAPPED_FLAGS
-    or a parameter in ISS_UNMAPPED_PARAMS; an unterminated quoted value; a
-    Source name with a wildcard other than `*.<ext>`."""
+    -> ("plugins", "x.dll"). Reads the script under THE .iss CONTRACT above
+    and fails, naming the line, on anything outside it: a line iss_lines()
+    refuses; a non-ASCII byte on a line this maps (a `#` line, a section
+    header, a [Files] entry) of a script without a byte order mark; a line
+    ending in a backslash; a `#` line other than a header block before the
+    first section; a `{#` other than `{#<Name>}` of a header name; a section
+    header other than one of ISS_SECTIONS as written; other text before the
+    first section. In [Files]: an ISPP expansion anywhere but the directory of
+    a quoted Source; a DestDir outside {app}, with a `.` or `..` part or with a
+    constant below {app}; a flag in ISS_UNMAPPED_FLAGS or a parameter in
+    ISS_UNMAPPED_PARAMS; an unterminated quoted value; a Source name with a
+    wildcard other than `*.<ext>`."""
     lines, bom = iss_lines(iss)
     entries, section = [], None
+    # The header block being read: (the line expected next, its <Name>).
+    pending, defined = None, set()
     for lineno, raw in enumerate(lines, 1):
         line = raw.strip(" \t")
         where = f"{iss.name}:{lineno}"
+
+        def refuse(why: str):
+            return SbomError(f"{where}: {why}: {line!r} (outside the .iss contract in scripts/ci/artifact-sbom.py; "
+                             f"extend its allowlists deliberately, never emulate more of the preprocessor)")
         if line.endswith("\\"):
-            raise SbomError(f"{where}: a line ending in a backslash: the preprocessor joins it with the next "
-                            f"line, which this script does not do")
-        directive = bool(ISPP_DIRECTIVE.match(line))
-        header = line.startswith("[") and line.endswith("]")
-        entry = section == "files" and not directive and not header and bool(line) and not line.startswith(";")
+            raise SbomError(f"{where}: a line ending in a backslash: the preprocessor can join it with the next "
+                            f"line (#pragma spansymbol), which this script does not do")
+        directive = line.startswith("#")
+        header = line.startswith("[")
+        entry = section == "Files" and not directive and not header and bool(line) and not line.startswith(";")
         if not bom and (directive or header or entry) and not line.isascii():
             raise SbomError(f"{where}: a non-ASCII character in a line this maps, in a script with no UTF-8 byte "
                             f"order mark: Inno Setup reads that line as UTF-8 or in the build machine's ANSI code "
                             f"page depending on its version and the rest of the file; save the script as UTF-8 with "
                             f"a byte order mark, or keep the line ASCII")
+        for i in (i for i in range(len(line) - 1) if line.startswith("{#", i)):
+            m = ISS_INLINE.match(line, i)
+            if not m or m.group(1) not in ISS_HEADER_NAMES:
+                raise refuse(f"preprocessor expansion at column {i + 1}: only {{#<Name>}} of a header name "
+                             f"({', '.join(ISS_HEADER_NAMES)}) is accepted")
+        if pending is not None:
+            want, name = pending
+            m = (ISS_HEADER_DEFINE.fullmatch(line) if want == "define" else
+                 line == ISS_HEADER_ENDIF if want == "endif" else None)
+            if not m or (want == "define" and m.group(1) != name):
+                raise refuse(f"the #ifndef {name} block must continue with "
+                             + (f'#define {name} "<literal>"' if want == "define" else "#endif")
+                             + " on the next line (literal characters: letters, digits, `.`, `_`, `-`, `\\`)")
+            pending = ("endif", name) if want == "define" else None
+            if want == "endif":
+                defined.add(name)
+            continue
         if directive:
-            if section is not None or not ISPP_HEADER_LINE.match(line):
-                raise SbomError(f"{where}: preprocessor directive {line!r}: this script evaluates no ISPP, "
-                                f"and only a #ifndef/#define \"literal\"/#endif default before the first "
-                                f"section cannot change the [Files] lines")
+            if section is not None:
+                raise refuse("a preprocessor line after the first section")
+            m = ISS_HEADER_IFNDEF.fullmatch(line)
+            if not m or m.group(1) not in ISS_HEADER_NAMES or m.group(1) in defined:
+                raise refuse(f"a preprocessor line other than a header block (#ifndef <Name> / #define <Name> "
+                             f"\"<literal>\" / #endif, <Name> one of {', '.join(ISS_HEADER_NAMES)}, each once)")
+            pending = ("define", m.group(1))
             continue
         if header:
-            section = line[1:-1].strip(" \t").lower()
+            if not (line.endswith("]") and line[1:-1] in ISS_SECTIONS):
+                raise refuse(f"a section header other than exactly one of "
+                             f"{', '.join(f'[{s}]' for s in ISS_SECTIONS)}")
+            section = line[1:-1]
             continue
+        if section is None and line and not line.startswith(";"):
+            raise refuse("text before the first section other than a comment or a header block")
         if not entry:
             continue
         fields, quoted = {}, set()
@@ -522,6 +618,9 @@ def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
             raise SbomError(f"{where}: Source name {name!r}: only a literal name or `*.<ext>` is mapped "
                             f"onto the archive the way Inno Setup resolves it")
         entries.append(("/".join(parts), name))
+    if pending is not None:
+        raise SbomError(f"{iss.name}: the #ifndef {pending[1]} block is not finished at the end of the script "
+                        f"(outside the .iss contract in scripts/ci/artifact-sbom.py)")
     if not entries:
         raise SbomError(f"{iss.name}: no Source: lines in a [Files] section")
     return entries
@@ -862,8 +961,7 @@ def inspect(doc: dict):
         meta = doc.get("metadata") or {}
         root = meta.get("component") or {}
         sha = next((h.get("content") for h in root.get("hashes", []) or [] if h.get("alg") == "SHA-256"), None)
-        unpacked = next((_unpacked_files(p.get("value")) for p in meta.get("properties", []) or []
-                         if p.get("name") == NOTE_PREFIX + "unpacked-files"), 0)
+        unpacked = _unpacked_files(cdx_note(meta, "unpacked-files"))
         return "cdx", len(comps), paths, root.get("name"), sha, unpacked
     if "spdxVersion" in doc:
         root = _spdx_root(doc)
@@ -1016,8 +1114,7 @@ def image_marker(cdx: dict, spdx: dict):
     croot, sroot = _image_roots(cdx, spdx)
     cmarked = any(c.get("aggregate") == "incomplete" and croot.get("bom-ref") in (c.get("assemblies") or [])
                   for c in cdx.get("compositions") or [])
-    ctok = next((p.get("value") for p in (cdx.get("metadata") or {}).get("properties") or []
-                 if p.get("name") == NOTE_PREFIX + "incomplete-reasons"), None)
+    ctok = cdx_note(cdx.get("metadata"), "incomplete-reasons")
     smarked = any(r.get("spdxElementId") == sroot.get("SPDXID") and r.get("relationshipType") == "CONTAINS"
                   and r.get("relatedSpdxElement") == "NOASSERTION" for r in spdx.get("relationships") or [])
     stok = spdx_note(sroot.get("comment"), "incomplete-reasons")
