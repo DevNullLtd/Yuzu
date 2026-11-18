@@ -46,7 +46,7 @@ enum class AddressClass : std::uint8_t {
     Multicast,
     Reserved, // 240.0.0.0/4 including the limited broadcast address
     /// Single well-known cloud metadata endpoints that sit inside otherwise Private or Public
-    /// blocks: 100.100.100.200 (Alibaba, inside 100.64.0.0/10), 168.63.129.16 (Azure WireServer,
+    /// blocks: the Alibaba metadata address (inside the carrier-grade NAT block), 168.63.129.16 (Azure WireServer,
     /// otherwise "public"), fd00:ec2::254 (AWS IMDS over IPv6, inside fc00::/7). 169.254.169.254
     /// is LinkLocal (the block it lives in).
     CloudMetadata,

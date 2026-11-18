@@ -555,7 +555,7 @@ TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
 TEST_CASE("local_path: /proc, /sys and /dev paths are pseudo-filesystem paths", "[shared][local_path]") {
     for (const char* p : {"/proc", "/proc/kmsg", "/proc/self/exe", "/sys/kernel", "/dev/zero", "/dev"})
         CHECK(lp::posix_pseudo_fs_path(p));
-    for (const char* p : {"/procfs/x", "/system", "/devices/x", "/home/proc/kmsg", "/", "/tmp"})
+    for (const char* p : {"/procfs/x", "/system", "/devices/x", "/data/proc/kmsg", "/", "/tmp"})
         CHECK_FALSE(lp::posix_pseudo_fs_path(p));
 }
 
