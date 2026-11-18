@@ -166,9 +166,10 @@ status:
 ##            a root reached through a link or on a network mount is dropped and reported, and no
 ##            link is followed at any path component.
 ## Candidates are files named <stem>.so or <stem>.so.<digits and dots> (Linux) and <stem>.dylib
-## (macOS). Each candidate is opened once and its header is read in-process within fixed bounds
-## (at most 128 ELF program headers, 64 KiB of dynamic section, 4,096 Mach-O load commands in
-## 256 KiB; a fat or fat64 file is read through its first slice only). A file whose name matches
+## (macOS). Each candidate is opened once and its header is read in-process by the shared bounded
+## readers within fixed bounds (at most 128 ELF program headers, 4,096 dynamic entries, 1,024
+## Mach-O load commands in 512 KiB; a universal file uses its first readable dynamic-library slice).
+## The name and version a file declares are its own claim; no signature is checked. A file whose name matches
 ## but whose header says it is not a shared library gives no row. A shared library whose header
 ## cannot be read inside those bounds still gives a row, named from its file name, with the version
 ## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.

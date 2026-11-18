@@ -1583,18 +1583,21 @@ host listed). An excluded directory is counted and reported on a `supported` sta
 informational token `package_tree_skipped`: never a silent skip. This is the answer to the open
 question of whether package-owned trees are excluded: yes.
 
-**Readers.** The ELF SONAME (program headers, `PT_DYNAMIC`, `DT_SONAME` through the `PT_LOAD`
-mapping) and the Mach-O `LC_ID_DYLIB` (thin 32 and 64 bit, either byte order, fat and fat64) are read
-in-process over a read function bounded by the file size: no struct is cast over file bytes, every
-offset plus length is checked before the read with overflow-safe arithmetic, and every count and size
-has a ceiling (128 program headers, 64 KiB of dynamic section, 255-byte names, 16 fat slices, 4,096
-load commands in 256 KiB). A fat file's first slice inside the file is read through a window rebased to
-that slice, with the slice size as the file size, so no header, load command, command size or name can
-reach into a neighbouring slice. A file whose name matches and whose header says it is not a shared
-library gives no row; one that cannot be read inside the bounds gives a row from its file name, with
-`version_source` `unreadable` (an item-level gap; the scan stays complete). The parsers are fuzzed
-(`tests/fuzz/fuzz_component_native.cpp`, registered where the ZIP target is, path-filtered to
-`component_native_parsers*`) and covered by a deterministic truncation and byte-damage sweep.
+**Readers.** The ELF SONAME and the Mach-O `LC_ID_DYLIB` are read by the shared, bounded, fuzz-tested
+readers `read_elf` and `read_macho` (`agents/shared/binary_header_elf.hpp`, `binary_header_macho.hpp`,
+over `binary_header_reader.hpp`), not by parsers of the plugin's own. SAM-22 depends on the change that
+adds them and cannot merge before it. The plugin keeps a thin adapter
+(`component_native_parsers.hpp`) that turns a file's read function into the shared source and maps the
+result to three outcomes: `not_this_format` is not a library (no row); `io`, `truncated`, `malformed`
+and `limit_exceeded` are unreadable (a row from the file name, `version_source` `unreadable`, an
+item-level gap; the scan stays complete). An ELF is a library only when its type is `ET_DYN`; a Mach-O
+file only through the first slice that has no error and is an `MH_DYLIB`, and a slice that could not be
+read is never an answer. The consumer obligations of the shared readers are met here: the file's
+`unchanged()` is checked after every parse (`archive_changed`), each read is wrapped in the scan
+deadline, one `catch(...)` per file read keeps every exception inside the plugin, and every string
+taken from a reader passes the name sanitiser before it reaches a row. A name or version a file
+declares is the file's own claim, with no signature check. The readers carry their own fuzz targets;
+`tests/fuzz/fuzz_component_native.cpp` fuzzes the adapter and the naming rules.
 
 **Default off, at the dispatch gate.** `component_inventory.native` ships switched off through an
 action-level kill-switch row that the server seeds at boot (`seed_action_kill_switch_default_off`,
