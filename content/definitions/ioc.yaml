@@ -50,7 +50,10 @@ spec:
           to check. On Windows this queries the DNS resolver cache; on
           Linux/macOS it is a substring search over /etc/hosts lines
           (comments stripped), so a short domain can match more than
-          intended.
+          intended. At most 100 domains per command (counted after splitting on
+          commas, trimming whitespace and dropping empty entries;
+          duplicates count); more is refused with an error row and
+          nothing is checked.
       file_hashes:
         type: string
         displayName: File Hashes (SHA-256)
@@ -81,7 +84,9 @@ spec:
         type: string
         description: >
           Which IOC category this row checked. `error` appears only once,
-          in place of all rows, when no IOC parameter was provided at all.
+          in place of all rows (no header row, no check run, rc 1), when no
+          IOC parameter was provided (`error|none|false|...`) or more than
+          100 domains were (`error|domains|false|Too many domains ...`).
         values: [ip, domain, hash, file, port, error]
         example: ip
         platforms: [windows, linux, darwin]
@@ -100,7 +105,7 @@ spec:
       - name: detail
         type: string
         description: >-
-          Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run). Values: free text.
+          Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run; on Windows `DNS resolver cache could not be read` when the cache was unreadable, with the result also marked constrained). Values: free text.
         example: Found in /etc/hosts
         platforms: [windows, linux, darwin]
     aggregation:

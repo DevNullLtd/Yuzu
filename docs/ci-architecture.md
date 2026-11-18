@@ -3296,7 +3296,7 @@ agent-only (the `server` option is off for a non-Linux target), so a `build_serv
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
 | `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
 | `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
-| `local test runner platform selftest` | drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
+| `local test runner platform selftest 1 of 3` to `3 of 3` | three shards of one case set (each runs every third case); drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |

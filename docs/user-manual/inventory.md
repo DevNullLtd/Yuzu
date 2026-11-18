@@ -566,7 +566,8 @@ software is simply deleted from the device's list; the history entry is the reco
 there. History older than 400 days is pruned, and decommissioning a device deletes its history
 and its components with it. The change
 history is read through `GET /api/v1/inventory/software/changes` and the components through
-`GET /api/v1/inventory/software/components` (see the REST API reference); the dashboard shows
+`GET /api/v1/inventory/software/components` (see the REST API reference; the MCP tool
+`query_software_components` answers the same question); the dashboard shows
 neither yet. The agent of this build
 sends v3 (and no longer has a v2 writer). Operators can see the outcome of each section in
 `yuzu_inventory_section_ingest_total{facet,outcome}`, where `outcome` is `stored`, `status_only`,
@@ -910,13 +911,17 @@ active" filter.)
 The **`query_installed_software`** MCP tool exposes the same data to agentic
 workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
 
-- Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan.
+- Filter by software `name` and/or `agent_id`; omit both for a fleet-wide scan. The lookup
+  filters of the REST route are accepted too: `q`, `kind`, `ecosystem`, `source`, `match`
+  (`exact`, `prefix` or `contains`), `status` and `version_min` / `version_max`; the rows
+  carry the lookup fields and the result carries `count` and `totals`, exactly as the REST
+  `data` object (both call one function). `purl` and `vers` are REST-only.
 - Returns up to `limit` rows (max 1000; any integer that fits int64 is clamped to 1..1000).
   When `result_truncated_by_cap` is `true` more rows may exist: pass `next_cursor` back as
   `cursor` to continue the keyset walk (the cursor is opaque and bound to the filter set).
   Optional `version` filter; each row also carries `source`. A wrongly typed argument (a
-  non-string `agent_id`, `name`, `version` or `cursor`, or a non-integer `limit`) is refused
-  with `kInvalidParams`, never ignored or converted.
+  non-string `agent_id`, `name`, `version`, `cursor` or lookup filter, or a non-integer
+  `limit`) is refused with `kInvalidParams`, never ignored or converted.
 - **The caller's scope is applied in SQL** — the gate composes management-group
   visibility with the caller's service-scope tag
   (`meet(management-group, service-scope)`), so a management-group-confined
@@ -937,6 +942,11 @@ workers, gated SOLELY by `AuthRoutes::require_fleet_read` (#3290 Phase 2):
   response as "unknown — do **not** proceed as if nothing is installed". A
   genuinely empty result (no error, zero rows) means the query succeeded and
   matched nothing in your scope.
+- **Components and sync runs.** `query_software_components` is the twin of
+  `GET /api/v1/inventory/software/components` (same gate, scope, filters and `totals` rule;
+  strict input, and no CSV export). `sync_hardware_software` starts a paced on-demand sync
+  (`confirm`, `last_synced_before`) and returns an `execution_id`; `get_software_sync_status`
+  reads that run's progress (the twin of `GET /api/v1/hardware/sync/{execution_id}`).
 
 ### REST (for automation / scripts)
 
@@ -983,8 +993,8 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   `vers:<scheme>/...` string), `purl` (exact Package URL), `status`, `limit` (max 1000; 10000
   with `format`), `cursor` and `format` (`json` or `csv`: an export). Omit `name` and
   `agent_id` for a fleet-wide scan. The full parameter and error tables are in
-  [rest-api.md](rest-api.md); everything except `name`, `agent_id`, `version`, `limit` and
-  `cursor` is REST-only (the MCP tool takes only those).
+  [rest-api.md](rest-api.md); `format`, `purl` and `vers` are REST-only (the MCP tool takes
+  every other parameter).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
   {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
@@ -994,7 +1004,7 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
-  tool's rows keep the 14 package fields until its twin catches up.
+  tool's rows carry the same 23 fields.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
   purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
@@ -1427,7 +1437,8 @@ place, **Hardware** and **Software**, each its own page:
       the `202` body `agents_reached` is the number of agents that accepted the request; the
       audit row's `reached` is the number the run planned to send to. The body also carries
       an `execution_id`: `GET /api/v1/hardware/sync/{execution_id}` reports the frames
-      accepted and the agents that armed the sync or failed. An agent answers when it arms
+      accepted and the agents that armed the sync or failed (the MCP tool
+      `get_software_sync_status` reads the same record). An agent answers when it arms
       the sync, not when its report lands, so those figures count requests taken up, not
       reports received.
   - **Who sees what.** The catalogue is a fleet-wide aggregate that cannot be narrowed to
@@ -1930,7 +1941,7 @@ The server turns every distinct installed-software title into a stable identity 
 - **Automatic product creation is off.** The job does not create products for unmatched titles; they wait in the queue.
 - **What is kept, and for how long.** The title dimension is permanent: it keeps one row for every distinct title the fleet has ever reported, and is never pruned. Titles that embed a version in their name (many do) therefore add rows over time, so the table grows with the number of distinct titles ever seen, not with the current fleet. `yuzu_software_titles` shows how many titles are in the current fleet; the table's size is visible in Postgres. A future retention policy would be a separate decision. The curation queue is different: its open rows always mirror the current fleet, and an empty title list (see below) empties it; only each row's first-queued time is lost, because the rows are rebuilt as titles return.
 - **Titles that are too long.** A title whose name, publisher and ecosystem together exceed 2,400 bytes is left out of the title list, and so is never normalised or queued; this is far beyond any real software name and exists so that one malformed report cannot stop the whole catalogue refresh. Each catalogue refresh that leaves such titles out writes one warning to the server log with their count.
-- **Where to look.** `GET /api/v1/inventory/software/normalization/status` gives the pack version and the title and queue counts, and `GET .../queue` lists the titles waiting for curation, most-installed first (see [REST API](rest-api.md#software-normalisation-curation)). There is no MCP tool or page for this yet (the MCP twin is a recorded ADR-1005 exception, revisit by 2026-12-31). The Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and the metrics below, remain available.
+- **Where to look.** `GET /api/v1/inventory/software/normalization/status` gives the pack version and the title and queue counts, and `GET .../queue` lists the titles waiting for curation, most-installed first (see [REST API](rest-api.md#software-normalisation-curation)). The same operations are MCP tools: `get_software_normalization_status`, `list_software_curation_queue`, `curate_software_alias`, `reject_software_curation` and `replace_software_normalization_pack` each call the same function as their route, under the same global grant and the same audit-before-write rows (the MCP `requested` row omits the correlation id the REST row carries; see [Audit log](audit-log.md)), and the three writes need a supervised-tier MCP token ([MCP tools](mcp.md)); over MCP the whole JSON-RPC request is also capped at 4 MiB before routing. There is no page for this yet. The Postgres tables `product_registry_store.title_dimension` (one row per title) and `product_registry_store.curation_queue`, and the metrics below, remain available.
 - **Known limits of the seed pack.** The seed is a starting set, not a measured one. Its Windows rows bind to the `windows` ecosystem only, so the same product reported as an `msi`, `optional_feature` or `macos_pkgutil` title is queued rather than matched. Several raw names will not match what a collector really reports (a locale suffix, or an edition word the real title omits). The version token recorded for a title is its first version-like word, so `SQL Server 2019` records `2019`. A short generic name with no vendor (a `via:` label: `git`, `curl`, `bash`) matches a pack row that carries a product token, so `normalized` does not mean the publisher was verified. And the pack names products with short canonical titles, so a deployment whose registry already holds a longer name for the same product may hold both.
 - **Metrics and alerts.** `yuzu_software_titles{norm_status}`, `yuzu_software_unnormalized_ratio` (install-weighted, the headline coverage figure), `yuzu_software_normalization_curation_queue_size`, `yuzu_software_normalization_pack_info{pack_version}` and the job's run, duration and last-success series. `YuzuSoftwareNormalizationStale` fires when no clean tick has completed for over two hours; `YuzuSoftwareNormalizationFailing` fires when two hourly ticks fail within three hours. The ratio is not exported until the title list has had a first non-empty read, and it keeps its last value if the list later becomes empty; an empty list is never reported as a perfect score.
 - **When the catalogue rollup stalls.** The job's title list is rebuilt by the hourly catalogue rollup, so it inherits that rollup's limits, including its scale ceiling of about 6,000 endpoints. When the rollup stops completing, the title list stops refreshing, the normalisation gauges freeze at their last values and no new title is picked up, while the job itself keeps ticking cleanly, so neither normalisation alert fires. The signal is the catalogue rollup's own alerts (`YuzuInventoryCatalogRollupStale` and `YuzuInventoryCatalogRollupFailing`): check them first.
@@ -1946,7 +1957,7 @@ The server keeps the dates after which a software title or an operating system v
 - **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
 - **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
 - **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
-- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000).
+- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000). The same three operations are MCP tools, `list_software_lifecycle_rules`, `import_software_lifecycle_rules` and `delete_software_lifecycle_rules`: each calls the same function as its route, under the same global grant, limits, refusals and audit rows, and is available to a supervised-tier MCP token ([MCP tools](mcp.md)); the whole JSON-RPC request is also capped at 4 MiB before routing, so a large `cle` file whose JSON-escaped form plus the envelope passes that cap is refused by the transport. The catalogue identity and `package_id` half of the lifecycle surface is not part of this and is not built yet (#6090).
 - **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)
