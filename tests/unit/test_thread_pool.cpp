@@ -13,8 +13,11 @@
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
+#include <memory>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -133,4 +136,104 @@ TEST_CASE("ThreadPool applies backpressure when the queue is full", "[thread_poo
     REQUIRE_FALSE(pool.submit([] {}));
 
     // release_on_exit unblocks the workers so ~ThreadPool joins cleanly.
+}
+
+// ── Protective lane (ADR-0074): a reserved slot containment can always use ──────────────────────
+
+namespace {
+// Blocks until released; counts how many have STARTED.
+struct Gate {
+    std::mutex m;
+    std::condition_variable cv;
+    bool open = false;
+    std::atomic<int> started{0};
+    void block() {
+        ++started;
+        std::unique_lock lock(m);
+        cv.wait_for(lock, std::chrono::seconds(30), [this] { return open; });
+    }
+    void release() {
+        { std::lock_guard lock(m); open = true; }
+        cv.notify_all();
+    }
+};
+
+bool spin_until(const std::function<bool()>& pred, std::chrono::milliseconds limit = std::chrono::seconds(10)) {
+    const auto end = std::chrono::steady_clock::now() + limit;
+    while (!pred()) {
+        if (std::chrono::steady_clock::now() > end)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+    }
+    return true;
+}
+} // namespace
+
+TEST_CASE("ThreadPool: N-1 stuck ordinary tasks cannot starve a protective task", "[thread_pool][protective]") {
+    // 4 workers, 1 reserved: at most 3 ordinary tasks may run at once. Submit 6 stuck ordinary
+    // tasks: exactly 3 start, the other 3 wait in the queue, and the reserved worker stays free.
+    auto gate = std::make_shared<Gate>();
+    auto gauge = std::make_shared<yuzu::agent::PoolGauge>();
+    {
+        ThreadPool pool(4, 1000, /*reserved_protective=*/1, gauge);
+        for (int i = 0; i < 6; ++i)
+            REQUIRE(pool.submit([gate] { gate->block(); }));
+        REQUIRE(spin_until([&] { return gate->started.load() == 3; }));
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        CHECK(gate->started.load() == 3); // never the 4th: the last slot is reserved
+        CHECK(pool.stats().running == 3);
+        // The heartbeat reads this gauge (yuzu.command_pool_busy = "running/workers"): 3 of 4, 3 queued.
+        CHECK(gauge->workers.load() == 4);
+        CHECK(gauge->running.load() == 3);
+        CHECK(gauge->queued.load() == 3);
+
+        std::atomic<bool> protective_ran{false};
+        const auto t0 = std::chrono::steady_clock::now();
+        REQUIRE(pool.submit([&] { protective_ran = true; }, /*protective=*/true));
+        CHECK(spin_until([&] { return protective_ran.load(); }, std::chrono::seconds(2)));
+        CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(2));
+        gate->release(); // let the ordinary ones drain before the pool is destroyed
+    }
+}
+
+TEST_CASE("ThreadPool: a protective task also runs when every ordinary slot is busy and queued behind",
+          "[thread_pool][protective]") {
+    auto gate = std::make_shared<Gate>();
+    ThreadPool pool(4, /*max_queue_size=*/2, /*reserved_protective=*/1);
+    for (int i = 0; i < 3; ++i) { // one at a time: the queue bound is 2, a worker must take each first
+        REQUIRE(pool.submit([gate] { gate->block(); }));
+        REQUIRE(spin_until([&] { return gate->started.load() == i + 1; }));
+    }
+    for (int i = 0; i < 2; ++i) // 2 more wait in the ordinary queue (its bound)
+        REQUIRE(pool.submit([gate] { gate->block(); }));
+    CHECK_FALSE(pool.submit([] {})); // the ordinary lane is full ...
+    std::atomic<bool> ran{false};
+    CHECK(pool.submit([&] { ran = true; }, true)); // ... and does not reject a protective task
+    CHECK(spin_until([&] { return ran.load(); }, std::chrono::seconds(2)));
+    gate->release();
+}
+
+TEST_CASE("ThreadPool: with no reserved slot an ordinary task takes every worker (the regression this fixes)",
+          "[thread_pool][protective]") {
+    auto gate = std::make_shared<Gate>();
+    ThreadPool pool(4, 1000, /*reserved_protective=*/0);
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(pool.submit([gate] { gate->block(); }));
+    REQUIRE(spin_until([&] { return gate->started.load() == 4; }));
+    std::atomic<bool> ran{false};
+    REQUIRE(pool.submit([&] { ran = true; }, true));
+    std::this_thread::sleep_for(std::chrono::milliseconds(300));
+    CHECK_FALSE(ran.load()); // starved: no free worker at all
+    gate->release();
+    CHECK(spin_until([&] { return ran.load(); }));
+}
+
+TEST_CASE("ThreadPool: the reservation never leaves zero workers for ordinary tasks and drains on stop",
+          "[thread_pool][protective]") {
+    ThreadPool pool(4, 1000, /*reserved_protective=*/99); // clamped to workers - 1
+    CHECK(pool.stats().reserved_protective == 3);
+    std::atomic<int> done{0};
+    for (int i = 0; i < 10; ++i)
+        REQUIRE(pool.submit([&] { ++done; }));
+    CHECK(spin_until([&] { return done.load() == 10; }));
 }

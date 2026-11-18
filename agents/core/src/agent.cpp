@@ -82,6 +82,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "spark_heartbeat.hpp" // emit_spark_heartbeat_tags — spark fleet telemetry
 #include "spark_mechanism.hpp" // make_{file,registry,service}_mechanism factories
 #include "thread_pool.hpp" // bounded dispatch pool + per-task exception firewall (#2037)
+#include <yuzu/protective_actions.hpp> // is_protective_action: the reserved-lane predicate (ADR-0074)
 
 #ifdef _WIN32
 #include <winsock2.h> // gethostname (must precede windows.h)
@@ -272,6 +273,12 @@ std::string read_file_contents(const std::filesystem::path& p) {
 // Stream type alias: agent writes CommandResponse, reads CommandRequest.
 // (Subscribe RPC: stream CommandResponse -> stream CommandRequest)
 using SubscribeStream = grpc::ClientReaderWriter<pb::CommandResponse, pb::CommandRequest>;
+
+// Command pool shape (ADR-0074): the queue depth every lane uses (the ThreadPool default), and the
+// number of workers held back for PROTECTIVE actions so containment cannot be starved by stuck
+// ordinary commands. Both pool construction sites use these two names.
+constexpr std::size_t kCommandQueueDepth = 1000;
+constexpr std::size_t kReservedProtectiveWorkers = 1;
 
 // ThreadPool (bounded dispatch pool + per-task exception firewall, #2037) now
 // lives in thread_pool.hpp so the firewall behaviour is unit-testable in
@@ -1316,7 +1323,8 @@ public:
         // point of rung 1 — an agent that lives long enough to SAY spark degraded, rather
         // than a crash-loop that destroys the very signal the degrade path produces.
         try {
-            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+            thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
         } catch (const std::exception& e) {
             spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
                              "is out of threads. Exiting with a startup failure rather than "
@@ -2866,6 +2874,15 @@ public:
                             // which is not separately detectable. "replays" counts
                             // served terminal replays.
                             tags["yuzu.dedup_degraded"] = command_dedup_ ? "0" : "1";
+                            // ADR-0074: the command pool's in-flight gauge (tasks executing now,
+                            // "running/workers", plus "queued"): a wedge (every ordinary worker
+                            // held by a stalled filesystem or resolver) shows here while the
+                            // reserved protective worker keeps containment running.
+                            // Read from pool_gauge_ (lock-free atomics that outlive every pool),
+                            // never from thread_pool_ itself: a reconnect destroys and re-creates it.
+                            tags["yuzu.command_pool_busy"] = std::to_string(pool_gauge_->running.load()) +
+                                                             "/" + std::to_string(pool_gauge_->workers.load());
+                            tags["yuzu.command_pool_queued"] = std::to_string(pool_gauge_->queued.load());
                             // #3665: >0 when THIS process start recovered from a corrupt
                             // command_dedup.db (history before the boot was lost). Without
                             // this tag the recovery would be visible only in the endpoint's
@@ -3891,6 +3908,11 @@ public:
                     // so concurrent dispatch is required.
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
+                    // ADR-0074: a protective action (the closed firewall containment set and
+                    // __guard__.push_rules) goes to the pool's reserved lane; every other command
+                    // can never occupy the last reserved worker.
+                    const bool protective_lane =
+                        yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());
                     bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
                         // Outer exception firewall (#2037). The ThreadPool worker
                         // already contains any escaped exception so the agent
@@ -3912,7 +3934,7 @@ public:
                             send_dispatch_failure(stream, cmd.command_id(),
                                                   "agent dispatch error: non-std exception");
                         }
-                    });
+                    }, protective_lane);
 
                     if (!submitted) {
                         spdlog::warn("Thread pool queue full — rejecting command {}",
@@ -4092,7 +4114,8 @@ public:
                     // cleanly. (governance: cpp-safety BLOCKING, sre OR-5, happy-path F1.)
                     try {
                         thread_pool_ =
-                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency());
+                            std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
+                                                         kReservedProtectiveWorkers, pool_gauge_);
                     } catch (const std::exception& e) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect ({}) — the host is out of threads. Stopping "
@@ -5007,6 +5030,8 @@ private:
     // tag.
     std::shared_ptr<std::atomic<bool>> dex_health_;
     std::unique_ptr<ISignalObserver> dex_observer_;
+    // Declared BEFORE thread_pool_ (it outlives every pool and is read by the heartbeat thread).
+    std::shared_ptr<PoolGauge> pool_gauge_ = std::make_shared<PoolGauge>();
     std::unique_ptr<ThreadPool> thread_pool_;
     // F3 orphan-exit accounting for mechanism-internal detached workers
     // (#2012/#3840 plan, "F3 orphan-exit accounting - Route A (corrected)").
