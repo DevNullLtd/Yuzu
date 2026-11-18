@@ -3577,9 +3577,24 @@ test('server feature option lint',
   timeout: 300,
 )
 
-test('local test runner platform selftest',
+# Three shards of one selftest (`<index>/<count>` picks every count-th case): it runs the real runner
+# in a fresh set of shells per case, which takes about 19 s on an idle Windows runner and passed the
+# 30 s limit on a loaded one (#8207), the split the CI guard's own warning asks for.
+test('local test runner platform selftest 1 of 3',
   _python3_test,
-  args: [files('test_run_tests_platform.py')],
+  args: [files('test_run_tests_platform.py'), '0/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 2 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '1/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 3 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '2/3'],
   suite: 'platform',
   timeout: 30,
 )
