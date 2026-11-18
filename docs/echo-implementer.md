@@ -633,7 +633,7 @@ header):
    `registry`, which also adds the sixth `System` category chip) in a static array
    (`kSources` in `echo_process_tree.cpp`, plus the Push allowlist in
    `echo_tree_routes.cpp` and `kSrc` in `live_model.cpp`'s `parse_capture_sources`); a new source is toggled through `echo.configure`
-   until it is added to both; presentation metadata (category, always-on, `$`-name, badges)
+   until it is added to all three; presentation metadata (category, always-on, `$`-name, badges)
    lives in that render function. Device-level panels (no pid) go in the
    process-tree pane (`render_echo_*_panel` + an `echo_tree_routes` fragment).
 10. **Tests** — extend `test_echo_schema_registry.cpp` (every source has all three

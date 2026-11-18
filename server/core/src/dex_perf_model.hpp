@@ -15,8 +15,9 @@
 /// header ("A4: device perf sparklines" and "F2a PR2: device drill perf extensions") hold
 /// the DexPerfPoint and DexProcPerfRow parsers, which parse the per-device Echo
 /// `echo.sql` output, and the canned SQL strings that produce it. They are still pure
-/// functions over strings (no I/O, no store); the query itself is dispatched by
-/// dex_routes.cpp.
+/// functions over strings (no I/O, no store) apart from the wall-clock read in
+/// dex_procperf_sql(), whose pure form is dex_procperf_sql_at(); the query itself is
+/// dispatched by dex_routes.cpp.
 ///
 /// Honesty rules: a metric nobody reported is ABSENT (std::nullopt), never 0;
 /// every aggregate carries its reporting population; cohorts below

@@ -95,11 +95,11 @@ TEST_CASE("live kind table: the 22 audit verbs are pinned as literals", "[live][
     CHECK(table_verbs == expected_verbs);
 }
 
-// QE-4: the table has exactly the 22 pinned rows. The table is private, so the check runs
-// through the public resolvers: every pinned token resolves, and made-up neighbours of the
-// pinned tokens (a plausible 23rd kind, the DEX perf names, singular/plural and case
-// variants) do not.
-TEST_CASE("live kind table: exactly the 22 pinned tokens resolve", "[live][model]") {
+// QE-4: the table is private and has no enumerator, so this cannot prove the row count. It
+// runs through the public resolvers: every pinned token resolves, and a fixed list of made-up
+// neighbours of the pinned tokens (a plausible 23rd kind, the DEX perf names, singular/plural
+// and case variants) does not. A 23rd row whose token is not in that list is not detected.
+TEST_CASE("live kind table: the 22 pinned tokens resolve and listed neighbours do not", "[live][model]") {
     std::size_t resolved = 0;
     for (const auto& k : all_kinds())
         if (live::resolve_dashboard_kind(k))
@@ -120,8 +120,8 @@ TEST_CASE("live kind table: REST subset is exactly uptime + processes", "[live][
     for (const auto& k : all_kinds())
         if (live::resolve_rest_kind(k))
             rest.insert(k);
-    // This exact-set pin is the tripwire for a positional mis-port of the in-flight #8122's
-    // `bool escaped_rows` into LiveKind: a positional `true` after `columns` would silently
+    // This exact-set pin is the tripwire for a positional mis-port of a `bool escaped_rows`
+    // field (see #8122) into LiveKind: a positional `true` after `columns` would silently
     // bind to `rest_v1` and widen the REST surface to a dashboard-only kind, which this
     // check turns into a failure. Do not loosen it to a subset check.
     CHECK(rest == std::set<std::string>{"uptime", "processes"});
@@ -269,6 +269,15 @@ TEST_CASE("live parsers: services shapes follow the device OS, then the sniff", 
         REQUIRE(s.rows.size() == 1);
         CHECK(s.rows[0].name == "x");
         CHECK(s.rows[0].display == "123"); // not misread as a macOS pid
+        CHECK(s.rows[0].status == "Stopped");
+        CHECK(s.rows[0].startup == "Manual");
+        CHECK(s.running == 0);
+    }
+    SECTION("unknown OS, 5-field row with a dash in column 2 also defaults to the Windows shape") {
+        const auto s = live::parse_services("svc|x|-|Stopped|Manual\n", "");
+        REQUIRE(s.rows.size() == 1);
+        CHECK(s.rows[0].name == "x");
+        CHECK(s.rows[0].display == "-");
         CHECK(s.rows[0].status == "Stopped");
         CHECK(s.rows[0].startup == "Manual");
         CHECK(s.running == 0);

@@ -96,8 +96,8 @@ inline constexpr std::size_t kMaxLiveRows = 20000;
 ///
 /// Set new fields BY NAME (designated initialisers or an assignment after
 /// construction), never positionally: a positional bool added after `columns` would
-/// silently bind to `rest_v1` (a positional bool port was the hazard raised in review
-/// of the in-flight #8122, which adds `bool escaped_rows`). The `rest == {uptime,
+/// silently bind to `rest_v1` (a change that appends a positional `bool escaped_rows`
+/// to the kind table was the hazard raised in review of #8122). The `rest == {uptime,
 /// processes}` pin in test_live_model.cpp is the tripwire for such a mis-port.
 struct LiveKind {
     std::string plugin;
