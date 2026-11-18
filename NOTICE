@@ -60,6 +60,13 @@ section is maintained manually; see `vcpkg.json` and
   cpp-httplib ........................... MIT
   SQLite ................................ Public Domain
   libpq (PostgreSQL client library) ..... PostgreSQL License (BSD-style)
+  libxlsxwriter (server) ................ BSD-2-Clause
+      Copyright 2014-2026, John McNamara. It carries FreeBSD's queue.h
+      (BSD-3-Clause) and tree.h (BSD-2-Clause), an MD5 implementation (public domain) and
+      tmpfileplus, which is
+      MPL-2.0 (Copyright (c) 2012-16 David Ireland): that one file is compiled in unmodified
+      and its source is available from the libxlsxwriter release the vcpkg port builds
+  minizip (libxlsxwriter dependency) .... Zlib
   OpenSSL ............................... Apache-2.0 / OpenSSL
   Catch2 (test only) .................... BSL-1.0
   ctx ................................... Apache-2.0

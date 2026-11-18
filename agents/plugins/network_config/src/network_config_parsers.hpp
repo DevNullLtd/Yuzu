@@ -84,7 +84,38 @@
 #include <netinet/in.h>
 #endif
 
+#include <uri_userinfo_redact.hpp> // yuzu::shared::redact_proxy_value
+#include <row_field.hpp>           // yuzu::shared::row_field
+
 namespace yuzu::network_config {
+
+/// VESTIGIAL. An earlier design treated a single URL and a WinHTTP list
+/// differently; the redaction is now ONE fail-closed rule and both shapes
+/// behave identically. Kept (with the Windows call site that passes `list`)
+/// because that code cannot be recompiled from every build host; do not add
+/// behaviour that depends on it.
+enum class ProxyShape { single, list };
+
+/// One `proxy_address|<value>` row. The value is an endpoint-supplied proxy
+/// setting. If it holds ANY '@' the output is `REDACTED@` plus the text after
+/// the LAST '@' of the whole value (scheme, earlier list entries and a path
+/// '@' are dropped on purpose: yuzu::shared::redact_proxy_value); a value with
+/// no '@' is unchanged. The result goes through yuzu::shared::row_field (backslash-preserving) so a '|', CR
+/// or LF cannot forge columns or rows. `shape` is vestigial (see ProxyShape).
+[[nodiscard]] inline std::string format_proxy_address_row(std::string_view raw,
+                                                          ProxyShape shape = ProxyShape::single) {
+    return "proxy_address|" + yuzu::shared::row_field(
+                                  shape == ProxyShape::list
+                                      ? yuzu::shared::redact_proxy_value(raw)
+                                      : yuzu::shared::redact_proxy_single(raw));
+}
+
+/// One `bypass|<value>` row (`no_proxy`, the WinHTTP bypass list, the macOS
+/// exceptions list). Endpoint-controlled free text: yuzu::shared::row_field keeps a
+/// '|', CR or LF from adding columns or forging `proxy_*` rows.
+[[nodiscard]] inline std::string format_bypass_row(std::string_view raw) {
+    return "bypass|" + yuzu::shared::row_field(raw);
+}
 
 // ── /proc/net/arp (Linux arp leg) ────────────────────────────────────────
 
