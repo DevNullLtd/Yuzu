@@ -107,7 +107,7 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What the server does.** A policy check response nested past the depth guard, or whose evaluation throws, scores that device `error` (the check result carries `{"reason":"unevaluable_response"}` when evaluation threw) and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception"}`; the collect pass carries on with every other device, and each target is its own failure domain. A numeric JSON value in a row is compared as text, as before (`{"hostname":1}` reads as `"1"`). The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR, CRLF and LF as one line break, and result rows lose every embedded carriage return (not only a trailing one).
 
-**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings it diffs at collection.
+**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings of its snapshot-diff sources and its fleet snapshot at collection (its cursor-based sources keep their own replacing cursor codecs).
 
 **Still open.**
 - Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.

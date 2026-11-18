@@ -3134,16 +3134,18 @@ groups:
             pressure, and remember the status shown for the affected devices may be stale.
 
       # WP07: the server's boot-time check found the PostgreSQL database encoding is not UTF8.
-      # The check is WARN-ONLY (refusing to start is an undecided owner call), so this alert is
+      # The gauge is per replica but the fact is per database (every replica shares one), so the
+      # alert groups by job only: one alert for the deployment, not one per replica. The check is
+      # WARN-ONLY (refusing to start is an undecided owner call), so this alert is
       # the only thing that keeps the condition visible after the one-off log line scrolls away.
       - alert: YuzuPgServerEncodingNotUtf8
         expr: |
-          max by (job, instance) (yuzu_pg_server_encoding_not_utf8) == 1
+          max by (job) (yuzu_pg_server_encoding_not_utf8) == 1
         for: 5m
         labels:
           severity: warning
         annotations:
-          summary: "PostgreSQL database encoding is not UTF8 on {{ $labels.instance }}"
+          summary: "The PostgreSQL database encoding is not UTF8 (reported by at least one {{ $labels.job }} server)"
           description: >-
             yuzu_pg_server_encoding_not_utf8 is 1: at start the server found the database
             encoding is not UTF8. Postgres then does not reject invalid UTF-8 from agents, and

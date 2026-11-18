@@ -36,14 +36,30 @@ REQUIRED = [
     ("services", S + r"\(\*current\);\s*const std::string svc_key"),
     ("users", r"enumerate_users\(\);\s*" + S + r"\(current\);\s*auto prev_json = db_->get_state\(usr_key\)"),
     ("mapdrive", S + r"\(\*current\);\s*const std::string md_key"),
+    # fleet_snapshot: four statements, each pinned together with its neighbours so deleting or
+    # commenting out any one of them leaves at least one pattern unmatched.
+    ("fleet_snapshot processes", r"\}\s*" + S + r"\(processes\);\s*" + S + r"\(connections\);"),
+    ("fleet_snapshot connections", S + r"\(processes\);\s*" + S + r"\(connections\);\s*" + S + r"\(hostname\);"),
+    ("fleet_snapshot hostname", S + r"\(connections\);\s*" + S + r"\(hostname\);\s*" + S + r"\(local_ips\);"),
+    ("fleet_snapshot local_ips", S + r"\(hostname\);\s*" + S + r"\(local_ips\);\s*auto redaction"),
 ]
-FLOOR = 11  # call sites in echo_plugin.cpp (the stream leg has two: name and user)
+FLOOR = 15  # call sites in echo_plugin.cpp (the stream leg has two, fleet_snapshot four)
+
+
+_TOKEN = re.compile(
+    r'"(?:\\.|[^"\\\n])*"'      # string literal: kept verbatim
+    r"|'(?:\\.|[^'\\\n])'"      # char literal: kept verbatim
+    r"|//[^\n]*"                  # line comment: dropped
+    r"|/\*.*?\*/",                # block comment: dropped
+    re.S,
+)
 
 
 def strip_comments(text: str) -> str:
-    """Remove /* */ and // comments so commenting a call out cannot satisfy a pattern."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    """Drop // and /* */ comments in source order, so a `/*` inside a `//` comment (a glob like
+    `echo_*.cpp`) cannot open a bogus block comment, and commenting a call out cannot satisfy a
+    pattern. String and char literals are left intact."""
+    return _TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'" else " ", text)
 
 
 def main() -> int:

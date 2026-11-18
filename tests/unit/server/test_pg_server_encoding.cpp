@@ -43,6 +43,13 @@ TEST_CASE("server_encoding_of: reports UTF8 for the test database and SQL_ASCII 
     REQUIRE(PQstatus(utf8_conn.get()) == CONNECTION_OK);
     INFO("test cluster database encoding = " << server_encoding_of(utf8_conn.get()));
     CHECK(server_encoding_is_utf8(server_encoding_of(utf8_conn.get())));
+    {
+        // UTF8 -> the gauge reads 0.
+        yuzu::MetricsRegistry m;
+        std::string enc;
+        CHECK(report_server_encoding(utf8_conn.get(), m, &enc));
+        CHECK(m.gauge("yuzu_pg_server_encoding_not_utf8").value() == 0.0);
+    }
 
     // A SQL_ASCII database is the case the check exists for. template0 is the only template that
     // permits a different encoding. Named from this fixture's unique name; dropped below.
@@ -63,5 +70,11 @@ TEST_CASE("server_encoding_of: reports UTF8 for the test database and SQL_ASCII 
         const auto enc = server_encoding_of(ascii_conn.get());
         CHECK(enc == "SQL_ASCII");
         CHECK_FALSE(server_encoding_is_utf8(enc));
+        // SQL_ASCII -> the gauge is 1 (a deleted assignment leaves the default 0 and fails here).
+        yuzu::MetricsRegistry m;
+        std::string reported;
+        CHECK_FALSE(report_server_encoding(ascii_conn.get(), m, &reported));
+        CHECK(reported == "SQL_ASCII");
+        CHECK(m.gauge("yuzu_pg_server_encoding_not_utf8").value() == 1.0);
     }
 }

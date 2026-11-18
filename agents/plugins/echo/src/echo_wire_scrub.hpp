@@ -75,6 +75,7 @@ inline void scrub_wire_strings(MapDriveEntry& m) {
 inline void scrub_wire_strings(yuzu::agent::ProcessInfo& p) {
     scrub_wire_strings(p.name);
     scrub_wire_strings(p.user);
+    scrub_wire_strings(p.cmdline);
 }
 
 template <class T>

@@ -3987,6 +3987,13 @@ private:
             // nothing to widen it with and `fleet_snapshot_window_seconds` no longer has an effect.
             connections = std::move(live);
         }
+        // The snapshot carries identity strings (host name, process names/users/command lines,
+        // socket owners, local addresses) as raw OS bytes: well-formed UTF-8 at collection, like
+        // every other Echo identity sink (echo_wire_scrub.hpp).
+        yuzu::echo::scrub_wire_strings(processes);
+        yuzu::echo::scrub_wire_strings(connections);
+        yuzu::echo::scrub_wire_strings(hostname);
+        yuzu::echo::scrub_wire_strings(local_ips);
 
         // Redaction defaults are now unioned inside load_redaction_patterns (so
         // every collect path — collect_fast, procperf, and this snapshot — is

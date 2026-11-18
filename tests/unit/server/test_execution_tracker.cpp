@@ -5214,14 +5214,28 @@ TEST_CASE("ExecutionTracker: invalid UTF-8 never becomes a stored error_detail (
     auto id = tracker.create_execution(exec);
     REQUIRE(id.has_value());
 
+    // Control: a valid write must land, so an empty result below can only mean the invalid write
+    // was refused (never "the harness stored nothing").
+    AgentExecStatus ok_row;
+    ok_row.agent_id = "agent-valid";
+    ok_row.status = "failure";
+    ok_row.error_detail = "plain ascii detail";
+    REQUIRE(tracker.update_agent_status(*id, ok_row));
+
     AgentExecStatus s;
     s.agent_id = "agent-utf8";
     s.status = "failure";
     s.error_detail = std::string("bad\xff") + "byte";
-    (void)tracker.update_agent_status(*id, s); // accepted or refused: either is fine ...
+    const bool accepted = tracker.update_agent_status(*id, s);
+
+    std::size_t seen_valid = 0, seen_utf8 = 0;
     for (const auto& a : tracker.get_agent_statuses(*id)) {
-        // ... but whatever is stored must be strict-dump safe.
+        // Whatever is stored must be strict-dump safe.
         CHECK_NOTHROW((void)nlohmann::json(a.error_detail).dump());
         CHECK(a.error_detail.find('\xff') == std::string::npos);
+        seen_valid += a.agent_id == "agent-valid";
+        seen_utf8 += a.agent_id == "agent-utf8";
     }
+    CHECK(seen_valid == 1);                 // the loop body ran for the control row
+    CHECK(seen_utf8 == (accepted ? 1u : 0u)); // refused write => no row; accepted => stored clean
 }
