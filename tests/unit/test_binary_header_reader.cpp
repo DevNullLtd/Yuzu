@@ -10,6 +10,7 @@
 
 #include <array>
 #include <bit>
+#include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -22,6 +23,8 @@ using namespace yuzu::shared::binary_header;
 namespace {
 
 constexpr std::uint64_t kMax64 = std::numeric_limits<std::uint64_t>::max();
+// A copy would carry its own counters and fork the budget, so there is none.
+static_assert(!std::copy_constructible<Reader> && !std::assignable_from<Reader&, const Reader&>);
 
 std::array<std::byte, 16> sixteen_bytes() {
     std::array<std::byte, 16> a{};

@@ -679,11 +679,15 @@ TEST_CASE("binary_header_pe: version tree grammar violations are malformed", "[b
         std::function<void(Image&)> patch;
     };
     const std::vector<Case> cases = {
-        {"root wLength past the data", [&](Image& i) { set16(i.bytes, b, i.bytes.size()); }},
+        {"root wLength past the data",
+         [&](Image& i) { set16(i.bytes, b, static_cast<std::uint32_t>(i.bytes.size())); }},
         {"root wLength under a header", [&](Image& i) { set16(i.bytes, b, 4); }},
         {"root key", [&](Image& i) { set16(i.bytes, b + 6, 'X'); }},
         {"fixed signature", [&](Image& i) { set32(i.bytes, b + 40, 0x12345678u); }},
         {"fixed length under 52", [&](Image& i) { set16(i.bytes, b + 2, 20); }},
+        {"fixed length past the root", [&](Image& i) { set16(i.bytes, b + 2, 0xFFFF); }},
+        {"Translation length past its node",
+         [&](Image& i) { set16(i.bytes, node_off(i.bytes, u"Translation") + 2, 0xFFFF); }},
         {"child wLength under a header", [&](Image& i) { set16(i.bytes, b + 92, 4); }},
         {"child wLength past the parent", [&](Image& i) { set16(i.bytes, b + 92, 0xFFFF); }},
     };

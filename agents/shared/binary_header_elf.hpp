@@ -12,7 +12,7 @@
  * Error policy. A fault in the ELF header or the program-header table (including an I/O error
  * reading them) is an error. Everything derived from the segments DEGRADES instead of failing the
  * file, an I/O error from the Source included: the field comes back empty and, where one exists,
- * a flag says why (notes_truncated, dynamic_unreadable); what was already parsed is kept.
+ * a flag says why (interpreter_unreadable, notes_truncated, dynamic_unreadable); the rest is kept.
  */
 
 #pragma once
@@ -28,6 +28,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::shared::binary_header {
@@ -39,6 +40,7 @@ struct ElfLimits {
     std::size_t max_note_name_bytes{64};
     std::size_t max_note_desc_bytes{4096};
     std::size_t max_dynamic_entries{4096};
+    // The NUL counts toward this cap (longest interpreter or soname 1023); Mach-O's excludes it.
     std::size_t max_string_bytes{1024};
 };
 
@@ -72,6 +74,7 @@ struct ElfInfo {
     std::vector<ElfNote> notes;
     bool notes_truncated{false};
     bool dynamic_unreadable{false};
+    bool interpreter_unreadable{false}; // a PT_INTERP exists but gave no string
 };
 
 namespace elf_detail {
@@ -122,8 +125,8 @@ template <std::unsigned_integral T>
     return out;
 }
 
-// First PT_INTERP. Its [offset, offset + filesz) must lie in the file and the NUL must lie in it
-// too; empty on any fault, an I/O error included.
+// First PT_INTERP. Its [offset, offset + filesz) must lie in the file and the NUL in its first
+// min(max_string_bytes, filesz) bytes; empty on any fault, an I/O error included.
 [[nodiscard]] inline std::string read_interpreter(Reader& r,
                                                   const std::vector<ElfProgramHeader>& phs,
                                                   const ElfLimits& lim) {
@@ -141,7 +144,7 @@ template <std::unsigned_integral T>
     return {};
 }
 
-// Appends the notes of one PT_NOTE segment; sets truncated and stops the segment at its first
+// Appends the notes of one PT_NOTE segment; sets notes_truncated and stops the segment at its first
 // inconsistency (an unreadable segment included), keeping what was parsed before it.
 inline void read_note_segment(Reader& r, const ElfProgramHeader& ph, std::endian order,
                               const ElfLimits& lim, ElfInfo& info) {
@@ -364,6 +367,10 @@ read_elf(const Source& src, const ElfLimits& lim = {}, ReadBudget budget = {}) {
     }
 
     info.interpreter = read_interpreter(r, info.program_headers, lim);
+    info.interpreter_unreadable = info.interpreter.empty() && std::ranges::any_of(
+        info.program_headers, [](const auto& p) { return p.type == kPtInterp; });
+    // Read before the notes: PT_NOTE reads repeat per segment, so they may starve only themselves.
+    read_soname(r, info.program_headers, info.is64, order, lim, info);
 
     for (const auto& ph : info.program_headers) {
         if (ph.type == kPtNote)
@@ -376,7 +383,6 @@ read_elf(const Source& src, const ElfLimits& lim = {}, ReadBudget budget = {}) {
         }
     }
 
-    read_soname(r, info.program_headers, info.is64, order, lim, info);
     return info;
 }
 

@@ -7,7 +7,7 @@
  * every slice read is first bounds-checked against the slice's own [offset, offset + size) and then
  * issued at slice offset + relative offset, so a slice can never be completed from its neighbour's
  * bytes. A thin file's parse failure is the function's error; a universal file's is the slice's, and
- * one bad slice never fails the others.
+ * one slice fails the others only by spending the shared ReadBudget (they then end limit_exceeded).
  *
  * Decoded: the Mach-O header, LC_ID_DYLIB, LC_UUID, LC_BUILD_VERSION, the four
  * LC_VERSION_MIN_* commands and LC_SOURCE_VERSION. Every other command is skipped by its size.
@@ -27,6 +27,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 namespace yuzu::shared::binary_header {
@@ -54,7 +55,7 @@ struct MachoBuildVersion {
 struct MachoSlice {
     std::uint64_t offset{0};
     std::uint64_t size{0};
-    std::optional<ParseError> error; // set: only offset, size, byte_order, cpu_type, cpu_subtype are valid (the fat_arch entry); the rest keep defaults
+    std::optional<ParseError> error; // set: only the fat_arch fields hold (offset, size, cpu_type, cpu_subtype); byte_order is the table's, the rest defaults
     bool is64{false};
     std::endian byte_order{std::endian::little};
     std::uint32_t cpu_type{0};
@@ -270,12 +271,12 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
     }
 
     // Universal. nfat_arch is the field a Java class file (same four magic bytes) fills with its
-    // version word, at least 45: the cap keeps it from being read as a universal file.
+    // version word, at least 45: such a count is refused whatever max_fat_archs allows.
     if (head.size() < kFatHeaderBytes)
         return std::unexpected(ParseError::truncated);
     const bool is64 = magic == kFatMagic64;
     const std::uint32_t nfat = u32(head, 4, std::endian::big);
-    if (nfat == 0 || nfat > lim.max_fat_archs)
+    if (nfat == 0 || nfat > lim.max_fat_archs || nfat >= 45)
         return std::unexpected(ParseError::not_this_format);
     const std::size_t entry = is64 ? kFatArch64Bytes : kFatArchBytes;
     const auto table_len = checked_mul(nfat, entry);

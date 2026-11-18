@@ -444,6 +444,9 @@ TEST_CASE("macho: not-this-format inputs", "[binary_header][macho]") {
         const auto r = parse(java);
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error() == ParseError::not_this_format);
+        const auto wide = parse(java, MachoLimits{.max_fat_archs = 64}); // not the caller's cap either
+        REQUIRE_FALSE(wide.has_value());
+        CHECK(wide.error() == ParseError::not_this_format);
     }
     SECTION("unknown magic") {
         const auto r = parse(Bytes(64, 'A'));

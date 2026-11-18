@@ -3,7 +3,7 @@
  * (binary_header_elf.hpp).
  *
  * Pure header, no I/O except one real capture: synthesised images come from the builder below
- * (ELF32-LE, ELF64-LE and ELF64-BE), the real elf_shared.bin is loaded through
+ * (ELF32 and ELF64, each in both byte orders), the real elf_shared.bin is loaded through
  * YUZU_TEST_FIXTURE_DIR and its case FAILS when the file is absent. Adjacent-byte cases use a
  * recording Source to prove no byte outside the enclosing region was requested.
  */
@@ -382,7 +382,7 @@ TEST_CASE("elf: not-this-format and header faults", "[binary_header][elf]") {
     auto bad_magic = img;
     bad_magic[1] = 'X';
     expect_err(bad_magic, bh::ParseError::not_this_format);
-    for (const std::uint8_t v : {0, 3, 255}) {
+    for (const std::uint8_t v : {std::uint8_t{0}, std::uint8_t{3}, std::uint8_t{255}}) {
         auto bad_class = img;
         bad_class[4] = v;
         expect_err(bad_class, bh::ParseError::malformed);
@@ -443,6 +443,7 @@ TEST_CASE("elf: interpreter degrades, never fails the file", "[binary_header][el
             lim.max_string_bytes = 5;
             const auto i = must_read(build(canonical(sh).spec), lim);
             CHECK(i.interpreter.empty());
+            CHECK(i.interpreter_unreadable);
             lim.max_string_bytes = std::string_view(kInterp).size() + 1; // the cap counts the NUL
             CHECK(must_read(build(canonical(sh).spec), lim).interpreter == kInterp);
         }
@@ -545,6 +546,10 @@ TEST_CASE("elf: notes, alignment and truncation", "[binary_header][elf]") {
             CHECK(j.notes.size() == 1);
             CHECK_FALSE(j.notes_truncated);
             CHECK(j.build_id == kBuildIdHex);
+            lim.max_note_name_bytes = 3; // one under each cap in turn, every byte present
+            CHECK(must_read(build(canonical(sh).spec), lim).notes.empty());
+            lim = bh::ElfLimits{.max_note_desc_bytes = 19};
+            CHECK(must_read(build(canonical(sh).spec), lim).notes.empty());
         }
         { // over-cap namesz keeps the earlier note
             auto c = canonical(sh);
@@ -822,6 +827,7 @@ TEST_CASE("elf: read_at failures: mandatory reads surface as io, derived reads d
         CHECK(r->is64);
         CHECK(r->program_headers.size() == 4);
         CHECK(r->interpreter == (reg == kInterpReg ? "" : kInterp));
+        CHECK(r->interpreter_unreadable == (reg == kInterpReg));
         CHECK(r->notes_truncated == (reg == kNoteReg));
         CHECK(r->notes.empty() == (reg == kNoteReg));
         CHECK(r->build_id.empty() == (reg == kNoteReg));
@@ -850,12 +856,12 @@ TEST_CASE("elf: read budget is honoured and degrades", "[binary_header][elf]") {
             CHECK(r->interpreter == kInterp);
             CHECK_FALSE(r->dynamic_unreadable);
         }
-        { // one read fewer: the last read (the soname string) is refused and the result degrades
+        { // one read fewer: the last read (the notes, read after the soname) is the one refused
             Probe l2(img);
             auto r = bh::read_elf(l2.source(), {}, bh::ReadBudget{total, reads - 1});
             REQUIRE(r.has_value());
-            CHECK(r->soname.empty());
-            CHECK(r->dynamic_unreadable);
+            CHECK(r->soname == kSoname);
+            CHECK(r->notes_truncated);
             CHECK(l2.reads.size() == reads - 1);
             CHECK(l2.total <= total);
         }
@@ -1003,4 +1009,5 @@ TEST_CASE("elf: real capture elf_shared.bin", "[binary_header][elf]") {
     }));
     CHECK_FALSE(i.dynamic_unreadable);
     CHECK_FALSE(i.notes_truncated);
+    CHECK_FALSE(i.interpreter_unreadable); // it has no PT_INTERP: empty, and not flagged
 }

@@ -42,6 +42,7 @@ struct PeLimits {
 struct PeStringTable {
     std::uint16_t language{0};
     std::uint16_t code_page{0};
+    // Not sanitised: control and bidi characters in the resource pass through to both strings.
     std::vector<std::pair<std::string, std::string>> strings; // UTF-8 key and value, resource order
 };
 
@@ -97,7 +98,7 @@ struct PeVersionInfo {
 
 namespace pe_detail {
 
-constexpr auto kLE = std::endian::little;
+inline constexpr auto kLE = std::endian::little;
 
 struct Section {
     std::uint32_t va{0};

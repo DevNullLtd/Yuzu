@@ -22,6 +22,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace yuzu::shared::binary_header {
 
@@ -38,8 +39,9 @@ enum class ParseError { io, truncated, not_this_format, malformed, limit_exceede
     return "unknown";
 }
 
-// nullopt = I/O error; fewer bytes than asked only at end of data. This is word for word the
-// contract of FileView::read_at (component_walk.hpp), so a caller passes {fv.read_at, fv.size}.
+// nullopt = I/O error; fewer bytes than asked only at end of data. This is the contract of
+// FileView::read_at (component_walk.hpp), so a caller passes {fv.read_at, fv.size}, and checks
+// fv.unchanged() afterwards: a file rewritten between two reads parses torn and nothing says so.
 using ReadAt = std::function<std::optional<std::string>(std::uint64_t offset, std::size_t len)>;
 
 struct Source {
@@ -102,9 +104,11 @@ struct ReadBudget {
 class Reader {
 public:
     explicit Reader(const Source& src, ReadBudget budget = {}) : src_(src), budget_(budget) {}
+    Reader(const Reader&) = delete; // a copy would carry its own counters and fork the budget
+    Reader& operator=(const Reader&) = delete;
 
     // truncated: offset+len overflows or passes the source size. limit_exceeded: either budget
-    // would be passed; both are decided BEFORE read_at is called. io: read_at gave nullopt.
+    // would be passed; both decided BEFORE read_at is called. io: read_at is empty or gave nullopt.
     // truncated: read_at answered fewer than len bytes. malformed: it answered more.
     [[nodiscard]] std::expected<std::string, ParseError> read(std::uint64_t offset,
                                                               std::size_t len) {
