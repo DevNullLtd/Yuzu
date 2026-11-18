@@ -39,3 +39,22 @@
 /tests/unit/server/test_capability_catalogue.cpp       @fjarvis @FortitudeEtc
 /tests/unit/server/test_command_capability.cpp         @fjarvis @FortitudeEtc
 /tests/unit/server/test_dispatch_destructive_gate.cpp  @fjarvis @FortitudeEtc
+
+# Release supply-chain controls: owners @fjarvis @Tr3kkR
+# Workflows, the image vulnerability gate and its acceptance files, and the SBOM and
+# release-artifact checks. The gate checks the format of an acceptance's approval record
+# only; review of changes to these paths is the control that makes an acceptance an
+# approval (docs/ci-architecture.md, image vulnerability gate). Either owner can satisfy
+# the review request, so it is still available when one of them authored the change.
+# Paths that do not exist yet arrive with the WP15 supply-chain branches.
+/.github/workflows/                                    @fjarvis @Tr3kkR
+/.github/CODEOWNERS                                    @fjarvis @Tr3kkR
+/.trivyignore.yaml                                     @fjarvis @Tr3kkR
+/.grype.yaml                                           @fjarvis @Tr3kkR
+/scripts/ci/image-vuln-gate*                           @fjarvis @Tr3kkR
+/scripts/ci/image-identity.sh                          @fjarvis @Tr3kkR
+/scripts/ci/artifact-sbom.py                           @fjarvis @Tr3kkR
+/scripts/ci/check-release-signing.sh                   @fjarvis @Tr3kkR
+/scripts/check-release-artifacts.sh                    @fjarvis @Tr3kkR
+/vcpkg.json                                            @fjarvis @Tr3kkR
+/vcpkg-configuration.json                              @fjarvis @Tr3kkR
