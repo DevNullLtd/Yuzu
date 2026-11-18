@@ -7,14 +7,20 @@
  * It reads the clock once and returns at once unless a whole work_quantum of work has passed, so
  * a per-entry call is cheap and a 50,000-entry flat listing is paced like any other work.
  *
- * GovernorState is plain data on purpose: nothing here stores it; a caller that needs it across
- * slices persists it behind a write-ahead marker.
+ * GovernorState is plain data on purpose: nothing here stores it. The restart count needs no
+ * store: record_slice takes it from the cursor (Cursor::generation), so a replayed slice counts
+ * once and a caller whose only memory is the cursor still reaches `unstable`. The stall count is
+ * the consecutive attempts on ONE cursor (a stall issues no cursor, so no cursor field carries
+ * it): a caller that retries a cursor keeps consecutive_stalls while it does, behind a write-ahead
+ * marker when that spans slices; one that keeps nothing must not retry. A slice that returned no
+ * result (it threw, timed out or was refused a worker) is a stall too: record_failed_slice.
  */
 #pragma once
 
 #include <algorithm>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <utility>
 
@@ -32,9 +38,12 @@ struct GovernorLimits {
     unsigned max_restarts{3};
 };
 
+// The longest slice valid() accepts (one hour): a valid slice's deadline sum cannot overflow.
+inline constexpr std::chrono::milliseconds kMaxSlice{3'600'000};
+
 [[nodiscard]] inline bool valid(const GovernorLimits& l) noexcept {
-    return l.slice.count() > 0 && l.work_quantum.count() > 0 && l.duty_percent >= 1 &&
-           l.duty_percent <= 100;
+    return l.slice.count() > 0 && l.slice <= kMaxSlice && l.work_quantum.count() > 0 &&
+           l.work_quantum <= l.slice && l.duty_percent >= 1 && l.duty_percent <= 100;
 }
 
 struct GovernorEnv {
@@ -61,7 +70,7 @@ public:
         }
         // valid() refuses a zero duty and the caller gates on it; one that still arrives is paced as
         // 1 %, the gentlest setting, never divided by.
-        auto nap = work * (100 - limits_.duty_percent) / std::max(limits_.duty_percent, 1u);
+        auto nap = work * (100 - limits_.duty_percent) / (std::max)(limits_.duty_percent, 1u);
         // Never sleep to or past the deadline: leave at least 1 ms of slice.
         const auto room = std::chrono::duration_cast<std::chrono::milliseconds>(deadline_ - t) -
                           std::chrono::milliseconds{1};
@@ -86,18 +95,21 @@ enum class Health { ok, stalled, unstable };
 
 struct GovernorState {
     unsigned consecutive_stalls{0};
-    unsigned restarts{0};
+    std::uint64_t restarts{0}; // the cursor's count after the last slice: derived, not accumulated
     Health health{Health::ok};
 };
 
 // Pure. A restart legitimately returns an earlier position, so it is never a stall and takes
 // precedence over `advanced`. Any non-ok health is sticky.
+// `generation` is Cursor::generation of the cursor the slice resumed from; with `restarted` it is
+// the restart count, so `unstable` follows from the cursor alone (a zero max_restarts acts as 1).
 [[nodiscard]] inline GovernorState record_slice(GovernorState s, const GovernorLimits& l,
-                                                bool advanced, bool restarted) noexcept {
-    if (restarted) {
-        ++s.restarts;
-        if (s.restarts >= l.max_restarts && s.health == Health::ok)
-            s.health = Health::unstable;
+                                                bool advanced, bool restarted,
+                                                std::uint32_t generation) noexcept {
+    s.restarts = std::uint64_t{generation} + (restarted ? 1u : 0u);
+    if (s.restarts >= (std::max)(l.max_restarts, 1u) && s.health == Health::ok)
+        s.health = Health::unstable;
+    if (restarted) { // never a stall: the stall count stands
     } else if (advanced) {
         s.consecutive_stalls = 0;
     } else {
@@ -106,6 +118,12 @@ struct GovernorState {
             s.health = Health::stalled;
     }
     return s;
+}
+
+/// The failure input: a slice that returned no result is a non-advancing attempt on its cursor.
+[[nodiscard]] inline GovernorState record_failed_slice(GovernorState s, const GovernorLimits& l,
+                                                       std::uint32_t generation) noexcept {
+    return record_slice(s, l, false, false, generation);
 }
 
 } // namespace yuzu::shared::file_search

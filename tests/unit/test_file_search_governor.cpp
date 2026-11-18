@@ -43,6 +43,14 @@ TEST_CASE("governor: limits validation", "[file_search][governor]") {
     l = {};
     l.work_quantum = milliseconds{0};
     CHECK_FALSE(fs::valid(l));
+    l = {};
+    l.work_quantum = l.slice + milliseconds{1}; // a quantum longer than the slice never paces
+    CHECK_FALSE(fs::valid(l));
+    l = {};
+    l.slice = fs::kMaxSlice;
+    CHECK(fs::valid(l));
+    l.slice += milliseconds{1}; // the bound is far below the slice that overflows the deadline sum
+    CHECK_FALSE(fs::valid(l));
 }
 
 TEST_CASE("governor: deadline is construction time plus slice", "[file_search][governor]") {
@@ -128,6 +136,9 @@ TEST_CASE("governor: never sleeps before one quantum of work", "[file_search][go
     g.pace();
     REQUIRE(c.sleeps.size() == 1);
     CHECK(c.sleeps[0] == milliseconds{50});
+    c.work(milliseconds{200}); // the nap follows the work measured since the last sleep ENDED
+    g.pace();
+    CHECK(c.sleeps.back() == milliseconds{200});
 }
 
 TEST_CASE("governor: the sleep is clamped short of the deadline", "[file_search][governor]") {
@@ -143,10 +154,10 @@ TEST_CASE("governor: record_slice stalls after max_stalls non-advancing slices",
           "[file_search][governor]") {
     const fs::GovernorLimits l;
     fs::GovernorState s;
-    s = fs::record_slice(s, l, false, false);
-    s = fs::record_slice(s, l, false, false);
+    s = fs::record_slice(s, l, false, false, 0);
+    s = fs::record_failed_slice(s, l, 0); // no result (threw, timed out, refused): a stall too
     CHECK(s.health == fs::Health::ok);
-    s = fs::record_slice(s, l, false, false);
+    s = fs::record_slice(s, l, false, false, 0);
     CHECK(s.health == fs::Health::stalled);
     CHECK(s.consecutive_stalls == 3);
 }
@@ -154,24 +165,26 @@ TEST_CASE("governor: record_slice stalls after max_stalls non-advancing slices",
 TEST_CASE("governor: an advancing slice resets the stall count", "[file_search][governor]") {
     const fs::GovernorLimits l;
     fs::GovernorState s;
-    s = fs::record_slice(s, l, false, false);
-    s = fs::record_slice(s, l, false, false);
-    s = fs::record_slice(s, l, true, false);
+    s = fs::record_slice(s, l, false, false, 0);
+    s = fs::record_slice(s, l, false, false, 0);
+    s = fs::record_slice(s, l, true, false, 0);
     CHECK(s.consecutive_stalls == 0);
-    s = fs::record_slice(s, l, false, false);
-    s = fs::record_slice(s, l, false, false);
+    s = fs::record_slice(s, l, false, false, 0);
+    s = fs::record_slice(s, l, false, false, 0);
     CHECK(s.health == fs::Health::ok);
 }
 
 TEST_CASE("governor: a restarted slice is not a stall", "[file_search][governor]") {
     const fs::GovernorLimits l;
     fs::GovernorState s;
-    s = fs::record_slice(s, l, false, false);
-    s = fs::record_slice(s, l, false, true);
+    s = fs::record_slice(s, l, false, false, 0);
+    s = fs::record_slice(s, l, false, true, 0);
     CHECK(s.restarts == 1);
     CHECK(s.consecutive_stalls == 1); // unchanged by the restart, advanced or not
-    s = fs::record_slice(s, l, true, true);
+    s = fs::record_slice(s, l, true, true, 0); // replayed after a lost response: counted once
     CHECK(s.consecutive_stalls == 1);
+    CHECK(s.restarts == 1);
+    s = fs::record_slice(s, l, true, true, 1); // the next cursor's restart is the second
     CHECK(s.restarts == 2);
 }
 
@@ -179,15 +192,22 @@ TEST_CASE("governor: max_restarts gives unstable and health is sticky", "[file_s
     const fs::GovernorLimits l;
     fs::GovernorState s;
     for (unsigned i = 0; i < l.max_restarts; ++i)
-        s = fs::record_slice(s, l, true, true);
+        s = fs::record_slice(s, l, true, true, i);
     CHECK(s.health == fs::Health::unstable);
-    s = fs::record_slice(s, l, true, false);
+    for (unsigned i = 0; i < l.max_stalls; ++i) // later stalls keep the first terminal state
+        s = fs::record_slice(s, l, false, false, l.max_restarts);
     CHECK(s.health == fs::Health::unstable);
 
     fs::GovernorState t;
     for (unsigned i = 0; i < l.max_stalls; ++i)
-        t = fs::record_slice(t, l, false, false);
+        t = fs::record_slice(t, l, false, false, 0);
     REQUIRE(t.health == fs::Health::stalled);
-    t = fs::record_slice(t, l, true, false);
+    t = fs::record_slice(t, l, true, false, l.max_restarts); // nor does a spent restart budget
     CHECK(t.health == fs::Health::stalled);
+    // The verdict follows from the cursor alone: a caller that kept no state reaches it too.
+    CHECK(fs::record_slice({}, l, true, true, l.max_restarts - 1).health == fs::Health::unstable);
+    CHECK(fs::record_slice({}, l, true, false, l.max_restarts).health == fs::Health::unstable);
+    fs::GovernorLimits zero;
+    zero.max_restarts = 0; // acts as 1: unstable at the first restart, not before it
+    CHECK(fs::record_slice({}, zero, true, false, 0).health == fs::Health::ok);
 }

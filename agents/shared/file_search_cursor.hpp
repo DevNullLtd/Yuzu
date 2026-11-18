@@ -20,6 +20,7 @@
 // retries the previous one. A slice that completes the walk issues no cursor and may return the resume
 // position itself, so strictly_advances applies only to a cursor that is issued. One cursor covers
 // one root, so a failing volume never advances another volume's position.
+// Retries of one cursor are counted by the caller and bounded (file_search_governor.hpp: stalls).
 //
 // Transitions: strictly_advances accepts exactly two, each with the same query hash,
 // sequence + 1 (no wrap) and a non-decreasing prior_gaps.
@@ -74,7 +75,7 @@ struct Cursor {
     std::uint64_t sequence{0};
     std::uint32_t generation{0};
     std::uint32_t prior_gaps{0};
-    Position position;
+    Position position{};
     bool operator==(const Cursor&) const = default;
 };
 
@@ -151,8 +152,9 @@ private:
 
 } // namespace detail
 
-/// Empty for a Cursor whose position is not valid_position (a producer bug; decode_cursor of the
-/// empty token is bad_prefix), so a hostile name can never be written to the wire.
+/// Empty for a Cursor whose position is not valid_position (a producer bug, or a listed name over
+/// kMaxNameBytes; decode_cursor of the empty token is bad_prefix), so a hostile name can never be
+/// written to the wire. Empty from a slice that did not complete is an error, never "finished".
 [[nodiscard]] inline std::string encode_cursor(const Cursor& c) {
     if (!valid_position(c.position))
         return {};

@@ -48,6 +48,8 @@ using Canonicaliser = std::function<std::string(std::string_view)>;
 
 /// How names are compared: the id is bound into the query hash; canon maps both the pattern and
 /// every candidate name to the form that is compared byte for byte.
+/// CONTRACT: canon is pure, its id names exactly one behaviour, and it never writes a '*' or '?'
+/// its input did not hold; compile() checks the star and literal limits again on its output.
 struct NameSemantics {
     std::string id;
     Canonicaliser canon;
@@ -103,6 +105,14 @@ public:
         p.canonical_ = p.canon_fn_ ? p.canon_fn_(collapsed) : collapsed;
         if (p.canonical_.size() > kMaxCanonicalPatternBytes)
             return std::unexpected(PatternError::too_long);
+        // The same two limits on the canonical pattern: a canonicaliser must not add a wildcard.
+        stars = static_cast<std::size_t>(std::ranges::count(p.canonical_, '*'));
+        literals = p.canonical_.size() - stars -
+                   static_cast<std::size_t>(std::ranges::count(p.canonical_, '?'));
+        if (stars > kMaxStars)
+            return std::unexpected(PatternError::too_many_stars);
+        if (literals < kMinLiteralBytes)
+            return std::unexpected(PatternError::too_few_literals);
         return p;
     }
 

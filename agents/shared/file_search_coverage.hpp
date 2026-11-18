@@ -173,7 +173,7 @@ struct CoverageEnvelope {
     rows.push_back(std::string("coverage|") + (e.complete() ? "complete" : "partial") +
                    "|slices=" + std::to_string(e.slices) +
                    "|prior_gaps=" + std::to_string(e.prior_gaps) + "|consistency=" +
-                   (e.slices > 1 ? "not_a_snapshot" : "single_pass"));
+                   (e.slices > 1 || e.has_cursor ? "not_a_snapshot" : "single_pass"));
     return rows;
 }
 

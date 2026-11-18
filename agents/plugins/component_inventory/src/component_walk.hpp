@@ -36,14 +36,15 @@
  * Links and network mounts are never listed; each is counted in its own stat. Any other entry type is
  * skipped uncounted.
  *
- * ORDERED WALK. walk_ordered() (below walk()) is the sorted, depth-first, resumable walk of the
+ * ORDERED WALK. walk_ordered() (above walk()) is the sorted, depth-first, resumable walk of the
  * on-demand file search. It lists a directory, sorts the listing by name bytes, and visits every file
  * and directory entry through a caller-supplied visitor (the walk itself matches nothing and opens
  * nothing). A slice ends on a budget (time, entries, rows) with a file_search::Position naming the last
  * completed point, and the next slice resumes from that position by matching names against the real
  * listings; a changed directory identity restarts that subtree (duplicates possible, never a silent
- * skip). Everything that hides rows from the walk is an OrderedGap, never a silent cut. The full rules
- * sit on the declaration.
+ * skip). Every directory the walk could not search (a bound, a read failure, a mount, a device
+ * change) is an OrderedGap, never a silent cut; links are skipped and counted, not followed, and
+ * what a resume cannot see is listed under NOT DETECTED. The full rules sit on the declaration.
  */
 #pragma once
 
@@ -505,8 +506,8 @@ private:
  * change between slices that moves neither is not seen and leaves no gap: an entry added at or before
  * the resume point of a directory that kept its identity, a completed directory swapped for another of
  * the same name, and a replacement that reports the same identity as the directory it replaced (a
- * filesystem may reuse one) or reports none. Such entries are not visited. A walk of more than one
- * slice is not a snapshot.
+ * filesystem may reuse one) or reports none, or the directory it replaced had reported none. Such
+ * entries are not visited. A walk of more than one slice is not a snapshot.
  *
  * MEMORY. The sorted listings of the directories currently entered are held and the entry budget does
  * NOT bound them (descending through first children counts one entry per level while every level holds

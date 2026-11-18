@@ -26,7 +26,7 @@
  *  - case 5 (restart loop): record_slice not counting restarts, or not making unstable sticky, fails the
  *    health sequence; max_restarts not consulted fails the unstable-at-the-third-restart step.
  *  - case 6 (stall): record_slice counting a stall only on some slices, or not making stalled sticky,
- *    fails the health sequence; the walker reading a listing on a zero budget fails the same-position check.
+ *    fails the health sequence. (The walker's zero-budget rule is pinned in test_component_walk_ordered.cpp.)
  *  - case 7 (coverage carried): CoverageEnvelope::complete() ignoring prior_gaps, or next_cursor dropping
  *    the slice's gap count (or its saturating sum), makes the final envelope read complete.
  *  - case 1b (completing slice): the driver validating a cursor on the slice that completes the walk fails
@@ -130,7 +130,7 @@ struct Search {
         };
         OrderedResult res = walk_ordered("/r", cursor.position, wl, ops, g.deadline(), visit);
         REQUIRE(fs.total_opens == 0);
-        gov = fsr::record_slice(gov, gl, res.advanced, res.restarted);
+        gov = fsr::record_slice(gov, gl, res.advanced, res.restarted, cursor.generation);
 
         fsr::CoverageEnvelope env;
         env.prior_gaps = cursor.prior_gaps;

@@ -79,6 +79,8 @@ TEST_CASE("mount_entries: each malformed shape counts once and adds no entry", "
              "22 1 :2 / / rw - ext4 /dev/sda2 rw",                 // empty major
              "22 1 8: / / rw - ext4 /dev/sda2 rw",                 // empty minor
              "22 1 -8:2 / / rw - ext4 /dev/sda2 rw",               // sign
+             "22 1 8x:2 / / rw - ext4 /dev/sda2 rw",               // digits then junk, major
+             "22 1 8:2x / / rw - ext4 /dev/sda2 rw",               // digits then junk, minor
              "22 1 8:2 / / rw - ",                                 // missing fstype
              "22 1 8:2 / /mnt  - ext4 /dev/sda2 rw",               // doubled space, no options
              "22 1 8:2  / /mnt rw - ext4 /dev/sda2 rw",            // empty root mid-head

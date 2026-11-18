@@ -181,6 +181,14 @@ TEST_CASE("file_search pattern: limits apply to the raw pattern, then the canoni
     CHECK(fs::Pattern::compile("abc/def", slash_eater).error() == fs::PatternError::forbidden_byte);
     CHECK(fs::Pattern::compile(std::string(129, 'a'), dbl(1)).error() ==
           fs::PatternError::too_long);
+    // A canonicaliser that writes wildcards cannot widen the query: both limits hold on its output.
+    const auto to = [](std::string out) {
+        return fs::NameSemantics{"z", [out](std::string_view) { return out; }};
+    };
+    CHECK_FALSE(accepts("abc", to("abc*****"))); // five stars
+    CHECK_FALSE(accepts("abc", to("***")));      // no literal left
+    CHECK_FALSE(accepts("abc", to("ab?")));      // a '?' is not a literal
+    CHECK(accepts("abc", to("a*b*c*d*e?")));     // four stars and five literals: within both
 }
 
 TEST_CASE("file_search semantics: ascii fold vs byte exact", "[file_search][query]") {
@@ -221,6 +229,10 @@ TEST_CASE("file_search matcher: worst-case work is bounded", "[file_search][quer
     steps = 0;
     CHECK_FALSE(p->matches_counted(std::string(fs::kMaxCanonicalNameBytes + 1, 'a'), steps));
     CHECK(steps == 0);
+    // At the cap itself the matcher still answers, through its last cells (offsets 1019, 1020).
+    const std::string head(fs::kMaxCanonicalNameBytes - 4, 'a');
+    CHECK(m("aaa*?", head + "\xf0\x9f\x98\x80")); // one scalar ends at the last offset
+    CHECK(m("aaa*?", head + "aaa\xf0"));          // a stray lead byte is the last byte
 }
 
 TEST_CASE("file_search query_hash: stable, field-sensitive, length-prefixed", "[file_search][query]") {

@@ -126,6 +126,10 @@ TEST_CASE("coverage: consistency and cumulative verdict", "[file_search][coverag
     e.slices = 2;
     CHECK(fs::format_coverage_rows(e).back() ==
           "coverage|complete|slices=2|prior_gaps=0|consistency=not_a_snapshot");
+    e = clean();
+    e.has_cursor = true; // slice 1 of a search that leaves a cursor is already not a snapshot
+    CHECK(fs::format_coverage_rows(e).back() ==
+          "coverage|partial|slices=1|prior_gaps=0|consistency=not_a_snapshot");
 
     e = clean();
     e.prior_gaps = 1; // no gap of its own in this slice

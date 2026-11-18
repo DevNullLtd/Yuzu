@@ -3,10 +3,12 @@
 //
 // encode_name keeps a byte verbatim only when it belongs to a well-formed UTF-8 scalar
 // (utf8_scalar_len) and is not '%', '|', '\\', 0x7F or below 0x20; every other byte becomes %XX
-// with UPPERCASE hex. The result therefore never contains the row delimiter, a control byte or
+// with UPPERCASE hex. The result therefore never contains the row delimiter, an ASCII control or
 // anything that is not well-formed UTF-8, and decode_name gives back the exact original bytes,
 // including NUL and invalid UTF-8. decode_name is strict: it accepts a string only when
 // encode_name(decoded) equals the input, so every name has exactly ONE encoding.
+// Well-formed scalars above 0x7F pass verbatim, C1 controls, U+2028, U+2029, bidirectional controls
+// and noncharacters included: split rows on '\n' only, and isolate bidirectional text on display.
 //
 // '/' is never encoded, so a '/'-joined path encodes component-wise for free.
 //
