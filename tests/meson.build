@@ -609,6 +609,10 @@ agent_test_exe = executable(
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
+    'unit/test_binary_header_reader.cpp',  # shared bounded byte reader + endian loads (agents/shared/binary_header_reader.hpp), portable
+    'unit/test_binary_header_pe.cpp',      # shared PE version-resource reader (agents/shared/binary_header_pe.hpp): synthesised images + a real capture, portable
+    'unit/test_binary_header_elf.cpp',     # shared ELF header/program-header/note/SONAME reader (agents/shared/binary_header_elf.hpp): synthesised images + a real capture, portable
+    'unit/test_binary_header_macho.cpp',   # shared Mach-O thin/universal header + load-command reader (agents/shared/binary_header_macho.hpp): synthesised images + real captures, portable
     'unit/test_printing_identity.cpp',           # #4679: getpwuid_r-shaped, ERANGE-growing, fail-closed identity lookup (POSIX)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
@@ -4294,6 +4298,14 @@ if _bash_test.found()
     test('plugin readme touch-rule selftest',
       _bash_test,
       args: [files('../scripts/ci/check-plugin-readme-touch.sh'), '--selftest'],
+      suite: 'docs',
+      timeout: 60,
+    )
+    # The pull_request diff base (merge commit's first parent) shared by the
+    # README touch rule and the spawn scan; also pins both workflows to it.
+    test('pr merge-parent base selftest',
+      _bash_test,
+      args: [files('../scripts/ci/pr-merge-parent.sh'), '--selftest'],
       suite: 'docs',
       timeout: 60,
     )
