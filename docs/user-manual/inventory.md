@@ -2064,7 +2064,7 @@ sync, defeating the hash-skip protocol.
   page is therefore sometimes shorter than `limit`, so follow `next_cursor` until it is empty and
   never take a short page as the last. A page always holds at least one device and a row is never
   truncated. The byte bound limits the response only: a `limit=1000` request still reads 1001 rows
-  from the store, and only the per-replica read cap bounds that. It reads the stored records, not the 30-day device roster, so a
+  from the store, and only the per-replica read cap bounds that (a read refused for it is a retryable `503`; see [Server administration](server-admin.md#bulk-device-ci-read-concurrency)). It reads the stored records, not the 30-day device roster, so a
   device that has been offline longer still appears while its record exists. Walk the pages one
   at a time and off-peak; do not fan pages out in parallel. Every page leases one connection from
   the server's shared PostgreSQL pool (`--postgres-pool-size`), which also serves RBAC checks and
