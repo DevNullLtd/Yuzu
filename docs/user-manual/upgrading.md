@@ -78,6 +78,24 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - At the supervised MCP tier, after a refusal for audit reasons, request a new approval before retrying.
 - An `attempted` row with no outcome row after it means "started, outcome unknown". Pair each outcome row (success or failure) with an earlier `attempted` row of the same verb, earliest first, one outcome per `attempted` row. Create: by principal and group name, ignoring `target_id` on the success row (it carries the new group's id; the `attempted` and failure rows have an empty one). Add member: by principal, `target_id` (the group id) and agent id, where a success row's agent id is its `detail` without the trailing ` agent_known=<flag>` token. Remove member: by principal, `target_id` and agent id (`detail`). A failure row's key is the part of its `detail` after the token. An `attempted` row left without an outcome row is an orphan, so check whether the group or member exists before retrying. There is no per-request correlator, so two concurrent requests by one principal with the same key are paired by count only, and on MCP where the session writer is unwired the principal on a row can be empty.
 
+## ⚠️ Breaking: outbound address checks decode SIIT and IPv4-compatible IPv6 addresses and refuse an undecodable local-use NAT64 address
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** This applies to an OIDC issuer, JWKS or token endpoint, or a CRL source host, whose name resolves to an IPv6 address that embeds an IPv4 address in the SIIT or IPv4-compatible form, or to an address in the local-use NAT64 prefix `64:ff9b:1::/48`. An ordinary public IdP or CRL host needs no configuration. On a network that translates through a local-use prefix, declare its exact prefix and length with `--oidc-nat64-prefix`.
+
+**What the build does.**
+
+- **Embedded forms are decoded.** SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the IPv4 address they embed, as IPv4-mapped, NAT64 and 6to4 addresses are, but never as more open than `non-global`.
+- **OIDC.** An embedded unspecified, link-local, cloud-metadata, multicast or reserved address is refused even with `--oidc-allow-private-networks` set. An embedded loopback or private address stays behind that switch, as its plain form is. Plain http to the SIIT or IPv4-compatible form of a public address is refused, as plain http to a public address is.
+- **Local-use NAT64.** An address in `64:ff9b:1::/48` cannot be decoded without the network's prefix length, so one that no known prefix covers is refused whatever the switch says. For OIDC a prefix is known when it is configured with `--oidc-nat64-prefix` or learned from `ipv4only.arpa`. For CRL source registration only the declared prefixes are known.
+- **CRL source registration.** An embedded loopback address and one of this server's own addresses are refused with no override, as their plain forms are.
+- **Registering or replacing a source classifies its URLs.** This includes a `PUT /api/v1/crypto/revocation-sources/{id}` (or MCP `update_revocation_source`). A host whose SIIT or IPv4-compatible address embeds a private or carrier-grade NAT address is classed `private` or `carrier-grade-nat`, and the request needs `confirmed_address_classes` to list that class.
+
+**Who is affected.** A deployment whose OIDC or CRL hosts resolve to one of these forms. Ordinary IPv4, IPv4-mapped, well-known NAT64 and global IPv6 addresses are not affected.
+
+**Configuring a local-use translator.** If a request or registration is refused for an address in `64:ff9b:1::/48`, add your translator's exact prefix and length to `--oidc-nat64-prefix` and restart. Ask whoever runs the translator for it: the prefix can be longer than the `64:ff9b:1::/48` block, and a prefix of the wrong length decodes the wrong IPv4 address, which can make an internal address read as public. The flag is shared: a prefix declared for CRL sources is also trusted for OIDC egress, where it can permit HTTPS to a unique-local address without `--oidc-allow-private-networks` (see the operator warning under "Egress policy" in [authentication.md](authentication.md)), so declare only real translation prefixes.
+
 ## Behaviour change: a service-scoped credential's execution visibility is limited to its service scope (#5557)
 
 **In short.** Affected: integrations that read executions with a service-scoped API token (one created with `scope_service`). To do: treat not found as "not yet" until an agent in the token's service scope has replied, poll no faster than about once every 5 seconds and stop after a timeout, or read the execution with the credential that dispatched it.
