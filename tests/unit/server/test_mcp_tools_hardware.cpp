@@ -2496,8 +2496,8 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable 503 with Retry-After on
     CHECK(body["error"]["remediation"].get<std::string>().find("one page at a time") != std::string::npos);
     CHECK(res->body.find("SN-a") == std::string::npos);
     CHECK(t.ci_store.reads == 0);
-    // Nothing was read, so nothing is audited: a busy refusal writes no row on REST (MCP writes
-    // one generic row, see the MCP test).
+    // Nothing was read or served, so nothing is audited: a busy refusal writes no row on either
+    // transport (see the MCP test).
     CHECK(t.domain_rows.empty());
     CHECK(t.generic_rows.empty());
     CHECK(res->get_header_value("Sec-Audit-Failed").empty());
@@ -2522,8 +2522,8 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable 503 with Retry-After on
     CHECK(t.ci_slots->in_use() == 0);
 }
 
-TEST_CASE("bulk read cap: a saturated cap is a retryable MCP error with the same hint and writes only "
-          "the generic row",
+TEST_CASE("bulk read cap: a saturated cap is a retryable MCP error with the same hint and writes no "
+          "audit row",
           "[mcp][hardware][ci_page][bulk_read_slots]") {
     Twin t(capped(1));
     seed(t, {"a", "b"});
@@ -2540,14 +2540,13 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable MCP error with the same
           std::string::npos);
     CHECK(r.dump().find("SN-a") == std::string::npos);
     CHECK(t.ci_store.reads == 0);
-    // No domain row (nothing was read); ONE generic row, never the two-row store-unreadable answer.
+    // Nothing was read or served, so no row on either transport: a busy refusal must not be an
+    // audit writer outside the cap (#7951).
     CHECK(t.domain_rows.empty());
-    REQUIRE(t.generic_rows.size() == 1);
-    CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|failure");
-    CHECK(t.generic_details[0] == "hardware CI records (MCP) state=read capacity in use");
+    CHECK(t.generic_rows.empty());
     REQUIRE(t.busy_seen.size() == 1);
     CHECK(t.busy_seen[0] == hardware_ci_page::Surface::kMcp);
-    CHECK(r.dump().find("audit_persisted") == std::string::npos); // the generic row persisted
+    CHECK(r.dump().find("audit_persisted") == std::string::npos); // nothing was meant to persist
 
     held.reset();
     const json ok = t.call("list_hardware_ci_records");
@@ -2555,7 +2554,7 @@ TEST_CASE("bulk read cap: a saturated cap is a retryable MCP error with the same
     CHECK(t.ci_slots->in_use() == 0);
 }
 
-TEST_CASE("bulk read cap: a flood of busy refusals writes no domain rows on either transport",
+TEST_CASE("bulk read cap: a flood of busy refusals writes no audit rows on either transport",
           "[hardware][ci_page][bulk_read_slots]") {
     Twin t(capped(1));
     seed(t, {"a"});
@@ -2567,7 +2566,7 @@ TEST_CASE("bulk read cap: a flood of busy refusals writes no domain rows on eith
         CHECK(t.call("list_hardware_ci_records").contains("error"));
     }
     CHECK(t.domain_rows.empty());
-    CHECK(t.generic_rows.size() == static_cast<std::size_t>(kN)); // MCP's generic row only
+    CHECK(t.generic_rows.empty()); // a busy refusal writes no row on either transport
     CHECK(t.ci_store.reads == 0);
     CHECK(std::count(t.busy_seen.begin(), t.busy_seen.end(), hardware_ci_page::Surface::kRest) == kN);
     CHECK(std::count(t.busy_seen.begin(), t.busy_seen.end(), hardware_ci_page::Surface::kMcp) == kN);
@@ -2963,7 +2962,7 @@ TEST_CASE("byte bound: the published schemas and descriptions name page_bytes_ca
 
 // ───────────────── the slot is held through the access-audit writes (#7951) ─────────────────────
 
-TEST_CASE("bulk read cap: REST holds the slot through the audit write and frees it before the response",
+TEST_CASE("bulk read cap: REST holds the slot through the audit write and holds none after the handler returns",
           "[hardware][route][rest][ci_page][bulk_read_slots]") {
     Twin t(capped(2));
     seed(t, {"a", "b"});
@@ -2991,7 +2990,7 @@ TEST_CASE("bulk read cap: MCP holds the slot through both audit rows and frees i
     CHECK(t.ci_slots->in_use() == 0);
 }
 
-TEST_CASE("bulk read cap: a point read and a refused page hold no slot during their audit write",
+TEST_CASE("bulk read cap: a point read holds no slot during its audit write",
           "[hardware][route][rest][ci_page][bulk_read_slots]") {
     Twin t(capped(2));
     seed(t, {"a", "b"});
@@ -3055,53 +3054,3 @@ TEST_CASE("audit outage: a stalled audit write holds its slot, so the cap refuse
     CHECK(t.ci_store.reads == reads_before); // refused before any read
     // (the second request's own audit hook never runs: a busy refusal writes no REST row)
 }
-
-TEST_CASE("audit outage: concurrent MCP busy refusals write at most one generic row at a time",
-          "[mcp][hardware][ci_page][bulk_read_slots][security]") {
-    Twin t(capped(1));
-    seed(t, {"a", "b"});
-    auto held = t.ci_slots->try_acquire(); // every call is refused as busy
-    REQUIRE(held.has_value());
-    std::mutex gate_mu;
-    std::condition_variable gate_cv;
-    bool entered = false;
-    bool let_go = false;
-    t.on_generic_audit = [&] {
-        std::unique_lock lk(gate_mu);
-        entered = true;
-        gate_cv.notify_all();
-        gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return let_go; });
-    };
-    json first_reply;
-    std::thread first([&] { first_reply = t.call("list_hardware_ci_records"); });
-    struct Finish {
-        std::mutex& mu;
-        std::condition_variable& cv;
-        bool& go;
-        std::thread& th;
-        ~Finish() {
-            {
-                std::lock_guard lk(mu);
-                go = true;
-            }
-            cv.notify_all();
-            if (th.joinable())
-                th.join();
-        }
-    } finish{gate_mu, gate_cv, let_go, first};
-    {
-        std::unique_lock lk(gate_mu);
-        REQUIRE(gate_cv.wait_for(lk, std::chrono::seconds{10}, [&] { return entered; }));
-    }
-    // The first refusal's row write is stalled. A second refusal answers the same busy error but
-    // writes no row and says so.
-    const json second = t.call("list_hardware_ci_records");
-    REQUIRE(second.contains("error"));
-    CHECK(second["error"]["message"] == kBusyMessage);
-    CHECK(second["error"]["data"]["audit_persisted"] == false);
-    {
-        std::lock_guard lk(t.mu);
-        CHECK(t.generic_rows.size() == 1); // only the stalled first row was attempted
-    }
-}
-

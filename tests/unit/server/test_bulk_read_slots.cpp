@@ -34,6 +34,10 @@ static_assert(!std::is_copy_assignable_v<BulkReadSlots>);
 static_assert(!std::is_copy_constructible_v<BulkReadSlots::Slot>);
 static_assert(!std::is_copy_assignable_v<BulkReadSlots::Slot>);
 static_assert(std::is_nothrow_move_constructible_v<BulkReadSlots::Slot>);
+// A served Page carries the slot (Page::hold), so it is move-only: a copy would double-release.
+static_assert(!std::is_copy_constructible_v<hcp::Page>);
+static_assert(!std::is_copy_assignable_v<hcp::Page>);
+static_assert(std::is_nothrow_move_constructible_v<hcp::Page>);
 
 TEST_CASE("bulk read cap: the Config default is the resolver's unset sentinel",
           "[bulk_read_slots]") {

@@ -282,18 +282,15 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         f.audit_detail = std::format("hardware CI records ({}) state=collation ordering unverified", name);
         return f;
     case ReadError::kBusy:
-        // The store is fine and nothing was read: no domain audit row on either transport (the
-        // `yuzu_hardware_ci_read_busy_total` counter is the evidence). REST writes no row; MCP
-        // writes exactly one generic best-effort row per refused call, so a busy refusal is
-        // cheaper than a served read but not free on the audit path. `audit_detail` is the text
-        // of MCP's one generic row.
+        // The store is fine and nothing was read or served: NO audit row on either transport (the
+        // `yuzu_hardware_ci_read_busy_total` counter is the record). A refusal holds no slot, so a
+        // row here would be an audit writer outside the cap (#7951). `audit_outcome` and
+        // `audit_detail` stay empty: nothing consumes them for this answer.
         f.unavailable = true;
         f.retry_after_ms = kBusyRetryAfterMs;
         f.retry_after_header = true;
         f.remediation = kBusyRemediation;
         f.domain_audit_row = false;
-        f.audit_outcome = "failure";
-        f.audit_detail = std::format("hardware CI records ({}) state=read capacity in use", name);
         return f;
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;

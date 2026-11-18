@@ -3,7 +3,8 @@
 // AuditStore and the "bulk readers" (a Reader that holds a real leased connection until the test
 // lets it go), exactly as production shares them.
 //
-// Three cases share one rig shape. The CONTROL has no cap: readers equal to the pool size starve the
+// Two cases (control + capped) hold readers on real leased connections; two more (below) lock the
+// audit table. They share the pool shape. The CONTROL has no cap: readers equal to the pool size starve the
 // authorization read and the audit write (the defect). The CAPPED case holds the same pool under
 // the same reader burst with the cap in place: the surplus readers are refused as busy, and an
 // unrelated authorised read and its audit write still obtain a connection.
@@ -239,7 +240,7 @@ namespace {
 
 struct AuditLockRun {
     bool authz_ok{false};
-    int audit_writers_parked{0}; // served reads whose audit INSERT was still waiting on the lock
+    int audit_writers_parked{0}; // served reads that went on to their audit write (see `waiting`)
     int busy{0};
     int served{0};
     int audit_ok{0};
@@ -283,12 +284,14 @@ AuditLockRun run_with_locked_audit_table(const std::string& dsn, int cap, bool h
                     t.join();
         }
     };
-    std::function<void()> unlock_fn = unlock;
-    Cleanup cleanup{unlock_fn, threads};
-
+    // Declared BEFORE `cleanup`: the thread bodies capture it by reference, so it must outlive the
+    // joins on every exit path.
     const hcp::Reader instant = [](const DeviceCiKeysetQuery&) -> std::optional<std::vector<DeviceCiRecord>> {
         return std::vector<DeviceCiRecord>{};
     };
+    std::function<void()> unlock_fn = unlock;
+    Cleanup cleanup{unlock_fn, threads};
+
     for (int i = 0; i < kPool; ++i)
         threads.emplace_back([&] {
             auto page = hcp::read_page(instant, {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
@@ -309,7 +312,25 @@ AuditLockRun run_with_locked_audit_table(const std::string& dsn, int cap, bool h
     const auto deadline = std::chrono::steady_clock::now() + 10s;
     while (busy.load() + parked.load() < kPool && std::chrono::steady_clock::now() < deadline)
         std::this_thread::sleep_for(5ms);
-    std::this_thread::sleep_for(300ms); // let the audit INSERTs reach the lock wait
+    // Then wait until the server REPORTS that many audit INSERTs ungranted on the locked table
+    // (pg_locks, read from the locker's own session), instead of sleeping and hoping they got there.
+    const int expected_waiters = hold_slot_through_audit ? cap : kPool;
+    int waiting = 0;
+    const auto lock_deadline = std::chrono::steady_clock::now() + 10s;
+    while (std::chrono::steady_clock::now() < lock_deadline) {
+        auto r = pg::exec_params(
+            locker.get(),
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events'",
+            std::vector<std::string>{});
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
+            waiting = std::atoi(PQgetvalue(r.get(), 0, 0));
+        if (waiting >= expected_waiters)
+            break;
+        std::this_thread::sleep_for(10ms);
+    }
+    CHECK(waiting == expected_waiters); // the writers really are parked on the lock
 
     AuditLockRun out;
     out.authz_ok = rbac.user_rbac_group_names_checked("tester").has_value();

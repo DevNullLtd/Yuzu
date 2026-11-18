@@ -40,19 +40,24 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
 1. One caller can hold every slot, and the semaphore wait is not first-in-first-out, so a low-privilege
    `Inventory:Read` caller can starve the CMDB sync's bulk read. A per-principal limit is a follow-up.
 2. Point reads (`agent_id`) are uncapped.
-3. There is no audit-liveness breaker. The slot is held through the route's own access-audit write, so a locked
-   audit table (migration DDL, `VACUUM FULL`) parks at most `cap` bulk-read audit writers (proved on a real
-   pool in `test_hardware_ci_read_cap_pg.cpp`, with a control). Every OTHER audited route's audit write is
-   uncapped and the same lock can still saturate the pool through them (a mechanism that predates this
-   change), and the refusals that write an audit row without reading (a malformed cursor, a scope too wide)
-   hold no slot. MCP busy refusals write one generic row each, never more than one such write at a time per
-   replica; a refusal that finds that write taken writes no row and answers `audit_persisted: false`.
-4. A slot is held for the whole store call and then the access-audit write(s): for each, a pool acquire of up to 3 s (500 ms when the pool is saturated),
-   up to 10 s to open a connection and the 5 s statement limit. Against a database that stops answering
-   rather than running slowly those limits may not fire, so a hold can exceed that sum. Recovery is passive.
+3. There is no audit-liveness breaker. The slot is held through the audit write of a served bulk page, so a
+   locked audit table (migration DDL, `VACUUM FULL`) parks at most `cap` such writers (proved on a real pool in
+   `test_hardware_ci_read_cap_pg.cpp`, with a control). The audit writes that hold no slot stay uncapped: point
+   reads (`agent_id`), the failure row after a failed store read, the refusal rows (scope too wide, collation
+   ordering unverified, MCP argument refusals) and every other audited route, so the same lock can still
+   saturate the pool through them (a mechanism that predates this change), and at pool 1 or 2 (cap 1) one
+   stalled audit write can leave authorization without a connection. A busy refusal writes no row on either
+   transport. Owner adjudication: recorded as pre-existing and out of scope for this change (2026-11-18); the
+   class-wide follow-up is the audit-write-path issue.
+4. A slot is held for the whole store call and then the access-audit write(s). The store call: a pool acquire of up to 3 s
+   (500 ms when the pool is saturated), up to 10 s to open a connection and the 5 s statement limit. Each audit
+   write: a pool acquire of up to 4 s, up to 10 s to connect, the pool's 30 s statement limit and a 10 s lock
+   wait. A DSN with its own `options=` gets none of the injected limits, so a write parked on a lock holds its
+   slot until the lock ends. Against a database that stops answering rather than running slowly those limits
+   may not fire, so a hold can exceed those sums. Recovery is passive.
 5. A read waiting for a slot occupies an HTTP worker for up to 500 ms; the cap bounds connections, not workers.
 6. The byte bound does not bound memory: a cap of 8 can transiently hold several hundred MB on one replica.
-7. REST busy refusals are counter-only (`yuzu_hardware_ci_read_busy_total{surface="rest"}`): no principal is
+7. Busy refusals are counter-only on both transports (`yuzu_hardware_ci_read_busy_total{surface}`): no principal is
    attributed to a refusal flood.
 8. No alert rule and no in-use gauge ship for the cap yet.
 9. Retries are not rate limited, and the server adds no jitter to its `retry_after_ms` hint.

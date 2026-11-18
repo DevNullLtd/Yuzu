@@ -17,12 +17,15 @@
 /// access row, so while the audit store is down every attempt still performs its read and then
 /// discards the page, and while the audit table is locked (migration DDL, VACUUM FULL) every
 /// served read's audit INSERT waits on the lock holding a pooled connection. The slot is held
-/// across the read AND that route's own access-audit write (`hardware_ci_page::Page::hold`,
-/// released by the transport right after the audit write), so at most `cap` reads-or-audit-writes
-/// of this route hold a connection at once per replica, whatever the client's retry rate. It is a
-/// CONCURRENCY bound only: retries are not rate-limited, and the cap is per replica, so the
-/// fleet-wide ceiling is replicas x cap. It bounds this route's audit writes only; every other
-/// route's audit write is uncapped.
+/// across the read AND the access-audit write of a served bulk page
+/// (`hardware_ci_page::Page::hold`, released by the transport right after the audit write), so at
+/// most `cap` such reads-or-audit-writes hold a connection at once per replica, whatever the
+/// client's retry rate. It is a CONCURRENCY bound only: retries are not rate-limited, and the cap
+/// is per replica, so the fleet-wide ceiling is replicas x cap. It does NOT bound the audit writes
+/// of point reads (`agent_id`), of the failure row after a failed store read, of the refusal rows
+/// (scope too wide, collation ordering unverified, MCP argument refusals), or of any other route;
+/// a busy refusal writes no row. At pool 1 or 2 the cap is half the pool or more, so a stalled
+/// audit write can still leave authorization without a connection.
 ///
 /// ONE instance, owned by `ServerImpl`, shared by REST and MCP (a second instance would double
 /// the cap). A request that names an `agent_id` (a point read) takes no slot, so

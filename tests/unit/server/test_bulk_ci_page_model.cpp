@@ -900,13 +900,13 @@ TEST_CASE("hardware ci page: every ReadError has one answer on both transports",
          "resume the old cursor); if it persists, ask an administrator to check the database "
          "collation state (see PostgreSQL collation version in server-admin.md)",
          60000, true},
-        // Busy: nothing was read, so NO domain audit row on either transport (REST writes none;
-        // MCP writes one generic best-effort row); the 2000 ms hint is pinned here for both
-        // surfaces (the CI hint script only scans newly added tools).
+        // Busy: nothing was read or served, so NO audit row on either transport (the busy counter
+        // is the record); the 2000 ms hint is pinned here for both surfaces (the CI hint script
+        // only scans newly added tools).
         {hcp::ReadError::kBusy, true,
-         "hardware CI bulk read capacity in use; retry after the hint", false, "failure",
-         "hardware CI records (REST) state=read capacity in use",
-         "hardware CI records (MCP) state=read capacity in use",
+         "hardware CI bulk read capacity in use; retry after the hint", false, "",
+         "",
+         "",
          "wait retry_after_ms, then retry the same cursor with some jitter and back off on repeats "
          "(one retry usually succeeds; give up after about 5 minutes of continuous refusals); read "
          "one page at a time, never several in parallel",

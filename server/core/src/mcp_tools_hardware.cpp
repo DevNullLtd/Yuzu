@@ -42,7 +42,6 @@
 
 #include <nlohmann/json.hpp>
 
-#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <span>
@@ -98,30 +97,14 @@ void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, cons
 }
 
 // The bulk read was refused as busy (hardware_ci_page::ReadError::kBusy): this replica is at its
-// bulk-read cap and nothing was read. It writes ONLY the generic mcp.<tool> row, never the domain
-// row and never the two-row answer_store_unreadable. REST writes no audit row for a busy refusal.
-// MCP writes ONE generic best-effort row per refused call, but never more than
-// kMaxBusyAuditRowsInFlight at a time on this replica: a refusal holds no bulk-read slot, so
-// without this bound a flood of refusals during an audit-table lock would each park a pool
-// connection in an INSERT (#7951). A refusal that finds the gate taken writes no row and answers
-// `audit_persisted: false`; the busy counter still counts it, so the counter minus the rows is the
-// number skipped. The error is retryable with the failure table's hint.
-constexpr int kMaxBusyAuditRowsInFlight = 1;
-std::atomic<int> g_busy_audit_rows_in_flight{0};
-
-struct BusyAuditGate {
-    bool admitted;
-    BusyAuditGate() : admitted(g_busy_audit_rows_in_flight.fetch_add(1) < kMaxBusyAuditRowsInFlight) {}
-    ~BusyAuditGate() { g_busy_audit_rows_in_flight.fetch_sub(1); }
-    BusyAuditGate(const BusyAuditGate&) = delete;
-    BusyAuditGate& operator=(const BusyAuditGate&) = delete;
-};
-
+// bulk-read cap and nothing was read or served. It writes NO audit row, exactly like REST: a refusal
+// holds no bulk-read slot, so an audit INSERT here would be a writer outside the cap that a locked
+// audit table could park on a pooled connection (#7951). `yuzu_hardware_ci_read_busy_total` is the
+// record of a refusal. The envelope omits audit_persisted (nothing was meant to persist), like
+// answer_audit_withheld. The error is retryable with the failure table's hint.
 void answer_read_busy(const ToolCallContext& ctx, const hardware_ci_page::ReadFailure& f) {
-    const BusyAuditGate gate;
-    const bool generic_ok = gate.admitted && ctx.audit(std::string(f.audit_outcome), f.audit_detail);
     answer(ctx, ctx.a4_error(kInternalError, std::string(f.message), std::string(f.remediation),
-                             f.retry_after_ms, {}, generic_ok));
+                             f.retry_after_ms, {}, /*audit_ok=*/true));
 }
 
 // Either access row was dropped: the personal data is NOT served. The message already says
@@ -257,7 +240,7 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
         if (read.error() == hardware_ci_page::ReadError::kBusy) {
-            // Busy: nothing was read, so no domain row (see answer_read_busy).
+            // Busy: nothing was read or served, so no audit row at all (see answer_read_busy).
             if (deps->ci_read_busy_fn)
                 deps->ci_read_busy_fn(hardware_ci_page::Surface::kMcp);
             answer_read_busy(ctx, f);
