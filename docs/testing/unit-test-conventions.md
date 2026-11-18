@@ -31,8 +31,8 @@ The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daem
 ## Echo tests
 
 New and changed `tests/unit/**/test_echo*.cpp` follow [echo-test-standard.md](echo-test-standard.md): ten rules (cost and
-determinism, host dependence and honesty) and the lexical gate `tests/test_echo_test_standard_lexical.py` (meson suite `echo`) that
-checks four of them. A finding is waived only by a real `// echo-test-ok: <reason>` comment, justified in the PR.
+determinism, host dependence and honesty) and the lexical gate `tests/test_echo_test_standard_lexical.py` (meson suite `echo`),
+whose four patterns cover rules 3 to 5. A finding is waived only by a real `// echo-test-ok: <reason>` comment, justified in the PR.
 
 ## Route-handler tests — `TestRouteSink`
 

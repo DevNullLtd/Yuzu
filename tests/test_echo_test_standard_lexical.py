@@ -134,10 +134,26 @@ def echo_files():
     return sorted(UNIT.rglob("test_echo*.cpp"))
 
 
+def decode(data):
+    """Source text from a file's bytes, newlines translated exactly as Path.read_text does, so a
+    CRLF checkout (the Windows leg) scans like an LF one."""
+    return data.decode("utf-8").replace("\r\n", "\n").replace("\r", "\n")
+
+
+def file_problems(name, data):
+    """Findings for one file's bytes. A file that is not UTF-8 is one finding that names it, not a
+    traceback that does not."""
+    try:
+        src = decode(data)
+    except UnicodeDecodeError as e:
+        return [f"{name}: not valid UTF-8 (byte {e.start}); re-save as UTF-8"]
+    return problems(name, src)
+
+
 def tree_problems():
     out = []
     for f in echo_files():
-        out += problems(f.relative_to(ROOT).as_posix(), f.read_text(encoding="utf-8"))
+        out += file_problems(f.relative_to(ROOT).as_posix(), f.read_bytes())
     return out
 
 
@@ -254,6 +270,21 @@ class EchoTestStandardLexical(unittest.TestCase):
             with self.subTest(clean=guard):
                 src = body("CHECK(v.size() == 2);", f"{guard};", "CHECK(v[1] == 3);")
                 self.assertEqual(problems("test_echo_x.cpp", src), [])
+
+    def test_a_non_utf8_file_is_one_finding_that_names_it(self):
+        name = "tests/unit/test_echo_x.cpp"
+        found = file_problems(name, b"void f() {}\n// caf\xe9\n")
+        self.assertEqual(len(found), 1, found)
+        self.assertIn(name, found[0])
+        self.assertIn("re-save as UTF-8", found[0])
+
+    def test_crlf_scans_like_lf(self):
+        src = ("void f() {\n    // echo-test-ok: the owner joins on unwind\n"
+               "    REQUIRE(fut.wait_for(1s) == ready);\n    REQUIRE(g.wait_for(1s) == ready);\n}\n")
+        lf = file_problems("test_echo_x.cpp", src.encode())
+        crlf = file_problems("test_echo_x.cpp", src.replace("\n", "\r\n").encode())
+        self.assertEqual(len(lf), 1, lf)  # the second wait is flagged, the marked first is not
+        self.assertEqual(crlf, lf)
 
     def test_wait_guard_is_per_definition(self):
         src = ("TEST_CASE(\"a\") {\n    const ScopeExit g{[&] {}};\n}\n"
