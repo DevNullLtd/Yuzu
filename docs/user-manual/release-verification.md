@@ -209,14 +209,20 @@ it is checked), and untagged digests in every package (an attempt whose push was
 signed or tagged, or that a later attempt replaced). Do not deploy them, and do not take a
 signature on one as a release: a published image is the digest a release tag (`:X.Y.Z`) names, of a
 version with a published GitHub Release, that `cosign verify` accepts for that release's tag.
-Candidates are left in place; nothing deletes them as routine cleanup.
+Candidates are left in place; nothing deletes them as routine cleanup. If you use image
+automation that picks the newest tag, restrict it to release tags (`^[0-9]+\.[0-9]+\.[0-9]+$`, which
+excludes candidate and pre-release tags) or pin by digest, so it never selects a candidate.
 
-**Release images are not deleted.** The release process never deletes an image: the digest a
-published release's `:X.Y.Z` names stays in the registry, so a deployment pinned to it keeps
-pulling. If a release image ever had to be withdrawn, the project would announce it with the
-release. If a release's `:X.Y.Z`, or a digest its journal names, stops resolving without such an
-announcement, treat it as an incident, not as a registry fault to wait out: keep running what you
-have, do not replace it with an image no release names, and report it through
+**Release images are not deleted, and release tags are not moved by hand.** The release process
+deletes no image. Deleting a GHCR package version is an owner-handled incident outside the release
+process, recorded in the release's tracking issue, and deleting a digest any published release ever
+announced (see that release's journals) is never done, so a deployment pinned to such a digest
+keeps pulling. A release tag moves only in the release workflow; a wrong or superseded release is
+fixed by a new patch release, never by moving a tag by hand. If a release image or tag ever had to
+stop being served, the project would announce it with the release. If a release's `:X.Y.Z`, or a
+digest its journal names, stops resolving or changes without such an announcement, treat it as an
+incident, not as a registry fault to wait out: keep running what you have, do not replace it with an
+image no release names, and report it through
 [private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new).
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
@@ -310,6 +316,15 @@ above); never take it from an error message.
 
 On success: `Verified OK`. Combined with step 1, this proves every
 listed asset is exactly what the workflow produced.
+
+Rely on the signed list, not on the release's asset list: release assets
+can change after publication (GitHub's immutable-releases setting is off
+for this repository, and the agent bundle's files are attached after the
+release). Download every asset and run `sha256sum -c SHA256SUMS` without
+`--ignore-missing`, so a listed file that is missing or changed fails. An
+asset that no signed list names proves nothing, and the agent bundle's
+per-attempt lists are not themselves listed anywhere signed, so a removed
+attempt (its list, signature and files together) cannot be detected.
 
 ## 3. Verify Docker image signatures (cosign)
 

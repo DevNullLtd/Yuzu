@@ -1143,14 +1143,27 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   request it, and "Require review from Code Owners" is off on the protected branches by owner
   decision, so any one approving review merges such a change and
   separation of duties is a practice, not an enforced control. Disclose it with the control.
-- *Image deletion:* no tool or workflow deletes a GHCR image. Untagged candidate digests and the
-  bundle's candidate tags are left in place (each was scanned before its push). Deleting a package
-  version removes that digest under every tag naming it, so any deletion is a manual action by a
-  package admin that the operator confirms after checking the registry's own tag list
-  (`docs/ci-architecture.md` "What the journal does not cover"); the release process never deletes
-  a published release's image, and a withdrawal would be announced
-  (`docs/user-manual/release-verification.md`). The confirmation and the registry check are
-  recorded by hand in the release's tracking issue: a practice, not an enforced control.
+- *What the release's evidence can prove:* release assets are not immutable (GitHub's immutable
+  releases setting is off for the repository), so a holder of `contents: write` can delete,
+  replace or add one after publication, and the release process itself adds the agent bundle's
+  files afterwards (the attach job, which replaces only an incomplete upload of its own) and may
+  re-upload a missing asset by hand (release skill, Phase 4). A verifier can rely on the signed
+  `SHA256SUMS` (identity: `release.yml` at the release's tag): a listed file present and matching
+  is what that workflow produced, and `sha256sum -c SHA256SUMS` fails on a listed file that is
+  missing or changed. An asset no signed list names proves nothing, and nothing signed lists the
+  agent bundle's attempts, so removing one attempt's whole set is not detectable
+  (`docs/ci-architecture.md` "What the journal does not cover").
+- *Image deletion and release tags:* the release process deletes no image. Deleting a GHCR package
+  version is an owner-handled incident outside the release process, recorded in the release's
+  tracking issue, and deleting a digest any published release ever announced (see that release's
+  journals) is never done. Untagged candidate digests and the bundle's candidate tags are left in
+  place (each was scanned before its push). A release tag moves only in `release.yml`'s "Tag the
+  release" step; no tool or documented procedure moves one by hand, a wrong or superseded release
+  is fixed by a new patch release, and a tag that must stop being served is an owner-handled
+  incident, announced (`docs/user-manual/release-verification.md`) and recorded in the release's
+  tracking issue (`docs/ci-architecture.md` "Release tag policy"). Both are practices, not
+  enforced controls: a package admin can delete a version, and a `packages: write` holder can move
+  a tag; the tracking-issue record is the evidence.
 - *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
