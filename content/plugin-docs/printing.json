@@ -690,7 +690,7 @@
       "server/core/src/capability_decls/plugin_action_catalogue_printing.hpp"
     ],
     "changelog": [
-      "changelog.d/wp12b-printing-getpwuid-r.fixed.md"
+      "changelog.d/8216-printing-getpwuid-r.fixed.md"
     ],
     "definitions": [
       "content/definitions/printing.yaml"
