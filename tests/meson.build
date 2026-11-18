@@ -308,7 +308,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
-    'unit/test_session_log_fingerprint.cpp', # F50: session id never logged raw
+    'unit/test_session_log_fingerprint.cpp', # #8159: session id never logged raw
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
@@ -4678,14 +4678,14 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
-# F50: the agent's Registered line logs session_fp, and no script parses session= from it.
+# #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
 test('agent session id log wiring lexical gate',
   _python3_test,
   args: [files('test_agent_session_log_wiring_lexical.py')],
   suite: 'docs',
   timeout: 60,
 )
-# F50: the session_fp -> session id join in scripts/lib/agent-session-fp.sh, on LF and CRLF fixtures.
+# #8159: the session_fp -> session id join in scripts/lib/agent-session-fp.sh, on LF and CRLF fixtures.
 test('agent session fp shell join',
   _python3_test,
   args: [files('test_agent_session_fp_shell.py')],

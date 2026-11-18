@@ -132,8 +132,13 @@ inline constexpr std::size_t kQueryDetailMaxBytes = 120;
     if (raw.size() > kQueryDetailMaxBytes) {
         // Cut on a code-point boundary: back up over continuation bytes so no lead byte dangles.
         std::size_t cut = kQueryDetailMaxBytes;
+        const std::size_t first = cut;
         while (cut > 0 && (static_cast<unsigned char>(raw[cut]) & 0xC0) == 0x80)
             --cut;
+        // Backed up onto an ASCII byte: the continuation bytes were stray (malformed input), not
+        // the tail of a character, so keep everything before them rather than dropping that byte.
+        if (static_cast<unsigned char>(raw[cut]) < 0x80)
+            cut = first;
         raw = raw.substr(0, cut);
     }
     const std::string safe = ::yuzu::log_key_token(raw);

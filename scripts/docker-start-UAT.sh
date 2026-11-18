@@ -427,7 +427,7 @@ start_all() {
                 return 1
             fi
         done
-        # The agent log carries only a session_fp (F50); the id comes from the server container's
+        # The agent log carries only a session_fp (#8159); the id comes from the server container's
         # "ProxyRegister succeeded" line, joined on the fingerprint.
         # shellcheck source=lib/agent-session-fp.sh
         # shellcheck disable=SC1091
@@ -435,7 +435,8 @@ start_all() {
         # docker logs of an absent container must not abort under set -e: stage to a file.
         local srv_log="$UAT_DIR/server-container.log"
         docker logs yuzu-uat-server > "$srv_log" 2>&1 || true
-        LAST_SESSION_ID=$(resolve_agent_session "$log" "$srv_log")
+        LAST_SESSION_ID=$(resolve_agent_session "$log" "$srv_log") \
+            || { fail "$label agent session cannot be resolved (see message above)"; return 1; }
         ok "$label agent up ($LAST_SESSION_ID, ${waited}s)"
 
         if echo "$LAST_SESSION_ID" | grep -q "gw-session"; then

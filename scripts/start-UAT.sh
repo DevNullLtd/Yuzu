@@ -873,12 +873,13 @@ start_all() {
         exit 1
     fi
     local session_id
-    # The agent log carries only a session_fp (F50); the id comes from the server's own
+    # The agent log carries only a session_fp (#8159); the id comes from the server's own
     # "ProxyRegister succeeded" line, joined on the fingerprint.
     # shellcheck source=lib/agent-session-fp.sh
     # shellcheck disable=SC1091
     . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
-    session_id=$(resolve_agent_session "$UAT_DIR/agent.log" "$UAT_DIR/server.log")
+    session_id=$(resolve_agent_session "$UAT_DIR/agent.log" "$UAT_DIR/server.log") \
+        || { fail "Cannot resolve the agent session (see message above)"; exit 1; }
     ok "Agent up (PID $agent_pid) — $session_id"
 
     # Verify it routed through gateway (gw-session prefix)

@@ -1,4 +1,4 @@
-// F50: the session id (a bearer credential) must never be rendered into a log line; only a
+// #8159: the session id (a bearer credential) must never be rendered into a log line; only a
 // short non-reversible fingerprint may be.
 
 #include "session_log_fingerprint.hpp"

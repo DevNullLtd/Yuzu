@@ -14,7 +14,14 @@ QUERY_STEPS = ("could not set non-blocking mode", "could not send probe query",
                "could not flush probe query", "connection lost during probe")
 
 
+def strip_comments(text):
+    """Remove // and /* */ comments (string literals are left alone; the pinned shapes contain none)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
+    return re.sub(r"//[^\n]*", "", text)
+
+
 def check(text):
+    text = strip_comments(text)
     errs = []
     m = re.search(r"std::string pq_query_error\([^)]*\)\s*\{(.*?)\n\}", text, re.S)
     if not m:
@@ -39,7 +46,14 @@ def main():
     # mutation self-test: reverting pq_query_error to the connect classifier, or a site to pq_error, must fail
     mut1 = good.replace("return pg::query_failure_detail(step,", "return pg::connect_failure_cause(", 1)
     mut2 = good.replace('pq_query_error(c, "connection lost during probe")', 'pq_error(c, "connection lost during probe")', 1)
-    assert check(mut1) and check(mut2), "selftest: mutations must be caught"
+    # a comment-only mention of query_failure_detail must NOT satisfy the pin
+    mut3 = good.replace("return pg::query_failure_detail(step,", "return pg::connect_failure_cause(  // query_failure_detail(", 1)
+    mut4 = re.sub(r"(std::string pq_query_error\([^)]*\)\s*\{)", r"\1 /* query_failure_detail( */", mut1, count=1)
+    # the result_error path reverted to raw text
+    mut5 = good.replace('pg::query_failure_detail("probe query failed", m)', 'std::string(m)', 1)
+    # a query-phase step moved to the connect helper via a comment-hidden original
+    mut6 = good.replace('pq_query_error(c, "could not send probe query")', 'pq_error(c, "could not send probe query") // pq_query_error(c, "could not send probe query")', 1)
+    assert all(check(m) for m in (mut1, mut2, mut3, mut4, mut5, mut6)), "selftest: mutations must be caught"
     errs = check(good)
     for e in errs:
         print("FAIL:", e)

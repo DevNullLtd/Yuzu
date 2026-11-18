@@ -2,7 +2,7 @@
 
 /**
  * session_log_fingerprint.hpp - the only form in which the server-issued session id may appear
- * in the agent log (F50, CWE-532).
+ * in the agent log (#8159, CWE-532).
  *
  * The session id is the bearer proof of agent identity on Heartbeat and ReportInventory, and the
  * agent log tail is readable through agent_logging.get_log and stored in the response store. So

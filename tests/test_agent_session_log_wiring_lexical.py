@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Tripwire (F50): the agent's "Registered with server" log line carries a session FINGERPRINT
+"""Tripwire (#8159): the agent's "Registered with server" log line carries a session FINGERPRINT
 (`session_fp=`, first 8 hex of SHA-256), never the session id, which is a bearer credential
 readable through agent_logging.get_log.
 
@@ -9,8 +9,8 @@ Best-effort lexical gate, two checks:
   2. No text file in the repo parses `session=` out of that agent line. Backslash continuations are
      joined, and a `session=` extractor within WINDOW lines of a "Registered with server" mention
      (a separate-line extractor included) fails. A line that carries the marker
-     `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (the
-     direct-id fallbacks and the upgrade note quoting the old line).
+     `tripwire-allow: <reason>` is exempt, so each exemption is visible at its own line (only the
+     upgrade note quoting the old line). There is NO other `session=` read of that line.
 The server-side "ProxyRegister succeeded: ... session=" line is the id's source and is not flagged.
 """
 import pathlib
@@ -107,6 +107,8 @@ def selftest():
     ]
     for b in bad:
         assert check_text("x.sh", b), ("selftest: must fire on", b)
+    # re-adding a session= read of the Registered line (a fallback) must be RED
+    assert check_text("lib.sh", 'grep -a "Registered with server" "$1" | grep -aoE \'session=[^ ,)]+\''), "selftest fallback"
     assert not check_text("x.sh", "Registered with server (session_fp=ab12cd34, "), "selftest ok-fp"
     assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: legacy'), "selftest allow"
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"

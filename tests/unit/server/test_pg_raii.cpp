@@ -325,6 +325,9 @@ TEST_CASE("query_failure_detail keeps the step and a folded, capped first line (
     CHECK(g == "s: " + std::string(119, 'x')); // the 2-byte character is dropped whole
     for (const unsigned char c : g)
         CHECK(c < 0x80);
+    // Malformed input: stray continuation bytes after ASCII do not cost the ASCII byte before them.
+    const auto h = query_failure_detail("s", std::string(120, 'y') + "\x80\x80more");
+    CHECK(h.substr(0, 3 + 120) == "s: " + std::string(120, 'y'));
 }
 
 TEST_CASE("connect_failure_cause: each branch, and the mis-bucketing cases", "[raii][F56]") {

@@ -41,7 +41,7 @@ __declspec(allocate(".CRT$XCB"))
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
 #include "agent.grpc.pb.h"
 #include "guaranteed_state.pb.h"
-#include "session_log_fingerprint.hpp" // F50: the session id is a bearer credential; log a fingerprint only
+#include "session_log_fingerprint.hpp" // #8159: the session id is a bearer credential; log a fingerprint only
 
 // Local-only helper, exposed for unit testing.
 #include "plugin_config_sync.hpp"
