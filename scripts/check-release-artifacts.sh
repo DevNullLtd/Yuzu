@@ -38,6 +38,12 @@
 #     yuzu-agent-windows-x64.cdx.json + .spdx.json
 #     yuzu-agent-macos-arm64.cdx.json + .spdx.json
 #
+#   Per-package SBOMs (S8): every *.deb, *.rpm, *.exe and *.pkg has its own
+#   <name without the extension>.cdx.json + .spdx.json, and every SBOM present
+#   belongs to an archive base above, a package, or an image below (no orphan
+#   SBOM is signed into SHA256SUMS). Their CONTENT (scope, bound, SHA-256 of
+#   the file they describe) is checked by scripts/ci/artifact-sbom.py check.
+#
 #   Image SBOMs:
 #     yuzu-server-image.cdx.json   + .spdx.json
 #     yuzu-gateway-image.cdx.json  + .spdx.json
@@ -157,6 +163,37 @@ for base in "${SBOM_BASES[@]}"; do
   done
 done
 
+# ── Per-package SBOMs, and no SBOM without an artifact (S8) ─────────
+for f in "$ART_DIR"/*.deb "$ART_DIR"/*.rpm "$ART_DIR"/*.exe "$ART_DIR"/*.pkg; do
+  [[ -f "$f" ]] || continue
+  name="${f##*/}"
+  stem="${name%.*}"
+  for fmt in cdx.json spdx.json; do
+    if [[ ! -s "$ART_DIR/$stem.$fmt" ]]; then
+      echo "::error::missing SBOM for $name: $stem.$fmt" >&2
+      fail=1
+    fi
+  done
+done
+
+for f in "$ART_DIR"/*.cdx.json "$ART_DIR"/*.spdx.json; do
+  [[ -f "$f" ]] || continue
+  name="${f##*/}"
+  stem="${name%.cdx.json}"
+  stem="${stem%.spdx.json}"
+  known=0
+  for base in "${SBOM_BASES[@]}"; do
+    [[ "$stem" == "$base" ]] && known=1
+  done
+  for ext in deb rpm exe pkg; do
+    [[ -f "$ART_DIR/$stem.$ext" ]] && known=1
+  done
+  if (( ! known )); then
+    echo "::error file=$name::SBOM describes no artifact of this release (no archive, package or image named $stem)" >&2
+    fail=1
+  fi
+done
+
 # ── Sanity check: SBOMs parse as JSON ────────────────────────────────
 # `jq` is available on ubuntu-24.04 runners. If absent we skip rather
 # than fail — the structural check is a bonus, not the contract.
@@ -228,6 +265,7 @@ echo "Release artifact completeness gate: OK"
 echo "  archives:         ${#REQUIRED_ARCHIVES[@]} required files present"
 echo "  installers/pkgs:  ${#REQUIRED_GLOBS[@]} required globs satisfied"
 echo "  SBOMs:            ${#SBOM_BASES[@]} bases × 2 formats (CycloneDX + SPDX) present"
+echo "  package SBOMs:    one CycloneDX + SPDX pair per .deb/.rpm/.exe/.pkg; no orphan SBOM"
 if [[ -n "$RELEASE_VERSION" ]]; then
   echo "  asset names:      GitHub-safe; every package is from ${RELEASE_VERSION}"
 else

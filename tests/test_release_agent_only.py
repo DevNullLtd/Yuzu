@@ -269,8 +269,10 @@ def problems(release: str, check: str, bundle: str) -> list:
         if f"yuzu-agent-{os_tag}" not in {re.sub(r"\.(zip|tar\.gz)$", "", n) for n in reference}:
             found.append(f"no yuzu-agent-{os_tag} archive in the agreed set {sorted(reference)}")
     stems = {re.sub(r"\.(zip|tar\.gz)$", "", n) for n in reference}
-    platform_sboms = literal(re.findall(r"output-file:\s+(yuzu-[a-z0-9-]+)\.(?:cdx|spdx)\.json", release))
-    platform_sboms = {s for s in platform_sboms if not s.endswith("-image")}
+    # The archive SBOMs are made by scripts/ci/artifact-sbom.py (S8), from the
+    # archive named in each job's `for artifact in ...` loop or `--artifact`.
+    platform_sboms = {re.sub(r"\.(zip|tar\.gz)$", "", n) for n in literal(
+        re.findall(rf"(?:for artifact in|--artifact)\s+({ARCHIVE_RE})", release))}
     platform_bases = {b for b in sbom_bases if not b.endswith("-image")}
     if platform_sboms != stems:
         found.append(f"release.yml platform SBOM stems {sorted(platform_sboms)} do not match the archives {sorted(stems)}")
@@ -354,7 +356,8 @@ class ReleaseAgentOnly(unittest.TestCase):
             "macos upload path typo": ("release", "path: yuzu-agent-macos-arm64.tar.gz", "path: yuzu-agent-macos-arm4.tar.gz"),
             "windows attest subject typo": ("release", "            yuzu-agent-windows-x64.zip\n            YuzuAgentSetup-*.exe", "            yuzu-agentwindows-x64.zip\n            YuzuAgentSetup-*.exe"),
             "attach list old name": ("release", "artifacts/yuzu-agent-macos-arm64.tar.gz", "artifacts/yuzu-macos-arm64.tar.gz"),
-            "windows SBOM stem old": ("release", "output-file: yuzu-agent-windows-x64.cdx.json", "output-file: yuzu-windows-x64.cdx.json"),
+            "windows SBOM stem old": ("release", "--artifact yuzu-agent-windows-x64.zip @common", "--artifact yuzu-windows-x64.zip @common"),
+            "macos SBOM archive dropped": ("release", "for artifact in yuzu-agent-macos-arm64.tar.gz ./YuzuAgent-*.pkg", "for artifact in ./YuzuAgent-*.pkg"),
             "required archive old name": ("check", '  "yuzu-agent-windows-x64.zip"', '  "yuzu-windows-x64.zip"'),
             "required archive dropped": ("check", '  "yuzu-agent-macos-arm64.tar.gz"\n', ""),
             "SBOM base typo": ("check", '  "yuzu-agent-macos-arm64"\n', '  "yuzu-agent-macos-arm"\n'),

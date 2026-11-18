@@ -309,8 +309,8 @@ private:
                     std::get<double>(cur[j]) += std::get<double>(in[j]);
                 else {
                     // Saturate: signed overflow is undefined, and a wrapped total would be
-                    // a plausible wrong number. (The SQL UPSERT promotes to REAL instead;
-                    // this sums within one batch only.)
+                    // a plausible wrong number. (The SQL UPSERT saturates at the same
+                    // bounds, so the in-memory merge and the stored row agree.)
                     auto& a = std::get<int64_t>(cur[j]);
                     const int64_t b = std::get<int64_t>(in[j]);
                     if (b > 0 && a > std::numeric_limits<int64_t>::max() - b)
@@ -897,9 +897,12 @@ public:
     /// live-set scan per pass into a temp table, then batches by id. A deadline hit is a
     /// result, not an error (GcResult::live_set_built says whether the scan finished; a
     /// pass whose scan outruns the deadline deletes nothing); any OTHER failure is
-    /// returned as an error, never as an empty success.
-    [[nodiscard]] std::expected<GcResult, std::string> gc_dictionary(EchoDatabase& db,
-                                                                      Clock::time_point deadline);
+    /// returned as an error, never as an empty success. `cancelled`, when set, is polled
+    /// wherever the deadline is (between batches and by the statement progress handler) and
+    /// counts as the deadline: a cancelled pass reports deadline_hit and deletes nothing more.
+    [[nodiscard]] std::expected<GcResult, std::string>
+    gc_dictionary(EchoDatabase& db, Clock::time_point deadline,
+                  const std::function<bool()>& cancelled = {});
 
 private:
     [[nodiscard]] Clock::time_point now() const { return now_ ? now_() : Clock::now(); }

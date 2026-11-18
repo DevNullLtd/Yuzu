@@ -125,8 +125,9 @@ while IFS= read -r nested; do
     flat="$PROTO_DIR/$(basename "$nested")"
     # nested proto with no flat mirror is compiled only via its import path; skip.
     [ -f "$flat" ] || continue
-    rm -rf "$TMP_NESTED"
-    mkdir -p "$TMP_NESTED"
+    # Empty it IN PLACE: freeing and re-creating a mktemp name would let another
+    # local user plant a directory at the predictable path in between (F74).
+    find "$TMP_NESTED" -mindepth 1 -delete
     erl -noshell -pa "$GPB_EBIN" -eval "
         {ok, Terms} = file:consult(\"rebar.config\"),
         Grpc = proplists:get_value(grpc, Terms, []),
