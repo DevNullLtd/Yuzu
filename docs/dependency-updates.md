@@ -285,23 +285,21 @@ Pushed with forged commit identities and then re-run from a reopened PR, a
 maintainer's own approval would pass this gate. It would not count towards a
 merge under the `dev` ruleset, which requires the most recent push to be
 approved by someone other than its pusher, and GitHub does not let a PR's
-author approve it. That merge rule is a review rule, not a backstop for the
-gate. It holds against an ordinary write collaborator, but not against:
+author approve it. That merge rule is a review rule, not a security control
+for the gate. Today a write collaborator can defeat it, and an organisation
+admin can bypass it:
 
-- an organisation admin, whom the rulesets let bypass it;
-- anyone who can use a repository-wide token to push or approve as the
-  token's owner, such as `CLA_REPO_ACCESS_TOKEN`: a classic `repo`-scope
-  personal access token (see `cla.yml`) kept as a repository secret, which a
-  workflow pushed to any branch can read. With such a token a maintainer could
-  push a head as the token's owner and approve it themselves (this gate and
-  the merge rule would both see the token's owner as the pusher), or approve
-  their own pull request, any pull request and not only the bump PR, as the
-  token's owner, and merge with no independent review.
+- `CLA_REPO_ACCESS_TOKEN` (see `cla.yml`) is a classic `repo`-scope personal
+  access token kept as a repository secret, which a workflow pushed to any
+  branch can read. With it, anyone who can push a branch can push a head as
+  the token's owner and approve it, or approve any pull request as the
+  token's owner, and merge with no independent review;
+- the rulesets let organisation admins bypass the merge rule.
 
-The PR token would be another such token if it were a repository secret,
-which is why it is stored in the `vcpkg-baseline` environment, which only
-`main` may use (see "Where the token is stored"). That closes the PR token's
-route only; the merge rule still does not hold against the two above.
+The PR token is stored in the `vcpkg-baseline` environment, which only `main`
+may use (see "Where the token is stored"), so that it does not add another
+such route. That does not make the merge rule a control; scoping or replacing
+`CLA_REPO_ACCESS_TOKEN` and the admin bypass are owner decisions.
 
 **If the bump PR cannot be approved.** The bump workflow's last step, "Check
 the bump PR can be approved", fails the run, and so opens or comments on the
@@ -431,7 +429,7 @@ issue stays open.
   4. make sure there is no repository or organisation secret of that name.
      `gh secret list --repo DevNullLtd/Yuzu` must not list it (delete it with
      `gh secret delete VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` if it
-     does), and `gh api repos/DevNullLtd/Yuzu/actions/organization-secrets
+     does), and `gh api --paginate repos/DevNullLtd/Yuzu/actions/organization-secrets
      --jq '.secrets[].name'`, the organisation secrets shared with this
      repository, must not list it either (an organisation owner removes it);
   5. required reviewers are optional. With them, every run, the monthly one

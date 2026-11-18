@@ -446,17 +446,15 @@ jobs:
       # ones GitHub records on the head approves it, and the step cannot tell
       # whether that account is an independent person.
       # The dev ruleset's merge rule (the most recent push must be approved by
-      # someone other than its pusher) is a review rule, not a backstop for
-      # this step. It holds against an ordinary write collaborator, but not
-      # against an organisation admin, whom the rulesets let bypass it, nor
-      # against anyone who can use a repository-wide token to push or approve
-      # as that token's owner, such as CLA_REPO_ACCESS_TOKEN (cla.yml: a
-      # classic `repo`-scope PAT kept as a repository secret, which a workflow
-      # on any branch can read). VCPKG_BASELINE_PR_TOKEN would be another if it
-      # were a repository secret, so it is kept in the `vcpkg-baseline`
-      # environment, which only `main` may use; that closes this one route and
-      # not the other two (docs/dependency-updates.md, "Self-hosted CI is held
-      # until a maintainer approves the head").
+      # someone other than its pusher) is a review rule, not a security
+      # control for this step. Today a write collaborator can defeat it: a
+      # workflow pushed to any branch can read CLA_REPO_ACCESS_TOKEN (cla.yml:
+      # a classic `repo`-scope PAT kept as a repository secret) and push or
+      # approve as that token's owner. Organisation admins can bypass it.
+      # VCPKG_BASELINE_PR_TOKEN is kept in the `vcpkg-baseline` environment,
+      # which only `main` may use, so that it does not add another such route;
+      # that does not make the merge rule a control (docs/dependency-updates.md,
+      # "Self-hosted CI is held until a maintainer approves the head").
       #
       # A later CHANGES_REQUESTED review, or a dismissal, withdraws an
       # approval. The approval is therefore bound to the reviewed head: a new
