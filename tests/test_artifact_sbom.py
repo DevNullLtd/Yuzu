@@ -376,6 +376,9 @@ INNO_HEADER = ("Index\tSourceFilename\tTimeStamp\tVersion\tSHA256Sum\tOriginalSi
 # the agent core and the vcpkg runtime DLLs scripts/deploy_build_dlls.py copies
 # there. ISCC sorts a wildcard's matches by name.
 CORE_DLLS = ("libcrypto-3-x64.dll", "libssl-3-x64.dll", "yuzu_agent_core.dll", "zlib1.dll")
+# What deploy/packaging/windows/stage-msvc-runtime.ps1 stages into
+# build-windows\msvc-runtime (its $Required set), for the .iss wildcard there.
+MSVC_RUNTIME_DLLS = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll")
 
 
 def iss_sources() -> list:
@@ -397,7 +400,8 @@ def make_inno_build(build: Path) -> list:
     rows, seen = [], set()
     for src in iss_sources():
         folder, name = src.rsplit("\\", 1)
-        for n in (CORE_DLLS if name == "*.dll" else (name,)):
+        wild = MSVC_RUNTIME_DLLS if folder.lower().rsplit("\\", 1)[-1] == "msvc-runtime" else CORE_DLLS
+        for n in (wild if name == "*.dll" else (name,)):
             rel = f"{folder}\\{n}"
             if rel.lower() in seen:
                 continue
@@ -602,7 +606,8 @@ class Units(unittest.TestCase):
         dest, listed = self._contents(manifest, build)
         want = [rel.replace("\\", "/") for rel, _ in rows]
         self.assertEqual(listed, want)
-        self.assertEqual(listed[:2], ["agents/core/yuzu-agent.exe", "agents/core/libcrypto-3-x64.dll"])
+        self.assertEqual(listed[:2], ["msvc-runtime/vcruntime140.dll", "msvc-runtime/vcruntime140_1.dll"])
+        self.assertIn("agents/core/yuzu-agent.exe", listed)
         self.assertIn("agents/core/yuzu_agent_core.dll", listed)
         self.assertGreater(sum(1 for p in listed if p.startswith("agents/plugins/")), 40)
         # Each file is copied, byte for byte, to its build-relative path, and
@@ -801,7 +806,11 @@ class Units(unittest.TestCase):
                                                             r"manifest\.txt", s)]
         self.assertEqual(writers, ["Build Windows installers (InnoSetup)"])
         self.assertNotIn("--contents-from", wf)
-        self.assertNotIn("--iss", wf)
+        # No SBOM step reads the .iss (another step, the payload import check,
+        # takes its own --iss argument; that is not an SBOM input).
+        for n, s in steps:
+            if "artifact-sbom.py" in s:
+                self.assertNotIn("--iss", s, n)
 
     def test_pkg_staged_names_are_the_ones_build_pkg_stages(self):
         # The .pkg's payload names come from deploy/packaging/macos/build-pkg.sh,
