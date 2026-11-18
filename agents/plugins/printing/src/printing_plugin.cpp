@@ -112,7 +112,6 @@
 #include <httplib.h>
 
 #include <cstdio>
-#include <pwd.h>
 #include <sys/stat.h>
 #include <unistd.h>
 #endif

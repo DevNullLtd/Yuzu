@@ -11,7 +11,9 @@
 
 #include <cstring>
 #include <string>
+#include <vector>
 
+#include <pwd.h>
 #include <unistd.h>
 
 namespace {
@@ -28,6 +30,19 @@ TEST_CASE("printing identity: a found record yields its name", "[printing][ident
         return 0;
     };
     CHECK(username_for_uid(1000, fake) == "alice");
+}
+
+TEST_CASE("printing identity: the uid is forwarded to the lookup", "[printing][identity]") {
+    uid_t seen = 0;
+    auto fake = [&](uid_t uid, struct passwd* pw, char* buf, size_t len, struct passwd** res) {
+        seen = uid;
+        std::strncpy(buf, "carol", len);
+        pw->pw_name = buf;
+        *res = pw;
+        return 0;
+    };
+    CHECK(username_for_uid(4242, fake) == "carol");
+    CHECK(seen == 4242);
 }
 
 TEST_CASE("printing identity: ERANGE grows the buffer and retries", "[printing][identity]") {
@@ -72,7 +87,25 @@ TEST_CASE("printing identity: every failure is an empty name (fail closed)",
             return ERANGE;
         };
         CHECK(username_for_uid(1, fake).empty());
-        CHECK(max_len <= yuzu::printing::kMaxPasswdBufferBytes);
+        CHECK(max_len == yuzu::printing::kMaxPasswdBufferBytes);
+    }
+    SECTION("error with a non-null result is still empty") {
+        auto fake = [](uid_t, struct passwd* pw, char* buf, size_t len, struct passwd** res) {
+            std::strncpy(buf, "mallory", len);
+            pw->pw_name = buf;
+            *res = pw;
+            return EIO;
+        };
+        CHECK(username_for_uid(1, fake).empty());
+    }
+    SECTION("empty pw_name") {
+        auto fake = [](uid_t, struct passwd* pw, char* buf, size_t len, struct passwd** res) {
+            std::strncpy(buf, "", len);
+            pw->pw_name = buf;
+            *res = pw;
+            return 0;
+        };
+        CHECK(username_for_uid(1, fake).empty());
     }
     SECTION("null pw_name") {
         auto fake = [](uid_t, struct passwd* pw, char*, size_t, struct passwd** res) {
@@ -84,9 +117,34 @@ TEST_CASE("printing identity: every failure is an empty name (fail closed)",
     }
 }
 
-TEST_CASE("printing identity: the real lookup resolves the current euid", "[printing][identity]") {
-    // Always present on a host that can run the suite; "" would mean the passwd db lacks it.
-    CHECK_FALSE(username_for_uid(::geteuid()).empty());
+TEST_CASE("printing identity: the real lookup matches an independent getpwuid_r",
+          "[printing][identity]") {
+    auto independent = [](uid_t uid) -> std::string {
+        std::vector<char> buf(16384);
+        struct passwd pw{};
+        struct passwd* res = nullptr;
+        if (::getpwuid_r(uid, &pw, buf.data(), buf.size(), &res) != 0 || res == nullptr ||
+            res->pw_name == nullptr)
+            return {};
+        return res->pw_name;
+    };
+
+    SECTION("current euid") {
+        const std::string expected = independent(::geteuid());
+        if (expected.empty())
+            SKIP("the effective uid has no passwd entry on this host");
+        CHECK(username_for_uid(::geteuid()) == expected);
+    }
+    SECTION("uid 0") {
+        if (independent(0) != "root")
+            SKIP("no root entry for uid 0 on this host");
+        CHECK(username_for_uid(0) == "root");
+    }
+    SECTION("an unassigned uid is empty") {
+        if (!independent(4000000000u).empty())
+            SKIP("uid 4000000000 is assigned on this host");
+        CHECK(username_for_uid(4000000000u).empty());
+    }
 }
 
 #endif // !_WIN32
