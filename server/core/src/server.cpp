@@ -14629,7 +14629,8 @@ private:
             [this](std::string_view principal, std::string_view securable,
                    yuzu::server::authz::Operation op) {
                 return dispatch_has_permission(principal, securable, op);
-            });
+            },
+            &parameters); // sg10: the send path always passes the parameters (param-escalated securable)
 
         if (!decision) {
             const auto& denial = decision.error();

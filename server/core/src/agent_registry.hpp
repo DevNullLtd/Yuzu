@@ -122,7 +122,8 @@ classify_and_authorize_dispatch(
     const CommandCapabilityRegistry& registry, const DispatchCaller& caller,
     std::string_view plugin, std::string_view action,
     const std::function<bool(std::string_view principal, std::string_view securable,
-                             authz::Operation operation)>& has_permission) {
+                             authz::Operation operation)>& has_permission,
+    const std::unordered_map<std::string, std::string>* parameters = nullptr) {
     auto classified = registry.classify(plugin, action);
     if (!classified) {
         return std::unexpected(DispatchDenial{
@@ -130,7 +131,18 @@ classify_and_authorize_dispatch(
                                                                   : DispatchDenialReason::Unclassified,
             {}, authz::Operation::Read});
     }
-    const CommandCapability cap = *classified;
+    CommandCapability cap = *classified;
+    // sg10: a row that escalates its securable on a parameter (`CommandCapability::
+    // param_escalation_key`) is judged, and reported, under the escalated securable when the
+    // parameter is supplied and non-empty. `parameters == nullptr` means the caller does not know
+    // them (the MCP/REST pre-dispatch DRY RUN): the escalation is then NOT evaluated here and is
+    // enforced at the send path, `ServerImpl::build_classified_command`, which always passes them.
+    if (parameters != nullptr && !cap.param_escalation_key.empty() &&
+        !cap.param_escalation_securable.empty()) {
+        if (const auto it = parameters->find(std::string(cap.param_escalation_key));
+            it != parameters->end() && !it->second.empty())
+            cap.securable = cap.param_escalation_securable;
+    }
 
     // #1398 defense in depth: see DispatchDenialReason::Unclassified's doc
     // comment — every fragment's compile-time sweep should make this

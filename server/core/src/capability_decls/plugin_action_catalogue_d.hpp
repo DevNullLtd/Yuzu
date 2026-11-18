@@ -264,6 +264,11 @@ inline constexpr std::array<CommandCapability, 43> kPluginActionCatalogueD{{
         .operation = authz::Operation::Read,
         .risk_tier = authz::RiskTier::Low,
         .execute_gate = ExecuteGate::None,
+        // sg10 (owner ruling 2026-11-18): a caller-supplied `targets` list makes this a network
+        // probe of operator-chosen hosts, an `Infrastructure` read; the built-in default patch
+        // servers stay `SoftwareDeployment:Read`.
+        .param_escalation_key = "targets",
+        .param_escalation_securable = "Infrastructure",
     },
 
     // ── services (agents/plugins/services/src/services_plugin.cpp) ─────────

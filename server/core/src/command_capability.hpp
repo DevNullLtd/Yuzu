@@ -106,6 +106,16 @@ struct CommandCapability {
     /// designated-initializer row value-initializes to `Unspecified` (the
     /// zero enumerator), which every fragment's compile-time sweep rejects.
     ExecuteGate execute_gate{ExecuteGate::Unspecified};
+    /// OPTIONAL parameter-dependent securable (sg10). When BOTH are non-empty and the dispatch's
+    /// parameters carry a NON-EMPTY value under `param_escalation_key`, the RBAC check (and the
+    /// securable reported on a denial and on the returned row) uses `param_escalation_securable`
+    /// instead of `securable`. Empty (the default) = the row's securable is the only one. Today
+    /// only `windows_updates.patch_connectivity` (a caller-supplied `targets` probe is an
+    /// `Infrastructure` read, the built-in default targets stay `SoftwareDeployment`). Evaluated
+    /// ONLY where the parameters are passed to `classify_and_authorize_dispatch`
+    /// (`ServerImpl::build_classified_command`, the one send path).
+    std::string_view param_escalation_key{};
+    std::string_view param_escalation_securable{};
 };
 
 namespace detail {
