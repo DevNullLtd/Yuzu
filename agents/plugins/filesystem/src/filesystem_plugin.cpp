@@ -125,6 +125,13 @@ using yuzu::filesystem::find_by_hash::kMaxHashFileSize;
 
 // ── Path validation ─────────────────────────────────────────────────────
 
+// A path as UTF-8 bytes: path::string() throws on Windows for a name the active code page cannot
+// represent, and a throw out of the reserved-path decision must never become an allow.
+std::string path_bytes(const fs::path& p) {
+    const auto u = p.u8string();
+    return std::string(reinterpret_cast<const char*>(u.data()), u.size());
+}
+
 // WP06 F55: the agent's own data dir, log file and TLS key/cert/CA paths, captured at init and
 // refused by every validate_path* below (best effort, see filesystem_reserved_paths.hpp).
 //
@@ -136,7 +143,7 @@ yuzu::filesystem::reserved::Set baseline_reserved() {
     std::error_code ec;
     auto add = [&](const fs::path& p) {
         auto c = fs::weakly_canonical(p, ec);
-        set.dirs.push_back((ec ? p.lexically_normal() : c).string());
+        set.dirs.push_back(path_bytes(ec ? p.lexically_normal() : c));
         ec.clear();
     };
 #ifdef _WIN32
@@ -161,7 +168,11 @@ yuzu::filesystem::reserved::Set baseline_reserved() {
 }
 
 std::mutex g_reserved_mu;
-yuzu::filesystem::reserved::Set g_reserved = baseline_reserved();
+// Built on first use (never at library load, where file I/O would run under the loader lock).
+yuzu::filesystem::reserved::Set& g_reserved_set() {
+    static yuzu::filesystem::reserved::Set set = baseline_reserved();
+    return set;
+}
 
 long own_pid() {
 #ifdef _WIN32
@@ -174,18 +185,18 @@ long own_pid() {
 // Decide by IDENTITY, not spelling (a hard link, a bind mount, `..`, a case or Unicode alias all
 // name the same object under a different string). `p` need not exist. Any error resolving it
 // REFUSES (fail closed). Best effort against a writer who controls a parent directory.
-bool path_is_reserved(const fs::path& p) {
+bool path_is_reserved_unguarded(const fs::path& p) {
     std::error_code ec;
     const fs::path canon = fs::weakly_canonical(p, ec);
     if (ec)
         return true;
-    const std::string cs = canon.string();
+    const std::string cs = path_bytes(canon);
     if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
         return true;
     yuzu::filesystem::reserved::Set snapshot;
     {
         std::lock_guard lk(g_reserved_mu);
-        snapshot = g_reserved;
+        snapshot = g_reserved_set();
     }
     if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
         return true;
@@ -210,15 +221,20 @@ bool path_is_reserved(const fs::path& p) {
                     std::error_code e4;
                     if (!fs::exists(d, e4) || e4)
                         continue;
-                    fs::recursive_directory_iterator it{
-                        fs::path{d}, fs::directory_options::skip_permission_denied, e4};
+                    // No skip_permission_denied: a subdirectory this process cannot read may hold the
+                    // very file this candidate links to, so an unreadable entry REFUSES.
+                    fs::recursive_directory_iterator it{fs::path{d}, fs::directory_options::none, e4};
                     if (e4)
                         return true;
-                    for (; it != fs::recursive_directory_iterator{}; it.increment(e4)) {
-                        if (e4 || ++seen > kMaxScan)
+                    const fs::recursive_directory_iterator end{};
+                    while (it != end) {
+                        if (++seen > kMaxScan)
                             return true;
                         std::error_code e5;
                         if (it->is_regular_file(e5) && !e5 && fs::equivalent(it->path(), canon, e5) && !e5)
+                            return true;
+                        it.increment(e4);
+                        if (e4)
                             return true;
                     }
                 }
@@ -237,6 +253,15 @@ bool path_is_reserved(const fs::path& p) {
     return false;
 }
 
+// Any exception (an unrepresentable name, bad_alloc) REFUSES.
+bool path_is_reserved(const fs::path& p) {
+    try {
+        return path_is_reserved_unguarded(p);
+    } catch (...) {
+        return true;
+    }
+}
+
 bool is_reserved_canonical(const std::string& canonical) {
     return path_is_reserved(fs::path{canonical});
 }
@@ -249,7 +274,7 @@ void add_reserved(yuzu::filesystem::reserved::Set& set, std::string_view raw, bo
     auto c = fs::weakly_canonical(fs::path{std::string{raw}}, ec);
     if (ec)
         c = fs::path{std::string{raw}}.lexically_normal(); // never drop a reserved entry
-    (is_dir ? set.dirs : set.files).push_back(c.string());
+    (is_dir ? set.dirs : set.files).push_back(path_bytes(c));
 }
 
 // Canonicalize a path and optionally enforce a base directory restriction.
@@ -310,6 +335,15 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
     // If it exists, do full validation
     if (fs::exists(path_str, ec)) {
         return validate_path(raw_path, base_dir);
+    }
+
+    // A symlink leaf that does not resolve is a dangling link: a write through it would create
+    // its target, wherever that is (possibly inside a reserved directory). Refuse it.
+    {
+        std::error_code lec;
+        const auto st = fs::symlink_status(path_str, lec);
+        if (lec ? (lec != std::errc::no_such_file_or_directory) : fs::is_symlink(st))
+            return {};
     }
 
     // For non-existent paths, validate the parent directory
@@ -880,7 +914,7 @@ public:
         for (auto key : yuzu::shared::agent_paths::kReservedFileKeys)
             add_reserved(set, ctx.get_config(key), /*is_dir=*/false);
         std::lock_guard lk(g_reserved_mu);
-        g_reserved = std::move(set);
+        g_reserved_set() = std::move(set);
         return {};
     }
 
@@ -1024,6 +1058,9 @@ private:
                 continue;
 
             const auto& entry = *it;
+            // A reserved entry is not listed: its name and size are metadata of a refused object.
+            if (path_is_reserved(entry.path()))
+                continue;
             std::string entry_name = entry.path().filename().string();
             std::string entry_type = "other";
             std::uintmax_t entry_size = 0;

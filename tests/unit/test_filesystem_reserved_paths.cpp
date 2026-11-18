@@ -16,7 +16,12 @@
 #include <array>
 #include <filesystem>
 #include <fstream>
+#include <memory>
+#include <optional>
 #include <string>
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 namespace fs = std::filesystem;
 namespace rsv = yuzu::filesystem::reserved;
@@ -219,5 +224,121 @@ TEST_CASE("filesystem plugin: identity, /proc, exists, walkers and shutdown (WP0
     auto after = run("read", {{"path", key.string()}});
     CHECK(after.rc != 0);
     CHECK(after.captured.find("SECRET-SENTINEL") == std::string::npos);
+}
+
+namespace {
+std::optional<yuzu::agent::PluginHandle> load_fs_plugin() {
+    const auto plugin_path = sup::find_plugin();
+    if (plugin_path.empty()) {
+        WARN("filesystem plugin library not found -- skipping");
+        return std::nullopt;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value() || !handle->descriptor()) {
+        WARN("filesystem plugin did not load -- skipping");
+        return std::nullopt;
+    }
+    return std::move(*handle);
+}
+
+auto make_runner(yuzu::agent::PluginHandle& handle) {
+    return [&handle](const char* action, std::initializer_list<std::pair<const char*, std::string>> kv) {
+        std::vector<std::pair<std::string, std::string>> own(kv.begin(), kv.end());
+        std::vector<YuzuParam> ps;
+        for (auto& [k, v] : own)
+            ps.push_back({k.c_str(), v.c_str()});
+        yuzu::agent::LocalDispatcher d;
+        return d.run(handle.descriptor(), action, ps);
+    };
+}
+} // namespace
+
+TEST_CASE("filesystem plugin: a hard link to a file in an UNREADABLE reserved subdirectory is refused",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    if (::geteuid() == 0) {
+        WARN("running as root: chmod 000 does not hide a directory from root -- skipping");
+        return;
+    }
+    auto handle = load_fs_plugin();
+    if (!handle)
+        return;
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_hl_"};
+    std::error_code ec;
+    const auto data_dir = root.path / "data";
+    const auto locked = data_dir / "locked";
+    fs::create_directories(locked, ec);
+    const auto key = locked / "agent-client.key";
+    {
+        std::ofstream o(key);
+        o << "SECRET-SENTINEL\n";
+    }
+    const auto hard = root.path / "innocent-hardlink.txt";
+    std::error_code hec;
+    fs::create_hard_link(key, hard, hec);
+    REQUIRE_FALSE(hec);
+    fs::permissions(locked, fs::perms::none, ec);
+    REQUIRE_FALSE(ec);
+
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    auto run = make_runner(*handle);
+    auto r = run("read", {{"path", hard.string()}});
+    // Restore before any assertion can unwind, so TempDir can clean up.
+    std::error_code rec;
+    fs::permissions(locked, fs::perms::owner_all, rec);
+    CHECK(r.rc != 0);
+    CHECK(r.captured.find("SECRET-SENTINEL") == std::string::npos);
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+TEST_CASE("filesystem plugin: write_content refuses a dangling symlink leaf; list_dir skips reserved entries",
+          "[agent][filesystem_plugin][reserved][symlink]") {
+    auto handle = load_fs_plugin();
+    if (!handle)
+        return;
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_dl_"};
+    std::error_code ec;
+    const auto data_dir = root.path / "data";
+    const auto other = root.path / "other";
+    fs::create_directories(data_dir, ec);
+    fs::create_directories(other, ec);
+    const auto key = data_dir / "agent-client.key";
+    {
+        std::ofstream o(key);
+        o << "SECRET-SENTINEL\n";
+    }
+    {
+        std::ofstream o(other / "ok.txt");
+        o << "fine\n";
+    }
+    // A name inside the reserved dir that does not exist yet, reached through a dangling link.
+    const auto planted = data_dir / "trust-planted.pem";
+    const auto dangle = other / "dangle";
+    std::error_code lec;
+    fs::create_symlink(planted, dangle, lec);
+    REQUIRE_FALSE(lec);
+    const auto hard = other / "hardlink.key";
+    std::error_code hec;
+    fs::create_hard_link(key, hard, hec);
+    const auto symkey = other / "symkey";
+    fs::create_symlink(key, symkey, lec);
+
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    auto run = make_runner(*handle);
+
+    auto w = run("write_content", {{"path", dangle.string()}, {"content", "EVIL"}, {"create", "true"}});
+    CHECK(w.rc != 0);
+    CHECK_FALSE(fs::exists(planted));
+
+    auto ls = run("list_dir", {{"path", other.string()}});
+    CHECK(ls.captured.find("ok.txt") != std::string::npos);
+    CHECK(ls.captured.find("symkey") == std::string::npos);
+    if (!hec)
+        CHECK(ls.captured.find("hardlink.key") == std::string::npos);
+    auto ls2 = run("list_dir", {{"path", root.path.string()}});
+    CHECK(ls2.captured.find("entry|data|") == std::string::npos);
+    CHECK(ls2.captured.find("entry|other|") != std::string::npos);
+    handle->descriptor()->shutdown(ctx.get());
 }
 #endif
