@@ -37,7 +37,7 @@ import cpp_lex_helper as lexh  # noqa: E402
 
 SRC = ROOT / "agents" / "plugins" / "services" / "src" / "services_plugin.cpp"
 CALL = "if (!yuzu::services::start_mode_readback_matches(mode, st)) {"
-RUN = '''auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)},
+RUN = '''auto st = run_command({std::string{systemctl_path}, "is-enabled", "--", std::string(name)},
                               /*merge_stderr=*/false);'''
 
 
@@ -106,7 +106,7 @@ def problems(src):
         out.append("set_start_mode no longer judges the readback with start_mode_readback_matches(mode, st)")
     if re.search(r"start_mode_took_effect\(", code):
         out.append("services_plugin.cpp calls the bare start_mode_took_effect( (cannot see a readback that did not run)")
-    if not re.search(r'auto st = run_command\( ?\{ ?systemctl_path, "", "", std::string\( ?name ?\) ?\}, ?false ?\)', code):
+    if not re.search(r'auto st = run_command\( ?\{ ?std::string\{ ?systemctl_path ?\}, "", "", std::string\( ?name ?\) ?\}, ?false ?\)', code):
         out.append("the is-enabled readback is not run with stderr unmerged: run_command({..}, false)")
     if '"state|{}"' not in live:
         out.append('the success path no longer emits the "state|{}" line')

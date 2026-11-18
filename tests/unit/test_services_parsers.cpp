@@ -403,3 +403,115 @@ TEST_CASE("set_start_mode argv: every name is_safe_service_name admits reaches t
         CHECK(launchctl_set_start_mode_argv("/bin/launchctl", "enable", name, false).back() == name);
     }
 }
+
+TEST_CASE("start_mode_took_effect: the read-back must match the requested mode, empty fails closed "
+          "(WP13 UP11)",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    CHECK(start_mode_took_effect("automatic", "static\n"));
+    CHECK_FALSE(start_mode_took_effect("automatic", "disabled\n")); // wrapper did nothing
+    CHECK_FALSE(start_mode_took_effect("automatic", "masked\n"));
+    CHECK(start_mode_took_effect("manual", "disabled\n"));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled\n"));
+    CHECK(start_mode_took_effect("disabled", "masked\n"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "enabled\n"));
+    CHECK_FALSE(start_mode_took_effect("automatic", "")); // a 0-byte wrapper leaves nothing to read
+    CHECK_FALSE(start_mode_took_effect("bogus", "enabled"));
+}
+
+TEST_CASE("start_mode_took_effect: error text and non-end states never match (closed set)",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    for (const char* mode : {"automatic", "manual", "disabled"}) {
+        CHECK_FALSE(start_mode_took_effect(mode, "not-found\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "Failed to connect to bus: No such file or directory\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "bad\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "transient\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "linked\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "Unit foo.service not found.\n"));
+    }
+    for (const char* st : {"enabled", "static", "indirect", "alias", "generated"})
+        CHECK(start_mode_took_effect("automatic", st));
+    for (const char* st : {"disabled", "static", "indirect", "alias", "generated"})
+        CHECK(start_mode_took_effect("manual", st));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "static"));
+}
+
+TEST_CASE("start_mode_took_effect: a -runtime state means the persistent verb did not act",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    // enable/disable/mask are persistent: a /run-only state is what a no-op wrapper leaves.
+    CHECK_FALSE(start_mode_took_effect("automatic", "enabled-runtime\n"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "masked-runtime\n"));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime\n"));
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    CHECK(start_mode_took_effect("disabled", "masked\n"));
+}
+
+TEST_CASE("start_mode_readback: SysV redirect text is a stderr line, never part of the state",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    // With stderr NOT merged (the plugin's readback), a SysV-only unit's stdout is just the state.
+    CHECK(start_mode_took_effect("automatic", "enabled\n"));
+    // If that text ever reached the first line the parser must refuse, not scan for a state line.
+    CHECK_FALSE(start_mode_took_effect(
+        "automatic",
+        "crond is not a native service, redirecting to systemd-sysv-install.\nenabled\n"));
+}
+
+TEST_CASE("start_state_is_unchangeable: the states a verb cannot change", "[services][up11]") {
+    using yuzu::services::start_state_is_unchangeable;
+    for (const char* st : {"static\n", "indirect", "alias\n", "generated\r\n"})
+        CHECK(start_state_is_unchangeable(st));
+    for (const char* st : {"enabled", "disabled", "masked", "", "not-found"})
+        CHECK_FALSE(start_state_is_unchangeable(st));
+}
+
+TEST_CASE("start_mode_readback_matches: a readback that did not run is not a match",
+          "[services][up11]") {
+    using yuzu::services::start_mode_readback_matches;
+    yuzu::agent::SubprocessResult ran;
+    ran.tool_ran = true;
+    ran.termination_reason = yuzu::agent::TerminationReason::exited;
+    ran.exit_code = 1; // is-enabled exits non-zero for `disabled`
+    ran.output = "disabled\n";
+    CHECK(start_mode_readback_matches("manual", ran));
+    yuzu::agent::SubprocessResult not_ran = ran;
+    not_ran.tool_ran = false;
+    CHECK_FALSE(start_mode_readback_matches("manual", not_ran));
+    yuzu::agent::SubprocessResult timed = ran;
+    timed.timed_out = true;
+    timed.termination_reason = yuzu::agent::TerminationReason::deadline;
+    CHECK_FALSE(start_mode_readback_matches("manual", timed));
+}
+
+TEST_CASE("start_mode_needs_unmask: automatic and manual unmask first, disabled (mask) does not",
+          "[services][unmask]") {
+    using yuzu::services::start_mode_needs_unmask;
+    CHECK(start_mode_needs_unmask("automatic")); // mask -> automatic must be able to enable
+    CHECK(start_mode_needs_unmask("manual"));
+    CHECK_FALSE(start_mode_needs_unmask("disabled"));
+    CHECK_FALSE(start_mode_needs_unmask("bogus"));
+    CHECK_FALSE(start_mode_needs_unmask(""));
+}
+
+TEST_CASE("start_mode_should_remask: a failed change after an unmask restores the mask",
+          "[services][unmask]") {
+    using yuzu::services::start_mode_should_remask;
+    using yuzu::services::start_state_is_masked;
+    CHECK(start_state_is_masked("masked\n"));
+    CHECK(start_state_is_masked("masked-runtime"));
+    CHECK_FALSE(start_state_is_masked("disabled\n"));
+    CHECK_FALSE(start_state_is_masked(""));
+    CHECK_FALSE(start_state_is_masked("not-found"));
+    // unit was masked, the change failed: put the mask back
+    CHECK(start_mode_should_remask("automatic", true, false));
+    CHECK(start_mode_should_remask("manual", true, false));
+    // a unit that was NOT masked is never masked by a failure; success never remasks
+    CHECK_FALSE(start_mode_should_remask("automatic", false, false));
+    CHECK_FALSE(start_mode_should_remask("automatic", true, true));
+    // disabled is the mask verb itself: nothing was unmasked
+    CHECK_FALSE(start_mode_should_remask("disabled", true, false));
+}
