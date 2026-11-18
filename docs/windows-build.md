@@ -179,9 +179,13 @@ validly signed by Microsoft. It also refuses a release whose toolset
 above): agent self-update replaces only `yuzu-agent.exe`, never the runtime
 already on a device (#8219), so the release toolset moves only by a reviewed
 change to that file, whose comment says what such a change must announce.
-Without `VCToolsVersion` the script fails in GitHub Actions; in a local build
-outside an MSVC environment the pin is skipped with a warning. The staged DLLs and their file versions are
-written to the job's step summary.
+Without a readable `VCToolsVersion` the script fails in GitHub Actions.
+Outside GitHub Actions the pin check is skipped with a warning whenever
+`VCToolsVersion` is unset (or not a version), including under
+`setup_msvc_env.sh`, which does not export it. The staged DLLs and their file
+versions are written to the job's step summary, which covers that workflow run
+only; the shipped version is the file version of the Microsoft-signed DLLs in
+the payload.
 
 Two steps later, after "Verify the agent runs from the packaged archive",
 "Check the DLL import closure of both payloads" runs

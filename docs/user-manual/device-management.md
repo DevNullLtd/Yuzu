@@ -492,6 +492,8 @@ The agent exports the full certificate chain (leaf + intermediates) as PEM in me
 
 Administrators can upload new agent binaries to the server and promote them to production. Connected agents will download and apply the update automatically.
 
+**Windows agents.** Agent self-update replaces `yuzu-agent.exe` only. It does not install or refresh the Visual C++ runtime the agent carries in its `bin` directory, or any plugin, so a Windows agent updated this way mixes builds and is not a supported configuration (see [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime) and "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Agents check for updates automatically by default, so do not publish a Windows package for self-update, or run Windows agents with `--no-auto-update` (the installer does not set it). Deploy each Windows agent from the installer or archive of a single release; to reprovision one, uninstall it (or remove its install directory), then install it from the installer or archive of a single release.
+
 ### Upload a New Binary
 
 **Dashboard:** Navigate to **Settings > Plugins and updates** (or the **Agent Updates** panel on the Settings page) and use the upload form. The upload names the version (the file name without its extension). On **Settings > Plugins and updates** the upload and each rollout change ask you to confirm; the older Settings page does not. Uploading a package with the same platform, architecture and version replaces it and resets its rollout and mandatory flag. The rollout percentage is the share of devices that may be offered the package, not how many have updated.

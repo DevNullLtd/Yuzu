@@ -253,10 +253,20 @@ Visual C++ runtime in the agent's `bin` directory, unmodified and signed by
 Microsoft: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
 `msvcp140_atomic_wait.dll` and any other `vcruntime140_*.dll` or
 `msvcp140_*.dll` the build machine's Visual Studio redistributable directory
-holds. The Windows SBOM is not generated to list them: treat them
-as absent from it. Each release records the DLLs it shipped and their file
-versions in the step summary of its `Build Windows x64` job, and the version
-follows the Visual C++ toolset the release is pinned to
+holds. The Windows SBOM step scans the whole workspace, which holds these DLLs
+in two places (the staged archive directory and `build-windows\msvc-runtime`).
+The cataloguer that step uses (syft, through the pinned
+`anchore/sbom-action`) lists each native DLL it finds as an application
+component, named and versioned from the DLL's version resource (for a
+Microsoft DLL, its file description), with a CPE and no package URL (purl), so
+a runtime DLL can appear more than once. A scanner or policy that matches
+components on purl does not see them. No release SBOM has yet been inspected
+for these entries. The authoritative version of the runtime a release shipped
+is the file version of the Microsoft-signed DLLs in its payload (the archive's
+`bin` directory, or `bin` under the installed agent's directory). The
+`Build Windows x64` job's step summary lists the staged DLLs and their file
+versions for that workflow run and is kept only as long as the run is. The
+version follows the Visual C++ toolset the release is pinned to
 (`deploy/packaging/windows/msvc-toolset.pin`). Their licence terms are in
 `NOTICE`. Windows Update does not service this copy; see "Windows agent:
 Visual C++ runtime" in the [user manual](README.md#windows-agent-visual-c-runtime).

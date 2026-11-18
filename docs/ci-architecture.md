@@ -498,9 +498,12 @@ yet, and the PR-time coverage is the `docs`-suite tests named below
   redistributable directory (`VCToolsRedistDir`) into the zip's `bin` and into
   `build-windows\msvc-runtime`, which `yuzu-agent.iss` installs into
   `{app}\bin`. It refuses a missing required DLL, a redistributable older than
-  the toolset and, on Windows, a DLL not validly signed by Microsoft, and it
-  writes the staged DLLs and file versions to the step summary (the record of
-  which runtime a release shipped).
+  the toolset and, on Windows, a DLL not validly signed by Microsoft. It
+  writes the staged DLLs and file versions to the step summary, which covers
+  that workflow run and is kept only as long as the run is; the authoritative
+  version is the file version of the Microsoft-signed DLLs in the shipped
+  payload (the zip's `bin`, or `{app}\bin` after an install). A failed
+  summary write is a warning, not a failure.
 - **MSVC toolset pin.** The same script refuses the release when
   `VCToolsVersion`'s major.minor differs from
   `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
@@ -1293,8 +1296,14 @@ Actions cache service.
   `release.yml` identity before the release is created.
 - Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
   The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
-  app-local, which the Windows SBOM is not generated to list; their file versions
-  are in the `build-windows` job's step summary
+  app-local. The Windows SBOM step scans `path: .`, which holds them in the
+  staged archive directory and in `build-windows\msvc-runtime`; its syft
+  cataloguer lists each as an application component named and versioned from
+  its version resource, with a CPE and no package URL (purl), possibly more
+  than once, so a purl-matching scanner does not see them (not yet inspected in
+  a release SBOM). Their authoritative version is the file version of the
+  Microsoft-signed DLLs in the shipped payload; the `build-windows` job's step
+  summary lists them for that run only
   ([Windows agent runtime gates](#windows-agent-runtime-gates-build-windows-job-release-only)).
 - Authenticode and Apple signing and notarization run only when their
   secrets are set, and skip silently otherwise. On 2026-11-17 none of

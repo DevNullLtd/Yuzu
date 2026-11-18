@@ -122,15 +122,19 @@ and the installer (`YuzuAgentSetup-<version>.exe`) carry the runtime in the agen
 directory, next to `yuzu-agent.exe`, so a Windows 10 or later x64 machine needs no
 Redistributable installed first. The agent uses that copy even when the machine also has the
 Redistributable installed, and Windows Update does not service it. Each release builds the
-agent with one pinned Visual C++ toolset and ships the runtime of that toolset; the release job
-records the DLLs and their file versions in its step summary.
+agent with one pinned Visual C++ toolset and ships the runtime of that toolset. The version a
+device runs is the file version of the Microsoft-signed DLLs in the agent's `bin` directory;
+the release job's step summary lists the staged DLLs and their file versions for that
+workflow run only, and is kept only as long as the run is.
 
 **Each release's installer and archive carry that release's runtime and plugins.** Deploy a
 Windows agent from the installer or archive of a single release. Agent self-update (OTA)
 replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin
-(#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported configuration (see
-"Deployment contract (hard cutover)" in [Upgrading](upgrading.md)): reprovision it from the
-installer or archive of the release you run.
+(#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported
+configuration (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)):
+reprovision it from the installer or archive of the release you run. To reprovision a Windows
+agent, uninstall it (or remove its install directory), then install it from the installer or
+archive of a single release.
 
 **Code loaded into the agent uses the same copy.** A third-party component that runs inside
 the agent process, for example the Configuration Manager client objects the `sccm` plugin
@@ -139,7 +143,10 @@ Redistributable installs in `System32`. That copy is the one the installer or ar
 release brought.
 
 **If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service
-manager restarts the service every 60 seconds and each start fails the same way. Reprovision
+manager restarts the service every 60 seconds and each start fails the same way. Signs of it
+in Event Viewer: Service Control Manager events 7031 or 7034 for the agent service
+(`YuzuAgent`) in the System log, and an error in the Application log naming
+`VCRUNTIME140.dll` or `MSVCP140.dll`, or an access violation in `msvcp140.dll`. Reprovision
 the device from the installer or archive of one release.
 
 Releases up to and including 0.15.0 did not carry the runtime. On a machine without the

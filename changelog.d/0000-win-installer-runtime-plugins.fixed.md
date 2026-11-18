@@ -8,8 +8,9 @@
   now copies them, unmodified, from the build machine's Visual Studio redistributable directory
   into the agent's `bin` directory in both payloads (app-local deployment; see `NOTICE`, which both
   payloads now carry), builds with one pinned Visual C++ toolset (`msvc-toolset.pin`; the
-  release fails on any other), and records the shipped DLLs and their versions in the release
-  job's step summary. A new release step reads the PE import table of every shipped `.exe` and
+  release fails on any other), and lists the staged DLLs and their file versions in the release
+  job's step summary for that workflow run (the shipped version is the file version of the
+  Microsoft-signed DLLs in the payload). A new release step reads the PE import table of every shipped `.exe` and
   `.dll` and fails the release when one imports a DLL its payload does not carry, treating the
   Visual C++ runtime as missing even though the build runner has it installed, which is how the
   gap went unnoticed. The agent uses its own copy of the runtime even where the
