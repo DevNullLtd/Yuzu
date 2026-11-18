@@ -10,6 +10,7 @@
 #include <file_search_cursor.hpp>
 #include <file_search_position.hpp>
 
+#include <compare>
 #include <cstddef>
 #include <cstdint>
 #include <initializer_list>
@@ -121,7 +122,7 @@ TEST_CASE("walk_order: depth-first vectors", "[file_search]") {
     CHECK(lt(pos({"X"}, "Q"), pos({"X", "R"})));
     // reflexive equality
     for (const auto& p : {pos({}), pos({}, "a"), pos({"X", "Y"}, "z")})
-        CHECK(fs::walk_order(p, p) == 0);
+        CHECK(std::is_eq(fs::walk_order(p, p)));
 }
 
 TEST_CASE("walk_order: identities do not affect the order", "[file_search]") {
@@ -131,10 +132,10 @@ TEST_CASE("walk_order: identities do not affect the order", "[file_search]") {
     b.root_file_id = 8;
     b.dirs[0].dev = 7;
     b.dirs[1].file_id = 6;
-    CHECK(fs::walk_order(a, b) == 0);
+    CHECK(std::is_eq(fs::walk_order(a, b)));
     auto later = pos({"X", "Y"}, "n");
     later.dirs[0].dev = 99;
-    CHECK(fs::walk_order(a, later) < 0);
+    CHECK(std::is_lt(fs::walk_order(a, later)));
 }
 
 TEST_CASE("walk_order: antisymmetric and transitive over a small universe", "[file_search]") {
@@ -408,7 +409,7 @@ TEST_CASE("strictly_advances: restart transition", "[file_search]") {
     restart.position = pos({}, ""); // restarts from the start: EARLIER
     restart.position.root_dev = 5;
     restart.position.root_file_id = 6;
-    CHECK(fs::walk_order(prev.position, restart.position) > 0);
+    CHECK(std::is_gt(fs::walk_order(prev.position, restart.position)));
     CHECK(fs::strictly_advances(prev, restart));
 
     auto new_root = restart;

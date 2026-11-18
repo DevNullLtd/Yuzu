@@ -224,7 +224,7 @@ private:
 /// prior_gaps + gaps_this_slice saturating at UINT32_MAX, the given position.
 [[nodiscard]] inline Cursor next_cursor(const Cursor& previous, Position position, bool restarted,
                                         std::size_t gaps_this_slice) noexcept {
-    constexpr std::uint64_t kMax = std::numeric_limits<std::uint32_t>::max();
+    constexpr std::uint64_t kMax = (std::numeric_limits<std::uint32_t>::max)();
     Cursor n;
     n.query_hash = previous.query_hash;
     n.sequence = previous.sequence + 1;
@@ -240,12 +240,12 @@ private:
 [[nodiscard]] inline bool strictly_advances(const Cursor& previous, const Cursor& next) noexcept {
     if (previous.query_hash != next.query_hash)
         return false;
-    if (previous.sequence == std::numeric_limits<std::uint64_t>::max() ||
+    if (previous.sequence == (std::numeric_limits<std::uint64_t>::max)() ||
         next.sequence != previous.sequence + 1)
         return false;
     if (next.prior_gaps < previous.prior_gaps)
         return false;
-    if (previous.generation != std::numeric_limits<std::uint32_t>::max() &&
+    if (previous.generation != (std::numeric_limits<std::uint32_t>::max)() &&
         next.generation == previous.generation + 1)
         return true; // RESTART: position and root identity are unconstrained
     if (next.generation != previous.generation)

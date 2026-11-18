@@ -226,7 +226,7 @@ public:
         : root_(root), original_(resume), resume_(resume), limits_(limits), fs_(fs), deadline_(deadline),
           visit_(visit), max_retained_(max_retained),
           // A Position cannot name deeper than this, so nothing deeper is entered either.
-          max_depth_(std::min(limits.max_depth, fsr::kMaxPositionDepth)) {
+          max_depth_((std::min)(limits.max_depth, fsr::kMaxPositionDepth)) {
         stack_.reserve(max_depth_ + 1);
     }
 
@@ -343,7 +343,7 @@ private:
         }
 
         retained_ += charge;
-        out_.retained_bytes_peak = std::max(out_.retained_bytes_peak, retained_);
+        out_.retained_bytes_peak = (std::max)(out_.retained_bytes_peak, retained_);
         const bool done = walk_entries(path, depth, lr, on_path);
         retained_ -= charge;
         return done;
