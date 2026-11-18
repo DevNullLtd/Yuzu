@@ -234,6 +234,9 @@ inline std::optional<ConfigCheckResult> tmp_noexec_check(const LinesResult& r) {
 #if defined(__linux__) || defined(__APPLE__)
 namespace detail {
 
+// The popen helpers below are Linux-only: no macOS leg spawns a shell (the macOS reads go through
+// the bounded argv runner supplied by the plugin).
+#ifdef __linux__
 // popen with RAII ownership: an exception (std::bad_alloc while appending) between popen and the
 // close still closes the FILE* and reaps the child. Move-less by design.
 struct Pipe {
@@ -272,6 +275,7 @@ inline std::string run_cmd(const char* cmd, bool* exited_ok = nullptr) {
     }
     return result;
 }
+#endif // __linux__
 
 // Open failure -> errno from open. A fault after open (badbit, libstdc++) -> the
 // errno the kernel set during the read, else EIO. (libc++ reports a read fault as

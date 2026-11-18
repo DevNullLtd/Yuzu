@@ -26,6 +26,18 @@ behavioural test, so they are pinned lexically):
       scan/cve_scan/config_scan call emit_coverage_row, summary calls emit_coverage_summary_row,
       and inventory calls neither row emitter (its rows feed NVD matching).
 
+Two more groups cover the Apple-only glue in vuln_scan_plugin.cpp, which no off-Mac build
+compiles:
+  (e) the lines that copy the parser's results into the coverage state and decide the status are
+      pinned verbatim (`cov->macos_software = true`, `cov->sp_readable = parsed.readable`, the
+      parser called with the run's `ok`, the runner's `ok` including the exit code, the config
+      scan given `macos_run`, `config_unreadable` set under `any_config_unreadable`, the status
+      declared only for a non-empty token and from `coverage_token(cov)`, both
+      `fold_backslashes` calls);
+  (f) no `popen`, `system`, `exec*`, `posix_spawn` or `fork` call appears on any line a macOS build
+      compiles (a conditional block whose directive names `__APPLE__`, or one that does not
+      exclude it; a `#else` after an `__APPLE__` branch is outside it).
+
 Not caught (disclosed): a name built at run time, split across preprocessor macros, or reached by
 indirection. Self-test: test_vuln_scan_no_brew_lexical_selftest.py.
 """
@@ -244,9 +256,79 @@ def pin_errors(root: pathlib.Path) -> list[str]:
         ):
             if not re.search(needle, plug[0]):
                 errs.append(f"vuln_scan_plugin.cpp: {why}")
+        for needle, why in APPLE_GLUE:
+            if not re.search(needle, plug[0]):
+                errs.append(f"vuln_scan_plugin.cpp: {why}")
         if len(re.findall(r"\bdeclare_coverage\s*\(\s*ctx\b", plug[0])) != len(ACTIONS):
             errs.append(f"declare_coverage(ctx, ...) must appear exactly {len(ACTIONS)} times in vuln_scan_plugin.cpp")
+    # (f) no process-spawning call on a line a macOS build compiles
+    for name, (code, _lits) in lexed.items():
+        for ln in apple_compiled_lines(code):
+            m = SPAWN_CALL.search(re.sub(r'"[^"\n]*"', '""', ln))  # string contents are not calls
+            if m:
+                errs.append(f"{name}: `{m.group(0)}` on a line a macOS build compiles "
+                            "(macOS reads go through the bounded argv runner)")
     return errs
+
+
+# Calls that start a shell or a child process. A match is `name(` as a whole word.
+SPAWN_CALL = re.compile(r"\b(?:popen|system|fork|vfork|execl|execlp|execle|execv|execvp|execve|execvpe"
+                        r"|posix_spawn|posix_spawnp)\s*\(")
+_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+
+
+def _may_compile_on_macos(kind: str, cond: str) -> bool:
+    """Whether a conditional branch can be compiled for macOS. Unknown conditions say yes."""
+    if kind == "ifndef" or "!" in cond or "__APPLE__" in cond:
+        return True
+    if "__linux__" in cond or "_WIN32" in cond:
+        return False
+    return True
+
+
+def apple_compiled_lines(code: str) -> list[str]:
+    """The lines of (lexed) source that a macOS build compiles. A stack of conditional frames
+    tracks whether every enclosing branch can compile there; `#else` after an `__APPLE__` branch
+    is off, `#else` after only Linux/Windows branches is on."""
+    out: list[str] = []
+    stack: list[list] = []  # [branch_on, apple_branch_seen_in_chain]
+    for line in code.split("\n"):
+        m = _DIRECTIVE.match(line)
+        if m:
+            kind, cond = m.group(1), m.group(2)
+            apple = "__APPLE__" in cond and "!" not in cond and kind != "ifndef"
+            if kind in ("if", "ifdef", "ifndef"):
+                stack.append([_may_compile_on_macos(kind, cond), apple])
+            elif kind == "elif" and stack:
+                stack[-1][0] = _may_compile_on_macos(kind, cond) and not stack[-1][1]
+                stack[-1][1] = stack[-1][1] or apple
+            elif kind == "else" and stack:
+                stack[-1][0] = not stack[-1][1]
+            elif kind == "endif" and stack:
+                stack.pop()
+            continue
+        if all(f[0] for f in stack):
+            out.append(line)
+    return out
+
+
+# Lines the Apple glue must keep, pinned verbatim (whitespace-insensitive): (pattern, what breaks).
+APPLE_GLUE = (
+    (r"cov->macos_software\s*=\s*true\s*;", "the software leg is not marked as macOS"),
+    (r"cov->sp_readable\s*=\s*parsed\.readable\s*;", "sp_readable is not taken from the parser"),
+    (r"parse_system_profiler_apps\(\s*r\.out\s*,\s*r\.ok\s*\)", "the parser is not given the run's ok"),
+    (r"out\.ok\s*=\s*out\.ran\s*&&\s*r\.exit_code\s*==\s*0\s*;", "the runner's ok ignores the exit code"),
+    (r"run_all_config_checks\(\s*macos_run\s*\)", "the config scan is not given the bounded macOS runner"),
+    (r"if\s*\(\s*cov\s*&&\s*yuzu::vuln::any_config_unreadable\(\s*checks\s*\)\s*\)\s*"
+     r"cov->config_unreadable\s*=\s*true\s*;", "config_unreadable is not raised from the checks"),
+    (r"const\s+auto\s+token\s*=\s*yuzu::vuln::coverage_token\(\s*cov\s*\)\s*;",
+     "the status token is not derived from the coverage state"),
+    (r"if\s*\(\s*!\s*token\.empty\(\)\s*\)\s*ctx\.set_result_status\(\s*YUZU_RESULT_STATUS_CONSTRAINED\s*,"
+     r"\s*YUZU_RESULT_COMPLETENESS_PARTIAL\s*,\s*token\s*\)",
+     "the status is not declared exactly when the token is non-empty"),
+    (r"fold_backslashes\(\s*a\.name\s*\)", "a backslash in an application name is not folded"),
+    (r"fold_backslashes\(\s*a\.version\s*\)", "a backslash in an application version is not folded"),
+)
 
 
 def scan_tree(root: pathlib.Path) -> list[str]:

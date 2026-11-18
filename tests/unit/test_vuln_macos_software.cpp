@@ -112,7 +112,7 @@ TEST_CASE("macos commands: bounds are set", "[vuln][macos]") {
     CHECK(kMacosCommandMaxOutput == 8u * 1024u * 1024u);
 }
 
-#if defined(__linux__) || defined(__APPLE__)
+#if defined(__linux__)
 TEST_CASE("run_cmd: exit status is reported and the pipe is released", "[vuln][runcmd]") {
     bool ok = false;
     CHECK(detail::run_cmd("printf 'x\\n'", &ok) == "x");
@@ -374,7 +374,7 @@ TEST_CASE("macos config: a failed or unrecognised read is UNREADABLE, never a ve
     }
 }
 
-TEST_CASE("macos config: near-miss lines are NOT accepted (prefix matches were the defect)",
+TEST_CASE("macos config: near-miss lines are NOT accepted",
           "[vuln][macos][config]") {
     struct NearMiss { MacosCheck c; const char* line; };
     const NearMiss cases[] = {
@@ -825,7 +825,7 @@ TEST_CASE("end to end shape: Chrome and Firefox unversioned beside Safari and Zo
     CHECK(count_unusable_cve_apps(e.apps, kCveRules) == 2);
 }
 
-// ── round 8: reshaped profiler lines must not silently drop an application ──────────────────────
+// ── reshaped profiler lines must not silently drop an application ───────────────────────────────
 
 namespace {
 // One healthy report of `n` apps in the real measured shape (4-space name, blank, 6-space props).
@@ -1001,7 +1001,7 @@ TEST_CASE("usable_version: a segment too large to compare is unusable", "[vuln][
     CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"Python", "3.99999999999999999999"}}, kCveRules) == 1);
 }
 
-// ── cases added after the round-7 mutation review ───────────────────────────────────────────────
+// ── count_unusable and the matcher fold the same way ────────────────────────────────────────────
 
 TEST_CASE("count_unusable: uppercase A and Z fold like the matcher", "[vuln][macos][cveinput]") {
     CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"APACHE HTTP Server", ""}}, kCveRules) == 1);
@@ -1048,8 +1048,8 @@ TEST_CASE("parse: a tab after the four-space indent is suspect and never a name"
     CHECK(t.suspect_lines == 1);
 }
 
-// ── round 9: a name line lost TOGETHER with another reshape must not attach a Version to the
-//    wrong application ───────────────────────────────────────────────────────────────────────
+// ── a name line lost TOGETHER with another reshape must not attach a Version to the wrong
+//    application ───────────────────────────────────────────────────────────────────────────────
 
 TEST_CASE("lost name: class X, the orphaned Version at indent 3, is counted", "[vuln][macos][reshaped]") {
     // the name line of app N is lost and its Version line sits at indent 3
@@ -1080,7 +1080,7 @@ TEST_CASE("lost name: an indent-3 Version line and a first Version after another
     CHECK(parse_system_profiler_apps("    B:\n      Version: 2\n      Kind: x\n", true).suspect_lines == 0);
 }
 
-TEST_CASE("reshaped lines: boundary rows that earlier rounds left unpinned", "[vuln][macos][reshaped]") {
+TEST_CASE("reshaped lines: boundary rows", "[vuln][macos][reshaped]") {
     // an indent-5 property after a blank that follows a name: not suspect; after a non-name: suspect
     const std::string pre = "    A:\n";
     CHECK(parse_system_profiler_apps(pre + "\n     Kind: x\n", true).suspect_lines == 0);
@@ -1090,7 +1090,7 @@ TEST_CASE("reshaped lines: boundary rows that earlier rounds left unpinned", "[v
     CHECK_FALSE(usable_version("1.1000000000000000000"));
 }
 
-// ── round 10: three independent faults, and unreadable companions ───────────────────────────────
+// ── three independent faults, and unreadable companions ─────────────────────────────────────────
 
 TEST_CASE("lost name: a 3-space property line after a blank that follows no name is counted",
           "[vuln][macos][reshaped]") {

@@ -241,6 +241,7 @@ TEST_CASE("CVE matching: unrelated product does not match", "[vuln][match]") {
 TEST_CASE("compare_versions: an oversized segment saturates instead of overflowing", "[vuln][version]") {
     CHECK(compare_versions("1.99999999999999999999999", "2.0") < 0);
     CHECK(compare_versions("1.99999999999999999999999", "1.5") > 0); // saturated: larger than 5
+    CHECK(compare_versions("1.18446744073709551616", "1.0") > 0);      // 2^64 saturates, not wraps to 0
     CHECK(compare_versions("1.99999999999999999999999", "1.99999999999999999999999") == 0);
     CHECK(compare_versions("3.9.6", "3.10.0") < 0); // ordinary versions are unchanged
 }
