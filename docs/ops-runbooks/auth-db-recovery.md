@@ -1300,7 +1300,7 @@ whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
 
-The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
+Break-glass password attempts are bounded without a lockout: at most 2 in flight, 1 per source address, each waiting at most 150 ms and otherwise refused `429` (`yuzu_auth_pbkdf2_budget_rejected_total{class="break_glass",reason="stripe_busy"}`), so a flood of attempts at the account can make the operator's own attempt answer `429` until it stops; retry, nothing is locked. The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
 spend the per-account second-factor failure budget, so a break-glass login can be refused with the
 uniform `401` while that account's second factor is locked. Arming resets that lock in the same
 statement (the audit row says so), which is the host-side remedy; see

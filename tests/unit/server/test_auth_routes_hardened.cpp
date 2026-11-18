@@ -427,3 +427,38 @@ TEST_CASE("sso-only: the armed break-glass login is not denied by a flood of its
     CHECK(in_time);
     CHECK(status == 202); // the MFA challenge, never the stripe-timeout 429 (mutation: RED)
 }
+
+TEST_CASE("sso-only: break-glass guesses are bounded at 2 concurrent (exact numbers), without a lockout",
+          "[pg][auth][hardened][routes][concurrency][stripe]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    auto& gate = h.auth_routes->break_glass_gate_for_test();
+    REQUIRE(gate.capacity() == 2);
+    auto login = [&](const char* pw) {
+        auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", pw}}), kFormCt);
+        return res ? res->status : -1;
+    };
+    {
+        // One attacker attempt in flight: the legitimate operator (another source) still gets in.
+        auto one = gate.try_acquire_for(std::chrono::milliseconds(10));
+        REQUIRE(one.ok());
+        CHECK(login("adminpassword1") == 202);
+    }
+    {
+        // Two in flight (the bound): a third attempt is refused 429 within the bounded wait,
+        // right password or wrong, and nothing was locked (no lockout row, no counter).
+        auto one = gate.try_acquire_for(std::chrono::milliseconds(10));
+        auto two = gate.try_acquire_for(std::chrono::milliseconds(10));
+        REQUIRE(one.ok());
+        REQUIRE(two.ok());
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(login("WRONGpassword1") == 429);
+        CHECK(login("adminpassword1") == 429);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        CHECK(ms < std::chrono::milliseconds(800)); // two bounded waits of 150 ms, never a hang
+    }
+    CHECK(h.count_audits("auth.lockout.applied") == 0);
+    CHECK(login("adminpassword1") == 202); // never locked out: the operator is back in at once
+}

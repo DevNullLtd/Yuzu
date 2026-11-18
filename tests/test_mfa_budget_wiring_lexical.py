@@ -90,6 +90,8 @@ def check_gate_order(t):
         bad.append("the sso-only pre_verify_gate must run BEFORE the PBKDF2 slot is taken")
     if not stripe < gate:
         bad.append("the bounded stripe wait (try_lock_for) must come before the gate/slot")
+    if "break_glass_gate_.try_acquire_for(" not in body[:slot]:
+        bad.append("the lockout-exempt break-glass guess gate must be taken before the slot")
     pre = body[:stripe]
     if "if (lockout_active)" not in pre[-400:]:
         bad.append("the login stripe must be taken only when lockout_active (a lockout-exempt "

@@ -236,6 +236,7 @@ public:
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
     }
+    BoundedGate& break_glass_gate_for_test() { return break_glass_gate_; }
     std::timed_mutex& login_lock_for_test(const std::string& username) {
         return login_lock_for(username);
     }
@@ -1262,6 +1263,12 @@ private:
     std::string stripe_salt_{std::to_string((static_cast<std::uint64_t>(std::random_device{}()) << 32) ^
                                             std::random_device{}())};
     std::atomic<int> stripe_waiters_{0};
+    /// Bounds CONCURRENT password guesses against the lockout-exempt break-glass account (which
+    /// keeps no lockout counter and so takes no stripe): capacity 2, bounded wait, one object so
+    /// no name can collide onto it. Capacity 2 with one slot per source address means a single
+    /// address cannot hold it and the legitimate operator is not starved by one attacker.
+    static constexpr int kBreakGlassGuessConcurrency = 2;
+    BoundedGate break_glass_gate_{kBreakGlassGuessConcurrency};
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};
     /// Uniform 429 + Retry-After for a full PBKDF2 budget (A4 envelope; same shape for any name).

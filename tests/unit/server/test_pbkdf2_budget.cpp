@@ -217,3 +217,33 @@ TEST_CASE("Pbkdf2Budget: concurrent acquirers never exceed the cap", "[pbkdf2_bu
     CHECK(peak.load() >= 2); // and the contention was real
     CHECK(b.in_flight() == 0);
 }
+
+TEST_CASE("Pbkdf2Budget: break-glass is limited to ONE slot per source whatever the configured cap",
+          "[pbkdf2_budget]") {
+    Pbkdf2Budget b{66, /*per_source_cap=*/64};
+    auto first = b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.7");
+    REQUIRE(first.ok());
+    auto second = b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.7");
+    CHECK_FALSE(second.ok()); // mutation: honouring the configured 64 would admit it
+    CHECK(second.refusal() == Pbkdf2Refusal::kPerSource);
+    CHECK(b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.8").ok());
+}
+
+TEST_CASE("BoundedGate: capacity 2 admits two holders, refuses the third within the wait",
+          "[pbkdf2_budget][concurrency]") {
+    BoundedGate g{2};
+    auto a = g.try_acquire_for(std::chrono::milliseconds(10));
+    auto b = g.try_acquire_for(std::chrono::milliseconds(10));
+    CHECK(a.ok());
+    CHECK(b.ok());
+    const auto t0 = std::chrono::steady_clock::now();
+    auto c = g.try_acquire_for(std::chrono::milliseconds(120));
+    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    CHECK_FALSE(c.ok());
+    CHECK(waited >= std::chrono::milliseconds(100));
+    CHECK(waited < std::chrono::milliseconds(400)); // bounded
+    { auto gone = std::move(a); }
+    CHECK(g.try_acquire_for(std::chrono::milliseconds(10)).ok()); // a freed permit is reusable
+    CHECK(g.in_use() == 1);
+}

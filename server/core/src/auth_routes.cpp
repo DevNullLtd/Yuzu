@@ -2182,6 +2182,24 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
     // logins for ONE unknown name (which never locks) would otherwise queue unboundedly and
     // starve the pool, invisibly to the slot budget. A timeout answers the existing 429
     // (kBusy), uniform for any name.
+    // The lockout-exempt break-glass account instead takes the dedicated, bounded guess gate
+    // (capacity 2, one slot per source in the budget): it keeps no lockout counter, so without a
+    // bound it would be an unthrottled parallel guessing target.
+    std::optional<BoundedGate::Permit> bg_permit;
+    if (opts.lockout_exempt && opts.metric_route == "login") {
+        stripe_waiters_.fetch_add(1, std::memory_order_relaxed);
+        bg_permit.emplace(break_glass_gate_.try_acquire_for(kLoginStripeWait));
+        stripe_waiters_.fetch_sub(1, std::memory_order_relaxed);
+        if (!bg_permit->ok()) {
+            if (auto* m = auth_mgr_.metrics_registry())
+                m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                           {{"route", opts.metric_route},
+                            {"class", "break_glass"},
+                            {"reason", "stripe_busy"}})
+                    .increment();
+            return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
+        }
+    }
     std::unique_lock<std::timed_mutex> login_lk;
     if (lockout_active) {
         login_lk = std::unique_lock<std::timed_mutex>(login_lock_for(username), std::defer_lock);

@@ -27,6 +27,8 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
@@ -132,7 +134,11 @@ public:
                 return Slot{Pbkdf2Refusal::kClassFull};
         }
         auto& map = cls == Pbkdf2Class::kAuthenticated ? per_principal_ : per_source_;
-        const int per_cap = cls == Pbkdf2Class::kAuthenticated ? per_principal_cap_ : per_source_cap_;
+        // The break-glass lane allows ONE concurrent attempt per source address whatever the
+        // configured per-source cap, so a single address cannot hold the account's guess gate.
+        const int per_cap = cls == Pbkdf2Class::kAuthenticated ? per_principal_cap_
+                            : cls == Pbkdf2Class::kBreakGlass  ? 1
+                                                               : per_source_cap_;
         if (!key.empty() || cls != Pbkdf2Class::kAuthenticated) {
             auto it = map.find(key);
             if (it != map.end() && it->second >= per_cap)
@@ -176,6 +182,60 @@ private:
     int per_principal_cap_{3};
     std::unordered_map<std::string, int> per_principal_;
     std::unordered_map<std::string, int> per_source_;
+};
+
+/// A tiny counting gate with a BOUNDED wait: at most `capacity` holders, and a waiter gives up
+/// after the timeout (the caller answers 429). Used for the break-glass account, which keeps no
+/// lockout counter (so no per-username stripe), to bound the CONCURRENT password guesses against
+/// it. One object, so no name can collide onto it. Header-only, no I/O.
+class BoundedGate {
+public:
+    explicit BoundedGate(int capacity) : cap_(capacity < 1 ? 1 : capacity) {}
+
+    class Permit {
+    public:
+        Permit() = default;
+        Permit(Permit&& o) noexcept : g_(o.g_) { o.g_ = nullptr; }
+        Permit& operator=(Permit&&) = delete;
+        Permit(const Permit&) = delete;
+        Permit& operator=(const Permit&) = delete;
+        ~Permit() {
+            if (g_)
+                g_->release();
+        }
+        [[nodiscard]] bool ok() const { return g_ != nullptr; }
+
+    private:
+        friend class BoundedGate;
+        explicit Permit(BoundedGate* g) : g_(g) {}
+        BoundedGate* g_{nullptr};
+    };
+
+    [[nodiscard]] Permit try_acquire_for(std::chrono::milliseconds wait) {
+        std::unique_lock lk(mu_);
+        if (!cv_.wait_for(lk, wait, [&] { return in_use_ < cap_; }))
+            return Permit{};
+        ++in_use_;
+        return Permit{this};
+    }
+    int capacity() const { return cap_; }
+    int in_use() const {
+        std::lock_guard lk(mu_);
+        return in_use_;
+    }
+
+private:
+    void release() {
+        {
+            std::lock_guard lk(mu_);
+            --in_use_;
+        }
+        cv_.notify_one();
+    }
+    mutable std::mutex mu_;
+    std::condition_variable cv_;
+    int cap_;
+    int in_use_{0};
 };
 
 inline const char* to_string(Pbkdf2Refusal r) {
