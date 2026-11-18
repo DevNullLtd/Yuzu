@@ -30,9 +30,13 @@
   rule group (Mutating, Irreversible, admin or approval). The sixth, `license_scan`, is
   deliberately not installed: installing it starts the agent's daily software-licensing
   collection with no operator action, which ADR-3006 (decision D10) rules out until the
-  fleet-level setting for additions exists; the release zip still carries it. Agent
+  fleet-level setting for additions exists (#8309); the release zip still carries it. Agent
   self-update (OTA) installs no plugin; each release's installer and archive carry its
-  plugins. A
-  new docs lint (`tests/test_agent_installer_plugin_coverage_lint.py`) fails when a plugin
-  built by `meson.build` has no installer line and no recorded `; plugin-not-installed:`
-  reason.
+  plugins. Uninstalling now also removes `plugins\license_scan.dll` (copied in from the zip,
+  if it was) and the `bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified` files agent
+  self-update leaves, for an agent installed with this installer (an earlier installer's
+  uninstaller leaves them; delete them by hand). Uninstall still keeps the data directory
+  `%ProgramData%\Yuzu` apart from the enrollment token file. A new docs lint (`tests/test_agent_installer_plugin_coverage_lint.py`) fails
+  when a plugin built by `meson.build` has no installer line and no recorded
+  `; plugin-not-installed:` reason, or when an excluded plugin's DLL or those two files have
+  no uninstall entry.

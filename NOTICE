@@ -91,7 +91,8 @@ section is maintained manually; see `vcpkg.json` and
       Copyright (c) Microsoft Corporation, redistributed unmodified and installed in the
       agent's own bin directory ("app-local"), a deployment Microsoft documents for these
       files (learn.microsoft.com, "Redistributing Visual C++ files"). Not covered by the
-      AGPL; Microsoft's terms apply to them.
+      AGPL; Microsoft's terms apply to them. Decision record (2026-11-18 owner ruling):
+      docs/windows-build.md, "Decision record: app-local Visual C++ runtime".
 
 Before cutting the first AGPL-era release, run an SBOM / attribution
 aggregator (e.g. scancode-toolkit or OSS Review Toolkit) over the

@@ -196,3 +196,48 @@ counts as missing unless the payload carries it (the runner has it in
 `System32`; a customer machine need not). A local
 `deploy/packaging/windows/build-installer.sh` run stages the runtime the same
 way and needs `pwsh`. Neither step has run on a real release tag yet.
+
+## Decision record: app-local Visual C++ runtime (2026-11-18)
+
+**Decision.** Owner ruling (fjarvis), 2026-11-18: both Windows agent payloads,
+the release archive `yuzu-agent-windows-x64.zip` and the installer
+`YuzuAgentSetup-<version>.exe`, carry the Microsoft Visual C++ runtime
+app-local in the agent's `bin` directory, staged as described in the section
+above. `NOTICE` records the redistribution terms.
+
+**Reason.** Each payload must be self-contained. The archive is sideloaded:
+it is unpacked and run with no installer, so nothing installs a prerequisite
+for it. The installer carries the same files rather than requiring, or
+installing, Microsoft's Visual C++ Redistributable. Up to 0.15.0 neither
+payload carried the runtime, and the agent did not start on a machine without
+a recent enough Redistributable.
+
+**Accepted residual (governance finding UP-3).** Every DLL loaded into the
+agent process shares the agent's copy of the runtime: the Windows loader
+binds a DLL's import of `vcruntime140.dll` or `msvcp140.dll` to the module of
+that name already loaded in the process, not to the copy in `System32`. That
+includes third-party code. The `sccm` plugin creates the Configuration
+Manager client's COM objects in-process (`CoCreateInstance` of
+`Microsoft.SMS.Client` with `CLSCTX_INPROC_SERVER`,
+`agents/plugins/sccm/src/sccm_plugin.cpp`), so the ConfigMgr client DLL runs
+on the agent's runtime; a Winsock namespace provider loaded by name
+resolution does too. A vendor DLL built with a NEWER MSVC toolset than the
+release's pinned one may fail to load or misbehave, up to stopping the agent.
+The ConfigMgr client DLL's own imports have not been inspected. The owner
+accepted this residual in the same ruling. The user manual discloses it
+(`docs/user-manual/README.md`, "Windows agent: Visual C++ runtime").
+
+**Mitigation.** The release builds with one pinned MSVC toolset
+(`deploy/packaging/windows/msvc-toolset.pin`, introduced in commit
+0f23a273e4; the release fails on any other), so the runtime a release ships
+is known. The release skill's preflight (`.claude/skills/release/SKILL.md`
+and `.codex/skills/release/SKILL.md`, Phase 0) has a step to bump the
+toolset, and with it the runtime, to the newest available before each
+release. This narrows the gap between the runtime the agent carries and the
+toolset a vendor DLL was built with; it does not close it. A vendor DLL built
+after a release can still need a newer runtime, and agent self-update does
+not replace the runtime on a device (#8219).
+
+**Not decided here.** Running the `sccm` plugin's ConfigMgr calls out of the
+agent process, and refreshing the runtime through agent self-update (#8219),
+are possible follow-ups.

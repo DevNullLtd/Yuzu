@@ -133,14 +133,39 @@ replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or an
 (#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported
 configuration (see "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)):
 reprovision it from the installer or archive of the release you run. To reprovision a Windows
-agent, uninstall it (or remove its install directory), then install it from the installer or
-archive of a single release.
+agent, remove it, then install it from the installer or archive of a single release. An agent
+installed with the installer is removed by uninstalling it; deleting its install directory is
+not the same, because it leaves the `YuzuAgent` service registered. An agent deployed from the
+archive has no uninstaller: stop the `YuzuAgent` service, run `yuzu-agent.exe --remove-service`
+from its `bin` directory, then delete the directory you unpacked it into.
+
+**What uninstalling removes.** Uninstalling the agent (from Settings > Apps, or the
+uninstaller in the install directory) stops and removes the `YuzuAgent` service and removes:
+
+- every file the installer installed, and the `logs` directory;
+- `plugins\license_scan.dll` and, in `bin`, `yuzu-agent.old.exe` and `.yuzu-update-verified`,
+  which the installer does not install: `license_scan.dll` is in the release archive (see
+  below), and the other two are left by agent self-update. The uninstaller of an agent
+  installed with the 0.15.0 or an earlier installer does not remove these three; delete any of
+  them that remain after uninstalling;
+- the enrollment token file `%ProgramData%\Yuzu\enrollment-token`, and the boot-time process
+  trace setting with its file `%ProgramData%\Yuzu\procboot.etl`.
+
+It keeps the rest of the agent's data directory, `%ProgramData%\Yuzu`: its local databases,
+its certificates and anything in the update trust-anchor directory `agent-certs`. A later
+install uses that directory again. To leave no earlier state on the device, delete
+`%ProgramData%\Yuzu` after uninstalling, and enroll the agent again when you install it.
+Uninstall also keeps any other file added to the install directory, and a randomly named
+`yuzu-update-*.tmp` file that an interrupted self-update can leave in `bin` (the agent does not
+load it). A file still in use when uninstall runs is not removed.
 
 **Code loaded into the agent uses the same copy.** A third-party component that runs inside
 the agent process, for example the Configuration Manager client objects the `sccm` plugin
 creates in-process, also binds to the agent's copy of the runtime, not to the one the
 Redistributable installs in `System32`. That copy is the one the installer or archive of the
-release brought.
+release brought. A vendor DLL built with a newer Visual C++ toolset than the release's can
+fail to load in the agent or misbehave there; the Configuration Manager client that `sccm`
+loads is the known case.
 
 **If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service
 manager restarts the service every 60 seconds and each start fails the same way. Signs of it
@@ -159,8 +184,8 @@ five of them, with these components: System (`browser_inventory`, `printing`,
 `privacy_permissions`), Network (`netprobe`) and Windows (`rdp_control`). It deliberately does
 not install `license_scan`: installing it starts the agent's daily software-licensing
 collection on the device with no operator action, and under ADR-3006 (decision D10) no release
-adds a unit that runs by default until the fleet-level setting for additions exists. The
-release archive still carries `license_scan`.
+adds a unit that runs by default until the fleet-level setting for additions exists (#8309
+tracks it). The release archive still carries `license_scan`.
 
 ## Quick Start
 

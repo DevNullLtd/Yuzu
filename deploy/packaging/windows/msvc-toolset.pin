@@ -14,5 +14,8 @@
 # release notes must state that agent self-update does not carry the new
 # runtime, until #8219/#8218 change what OTA delivers. Keep
 # docs/windows-build.md's toolchain table and the Wee Tam runner
-# (deploy/windows/README.md) on the same toolset.
+# (deploy/windows/README.md) on the same toolset. The release skill's preflight
+# checks every release for a newer toolset to bump to; why the runtime is
+# app-local, and the residual that leaves: docs/windows-build.md, "Decision
+# record: app-local Visual C++ runtime (2026-11-18)".
 14.44

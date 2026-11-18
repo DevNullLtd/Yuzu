@@ -82,6 +82,8 @@ Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml
 
 Optional `--full` adds a local C++ + Erlang compile (~2 min).
 
+**Windows Visual C++ toolset and runtime (manual, every release; `release-preflight.sh` does not check it).** The Windows agent carries the Visual C++ runtime of the toolset in `deploy/packaging/windows/msvc-toolset.pin` app-local, and every DLL loaded into the agent, including vendor code such as the Configuration Manager client the `sccm` plugin loads, shares that copy (decision record: "Decision record: app-local Visual C++ runtime (2026-11-18)" in `docs/windows-build.md`). Before tagging, compare the pin with the newest MSVC toolset available for Visual Studio 2022 Build Tools (on Wee Tam, which builds the release, the version directories under `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\`, after checking the Visual Studio Installer for an update). If a newer one exists, bump to it in a reviewed PR merged before the tag: install it on Wee Tam (`deploy/windows/README.md`), change `msvc-toolset.pin` and the cl.exe row of `docs/windows-build.md`'s toolchain table together (`tests/test_windows_payload_imports.py` fails when they disagree), and add the changelog fragment the pin file's comment asks for. The release fails when the runner's `VCToolsVersion` differs from the pin, so the runner and the pin move together. If you keep the older toolset, say why in the release report.
+
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
 ## Phase 0.5 — Branch reconciliation (only when preflight check #8 fails)
