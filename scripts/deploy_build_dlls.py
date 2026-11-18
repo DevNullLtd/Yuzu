@@ -16,6 +16,18 @@ import shutil
 import sys
 
 
+# Copies that failed, filled in by copy_newer() and reported by main():
+#   MISSING - the destination does not exist after the failed copy, so the
+#             build tree lacks the DLL: main() exits 1 (the Meson custom_target
+#             fails; the configure-time run reports a warning).
+#   STALE   - the destination exists but could not be replaced, usually
+#             because a running yuzu-agent has it loaded: main() warns on
+#             stderr and carries on, as before, so a developer can rebuild
+#             with the agent running. The old copy is still in the tree.
+MISSING = []
+STALE = []
+
+
 def copy_newer(src, dst_dir):
     """Copy src into dst_dir if the destination is missing or older."""
     os.makedirs(dst_dir, exist_ok=True)
@@ -23,8 +35,12 @@ def copy_newer(src, dst_dir):
     try:
         if not os.path.exists(dst) or os.path.getmtime(src) > os.path.getmtime(dst):
             shutil.copy2(src, dst)
-    except PermissionError:
-        pass  # DLL may be locked by a running process
+    except OSError as e:
+        # A DLL locked by a running process (PermissionError) used to be
+        # swallowed here whether or not an older copy existed, so a copy that
+        # never happened left the build tree without the DLL and nothing said
+        # so. Record it instead; main() decides how loud to be.
+        (STALE if os.path.isfile(dst) else MISSING).append((src, dst, e))
 
 
 def find_vcpkg_dll_dir(explicit_bin, triplet, debug):
@@ -77,10 +93,21 @@ def main():
     # gaps (DLLs whose filename doesn't already exist) to avoid overwriting
     # a debug DLL with a same-named release DLL (or vice versa).
     dll_dir = find_vcpkg_dll_dir(args.vcpkg_bin, args.triplet, args.debug)
+    if not dll_dir or not os.path.isdir(dll_dir):
+        print(f"deploy_build_dlls: WARNING: no vcpkg DLL directory found "
+              f"(--vcpkg-bin {args.vcpkg_bin or '(none)'}, VCPKG_ROOT fallback: {dll_dir or 'none'}); "
+              f"no dependency DLLs were copied next to the executables", file=sys.stderr)
     if dll_dir and os.path.isdir(dll_dir):
         # Also locate the counterpart directory (release if debug, vice versa)
         parent = os.path.dirname(dll_dir)       # .../debug  or .../x64-windows
         grandparent = os.path.dirname(parent)   # .../x64-windows or .../installed
+        # NOTE: only the debug branch resolves to the real counterpart
+        # (<prefix>/bin). For a release build dll_dir is <prefix>/bin, so
+        # grandparent is the directory ABOVE the prefix and other_dir names
+        # a path that normally does not exist: release builds get no gap-fill.
+        # That is left as is on purpose. Pointing it at <prefix>/debug/bin
+        # would copy debug-only DLLs (zlibd1.dll and the like) into a release
+        # agents/core, and yuzu-agent.iss installs agents\core\*.dll.
         if args.debug:
             other_dir = os.path.join(grandparent, 'bin')
         else:
@@ -109,11 +136,22 @@ def main():
         copy_newer(dll, plugin_dst)
         copied += 1
 
+    for src, dst, e in STALE:
+        print(f"deploy_build_dlls: WARNING: could not replace {dst} (is a yuzu-agent "
+              f"running?); the build tree keeps an older copy than {src}: {e}", file=sys.stderr)
+    if MISSING:
+        for src, dst, e in MISSING:
+            print(f"deploy_build_dlls: ERROR: could not copy {src} to {dst}: {e}", file=sys.stderr)
+        print(f"deploy_build_dlls: {len(MISSING)} DLL(s) missing from the build tree; "
+              f"the agent will not load without them", file=sys.stderr)
+        return 1
+
     # Write stamp file so custom_target is satisfied
     stamp = os.path.join(build, '.dlls_deployed')
     with open(stamp, 'w') as f:
         f.write(f'copied {copied} items\n')
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    sys.exit(main())

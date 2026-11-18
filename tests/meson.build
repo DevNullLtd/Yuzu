@@ -3580,6 +3580,16 @@ test('local test runner platform selftest',
   timeout: 30,
 )
 
+# scripts/deploy_build_dlls.py (the Windows build's DLL deploy step) fails on
+# a DLL copy that did not happen instead of swallowing it, warns on a locked
+# destination that keeps an older copy, and copies the same DLLs as before.
+test('deploy build DLLs selftest',
+  _python3_test,
+  args: [files('test_deploy_build_dlls.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
