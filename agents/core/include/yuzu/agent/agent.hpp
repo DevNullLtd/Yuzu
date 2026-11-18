@@ -105,6 +105,15 @@ struct Config {
                                // start. Emitting nothing at all is what made a fleet-wide
                                // boot failure invisible. The enforcing legacy Guardian path
                                // is unaffected.
+    // Registry spark periodic path verification (#5719 item 5, #7836, REG-15-I2):
+    // --spark-registry-path-verify-interval SECONDS /
+    // YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL, boot-time. 0 (the default) = OFF:
+    // the Registry mechanism opens no key for verification, because an open per key per
+    // interval on a key with an auditing SACL writes Security-log events and can evict
+    // older ones. A value of 1..4 is raised to 5 s; the CLI refuses a negative or a
+    // value above 86400. Windows only: accepted and ignored on Linux and macOS, where
+    // there is no Registry mechanism.
+    int spark_registry_path_verify_interval_s{0};
 
     // Software Licensing & Entitlements (SLE, ADR-0024) — the per-user `user_ref`
     // knob for the `software_licensing` daily-sync source (Decision 11). One of
