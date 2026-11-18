@@ -621,5 +621,12 @@ older leaf of an agent that re-enrolled with a single-use token) is lifecycle bo
 by system code (`revoke_older_agent_leaves`, one statement that revokes only leaves OLDER than the new
 one by `(issued_at, serial_hex)`, never a newer one, and only when the new leaf is itself active, so concurrent re-enrolments never revoke each other's fresh leaf), is skipped by `agent_leaf_state` and `sign_agent_csr`'s revoked-identity guard, and is
 counted in the superseded revocation bucket, never in "other". The revoked set stays append-only. A
-Returning to an earlier build is outside the deployment contract; `reenrolled` revocations are
-append-only and are never undone.
+return to an earlier build is not a supported path; `reenrolled` revocations are append-only and are
+never undone.
+
+The supersede is best effort (#8254): there is no durable "owed" marker, so a crash between issuance
+and the revoke leaves the older leaf valid until it expires; `issued_at` has one-second resolution,
+so on a same-second tie whose caller serial is the lower one both leaves stay live until the next
+re-enrolment (never zero); and no lock surrounds issuance, only the revoke. Review by 2027-03-01.
+An operator-revoked leaf cannot be cleared (#8255): an old revoked leaf of an id that also holds a
+newer live leaf blocks renewal and token re-enrolment of that id until it expires.

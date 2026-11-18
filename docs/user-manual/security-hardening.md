@@ -937,3 +937,52 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 > rotation, so the old one must be **deleted** at the IdP; and deletion does not reach what was
 > already issued under it — access tokens stay valid until they expire, and sessions have to be
 > ended separately at the IdP and in Yuzu.
+
+## Agent re-registration proof: alert runbook
+
+The alerts below belong to `--agent-reregistration-proof` (see [Upgrading: re-registration proof](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01) for the modes, the soak and the recovery rules). Each heading is the alert name; every `runbook_url` in `docs/prometheus/yuzu-alerts.yml` for these alerts points here. The authoritative count of decisions is always `yuzu_register_reregistration_total`; audit rows are bounded and can be dropped.
+
+### YuzuAgentReregistrationWouldRefuse
+
+`audit` mode admitted a re-registration that `enforce` would refuse. For each `outcome` in `yuzu_register_reregistration_total{mode="audit"}`: `no_proof` (no certificate or token shown for a live-leaf id), `unattested_gateway` (a gateway that cannot witness certificates: set `witness_client_cert` on its agent listener; the gateway reads its configuration at boot), `revoked_identity`, `lookup_failed` (the CA store could not be read). Look at the `agent.reregistration_unproven` rows for the agent ids and addresses. Do not switch to `enforce` while real agents appear here.
+
+### YuzuAgentReregistrationUnattestedGateway
+
+A gateway reported that it cannot witness client certificates. Under `enforce` every leaf-holding agent behind it is refused. Fix the gateway's agent listener (`verify => verify_peer`, `fail_if_no_peer_cert => false`, `witness_client_cert => true`; the gateway reads its configuration at boot, so the change is in effect on a gateway process started afterwards); a wizard, demo, UAT or plaintext gateway cannot be enforced.
+
+### YuzuAgentReregistrationRefused
+
+`enforce` refused re-registrations. Check the `agent.reregistration_refused` rows. A real agent that lost its key: if it has no certificate file, give it a fresh single-use token (`max_uses` 1); if it still holds a certificate file, remove its `cert_dir`, restart it and give it the token. Unexpected ids and addresses are the takeover attempt the control stops.
+
+### YuzuAgentReregistrationLookupFailed
+
+The CA store could not be read, so every re-registration is refused `UNAVAILABLE` (retryable). Restore the PostgreSQL/CA store; agents retry on their own backoff.
+
+### YuzuAgentReenrolTokenRefusedBurst
+
+More than five re-enrolment tokens were refused in 15 minutes. Read `yuzu_register_reenrol_token_refused_total{reason}`: `multi_use_token` means the wrong kind of token was minted (re-enrolment needs `max_uses` 1; the single-token form defaults to 100); `already_consumed`, `expired`, `revoked` mean a spent or dead token is being retried; `not_found` repeated across ids means token guessing.
+
+### YuzuAgentReenrolTokenNoLeaf
+
+A single-use token was consumed to re-enrol a live-leaf id but no leaf was issued (`yuzu_register_reenrol_token_no_leaf_total{reason}`). `no_csr`: the agent still holds a certificate file it believes valid, so it sent no CSR. On that endpoint remove `cert_dir`, restart the agent and give it a fresh single-use token. `no_signer`: the server has no CA signer wired. `signer_failed` or `signer_threw`: read the server log for the signer error (a per-agent rate limit is one cause). The spent token cannot be reused; the older leaf is not superseded. Tracked: #8252, #8253.
+
+### YuzuAgentReregistrationAuditWriteFailed
+
+A re-registration audit row could not be written (`reason` `store_unavailable` or `write_failed`). Restore the audit store. The decision still happened and is counted in `yuzu_register_reregistration_total`; the call itself is not changed by the failed write.
+
+### YuzuAgentReregistrationAuditIdsTruncated
+
+More than 20000 DISTINCT agent ids were dropped by the audit budget inside one 10 s window, so the dropped-row summary could not name them all (`ids_truncated=N` on each summary row). Treat it as a sustained flood of re-registrations for ids that hold live leaves. The unbudgeted `yuzu_register_reregistration_total` still counts every one; find the source in the per-source counts of the `agent.reregistration_unproven` aggregate rows (`sources=`) and in gateway and firewall logs.
+
+### YuzuAgentReregistrationAuditSummaryDropped
+
+A dropped-row summary chunk was not written (`reason`: `queue_full`, the 128-row queue overflowed; `write_failed`, three failed writes; `shutdown`, still queued when the server stopped). Restore the audit store if `write_failed`. The ids that chunk named remain counted by `yuzu_register_reregistration_audit_dropped_total`.
+
+### YuzuAgentLeafSupersedeFailed
+
+After a token re-enrolment issued a fresh leaf, revoking the agent's OLDER leaves failed or threw. A failure writes a `ca.cert.supersede_failed` audit row; **a throw writes no audit row**, only a server log line and `yuzu_server_ca_supersede_failed_total`. The older, possibly lost or stolen leaf stays valid until it expires (about 365 days) or you revoke it. Revoke it by hand: `GET /api/v1/ca/issued` (needs `Security:Read`), find the agent's leaves, and `POST /api/v1/ca/revoke` the serial of the OLDER one (`Security:Delete`; irreversible for that serial). Tracked: #8254.
+
+### YuzuAgentReregistrationModeMixed
+
+Server replicas run different `--agent-reregistration-proof` values for more than 10 minutes. The flag is per process, so the fleet is only as enforced as its weakest replica: set the same value on every replica. A throwaway `enforce` replica used for the soak test raises this alert by design; stop it when the test is done.
+
