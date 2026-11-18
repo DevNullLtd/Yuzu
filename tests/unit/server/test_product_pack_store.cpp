@@ -592,6 +592,54 @@ TEST_CASE("ProductPackStore::install: a partial success surfaces which documents
     CHECK(saw_b);
 }
 
+TEST_CASE("pack install: a PARTIAL install never records its idempotency key, so a retry is not "
+          "answered with a clean replay (WP06 F4)",
+          "[product_pack_store][pg][f4]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, product_pack_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ProductPackStore store{pool};
+    REQUIRE(store.is_open());
+    store.set_require_signed_packs(false);
+
+    auto partial_fn = [](const std::string&,
+                         const std::string& yaml) -> std::expected<std::string, std::string> {
+        const auto name = ProductPackStore::extract_yaml_value(yaml, "name");
+        if (name == "item-bad-a" || name == "item-bad-b")
+            return std::unexpected("unavailable");
+        return std::string{"item-id-ok"};
+    };
+    yuzu::server::InstallPartialResult partial;
+    auto first = store.install(kThreeItemPartialFailureYaml, partial_fn, {}, "k-partial", &partial);
+    REQUIRE(first.has_value());
+    REQUIRE_FALSE(partial.errors.empty());
+
+    int calls = 0;
+    auto counting_fn = [&](const std::string&,
+                           const std::string&) -> std::expected<std::string, std::string> {
+        ++calls;
+        return std::string{"item-id-retry-" + std::to_string(calls)};
+    };
+    auto retry = store.install(kThreeItemPartialFailureYaml, counting_fn, {}, "k-partial");
+    REQUIRE(retry.has_value());
+    // Not a replay: the retry really ran the items, and is a NEW pack, not the half-installed one.
+    CHECK(calls > 0);
+    CHECK(*retry != *first);
+
+    // A COMPLETE install still records its key: the retry is a replay and runs nothing.
+    int calls2 = 0;
+    auto ok_fn = [&](const std::string&, const std::string&) -> std::expected<std::string, std::string> {
+        ++calls2;
+        return std::string{"item-id-full-" + std::to_string(calls2)};
+    };
+    auto done = store.install(kThreeItemPartialFailureYaml, ok_fn, {}, "k-complete");
+    REQUIRE(done.has_value());
+    const int after_first = calls2;
+    auto replay = store.install(kThreeItemPartialFailureYaml, ok_fn, {}, "k-complete");
+    REQUIRE(replay.has_value());
+    CHECK(*replay == *done);
+    CHECK(calls2 == after_first);
+}
+
 TEST_CASE("pack install: an authorization refusal is a 403, an unavailable authorizer a 503, "
           "never a 400 (WP06 F4)",
           "[product_pack_store][pg][f4]") {

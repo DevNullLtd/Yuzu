@@ -52,6 +52,7 @@
 
 #include <expected>
 #include <functional>
+#include <cstdint>
 #include <string>
 
 namespace yuzu::server {
@@ -66,8 +67,14 @@ using ArmingResult = std::expected<bool, std::string>;
 /// costs up to a pooled-connection timeout on the single shared tick thread; with the store
 /// evidently down, a tick that kept asking per held schedule would starve everything behind it
 /// (and the outbox delivery sharing that thread). The remaining occurrences stay due: nothing is
-/// advanced, denied or lost, and the next tick asks again.
+/// advanced, denied or lost; the next tick asks the ones not currently held.
 inline constexpr int kMaxArmingUnavailablePerTick = 3;
+
+/// How long a scheduled occurrence whose arming answer was UNAVAILABLE is left alone before it is
+/// asked again. The scheduler skips a held schedule WITHOUT asking and WITHOUT spending the per-tick
+/// cap, so the schedules behind it (a Read-pair one needs no store read at all) still run during
+/// the outage. Nothing is advanced, denied or lost: when the hold lapses the schedule is asked again.
+inline constexpr std::int64_t kArmingHoldSeconds = 90;
 
 /// The creator's CURRENT legacy admin role, evaluated LAZILY (only when the decision needs it:
 /// RBAC off, a non-Read pair, a non-engine principal), so the auth store is not read for a Read

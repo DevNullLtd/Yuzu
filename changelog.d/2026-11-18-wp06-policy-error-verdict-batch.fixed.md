@@ -1,0 +1,1 @@
+- **A policy whose check instruction was deleted writes its per-device error verdicts in one batched statement.** The evaluator thread no longer makes one database round trip per target (about 25 seconds at 5,000 targets, far longer under a slow pool).

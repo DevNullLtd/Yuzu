@@ -19587,6 +19587,19 @@ private:
                           "could not be determined (auth-store fault). Not a denial; retried.",
                           "counter");
         metrics_.counter("yuzu_schedule_arming_unavailable_total");
+        // Starvation signal: a held schedule is skipped without being asked, so without these two
+        // series nothing says how much scheduled work is not running during an auth-store outage.
+        metrics_.describe("yuzu_schedule_arming_deferred_total",
+                          "Due scheduled occurrences skipped this tick because an earlier arming "
+                          "check for them was unavailable and their hold has not lapsed. Not a "
+                          "denial; asked again when the hold lapses.",
+                          "counter");
+        metrics_.counter("yuzu_schedule_arming_deferred_total");
+        metrics_.describe("yuzu_schedule_due_held",
+                          "Scheduled occurrences currently held because their arming check was "
+                          "unavailable (auth-store fault), as of the last scheduler tick. 0 = none.",
+                          "gauge");
+        metrics_.gauge("yuzu_schedule_due_held").set(0.0);
         metrics_.describe("yuzu_server_command_outbox_deliver_arming_unavailable_total",
                           "Outbox occurrences rescheduled because the arming principal's "
                           "authority could not be determined at send time (auth-store fault). "

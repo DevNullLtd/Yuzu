@@ -188,6 +188,14 @@ public:
     update_agent_status(const std::string& policy_id, const std::string& agent_id,
                         const std::string& status, const std::string& check_result = "",
                         std::optional<int64_t> expected_gen = std::nullopt);
+    /// WP06 F4: write an explicit `error` verdict (with `check_result`) for EVERY agent in
+    /// `agent_ids` in chunked, batched statements instead of one round trip per target. Same
+    /// UPSERT semantics as the unfenced `update_agent_status(..., "error", ...)` (the retry count and
+    /// `last_fix_at` of an existing row are kept). Returns the number of rows written; a store
+    /// failure is `unexpected` and the fleet-compliance cache is invalidated either way a row landed.
+    [[nodiscard]] std::expected<std::size_t, std::string>
+    set_agents_error_status(const std::string& policy_id, const std::vector<std::string>& agent_ids,
+                            const std::string& check_result);
     [[nodiscard]] std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
     get_agent_status(const std::string& policy_id, const std::string& agent_id) const;
     [[nodiscard]] std::expected<std::vector<PolicyAgentStatus>, PolicyReadError>

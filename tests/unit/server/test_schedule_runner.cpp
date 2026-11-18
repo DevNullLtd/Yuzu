@@ -132,6 +132,8 @@ struct Harness {
     // construction time, since Deps is copied into the runner once and
     // there's no other way to change should_stop's behavior per-test.
     std::function<bool()> should_stop_hook;
+    // WP06 F53: the arming-hold clock (epoch seconds); unset = the real clock.
+    std::function<std::int64_t()> now_hook;
     // #6096: when set, the fake enqueue_fn models the real outbox's idempotence on the
     // occurrence key (a repeat is AlreadyEnqueued and adds no row). `outbox_rows` is then the
     // number of durable occurrences, i.e. the number of times the schedule actually RAN.
@@ -216,6 +218,14 @@ struct Harness {
                   return outbox_rows.contains(occurrence_id);
               },
               .should_stop = [this] { return should_stop_hook && should_stop_hook(); },
+              .now_epoch_fn =
+                  [this]() -> std::int64_t {
+                  if (now_hook)
+                      return now_hook();
+                  return std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+              },
           }) {
         INFO("[schedrunner instr] fixture status (blank == database came up OK): "
              << instr_db.error());
@@ -1761,6 +1771,8 @@ TEST_CASE("ScheduleRunner: an UNAVAILABLE arming answer (auth-store fault) HOLDS
             return std::unexpected(std::string("auth store error"));
         return true;
     });
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
     auto id = h.make_due("test.def", "interval");
     const auto before = h.get(id).next_execution_at;
 
@@ -1770,7 +1782,10 @@ TEST_CASE("ScheduleRunner: an UNAVAILABLE arming answer (auth-store fault) HOLDS
 
     fault = false; // the store recovers
     h.runner.tick();
-    CHECK(h.enqueues.size() == 1); // the held occurrence fires
+    CHECK(h.enqueues.empty()); // still inside the 90 s hold: not asked again yet
+    clock += yuzu::server::kArmingHoldSeconds + 1;
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1); // the hold lapsed: the held occurrence fires
 }
 
 TEST_CASE("ScheduleRunner: a tick stops asking the arming check after kMaxArmingUnavailablePerTick "
@@ -1794,6 +1809,63 @@ TEST_CASE("ScheduleRunner: a tick stops asking the arming check after kMaxArming
         CHECK(h.get(id).next_execution_at == 1); // nothing advanced, nothing lost
     h.runner.tick(); // the counter resets: the next tick asks again
     CHECK(asked == 2 * yuzu::server::kMaxArmingUnavailablePerTick);
+}
+
+TEST_CASE("ScheduleRunner: held schedules do not starve a healthy one behind them, and are asked "
+          "again once their hold lapses (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    int asked_held = 0;
+    Harness h([&](const std::string& principal, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        if (principal == "admin") {
+            ++asked_held;
+            return std::unexpected(std::string("auth store error"));
+        }
+        return true; // a creator whose check needs no store read
+    });
+    std::int64_t clock = 1'000'000;
+    h.now_hook = [&] { return clock; };
+    std::vector<std::string> held_ids;
+    for (int i = 0; i < 4; ++i) {
+        InstructionSchedule s;
+        s.name = "held-" + std::to_string(i);
+        s.definition_id = "test.def";
+        s.frequency_type = "interval";
+        s.interval_minutes = 60;
+        s.enabled = true;
+        s.created_by = "admin";
+        s.next_execution_at = 1 + i;
+        auto id = h.engine.create_schedule(s);
+        REQUIRE(id.has_value());
+        held_ids.push_back(*id);
+    }
+    InstructionSchedule healthy;
+    healthy.name = "healthy";
+    healthy.definition_id = "test.def";
+    healthy.frequency_type = "interval";
+    healthy.interval_minutes = 60;
+    healthy.enabled = true;
+    healthy.created_by = "reader";
+    healthy.next_execution_at = 100; // behind every held schedule in the due order
+    REQUIRE(h.engine.create_schedule(healthy).has_value());
+
+    h.runner.tick(); // asks the first three held, then stops
+    CHECK(asked_held == yuzu::server::kMaxArmingUnavailablePerTick);
+    CHECK(h.enqueues.empty());
+
+    h.runner.tick(); // the three are skipped UNASKED; the fourth is asked; the healthy one runs
+    CHECK(asked_held == 4);
+    REQUIRE(h.enqueues.size() == 1);
+    CHECK(h.enqueues[0].principal == "reader");
+
+    h.runner.tick(); // every held schedule is still inside its hold: nobody is asked
+    CHECK(asked_held == 4);
+
+    clock += yuzu::server::kArmingHoldSeconds + 1; // the hold lapses: asked again
+    h.runner.tick();
+    CHECK(asked_held > 4);
+    for (const auto& id : held_ids)
+        CHECK(h.get(id).next_execution_at < 100); // never advanced, never lost
 }
 
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",

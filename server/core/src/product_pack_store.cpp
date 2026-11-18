@@ -925,7 +925,10 @@ std::expected<std::string, std::string> ProductPackStore::install(
                 pack_id, sanitize_pg_text(pack_name), sanitize_pg_text(pack_version),
                 sanitize_pg_text(pack_description), sanitize_pg_text(yaml_bundle),
                 std::to_string(now), pack_verified ? "true" : "false",
-                idempotency_key.empty() ? std::nullopt
+                // WP06 F4: a PARTIAL install (some item refused/unavailable) never records its key.
+                // Persisting it would make a retry answer "existing_id" as a clean success and
+                // never install the missing items: the half-installed pack would read as complete.
+                (idempotency_key.empty() || !errors.empty()) ? std::nullopt
                                         : std::optional<std::string>(
                                               sanitize_pg_text(idempotency_key))});
         if (pres.status() != PGRES_COMMAND_OK)

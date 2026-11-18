@@ -703,6 +703,27 @@ TEST_CASE("policy evaluator: a deleted check instruction writes an explicit per-
     CHECK((*row)->check_result.find("instruction_missing") != std::string::npos);
 }
 
+TEST_CASE("policy store: set_agents_error_status writes every target in batched statements and keeps "
+          "an existing row's fix-attempt count (WP06 F4)", "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    auto pid = h.author("result.hostname != ''");
+    // 2500 targets > the 1000-row chunk, plus one pre-existing compliant row to overwrite.
+    REQUIRE(h.ps.update_agent_status(pid, "agent-0", "compliant").has_value());
+    std::vector<std::string> targets;
+    for (int i = 0; i < 2500; ++i)
+        targets.push_back("agent-" + std::to_string(i));
+    auto n = h.ps.set_agents_error_status(pid, targets, R"({"phase":"check","result":"instruction_missing"})");
+    REQUIRE(n.has_value());
+    CHECK(*n == 2500);
+    CHECK(h.status_of(pid, "agent-0") == "error");
+    CHECK(h.status_of(pid, "agent-2499") == "error");
+    auto none = h.ps.set_agents_error_status(pid, {}, "x");
+    REQUIRE(none.has_value());
+    CHECK(*none == 0);
+}
+
 TEST_CASE("policy evaluator: interval throttles re-dispatch", "[pg][policy][evaluator]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};

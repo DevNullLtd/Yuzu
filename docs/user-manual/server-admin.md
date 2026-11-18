@@ -1064,15 +1064,16 @@ paused. The thresholds below (2 m, 5 m, 6 acquisitions per 30 m, 120 s) are
 initial claims with no multi-replica fleet data behind them; tune them from your
 own history.
 
-**Every one of these alerts needs a successful scrape, and no server `up == 0`
-rule ships.** If the primary freezes while its kernel keeps acknowledging packets,
+**Every one of these alerts needs a successful scrape.** The shipped
+`YuzuServerMetricsScrapeDown` rule (`up{job="yuzu-server"} == 0`, group
+`yuzu-metrics-scrape`) is the server dead-man's-switch; it requires the scrape job to be named
+`yuzu-server`. If the primary freezes while its kernel keeps acknowledging packets,
 the `/metrics` handler's own database queries hang too, the scrape fails, every
 `yuzu_server_leader_*` series goes stale at once and every rule below evaluates
-empty. Configure an `up{job="<your server job>"} == 0` alert (the shipped scrape configs
-name the job `yuzu-server`; use yours, with a `for:` of a few scrape intervals) and probe `/readyz`
-from a blackbox exporter or your load balancer as the backstop. A hung scrape becomes
-`up == 0` only after Prometheus's `scrape_timeout`. No server dead-man's-switch rule ships:
-#2956 tracked it and was closed without building it.
+empty. Keep the scrape job named `yuzu-server` so `YuzuServerMetricsScrapeDown` applies (with a
+differently named job, write the same `up == 0` rule for yours), and probe `/readyz`
+from a blackbox exporter or your load balancer as a second backstop. A hung scrape becomes
+`up == 0` only after Prometheus's `scrape_timeout`.
 
 Find the replica that is the leader with
 `yuzu_server_leader_is_leader == 1`; the cluster's authoritative record is
@@ -1246,7 +1247,7 @@ no-backfill, since this store never existed before 3.3).
   dispatch to agents now follows within ~5 seconds of enqueue via the
   delivery loop — up to ~35 seconds total, where it was previously inline/
   immediate.
-- **Held scheduled work when the auth store is unreadable.** When the creator's authority cannot be read (an auth-store fault, or an enforced-RBAC permission read that failed), the schedule is HELD, not advanced and not denied, and is asked again on the next tick; an account that no longer exists, or a stored creator name the store will never accept, is a definitive denial (audited `arming_check_denied`, schedule advanced). A tick spends at most 3 such unavailable answers: after the third, the remaining due schedules are left due, nothing advanced or lost, so a healthy schedule behind held ones fires on a later tick. The command outbox applies the same limit of 3 to occurrences whose send-time arming check is unavailable: the third is rescheduled with back-off and the rest of that tick's pending occurrences wait for the next tick. Runbook: if `YuzuScheduleArmingUnavailable` or `YuzuCommandOutboxArmingUnavailable` fires, check Postgres reachability and the auth store first (`/readyz`, the server ERROR log for `schedule_runner: ... arming checks unavailable` and `command_outbox_delivery: ... arming check unavailable`); nothing needs to be re-queued, held work runs when the store answers.
+- **Held scheduled work when the auth store is unreadable.** When the creator's authority cannot be read (an auth-store fault, or an enforced-RBAC permission read that failed), the schedule is HELD, not advanced and not denied, and is asked again once its hold lapses (90 seconds); an account that no longer exists, or a stored creator name the store will never accept, is a definitive denial (audited `arming_check_denied`, schedule advanced). A tick spends at most 3 such unavailable answers, and a schedule that was answered unavailable is then skipped without being asked for 90 seconds, so a healthy schedule behind held ones (a Read-pair schedule needs no store read) fires on the next tick or the one after instead of waiting out the outage. Nothing is advanced, denied or lost. `yuzu_schedule_due_held` is the number of schedules on hold as of the last tick, `yuzu_schedule_arming_deferred_total` counts the skipped asks, and `YuzuScheduleDueHeld` fires when the gauge stays above zero for 10 minutes. The command outbox applies the same limit of 3 to occurrences whose send-time arming check is unavailable: the third is rescheduled with back-off and the rest of that tick's pending occurrences wait for the next tick. Runbook: if `YuzuScheduleArmingUnavailable` or `YuzuCommandOutboxArmingUnavailable` fires, check Postgres reachability and the auth store first (`/readyz`, the server ERROR log for `schedule_runner: ... arming checks unavailable` and `command_outbox_delivery: ... arming check unavailable`); nothing needs to be re-queued, held work runs when the store answers.
 - **The audit trail for one scheduled fire is now two events, not one.**
   `instruction.schedule_fired` (result `queued`) marks the enqueue; a new
   `command.outbox_delivered` (result `success`/`failure`/`denied`) marks the
@@ -5071,7 +5072,7 @@ Recreating the database with the libc `C` collation, whose ordering does not dep
 
 *The first failure of the start-time check.* The counter is created at 0 before the start-time check runs, and the start-time check is counted like any other. What is true is that a series first scraped already at `1` gives `increase()` no earlier sample, so `YuzuPgCollationCheckBlind` cannot see that one failure. A check that cannot read from boot fires the alert about ten to fifteen minutes after boot (reasoned, not measured), because the rechecks that follow run every minute.
 
-*Known limits of the alerts.* (1) A check stuck mid-query adds no counter increments, leaves the mismatch gauge as it was and logs nothing, so neither `YuzuPgCollationVersionMismatch` nor `YuzuPgCollationCheckBlind` fires; `YuzuPgCollationCheckStale` covers it after about two hours plus its hold, and your own `up == 0` alert and process monitoring cover a process that is down. (2) A replica that restarts more often than once a minute while the check keeps failing never rechecks, and its counter is born at `1` after each start, so `increase()` sees nothing and no counter-based alert from this feature fires. The shipped alert `YuzuServerRestartLoop` is the one to rely on for a replica that restarts repeatedly; it has its own limits (it needs more than 3 resets of `yuzu_server_uptime_seconds` in 3 hours, one continuous series per instance, and a loop faster than the metrics sweep can keep it silent). (3) After a restart during an unreadable spell the mismatch gauge is absent until the first recheck, so a standing `YuzuPgCollationVersionMismatch` can resolve and fire again a minute or two later (reasoned). (4) Neither the mismatch nor the blind alert covers a server that is down or an unreachable `/metrics`; keep your own `up == 0` alert on the server job.
+*Known limits of the alerts.* (1) A check stuck mid-query adds no counter increments, leaves the mismatch gauge as it was and logs nothing, so neither `YuzuPgCollationVersionMismatch` nor `YuzuPgCollationCheckBlind` fires; `YuzuPgCollationCheckStale` covers it after about two hours plus its hold, and your own `up == 0` alert and process monitoring cover a process that is down. (2) A replica that restarts more often than once a minute while the check keeps failing never rechecks, and its counter is born at `1` after each start, so `increase()` sees nothing and no counter-based alert from this feature fires. The shipped alert `YuzuServerRestartLoop` is the one to rely on for a replica that restarts repeatedly; it has its own limits (it needs more than 3 resets of `yuzu_server_uptime_seconds` in 3 hours, one continuous series per instance, and a loop faster than the metrics sweep can keep it silent). (3) After a restart during an unreadable spell the mismatch gauge is absent until the first recheck, so a standing `YuzuPgCollationVersionMismatch` can resolve and fire again a minute or two later (reasoned). (4) Neither the mismatch nor the blind alert covers a server that is down or an unreachable `/metrics`; `YuzuServerMetricsScrapeDown` covers a down server on the server job.
 
 ### Provisioning a native (non-container) install
 

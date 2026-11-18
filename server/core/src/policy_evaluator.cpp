@@ -503,17 +503,20 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
         return std::unexpected(
             yuzu::server::genericize_db_error("PolicyEvaluator::kickoff_check dispatch",
                                               dispatch_result.error()));
+    // One batched UPDATE for every target (not one round trip each, serially, on policy_eval_thread_
+    // with no should_stop: ~25 s at 5000 targets, far longer under pool timeouts). Counted once, one
+    // summary warn. A should_stop break is deliberately NOT added: the claim already stamped the
+    // interval, so a skipped tail would keep a stale verdict as current.
+    auto write_error_verdicts = [&](const char* reason_json) {
+        auto r = d_.policy_store->set_agents_error_status(p.id, targets, reason_json);
+        if (!r)
+            spdlog::warn("policy_evaluator: error-verdict write failed for policy {} ({} target(s)): {}",
+                         p.id, targets.size(), r.error());
+    };
     if (dispatch_result->pair_mismatch) {
         // WP06 F4: the verdict is an explicit per-agent `error` (never a stale compliant), with a
         // named reason, exactly as the verify path records a failed dispatch.
-        for (const auto& tgt : targets) {
-            auto r = d_.policy_store->update_agent_status(
-                p.id, tgt, "error", R"({"phase":"check","result":"instruction_pair_mismatch"})",
-                std::nullopt);
-            if (!r)
-                spdlog::warn("policy_evaluator: pair-mismatch status write failed for {}/{}: {}",
-                             p.id, tgt, r.error());
-        }
+        write_error_verdicts(R"({"phase":"check","result":"instruction_pair_mismatch"})");
         if (d_.metrics)
             d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
                 .increment();
@@ -523,14 +526,7 @@ std::expected<std::string, std::string> PolicyEvaluator::kickoff_check(const Pol
     if (dispatch_result->instruction_missing) {
         // A deleted check instruction must not leave the last verdict standing as current: every
         // target gets an explicit `error` with a named reason, like the mismatch case above.
-        for (const auto& tgt : targets) {
-            auto r = d_.policy_store->update_agent_status(
-                p.id, tgt, "error", R"({"phase":"check","result":"instruction_missing"})",
-                std::nullopt);
-            if (!r)
-                spdlog::warn("policy_evaluator: instruction-missing status write failed for {}/{}: {}",
-                             p.id, tgt, r.error());
-        }
+        write_error_verdicts(R"({"phase":"check","result":"instruction_missing"})");
         if (d_.metrics)
             d_.metrics->counter("yuzu_server_policy_eval_errors_total", {{"phase", "check"}})
                 .increment();

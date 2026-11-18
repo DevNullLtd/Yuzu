@@ -1216,6 +1216,59 @@ PolicyStore::update_agent_status(const std::string& policy_id, const std::string
     return true;
 }
 
+std::expected<std::size_t, std::string>
+PolicyStore::set_agents_error_status(const std::string& policy_id,
+                                     const std::vector<std::string>& agent_ids,
+                                     const std::string& check_result) {
+    if (!open_)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) + "database not open");
+    if (policy_id.empty())
+        return std::unexpected("policy_id is required");
+    if (agent_ids.empty())
+        return std::size_t{0};
+
+    auto lease = pool_.try_acquire_for(kAcquireTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                               "database unavailable — try again");
+    constexpr std::size_t kChunk = 1000;
+    std::size_t written = 0;
+    const std::string cr = sanitize_pg_text(check_result);
+    for (std::size_t i = 0; i < agent_ids.size(); i += kChunk) {
+        const auto e = std::min(agent_ids.size(), i + kChunk);
+        std::vector<std::string_view> chunk;
+        chunk.reserve(e - i);
+        for (std::size_t j = i; j < e; ++j)
+            if (!agent_ids[j].empty())
+                chunk.emplace_back(agent_ids[j]);
+        if (chunk.empty())
+            continue;
+        pg::PgResult res = pg::exec_params(
+            lease.get(),
+            "INSERT INTO policy_store.policy_status "
+            "(policy_id, agent_id, status, last_check_at, last_fix_at, check_result, "
+            " fix_attempt_count) "
+            "SELECT $1, a, 'error', EXTRACT(EPOCH FROM NOW())::bigint, 0::bigint, $3, 0 "
+            "FROM unnest($2::text[]) AS a "
+            "ON CONFLICT (policy_id, agent_id) DO UPDATE SET "
+            "  status = 'error', last_check_at = EXCLUDED.last_check_at, "
+            "  check_result = EXCLUDED.check_result "
+            "RETURNING policy_id",
+            std::vector<std::string>{policy_id, pg::to_text_array(chunk), cr});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::error("PolicyStore: write failed in set_agents_error_status: {}",
+                          PQerrorMessage(lease.get()));
+            if (written > 0)
+                invalidate_fleet_compliance_cache();
+            return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                                   "failed to update compliance status");
+        }
+        written += static_cast<std::size_t>(PQntuples(res.get()));
+    }
+    invalidate_fleet_compliance_cache();
+    return written;
+}
+
 std::expected<std::optional<PolicyAgentStatus>, PolicyReadError>
 PolicyStore::get_agent_status(const std::string& policy_id, const std::string& agent_id) const {
     if (!open_) {

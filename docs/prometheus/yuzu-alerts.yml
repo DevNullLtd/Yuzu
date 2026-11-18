@@ -3786,7 +3786,7 @@ groups:
             relying parties that check freshness (a reverse proxy reading
             GET /api/v1/ca/crl) refuse certificates from this CA. This rule
             needs a successful scrape: a server that is down or an unreachable
-            /metrics silences it, so keep your own `up == 0` alert.
+            /metrics silences it; the YuzuServerMetricsScrapeDown alert covers that.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-near-expiry-or-expired"
 
       - alert: YuzuCaCrlExpired
@@ -3862,7 +3862,7 @@ groups:
             correct clock (never all of them, and not while Postgres is
             unreachable) so its boot publish replaces the CRL; see "CRL dated
             in the future" in docs/pki-architecture.md. This rule needs a successful
-            scrape, so keep your own `up == 0` alert.
+            scrape; the YuzuServerMetricsScrapeDown alert covers a missing one.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/pki-architecture.md#crl-dated-in-the-future"
 
       - alert: YuzuCaRevocationSweepReadFailing
@@ -4733,7 +4733,7 @@ groups:
         # series means the check could not run or does not apply, NOT that the database is
         # healthy, and this rule is silent on it: the alert YuzuPgCollationCheckBlind covers
         # this, and the server log's "[PG] could not check" WARN line names the cause. A
-        # missing scrape is likewise silent here, so keep your own `up == 0` alert on the
+        # missing scrape is likewise silent here; YuzuServerMetricsScrapeDown covers the
         # server job. The check repeats every minute while it is 1, so after the database is
         # fixed the next check sets the gauge to 0 and this clears without a restart.
         # The mismatch is ONE shared pg_database fact, so the alert collapses replicas with
@@ -4785,8 +4785,8 @@ groups:
             created with the C collation has no collation version and is not affected. This
             rule needs a successful scrape and a check that can run: a server that is down or
             an unreachable /metrics silences it, and an absent series means the check could not
-            run or does not apply, not that the database is healthy, so keep your own
-            `up == 0` alert; the alert YuzuPgCollationCheckBlind covers a check that cannot
+            run or does not apply, not that the database is healthy, so
+            YuzuServerMetricsScrapeDown covers that; the alert YuzuPgCollationCheckBlind covers a check that cannot
             run. Runbook: docs/user-manual/server-admin.md, "PostgreSQL collation version".
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#postgresql-collation-version"
 
@@ -4899,7 +4899,7 @@ groups:
         # covers what neither of the other two can: a stuck check adds no counter increments,
         # leaves the mismatch gauge as it was and logs nothing.
         # An absent series (a process that never finished its boot check, or a scrape gap) is
-        # silent here: keep your own `up == 0` rule. The value is a replica wall-clock time
+        # silent here: YuzuServerMetricsScrapeDown covers a missing scrape. The value is a replica wall-clock time
         # compared with Prometheus's time(), so a replica clock that is more than about an hour
         # off moves the threshold, and the hourly wait uses a clock that does not advance while
         # the host is suspended, so a suspend can also fire it (both reasoned): check the
@@ -4926,7 +4926,7 @@ groups:
             does not advance while suspended) or when the replica's clock is more than about an
             hour off the Prometheus server's, so check the replica's uptime and clock before
             treating it as a hang. An absent series (a process that never finished its boot
-            check, or a scrape gap) does not fire this alert: keep your own `up == 0` rule.
+            check, or a scrape gap) does not fire this alert: `YuzuServerMetricsScrapeDown` covers a missing scrape.
             Each replica exports its own series, so one database problem raises one alert per
             replica: group the notifications by alertname and job. Runbook:
             docs/user-manual/server-admin.md, "PostgreSQL collation version".
@@ -9054,37 +9054,57 @@ groups:
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/policy-engine.md"
       - alert: YuzuScheduleArmingUnavailable
         # A due schedule was HELD (not advanced) because its creator's authority could not be
-        # determined: an auth-store fault. A single tick during a short blip is normal; 15 minutes
-        # of continuing increases means the fault is not clearing and scheduled work is not
-        # running. The window and the hold are both 15m, so a fault that clears inside the hold
-        # stays quiet.
+        # determined: an auth-store fault. A single tick during a short blip is normal. The 5m
+        # window asks "is it increasing NOW" and `for: 15m` holds that condition for 15 minutes, so
+        # a fault that clears inside the hold stays quiet and a continuing one fires about 16
+        # minutes in. (A 15m window with a 15m hold fires after a short fault that already ended.)
         expr: |
-          sum by (instance) (increase(yuzu_schedule_arming_unavailable_total[15m])) > 0
+          sum by (instance) (increase(yuzu_schedule_arming_unavailable_total[5m])) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Scheduled work is held on {{ $labels.instance }}: the auth store cannot answer"
           description: >-
-            yuzu_schedule_arming_unavailable_total has kept increasing on {{ $labels.instance }}
-            for 15 minutes: due schedules are held, not advanced, because the creator's authority
+            yuzu_schedule_arming_unavailable_total has been increasing on {{ $labels.instance }}
+            continuously for 15 minutes: due schedules are held, not advanced, because the creator's authority
             cannot be read from the auth store. Nothing is denied and nothing is lost; the
             schedules run when the store answers. Check Postgres reachability and the auth store
             (YuzuServerPostgresUnreachable, the server ERROR log).
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
+      - alert: YuzuScheduleDueHeld
+        # How much scheduled work is parked on the arming hold: the gauge is the number of due
+        # schedules the scheduler is skipping because their creator's authority could not be read.
+        # min_over_time over 5m is above zero only when EVERY sample in the window was, and the 5m
+        # hold adds to that, so a hold must last about 10 minutes unbroken; a blip that clears
+        # earlier never fires. A hold that persists means scheduled work is not running.
+        expr: |
+          min by (instance) (min_over_time(yuzu_schedule_due_held[5m])) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "{{ $value }} scheduled occurrence(s) held on {{ $labels.instance }} for 10 minutes: the auth store cannot answer"
+          description: >-
+            yuzu_schedule_due_held has stayed above zero on {{ $labels.instance }} for about 10 minutes:
+            due schedules are skipped (held, not advanced, not denied) because their creator's
+            authority cannot be read from the auth store. They run when the store answers.
+            yuzu_schedule_arming_deferred_total counts the skipped asks. Check Postgres
+            reachability and the auth store.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
       - alert: YuzuCommandOutboxArmingUnavailable
         # The same fault at the command outbox's send-time re-authorization: the occurrence is
         # rescheduled with back-off, not denied.
         expr: |
-          sum by (instance) (increase(yuzu_server_command_outbox_deliver_arming_unavailable_total[15m])) > 0
+          sum by (instance) (increase(yuzu_server_command_outbox_deliver_arming_unavailable_total[5m])) > 0
         for: 15m
         labels:
           severity: warning
         annotations:
           summary: "Command-outbox delivery is held on {{ $labels.instance }}: the auth store cannot answer"
           description: >-
-            yuzu_server_command_outbox_deliver_arming_unavailable_total has kept increasing on
-            {{ $labels.instance }} for 15 minutes: scheduled command occurrences are rescheduled
+            yuzu_server_command_outbox_deliver_arming_unavailable_total has been increasing on
+            {{ $labels.instance }} continuously for 15 minutes: scheduled command occurrences are rescheduled
             with back-off because the send-time re-authorization cannot read the auth store. They
             are not denied. Check Postgres reachability and the auth store.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/metrics.md"
