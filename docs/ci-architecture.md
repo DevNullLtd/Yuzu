@@ -526,7 +526,10 @@ Pinned by `tests/test_windows_payload_imports.py` (the checker over
 synthetic PE32 and PE32+ images, the wiring and step order, and the staging
 script under pwsh) and `tests/test_agent_installer_plugin_coverage_lint.py`
 (every built plugin has an installer line or a recorded
-`; plugin-not-installed:` reason). Reference: `docs/windows-build.md`.
+`; plugin-not-installed:` reason; `[UninstallDelete]` deletes every excluded
+plugin's DLL and the two files agent self-update leaves in `bin`,
+`[InstallDelete]` deletes those two, and neither section uses a wildcard).
+Reference: `docs/windows-build.md`.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 

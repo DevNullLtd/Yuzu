@@ -268,9 +268,10 @@ Filename: "powershell.exe"; Parameters: "-NoProfile -ExecutionPolicy Bypass -Com
 ; that was never actually startable, so a flat delay is no longer sufficient --
 ; poll for STOPPED (bounded to 15s, same pattern as PrepareToInstall's install-
 ; time poll) instead of a fixed 3s wait (Gate 3 release-deploy finding,
-; governance re-run). Falls through regardless of outcome: --remove-service and
-; file deletion below are safe even if the process is still exiting (marks for
-; delete / falls back to delete-on-reboot for a locked exe), same as before.
+; governance re-run). Falls through regardless of outcome: --remove-service
+; marks the service for deletion even if the process is still exiting, and a
+; file still locked when the uninstaller deletes files is left in place (no
+; [Files] entry uses uninsrestartdelete, so nothing is deleted at a reboot).
 ; Deliberately NOT gated on StopResultCode the way PrepareToInstall's poll is
 ; (that skip matters there because installs may be scripted/repeated across a
 ; fleet -- worth optimizing the dominant case); this always polls, so a
@@ -312,11 +313,15 @@ Type: files; Name: "{app}\plugins\tar.dll"
 ; The same rule applies: a stale quarantine.dll left in the plugin directory would be loaded by
 ; the glob beside firewall.dll and register the retired actions again.
 Type: files; Name: "{app}\plugins\quarantine.dll"
-; Agent self-update leftovers (agents/core/src/updater.cpp). The agent rolls back to
-; bin\yuzu-agent.old.exe at start when it exists without bin\.yuzu-update-verified, so an
-; install over a self-updated agent whose marker was never written would have the next start
-; replace the executable this installer just laid down with the older one. Both are deleted
-; before [Files] runs. Exact names only; the same two are in [UninstallDelete].
+; Agent self-update leftovers (agents/core/src/updater.cpp): the previous executable and the
+; marker the new one writes when it registers. Deleted so that no older executable is left beside the
+; one this installer lays down. The agent writes the marker when it registers, before its one
+; rollback check, so it rolls back to yuzu-agent.old.exe only when that write fails (and never
+; with self-update disabled). [InstallDelete] runs after PrepareToInstall has stopped the
+; service; a file still in use (an old.exe that is still a running image after the 15 s stop
+; poll) is skipped silently, and its marker may still be deleted: the next registration writes
+; the marker again before the check, which then removes old.exe. Exact names only; the same two
+; are in [UninstallDelete].
 Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
 Type: files; Name: "{app}\bin\.yuzu-update-verified"
 
@@ -330,16 +335,16 @@ Type: files; Name: "{app}\bin\.yuzu-update-verified"
 ;     zip, so an operator may have copied it in.
 ;   - bin\yuzu-agent.old.exe and bin\.yuzu-update-verified: written by agent
 ;     self-update (agents/core/src/updater.cpp: the previous executable kept
-;     for rollback, and the marker that the new one registered). A leftover
-;     yuzu-agent.old.exe without the marker is what the next agent start rolls
-;     back to.
+;     for rollback, and the marker that the new one registered). See the
+;     [InstallDelete] note on when the agent rolls back to old.exe.
 ; Exact names only, never a wildcard. [UninstallRun], which runs first, stops
 ; the service; a file still locked after that is not deleted. Randomly named
 ; temporaries that an interrupted self-update can leave in bin
 ; (yuzu-update-*.tmp, .yuzu-update-verified.tmp.*) are not removed; nothing
-; loads them. docs/user-manual/README.md ("What uninstalling removes") lists
-; what uninstall keeps. tests/test_agent_installer_plugin_coverage_lint.py
-; pins these entries (one for every plugin-not-installed record).
+; loads them. docs/user-manual/README.md ("Reprovisioning a Windows agent",
+; "What uninstalling removes") lists what uninstall keeps.
+; tests/test_agent_installer_plugin_coverage_lint.py pins these entries (one
+; for every plugin-not-installed record).
 Type: files; Name: "{app}\plugins\license_scan.dll"
 Type: files; Name: "{app}\bin\yuzu-agent.old.exe"
 Type: files; Name: "{app}\bin\.yuzu-update-verified"

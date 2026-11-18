@@ -37,8 +37,12 @@ What they pin:
   (`{app}\plugins\<name>.dll`: the zip carries it, so an operator may have
   copied it in, and the uninstaller removes only what [Files] installed) and
   the two files agent self-update leaves in `{app}\bin`
-  (`yuzu-agent.old.exe`, `.yuzu-update-verified`). No `files` entry there
-  uses a wildcard.
+  (`yuzu-agent.old.exe`, `.yuzu-update-verified`).
+- [InstallDelete] deletes the same two self-update files, by exact name, so
+  an install over a self-updated agent leaves no older executable beside the
+  one it installs.
+- No entry of any type in [UninstallDelete] or [InstallDelete] uses a
+  wildcard (`*` or `?`).
 
 Each check also runs against a mutated copy of the sources and must fail
 there, so a check that has stopped matching anything cannot pass silently.
@@ -215,8 +219,8 @@ def problems(iss: str, meson_text: str, read_plugin_meson, options: str, release
         if ud.count(entry) != 1:
             found.append(f"[UninstallDelete]: needs exactly one `{entry}` (left by agent self-update)")
     for l in ud:
-        if l.startswith("Type: files;") and re.search(r"[*?]", l):
-            found.append(f"[UninstallDelete]: a files entry uses a wildcard: {l}")
+        if re.search(r"[*?]", l):
+            found.append(f"[UninstallDelete]: an entry uses a wildcard: {l}")
     # [InstallDelete]: the same self-update leftovers, so an install over a self-updated
     # agent is not rolled back to the older executable at its next start.
     idl = [l.strip() for l in section(iss, "InstallDelete").splitlines()
@@ -224,7 +228,10 @@ def problems(iss: str, meson_text: str, read_plugin_meson, options: str, release
     for entry in OTA_LEFTOVERS:
         if idl.count(entry) != 1:
             found.append(f"[InstallDelete]: needs exactly one `{entry}` (else an install over a "
-                         f"self-updated agent can roll back to the older executable)")
+                         f"self-updated agent can leave the older executable beside the new one)")
+    for l in idl:
+        if re.search(r"[*?]", l):
+            found.append(f"[InstallDelete]: an entry uses a wildcard: {l}")
     return found
 
 
@@ -278,6 +285,8 @@ class InstallerPluginCoverage(unittest.TestCase):
             "old exe uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\n'),
             "update marker uninstall entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\nType: filesandordirs; Name: "{app}\\logs"', 'Type: filesandordirs; Name: "{app}\\logs"'),
             "a wildcard uninstall entry added": ("iss", 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', 'Type: files; Name: "{app}\\plugins\\license_scan.dll"\nType: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\nType: files; Name: "{app}\\plugins\\*.dll"\n'),
+            "a wildcard filesandordirs uninstall entry added": ("iss", 'Type: filesandordirs; Name: "{app}\\logs"\n', 'Type: filesandordirs; Name: "{app}\\logs"\nType: filesandordirs; Name: "{app}\\plugins\\*"\n'),
+            "a wildcard install-delete entry added": ("iss", 'Type: files; Name: "{app}\\plugins\\quarantine.dll"\n', 'Type: files; Name: "{app}\\plugins\\quarantine.dll"\nType: files; Name: "{app}\\bin\\yuzu-update-*.tmp"\n'),
             # [InstallDelete]: the first occurrence of each self-update name is the install-time one.
             "old exe install-delete entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\yuzu-agent.old.exe"\n', ""),
             "update marker install-delete entry dropped": ("iss", 'Type: files; Name: "{app}\\bin\\.yuzu-update-verified"\n', ""),
