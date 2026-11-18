@@ -73,8 +73,7 @@ carries it, which makes agent inflow countable without any extra machinery.
 | `nightly-broken` | nightly.yml | Nightly failed; no merge to `main` while open. |
 | `release-legs-broken` | release-legs-alert.yml / release-legs-daily.yml (Tier 2b daily dispatch) | The daily release/LTO legs on `dev` failed, or the daily workflow's reconcile or dispatch job did; closed by the next green dispatch. No merge discipline, but the release skill checks it before tagging. |
 | `runner-inventory-drift` | runner-inventory-sentinel.yml | Self-hosted runner drift detected. |
-| `vcpkg-baseline-broken` | vcpkg-baseline-update.yml | The monthly vcpkg baseline bump failed; opened by its `alert` job. No merge discipline; closed by the next green run. |
-| `vcpkg-bump-reviewed` | maintainer (applies) / vcpkg-baseline-update.yml (removes) | **Pull-request label.** A maintainer other than the PR token's owner has reviewed the upstream vcpkg range of the open baseline-bump PR; `ci.yml` runs its self-hosted legs on that PR only while the label is present at the PR's current head. The bump workflow removes it before each new push (`docs/dependency-updates.md`). |
+| `vcpkg-baseline-broken` | vcpkg-baseline-update.yml | The monthly vcpkg baseline bump failed; opened by its `alert` job. No merge discipline; closed by the next green run of `main`'s copy that pushes the bump PR. |
 
 `duplicate` and `invalid` are GitHub defaults applied by humans at close time.
 

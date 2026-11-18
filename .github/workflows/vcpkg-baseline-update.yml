@@ -24,18 +24,20 @@ name: vcpkg baseline update
 # reviews it. When the secret is unset the run fails at its first step,
 # before the bump, naming it, and the `alert` job files the issue.
 #
-# SELF-HOSTED OPT-IN. The PR builds an unreviewed microsoft/vcpkg HEAD. ci.yml
-# skips its self-hosted legs on a deps/vcpkg-baseline-* branch, and keeps
-# `Preflight (runner health)` red, until a maintainer has reviewed the
-# upstream range and added the `vcpkg-bump-reviewed` label. The PR is always
-# on the one branch below, so each month's bump updates the open PR instead
-# of opening another; the label is removed before every new push, so a
-# review of last month's range never covers this month's.
+# SELF-HOSTED APPROVAL. The PR builds an unreviewed microsoft/vcpkg HEAD.
+# ci.yml skips its self-hosted legs on a deps/vcpkg-baseline-* branch, and
+# keeps `Preflight (runner health)` red, until a maintainer other than the
+# PR's author has APPROVED the PR at the head the CI run builds (ci.yml's
+# vcpkg_bump_approval step). The PR is always on the one branch below, so
+# each month's bump updates the open PR instead of opening another; the new
+# head carries no approval, so a review of last month's range never covers
+# this month's.
 #
 # FAILURE SIGNAL. A scheduled run's failure notification goes only to the
 # user who last edited the cron line, so any failure opens (or comments on) a
 # `vcpkg-baseline-broken` issue, the nightly-broken pattern from nightly.yml,
-# and the next green run closes it. No merge discipline is attached: the
+# and the next green run of main's copy that pushes the bump closes it
+# (close-on-green). No merge discipline is attached: the
 # issue is a repair prompt.
 #
 # SCHEDULE RUNS MAIN'S COPY. A scheduled run uses this file as it is on the
@@ -50,12 +52,12 @@ on:
 
 # Scorecard Token-Permissions hardening: least-privilege read at workflow
 # scope. The PR itself is pushed and opened with VCPKG_BASELINE_PR_TOKEN, so
-# GITHUB_TOKEN writes only labels and issues (job-level grants below).
+# GITHUB_TOKEN writes only issues (job-level grants below).
 permissions:
   contents: read
 
-# One run at a time: a scheduled run and a dispatch would otherwise race the
-# label removal and the force-push of the same branch.
+# One run at a time: a scheduled run and a dispatch would otherwise race
+# each other's force-push of the same branch.
 concurrency:
   group: vcpkg-baseline-update
   cancel-in-progress: false
@@ -67,16 +69,26 @@ jobs:
     timeout-minutes: 10
     permissions:
       contents: read          # actions/checkout
-      pull-requests: write    # remove the opt-in label from the open bump PR
+    outputs:
+      # created / updated when this run pushed the bump branch with the PR
+      # token; close-on-green closes the alert issue only then.
+      pr_operation: ${{ steps.cpr.outputs.pull-request-operation }}
     steps:
-      # First, so a missing secret fails the run every month, also one with
-      # nothing to bump, and before anything is changed.
+      # First, so a missing, expired or revoked token fails the run every
+      # month, also one with nothing to bump, and before anything is changed.
+      # The authenticated read proves only that GitHub accepts the token; its
+      # write permissions are proven only by the push in "Create pull request".
       - name: Require the PR token
         env:
           HAS_PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN != '' }}
+          PR_TOKEN: ${{ secrets.VCPKG_BASELINE_PR_TOKEN }}
         run: |
           if [[ "$HAS_PR_TOKEN" != "true" ]]; then
             echo "::error::Repository secret VCPKG_BASELINE_PR_TOKEN is not set. The bump edits .github/workflows/*.yml, which GITHUB_TOKEN cannot push (no 'workflows' permission). Create it as described in docs/dependency-updates.md, 'The PR token'."
+            exit 1
+          fi
+          if ! GH_TOKEN="$PR_TOKEN" gh api "repos/$GITHUB_REPOSITORY" --jq .full_name > /dev/null; then
+            echo "::error::GitHub did not accept VCPKG_BASELINE_PR_TOKEN for an authenticated read of this repository (expired, revoked, not yet approved by the organization, or an API outage). Rotate it as described in docs/dependency-updates.md, 'The PR token', or re-run once the API recovers."
             exit 1
           fi
 
@@ -131,13 +143,15 @@ jobs:
           set -euo pipefail
           old="$CURRENT_SHA"
           new="$LATEST_SHA"
-          # Every active tracked reference of the baseline SHA. Historical
-          # docs/reviews evidence is immutable. When a new file pins the
-          # baseline, add it here and to the PR body below:
-          # tests/shell/test_vcpkg_baseline_bump.sh fails if a tracked file
-          # carries the current baseline SHA but is not listed here (outside
-          # docs/reviews/, governance.d/ and the changelog), or if the PR body
-          # lists a different set.
+          # Every active tracked reference of the baseline SHA, in full or as
+          # its 12-character short form. Historical docs/reviews evidence is
+          # immutable. When a new file pins the baseline, add it here and to
+          # the PR body below: tests/shell/test_vcpkg_baseline_bump.sh fails
+          # if a tracked file carries the current baseline SHA, or a short
+          # prefix of it, but is not listed here (outside docs/reviews/,
+          # governance.d/, the changelog and a "moved from `x` to `y`" bump
+          # record), if a short form is not exactly 12 characters, or if the
+          # PR body lists a different set.
           files=(
             vcpkg.json
             vcpkg-configuration.json
@@ -153,43 +167,26 @@ jobs:
             deploy/docker/Dockerfile.ci
             deploy/windows/Provision-Windows-Runner.ps1
             deploy/windows/toolchain-contract.json
+            deploy/windows/README.md
             deploy/macos/README.md
           )
-          # sed -i works because SHAs are globally unique 40-char strings.
-          sed -i "s/${old}/${new}/g" "${files[@]}"
+          # sed -i works because SHAs are globally unique 40-char strings; the
+          # full SHA is rewritten first, so the second expression meets only
+          # the 12-character short forms.
+          sed -i -e "s/${old}/${new}/g" -e "s/${old:0:12}/${new:0:12}/g" "${files[@]}"
           echo "Updated files:"
-          grep -l "${new}" "${files[@]}" || true
-          # Fail loudly if any tracked file still carries the old SHA —
-          # that means a file was added to the list without existing on
-          # disk, or the sed silently did nothing.
-          if grep -l "${old}" "${files[@]}" 2>/dev/null; then
+          grep -l "${new:0:12}" "${files[@]}" || true
+          # Fail loudly if any listed file still carries the old SHA, in
+          # either form (its 12-character prefix matches both): a file was
+          # added to the list without existing on disk, or the sed silently
+          # did nothing.
+          if grep -l "${old:0:12}" "${files[@]}" 2>/dev/null; then
             echo "::error::One or more files still reference the old SHA after sed"
             exit 1
           fi
 
-      # The opt-in label covers the head it was added at. Remove it from the
-      # open bump PR BEFORE pushing a new bump, so the new upstream range
-      # never inherits last month's review (ci.yml's vcpkg_bump_optin step).
-      # Fail-closed: if the label cannot be checked or removed, nothing is
-      # pushed. Tested by tests/shell/test_vcpkg_baseline_bump.sh.
-      - name: Withdraw the self-hosted opt-in from the open bump PR
-        if: steps.check.outputs.changed == 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          BUMP_BRANCH: deps/vcpkg-baseline-update
-          OPT_IN_LABEL: vcpkg-bump-reviewed
-        run: |
-          set -euo pipefail
-          prs=$(gh api -X GET "repos/$GITHUB_REPOSITORY/pulls" \
-                  -f state=open -f head="$GITHUB_REPOSITORY_OWNER:$BUMP_BRANCH" -f per_page=100 \
-                  --jq ".[] | select(any(.labels[]; .name == \"$OPT_IN_LABEL\")) | .number")
-          for pr in $prs; do
-            [[ "$pr" =~ ^[1-9][0-9]*$ ]] || { echo "::error::unexpected PR number '$pr'"; exit 1; }
-            gh api -X DELETE "repos/$GITHUB_REPOSITORY/issues/$pr/labels/$OPT_IN_LABEL" > /dev/null
-            echo "Removed '$OPT_IN_LABEL' from PR #$pr before pushing the new bump."
-          done
-
       - name: Create pull request
+        id: cpr
         if: steps.check.outputs.changed == 'true'
         uses: peter-evans/create-pull-request@15733dbdfeedb4f7fdb73d13c6f5ac83b710fab8 # v8.1.2
         with:
@@ -211,12 +208,13 @@ jobs:
             - New: `${{ steps.latest.outputs.sha }}`
             - Upstream range: https://github.com/microsoft/vcpkg/compare/${{ steps.current.outputs.sha }}...${{ steps.latest.outputs.sha }}
 
-            **Self-hosted CI is held until a maintainer opts in.** This PR
-            builds an unreviewed upstream vcpkg range, so `Preflight (runner
-            health)` stays red and the self-hosted legs do not run until a
-            maintainer other than the token's owner has reviewed the range
-            above, added the `vcpkg-bump-reviewed` label and re-run the failed
-            jobs. A later bump removes the label again.
+            **Self-hosted CI is held until a maintainer approves this head.**
+            This PR builds an unreviewed upstream vcpkg range, so `Preflight
+            (runner health)` stays red and the self-hosted legs do not run
+            until a maintainer other than this PR's author has reviewed the
+            diff and the range above, approved the PR at its current head, and
+            chosen "Re-run failed jobs" on the CI run for that head. A later
+            push, including next month's bump, needs a new approval.
 
             Updates every active tracked reference of the baseline SHA
             (historical `docs/reviews/` evidence remains frozen):
@@ -234,7 +232,8 @@ jobs:
             - `deploy/docker/Dockerfile.ci` `VCPKG_COMMIT` ENV
             - `deploy/windows/Provision-Windows-Runner.ps1` `$VcpkgBaseline` param
             - `deploy/windows/toolchain-contract.json` `vcpkg_baseline` pin
-            - `deploy/macos/README.md` vcpkg baseline reference
+            - `deploy/windows/README.md` example manifest `vcpkg_baseline` (short form)
+            - `deploy/macos/README.md` vcpkg baseline references (full and short form)
 
             CI will re-resolve every vcpkg port against the new baseline. If
             any downstream port now fails to build, **revert this PR** and
@@ -278,7 +277,7 @@ jobs:
               `read/write on this repository (docs/dependency-updates.md, "The PR token").`,
               `Not a merge gate.`,
               ``,
-              `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; closed automatically by the next green run.)`,
+              `(auto-posted by .github/workflows/vcpkg-baseline-update.yml; closed automatically by the next green run of main's copy that pushes the bump PR.)`,
             ].join('\n');
 
             const existing = await github.rest.issues.listForRepo({
@@ -307,14 +306,18 @@ jobs:
               core.notice(`Opened vcpkg-baseline-broken issue #${created.data.number}`);
             }
 
-  # Symmetric counterpart to `alert`, the close-on-green job from nightly.yml:
-  # closes every open `vcpkg-baseline-broken` issue once a run succeeds. A
-  # month with nothing to bump is green too; the token check runs every month,
-  # so a green run still means the secret is set.
+  # Counterpart to `alert`, after the close-on-green job in nightly.yml, but it
+  # closes the open `vcpkg-baseline-broken` issues only on a run that proved
+  # the whole path works: the scheduled copy on main (a dispatch of a dev or
+  # feature-branch copy proves nothing about the schedule), and a run that
+  # pushed the bump branch with the PR token (created or updated the PR). A
+  # green month with nothing to bump, or with nothing new to push, has not
+  # exercised the push, so it leaves the issue open; the next pushing run
+  # closes it.
   close-on-green:
     name: "Close vcpkg-baseline-broken on green"
     needs: [propose-bump]
-    if: success()
+    if: ${{ success() && github.ref == 'refs/heads/main' && (needs.propose-bump.outputs.pr_operation == 'created' || needs.propose-bump.outputs.pr_operation == 'updated') }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
@@ -327,7 +330,7 @@ jobs:
             const label = 'vcpkg-baseline-broken';
             const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
             const body = [
-              `The vcpkg baseline bump ran green @ \`${context.sha.substring(0, 7)}\`.`,
+              `The vcpkg baseline bump ran green on main's copy and pushed the bump PR with the PR token @ \`${context.sha.substring(0, 7)}\`.`,
               ``,
               `**Run:** ${runUrl}`,
               ``,

@@ -203,8 +203,11 @@ runs at 10:00 UTC on the 1st of each month (and is
    the run's first step, so an unset secret fails every month, also one with
    nothing to bump, with an error naming it. See "The PR token" below.
 6. On any failure, opens (or comments on) a `vcpkg-baseline-broken` issue,
-   the `nightly-broken` pattern. It is a repair prompt, not a merge gate. The
-   next green run closes it automatically.
+   the `nightly-broken` pattern. It is a repair prompt, not a merge gate. It
+   is closed automatically only by a green run that proves the whole path
+   works: a run of `main`'s copy (the scheduled one, or a dispatch from
+   `main`) that pushed the bump and created or updated the PR. A green run
+   with nothing to bump, or a dispatch from `dev`, leaves it open.
 
 **Schedule runs `main`'s copy.** A scheduled run uses the workflow file as it
 is on the default branch, `main`. A change to
@@ -212,43 +215,63 @@ is on the default branch, `main`. A change to
 schedule only once `dev` is promoted to `main`; until then the schedule keeps
 the old behaviour. A `workflow_dispatch` run from `dev` uses `dev`'s copy.
 
-**Self-hosted CI is held until a maintainer opts in.** The bump PR builds an
-unreviewed `microsoft/vcpkg` HEAD, opened by automation at a known time. The
-self-hosted runners are persistent and fill the caches that release builds
-read ([CI architecture](ci-architecture.md#release-build-environment-and-provenance)),
-so `ci.yml` does not run its self-hosted legs on a `deps/vcpkg-baseline-*`
-branch until the PR carries the `vcpkg-bump-reviewed` label at its current
-head. Until then `Preflight (runner health)` is red, the PR cannot merge, and
-only the GitHub-hosted jobs run. To opt in, a maintainer other than the
-token's owner:
+**Self-hosted CI is held until a maintainer approves the head.** The bump PR
+builds an unreviewed `microsoft/vcpkg` HEAD, opened by automation at a known
+time. The self-hosted runners are persistent and fill the caches that release
+builds read ([CI architecture](ci-architecture.md#release-build-environment-and-provenance)),
+so `ci.yml` does not run its self-hosted legs on a `deps/vcpkg-baseline*`
+branch until a maintainer has approved the PR at exactly the head that CI run
+builds. Until then `Preflight (runner health)` is red, so the PR cannot merge
+(short of an administrator's ruleset bypass, after which the push CI on `dev`
+runs the self-hosted legs), and only the GitHub-hosted jobs run. To approve, a
+maintainer other than the PR's author:
 
-1. reviews the upstream range linked in the PR body (the port changes between
-   the old and new baseline), looking for anything unexpected in the ports
-   Yuzu uses;
-2. adds the `vcpkg-bump-reviewed` label;
-3. on the newest CI run of the PR, chooses "Re-run failed jobs" ("Re-run all
-   jobs" works too). The gate reads the labels live, so the re-run sees the
-   label.
+1. reviews the PR's diff and the upstream range linked in the PR body (the
+   port changes between the old and new baseline), looking for anything
+   unexpected in the ports Yuzu uses;
+2. approves the PR (Files changed → Review changes → Approve) while it is at
+   that head;
+3. on the CI run for that head, chooses "Re-run failed jobs" ("Re-run all
+   jobs" works too). Submitting a review starts no CI run; the gate reads the
+   reviews live, so the re-run sees the approval.
 
-The label covers the head it was added at. The next bump removes it before
-it pushes, so each new range needs its own review; a re-run of the workflow
-removes it too, even when the range has not moved. That next bump also
-rebuilds the branch from `dev`, so a fix committed to the bump branch by hand
-is overwritten: merge or close the PR before the 1st of the month. A direct
-`workflow_dispatch` of `ci.yml` is not an opt-in route: it is accepted only on
-`dev` and `main`.
+`ci.yml`'s `vcpkg_bump_approval` step counts an approval only if it is the
+reviewer's latest approve, request-changes or dismissed review (a comment-only
+review changes nothing), was submitted on the commit the run builds, and comes
+from a person, not a bot or the PR's author, with write or admin access to the
+repository (the repository is public, so anyone can leave an approving
+review). A later "Request changes" from that reviewer, or a dismissal,
+withdraws it. Any push to the branch, including next month's bump, makes a
+new head that carries no approval, so each new range needs its own review. If
+the gate refuses with the PR already at a newer head, review and approve that
+head and re-run its newest CI run. The next bump also rebuilds the branch from
+`dev`, so a fix committed to the bump branch by hand is overwritten: merge or
+close the PR before the 1st of the month. A direct `workflow_dispatch` of
+`ci.yml` is not a way round the approval: it is accepted only on `dev` and
+`main`.
 
-CI on the PR, once opted in, re-resolves every downstream vcpkg port against
+**Where the approval is recorded.** GitHub keeps every review on the PR: the
+reviewer, the time and the commit it was submitted on (the PR's
+Conversation tab, or `gh api repos/DevNullLtd/Yuzu/pulls/<number>/reviews`).
+That record, not the CI log, is the evidence of who approved which range: the
+gate's run log, which names the approver it accepted, expires with the
+repository's Actions log retention.
+
+CI on the PR, once approved, re-resolves every downstream vcpkg port against
 the new baseline — if anything breaks, the PR is left open for manual
 investigation instead of silently merging a broken build.
 
 When adding a new active file that pins the vcpkg baseline SHA (e.g., a new CI
 workflow or Dockerfile), **add it to the `files` array in
 `.github/workflows/vcpkg-baseline-update.yml`** and to the list in the PR body
-there. Do not add immutable `docs/reviews/` evidence. The post-sed verifier
-checks listed files; `tests/shell/test_vcpkg_baseline_bump.sh` (run in CI's
-preflight) fails if a tracked file carries the current baseline SHA without
-being listed, or if the PR body lists a different set.
+there. Do not add immutable `docs/reviews/` evidence. The sed rewrites the
+full SHA and its 12-character short form; write any short form at exactly 12
+characters. The post-sed verifier checks listed files;
+`tests/shell/test_vcpkg_baseline_bump.sh` (run in CI's preflight) fails if a
+tracked file carries the current baseline SHA, in full or as a short prefix,
+without being listed, if a short form has another length, or if the PR body
+lists a different set. A bump record of the form "moved from `<old>` to
+`<new>`", like the one below, is history and exempt.
 
 ### The PR token
 
@@ -271,17 +294,20 @@ open.
   token works only once an organization owner approves it.
 - **Expiry:** 90 days or less.
 - **Attribution.** A PR opened with a personal token is authored by the
-  token's owner, so that person is not an independent reviewer of it: a
-  different maintainer reviews the upstream range, applies the opt-in label
-  and approves the merge.
+  token's owner, so that person is not an independent reviewer of it, and
+  GitHub does not let an author approve their own PR. A different maintainer
+  reviews the upstream range and approves the PR, which both releases the
+  self-hosted legs for that head and counts towards the merge.
 - **Create or rotate.** Create the new token with the settings above, store it
   with `gh secret set VCPKG_BASELINE_PR_TOKEN --repo DevNullLtd/Yuzu` (or
   Settings → Secrets and variables → Actions), run the workflow once with
   `workflow_dispatch` on `dev` and confirm it ends green or opens/updates the
-  bump PR, then revoke the old token. Rotate before the expiry date; the
-  workflow only checks that the secret is present, so an expired token shows
-  up only as a failed "Create pull request" (typically `git` exiting 128) and
-  a `vcpkg-baseline-broken` issue.
+  bump PR, then revoke the old token. Rotate before the expiry date. The
+  workflow's first step makes an authenticated read with the token, so an
+  expired or revoked token fails every run there and opens a
+  `vcpkg-baseline-broken` issue; a token GitHub accepts but whose permissions
+  are short fails only at "Create pull request" (typically `git` exiting 1 or
+  128).
 - **If it leaks.** Revoke it at once (the owner's Settings → Developer
   settings → Personal access tokens, or an organization owner's token
   review), then create and store a replacement as above. A leaked token can

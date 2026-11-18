@@ -351,8 +351,8 @@ jobs:
   # offline, preflight-gate fails red (and with it `preflight`). Required checks
   # must never disappear behind a successful skip merely because their
   # control-plane evidence is missing. It also fails red, by design, on an
-  # automated vcpkg baseline PR that no maintainer has opted in to the
-  # self-hosted runners (the `vcpkg_bump_optin` step below).
+  # automated vcpkg baseline PR that no maintainer has approved at the run's
+  # head (the `vcpkg_bump_approval` step below).
   preflight-gate:
     name: "Preflight (gate)"
     needs: [trusted_inputs]
@@ -403,7 +403,7 @@ jobs:
           ref: ${{ github.workflow_sha }}
           persist-credentials: false
 
-      # ── Automated vcpkg baseline PRs: self-hosted legs need an opt-in ───
+      # ── Automated vcpkg baseline PRs: self-hosted legs need an approval ─
       # vcpkg-baseline-update.yml opens its monthly PR (branch
       # deps/vcpkg-baseline-*) with a token that starts CI, at a public,
       # predictable time, and the PR builds an unreviewed microsoft/vcpkg HEAD.
@@ -411,31 +411,38 @@ jobs:
       # job, and those runners are persistent and write the caches release
       # builds read (docs/ci-architecture.md "Release build environment and
       # provenance"). So this step FAILS the gate on such a PR until a
-      # maintainer has read the upstream range and applied the label below:
-      # the self-hosted legs are skipped, `Preflight (runner health)` goes red
-      # (a skipped leg would otherwise satisfy its required check), and the
-      # GitHub-hosted jobs, which do not need this job, still run. Opt in by
-      # adding the label, then "Re-run failed jobs" on the newest run: labels
-      # are read live from the API, never from the event payload, so a re-run
-      # sees the label. The label binds to the PR's current head: a run for an
-      # older head fails, and vcpkg-baseline-update.yml removes the label
-      # before it pushes a new bump. A direct dispatch of ci.yml is no opt-in
-      # route: trusted_inputs refuses any ref but dev and main. Fail-closed on
-      # any API or input defect. Tested by
-      # tests/shell/test_vcpkg_bump_selfhosted_gate.sh.
-      - name: Require maintainer opt-in for an automated vcpkg baseline PR
-        id: vcpkg_bump_optin
+      # maintainer has APPROVED the PR at exactly the head this run builds:
+      # the self-hosted legs are skipped, `Preflight (runner health)` goes red,
+      # and the GitHub-hosted jobs, which do not need this job, still run.
+      #
+      # The step passes only if some reviewer's latest APPROVED,
+      # CHANGES_REQUESTED or DISMISSED review (a COMMENTED review changes
+      # nothing, as on GitHub) is APPROVED, was submitted on commit_id ==
+      # this run's head SHA, and comes from a User account (never a bot) that
+      # is not the PR's author (the bump token's owner) and holds write or
+      # admin access (the repository is public, so anyone may leave an
+      # approving review). A later CHANGES_REQUESTED review, or a dismissal,
+      # withdraws it. The approval is therefore bound to the reviewed head: a
+      # new push needs a new approval, whatever happened to the old one, and
+      # GitHub keeps the review (reviewer, time, commit) as the record.
+      # Reviews and permissions are read live from the API, so "Re-run failed
+      # jobs" on the run for the approved head sees the approval; submitting a
+      # review starts no run. A direct dispatch of ci.yml is no route around
+      # this: trusted_inputs refuses any ref but dev and main. Fail-closed on
+      # any API or input defect. Tested by tests/shell/test_vcpkg_baseline_bump.sh.
+      - name: Require a maintainer approval at this head for an automated vcpkg baseline PR
+        id: vcpkg_bump_approval
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           EVENT_NAME: ${{ github.event_name }}
           HEAD_REF: ${{ github.head_ref }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR_ID: ${{ github.event.pull_request.user.id }}
           RUN_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          OPT_IN_LABEL: vcpkg-bump-reviewed
         run: |
           set -uo pipefail
           if [[ "$EVENT_NAME" != "pull_request" || "$HEAD_REF" != deps/vcpkg-baseline* ]]; then
-            echo "Not an automated vcpkg baseline PR; no opt-in needed."
+            echo "Not an automated vcpkg baseline PR; no approval needed."
             exit 0
           fi
           refuse() {
@@ -445,23 +452,51 @@ jobs:
           }
           [[ "$PR_NUMBER" =~ ^[1-9][0-9]*$ ]] || refuse "malformed PR number '$PR_NUMBER' (failing closed)."
           [[ "$RUN_HEAD_SHA" =~ ^[0-9a-f]{40}$ ]] || refuse "malformed head SHA '$RUN_HEAD_SHA' (failing closed)."
-          if ! pr_json=$(gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER"); then
-            refuse "could not read PR #$PR_NUMBER (failing closed)."
+          [[ "$PR_AUTHOR_ID" =~ ^[1-9][0-9]*$ ]] || refuse "malformed PR author id '$PR_AUTHOR_ID' (failing closed)."
+          procedure="A maintainer other than the PR's author reviews the PR's diff and the upstream vcpkg range at head $RUN_HEAD_SHA, approves the PR at that head, then chooses \"Re-run failed jobs\" on this run (docs/dependency-updates.md). If the PR has moved on, do that on the newest run instead: an approval covers only the head it was submitted at."
+          if ! pages=$(gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/reviews?per_page=100"); then
+            refuse "could not read PR #$PR_NUMBER's reviews (failing closed)."
           fi
-          if ! live_head=$(jq -er '.head.sha' <<<"$pr_json"); then
-            refuse "could not read PR #$PR_NUMBER's head (failing closed)."
+          # One row per reviewer: that reviewer's latest decisive review (by
+          # review id, which GitHub assigns in submission order), kept only if
+          # it approves this exact head and is not the author's or a bot's.
+          if ! candidates=$(jq -r --arg head "$RUN_HEAD_SHA" --argjson author "$PR_AUTHOR_ID" '
+                if type != "array" or any(.[]; type != "array") then error("reviews are not a list of pages") else . end
+                | add // []
+                | map(select(.state == "APPROVED" or .state == "CHANGES_REQUESTED" or .state == "DISMISSED"))
+                | map(select((.user | type) == "object" and (.user.id | type) == "number" and (.id | type) == "number"))
+                | group_by(.user.id)
+                | map(max_by(.id))
+                | map(select(.state == "APPROVED"
+                             and .commit_id == $head
+                             and .user.type == "User"
+                             and (.user.login | type) == "string"
+                             and .user.id != $author))
+                | .[].user.login' <<<"$pages"); then
+            refuse "could not parse PR #$PR_NUMBER's reviews (failing closed)."
           fi
-          if [[ "$live_head" != "$RUN_HEAD_SHA" ]]; then
-            refuse "this run is for head $RUN_HEAD_SHA, but PR #$PR_NUMBER is now at $live_head. Re-run the newest CI run instead."
+          if [[ -z "$candidates" ]]; then
+            refuse "automated vcpkg baseline PR #$PR_NUMBER has no maintainer approval at head $RUN_HEAD_SHA, so the self-hosted runners are not used. $procedure"
           fi
-          if ! labels=$(jq -er '[.labels[].name] | join("\n")' <<<"$pr_json"); then
-            refuse "could not read PR #$PR_NUMBER's labels (failing closed)."
+          unverified=0
+          while IFS= read -r login; do
+            # A GitHub login; this also refuses an app's "name[bot]" login.
+            if [[ ! "$login" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+              unverified=1; continue
+            fi
+            # 404 (not a collaborator) and any API failure both count as "no".
+            if ! perm=$(gh api "repos/$GITHUB_REPOSITORY/collaborators/$login/permission" --jq '.permission'); then
+              unverified=1; continue
+            fi
+            if [[ "$perm" == "admin" || "$perm" == "write" ]]; then
+              echo "PR #$PR_NUMBER is approved at head $RUN_HEAD_SHA by $login ($perm access), not its author: self-hosted legs may run."
+              exit 0
+            fi
+          done <<<"$candidates"
+          if [[ "$unverified" -eq 1 ]]; then
+            refuse "could not confirm that an approver of PR #$PR_NUMBER at head $RUN_HEAD_SHA has write access (failing closed). $procedure"
           fi
-          if grep -Fxq -- "$OPT_IN_LABEL" <<<"$labels"; then
-            echo "PR #$PR_NUMBER carries '$OPT_IN_LABEL' at head $RUN_HEAD_SHA: self-hosted legs may run."
-            exit 0
-          fi
-          refuse "automated vcpkg baseline PR #$PR_NUMBER has not been opted in to the self-hosted runners. A maintainer reviews the upstream vcpkg range, adds the '$OPT_IN_LABEL' label, then re-runs the failed jobs (docs/dependency-updates.md)."
+          refuse "PR #$PR_NUMBER's approvals at head $RUN_HEAD_SHA are from accounts without write access. $procedure"
 
       # ── Docs-only vs code gate (issue #1978, push arm #5320) ────────────
       # Decide whether the heavy build matrix runs for this PR or push. The
@@ -703,7 +738,7 @@ jobs:
           bash tests/shell/test_linux_concurrent_step.sh      # Linux test step: both halves' verdicts, kill switch, cancel/EXIT traps (~45 s)
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
-          bash tests/shell/test_vcpkg_baseline_bump.sh           # vcpkg bump PR: self-hosted opt-in gate + label withdrawal
+          bash tests/shell/test_vcpkg_baseline_bump.sh           # vcpkg bump PR: self-hosted approval gate + bump inventory
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
           bash tests/shell/test_integration_port_retry.sh        # integration-test.sh lost-port-race classifier + process-ownership guard (#7538)
           python3 tests/test_extract_run_block.py

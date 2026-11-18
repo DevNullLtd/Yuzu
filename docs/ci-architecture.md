@@ -1205,12 +1205,12 @@ share one OS account. Fork pull requests do not run there unless a maintainer
 approves a revision through `trusted-fork-ci.yml`, which isolates its caches
 ([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
 vcpkg baseline PR (branch `deps/vcpkg-baseline-*`, opened by
-`vcpkg-baseline-update.yml`) does not run there either until a maintainer has
-reviewed its upstream range and added the `vcpkg-bump-reviewed` label: until
-then `preflight-gate` fails, its self-hosted legs are skipped and
-`Preflight (runner health)` is red
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer
+other than its author has reviewed its upstream range and approved the PR at
+the head the CI run builds: until then `preflight-gate` fails, its self-hosted
+legs are skipped and `Preflight (runner health)` is red
 ([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
-maintainer opts in"). That limits when unreviewed upstream code reaches these
+maintainer approves the head"). That limits when unreviewed upstream code reaches these
 hosts; it does not separate the caches below from release builds.
 
 **State that persists into a release build.** Release builds reuse local state
@@ -1281,7 +1281,7 @@ issue:
   `release.yml`). Only release jobs write the BuildKit layer cache through
   BuildKit, but a CI job running as the same OS account (any job on the same
   Big Tam or Wee Tam pool, or on the same runner agent) can write its
-  directory directly. The vcpkg baseline PR's opt-in label narrows
+  directory directly. The vcpkg baseline PR's approval gate narrows
   one unattended route into these caches; it does not close the gap, which
   needs release builds that start from no cache a CI job can write.
 
