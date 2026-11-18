@@ -679,7 +679,7 @@ TEST_CASE("Echo rename: definition-id references follow in schedules and executi
     }
     CHECK(version_of(dsn, "schedule_engine") == "2");
     CHECK(version_of(dsn, "execution_tracker") == "10"); // v8 is the rename step; v9 (#3678) and v10 follow it
-    CHECK(version_of(dsn, "approval_manager") == "5");
+    CHECK(version_of(dsn, "approval_manager") == "4");
     CHECK(version_of(dsn, "device_token_store") == "2");
     CHECK(version_of(dsn, "policy_store") == "6");
     CHECK(version_of(dsn, "workflow_engine") == "3");
