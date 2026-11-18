@@ -452,7 +452,7 @@ jobs:
       # workflow pushed to any branch can read CLA_REPO_ACCESS_TOKEN (cla.yml:
       # a classic `repo`-scope PAT kept as a repository secret) and push or
       # approve as that token's owner; accepted by the project owner on
-      # 2026-11-18 pending replacement of the archived CLA action.
+      # 2026-11-18 pending replacement of the archived CLA action (#8230).
       # Organisation admins can bypass it: the OrganizationAdmin bypass on
       # Protect Dev and Protect Main is a deliberate break-glass route,
       # accepted by the project owner on 2026-11-18, and its use is visible in

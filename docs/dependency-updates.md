@@ -302,11 +302,11 @@ admin can bypass it:
   the token's owner and approve it, or approve any pull request as the
   token's owner, and merge with no independent review. This is accepted by
   the project owner on 2026-11-18 pending replacement of the archived CLA
-  action;
+  action (#8230), to be reviewed by 2027-05-18;
 - the rulesets let organisation admins bypass the merge rule. The
   OrganizationAdmin bypass on Protect Dev and Protect Main is a deliberate
-  break-glass route, accepted by the project owner on 2026-11-18, and its use
-  is visible in the audit log.
+  break-glass route, accepted by the project owner on 2026-11-18 (to be
+  reviewed by 2027-05-18), and its use is visible in the audit log.
 
 The bump App's private key is stored in the `vcpkg-baseline` environment,
 which only `main` may use (see "Where the credentials are stored"), so that it
