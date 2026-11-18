@@ -7,20 +7,21 @@ owner's decisions for slice 2 are under [Decisions](#decisions), each with the d
 (2026-10-19 to 2026-10-28). Where possible it states outcomes and leaves mechanisms to the
 implementation PRs, which get their own governance.
 
-**Only 2a-1 of slice 2 is on `dev`** (checked 2026-10-28): 2a-1 merged as PR #6563, so
-`certificate_inventory` is in the typed set, and this design's PR split merged as PR #6597. No
-certificate store, ingest or `server_capabilities` code is on `dev`: `RegisterResponse` in
-`proto/yuzu/agent/v1/agent.proto` ends at field 8. Where this doc says a PR "does" something, it
-describes that PR's plan. Where it says "on the 2a-2a branch" (or another PR's branch), it describes
-that PR's unmerged implementation, recorded so this design matches it; it becomes fact only when
-that PR merges. Since the owner's 2026-10-28 split, "the 2a-2a branch" (`feat/cert-inventory-store-v2`)
-covers the certificate store and ingest only; the capability and gateway enforcement are 2a-2a-cap's.
-2b-1a is PR #6583 and 2a-1b (`feat/typed-source-background-purge`) is PR #6676, both open. Other
-work so far is on local branches that are not pushed: 2a-2a `feat/cert-inventory-store-v2`,
-2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstones`, 2a-2d
+**On `dev`** (checked 2026-11-18 against `origin/dev` and GitHub): 2a-1 (PR #6563), this design's
+PR split (PR #6597), 2a-1b (PR #6676), 2a-2a (PR #6684, the certificate store and ingest) and 2b-1a
+(PR #6583, the registered-CRL source registry, register-only) have merged, and so has a hardening
+of 2b-1a's address checks and its create read-back (PR #8141). Nothing else in slice 2 is on `dev`:
+there is no `server_capabilities` code (`RegisterResponse` in `proto/yuzu/agent/v1/agent.proto`
+ends at field 8), no agent collector, no certificate read surface and no CRL fetcher. Where this
+doc says a PR "does" something, it describes that PR's plan. Where it says "on the 2a-2b branch"
+(or another PR's branch), it describes that PR's unmerged implementation, recorded so this design
+matches it; it becomes fact only when that PR merges. Since the owner's 2026-10-28 split, the
+capability and gateway enforcement are 2a-2a-cap's, not 2a-2a's. Work not yet raised is on local
+branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstones`, 2a-2d
 `feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
+Issue #6590 holds three open owner rulings on the CRL store contract that 2b-1b depends on.
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1070,8 +1071,10 @@ errors such as non-object arguments, an unwired gate or a parse error):
 | 409 / `conflict` (register of an already-registered CA) | no | the existing source id |
 | 503 / store degraded, admission shed, or audit write failed | yes | `retry_after_ms` |
 
-The `POST` and `PUT` bodies get an entry in `kBodyCapTable` (`body_cap_policy.hpp:179`), as the
-pre-auth body-cap routed concern requires for a new mutating route. The proposed cap is 128 KiB.
+The `POST` and `PUT` bodies get an entry in `kBodyCapTable` (`body_cap_policy.hpp`), as the
+pre-auth body-cap routed concern requires for a new mutating route. 2b-1a shipped a cap of 192 KiB
+on `/api/v1/crypto/revocation-sources`, equal to `revocation_source::kBodyMaxBytes`
+(`revocation_source_service.hpp`): the largest valid body, JSON-escaped, is about 151 KiB.
 
 ### Parameters: strict or free text, the same on both twins
 
@@ -1506,11 +1509,14 @@ review, as a new egress surface.
   `distributionPoint`, `onlySomeReasons`, `onlyContainsUserCerts` and `onlyContainsCACerts`. An
   indirect CRL (`indirectCRL`) or `onlyContainsAttributeCerts` is recorded and never used (cause
   `out_of_scope`).
-- **Source configuration check.** Source ids are never reused (they come from a sequence that is
-  never reset), and every `source` row carries a `config_version` taken from one global Postgres
-  sequence (`revocation_source.config_seq`) in the same transaction as the register, `PUT`,
-  `DELETE` or high-water reset that changes it. So a `DELETE` followed by a re-register can never
-  reproduce an earlier (source id, `config_version`) pair. Before a fetch, the
+- **Source configuration check.** Source ids are never reused (an identity column that is never
+  reset), and every `source` row carries a `config_version`. 2b-1a ships it as a per-row counter:
+  1 at register, raised by one in the same transaction as a `PUT` that changes the source or a
+  high-water reset (`revocation_source_store.cpp`), not the global sequence
+  (`revocation_source.config_seq`) this design first proposed. Because ids are never reused, a
+  `DELETE` followed by a re-register still cannot reproduce an earlier (source id,
+  `config_version`) pair. Whether the design or the code changes to match is one of the #6590
+  rulings, settled before 2b-1b. Before a fetch, the
   job snapshots the source's `config_version`, the URL and the key set. The acceptance transaction
   locks the `source` row (`FOR UPDATE`) and stores the CRL only if `config_version` is unchanged and
   the URL is still registered; otherwise it discards the CRL, records cause `config_changed`,
@@ -1541,8 +1547,10 @@ review, as a new egress surface.
 - **A reset cannot be replayed into.** Plain `http` is allowed, so after a reset an on-path
   attacker or a stale mirror could serve an older CRL that still verifies, possibly one from before
   the rebuild with a higher number. So:
-  - the reset body lists the source's keys after the rebuild. Every key not listed is removed, and
-    every held CRL of the CA is deleted, in the same transaction as the reset;
+  - the reset body lists the source's keys after the rebuild, and every key not listed is removed,
+    in the same transaction as the reset. **Deferred to #6590, not in 2b-1a:** the shipped reset
+    accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this must land before
+    2b-1b accepts any CRL. Every held CRL of the CA is deleted in the reset's transaction;
   - the reset clears each scope's number and `this_update` but writes `reset_at` (Postgres `now()`
     at the reset) on every high-water row of the CA, and on a CA-level row that scopes first seen
     later inherit. **`reset_at` is kept permanently**: every CRL accepted afterwards, not only the
