@@ -205,9 +205,9 @@ session and be issued a CA-signed leaf in its name. Both paths now run ONE decis
 |---|---|
 | no live and no revoked leaf in `ca_issued` for the id (first enrolment completing, **expired** leaf, operator-CA agent) | unchanged, admitted |
 | the current leaf (direct: the mTLS peer certificate; gateway: the certificate the gateway **witnessed**) | admitted |
-| a fresh **single-use** enrollment token | admitted; audited `agent.reenrolled_with_token`; the OLDER live leaves are revoked (reason `reenrolled`, one statement, only leaves older than the new one by `(issued_at, serial_hex)`, so two concurrent re-enrolments converge on the newest instead of cross-revoking) once the new one is issued; the CRL is published by the leader's freshness tick, never on the handler thread |
+| a fresh **single-use** enrollment token | admitted; audited `agent.reenrolled_with_token`; the agent's OLDER live leaves are revoked (reason `reenrolled`; one transaction under a per-agent advisory lock; only leaves OLDER than the new one by `(issued_at, serial_hex)`, never a newer one; the new leaf must itself be active) once the new one is issued; the CRL is published by the leader's freshness tick, never on the handler thread |
 | a multi-use (fleet) token | refused INSIDE the token-consume transaction (`require_single_use`): a shared token is not proof of an existing identity, and its `use_count` is not incremented |
-| a revoked, unexpired identity with nothing live, or a live leaf beside an operator-revoked one (decided BEFORE any token is spent: `sign_agent_csr`'s HIGH-2 guard would refuse the issuance) | refused, token or not (clearing a revocation is an operator action); only the current leaf passes |
+| a revoked, unexpired identity with nothing live, or a live leaf beside an operator-revoked one (decided BEFORE any token is spent: `sign_agent_csr`'s HIGH-2 guard would refuse the issuance) | refused, token or not (an operator-revoked leaf is irreversible for that agent id for its life: there is no un-revoke; recover by enrolling under a new agent id); only the current leaf passes |
 | a live leaf and none of the above | refused with gRPC `UNAUTHENTICATED` (uniform message); never `accepted=false`, which the agent treats as permanent |
 
 The gate keys on the **leaf state, not on the `pending_agents` row**: an id whose enrollment row was deleted but which still holds a live leaf runs the same decision (otherwise auto-approve or a token would issue a second live leaf without proof). Agent ids are byte-exact in the enrollment lookup, the `ca_store` read and the certificate CN match: a case, whitespace or unicode variant is a different id with no row and is never admitted as the victim (pinned by a test). Only a **live** leaf (active, unexpired by the database clock) triggers the gate (owner decision D2), so
@@ -228,7 +228,7 @@ Trust is the same as `gateway_observed_peer`: a compromised, pin-authorized gate
 certificate (the R-6 residual below is unchanged); this closes the unauthenticated-caller hole, not a
 malicious gateway.
 
-**Rollout.** `--agent-reregistration-proof off|audit|enforce` (`YUZU_AGENT_REREGISTRATION_PROOF`), default
+**Modes.** `--agent-reregistration-proof off|audit|enforce` (`YUZU_AGENT_REREGISTRATION_PROOF`), default
 `audit` by default: decide and count (`yuzu_register_reregistration_total`), admit as before.
 `enforce` refuses. In `enforce` a gateway-relayed re-registration from a gateway that does not witness
 (`gateway_attests_peer_cert` false: a plaintext listener, or TLS without `witness_client_cert`) has no
@@ -241,7 +241,7 @@ gateway's agent listener before enabling it.
 
 **Residual under `enforce`:** a holder of an unspent single-use enrollment token can still re-enrol any live-leaf agent id and supersede its leaf (accepted token-custody trust, tracked as #8171); treat unspent re-enrolment tokens as secrets.
 
-**SOC 2 addendum (CC6.1 / CC6.3 / CC7.2).** CC6.1/CC6.3: in `enforce`, possession of the agent's current leaf (or a single-use token an operator issued) is required to re-register an enrolled id; in `audit` and `off` it is NOT, so the control is not in force. CC7.2: every refusal (`agent.reregistration_refused`) and every audit-mode admission of an unproven re-registration (`agent.reregistration_unproven`) leaves an audit row (bounded per id; the aggregate row and `yuzu_register_reregistration_audit_dropped_total` account for suppressed rows), token re-enrolments leave `agent.reenrolled_with_token`, and a superseded leaf leaves `ca.cert.revoked` with `reason=reenrolled`. The batch token mint route and `--generate-tokens` default `max_uses` to 1; the single-token form route defaults to 100.
+**SOC 2 addendum (CC6.1 / CC6.3 / CC7.2).** CC6.1/CC6.3: in `enforce`, possession of the agent's current leaf (or a single-use token an operator issued) is required to re-register an enrolled id; in `audit` and `off` it is NOT, so the control is not in force. CC7.2: refusals (`agent.reregistration_refused`) and audit-mode admissions of an unproven re-registration (`agent.reregistration_unproven`) are written as audit rows, but rows are BOUNDED and can be dropped under load or attack (absence of a row is not proof; the authoritative count is `yuzu_register_reregistration_total`; dropped rows are counted in `yuzu_register_reregistration_audit_dropped_total` and summarised by an aggregate row), token re-enrolments leave `agent.reenrolled_with_token`, and a superseded leaf leaves `ca.cert.revoked` with `reason=reenrolled`. The batch token mint route and `--generate-tokens` default `max_uses` to 1; the single-token form route defaults to 100.
 
 **A superseded leaf and the CRL file.** The server's mTLS gate reads `ca_store`, so a superseded leaf is refused immediately. The CRL **file** is published by the leader's freshness tick (15 s, +1/5 min backoff, unbounded while no replica holds leadership), so a relying party that only reads the CRL sees the revocation later.
 

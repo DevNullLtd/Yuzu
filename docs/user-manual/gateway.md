@@ -3326,10 +3326,13 @@ discarded in a state that must not run a handler (`extra_request_data`, `stream_
 
 ### Moving the agent edge to mutual TLS
 
-Agent identity at the gateway is application-layer: the agent listener is **one-way
-TLS**, encrypting the hop and authenticating the gateway to the agent, and a client
-certificate is neither requested nor checked. The move to client certificates has three
-stages. Only the first two exist in code today, and the second enforces nothing.
+Agent identity at the gateway is application-layer: the agent listener encrypts the hop and
+authenticates the gateway to the agent. On a listener with `witness_client_cert` (stage 2a, the
+shipped `sys.config.prod` and reference configs) a client certificate is requested and only
+**witnessed** and forwarded to the server, which verifies it; the gateway itself checks nothing and
+serves peers with no certificate. On a listener without it (stage 1) a certificate is neither
+requested nor checked. The move to client certificates has three stages. Only the first two (with
+2a) exist in code today, and the second enforces nothing.
 
 1. **One-way TLS.** `tls => #{..., verify => verify_none,
    fail_if_no_peer_cert => false}`. The shape of a listener without `witness_client_cert` (stage 2a below adds it).
@@ -3341,7 +3344,7 @@ stages. Only the first two exist in code today, and the second enforces nothing.
    with `gateway_attests_peer_cert => true`, **overwriting** whatever the agent sent. The server decides
    whether it proves the agent id (chains to its own CA, valid now, an agent leaf, CN equals the id, not
    revoked) before it re-admits an already-enrolled id; see `docs/pki-architecture.md` "Re-registration
-   proof (WP01)" and [Upgrading](upgrading.md). The gateway enforces nothing itself and a peer with no
+   proof (WP01)" and [Upgrading](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01). The gateway enforces nothing itself and a peer with no
    certificate is still served.
 2. **Request a certificate, enforce nothing (available now, configuration only).**
    `tls => #{..., verify => verify_peer, fail_if_no_peer_cert => false}` asks every client

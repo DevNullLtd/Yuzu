@@ -62,9 +62,13 @@ the default and `enforce` is not made the default by this change.
 6. **Token-holder takeover (accepted, #8171).** Under `enforce` a holder of an unspent single-use token
    can re-enrol any live-leaf id and supersede its leaf; recovery is a new single-use token for the
    victim. Token custody is the control.
-7. **Revoked-as-`reenrolled` presenter.** A direct-TLS agent whose leaf was superseded keeps presenting it
-   and is answered "client certificate is revoked" before any token is read; documented manual
-   recovery (delete the agent's certificate and key, restart with a fresh single-use token).
+7. **Revoked-as-`reenrolled` presenter.** A direct-TLS agent whose leaf was superseded keeps presenting it and sends no CSR. Without the optional server change (commit `1b71bc3686`) it is answered "client certificate is revoked" before any token is read; with it, the token is accepted but a new leaf is issued only if the agent sends a CSR. The reliable recovery is manual: delete the agent's provisioned certificate and key and restart it with a fresh single-use token.
 8. **CRL file latency.** The superseded leaf is refused by the server's mTLS gate immediately; the CRL
    file lags the leader's freshness tick.
 9. **No rate limit** on re-registration attempts (#828, out of scope); the new read is one indexed query.
+10. **Operator-revoked leaf is irreversible.** The revoked set is append-only and there is no un-revoke action; the revoked-identity guard refuses all issuance for that agent id until the leaf expires (~365 days). Recovery is enrolling under a NEW agent id (the guard is keyed on the exact id); review date 2027-03-01 for an audited clear-and-reissue route.
+11. **Audit rows are bounded and can be dropped.** Per 10 s window and per server process: 3 rows per repeated id; a reserved bucket (250) for ids not seen recently; per-source (50) and global (1000) caps for the rest; dropped rows are counted, summarised in one system-principal aggregate row (by time and at shutdown) and alerted. The authoritative count is `yuzu_register_reregistration_total`. Residual: more than 250 brand-new live-leaf ids from many sources in one window can push a victim's row out.
+12. **Supersede is best effort (owner decision D4).** A failure (including a swallowed exception) is counted, audited and alerted (`YuzuAgentLeafSupersedeFailed`); there is no durable "supersede owed" marker swept by the leader tick, so a crash between issuance and the revoke leaves the older, possibly stolen leaf valid until it expires. A durable marker is a follow-up.
+13. **Droppable commits.** `1b71bc3686` (option 2: a superseded leaf plus a token is "no proof") and `65a9339d22` (F: return the token use when the leaf is not issued) are separate and droppable pending an owner decision; known limits recorded in the Gate 8 ledger: a no-CSR re-enrolment consumes the token and issues nothing, and the refund fires on any missing leaf, including a client-induced one.
+
+Fix commits: `df2851d309`, `f628b94e60`, `b96ec367b2`, `34a9af4aa0`, `2ac767c28b`, `5cc3865659`, `3a5e49d976`, `2127e95eed`, `6eacba523f`, `1b71bc3686`, `65a9339d22`, and the Gate 8 pass 3 commits after them (see `git log`).

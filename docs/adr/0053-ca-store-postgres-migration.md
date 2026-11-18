@@ -619,8 +619,7 @@ until #4432 delivers it (still open at this date).
 Two behaviours of the store are part of the contract: a leaf the server revokes as `reenrolled` (the
 older leaf of an agent that re-enrolled with a single-use token) is lifecycle bookkeeping, written only
 by system code (`revoke_older_agent_leaves`, one statement that revokes only leaves OLDER than the new
-one by `(issued_at, serial_hex)`, so concurrent re-enrolments converge on the newest and never
-cross-revoke), is skipped by `agent_leaf_state` and `sign_agent_csr`'s revoked-identity guard, and is
+one by `(issued_at, serial_hex)`, never a newer one, and only when the new leaf is itself active, so concurrent re-enrolments never revoke each other's fresh leaf), is skipped by `agent_leaf_state` and `sign_agent_csr`'s revoked-identity guard, and is
 counted in the superseded revocation bucket, never in "other". The revoked set stays append-only. A
 Returning to an earlier build is outside the deployment contract; `reenrolled` revocations are
 append-only and are never undone.
