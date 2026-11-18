@@ -305,11 +305,12 @@ std::vector<AppInfo> get_installed_apps([[maybe_unused]] yuzu::vuln::CoverageSta
 // Run one macOS command through the shared bounded runner (execve of argv[0], own process group,
 // deadline, output cap). ok = ran to completion, exit 0, output not cut short; ran = the same
 // without the exit-0 requirement.
-yuzu::vuln::CommandRead macos_run_for(const yuzu::vuln::Argv& argv, long long deadline_ms) {
+yuzu::vuln::CommandRead macos_run_for(const yuzu::vuln::Argv& argv, long long deadline_ms,
+                                      bool merge_stderr = false) {
     yuzu::agent::SubprocessOptions opts;
     opts.deadline = std::chrono::milliseconds(deadline_ms);
     opts.output_cap_bytes = yuzu::vuln::kMacosCommandMaxOutput;
-    opts.merge_stderr = false;
+    opts.merge_stderr = merge_stderr;
     const auto r = yuzu::agent::run_bounded_subprocess(argv, opts);
     yuzu::vuln::CommandRead out;
     out.out = r.output;
@@ -320,8 +321,8 @@ yuzu::vuln::CommandRead macos_run_for(const yuzu::vuln::Argv& argv, long long de
 }
 
 // The small status tools (spctl, fdesetup, ...) get a short deadline.
-yuzu::vuln::CommandRead macos_run(const yuzu::vuln::Argv& argv) {
-    return macos_run_for(argv, yuzu::vuln::kMacosToolDeadlineMs);
+yuzu::vuln::CommandRead macos_run(const yuzu::vuln::Argv& argv, bool merge_stderr) {
+    return macos_run_for(argv, yuzu::vuln::kMacosToolDeadlineMs, merge_stderr);
 }
 
 // system_profiler: process-wide single flight plus a short result cache (failures included, so a

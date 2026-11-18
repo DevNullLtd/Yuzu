@@ -408,13 +408,18 @@ TEST_CASE("macos config: a null reader fails closed", "[vuln][macos][config]") {
 TEST_CASE("macos config: the table drives the reader with each check's own argv",
           "[vuln][macos][config]") {
     std::vector<std::string> seen;
-    const auto rows = run_macos_checks_table([&](const Argv& a) {
+    std::vector<bool> merged;
+    const auto rows = run_macos_checks_table([&](const Argv& a, bool merge_stderr) {
         seen.push_back(a[0]);
+        merged.push_back(merge_stderr);
         return CommandRead{};
     });
     CHECK(rows.size() == 6);
     CHECK(seen.size() == 6);
     CHECK(seen[0] == "/usr/sbin/spctl");
+    // only the defaults row reports on stderr
+    CHECK(std::count(merged.begin(), merged.end(), true) == 1);
+    CHECK(merged[5]);
 }
 
 TEST_CASE("macos config: an UNREADABLE row is counted in summary's UNREADABLE bucket",
@@ -437,4 +442,95 @@ TEST_CASE("macos config: any_config_unreadable keys on severity", "[vuln][macos]
     CHECK_FALSE(any_config_unreadable(v));
     v.push_back(macos_check_result(MacosCheck::Sip, {"", false, false}));
     CHECK(any_config_unreadable(v));
+}
+
+// ── golden fixtures: REAL output, verified on macOS 27.0.1 (one Apple Silicon host; 13-15 not
+//    measured; exit codes not yet captured) ────────────────────────────────────────────────────
+
+TEST_CASE("golden macOS 27.0.1: the five status tools' real lines are accepted", "[vuln][macos][golden]") {
+    const auto r = [](MacosCheck c, const char* line) { return macos_check_result(c, good(line)); };
+    auto gk = r(MacosCheck::Gatekeeper, "assessments enabled");
+    CHECK(gk.severity == "INFO");
+    CHECK(gk.passed);
+    auto fv = r(MacosCheck::FileVault, "FileVault is On.");
+    CHECK(fv.severity == "INFO");
+    CHECK(fv.passed);
+    auto sip = r(MacosCheck::Sip, "System Integrity Protection status: enabled.");
+    CHECK(sip.severity == "INFO");
+    CHECK(sip.passed);
+    // the firewall on that Mac is genuinely OFF: a real finding, not an unreadable
+    auto fw = r(MacosCheck::Firewall, "Firewall is disabled. (State = 0)");
+    CHECK(fw.severity == "MEDIUM");
+    CHECK(fw.detail == "Disabled");
+    CHECK_FALSE(fw.passed);
+    auto rl = r(MacosCheck::RemoteLogin, "Remote Login: Off");
+    CHECK(rl.severity == "INFO");
+    CHECK(rl.passed);
+}
+
+namespace {
+const char* const kDefaultsAbsent =
+    "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.";
+} // namespace
+
+TEST_CASE("golden macOS 27.0.1: an absent AutomaticCheckEnabled key is INFO, not unreadable or bad",
+          "[vuln][macos][golden]") {
+    // exit code unknown (believed 1): the verdict must not depend on it
+    for (const CommandRead& rd : {CommandRead{kDefaultsAbsent, false, true},
+                                  CommandRead{kDefaultsAbsent, true, true},
+                                  CommandRead{std::string(kDefaultsAbsent) + "\n", false, true}}) {
+        auto res = macos_check_result(MacosCheck::AutoUpdate, rd);
+        CHECK(res.severity == "INFO");
+        CHECK(res.title == "Automatic Software Updates");
+        CHECK(res.detail == "Automatic update check: not set (macOS default applies)");
+        CHECK(res.passed);
+    }
+    // 1 good, 0 bad, anything else unknown
+    CHECK(macos_check_result(MacosCheck::AutoUpdate, good("1")).passed);
+    CHECK(macos_check_result(MacosCheck::AutoUpdate, good("0")).severity == "MEDIUM");
+    CHECK(macos_check_result(MacosCheck::AutoUpdate, good("2")).severity == "UNREADABLE");
+    CHECK(macos_check_result(MacosCheck::AutoUpdate,
+                             good("Error: Could not find key 'Other' in domain 'x'."))
+              .severity == "UNREADABLE");
+    // the tool did not run at all: still unreadable, even with the message text
+    CHECK(macos_check_result(MacosCheck::AutoUpdate, {kDefaultsAbsent, false, false}).severity ==
+          "UNREADABLE");
+    // other checks have no absent form
+    CHECK(macos_check_result(MacosCheck::Gatekeeper, {kDefaultsAbsent, false, true}).severity ==
+          "UNREADABLE");
+}
+
+TEST_CASE("golden macOS 27.0.1: the real system_profiler shape parses; property lines are not names",
+          "[vuln][macos][golden]") {
+    const std::string real =
+        "Applications:\n"
+        "\n"
+        "    App Store:\n"
+        "\n"
+        "      Version: 3.0\n"
+        "      Obtained from: Apple\n"
+        "      Last Modified: 24/09/2026, 08:10\n"
+        "      Kind: Apple Silicon\n"
+        "      Signed by: Software Signing, Apple Code Signing Certification Authority, Apple Root CA\n"
+        "      Location: /System/Applications/App Store.app\n"
+        "\n"
+        "    Safari:\n"
+        "\n"
+        "      Version: 27.0\n"
+        "      Obtained from: Apple\n"
+        "      Signed by:\n"
+        "      Location: /Applications/Safari.app\n";
+    auto e = parse_system_profiler_apps(real, true);
+    REQUIRE(e.apps.size() == 2);
+    CHECK(e.apps[0].name == "App Store");
+    CHECK(e.apps[0].version == "3.0");
+    CHECK(e.apps[1].name == "Safari");
+    CHECK(e.apps[1].version == "27.0");
+    CHECK(e.readable);
+    // 6-space property lines (even ones ending in ':') are never names
+    for (const auto& a : e.apps) {
+        CHECK(a.name != "Signed by");
+        CHECK(a.name != "Obtained from");
+        CHECK(a.name != "Location");
+    }
 }
