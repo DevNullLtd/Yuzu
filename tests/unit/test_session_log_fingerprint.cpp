@@ -12,7 +12,7 @@
 
 #include <string>
 
-TEST_CASE("session_log_fingerprint never contains the session id", "[agent][log_injection][F50]") {
+TEST_CASE("session_log_fingerprint never contains the session id", "[agent][log_injection][session_fp]") {
     const std::string sid = "0123456789abcdef0123456789abcdef-session-credential";
     const std::string fp = yuzu::agent::session_log_fingerprint(sid);
     CHECK(fp.size() == 8);

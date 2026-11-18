@@ -110,6 +110,51 @@ def main():
         r = bash(f"resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{big.as_posix()}'")
         if r.stdout.strip() != SID or time.monotonic() - t0 > 30:
             bad.append(f"20k-line log: {r.stdout!r} in {time.monotonic() - t0:.1f}s")
+        # the cap bounds the cost but must still reach a session that is NOT the very last one
+        # (kills "cap 200 -> 5"): the target is followed by 50 other distinct sessions
+        deep = d / "server-deep.log"
+        with open(deep, "w") as f:
+            f.write(f"ProxyRegister succeeded: agent=t, session={SID}\n")
+            for n in range(50):
+                f.write(f"ProxyRegister succeeded: agent=o{n}, session=gw-session-other-{n:04d}\n")
+        r = bash(f"resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{deep.as_posix()}'")
+        if r.stdout.strip() != SID:
+            bad.append(f"target 50 sessions from the end must be found: {r.stdout!r} {r.stderr!r}")
+        # the candidate list is DISTINCT sessions (kills "drop the awk filter"): the target once, then
+        # 300 repeats of one other session; without de-duplication the cap window is all repeats
+        dup = d / "server-dup.log"
+        with open(dup, "w") as f:
+            f.write(f"ProxyRegister succeeded: agent=t, session={SID}\n")
+            for _ in range(300):
+                f.write("ProxyRegister succeeded: agent=o, session=gw-session-repeat\n")
+        r = bash(f"resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{dup.as_posix()}'")
+        if r.stdout.strip() != SID:
+            bad.append(f"repeats must not crowd out a distinct session: {r.stdout!r} {r.stderr!r}")
+        # LAST match wins (kills "last -> first"): two different sessions sharing one 8-hex fingerprint
+        seen = {}
+        n = 0
+        while True:
+            cand = f"gw-session-collide-{n}"
+            h = hashlib.sha256(cand.encode()).hexdigest()[:8]
+            if h in seen:
+                first, second, cfp = seen[h], cand, h
+                break
+            seen[h] = cand
+            n += 1
+        coll_agent = d / "agent-coll.log"
+        coll_agent.write_bytes(f"Registered with server (session_fp={cfp}, enrollment=enrolled)\n".encode())
+        coll_server = d / "server-coll.log"
+        coll_server.write_text(f"ProxyRegister succeeded: agent=a, session={first}\n"
+                               f"ProxyRegister succeeded: agent=b, session={second}\n")
+        r = bash(f"resolve_agent_session '{coll_agent.as_posix()}' '{coll_server.as_posix()}'")
+        if r.stdout.strip() != second:
+            bad.append(f"the LAST matching session must win: want {second}, got {r.stdout!r}")
+        # no hash tool, end to end through resolve_agent_session: rc 127 and the message, never a
+        # silent rc 2 (kills "drop || return 127")
+        env127 = path_with("none-e2e", None)
+        r = bash(f"resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{(d/'server-lf.log').as_posix()}'", env=env127)
+        if r.returncode != 127 or "cannot join" not in r.stderr:
+            bad.append(f"no hash tool via resolve_agent_session: rc={r.returncode} err={r.stderr!r}")
         # no hash tool: loud failure. PATH holds only the basics.
         env = path_with("none", None)
         r = bash("printf %s x | _sha256_hex8", env=env)

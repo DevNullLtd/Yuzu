@@ -110,7 +110,7 @@ def selftest():
     # re-adding a session= read of the Registered line (a fallback) must be RED
     assert check_text("lib.sh", 'grep -a "Registered with server" "$1" | grep -aoE \'session=[^ ,)]+\''), "selftest fallback"
     assert not check_text("x.sh", "Registered with server (session_fp=ab12cd34, "), "selftest ok-fp"
-    assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: legacy'), "selftest allow"
+    assert not check_text("x.sh", 'grep "Registered with server" x | grep session=  # tripwire-allow: reviewed example'), "selftest allow"
     assert not check_text("x.sh", "ProxyRegister succeeded: agent=a, session=b"), "selftest server line"
     # Windows-style path separators must not matter
     assert check_text("scripts\\x.sh".replace("\\", "/"), bad[0]), "selftest path"

@@ -15,9 +15,32 @@ QUERY_STEPS = ("could not set non-blocking mode", "could not send probe query",
 
 
 def strip_comments(text):
-    """Remove // and /* */ comments (string literals are left alone; the pinned shapes contain none)."""
-    text = re.sub(r"/\*.*?\*/", "", text, flags=re.S)
-    return re.sub(r"//[^\n]*", "", text)
+    """Remove // and /* */ comments in SOURCE ORDER, leaving string and char literals intact (a "/*"
+    inside a string is not a comment, and a comment-looking tail inside a string must not hide code)."""
+    out, i, n = [], 0, len(text)
+    while i < n:
+        c = text[i]
+        if c == '"' or c == "'":
+            j = i + 1
+            while j < n and text[j] != c:
+                j += 2 if text[j] == "\\" else 1
+            out.append(text[i:j + 1])
+            i = j + 1
+        elif text.startswith("//", i):
+            j = text.find("\n", i)
+            i = n if j < 0 else j
+        elif text.startswith("/*", i):
+            j = text.find("*/", i + 2)
+            i = n if j < 0 else j + 2
+        else:
+            out.append(c)
+            i += 1
+    return "".join(out)
+
+
+def strip_strings(text):
+    """Blank string/char literal CONTENTS so a substring inside a literal cannot satisfy a pin."""
+    return re.sub(r'"(?:\\.|[^"\\])*"', '""', text)
 
 
 def check(text):
@@ -27,7 +50,8 @@ def check(text):
     if not m:
         return ["pq_query_error not found"]
     body = m.group(1)
-    if "query_failure_detail(" not in body or "connect_failure_cause" in body:
+    body_code = strip_strings(body)
+    if not re.search(r"return\s+pg::query_failure_detail\(", body_code) or "connect_failure_cause" in body_code:
         errs.append("pq_query_error must call pg::query_failure_detail and not connect_failure_cause")
     for step in QUERY_STEPS:
         if f'pq_query_error(c, "{step}")' not in text:
@@ -53,7 +77,12 @@ def main():
     mut5 = good.replace('pg::query_failure_detail("probe query failed", m)', 'std::string(m)', 1)
     # a query-phase step moved to the connect helper via a comment-hidden original
     mut6 = good.replace('pq_query_error(c, "could not send probe query")', 'pq_error(c, "could not send probe query") // pq_query_error(c, "could not send probe query")', 1)
-    assert all(check(m) for m in (mut1, mut2, mut3, mut4, mut5, mut6)), "selftest: mutations must be caught"
+    # a dropped call that keeps the substring only inside a string literal must be RED
+    mut7 = good.replace("return pg::query_failure_detail(step,", 'return std::string("query_failure_detail(") + std::string(step', 1)
+    assert all(check(m) for m in (mut1, mut2, mut3, mut4, mut5, mut6, mut7)), "selftest: mutations must be caught"
+    # a benign "/*" inside a string literal before the pinned function must stay GREEN
+    benign = good.replace("std::string pq_query_error(", 'static const char* kBenignGlob = "/*";\nstd::string pq_query_error(', 1)
+    assert not check(benign), "selftest: a string containing /* must not false-RED"
     errs = check(good)
     for e in errs:
         print("FAIL:", e)

@@ -68,7 +68,7 @@ resolve_agent_session() {
     id=$(session_for_fp "$fp" < "$2") || rc=$?
     [ "$rc" -eq 0 ] || return "$rc"
     if [ -z "$id" ]; then
-        echo "resolve_agent_session: no ProxyRegister session matches session_fp=$fp in $2" >&2
+        echo "resolve_agent_session: no ProxyRegister session matches session_fp=$fp in $2 (only the most recent $_SESSION_FP_MAX_CANDIDATES distinct sessions are examined)" >&2
         return 2
     fi
     printf '%s\n' "$id"
