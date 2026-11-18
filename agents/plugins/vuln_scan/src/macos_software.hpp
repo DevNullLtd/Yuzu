@@ -76,8 +76,8 @@ inline constexpr std::string_view kMacosCveInputIncomplete = "macos:vuln_scan:cv
 inline constexpr std::string_view kMacosSoftwareListUnrecognised =
     "macos:vuln_scan:software_list_unrecognised";
 
-// In-band coverage notes: the operator-visible half of the result status (the status token itself
-// reaches only the agent log). Emitted as rows in the SAME output as the CONSTRAINED status.
+// In-band coverage notes: the operator-visible half of the result status (the completeness and
+// provenance token are in the agent log only). Emitted as rows in the SAME output as the CONSTRAINED status.
 inline constexpr std::string_view kCoverageNoteHomebrew =
     "Homebrew formulae and casks are not scanned";
 inline constexpr std::string_view kCoverageNoteUnreadable =

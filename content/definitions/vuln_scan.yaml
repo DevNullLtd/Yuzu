@@ -18,7 +18,7 @@ metadata:
     policy, remote desktop config, etc.). Each finding is classified by
     severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check
     could not run; not an issue). On macOS, Homebrew formulae and casks are
-    not scanned (use pkg_inventory.packages; restoring CVE matching is tracked in
+    not scanned (use pkg_inventory.packages; Homebrew CVE matching is tracked in
     #8256); the run ends with a row titled
     "Coverage" saying so (INFO, or UNREADABLE when the software list could not
     be read completely, a profiler line was not recognised, an application
@@ -206,7 +206,8 @@ metadata:
     matching; use the full "scan" action for combined results. On macOS a
     check whose system tool could not be read (missing, failed, no
     permission, unrecognised output) is reported as an UNREADABLE row with detail
-    "Unknown (read failed)" and severity UNREADABLE, never as a finding.
+    "Unknown (read failed)" and severity UNREADABLE, never as a finding (the
+    standing Open Ports row is UNREADABLE with no Coverage row).
   tags: [security, compliance, configuration, hardening]
 
 spec:
@@ -359,11 +360,9 @@ metadata:
     macOS the list is system_profiler applications only; Homebrew formulae and
     casks are not included (use pkg_inventory.packages; tracked in #8256), and a macOS run that
     read nothing returns no rows. The rows are pure name|version pairs with no
-    coverage row, and the coverage status is visible only in the agent log (not
-    in REST, MCP or the dashboard): treat the list as "system_profiler
+    coverage row, and the coverage status is not in the response rows REST, MCP or the dashboard serve, and its completeness and provenance token are in the agent log only: treat the list as "system_profiler
     applications only, Homebrew excluded", and never read an empty macOS list
-    as "no software installed" (an empty list means the read failed or nothing was found). A backslash in an application name or version
-    is shown as "/" (the owner accepted this lossy fold).
+    as "no software installed" (an empty list means the read failed or nothing was found). vuln_scan folds a backslash in an application name or version to "/" (installed_apps preserves it).
   tags: [security, vulnerability, inventory, software]
 
 spec:

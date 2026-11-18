@@ -433,8 +433,9 @@ std::vector<Finding> do_config_scan_impl([[maybe_unused]] yuzu::vuln::CoverageSt
 
 // ── Output helpers ────────────────────────────────────────────────────────
 
-// Declare the run's coverage. The CONSTRAINED/PARTIAL status reaches the agent log only (the row
-// models REST/MCP serve do not carry it), so the operator-visible half is the in-band rows below.
+// Declare the run's coverage. The response rows REST/MCP/the dashboard serve do not carry the
+// status, and the completeness and provenance token are in the agent log only, so the
+// operator-visible half is the in-band rows below.
 // No-op on Linux/Windows and on a macOS run that read everything it consumes.
 void declare_coverage(yuzu::CommandContext& ctx, const yuzu::vuln::CoverageState& cov) {
     const auto token = yuzu::vuln::coverage_token(cov);

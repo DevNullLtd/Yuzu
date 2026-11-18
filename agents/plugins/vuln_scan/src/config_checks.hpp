@@ -554,7 +554,9 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
 //   systemsetup -getremotelogin  -> "Remote Login: Off", exit 0 (run via sudo, not as the daemon)
 //   defaults read <PATH form: /Library/Preferences/com.apple.SoftwareUpdate> AutomaticCheckEnabled
 //                                -> "Error: Could not find key ... ." (key absent), exit 1
-// UNMEASURED (a read whose text differs is UNREADABLE): the BARE-domain defaults text, a system plist
+// The BARE-domain defaults read printed its key-absent text on macOS 27.0.1 as euid 501 only (both
+// reads absent and in agreement: the INFO "not set" row).
+// UNMEASURED (a read whose text differs is UNREADABLE): a bare-domain value of 0 or 1, a system plist
 // at 0, 1, absent or shadowed by a per-user/managed value as the LaunchDaemon account, any tool's
 // exit code in its BAD state, the enabled Firewall `State` digit ("12" below is accepted on Apple's
 // documentation, unverified; the only measured pairing is disabled <-> 0), `systemsetup` as the
