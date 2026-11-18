@@ -182,6 +182,32 @@ long own_pid() {
 #endif
 }
 
+// "No such file" is the only stat outcome that proves a name is a DIFFERENT object. Everything else
+// (EACCES, ELOOP, EIO, ...) is undecidable and the callers REFUSE.
+bool absent_error(const std::error_code& e) {
+    return e == std::errc::no_such_file_or_directory || e == std::errc::not_a_directory;
+}
+
+enum class Ident { Different, Same, Unknown };
+
+Ident identity_of(const fs::path& a, const fs::path& b) {
+    std::error_code e;
+    const bool ea = fs::exists(a, e);
+    if (e)
+        return Ident::Unknown;
+    if (!ea)
+        return Ident::Different;
+    const bool eb = fs::exists(b, e);
+    if (e)
+        return Ident::Unknown;
+    if (!eb)
+        return Ident::Different;
+    const bool same = fs::equivalent(a, b, e);
+    if (e)
+        return absent_error(e) ? Ident::Different : Ident::Unknown;
+    return same ? Ident::Same : Ident::Different;
+}
+
 // Decide by IDENTITY, not spelling (a hard link, a bind mount, `..`, a case or Unicode alias all
 // name the same object under a different string). `p` need not exist. Any error resolving it
 // REFUSES (fail closed). Best effort against a writer who controls a parent directory.
@@ -193,6 +219,12 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     const std::string cs = path_bytes(canon);
     if (yuzu::filesystem::reserved::is_proc_secret_path(cs, own_pid()))
         return true;
+#ifndef _WIN32
+    // macOS has no /proc: the agent's own descriptors are /dev/fd/N, /dev/stdin|stdout|stderr.
+    if (yuzu::filesystem::reserved::is_dev_fd_path(cs) ||
+        yuzu::filesystem::reserved::is_dev_fd_path(path_bytes(p.lexically_normal())))
+        return true;
+#endif
     yuzu::filesystem::reserved::Set snapshot;
     {
         std::lock_guard lk(g_reserved_mu);
@@ -200,26 +232,32 @@ bool path_is_reserved_unguarded(const fs::path& p) {
     }
     if (yuzu::filesystem::reserved::is_agent_reserved_path(snapshot, cs))
         return true;
-    // Identity: the candidate (or an ancestor of it) IS a reserved object.
-    for (const auto& f : snapshot.files) {
-        std::error_code e2;
-        if (fs::exists(canon, e2) && !e2 && fs::exists(f, e2) && !e2 && fs::equivalent(canon, f, e2) && !e2)
+    // Identity: the candidate (or an ancestor of it) IS a reserved object. A stat that FAILS for any
+    // reason other than "no such file" is Unknown and REFUSES: an unreadable parent or an
+    // unstattable entry must never read as "different object" (that was the fail-open).
+    for (const auto& f : snapshot.files)
+        if (identity_of(canon, fs::path{f}) != Ident::Different)
             return true;
-    }
     // A HARD LINK to a file inside a reserved directory has no ancestor in it: it is the same
     // object under another name. Only a regular file with more than one link can be one, so only
-    // then enumerate the reserved dirs (bounded) and compare identity. An enumeration that cannot
-    // be completed REFUSES (fail closed).
+    // then enumerate the reserved dirs (bounded) and compare identity. EVERY error other than
+    // "no such file" (on the directory, on an entry, on the identity probe) REFUSES.
     {
         std::error_code e3;
-        if (fs::is_regular_file(canon, e3) && !e3) {
+        const bool regular = fs::is_regular_file(canon, e3);
+        if (e3 && !absent_error(e3))
+            return true;
+        if (regular) {
             const auto links = fs::hard_link_count(canon, e3);
             if (e3 || links > 1) {
                 constexpr std::size_t kMaxScan = 20000;
                 std::size_t seen = 0;
                 for (const auto& d : snapshot.dirs) {
                     std::error_code e4;
-                    if (!fs::exists(d, e4) || e4)
+                    const bool dir_exists = fs::exists(fs::path{d}, e4);
+                    if (e4)
+                        return true;
+                    if (!dir_exists)
                         continue;
                     // No skip_permission_denied: a subdirectory this process cannot read may hold the
                     // very file this candidate links to, so an unreadable entry REFUSES.
@@ -231,8 +269,17 @@ bool path_is_reserved_unguarded(const fs::path& p) {
                         if (++seen > kMaxScan)
                             return true;
                         std::error_code e5;
-                        if (it->is_regular_file(e5) && !e5 && fs::equivalent(it->path(), canon, e5) && !e5)
+                        const bool reg = it->is_regular_file(e5);
+                        if (e5 && !absent_error(e5))
                             return true;
+                        if (reg && !e5) {
+                            std::error_code e6;
+                            const bool same = fs::equivalent(it->path(), canon, e6);
+                            if (e6 && !absent_error(e6))
+                                return true;
+                            if (same && !e6)
+                                return true;
+                        }
                         it.increment(e4);
                         if (e4)
                             return true;
@@ -242,11 +289,9 @@ bool path_is_reserved_unguarded(const fs::path& p) {
         }
     }
     for (fs::path a = canon; !a.empty(); a = a.parent_path()) {
-        for (const auto& d : snapshot.dirs) {
-            std::error_code e2;
-            if (fs::exists(a, e2) && !e2 && fs::exists(d, e2) && !e2 && fs::equivalent(a, d, e2) && !e2)
+        for (const auto& d : snapshot.dirs)
+            if (identity_of(a, fs::path{d}) != Ident::Different)
                 return true;
-        }
         if (a == a.parent_path())
             break;
     }
@@ -344,6 +389,19 @@ std::string validate_path_or_parent(std::string_view raw_path, std::string_view 
         const auto st = fs::symlink_status(path_str, lec);
         if (lec ? (lec != std::errc::no_such_file_or_directory) : fs::is_symlink(st))
             return {};
+#ifdef _WIN32
+        // MSVC reports a dangling NTFS junction as file_type::junction (not symlink), and a write
+        // through it follows the target. Refuse a junction and ANY reparse-point leaf (mount point,
+        // other tag): a leaf that does not exist has no business carrying one.
+        if (!lec && st.type() == fs::file_type::junction)
+            return {};
+        {
+            const std::wstring wide = fs::path{path_str}.wstring();
+            const DWORD attrs = ::GetFileAttributesW(wide.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT) != 0)
+                return {};
+        }
+#endif
     }
 
     // For non-existent paths, validate the parent directory

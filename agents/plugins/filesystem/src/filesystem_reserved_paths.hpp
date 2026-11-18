@@ -113,4 +113,17 @@ struct Set {
     return false;
 }
 
+/// POSIX (macOS in particular): `/dev/fd/N`, `/dev/stdin`, `/dev/stdout`, `/dev/stderr` name the
+/// agent's own open descriptors (an inherited secret file, the log). macOS has no `/proc`, so
+/// `is_proc_secret_path` cannot see them; on Linux the same names are symlinks into `/proc/self`.
+/// Refused as a literal or canonical spelling. Pure; never true for a Windows path.
+[[nodiscard]] inline bool is_dev_fd_path(std::string_view path) {
+    constexpr std::string_view kDev = "/dev/";
+    if (path.substr(0, kDev.size()) != kDev)
+        return false;
+    const std::string_view rest = path.substr(kDev.size());
+    const std::string_view first = rest.substr(0, rest.find('/'));
+    return first == "fd" || first == "stdin" || first == "stdout" || first == "stderr";
+}
+
 } // namespace yuzu::filesystem::reserved

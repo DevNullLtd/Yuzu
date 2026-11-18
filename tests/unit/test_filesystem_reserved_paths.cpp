@@ -14,11 +14,14 @@
 #include "test_helpers.hpp"
 
 #include <array>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
+#include <utility>
+#include <vector>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -60,6 +63,18 @@ TEST_CASE("is_agent_reserved_path: an empty set reserves nothing; windows separa
     CHECK(rsv::is_agent_reserved_path(s, "C:\\ProgramData\\Yuzu\\yuzu-agent.log"));
 }
 
+TEST_CASE("is_dev_fd_path: /dev/fd/N and the stdio aliases are refused (macOS has no /proc)",
+          "[agent][filesystem_plugin][reserved]") {
+    CHECK(rsv::is_dev_fd_path("/dev/fd/3"));
+    CHECK(rsv::is_dev_fd_path("/dev/fd"));
+    CHECK(rsv::is_dev_fd_path("/dev/stdin"));
+    CHECK(rsv::is_dev_fd_path("/dev/stdout"));
+    CHECK(rsv::is_dev_fd_path("/dev/stderr"));
+    CHECK_FALSE(rsv::is_dev_fd_path("/dev/null"));
+    CHECK_FALSE(rsv::is_dev_fd_path("/dev/fdx/3"));
+    CHECK_FALSE(rsv::is_dev_fd_path("/home/u/dev/fd/3"));
+}
+
 TEST_CASE("is_proc_secret_path: the agent's own /proc entries and any pid's secret files are refused",
           "[agent][filesystem_plugin][reserved]") {
     CHECK(rsv::is_proc_secret_path("/proc/4242/environ", 4242));
@@ -81,13 +96,11 @@ TEST_CASE("filesystem plugin: read/search/file_hash/get_acl refuse the agent's o
           "[agent][filesystem_plugin][reserved]") {
     const auto plugin_path = sup::find_plugin();
     if (plugin_path.empty()) {
-        WARN("filesystem plugin library not found -- skipping");
-        return;
+        SKIP("filesystem plugin library not found");
     }
     auto handle = yuzu::agent::PluginHandle::load(plugin_path);
     if (!handle.has_value() || !handle->descriptor()) {
-        WARN("filesystem plugin did not load -- skipping");
-        return;
+        SKIP("filesystem plugin did not load");
     }
 
     yuzu::test::TempDir root{"yuzu_test_fs_reserved_"};
@@ -165,13 +178,11 @@ TEST_CASE("filesystem plugin: identity, /proc, exists, walkers and shutdown (WP0
           "[agent][filesystem_plugin][reserved]") {
     const auto plugin_path = sup::find_plugin();
     if (plugin_path.empty()) {
-        WARN("filesystem plugin library not found -- skipping");
-        return;
+        SKIP("filesystem plugin library not found");
     }
     auto handle = yuzu::agent::PluginHandle::load(plugin_path);
     if (!handle.has_value() || !handle->descriptor()) {
-        WARN("filesystem plugin did not load -- skipping");
-        return;
+        SKIP("filesystem plugin did not load");
     }
     yuzu::test::TempDir root{"yuzu_test_fs_reserved2_"};
     std::error_code ec;
@@ -230,13 +241,11 @@ namespace {
 std::optional<yuzu::agent::PluginHandle> load_fs_plugin() {
     const auto plugin_path = sup::find_plugin();
     if (plugin_path.empty()) {
-        WARN("filesystem plugin library not found -- skipping");
-        return std::nullopt;
+        SKIP("filesystem plugin library not found");
     }
     auto handle = yuzu::agent::PluginHandle::load(plugin_path);
     if (!handle.has_value() || !handle->descriptor()) {
-        WARN("filesystem plugin did not load -- skipping");
-        return std::nullopt;
+        SKIP("filesystem plugin did not load");
     }
     return std::move(*handle);
 }
@@ -256,12 +265,10 @@ auto make_runner(yuzu::agent::PluginHandle& handle) {
 TEST_CASE("filesystem plugin: a hard link to a file in an UNREADABLE reserved subdirectory is refused",
           "[agent][filesystem_plugin][reserved][hardlink]") {
     if (::geteuid() == 0) {
-        WARN("running as root: chmod 000 does not hide a directory from root -- skipping");
-        return;
+        SKIP("running as root: chmod does not hide a directory from root");
     }
     auto handle = load_fs_plugin();
-    if (!handle)
-        return;
+    REQUIRE(handle);
     yuzu::test::TempDir root{"yuzu_test_fs_reserved_hl_"};
     std::error_code ec;
     const auto data_dir = root.path / "data";
@@ -291,11 +298,99 @@ TEST_CASE("filesystem plugin: a hard link to a file in an UNREADABLE reserved su
     handle->descriptor()->shutdown(ctx.get());
 }
 
+namespace {
+// Plants a hard link to a reserved key, applies a permission change that hides the reserved tree
+// from THIS non-root process after init, reads the link, restores permissions.
+// The link's own name and parent are innocent; only the identity scan can refuse it.
+void run_hardlink_shape(const char* label, bool key_in_subdir, fs::perms data_dir_perms,
+                        fs::perms subdir_perms, bool lock_parent) {
+    if (::geteuid() == 0)
+        SKIP("running as root: chmod does not hide a directory from root");
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_shape_"};
+    std::error_code ec;
+    const auto parent = root.path / "parent";
+    const auto data_dir = parent / "data";
+    const auto sub = data_dir / "sub";
+    fs::create_directories(key_in_subdir ? sub : data_dir, ec);
+    const auto key = (key_in_subdir ? sub : data_dir) / "agent-client.key";
+    {
+        std::ofstream o(key);
+        o << "SECRET-SENTINEL\n";
+    }
+    const auto hard = root.path / "innocent-hardlink.txt";
+    std::error_code hec;
+    fs::create_hard_link(key, hard, hec);
+    REQUIRE_FALSE(hec);
+
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    if (key_in_subdir)
+        fs::permissions(sub, subdir_perms, ec);
+    fs::permissions(data_dir, data_dir_perms, ec);
+    if (lock_parent)
+        fs::permissions(parent, fs::perms::none, ec);
+
+    auto run = make_runner(*handle);
+    auto r = run("read", {{"path", hard.string()}});
+    // Restore before any assertion can unwind, so TempDir can clean up.
+    std::error_code rec;
+    fs::permissions(parent, fs::perms::owner_all, rec);
+    fs::permissions(data_dir, fs::perms::owner_all, rec);
+    if (key_in_subdir)
+        fs::permissions(sub, fs::perms::owner_all, rec);
+    INFO(label);
+    CHECK(r.rc != 0);
+    CHECK(r.captured.find("SECRET-SENTINEL") == std::string::npos);
+    handle->descriptor()->shutdown(ctx.get());
+}
+} // namespace
+
+TEST_CASE("filesystem plugin: a hard link into a reserved dir that is readable but not searchable (0444) is refused",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    run_hardlink_shape("data dir 0444, no subdir", false,
+                       fs::perms::owner_read | fs::perms::group_read | fs::perms::others_read, fs::perms::all,
+                       false);
+}
+
+TEST_CASE("filesystem plugin: a hard link into a reserved dir that is readable but not searchable (0400) is refused",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    run_hardlink_shape("data dir 0400, no subdir", false, fs::perms::owner_read, fs::perms::all, false);
+}
+
+TEST_CASE("filesystem plugin: a hard link into a listable but unenterable reserved subdirectory (0644) is refused",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    run_hardlink_shape("subdir 0644", true, fs::perms::owner_all,
+                       fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                           fs::perms::others_read,
+                       false);
+}
+
+TEST_CASE("filesystem plugin: a hard link into a reserved dir whose PARENT cannot be searched is refused",
+          "[agent][filesystem_plugin][reserved][hardlink]") {
+    run_hardlink_shape("parent 0000", false, fs::perms::owner_all, fs::perms::all, true);
+}
+
+TEST_CASE("filesystem plugin: /dev/fd, /dev/stdin and friends are refused on POSIX",
+          "[agent][filesystem_plugin][reserved]") {
+    auto handle = load_fs_plugin();
+    REQUIRE(handle);
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    auto run = make_runner(*handle);
+    for (const char* p : {"/dev/fd/0", "/dev/stdin", "/dev/stdout", "/dev/stderr", "/dev/fd/1"}) {
+        INFO(p);
+        auto r = run("read", {{"path", p}});
+        CHECK(r.rc != 0);
+    }
+    handle->descriptor()->shutdown(ctx.get());
+}
+
 TEST_CASE("filesystem plugin: write_content refuses a dangling symlink leaf; list_dir skips reserved entries",
           "[agent][filesystem_plugin][reserved][symlink]") {
     auto handle = load_fs_plugin();
-    if (!handle)
-        return;
+    REQUIRE(handle);
     yuzu::test::TempDir root{"yuzu_test_fs_reserved_dl_"};
     std::error_code ec;
     const auto data_dir = root.path / "data";
@@ -339,6 +434,41 @@ TEST_CASE("filesystem plugin: write_content refuses a dangling symlink leaf; lis
     auto ls2 = run("list_dir", {{"path", root.path.string()}});
     CHECK(ls2.captured.find("entry|data|") == std::string::npos);
     CHECK(ls2.captured.find("entry|other|") != std::string::npos);
+    handle->descriptor()->shutdown(ctx.get());
+}
+
+#endif // !_WIN32
+
+#ifdef _WIN32
+// WP06 F55 (Windows only; run on a Windows host): MSVC reports a dangling NTFS junction as
+// file_type::junction, so the dangling-symlink guard alone would let ofstream follow it.
+TEST_CASE("filesystem plugin: write_content refuses a dangling NTFS junction leaf",
+          "[agent][filesystem_plugin][reserved][junction]") {
+    const auto plugin_path = sup::find_plugin();
+    if (plugin_path.empty())
+        SKIP("filesystem plugin library not found");
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    if (!handle.has_value() || !handle->descriptor())
+        SKIP("filesystem plugin did not load");
+    yuzu::test::TempDir root{"yuzu_test_fs_reserved_jn_"};
+    std::error_code ec;
+    const auto data_dir = root.path / "data";
+    const auto other = root.path / "other";
+    const auto target = data_dir / "trust-planted-dir";
+    fs::create_directories(other, ec);
+    fs::create_directories(target, ec);
+    const auto junction = other / "jn";
+    const std::string cmd = "cmd /c mklink /J \"" + junction.string() + "\" \"" + target.string() + "\" >nul";
+    REQUIRE(std::system(cmd.c_str()) == 0);
+    fs::remove(target, ec); // the junction now dangles
+    yuzu::agent::StandalonePluginContext ctx{"filesystem", {{"agent.data_dir", data_dir.string()}}};
+    REQUIRE(handle->descriptor()->init(ctx.get()) == 0);
+    const std::string jp = junction.string();
+    const std::array<YuzuParam, 3> params{{{"path", jp.c_str()}, {"content", "EVIL"}, {"create", "true"}}};
+    yuzu::agent::LocalDispatcher d;
+    auto w = d.run(handle->descriptor(), "write_content", params);
+    CHECK(w.rc != 0);
+    CHECK_FALSE(fs::exists(target));
     handle->descriptor()->shutdown(ctx.get());
 }
 #endif
