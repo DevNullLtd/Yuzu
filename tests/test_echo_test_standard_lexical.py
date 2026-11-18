@@ -8,8 +8,9 @@ string/char literals stripped first:
   [async]      any std::async: a bounded return goes through yuzu::test::must_return_within.
   [wait]       a wait_for / wait_until with no ScopeExit or Joiner earlier in the same top-level
                definition: a failed assertion would unwind past the thread it waits on.
-  [size-check] a CHECK on X.size() / X.empty() followed within 10 lines by X[ / X.front() /
-               X.back(): a failed CHECK carries on into an out-of-range read. Use REQUIRE.
+  [size-check] a CHECK on X.size() / X.empty() followed, on its own line or within 10 lines, by
+               X[ / X.front() / X.back(), with no REQUIRE between that proves X non-empty by
+               itself: a failed CHECK carries on into an out-of-range read. Use REQUIRE.
                (.at() throws, a clean failure, so it is not flagged.)
 
 A finding is waived only by `// echo-test-ok: <reason>` in a real `//` line comment on the same
@@ -17,7 +18,8 @@ line, or on the comment-only line directly above. The same text inside a string 
 comment waives nothing. There is no baseline file: the tree is clean, or the finding is marked.
 
 The gate is lexical: a guard token that is present but does not protect the wait passes, and a
-size CHECK more than 10 lines before its index, or through an alias, is missed.
+size CHECK more than 10 lines before its index, or through an alias, is missed. It does not compare
+the index with the asserted size either: REQUIRE(v.size() >= 1) and then v[5] passes.
 """
 import pathlib
 import re
@@ -107,13 +109,21 @@ def problems(name, src):
     for m in SIZE_CHECK.finditer(code):
         line = lineno(m.start())
         x = r"(?:\.|->)".join(re.escape(t) for t in re.split(r"\.|->", m.group(1)))
-        window = "\n".join(lines[line:line + SIZE_WINDOW])
+        # from the end of the match on its own line (an index may share it) to SIZE_WINDOW lines on
+        end = starts[line + SIZE_WINDOW] if line + SIZE_WINDOW < len(starts) else len(code)
+        window = code[m.end():end]
         index = re.search(rf"\b{x}\s*(?:\[|(?:\.|->)\s*(?:front|back)\s*\()", window)
         if not index:
             continue
-        # a REQUIRE on the same size before the index makes the index safe
-        guard = re.search(rf"\bREQUIRE(?:_FALSE)?\s*\(\s*!?\s*{x}\s*(?:\.|->)\s*(?:size|empty)\s*\(", window)
-        if guard and guard.start() < index.start():
+        # an index is safe only after a REQUIRE that proves the size non-empty by itself: == N or
+        # >= N with a literal N >= 1, > N, !empty(). One that allows an empty container (== 0,
+        # .empty(), <, !=, a non-literal bound) guards nothing: the finding needs a marker.
+        size = rf"{x}\s*(?:\.|->)\s*size\s*\(\s*\)"
+        empty = rf"{x}\s*(?:\.|->)\s*empty\s*\(\s*\)"
+        tail = r"[uUlL]*\s*\)"  # the bound must end the REQUIRE: `|| x` would allow an empty container
+        proves = re.compile(rf"\bREQUIRE\s*\(\s*(?:{size}\s*(?:==|>=)\s*0*[1-9]\d*{tail}"
+                            rf"|{size}\s*>\s*\d+{tail}|!\s*{empty})|\bREQUIRE_FALSE\s*\(\s*{empty}")
+        if any(g.start() < index.start() for g in proves.finditer(window)):
             continue
         add(line, "size-check",
             f"CHECK on {m.group(1)}.size()/empty() then an index: use REQUIRE so a failure stops here")
@@ -212,12 +222,37 @@ class EchoTestStandardLexical(unittest.TestCase):
             "a size CHECK followed by .at()": "void f() {\n    CHECK(v.size() == 2);\n    CHECK(v.at(1) == 3);\n}\n",
             "a size CHECK then a REQUIRE on the same size before the index":
                 "void f() {\n    CHECK(v.size() == 2);\n    REQUIRE(v.size() == 2);\n    CHECK(v[1] == 3);\n}\n",
+            "a size CHECK then a different but non-empty REQUIRE before the index (the tree's shape)":
+                "void f() {\n    CHECK(v.empty());\n    REQUIRE(v.size() == 1);\n    CHECK(v[0] == 3);\n}\n",
             "a wait with a ScopeExit earlier in the definition":
                 "TEST_CASE(\"x\") {\n    const ScopeExit g{[&] {}};\n    REQUIRE(fut.wait_for(1s) == ready);\n}\n",
             "a size CHECK on a different container": "void f() {\n    CHECK(a.size() == 2);\n    CHECK(b[1] == 3);\n}\n",
         }
         for label, src in clean.items():
             with self.subTest(control=label):
+                self.assertEqual(problems("test_echo_x.cpp", src), [])
+
+    def test_size_check_blind_spots_are_closed(self):
+        def body(*stmts):
+            return "void f() {\n" + "".join(f"    {t}\n" for t in stmts) + "}\n"
+
+        flagged = {
+            "an index on the CHECK's own line": body("CHECK(v.size() == 2); CHECK(v[1] == 3);"),
+            "a REQUIRE after the index": body("CHECK(v.size() == 2);", "CHECK(v[1] == 3);",
+                                              "REQUIRE(v.size() == 2);"),
+        }
+        # a REQUIRE on the size that still allows an empty container guards nothing
+        for guard in ("REQUIRE(v.size() == 0)", "REQUIRE(v.empty())", "REQUIRE(v.size() < 2)",
+                      "REQUIRE(v.size() != 2)", "REQUIRE(v.size() == n)"):
+            flagged[guard] = body("CHECK(v.size() == 2);", f"{guard};", "CHECK(v[1] == 3);")
+        for label, src in flagged.items():
+            with self.subTest(must_flag=label):
+                self.assertFlagged("test_echo_x.cpp", src, "size-check")
+        # a REQUIRE that proves the size non-empty by itself clears it
+        for guard in ("REQUIRE(v.size() == 2)", "REQUIRE(v.size() >= 1)", "REQUIRE(v.size() > 0)",
+                      "REQUIRE(!v.empty())", "REQUIRE_FALSE(v.empty())"):
+            with self.subTest(clean=guard):
+                src = body("CHECK(v.size() == 2);", f"{guard};", "CHECK(v[1] == 3);")
                 self.assertEqual(problems("test_echo_x.cpp", src), [])
 
     def test_wait_guard_is_per_definition(self):

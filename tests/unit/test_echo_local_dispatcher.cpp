@@ -46,6 +46,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -1226,13 +1227,23 @@ using SockLen = int;
 constexpr SockT kNoSock = INVALID_SOCKET;
 constexpr int kShutWrite = SD_SEND; // half-close: send our FIN, keep the socket
 void close_sock(SockT s) { ::closesocket(s); }
+int last_os_error() { return ::WSAGetLastError(); }
+bool is_timeout(int e) { return e == WSAETIMEDOUT; } // what a timed-out SO_RCVTIMEO recv reports
 #else
 using SockT = int;
 using SockLen = socklen_t;
 constexpr SockT kNoSock = -1;
 constexpr int kShutWrite = SHUT_WR; // half-close: send our FIN, keep the socket
 void close_sock(SockT s) { ::close(s); }
+int last_os_error() { return errno; }
+bool is_timeout(int e) { return e == EAGAIN || e == EWOULDBLOCK; } // a timed-out SO_RCVTIMEO recv
 #endif
+
+// "<call>: OS error <code>" for the socket call that just failed. Read the code before any other
+// call can overwrite it; the text is what a failed `== ""` / `== "fin"` prints (standard rule 6).
+std::string os_failure(const char* call) {
+    return std::format("{}: OS error {}", call, last_os_error());
+}
 
 std::uint32_t current_pid() {
 #ifdef _WIN32
@@ -1261,84 +1272,114 @@ struct LoopbackPair {
                 close_sock(s);
     }
 
-    [[nodiscard]] bool open() {
+    // "" once the pair is established, else the call that failed and its OS code
+    // ("bind: OS error 1"), so a failed `REQUIRE(pair.open() == "")` prints the cause.
+    [[nodiscard]] std::string open() {
 #ifdef _WIN32
-        static const bool winsock_ok = [] {
+        static const int winsock_rc = [] {
             WSADATA wsa;
-            return ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+            return ::WSAStartup(MAKEWORD(2, 2), &wsa); // returns the error code itself
         }();
-        if (!winsock_ok)
-            return false;
+        if (winsock_rc != 0)
+            return std::format("WSAStartup: OS error {}", winsock_rc);
 #endif
-        const auto port_of = [](SockT s) {
+        std::string failure;
+        const auto port_of = [&failure](SockT s) {
             sockaddr_in a{};
             SockLen len = sizeof a;
-            if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) != 0)
+            if (::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) != 0) {
+                failure = os_failure("getsockname");
                 return 0;
+            }
             return static_cast<int>(ntohs(a.sin_port));
         };
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_port = 0;
         if (::inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr) != 1)
-            return false;
+            return os_failure("inet_pton");
         listener = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (listener == kNoSock ||
-            ::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0 ||
-            ::listen(listener, 1) != 0)
-            return false;
+        if (listener == kNoSock)
+            return os_failure("socket (listener)");
+        if (::bind(listener, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
+            return os_failure("bind");
+        if (::listen(listener, 1) != 0)
+            return os_failure("listen");
         listener_port = port_of(listener);
+        if (!failure.empty())
+            return failure;
         addr.sin_port = htons(static_cast<std::uint16_t>(listener_port));
         client = ::socket(AF_INET, SOCK_STREAM, 0);
-        if (client == kNoSock ||
-            ::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
-            return false;
+        if (client == kNoSock)
+            return os_failure("socket (client)");
+        if (::connect(client, reinterpret_cast<sockaddr*>(&addr), sizeof addr) != 0)
+            return os_failure("connect");
         server = ::accept(listener, nullptr, nullptr);
+        if (server == kNoSock)
+            return os_failure("accept");
         client_port = port_of(client);
-        return server != kNoSock && listener_port != 0 && client_port != 0;
+        return failure;
     }
 };
 
 // Blocks until the peer's FIN arrives (recv returns 0), which leaves this end in CLOSE_WAIT. A
 // blocking kernel event, not a poll: nothing is sent on the pair, so 0 can only mean the FIN. The
-// receive is bounded by `bound` (5 s by default; a loopback FIN arrives in microseconds, so only a
-// missing FIN reaches it): a timed-out recv returns non-zero, so a missing FIN is a false return,
-// never a hang.
-bool wait_for_peer_fin(SockT s, std::chrono::milliseconds bound = std::chrono::seconds{5}) {
+// receive is bounded by `bound`, so a missing FIN is a "timeout" return, never a hang. The 5 s
+// default is a failure deadline that only a missing FIN reaches, not a performance limit; the
+// normal-path FIN latency is not recorded (#8234), so none is claimed. Recorded figures (macOS,
+// 2026-11-18): with no FIN pending and a 50 ms bound the recv returned in 0.051 s; with the
+// half-close removed from the closing_dedup case the 5 s deadline fired and the case failed as
+// `"timeout" == "fin"`, the whole test process taking 6.2 s.
+// Returns "fin" (recv == 0), "timeout" (the bound passed with nothing to read), or the failing call
+// and its OS code ("setsockopt (SO_RCVTIMEO): OS error 9", "recv: unexpected data"), so a failed
+// `== "fin"` prints the cause (standard rule 6).
+std::string wait_for_peer_fin(SockT s, std::chrono::milliseconds bound = std::chrono::seconds{5}) {
     char buf[16];
 #ifdef _WIN32
     const DWORD timeout_ms = static_cast<DWORD>(bound.count());
     if (::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout_ms),
                      sizeof timeout_ms) != 0)
-        return false;
-    return ::recv(s, buf, static_cast<int>(sizeof buf), 0) == 0;
+        return os_failure("setsockopt (SO_RCVTIMEO)");
+    const int n = ::recv(s, buf, static_cast<int>(sizeof buf), 0);
 #else
     timeval timeout{};
     timeout.tv_sec = static_cast<time_t>(bound.count() / 1000);
     timeout.tv_usec = static_cast<suseconds_t>((bound.count() % 1000) * 1000);
     if (::setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof timeout) != 0)
-        return false;
-    return ::recv(s, buf, sizeof buf, 0) == 0;
+        return os_failure("setsockopt (SO_RCVTIMEO)");
+    const ssize_t n = ::recv(s, buf, sizeof buf, 0);
 #endif
+    if (n == 0)
+        return "fin";
+    if (n > 0)
+        return "recv: unexpected data";
+    const int err = last_os_error();
+    if (is_timeout(err))
+        return "timeout";
+    return std::format("recv: OS error {}", err);
 }
 
 } // namespace
 
 // The bounded receive's other half: the CLOSE_WAIT cases below only ever call wait_for_peer_fin with
 // a FIN already sent, so deleting its timeout would fail none of them. Nothing is sent here, so the
-// only way out of the recv is the timeout. This is the standard's permitted bounded negative wait (a
-// "did not happen" can only be seen by waiting; a slow host can make it pass vacuously, never fail)
-// and the bound is short. It asserts the false return only, never the elapsed time: Windows rounds a
-// short SO_RCVTIMEO up. must_return_within turns a deleted timeout into a named exit instead of a hang
-// to the shard timeout.
-TEST_CASE("loopback: a receive with no FIN pending times out and reports false", "[echo][loopback_fin]") {
+// only way out of the recv is the timeout expiring (or an error, which this case reports as the
+// failing call and OS code rather than as a timeout). This is the standard's permitted bounded
+// negative wait (a "did not happen" can only be seen by waiting; a slow host can make it pass
+// vacuously, never fail) and the bound is short. It requires the "timeout" outcome, never the
+// elapsed time: Windows rounds a short SO_RCVTIMEO up. must_return_within turns a deleted timeout
+// into a named exit instead of a hang to the shard timeout.
+TEST_CASE("loopback: a receive with no FIN pending times out", "[echo][loopback_fin]") {
     LoopbackPair pair;
-    REQUIRE(pair.open());
-    bool got_fin = true;
+    REQUIRE(pair.open() == "");
+    std::string outcome;
     yuzu::test::must_return_within(yuzu::test::kReturnBound, "wait_for_peer_fin with no FIN pending", [&] {
-        got_fin = wait_for_peer_fin(pair.server, std::chrono::milliseconds{50});
+        outcome = wait_for_peer_fin(pair.server, std::chrono::milliseconds{50});
     });
-    CHECK_FALSE(got_fin);
+    CHECK(outcome == "timeout");
+    // A failing call reports itself and its OS code, never "timeout" (no socket is touched).
+    CHECK(wait_for_peer_fin(kNoSock, std::chrono::milliseconds{50})
+              .starts_with("setsockopt (SO_RCVTIMEO): OS error "));
 }
 
 TEST_CASE("echo plugin: status counts each source's finest tier and query and export "
@@ -1511,7 +1552,7 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     };
 
     LoopbackPair first;
-    REQUIRE(first.open());
+    REQUIRE(first.open() == "");
     {
         const auto r = d.run(desc, "collect_fast");
         INFO(r.captured);
@@ -1526,7 +1567,7 @@ TEST_CASE("echo plugin: a polled tcp row is named by the process source, and sta
     // exit path, so a failed REQUIRE cannot leave the process singleton paused.
     session.pause_source("process", "collect_fast");
     LoopbackPair second;
-    REQUIRE(second.open());
+    REQUIRE(second.open() == "");
     {
         const auto r = d.run(desc, "collect_fast");
         INFO(r.captured);
@@ -1614,9 +1655,9 @@ TEST_CASE("echo plugin: a closing tcp socket whose insert failed is recorded on 
     // The accepted end becomes CLOSE_WAIT once the client closes and its FIN has arrived; that
     // end still has an fd here, so both the macOS fd walk and the Linux inode map keep it.
     LoopbackPair pair;
-    REQUIRE(pair.open());
+    REQUIRE(pair.open() == "");
     REQUIRE(::shutdown(pair.client, kShutWrite) == 0);
-    REQUIRE(wait_for_peer_fin(pair.server));
+    REQUIRE(wait_for_peer_fin(pair.server) == "fin");
 
     // The accepted end's row: its remote port is the client's. A first sighting already closing
     // is recorded as a connection (connect_count 1).

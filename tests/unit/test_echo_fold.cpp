@@ -1709,6 +1709,10 @@ TEST_CASE("fold_rows waits while a GC pass holds op_mu_", "[echo][fold][gc][conc
         }};
         gc = std::thread(
             [&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
+        // 30 s is a hang backstop on an in-memory wait the code under test releases, not a
+        // performance limit, so it cites no measurement (standard rule 9): gc_dictionary takes
+        // op_mu_ and reads the clock (`expired()`) before any SQL, and that first read sets
+        // `parked`.
         REQUIRE(parked.get_future().wait_for(std::chrono::seconds{30}) == std::future_status::ready);
         fold = std::thread([&] {
             fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
