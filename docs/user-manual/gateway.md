@@ -3371,12 +3371,67 @@ Supply it at boot from the `YUZU_GW_COOKIE` environment variable:
 export YUZU_GW_COOKIE="$(openssl rand -hex 32)"   # strong, unique per cluster
 ```
 
-If `YUZU_GW_COOKIE` is unset, `vm.args.src` falls back to the historical
-default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
-**refuses to start** — it fails closed, because a known cookie is
-unauthenticated RCE (#659). For local dev/CI where distribution is not
-exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
-in a cluster must share the same cookie.
+`vm.args.src` carries **no fallback cookie**. A cookie committed to the
+repository is unauthenticated RCE (#659), and the in-VM boot guard
+(`yuzu_gw_app:check_distribution_cookie/0`) only runs after distribution is
+already listening, so the refusal is made **before the VM starts**. One shell
+policy, `deploy/docker/gateway-cookie-policy.sh` (installed as
+`/opt/yuzu_gw/gateway-cookie-policy.sh`), is shared by both callers: the cookie
+must be 32 to 255 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
+or `+`, and must not be the published default. (Whitespace, CR/LF, backslash,
+`&` and `$` are refused: busybox and GNU awk disagree on a backslash, so
+replicas would compute different cookies, and a `\&` makes the release start
+script loop forever.)
+
+- The container entrypoint (`deploy/docker/gateway-entrypoint.sh`) exits 1 with
+  the reason when the cookie breaks the policy.
+- The systemd unit refuses the same in an `ExecStartPre`, with **no override**.
+- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) does not
+  restore a known cookie: when the cookie is empty or *exactly* the published
+  default, the entrypoint substitutes a fresh random per-boot cookie that is never
+  logged. The override replaces nothing else: a custom cookie that is shorter
+  than 32 characters, or that **starts with** the published literal, is refused
+  like any other weak cookie. A real shared cookie that contains the literal
+  elsewhere is kept, so replicas still agree. **N replicas on the override are N singletons that cannot
+  cluster** (each draws its own cookie). A node advertising `127.0.0.1` (the
+  single-node default) also has its distribution listener and EPMD bound to
+  loopback; a node advertising a routable address is protected by the random
+  cookie only.
+- **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
+  The release tarball ships it (and `yuzu-gateway.service`) inside its single
+  top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
+  `mkdir -p /opt/yuzu_gw && tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  and install the bundled unit to `/etc/systemd/system/` (then `systemctl daemon-reload`)
+  (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
+  `/opt/yuzu_gw/`). If it is missing the unit fails with
+  `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
+  and, after the restart limit, `start-limit-hit`.
+- A start that bypasses both (running `bin/yuzu_gw` by hand, the
+  `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
+  OTP's own per-host random `~/.erlang.cookie` (the empty `-setcookie` line that
+  `vm.args.src` leaves when `YUZU_GW_COOKIE` is unset is accepted by the VM, which
+  creates that 20-character file, mode 0400, and uses it; checked against a real
+  release boot and by case V of `tests/shell/test_gateway_entrypoint_cookie.sh`),
+  which the in-VM guard then refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
+  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
+  paths there is also no character check: a cookie containing `\&` makes the
+  release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
+  a backslash is dropped by busybox awk but kept by GNU awk. Keep `YUZU_GW_COOKIE`
+  to `[A-Za-z0-9._~+=-]` there too.
+
+All nodes in a cluster must share the same `YUZU_GW_COOKIE`. A single-node
+deployment sets either a strong cookie, or `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` for
+a throwaway rig.
+
+**Distribution is not encrypted.** Erlang distribution here is plain TCP: the
+cookie authenticates the connection handshake only, it gives no confidentiality
+or per-message integrity. Cross-node command traffic (including plugin
+parameters) therefore must only cross a network you trust. Keep EPMD and the
+distribution range on a dedicated cluster network and firewalled to the other
+gateway nodes. There is no encryption and the cluster network must be trusted and
+firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped and is
+tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). Do not run
+a multi-node gateway cluster across an untrusted network.
 
 The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
 `#4555`): DNS-based cluster discovery means a node dials addresses it did not
@@ -3384,8 +3439,15 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
-bypasses the length check too.
+floor with room to spare. The in-VM guard
+(`yuzu_gw_app:evaluate_cookie`) under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` tolerates
+an **empty, short, exactly-default or literal-containing** cookie on an
+entrypoint-less start (`docker run --entrypoint`, a hand-run `bin/yuzu_gw`, the
+chisel image). The container entrypoint is stricter, and the systemd unit has no
+override: the entrypoint replaces only an empty or exactly-default cookie and
+refuses a short cookie or one that starts with the literal even with the
+override. A unit test pins the in-VM tolerance, so changing it is a visible
+decision.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
@@ -3408,8 +3470,9 @@ network is still the first line of defense.
 > at 0 is the signal to check for this. AAAA support is tracked as a
 > follow-up.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
-> boot guard and restores the unauthenticated inter-node RPC surface (#659); it
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (a random per-boot one is used by the
+> entrypoint; the in-VM guard only warns for a start that bypasses the entrypoint); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
 > files). On `.deb`/`.rpm` installs the cookie is auto-generated into
 > `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to

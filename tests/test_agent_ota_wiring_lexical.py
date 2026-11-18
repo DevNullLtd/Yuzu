@@ -18,14 +18,22 @@ refactor could silently stop CALLING them. This gate pins the call sites lexical
      between the heartbeat flag and its cancel, and must end by joining
      `update_thread_.join()` after the sync thread. The post-publish predicate is only sound
      because of this flag-then-cancel order.
+  5. (#7291) The update-verified marker is written by `updater->mark_update_verified();`
+     directly after `set_updater(updater);` and BEFORE `if (updater->perform_startup_maintenance())`,
+     i.e. after Register succeeded and before the one rollback check that consumes the marker.
+     The test_updater.cpp cases call both functions themselves, so only this gate fails if the call
+     is deleted or moved below the check.
+  6. (#7291) agent.cpp holds no `yuzu-update-verified` string literal: Updater owns the marker
+     path, and the old first-command-read writer (which ran after the rollback check, so the check
+     never saw this run's marker) must not return.
 
 Robustness: `//` comments are stripped and whitespace is collapsed before matching, so line
 wrapping, re-indentation and comment text mentioning a token cannot satisfy or break a check.
 Patterns anchor on distinctive tokens, never line numbers.
 
 Lexical only: it cannot see a relocation that keeps the tokens but changes control flow
-(review-enforced). The self-test applies 14 in-memory mutations (10 deletions/reorders across
-the invariants, plus 4 predicate-ctor arity reversions at the register, heartbeat, subscribe
+(review-enforced). The self-test applies 17 in-memory mutations (13 deletions/reorders/insertions
+across the invariants, plus 4 predicate-ctor arity reversions at the register, heartbeat, subscribe
 and sync sites) and requires problems() to be non-empty on each; a mutation whose pattern no
 longer matches agent.cpp fails loudly (stale pattern) rather than passing vacuously.
 
@@ -51,7 +59,8 @@ ROOT = Path(__file__).resolve().parent.parent
 AGENT_CPP = ROOT / "agents" / "core" / "src" / "agent.cpp"
 TAG = "test_agent_ota_wiring_lexical"
 HINT = (
-    " (this gate pins the #2182 wiring; if agent.cpp was legitimately restructured or renamed,"
+    " (this gate pins the #2182 OTA wiring and the #7291 update-verified marker ordering; if agent.cpp"
+    " was legitimately restructured or renamed,"
     " update tests/test_agent_ota_wiring_lexical.py)"
 )
 
@@ -101,6 +110,13 @@ def problems(src):
         out.append("quiesce_run_workers() no longer ends with update_thread_.join() after the sync thread join (#2182)")
     if not re.search(r"cancel_ctx\(heartbeat_ctx_\); ?cancel_ctx\(sync_ctx_\); ?cancel_ctx\(register_ctx_\);", t):
         out.append("stop() no longer cancels heartbeat, sync and register contexts in sequence (#2182)")
+    if not re.search(r"set_updater\(updater\); ?updater->mark_update_verified\(\); ?"
+                     r"if \(updater->perform_startup_maintenance\(\)\)", t):
+        out.append("agent.cpp no longer calls updater->mark_update_verified() between set_updater(updater) "
+                   "and the perform_startup_maintenance() rollback check (#7291)")
+    if "yuzu-update-verified" in t:
+        out.append("agent.cpp names the .yuzu-update-verified marker file again; Updater owns that path, "
+                   "so a second writer in agent.cpp (the old first-command-read one) is back (#7291)")
     return out
 
 
@@ -140,6 +156,15 @@ MUTATIONS = [
      "sub_slot is no longer built"),
     (r"(CtxSlot sync_slot\{ctx_mu_, sync_ctx_, &ctx),\s*\[this\] \{.*?\}\}", r"\g<1>}", re.S, 1,
      "sync_slot is no longer built"),
+    # #7291: the marker call deleted; moved below the maintenance block; the old writer back
+    (r"^ *updater->mark_update_verified\(\);\n", "", re.M, 0,
+     "mark_update_verified() between"),
+    (r"^( *)updater->mark_update_verified\(\);\n( *if \(updater->perform_startup_maintenance\(\)\) \{\n.*?\n\1\}\n)",
+     r"\g<2>\g<1>updater->mark_update_verified();\n", re.M | re.S, 1,
+     "mark_update_verified() between"),
+    (r'(spdlog::info\("Received command: plugin=\{\}, action=\{\}, id=\{\}", cmd\.plugin\(\),\n\s*cmd\.action\(\), cmd\.command_id\(\)\);)',
+     r'\g<1>\n std::ofstream{current_executable_path().parent_path() / ".yuzu-update-verified"} << "ok";',
+     0, 1, "names the .yuzu-update-verified marker file again"),
 ]
 
 

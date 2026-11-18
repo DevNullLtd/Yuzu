@@ -71,8 +71,8 @@ per-device app-usage route (see the map below). Conventions:
   `PUT` and `DELETE` on the score policy and `POST` on the live-info route
   (a `POST` only because it waits for the device to answer).
 - **Failed store reads.** Some routes fail loudly and some do not. The device
-  score, the catalogue, the Apps list, per-device application usage and the
-  retained application-performance reads (the picker, the fleet, group and tag
+  score, the catalogue, the Apps list, per-device application usage, fleet
+  application usage and the retained application-performance reads (the picker, the fleet, group and tag
   trends, the version-devices drill, the version comparison and one device's
   retained history) answer `503` with a `retry_after_ms` hint. The Overview,
   Health score, Trends, the signal rollup, scope and signal drill-down, the
@@ -86,7 +86,11 @@ per-device app-usage route (see the map below). Conventions:
 - **Audit.** Routes that name individual devices write an audit row before
   they answer, and refuse to answer (`503` with `Sec-Audit-Failed: true`) if
   that row cannot be stored. Aggregates that carry no device identity are not
-  audited. Each area page lists its verbs.
+  audited, with exceptions: the cohort comparison and fleet application usage
+  are audited aggregates. Fleet usage reads Forensics-tier usage and, at the
+  default floor of 1, a cell can be one device's figures, so every request that
+  passes validation is audited as `dex.apps.usage.view` before it is read. Each
+  area page lists its verbs.
 - **Service-scoped tokens.** A token scoped to one service is refused on
   every DEX route except these:
   - The per-device routes under `/api/v1/dex/devices/{id}` accept it only for a
@@ -95,9 +99,12 @@ per-device app-usage route (see the map below). Conventions:
     can see.
   - Both kinds need RBAC enforcement to be on and the service owner role to hold
     the permission.
-  - Every other route is refused, aggregates included, and so is the per-device
-    app-usage route, because the service owner role does not hold
-    `Forensics:Read`.
+  - Every other route is refused, aggregates included. The per-device app-usage
+    route is refused because the service owner role does not hold
+    `Forensics:Read`. The fleet application usage route is refused at its first
+    gate, `GuaranteedState:Read`, which is a fleet-wide permission that a
+    service-scoped token is refused at, and it would fail its `Forensics:Read`
+    gate as well.
   - Every refusal on REST and MCP is audited. The overview, the signal and
     application drill-downs, the performance and network device lists, the group
     and tag trends and the version comparison record it under their own verb
@@ -127,7 +134,9 @@ and in the server's own `GET /api/v1/openapi.json`.
 
 ## The MCP server
 
-An agentic worker reaches the same data through MCP tools. Conventions:
+An agentic worker reaches the same data through MCP tools, except fleet usage
+per application (`GET /api/v1/dex/apps/usage`), which has no MCP tool yet.
+Conventions:
 
 - **Endpoint and tokens.** `POST /mcp/v1/` with an API token minted with an
   `mcp_tier` (`readonly`, `operator` or `supervised`). A token without a tier
@@ -137,7 +146,8 @@ An agentic worker reaches the same data through MCP tools. Conventions:
   per-device app-usage tool needs `Forensics:Read` instead, and is available at
   every tier too.
 - **Same model, same numbers.** A tool answers from the same read model as the
-  REST route it mirrors, so the two agree figure for figure. Tool arguments
+  REST route it mirrors (where the route has a tool), so the two agree figure for
+  figure. Tool arguments
   match the route's query parameters. The one difference is the device: the
   per-device tools take it as `agent_id`, where the REST routes carry it in the
   path as `{id}`.
@@ -182,7 +192,8 @@ disagree, they win. See [contributing](contributing.md) for the rule.
 Every route listed here is under `/api/v1`. "Read" means
 `GuaranteedState:Read` unless the row says otherwise. Audit statements describe
 the REST route and its MCP twin, except that `compare_app_perf_versions`
-records `mcp.compare_app_perf_versions` on success. The dashboard writes the
+records `mcp.compare_app_perf_versions` on success and that fleet usage per
+application has no MCP twin yet. The dashboard writes the
 same verb when it opens the same view, with two exceptions: the Overview and
 the application drill-down open without an audit row. Unless a row says
 otherwise, a service-scoped token is refused on the route and on the tool in
@@ -256,6 +267,7 @@ this map; see [network](network.md).
 | Capability | Dashboard | REST | MCP | Fed by | Permission and audit | Page |
 |---|---|---|---|---|---|---|
 | One device's per-executable usage | Device page, Application usage | `GET /api/v1/forensics/agents/{id}/app-usage` | `get_agent_app_usage` | Echo `usage`, `app_usage` plugin, daily sync | `Forensics:Read` scoped to the device; refused to service-scoped tokens, whose role does not hold `Forensics:Read`; audited `app_usage.agent.view`, fails closed | [app usage](app-usage.md) |
+| Fleet usage per application: devices, run time, launches and crashes and hangs per hour of use | Not yet on the Apps page | `GET /api/v1/dex/apps/usage` | Not yet available | Echo `usage`, `app_usage` plugin, daily sync, DEX observer | `Forensics:Read` and `GuaranteedState:Read`, both required (Administrator only while RBAC is off); refused to service-scoped tokens; audited `dex.apps.usage.view` once parameters validate before the read, fails closed | [app usage](app-usage.md#fleet-usage-per-application) |
 
 ### Alerts
 

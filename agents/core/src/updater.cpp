@@ -13,6 +13,8 @@
 
 #include "updater_rpc_guard.hpp"
 
+#include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic: the update-verified marker
+
 #include <yuzu/metrics.hpp>
 
 // Generated protobuf/gRPC headers (flat output from YuzuProto.cmake)
@@ -199,6 +201,13 @@ bool iequal(std::string_view a, std::string_view b) {
         return std::tolower(static_cast<unsigned char>(lhs)) ==
                std::tolower(static_cast<unsigned char>(rhs));
     });
+}
+
+/// The update-verified marker, beside the executable. ONE definition for its writer
+/// (Updater::mark_update_verified) and its reader (Updater::rollback_if_needed): if the two paths
+/// drift apart, a verified build is rolled back (#7291).
+std::filesystem::path update_verified_marker(const std::filesystem::path& exe_path) {
+    return exe_path.parent_path() / ".yuzu-update-verified";
 }
 
 } // anonymous namespace
@@ -1004,6 +1013,26 @@ void Updater::cleanup_old_binary() {
     }
 }
 
+void Updater::mark_update_verified() {
+    if (!config_.enabled) { // self-guarded: a disabled updater writes nothing beside the binary
+        return;
+    }
+    const auto marker = update_verified_marker(exe_path_);
+    // REPLACE whatever sits at the name, never write through it: remove() takes a link itself,
+    // never its target, and the shared writer renames an exclusive-create, no-follow temp over
+    // the name. A refused write is not an option here: no marker is exactly what sends
+    // rollback_if_needed down its rollback branch, so a planted link must not leave none.
+    std::error_code ec;
+    std::filesystem::remove(marker, ec);
+    auto written = yuzu::shared::write_file_atomic(marker, "ok");
+    if (!written) {
+        spdlog::warn("Could not write the update verification marker '{}': {}", marker.string(),
+                     written.error().message);
+        return;
+    }
+    spdlog::debug("Wrote update verification marker: {}", marker.string());
+}
+
 bool Updater::perform_startup_maintenance() {
     if (!config_.enabled) {
         return false;
@@ -1033,9 +1062,12 @@ bool Updater::rollback_if_needed() {
         return false;
     }
 
-    // Check for the verification marker written by the agent after successful
-    // registration following an update
-    auto marker_path = exe_path_.parent_path() / ".yuzu-update-verified";
+    // Check for the verification marker the agent writes (mark_update_verified) as soon as
+    // registration succeeds, before this check runs. So with the marker written at registration this
+    // rollback branch is reachable only when that write failed (or an earlier run's marker was
+    // never consumed): it is not a crash guard. A build that dies before it registers is never
+    // seen by this check at all.
+    const auto marker_path = update_verified_marker(exe_path_);
 
     if (fs::exists(marker_path, ec)) {
         // The update was verified — clean up the old binary and the marker
