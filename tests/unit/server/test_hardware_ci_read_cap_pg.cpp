@@ -176,8 +176,8 @@ TEST_CASE("bulk read cap: a saturated cap leaves connections for authorization a
     // Fill the cap with readers that hold real connections.
     std::vector<std::optional<hcp::ReadError>> outcome(kPool);
     std::vector<std::thread> threads;
-    JoinGuard guard{readers, threads}; // after everything the reader threads touch
     std::atomic<int> surplus_done{0}; // surplus readers that have returned (outcome is written)
+    JoinGuard guard{readers, threads}; // after everything the reader threads touch
     auto run_reader = [&](int i) {
         const auto page = hcp::read_page(readers.reader(), {}, std::nullopt, nullptr, &slots, hcp::kRestRowBudgetBytes);
         if (!page)

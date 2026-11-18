@@ -742,7 +742,7 @@ On a `503` other than the collation refusal, wait `retry_after_ms` and retry the
 1. Request `GET /api/v1/hardware-ci?limit=1000` (no `cursor` on the first call).
 2. On `200`, process `data.devices`, then follow `data.next_cursor` as `cursor` until it is empty. A page shorter than `limit` is not the end (`page_bytes_capped` explains why); only an empty `next_cursor` is.
 3. On `503`, wait `Retry-After` / `retry_after_ms` (with the jitter and backoff rule above) and retry the same cursor; after about 5 minutes of continuous `503` answers, stop and alert. After a collation refusal, restart from the first page.
-4. Run one walker per pull; parallel walkers beyond the cap see occasional retryable `503` answers, which step 3 absorbs.
+4. Run one walker per pull; more than one parallel walker will see occasional retryable `503` answers, which step 3 absorbs.
 5. Set a client request timeout above about 20 seconds and treat a timeout like a `503` (wait, then retry the same cursor). A request that holds a slot against a database that stops answering can run past the 3 s + 10 s + 5 s bounds, and a hung request is otherwise never counted toward the 5 minutes.
 
 **Credentials.** Use a dedicated API token for the pull, not a personal one, and not a service-scoped token.

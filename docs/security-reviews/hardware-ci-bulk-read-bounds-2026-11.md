@@ -5,7 +5,7 @@
 concurrent bulk reads (#7949), a byte bound on one response page (#7950) and the audit-outage read
 amplification note (#7951). Commits on `fix/hardware-ci-bulk-read-bounds`: `915454b74b` (the cap),
 `28e94b3b9a` (the byte bound), `547d449e1b` (audit rows, coverage and changelog), `eba2214145` (governance
-round 1 fix) and the round 2 fix commit (documentation, the triage and client guidance, and test hardening).
+round 1 fix) and `cd9c5dea60` (round 2 fix; documentation, the triage and client guidance, and test hardening).
 **Status:** implemented and governed, with two fix rounds; not merged. The residuals below are recorded, not accepted.
 
 **Supersession.** The subjects of `915454b74b` ("authz and audit keep a connection") and `28e94b3b9a`
