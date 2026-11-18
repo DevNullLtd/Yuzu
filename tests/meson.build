@@ -3539,6 +3539,16 @@ test('image vulnerability gate',
   timeout: 60,
 )
 
+# WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
+# release publish jobs' buildx type=local caches, removes only unreferenced
+# blobs and never leaves an index naming a removed blob. Synthetic layout.
+test('buildx cache prune',
+  _python3_test,
+  args: [files('test_prune_buildcache.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
 # against a synthetic complete artifacts directory, then with each expected
 # SBOM removed, which must fail. Needs a POSIX bash; skips on Windows.

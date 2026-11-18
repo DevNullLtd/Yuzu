@@ -63,8 +63,10 @@ jobs:
           set -eu
           # docker-publish-chisel writes a type=local,mode=max buildx cache per
           # image under $RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>-chisel —
-          # several GB per arch with no built-in eviction. buildx rewrites the dir
-          # each run, so an untouched *-chisel dir is genuinely stale. Linux-only
+          # several GB per arch with no built-in eviction. Every release run
+          # writes into the dir, so a *-chisel dir untouched for 30 days is
+          # genuinely stale (no release used it). Within a dir that IS used,
+          # superseded blobs pile up: the next step removes those. Linux-only
           # (the chisel C++ builds run on the self-hosted Big Tam Linux runner).
           bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
           if [[ ! -d "$bc" ]]; then
@@ -107,6 +109,33 @@ jobs:
           # vcpkg_installed/ trees this workflow's own header promises not to
           # touch.
           clean: false
+
+      - name: Prune unreferenced buildx cache blobs (WP15/S9)
+        run: |
+          set -eu
+          # Every release publish job exports a type=local,mode=max cache to
+          # $RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>. An export writes
+          # new blobs and replaces index.json but never deletes the blobs only
+          # the old index named, and YUZU_PACKAGE_REFRESH makes the package
+          # layer new on every run attempt, so the dirs grow without bound
+          # (one server dir measured 20 GB, 6.3 GB referenced). The script
+          # removes only blobs no index can reach and older than 24 h, skips a
+          # dir written in the last 3 h (a release may be using it) or one it
+          # cannot parse, and removes a whole dir rather than leave its index
+          # naming a removed blob (the next release then builds it cold).
+          bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
+          if [[ ! -d "$bc" ]]; then
+            echo "::notice::buildx cache dir $bc not present — skipping"
+            exit 0
+          fi
+          before=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
+          shopt -s nullglob
+          dirs=("$bc"/*/)
+          if [[ ${#dirs[@]} -gt 0 ]]; then
+            python3 -I scripts/ci/prune-buildcache.py "${dirs[@]}"
+          fi
+          after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
+          echo "buildx caches: before=${before} after=${after}"
 
       - name: Sweep leaked yuzu_test_* databases (#1367)
         run: bash scripts/ci/sweep-test-databases.sh
