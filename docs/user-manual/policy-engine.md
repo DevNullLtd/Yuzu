@@ -313,9 +313,10 @@ What this means in use:
   phase `verify`; it is not counted as a failed evaluation (`error`).
   A `blocked` status from a refused fix is not kept: the next check of an allowed
   instruction records the device's own result in its place. The lasting record of a
-  refused fix is the `policy.remediate` `denied` row the route writes, the `policy.dispatch`
-  audit row (attempted every time, but lost if the audit store fails to persist it; see the
-  [audit log](audit-log.md)) and the `yuzu_server_policy_dispatch_denied_total` counter. A
+  refused fix is the `policy.remediate` `denied` row the route writes and the `policy.dispatch`
+  audit row (each attempted every time, and each lost if the audit store fails to persist it;
+  see the [audit log](audit-log.md)), and the `yuzu_server_policy_dispatch_denied_total`
+  counter. A
   retry that names `agent_ids` answers the refusal `409` again; a retry with no `agent_ids`
   selects `non_compliant` devices only, so it answers "no non_compliant agents" until the
   next check scores the devices.
