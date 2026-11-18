@@ -1112,7 +1112,7 @@ public:
                           "counter");
         metrics_.describe("yuzu_auth_pbkdf2_budget_rejected_total",
                           "Password-hash requests refused 429 by the concurrency budget, stripe or "
-                          "break-glass gate (labels: route, class, reason)",
+                          "break-glass lane (labels: route, class, reason)",
                           "counter");
         // Pre-seed so the first lock / refusal reads as an increase from 0, not a new series.
         for (const char* n : {"yuzu_auth_mfa_lockout_applied_total",
@@ -1122,8 +1122,7 @@ public:
         for (const char* route : {"login", "password_change", "mfa_recovery"})
             for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
                 for (const char* reason : {"per_source", "per_principal", "class_full",
-                                           "global_full", "stripe_busy", "stripe_cap",
-                                           "gate_busy"})
+                                           "global_full", "stripe_busy", "stripe_cap"})
                     metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
                                      {{"route", route}, {"class", cls}, {"reason", reason}});
         metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight_peak",
@@ -1131,7 +1130,15 @@ public:
                           "gauge");
         metrics_.describe("yuzu_auth_login_stripe_waiters",
                           "Login requests now waiting (at most 150 ms each) for their username's "
-                          "serialisation stripe (the break-glass gate wait is not counted)",
+                          "serialisation stripe",
+                          "gauge");
+        metrics_.describe("yuzu_auth_login_stripe_waiter_cap",
+                          "Most login requests that may wait for a username stripe at once (and "
+                          "at most 2 per stripe)",
+                          "gauge");
+        metrics_.describe("yuzu_auth_pbkdf2_budget_break_glass_lane",
+                          "Concurrent break-glass password attempts allowed (one per source "
+                          "address): min(4, cap/4)",
                           "gauge");
         metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
                           "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
@@ -16659,6 +16666,27 @@ private:
             auth_routes_->set_stripe_waiter_cap(
                 static_cast<int>(std::max<std::size_t>(2, pool_max / 8)));
             metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(pbkdf2_cap));
+            const int stripe_cap_waiters = static_cast<int>(std::max<std::size_t>(2, pool_max / 8));
+            const int bg_lane = auth_routes_->pbkdf2_budget().break_glass_cap();
+            metrics_.gauge("yuzu_auth_login_stripe_waiter_cap")
+                .set(static_cast<double>(stripe_cap_waiters));
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_break_glass_lane")
+                .set(static_cast<double>(bg_lane));
+            metrics_.gauge("yuzu_auth_login_stripe_waiters").set(0.0);
+            metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight_peak").set(0.0);
+            spdlog::info("login concurrency limits: worker pool {}, hashing cap {}, stripe waiter cap "
+                         "{} (2 per stripe), break-glass lane {}",
+                         pool_max, pbkdf2_cap, stripe_cap_waiters, bg_lane);
+            if (pool_max < 64 || bg_lane < yuzu::server::kBreakGlassLaneMax ||
+                static_cast<std::size_t>(pbkdf2_cap + stripe_cap_waiters) >= pool_max) {
+                spdlog::warn(
+                    "login concurrency limits are reduced by the small HTTP worker pool ({} "
+                    "workers): hashing cap {}, stripe waiter cap {}, break-glass lane {} (full size "
+                    "{} from a pool of 64). A modest flood of logins can occupy most of the pool and "
+                    "a few addresses can keep the break-glass lane busy; raise --http-worker-threads",
+                    pool_max, pbkdf2_cap, stripe_cap_waiters, bg_lane,
+                    yuzu::server::kBreakGlassLaneMax);
+            }
         }
         // A security-relevant toggle nobody can confirm the state of is an operability
         // gap. --max-sse-streams already surfaces its resolved value as a gauge; this

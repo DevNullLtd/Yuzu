@@ -15,9 +15,8 @@
 ///   - kBreakGlass (a /login naming the armed break-glass account under sso-only) owns a FLOOR of
 ///     `bg_cap = min(4, max(1, max(1, C/2)/2))` slots (4 at C = 66) that no other class can
 ///     consume: the other two classes together are bounded at `main_cap = C - bg_cap` (62). The
-///     lane is exactly its size (the guess gate in AuthRoutes admits the same 4 at once) and is
-///     held to ONE slot per source address whatever the configured per-source cap; it takes no
-///     per-username stripe.
+///     lane is exactly that size and is held to ONE slot per source address whatever the
+///     configured per-source cap; it takes no per-username stripe.
 ///   - kUnauthenticated (POST /login, the recovery-code check behind a pending login token) may
 ///     hold at most `main_cap - max(1, main_cap/2)` slots (31) and at most `per_source_cap` per
 ///     source address.
@@ -32,15 +31,15 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
-#include <condition_variable>
 #include <mutex>
 #include <string>
 #include <unordered_map>
 
 namespace yuzu::server {
 
-/// Most concurrent break-glass attempts process-wide: the guess gate size AND the break-glass
-/// lane size, so the lane the budget reserves is exactly the lane that is reachable.
+/// Most concurrent break-glass attempts process-wide (the lane is min(this, cap/4), so 1 on
+/// pools of 10-15 workers and 4 from a pool of 64). The lane, taken per source address and
+/// non-blocking, IS the bound on concurrent break-glass guesses; there is no second gate.
 inline constexpr int kBreakGlassLaneMax = 4;
 
 enum class Pbkdf2Class { kUnauthenticated, kAuthenticated, kBreakGlass };
@@ -145,7 +144,7 @@ public:
         }
         auto& map = cls == Pbkdf2Class::kAuthenticated ? per_principal_ : per_source_;
         // The break-glass lane allows ONE concurrent attempt per source address whatever the
-        // configured per-source cap, so a single address cannot hold the account's guess gate.
+        // configured per-source cap, so a single address cannot fill the lane.
         const int per_cap = cls == Pbkdf2Class::kAuthenticated ? per_principal_cap_
                             : cls == Pbkdf2Class::kBreakGlass  ? 1
                                                                : per_source_cap_;
@@ -194,60 +193,6 @@ private:
     int per_principal_cap_{3};
     std::unordered_map<std::string, int> per_principal_;
     std::unordered_map<std::string, int> per_source_;
-};
-
-/// A tiny counting gate with a BOUNDED wait: at most `capacity` holders, and a waiter gives up
-/// after the timeout (the caller answers 429). Used for the break-glass account, which keeps no
-/// lockout counter (so no per-username stripe), to bound the CONCURRENT password guesses against
-/// it. One object, so no name can collide onto it. Header-only, no I/O.
-class BoundedGate {
-public:
-    explicit BoundedGate(int capacity) : cap_(capacity < 1 ? 1 : capacity) {}
-
-    class Permit {
-    public:
-        Permit() = default;
-        Permit(Permit&& o) noexcept : g_(o.g_) { o.g_ = nullptr; }
-        Permit& operator=(Permit&&) = delete;
-        Permit(const Permit&) = delete;
-        Permit& operator=(const Permit&) = delete;
-        ~Permit() {
-            if (g_)
-                g_->release();
-        }
-        [[nodiscard]] bool ok() const { return g_ != nullptr; }
-
-    private:
-        friend class BoundedGate;
-        explicit Permit(BoundedGate* g) : g_(g) {}
-        BoundedGate* g_{nullptr};
-    };
-
-    [[nodiscard]] Permit try_acquire_for(std::chrono::milliseconds wait) {
-        std::unique_lock lk(mu_);
-        if (!cv_.wait_for(lk, wait, [&] { return in_use_ < cap_; }))
-            return Permit{};
-        ++in_use_;
-        return Permit{this};
-    }
-    int capacity() const { return cap_; }
-    int in_use() const {
-        std::lock_guard lk(mu_);
-        return in_use_;
-    }
-
-private:
-    void release() {
-        {
-            std::lock_guard lk(mu_);
-            --in_use_;
-        }
-        cv_.notify_one();
-    }
-    mutable std::mutex mu_;
-    std::condition_variable cv_;
-    int cap_;
-    int in_use_{0};
 };
 
 inline const char* to_string(Pbkdf2Refusal r) {

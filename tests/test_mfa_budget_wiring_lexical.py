@@ -72,50 +72,64 @@ def check_routes(t):
     return bad
 
 
-def check_gate_order(t):
-    """verify_password_with_lockout order: the sso-only gate FIRST (before the break-glass gate,
-    the stripe and every slot); for break-glass the non-blocking per-source budget slot BEFORE
-    the shared guess gate; the stripe only for lockout_active and only with a bounded wait."""
+def check_gate_order(t, hpp="", server=""):
+    """verify_password_with_lockout shape (token/regex level, see LIMITS): the sso-only gate FIRST;
+    the break-glass slot (every attempt, no over-length shortcut) before the stripe; the ordinary
+    slot likewise; the stripe only for lockout_active, with defer_lock, try_lock first and the
+    bounded kLoginStripeWait; the per-stripe and global waiter comparisons present as written."""
     a = t.find("AuthRoutes::verify_password_with_lockout(")
     if a < 0:
         return ["verify_password_with_lockout not found"]
     body = t[a:]
-    gate = body.find("opts.pre_verify_gate()")
-    bg_slot = body.find("acquire_pbkdf2(Pbkdf2Class::kBreakGlass")
-    bg_gate = body.find("break_glass_gate_.try_acquire_for(")
-    stripe = body.find("try_lock_for(kLoginStripeWait)")
-    slot = body.find("acquire_pbkdf2(!login_route")
-    anchors = {"pre_verify_gate": gate, "break-glass slot": bg_slot, "break-glass gate": bg_gate,
+    fn_end = body.find("PasswordVerifyFn AuthRoutes::password_change_verify_fn")
+    fn = body if fn_end < 0 else body[:fn_end]
+    gate = fn.find("opts.pre_verify_gate()")
+    bg_slot = fn.find("acquire_pbkdf2(Pbkdf2Class::kBreakGlass")
+    stripe = fn.find("try_lock_for(kLoginStripeWait)")
+    slot = fn.find("acquire_pbkdf2(!login_route")
+    anchors = {"pre_verify_gate": gate, "break-glass slot": bg_slot,
                "stripe try_lock_for": stripe, "ordinary slot": slot}
     missing = [k for k, v in anchors.items() if v < 0]
     if missing:
         return [f"anchors missing: {missing}"]
     bad = []
     if not gate < bg_slot:
-        bad.append("the sso-only pre_verify_gate must run BEFORE the break-glass slot/gate")
-    if not bg_slot < bg_gate:
-        bad.append("the break-glass per-source budget slot must be taken BEFORE the shared gate")
+        bad.append("the sso-only pre_verify_gate must run BEFORE the break-glass slot")
     if not gate < stripe or not gate < slot:
         bad.append("the sso-only pre_verify_gate must run before the stripe and the ordinary slot")
-    pre = body[:stripe]
-    if "if (lockout_active)" not in pre[-1200:]:
+    if not re.search(r"if \(break_glass_attempt\) \{\s*pbkdf2_slot\.emplace\(acquire_pbkdf2\(Pbkdf2Class::kBreakGlass", fn):
+        bad.append("the break-glass slot must be taken for EVERY break-glass attempt "
+                   "(`if (break_glass_attempt) {`, no over-length shortcut)")
+    if not re.search(r"if \(!break_glass_attempt\) \{\s*const bool login_route", fn):
+        bad.append("the ordinary slot must be taken for EVERY attempt "
+                   "(`if (!break_glass_attempt) {`, no over-length shortcut)")
+    if re.search(r"password_exceeds_max\(password\)\)?\s*\{\s*(?:const bool login_route|pbkdf2_slot)", fn):
+        bad.append("a slot must not be skipped for an over-length password")
+    if "if (lockout_active)" not in fn[:stripe][-1500:]:
         bad.append("the login stripe must be taken only when lockout_active")
-    if "login_lk.lock()" in body[:slot]:
-        bad.append("the login stripe must use try_lock_for, never an unbounded lock()")
-    fn_end = body.find("PasswordVerifyFn AuthRoutes::password_change_verify_fn")
-    fn = body if fn_end < 0 else body[:fn_end]
-    if "std::defer_lock" not in fn:
+    if not re.search(r"login_lk\s*=\s*std::unique_lock<std::timed_mutex>\(login_lock_for\(username\),\s*std::defer_lock\)", fn):
         bad.append("the login stripe unique_lock must be constructed with std::defer_lock")
+    if re.search(r"login_lock_for\([^)]*\)\s*\.\s*lock\(\)|login_lk\.lock\(\)", fn):
+        bad.append("the login stripe must never be locked unboundedly")
     if re.search(r"(?:lock_guard|scoped_lock)<std::timed_mutex>", fn):
         bad.append("no lock_guard/scoped_lock on a login stripe (unbounded wait)")
-    if re.search(r"unique_lock<std::timed_mutex>\s*\w*\s*[({][^)};]*login_lock_for\([^)]*\)\s*[)}]", fn):
-        bad.append("a login stripe unique_lock without std::defer_lock blocks unboundedly")
     if "try_lock_for(std::chrono" in fn:
         bad.append("the stripe wait must be kLoginStripeWait, not an ad-hoc duration")
-    if "kStripeWaitersPerStripe" not in fn or "stripe_waiters_per_" not in fn:
-        bad.append("the per-stripe waiter cap (kStripeWaitersPerStripe) is missing")
-    if "stripe_waiter_cap_" not in fn or "StripeWaiterGuard" not in fn:
-        bad.append("the stripe waiter cap (StripeWaiterGuard + stripe_waiter_cap_) is missing")
+    if not re.search(r"if \(!login_lk\.try_lock\(\)\) \{", fn):
+        bad.append("the stripe lock must be TRIED first (only a would-be waiter counts)")
+    if not re.search(r"if \(stripe_waiter\.prior\(\) >= kStripeWaitersPerStripe\) \{[^}]*return \{PasswordCheckOutcome::kBusy", fn):
+        bad.append("the per-stripe waiter comparison must be present and return kBusy")
+    if not re.search(r"if \(waiter\.prior\(\) >= stripe_waiter_cap_\.load\(std::memory_order_relaxed\)\) \{[^}]*return \{PasswordCheckOutcome::kBusy", fn):
+        bad.append("the global waiter ceiling comparison must be present and return kBusy")
+    if hpp:
+        if not re.search(r"kLoginStripeWait\{150\}", hpp):
+            bad.append("kLoginStripeWait must be 150 ms (auth_routes.hpp)")
+        if not re.search(r"kStripeWaitersPerStripe\s*=\s*2\b", hpp):
+            bad.append("kStripeWaitersPerStripe must be 2 (auth_routes.hpp)")
+    if server:
+        for tok in ("auth_routes_->set_stripe_waiter_cap(", "auth_routes_->set_pbkdf2_cap("):
+            if tok not in server:
+                bad.append(f"server.cpp must call {tok} (production sizing is wired nowhere else)")
     return bad
 
 
@@ -131,17 +145,21 @@ def check(files):
         bad.append(f"verifier callers outside auth_routes.cpp: {sorted(sites)}")
     if "auth_routes.cpp" in files:
         bad += check_routes(files["auth_routes.cpp"])
-        bad += check_gate_order(files["auth_routes.cpp"])
+        bad += check_gate_order(files["auth_routes.cpp"], files.get("auth_routes.hpp", ""),
+                                files.get("server.cpp", ""))
     else:
         bad.append("auth_routes.cpp missing")
     return bad
 
 
 def load():
-    return {
-        p.name: strip_comments(p.read_text(encoding="utf-8", errors="replace"))
-        for p in sorted(SRC.glob("*.[ch]pp"))
-    }
+    out = {}
+    for p in sorted(SRC.glob("*.[ch]pp")):
+        t = p.read_text(encoding="utf-8", errors="replace")
+        # server.cpp holds string literals containing "/*" that make comment stripping eat code,
+        # so it is read raw (its pins are call tokens spelled `auth_routes_->set_...(`).
+        out[p.name] = t if p.name == "server.cpp" else strip_comments(t)
+    return out
 
 
 def selftest(files):
@@ -194,30 +212,40 @@ def selftest(files):
             failures.append("MUTATION NOT DETECTED: stripe taken for lockout-exempt names")
     else:
         failures.append("selftest cannot find the lockout_active stripe condition")
-    m = dict(files)
-    swapped = base.replace("acquire_pbkdf2(Pbkdf2Class::kBreakGlass", "XX_SLOT", 1).replace(
-        "break_glass_gate_.try_acquire_for(", "acquire_pbkdf2(Pbkdf2Class::kBreakGlass", 1).replace(
-        "XX_SLOT", "break_glass_gate_.try_acquire_for(", 1)
-    if swapped != base:
-        m["auth_routes.cpp"] = swapped
-        if not check(m):
-            failures.append("MUTATION NOT DETECTED: break-glass gate taken before the slot")
-    else:
-        failures.append("selftest cannot find the break-glass slot/gate")
-    for label, a, b in (
-        ("stripe without defer_lock", "login_lock_for(username), std::defer_lock)", "login_lock_for(username))"),
-        ("ad-hoc stripe wait", "try_lock_for(kLoginStripeWait)", "try_lock_for(kLoginStripeWait)) || login_lk.try_lock_for(std::chrono::hours(1)"),
-        ("extra lock_guard", "std::unique_lock<std::timed_mutex> login_lk;", "std::lock_guard<std::timed_mutex> extra(login_lock_for(username)); std::unique_lock<std::timed_mutex> login_lk;"),
-        ("waiter cap dropped", "stripe_waiter_cap_.load", "stripe_cap_gone_.load"),
-        ("per-stripe cap dropped", "kStripeWaitersPerStripe", "kStripeWaitersGone"),
-    ):
-        if a in base:
-            m = dict(files)
-            m["auth_routes.cpp"] = base.replace(a, b, 1)
-            if not check(m):
-                failures.append(f"MUTATION NOT DETECTED: {label}")
-        else:
+    def mut(label, fn_):
+        m = dict(files)
+        try:
+            changed = fn_(m)
+        except Exception as e:  # noqa
+            failures.append(f"selftest cannot build mutation {label}: {e}")
+            return
+        if not changed:
             failures.append(f"selftest cannot find the text for: {label}")
+        elif not check(m):
+            failures.append(f"MUTATION NOT DETECTED: {label}")
+
+    def sub_cpp(old, new, key="auth_routes.cpp", count=1):
+        def f(m):
+            if old not in m[key]:
+                return False
+            m[key] = m[key].replace(old, new, count)
+            return True
+        return f
+
+    mut("stripe without defer_lock", sub_cpp("login_lock_for(username), std::defer_lock)", "login_lock_for(username))"))
+    mut("ad-hoc stripe wait", sub_cpp("try_lock_for(kLoginStripeWait)", "try_lock_for(std::chrono::hours(1))"))
+    mut("extra lock_guard", sub_cpp("std::unique_lock<std::timed_mutex> login_lk;", "std::lock_guard<std::timed_mutex> extra(login_lock_for(username)); std::unique_lock<std::timed_mutex> login_lk;"))
+    mut("blocking login_lock_for(...).lock()", sub_cpp("std::unique_lock<std::timed_mutex> login_lk;", "login_lock_for(username).lock(); std::unique_lock<std::timed_mutex> login_lk;"))
+    mut("per-stripe comparison neutralised", sub_cpp("if (stripe_waiter.prior() >= kStripeWaitersPerStripe) {", "if (false && stripe_waiter.prior() >= kStripeWaitersPerStripe) {"))
+    mut("global comparison neutralised", sub_cpp("if (waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {", "if (false && waiter.prior() >= stripe_waiter_cap_.load(std::memory_order_relaxed)) {"))
+    mut("both caps deleted, tokens kept in a string", lambda m: m.__setitem__("auth_routes.cpp", re.sub(r"if \((?:false && )?(?:stripe_waiter|waiter)\.prior\(\)[^{]*\{", 'const char* x = "kStripeWaitersPerStripe stripe_waiter_cap_"; if (false) {', m["auth_routes.cpp"])) or True)
+    mut("kLoginStripeWait 150 -> 3600000", sub_cpp("kLoginStripeWait{150}", "kLoginStripeWait{3600000}", key="auth_routes.hpp"))
+    mut("kStripeWaitersPerStripe 2 -> 1000", sub_cpp("kStripeWaitersPerStripe = 2", "kStripeWaitersPerStripe = 1000", key="auth_routes.hpp"))
+    mut("try_lock() first dropped", sub_cpp("if (!login_lk.try_lock()) {", "if (true) {"))
+    mut("over-length shortcut back on the ordinary slot", sub_cpp("if (!break_glass_attempt) {\n        const bool login_route", "if (!break_glass_attempt && !auth::password_exceeds_max(password)) {\n        const bool login_route"))
+    mut("over-length shortcut back on the break-glass slot", sub_cpp("if (break_glass_attempt) {\n        pbkdf2_slot.emplace", "if (break_glass_attempt && !auth::password_exceeds_max(password)) {\n        pbkdf2_slot.emplace"))
+    mut("server.cpp stops calling set_stripe_waiter_cap", sub_cpp("auth_routes_->set_stripe_waiter_cap(", "auth_routes_->set_stripe_waiter_cap_gone(", key="server.cpp"))
+    mut("server.cpp stops calling set_pbkdf2_cap", sub_cpp("auth_routes_->set_pbkdf2_cap(", "auth_routes_->set_pbkdf2_cap_gone(", key="server.cpp"))
     # A new caller elsewhere must be caught too.
     m = dict(files)
     m["rogue.cpp"] = "void f(){ db->mfa_verify_login_code(u, c); }"

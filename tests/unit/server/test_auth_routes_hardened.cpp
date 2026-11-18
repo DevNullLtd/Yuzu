@@ -34,6 +34,7 @@
 #include "pg/pg_pool.hpp"
 #include "session_store.hpp"
 #include "test_route_sink.hpp"
+#include "password_policy.hpp" // kMaxPasswordBytes
 #include "test_pbkdf2_budget_fill.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
@@ -429,49 +430,56 @@ TEST_CASE("sso-only: the armed break-glass login is not denied by a flood of its
     CHECK(status == 202); // the MFA challenge, never the stripe-timeout 429 (mutation: RED)
 }
 
-TEST_CASE("sso-only: break-glass guesses are bounded at 4 concurrent (exact numbers), without a lockout",
+namespace {
+/// Takes the whole break-glass lane through the budget, one slot per distinct source: the real
+/// production state of "n break-glass attempts in flight".
+std::vector<Pbkdf2Budget::Slot> hold_break_glass_lane(Pbkdf2Budget& b, int n, const char* tag) {
+    std::vector<Pbkdf2Budget::Slot> held;
+    for (int i = 0; i < n; ++i) {
+        held.push_back(b.try_acquire(Pbkdf2Class::kBreakGlass, std::string(tag) + std::to_string(i)));
+        REQUIRE(held.back().ok());
+    }
+    return held;
+}
+} // namespace
+
+TEST_CASE("sso-only: break-glass guesses are bounded by the lane (exact numbers), without a lockout",
           "[pg][auth][hardened][routes][concurrency][stripe]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
-    auto& gate = h.auth_routes->break_glass_gate_for_test();
-    REQUIRE(gate.capacity() == 4);
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(66); // the default pool of 264: break-glass lane 4
+    REQUIRE(budget.break_glass_cap() == 4);
     auto login = [&](const char* pw) {
         auto res = h.sink.Post("/login", form({{"username", "admin"}, {"password", pw}}), kFormCt);
         return res ? res->status : -1;
     };
-    std::vector<BoundedGate::Permit> held;
-    auto hold = [&](int n) {
-        for (int i = 0; i < n; ++i) {
-            held.push_back(gate.try_acquire_for(std::chrono::milliseconds(10)));
-            REQUIRE(held.back().ok());
-        }
-    };
-    hold(3); // three attacker attempts in flight: the legitimate operator still gets in
-    CHECK(login("adminpassword1") == 202);
-    hold(1); // four in flight (the bound): a fifth is refused 429 within the bounded wait
-    const auto t0 = std::chrono::steady_clock::now();
-    CHECK(login("WRONGpassword1") == 429);
-    CHECK(login("adminpassword1") == 429);
-    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0);
-    CHECK(ms < std::chrono::milliseconds(800)); // two bounded waits of 150 ms, never a hang
-    held.clear();
+    {
+        auto three = hold_break_glass_lane(budget, 3, "attacker-"); // three attackers in flight
+        CHECK(login("adminpassword1") == 202); // the operator, another source, still gets in
+    }
+    {
+        auto four = hold_break_glass_lane(budget, 4, "attacker-"); // the lane is full
+        const auto t0 = std::chrono::steady_clock::now();
+        CHECK(login("WRONGpassword1") == 429); // refused at once, right password or wrong
+        CHECK(login("adminpassword1") == 429);
+        const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now() - t0);
+        CHECK(ms < std::chrono::milliseconds(500)); // no waiting: the slot is non-blocking
+    }
     CHECK(h.count_audits("auth.lockout.applied") == 0); // nothing was locked
     CHECK(login("adminpassword1") == 202);              // the operator is back in at once
 }
 
-TEST_CASE("sso-only: a saturated break-glass gate does not tell names or arm state apart",
+TEST_CASE("sso-only: a saturated break-glass lane does not tell unarmed or unknown names apart",
           "[pg][auth][hardened][routes][concurrency][stripe]") {
     HardenedHarness h("sso-only", "admin"); // admin is the break-glass name, NOT armed
-    auto& gate = h.auth_routes->break_glass_gate_for_test();
-    std::vector<BoundedGate::Permit> held;
-    for (int i = 0; i < gate.capacity(); ++i) {
-        held.push_back(gate.try_acquire_for(std::chrono::milliseconds(10)));
-        REQUIRE(held.back().ok());
-    }
-    // The sso-only gate runs before the break-glass gate, so unarmed, other and unknown names
-    // never touch it: the same generic 401, no Retry-After (mutation: gate first -> 429 for admin).
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(66);
+    auto held = hold_break_glass_lane(budget, budget.break_glass_cap(), "attacker-");
+    // The sso-only gate runs before the lane, so unarmed, other and unknown names never touch it:
+    // the same generic 401, no Retry-After (mutation: gate after the slot -> 429 for admin).
     for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);
@@ -481,41 +489,43 @@ TEST_CASE("sso-only: a saturated break-glass gate does not tell names or arm sta
     }
 }
 
-TEST_CASE("break-glass: per-source limits sit in FRONT of the shared gate (a source never queues)",
+TEST_CASE("break-glass: one slot per source address, taken without waiting",
           "[pg][auth][hardened][routes][concurrency][stripe]") {
     HardenedHarness h("sso-only", "admin");
     h.enroll_mfa("admin");
     h.arm("admin");
     auto& budget = h.auth_routes->pbkdf2_budget();
-    auto& gate = h.auth_routes->break_glass_gate_for_test();
-    // Source A already has its one break-glass attempt in flight (its per-source slot)...
+    budget.set_cap(66);
     auto a_inflight = budget.try_acquire(Pbkdf2Class::kBreakGlass, "203.0.113.5");
     REQUIRE(a_inflight.ok());
-    // ...and other attackers hold every permit of the shared gate.
-    std::vector<BoundedGate::Permit> held;
-    for (int i = 0; i < gate.capacity(); ++i) {
-        held.push_back(gate.try_acquire_for(std::chrono::milliseconds(10)));
-        REQUIRE(held.back().ok());
-    }
     auto attempt = [&](const char* addr) {
         httplib::Request req;
         req.remote_addr = addr;
         PasswordCheckOptions opts;
         opts.lockout_exempt = true;
         opts.metric_route = "login";
-        const auto t0 = std::chrono::steady_clock::now();
-        const auto r = h.auth_routes->verify_password_with_lockout("admin", "WRONGpassword1", req, opts);
-        return std::pair{r.outcome, std::chrono::duration_cast<std::chrono::milliseconds>(
-                                        std::chrono::steady_clock::now() - t0)};
+        return h.auth_routes->verify_password_with_lockout("admin", "WRONGpassword1", req, opts).outcome;
     };
-    // A's SECOND request fails fast on its own per-source slot: it never waits for the gate
-    // (mutation: the shared gate first -> it waits the full bounded 150 ms before the refusal).
-    auto [a_outcome, a_ms] = attempt("203.0.113.5");
-    CHECK(a_outcome == PasswordCheckOutcome::kBusy);
-    CHECK(a_ms < std::chrono::milliseconds(130));
-    // With only three permits held, another source's attempt is served (a normal wrong-password
-    // verdict), while A's slot stays held: one source never queues ahead of another.
-    held.pop_back();
-    auto [b_outcome, b_ms] = attempt("198.51.100.9");
-    CHECK(b_outcome == PasswordCheckOutcome::kBadCredential);
+    CHECK(attempt("203.0.113.5") == PasswordCheckOutcome::kBusy); // A's second request: per source
+    CHECK(attempt("198.51.100.9") == PasswordCheckOutcome::kBadCredential); // another source: served
+}
+
+TEST_CASE("break-glass: an over-length password takes the lane too (no flood bypass)",
+          "[pg][auth][hardened][routes][concurrency][stripe]") {
+    HardenedHarness h("sso-only", "admin");
+    h.enroll_mfa("admin");
+    h.arm("admin");
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(66);
+    auto held = hold_break_glass_lane(budget, budget.break_glass_cap(), "attacker-");
+    httplib::Request req;
+    req.remote_addr = "198.51.100.77";
+    PasswordCheckOptions opts;
+    opts.lockout_exempt = true;
+    opts.metric_route = "login";
+    const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
+    // Without the fix the over-length shortcut skipped the lane and answered a normal bad
+    // credential (kBadCredential) however many of these were in flight.
+    CHECK(h.auth_routes->verify_password_with_lockout("admin", over, req, opts).outcome ==
+          PasswordCheckOutcome::kBusy);
 }

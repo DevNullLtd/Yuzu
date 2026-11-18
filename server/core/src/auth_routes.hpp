@@ -164,7 +164,7 @@ struct PasswordCheckOptions {
     /// break-glass exemption — see `POST /login`). The attempt is still
     /// verified; a failure is still the caller's to audit.
     bool lockout_exempt{false};
-    /// Runs FIRST: before any stripe, PBKDF2 slot, break-glass gate or lockout pre-check.
+    /// Runs FIRST: before any stripe, PBKDF2 slot or lockout pre-check.
     /// Return false to refuse (having written the
     /// response) → `kGateRejected`. `/login` uses this for its sso-only gate.
     std::function<bool()> pre_verify_gate;
@@ -240,7 +240,6 @@ public:
     std::size_t login_stripe_index_for_test(const std::string& username) const {
         return login_stripe_index(username);
     }
-    BoundedGate& break_glass_gate_for_test() { return break_glass_gate_; }
     std::timed_mutex& login_lock_for_test(const std::string& username) {
         return login_lock_for(username);
     }
@@ -747,7 +746,7 @@ public:
     /// behaviour-preserving, from `POST /login`'s lockout-critical section so
     /// the self-service current-password proof can never drift from it).
     /// Order: `opts.pre_verify_gate` FIRST (before any stripe, slot or gate); for the armed
-    /// break-glass account its non-blocking per-source slot then the guess gate; otherwise,
+    /// break-glass account its non-blocking per-source lane slot (no stripe); otherwise,
     /// under the per-username login stripe (`login_lock_for`, held only when lockout
     /// accounting applies; waited for at most `kLoginStripeWait`, waiters capped): the PBKDF2
     /// slot → lockout pre-check (fail-OPEN on a read error, remembered so a
@@ -1291,12 +1290,6 @@ private:
         int prior_;
     };
     void count_budget_refusal(const std::string& route, const char* cls, const char* reason);
-    /// Bounds CONCURRENT password guesses against the lockout-exempt break-glass account (which
-    /// keeps no lockout counter and so takes no stripe): capacity 4, bounded wait, one object so
-    /// no name can collide onto it. Capacity 4 with one slot per source address (taken first, non-blocking) means a single
-    /// address cannot hold it and the legitimate operator is not starved by one attacker.
-    static constexpr int kBreakGlassGuessConcurrency = kBreakGlassLaneMax;
-    BoundedGate break_glass_gate_{kBreakGlassGuessConcurrency};
     Pbkdf2Budget pbkdf2_budget_{static_cast<int>(
         std::max(2u, std::thread::hardware_concurrency() / 4))};
     /// Uniform 429 + Retry-After for a full PBKDF2 budget (A4 envelope; same shape for any name).

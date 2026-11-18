@@ -2,7 +2,7 @@
  * test_pbkdf2_budget.cpp — the lane and floor arithmetic of the process-wide PBKDF2 concurrency
  * budget (WP03 perf-F1; server/core/src/pbkdf2_budget.hpp). Header-only subject, no database.
  *
- * Numbers: cap 66 (default pool of 264): break-glass floor 4 (= the lane = the guess gate), main
+ * Numbers: cap 66 (default pool of 264): break-glass lane 4, main
  * share 62 (unauthenticated 31, authenticated 31), per-principal 3. Cap 8 (the floor): break-glass 2, main 6 (3 / 3).
  */
 
@@ -227,25 +227,6 @@ TEST_CASE("Pbkdf2Budget: break-glass is limited to ONE slot per source whatever 
     CHECK_FALSE(second.ok()); // mutation: honouring the configured 64 would admit it
     CHECK(second.refusal() == Pbkdf2Refusal::kPerSource);
     CHECK(b.try_acquire(Pbkdf2Class::kBreakGlass, "198.51.100.8").ok());
-}
-
-TEST_CASE("BoundedGate: capacity 2 admits two holders, refuses a third within the wait",
-          "[pbkdf2_budget][concurrency]") {
-    BoundedGate g{2};
-    auto a = g.try_acquire_for(std::chrono::milliseconds(10));
-    auto b = g.try_acquire_for(std::chrono::milliseconds(10));
-    CHECK(a.ok());
-    CHECK(b.ok());
-    const auto t0 = std::chrono::steady_clock::now();
-    auto c = g.try_acquire_for(std::chrono::milliseconds(120));
-    const auto waited = std::chrono::duration_cast<std::chrono::milliseconds>(
-        std::chrono::steady_clock::now() - t0);
-    CHECK_FALSE(c.ok());
-    CHECK(waited >= std::chrono::milliseconds(100));
-    CHECK(waited < std::chrono::milliseconds(400)); // bounded
-    { auto gone = std::move(a); }
-    CHECK(g.try_acquire_for(std::chrono::milliseconds(10)).ok()); // a freed permit is reusable
-    CHECK(g.in_use() == 1);
 }
 
 TEST_CASE("Pbkdf2Budget: per-source keys are per class (an unauthenticated hash never blocks "

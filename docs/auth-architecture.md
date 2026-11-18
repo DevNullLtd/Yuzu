@@ -334,9 +334,11 @@ scope here.
   Postgres — e.g. `UPDATE ... WHERE failed_login_count < threshold RETURNING`)
   is the multi-replica-correct form and remains a tracked follow-up (#8215), not
   something this migration delivered incidentally. The stripe wait is bounded
-  (150 ms) and the number of waiters capped (`max(2, pool/8)`), so a flood of one
-  name cannot queue unboundedly; the stripe is per process (N replicas: up to
-  threshold x N guesses). `login_rate_limit` remains
+  (150 ms) and the number of waiters capped (2 per stripe, `max(2, pool/8)` overall), so a
+  flood of one name cannot queue unboundedly; the stripe is per process (N replicas:
+  about threshold + (N - 1) guesses per window, because each replica can have one
+  attempt in flight per name past its lockout check and the failure counter itself
+  is a database-atomic increment). `login_rate_limit` remains
   the companion control for the distributed vector.
   - *On failure*: `record_failed_login` increments the counter and arms
     `locked_until` on the threshold-th failure. A window that has **fully

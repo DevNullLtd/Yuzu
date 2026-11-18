@@ -25,6 +25,7 @@
 #include "rbac_store.hpp"
 #include "auth_routes.hpp"
 #include "pbkdf2_budget.hpp"
+#include "password_policy.hpp" // kMaxPasswordBytes
 #include "test_pbkdf2_budget_fill.hpp"
 #include "../../../server/core/src/auth_db_sql_helpers.hpp"
 
@@ -3434,7 +3435,9 @@ TEST_CASE("stripe waiters are capped: with the stripe held, only `cap` requests 
           "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
     AuthRoutesHarness h;
     h.cfg.auth_lockout_threshold = 5;
-    h.auth_routes->set_stripe_waiter_cap(2);
+    // Global ceiling HIGH so only the PER-STRIPE cap (2) can be what bounds the waiters of this
+    // one flooded stripe (mutation: per-stripe cap removed -> 8 waiters, RED).
+    h.auth_routes->set_stripe_waiter_cap(10);
     h.auth_routes->pbkdf2_budget().set_cap(66);
     h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
     auto& stripe = h.auth_routes->login_lock_for_test("cap-ghost");
@@ -3558,6 +3561,165 @@ TEST_CASE("stripe waiter cap: the blast radius is the flooded stripe, not unrela
     stripe_a.unlock();
     for (auto& t : flood)
         t.join();
+}
+
+
+TEST_CASE("global stripe-waiter ceiling: across three held stripes exactly `cap` requests wait",
+          "[pg][mfa][routes][auth_routes][stripe][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    h.auth_routes->set_stripe_waiter_cap(3); // global ceiling 3; per-stripe cap is 2
+    h.auth_routes->pbkdf2_budget().set_cap(66);
+    h.auth_routes->pbkdf2_budget().set_per_source_cap(64);
+    // Three names on three DISTINCT stripes, each held, 6 callers per name.
+    std::vector<std::string> names;
+    std::vector<std::size_t> seen;
+    for (int i = 0; names.size() < 3 && i < 5000; ++i) {
+        const std::string n = "ceiling-" + std::to_string(i);
+        const auto idx = h.auth_routes->login_stripe_index_for_test(n);
+        if (std::find(seen.begin(), seen.end(), idx) == seen.end()) {
+            seen.push_back(idx);
+            names.push_back(n);
+        }
+    }
+    REQUIRE(names.size() == 3);
+    for (const auto& n : names)
+        h.auth_routes->login_lock_for_test(n).lock();
+    constexpr int kPer = 6;
+    std::vector<std::chrono::milliseconds> took(3 * kPer);
+    std::atomic<int> peak{0};
+    std::atomic<bool> stop_sampling{false};
+    std::thread sampler([&] {
+        while (!stop_sampling.load()) {
+            const int w = h.auth_routes->stripe_waiters();
+            int p = peak.load();
+            while (w > p && !peak.compare_exchange_weak(p, w)) {}
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+    });
+    std::vector<std::thread> ts;
+    for (int n = 0; n < 3; ++n)
+        for (int i = 0; i < kPer; ++i)
+            ts.emplace_back([&, n, i] {
+                httplib::Request req;
+                req.remote_addr = "203.0.113." + std::to_string(n * kPer + i + 1);
+                PasswordCheckOptions opts;
+                opts.metric_route = "login";
+                const auto t0 = std::chrono::steady_clock::now();
+                (void)h.auth_routes->verify_password_with_lockout(names[n], "whatever-123456", req,
+                                                                  opts);
+                took[n * kPer + i] = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0);
+            });
+    for (auto& t : ts)
+        t.join();
+    stop_sampling = true;
+    sampler.join();
+    for (const auto& n : names)
+        h.auth_routes->login_lock_for_test(n).unlock();
+    int waited = 0;
+    for (const auto& t : took)
+        if (t >= std::chrono::milliseconds(120))
+            ++waited;
+    CHECK(waited == 3);       // mutation: global ceiling removed -> 6 (2 per stripe x 3)
+    CHECK(peak.load() <= 3);  // never more than the ceiling waiting at once
+}
+
+TEST_CASE("an over-length password takes a hashing slot too: a full lane refuses it (no flood escape)",
+          "[pg][mfa][routes][auth_routes][concurrency]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    httplib::Request req;
+    req.remote_addr = "198.51.100.50";
+    PasswordCheckOptions opts;
+    opts.metric_route = "login";
+    const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
+    // Before the fix the over-length shortcut skipped the slot (the hash is skipped) but the
+    // request still took a stripe and a database read, so a flood of them escaped every cap.
+    CHECK(h.auth_routes->verify_password_with_lockout("over-max-ghost", over, req, opts).outcome ==
+          PasswordCheckOutcome::kBusy);
+}
+
+TEST_CASE("live pool of 10: unique unknown names with over-length passwords cannot pin the workers",
+          "[pg][mfa][routes][auth_routes][concurrency][stripe]") {
+    AuthRoutesHarness h;
+    h.cfg.auth_lockout_threshold = 5;
+    auto& budget = h.auth_routes->pbkdf2_budget();
+    budget.set_cap(8); // unauthenticated lane 3 (production for a pool of 10 is cap 5)
+    budget.set_per_source_cap(64);
+    h.auth_routes->set_stripe_waiter_cap(2);
+    httplib::Server svr;
+    svr.new_task_queue = [] { return new httplib::ThreadPool(10, 10, 400); };
+    std::atomic<int> in_handler{0}, entered{0};
+    svr.Post("/login", [&](const httplib::Request& req, httplib::Response& res) {
+        ++entered;
+        ++in_handler;
+        PasswordCheckOptions opts;
+        opts.metric_route = "login";
+        const auto r = h.auth_routes->verify_password_with_lockout(
+            req.get_param_value("username"), req.get_param_value("password"), req, opts);
+        --in_handler;
+        res.status = r.outcome == PasswordCheckOutcome::kBusy ? 429 : 401;
+        res.set_content("x", "text/plain");
+    });
+    svr.Get("/healthz", [](const httplib::Request&, httplib::Response& res) {
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread server_thread([&] { svr.listen_after_bind(); });
+    svr.wait_until_ready();
+
+    // Make the lockout read SLOW: another connection holds an exclusive lock on auth.users, so
+    // every request that reaches the database blocks there (a slow or contended store).
+    yuzu::server::pg::PgConn locker{PQconnectdb(h.auth_db.dsn().c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(yuzu::server::pg::PgResult{PQexec(locker.get(), "BEGIN")}.ok());
+    REQUIRE(yuzu::server::pg::PgResult{
+        PQexec(locker.get(), "LOCK TABLE auth.users IN ACCESS EXCLUSIVE MODE")}.ok());
+
+    const std::string over(yuzu::server::auth::kMaxPasswordBytes + 1, 'x');
+    constexpr int kFlood = 160; // unique names: distinct stripes, no waiting, no lockout rows
+    std::vector<std::thread> flood;
+    std::atomic<int> answered{0};
+    for (int i = 0; i < kFlood; ++i)
+        flood.emplace_back([&, i, port] {
+            httplib::Client c("127.0.0.1", port);
+            c.set_read_timeout(30, 0);
+            auto r = c.Post("/login", "username=over-max-" + std::to_string(i) + "&password=" + over,
+                            "application/x-www-form-urlencoded");
+            if (r)
+                ++answered;
+        });
+    // Saturation is ASSERTED, not assumed: wait (bounded) until the flood has reached the handlers.
+    for (int i = 0; i < 500 && entered.load() < 40; ++i)
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    const bool saturated = entered.load() >= 40;
+    std::this_thread::sleep_for(std::chrono::milliseconds(300)); // refused requests have left
+    const int blocked_now = in_handler.load(); // requests still parked on the locked database
+    const auto t0 = std::chrono::steady_clock::now();
+    httplib::Client hc("127.0.0.1", port);
+    hc.set_read_timeout(10, 0);
+    auto health = hc.Get("/healthz");
+    const auto health_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::steady_clock::now() - t0);
+    // Release the lock so the blocked requests (at most the lane) finish.
+    (void)yuzu::server::pg::PgResult{PQexec(locker.get(), "COMMIT")};
+    for (auto& t : flood)
+        t.join();
+    svr.stop();
+    server_thread.join();
+    CHECK(saturated);
+    CHECK((health && health->status == 200));
+    // With the slot taken for over-length passwords only the unauthenticated lane (3) reaches the
+    // blocked database read, the rest are refused 429 at once, so /healthz is served promptly.
+    // Without the fix every one of the ten workers blocks on the lock and /healthz waits for it.
+    CHECK(health_ms < std::chrono::milliseconds(700));
+    CHECK(blocked_now <= 6); // lane 3 + margin; without the fix all 10 workers are parked here
+    CHECK(answered.load() == kFlood);
 }
 
 #endif // !_WIN32
