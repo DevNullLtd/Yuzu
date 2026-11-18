@@ -1071,6 +1071,7 @@
     ],
     "privilege_row": false,
     "tests": [
+      "tests/unit/test_tags_concurrency.cpp",
       "tests/unit/test_tags_plugin.cpp"
     ]
   },

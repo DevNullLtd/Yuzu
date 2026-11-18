@@ -736,15 +736,21 @@ int main(int argc, char* argv[]) {
         ->envname("YUZU_INVENTORY_EXPORT_CONCURRENCY");
     app.add_option("--inventory-export-max-rows", cfg.inventory_export_max_rows,
                    "Most rows one streamed installed-software export may write "
-                   "(GET /api/v1/inventory/software/export, JSONL and CSV). A stream that would "
-                   "pass it is cut without its terminating chunk, so the client sees an aborted "
-                   "transfer, never a file that looks complete. Default 5000000.")
+                   "(GET /api/v1/inventory/software/export, JSONL, CSV and XLSX). A stream that "
+                   "would pass it is cut without its terminating chunk, so the client sees an "
+                   "aborted transfer, never a file that looks complete. An XLSX export is built "
+                   "whole before anything is sent, so one that would pass it is answered 413 "
+                   "instead; the XLSX sheet's own limit of 1048575 data rows also applies. "
+                   "Default 5000000.")
         ->check(CLI::Range(std::int64_t{1000}, std::int64_t{1'000'000'000}))
         ->envname("YUZU_INVENTORY_EXPORT_MAX_ROWS");
     app.add_option("--inventory-export-max-bytes", cfg.inventory_export_max_bytes,
                    "Most body bytes one streamed installed-software export may write (JSONL and "
-                   "CSV). Cut like --inventory-export-max-rows when passed. Default 1073741824 "
-                   "(1 GiB).")
+                   "CSV). Cut like --inventory-export-max-rows when passed. For XLSX it bounds "
+                   "the UNCOMPRESSED SHEET (cell text plus markup and escaping), not the "
+                   "finished file; an XLSX export holds up to 3 times that on the data volume "
+                   "(under <data dir>/export-tmp) while it is built and sent, and is refused "
+                   "when that would leave under 1 GiB free. Default 1073741824 (1 GiB).")
         ->check(CLI::Range(std::int64_t{1} << 20, std::int64_t{1} << 40))
         ->envname("YUZU_INVENTORY_EXPORT_MAX_BYTES");
     app.add_option("--inventory-sync-cooldown", cfg.inventory_sync_cooldown_s,

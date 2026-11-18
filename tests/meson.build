@@ -609,6 +609,7 @@ agent_test_exe = executable(
     'unit/test_row_byte_budget.cpp',    # shared row/byte budget (agents/shared/row_byte_budget.hpp), portable
     'unit/test_wall_clock_step.cpp',    # #4503: shared consecutive-sample wall-vs-monotonic clock-step guard (agents/shared/wall_clock_step.hpp), portable
     'unit/test_smbios_parsers.cpp',     # H.1: shared bounds-checked SMBIOS walker (agents/shared/smbios_parsers.hpp) + firmware_posture adapter differential, portable
+    'unit/test_printing_identity.cpp',           # #4679: getpwuid_r-shaped, ERANGE-growing, fail-closed identity lookup (POSIX)
     'unit/test_printing_parsers.cpp',            # Wave 9 PR9.1b
     'unit/test_printing_local_dispatcher.cpp',   # Wave 9 PR9.1b
     'unit/test_browser_policy_parsers.cpp',         # Wave 10 PR10.2-b: pure policy-row model (every OS) + injected-root Linux JSON walk (POSIX-only bodies)
@@ -650,6 +651,9 @@ agent_test_exe = executable(
     'unit/test_asset_tags_parsers.cpp',   # #232: pure cap/escape/apply_sync/snapshot helpers (asset_tags_parsers.hpp)
     'unit/test_asset_tags_store.cpp',   # #232: atomic state-file lifecycle (asset_tags_store.hpp), TempDir-based
     'unit/test_asset_tags_actions.cpp',   # #232: real asset_tags dylib/.so/.dll via LocalDispatcher, unguarded on every OS
+    'unit/test_wp12_lookup_helpers.cpp', # WP12: injected-lookup/fake-list tests for users_group_lookup.hpp, filesystem_posix_names.hpp, dns_cache_list.hpp
+    'unit/test_ioc_domain_cap.cpp', # F66: real ioc plugin, `domains` cap of 100 per command via LocalDispatcher
+    'unit/test_tags_concurrency.cpp', # F37: real tags plugin driven from concurrent threads via LocalDispatcher ([tsan])
     'unit/test_tags_plugin.cpp',   # #4728: TU-inclusion seam over tags_plugin.cpp -- save_tags() through the shared atomic write
     'unit/test_asset_tags_sync_lock.cpp', # #232: TU-inclusion seam over asset_tags_plugin.cpp -- sync writes under g_mu (a condition-variable seam, no per-OS body, runs on every OS)
     'unit/test_system_hardening_parsers.cpp',            # Wave 8 PR8.1-b: pure state mappers + errno classifier over REAL CAPTURE fixtures
@@ -903,6 +907,7 @@ agent_test_exe = executable(
                 firmware_posture_plugin_lib,  # Wave 8 PR8.4
                 browser_inventory_plugin_lib,  # Wave 10 P2a
                 local_security_policy_plugin_lib,  # Wave 8 PR8.3
+                tags_plugin_lib,  # F37: test_tags_concurrency.cpp loads the real plugin by path
                 asset_tags_plugin_lib,  # #232: test_asset_tags_actions.cpp loads the real plugin by path
                 system_hardening_plugin_lib,  # Wave 8 PR8.1-b
                 runtimes_plugin_lib,  # Wave 10 PR10.1-b
@@ -1768,6 +1773,7 @@ if build_server
       'unit/server/test_secure_random.cpp',
       'unit/server/test_quarantine_store.cpp',
       'unit/server/test_quarantine_dispatch_decision.cpp', # #3127: pure write/response classification — no Postgres, no MCP transport, no agent
+      'unit/server/test_quarantine_release_decision.cpp',  # #7585b: pure release-half decision tables, the bounded reply wait and the reply-retention rule — no Postgres
       'unit/server/test_quarantine_dispatch_gate.cpp',     # #881: containment gate at the dispatch chokepoint — pure arm/degradation logic, no store
       'unit/server/test_plugin_presence_dispatch_gate.cpp', # #3424/#3511: plugin-presence filter at the dispatch chokepoint — mirrors test_quarantine_dispatch_gate.cpp
       'unit/server/test_os_kill_switch_dispatch_gate.cpp', # #5294: per-OS kill-switch filter at the dispatch chokepoint — mirrors test_plugin_presence_dispatch_gate.cpp
@@ -2137,6 +2143,8 @@ if build_server
       # SAM-36 streamed export: pure parse/chunk/clamp core, then the route over fake page readers (no store, no [pg], no sleeps)
       'unit/server/test_software_export_stream.cpp',
       'unit/server/test_software_export_routes.cpp',
+      # SAM-36b XLSX writer: real (tiny) workbooks in a yuzu_test_ dir, read back through minizip; the sheet-byte accounting, the read-back check (damaged zips, and failed writes made with RLIMIT_FSIZE), the pure disk budget, exclusive file creation
+      'unit/server/test_software_export_xlsx.cpp',
       'unit/server/test_software_title_dimension.cpp',
       'unit/server/test_software_licensing_store.cpp',
       'unit/server/test_software_licensing_ingestion.cpp',
@@ -2302,7 +2310,9 @@ if build_server
     # it links Catch2 without Catch2Main.
     # cli11_dep: test_server_ota_options.cpp parses real CLI::App argv in-process
     # to pin the OTA flag/env contract (header-only, no link cost).
-    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system')],
+    # minizip_dep (server/core/meson.build): test_software_export_xlsx.cpp and the XLSX cases of
+    # test_software_export_routes.cpp read the finished workbook back through minizip's unzip API.
+    dependencies: [yuzu_server_core_dep, catch2_nomain_dep, cli11_dep, dependency('openssl', required: true, include_type: 'system'), minizip_dep],
   )
   # Sharded 2026-07-13 (#2092 — the split the 2026-07-12 recalibration comment
   # promised): test() entries over the SAME binary, partitioned by Catch2
@@ -3578,9 +3588,24 @@ test('server feature option lint',
   timeout: 300,
 )
 
-test('local test runner platform selftest',
+# Three shards of one selftest (`<index>/<count>` picks every count-th case): it runs the real runner
+# in a fresh set of shells per case, which takes about 19 s on an idle Windows runner and passed the
+# 30 s limit on a loaded one (#8207), the split the CI guard's own warning asks for.
+test('local test runner platform selftest 1 of 3',
   _python3_test,
-  args: [files('test_run_tests_platform.py')],
+  args: [files('test_run_tests_platform.py'), '0/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 2 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '1/3'],
+  suite: 'platform',
+  timeout: 30,
+)
+test('local test runner platform selftest 3 of 3',
+  _python3_test,
+  args: [files('test_run_tests_platform.py'), '2/3'],
   suite: 'platform',
   timeout: 30,
 )
@@ -4753,6 +4778,16 @@ test('same-site gate production wiring lexical selftest',
   timeout: 60,
 )
 
+# WP12: the tags/users/filesystem agent plugins must not call the non-reentrant getpwuid/getpwnam/
+# getgrnam/getgrgid (concurrent dispatch pool). Source-text only; the ONLY plain-build regression
+# check for those call sites (the race itself is caught only by the nightly TSan job).
+test('plugin reentrant libc lookups lexical gate',
+  _python3_test,
+  args: [files('test_plugin_reentrant_libc_lexical.py'), meson.current_source_dir() / '..'],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # A unit-test file marked "Whole file compiled out under TSan" must have nothing after its
 # `#ifndef YUZU_TSAN_BUILD` guard's closing `#endif`: no PR job builds with TSan, so a case added
 # there compiles everywhere except the nightly's TSan leg (#6419). Source-text only, so Python.
@@ -5031,12 +5066,25 @@ test('issue lifecycle docs',
 
 # The old standalone containment agent plugin is removed and nothing names it again (device
 # containment is the firewall plugin's four actions): no tracked file outside the history
-# allowlist names its files, actions, rule or chain prefixes or definition ids.
+# allowlist names its files, actions, rule or chain prefixes or definition ids. The same file runs
+# the Linux firewall helper under every POSIX shell on the host (a few hundred short processes), so
+# its budget is wider than the source-text gates around it.
 test('removed containment plugin lexical gate',
   _python3_test,
   args: [files('test_legacy_quarantine_plugin_removed_lexical.py')],
   suite: 'docs',
   timeout: 120,
+)
+
+# Two quarantine facts no behavioural test can fail on: the apply claim is stamped and tested on the
+# database clock (quarantine_store.cpp never binds a replica clock reading into it), and server.cpp
+# seeds the reconciler's metric families at boot exactly once. Source-text only; carries its own
+# in-memory mutation self-test.
+test('quarantine wiring lexical gate',
+  _python3_test,
+  args: [files('test_quarantine_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
 )
 
 # The Windows package-sources upgrade note states the fresh-deployment contract (routed
