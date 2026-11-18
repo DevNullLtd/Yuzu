@@ -439,9 +439,6 @@ def run(args: argparse.Namespace) -> int:
     rc, last = install_check()
     if rc != 0:
         say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
-        if rc == 6:
-            say("  exit 6 means the sudoers file exists but this user cannot read it, so the grants are "
-                "UNVERIFIED: the sudoers file is root-only (0440, correct); re-run as root; do not change the mode", file=sys.stderr)
         return EXIT_PRECONDITION
     base = args.dashboard.rstrip("/")
     client = Client(base)

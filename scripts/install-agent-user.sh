@@ -33,10 +33,12 @@
 #       place — a syntactically broken sudoers file would brick the
 #       entire sudo subsystem on this host, so we never write to
 #       /etc/sudoers.d/ directly.
-# 5.  (Linux only) Sets file capabilities on the agent binary so plugins
-#       that need raw sockets, ptrace, or ip-route management can do
-#       so without an extra sudo round-trip:
-#         cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace +eip
+# 5.  (Linux only) Sets NO file capability on the agent binary and strips any it finds
+#       (`setcap -r`). A file capability on a 0755 binary is a local privilege escalation:
+#       any local account that runs it receives the capability, and the invoker chooses
+#       the plugin directory the agent loads. Capabilities belong to the service only
+#       (systemd AmbientCapabilities in the packaged unit, `setpriv --ambient-caps` in
+#       scripts/start-UAT.sh --as-user).
 # 6.  Installs two root-owned helper programs (root:root 0755 on Linux, root:wheel 0755 on
 #       macOS), the only programs the sudoers file lets the agent account run as root for
 #       the work that needs more than a fixed command:
@@ -96,9 +98,8 @@
 #   - removes the agent's filesystem hierarchy (logs are preserved
 #     under /var/log/yuzu-agent.removed-<timestamp>/ for forensics)
 #   - deletes the user account
-# Capabilities applied to the agent binary are NOT removed because the
-# binary itself is not owned by this script — uninstall the package to
-# remove the binary, capabilities go with it.
+# The agent binary is not owned by this script, so it is left in place (this script sets
+# no file capability on it); uninstall the package to remove the binary.
 #
 # ARGUMENTS
 # ─────────
@@ -113,29 +114,34 @@
 #                    state dirs.
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
-#   --binary-path P  Override the path to the agent binary for setcap.
+#   --binary-path P  Override the path to the agent binary whose file capabilities
+#                    are stripped.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
-#                    On macOS this is a no-op (no setcap equivalent).
+#                    On macOS this is a no-op (no file capabilities).
 #   --no-sudoers     Skip the sudoers file install and the two helpers it
 #                    names. Useful in test environments where you don't
 #                    want any privilege grants; the agent will still run
 #                    but the firewall containment actions and other
 #                    privileged plugins will fail at dispatch time (which
 #                    the test ladder catches).
-#   --no-setcap      Skip the setcap step on Linux. Useful if you set
-#                    capabilities via a packaging tool (.deb postinst,
-#                    .rpm %post).
+#   --no-cap-cleanup Skip stripping file capabilities from the binary
+#                    (Linux). The script never GRANTS file capabilities;
+#                    this only skips stripping file capabilities from the binary.
 #
 # EXIT CODES
 # ──────────
 #   0  - install/check/uninstall succeeded
 #   1  - install/check/uninstall failed; details on stderr (an install that could not
 #        install a helper also exits 1, after removing the sudoers file)
-#   2  - argument or precondition error (not run as root, unsupported OS)
+#   2  - argument or precondition error (not run as root, unsupported OS, unknown flag)
 #   3  - sudoers file failed visudo validation; it was not installed and the
 #        installer removed any earlier file, so no old grant stays (another
 #        install failure of that file exits with that command's own status)
+#   5  - file capabilities may still be live on the binary (`setcap` missing while the
+#        binary carries them, or `getcap` also missing so that cannot be ruled out;
+#        `setcap -r` failed; or `getcap` still shows them afterwards). Checked after the
+#        helper and sudoers steps, so a helper failure (1) or a sudoers failure (3) wins.
 #
 # THIS SCRIPT MUST BE RUN AS ROOT.
 # We don't try to be cute about that — every action below requires root.
@@ -223,7 +229,7 @@ while [[ $# -gt 0 ]]; do
         --account-name)   ACCOUNT_NAME="$2"; shift 2 ;;
         --binary-path)    BINARY_PATH="$2"; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
-        --no-setcap)      SKIP_SETCAP=1; shift ;;
+        --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
         -h|--help)        usage; exit 0 ;;
         *)                echo "unknown arg: $1" >&2; echo "use --help for usage." >&2; exit 2 ;;
     esac
@@ -1698,39 +1704,61 @@ check_helpers() {
     return "$rc"
 }
 
-# ── linux capabilities ──────────────────────────────────────────────────────
-# Capabilities granted to the agent binary directly. These avoid a
-# sudo round-trip for syscalls the agent makes itself (raw sockets,
-# routing-table writes, ptrace). They do NOT transfer through execve,
-# so plugins that shell out to iptables still need the sudoers entry
-# for the firewall helper above — capabilities cover only the agent's own
-# syscalls, not its child processes.
-#
-# +eip means the capability is in the binary's effective, inheritable,
-# AND permitted sets. eip is the right combination for a daemon
-# binary; +ep alone wouldn't survive setuid (we don't setuid) and +ei
-# alone wouldn't be effective without explicit cap_set_proc().
+# ── linux capabilities: file capabilities are REMOVED, never granted ─────────
+# A file capability such as `cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip`
+# on the agent binary is a hazard. The binary is 0755, so ANY local user who executes it would
+# receive those capabilities, and that user chooses --plugin-dir / YUZU_PLUGIN_DIR, which the
+# agent dlopens: local root. Capabilities belong to the SERVICE only (systemd
+# AmbientCapabilities in the packaged unit; `setpriv --ambient-caps` in
+# scripts/start-UAT.sh --as-user). This script never grants file capabilities. Each run removes
+# any file capability found on the binary at `--binary-path` (idempotent).
 
-apply_setcap() {
+strip_file_capabilities() {
     if [[ "$PLATFORM" != "linux" ]]; then return 0; fi
     if [[ "$SKIP_SETCAP" -eq 1 ]]; then
-        log "skipping setcap (--no-setcap)"
-        return 0
-    fi
-    if ! command -v setcap >/dev/null 2>&1; then
-        warn "setcap not installed — skipping (apt: libcap2-bin, dnf: libcap)"
+        log "skipping file-capability cleanup (--no-cap-cleanup)"
+        # Loud, on stderr: this flag can leave an exploitable file capability on a binary that
+        # any local user can execute, and the install still exits 0.
+        if [[ -f "$BINARY_PATH" ]] && command -v getcap >/dev/null 2>&1; then
+            local live
+            live=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+            if [[ -n "$live" ]]; then
+                warn "--no-cap-cleanup: file capabilities are STILL LIVE on $BINARY_PATH: $live"
+                warn "  any local user can run that binary with them; remove with: setcap -r $BINARY_PATH"
+            fi
+        fi
         return 0
     fi
     if [[ ! -f "$BINARY_PATH" ]]; then
-        warn "agent binary not found at $BINARY_PATH — skipping setcap"
-        warn "  re-run with --binary-path PATH after the agent is installed,"
-        warn "  or set capabilities from your packaging tool (postinst hook)."
+        log "agent binary not found at $BINARY_PATH - no file capabilities to strip"
         return 0
     fi
-
-    log "applying capabilities to $BINARY_PATH"
-    log "  cap_net_admin, cap_net_raw, cap_dac_read_search, cap_sys_ptrace +eip"
-    run setcap "cap_net_admin,cap_net_raw,cap_dac_read_search,cap_sys_ptrace+eip" "$BINARY_PATH"
+    local have_getcap=0 caps=""
+    if command -v getcap >/dev/null 2>&1; then
+        have_getcap=1
+        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+        if [[ -z "$caps" ]]; then
+            log "no file capabilities on $BINARY_PATH (good)"
+            return 0
+        fi
+        log "stripping file capabilities from $BINARY_PATH: $caps"
+    fi
+    if ! command -v setcap >/dev/null 2>&1; then
+        # FAIL (exit 5), never "skip": with the capability possibly still live the install is NOT
+        # safe, and the caller must not report success.
+        warn "setcap not installed - cannot strip file capabilities from $BINARY_PATH"
+        warn "  remove them by hand: setcap -r $BINARY_PATH   (apt: libcap2-bin, dnf: libcap)"
+        return 5
+    fi
+    run setcap -r "$BINARY_PATH" || { warn "setcap -r $BINARY_PATH failed"; return 5; }
+    if [[ "$DRY_RUN" -eq 0 && "$have_getcap" -eq 1 ]]; then
+        caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
+        if [[ -n "$caps" ]]; then
+            warn "file capabilities STILL present on $BINARY_PATH after setcap -r: $caps"
+            return 5
+        fi
+    fi
+    return 0
 }
 
 # ── verification ────────────────────────────────────────────────────────────
@@ -1799,16 +1827,21 @@ check_install() {
         check_helpers || ((errs++))
     fi
 
-    # 5. capabilities (Linux only)
-    if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 0 && -f "$BINARY_PATH" ]]; then
+    # 5. file capabilities (Linux only): their PRESENCE is drift (this installer strips them);
+    # a missing getcap means that cannot be verified, which is also drift.
+    if [[ "$PLATFORM" == "linux" && "$SKIP_SETCAP" -eq 1 ]]; then
+        log "file-capability check skipped (--no-cap-cleanup): a pass does not prove the binary carries none"
+    elif [[ "$PLATFORM" == "linux" && -f "$BINARY_PATH" ]]; then
         if command -v getcap >/dev/null 2>&1; then
             local caps
             caps=$(getcap "$BINARY_PATH" 2>/dev/null || true)
-            if [[ -z "$caps" ]]; then
-                warn "no capabilities set on $BINARY_PATH"; ((errs++))
-            else
-                log "capabilities on $BINARY_PATH: $caps"
+            if [[ -n "$caps" ]]; then
+                warn "file capabilities present on $BINARY_PATH: $caps (re-run this installer to strip them)"
+                ((errs++))
             fi
+        else
+            warn "getcap not installed: cannot verify that $BINARY_PATH carries no file capability"
+            ((errs++))
         fi
     fi
 
@@ -1854,7 +1887,8 @@ case "$ACTION" in
             helper_rc=1
             remove_sudoers
         fi
-        apply_setcap
+        cap_rc=0
+        strip_file_capabilities || cap_rc=$?
         if [[ "$helper_rc" -ne 0 ]]; then
             if [[ -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
@@ -1868,6 +1902,10 @@ case "$ACTION" in
                 warn "$SUDOERS_FILE could not be removed: remove it by hand"
             fi
             exit "$sudoers_rc"
+        fi
+        if [[ "$cap_rc" -ne 0 ]]; then
+            warn "install INCOMPLETE: file capabilities may still be present on $BINARY_PATH (exit $cap_rc)"
+            exit "$cap_rc"
         fi
         log "install complete. Verify with: $0 --check"
         ;;
