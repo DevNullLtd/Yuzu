@@ -39,6 +39,8 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source=../lib/agent-session-fp.sh
+. "$REPO_ROOT/scripts/lib/agent-session-fp.sh"
 COMPOSE_BASE="$REPO_ROOT/deploy/docker/docker-compose.ha-gateway-failover.yml"
 COMPOSE_OVERLAY="$REPO_ROOT/deploy/docker/docker-compose.ha-gateway-two-replica.yml"
 CLIENT="$HERE/ha-two-replica-probe-client.py"
@@ -302,10 +304,8 @@ agent_map() { # container,agent id,session per agent (session via the route tabl
         fp="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
         sess=""
         if [ -n "$fp" ]; then
-            # The agent log carries only session_fp= (#8159): the first 8 hex of SHA-256(session id).
-            # Join it to the id in the route table, the same key the rest of this script uses.
-            sess="$(psql_q "SELECT session_id FROM gateway_route_store.agent_routes WHERE encode(sha256(convert_to(session_id,'UTF8')),'hex') LIKE '$fp%' LIMIT 1")" \
-                || echo "agent_map: psql failed resolving the session for $name (route table unreadable)" >&2
+            # Exactly one route row or the whole map fails (shared with the tests, scripts/lib).
+            sess="$(route_session_for_fp "$fp")" || { echo "agent_map: cannot resolve the session for $name" >&2; return 1; }
         else
             echo "agent_map: no session_fp on the Registered line of $name; cannot resolve its session" >&2
             return 1

@@ -160,6 +160,47 @@ def main():
         r = bash("printf %s x | _sha256_hex8", env=env)
         if r.returncode == 0 or "cannot join" not in r.stderr:
             bad.append(f"no-hash-tool must fail loudly: rc={r.returncode} err={r.stderr!r}")
+        # last-occurrence recency (kills "awk '!seen[$0]++'" first-occurrence): the target registered
+        # first and AGAIN last, with 250 other distinct sessions between; a first-occurrence filter
+        # leaves it outside the 200-candidate window
+        rec = d / "server-recent.log"
+        with open(rec, "w") as f:
+            f.write(f"ProxyRegister succeeded: agent=t, session={SID}\n")
+            for n in range(250):
+                f.write(f"ProxyRegister succeeded: agent=o{n}, session=gw-session-mid-{n:04d}\n")
+            f.write(f"ProxyRegister succeeded: agent=t, session={SID}\n")
+        r = bash(f"resolve_agent_session '{(d/'agent-lf.log').as_posix()}' '{rec.as_posix()}'")
+        if r.stdout.strip() != SID:
+            bad.append(f"a session that re-registered recently must stay in the recent window: {r.stdout!r}")
+        # the HA scripts' route-table join (route_session_for_fp): exactly ONE non-empty row, else rc 1
+        # with a message and NO stdout (zero rows, many rows, a failed query, a bad fingerprint)
+        cases = [
+            ("one", "psql_q() { printf '%s\\n' '" + SID + "'; }", 0, SID),
+            ("one-crlf", "psql_q() { printf '%s\\r\\n' '" + SID + "'; }", 0, SID),
+            ("zero", "psql_q() { :; }", 1, ""),
+            ("blank", "psql_q() { printf '\\n  \\n'; }", 1, ""),
+            ("many", "psql_q() { printf '%s\\n%s\\n' a b; }", 1, ""),
+            ("failed", "psql_q() { return 2; }", 1, ""),
+            ("failed-with-rows", "psql_q() { printf '%s\\n' x; return 2; }", 1, ""),
+        ]
+        for name, stub, rc, want in cases:
+            r = bash(f"{stub}; route_session_for_fp '{FP}'")
+            if r.returncode != rc or r.stdout.strip() != want or (rc and not r.stderr.strip()):
+                bad.append(f"route_session_for_fp {name}: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
+        r = bash("psql_q() { printf '%s' \"$1\" >&2; return 2; }; route_session_for_fp '" + FP + "'")
+        if "LIMIT" in r.stderr.upper() or "LIKE '" + FP + "%'" not in r.stderr:
+            bad.append(f"the route query must not LIMIT (a collision must reach the count check): {r.stderr!r}")
+        r = bash("psql_q() { echo x; }; route_session_for_fp \"ab'; DROP\"")
+        if r.returncode != 1 or r.stdout.strip():
+            bad.append(f"route_session_for_fp must refuse a non-8-hex fingerprint: rc={r.returncode} out={r.stdout!r}")
+        # both HA scripts must resolve through it (no raw LIKE ... LIMIT 1, no '|| echo' success)
+        for name in ("ha-gateway-failover-spike.sh", "ha-gateway-two-replica-probe.sh"):
+            txt = (ROOT / "scripts/ha" / name).read_text()
+            if ("route_session_for_fp" not in txt or "agent-session-fp.sh" not in txt
+                    or "LIKE '$fp%' LIMIT 1" in txt):
+                bad.append(f"{name} must resolve sessions through route_session_for_fp")
+            if '|| { echo "agent_map: cannot resolve the session' not in txt or "return 1; }" not in txt:
+                bad.append(f"{name}: a failed lookup must return 1")
     for b in bad:
         print("FAIL:", b)
     if bad:
