@@ -760,29 +760,10 @@ grpc::Status GatewayUpstreamServiceImpl::ProxyRegister(grpc::ServerContext* cont
                 .token_presented = !request->enrollment_token().empty(),
                 .transport_can_prove = attests},
             metrics_,
-            [&](std::string_view action, std::string_view result, std::string_view outcome,
-                std::string_view mode) {
-                if (!audit_store_ || !audit_store_->is_open())
-                    return;
-                AuditEvent ev;
-                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                   std::chrono::system_clock::now().time_since_epoch())
-                                   .count();
-                ev.principal = "agent:" + info.agent_id();
-                ev.principal_role = "agent";
-                ev.action = std::string(action);
-                ev.target_type = "Agent";
-                ev.target_id = info.agent_id();
-                std::string detail = std::string("path=gateway_proxy outcome=")
-                                         .append(outcome)
-                                         .append(" mode=")
-                                         .append(mode);
-                append_origin_detail(detail); // #1064: gateway_ip + origin_observed
-                ev.detail = std::move(detail);
-                ev.source_ip = agent_source_ip; // #1064: agent origin, not gateway IP
-                ev.result = std::string(result);
-                (void)audit_store_->log(ev);
-            });
+            yuzu::server::make_reregistration_audit_sink(
+                audit_store_, "gateway_proxy", info.agent_id(), agent_source_ip,
+                [&](std::string& d) { append_origin_detail(d); /* #1064 */ },
+                [&] { signal_grpc_audit_failed(context); }, metrics_));
     };
 
     // Fast path: agent already enrolled from a prior connection

@@ -2486,3 +2486,45 @@ TEST_CASE("CaStore: a leaf revoked as 'reenrolled' counts in the superseded buck
     CHECK(count(CaRevokeBucket::kOther) == 1);      // only the genuine, operator-typed revocation
     CHECK(count(CaRevokeBucket::kUnpublished) == 0);
 }
+
+TEST_CASE("CaStore::revoke_older_agent_leaves converges to ONE live leaf under real concurrency, "
+          "including a same-second issued_at tie, and db_now is the database clock",
+          "[ca_store][pg][wp01][agent_leaf_state]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, ca_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    CaStore store{pool};
+    REQUIRE(store.is_open());
+
+    auto dbnow = store.db_now();
+    REQUIRE(dbnow.has_value());
+    CHECK(std::llabs(*dbnow - now_s()) < 60);
+
+    const auto future = now_s() + 30 * 86400;
+    const auto stamp = now_s() - 100;
+    for (int round = 0; round < 12; ++round) {
+        const std::string agent = "race-" + std::to_string(round);
+        const std::string a = "A" + std::to_string(round) + "0", b = "A" + std::to_string(round) + "1",
+                          c = "A" + std::to_string(round) + "2";
+        // Three leaves with the SAME issued_at second: the old order had no winner here, so both
+        // sessions' statements could keep their own leaf.
+        for (const auto& serial : {a, b, c})
+            REQUIRE(store.record_issued(agent_leaf_at(serial, agent, future, stamp)).has_value());
+        std::vector<std::string> r1, r2;
+        std::thread t1([&] {
+            auto r = store.revoke_older_agent_leaves(agent, b);
+            if (r)
+                r1 = *r;
+        });
+        std::thread t2([&] {
+            auto r = store.revoke_older_agent_leaves(agent, c);
+            if (r)
+                r2 = *r;
+        });
+        t1.join();
+        t2.join();
+        auto live = store.live_agent_serials(agent);
+        REQUIRE(live.has_value());
+        INFO("round " << round);
+        CHECK(live->size() == 1); // never zero, never two
+    }
+}

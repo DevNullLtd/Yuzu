@@ -29,6 +29,7 @@
 
 #include "delivery_pool_metrics.hpp"
 #include "agent_service_impl.hpp"
+#include "agent_reregistration_apply.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -5130,4 +5131,46 @@ TEST_CASE("WP01 CH-7a: a live leaf beside an operator-revoked one refuses BEFORE
     for (const auto& t : *toks)
         CHECK(t.use_count == 0); // the single-use token is still spendable once an operator clears it
     CHECK(signed_count == 0);
+}
+
+TEST_CASE("WP01: the gateway path writes its own audit row (result, path, source address) and the "
+          "shared sink tolerates a closed audit store",
+          "[pg][agent_service][register][gateway][wp01][reregistration]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    GatewayResponseHarness h(pool);
+    wp01::GatewayUpstreamServiceImpl gw{h.registry, h.bus, h.auth_mgr, h.auto_approve, &h.metrics};
+    gw.set_audit_store(h.audit.get());
+    wp01::HookProbe probe;
+    auto hooks = wp01::make_hooks(probe);
+    gw.set_agent_identity_hooks(hooks);
+    gw.set_reregistration_proof_mode(wp01::ReregistrationProofMode::Enforce);
+    wp01::enroll(h, "gw-audit-1");
+
+    auto req = wp01::request("gw-audit-1");
+    req.set_gateway_attests_peer_cert(true);
+    req.set_gateway_observed_peer("203.0.113.9");
+    apb::RegisterResponse resp;
+    CHECK(gw.ProxyRegister(nullptr, &req, &resp).error_code() == grpc::StatusCode::UNAUTHENTICATED);
+
+    auto rows = h.audit->query({});
+    REQUIRE(rows.has_value());
+    bool found = false;
+    for (const auto& ev : *rows) {
+        if (ev.action != "agent.reregistration_refused" || ev.target_id != "gw-audit-1")
+            continue;
+        found = true;
+        CHECK(ev.result == "denied");
+        CHECK(ev.principal == "agent:gw-audit-1");
+        CHECK(ev.source_ip == "203.0.113.9"); // the agent's origin, not the gateway's address
+        CHECK(ev.detail.find("path=gateway_proxy") != std::string::npos);
+        CHECK(ev.detail.find("outcome=no_proof") != std::string::npos);
+        CHECK(ev.detail.find("mode=enforce") != std::string::npos);
+    }
+    CHECK(found); // dropping the gateway audit sink goes RED here
+
+    // A sink over a null store is a no-op, not a crash.
+    const auto sink = yuzu::server::make_reregistration_audit_sink(
+        nullptr, "direct", "x", "1.2.3.4", nullptr, nullptr, &h.metrics);
+    sink("agent.reregistration_refused", "denied", "no_proof", "enforce", {});
 }

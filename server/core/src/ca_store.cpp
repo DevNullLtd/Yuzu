@@ -1388,26 +1388,68 @@ CaStore::revoke_older_agent_leaves(const std::string& agent_id, const std::strin
     auto lease = pool_.try_acquire_for(kWriteTimeout);
     if (!lease)
         return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE ca_store.ca_issued o SET status = 'revoked', revocation_reason = $3, "
-        "revoked_at = $4::bigint FROM ca_store.ca_issued n "
-        "WHERE n.serial_hex = $2 AND n.purpose = 'agent' AND n.subject = $1 "
-        "AND o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
-        "AND o.not_after > extract(epoch FROM now())::bigint "
-        "AND (o.issued_at, o.serial_hex) < (n.issued_at, n.serial_hex) "
-        "RETURNING o.serial_hex",
-        std::vector<std::string>{sanitize_pg_text(agent_id), *keep,
-                                 std::string(kRevokeReasonReenrolled),
-                                 std::to_string(now_epoch())});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(std::string(kCaDbErrorPrefix) +
-                               "revoke_older_agent_leaves failed: " + PQerrorMessage(lease.get()));
     std::vector<std::string> out;
-    const int n = PQntuples(res.get());
-    for (int i = 0; i < n; ++i)
-        out.push_back(text_col(res.get(), i, 0));
+    std::string failure;
+    // ONE transaction under a per-agent advisory lock (ADR-0012): the lock is taken BEFORE the
+    // UPDATE's snapshot, so two concurrent re-enrolments of one id run strictly one after the
+    // other, and the second sees the first's committed leaf. The statement keeps exactly the
+    // NEWEST active unexpired agent leaf by (issued_at, serial_hex) and revokes every other one:
+    // it converges to one live leaf even on a same-second issued_at tie, and it can never leave
+    // the id with zero live leaves (the newest is always kept). `issued_at` is stamped from the
+    // DATABASE clock at issuance (sign_agent_csr uses db_now()), so a lagging replica clock cannot
+    // make its newer leaf look older.
+    const bool ok = pool_.with_txn_on(std::move(lease), [&](PGconn* conn) -> bool {
+        pg::PgResult lock = pg::exec_params(
+            conn, "SELECT pg_advisory_xact_lock(hashtextextended('ca_agent_leaf:' || $1, 0))",
+            std::vector<std::string>{sanitize_pg_text(agent_id)});
+        if (lock.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        pg::PgResult res = pg::exec_params(
+            conn,
+            "UPDATE ca_store.ca_issued o SET status = 'revoked', revocation_reason = $3, "
+            "revoked_at = $4::bigint "
+            "WHERE o.purpose = 'agent' AND o.subject = $1 AND o.status = 'active' "
+            "AND o.not_after > extract(epoch FROM now())::bigint "
+            "AND EXISTS (SELECT 1 FROM ca_store.ca_issued k WHERE k.serial_hex = $2 "
+            "           AND k.purpose = 'agent' AND k.subject = $1) "
+            "AND o.serial_hex <> (SELECT n.serial_hex FROM ca_store.ca_issued n "
+            "                     WHERE n.purpose = 'agent' AND n.subject = $1 "
+            "                     AND n.status = 'active' "
+            "                     AND n.not_after > extract(epoch FROM now())::bigint "
+            "                     ORDER BY n.issued_at DESC, n.serial_hex DESC LIMIT 1) "
+            "RETURNING o.serial_hex",
+            std::vector<std::string>{sanitize_pg_text(agent_id), *keep,
+                                     std::string(kRevokeReasonReenrolled),
+                                     std::to_string(now_epoch())});
+        if (res.status() != PGRES_TUPLES_OK) {
+            failure = PQerrorMessage(conn);
+            return false;
+        }
+        const int n = PQntuples(res.get());
+        for (int i = 0; i < n; ++i)
+            out.push_back(text_col(res.get(), i, 0));
+        return true;
+    });
+    if (!ok)
+        return std::unexpected(std::string(kCaDbErrorPrefix) +
+                               "revoke_older_agent_leaves failed: " + failure);
     return out;
+}
+
+std::expected<std::int64_t, std::string> CaStore::db_now() {
+    if (!open_)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database not open");
+    auto lease = pool_.try_acquire_for(kReadTimeout);
+    if (!lease)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "database unavailable — try again");
+    pg::PgResult res = pg::exec_params(lease.get(),
+                                       "SELECT floor(extract(epoch FROM now()))::bigint",
+                                       std::vector<std::string>{});
+    if (res.status() != PGRES_TUPLES_OK || PQntuples(res.get()) != 1)
+        return std::unexpected(std::string(kCaDbErrorPrefix) + "db_now failed");
+    return static_cast<std::int64_t>(std::strtoll(text_col(res.get(), 0, 0).c_str(), nullptr, 10));
 }
 
 bool CaStore::delete_issued_by(const std::string& issued_by) {

@@ -42,10 +42,10 @@ TEST_CASE("reregistration gate: a live leaf needs the current leaf or a token",
     CHECK(decide(kLive, true, true) == ReregistrationOutcome::ProvenByLeaf); // the leaf wins
     CHECK(decide(kLive, false, true) == ReregistrationOutcome::ViaToken);
     CHECK(decide(kLive, false, false) == ReregistrationOutcome::RefuseNoProof);
-    // A gateway that could not witness: refusal is distinguished (the fix is to upgrade it),
-    // but a token is independent proof and still works.
+    // A listener that cannot witness is reported as such BEFORE the token is looked at, so a stale
+    // token cannot disguise it as the healthy `via_token` outcome.
     CHECK(decide(kLive, false, false, /*can_prove=*/false) == ReregistrationOutcome::RefuseUnattested);
-    CHECK(decide(kLive, false, true, /*can_prove=*/false) == ReregistrationOutcome::ViaToken);
+    CHECK(decide(kLive, false, true, /*can_prove=*/false) == ReregistrationOutcome::RefuseUnattested);
     // A live leaf beside an operator-revoked one (UP-5 / CH-7a): sign_agent_csr's HIGH-2 guard
     // would refuse the issuance, so a token must NOT be consumed for it: refuse BEFORE the token
     // block, token or not. Only the current leaf proves it.
@@ -105,29 +105,69 @@ TEST_CASE("reregistration refusal message does not name the reason", "[reregistr
         CHECK(m.find(leak) == std::string::npos);
 }
 
-TEST_CASE("reregistration audit budget: refusal rows are bounded, the admitted audit-mode row never is",
+TEST_CASE("reregistration audit budget: a legitimate first admit always leaves a row, a flood on one "
+          "id is cut to the per-id budget with ONE aggregate row per closed window, refusals are bounded",
           "[reregistration_gate][wp01]") {
     const std::expected<AgentLeafState, std::string> live{AgentLeafState{.has_live = true}};
     AgentIdentityHooks hooks;
     hooks.leaf_state = [&](const std::string&) { return live; };
-    int refusal_rows = 0, unproven_rows = 0;
-    const ReregistrationAuditSink sink = [&](std::string_view action, std::string_view, std::string_view,
-                                             std::string_view) {
-        (action == kAuditActionReregistrationUnproven ? unproven_rows : refusal_rows)++;
+    int refusal_rows = 0, unproven_rows = 0, aggregate_rows = 0;
+    std::string aggregate_extra;
+    const ReregistrationAuditSink sink = [&](std::string_view action, std::string_view,
+                                             std::string_view outcome, std::string_view,
+                                             std::string_view extra) {
+        if (outcome == "aggregate") {
+            ++aggregate_rows;
+            aggregate_extra = std::string(extra);
+        } else if (action == kAuditActionReregistrationUnproven) {
+            ++unproven_rows;
+        } else {
+            ++refusal_rows;
+        }
     };
+    yuzu::MetricsRegistry metrics;
     const ReregistrationEvidence ev{};
-    // audit mode: 200 admitted unproven re-registrations spread over 200 distinct ids (more keys than
-    // the budget tracks): EVERY one leaves a row.
-    for (int i = 0; i < 200; ++i) {
-        const std::string id = "audit-id-" + std::to_string(i);
+    auto audit_attempt = [&](const std::string& id) {
         (void)apply_reregistration_gate(ReregistrationProofMode::Audit, &hooks, "direct", id, id, ev,
-                                        nullptr, sink);
-    }
+                                        &metrics, sink);
+    };
+    // Start from a fresh window regardless of what earlier cases in this process did.
+    detail::reregistration_audit_clock_skew_ms() += 1'000'000;
+    audit_attempt("window-reset");
+    unproven_rows = aggregate_rows = 0;
+
+    // 200 DISTINCT ids, one admitted attempt each (more ids than the old 64-key table): EVERY one
+    // leaves its row.
+    for (int i = 0; i < 200; ++i)
+        audit_attempt("audit-id-" + std::to_string(i));
     CHECK(unproven_rows == 200);
-    // enforce: a flood on ONE id is bounded (rows <= the per-key budget), still refused each time.
+
+    // An attacker looping on ONE known id: cut to the per-id budget (3), the rest dropped+counted.
+    unproven_rows = 0;
+    for (int i = 0; i < 100; ++i)
+        audit_attempt("victim-loop");
+    CHECK(unproven_rows == 3);
+    CHECK(metrics.counter("yuzu_register_reregistration_audit_dropped_total",
+                          {{"action", std::string(kAuditActionReregistrationUnproven)}})
+              .value() == 97.0);
+    // The decision counter is NOT sampled.
+    CHECK(metrics.counter("yuzu_register_reregistration_total",
+                          {{"path", "direct"}, {"outcome", "no_proof"}, {"mode", "audit"}})
+              .value() == 301.0); // 1 window-reset + 200 distinct + 100 loop
+
+    // The window reopens: the next admit gets its row again AND the closed window's suppressed
+    // total is written once, as one aggregate row.
+    detail::reregistration_audit_clock_skew_ms() += 11'000;
+    aggregate_rows = 0;
+    audit_attempt("victim-loop");
+    CHECK(unproven_rows == 4); // 3 + the reopened window's first row
+    CHECK(aggregate_rows == 1);
+    CHECK(aggregate_extra == "suppressed=97");
+
+    // enforce: a flood on ONE id is bounded to the refusal budget, still refused each time.
     for (int i = 0; i < 100; ++i) {
         const auto v = apply_reregistration_gate(ReregistrationProofMode::Enforce, &hooks, "direct",
-                                                 "flood-id", "flood-id", ev, nullptr, sink);
+                                                 "flood-id", "flood-id", ev, &metrics, sink);
         CHECK(v.route == ReregistrationVerdict::Route::Refuse);
     }
     CHECK(refusal_rows > 0);

@@ -428,15 +428,21 @@ public:
     [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     live_agent_serials(const std::string& agent_id);
 
-    /// WP01 (D4 / UP-1): in ONE statement, revoke (reason `kRevokeReasonReenrolled`) every ACTIVE,
-    /// unexpired agent leaf of `agent_id` that is OLDER than `keep_serial` (ordered by
-    /// `(issued_at, serial_hex)`, a total order), and nothing else. Two concurrent re-enrolments of
+    /// WP01 (D4 / UP-1): in ONE transaction under a per-agent advisory lock, revoke (reason
+    /// `kRevokeReasonReenrolled`) every ACTIVE, unexpired agent leaf of `agent_id` except the
+    /// NEWEST one (ordered by `(issued_at, serial_hex)`, a total order), provided `keep_serial` is
+    /// one of the agent's own leaves (otherwise nothing is revoked). Two concurrent re-enrolments of
     /// one id each call this with their own fresh serial; the ordering makes them converge on the
     /// newest leaf instead of cross-revoking each other's (which left the id with NO live leaf, so
     /// a certificate-less Register would be admitted). Returns the revoked serials;
     /// `unexpected(msg)` is a genuine write failure (nothing was revoked: it is one statement).
     [[nodiscard]] std::expected<std::vector<std::string>, std::string>
     revoke_older_agent_leaves(const std::string& agent_id, const std::string& keep_serial);
+
+    /// The database clock in epoch seconds. Leaf `issued_at` is stamped from it (never from a
+    /// replica's `system_clock`), so the newest-leaf order `revoke_older_agent_leaves` uses is one
+    /// clock's order. `unexpected(msg)` is a genuine read failure.
+    [[nodiscard]] std::expected<std::int64_t, std::string> db_now();
 
     /// `nullopt` = a successful read finding no such serial (or a non-hex serial — there is no
     /// such cert). `unexpected(msg)` (prefixed `kCaDbErrorPrefix`) is a genuine read failure.

@@ -80,7 +80,7 @@ struct ReregistrationEvidence {
     bool cert_proves_identity{false};
     /// The request carries a non-empty enrollment token (validity is decided by the token block).
     bool token_presented{false};
-    /// Gateway path only: an upgraded gateway ran the witness overwrite for this request
+    /// Gateway path only: the gateway's listener can witness client certificates for this request
     /// (`gateway_attests_peer_cert`). Always true on the direct path, where the server sees the
     /// transport itself.
     bool transport_can_prove{true};
@@ -91,7 +91,7 @@ enum class ReregistrationOutcome {
     ProvenByLeaf,          ///< The current leaf was shown (admit).
     ViaToken,              ///< No cert proof, a token was presented: route to the token block.
     RefuseNoProof,         ///< Live leaf, no cert proof, no token.
-    RefuseUnattested,      ///< As above, and the gateway could not witness (not upgraded).
+    RefuseUnattested,      ///< As above, and the gateway could not witness (its listener cannot witness).
     RefuseRevokedIdentity, ///< Revoked unexpired identity, nothing live: refused, token or not.
     LookupFailed,          ///< ca_store could not answer: cannot tell, never "no leaf".
 };
@@ -134,10 +134,14 @@ decide_reregistration(const std::expected<AgentLeafState, std::string>& leaf,
     if (leaf->has_live) {
         if (ev.cert_proves_identity)
             return ReregistrationOutcome::ProvenByLeaf;
+        // A listener that cannot witness is reported FIRST: a stale or irrelevant token must not
+        // turn the operator-visible answer into `via_token` (which the audit-mode soak query
+        // treats as healthy) when the real fault is the listener.
+        if (!ev.transport_can_prove)
+            return ReregistrationOutcome::RefuseUnattested;
         if (ev.token_presented)
             return ReregistrationOutcome::ViaToken;
-        return ev.transport_can_prove ? ReregistrationOutcome::RefuseNoProof
-                                      : ReregistrationOutcome::RefuseUnattested;
+        return ReregistrationOutcome::RefuseNoProof;
     }
     if (leaf->has_revoked_unexpired)
         return ReregistrationOutcome::RefuseRevokedIdentity;

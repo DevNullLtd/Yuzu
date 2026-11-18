@@ -3700,8 +3700,20 @@ public:
                                    "expired", "revoked", "already_consumed"})
             (void)metrics_.counter("yuzu_register_reenrol_token_refused_total",
                                    {{"reason", reason}});
+        for (const char* action : {"agent.reregistration_unproven", "agent.reregistration_refused"})
+            (void)metrics_.counter("yuzu_register_reregistration_audit_dropped_total",
+                                   {{"action", action}});
+        (void)metrics_.counter("yuzu_register_reregistration_audit_write_failures_total");
         (void)metrics_.counter("yuzu_server_ca_superseded_leaf_total");
         (void)metrics_.counter("yuzu_server_ca_supersede_failed_total");
+        metrics_.describe("yuzu_register_reregistration_audit_dropped_total",
+                          "Re-registration audit rows NOT written because the per-id audit budget "
+                          "was spent (a flood on one id). The decision counter still counts every "
+                          "attempt; one aggregate row (suppressed=N) is written per closed window.",
+                          "counter");
+        metrics_.describe("yuzu_register_reregistration_audit_write_failures_total",
+                          "Re-registration audit rows whose write FAILED (audit store error).",
+                          "counter");
         metrics_.describe("yuzu_server_agent_reregistration_proof_mode",
                           "Active --agent-reregistration-proof mode of THIS server process "
                           "(1 for the active mode, 0 for the others). The flag is per process: "
@@ -9821,8 +9833,9 @@ public:
                         // Audit/off do NOT close the takeover: say so at every boot.
                         spdlog::warn("PKI: agent re-registration proof mode = {} - a certificate-"
                                      "less caller that knows an enrolled agent id can STILL "
-                                     "re-register it and be issued a certificate. Upgrade every "
-                                     "gateway, watch yuzu_register_reregistration_total, then set "
+                                     "re-register it and be issued a certificate. Set "
+                                     "witness_client_cert on every gateway's agent listener, watch "
+                                     "yuzu_register_reregistration_total, then set "
                                      "--agent-reregistration-proof=enforce",
                                      to_string(proof_mode));
                     }
@@ -13421,6 +13434,17 @@ private:
         rec.purpose = "agent";
         rec.not_after =
             std::chrono::duration_cast<std::chrono::seconds>(not_after.time_since_epoch()).count();
+        // WP01 (UP-1 / D): `issued_at` orders an agent's leaves for the newest-leaf supersede, so it
+        // is stamped from the DATABASE clock (one clock for every replica), never this replica's
+        // system_clock: a lagging replica's newer leaf must not look older and get revoked.
+        // Fail closed: an unreadable database clock means no issuance (the agent retries).
+        if (auto db_now = ca_store_->db_now(); db_now) {
+            rec.issued_at = *db_now;
+        } else {
+            spdlog::error("PKI: cannot read the database clock - agent cert not issued: {}",
+                          ::yuzu::log_key_token(db_now.error()));
+            return std::nullopt;
+        }
         rec.cert_pem = issued->cert_pem;
         rec.issued_by = "agent:" + agent_id;
         rec.enrollment_request_id = agent_id;

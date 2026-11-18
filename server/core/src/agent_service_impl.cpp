@@ -396,29 +396,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                 .token_presented = !request->enrollment_token().empty(),
                 .transport_can_prove = true},
             &metrics_,
-            [&](std::string_view action, std::string_view result, std::string_view outcome,
-                std::string_view mode) {
-                // The decision's audit row (bounded by the apply helper). Same actor shape as the
-                // enrollment rows above; a dropped row surfaces on the wire like theirs.
-                if (!audit_store_ || !audit_store_->is_open())
-                    return;
-                AuditEvent ev;
-                ev.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
-                                   std::chrono::system_clock::now().time_since_epoch())
-                                   .count();
-                ev.principal = "agent:" + info.agent_id();
-                ev.principal_role = "agent";
-                ev.action = std::string(action);
-                ev.target_type = "Agent";
-                ev.target_id = info.agent_id();
-                ev.detail = std::string("path=direct outcome=").append(outcome).append(" mode=")
-                                .append(mode);
-                if (context)
-                    ev.source_ip = extract_peer_ip(context->peer());
-                ev.result = std::string(result);
-                if (!audit_store_->log(ev))
-                    signal_grpc_audit_failed(context);
-            });
+            yuzu::server::make_reregistration_audit_sink(
+                audit_store_, "direct", info.agent_id(),
+                context ? extract_peer_ip(context->peer()) : std::string{}, nullptr,
+                [&] { signal_grpc_audit_failed(context); }, &metrics_));
     };
 
     // Fast path: agent already enrolled from a prior connection — skip enrollment
@@ -715,8 +696,9 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             if (reenrol_via_token) {
                 // WP01 / owner decision D5: a MULTI-USE (fleet) token is not proof of an existing
                 // identity - it is shared by every holder - so only a single-use token (max_uses ==
-                // 1) re-enrols an id that already holds a live leaf. The store counted the use
-                // before we could tell; the refusal does not pretend otherwise.
+                // 1) re-enrols an id that already holds a live leaf. That is decided INSIDE the
+                // consume UPDATE (require_single_use), so a multi-use token is never consumed and
+                // never reaches here; this is a defence-in-depth backstop only.
                 if (claim.max_uses != 1)
                     return reenrol_token_refusal("multi_use_token");
                 reenrolled_with_token = true;
