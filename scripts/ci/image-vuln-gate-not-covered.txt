@@ -1,0 +1,25 @@
+# Images NOT covered by OS package vulnerability scanning (WP15/S9).
+#
+# scripts/ci/image-vuln-gate.sh fails an image whose OS package scan finds no
+# package at all: a scan that saw nothing is not a clean scan. An image listed
+# here passes that check anyway, and the gate prints NOT COVERED with the reason
+# for it on every run (and records it in the report). Listing an image is a
+# reviewed decision that its OS packages ship UNSCANNED; it is not an acceptance
+# of any vulnerability in them.
+#
+# Format: `<image name>: <reason>`, one per line. The name is the published
+# repository name without the registry (yuzu-server-chisel), as release.yml
+# passes it (`NAME=sha256:...`) and as pre-release.yml's tags end in it.
+# Remove a line as soon as the scanner sees the image's packages; the gate
+# warns when a listed image does have OS packages.
+#
+# Why these four: they are assembled FROM scratch from Ubuntu package slices cut
+# with Canonical's chisel. A chiselled root has no dpkg status database, and
+# these images do not cut the base-files_chisel slice that would write a chisel
+# manifest, so Trivy 0.70.0 detects Ubuntu 26.04 but reports "No OS package is
+# detected" (0 packages, checked 2026-11-18 on the v0.15.0 server and gateway
+# chisel images). What ships unscanned is each Dockerfile's SLICES list.
+yuzu-server-chisel: chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libssl3t64, libpq5 (and its krb5/ldap dependencies), zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.server.chisel SLICES)
+yuzu-gateway-chisel: chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libncursesw6, libtinfo6, libssl3t64, zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.gateway.chisel SLICES); the bundled Erlang/OTP runtime is not identified by Trivy either
+yuzu-agent-chisel: chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 slices of libc6, libgcc-s1, libstdc++6, libssl3t64, libsqlite3-0, libsystemd0, libblkid1, zlib1g, openssl config, ca-certificates, netbase, busybox-static (deploy/docker/Dockerfile.agent.chisel SLICES)
+yuzu-agent-bundle-chisel: chiselled FROM scratch, no dpkg database or chisel manifest; ships unscanned Ubuntu 26.04 base-files, base-passwd and busybox-static slices plus the agent release archives it delivers (deploy/docker/Dockerfile.agent-bundle.chisel SLICES); the archives' own SBOMs are release assets

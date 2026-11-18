@@ -1595,6 +1595,24 @@ jobs:
           IMAGE: ${{ steps.built.outputs.id }}
         run: scripts/ci/verify-healthcheck-invariants.sh "${ROLE}=${IMAGE}"
 
+      # WP15/S9: the runtime stage upgrades its Debian packages at build time,
+      # and the healthcheck probe above never starts yuzu-server, so prove the
+      # binary still loads on the upgraded libraries before the image is
+      # pushed: every shared library resolves (ldd) and it runs (--version).
+      # Offline (--network none), by the pinned image ID.
+      - name: Verify yuzu-server loads on the upgraded runtime
+        if: matrix.image == 'server'
+        env:
+          IMAGE: ${{ steps.built.outputs.id }}
+        run: |
+          out="$(docker run --rm --network none --entrypoint sh "$IMAGE" -c 'ldd /usr/local/bin/yuzu-server')"
+          echo "$out"
+          if grep -q 'not found' <<<"$out"; then
+            echo "::error::yuzu-server has an unresolved shared library on the upgraded runtime (above)"
+            exit 1
+          fi
+          docker run --rm --network none --entrypoint yuzu-server "$IMAGE" --version
+
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
       # Scans the image just built and probed (by its pinned ID), BEFORE
       # "Build and push": a CRITICAL vulnerability with a fix, not accepted in
@@ -1608,8 +1626,11 @@ jobs:
       # vulnerability gate".
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
+          NAME: yuzu-${{ matrix.image }}
           IMAGE: ${{ steps.built.outputs.id }}
-        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+        run: |
+          rm -rf "$RUNNER_TEMP/image-vuln-gate"
+          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -1661,9 +1682,13 @@ jobs:
       # does not run.
       - name: Verify the pushed image is the scanned one
         env:
+          NAME: yuzu-${{ matrix.image }}
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+        run: |
+          scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+          echo "verify-pushed: ok, $REF has the scanned image's layers" \
+            >> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.gate.txt"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Syft scans the pushed image by digest (pulls manifest +
@@ -1736,6 +1761,24 @@ jobs:
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
+          overwrite: true
+
+      - name: Upload image vulnerability gate report
+        # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}.json (the full
+        # Trivy report: image ID, layers, every package, the findings and the
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
+        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # The release job attaches them to the GitHub Release, inside the
+        # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
+        # 90 days (the repository's maximum retention) for a leg whose release
+        # never ran.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-${{ matrix.image }}-image-vuln-gate
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
+          # A re-run attempt's report replaces the earlier attempt's.
           overwrite: true
 
       - name: Image summary
@@ -1862,8 +1905,11 @@ jobs:
 
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
+          NAME: yuzu-postgres
           IMAGE: ${{ steps.built.outputs.id }}
-        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+        run: |
+          rm -rf "$RUNNER_TEMP/image-vuln-gate"
+          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the scan image
         if: always()
@@ -1901,9 +1947,13 @@ jobs:
       # See the same step in docker-publish (WP15/S9).
       - name: Verify the pushed image is the scanned one
         env:
+          NAME: yuzu-postgres
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-postgres@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+        run: |
+          scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+          echo "verify-pushed: ok, $REF has the scanned image's layers" \
+            >> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.gate.txt"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       - name: Generate image SBOM (CycloneDX)
@@ -1967,6 +2017,24 @@ jobs:
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
+          overwrite: true
+
+      - name: Upload image vulnerability gate report
+        # WP15/S9 evidence of the pre-push gate: trivy-yuzu-postgres.json (the full
+        # Trivy report: image ID, layers, every package, the findings and the
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
+        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # The release job attaches them to the GitHub Release, inside the
+        # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
+        # 90 days (the repository's maximum retention) for a leg whose release
+        # never ran.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-postgres-image-vuln-gate
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
+          # A re-run attempt's report replaces the earlier attempt's.
           overwrite: true
 
       - name: Image summary
@@ -2164,8 +2232,11 @@ jobs:
       # image is the scanned one" proves it did.
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
+          NAME: yuzu-${{ matrix.image }}-chisel
           IMAGE: ${{ steps.built.outputs.id }}
-        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+        run: |
+          rm -rf "$RUNNER_TEMP/image-vuln-gate"
+          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Remove the verification image
         if: always()
@@ -2213,9 +2284,13 @@ jobs:
       # See the same step in docker-publish (WP15/S9).
       - name: Verify the pushed image is the scanned one
         env:
+          NAME: yuzu-${{ matrix.image }}-chisel
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+        run: |
+          scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+          echo "verify-pushed: ok, $REF has the scanned image's layers" \
+            >> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.gate.txt"
 
       # ── Docker image SBOM (CycloneDX + SPDX) ────────────────────────
       # Mirrors docker-publish's SBOM steps so the chisel demo images get
@@ -2284,6 +2359,24 @@ jobs:
           # SBOM. With no continue-on-error and
           # if-no-files-found: error, a re-run either uploads this attempt's
           # SBOM or fails the job (#5242).
+          overwrite: true
+
+      - name: Upload image vulnerability gate report
+        # WP15/S9 evidence of the pre-push gate: trivy-yuzu-${{ matrix.image }}-chisel.json (the full
+        # Trivy report: image ID, layers, every package, the findings and the
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
+        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # The release job attaches them to the GitHub Release, inside the
+        # signed SHA256SUMS, like the SBOMs; this artifact also keeps them for
+        # 90 days (the repository's maximum retention) for a leg whose release
+        # never ran.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-${{ matrix.image }}-chisel-image-vuln-gate
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
+          # A re-run attempt's report replaces the earlier attempt's.
           overwrite: true
 
       - name: Image summary
@@ -2398,8 +2491,11 @@ jobs:
 
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         env:
+          NAME: yuzu-agent-bundle-chisel
           IMAGE: ${{ steps.built.outputs.id }}
-        run: scripts/ci/image-vuln-gate.sh "$IMAGE"
+        run: |
+          rm -rf "$RUNNER_TEMP/image-vuln-gate"
+          scripts/ci/image-vuln-gate.sh --report-dir "$RUNNER_TEMP/image-vuln-gate" "$NAME=$IMAGE"
 
       - name: Refuse to publish if the tag moved (#5282)
         run: bash scripts/ci/check-release-tag-sha.sh
@@ -2428,9 +2524,13 @@ jobs:
       # See the same step in docker-publish (WP15/S9).
       - name: Verify the pushed image is the scanned one
         env:
+          NAME: yuzu-agent-bundle-chisel
           REF: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
           LAYERS: ${{ steps.built.outputs.layers }}
-        run: scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+        run: |
+          scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
+          echo "verify-pushed: ok, $REF has the scanned image's layers" \
+            >> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.gate.txt"
 
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -2475,6 +2575,23 @@ jobs:
         run: |
           cosign sign --yes "${IMAGE}@${DIGEST}"
           echo "Signed ${IMAGE}@${DIGEST} with cosign keyless (OIDC)"
+
+      - name: Upload image vulnerability gate report
+        # WP15/S9 evidence of the pre-push gate: trivy-yuzu-agent-bundle-chisel.json (the full
+        # Trivy report: image ID, layers, every package, the findings and the
+        # accepted ones), .txt (the table) and .gate.txt (Trivy version, DB
+        # UpdatedAt, image ID, OS package coverage, result, verify-pushed).
+        # This job runs after the release exists, so they are not a release
+        # asset (like this image's SBOM): this artifact, kept for 90 days (the
+        # repository's maximum retention), is the record.
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: yuzu-agent-bundle-chisel-image-vuln-gate
+          path: ${{ runner.temp }}/image-vuln-gate/
+          if-no-files-found: error
+          retention-days: 90
+          # A re-run attempt's report replaces the earlier attempt's.
+          overwrite: true
 
       - name: Bundle summary
         env:
@@ -2575,7 +2692,9 @@ jobs:
             -name '*.rpm'    -o \
             -name '*.pkg'    -o \
             -name '*.cdx.json' -o \
-            -name '*.spdx.json' \
+            -name '*.spdx.json' -o \
+            -name 'trivy-*.json' -o \
+            -name 'trivy-*.txt' \
           \) -exec mv {} . \;
 
       - name: Verify release artifact completeness
@@ -2595,7 +2714,9 @@ jobs:
           # *.zip glob covers both yuzu-agent-windows-x64.zip and yuzu-compose-wizard-*.zip.
           # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
           # verify the SBOM they download matches the SBOM we shipped.
-          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json > SHA256SUMS
+          # trivy-* are the image vulnerability gate's reports (WP15/S9), the
+          # evidence of what each image was scanned with and found.
+          sha256sum *.tar.gz *.zip *.exe *.deb *.rpm *.pkg *.cdx.json *.spdx.json trivy-* > SHA256SUMS
           cat SHA256SUMS
 
       - name: Install cosign
@@ -2838,6 +2959,13 @@ jobs:
           for the full verification workflow (\`gh attestation verify\`,
           \`cosign verify\`, CycloneDX / SPDX validation).
 
+          Each image was scanned for vulnerabilities before it was pushed; the
+          reports are the \`trivy-yuzu-*\` assets (inside \`SHA256SUMS\`): the
+          full Trivy JSON, a table, and a \`.gate.txt\` summary with the Trivy
+          version, the vulnerability DB date, the image ID and which images'
+          OS packages the scanner could not see. See
+          [\`docs/user-manual/release-verification.md\`](docs/user-manual/release-verification.md).
+
           See the [user manual](docs/user-manual/) for full setup instructions.
           NOTES_EOF
           # Strip leading whitespace from heredoc indentation
@@ -2898,6 +3026,7 @@ jobs:
               artifacts/*.rpm \
               artifacts/*.cdx.json \
               artifacts/*.spdx.json \
+              artifacts/trivy-* \
               artifacts/*.intoto.jsonl \
               artifacts/SHA256SUMS \
               artifacts/SHA256SUMS.sigstore \

@@ -5,14 +5,20 @@
 # published tags). The gate fails on any CRITICAL vulnerability that has a fix
 # and is not accepted here.
 #
-# Rules for an entry (the gate refuses a file that breaks the first two):
+# Rules for an entry. scripts/ci/image-vuln-gate-checks.py parses this file
+# and the gate refuses it unless every entry follows them, in this exact
+# block-style shape (no flow style, anchors or comments after a value):
+#   - `id`, first: the vulnerability id.
+#   - `paths` or `purls` (a block list): scope it as narrowly as Trivy allows,
+#     never a bare CVE id that would also hide the same CVE in another package.
 #   - `statement`: why the finding does not apply or cannot be fixed by us yet,
 #     with the evidence.
-#   - `expired_at`: at most about 90 days out. When it passes, Trivy stops
-#     honouring the entry and the next release fails on the finding again, so
-#     it is re-reviewed rather than forgotten.
-#   - Scope it as narrowly as Trivy allows (`paths` or `purls`), never a bare
-#     CVE id that would also hide the same CVE in another package.
+#   - `expired_at`: at most 92 days out. When it passes, Trivy stops honouring
+#     the entry and the next release fails on the finding again, so it is
+#     re-reviewed rather than forgotten. The gate warns 21 days before.
+#   - `approved_by`: the GitHub login of the person who accepted the finding
+#     (Trivy ignores this key; the gate requires it). The pull request adding
+#     or renewing the entry is the approval record.
 #   - Remove the entry as soon as the upstream image no longer carries it.
 
 vulnerabilities:
@@ -34,3 +40,4 @@ vulnerabilities:
       session-resumption flaw is unreachable. Accepted until upstream rebuilds
       gosu. WP15/S9, reviewed 2026-11-17.
     expired_at: 2027-02-15
+    approved_by: fjarvis

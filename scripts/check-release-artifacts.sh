@@ -48,6 +48,10 @@
 #   (yuzu-agent-bundle-chisel is built after the release from its assets, so
 #   its SBOM is not a release asset and is not expected here.)
 #
+#   Image vulnerability gate reports (WP15/S9), for the same six images:
+#     trivy-<image>.json + .txt + .gate.txt   (e.g. trivy-yuzu-server.json)
+#   (the agent bundle's report is a workflow artifact, for the same reason.)
+#
 # Every file's name must also be one GitHub stores unchanged (letters,
 # digits, ".", "_" and "-", starting with a letter or digit), or SHA256SUMS
 # and the provenance subjects would name an asset that does not exist.
@@ -157,11 +161,39 @@ for base in "${SBOM_BASES[@]}"; do
   done
 done
 
+# ── Image vulnerability gate reports (WP15/S9) ───────────────────────
+# Each publish job uploads its pre-push gate's reports; they are the record of
+# what the image was scanned with (Trivy version, DB date), what it found and
+# which images' OS packages the scanner could not see. A release without one
+# would have no evidence that its image passed the gate.
+GATE_REPORT_IMAGES=(
+  "yuzu-server"
+  "yuzu-gateway"
+  "yuzu-postgres"
+  "yuzu-server-chisel"
+  "yuzu-gateway-chisel"
+  "yuzu-agent-chisel"
+)
+
+for img in "${GATE_REPORT_IMAGES[@]}"; do
+  for suffix in json txt gate.txt; do
+    f="trivy-${img}.${suffix}"
+    if [[ ! -s "$ART_DIR/$f" ]]; then
+      echo "::error::missing or empty image vulnerability gate report: $f" >&2
+      fail=1
+    fi
+  done
+  if [[ -s "$ART_DIR/trivy-${img}.gate.txt" ]] && ! grep -qx 'gate: pass' "$ART_DIR/trivy-${img}.gate.txt"; then
+    echo "::error::trivy-${img}.gate.txt does not record a passing gate" >&2
+    fail=1
+  fi
+done
+
 # ── Sanity check: SBOMs parse as JSON ────────────────────────────────
 # `jq` is available on ubuntu-24.04 runners. If absent we skip rather
 # than fail — the structural check is a bonus, not the contract.
 if command -v jq >/dev/null 2>&1; then
-  for f in "$ART_DIR"/*.cdx.json "$ART_DIR"/*.spdx.json; do
+  for f in "$ART_DIR"/*.cdx.json "$ART_DIR"/*.spdx.json "$ART_DIR"/trivy-*.json; do
     [[ -f "$f" ]] || continue
     if ! jq empty "$f" >/dev/null 2>&1; then
       echo "::error file=$f::SBOM is not valid JSON" >&2
