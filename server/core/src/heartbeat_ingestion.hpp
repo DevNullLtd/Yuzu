@@ -153,15 +153,18 @@ public:
     /// carries no tag to gate on — reconnect itself is the signal). The
     /// callee (`QuarantineContainmentReconciler::notify_agent_heartbeat`)
     /// owns its own fast-path cache lookup, so an unset or a hit-nothing fn
-    /// costs at most one branch here. Optional; unset = no reconcile.
+    /// costs at most one branch here. A hit only MARKS the device due: the call
+    /// reads no store and dispatches nothing, and the reconciler thread does the
+    /// work within a second (#7619). Optional; unset = no reconcile.
     ///
     /// Synchronized (governance Gate 3, cpp-safety, 2026-08-24) — unlike
     /// `guardian_reconcile_fn_`/`offline_store_` above, which are bare/raw
     /// and rely on the (pre-existing, out of scope for this fix) benign-
     /// aligned-pointer-store argument. That argument does not extend to a
     /// `std::function`: a live `ingest()` call on a heartbeat-handler thread
-    /// can still be INSIDE `quarantine_reconcile_fn_(...)` — doing blocking
-    /// Postgres + gRPC-dispatch I/O — when `server.cpp`'s stop() sequence
+    /// can still be INSIDE `quarantine_reconcile_fn_(...)` — a mark under a
+    /// short mutex today, and written before #7619 as blocking Postgres +
+    /// gRPC-dispatch I/O, so the barrier is kept either way — when `server.cpp`'s stop() sequence
     /// nulls the fn and then `.reset()`s the `QuarantineContainmentReconciler`
     /// the fn's closure captures. `agent_server_->Shutdown(deadline)` is a
     /// BOUNDED drain, not a quiescence guarantee (same "a handler thread can

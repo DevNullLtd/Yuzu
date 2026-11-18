@@ -56,4 +56,12 @@ struct QuarantineRecord {
     std::int64_t device_release_owed_at{0};
 };
 
+/// How a record-scoped guarded write ended, as the pure decision code (`quarantine_release_decision.hpp`)
+/// reads it. The store maps its `std::expected<void, std::string>` onto this with
+/// `classify_quarantine_write` (`quarantine_store.hpp`), so the error literals are compared in one place.
+/// `not_quarantined`: the guarded UPDATE touched no row (the record ended, was superseded, or its release
+/// was already cleared). `apply_in_flight`: an apply's claim is live, or an apply was claimed after the
+/// observation this write rests on (#7613). `store_error`: any other failure, nothing decided.
+enum class QuarantineWrite { ok, not_quarantined, apply_in_flight, store_error };
+
 } // namespace yuzu::server

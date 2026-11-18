@@ -26,6 +26,7 @@
 #include "plugin_init_failed_labels.hpp" // catalogue-bounded plugin label for yuzu_fleet_plugin_init_failed
 #include "offline_endpoint_store.hpp" // HA WS-5 presence merge (ADR-2002 §7a)
 #include "echo_corruption_audit.hpp" // #1567 tag keys + parse helpers
+#include "echo_storage_offline_tag.hpp" // the Echo storage-offline tag -> fleet gauge
 #include "spark_fleet_tags.hpp" // SparkEngine fleet telemetry keys + count parse (rung 1)
 #include "result_set_store.hpp"
 #include "device_token_store.hpp"
@@ -995,6 +996,14 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "evaluated), per-account authorized_keys key fingerprints with option names, and whether "
          "sshd is enabled; never a key comment, option value or key-file path; Linux and macOS, "
          "Windows is planned; read-only, default-off, Forensics:Read single-target"},
+        {"process_introspect.inspect",
+         "Per-process introspection of one pid, one facet per request (resource_limits, "
+         "sigmasks, caps, seccomp, oom, sched): numbers, masks and fixed tokens only, never "
+         "file or memory contents, environment values or command-line arguments; Linux only, macOS "
+         "and Windows are planned; read-only, default-off, Forensics:Read single-target (a "
+         "non-admin also needs approval); pid from crossplatform.process.list; a degraded read is "
+         "CONSTRAINED, never an empty OK; no_such_process* and pid_reused terminal, torn_read "
+         "retryable"},
         // status
         {"status.version", "Agent version, build number, and git commit hash"},
         {"status.info", "Platform OS, architecture, and hostname"},
@@ -3239,6 +3248,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
 
     int ota_signature_refusing = 0;
     int echo_db_corruption_agents = 0;               // #1567
+    // Agents whose Echo database is offline, by reason (kEchoStorageOfflineReasons order).
+    std::array<int, kEchoStorageOfflineReasons.size()> echo_storage_offline{};
     std::map<std::string, int64_t> plugin_init_failed; // #1567: plugin -> agents
     // Tokens summed under plugin="unknown" (a well-formed name outside the catalogue), and the
     // AGENTS that sent at least one token the label dropped, per reason (the rejected gauge).
@@ -3269,6 +3280,8 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         return keys;
     }();
     static const std::string dedup_rows_key{kDedupRowsTag};
+    // std::string twin of the C-string tag key (same reason as dedup_keys above).
+    static const std::string echo_storage_offline_key{kEchoTagStorageOffline};
 
     for (const auto& [id, snap] : snapshots_) {
         ++healthy_count;
@@ -3291,6 +3304,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
         if (auto it = snap.status_tags.find(kEchoTagCorruptionTotal);
             it != snap.status_tags.end() && parse_echo_corruption_total(it->second))
             ++echo_db_corruption_agents;
+        // Echo loaded offline (a failed or space-starved v10 migration, retried in the background):
+        // in-place read, no copy; the value is agent-controlled so it maps to a closed label set.
+        if (auto it = snap.status_tags.find(echo_storage_offline_key); it != snap.status_tags.end())
+            if (const auto idx = parse_echo_storage_offline(it->second))
+                ++echo_storage_offline[*idx];
         if (auto it = snap.status_tags.find("yuzu.plugins_failed");
             it != snap.status_tags.end() && !it->second.empty()) {
             std::string_view rest{it->second};
@@ -3788,6 +3806,11 @@ void AgentHealthStore::recompute_metrics(yuzu::MetricsRegistry& metrics,
     // other well-formed name is summed under plugin="unknown" (see the block below).
     metrics.gauge("yuzu_fleet_echo_db_corruption_agents")
         .set(static_cast<double>(echo_db_corruption_agents));
+    // Fixed label set, published every sweep including 0 (no clear needed).
+    for (std::size_t i = 0; i < kEchoStorageOfflineReasons.size(); ++i)
+        metrics.gauge("yuzu_fleet_echo_storage_offline",
+                      {{"reason", std::string{kEchoStorageOfflineReasons[i]}}})
+            .set(static_cast<double>(echo_storage_offline[i]));
     // #5332: published every sweep, 0 included (a server-owned count over the reporting
     // population, like yuzu_fleet_echo_db_corruption_agents above), so the fixed label set
     // needs no clear_gauge_family.

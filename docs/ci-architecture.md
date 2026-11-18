@@ -1380,6 +1380,15 @@ so a leaf it left behind (a killed run) is expected to refuse `Get-Item`, `Remov
 first. The recipe above still applies: the deny covers read only, so open the key with `DELETE` access and call
 `NtDeleteKey`; its sibling directly under `bam` carries the default DACL.
 
+**Spark Linux Service case (`YUZU_REQUIRE_SPARK_DBUS_TESTS`, #5719 item 5; a Linux-leg concern, not part of the Windows test phase above).** The Linux Service case in
+`test_spark_mechanism.cpp` needs a `dbus-daemon` binary on `PATH` (it starts a private one on a per-process salted
+socket and drives a child process against it). Where the daemon is missing, or the socket path is too long for
+`sockaddr_un`, the case SKIPs; with `YUZU_REQUIRE_SPARK_DBUS_TESTS` set to anything non-empty other than `0` the same
+condition FAILs instead (the same contract as `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS` above). No workflow sets it
+today and no workflow installs `dbus-daemon`, so whether a leg runs the case depends on its runner image, and where
+the daemon is missing the case skips silently; installing the daemon and setting the variable on a leg that is
+meant to have it is tracked in #7901.
+
 **Leaked ETW sessions (#7175).** The echo plugin's registry source starts a system-wide real-time ETW session named
 `YuzuEchoRegistryEtw-<pid>` (`agents/plugins/echo/src/echo_registry_source.cpp`, the session-name function). A
 real-time session outlives its process until something stops it, so a test process that is killed (a meson timeout),
@@ -3287,7 +3296,7 @@ agent-only (the `server` option is off for a non-Linux target), so a `build_serv
 | `instructions runner hardening` | `WindowsConsoleBreak` (win32) next to about two thousand lines of POSIX tests |
 | `gateway wrapper guard selftest` | exercises the real wrapper subprocess, native exit/status handling and diagnostic captures on each OS, including Windows pipe decoding |
 | `contract evidence selftest` | exercises subprocess deadlines, child cleanup and native-path evidence handling; Windows task-tree termination and POSIX signals need separate observations |
-| `local test runner platform selftest` | drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
+| `local test runner platform selftest 1 of 3` to `3 of 3` | three shards of one case set (each runs every third case); drives bash with native fixture paths (MSYS2 `cygpath` on Windows), UTF-8 output and the per-OS supported target selection |
 | `windows sdk contract` | exercises the MSYS2 bash setup contract on win32 |
 | `Windows toolchain contract` | registered only where `pwsh` is installed (not the Linux image) |
 | `build_examples=false gating smoke test` | selects the per-OS vcpkg triplet with `uname -s` and configures a real build on each leg |

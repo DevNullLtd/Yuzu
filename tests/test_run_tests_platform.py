@@ -206,5 +206,23 @@ exec bash "$fixture_root/scripts/run-tests.sh" "$2"
         self.assertIn("Failed:  1", result.stdout)
 
 
+def _each_test(suite):
+    for item in suite:
+        if isinstance(item, unittest.TestSuite):
+            yield from _each_test(item)
+        else:
+            yield item
+
+
 if __name__ == "__main__":
-    unittest.main()
+    # `<index>/<count>` runs every count-th case (ordered by id), so meson can run the cases as
+    # parallel shards: each case starts the real runner in its own shells, which is slow on Windows,
+    # and one process running all of them passed its 30 s limit on a loaded runner. The default
+    # `0/1` runs every case.
+    index, count = (int(part) for part in (sys.argv[1] if len(sys.argv) > 1 else "0/1").split("/"))
+    if not 0 <= index < count:
+        sys.exit(f"shard {index}/{count} is out of range")
+    cases = sorted(_each_test(unittest.defaultTestLoader.loadTestsFromTestCase(RunnerPlatform)),
+                   key=lambda case: case.id())
+    outcome = unittest.TextTestRunner(verbosity=1).run(unittest.TestSuite(cases[index::count]))
+    sys.exit(0 if outcome.wasSuccessful() else 1)
