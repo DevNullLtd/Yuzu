@@ -326,6 +326,16 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher) {
     if (!matcher.is_object())
         return "matcher must be a JSON object";
+    // The per-field bounds, read from the parsed value before it is serialised. Only a string
+    // has a length here; a key of any other type is left to the type checks.
+    const auto too_long = [&matcher](const char* key, std::size_t bound) {
+        const auto it = matcher.find(key);
+        return it != matcher.end() && it->is_string() &&
+               it->get_ref<const std::string&>().size() > bound;
+    };
+    if (too_long("column", kMatcherColumnMaxBytes) || too_long("op", kMatcherOpMaxBytes) ||
+        too_long("value", kMatcherValueMaxBytes))
+        return std::string(kMatcherFieldTooLargeMessage);
     return validate_matcher(matcher.dump());
 }
 

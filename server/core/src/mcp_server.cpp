@@ -18139,23 +18139,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         rs_refuse_nul("parent_id", source_kind::kInstructionResult);
                         return;
                     }
-                    if (args.contains("matcher") && args["matcher"].is_object()) {
-                        const auto& m = args["matcher"];
-                        auto matcher_field_len = [&m](const char* key) -> std::size_t {
-                            return (m.contains(key) && m[key].is_string())
-                                       ? m[key].template get_ref<const std::string&>().size()
-                                       : 0;
-                        };
-                        if (matcher_field_len("column") > kMatcherColumnMaxLen ||
-                            matcher_field_len("op") > kMatcherOpMaxLen ||
-                            matcher_field_len("value") > kMatcherValueMaxLen) {
-                            reject_field_too_large(std::format(
-                                "a matcher field exceeds its bound (column<={}, op<={}, "
-                                "value<={} bytes)",
-                                kMatcherColumnMaxLen, kMatcherOpMaxLen, kMatcherValueMaxLen));
-                            return;
-                        }
-                    }
                     // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
@@ -18163,8 +18146,13 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (args.contains("matcher")) {
                         if (const auto bad =
                                 yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
-                            // A matcher over the size bound is an input bound like the fields
-                            // above: counted and audited by the same responder. One text with REST.
+                            // A field or the whole matcher over its size bound is an input bound
+                            // like the fields above: counted and audited by the same responder.
+                            // The REST twin refuses both through this same check.
+                            if (*bad == yuzu::server::rs_matcher::kMatcherFieldTooLargeMessage) {
+                                reject_field_too_large(*bad);
+                                return;
+                            }
                             if (*bad == yuzu::server::rs_matcher::kMatcherTooLargeMessage) {
                                 reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *bad);
                                 return;

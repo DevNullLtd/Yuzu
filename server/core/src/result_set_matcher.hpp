@@ -116,6 +116,21 @@ inline constexpr std::string_view kMatcherTooLargeMessage =
 static_assert(kMatcherMaxBytes == 65536,
               "the message, the MCP schema description and the OpenAPI path item state the bound");
 
+/// The largest `column`, `op` and `value` a caller matcher may carry, in bytes: the three the MCP
+/// tool's input schema states (`mcp_input_bounds.hpp` takes its constants from these). They bound
+/// the size of a matcher field a caller supplies. A `value_set` entry has no bound of its own; it
+/// counts toward `kMatcherMaxBytes`.
+inline constexpr std::size_t kMatcherColumnMaxBytes = 128;
+inline constexpr std::size_t kMatcherOpMaxBytes = 32;
+inline constexpr std::size_t kMatcherValueMaxBytes = 512;
+/// The message for a field over its bound: MCP sends it as is, REST behind its
+/// `RESULT_SET_BAD_REQUEST: ` prefix.
+inline constexpr std::string_view kMatcherFieldTooLargeMessage =
+    "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)";
+static_assert(kMatcherColumnMaxBytes == 128 && kMatcherOpMaxBytes == 32 &&
+                  kMatcherValueMaxBytes == 512,
+              "the message and the OpenAPI path item state the three bounds");
+
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`
 /// or `value` must be a string and a present `value_set` an array. Only `echo_rows_ge` has a numeric field: its `n`
@@ -129,8 +144,10 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json);
 
 /// The admission check for a PRESENT caller `matcher` value (#4644): nullopt when acceptable,
 /// else the 400 / -32602 message. A value that is not a JSON object is refused ("matcher must be
-/// a JSON object"; it used to be dropped, which meant every responder qualified), then the
-/// object goes through `validate_matcher`. REST and MCP both call this ONE function, so a third
+/// a JSON object"; it used to be dropped, which meant every responder qualified), then one whose
+/// string `column`, `op` or `value` is over its bound (`kMatcherFieldTooLargeMessage`: the object's
+/// own three keys, whatever its `kind`), then the object goes through `validate_matcher`. REST and
+/// MCP both call this ONE function, so both apply the same bounds in the same order, and a third
 /// producer cannot admit accept-all by calling only the text check. An ABSENT matcher is the
 /// caller's own default and is not passed here.
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher);

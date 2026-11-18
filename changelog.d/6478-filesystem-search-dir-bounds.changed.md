@@ -37,3 +37,12 @@
   `400` / `-32602` and `matcher exceeds 65536 bytes as compact JSON`, before anything is
   dispatched. To do: divide a longer value list over more than one result set. The limit bounds
   the cost of evaluating a large matcher.
+- **Breaking - REST refuses a result-set `matcher` field over its bound (#6478).** Affected: a
+  caller of `POST /api/v1/result-sets/from-instruction-result` that sends a `matcher` whose
+  `column` is over 128 bytes, whose `op` is over 32 or whose `value` is over 512. It was accepted
+  before and is now refused with `400` and
+  `a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)`,
+  before anything is dispatched or stored. These are the bounds the MCP tool
+  `create_result_set_from_instruction_result` already applied; they bound the size of a matcher
+  field a caller supplies. To do: send a shorter field; a `value_set` entry has no bound of its
+  own.

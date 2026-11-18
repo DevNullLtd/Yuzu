@@ -40988,6 +40988,14 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             auto body = nlohmann::json::parse(res->body);
             REQUIRE(body.contains("error"));
             CHECK(body["error"]["code"] == kInvalidParams);
+            // The check is the admission function the REST twin shares (#6478); this tool's
+            // text and its input-bound counter are what they were.
+            CHECK(body["error"]["message"] ==
+                  "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
         }
         SECTION("the matcher as a whole: the one text the REST twin also sends, counted like "
                 "the fields above (#6478)") {

@@ -1213,6 +1213,36 @@ TEST_CASE("from-instruction-result: a malformed or oversized matcher is refused 
         CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
         CHECK(j["error"].at("retry_after_ms").is_null());
     }
+    // A column, op or value over its byte bound is refused the same way, with the MCP tool's
+    // text behind this route's prefix. Exactly at the bound the matcher is admitted, so the
+    // unknown id is what answers (404).
+    struct Field {
+        const char* key;
+        std::size_t bound;
+    };
+    for (const Field& f : {Field{"column", rs_matcher::kMatcherColumnMaxBytes},
+                           Field{"op", rs_matcher::kMatcherOpMaxBytes},
+                           Field{"value", rs_matcher::kMatcherValueMaxBytes}}) {
+        INFO(f.key);
+        nlohmann::json body{{"instruction_id", "no-such-instruction"},
+                            {"matcher", {{"column", "c"}, {"op", "eq"}, {"value", "v"}}}};
+        body["matcher"][f.key] = std::string(f.bound, 'x');
+        int status = 0;
+        h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+        CHECK(status == 404);
+        body["matcher"][f.key] = std::string(f.bound + 1, 'x');
+        for (const std::string& id : {iid, std::string("no-such-instruction")}) {
+            INFO(id);
+            body["instruction_id"] = id;
+            auto j = h.post("/api/v1/result-sets/from-instruction-result", body.dump(), status);
+            CHECK(status == 400);
+            CHECK(j["error"]["message"] ==
+                  "RESULT_SET_BAD_REQUEST: a matcher field exceeds its bound "
+                  "(column<=128, op<=32, value<=512 bytes)");
+            CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+            CHECK(j["error"].at("retry_after_ms").is_null());
+        }
+    }
     CHECK(h.calls.empty());
     CHECK(h.store->list_pending().empty());
 

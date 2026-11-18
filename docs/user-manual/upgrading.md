@@ -25,6 +25,12 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 **What changed.** Such a matcher was accepted, up to the request body limit. It is now refused with `400` (REST) or `-32602` (MCP) and `RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON`, before anything is dispatched or stored. The size is that of the matcher as the server re-serialises it (no insignificant whitespace), and the whole object counts; about 970 SHA-256 values fit in a `value_set`. The limit bounds the cost of evaluating a large matcher. The dashboard's matcher fields (`column`, `op`, `value`) cannot reach it.
 
+## ⚠️ Breaking: REST refuses a result-set `matcher` field over its bound (#6478)
+
+**In short.** Affected: a caller of `POST /api/v1/result-sets/from-instruction-result` that sends a `matcher` whose `column` is over 128 bytes, whose `op` is over 32 or whose `value` is over 512. To do: send a shorter field; an exact match on a longer value can be written as `"op":"in"` with that value in `value_set`, whose entries have no bound of their own.
+
+**What changed.** REST accepted such a field. It is now refused with `400` and `RESULT_SET_BAD_REQUEST: a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)`, before the instruction is looked up and before anything is dispatched or stored. These are the bounds the MCP tool `create_result_set_from_instruction_result` already applied, with the same text; the tool is unchanged. They bound the size of a matcher field a caller supplies, and apply to the matcher's own `column`, `op` and `value` whatever its `kind`. A set already stored is not checked again, so re-evaluating one behaves as before. The dashboard's form limits `column` to 128 and `value` to 512 characters, so it can exceed a bound only with non-ASCII text; the page then shows the refusal.
+
 ## ⚠️ Breaking: on-demand software sync asks for confirmation, is paced instead of capped at 500 devices, and cools down per group
 
 **In short.** Affected: anything that calls `POST /api/v1/hardware/sync` or the MCP tool `sync_hardware_software` for a whole group or the whole fleet (the Software page's **Whole fleet** choice, scripts and agentic workers). To do: send `"confirm": true` with a `group:<id>` or `__all__` scope, give the caller the global `ManagementGroup:Write` grant if it names the whole fleet, and stop relying on the 500-device refusal and the 60-second per-operator gap.

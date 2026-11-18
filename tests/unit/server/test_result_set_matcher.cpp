@@ -645,11 +645,12 @@ TEST_CASE("matcher: partialWhenConstrained is bound from the definition only and
 TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
           "[result_set][matcher]") {
     // The bound is on the compact JSON text the routes pass in: a matcher exactly at it passes.
-    nlohmann::json m{{"column", "c"}, {"op", "eq"}, {"value", ""}};
-    m["value"] = std::string(kMatcherMaxBytes - m.dump().size(), 'v');
+    // One value_set entry carries the size: an entry has no bound of its own.
+    nlohmann::json m{{"column", "c"}, {"op", "in"}, {"value_set", nlohmann::json::array({""})}};
+    m["value_set"][0] = std::string(kMatcherMaxBytes - m.dump().size(), 'v');
     REQUIRE(m.dump().size() == kMatcherMaxBytes);
     CHECK_FALSE(validate_matcher_object(m));
-    m["value"] = m["value"].get<std::string>() + "v";
+    m["value_set"][0] = m["value_set"][0].get<std::string>() + "v";
     const auto over = validate_matcher_object(m);
     REQUIRE(over);
     CHECK(*over == "matcher exceeds 65536 bytes as compact JSON");
@@ -665,6 +666,40 @@ TEST_CASE("matcher: admission refuses a matcher over the size bound (#6478)",
     CHECK(validate_matcher_object(
         {{"column", "c"}, {"op", "exists"}, {"note", std::string(kMatcherMaxBytes, 'n')}}));
     CHECK(validate_matcher(std::string(kMatcherMaxBytes + 1, ' ')));
+}
+
+TEST_CASE("matcher: admission refuses a column, op or value over its byte bound (#6478)",
+          "[result_set][matcher]") {
+    using nlohmann::json;
+    struct Field {
+        const char* key;
+        std::size_t bound;
+    };
+    for (const Field& f : {Field{"column", kMatcherColumnMaxBytes}, Field{"op", kMatcherOpMaxBytes},
+                           Field{"value", kMatcherValueMaxBytes}}) {
+        INFO(f.key);
+        json m{{"column", "c"}, {"op", "eq"}, {"value", "v"}};
+        m[f.key] = std::string(f.bound, 'x');
+        CHECK_FALSE(validate_matcher_object(m));
+        m[f.key] = std::string(f.bound + 1, 'x');
+        const auto over = validate_matcher_object(m);
+        REQUIRE(over);
+        CHECK(*over == "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)");
+        // The object's own three keys are bounded whatever its kind.
+        m["kind"] = "any_response";
+        CHECK(validate_matcher_object(m) == over);
+    }
+    // Only those three: a value_set entry and a key the matcher does not read have no bound of
+    // their own, and a nested object is not searched.
+    const std::string big(kMatcherValueMaxBytes + 1, 'x');
+    CHECK_FALSE(validate_matcher_object(
+        json{{"column", "c"}, {"op", "in"}, {"value_set", json::array({big, big})}}));
+    CHECK_FALSE(validate_matcher_object(
+        json{{"column", "c"}, {"op", "exists"}, {"note", json::object({{"value", big}})}}));
+    // A field over its bound is reported ahead of the whole-matcher bound, as the MCP tool did.
+    CHECK(validate_matcher_object(
+              json{{"column", big}, {"note", std::string(kMatcherMaxBytes, 'n')}}) ==
+          std::string(kMatcherFieldTooLargeMessage));
 }
 
 TEST_CASE("matcher: one parsed matcher answers every row as the one-shot predicates do (#6478)",

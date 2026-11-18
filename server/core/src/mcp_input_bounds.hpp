@@ -16,6 +16,7 @@
                                      // omitted-vs-supplied rule, shared with the REST
                                      // twins (#2500) because it was never MCP-specific
 #include "mcp_jsonrpc.hpp"           // kMcpMaxRequestBodyBytes, for the sizing static_asserts below
+#include "result_set_matcher.hpp"    // the three matcher field bounds, shared with the REST twin
 
 /// @file mcp_input_bounds.hpp
 /// The ONE home for MCP request-size bounds (#2437) — transport and handler.
@@ -130,9 +131,11 @@ inline constexpr std::size_t kInventoryQueryFieldMaxLen = 128;    // inventory-q
 inline constexpr std::size_t kInventoryQueryOpMaxLen = 32;        // inventory-query `conditions[].op`
 inline constexpr std::size_t kInventoryQueryValueMaxLen = 512;    // inventory-query `conditions[].value`
 inline constexpr std::size_t kInstructionIdMaxLen = 256;          // from-instruction-result `instruction_id`
-inline constexpr std::size_t kMatcherColumnMaxLen = 128;          // from-instruction-result `matcher.column`
-inline constexpr std::size_t kMatcherOpMaxLen = 32;               // from-instruction-result `matcher.op`
-inline constexpr std::size_t kMatcherValueMaxLen = 512;           // from-instruction-result `matcher.value`
+// from-instruction-result `matcher.column`, `.op` and `.value` (128, 32, 512): the shared admission
+// check's own constants, so the REST twin and this tool's served schema state one set of numbers.
+inline constexpr std::size_t kMatcherColumnMaxLen = rs_matcher::kMatcherColumnMaxBytes;
+inline constexpr std::size_t kMatcherOpMaxLen = rs_matcher::kMatcherOpMaxBytes;
+inline constexpr std::size_t kMatcherValueMaxLen = rs_matcher::kMatcherValueMaxBytes;
 
 /// The 19 of #4353's 20 tools whose schema `maxLength` needed a handler-side
 /// twin (see block above; `unlock_account` is the exception). Single source
