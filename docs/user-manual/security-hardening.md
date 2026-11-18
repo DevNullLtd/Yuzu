@@ -789,7 +789,7 @@ Two consequences worth planning for:
 
 ### Reconnect re-application (#3425), re-verify and drift
 
-The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: it runs every queued task and waits for every RUNNING task to return before it reconnects, with no bound; a command blocked in the kernel or sleeping a delay/stagger holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247).
+The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: a queued task that has not started is answered REJECTED ("agent reconnecting") without running and a staggered command's sleep ends within about a second, but the agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait.
 
 A device quarantined while **offline** is contained at the control plane immediately (the gate above
 refuses it), but its own firewall cannot be touched until a dispatch reaches it. The

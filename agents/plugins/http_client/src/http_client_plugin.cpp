@@ -385,21 +385,39 @@ std::string http_get(std::string_view url, int& status_code) {
     }
 
     bool https_unsupported = false;
+    // The body is received through a capped receiver: the cap aborts the transfer, so a hostile peer
+    // cannot make the agent buffer an unbounded body before the size is judged.
+    std::string body;
+    bool size_exceeded = false;
     auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
-                          https_unsupported, [&](auto& cli) { return cli.Get(parsed.path); });
+                          https_unsupported, [&](auto& cli) {
+                              body.clear();
+                              size_exceeded = false;
+                              return cli.Get(
+                                  parsed.path, [](const httplib::Response&) { return true; },
+                                  [&](const char* data, size_t len) {
+                                      if (body.size() + len > kMaxDownloadSize) {
+                                          size_exceeded = true;
+                                          return false;
+                                      }
+                                      body.append(data, len);
+                                      return true;
+                                  });
+                          });
     if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";
+    }
+    if (size_exceeded) {
+        status_code = res ? res->status : 0;
+        return "response body exceeds maximum size limit";
     }
     if (!res) {
         status_code = 0;
         return "connection failed";
     }
     status_code = res->status;
-    if (res->body.size() > kMaxDownloadSize) {
-        return "response body exceeds maximum size limit";
-    }
-    return res->body;
+    return body;
 }
 
 // HTTP HEAD via httplib (no shell, no command injection)
@@ -497,11 +515,20 @@ public:
     void shutdown(yuzu::PluginContext&) noexcept override { g_ctx = nullptr; }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) override {
-        if (action == "download") return do_download(ctx, params);
-        if (action == "get")      return do_get(ctx, params);
-        if (action == "head")     return do_head(ctx, params);
-        ctx.write_output(std::format("error|unknown action: {}", action));
-        return 1;
+        // The ABI seam: no exception (bad_alloc from a large body, a format failure) may cross it.
+        try {
+            if (action == "download") return do_download(ctx, params);
+            if (action == "get")      return do_get(ctx, params);
+            if (action == "head")     return do_head(ctx, params);
+            ctx.write_output(std::format("error|unknown action: {}", action));
+            return 1;
+        } catch (...) {
+            try {
+                ctx.write_output("error|internal error");
+            } catch (...) { // NOLINT(bugprone-empty-catch): nothing more can be done at the seam
+            }
+            return 1;
+        }
     }
 
 private:

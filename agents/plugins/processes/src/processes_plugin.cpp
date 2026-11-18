@@ -20,6 +20,7 @@
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
 #include <helper_budget.hpp>      // HelperBudget + the hash_unavailable markers
+#include <proc_stat.hpp>           // parse_stat_start_ticks / same_process: detect a recycled pid
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #ifndef _WIN32
 #include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
@@ -27,6 +28,8 @@
 #include <local_path_policy.hpp> // yuzu::shared::local_path (Windows/macOS image path guard)
 
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <array>
 #include <cctype>
 #include <chrono>
@@ -69,6 +72,7 @@ struct ProcessInfo {
     unsigned long pid;
     unsigned long ppid = 0; // parent PID (0 when unknown / a root) — for list_tree
     std::string name;
+    std::optional<std::uint64_t> start_ticks; // Linux: /proc/<pid>/stat starttime at enumeration
 };
 
 std::string to_lower(std::string_view sv) {
@@ -111,6 +115,15 @@ std::vector<ProcessInfo> enumerate_processes() {
     return procs;
 }
 #elif defined(__linux__)
+std::optional<std::uint64_t> read_start_ticks(unsigned long pid) {
+    std::ifstream ifs("/proc/" + std::to_string(pid) + "/stat");
+    if (!ifs.is_open())
+        return std::nullopt;
+    std::string line;
+    std::getline(ifs, line);
+    return yuzu::shared::parse_stat_start_ticks(line);
+}
+
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
     DIR* proc_dir = opendir("/proc");
@@ -157,6 +170,7 @@ std::vector<ProcessInfo> enumerate_processes() {
             if (have_name && have_ppid)
                 break; // PPid follows Name in /proc/<pid>/status — both captured
         }
+        pi.start_ticks = read_start_ticks(pi.pid);
         procs.push_back(std::move(pi));
     }
     closedir(proc_dir);
@@ -501,6 +515,22 @@ private:
     // process view — no separate flat hashed list). ppid is 0 for a root / unresolved
     // parent; sha256/path are empty when the path can't be resolved or the image is
     // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
+    // The name, the path and the hash of one row are three separate reads of a pid that can be
+    // recycled in between. A row is kept only when the process start time at enumeration equals the one
+    // seen after the hash; otherwise the path is dropped and the hash reads `hash_unavailable:pid_reused`
+    // (never another process's image hash under this process's name). Linux only: elsewhere unchanged.
+    static void settle_row([[maybe_unused]] const ProcessInfo& p, [[maybe_unused]] std::string& path,
+                           [[maybe_unused]] std::string& hash) {
+#if defined(__linux__)
+        if (path.empty())
+            return;
+        if (!yuzu::shared::same_process(p.start_ticks, read_start_ticks(p.pid))) {
+            path.clear();
+            hash = yuzu::shared::hash_unavailable("pid_reused");
+        }
+#endif
+    }
+
     int do_list_tree(yuzu::CommandContext& ctx) {
         auto procs = enumerate_processes();
         auto hash_cache = make_action_cache(); // one action only
@@ -510,6 +540,7 @@ private:
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
             std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
+            settle_row(p, path, hash);
             ctx.write_output(std::format("proc|{}|{}|{}|{}|{}", p.pid, p.ppid,
                                          sanitize_field(p.name), hash, sanitize_field(path)));
         }
@@ -530,6 +561,7 @@ private:
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid);
             std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
+            settle_row(p, path, hash);
             ctx.write_output(std::format("proc|{}|{}|{}|{}", p.pid, sanitize_field(p.name), hash,
                                          sanitize_field(path)));
         }

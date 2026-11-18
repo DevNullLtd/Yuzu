@@ -25281,15 +25281,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto specs = validate_bundle_steps(args["steps"].dump());
+                auto specs = validate_bundle_steps_typed(args["steps"].dump());
                 if (!specs) {
-                    if (specs.error().find(std::string(kReasonParamKeyInvalid)) != std::string::npos) {
+                    if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
                         // sg10 / UP-1: counted and audited like every other ingress refusal.
                         count_param_key_invalid(metrics, "bundle");
                         (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
                                        std::string("reason=") + std::string(kReasonParamKeyInvalid));
                     }
-                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error().message),
                                     "application/json");
                     return;
                 }

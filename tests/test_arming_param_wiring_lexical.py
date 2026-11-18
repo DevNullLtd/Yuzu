@@ -47,16 +47,47 @@ def check(source):
     return defects
 
 
+SCHEDULE_DEPS = re.compile(r"register_schedule_routes\(\s*inline_sink,\s*yuzu::server::schedule::Deps\{(.*?)\}\s*\);", re.S)
+PRESEED = re.compile(
+    r'for \(const char\* route : \{([^}]*)\}\)\s*metrics_\.counter\("yuzu_server_dispatch_target_rejected_total",\s*'
+    r'\{\{"route", route\},\s*\{"reason", std::string\(yuzu::server::kReasonParamKeyInvalid\)\}\}\);', re.S)
+ROUTES = {"command", "command_v1", "instruction_execute", "schedule", "bundle", "policy_fragment"}
+
+
+def check_param_key_wiring(source):
+    """The `param_key_invalid` counter wiring: the schedule routes get the metrics registry and the
+    six counted route labels are pre-seeded (absent() alerting needs the series at zero). Searched in
+    the raw text (the one-pass comment stripper above is not trustworthy across a whole file with
+    string literals that hold comment markers); the patterns span no comment."""
+    src = source
+    defects = []
+    m = SCHEDULE_DEPS.search(src)
+    if not m:
+        defects.append("the register_schedule_routes Deps block was not found")
+    elif ".metrics = &metrics_" not in " ".join(m.group(1).split()):
+        defects.append("the schedule routes Deps does not carry `.metrics = &metrics_` (param_key_invalid is never counted)")
+    p = PRESEED.search(src)
+    if not p:
+        defects.append("the param_key_invalid pre-seed loop was not found")
+    else:
+        got = {r.strip().strip('"') for r in p.group(1).split(",") if r.strip()}
+        if got != ROUTES:
+            defects.append(f"the param_key_invalid pre-seed routes are {sorted(got)}, expected {sorted(ROUTES)}")
+    return defects
+
+
 def selftest(source):
     mutants = {
         "drops the forwarded argument": source.replace("plugin, action, parameters)", "plugin, action, {})", 1),
         "passes the argument from a first lambda only": source.replace("plugin, action, parameters);", "plugin, action);", 1),
     }
+    mutants["schedule Deps without metrics"] = source.replace("                             .metrics = &metrics_,\n                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API","                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API",1)
+    mutants["pre-seed drops a route"] = source.replace('"instruction_execute", "schedule", "bundle",\n                                  "policy_fragment"}','"instruction_execute", "bundle",\n                                  "policy_fragment"}',1)
     for name, mutated in mutants.items():
         if mutated == source:
             print(f"SELFTEST SETUP FAILED: mutation '{name}' did not change the source")
             return 1
-        if not check(mutated):
+        if not (check(mutated) or check_param_key_wiring(mutated)):
             print(f"SELFTEST FAILED: mutation '{name}' was not caught")
             return 1
     return 0
@@ -64,7 +95,7 @@ def selftest(source):
 
 def main():
     source = SERVER.read_text(encoding="utf-8")
-    defects = check(source)
+    defects = check(source) + check_param_key_wiring(source)
     for d in defects:
         print("FAIL:", d)
     if defects:

@@ -45,7 +45,7 @@ Owner decision, Fraser Jarvis, 2026-11-18: the pool-teardown join (#8247), the b
 residual (#8204), the ~60 s `patch_connectivity` ordinary-worker hold, the ordinary-lane filesystem stall,
 and protective-lane starvation (#8288) are documented residuals the owner accepted for this change.
 
-- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: it runs every queued task and waits for every RUNNING task to return before it reconnects, with no bound; a command blocked in the kernel or sleeping a delay/stagger holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247).
+- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: a queued task that has not started is answered REJECTED ("agent reconnecting") without running and a staggered command's sleep ends within about a second, but the agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait.
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary
@@ -57,7 +57,9 @@ and protective-lane starvation (#8288) are documented residuals the owner accept
   `(plugin, action)`, is a follow-up tracked in #8288, not part of this change.
 - **A stagger or delay sleep runs on the worker.** A command carrying `stagger_seconds` or
   `delay_seconds` (up to 600 s) sleeps on its worker, protective commands included; the protective lane
-  does not skip it.
+  does not skip it. The sleep is taken in slices of at most one second and ends when the pool is closing
+  for a reconnect or the agent is stopping: the command is then not started, is answered REJECTED
+  ("agent reconnecting" or "agent stopping") and its claim is released so a redelivery can run it.
 - **Result writes share `stream_write_mu_`.** A protective result waits on the same stream write mutex as
   every ordinary result.
 - **The `firewall` plugin has no plugin-level mutex**, so two protective commands can enter it together.

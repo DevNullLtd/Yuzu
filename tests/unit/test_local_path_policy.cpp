@@ -600,6 +600,17 @@ TEST_CASE("image hash cache: the key is the opened image's identity, not path te
     { auto v = s0; v.st_size = 101;         CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     { auto v = s0; v.st_mtim.tv_sec = 1001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     { auto v = s0; v.st_mtim.tv_nsec = 6;   CHECK(yuzu::shared::image_identity_key(v) != base_key); }
+    // A far-future timestamp must not overflow the key arithmetic (sec * 1e9 + nsec is undefined
+    // behaviour past ~9.2e9 s) nor collide with a neighbour: the fields are written separately.
+    {
+        auto v = s0;
+        v.st_mtim.tv_sec = static_cast<decltype(v.st_mtim.tv_sec)>(0x7ffffffffffffff0LL);
+        v.st_mtim.tv_nsec = 5;
+        auto w = v;
+        w.st_mtim.tv_sec -= 1;
+        CHECK(yuzu::shared::image_identity_key(v) != yuzu::shared::image_identity_key(w));
+        CHECK(yuzu::shared::image_identity_key(v) == yuzu::shared::image_identity_key(v));
+    }
     { auto v = s0; v.st_ctim.tv_sec = 2001; CHECK(yuzu::shared::image_identity_key(v) != base_key); }
     { auto v = s0; v.st_ctim.tv_nsec = 10;  CHECK(yuzu::shared::image_identity_key(v) != base_key); } // ctime only
 

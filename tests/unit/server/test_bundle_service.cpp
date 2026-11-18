@@ -325,3 +325,30 @@ TEST_CASE("validate_bundle_steps: a params key with a NUL or control byte is ref
     nlohmann::json ok = {{"plugin", "os_info"}, {"action", "os_version"}, {"params", {{"targets", "h"}}}};
     CHECK(yuzu::server::validate_bundle_steps(nlohmann::json::array({ok}).dump()).has_value());
 }
+
+// A refusal is classified by its TYPED kind, never by matching message text: a params key literally
+// named `param_key_invalid` with an oversized value is a size refusal, not a hostile key.
+TEST_CASE("validate_bundle_steps_typed: the error kind is typed, never inferred from message text",
+          "[bundle_service][security][sg10]") {
+    using yuzu::server::BundleStepsError;
+    nlohmann::json hostile = {{"plugin", "os_info"}, {"action", "os_version"}};
+    hostile["params"] = nlohmann::json::object();
+    hostile["params"][std::string("targets\0x", 9)] = "h";
+    auto r = yuzu::server::validate_bundle_steps_typed(nlohmann::json::array({hostile}).dump());
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == BundleStepsError::Kind::kParamKeyInvalid);
+
+    nlohmann::json named = {{"plugin", "os_info"}, {"action", "os_version"}};
+    named["params"] = {{"param_key_invalid", std::string(70 * 1024, 'x')}};
+    auto big = yuzu::server::validate_bundle_steps_typed(nlohmann::json::array({named}).dump());
+    REQUIRE_FALSE(big.has_value());
+    CHECK(big.error().message.find("param_key_invalid") != std::string::npos); // the key name is echoed
+    CHECK(big.error().kind == BundleStepsError::Kind::kOther);                 // but it is a size refusal
+
+    auto malformed = yuzu::server::validate_bundle_steps_typed("param_key_invalid not json");
+    REQUIRE_FALSE(malformed.has_value());
+    CHECK(malformed.error().kind == BundleStepsError::Kind::kOther);
+    CHECK(yuzu::server::validate_bundle_steps_typed(
+              nlohmann::json::array({nlohmann::json{{"plugin", "os_info"}, {"action", "os_version"}}}).dump())
+              .has_value());
+}

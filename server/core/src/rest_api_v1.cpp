@@ -4462,16 +4462,16 @@ void RestApiV1::register_routes(
                       res.set_content(detail::a4_error(res, "steps is required"), "application/json");
                       return;
                   }
-                  auto specs = validate_bundle_steps(body["steps"].dump());
+                  auto specs = validate_bundle_steps_typed(body["steps"].dump());
                   if (!specs) {
-                      if (specs.error().find(std::string(kReasonParamKeyInvalid)) != std::string::npos) {
+                      if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
                           // sg10 / UP-1: counted and audited like every other ingress refusal.
                           count_param_key_invalid(metrics_registry, "bundle");
                           (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
                                          std::string("reason=") + std::string(kReasonParamKeyInvalid));
                       }
                       res.status = 400;
-                      res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
+                      res.set_content(detail::a4_error(res, "steps: " + specs.error().message), "application/json");
                       return;
                   }
                   auto session = auth_fn(req, res);

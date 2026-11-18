@@ -26,17 +26,24 @@
 namespace yuzu::shared {
 
 [[nodiscard]] inline std::string image_identity_key(const struct stat& st) {
+    // The seconds and nanoseconds fields are written separately: `sec * 1e9 + nsec` overflows a signed
+    // 64-bit value for a far-future timestamp (undefined behaviour), and a wrapped value could make two
+    // different timestamps collide.
 #if defined(__APPLE__)
-    const auto mtime_ns = static_cast<long long>(st.st_mtimespec.tv_sec) * 1000000000LL + st.st_mtimespec.tv_nsec;
-    const auto ctime_ns = static_cast<long long>(st.st_ctimespec.tv_sec) * 1000000000LL + st.st_ctimespec.tv_nsec;
+    const auto m_sec = static_cast<long long>(st.st_mtimespec.tv_sec);
+    const auto m_nsec = static_cast<long long>(st.st_mtimespec.tv_nsec);
+    const auto c_sec = static_cast<long long>(st.st_ctimespec.tv_sec);
+    const auto c_nsec = static_cast<long long>(st.st_ctimespec.tv_nsec);
 #else
-    const auto mtime_ns = static_cast<long long>(st.st_mtim.tv_sec) * 1000000000LL + st.st_mtim.tv_nsec;
-    const auto ctime_ns = static_cast<long long>(st.st_ctim.tv_sec) * 1000000000LL + st.st_ctim.tv_nsec;
+    const auto m_sec = static_cast<long long>(st.st_mtim.tv_sec);
+    const auto m_nsec = static_cast<long long>(st.st_mtim.tv_nsec);
+    const auto c_sec = static_cast<long long>(st.st_ctim.tv_sec);
+    const auto c_nsec = static_cast<long long>(st.st_ctim.tv_nsec);
 #endif
     return std::to_string(static_cast<unsigned long long>(st.st_dev)) + ":" +
            std::to_string(static_cast<unsigned long long>(st.st_ino)) + ":" +
-           std::to_string(static_cast<long long>(st.st_size)) + ":" + std::to_string(mtime_ns) + ":" +
-           std::to_string(ctime_ns);
+           std::to_string(static_cast<long long>(st.st_size)) + ":" + std::to_string(m_sec) + "." +
+           std::to_string(m_nsec) + ":" + std::to_string(c_sec) + "." + std::to_string(c_nsec);
 }
 
 /// Thread-safe (the hash runs on a bounded helper thread) and bounded (cleared when it reaches

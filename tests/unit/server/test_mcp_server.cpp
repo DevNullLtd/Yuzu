@@ -18747,6 +18747,13 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
         CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
                           {{"tool", "execute_instruction"}, {"reason", reason}})
                   .value() == 1.0);
+        // The refusal is audited as a `denied` row that names the reason.
+        bool audited = false;
+        for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+            if (ts.audit_log[k].find("|denied") != std::string::npos &&
+                ts.audit_details[k].find(reason) != std::string::npos)
+                audited = true;
+        CHECK(audited);
     };
 
     SECTION("plugin over 128 bytes") {
@@ -50726,7 +50733,9 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
     };
     for (const auto& c : cases) {
         INFO(c.reason);
+        yuzu::MetricsRegistry idef_reg;
         McpTestServer ts;
+        ts.metrics_for_test = &idef_reg;
         Rig rig;
         rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
         idef_start(ts, rig, "operator");
@@ -50737,6 +50746,10 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK(rig.calls.empty());
         CHECK(rig.approvals.empty()); // refused BEFORE the approval step
+        // Every bound reason is counted under the definition tool's own label.
+        CHECK(idef_reg.counter("yuzu_mcp_tool_args_too_large_total",
+                               {{"tool", "execute_instruction_definition"}, {"reason", c.reason}})
+                  .value() == 1.0);
         if (std::string(c.reason) == "param_key_invalid") {
             // sg10: audited like every other refused argument (a `denied` row naming the reason).
             bool saw = false;

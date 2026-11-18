@@ -396,8 +396,9 @@ enum class DispatchArm {
     return "none";
 }
 
-/// Did the caller name a target at all?
-///
+/// The reason token every `param_key_invalid` refusal uses, spelled once.
+inline constexpr std::string_view kReasonParamKeyInvalid = "param_key_invalid";
+
 /// The ONE ingress check for a request's parameter object (sg10 / UP-1): a key with a control byte,
 /// NUL or invalid UTF-8, or a string value with a NUL, is `param_key_invalid`. Called by REST
 /// `/api/command`, `/api/v1/commands`, `/api/instructions/{id}/execute` (legacy and v1), bundle step
@@ -414,16 +415,15 @@ enum class DispatchArm {
     for (const auto& [k, v] : params.items()) {
         if (!parameter_key_well_formed(k) ||
             (v.is_string() && v.get_ref<const std::string&>().find('\0') != std::string::npos))
-            return BoundViolation{"param_key_invalid",
+            return BoundViolation{kReasonParamKeyInvalid.data(),
                                   "a params key holds a control byte or invalid UTF-8, or a value "
                                   "holds a NUL byte"};
     }
     return std::nullopt;
 }
 
-/// The reason token and the one counter bump every `param_key_invalid` refusal uses
-/// (`yuzu_server_dispatch_target_rejected_total{route,reason}`), so the label is spelled once.
-inline constexpr std::string_view kReasonParamKeyInvalid = "param_key_invalid";
+/// The one counter bump every `param_key_invalid` refusal uses
+/// (`yuzu_server_dispatch_target_rejected_total{route,reason}`).
 inline void count_param_key_invalid(yuzu::MetricsRegistry* metrics, std::string_view route) noexcept {
     if (metrics == nullptr)
         return;
@@ -436,6 +436,8 @@ inline void count_param_key_invalid(yuzu::MetricsRegistry* metrics, std::string_
     }
 }
 
+/// Did the caller name a target at all?
+///
 /// The companion to `check_targeting_shape`, and the reason a sink can tell
 /// "broadcast me" from "I meant something specific". A sink that only sees an
 /// empty id vector cannot distinguish them — which is why every fix here has to

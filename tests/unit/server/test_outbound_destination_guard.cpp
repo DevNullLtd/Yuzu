@@ -210,3 +210,21 @@ TEST_CASE("destination guard: an empty resolver answer fails closed and a malfor
     CHECK(detail::bare_host("host.example:8080") == "host.example");
     CHECK(detail::bare_host("host.example") == "host.example");
 }
+
+// At capacity the table evicts (expired first, else the oldest), never clears wholesale: a target that
+// is still inside its window stays throttled, so one flood of new ids cannot make every throttled target
+// log and audit again at once.
+TEST_CASE("RefusalThrottle: at capacity a recent target stays throttled (eviction, not clear)",
+          "[destination_guard][throttle]") {
+    using yuzu::server::RefusalThrottle;
+    RefusalThrottle t{std::chrono::seconds(300)};
+    const auto t0 = std::chrono::steady_clock::now();
+    REQUIRE(t.admit(1, t0));
+    for (std::int64_t id = 2; id <= static_cast<std::int64_t>(RefusalThrottle::kMaxTracked); ++id)
+        REQUIRE(t.admit(id, t0 + std::chrono::seconds(1)));
+    // The table is full. A NEW id evicts the oldest (id 1), not everything.
+    REQUIRE(t.admit(100000, t0 + std::chrono::seconds(2)));
+    CHECK_FALSE(t.admit(2, t0 + std::chrono::seconds(3)));  // still inside its window: throttled
+    CHECK_FALSE(t.admit(100000, t0 + std::chrono::seconds(3)));
+    CHECK(t.admit(1, t0 + std::chrono::seconds(3)));         // the evicted one is a first sighting again
+}

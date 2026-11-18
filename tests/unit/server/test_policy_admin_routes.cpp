@@ -525,4 +525,8 @@ TEST_CASE("POST /api/policy-fragments: a hostile parameter key in check, fix or 
               .counter("yuzu_server_dispatch_target_rejected_total",
                        {{"route", "policy_fragment"}, {"reason", "param_key_invalid"}})
               .value() == 3.0);
+    // Nothing was stored by any of the three refused creates.
+    auto stored = store.query_fragments();
+    REQUIRE(stored.has_value());
+    CHECK(stored->empty());
 }

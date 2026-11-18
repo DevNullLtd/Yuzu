@@ -54,6 +54,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
 #include "command_params.hpp"                    // command_params_have_nul (sg10 / UP-1)
+#include "interruptible_wait.hpp"                 // sleep_interruptible: a stagger never outlives a reconnect or stop
 #include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
 #include "sync_scheduler.hpp"                 // ADR-0016 daily-sync framework
@@ -809,6 +810,11 @@ public:
                           "plugin would read a truncated name); refused before the dedup claim",
                           "counter");
         metrics_.counter("yuzu_agent_commands_refused_nul_params_total");
+        metrics_.describe("yuzu_agent_commands_rejected_closing_total",
+                          "Commands answered REJECTED without running because the command pool was "
+                          "closing for a reconnect or the agent was stopping (claim released)",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
@@ -1331,6 +1337,7 @@ public:
         try {
             thread_pool_ = std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
                                                          kReservedProtectiveWorkers, pool_gauge_);
+            command_pool_closing_.store(false, std::memory_order_release);
         } catch (const std::exception& e) {
             spdlog::critical("could not create the command dispatch thread pool ({}) — the host "
                              "is out of threads. Exiting with a startup failure rather than "
@@ -3630,6 +3637,10 @@ public:
                     if (stop_requested_.load(std::memory_order_acquire))
                         break;
 
+                    // True only when THIS delivery's claim() succeeded — gates the
+                    // queue-full release so it never deletes a concurrent owner's row.
+                    bool claimed_here = false;
+
                     // sg10 / UP-1: a parameter key or value with a NUL byte would be truncated by
                     // `c_str()` and read by a plugin as a different name. Refused BEFORE the
                     // dedup claim and the stagger sleep (no in-flight record, no held worker).
@@ -3651,10 +3662,6 @@ public:
                         continue;
                     }
 
-                    // True only when THIS delivery's claim() succeeded — gates the
-                    // queue-full release so it never deletes a concurrent owner's row.
-                    bool claimed_here = false;
-
                     // Command replay protection (HA WS-0, ADR-2002). claim() is the
                     // atomic first-writer-wins gate: on a duplicate we REPLAY the
                     // original terminal outcome (never a bare REJECTED that would
@@ -3670,7 +3677,8 @@ public:
                     // branch resolves via its own write + continue, so claiming it
                     // would leak an unresolved in-flight record AND wrongly answer a
                     // re-sent control command RUNNING. It is the ONLY dispatch that
-                    // bypasses the claim: gating on the literal (not the whole
+                    // skips claiming for a reason of its own (a command refused above, for a NUL
+                    // parameter, claims nothing and dispatches nothing): gating on the literal (not the whole
                     // reserved-name set) keeps durable idempotency the SAFE DEFAULT
                     // for any future reserved-name command — a future __update__ OTA
                     // path is deduplicated unless it, too, opts out in should_claim().
@@ -3945,7 +3953,7 @@ public:
                     // can never occupy the last reserved worker.
                     const bool protective_lane =
                         yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());
-                    bool submitted = thread_pool_->submit([this, target, cmd, stream]() {
+                    bool submitted = thread_pool_->submit([this, target, cmd, stream, claimed_here]() {
                         // Outer exception firewall (#2037). The ThreadPool worker
                         // already contains any escaped exception so the agent
                         // process survives; catching here additionally lets the
@@ -3953,7 +3961,7 @@ public:
                         // its own timeout for a command whose dispatch task threw
                         // outside the plugin execute() guard.
                         try {
-                            execute_command_task(target, cmd, stream);
+                            execute_command_task(target, cmd, stream, claimed_here);
                         } catch (const std::exception& e) {
                             spdlog::error("Command {} dispatch failed outside plugin execute: {}",
                                           cmd.command_id(), e.what());
@@ -4025,6 +4033,7 @@ public:
                 // Destroy thread pool BEFORE stream goes out of scope — this drains
                 // the queue, waits for in-flight tasks, and joins all worker threads,
                 // ensuring no task holds a dangling stream pointer.
+                command_pool_closing_.store(true, std::memory_order_release);
                 thread_pool_.reset();
 
                 // Stop and join the OTA update thread
@@ -4148,6 +4157,7 @@ public:
                         thread_pool_ =
                             std::make_unique<ThreadPool>(std::thread::hardware_concurrency(), kCommandQueueDepth,
                                                          kReservedProtectiveWorkers, pool_gauge_);
+                        command_pool_closing_.store(false, std::memory_order_release);
                     } catch (const std::exception& e) {
                         spdlog::critical("could not re-create the command dispatch thread pool on "
                                          "reconnect ({}) — the host is out of threads. Stopping "
@@ -4449,8 +4459,47 @@ private:
     // FAILURE-on-throw path around it stay small and readable. A `return`
     // here skips this command's remaining status writes exactly as it did
     // inside the lambda.
+    /// True while the command pool is being destroyed for a reconnect, or the agent is stopping: a task
+    /// that has not started its plugin yet must not start (and must not sleep a stagger), because the
+    /// pool destructor waits for every task (#8247 is the unbounded join of a RUNNING task).
+    [[nodiscard]] bool command_pool_closing() const {
+        return command_pool_closing_.load(std::memory_order_acquire) ||
+               stop_requested_.load(std::memory_order_acquire);
+    }
+
+    /// A command that never started (the pool is closing): answer REJECTED so the server does not wait,
+    /// release OUR claim so a redelivery after the reconnect can run it (never memoise a terminal for
+    /// work that did not happen), and erase its in-flight entry (record_command_terminal is not used:
+    /// it would memoise).
+    void reject_unstarted_command(const std::shared_ptr<SubscribeStream>& stream,
+                                  const pb::CommandRequest& cmd, bool claimed_here) {
+        const bool stopping = stop_requested_.load(std::memory_order_acquire);
+        spdlog::warn("Command {} not started: agent {}", cmd.command_id(),
+                     stopping ? "stopping" : "reconnecting");
+        metrics_.counter("yuzu_agent_commands_rejected_closing_total").increment();
+        if (!cmd.command_id().empty()) {
+            std::lock_guard lock(in_flight_mu_);
+            in_flight_ids_.erase(cmd.command_id());
+        }
+        if (command_dedup_ && claimed_here &&
+            command_dedup_->release(cmd.command_id()) == ReleaseOutcome::Error)
+            metrics_.counter("yuzu_agent_dedup_release_errors_total").increment();
+        pb::CommandResponse resp;
+        resp.set_command_id(cmd.command_id());
+        resp.set_status(pb::CommandResponse::REJECTED);
+        resp.set_output(stopping ? "command not started: agent stopping"
+                                 : "command not started: agent reconnecting");
+        std::lock_guard lock(stream_write_mu_);
+        stream->Write(resp, grpc::WriteOptions());
+    }
+
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
-                              const std::shared_ptr<SubscribeStream>& stream) {
+                              const std::shared_ptr<SubscribeStream>& stream, bool claimed_here) {
+        // A task still queued (or about to sleep) when the pool closes never starts.
+        if (command_pool_closing()) {
+            reject_unstarted_command(stream, cmd, claimed_here);
+            return;
+        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
@@ -4468,7 +4517,14 @@ private:
                           random_stagger, delay_s, total_delay);
 
             if (total_delay > 0) {
-                std::this_thread::sleep_for(std::chrono::seconds(total_delay));
+                // Sliced (<= 1 s) and stop-aware: a long stagger can never hold this worker past a
+                // reconnect or a stop. An interrupted command never ran: reject it and let it be
+                // redelivered.
+                if (!sleep_interruptible(std::chrono::seconds(total_delay),
+                                         [this] { return command_pool_closing(); })) {
+                    reject_unstarted_command(stream, cmd, claimed_here);
+                    return;
+                }
             }
 
             // Check expiration after the delay — skip stale commands
@@ -5238,6 +5294,9 @@ private:
     // during startup and never reassigned, so the reader thread and the dispatch
     // workers read the pointer freely; the store serialises its own access.
     std::unique_ptr<CommandDedupStore> command_dedup_;
+    /// Set just before the command pool is destroyed on a reconnect (cleared when a pool is created):
+    /// tasks that have not started their plugin reject instead of starting or sleeping a stagger.
+    std::atomic<bool> command_pool_closing_{false};
 
     // CHAOS-TTL-1 (PR #3784 fix round, governance ledger): a plugin-cooperation-
     // independent liveness signal for the server's per-device concurrency claim

@@ -15,12 +15,15 @@ regressible — nothing fails loudly when one is broken.
 1. **Every claimed command is resolved by EXACTLY ONE** of `record_terminal` (terminal, memoised) or
    `release` (transient — queue-full only). Otherwise its claim leaks.
 
-2. **`record_terminal` is called BEFORE the terminal wire Write.** The durable record is the source
-   of truth; the send is replayable. A new terminal-write site that forgets this degrades that
+2. **For a claimed command, `record_terminal` is called BEFORE the terminal wire Write.** The durable
+   record is the source of truth; the send is replayable. (A command refused before the claim, such as
+   one with a NUL parameter, has no record to write: it claims nothing and is answered `REJECTED` once.) A new terminal-write site that forgets this degrades that
    command to RUNNING-forever / outcome-lost.
 
-3. **The `__guard__` side channel is the ONLY dispatch that bypasses the claim.** Gate on the
-   literal, so dedup stays the SAFE DEFAULT for any future reserved-name command.
+3. **The `__guard__` side channel is the ONLY dispatch that skips claiming for a reason of its own.**
+   Gate on the literal, so dedup stays the SAFE DEFAULT for any future reserved-name command. (The one
+   other path that never claims is a refusal made BEFORE the claim step, today a parameter holding a
+   NUL byte: it is answered `REJECTED` and nothing is dispatched, so no claim exists to leak.)
 
 4. **A duplicate NEVER re-executes.** Terminal replays the stored frame; InFlight answers RUNNING
    (indeterminate).

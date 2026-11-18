@@ -313,6 +313,8 @@ agent_test_exe = executable(
     'unit/test_dex_rate_limiter.cpp',
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
+    'unit/test_interruptible_wait.cpp', # a stagger sleep is sliced and stop-aware
+    'unit/test_proc_stat.cpp', # a recycled pid is detected by the process start time
     'unit/test_command_params.cpp', # sg10: agent NUL-parameter refusal predicate
     'unit/test_shutdown_pipe.cpp',
     'unit/test_hard_exit.cpp',
@@ -4720,6 +4722,14 @@ test('sso-only runtime wiring lexical gate',
 test('windows etw cleanup wiring lexical gate',
   _python3_test,
   args: [files('test_etw_cleanup_wiring.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# Agent stop/reconnect path: a stagger sleep is sliced and stop-aware, the closing flag is set before the pool
+# is destroyed, an unstarted command is rejected (source-text only; in-file selftest).
+test('agent stagger stop wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_stagger_stop_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

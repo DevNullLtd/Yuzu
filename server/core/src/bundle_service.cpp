@@ -52,8 +52,8 @@ const char* state_token(BundleStepState st) {
 
 } // namespace
 
-std::expected<std::vector<BundleStepSpec>, std::string>
-validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
+std::expected<std::vector<BundleStepSpec>, BundleStepsError>
+validate_bundle_steps_typed(std::string_view steps_json, std::size_t max_steps) {
     // #2437-class guard: raw-text depth check before this function's own
     // parse. The REST /api/v1/bundles caller already checks the whole
     // request body before this is reached, but this function has no
@@ -63,20 +63,20 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
     // unbounded-recursion-on-dump() crash this branch's own `v.dump()`
     // (below, per-param-value coercion) would otherwise be exposed to.
     if (mcp::json_exceeds_depth(steps_json, mcp::kMcpMaxJsonDepth))
-        return std::unexpected("steps nests too deeply");
+        return std::unexpected(BundleStepsError{"steps nests too deeply", BundleStepsError::Kind::kOther});
     nlohmann::json doc;
     try {
         doc = nlohmann::json::parse(steps_json.begin(), steps_json.end());
     } catch (const nlohmann::json::exception& e) {
-        return std::unexpected(std::string("invalid JSON: ") + e.what());
+        return std::unexpected(BundleStepsError{std::string("invalid JSON: ") + e.what(), BundleStepsError::Kind::kOther});
     }
 
     if (!doc.is_array())
-        return std::unexpected("steps must be a JSON array");
+        return std::unexpected(BundleStepsError{"steps must be a JSON array", BundleStepsError::Kind::kOther});
     if (doc.empty())
-        return std::unexpected("steps array is empty");
+        return std::unexpected(BundleStepsError{"steps array is empty", BundleStepsError::Kind::kOther});
     if (doc.size() > max_steps)
-        return std::unexpected("too many steps (max " + std::to_string(max_steps) + ")");
+        return std::unexpected(BundleStepsError{"too many steps (max " + std::to_string(max_steps) + ")", BundleStepsError::Kind::kOther});
 
     std::vector<BundleStepSpec> specs;
     specs.reserve(doc.size());
@@ -85,19 +85,19 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
     for (const auto& elem : doc) {
         const std::string where = "step " + std::to_string(idx++);
         if (!elem.is_object())
-            return std::unexpected(where + ": must be an object");
+            return std::unexpected(BundleStepsError{where + ": must be an object", BundleStepsError::Kind::kOther});
         if (!elem.contains("plugin") || !elem["plugin"].is_string())
-            return std::unexpected(where + ": missing string 'plugin'");
+            return std::unexpected(BundleStepsError{where + ": missing string 'plugin'", BundleStepsError::Kind::kOther});
         if (!elem.contains("action") || !elem["action"].is_string())
-            return std::unexpected(where + ": missing string 'action'");
+            return std::unexpected(BundleStepsError{where + ": missing string 'action'", BundleStepsError::Kind::kOther});
 
         BundleStepSpec s;
         s.plugin = to_lower(elem["plugin"].get<std::string>());
         s.action = to_lower(elem["action"].get<std::string>());
         if (!is_ident(s.plugin))
-            return std::unexpected(where + ": invalid plugin name");
+            return std::unexpected(BundleStepsError{where + ": invalid plugin name", BundleStepsError::Kind::kOther});
         if (!is_ident(s.action))
-            return std::unexpected(where + ": invalid action name");
+            return std::unexpected(BundleStepsError{where + ": invalid action name", BundleStepsError::Kind::kOther});
         // Duplicate (plugin, action) steps are DELIBERATELY allowed (ADR-0011
         // §61-64): each step gets its own command_id, the persisted ordered step
         // map demuxes by command_id in request order, so e.g. two registry reads
@@ -106,12 +106,13 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
         if (elem.contains("params")) {
             const auto& p = elem["params"];
             if (!p.is_object())
-                return std::unexpected(where + ": 'params' must be an object");
+                return std::unexpected(BundleStepsError{where + ": 'params' must be an object", BundleStepsError::Kind::kOther});
             if (const auto bad = check_params_key_shape(p))
-                return std::unexpected(where + ": param_key_invalid: " + bad->message);
+                return std::unexpected(BundleStepsError{where + ": " + std::string(bad->reason) + ": " + bad->message,
+                                                        BundleStepsError::Kind::kParamKeyInvalid});
             if (p.size() > kMaxParamCountPerStep)
-                return std::unexpected(where + ": too many params (max " +
-                                       std::to_string(kMaxParamCountPerStep) + ")");
+                return std::unexpected(BundleStepsError{where + ": too many params (max " +
+                                       std::to_string(kMaxParamCountPerStep) + ")", BundleStepsError::Kind::kOther});
             s.params.reserve(p.size());
             for (const auto& [k, v] : p.items()) {
                 // Coerce to string: strings pass through, other JSON types are
@@ -119,11 +120,11 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
                 std::string val = v.is_string() ? v.get<std::string>() : v.dump();
                 // Bound the per-step payload — a bundle fans this out ×N (UP-7).
                 if (k.size() > kMaxParamKeyLen)
-                    return std::unexpected(where + ": param key too long (max " +
-                                           std::to_string(kMaxParamKeyLen) + " bytes)");
+                    return std::unexpected(BundleStepsError{where + ": param key too long (max " +
+                                           std::to_string(kMaxParamKeyLen) + " bytes)", BundleStepsError::Kind::kOther});
                 if (val.size() > kMaxParamValueLen)
-                    return std::unexpected(where + ": param '" + k + "' value too large (max " +
-                                           std::to_string(kMaxParamValueLen) + " bytes)");
+                    return std::unexpected(BundleStepsError{where + ": param '" + k + "' value too large (max " +
+                                           std::to_string(kMaxParamValueLen) + " bytes)", BundleStepsError::Kind::kOther});
                 s.params.emplace_back(k, std::move(val));
             }
         }
@@ -132,6 +133,14 @@ validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
     }
 
     return specs;
+}
+
+std::expected<std::vector<BundleStepSpec>, std::string>
+validate_bundle_steps(std::string_view steps_json, std::size_t max_steps) {
+    auto r = validate_bundle_steps_typed(steps_json, max_steps);
+    if (!r)
+        return std::unexpected(std::move(r.error().message));
+    return std::move(*r);
 }
 
 BundleAggregate aggregate_bundle(const std::vector<DispatchedStep>& steps,
