@@ -126,13 +126,18 @@ elf_soname(const ReadAt& rd, std::uint64_t file_size) {
     constexpr auto bad = [] { return std::unexpected(NativeError::unreadable); };
     constexpr auto none = [] { return std::unexpected(NativeError::not_library); };
 
-    if (file_size < 16)
+    // One read of min(16, file_size) bytes. Under 4 bytes cannot carry the magic and a magic
+    // mismatch is not a library; the right magic on a file shorter than the 16-byte ident is a
+    // recognisable library that cannot be parsed (unreadable), so it still gets a file-name row.
+    if (file_size < 4)
         return none();
-    const auto ident = read_exact(rd, file_size, 0, 16);
+    const auto ident = read_exact(rd, file_size, 0, std::min<std::uint64_t>(16, file_size));
     if (!ident)
         return bad();
     if ((*ident)[0] != '\x7f' || (*ident)[1] != 'E' || (*ident)[2] != 'L' || (*ident)[3] != 'F')
         return none();
+    if (file_size < 16)
+        return bad();
     const auto cls = static_cast<unsigned char>((*ident)[4]);
     const auto data = static_cast<unsigned char>((*ident)[5]);
     if ((cls != 1 && cls != 2) || (data != 1 && data != 2))

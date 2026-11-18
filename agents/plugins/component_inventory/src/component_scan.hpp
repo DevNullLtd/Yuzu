@@ -414,18 +414,26 @@ enum class Added { ok, anchor_full, section_full };
 
 /// A text field as it may cross the plugin ABI: a NUL or a byte outside well-formed UTF-8 becomes '?'
 /// first (the row travels as a C string and is parsed as UTF-8, so a NUL would cut it and a bad byte
-/// would cost the host's whole response), then the pipe/backslash/CR/LF escape. `path` and `anchor_app`
-/// carry file-system and archive-entry bytes verbatim; the other three are printable ASCII by
-/// construction and are scrubbed all the same, so the row's safety does not rest on the parsers.
+/// would cost the host's whole response), then every other control character (C0 below 0x20 and DEL,
+/// the unit and record separators 0x1E/0x1F among them) becomes '?' too, then the pipe/backslash/CR/LF
+/// escape; CR and LF are left to that escape, which folds them to a space. `path` and `anchor_app`
+/// carry file-system and archive-entry bytes verbatim (names are attacker-plantable); the other three
+/// are printable ASCII by construction and are scrubbed all the same, so the row's safety does not
+/// rest on the parsers or on a later layer.
 [[nodiscard]] inline std::string wire_field(std::string_view v) {
     std::string s(v);
     yuzu::shared::scrub_wire_bytes(s);
+    for (char& c : s) {
+        const auto u = static_cast<unsigned char>(c);
+        if ((u < 0x20 && u != '\r' && u != '\n') || u == 0x7F)
+            c = '?';
+    }
     return yuzu::util::safe_output_field(s);
 }
 
 /// comp|<kind>|name|version|version_source|path|size|mtime|anchor_app, every text field scrubbed and
-/// escaped (kind is java for the scan, native for the native action). The Row keeps its raw bytes (the real name is what acquisition opens); only the wire copy
-/// is changed.
+/// escaped (kind is java for the scan, native for the native action). The Row keeps its raw bytes (the
+/// real name is what acquisition opens); only the wire copy is changed.
 [[nodiscard]] inline std::string format_component_row(const Row& r) {
     std::string s = "comp|";
     s += wire_field(r.kind);

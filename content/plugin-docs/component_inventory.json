@@ -180,7 +180,7 @@
           ]
         },
         {
-          "description": "Absolute path of the library file. A NUL or a byte outside valid UTF-8 in a folder or file name is shown as ?.",
+          "description": "Absolute path of the library file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?.",
           "example": "/opt/app/lib/libssl.so.3.0.13",
           "name": "path",
           "platforms": [
@@ -213,7 +213,7 @@
           "values": null
         },
         {
-          "description": "First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?.",
+          "description": "First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.",
           "example": "app",
           "name": "anchor_app",
           "platforms": [
@@ -292,7 +292,7 @@
           ]
         },
         {
-          "description": "Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.",
+          "description": "Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL, another control character or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?.",
           "example": "/opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar",
           "name": "path",
           "platforms": [
@@ -325,7 +325,7 @@
           "values": null
         },
         {
-          "description": "First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?.",
+          "description": "First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?.",
           "example": "app",
           "name": "anchor_app",
           "platforms": [

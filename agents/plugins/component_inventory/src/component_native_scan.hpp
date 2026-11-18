@@ -22,7 +22,8 @@
  * states that residual.
  *
  * Untrusted bytes (a SONAME, an install name, a path) reach a row only through wire_field, in
- * format_component_row; the name rules additionally map any non-printable byte to '?'.
+ * format_component_row, which maps a NUL, any other control character (C0 and DEL) and a byte outside
+ * well-formed UTF-8 to '?'; the name rules additionally map any non-printable byte to '?'.
  */
 #pragma once
 

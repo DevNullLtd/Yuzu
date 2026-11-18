@@ -863,6 +863,37 @@ TEST_CASE("wire row: a NUL or a byte outside UTF-8 never reaches the C string", 
     CHECK(r.path.find('\0') != std::string::npos); // the Row keeps the raw bytes: acquisition opens the real name
 }
 
+TEST_CASE("wire row: a control character in a path or an anchor app never reaches the wire, for either kind",
+          "[runtime][component_scan][wire][component_inventory]") {
+    using namespace std::string_literals;
+    // The unit and record separators (0x1E, 0x1F), ESC, TAB and DEL are all valid single-byte UTF-8, so
+    // only the control-character scrub stands between a planted file name and the row.
+    const std::string ctl = "\x1e\x1f\x1b\x09\x7f"s;
+    for (const char* kind : {"java", "native"}) {
+        INFO("kind " << kind);
+        Row r;
+        r.kind = kind;
+        r.name = "n";
+        r.version = "1";
+        r.version_source = "filename";
+        r.path = "/opt/a" + ctl + "b/caf\xc3\xa9/x\r\ny.jar"; // a multi-byte scalar, then CR LF
+        r.size = 12;
+        r.mtime = -5;
+        r.anchor_app = "ap" + ctl + "p";
+        const std::string line = format_component_row(r);
+
+        CHECK(line == std::string("comp|") + kind + "|n|1|filename|/opt/a?????b/caf\xc3\xa9/x  y.jar|12|-5|ap?????p");
+        CHECK(std::count(line.begin(), line.end(), '|') == 8); // nine fields
+        CHECK(std::none_of(line.begin(), line.end(), [](char c) {
+            const auto u = static_cast<unsigned char>(c);
+            return u < 0x20 || u == 0x7f;
+        }));
+        CHECK(yuzu::shared::count_invalid_wire_bytes(line) == 0);
+        CHECK(r.path.find('\x1e') != std::string::npos); // the Row keeps the raw bytes
+        CHECK(r.anchor_app.find('\x7f') != std::string::npos);
+    }
+}
+
 namespace {
 
 /// The OS leg's targets as answer_scan sees them (it is duck-typed on these four members), so the

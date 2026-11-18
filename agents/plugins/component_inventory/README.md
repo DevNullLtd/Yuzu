@@ -110,10 +110,10 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<t
 | `name` | string | - | macOS, Linux | `libssl` | Library name: the SONAME (Linux) or install-name leaf (macOS) without its .so or .dylib suffix and version, or the file name's equivalent when the library declares none (libssl.so.3 reads libssl). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
 | `version` | string | - | macOS, Linux | `3.0.13` | Version from the file name (libssl.so.3.0.13 reads 3.0.13); when the name gives none, from the SONAME suffix (Linux) or the Mach-O current_version when it is not 0.0.0 (macOS); empty when none gives one. Status rows: the comma-joined cause tokens, or -. |
 | `version_source` | string | `filename` `elf` `macho` `unreadable` | macOS, Linux | `filename` | Where the version came from. Values: filename, elf (the SONAME, Linux), macho (current_version, macOS), unreadable (no source gave a version, or the header could not be read inside the fixed bounds; the row is still listed and the scan is not made incomplete by it). |
-| `path` | string | - | macOS, Linux | `/opt/app/lib/libssl.so.3.0.13` | Absolute path of the library file. A NUL or a byte outside valid UTF-8 in a folder or file name is shown as ?. |
+| `path` | string | - | macOS, Linux | `/opt/app/lib/libssl.so.3.0.13` | Absolute path of the library file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?. |
 | `size` | int64 | - | macOS, Linux | `3086784` | Size of the library file in bytes. |
 | `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the library file as Unix seconds. |
-| `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?. |
+| `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the library sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?. |
 
 **`crossplatform.components.scan` — `row_kind|kind|name|version|version_source|path|size|mtime|anchor_app`**
 
@@ -124,10 +124,10 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<t
 | `name` | string | - | macOS, Linux | `log4j-core` | Artifact name taken from the file name, without the version and extension (log4j-core-2.17.1.jar reads log4j-core). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
 | `version` | string | - | macOS, Linux | `2.17.1` | Version from the file name, corrected by the archive's pom.properties or MANIFEST.MF only when the file name carries that version; when the name gives none, from pom.properties, else MANIFEST.MF; empty when none gives one. Nested libraries take it from the entry name only. A pre-release or build qualifier (rc, beta, M1, snapshot, a build number) stays in it. Status rows: the comma-joined cause tokens, or -. |
 | `version_source` | string | `filename` `pom` `manifest` `unreadable` | macOS, Linux | `filename` | Where the version came from. Values: filename, pom, manifest, unreadable (no source gave a version; the row is still listed and the scan is not made incomplete by it). |
-| `path` | string | - | macOS, Linux | `/opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar` | Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?. |
+| `path` | string | - | macOS, Linux | `/opt/app/lib/app.war!WEB-INF/lib/log4j-core-2.17.1.jar` | Absolute path of the archive; a nested library is <archive path>!<entry name>. A NUL, another control character or a byte outside valid UTF-8 in a folder, file or entry name is shown as ?. |
 | `size` | int64 | - | macOS, Linux | `1789769` | Size in bytes: the archive file size, or the nested entry's uncompressed size. |
 | `mtime` | int64 | - | macOS, Linux | `1700000000` | Modification time of the archive file as Unix seconds; a nested library carries its archive's. |
-| `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL or a byte outside valid UTF-8 in the name is shown as ?. |
+| `anchor_app` | string | - | macOS, Linux | `app` | First path component below the scanned root: the application folder the archive sits under (the file name itself when it sits directly in a root). A NUL, another control character or a byte outside valid UTF-8 in the name is shown as ?. |
 <!-- END GENERATED -->
 
 ### Result status

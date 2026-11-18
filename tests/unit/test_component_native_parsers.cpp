@@ -295,6 +295,44 @@ TEST_CASE("elf_soname: no DT_SONAME is an empty answer; a non-ET_DYN file and a 
     expect_error(run_elf(cls.b), NativeError::unreadable);
 }
 
+TEST_CASE("elf_soname: the ELF magic on 4 to 15 bytes is unreadable (one read, a file-name row); under 4 bytes is not a library",
+          "[component_native][component_inventory]") {
+    const auto full = make_elf(true, false, "libfoo.so.1").b;
+    for (std::size_t n = 4; n <= 15; ++n) {
+        INFO("length " << n);
+        const auto cut = full.substr(0, n);
+        Rd rd(cut);
+        expect_error(run_elf(cut, &rd), NativeError::unreadable);
+        REQUIRE(rd.reqs.size() == 1); // one read, clamped to the file: never past its end
+        CHECK(rd.reqs[0].off == 0);
+        CHECK(rd.reqs[0].len == n);
+
+        Rd named(cut);
+        const auto d = describe_linux_file("libfoo.so.1", named.fn(), cut.size());
+        REQUIRE(d.has_value()); // recognisable but unparseable: a row from the file name
+        CHECK(d->name == "libfoo");
+        CHECK(d->version == "1");
+        CHECK(d->version_source == NativeVersionSource::filename);
+
+        Rd unversioned(cut);
+        const auto u = describe_linux_file("libfoo.so", unversioned.fn(), cut.size());
+        REQUIRE(u.has_value());
+        CHECK(u->version.empty());
+        CHECK(u->version_source == NativeVersionSource::unreadable);
+    }
+    for (std::size_t n = 0; n <= 3; ++n) {
+        INFO("length " << n);
+        const auto cut = full.substr(0, n);
+        expect_error(run_elf(cut), NativeError::not_library);
+        Rd rd(cut);
+        CHECK_FALSE(describe_linux_file("libfoo.so.1", rd.fn(), cut.size()).has_value());
+    }
+    // a 4-15 byte file that does not carry the magic stays not a library
+    auto wrong = full.substr(0, 10);
+    wrong[1] = 'X';
+    expect_error(run_elf(wrong), NativeError::not_library);
+}
+
 TEST_CASE("elf_soname: every bound is unreadable and nothing reads outside the file",
           "[component_native][component_inventory]") {
     for (const bool is64 : {true, false}) {
