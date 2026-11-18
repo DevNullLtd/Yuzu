@@ -18772,6 +18772,18 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
                             R"("}})"),
                         "param_value_len");
     }
+    SECTION("a params key with a NUL byte (sg10: counted under param_key_invalid)") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"targets\u0000x":"v"}})"),
+                        "param_key_invalid");
+    }
+    SECTION("a params key with a control byte") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"a\u0007b":"v"}})"),
+                        "param_key_invalid");
+    }
+    SECTION("a params value with a NUL byte") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"k":"v\u0000w"}})"),
+                        "param_key_invalid");
+    }
     SECTION("a params key over 256 bytes") {
         const std::string big_key(257, 'k');
         expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{")" +
@@ -25782,6 +25794,54 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
 // an admin's bundle step on an AdminOrApproval-gated pair was refused
 // ApprovalRequired unconditionally. This is the full-stack version of the
 // orchestrator-level falsifier in test_bundle_orchestrator.cpp.
+// sg10 / UP-1: a bundle step whose params key the agent would truncate is refused -32602, audited and
+// counted, and nothing is dispatched.
+TEST_CASE("MCP execute_bundle: a step params key with a NUL or control byte is refused, audited and "
+          "counted (sg10)",
+          "[pg][mcp][bundle][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry reg;
+    bool dispatched = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s},
+                                            .principal_is_admin = true};
+    };
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd"};
+    });
+    for (const char* key : {"targets\\u0000x", "a\\u0007b"}) {
+        auto res = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime","params":{")") +
+            key + R"(":"h"}}]}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK_FALSE(dispatched);
+    bool saw = false;
+    for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+        if (ts.audit_log[k] == "bundle.dispatch|denied" &&
+            ts.audit_details[k] == "reason=param_key_invalid")
+            saw = true;
+    CHECK(saw);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                      {{"route", "bundle"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
+}
+
 TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into DispatchFn (#1398)",
           "[pg][mcp][bundle][1398]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -50657,6 +50717,7 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         {{{"definition_id", std::string(129, 'x')}}, "ident_len"},
         {{{"definition_id", "d"}, {"params", many}}, "param_count"},
         {{{"definition_id", "d"}, {"params", {{std::string(257, 'k'), "v"}}}}, "param_key_len"},
+        {{{"definition_id", "d"}, {"params", {{std::string("targets\0x", 9), "v"}}}}, "param_key_invalid"},
         {{{"definition_id", "d"}, {"params", {{"k", std::string(65537, 'v')}}}}, "param_value_len"},
         {{{"definition_id", "d"}, {"scope", std::string(8193, 's')}}, "scope_len"},
         {{{"definition_id", "d"}, {"agent_ids", nlohmann::json::array()}}, "agent_ids_empty"},
@@ -50676,6 +50737,15 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK(rig.calls.empty());
         CHECK(rig.approvals.empty()); // refused BEFORE the approval step
+        if (std::string(c.reason) == "param_key_invalid") {
+            // sg10: audited like every other refused argument (a `denied` row naming the reason).
+            bool saw = false;
+            for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+                if (ts.audit_log[k].find("|denied") != std::string::npos &&
+                    ts.audit_details[k].find("param_key_invalid") != std::string::npos)
+                    saw = true;
+            CHECK(saw);
+        }
     }
 }
 

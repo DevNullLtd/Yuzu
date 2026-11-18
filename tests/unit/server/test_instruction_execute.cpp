@@ -3335,4 +3335,14 @@ TEST_CASE("execute: a params key with a NUL or control byte is refused param_key
     CHECK(as_refusal(out)->reason == "param_key_invalid");
     CHECK(r.calls.empty());
     CHECK(r.approvals.empty());
+    // Audited and counted (route label of the surface) like every sibling targeting refusal.
+    int denied = 0;
+    for (const auto& a : r.audits)
+        if (a.result == "denied" && a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied;
+    CHECK(denied == 3);
+    CHECK(r.counter("yuzu_server_dispatch_target_rejected_total",
+                    {{"route", "instruction_execute"}, {"reason", "param_key_invalid"}}) +
+              r.counter("yuzu_server_dispatch_target_rejected_total",
+                        {{"route", "mcp"}, {"reason", "param_key_invalid"}}) >= 1);
 }

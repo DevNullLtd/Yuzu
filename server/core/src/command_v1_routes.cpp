@@ -171,7 +171,7 @@ void handle_post(const Deps& d, const auth::Session& first, const httplib::Reque
                             std::string_view remediation = {}) {
         if (is_targeting_reason(reason) || reason == kReasonDestructiveUntargeted ||
             reason == kReasonForensicUntargeted || reason == kReasonDestructiveNoVisibleTarget ||
-            reason == kReasonBodyType)
+            reason == kReasonBodyType || reason == kReasonParamKeyInvalid)
             count_target_rejected(d.metrics, reason);
         (void)detail::emit_behavioral_audit(audit, req, res, "command.dispatch", "denied",
                                             "command", "", detail_of(reason));

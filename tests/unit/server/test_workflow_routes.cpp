@@ -8666,4 +8666,14 @@ TEST_CASE("POST /api/instructions/:id/execute: a params key with a NUL or contro
         CHECK(res->body.find("param_key_invalid") != std::string::npos);
     }
     CHECK(h.last_dispatch_execution_id.empty());
+    int denied = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "instruction.execute" && a.result == "denied" &&
+            a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied;
+    CHECK(denied == 2);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "instruction_execute"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
 }

@@ -804,6 +804,11 @@ public:
         metrics_.describe("yuzu_agent_uptime_seconds", "Agent uptime in seconds", "gauge");
         metrics_.describe("yuzu_agent_commands_executed_total", "Total commands executed by plugin",
                           "counter");
+        metrics_.describe("yuzu_agent_commands_refused_nul_params_total",
+                          "Commands refused because a parameter key or value held a NUL byte (a "
+                          "plugin would read a truncated name); refused before the dedup claim",
+                          "counter");
+        metrics_.counter("yuzu_agent_commands_refused_nul_params_total");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
@@ -3632,6 +3637,7 @@ public:
                         spdlog::warn("Command {} refused: a parameter key or value holds a NUL "
                                      "byte",
                                      cmd.command_id());
+                        metrics_.counter("yuzu_agent_commands_refused_nul_params_total").increment();
                         pb::CommandResponse refused;
                         refused.set_command_id(cmd.command_id());
                         refused.set_status(pb::CommandResponse::REJECTED);
@@ -4445,17 +4451,6 @@ private:
     // inside the lambda.
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
                               const std::shared_ptr<SubscribeStream>& stream) {
-        // Second copy of the NUL refusal (the read loop refuses first): nothing may reach the
-        // stagger sleep or the plugin with a truncatable parameter.
-        if (command_params_have_nul(cmd.parameters())) {
-            pb::CommandResponse refused;
-            refused.set_command_id(cmd.command_id());
-            refused.set_status(pb::CommandResponse::REJECTED);
-            refused.set_output("command refused: a parameter holds a NUL byte");
-            std::lock_guard lock(stream_write_mu_);
-            stream->Write(refused, grpc::WriteOptions());
-            return;
-        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min

@@ -41,6 +41,10 @@ must not be starvable by ordinary commands. The agent command pool therefore has
 
 ## What this does NOT establish
 
+Owner decision, Fraser Jarvis, 2026-11-18: the pool-teardown join (#8247), the bounded-helper unload
+residual (#8204), the ~60 s `patch_connectivity` ordinary-worker hold, the ordinary-lane filesystem stall,
+and protective-lane starvation (#8288) are documented residuals the owner accepted for this change.
+
 - **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: it runs every queued task and waits for every RUNNING task to return before it reconnects, with no bound; a command blocked in the kernel or sleeping a delay/stagger holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247).
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
@@ -50,7 +54,7 @@ must not be starvable by ordinary commands. The agent command pool therefore has
   may use ANY worker, so `workers` stuck protective tasks leave no worker for a further protective task
   or for an ordinary one (four stuck protective tasks on `ThreadPool(4, .., 1)` were verified to block
   both). Capping protective running at `workers - 1`, or one in-flight protective task per
-  `(plugin, action)`, is a follow-up, not part of this change.
+  `(plugin, action)`, is a follow-up tracked in #8288, not part of this change.
 - **A stagger or delay sleep runs on the worker.** A command carrying `stagger_seconds` or
   `delay_seconds` (up to 600 s) sleeps on its worker, protective commands included; the protective lane
   does not skip it.

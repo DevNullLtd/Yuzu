@@ -1712,6 +1712,14 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // sg10 / UP-1: `param_key_invalid` (a params key the agent would truncate, refused at the
+        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. The MCP
+        // execute tools count it under yuzu_mcp_tool_args_too_large_total instead.
+        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule",
+                                  "bundle", "policy_fragment"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonParamKeyInvalid)}});
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
@@ -3041,6 +3049,14 @@ public:
                                       "destination_resolver_busy"})
                 metrics_.counter(name, {{"cause", cause}});
         }
+        // A delivery whose name resolved to more than four vetted addresses tries only the first
+        // four (outbound_url_policy.hpp, kMaxDeliveryConnectAddresses); counted so the truncation
+        // is visible. Described and pre-seeded like its siblings.
+        metrics_.describe("yuzu_server_delivery_connect_addresses_truncated_total",
+                          "Webhook or offload-target deliveries whose name resolved to more than "
+                          "four vetted addresses and so tried only the first four",
+                          "counter");
+        metrics_.counter("yuzu_server_delivery_connect_addresses_truncated_total");
         // The two drop counters (closed `reason` set) and the delivery pool gauges are described
         // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
         yuzu::server::register_delivery_pool_metrics(metrics_);
@@ -18562,6 +18578,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .schedule_engine = schedule_engine_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: the 3-route legacy pre-v1 Responses API

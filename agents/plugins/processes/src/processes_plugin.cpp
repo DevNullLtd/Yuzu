@@ -20,7 +20,6 @@
 
 #include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
 #include <helper_budget.hpp>      // HelperBudget + the hash_unavailable markers
-#include <image_path_cache.hpp>    // ImagePathCache / hash_row_cached: the pre-budget lookup
 #include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
 #ifndef _WIN32
 #include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
@@ -52,12 +51,10 @@
 
 #ifdef __linux__
 #include <dirent.h>
-#include <cstdio>     // sscanf (maps identity)
 #include <fcntl.h>    // open (O_NONBLOCK on the exe link)
 #include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd
 #include <fstream>
 #include <sys/stat.h> // fstat (identity key)
-#include <sys/sysmacros.h> // makedev
 #include <unistd.h>   // readlink, close
 #endif
 
@@ -338,91 +335,30 @@ struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
 // helpers, gone when the action returns): an image replaced between two dispatches is always
 // re-hashed. Within an action it is keyed by the OPENED image's identity (dev, inode, size, mtime,
 // ctime), never by path text.
-struct ActionCache {
-    std::shared_ptr<yuzu::shared::ImageHashCache> identity; // shared with the action's helpers
-    yuzu::shared::ImagePathCache by_path;                   // identity-keyed, plugin thread only, consulted first
-};
-ActionCache make_action_cache() { return {std::make_shared<yuzu::shared::ImageHashCache>(), {}}; }
+using ActionCache = std::shared_ptr<yuzu::shared::ImageHashCache>;
+ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHashCache>(); }
 
-// The mount namespace of a process, read from procfs (a link read, never the image): part of the
-// cache key so two containers' identical images never share a hash. Empty on any failure.
-std::string mount_ns_of(unsigned long pid) {
-    char buf[64];
-    const auto n = ::readlink(("/proc/" + std::to_string(pid) + "/ns/mnt").c_str(), buf, sizeof(buf) - 1);
-    return n > 0 ? std::string(buf, static_cast<std::size_t>(n)) : std::string{};
-}
-
-// `<dev>:<inode>` shared by every mapping of the process's executable in its WHOLE /proc/<pid>/maps
-// (procfs only: no access to the image's filesystem, so it cannot stall on a hung mount). Empty (no
-// caching) on any failure: permission, a vanished process, no or conflicting mappings, a maps larger
-// than 4 MiB (never a prefix is parsed), or the action deadline passing mid-read.
-std::string image_identity_of(unsigned long pid, std::chrono::steady_clock::time_point deadline) {
-    constexpr std::size_t kMapsCap = 4 * 1024 * 1024;
-    std::array<char, 4096> lnk{};
-    const auto ln = ::readlink(("/proc/" + std::to_string(pid) + "/exe").c_str(), lnk.data(), lnk.size() - 1);
-    if (ln <= 0)
-        return {};
-    std::string exe(lnk.data(), static_cast<std::size_t>(ln));
-    bool deleted = false;
-    if (exe.ends_with(" (deleted)")) {
-        exe.erase(exe.size() - 10);
-        deleted = true;
-    }
-    yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/maps").c_str(), O_RDONLY | O_CLOEXEC)};
-    if (!fd.valid())
-        return {};
-    const auto maps = yuzu::shared::ImagePathCache::read_complete(
-        [&](char* b, std::size_t len) { return ::read(fd.fd(), b, len); }, kMapsCap,
-        [&] { return std::chrono::steady_clock::now() >= deadline; });
-    if (!maps)
-        return {};
-    return yuzu::shared::ImagePathCache::maps_identity(*maps, exe, deleted);
-}
-
-// True when `maps_id` (`<major hex>:<minor hex>:<inode>`) names the same device and inode as the opened
-// image's identity key (`<st_dev>:<st_ino>:...`, image_identity_key).
-bool maps_identity_matches_opened(const std::string& maps_id, const std::string& opened_key) {
-    unsigned maj = 0, min = 0;
-    unsigned long long ino = 0;
-    if (maps_id.empty() || std::sscanf(maps_id.c_str(), "%x:%x:%llu", &maj, &min, &ino) != 3)
-        return false;
-    const std::string want = std::to_string(static_cast<unsigned long long>(::makedev(maj, min))) + ":" +
-                             std::to_string(ino) + ":";
-    return opened_key.rfind(want, 0) == 0;
-}
-
-std::string hash_process_image(unsigned long pid, const std::string& path, ActionCache& cache,
+std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
                                const ImageGuard&, std::chrono::steady_clock::time_point action_deadline,
                                yuzu::shared::HelperBudget& budget) {
     if (path.empty())
         return {};
     const auto now = std::chrono::steady_clock::now();
-    // The identity cache (mount namespace + maps device/inode, never path text) answers FIRST: once the per-action cap of helpers left behind (or the action
-    // budget) is reached no further helper is started and such a row says so
-    // (`hash_unavailable:skipped`), but a row whose image this action already hashed keeps its hash.
-    const auto maps_id = image_identity_of(pid, action_deadline);
-    const auto key = yuzu::shared::ImagePathCache::make_key(mount_ns_of(pid), maps_id);
-    return yuzu::shared::hash_row_cached(
-        cache.by_path, key, now < action_deadline && budget.may_start(),
-        [&]() -> yuzu::shared::RowHash {
-            const auto remaining =
-                std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
-            const auto deadline = now + remaining;
-            auto result = yuzu::shared::bounded_call_ex(
-                std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
-                [pid, deadline, identity = cache.identity]() {
-                    return hash_linux_image(pid, deadline, identity);
-                });
-            budget.note(result.status);
-            if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
-                return {std::string{yuzu::shared::kHashUnavailableTimeout}, false};
-            const auto& img = *result.value;
-            if (img.key.empty())
-                return {std::string{}, false};
-            // Remembered only when the maps identity names the very inode that was opened through
-            // /proc/<pid>/exe and hashed: a process cannot plant an entry by shaping its own mappings.
-            return {img.hash, maps_identity_matches_opened(maps_id, img.key)};
-        });
+    // Once the per-action cap of helpers left behind (or the action budget) is reached no further
+    // helper is started: the row says so (`hash_unavailable:skipped`) instead of reading as an empty
+    // hash, and a dispatch cannot burn through the plugin's helper ceiling.
+    if (now >= action_deadline || !budget.may_start())
+        return yuzu::shared::kHashUnavailableSkipped;
+    const auto remaining = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+    const auto deadline = now + remaining;
+    auto result = yuzu::shared::bounded_call_ex(
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
+        [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
+    budget.note(result.status);
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
+        return yuzu::shared::kHashUnavailableTimeout;
+    const auto& img = *result.value;
+    return img.key.empty() ? std::string{} : img.hash;
 }
 #else
 using ImageGuard = yuzu::shared::local_path::LocalPathGuard;

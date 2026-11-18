@@ -1623,6 +1623,11 @@ TEST_CASE("command_v1: a params key with a NUL or control byte is refused 400 pa
         const auto res = rig.post(body);
         REQUIRE(res->status == 400);
         CHECK(reason_of(res) == "param_key_invalid");
+        CHECK(rig.has_audit("denied", "reason=param_key_invalid"));
     }
     CHECK(rig.sent().empty());
+    CHECK(rig.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "command_v1"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
 }

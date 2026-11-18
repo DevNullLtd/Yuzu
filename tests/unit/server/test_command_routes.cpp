@@ -1247,4 +1247,15 @@ TEST_CASE("/api/command: a params key with a NUL or control byte is refused 400 
     }
     CHECK(h.send_to_ids_called.empty());
     CHECK(h.last_stagger == -1);
+    // Audited and counted like every sibling targeting refusal (route=command).
+    int denied_rows = 0;
+    for (const auto& a : h.audit_calls)
+        if (a.action == "command.dispatch" && a.result == "denied" &&
+            a.detail.find("reason=param_key_invalid") != std::string::npos)
+            ++denied_rows;
+    CHECK(denied_rows == 2);
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "command"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
 }

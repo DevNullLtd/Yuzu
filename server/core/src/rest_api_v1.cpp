@@ -4413,8 +4413,8 @@ void RestApiV1::register_routes(
     // POST /api/v1/bundles — dispatch (async). Returns the correlation id; poll
     // GET /api/v1/bundles/{id} for the collated result.
     sink.Post("/api/v1/bundles",
-              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch,
-               exec_visible_fn](const httplib::Request& req, httplib::Response& res) {
+              [auth_fn, scoped_perm_fn, audit_fn, bundle_orch, exec_visible_fn,
+               metrics_registry](const httplib::Request& req, httplib::Response& res) {
                   // K-R6-01/CDX-R5-02: a bundle targets ONE device, so
                   // authorization is the per-target scoped gate on agent_id
                   // (below, once parsed) -- NOT the targetless global
@@ -4464,6 +4464,12 @@ void RestApiV1::register_routes(
                   }
                   auto specs = validate_bundle_steps(body["steps"].dump());
                   if (!specs) {
+                      if (specs.error().find(std::string(kReasonParamKeyInvalid)) != std::string::npos) {
+                          // sg10 / UP-1: counted and audited like every other ingress refusal.
+                          count_param_key_invalid(metrics_registry, "bundle");
+                          (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                         std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                      }
                       res.status = 400;
                       res.set_content(detail::a4_error(res, "steps: " + specs.error()), "application/json");
                       return;

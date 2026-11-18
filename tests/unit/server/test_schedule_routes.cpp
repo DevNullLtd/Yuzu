@@ -60,6 +60,8 @@
 
 #include "../test_helpers.hpp"
 
+#include <yuzu/metrics.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 #include <httplib.h>
@@ -288,6 +290,7 @@ yuzu::test::PgTestTemplate schedule_rbac_tpl{
 /// only way to observe audit rows here, matching every other #2542 module's
 /// convention).
 struct ScheduleRouteHarness {
+    yuzu::MetricsRegistry metrics; // declared first: outlives the registered handlers
     Config cfg{};
     auth::AuthManager auth_mgr{};
     // rbac_db/rbac_pool must outlive rbac (declaration order = destruction
@@ -372,6 +375,7 @@ struct ScheduleRouteHarness {
             return true;
         };
         deps.schedule_engine = schedule_engine.get();
+        deps.metrics = &metrics;
         schedule::register_schedule_routes(sink, deps);
     }
 
@@ -1736,4 +1740,50 @@ TEST_CASE("schedule_routes: wiring -- server.cpp still calls register_schedule_r
     REQUIRE(in.is_open());
     std::string src{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
     CHECK(src.find("register_schedule_routes(") != std::string::npos);
+}
+
+// sg10 / UP-1: a parameters key the agent would truncate is a 400 with ONE denied row and the counter,
+// nothing is stored.
+TEST_CASE("POST /api/schedules: a parameters key with a NUL or control byte answers 400, is audited "
+          "and counted, and stores nothing (sg10)",
+          "[server][routes][schedule_routes][rest][pg][validation][sg10]") {
+    ScheduleRouteHarness h;
+    auto headers = h.session_headers_for("sched-op", "ScheduleAndExecute5",
+                                         {{"Schedule", "Write"}, {"Execution", "Execute"}});
+    for (const char* body :
+         {R"({"name":"s","definition_id":"def-1","frequency_type":"daily","parameters":{"targets\u0000x":"h"}})",
+          R"({"name":"s","definition_id":"def-1","frequency_type":"daily","parameters":{"a\u0007b":"h"}})"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.dispatch("POST", "/api/schedules", body, "application/json", headers);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "schedule.create");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "reason=param_key_invalid");
+    }
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "schedule"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
+    CHECK(h.schedule_engine->query_schedules().empty());
+}
+
+// The persistence-layer backstop: a direct create_schedule (not through the route) refuses the same.
+TEST_CASE("ScheduleEngine::create_schedule: a parameter_values key with a NUL or control byte is refused "
+          "(sg10 backstop)",
+          "[server][schedule_routes][pg][sg10]") {
+    ScheduleRouteHarness h;
+    InstructionSchedule s;
+    s.name = "bad";
+    s.definition_id = "def-1";
+    s.frequency_type = "daily";
+    s.created_by = "tester";
+    for (const char* raw : {R"({"targets\u0000x":"h"})", R"({"a\u0007b":"h"})", R"({"k":"v\u0000w"})"}) {
+        s.parameter_values = raw;
+        auto r = h.schedule_engine->create_schedule(s);
+        CHECK_FALSE(r.has_value());
+    }
+    CHECK(h.schedule_engine->query_schedules().empty());
 }

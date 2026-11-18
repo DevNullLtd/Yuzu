@@ -6,6 +6,7 @@
 #include <string_view>
 
 #include <nlohmann/json.hpp>
+#include <yuzu/metrics.hpp>
 
 #include "command_capability.hpp" // parameter_key_well_formed (sg10 / UP-1)
 
@@ -401,10 +402,12 @@ enum class DispatchArm {
 /// NUL or invalid UTF-8, or a string value with a NUL, is `param_key_invalid`. Called by REST
 /// `/api/command`, `/api/v1/commands`, `/api/instructions/{id}/execute` (legacy and v1), bundle step
 /// validation, schedule create (via `validate_and_canonicalize_schedule_params`), policy-fragment
-/// create, and MCP `execute_instruction` / `execute_instruction_definition`. Any other path is refused
-/// at the dispatch chokepoint (a Forbidden denial) and the
-/// agent refuse the same shapes as defence in depth. Extend this, never copy the loop. A non-object
-/// `params` is the caller's own shape check, not judged here.
+/// create, and MCP `execute_instruction` / `execute_instruction_definition`. Each of those answers
+/// 400 (MCP `-32602`) with an audit row and `count_param_key_invalid` on its route label. Any other
+/// path that reaches a dispatch with such a key is refused at the dispatch chokepoint (a Forbidden
+/// denial), and the agent refuses a NUL parameter on its own (`command_params_have_nul`).
+/// Extend this, never copy the loop. A non-object `params` is the caller's own shape check, not
+/// judged here.
 [[nodiscard]] inline std::optional<BoundViolation> check_params_key_shape(const nlohmann::json& params) {
     if (!params.is_object())
         return std::nullopt;
@@ -416,6 +419,21 @@ enum class DispatchArm {
                                   "holds a NUL byte"};
     }
     return std::nullopt;
+}
+
+/// The reason token and the one counter bump every `param_key_invalid` refusal uses
+/// (`yuzu_server_dispatch_target_rejected_total{route,reason}`), so the label is spelled once.
+inline constexpr std::string_view kReasonParamKeyInvalid = "param_key_invalid";
+inline void count_param_key_invalid(yuzu::MetricsRegistry* metrics, std::string_view route) noexcept {
+    if (metrics == nullptr)
+        return;
+    try {
+        metrics
+            ->counter("yuzu_server_dispatch_target_rejected_total",
+                      {{"route", std::string(route)}, {"reason", std::string(kReasonParamKeyInvalid)}})
+            .increment();
+    } catch (...) { // NOLINT(bugprone-empty-catch): a counter fault never changes a correct refusal
+    }
 }
 
 /// The companion to `check_targeting_shape`, and the reason a sink can tell

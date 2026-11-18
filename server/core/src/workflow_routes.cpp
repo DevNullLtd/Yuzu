@@ -3612,6 +3612,10 @@ void WorkflowRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             if (j.contains("params")) {
                 // sg10 / UP-1: the shared ingress check (never a second copy of the rule).
                 if (const auto bad = check_params_key_shape(j["params"])) {
+                    count_param_key_invalid(metrics, "instruction_execute");
+                    if (audit_fn)
+                        audit_fn(req, "instruction.execute", "denied", "instruction", def_id,
+                                 std::string("reason=") + std::string(kReasonParamKeyInvalid));
                     res.status = 400;
                     res.set_content(detail::a4_error(res, std::string(bad->reason) + ": " + bad->message),
                                     "application/json");

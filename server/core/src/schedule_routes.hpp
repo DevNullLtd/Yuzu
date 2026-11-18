@@ -120,6 +120,8 @@
 #include <httplib.h>
 
 #include <functional>
+
+#include <yuzu/metrics.hpp>
 #include <optional>
 #include <string>
 
@@ -156,6 +158,9 @@ struct Deps {
     /// `ServerImpl::schedule_engine_`. Null -> every route answers 503
     /// without touching it.
     ScheduleEngine* schedule_engine{nullptr};
+    /// Counts `yuzu_server_dispatch_target_rejected_total{route="schedule",reason="param_key_invalid"}`.
+    /// Null -> not counted.
+    yuzu::MetricsRegistry* metrics{nullptr};
 };
 
 /// Register all 4 Schedules API routes against `sink`.

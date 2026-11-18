@@ -46,6 +46,7 @@ struct PolicyAdminHarness {
     // Declaration order matters (CLAUDE.md TestRouteSink convention): `sink`
     // captures `routes`'s `this` in its registered handlers, so `routes`
     // must outlive `sink` — declare it FIRST so it destructs LAST.
+    yuzu::MetricsRegistry metrics; // outlives the registered handlers
     PolicyAdminRoutes routes;
     yuzu::server::test::TestRouteSink sink;
     std::vector<AuditCall> audit_calls;
@@ -73,7 +74,7 @@ struct PolicyAdminHarness {
         };
 
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, policy_store,
-                               /*policy_evaluator=*/nullptr, /*metrics=*/nullptr);
+                               /*policy_evaluator=*/nullptr, &metrics);
     }
 };
 
@@ -484,4 +485,44 @@ TEST_CASE("POST /api/policies/:id/disable|enable: an unknown clean id answers 40
     }
     CHECK(h.audit_calls.empty());
     CHECK(h.emitted_events.empty());
+}
+
+// sg10 / UP-1: a fragment whose check, fix or postCheck parameter key holds a control byte is a 400,
+// audited and counted; nothing is stored.
+TEST_CASE("POST /api/policy-fragments: a hostile parameter key in check, fix or postCheck is refused 400, "
+          "audited and counted (sg10)",
+          "[compliance][admin][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    PolicyStore store{pool};
+    REQUIRE(store.is_open());
+    PolicyAdminHarness h{&store};
+
+    const std::string bad_key = std::string("bad\x07key");
+    const std::string sections[3] = {
+        "  check:\n    instruction: get_service_status\n    compliance: \"result.status == 'running'\"\n"
+        "    parameters:\n      " + bad_key + ": v\n",
+        "  check:\n    instruction: get_service_status\n    compliance: \"result.status == 'running'\"\n"
+        "  fix:\n    instruction: fix_it\n    parameters:\n      " + bad_key + ": v\n",
+        "  check:\n    instruction: get_service_status\n    compliance: \"result.status == 'running'\"\n"
+        "  postCheck:\n    instruction: get_service_status\n    compliance: \"result.status == 'running'\"\n"
+        "    parameters:\n      " + bad_key + ": v\n"};
+    for (const auto& spec : sections) {
+        h.audit_calls.clear();
+        const std::string yaml = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\n"
+                                 "displayName: Hostile\nspec:\n" + spec;
+        auto res = h.sink.Post("/api/policy-fragments", yaml, "text/plain");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        bool saw = false;
+        for (const auto& a : h.audit_calls)
+            if (a.action == "policy_fragment.create" && a.result == "denied" &&
+                a.detail == "reason=param_key_invalid")
+                saw = true;
+        CHECK(saw);
+    }
+    CHECK(h.metrics
+              .counter("yuzu_server_dispatch_target_rejected_total",
+                       {{"route", "policy_fragment"}, {"reason", "param_key_invalid"}})
+              .value() == 3.0);
 }
