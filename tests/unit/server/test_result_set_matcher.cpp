@@ -767,11 +767,14 @@ TEST_CASE("matcher: `in` matches a cell equal to a value_set entry byte for byte
         bool member;
     };
     // A prefix is not a match either way; an empty entry matches an empty cell; an entry given
-    // twice is one entry; a NUL is a byte like any other, in an entry and in a cell.
+    // twice is one entry; a NUL is a byte like any other, in an entry and in a cell. Letter case
+    // and a space at either end count, and any entry of several matches, not only the smallest.
     for (const Row& r : {Row{R"(["xy"])", "x", false}, Row{R"(["x"])", "xy", false},
                          Row{R"([""])", "", true}, Row{R"(["x","x"])", "x", true},
                          Row{R"(["a\u0000b"])", "a\0b"s, true},
-                         Row{R"(["a\u0000b"])", "a", false}}) {
+                         Row{R"(["a\u0000b"])", "a", false}, Row{R"(["x"])", "X", false},
+                         Row{R"(["x"])", "x ", false}, Row{R"(["x"])", " x", false},
+                         Row{R"(["a","b"])", "b", true}}) {
         const std::string m = R"({"column":"c","op":"in","value_set":)"s + r.value_set + "}";
         // The echo pipe shape (the cell is the first of two, so it may be empty) and the JSON one.
         const std::string echo = "__schema__|c|d\n" + r.cell + "|d\n__total__|1";

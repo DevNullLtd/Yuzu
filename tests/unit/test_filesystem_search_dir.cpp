@@ -150,7 +150,7 @@ TEST_CASE("search_dir: limits_for uses the search_dir entry cap and the caller's
 TEST_CASE("search_dir: has_lookahead refuses every (? group but the non-capturing one",
           "[filesystem][search_dir]") {
     // Never executed here: the first is the 49-byte shape that ran unbounded, the next two are ONE
-    // lookahead each (5 s for one 255-byte name on libc++).
+    // lookahead each (already costly over one long name on libc++).
     for (const std::string_view refused :
          {"(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*(?=.*x))))))))", ".*.*(?=.*.*x)y", ".*.*(?!.*.*x)y",
           "^(?!.*\\.bak$).*\\.log$", "a(?=b)", "(?!x)", "(?<n>x)", "x(?",

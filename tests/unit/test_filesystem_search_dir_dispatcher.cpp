@@ -228,7 +228,7 @@ TEST_CASE("filesystem search_dir: regex mode matches, and a nested-quantifier re
 
 TEST_CASE("filesystem search_dir: a regex lookahead is refused before it reaches the engine",
           "[filesystem][search_dir][dispatcher]") {
-    // Nesting depth 3 at most: unrefused it returns in about a millisecond (rc 0, total_matches|0),
+    // Nesting depth 3 at most: unrefused it returns at once (rc 0, total_matches|0),
     // so a missing check FAILS this case and never hangs it. Deeper shapes are pinned on the pure
     // predicate (test_filesystem_search_dir.cpp) and never executed.
     auto plugin = load_or_fail();
@@ -383,7 +383,7 @@ TEST_CASE("filesystem search_dir: a UNC base_dir is refused on its spelling, bef
 namespace {
 
 // ponytail: second copy of the helper in test_filesystem_find_by_hash_dispatcher.cpp; fold both
-// into filesystem_dispatcher_test_support.hpp (follow-up).
+// into filesystem_dispatcher_test_support.hpp (follow-up: #8301).
 /// The network mount points in the live kernel mount table, read from the test's side with the same
 /// shared classifiers the plugin uses.
 std::vector<std::string> live_network_mounts() {

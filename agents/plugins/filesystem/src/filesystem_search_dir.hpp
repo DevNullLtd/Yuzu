@@ -54,7 +54,7 @@ enum class MatchType { directories, files, both };
 /// True when a regex holds a `(?` group other than the non-capturing `(?:`. In the ECMAScript
 /// grammar that is a lookahead, `(?=` or `(?!`, and search_dir refuses one: no standard library
 /// bounds it (each lookahead is a fresh sub-match with its own complexity budget, so ONE lookahead
-/// over one 255-byte name ran for 5 s on libc++ and nested or repeated ones multiply), and a single
+/// over one name is already costly and nested or repeated ones multiply), and a single
 /// regex_match cannot be interrupted by the walk's deadline. Judged on the spelling alone, with no
 /// grammar of its own: an escaped `\(` is skipped, and a `(?` inside a bracket class is refused too
 /// (the three libraries need not parse a class alike, and refusing is the safe side).

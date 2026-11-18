@@ -14,8 +14,9 @@ The unit tests drive the pure formatters directly, so a plugin leg reverted to a
     a raw `std::format("proxy_address|` would leak proxy credentials) and no raw proxy_address row;
   * procfetch_plugin.cpp: three yuzu::procfetch::format_row sites, no raw `"{}|{}|{}|{}"` row;
   * wmi_plugin.cpp: format_row_line once and format_property_line once, no raw row/property row;
-  * filesystem_plugin.cpp: row_field on list_dir's entry name, search_dir's path and the Windows
-    version-info value.
+  * filesystem_plugin.cpp: row_field on list_dir's entry name and the Windows version-info value;
+    filesystem_search_dir.hpp: search_dir's `result|` row is built in one place, format_result_row,
+    which passes the path through row_field, and the walk emits only through it (#6478).
 
 A tripwire, not proof: it counts spellings in comment-stripped source. Self-checks run in
 memory against deliberately broken copies.
@@ -72,10 +73,15 @@ def check(files: dict) -> list:
         errs.append("wmi_plugin.cpp: expected one format_row_line and one format_property_line")
     if re.search(r'(?:std|fmt)::format\(\s*"(row\{\}|property)\|', wm):
         errs.append("wmi_plugin.cpp: raw row/property format")
-    fsx = files["filesystem"]
-    for needle in ("row_field(entry_name)", "row_field(entry_path)", "row_field(val)"):
+    fsx, sdh = files["filesystem"], files["filesystem_search_dir"]
+    for needle in ("row_field(entry_name)", "row_field(val)"):
         if fsx.count("yuzu::filesystem::acl::" + needle) != 1:
             errs.append(f"filesystem_plugin.cpp: expected yuzu::filesystem::acl::{needle} once")
+    for needle in ("acl::row_field(path_utf8)", "emit(format_result_row("):
+        if sdh.count(needle) != 1:
+            errs.append(f"filesystem_search_dir.hpp: expected {needle} once")
+    if (fsx + sdh).count('"result|') != 1:
+        errs.append('filesystem: a "result|" row is built outside format_result_row')
     return errs
 
 
@@ -88,6 +94,7 @@ def load() -> dict:
         "procfetch": strip_comments((p / "procfetch/src/procfetch_plugin.cpp").read_text(encoding="utf-8")),
         "wmi": strip_comments((p / "wmi/src/wmi_plugin.cpp").read_text(encoding="utf-8")),
         "filesystem": strip_comments((p / "filesystem/src/filesystem_plugin.cpp").read_text(encoding="utf-8")),
+        "filesystem_search_dir": strip_comments((p / "filesystem/src/filesystem_search_dir.hpp").read_text(encoding="utf-8")),
     }
 
 
@@ -116,6 +123,12 @@ def main() -> int:
     bad = dict(files)
     bad["filesystem"] = files["filesystem"].replace("yuzu::filesystem::acl::row_field(entry_name)", "entry_name", 1)
     assert check(bad), "self-check: reverted filesystem site not caught"
+    bad = dict(files)
+    bad["filesystem_search_dir"] = files["filesystem_search_dir"].replace("acl::row_field(path_utf8)", "std::string(path_utf8)", 1)
+    assert check(bad), "self-check: unescaped search_dir row not caught"
+    bad = dict(files)
+    bad["filesystem"] = files["filesystem"] + 'ctx.write_output(std::format("result|{}|{}", entry_path, type_str));'
+    assert check(bad), "self-check: raw search_dir row in the plugin not caught"
     # dead code and the fmt:: spelling: a call site in `#if 0` does not count, and a raw
     # fmt::format("proxy_address|...") is as bad as the std:: one
     dead = strip_comments("#if 0\nyuzu::network_config::format_proxy_address_row(x);\n#endif\nint y;")
