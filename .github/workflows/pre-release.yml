@@ -1207,7 +1207,10 @@ jobs:
             images+=("$REGISTRY/$img:$VERSION")
           done
           # --report-dir . keeps the trivy-* names the upload below expects.
-          scripts/ci/image-vuln-gate.sh --report-dir . "${images[@]}"
+          # --budget 1200: the gate stops itself, with a report per image,
+          # 20 minutes in, inside this job's 30-minute timeout (checkout and
+          # the pulls above come first).
+          scripts/ci/image-vuln-gate.sh --budget 1200 --report-dir . "${images[@]}"
 
       - name: Upload scan results
         if: always()

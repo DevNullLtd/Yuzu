@@ -49,7 +49,7 @@
 #     Detective only there: a new CVE disclosed after the push turns QA red.
 #
 # Usage:
-#   scripts/ci/image-vuln-gate.sh [--release] [--report-dir DIR [--attempt N]] [NAME=]IMAGE [[NAME=]IMAGE...]
+#   scripts/ci/image-vuln-gate.sh [--release] [--budget SECONDS] [--report-dir DIR [--attempt N]] [NAME=]IMAGE [[NAME=]IMAGE...]
 #
 # --release: an acceptance (an ignore entry or a not-covered listing) whose
 # approval_ref is `pending` is NOT honoured. Without it a pending one is
@@ -95,15 +95,31 @@
 # directory ($RUNNER_TEMP, else $TMPDIR), never a fixed shared path: the
 # self-hosted pools run four runners as ONE OS identity (#1871).
 #
-# Network calls have an overall deadline each (the DB digest lookup
-# RESOLVE_DEADLINE, the Trivy download CURL_DEADLINE, each DB download
-# DB_DEADLINE seconds), so a registry that trickles bytes cannot hold the gate
-# until the job's timeout, where it would be killed without a report.
+# Time budget. Every long-running call runs under `timeout`, bounded by its
+# own deadline AND by what is left of the gate's overall budget (--budget,
+# default GATE_BUDGET = 1500 s, 25 minutes): the digest lookup RESOLVE_DEADLINE
+# per DB source, the whole Trivy download (every curl retry included)
+# CURL_DEADLINE, each DB download DB_DEADLINE per source, each scan
+# SCAN_DEADLINE. When the budget runs out the gate stops itself, writes
+# `gate: FAIL: gate stopped ...: the gate ran out of its <N>s budget` for every
+# image not yet judged, and exits 1. So the gate ends, with its reports, within
+# the budget plus KILL_AFTER (+ cleanup) of starting: below the 30-minute
+# timeout of pre-release.yml's security-scan job (which passes --budget 1200
+# to leave room for its pulls) and of every release.yml job that runs it. A
+# job timeout or cancel that comes first is a signal, handled below.
+#
+# Signals. The Actions runner cancels a step with SIGINT, then SIGTERM about
+# 7.5 s later, then SIGKILL. On the first SIGINT or SIGTERM the gate ignores
+# any further one, writes `gate: FAIL: cancelled (<signal>) ...` for every
+# image not yet judged AT ONCE, then stops the running child (SIGTERM, and
+# SIGKILL after SIGNAL_GRACE = 3 s), removes its work directory and exits
+# 130/143: all of it well inside the 7.5 s before the runner's second signal.
 #
 # Exit status: 0 every image passed; 1 a fixable CRITICAL was found, a scan
 # failed, the DB was stale or unpinnable, an image was not covered or has no
-# advisory data, or the setup failed (fail closed: a scan that did not complete
-# is never a pass); 2 usage error; 130/143 cancelled by SIGINT/SIGTERM.
+# advisory data, the budget ran out, or the setup failed (fail closed: a scan
+# that did not complete is never a pass); 2 usage error; 130/143 cancelled by
+# SIGINT/SIGTERM.
 set -euo pipefail
 
 # Pinned Trivy. The sha256 values are from trivy_0.70.0_checksums.txt; the
@@ -120,10 +136,21 @@ TRIVY_SHA256_LINUX_ARM64="2f6bb988b553a1bbac6bdd1ce890f5e412439564e17522b88a4541
 # resolved to a manifest digest first and the download is pinned to it.
 DB_REPOS=("mirror.gcr.io/aquasec/trivy-db" "ghcr.io/aquasecurity/trivy-db")
 DB_TAG="2"
-# Overall deadlines (seconds) for the network calls, per call.
-RESOLVE_DEADLINE=90
-CURL_DEADLINE=300
-DB_DEADLINE=900
+# Deadlines (seconds), per call; every call is also bounded by what is left of
+# the gate's overall budget. Worst case with both DB sources failing slowly:
+# 2 x 60 + 180 + 2 x 420 = 1140 s of network calls, then the scans; the budget
+# (GATE_BUDGET, or --budget) cuts the total.
+RESOLVE_DEADLINE=60
+CURL_DEADLINE=180
+CURL_ATTEMPT=60
+DB_DEADLINE=420
+SCAN_DEADLINE=600
+GATE_BUDGET=1500
+# `timeout --kill-after`: a child that ignores SIGTERM is killed this long after.
+KILL_AFTER=2
+# On a signal, how long the gate waits for its child before killing it. With
+# KILL_AFTER, well under the runner's 7.5 s between SIGINT and SIGTERM.
+SIGNAL_GRACE=3
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 IGNORE_FILE="${YUZU_TRIVYIGNORE:-$ROOT/.trivyignore.yaml}"
@@ -151,11 +178,13 @@ usage() { sed -n '2,/^set -euo/{/^set -euo/d;s/^# \{0,1\}//;p}' "$0" >&2; exit 2
 REPORT_DIR=""
 RELEASE=0
 ATTEMPT=""
+BUDGET_ARG=""
 ARGS=()
 while [ $# -gt 0 ]; do
     case "$1" in
         --report-dir) [ $# -ge 2 ] || usage; REPORT_DIR="$2"; shift ;;
         --attempt) [ $# -ge 2 ] || usage; ATTEMPT="$2"; shift ;;
+        --budget) [ $# -ge 2 ] || usage; BUDGET_ARG="$2"; shift ;;
         --release) RELEASE=1 ;;
         -h|--help) usage ;;
         --) shift; ARGS+=("$@"); break ;;
@@ -169,6 +198,15 @@ if [ -n "$ATTEMPT" ]; then
     [[ "$ATTEMPT" =~ ^[1-9][0-9]{0,3}$ ]] || { err "--attempt must be a run attempt number (1-9999)"; exit 2; }
     [ -n "$REPORT_DIR" ] || { err "--attempt names the reports, so it needs --report-dir"; exit 2; }
 fi
+if [ -n "$BUDGET_ARG" ]; then
+    if ! [[ "$BUDGET_ARG" =~ ^[1-9][0-9]{0,3}$ ]] || [ "$BUDGET_ARG" -gt 3600 ]; then
+        err "--budget must be a number of seconds (1-3600)"
+        exit 2
+    fi
+    GATE_BUDGET="$BUDGET_ARG"
+fi
+# The budget's end, on bash's SECONDS clock (seconds since the script started).
+GATE_DEADLINE=$((SECONDS + GATE_BUDGET))
 # The reports' file stem for image NAME: trivy-NAME, or trivy-NAME.attempt-N.
 ATTEMPT_SUFFIX="${ATTEMPT:+.attempt-$ATTEMPT}"
 
@@ -254,25 +292,65 @@ die() {
 
 WORK=""
 CANCELLED=""
+# report_unjudged RC: every image that has no report yet gets one recording why
+# the gate stopped (a refusal must leave evidence). A cancelled run's reads
+# `gate: FAIL: cancelled (SIGINT) ...` or `(SIGTERM)`.
+# shellcheck disable=SC2317 # run by on_signal and finish (traps)
+report_unjudged() {
+    local rc="$1" i res
+    for i in "${!NAMES[@]}"; do
+        if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
+            if [ -n "$CANCELLED" ]; then
+                res="FAIL: cancelled ($CANCELLED) before this image was judged"
+            else
+                res="FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}"
+            fi
+            write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
+            summary_header
+            summary "| ${NAMES[$i]} | ? | ? | ${res} |"
+        fi
+    done
+}
 # The long-running child (Trivy, curl, the digest lookup), run through `child`
-# so a SIGTERM/SIGINT is handled at once: bash runs a trap only after a
-# FOREGROUND child exits, but interrupts `wait` for one.
+# so a SIGTERM/SIGINT is handled at once (bash runs a trap only after a
+# FOREGROUND child exits, but interrupts `wait` for one), and under `timeout`:
+#   child DEADLINE CMD...  runs CMD for at most DEADLINE seconds, or what is
+#   left of the gate's budget if that is less. When the budget is gone the
+#   gate stops (die), whatever CMD returned.
 CHILD=""
 child() {
-    "$@" &
+    local limit="$1" left rc=0
+    shift
+    left=$((GATE_DEADLINE - SECONDS))
+    [ "$left" -gt 0 ] || die "the gate ran out of its ${GATE_BUDGET}s budget"
+    [ "$limit" -le "$left" ] || limit="$left"
+    timeout --kill-after="$KILL_AFTER" "$limit" "$@" &
     CHILD=$!
-    local rc=0
     wait "$CHILD" || rc=$?
     CHILD=""
+    [ "$SECONDS" -lt "$GATE_DEADLINE" ] || die "the gate ran out of its ${GATE_BUDGET}s budget"
     return "$rc"
 }
 # shellcheck disable=SC2317 # run by the TERM/INT traps
 on_signal() {
-    trap - TERM INT
+    # Ignore the runner's second signal (SIGTERM ~7.5 s after its SIGINT): a
+    # default-action signal here would kill bash before the report is written.
+    trap '' TERM INT
     CANCELLED="$1"
     ABORT_REASON="cancelled ($1)"
+    # The report first, before any wait.
+    report_unjudged "$2"
     if [ -n "$CHILD" ]; then
+        # `timeout` passes the SIGTERM on to its command and SIGKILLs it
+        # KILL_AFTER seconds later; the gate waits SIGNAL_GRACE at most, then
+        # SIGKILLs `timeout` itself.
         kill -TERM "$CHILD" 2>/dev/null || true
+        local waited=0
+        while kill -0 "$CHILD" 2>/dev/null && [ "$waited" -lt $((SIGNAL_GRACE * 10)) ]; do
+            sleep 0.1
+            waited=$((waited + 1))
+        done
+        kill -KILL "$CHILD" 2>/dev/null || true
         wait "$CHILD" 2>/dev/null || true
     fi
     exit "$2"
@@ -282,24 +360,7 @@ trap 'on_signal SIGINT 130' INT
 # shellcheck disable=SC2317 # run by the EXIT trap
 finish() {
     local rc=$?
-    # A refusal must leave evidence: every image that has no report yet gets
-    # one recording why the gate stopped. A cancelled run's reads
-    # `gate: FAIL: cancelled (SIGTERM) ...`.
-    if [ "$rc" -ne 0 ]; then
-        local i res
-        for i in "${!NAMES[@]}"; do
-            if [ -z "${reported[${NAMES[$i]}]:-}" ]; then
-                if [ -n "$CANCELLED" ]; then
-                    res="FAIL: cancelled ($CANCELLED) before this image was judged"
-                else
-                    res="FAIL: gate stopped before this image was judged: ${ABORT_REASON:-unexpected error (exit $rc)}"
-                fi
-                write_gate_txt "${NAMES[$i]}" "${REFS[$i]}" "$res" || true
-                summary_header
-                summary "| ${NAMES[$i]} | ? | ? | ${res} |"
-            fi
-        done
-    fi
+    [ "$rc" -eq 0 ] || report_unjudged "$rc"
     [ -z "$WORK" ] || rm -rf "$WORK"
     exit "$rc"
 }
@@ -357,7 +418,7 @@ else
     esac
     tgz="trivy_${TRIVY_VERSION}_${asset}.tar.gz"
     url="https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/${tgz}"
-    child curl -fsSL --retry 3 --retry-delay 5 --max-time "$CURL_DEADLINE" -o "$WORK/$tgz" "$url" \
+    child "$CURL_DEADLINE" curl -fsSL --retry 3 --retry-delay 5 --max-time "$CURL_ATTEMPT" -o "$WORK/$tgz" "$url" \
         || die "could not download $url (within ${CURL_DEADLINE}s)"
     echo "${want}  $WORK/$tgz" | sha256sum -c --quiet - \
         || die "$tgz does not match its pinned sha256; refusing to run it"
@@ -377,6 +438,9 @@ export TMPDIR="$WORK/tmp"
 : > "$WORK/trivy.yaml"
 # Every Trivy call: the empty config and this run's cache.
 COMMON=(--config "$WORK/trivy.yaml" --cache-dir "$CACHE")
+# Each scan: Trivy's own timeout (its default is 5 minutes), just inside the
+# `timeout` the gate runs it under, so Trivy normally reports it itself.
+SCAN_TIMEOUT=(--timeout "$((SCAN_DEADLINE - 10))s")
 
 # ── The DB: once per run, pinned by digest, and fresh ────────────────────────
 # Each source's tag is resolved to its manifest digest and the download pinned
@@ -389,7 +453,8 @@ start_epoch="$(date +%s)"
 for repo in "${DB_REPOS[@]}"; do
     if [ -n "$test_db_digest" ]; then
         digest="$test_db_digest"
-    elif child "${CHECKS[@]}" resolve-digest "$repo:$DB_TAG" --deadline "$RESOLVE_DEADLINE" > "$WORK/digest"; then
+    elif child $((RESOLVE_DEADLINE + 5)) "${CHECKS[@]}" resolve-digest "$repo:$DB_TAG" \
+            --deadline "$RESOLVE_DEADLINE" > "$WORK/digest"; then
         digest="$(cat "$WORK/digest")"
     else
         echo "    could not resolve $repo:$DB_TAG within ${RESOLVE_DEADLINE}s; trying the next source"
@@ -400,8 +465,7 @@ for repo in "${DB_REPOS[@]}"; do
         continue
     fi
     echo "    $repo:$DB_TAG is $digest"
-    if child timeout --kill-after=10 "$DB_DEADLINE" \
-            "$TRIVY" image "${COMMON[@]}" --db-repository "$repo@$digest" --download-db-only; then
+    if child "$DB_DEADLINE" "$TRIVY" image "${COMMON[@]}" --db-repository "$repo@$digest" --download-db-only; then
         DB_REF="$repo@$digest"
         break
     fi
@@ -431,7 +495,7 @@ advisory_canary() {
         dir="$WORK/canary-$canary_n"
         out="$WORK/canary-$canary_n.json"
         if "${CHECKS[@]}" canary-rootfs "$dir" "$1" "$2" \
-            && child "$TRIVY" rootfs "${COMMON[@]}" --quiet --skip-db-update --scanners vuln \
+            && child "$SCAN_DEADLINE" "$TRIVY" rootfs "${COMMON[@]}" "${SCAN_TIMEOUT[@]}" --quiet --skip-db-update --scanners vuln \
                 --format json --output "$out" "$dir" \
             && msg="$("${CHECKS[@]}" canary-check "$out" "$1" "$2")"; then
             canary_result[$key]="ok|$1 $2: $(printf '%s\n' "$msg" | sed -n 's/^canary_advisories=//p') advisories matched by the canary"
@@ -463,10 +527,10 @@ for idx in "${!NAMES[@]}"; do
     # what the coverage check counts). Not --quiet: Trivy's log names the OS
     # it detected and warns when it finds no OS package. Informational, but a
     # scan that cannot complete is a failure, not an empty report.
-    if ! child "$TRIVY" image "${COMMON[@]}" --skip-db-update --image-src docker --scanners vuln \
+    if ! child "$SCAN_DEADLINE" "$TRIVY" image "${COMMON[@]}" "${SCAN_TIMEOUT[@]}" --skip-db-update --image-src docker --scanners vuln \
             --severity HIGH,CRITICAL --show-suppressed --ignorefile "$TRIVY_IGNORE" \
             --format json --output "$json" "$image" \
-        || ! child "$TRIVY" convert --quiet --format table --severity HIGH,CRITICAL --show-suppressed \
+        || ! child "$SCAN_DEADLINE" "$TRIVY" convert --quiet --format table --severity HIGH,CRITICAL --show-suppressed \
             --output "$table" "$json"; then
         err "$image: Trivy could not scan the image (treated as a failure)"
         failed=1
@@ -517,7 +581,7 @@ for idx in "${!NAMES[@]}"; do
     # The gate. Exit code 3 means findings; anything else non-zero is a Trivy
     # error, which must not read as a pass either.
     rc=0
-    child "$TRIVY" image "${COMMON[@]}" --quiet --skip-db-update --image-src docker --scanners vuln \
+    child "$SCAN_DEADLINE" "$TRIVY" image "${COMMON[@]}" "${SCAN_TIMEOUT[@]}" --quiet --skip-db-update --image-src docker --scanners vuln \
         --severity CRITICAL --ignore-unfixed --ignorefile "$TRIVY_IGNORE" \
         --exit-code 3 --format table "$image" || rc=$?
     case "$rc" in

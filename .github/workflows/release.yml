@@ -2490,6 +2490,10 @@ jobs:
       # The run attempt whose gate report was uploaded (its artifact and file
       # names carry it); attach-bundle-gate-report downloads exactly that one.
       gate_attempt: ${{ steps.gate_report_uploaded.outputs.attempt }}
+      # `<image>@<digest>` once this attempt's push is verified, empty when it
+      # pushed nothing; attach-bundle-gate-report refuses a report whose
+      # verify-pushed line does not name exactly this.
+      pushed_ref: ${{ steps.verify_pushed.outputs.ref }}
     concurrency:
       group: agent-bundle-publish-${{ github.ref }}
       cancel-in-progress: true
@@ -2606,8 +2610,10 @@ jobs:
           echo "value=${DIGEST}" >> "$GITHUB_OUTPUT"
           echo "Resolved ${{ steps.ref.outputs.image }} digest: ${DIGEST}"
 
-      # See the same step in docker-publish (WP15/S9).
+      # See the same step in docker-publish (WP15/S9). Its `ref` output is the
+      # job's pushed_ref, which ties the attached report to this digest.
       - name: Verify the pushed image is the scanned one
+        id: verify_pushed
         env:
           NAME: yuzu-agent-bundle-chisel
           REF: ${{ steps.ref.outputs.image }}@${{ steps.digest.outputs.value }}
@@ -2616,6 +2622,7 @@ jobs:
           scripts/ci/image-identity.sh verify-pushed "$REF" "$LAYERS"
           echo "verify-pushed: ok, $REF has the scanned image's layers" \
             >> "$RUNNER_TEMP/image-vuln-gate/trivy-$NAME.attempt-$GITHUB_RUN_ATTEMPT.gate.txt"
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
 
       - name: Generate bundle SBOM (CycloneDX)
         uses: anchore/sbom-action@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
@@ -2716,15 +2723,22 @@ jobs:
   # own checksum list signed keyless by this workflow identity, exactly as
   # SHA256SUMS is. It runs whether the bundle's gate passed or refused the
   # image (the record of a refusal matters as much), and only once the report
-  # was uploaded. It adds new assets only (their names are in no SHA256SUMS)
-  # and NEVER replaces one: every file name carries the bundle job's run
-  # attempt (trivy-yuzu-agent-bundle-chisel.attempt-N.*, and the checksum list
+  # was uploaded. The attached report is tied to the push: the bundle job's
+  # pushed_ref output (`<image>@<digest>`, set only once its push is verified)
+  # must be the digest the report's verify-pushed line records, and a report
+  # from an attempt that pushed nothing must record no push. It adds new
+  # assets only (their names are in no SHA256SUMS) and NEVER replaces a
+  # completed one: every file name carries the bundle job's run attempt
+  # (trivy-yuzu-agent-bundle-chisel.attempt-N.*, and the checksum list
   # yuzu-agent-bundle-chisel-image-vuln-gate.attempt-N.SHA256SUMS), so a re-run
   # adds its attempt's report beside the refused attempt's. A name already on
-  # the release (this job re-run for the same bundle attempt) is skipped when
-  # its content is identical (a .sigstore: when it verifies the same list) and
-  # fails the job when it differs. Kept out of the bundle job so contents:
-  # write is held by a job that builds nothing.
+  # the release (this job re-run for the same bundle attempt) is kept when it
+  # is a completed upload identical to this run's file (a .sigstore: when it
+  # verifies the same list), fails the job when it is a completed upload that
+  # differs, and is deleted and uploaded again when it is an interrupted
+  # upload (GitHub's asset state is not `uploaded`, or its bytes do not match
+  # GitHub's size or digest for it). Kept out of the bundle job so contents:
+  # write is held by a job that builds and checks out nothing.
   attach-bundle-gate-report:
     name: "Attach agent-bundle gate report to the release"
     needs: [release, docker-publish-agent-bundle]
@@ -2745,29 +2759,63 @@ jobs:
         uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
 
       - name: Sign and attach
+        # The report is tied to the push: with PUSHED_REF (the bundle job's
+        # verified push, `<image>@<digest>`) the attempt's .gate.txt must
+        # record `gate: pass` and that exact digest in its verify-pushed line;
+        # without it, no verify-pushed line. A mismatch is refused, so an
+        # attached report never claims the wrong image. Add, never replace
+        # (G8P4-chaos-injector-1): a name already on the release that GitHub
+        # reports in a state other than `uploaded`, or whose bytes do not match
+        # GitHub's own size or digest for it, is an interrupted upload that
+        # was never served, and is deleted and uploaded again; a completed one
+        # is kept when identical (a .sigstore: when it verifies this list) and
+        # refused when it differs. Every refusal is decided before anything is
+        # deleted. Tested with stub gh and cosign: tests/test_image_vuln_gate.py
+        # AttachBundleReport, which runs this block as written.
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           SIGN_REPOSITORY: ${{ github.repository }}
           SIGN_REF: ${{ github.ref }}
           ATTEMPT: ${{ needs.docker-publish-agent-bundle.outputs.gate_attempt }}
+          PUSHED_REF: ${{ needs.docker-publish-agent-bundle.outputs.pushed_ref }}
         run: |
           set -euo pipefail
           [[ "$ATTEMPT" =~ ^[1-9][0-9]{0,3}$ ]] || { echo "::error::bad bundle gate attempt '$ATTEMPT'"; exit 1; }
+          if [ -n "$PUSHED_REF" ] && ! [[ "$PUSHED_REF" =~ ^[a-z0-9][a-z0-9./_-]*/yuzu-agent-bundle-chisel@sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::bad pushed image reference '$PUSHED_REF'"
+            exit 1
+          fi
+          err() { echo "::error::$*"; }
           cd bundle-gate
           stem="yuzu-agent-bundle-chisel.attempt-${ATTEMPT}"
+          gate="trivy-${stem}.gate.txt"
           shopt -s nullglob
-          # Every scanner's report for the bundle image from that attempt
-          # (trivy-*, and grype-* once a second scanner is wired in), nothing else.
+          # Every scanner's report for the bundle image from that attempt, nothing else.
           reports=("trivy-${stem}".* "grype-${stem}".*)
           shopt -u nullglob
-          if [[ ! -s "trivy-${stem}.gate.txt" ]]; then
-            echo "::error::the bundle's gate report has no trivy-${stem}.gate.txt"
+          if [[ ! -s "$gate" ]]; then
+            err "the bundle's gate report has no $gate"
             exit 1
           fi
           for f in "${reports[@]}"; do
-            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { echo "::error::unexpected file name $f"; exit 1; }
+            [[ "$f" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || { err "unexpected file name $f"; exit 1; }
           done
+
+          # The report against the job's record of the push.
+          if [ -n "$PUSHED_REF" ]; then
+            grep -qxF "gate: pass" "$gate" \
+              || { err "attempt $ATTEMPT pushed $PUSHED_REF but its report does not record gate: pass; not attaching it"; exit 1; }
+            grep -qxF "verify-pushed: ok, $PUSHED_REF has the scanned image's layers" "$gate" \
+              || { err "attempt $ATTEMPT pushed $PUSHED_REF but its report does not record that digest (verify-pushed); not attaching it"; exit 1; }
+            echo "attempt $ATTEMPT published $PUSHED_REF; its report records it"
+          elif grep -q '^verify-pushed:' "$gate"; then
+            err "attempt $ATTEMPT's report records a push the job did not record; not attaching it"
+            exit 1
+          else
+            echo "attempt $ATTEMPT pushed no image; attaching its report as the record of that"
+          fi
+
           sums="yuzu-agent-bundle-chisel-image-vuln-gate.attempt-${ATTEMPT}.SHA256SUMS"
           sha256sum "${reports[@]}" > "$sums"
           cat "$sums"
@@ -2777,35 +2825,88 @@ jobs:
               --certificate-oidc-issuer https://token.actions.githubusercontent.com \
               "$2"
           }
-          # Add, never replace: a name already on the release is kept when it is
-          # identical (this job re-run for the same attempt) and refused when not.
-          existing="$(gh release view "${GITHUB_REF_NAME}" --json assets --jq '.assets[].name')"
-          mkdir -p ../on-release
+
+          # What is on the release already.
+          scratch="$(mktemp -d "$RUNNER_TEMP/yuzu-attach.XXXXXX")"
+          trap 'rm -rf "$scratch"' EXIT
+          release_id="$(gh api "repos/$GH_REPO/releases/tags/$GITHUB_REF_NAME" --jq '.id')"
+          [[ "$release_id" =~ ^[0-9]+$ ]] || { err "no release for $GITHUB_REF_NAME"; exit 1; }
+          # id, name, state, size, digest (empty when GitHub reports none).
+          gh api --paginate "repos/$GH_REPO/releases/$release_id/assets?per_page=100" \
+            --jq '.[] | [.id, .name, .state, .size, (.digest // "")] | @tsv' > "$scratch/assets.tsv"
+
+          # asset NAME: prints "id<TAB>state<TAB>size<TAB>digest" for that asset, or nothing.
+          asset() {
+            awk -F '\t' -v n="$1" '$2 == n { print $1 "\t" $3 "\t" $4 "\t" $5 }' "$scratch/assets.tsv"
+          }
+          # fetch ID SIZE DIGEST NAME: downloads a completed asset to $scratch/NAME;
+          # returns 1 when the bytes do not match GitHub's own size or digest for
+          # it (an incomplete upload). A download that fails stops the job: it is
+          # never read as an incomplete upload (that would delete a completed one).
+          fetch() {
+            local id="$1" size="$2" digest="$3" out="$scratch/$4"
+            gh api -H "Accept: application/octet-stream" "repos/$GH_REPO/releases/assets/$id" > "$out" \
+              || { err "could not download $4 from the release; nothing changed, re-run this job"; exit 1; }
+            [ "$(stat -c %s "$out")" = "$size" ] || return 1
+            [ -z "$digest" ] || [ "sha256:$(sha256sum "$out" | cut -d' ' -f1)" = "$digest" ] || return 1
+          }
+
           upload=()
-          for f in "${reports[@]}" "$sums"; do
-            if grep -qxF "$f" <<<"$existing"; then
-              gh release download "${GITHUB_REF_NAME}" --pattern "$f" --dir ../on-release --clobber
-              cmp -s "$f" "../on-release/$f" \
-                || { echo "::error::$f is already on the release with different content; refusing to replace it"; exit 1; }
-              echo "$f is already on the release, identical; kept"
+          replace=()
+          # classify NAME KIND: what to do with this run's file NAME, decided before
+          # anything is deleted. KIND is `file` (a completed asset is kept when
+          # byte-identical) or `sigstore` (kept when it verifies $sums). A completed
+          # asset that differs exits 1 here.
+          classify() {
+            local name="$1" kind="$2" row id state size digest
+            row="$(asset "$name")"
+            if [ -z "$row" ]; then
+              upload+=("$name")
+              return 0
+            fi
+            IFS=$'\t' read -r id state size digest <<<"$row"
+            if [ "$state" != "uploaded" ]; then
+              echo "$name is on the release in state '$state' (an interrupted upload, never served); it will be deleted and uploaded again"
+              replace+=("$id")
+              upload+=("$name")
+              return 0
+            fi
+            if ! fetch "$id" "$size" "$digest" "$name"; then
+              echo "$name is on the release but its bytes do not match GitHub's size or digest for it (an incomplete upload); it will be deleted and uploaded again"
+              replace+=("$id")
+              upload+=("$name")
+              return 0
+            fi
+            if [ "$kind" = sigstore ]; then
+              verify "$scratch/$name" "$sums" \
+                || { err "$name on the release does not verify $sums; refusing to replace it"; exit 1; }
+              echo "$name is already on the release and verifies; kept"
             else
-              upload+=("$f")
+              cmp -s "$name" "$scratch/$name" \
+                || { err "$name is already on the release with different content; refusing to replace it"; exit 1; }
+              echo "$name is already on the release, identical; kept"
+            fi
+          }
+
+          for f in "${reports[@]}" "$sums"; do
+            classify "$f" file
+          done
+          classify "$sums.sigstore" sigstore
+          # The list's signature: made only when none complete is on the release.
+          for f in "${upload[@]}"; do
+            if [ "$f" = "$sums.sigstore" ]; then
+              cosign sign-blob --yes "$sums" --bundle "$sums.sigstore"
+              verify "$sums.sigstore" "$sums"
             fi
           done
-          if grep -qxF "$sums.sigstore" <<<"$existing"; then
-            gh release download "${GITHUB_REF_NAME}" --pattern "$sums.sigstore" --dir ../on-release --clobber
-            verify "../on-release/$sums.sigstore" "$sums" \
-              || { echo "::error::$sums.sigstore on the release does not verify $sums; refusing to replace it"; exit 1; }
-            echo "$sums.sigstore is already on the release and verifies; kept"
-          else
-            cosign sign-blob --yes "$sums" --bundle "$sums.sigstore"
-            verify "$sums.sigstore" "$sums"
-            upload+=("$sums.sigstore")
-          fi
+
+          for id in "${replace[@]}"; do
+            gh api -X DELETE "repos/$GH_REPO/releases/assets/$id" > /dev/null
+          done
           if (( ${#upload[@]} )); then
-            gh release upload "${GITHUB_REF_NAME}" "${upload[@]}"
+            gh release upload "$GITHUB_REF_NAME" "${upload[@]}"
           fi
-          echo "Attached ${#upload[@]} new file(s) for attempt ${ATTEMPT} to ${GITHUB_REF_NAME} (nothing replaced)"
+          echo "Attached ${#upload[@]} file(s) for attempt ${ATTEMPT} to ${GITHUB_REF_NAME} (${#replace[@]} incomplete upload(s) replaced; no completed asset replaced)"
 
   # ── Create GitHub Release ────────────────────────────────────────────
   release:

@@ -114,10 +114,13 @@ STUB = textwrap.dedent(
         sys.exit(0)
     image = args[-1]
     gate = "--exit-code" in args
-    if mode == "hang" and not gate:
+    if mode in ("hang", "hang-stubborn") and not gate:
         # A scan that does not finish: the cancellation tests signal the gate
         # while it waits here, and check this process is gone afterwards.
-        import time
+        # hang-stubborn also ignores SIGTERM, as a busy Trivy can be slow to.
+        import signal, time
+        if mode == "hang-stubborn":
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
         open(os.environ["STUB_LOG"] + ".pid", "w").write(str(os.getpid()))
         time.sleep(60)
         sys.exit(0)
@@ -811,12 +814,12 @@ class GateBehaviour(unittest.TestCase):
                 self.assertEqual(self.calls(), [])
 
     # ── G8P3-release-deploy-3: a cancelled gate still writes its report ──
-    def start_gate(self, *images, extra=()):
+    def start_gate(self, *images, extra=(), mode="hang"):
         env = dict(os.environ)
         for k in list(env):
             if k.startswith("TRIVY_") or k.startswith("STUB_") or k.startswith("GITHUB_"):
                 del env[k]
-        env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE="hang",
+        env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE=mode,
                    YUZU_TRIVYIGNORE=str(IGNORE), YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST,
                    RUNNER_TEMP=str(self.tmp))
         return subprocess.Popen(["bash", str(GATE), *extra, *images], env=env,
@@ -846,6 +849,82 @@ class GateBehaviour(unittest.TestCase):
                 with self.assertRaises(ProcessLookupError):
                     os.kill(int(pidfile.read_text()), 0)  # the scan was stopped, not left running
                 self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
+
+    # ── G8P4-security-guardian-1: the runner's SIGINT, then its SIGTERM ──
+    def test_runner_cancel_sigint_then_sigterm_still_writes_the_report(self):
+        # The Actions runner cancels with SIGINT and sends SIGTERM about 7.5 s
+        # later. Here the scan ignores SIGTERM and the second signal comes
+        # after 1 s, while the gate is still stopping its child: the gate must
+        # have written its report before that wait, must not die of the second
+        # signal, and must finish well inside the runner's 7.5 s.
+        import signal
+        import time
+        pidfile = Path(str(self.log) + ".pid")
+        rep = self.tmp / "rep"
+        report = rep / "trivy-a.attempt-2.gate.txt"
+        p = self.start_gate("a=img:1", extra=("--report-dir", str(rep), "--attempt", "2"), mode="hang-stubborn")
+        self.addCleanup(lambda: p.poll() is None and p.kill())
+        deadline = time.monotonic() + 30
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pidfile.exists(), "the stub scan never started")
+        time.sleep(0.2)
+        started = time.monotonic()
+        p.send_signal(signal.SIGINT)
+        while not report.exists() and time.monotonic() - started < 1:
+            time.sleep(0.02)
+        self.assertTrue(report.exists(), "no report within 1 s of the SIGINT")
+        self.assertIsNone(p.poll(), "the gate exited before the second signal; the stub did not hold it")
+        time.sleep(max(0.0, 1 - (time.monotonic() - started)))
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=30)
+        self.assertLess(time.monotonic() - started, 7.5, "the gate outlived the runner's SIGTERM window")
+        self.assertEqual(p.returncode, 130, out + err)
+        t = report.read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: cancelled (SIGINT) before this image was judged", t)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pidfile.read_text()), 0)  # the SIGTERM-proof scan was killed
+        self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
+
+    # ── G8P4-unhappy-path-1: the gate's own overall budget ──
+    def test_budget_ends_the_gate_with_a_report(self):
+        import time
+        rep = self.tmp / "rep"
+        started = time.monotonic()
+        p = self.start_gate("a=img:1", "b=img:2", extra=("--budget", "3", "--report-dir", str(rep)),
+                            mode="hang-stubborn")
+        out, err = p.communicate(timeout=60)
+        self.assertLess(time.monotonic() - started, 15, "the budget did not end the gate")
+        self.assertEqual(p.returncode, 1, out + err)
+        for n in ("a", "b"):
+            t = (rep / f"trivy-{n}.gate.txt").read_text(encoding="utf-8")
+            self.assertIn("gate: FAIL: gate stopped before this image was judged: "
+                          "the gate ran out of its 3s budget", t)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(Path(str(self.log) + ".pid").read_text()), 0)
+        self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
+
+    def test_budget_is_validated(self):
+        for b in ("0", "x", "3601", "-5", "12345"):
+            with self.subTest(budget=b):
+                r = self.run_gate("img:1", extra=("--budget", b))
+                self.assertEqual(r.returncode, 2, r.stdout + r.stderr)
+                self.assertEqual(self.calls(), [])
+
+    def test_every_long_call_runs_under_a_deadline(self):
+        # Lexical: every `child` call names its deadline, and Trivy's scans
+        # carry an explicit --timeout (its default is 5 minutes).
+        text = GATE.read_text(encoding="utf-8")
+        code = [ln.split(" #", 1)[0] for ln in text.splitlines() if not ln.lstrip().startswith("#")]
+        calls = [m for ln in code for m in re.findall(r"(?:^|[\s!&|])child (.*)", ln)]
+        self.assertGreaterEqual(len(calls), 6, calls)
+        for c in calls:
+            self.assertRegex(c, r'^("\$[A-Z_]+_DEADLINE"|\$\(\([A-Z_]+_DEADLINE \+ [0-9]+\)\)) ', c)
+        self.assertIn('SCAN_TIMEOUT=(--timeout "$((SCAN_DEADLINE - 10))s")', text)
+        r = self.run_gate("img:1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        for scan in self.scans() + self.canaries():
+            self.assertIn("--timeout", scan)
 
 
 @unittest.skipUnless(have_bash(), "uses the gate's checker the same way the gate does")
@@ -1095,11 +1174,35 @@ class Checks(unittest.TestCase):
         r = self.run_checks("pending", ign, p_nc)
         self.assertEqual(r.returncode, 1)
         self.assertIn("yuzu-server-chisel: approval_ref is pending", r.stderr)
-        # An expired pending entry is not in force anywhere, so not pending.
+        # An expired entry is not pending, but it is not in force either: a
+        # release would fail on what it accepted (G8P4-release-deploy-1).
         old = self.tmp / "old.yaml"
         old.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0003", approved_on=None, approval_ref="pending",
                                                      expired_at=days(-1)), encoding="utf-8")
-        self.assertEqual(self.run_checks("pending", old, ok_nc).returncode, 0)
+        r = self.run_checks("pending", old, ok_nc)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CVE-2000-0003: expired on", r.stderr)
+        self.assertNotIn("approval_ref is pending", r.stderr)
+        # Expiring today or tomorrow can lapse mid-release: refused too.
+        for n in (0, 1):
+            soon = self.tmp / f"soon{n}.yaml"
+            soon.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0004", expired_at=days(n)), encoding="utf-8")
+            r = self.run_checks("pending", soon, ok_nc)
+            self.assertEqual(r.returncode, 1, n)
+            self.assertIn("CVE-2000-0004: expires on", r.stderr)
+        later = self.tmp / "later.yaml"
+        later.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0005", expired_at=days(2)), encoding="utf-8")
+        r = self.run_checks("pending", later, ok_nc)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("warning:", r.stdout)
+        # The same for a not-covered listing: expired, expiring, and a warning.
+        for exp, rc, text in ((days(-1), 1, "yuzu-server-chisel: expired on"),
+                              (days(1), 1, "yuzu-server-chisel: expires on"),
+                              (days(10), 0, "warning:")):
+            with self.subTest(listing_expires=exp):
+                r = self.run_checks("pending", ign, self.nc(nc_line(exp=exp)))
+                self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
+                self.assertIn(text, r.stdout + r.stderr)
         bad = self.tmp / "bad.yaml"
         bad.write_text("vulnerabilities:\n" + entry(paths=['"**"']), encoding="utf-8")
         self.assertEqual(self.run_checks("pending", bad, ok_nc).returncode, 1)
@@ -1339,6 +1442,298 @@ NOT_RELEASE_IMAGES = {
 }
 
 
+GH_STUB = textwrap.dedent(
+    """\
+    import hashlib, json, os, sys
+    a = sys.argv[1:]
+    st_path = os.environ["STUB_GH_STATE"]
+    st = json.load(open(st_path))
+    with open(os.environ["STUB_GH_LOG"], "a") as f:
+        f.write(json.dumps(a) + "\\n")
+    def save():
+        json.dump(st, open(st_path, "w"))
+    def by_id(i):
+        return next((x for x in st["assets"] if str(x["id"]) == str(i)), None)
+    repo = os.environ["GH_REPO"]
+    if a[0] == "api":
+        path = [x for x in a[1:] if x.startswith("repos/")][0]
+        if path == f"repos/{repo}/releases/tags/{st['tag']}":
+            print(st["release_id"]); sys.exit(0)
+        if path.startswith(f"repos/{repo}/releases/{st['release_id']}/assets"):
+            for x in st["assets"]:
+                print("\\t".join([str(x["id"]), x["name"], x["state"], str(x["size"]), x.get("digest", "")]))
+            sys.exit(0)
+        if path.startswith(f"repos/{repo}/releases/assets/"):
+            x = by_id(path.rsplit("/", 1)[1])
+            if x is None:
+                sys.exit(1)
+            if "DELETE" in a:
+                st["assets"].remove(x); save(); sys.exit(0)
+            if x.get("download_fails"):
+                sys.exit(1)
+            sys.stdout.buffer.write(bytes.fromhex(x["data"])); sys.exit(0)
+        sys.exit(2)
+    if a[:2] == ["release", "upload"]:
+        names = {x["name"] for x in st["assets"]}
+        for f in a[3:]:
+            if f in names:
+                print(f"HTTP 422: already_exists {f}", file=sys.stderr); sys.exit(1)
+            data = open(f, "rb").read()
+            st["next_id"] += 1
+            if f == os.environ.get("STUB_GH_INTERRUPT"):
+                st["assets"].append({"id": st["next_id"], "name": f, "state": "starter", "size": 0,
+                                     "data": data[: len(data) // 2].hex()})
+                save(); print("upload interrupted", file=sys.stderr); sys.exit(1)
+            st["assets"].append({"id": st["next_id"], "name": f, "state": "uploaded", "size": len(data),
+                                 "digest": "sha256:" + hashlib.sha256(data).hexdigest(), "data": data.hex()})
+            save()
+        sys.exit(0)
+    sys.exit(2)
+    """
+)
+COSIGN_STUB = textwrap.dedent(
+    """\
+    import hashlib, json, sys
+    a = sys.argv[1:]
+    def opt(n):
+        return a[a.index(n) + 1]
+    valued = {"--bundle", "--certificate-identity", "--certificate-oidc-issuer"}
+    pos = [x for i, x in enumerate(a[1:], 1) if not x.startswith("--") and a[i - 1] not in valued]
+    blob = pos[0]
+    sha = hashlib.sha256(open(blob, "rb").read()).hexdigest()
+    if a[0] == "sign-blob":
+        json.dump({"sha256": sha, "identity": "workflow"}, open(opt("--bundle"), "w")); sys.exit(0)
+    if a[0] == "verify-blob":
+        try:
+            b = json.load(open(opt("--bundle")))
+        except Exception:
+            sys.exit(1)
+        ok = b.get("sha256") == sha and opt("--certificate-identity").endswith("release.yml@refs/tags/v1.2.3")
+        sys.exit(0 if ok else 1)
+    sys.exit(2)
+    """
+)
+BUNDLE_IMAGE = "ghcr.io/o/yuzu-agent-bundle-chisel"
+PUSHED = BUNDLE_IMAGE + "@sha256:" + "e" * 64
+
+
+def attach_block():
+    """The attach job's `Sign and attach` run block, exactly as release.yml has it."""
+    body = job_block(RELEASE.read_text(encoding="utf-8"), "attach-bundle-gate-report")
+    step = body[body.index("- name: Sign and attach"):]
+    lines = step.split("\n")
+    start = next(i for i, ln in enumerate(lines) if ln.strip() == "run: |") + 1
+    indent = len(lines[start]) - len(lines[start].lstrip())
+    out = []
+    for ln in lines[start:]:
+        if ln.strip() and len(ln) - len(ln.lstrip()) < indent:
+            break
+        out.append(ln[indent:])
+    return "\n".join(out) + "\n"
+
+
+@unittest.skipUnless(have_bash() and shutil.which("cmp") and shutil.which("sha256sum"), "runs the bash block")
+class AttachBundleReport(unittest.TestCase):
+    """release.yml's attach-bundle-gate-report `Sign and attach` block, run as
+    written against stub gh and cosign (G8P4-chaos-injector-1,
+    G8P4-security-guardian-2)."""
+
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp(prefix="yuzu_test_attach_"))
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        bin_ = self.tmp / "bin"
+        bin_.mkdir()
+        for name, body in (("gh", GH_STUB), ("cosign", COSIGN_STUB)):
+            p = bin_ / name
+            p.write_text(f"#!{sys.executable}\n" + body, encoding="utf-8")
+            p.chmod(0o755)
+        self.bin = bin_
+        self.script = self.tmp / "attach.sh"
+        self.script.write_text(attach_block(), encoding="utf-8")
+        self.state = self.tmp / "state.json"
+        self.state.write_text(json.dumps({"tag": "v1.2.3", "release_id": 42, "next_id": 100, "assets": []}))
+        self.log = self.tmp / "gh.log"
+        self.work = self.tmp / "work"
+        (self.work / "bundle-gate").mkdir(parents=True)
+        (self.tmp / "rt").mkdir()
+        self.write_report()
+
+    def write_report(self, result="pass", pushed=PUSHED, attempt=2):
+        d = self.work / "bundle-gate"
+        stem = f"trivy-yuzu-agent-bundle-chisel.attempt-{attempt}"
+        (d / f"{stem}.json").write_text('{"SchemaVersion": 2}\n')
+        (d / f"{stem}.txt").write_text("table\n")
+        lines = ["image: yuzu-agent-bundle-chisel (sha256:1)", f"run attempt: {attempt}", f"gate: {result}",
+                 "scanned at: 2026-11-18T00:00:00Z"]
+        if pushed:
+            lines.append(f"verify-pushed: ok, {pushed} has the scanned image's layers")
+        (d / f"{stem}.gate.txt").write_text("\n".join(lines) + "\n")
+
+    def run_attach(self, pushed_ref=PUSHED, interrupt=""):
+        env = {k: v for k, v in os.environ.items() if not k.startswith(("GITHUB_", "STUB_"))}
+        env.update(PATH=f"{self.bin}{os.pathsep}{env.get('PATH', '')}", GH_REPO="o/r", GH_TOKEN="x",
+                   SIGN_REPOSITORY="o/r", SIGN_REF="refs/tags/v1.2.3", GITHUB_REF_NAME="v1.2.3",
+                   ATTEMPT="2", PUSHED_REF=pushed_ref, RUNNER_TEMP=str(self.tmp / "rt"),
+                   STUB_GH_STATE=str(self.state), STUB_GH_LOG=str(self.log), STUB_GH_INTERRUPT=interrupt)
+        return subprocess.run(["bash", str(self.script)], cwd=self.work, env=env,
+                              capture_output=True, text=True, timeout=60)
+
+    def assets(self):
+        return {a["name"]: a for a in json.loads(self.state.read_text())["assets"]}
+
+    def gh_calls(self):
+        return [json.loads(ln) for ln in self.log.read_text().splitlines()] if self.log.exists() else []
+
+    def deletes(self):
+        return [c for c in self.gh_calls() if "DELETE" in c]
+
+    def uploads(self):
+        return [c for c in self.gh_calls() if c[:2] == ["release", "upload"]]
+
+    def local(self, name):
+        return (self.work / "bundle-gate" / name).read_bytes()
+
+    def preload(self, name, data, state="uploaded", size=None, digest=None, **extra):
+        st = json.loads(self.state.read_text())
+        st["next_id"] += 1
+        a = {"id": st["next_id"], "name": name, "state": state,
+             "size": len(data) if size is None else size,
+             "digest": ("sha256:" + __import__("hashlib").sha256(data).hexdigest()) if digest is None else digest,
+             "data": data.hex()}
+        a.update(extra)
+        st["assets"].append(a)
+        self.state.write_text(json.dumps(st))
+        return a["id"]
+
+    SUMS = "yuzu-agent-bundle-chisel-image-vuln-gate.attempt-2.SHA256SUMS"
+    FILES = ["trivy-yuzu-agent-bundle-chisel.attempt-2." + s for s in ("gate.txt", "json", "txt")]
+
+    def complete_first_run(self):
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.log.unlink()
+        return r
+
+    def test_attaches_every_report_with_a_signed_list(self):
+        self.complete_first_run()
+        a = self.assets()
+        self.assertEqual(sorted(a), sorted(self.FILES + [self.SUMS, self.SUMS + ".sigstore"]))
+        for f in self.FILES + [self.SUMS]:
+            self.assertEqual(bytes.fromhex(a[f]["data"]), self.local(f), f)
+
+    def test_rerun_with_the_same_files_keeps_everything(self):
+        self.complete_first_run()
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.deletes(), [])
+        self.assertEqual(self.uploads(), [])
+        self.assertIn("identical; kept", r.stdout)
+        self.assertIn("verifies; kept", r.stdout)
+
+    def test_an_interrupted_upload_is_replaced_on_the_rerun(self):
+        # The wedge: the first run's upload dies part-way, leaving an asset in
+        # GitHub's `starter` state. The re-run must finish the job.
+        json_name = self.FILES[1]
+        r = self.run_attach(interrupt=json_name)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertEqual(self.assets()[json_name]["state"], "starter")
+        stale = self.assets()[json_name]["id"]
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(["api", "-X", "DELETE", f"repos/o/r/releases/assets/{stale}"], self.deletes())
+        a = self.assets()
+        self.assertEqual(a[json_name]["state"], "uploaded")
+        self.assertEqual(bytes.fromhex(a[json_name]["data"]), self.local(json_name))
+        self.assertEqual(sorted(a), sorted(self.FILES + [self.SUMS, self.SUMS + ".sigstore"]))
+
+    def test_an_open_sigstore_is_signed_again(self):
+        self.complete_first_run()
+        st = json.loads(self.state.read_text())
+        for x in st["assets"]:
+            if x["name"].endswith(".sigstore"):
+                x["state"] = "open"
+                old = x["id"]
+        self.state.write_text(json.dumps(st))
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual([c[-1] for c in self.deletes()], [f"repos/o/r/releases/assets/{old}"])
+        self.assertEqual(self.uploads(), [["release", "upload", "v1.2.3", self.SUMS + ".sigstore"]])
+
+    def test_an_asset_not_matching_its_own_size_or_digest_is_replaced(self):
+        name = self.FILES[2]
+        data = self.local(name)
+        for kw in ({"size": len(data)}, {"digest": "sha256:" + "0" * 64}):
+            with self.subTest(**kw):
+                self.state.write_text(json.dumps({"tag": "v1.2.3", "release_id": 42, "next_id": 100, "assets": []}))
+                self.log.unlink(missing_ok=True)
+                stored = data[:-1] if "size" in kw else data
+                old = self.preload(name, stored, **kw)
+                r = self.run_attach()
+                self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn("do not match GitHub's size or digest", r.stdout)
+                self.assertEqual([c[-1] for c in self.deletes()], [f"repos/o/r/releases/assets/{old}"])
+                self.assertEqual(bytes.fromhex(self.assets()[name]["data"]), data)
+
+    def test_a_completed_asset_that_differs_is_refused_and_nothing_is_deleted(self):
+        # One interrupted upload AND one completed-but-different asset: the
+        # refusal is decided first, so not even the incomplete one is deleted.
+        self.preload(self.FILES[1], b"partial", state="starter", size=0, digest="")
+        self.preload(self.FILES[2], b"another attempt's table\n")
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("with different content; refusing to replace it", r.stdout + r.stderr)
+        self.assertEqual(self.deletes(), [])
+        self.assertEqual(self.uploads(), [])
+
+    def test_a_completed_sigstore_that_does_not_verify_is_refused(self):
+        self.complete_first_run()
+        st = json.loads(self.state.read_text())
+        for x in st["assets"]:
+            if x["name"].endswith(".sigstore"):
+                bad = json.dumps({"sha256": "0" * 64}).encode()
+                x.update(data=bad.hex(), size=len(bad),
+                         digest="sha256:" + __import__("hashlib").sha256(bad).hexdigest())
+        self.state.write_text(json.dumps(st))
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("does not verify", r.stdout + r.stderr)
+        self.assertEqual(self.deletes(), [])
+        self.assertEqual(self.uploads(), [])
+
+    def test_a_failed_download_is_not_read_as_an_incomplete_upload(self):
+        self.preload(self.FILES[0], self.local(self.FILES[0]), download_fails=True)
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("could not download", r.stdout + r.stderr)
+        self.assertEqual(self.deletes(), [])
+        self.assertEqual(self.uploads(), [])
+
+    def test_the_report_is_tied_to_the_pushed_digest(self):
+        other = BUNDLE_IMAGE + "@sha256:" + "f" * 64
+        cases = (
+            # (report result, report's verify-pushed ref, job's pushed_ref, expected rc)
+            ("pass", PUSHED, PUSHED, 0),
+            ("pass", PUSHED, other, 1),       # the report names another digest
+            ("pass", None, PUSHED, 1),        # the job pushed, the report does not say so
+            ("pass", PUSHED, "", 1),          # the report says pushed, the job pushed nothing
+            ("FAIL: fixable CRITICAL", None, "", 0),  # a refusal that pushed nothing
+            ("FAIL: fixable CRITICAL", None, PUSHED, 1),
+            ("FAIL: fixable CRITICAL", PUSHED, PUSHED, 1),  # a push the gate did not pass
+        )
+        for result, in_report, job_ref, rc in cases:
+            with self.subTest(result=result, in_report=in_report, job_ref=job_ref):
+                self.state.write_text(json.dumps({"tag": "v1.2.3", "release_id": 42, "next_id": 100, "assets": []}))
+                self.log.unlink(missing_ok=True)
+                self.write_report(result=result, pushed=in_report)
+                r = self.run_attach(pushed_ref=job_ref)
+                self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
+                if rc:
+                    self.assertEqual(self.gh_calls(), [], "a refused report reached the release")
+        r = self.run_attach(pushed_ref="ghcr.io/o/yuzu-server@sha256:" + "e" * 64)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("bad pushed image reference", r.stdout)
+
+
 class WorkflowWiring(unittest.TestCase):
     def test_every_job_that_pushes_an_image_is_known(self):
         found = set()
@@ -1521,8 +1916,14 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn('reports=("trivy-${stem}".* "grype-${stem}".*)', att)
         self.assertIn('sums="yuzu-agent-bundle-chisel-image-vuln-gate.attempt-${ATTEMPT}.SHA256SUMS"', att)
         for needle in ('cosign sign-blob --yes "$sums"', "cosign verify-blob", "--certificate-identity",
-                       'gh release upload "${GITHUB_REF_NAME}" "${upload[@]}"', "cmp -s"):
+                       'gh release upload "$GITHUB_REF_NAME" "${upload[@]}"', "cmp -s"):
             self.assertIn(needle, att)
+        # The report is tied to the push (G8P4-security-guardian-2).
+        self.assertIn("pushed_ref: ${{ steps.verify_pushed.outputs.ref }}", bundle)
+        self.assertIn("PUSHED_REF: ${{ needs.docker-publish-agent-bundle.outputs.pushed_ref }}", att)
+        verify = bundle[bundle.index("id: verify_pushed"):]
+        verify = verify[:verify.index("- name:")]
+        self.assertLess(verify.index("image-identity.sh verify-pushed"), verify.index('echo "ref=$REF" >> "$GITHUB_OUTPUT"'))
         # Add, never replace (G8P3-security-guardian-2): no --clobber upload.
         self.assertNotRegex(att, r"gh release upload[^\n]*--clobber")
         self.assertNotRegex(att, r"\bdocker\s+(?:build|buildx|run|push)|actions/checkout",
@@ -1592,6 +1993,33 @@ class WorkflowWiring(unittest.TestCase):
         self.assertIn("scripts/ci/image-vuln-gate.sh", body)
         for name in PUBLISHED:
             self.assertGreaterEqual(body.count(name), 2, f"{name}: not pulled and scanned")
+
+    def test_gate_budget_fits_inside_every_job_that_runs_it(self):
+        # G8P4-unhappy-path-1: the gate stops itself (with reports) before the
+        # job's timeout. Its budget, plus a 5-minute margin for the job's other
+        # steps' worst case before it on pre-release (checkout, pulls) and the
+        # gate's own kill grace, stays under the job's timeout-minutes.
+        default = int(re.search(r"^GATE_BUDGET=(\d+)$", GATE.read_text(encoding="utf-8"), re.M).group(1))
+        checked, timeouts = [], []
+        for path in (RELEASE, PRE_RELEASE):
+            text = path.read_text(encoding="utf-8")
+            for job, body in jobs_of(text).items():
+                calls = re.findall(r"image-vuln-gate\.sh([^\n]*)", _code_lines(body))
+                if not calls:
+                    continue
+                checked.append(job)
+                minutes = int(re.search(r"^    timeout-minutes: (\d+)", body, re.M).group(1))
+                timeouts.append(minutes)
+                for c in calls:
+                    m = re.search(r"--budget (\d+)", c)
+                    budget = int(m.group(1)) if m else default
+                    with self.subTest(workflow=path.name, job=job):
+                        self.assertLessEqual(budget + 300, minutes * 60, f"{job}: budget {budget}s, timeout {minutes} min")
+        # The default alone also fits the shortest such job, so dropping a
+        # --budget never puts the gate past a job timeout.
+        self.assertLessEqual(default + 300, min(timeouts) * 60)
+        self.assertEqual(sorted(checked), sorted(["docker-publish", "docker-publish-postgres", "docker-publish-chisel",
+                                                  "docker-publish-agent-bundle", "security-scan"]))
 
 
 if __name__ == "__main__":

@@ -55,9 +55,13 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
   pending IGNORE_FILE NOT_COVERED_FILE
       The release skills' pre-tag check: validate both files and fail (exit 1)
       when any ignore entry or not-covered listing that is not expired still
-      has approval_ref `pending`, or when either file is malformed. A release
-      gate does not honour a pending one, so a tag cut with one fails at that
-      image's publish leg after the other legs have pushed.
+      has approval_ref `pending`, when any of them has EXPIRED or expires
+      within RELEASE_WINDOW_DAYS (each publish leg re-reads the date, so one
+      lapsing during the release fails the legs that have not run yet), or
+      when either file is malformed. A release gate does not honour a pending
+      or an expired one, so a tag cut with one fails at that image's publish
+      leg after the other legs have pushed. One expiring within WARN_DAYS is
+      printed as a warning.
 
   db-age METADATA_JSON [--downloaded-after EPOCH]
       Read Trivy's DB metadata.json, print UpdatedAt, DownloadedAt and the age,
@@ -117,6 +121,9 @@ import urllib.request
 
 MAX_EXPIRY_DAYS = 92
 WARN_DAYS = 21
+# The pre-tag check fails an acceptance expiring sooner than this (today or
+# tomorrow): a release, re-runs included, can run past midnight.
+RELEASE_WINDOW_DAYS = 2
 MAX_DB_AGE_HOURS = 72
 
 ENTRY_KEYS = ("id", "paths", "purls", "statement", "expired_at", "approved_by",
@@ -728,25 +735,47 @@ def cmd_pending(ignore_path, not_covered_path):
     if cmd_ignore_file(ignore_path) != 0:
         return 1
     now = today()
+
+    def check_expiry(tag, exp):
+        left = (exp - now).days
+        if left < 0:
+            found.append(f"{tag}: expired on {exp}: not in force, so a release fails on what it accepted; "
+                         f"renew it (a new review and approval) or remove it")
+        elif left < RELEASE_WINDOW_DAYS:
+            found.append(f"{tag}: expires on {exp}, within {RELEASE_WINDOW_DAYS} days: it can lapse during the "
+                         f"release and fail the legs that run after; renew it or remove it")
+        elif left <= WARN_DAYS:
+            print(f"warning: {tag}: expires on {exp} ({left} days)")
+
     for e in entries:
         exp = parse_date(e.get("expired_at"))
+        tag = f"{ignore_path}:{e['_line']}: {e['id']}"
+        if exp is not None:
+            check_expiry(tag, exp)
         if e.get("approval_ref") == PENDING and exp is not None and exp >= now:
-            found.append(f"{ignore_path}:{e['_line']}: {e['id']}: approval_ref is pending")
+            found.append(f"{tag}: approval_ref is pending")
     try:
         listed = read_not_covered(not_covered_path, require_approved=True)
+        with open(not_covered_path, encoding="utf-8") as f:
+            nc_lines = f.read().split("\n")
     except (OSError, UnicodeDecodeError, Bad) as e:
         print(f"{not_covered_path}: {e}", file=sys.stderr)
         return 1
+    for no, line in enumerate(nc_lines, 1):
+        m = NOT_COVERED_LINE.match(line)
+        if m and not line.lstrip().startswith("#"):
+            check_expiry(f"{not_covered_path}:{no}: {m.group('name')}", parse_date(m.group("exp")))
     for name, (_, in_force, why) in listed.items():
         if not in_force and "pending" in why:
             found.append(f"{not_covered_path}: {name}: approval_ref is pending")
     for m in found:
         print(m, file=sys.stderr)
     if found:
-        print(f"{len(found)} acceptance(s) or listing(s) pending approval: a release gate does not honour them, "
-              f"so record each approving pull request and date before tagging", file=sys.stderr)
+        print(f"{len(found)} problem(s) above: a release gate does not honour a pending or expired acceptance "
+              f"or listing, so record each approving pull request and date, and renew or remove what expires, "
+              f"before tagging", file=sys.stderr)
         return 1
-    print("no pending acceptance or listing")
+    print("no pending, expired or expiring acceptance or listing")
     return 0
 
 
