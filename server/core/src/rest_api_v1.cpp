@@ -12149,130 +12149,45 @@ void RestApiV1::register_routes(
         }
         return gate;
     };
-    auto lookup_facts_reads = [software_inventory_store, hostnames_fn]() {
-        software_list::FactsReads io;
-        io.last_seen = [software_inventory_store](const std::vector<std::string>& ids) {
-            return software_inventory_store->source_last_seen_bulk("installed_software", ids);
-        };
-        io.hostnames = hostnames_fn; // the device table's roster, not the connected-agent registry
-        return io;
-    };
-    auto lookup_totals_reads = [software_inventory_store]() {
-        software_list::TotalsReads io;
-        io.catalog_meta = [software_inventory_store] {
-            return software_inventory_store->catalog_rollup_meta();
-        };
-        io.component_meta = [software_inventory_store] {
-            return software_inventory_store->component_rollup_meta();
-        };
-        io.title_totals = [software_inventory_store](std::string_view name) {
-            return software_inventory_store->catalog_title_totals(name);
-        };
-        io.version_set_totals = [software_inventory_store](std::string_view name,
-                                                           const std::vector<std::string>& vs) {
-            return software_inventory_store->installed_software_version_set_totals(name, vs);
-        };
-        io.component_totals = [software_inventory_store](
-                                  std::string_view kind, std::string_view name,
-                                  const std::optional<std::vector<std::string>>& vs) {
-            return software_inventory_store->component_totals(kind, name, vs);
-        };
-        return io;
-    };
-    // The version-range step both lookup routes share (`rq.range` is engaged: version_min/version_max
-    // and `vers` are one range). `read_distinct` is a LIVE distinct-version
-    // read of the title or component (never an hourly rollup: a version first reported since the
-    // last refresh must be inside the range) OVER THE CALLER'S SCOPE (the gate's VisibleSet is
-    // pushed into it, swl::scope_ids; a global caller reads the fleet); it resolves to the exact
-    // version set under the catalogue comparator for EVERY caller, a SQL predicate only that never
-    // leaves the handler. Returns the set, or nullopt once the response is written: 503 on a
-    // degraded read, 400 when the read was cut at kCatalogRowCap and the range cannot be
-    // resolved. Because the read is scoped, that 400 is a fact about the caller's own rows: a
-    // confined caller is answered for a title with 2000 versions outside its scope exactly as for
-    // an unknown title, never a fleet-wide threshold it could not otherwise observe.
-    auto resolve_range = [sw_503](const httplib::Request& req, httplib::Response& res,
-                                  const std::string& cid, const char* verb,
-                                  const std::string& audit_key, auto&& read_distinct,
-                                  const auto& rq) -> std::optional<std::vector<std::string>> {
-        const auto distinct = read_distinct();
-        if (!distinct) {
-            sw_503(req, res, cid, verb, audit_key, "version read degraded",
-                   "software inventory store degraded — version range read failed");
-            return std::nullopt;
-        }
-        auto set = software_list::resolve_version_range(*distinct, *rq.range);
-        if (!set) {
-            res.status = 400;
-            res.set_content(detail::a4_error(res, set.error()), "application/json");
-            return std::nullopt;
-        }
-        return std::move(*set);
-    };
+    // The store reads, the version-range resolve, the device facts and the totals read of both
+    // lookup routes are software_list::lookup_installs / lookup_components (software_list_model.hpp,
+    // the same functions the MCP lookup tools call); a route binds its reads with
+    // software_list::bind_lookup_reads over the store pointer and hostnames_fn held here.
     // The per-route constants of the shared tail below.
     struct LookupShape {
         const char* noun;         // audit detail prefix of an export: "installs" | "components"
         const char* csv_filename; // Content-Disposition of the CSV export
         std::size_t csv_columns;  // width of the CSV truncation trailer
-        bool components;          // totals key: instances (true) | installs (false)
     };
-    // The tail both lookup routes share once their page is read: the cursor-400 / degraded-503
-    // split, the per-page device facts, the totals decision + read (JSON only; a degraded read is
-    // a 503, never a null), the set-and-proceed audit (`success` on EVERY call, continuation
-    // pages tagged page=continuation — the cursor is opaque but unauthenticated, so per-call
-    // audit keeps a forged cursor from walking the fleet unrecorded; a post-filter drop is
-    // audited distinctly as `denied`), then the CSV file (continuation in X-Next-Cursor, in-band
-    // trailer on a capped page) or the JSON body with totals / totals_omitted / audit_persisted.
-    // `read` is the model's page result, `query` the parsed store query, `read_totals`,
-    // `to_csv` and `to_json` the route's model functions.
-    auto serve_lookup_page = [audit_fn, sw_503, lookup_facts_reads, lookup_totals_reads](
-                                 const httplib::Request& req, httplib::Response& res,
-                                 const std::string& cid, const char* verb,
-                                 const std::string& audit_key, const std::string& format,
-                                 bool continuation, const auto& read, bool admit_all,
-                                 const auto& query, auto&& read_totals, auto&& to_csv,
-                                 auto&& to_json, const LookupShape& shape) {
+    // The tail both lookup routes share once their lookup core has answered: the 400 / 503 split
+    // of a LookupError (the core writes no audit row; a 503 is audited here), the set-and-proceed
+    // audit (`success` on EVERY call, continuation pages tagged page=continuation: the cursor is
+    // opaque but unauthenticated, so per-call audit keeps a forged cursor from walking the fleet
+    // unrecorded; a post-filter drop is audited distinctly as `denied`), then the CSV file
+    // (continuation in X-Next-Cursor, in-band trailer on a capped page) or the JSON body with
+    // totals / totals_omitted / audit_persisted. `lookup` is the core's result (totals are read
+    // for JSON only: the route passes want_totals = !csv), `to_csv` the route's model function.
+    auto serve_lookup_page = [audit_fn, sw_503](const httplib::Request& req, httplib::Response& res,
+                                                const std::string& cid, const char* verb,
+                                                const std::string& audit_key,
+                                                const std::string& format, bool continuation,
+                                                const auto& lookup, auto&& to_csv,
+                                                const LookupShape& shape) {
         namespace swc = software_catalogue;
         namespace swl = software_list;
         const bool csv = format == "csv";
         const bool export_mode = !format.empty();
-        if (!read) {
-            if (read.error()) {
+        if (!lookup) {
+            const auto& err = lookup.error();
+            if (err.fault == swl::LookupFault::kBadRequest) {
                 res.status = 400;
-                res.set_content(
-                    detail::a4_error(res, std::string(swc::cursor_error_message(*read.error()))),
-                    "application/json");
+                res.set_content(detail::a4_error(res, err.message), "application/json");
                 return;
             }
-            // Store degraded (pool/query failure) — surface it, NEVER an empty list. A silent
-            // empty reads as "installed nowhere" for a fleet vuln query (ADR-0016 §7
-            // authoritative reads; agentic-first A4 failure-vs-empty). Audit the degraded access
-            // (CC7.2) through the #1647 throw-safe kernel.
-            sw_503(req, res, cid, verb, audit_key, "store degraded",
-                   "software inventory store degraded — query failed");
+            sw_503(req, res, cid, verb, audit_key, err.audit_detail, err.message);
             return;
         }
-        const auto& page = *read;
-        const auto facts =
-            swl::load_device_facts(lookup_facts_reads(), swl::page_agent_ids(page.rows));
-        if (!facts) {
-            sw_503(req, res, cid, verb, audit_key, "device facts degraded",
-                   "software inventory store degraded — last-poll read failed");
-            return;
-        }
-
-        // Totals (JSON only). The admission rule is the model's; the decision is the gate's:
-        // scope == nullopt is the unfiltered (AdmitAll) case, anything engaged gets rows and NO
-        // totals (a fleet rollup cannot be confined, ADR-0017).
-        const auto decision = swl::totals_decision(admit_all, query);
-        swl::TotalsOutcome totals;
-        if (!csv && decision.serve) {
-            totals = read_totals(lookup_totals_reads(), query);
-            if (totals.status == swl::TotalsStatus::kDegraded) {
-                sw_503(req, res, cid, verb, audit_key, "totals degraded",
-                       "software inventory store degraded — totals read failed");
-                return;
-            }
-        }
+        const auto& page = lookup->page;
 
         bool denied_ok = true;
         if (const auto denied = swc::denied_detail(page); !denied.empty())
@@ -12297,18 +12212,13 @@ void RestApiV1::register_routes(
                 res.set_header("X-Next-Cursor", page.next_cursor);
             if (!audit_ok)
                 res.set_header("Sec-Audit-Failed", "true");
-            auto body = to_csv(page.rows, *facts);
+            auto body = to_csv(page.rows, lookup->facts);
             if (page.hit_cap)
                 body += export_csv_truncation_row(ExportCut{.row_cap = true}, shape.csv_columns);
             res.set_content(std::move(body), "text/csv; charset=utf-8");
             return;
         }
-        auto body = to_json(page.rows, *facts, page.next_cursor, page.devices_omitted, page.hit_cap);
-        if (decision.serve && totals.status == swl::TotalsStatus::kServed)
-            swl::set_totals(body, totals, shape.components);
-        else
-            swl::set_totals_omitted(body,
-                                    decision.serve ? swl::kOmittedBuilding : decision.omitted);
+        auto body = swl::lookup_body(*lookup);
         if (!audit_ok)
             body["audit_persisted"] = false;
         res.set_content(ok_json(swc::dump_safe(body)), "application/json");
@@ -12316,7 +12226,7 @@ void RestApiV1::register_routes(
 
     sink.Get(
         "/api/v1/inventory/software/components",
-        [software_inventory_store, lookup_admit, resolve_range,
+        [software_inventory_store, hostnames_fn, lookup_admit,
          serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
             namespace swc = software_catalogue;
             namespace swl = software_list;
@@ -12340,29 +12250,16 @@ void RestApiV1::register_routes(
                 export_mode ? "inventory.components.export" : "inventory.components.view";
             const std::string audit_key = swl::audit_target(rq);
 
-            if (rq.has_range()) {
-                auto set = resolve_range(
-                    req, res, cid, verb, audit_key,
-                    [&] {
-                        return software_inventory_store->component_versions(
-                            rq.query.kind, rq.query.name, swl::scope_ids(gate.scope));
-                    },
-                    rq);
-                if (!set)
-                    return;
-                rq.query.versions = std::move(*set);
-            }
-
-            const auto read = swl::read_components_page(
-                [software_inventory_store](const SoftwareComponentQuery& q) {
-                    return software_inventory_store->query_components(q);
-                },
-                rq, gate.scope);
-            serve_lookup_page(req, res, cid, verb, audit_key, rq.format, continuation, read,
-                              !gate.scope.has_value(), rq.query, &swl::read_component_totals,
-                              &swl::components_csv, &swl::components_response_json,
+            // The version-range resolve, the page, the facts and the totals (JSON only) are the
+            // lookup core's, the same function the MCP query_software_components tool calls.
+            const std::string format = rq.format;
+            const auto lookup = swl::lookup_components(
+                swl::bind_lookup_reads(*software_inventory_store, hostnames_fn), std::move(rq),
+                gate.scope, format != "csv");
+            serve_lookup_page(req, res, cid, verb, audit_key, format, continuation, lookup,
+                              &swl::components_csv,
                               LookupShape{"components", "software-components.csv",
-                                          swl::kComponentsCsvColumns, true});
+                                          swl::kComponentsCsvColumns});
         });
 
     sink.Get(R"(/api/v1/inventory/([^/]+)/([^/]+))",
@@ -12514,7 +12411,7 @@ void RestApiV1::register_routes(
     // sink → false, not a 500 with no trail) — full parity with the MCP sibling's
     // mcp_audit (which wraps the same kernel), not just the bool-surfacing half.
     sink.Get("/api/v1/inventory/software",
-             [fleet_read_fn, software_inventory_store, resolve_range,
+             [fleet_read_fn, software_inventory_store, hostnames_fn,
               serve_lookup_page](const httplib::Request& req, httplib::Response& res) {
                  const auto cid = detail::make_correlation_id();
                  res.set_header("X-Correlation-Id", cid); // echo on every path (A3)
@@ -12569,33 +12466,20 @@ void RestApiV1::register_routes(
                      export_mode ? "inventory.software.export" : "inventory.software.query";
                  const std::string audit_key = swl::audit_target(rq);
 
-                 if (rq.has_range()) {
-                     auto set = resolve_range(
-                         req, res, cid, verb, audit_key,
-                         [&] {
-                             return software_inventory_store->installed_software_distinct_versions(
-                                 rq.base.query.name, swl::scope_ids(gate.scope));
-                         },
-                         rq);
-                     if (!set)
-                         return;
-                     rq.base.query.versions = std::move(*set);
-                 }
-
-                 // The model decodes the cursor, pushes the scope into SQL up to
-                 // kScopePushdownMaxIds (complete pages, nothing hidden) and post-filters only a
-                 // wider scope — the gate's own composed meet(management-group, service-scope)
-                 // VisibleSet (#3290). `devices_omitted` is DEFINED as the devices hidden by that
-                 // filter (0 under push-down).
-                 const auto read =
-                     swl::read_list_page(swc::devices_reader(*software_inventory_store), rq,
-                                         gate.scope);
-                 serve_lookup_page(req, res, cid, verb, audit_key, rq.base.format, continuation,
-                                   read, !gate.scope.has_value(), rq.base.query,
-                                   &swl::read_application_totals, &swl::list_csv,
-                                   &swl::list_response_json,
+                 // The version-range resolve, the page (the model decodes the cursor, pushes the
+                 // scope into SQL up to kScopePushdownMaxIds and post-filters only a wider scope:
+                 // the gate's own composed meet(management-group, service-scope) VisibleSet,
+                 // #3290; `devices_omitted` is the devices hidden by that filter, 0 under
+                 // push-down), the facts and the totals (JSON only) are the lookup core's, the
+                 // same function the MCP query_installed_software tool calls.
+                 const std::string format = rq.base.format;
+                 const auto lookup = swl::lookup_installs(
+                     swl::bind_lookup_reads(*software_inventory_store, hostnames_fn),
+                     std::move(rq), gate.scope, format != "csv");
+                 serve_lookup_page(req, res, cid, verb, audit_key, format, continuation, lookup,
+                                   &swl::list_csv,
                                    LookupShape{"installs", "software-installs.csv",
-                                               swl::kListCsvColumns, false});
+                                               swl::kListCsvColumns});
              });
 
     // ── Devices (#4033, #2146 API-parity Batch A) ─────────────────────────
