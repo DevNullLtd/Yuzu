@@ -27,10 +27,17 @@ What it pins:
   and before the installer is compiled, with --build-dir equal to ISCC's
   /DBuildDir.
 - yuzu-agent.iss installs {#BuildDir}\msvc-runtime\*.dll into {app}\bin under
-  core, without skipifsourcedoesntexist (an unstaged build fails ISCC).
+  core, without skipifsourcedoesntexist (an unstaged build fails ISCC), and
+  before yuzu-agent.exe (an interrupted install leaves a new runtime under an
+  old executable, never the reverse); both payloads carry NOTICE.
 - stage-msvc-runtime.ps1 requires the four DLLs, never names vcvars, ends in
-  `exit 0`; run behaviourally under pwsh over a fake redistributable tree
-  (copy set, refusals, the release's `& script; $LASTEXITCODE` idiom).
+  `exit 0`, matches the signer's O= exactly; run behaviourally under pwsh over
+  a fake redistributable tree (copy set, refusals, the release's
+  `& script; $LASTEXITCODE` idiom, the MSVC toolset pin in msvc-toolset.pin,
+  removal of stale runtime DLLs, the step-summary record).
+- The PE reader itself, over PE32 and PE32+ images, legacy (VA-based)
+  delay-load descriptors, several sections and a name in a section's
+  uninitialised tail; and the runtime/debug/API-set name classification.
 - build-installer.sh stages the runtime too.
 
 Each lexical check also runs against a mutated copy of the sources and must
@@ -53,6 +60,8 @@ ROOT = Path(__file__).resolve().parent.parent
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
 ISS = ROOT / "deploy" / "packaging" / "windows" / "yuzu-agent.iss"
 STAGE = ROOT / "deploy" / "packaging" / "windows" / "stage-msvc-runtime.ps1"
+PIN = ROOT / "deploy" / "packaging" / "windows" / "msvc-toolset.pin"
+WINDOWS_BUILD_MD = ROOT / "docs" / "windows-build.md"
 BUILD_SH = ROOT / "deploy" / "packaging" / "windows" / "build-installer.sh"
 CHECKER = ROOT / "scripts" / "ci" / "check-windows-payload-imports.py"
 
@@ -62,6 +71,10 @@ _spec.loader.exec_module(chk)
 
 CHECK_STEP = "Check the DLL import closure of both payloads"
 RUNTIME_LINE = 'Source: "{#BuildDir}\\msvc-runtime\\*.dll"; DestDir: "{app}\\bin"; Components: core; Flags: ignoreversion'
+EXE_LINE = 'Source: "{#BuildDir}\\agents\\core\\yuzu-agent.exe"; DestDir: "{app}\\bin"; Components: core; Flags: ignoreversion'
+NOTICE_LINE = 'Source: "..\\..\\..\\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion'
+NOTICE_COPY = 'Copy-Item "NOTICE" "${staging}/"'
+SIGNER_MATCH = "-cnotmatch '(^|,\\s*)O=Microsoft Corporation(\\s*,|$)'"
 STAGE_CALL = '& ./deploy/packaging/windows/stage-msvc-runtime.ps1 -Destination "${staging}/bin", "build-windows/msvc-runtime"'
 STAGE_CHECK = 'if ($LASTEXITCODE -ne 0) { Write-Error "stage-msvc-runtime.ps1 failed"; exit 1 }'
 CHECK_MUST = (
@@ -75,42 +88,101 @@ CHECK_MUST = (
 REQUIRED_CRT = ("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "msvcp140_atomic_wait.dll")
 
 
-# ── a minimal PE32+ writer (just enough for an import table) ────────────────
+# ── a minimal PE writer (just enough for an import table) ───────────────────
 
-def make_pe(imports=(), delay=(), garbage=False) -> bytes:
+PE32_BASE, PE32P_BASE = 0x400000, 0x140000000
+
+
+def make_pe(imports=(), delay=(), garbage=False, pe32=False, legacy_delay=False,
+            names_section=False, tail_import=None, slack=0) -> bytes:
+    """A PE image whose import and delay-import tables name `imports` and `delay`.
+
+    pe32          a PE32 (0x10B) image instead of PE32+ (0x20B).
+    legacy_delay  pre-VC7 delay descriptors: attributes 0 and the DLL name as a
+                  VA (image base + RVA), which the reader must rebase.
+    names_section the name strings in a second section (.rdata) of their own.
+    tail_import   one more import whose name RVA lies in the names section's
+                  uninitialised tail (VirtualSize > SizeOfRawData). The file
+                  bytes at the offset a reader would compute WITHOUT the tail
+                  check hold a plausible name ("decoy.dll"), so a reader that
+                  skips the check returns it instead of failing.
+    slack         extra VirtualSize past SizeOfRawData on the names section.
+    """
     if garbage:
         return b"MZ" + b"\0" * 100
-    va, raw = 0x1000, 0x200
+    image_base = PE32_BASE if pe32 else PE32P_BASE
+    imports = list(imports) + ([tail_import] if tail_import else [])
+    delay = list(delay)
+    align = 0x200
     imp_size = (len(imports) + 1) * 20 if imports else 0
     dly_size = (len(delay) + 1) * 32 if delay else 0
-    names_off = imp_size + dly_size
+    va1 = 0x1000
+    names_va = 0x2000 if names_section else va1 + imp_size + dly_size
+
     names = b""
-    name_rvas = []
-    for n in list(imports) + list(delay):
-        name_rvas.append(va + names_off + len(names))
+    rvas = []
+    for i, n in enumerate(imports + delay):
+        if tail_import and i == len(imports) - 1:
+            rvas.append(None)
+            continue
+        rvas.append(names_va + len(names))
         names += n.encode("ascii") + b"\0"
-    sec = bytearray(names_off + len(names))
-    sec[names_off:] = names
-    for i, _ in enumerate(imports):
-        struct.pack_into("<IIIII", sec, 20 * i, 0, 0, 0, name_rvas[i], 0x1)
-    for j, _ in enumerate(delay):
-        struct.pack_into("<IIIIIIII", sec, imp_size + 32 * j, 1, name_rvas[len(imports) + j], 0, 0, 0, 0, 0, 0)
-    sec = bytes(sec) + b"\0" * (-len(sec) % 0x200)
-    opt = bytearray(240)
-    struct.pack_into("<H", opt, 0, 0x20B)
-    struct.pack_into("<Q", opt, 24, 0x140000000)
-    struct.pack_into("<I", opt, 108, 16)
+
+    tables = bytearray(imp_size + dly_size)
+    sec1 = tables if names_section else tables + names
+    sec1 = bytes(sec1) + b"\0" * (-len(sec1) % align)
+    sections = [[b".idata\0\0", va1, bytes(sec1), len(sec1)]]
+    if names_section:
+        sec2 = names + b"\0" * (-len(names) % align)
+        sections.append([b".rdata\0\0", 0x2000, sec2, len(sec2)])
+    names_sec = sections[-1]
+    names_sec[3] += slack
+    if tail_import:
+        names_sec[3] += 0x200
+        rvas[len(imports) - 1] = names_sec[1] + len(names_sec[2]) + 0x10
+
+    for i in range(len(imports)):
+        struct.pack_into("<IIIII", tables, 20 * i, 0, 0, 0, rvas[i], 0x1)
+    for j in range(len(delay)):
+        rva = rvas[len(imports) + j]
+        attrs, name = (0, (image_base + rva) & 0xFFFFFFFF) if legacy_delay else (1, rva)
+        struct.pack_into("<IIIIIIII", tables, imp_size + 32 * j, attrs, name, 0, 0, 0, 0, 0, 0)
+    first = bytes(tables) + (b"" if names_section else names)
+    sections[0][2] = first + b"\0" * (len(sections[0][2]) - len(first))
+
+    if pe32:
+        opt = bytearray(224)
+        struct.pack_into("<H", opt, 0, 0x10B)
+        struct.pack_into("<I", opt, 28, image_base)
+        struct.pack_into("<I", opt, 92, 16)
+        dirs = 96
+    else:
+        opt = bytearray(240)
+        struct.pack_into("<H", opt, 0, 0x20B)
+        struct.pack_into("<Q", opt, 24, image_base)
+        struct.pack_into("<I", opt, 108, 16)
+        dirs = 112
     if imports:
-        struct.pack_into("<II", opt, 112 + 8 * 1, va, imp_size)
+        struct.pack_into("<II", opt, dirs + 8 * 1, va1, imp_size)
     if delay:
-        struct.pack_into("<II", opt, 112 + 8 * 13, va + imp_size, dly_size)
+        struct.pack_into("<II", opt, dirs + 8 * 13, va1 + imp_size, dly_size)
     dos = bytearray(0x40)
     dos[0:2] = b"MZ"
     struct.pack_into("<I", dos, 0x3C, 0x40)
-    coff = struct.pack("<HHIIIHH", 0x8664, 1, 0, 0, 0, len(opt), 0x22)
-    shdr = b".idata\0\0" + struct.pack("<IIIIIIHHI", len(sec), va, len(sec), raw, 0, 0, 0, 0, 0xC0000040)
-    head = bytes(dos) + b"PE\0\0" + coff + bytes(opt) + shdr
-    return head + b"\0" * (raw - len(head)) + sec
+    coff = struct.pack("<HHIIIHH", 0x14C if pe32 else 0x8664, len(sections), 0, 0, 0, len(opt),
+                       0x102 if pe32 else 0x22)
+    raw = align
+    shdrs, body = b"", b""
+    for name, va, data, vsize in sections:
+        shdrs += name + struct.pack("<IIIIIIHHI", vsize, va, len(data), raw + len(body), 0, 0, 0, 0, 0xC0000040)
+        body += data
+    head = bytes(dos) + b"PE\0\0" + coff + bytes(opt) + shdrs
+    image = head + b"\0" * (raw - len(head)) + body
+    if tail_import:
+        # Where rawptr + (rva - va) lands: past the names section's raw data.
+        decoy_off = raw + sum(len(s[2]) for s in sections[:-1]) + (rvas[len(imports) - 1] - names_sec[1])
+        image += b"\0" * (decoy_off - len(image)) + b"decoy.dll\0"
+    return image
 
 
 OS_DLLS = ("kernel32.dll", "advapi32.dll", "ws2_32.dll")
@@ -241,6 +313,156 @@ class CheckerZip(_Tmp):
         self.assertIn("plugins\\ holds no plugin DLL", out)
 
 
+class PEReader(unittest.TestCase):
+    """chk.pe_imports over the image shapes the release can meet, each through
+    the branch of the reader it exists for."""
+
+    def test_pe32plus_baseline(self):
+        self.assertEqual(chk.pe_imports(make_pe(["kernel32.dll", "msvcp140.dll"], delay=["zlib1.dll"])),
+                         ["kernel32.dll", "msvcp140.dll", "zlib1.dll"])
+
+    def test_pe32_image(self):
+        # 0x10B: ImageBase at +28, NumberOfRvaAndSizes at +92, directories at +96.
+        img = make_pe(["kernel32.dll", "vcruntime140.dll"], delay=["wlanapi.dll"], pe32=True)
+        self.assertEqual(struct.unpack_from("<H", img, 0x40 + 24)[0], 0x10B)
+        self.assertEqual(chk.pe_imports(img), ["kernel32.dll", "vcruntime140.dll", "wlanapi.dll"])
+
+    def test_legacy_delay_descriptor_is_rebased(self):
+        # attrs bit 0 clear: the name is a VA, image base 0x400000 + RVA.
+        img = make_pe(["kernel32.dll"], delay=["legacy1.dll", "legacy2.dll"], pe32=True, legacy_delay=True)
+        self.assertEqual(chk.pe_imports(img), ["kernel32.dll", "legacy1.dll", "legacy2.dll"])
+
+    def test_legacy_delay_descriptor_in_pe32plus_fails_closed(self):
+        # A 32-bit field cannot hold a PE32+ VA: the rebased value is in no
+        # section, and the reader refuses rather than guess.
+        img = make_pe(["kernel32.dll"], delay=["legacy.dll"], legacy_delay=True)
+        with self.assertRaisesRegex(chk.PEError, "in no section"):
+            chk.pe_imports(img)
+
+    def test_names_in_a_second_section(self):
+        for pe32 in (False, True):
+            with self.subTest(pe32=pe32):
+                img = make_pe(["kernel32.dll", "msvcp140.dll"], delay=["zlib1.dll"], pe32=pe32, names_section=True)
+                self.assertEqual(struct.unpack_from("<H", img, 0x40 + 6)[0], 2)
+                self.assertEqual(chk.pe_imports(img), ["kernel32.dll", "msvcp140.dll", "zlib1.dll"])
+
+    def test_virtual_size_past_raw_data(self):
+        # VirtualSize > SizeOfRawData with every name in the raw part: read.
+        img = make_pe(["kernel32.dll", "msvcp140.dll"], names_section=True, slack=0x1000)
+        self.assertEqual(chk.pe_imports(img), ["kernel32.dll", "msvcp140.dll"])
+
+    def test_name_in_the_uninitialised_tail_fails_closed(self):
+        # The loader would read zeros there; the file bytes at the naive
+        # offset say "decoy.dll". The reader must refuse, not return either.
+        for names_section in (False, True):
+            with self.subTest(names_section=names_section):
+                img = make_pe(["kernel32.dll"], tail_import="ignored.dll", names_section=names_section)
+                self.assertIn(b"decoy.dll", img)
+                with self.assertRaisesRegex(chk.PEError, "uninitialised tail"):
+                    chk.pe_imports(img)
+
+    def test_tail_name_fails_the_payload(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_payload_imports_") as d:
+            d = Path(d)
+            (d / "System32").mkdir()
+            for n in OS_DLLS:
+                (d / "System32" / n).write_bytes(b"")
+            zp = d / "yuzu-agent-windows-x64.zip"
+            files = {"bin/yuzu-agent.exe": AGENT, "bin/yuzu_agent_core.dll": CORE, "bin/fmt.dll": FMT,
+                     "plugins/os_info.dll": PLUGIN,
+                     "plugins/odd.dll": make_pe(["kernel32.dll"], tail_import="x.dll", pe32=True)}
+            files.update({f"bin/{n}": crt_pe(n) for n in REQUIRED_CRT})
+            with zipfile.ZipFile(zp, "w") as z:
+                for rel, data in files.items():
+                    z.writestr("top/" + rel, data)
+            r = subprocess.run([sys.executable, "-I", str(CHECKER), "--zip", str(zp), "--system-dir", str(d / "System32")],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("plugins\\odd.dll: not a readable PE image", r.stdout)
+            self.assertNotIn("decoy.dll", r.stdout)
+
+
+class Classification(unittest.TestCase):
+    """Which class each imported name gets: a table, so a regex edit that
+    moves a name is a visible test failure."""
+
+    TABLE = {
+        "vcruntime140.dll": "redist", "vcruntime140_1.dll": "redist", "vcruntime140_threads.dll": "redist",
+        "msvcp140.dll": "redist", "msvcp140_1.dll": "redist", "msvcp140_2.dll": "redist",
+        "msvcp140_atomic_wait.dll": "redist", "msvcp140_codecvt_ids.dll": "redist",
+        "concrt140.dll": "redist", "vccorlib140.dll": "redist", "vcomp140.dll": "redist",
+        "vcruntime140d.dll": "debug", "vcruntime140_1d.dll": "debug", "vcruntime140_threadsd.dll": "debug",
+        "msvcp140d.dll": "debug", "msvcp140_1d.dll": "debug", "msvcp140_2d.dll": "debug",
+        "msvcp140d_atomic_wait.dll": "debug", "msvcp140d_codecvt_ids.dll": "debug",
+        "concrt140d.dll": "debug", "vccorlib140d.dll": "debug", "vcomp140d.dll": "debug",
+        "ucrtbased.dll": "debug",
+        "api-ms-win-crt-runtime-l1-1-0.dll": "apiset", "api-ms-win-core-synch-l1-2-0.dll": "apiset",
+        "ext-ms-win-ntuser-window-l1-1-0.dll": "apiset",
+        "kernel32.dll": "other", "ucrtbase.dll": "other", "advapi32.dll": "other", "fmt.dll": "other",
+        "msvcp140x.dll": "other", "vcruntime140_.dll": "other",
+        # Case does not matter: the v0.15.0 binaries import upper-case names.
+        "VCRUNTIME140.dll": "redist", "MSVCP140_ATOMIC_WAIT.DLL": "redist", "MSVCP140D.dll": "debug",
+        "MSVCP140D_ATOMIC_WAIT.dll": "debug", "API-MS-WIN-CRT-HEAP-L1-1-0.DLL": "apiset", "KERNEL32.dll": "other",
+    }
+
+    def test_table(self):
+        for name, want in self.TABLE.items():
+            with self.subTest(name):
+                self.assertEqual(chk.classify(name), want)
+
+    def test_debug_wins_over_redist(self):
+        # Each debug name is caught by DEBUG_CRT_RE itself, whatever
+        # REDIST_RE would make of it.
+        for name, want in self.TABLE.items():
+            if want == "debug":
+                with self.subTest(name):
+                    self.assertTrue(chk.DEBUG_CRT_RE.match(name))
+
+    def test_debug_name_fails_a_payload_even_when_shipped(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_payload_imports_") as d:
+            d = Path(d)
+            (d / "System32").mkdir()
+            for n in OS_DLLS:
+                (d / "System32" / n).write_bytes(b"")
+            zp = d / "z.zip"
+            files = {"bin/yuzu-agent.exe": AGENT, "bin/yuzu_agent_core.dll": CORE, "bin/fmt.dll": FMT,
+                     "plugins/os_info.dll": PLUGIN,
+                     "plugins/x.dll": make_pe(["kernel32.dll", "msvcp140d_atomic_wait.dll"]),
+                     "bin/msvcp140d_atomic_wait.dll": make_pe(["kernel32.dll"])}
+            files.update({f"bin/{n}": crt_pe(n) for n in REQUIRED_CRT})
+            with zipfile.ZipFile(zp, "w") as z:
+                for rel, data in files.items():
+                    z.writestr("top/" + rel, data)
+            r = subprocess.run([sys.executable, "-I", str(CHECKER), "--zip", str(zp), "--system-dir", str(d / "System32")],
+                               capture_output=True, text=True, timeout=60)
+            self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+            self.assertIn("debug C++ runtime msvcp140d_atomic_wait.dll", r.stdout)
+
+
+class CheckerUsage(_Tmp):
+    def test_missing_paths_are_usage_errors(self):
+        zp = self.tmp / "absent.zip"
+        cases = {
+            "missing --zip": (["--zip", str(zp)], "--zip"),
+            "missing --system-dir": (["--zip", str(zp), "--system-dir", str(self.tmp / "NoSystem32")], "--system-dir"),
+            "missing --iss": (["--iss", str(self.tmp / "absent.iss"), "--build-dir", str(self.tmp)], "--iss"),
+        }
+        for name, (argv, flag) in cases.items():
+            with self.subTest(name):
+                code, out = self.run_check(*argv)
+                self.assertEqual(code, 2, out)
+                self.assertIn(f"check-windows-payload-imports: {flag} ", out)
+                self.assertNotIn("Traceback", out)
+
+    def test_unreadable_zip_fails_without_traceback(self):
+        zp = self.tmp / "broken.zip"
+        zp.write_bytes(b"not a zip")
+        code, out = self.run_check("--zip", str(zp))
+        self.assertEqual(code, 1, out)
+        self.assertIn("not a readable zip archive", out)
+        self.assertNotIn("Traceback", out)
+
+
 class CheckerIss(_Tmp):
     """The .iss mode, against the REAL yuzu-agent.iss over a synthetic build tree."""
 
@@ -362,6 +584,16 @@ def wiring_problems(release, iss, stage, build_sh):
         found.append("yuzu-agent.iss: the msvc-runtime Source line (core, {app}\\bin, no skipifsourcedoesntexist) is missing")
     if re.search(r"msvc-runtime[^\n]*skipifsourcedoesntexist", iss_code, re.I):
         found.append("yuzu-agent.iss: the runtime line may be skipped when unstaged")
+    iss_lines = [l.strip() for l in iss_code.splitlines()]
+    if RUNTIME_LINE in iss_lines and EXE_LINE in iss_lines:
+        if iss_lines.index(RUNTIME_LINE) > iss_lines.index(EXE_LINE):
+            found.append("yuzu-agent.iss: the msvc-runtime line must come before yuzu-agent.exe")
+    else:
+        found.append("yuzu-agent.iss: the yuzu-agent.exe Source line is not where this check expects it")
+    if NOTICE_LINE not in iss_lines:
+        found.append("yuzu-agent.iss: NOTICE is not installed into {app} under core")
+    if NOTICE_COPY not in pkg_code or not (0 <= pkg_code.find(NOTICE_COPY) < pkg_code.find("Compress-Archive")):
+        found.append("Package archive: NOTICE is not copied into the zip before Compress-Archive")
 
     stage_code = re.sub(r"<#.*?#>", "", stage, flags=re.S)
     stage_code = "\n".join(l for l in stage_code.splitlines() if not l.lstrip().startswith("#"))
@@ -378,6 +610,10 @@ def wiring_problems(release, iss, stage, build_sh):
         found.append("stage-msvc-runtime.ps1 must end with `exit 0` (release.yml tests $LASTEXITCODE)")
     if "Get-AuthenticodeSignature" not in stage_code:
         found.append("stage-msvc-runtime.ps1 no longer checks the Microsoft signature on Windows")
+    if SIGNER_MATCH not in stage_code:
+        found.append("stage-msvc-runtime.ps1: the signer check no longer matches the subject's O= exactly")
+    if "[string] $PinFile = (Join-Path $PSScriptRoot 'msvc-toolset.pin')" not in stage_code:
+        found.append("stage-msvc-runtime.ps1: the toolset pin no longer defaults to msvc-toolset.pin beside it")
 
     if not re.search(r'^\s*"\$PWSH" -NoProfile -ExecutionPolicy Bypass -File "\$WIN_STAGE" -Destination "\$WIN_RUNTIME_DIR"\s*$',
                      build_sh, re.M):
@@ -392,6 +628,14 @@ class Wiring(unittest.TestCase):
 
     def test_source_is_clean(self):
         self.assertEqual(wiring_problems(**self.srcs), [])
+
+    def test_toolset_pin_file(self):
+        values = [l.strip() for l in PIN.read_text(encoding="utf-8").splitlines()
+                  if l.strip() and not l.strip().startswith("#")]
+        self.assertEqual(len(values), 1, values)
+        self.assertRegex(values[0], r"^\d+\.\d+$")
+        # The documented release toolset (Wee Tam's cl.exe) is the pinned one.
+        self.assertIn(f"\\VC\\Tools\\MSVC\\{values[0]}.", WINDOWS_BUILD_MD.read_text(encoding="utf-8"))
 
     def test_mutations_are_caught(self):
         mutations = {
@@ -417,6 +661,11 @@ class Wiring(unittest.TestCase):
             "stage calls vcvars": ("stage", "function Find-VersionDirFromVswhere {", "function Find-VersionDirFromVswhere {\n    & cmd /c vcvars64.bat"),
             "stage loses exit 0": ("stage", "\nexit 0\n", "\n"),
             "stage drops the signature check": ("stage", "Get-AuthenticodeSignature", "Get-Item"),
+            "signer check unanchored": ("stage", SIGNER_MATCH, "-notmatch 'O=Microsoft Corporation'"),
+            "pin default moved": ("stage", "(Join-Path $PSScriptRoot 'msvc-toolset.pin')", "''"),
+            "iss runtime line after the exe": ("iss", RUNTIME_LINE + "\n" + EXE_LINE, EXE_LINE + "\n" + RUNTIME_LINE),
+            "iss NOTICE dropped": ("iss", NOTICE_LINE, "; NOTICE"),
+            "zip NOTICE dropped": ("release", NOTICE_COPY, "$null = 0"),
             "build-installer stops staging": ("build_sh", '"$PWSH" -NoProfile -ExecutionPolicy Bypass -File "$WIN_STAGE" -Destination "$WIN_RUNTIME_DIR"', "true"),
         }
         for name, (which, old, new) in mutations.items():
@@ -453,6 +702,8 @@ class _PrereqCheck(unittest.TestCase):
 
 
 @unittest.skipUnless(_PWSH, "no working pwsh on PATH")
+@unittest.skipIf(os.name == "nt", "the fake redistributable's DLLs are unsigned, and on Windows the script "
+                                  "requires a valid Microsoft Authenticode signature; these run on Linux")
 class StageScriptBehaviour(_Tmp):
     def redist(self, version="14.44.35112", files=REQUIRED_CRT + ("msvcp140_1.dll", "vcruntime140_threads.dll",
                                                                   "concrt140.dll", "vccorlib140.dll"), crt_dirs=("Microsoft.VC143.CRT",)):
@@ -466,7 +717,8 @@ class StageScriptBehaviour(_Tmp):
         return vdir
 
     def run_stage(self, args, env_extra=None, wrapper=False):
-        env = {k: v for k, v in os.environ.items() if k not in ("VCToolsRedistDir", "VCToolsVersion")}
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("VCToolsRedistDir", "VCToolsVersion", "GITHUB_STEP_SUMMARY")}
         env.update(env_extra or {})
         if wrapper:
             # As release.yml calls it: a pwsh step (stop on error) that runs the
@@ -516,6 +768,7 @@ class StageScriptBehaviour(_Tmp):
             "no CRT directory": (dict(crt_dirs=()), {}, "need exactly one"),
             "redistributable older than the toolset": ({}, {"VCToolsVersion": "14.45.35000"}, "older than the toolset"),
         }
+        pin_1445 = self.pin("14.45")
         for name, (kw, env, msg) in cases.items():
             with self.subTest(name):
                 sub = self.tmp / re.sub(r"\W+", "_", name)
@@ -524,7 +777,8 @@ class StageScriptBehaviour(_Tmp):
                 try:
                     vdir = self.redist(**kw)
                     dest = sub / "out"
-                    code, out = self.run_stage({"dest": [str(dest)], "extra": f"-RedistDir '{vdir}'"},
+                    code, out = self.run_stage({"dest": [str(dest)],
+                                                "extra": f"-RedistDir '{vdir}' -PinFile '{pin_1445}'"},
                                                env, wrapper=True)
                 finally:
                     self.tmp = old_tmp
@@ -532,6 +786,88 @@ class StageScriptBehaviour(_Tmp):
                 self.assertNotIn("AFTER-STAGE", out)
                 self.assertIn(msg, out)
                 self.assertFalse(dest.exists() and any(dest.iterdir()), f"{name}: copied something before refusing")
+
+    def pin(self, text, name=None):
+        path = self.tmp / (name or f"pin-{re.sub(r'[^0-9a-z]+', '_', text)}.pin")
+        path.write_text("# a comment line\n\n" + text + "\n", encoding="utf-8")
+        return path
+
+    def test_toolset_pin(self):
+        """msvc-toolset.pin: a known toolset must match it; an unknown one warns and passes."""
+        cases = {
+            # name: (redist version, VCToolsVersion or None, pin text or None for the tracked file, ok, messages)
+            "match (the tracked pin file)": ("14.44.35112", "14.44.35207", None, True,
+                                             ("MSVC toolset 14.44.35207 matches the pin 14.44",)),
+            "match (-PinFile)": ("14.45.35000", "14.45.35000", "14.45", True, ("matches the pin 14.45",)),
+            "toolset newer than the pin": ("14.45.35000", "14.45.35000", "14.44", False,
+                                           ("built by MSVC toolset 14.45.35000 (14.45)", "pins 14.44", "#8219")),
+            "toolset older than the pin": ("14.44.35112", "14.43.34808", "14.44", False,
+                                           ("built by MSVC toolset 14.43.34808 (14.43)", "pins 14.44")),
+            "unknown toolset warns and passes": ("14.44.35112", None, "not a version", True,
+                                                 ("toolset version unknown", "pin and the redistributable/toolset comparison are skipped")),
+            "malformed pin": ("14.44.35112", "14.44.35207", "14.44\n14.45", False, ("exactly one major.minor line",)),
+            "missing pin file": ("14.44.35112", "14.44.35207", "", False, ("is missing",)),
+        }
+        for name, (redist, tools, pin_text, ok, msgs) in cases.items():
+            with self.subTest(name):
+                sub = self.tmp / re.sub(r"\W+", "_", name)
+                sub.mkdir()
+                old_tmp, self.tmp = self.tmp, sub
+                try:
+                    vdir = self.redist(version=redist)
+                    if pin_text is None:
+                        extra = ""
+                    elif pin_text == "":
+                        extra = f"-PinFile '{sub / 'absent.pin'}'"
+                    else:
+                        extra = f"-PinFile '{self.pin(pin_text)}'"
+                    dest = sub / "out"
+                    env = {"VCToolsRedistDir": str(vdir)}
+                    if tools:
+                        env["VCToolsVersion"] = tools
+                    code, out = self.run_stage({"dest": [str(dest)], "extra": extra}, env, wrapper=True)
+                finally:
+                    self.tmp = old_tmp
+                for msg in msgs:
+                    self.assertIn(msg, out)
+                if ok:
+                    self.assertEqual(code, 0, out)
+                    self.assertTrue((dest / "msvcp140.dll").is_file(), out)
+                else:
+                    self.assertNotEqual(code, 0, out)
+                    self.assertNotIn("AFTER-STAGE", out)
+                    self.assertFalse(dest.exists() and any(dest.iterdir()), f"{name}: copied something before refusing")
+
+    def test_stale_runtime_dlls_are_removed(self):
+        vdir = self.redist()
+        dest = self.tmp / "msvc-runtime"
+        dest.mkdir()
+        for n in ("msvcp140_9.dll", "VCRUNTIME140D.dll", "msvcp140.dll", "yuzu-agent.exe", "fmt.dll"):
+            (dest / n).write_bytes(b"stale")
+        code, out = self.run_stage({"dest": [str(dest)], "extra": f"-RedistDir '{vdir}'"}, wrapper=True)
+        self.assertEqual(code, 0, out)
+        names = sorted(p.name for p in dest.iterdir())
+        self.assertEqual(names, sorted(REQUIRED_CRT + ("msvcp140_1.dll", "vcruntime140_threads.dll",
+                                                       "yuzu-agent.exe", "fmt.dll")), out)
+        self.assertEqual((dest / "msvcp140.dll").read_bytes(), b"msvcp140.dll")
+        self.assertEqual((dest / "fmt.dll").read_bytes(), b"stale")
+
+    def test_step_summary_records_the_shipped_runtime(self):
+        vdir = self.redist()
+        summary = self.tmp / "step-summary.md"
+        summary.write_text("earlier step\n", encoding="utf-8")
+        code, out = self.run_stage({"dest": [str(self.tmp / "a"), str(self.tmp / "b")],
+                                    "extra": f"-RedistDir '{vdir}'"},
+                                   {"GITHUB_STEP_SUMMARY": str(summary), "VCToolsVersion": "14.44.35207"},
+                                   wrapper=True)
+        self.assertEqual(code, 0, out)
+        text = summary.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("earlier step\n"), text)
+        self.assertEqual(text.count("### Visual C++ runtime shipped app-local"), 1, text)
+        self.assertIn("toolset: 14.44.35207", text)
+        for n in REQUIRED_CRT + ("msvcp140_1.dll", "vcruntime140_threads.dll"):
+            self.assertIn(f"| {n} |", text)
+        self.assertNotIn("concrt140.dll", text)
 
     def test_single_destination_by_file_as_build_installer_does(self):
         vdir = self.redist()

@@ -7,7 +7,7 @@
     yuzu-agent.exe, yuzu_agent_core.dll, every plugin and every vcpkg DLL are
     built with MSVC and import vcruntime140.dll, vcruntime140_1.dll and
     msvcp140.dll; yuzu-agent.exe also imports msvcp140_atomic_wait.dll
-    (redistributable 14.28 or later). Up to v0.15.0 neither the release zip nor
+    (first shipped in redistributable 14.28). Up to v0.15.0 neither the release zip nor
     YuzuAgentSetup carried them, so the agent ran only where some other product
     had installed the Visual C++ Redistributable.
 
@@ -34,6 +34,12 @@
     including in the application's own directory ("app-local"), under the
     Distributable Code terms of the Visual Studio licence; see NOTICE.
 
+    Before copying, it removes every vcruntime140*.dll and msvcp140*.dll
+    already in a destination, so a reused directory cannot ship a stale one.
+    When $env:GITHUB_STEP_SUMMARY is set (a GitHub Actions step), it appends
+    the staged DLL names and file versions to the step summary, which records
+    the runtime each release shipped.
+
 .PARAMETER Destination
     One or more directories to copy the DLLs into (created if absent).
 
@@ -43,22 +49,35 @@
 
 .PARAMETER ToolsVersion
     The MSVC toolset version that built the binaries (14.44.35207). Defaults to
-    $env:VCToolsVersion. When known, the redistributable's major.minor must be
-    at least the toolset's: a newer toolset can need runtime exports an older
-    redistributable lacks.
+    $env:VCToolsVersion. When known, its major.minor must equal the pin in
+    -PinFile, and the redistributable's major.minor must be at least the
+    toolset's: a newer toolset can need runtime exports an older
+    redistributable lacks. When unknown (a local build outside an MSVC
+    environment), both comparisons are skipped with a warning.
+
+.PARAMETER PinFile
+    The file holding the pinned toolset major.minor (msvc-toolset.pin next to
+    this script by default): one non-comment line such as 14.44. agent
+    self-update replaces only yuzu-agent.exe, never the app-local runtime
+    (#8219), so a release built by a newer toolset than the pin could ship an
+    executable that the runtime already on a device cannot run. The file says
+    how to change the pin.
 
 .NOTES
     PowerShell 7+ (pwsh.exe) only, like every Yuzu-authored script
-    (docs/windows-build.md). Fails with a terminating error, never a partial
-    copy: every DLL is copied to every destination and its hash compared, or
-    the script throws. Ends with `exit 0`, so a caller can test $LASTEXITCODE.
+    (docs/windows-build.md). Every check runs before anything is copied. A
+    copy that then fails (a later destination after an earlier one was
+    written, or a hash that differs) throws, so the calling release step
+    fails and nothing is published; it does not undo what was already
+    copied. Ends with `exit 0`, so a caller can test $LASTEXITCODE.
 #>
 [CmdletBinding(PositionalBinding = $false)]
 param(
     [Parameter(Mandatory = $true)]
     [string[]] $Destination,
     [string] $RedistDir = $env:VCToolsRedistDir,
-    [string] $ToolsVersion = $env:VCToolsVersion
+    [string] $ToolsVersion = $env:VCToolsVersion,
+    [string] $PinFile = (Join-Path $PSScriptRoot 'msvc-toolset.pin')
 )
 
 if ($PSVersionTable.PSVersion.Major -lt 7) {
@@ -115,6 +134,20 @@ function Get-MajorMinor([string] $Text) {
     return $null
 }
 
+function Read-ToolsetPin([string] $Path) {
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) {
+        throw "stage-msvc-runtime: the toolset pin file '$Path' is missing"
+    }
+    $values = @(Get-Content -LiteralPath $Path |
+                ForEach-Object { $_.Trim() } |
+                Where-Object { $_ -and -not $_.StartsWith('#') })
+    if ($values.Count -ne 1 -or $values[0] -notmatch '^\d+\.\d+$') {
+        throw ("stage-msvc-runtime: '$Path' must hold exactly one major.minor line (such as 14.44); " +
+               "found: $($values -join ', ')")
+    }
+    return [version]$values[0]
+}
+
 if ($RedistDir) {
     $from = if ($PSBoundParameters.ContainsKey('RedistDir')) { '-RedistDir' } else { 'VCToolsRedistDir' }
     $versionDir = $RedistDir.TrimEnd('\', '/')
@@ -128,6 +161,14 @@ Write-Host "Visual C++ runtime source ($from): $crtDir"
 $redistVersion = Get-MajorMinor (Split-Path -Leaf $versionDir)
 $toolsMajorMinor = Get-MajorMinor $ToolsVersion
 if ($toolsMajorMinor) {
+    $pin = Read-ToolsetPin $PinFile
+    if ($toolsMajorMinor -ne $pin) {
+        throw ("stage-msvc-runtime: the binaries were built by MSVC toolset $ToolsVersion ($toolsMajorMinor), " +
+               "but $(Split-Path -Leaf $PinFile) pins $pin. Agent self-update replaces only yuzu-agent.exe, " +
+               "never the app-local runtime (#8219), so the release toolset moves only by a reviewed change " +
+               "to the pin; see the comment in '$PinFile'")
+    }
+    Write-Host "MSVC toolset $ToolsVersion matches the pin $pin"
     if (-not $redistVersion) {
         throw "stage-msvc-runtime: cannot read a version from '$versionDir' to compare with toolset $ToolsVersion"
     }
@@ -137,7 +178,8 @@ if ($toolsMajorMinor) {
     }
     Write-Host "Redistributable $redistVersion, toolset $toolsMajorMinor"
 } else {
-    Write-Host "Toolset version unknown (VCToolsVersion is not set); redistributable/toolset comparison skipped"
+    Write-Warning ("stage-msvc-runtime: toolset version unknown (VCToolsVersion is not set); the toolset pin " +
+                   "and the redistributable/toolset comparison are skipped. A release build always sets it.")
 }
 
 foreach ($name in $Required) {
@@ -153,7 +195,7 @@ foreach ($dll in $dlls) {
     if ($IsWindows) {
         $sig = Get-AuthenticodeSignature -LiteralPath $dll.FullName
         if ($sig.Status -ne 'Valid' -or -not $sig.SignerCertificate -or
-            $sig.SignerCertificate.Subject -notmatch 'O=Microsoft Corporation') {
+            $sig.SignerCertificate.Subject -cnotmatch '(^|,\s*)O=Microsoft Corporation(\s*,|$)') {
             throw "stage-msvc-runtime: $($dll.FullName) is not validly signed by Microsoft ($($sig.Status))"
         }
     }
@@ -161,6 +203,11 @@ foreach ($dll in $dlls) {
 
 foreach ($dest in $Destination) {
     New-Item -ItemType Directory -Force -Path $dest | Out-Null
+    # A reused directory (a local build-windows\msvc-runtime) may hold runtime
+    # DLLs from an earlier run that this redistributable no longer has.
+    Get-ChildItem -LiteralPath $dest -File |
+        Where-Object { $_.Name -like 'vcruntime140*.dll' -or $_.Name -like 'msvcp140*.dll' } |
+        Remove-Item -Force
     foreach ($dll in $dlls) {
         $target = Join-Path $dest $dll.Name
         Copy-Item -LiteralPath $dll.FullName -Destination $target -Force
@@ -172,5 +219,16 @@ foreach ($dest in $Destination) {
         $v = $_.VersionInfo.FileVersion
         if ($v) { "$($_.Name) $v" } else { $_.Name }
     }) -join ', '))
+}
+
+if ($env:GITHUB_STEP_SUMMARY) {
+    $summary = @('### Visual C++ runtime shipped app-local', '',
+                 "Source: ``$crtDir``; toolset: $(if ($ToolsVersion) { $ToolsVersion } else { 'unknown' })", '',
+                 '| DLL | File version |', '|---|---|')
+    foreach ($dll in $dlls) {
+        $v = $dll.VersionInfo.FileVersion
+        $summary += "| $($dll.Name) | $(if ($v) { $v } else { 'none recorded' }) |"
+    }
+    Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Value ($summary + '') -Encoding utf8
 }
 exit 0

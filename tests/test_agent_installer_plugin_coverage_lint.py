@@ -7,7 +7,10 @@ rpm, the macOS pkg, the agent images) takes the plugins by glob. The .iss is
 compiled only by release.yml, so a plugin added to the build without an .iss
 line ships in the zip and silently not in the installer; six had drifted out
 that way (browser_inventory, license_scan, netprobe, printing,
-privacy_permissions, rdp_control). These checks read the source text; stdlib
+privacy_permissions, rdp_control). Five are now installed; license_scan is a
+recorded `plugin-not-installed` exclusion (ADR-3006 D10: installing it would
+start the daily software_licensing collection with no operator action), and
+the release zip still carries it. These checks read the source text; stdlib
 only, no Windows, no Inno Setup.
 
 What they pin:
@@ -214,6 +217,7 @@ class InstallerPluginCoverage(unittest.TestCase):
                     'Components: plugins\\network; Flags: ignoreversion\n')
         mutations = {
             "a plugin line dropped": ("iss", netprobe, ""),
+            "the license_scan exclusion dropped": ("iss", "; plugin-not-installed: license_scan:", "; license_scan:"),
             "a plugin line dropped, excluded without a reason": ("iss", netprobe, "; plugin-not-installed: netprobe: no\n"),
             "a plugin both listed and excluded": ("iss", netprobe, netprobe + "; plugin-not-installed: netprobe: kept out of the installer on purpose\n"),
             "a plugin line commented out": ("iss", netprobe, "; " + netprobe),

@@ -546,8 +546,13 @@ subdir('sdk')
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')
-  # build_examples gates ONLY the four genuinely decorative demo plugins
-  # below -- every other plugin is a real, shipped capability (several are
+  # build_examples gates ONLY the four plugins below: the three demo plugins
+  # (example, chargen, procfetch) and netprobe, which is NOT a demo -- it is
+  # active network measurement (ICMP/TCP round-trip, DNS timing) and the
+  # Windows installer installs it with the Network component. build_examples
+  # defaults to true and the release does not turn it off, so all four ship
+  # (tests/test_agent_installer_plugin_coverage_lint.py pins that). Every
+  # other plugin is a real, shipped capability (several are
   # unconditional link_depends of tests/meson.build's yuzu_agent_tests
   # target) and must build regardless of this flag (#4262). Verified via
   # a grep sweep of every subdir name against the rest of the tree before

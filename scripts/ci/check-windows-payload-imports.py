@@ -40,7 +40,9 @@ runner is provisioned (deploy/windows/README.md) and every vcpkg DLL ships in
 bin\ regardless, so the exposure is a DLL that is neither.
 
 Exit 0 when every import resolves, 1 when any does not (each missing import is
-listed with the binaries that need it), 2 on a usage error.
+listed with the binaries that need it) or a payload cannot be read, 2 on a
+usage error: bad arguments, or a --zip, --iss or --system-dir path that does
+not exist (a message, no traceback).
 """
 
 import argparse
@@ -51,22 +53,43 @@ import struct
 import sys
 import zipfile
 
-API_SET_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9.-]+\.dll$")
+# PE import names are case-insensitive (the v0.15.0 binaries import
+# VCRUNTIME140.dll), so every pattern here is too; tests/test_windows_payload_imports.py
+# holds a table of names and the class each must get.
+API_SET_RE = re.compile(r"^(api|ext)-ms-win-[a-z0-9.-]+\.dll$", re.I)
 # Visual C++ redistributable DLLs (VS 2015-2022 share the 14x ABI). Never an
 # OS DLL, whatever the build machine's System32 holds.
 REDIST_RE = re.compile(
     r"^(vcruntime140(_\d+|_threads)?|msvcp140(_\d+|_atomic_wait|_codecvt_ids)?|concrt140|vccorlib140|"
-    r"vcomp140|vcamp140|mfc140[a-z]*|mfcm140[a-z]*)\.dll$")
-# Debug runtimes: never redistributable, never acceptable in a release.
+    r"vcomp140|vcamp140|mfc140[a-z]*|mfcm140[a-z]*)\.dll$", re.I)
+# Debug runtimes: never redistributable, never acceptable in a release. The
+# debug names put the "d" after the version for most DLLs (msvcp140_1d.dll,
+# vcruntime140_threadsd.dll) but before the suffix for two
+# (msvcp140d_atomic_wait.dll, msvcp140d_codecvt_ids.dll); both forms count.
 DEBUG_CRT_RE = re.compile(
-    r"^(vcruntime140(_\d+)?d|msvcp140(_\d+|_atomic_wait|_codecvt_ids)?d|concrt140d|vccorlib140d|"
-    r"vcomp140d|ucrtbased|mfc140[a-z]*d|mfcm140[a-z]*d)\.dll$")
+    r"^(vcruntime140(_\d+|_threads)?d|msvcp140(_\d+|_atomic_wait|_codecvt_ids)?d|"
+    r"msvcp140d_(atomic_wait|codecvt_ids)|concrt140d|vccorlib140d|"
+    r"vcomp140d|ucrtbased|mfc140[a-z]*d|mfcm140[a-z]*d)\.dll$", re.I)
 PE_SUFFIXES = (".exe", ".dll")
 MAX_DESCRIPTORS = 4096
 
 
 class PEError(Exception):
     pass
+
+
+def classify(dll: str) -> str:
+    """The class of an imported DLL name: 'debug' (a debug C++ runtime, always
+    a failure), 'apiset' (resolved by Windows), 'redist' (the Visual C++
+    runtime, which must be shipped) or 'other' (shipped in bin\\ or an OS DLL).
+    Debug is tested first: ucrtbased.dll and the like are never 'other'."""
+    if DEBUG_CRT_RE.match(dll):
+        return "debug"
+    if API_SET_RE.match(dll):
+        return "apiset"
+    if REDIST_RE.match(dll):
+        return "redist"
+    return "other"
 
 
 def pe_imports(data: bytes) -> list:
@@ -269,8 +292,6 @@ def load_iss(iss_path, build_dir) -> Payload:
 def system_dll_names(dirs) -> set:
     names = set()
     for d in dirs:
-        if not os.path.isdir(d):
-            raise SystemExit(f"check-windows-payload-imports: --system-dir {d} is not a directory")
         names |= {n.lower() for n in os.listdir(d)}
     return names
 
@@ -294,13 +315,14 @@ def check(payload: Payload, system_names: set) -> list:
                 problems.append(f"{payload.label}: {where}\\{name}: no imports read (every Windows binary imports kernel32.dll)")
             for dll in imports:
                 low = dll.lower()
-                if DEBUG_CRT_RE.match(low):
+                kind = classify(low)
+                if kind == "debug":
                     problems.append(f"{payload.label}: {where}\\{name} imports the debug C++ runtime {dll}, "
                                     "which is not redistributable")
                     continue
-                if low in bin_names or API_SET_RE.match(low):
+                if low in bin_names or kind == "apiset":
                     continue
-                if not REDIST_RE.match(low) and low in system_names:
+                if kind != "redist" and low in system_names:
                     continue
                 missing.setdefault(low, []).append(f"{where}\\{name}")
     for dll, users in sorted(missing.items()):
@@ -330,6 +352,17 @@ def main(argv=None):
         ap.error("--iss and --build-dir go together")
     if not args.system_dir:
         ap.error("give at least one --system-dir")
+    # A path that does not exist is a usage error (exit 2, no traceback), not
+    # a finding about the payload.
+    usage = [f"--system-dir {d} is not a directory" for d in args.system_dir if not os.path.isdir(d)]
+    if args.zip and not os.path.isfile(args.zip):
+        usage.append(f"--zip {args.zip} is not a file")
+    if args.iss and not os.path.isfile(args.iss):
+        usage.append(f"--iss {args.iss} is not a file")
+    if usage:
+        for msg in usage:
+            print(f"check-windows-payload-imports: {msg}", file=sys.stderr)
+        return 2
     system_names = system_dll_names(args.system_dir)
     if not system_names:
         print("check-windows-payload-imports: the --system-dir set is empty", file=sys.stderr)
@@ -337,7 +370,12 @@ def main(argv=None):
 
     payloads = []
     if args.zip:
-        payloads.append(load_zip(args.zip))
+        try:
+            payloads.append(load_zip(args.zip))
+        except zipfile.BadZipFile as e:
+            print(f"::error::zip {os.path.basename(args.zip)}: not a readable zip archive ({e})")
+            print("check-windows-payload-imports: FAILED: a payload could not be read")
+            return 1
     if args.iss:
         payloads.append(load_iss(args.iss, args.build_dir))
     failed = False

@@ -875,6 +875,10 @@ jobs:
           # Plugin DLLs
           Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
+          # Third-party attribution, including the Visual C++ runtime staged
+          # below (yuzu-agent.iss installs the same file into {app}).
+          Copy-Item "NOTICE" "${staging}/"
+
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
           # every DLL vcpkg installed; since ADR-0035 step 3 the install above
           # is agent-only, so the server-only DLLs (libpq and its libecpg/

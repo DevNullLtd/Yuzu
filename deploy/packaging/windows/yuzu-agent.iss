@@ -68,10 +68,9 @@ Name: "plugins\advanced"; Description: "Advanced (discovery, IOC, vuln scan)"; T
 ;   ; plugin-not-installed: <dir>: <why it is left out>
 ; tests/test_agent_installer_plugin_coverage_lint.py fails otherwise (#4867).
 ; The release zip takes every plugin by glob, so a plugin missing here ships in
-; the zip and silently not in the installer. There are no exclusions today.
+; the zip and silently not in the installer. One plugin is excluded today:
+; plugin-not-installed: license_scan: ADR-3006 D10. Installing it starts the agent's daily software_licensing collection on every device the installer is run on, with no operator action, and no release may add a unit that runs by default until the fleet-level additions setting exists. The release zip still carries it.
 ; --- Core agent ---
-Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
-Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
 ; The Microsoft Visual C++ runtime that the agent, its plugins and the vcpkg
 ; DLLs import (vcruntime140*.dll, msvcp140*.dll), installed app-local next to
 ; yuzu-agent.exe so the agent runs on a machine with no Visual C++
@@ -79,7 +78,16 @@ Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core;
 ; msvc-runtime folder from the build machine's Visual Studio redistributable
 ; directory (stage-msvc-runtime.ps1 in this folder). No skipifsourcedoesntexist:
 ; a build that did not stage them fails to compile rather than ship without them.
+; This line comes BEFORE yuzu-agent.exe on purpose: Setup copies [Files] in
+; order, so an install that stops part-way leaves the new runtime under the old
+; executable (which runs: the runtime is backward compatible), never a new
+; executable over an older runtime or none (which may not start).
+; tests/test_windows_payload_imports.py pins the order.
 Source: "{#BuildDir}\msvc-runtime\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\core\yuzu-agent.exe"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
+Source: "{#BuildDir}\agents\core\*.dll"; DestDir: "{app}\bin"; Components: core; Flags: ignoreversion
+; Third-party attribution, including the Microsoft Visual C++ runtime above.
+Source: "..\..\..\NOTICE"; DestDir: "{app}"; Components: core; Flags: ignoreversion
 
 ; --- Plugins: core (always installed) ---
 Source: "{#BuildDir}\agents\plugins\status\status.dll"; DestDir: "{app}\plugins"; Components: core; Flags: ignoreversion
@@ -120,7 +128,6 @@ Source: "{#BuildDir}\agents\plugins\printing\printing.dll"; DestDir: "{app}\plug
 Source: "{#BuildDir}\agents\plugins\browser_policy\browser_policy.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\browser_inventory\browser_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\pkg_inventory\pkg_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
-Source: "{#BuildDir}\agents\plugins\license_scan\license_scan.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\middleware\middleware.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\component_inventory\component_inventory.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
 Source: "{#BuildDir}\agents\plugins\virtualization\virtualization.dll"; DestDir: "{app}\plugins"; Components: plugins\system; Flags: ignoreversion
