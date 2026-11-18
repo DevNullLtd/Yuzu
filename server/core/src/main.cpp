@@ -3,6 +3,7 @@
 #include <yuzu/server/auth_db.hpp>
 
 #include "audit_store.hpp"
+#include "bulk_read_slots.hpp" // kMaxBulkReadSlots (--hardware-ci-read-concurrency bound)
 #include <yuzu/server/server.hpp>
 #include <yuzu/version.hpp>
 
@@ -351,6 +352,15 @@ int main(int argc, char* argv[]) {
         ->default_val(16)
         ->check(CLI::PositiveNumber)
         ->envname("YUZU_POSTGRES_POOL_SIZE");
+    app.add_option("--hardware-ci-read-concurrency", cfg.hardware_ci_read_concurrency,
+                   "Max bulk device-CI reads (GET /api/v1/hardware-ci and the MCP "
+                   "list_hardware_ci_records tool) that may hold a PostgreSQL connection at once on "
+                   "this server (1-8). Default: min(2, max(1, pool/4)) for the effective "
+                   "--postgres-pool-size, logged at boot. Refused when above half the pool "
+                   "(at least 1). A read over the cap waits 500 ms, then gets a retryable 503. "
+                   "Fleet-wide capacity is this value x the number of server replicas.")
+        ->check(CLI::Range(1, yuzu::server::kMaxBulkReadSlots))
+        ->envname("YUZU_HARDWARE_CI_READ_CONCURRENCY");
     app.add_option("--shutdown-drain-seconds", cfg.shutdown_drain_seconds,
                    "On shutdown, keep serving for at least this many seconds after /readyz "
                    "starts answering 503, so a load balancer stops routing here before the "

@@ -228,6 +228,10 @@ std::string_view read_error_message(ReadError e) {
         return "the device CI data cannot be vouched for right now; retry after the hint and "
                "restart the walk from the first page (operators: see PostgreSQL collation "
                "version in server-admin.md)";
+    case ReadError::kBusy:
+        // Generic: it says this replica is at its bulk-read cap, nothing about the pool or the
+        // cap's value.
+        return "hardware CI bulk read capacity in use; retry after the hint";
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
     }
@@ -271,10 +275,24 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
         // persist marks the response Sec-Audit-Failed, hardware_routes.cpp), and no read ran.
         f.unavailable = true;
         f.retry_after_ms = device_ci_read_gate::kOrderingRetryAfterMs;
+        f.retry_after_header = true;
         f.remediation = kOrderingUnverifiedRemediation;
         f.domain_audit_row = true;
         f.audit_outcome = "failure";
         f.audit_detail = std::format("hardware CI records ({}) state=collation ordering unverified", name);
+        return f;
+    case ReadError::kBusy:
+        // The store is fine and nothing was read: no domain audit row on either transport (the
+        // `yuzu_hardware_ci_read_busy_total` counter is the evidence), so a flood of refused
+        // requests cannot become a flood of audit INSERTs on the shared pool. `audit_detail` is
+        // the text of MCP's one generic row.
+        f.unavailable = true;
+        f.retry_after_ms = kBusyRetryAfterMs;
+        f.retry_after_header = true;
+        f.remediation = kBusyRemediation;
+        f.domain_audit_row = false;
+        f.audit_outcome = "failure";
+        f.audit_detail = std::format("hardware CI records ({}) state=read capacity in use", name);
         return f;
     case ReadError::kCount: // a sentinel, not an error: answered like an out-of-range value
         break;
@@ -288,7 +306,7 @@ ReadFailure describe_read_error(ReadError e, Surface surface) {
 
 std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
-          const std::atomic<pg::CollationGate>* gate) {
+          const std::atomic<pg::CollationGate>* gate, BulkReadSlots* slots) {
     const std::string fp = filter_fingerprint(rq);
     Position incoming; // the head: nothing served yet
     if (!rq.cursor.empty()) {
@@ -336,7 +354,19 @@ read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
     // store limit, which the store reads as its whole row ceiling.
     const int want = std::clamp(rq.limit, 1, static_cast<int>(kPageMax));
     q.limit = want + 1;
+
+    // The concurrency cap, taken after every refusal above (they take no slot) and held ONLY
+    // around the store call: the slot is released before the cursor is minted and long before the
+    // caller's audit write asks for its own connection. A point read (`agent_id`) takes none, so
+    // confirm-before-retire never gets a busy answer during a walk.
+    std::optional<BulkReadSlots::Slot> slot;
+    if (slots != nullptr && rq.agent_id.empty()) {
+        slot = slots->try_acquire();
+        if (!slot)
+            return std::unexpected(ReadError::kBusy);
+    }
     auto rows = read(q);
+    slot.reset();
     if (!rows)
         return std::unexpected(ReadError::kDegraded);
     const auto limit = static_cast<std::size_t>(want);

@@ -87,6 +87,14 @@ Invariants:
      Both compile and pass every unit test.
   16. The `collation_gate_` member is declared before the `device_inventory_store_` member that
      borrows a pointer to it, so it outlives the store.
+  17. The bulk device-CI read's concurrency cap (#7949/#7951, `bulk_read_slots.hpp`) is wired at
+     both consumers and constructed on every boot path: `.ci_read_slots = hardware_ci_read_slots_.get(),`
+     (the hardware routes) and `tool_deps.ci_read_slots = hardware_ci_read_slots_.get();` (the MCP
+     tools) each appear exactly once and nothing assigns `ci_read_slots` to null (a null pointer
+     means "no cap" and serves, so a dropped wire leaves the pool unbounded with every unit test
+     green); the `hardware_ci_read_slots_` member is declared before `hardware_routes_` and
+     `mcp_server_`, which borrow it; the boot resolution (`resolve_bulk_read_cap(`) is called once
+     and its refusal arm sets `startup_failed_` and still constructs the slots object.
 
 `//` and block comments are stripped and whitespace collapsed before matching; string and
 character literals are blanked first so a token in a literal cannot satisfy or break a check, and
@@ -467,6 +475,125 @@ def problems(src):
             out.append(MSG_DESCRIBE)
             break
     return out + recheck_problems(t, pos)
+
+
+SLOTS_RESOLVE = "resolve_bulk_read_cap("
+SLOTS_REST_WIRE = ".ci_read_slots = hardware_ci_read_slots_.get(),"
+SLOTS_MCP_WIRE = "tool_deps.ci_read_slots = hardware_ci_read_slots_.get();"
+SLOTS_DECL = "std::unique_ptr<yuzu::server::BulkReadSlots> hardware_ci_read_slots_;"
+SLOTS_MAKE = "hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>("
+SLOTS_REFUSE_ARM = "if (!cap) {"
+MSG_SLOTS_REST_WIRE = ("the hardware routes' Deps is not handed `hardware_ci_read_slots_.get()` exactly "
+                       "once as `.ci_read_slots` (a null slots pointer means no cap and serves)")
+MSG_SLOTS_MCP_WIRE = ("the MCP ToolDeps is not handed `hardware_ci_read_slots_.get()` exactly once as "
+                      "`tool_deps.ci_read_slots` (a null slots pointer means no cap and serves)")
+MSG_SLOTS_NULL = "`ci_read_slots` is assigned null somewhere in server.cpp"
+MSG_SLOTS_DECL_ORDER = ("the hardware_ci_read_slots_ member is missing or is not declared before the "
+                        "{name} member that borrows a pointer to it")
+MSG_SLOTS_RESOLVE = ("server.cpp must call `resolve_bulk_read_cap(` exactly once, with "
+                     "`cfg_.hardware_ci_read_concurrency`: the boot arithmetic and its refusal")
+MSG_SLOTS_MAKE = ("`hardware_ci_read_slots_` must be constructed in exactly two places, the refusal "
+                  "arm and the accepted arm of the boot resolution, so it is never null")
+MSG_SLOTS_REFUSE = ("the refusal arm of the bulk read cap resolution does not set `startup_failed_` "
+                    "(an invalid explicit --hardware-ci-read-concurrency must refuse boot)")
+SLOTS_BORROWER_DECLS = (
+    ("hardware_routes_", "std::unique_ptr<HardwareRoutes> hardware_routes_;"),
+    ("mcp_server_", "std::unique_ptr<mcp::McpServer> mcp_server_;"),
+)
+
+
+def slots_problems(src):
+    """Wiring of the bulk read concurrency cap (invariant 17)."""
+    t = normalise(src)
+    out = []
+    if len(re.findall(re.escape(SLOTS_REST_WIRE), t)) != 1:
+        out.append(MSG_SLOTS_REST_WIRE)
+    if len(re.findall(re.escape(SLOTS_MCP_WIRE), t)) != 1:
+        out.append(MSG_SLOTS_MCP_WIRE)
+    if re.search(r"ci_read_slots\s*=\s*(nullptr|\{\}|NULL)", t) or len(re.findall(r"ci_read_slots =", t)) != 2:
+        out.append(MSG_SLOTS_NULL)
+    decl = t.find(SLOTS_DECL)
+    for name, borrower in SLOTS_BORROWER_DECLS:
+        pos = t.find(borrower)
+        if decl < 0 or pos < 0 or decl > pos:
+            out.append(MSG_SLOTS_DECL_ORDER.format(name=name))
+    resolves = [m.start() for m in re.finditer(re.escape(SLOTS_RESOLVE), t)]
+    if len(resolves) != 1 or "cfg_.hardware_ci_read_concurrency" not in t[resolves[0]:resolves[0] + 120]:
+        out.append(MSG_SLOTS_RESOLVE)
+    if len(re.findall(re.escape(SLOTS_MAKE), t)) != 2:
+        out.append(MSG_SLOTS_MAKE)
+    arm = t.find(SLOTS_REFUSE_ARM, resolves[0]) if resolves else -1
+    arm_end = t.find("} else {", arm) if arm >= 0 else -1
+    if arm < 0 or arm_end < 0 or "startup_failed_ = true;" not in t[arm:arm_end]:
+        out.append(MSG_SLOTS_REFUSE)
+    return out
+
+
+class HardwareCiReadSlotsWiring(unittest.TestCase):
+    def setUp(self):
+        self.src = SERVER_CPP.read_text(encoding="utf-8")
+
+    def test_clean(self):
+        self.assertEqual(slots_problems(self.src), [])
+
+    def test_rest_wire_dropped_or_nulled(self):
+        m = self.src.replace(SLOTS_REST_WIRE, ".ci_read_slots = nullptr,", 1)
+        self.assertNotEqual(m, self.src)
+        got = slots_problems(m)
+        self.assertIn(MSG_SLOTS_REST_WIRE, got)
+        self.assertIn(MSG_SLOTS_NULL, got)
+
+    def test_mcp_wire_dropped_or_nulled(self):
+        m = self.src.replace(SLOTS_MCP_WIRE, "tool_deps.ci_read_slots = nullptr;", 1)
+        self.assertNotEqual(m, self.src)
+        got = slots_problems(m)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, got)
+        self.assertIn(MSG_SLOTS_NULL, got)
+        m = self.src.replace(SLOTS_MCP_WIRE, "(void)0;", 1)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, slots_problems(m))
+
+    def test_wire_inside_if_0_does_not_count(self):
+        m = self.src.replace(SLOTS_REST_WIRE, "\n#if 0\n" + SLOTS_REST_WIRE + "\n#endif\n", 1)
+        self.assertIn(MSG_SLOTS_REST_WIRE, slots_problems(m))
+
+    def test_wired_twice(self):
+        m = self.src.replace(SLOTS_MCP_WIRE, SLOTS_MCP_WIRE + "\n" + SLOTS_MCP_WIRE, 1)
+        self.assertIn(MSG_SLOTS_MCP_WIRE, slots_problems(m))
+
+    def test_member_declared_after_each_borrower(self):
+        for name, borrower in SLOTS_BORROWER_DECLS:
+            with self.subTest(borrower=name):
+                i = self.src.index(SLOTS_DECL)
+                rest = self.src[:i] + self.src[i + len(SLOTS_DECL):]
+                k = rest.index(borrower) + len(borrower)
+                m = rest[:k] + "\n    " + SLOTS_DECL + rest[k:]
+                self.assertIn(MSG_SLOTS_DECL_ORDER.format(name=name), slots_problems(m))
+
+    def test_member_deleted(self):
+        m = self.src.replace(SLOTS_DECL, "", 1)
+        got = slots_problems(m)
+        for name, _ in SLOTS_BORROWER_DECLS:
+            self.assertIn(MSG_SLOTS_DECL_ORDER.format(name=name), got)
+
+    def test_resolution_deleted_or_not_fed_the_flag(self):
+        m = self.src.replace(SLOTS_RESOLVE, "resolve_bulk_read_cap_renamed(", 1)
+        self.assertIn(MSG_SLOTS_RESOLVE, slots_problems(m))
+        m = self.src.replace("resolve_bulk_read_cap(cfg_.hardware_ci_read_concurrency",
+                             "resolve_bulk_read_cap(2", 1)
+        self.assertNotEqual(m, self.src)
+        self.assertIn(MSG_SLOTS_RESOLVE, slots_problems(m))
+
+    def test_a_construction_arm_deleted(self):
+        i = self.src.index(SLOTS_MAKE)
+        j = self.src.index(";", i) + 1
+        m = self.src[:i] + "(void)0;" + self.src[j:]
+        self.assertIn(MSG_SLOTS_MAKE, slots_problems(m))
+
+    def test_refusal_arm_no_longer_refuses_boot(self):
+        i = self.src.index(SLOTS_REFUSE_ARM, self.src.index(SLOTS_RESOLVE))
+        j = self.src.index("startup_failed_ = true;", i)
+        m = self.src[:j] + "(void)0;" + self.src[j + len("startup_failed_ = true;"):]
+        self.assertIn(MSG_SLOTS_REFUSE, slots_problems(m))
 
 
 class PgCollationCheckWiring(unittest.TestCase):

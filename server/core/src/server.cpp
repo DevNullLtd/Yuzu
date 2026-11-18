@@ -2010,6 +2010,17 @@ public:
              {"store_not_open", "pool_acquire_timeout", "query_error", "read_concurrency_cap"})
             metrics_.counter("yuzu_server_quarantine_read_degrade_total", {{"reason", reason}});
 
+        // #7949: bulk device-CI reads refused because every read slot was taken. The surface
+        // label is the closed pair below, set only by hw_ci_read_busy_fn (never caller text).
+        // Seeded so the first refusal reads as an increase from 0.
+        metrics_.describe("yuzu_hardware_ci_read_busy_total",
+                          "Bulk device-CI reads (GET /api/v1/hardware-ci and MCP "
+                          "list_hardware_ci_records) refused with a retryable 503 because every "
+                          "read slot on this replica was taken, by surface (rest/mcp)",
+                          "counter");
+        for (const char* surface : {"rest", "mcp"})
+            metrics_.counter("yuzu_hardware_ci_read_busy_total", {{"surface", surface}});
+
         // #3402: the internal pushes that deliberately BYPASS that gate, seeded
         // across the full capability x result product. Every combination is
         // reachable — each of the five pushes can fail at the registry seam —
@@ -5677,6 +5688,27 @@ public:
         // plugin="unknown" and can neither displace a real plugin nor collide with one. Set once,
         // before the health recompute thread's first sweep (started in run()).
         health_store_.set_known_plugins(yuzu::server::catalogue_plugin_names(capability_registry_));
+
+        // The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp), resolved
+        // against the EFFECTIVE pool size (the same fallback the pool construction below uses).
+        // Always constructed, so the routes and the MCP tools are never handed a null: an invalid
+        // explicit value refuses boot and, defensively, leaves the tightest cap (1).
+        {
+            const int effective_pool =
+                cfg_.postgres_pool_size > 0 ? cfg_.postgres_pool_size : 16;
+            const auto cap =
+                yuzu::server::resolve_bulk_read_cap(cfg_.hardware_ci_read_concurrency, effective_pool);
+            if (!cap) {
+                spdlog::error("[HardwareCI] Refusing to start: {}", cap.error());
+                startup_failed_ = true;
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(1);
+            } else {
+                spdlog::info("[HardwareCI] bulk read concurrency cap {} (postgres pool size {}, {})",
+                             cap->cap, effective_pool,
+                             cap->defaulted ? "defaulted" : "set by --hardware-ci-read-concurrency");
+                hardware_ci_read_slots_ = std::make_unique<yuzu::server::BulkReadSlots>(cap->cap);
+            }
+        }
 
         // PostgreSQL substrate (ADR-0006/0007): one shared pool, constructed
         // BEFORE any Postgres-backed store and validated by a probe checkout so
@@ -21317,6 +21349,14 @@ private:
                 return std::nullopt;
             return device_inventory_store_->list_device_ci_after(q);
         };
+        // Counts a bulk read refused as busy. The label is chosen here from the closed Surface
+        // enum, never from request text.
+        auto hw_ci_read_busy_fn = [this](hardware_ci_page::Surface surface) {
+            metrics_
+                .counter("yuzu_hardware_ci_read_busy_total",
+                         {{"surface", surface == hardware_ci_page::Surface::kMcp ? "mcp" : "rest"}})
+                .increment();
+        };
         // agent_id -> hostname, one bulk read of the 30-day roster. Shared by the Software
         // devices tables and the Quarantined devices panel.
         auto hw_hostnames_fn = [this]() -> std::unordered_map<std::string, std::string> {
@@ -21562,6 +21602,8 @@ private:
                              .ci_detail_fn = hw_ci_detail_fn,
                              .ci_page_reader = hw_ci_page_reader,
                              .ci_collation_gate = &collation_gate_,
+                             .ci_read_slots = hardware_ci_read_slots_.get(),
+                             .ci_read_busy_fn = hw_ci_read_busy_fn,
                              // Actions lens (generic action runner): the connected
                              // agent's advertised plugins/actions, copied into the
                              // gRPC-free HwPluginActions shape.
@@ -24537,6 +24579,8 @@ private:
             tool_deps.ci_detail_fn = hw_ci_detail_fn;
             tool_deps.ci_page_reader = hw_ci_page_reader;
             tool_deps.ci_collation_gate = &collation_gate_;
+            tool_deps.ci_read_slots = hardware_ci_read_slots_.get();
+            tool_deps.ci_read_busy_fn = hw_ci_read_busy_fn;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
@@ -25452,6 +25496,14 @@ private:
     /// plus the same closures). The initialiser is `kInitialCollationGate` (Unproven), never
     /// Trusted. tests/test_pg_collation_check_wiring_lexical.py pins the order and the initialiser.
     std::atomic<pg::CollationGate> collation_gate_{pg::kInitialCollationGate};
+    /// The bulk device-CI read's concurrency cap (#7949/#7951, bulk_read_slots.hpp): ONE instance
+    /// shared by `hardware_routes_` (`Deps::ci_read_slots`) and `mcp_server_`
+    /// (`ToolDeps::ci_read_slots`), so REST and MCP draw on the same slots. It holds no store
+    /// pointer; it is declared BEFORE both borrowers so it is destroyed after them. Built in the
+    /// constructor (always, never null) once the effective pool size is known, because the
+    /// semaphore's capacity is fixed at construction.
+    /// tests/test_pg_collation_check_wiring_lexical.py pins the order and both wiring sites.
+    std::unique_ptr<yuzu::server::BulkReadSlots> hardware_ci_read_slots_;
     detail::EventBus event_bus_;
     detail::AgentRegistry registry_;
     /// Fleet health aggregation (heartbeat status_tags -> yuzu_fleet_* gauges, and the per-device

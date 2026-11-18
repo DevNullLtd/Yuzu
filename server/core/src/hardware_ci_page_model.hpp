@@ -33,6 +33,7 @@
 /// nothing else, and is bound to the `agent_id` filter, never to the scope or the limit.
 
 #include "authz_model.hpp"
+#include "bulk_read_slots.hpp"
 #include "device_ci_read_gate.hpp"
 #include "device_inventory_types.hpp"
 
@@ -158,6 +159,11 @@ struct Page {
 ///    concluded). A 503 with `retry_after_ms` `device_ci_read_gate::kOrderingRetryAfterMs`, never
 ///    an empty page and not `kDegraded` (that one says the store is unavailable). Decided after
 ///    every refusal that needs no read and BEFORE the store is asked, so no read is made.
+///  - `kBusy`: every bulk-read slot (`bulk_read_slots.hpp`) was taken for the whole bounded wait.
+///    A 503 with `retry_after_ms` `kBusyRetryAfterMs` and a `Retry-After` header, never an empty
+///    page and not `kDegraded` (the store is fine, this replica is at its read cap). Nothing was
+///    read, so it writes NO domain audit row (a busy flood must not become an audit INSERT flood
+///    on the shared pool); the `yuzu_hardware_ci_read_busy_total` counter is the evidence.
 ///  - `kCount`: NOT an error. A sentinel one past the last real enumerator, so a test can walk
 ///    every value and a `static_assert` can tie a table to the enumerator count; it is answered
 ///    like any out-of-range value. A new enumerator MUST be inserted BEFORE it: the
@@ -168,8 +174,12 @@ enum class ReadError {
     kCursorFilterMismatch,
     kScopeTooWide,
     kOrderingUnverified,
+    kBusy,
     kCount
 };
+
+/// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
+inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the
 /// same text on REST and MCP (it names the global-read way out and carries no count).
@@ -182,6 +192,10 @@ enum class ReadError {
 inline constexpr std::string_view kScopeTooWideRemediation =
     "use a credential with global read, pass agent_id, or ask an administrator to narrow the "
     "caller's scope";
+
+/// The A4 `remediation` hint for a `kBusy` refusal, the same text on REST and MCP.
+inline constexpr std::string_view kBusyRemediation =
+    "wait retry_after_ms and call once more; read one page at a time, never several in parallel";
 
 /// The A4 `remediation` hint for a `kOrderingUnverified` refusal, the same text on REST and MCP.
 inline constexpr std::string_view kOrderingUnverifiedRemediation =
@@ -205,6 +219,11 @@ enum class Surface { kRest, kMcp };
 ///    `audit_detail`). A refused cursor writes none. MCP also writes its generic row
 ///    (`audit_outcome`, `audit_detail`) on EVERY failure it answers, whatever `audit_detail`
 ///    holds; REST writes only the domain row, and none when `domain_audit_row` is false.
+///    A transport that answers an `unavailable` failure with `domain_audit_row` false (`kBusy`)
+///    writes no domain row and, on MCP, only the generic row (never the two-row store-unreadable
+///    answer).
+///  - `retry_after_header`: REST also sends `Retry-After` (whole seconds, `retry_after_ms`
+///    rounded up), so the header agrees with the body hint.
 ///  The `string_view` members (`message`, `remediation`, `audit_outcome`) point at string
 ///  literals or `inline constexpr` views, so they stay valid for the life of the program; only
 ///  `audit_detail` owns its text.
@@ -213,6 +232,7 @@ struct ReadFailure {
     std::string_view message;
     std::string_view remediation;
     std::int64_t retry_after_ms{-1}; ///< REST 503 hint; -1 = none
+    bool retry_after_header{false};
     bool domain_audit_row{false};
     std::string_view audit_outcome;
     std::string audit_detail;
@@ -222,15 +242,24 @@ struct ReadFailure {
 [[nodiscard]] ReadFailure describe_read_error(ReadError e, Surface surface);
 
 /// One page: decode the cursor, apply the scope as described in the file comment, check the
-/// collation gate, read. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
+/// collation gate, take a read slot, read. A `rq.limit` outside [1, kPageMax] is clamped into it (the parsers never
 /// produce one). `gate` is `device_ci_read_gate`'s input and has NO default: every caller states
 /// it. Null means "no gate" and the read is served (a unit test that deliberately models no gate
 /// passes an explicit `nullptr`; production passes `&collation_gate_`, pinned by a lexical test).
 /// The gate is checked after the cursor and scope refusals, which need no read and keep
 /// their own answers, and before the one store call.
+/// `slots` is the bulk-read concurrency cap (`bulk_read_slots.hpp`) and, like `gate`, has NO
+/// default: every caller states it. A slot is taken after every refusal above (they take none)
+/// and held ONLY around the one `read(rq)` call, then released before this returns, so it is gone
+/// before the caller's audit write needs a connection. A request that names an `agent_id` (a point
+/// read) takes none. When no slot frees within `kBulkReadSlotWait` the answer is
+/// `ReadError::kBusy` and nothing is read. Null means "no cap" and the read is served (a unit test
+/// that deliberately models no cap passes an explicit `nullptr`; production passes the one
+/// `hardware_ci_read_slots_` through `Deps::ci_read_slots` / `ToolDeps::ci_read_slots`, pinned by
+/// a lexical test).
 [[nodiscard]] std::expected<Page, ReadError>
 read_page(const Reader& read, const Request& rq, const authz::VisibleSet& scope,
-          const std::atomic<pg::CollationGate>* gate);
+          const std::atomic<pg::CollationGate>* gate, BulkReadSlots* slots);
 
 /// The production binding of `Reader` is a one-line lambda in server.cpp over
 /// `DeviceInventoryStore::list_device_ci_after`; there is no binder here so this header stays

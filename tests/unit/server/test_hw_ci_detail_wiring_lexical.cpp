@@ -341,9 +341,36 @@ TEST_CASE("collation read gate wiring (LEXICAL pin, not behaviour): both bulk-re
     const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
     CHECK(count_occurrences(rest, "hardware_ci_page::read_page(") == 1);
     CHECK(count_occurrences(rest, "hardware_ci_page::read_page(deps_.ci_page_reader,rq,gate.scope,"
-                                  "deps_.ci_collation_gate)") == 1);
+                                  "deps_.ci_collation_gate,deps_.ci_read_slots)") == 1);
     const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
     CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(") == 1);
     CHECK(count_occurrences(mcp, "hardware_ci_page::read_page(deps->ci_page_reader,*rq,gate.scope,"
-                                 "deps->ci_collation_gate)") == 1);
+                                 "deps->ci_collation_gate,deps->ci_read_slots)") == 1);
+}
+
+// #7949/#7951: the bulk-read concurrency cap (bulk_read_slots.hpp). A NULL slots pointer means "no
+// cap" and serves, so a deps field that silently defaulted to null would leave the pool unbounded
+// with every unit test green (the tests build their deps by hand). This pins the production
+// wiring: BOTH bulk-read consumers are handed the ONE `hardware_ci_read_slots_` (never null, never
+// a second instance), and each transport passes its deps' slots to `read_page`. The same pins on
+// server.cpp live in tests/test_pg_collation_check_wiring_lexical.py.
+TEST_CASE("bulk read cap wiring (LEXICAL pin, not behaviour): both bulk-read consumers share the "
+          "one production slots object and pass it to read_page",
+          "[hardware][wiring][lexical][bulk_read_slots]") {
+    const std::string flat = squeeze(comment_free_source("server.cpp"));
+
+    CHECK(count_occurrences(flat, ".ci_read_slots=hardware_ci_read_slots_.get(),") == 1);
+    CHECK(count_occurrences(flat, "tool_deps.ci_read_slots=hardware_ci_read_slots_.get();") == 1);
+    CHECK(count_occurrences(flat, "ci_read_slots=") == 2);
+    CHECK(count_occurrences(flat, "ci_read_slots=nullptr") == 0);
+    CHECK(count_occurrences(flat, "ci_read_slots={}") == 0);
+    // One instance: constructed in the two arms of the boot resolution and nowhere else.
+    CHECK(count_occurrences(flat, "BulkReadSlots>(") == 2);
+
+    // The transports pass the slots their deps carry as the LAST argument of the one call (the
+    // gate before it is pinned above), so a point-read exemption or a null cannot be hardcoded.
+    const std::string rest = squeeze(comment_free_source("hardware_routes.cpp"));
+    CHECK(count_occurrences(rest, "deps_.ci_collation_gate,deps_.ci_read_slots);") == 1);
+    const std::string mcp = squeeze(comment_free_source("mcp_tools_hardware.cpp"));
+    CHECK(count_occurrences(mcp, "deps->ci_collation_gate,deps->ci_read_slots);") == 1);
 }

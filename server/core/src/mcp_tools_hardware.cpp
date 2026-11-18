@@ -96,6 +96,17 @@ void answer_roster_unreadable(const ToolCallContext& ctx, const char* verb, cons
                             domain_detail);
 }
 
+// The bulk read was refused as busy (hardware_ci_page::ReadError::kBusy): this replica is at its
+// bulk-read cap and nothing was read. It writes ONLY the generic mcp.<tool> row, never the domain
+// row and never the two-row answer_store_unreadable: a flood of busy refusals must not become a
+// flood of audit INSERTs on the shared pool (the counter is the evidence). The error is retryable
+// with the failure table's hint.
+void answer_read_busy(const ToolCallContext& ctx, const hardware_ci_page::ReadFailure& f) {
+    const bool generic_ok = ctx.audit(std::string(f.audit_outcome), f.audit_detail);
+    answer(ctx, ctx.a4_error(kInternalError, std::string(f.message), std::string(f.remediation),
+                             f.retry_after_ms, {}, generic_ok));
+}
+
 // Either access row was dropped: the personal data is NOT served. The message already says
 // the audit subsystem is the cause, so the envelope does not also carry audit_persisted.
 void answer_audit_withheld(const ToolCallContext& ctx) {
@@ -219,11 +230,21 @@ void handle_list_hardware_ci_records(const ToolCallContext& ctx) {
     }
     // deps->ci_collation_gate: the collation gate (device_ci_read_gate.hpp); not Trusted refuses
     // the page before the store is asked. Null means no gate was wired (tests only).
+    // deps->ci_read_slots: the bulk-read concurrency cap (bulk_read_slots.hpp), the same instance
+    // REST uses, held only around the store call; a point read (agent_id) takes none. Null means no
+    // cap (tests only).
     const auto read = hardware_ci_page::read_page(deps->ci_page_reader, *rq, gate.scope,
-                                                  deps->ci_collation_gate);
+                                                  deps->ci_collation_gate, deps->ci_read_slots);
     if (!read) {
         // ONE answer per failure, shared with REST (hardware_ci_page::describe_read_error).
         const auto f = hardware_ci_page::describe_read_error(read.error(), hardware_ci_page::Surface::kMcp);
+        if (f.unavailable && !f.domain_audit_row) {
+            // Busy: nothing was read, so no domain row (see answer_read_busy).
+            if (deps->ci_read_busy_fn)
+                deps->ci_read_busy_fn(hardware_ci_page::Surface::kMcp);
+            answer_read_busy(ctx, f);
+            return;
+        }
         if (f.unavailable) {
             // A failed store read is never an empty page (ADR-0016 section 7).
             answer_store_unreadable(ctx, std::string(f.message).c_str(), "inventory.devices.ci",
@@ -453,7 +474,11 @@ constexpr ToolRecord kToolRecords[] = {
      "-32602 (a credential with global read has no such limit; otherwise pass agent_id or narrow "
      "the scope); that is terminal, do not retry it. A failed "
      "store read is a retryable error (wait retry_after_ms, 5000, then call once more; do not "
-     "loop), never an empty page. While the database collation version is changed under the stored "
+     "loop), never an empty page. Read one page at a time: the server allows only a few bulk reads "
+     "at once per replica (a limit on the database connections they hold; it does not limit how "
+     "many rows a read fetches), and when every slot is taken the call is refused with a "
+     "retryable error (retry_after_ms 2000, one more call after the wait, not a loop) and nothing "
+     "is read; a call with agent_id never waits for or is refused on that limit. While the database collation version is changed under the stored "
      "keys, or the check that confirms it has not yet concluded, the read is refused with a "
      "retryable error (retry_after_ms 60000, one more call, not a loop) until the check concludes, "
      "which after a mismatch needs an administrator to repair the database first (see the server "

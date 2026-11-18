@@ -345,6 +345,13 @@ public:
         /// `device_ci_read_gate.hpp`). Production wires `&collation_gate_`; null means no gate
         /// (serves) and is for tests that build a Deps by hand.
         const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
+        /// The bulk-read concurrency cap (`bulk_read_slots.hpp`), shared with the MCP twin.
+        /// Production wires `hardware_ci_read_slots_.get()`; null means no cap (serves) and is for
+        /// tests that build a Deps by hand.
+        BulkReadSlots* ci_read_slots{nullptr};
+        /// Counts one bulk read refused as busy (`yuzu_hardware_ci_read_busy_total{surface}`).
+        /// Empty = not counted (tests that do not look).
+        std::function<void(hardware_ci_page::Surface)> ci_read_busy_fn;
         ActionsFn actions_fn;
         ClassifyFn classify_fn;
         SchemaFn schema_fn;

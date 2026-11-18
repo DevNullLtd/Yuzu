@@ -307,6 +307,14 @@ A non-zero rate of `row_count_mismatch` or `content_digest_mismatch` means rows 
 
 The related `yuzu_inventory_read_degrade_total{source="device_ci",reason="sections_query_error"}` (see [Inventory](inventory.md)) counts a hardware record read whose record answered but whose sections did not, which the REST route answers `503` and the MCP tool with a retryable error; `query_error` counts the record read itself failing. `reason="keyed_read_budget"` counts a Hardware list CI read abandoned between chunks because its 20-second budget ran out: the list then shows the "CI columns unavailable" banner and `ci_degraded` is `true`, never partial CI. It appears on its first occurrence.
 
+## Bulk device-CI read capacity metric (#7949)
+
+| Metric | Type | Description |
+|---|---|---|
+| `yuzu_hardware_ci_read_busy_total{surface}` | counter | One increment per bulk device-CI read refused with a retryable `503` (REST) or retryable error (MCP) because every bulk-read slot on this replica was taken for the 500 ms wait. `surface` is `rest` (`GET /api/v1/hardware-ci`) or `mcp` (`list_hardware_ci_records`), a closed pair, both seeded at 0 at boot. Nothing was read and no domain audit row was written, so this counter is the only record of the refusal on REST. A read that names an `agent_id` takes no slot and is never counted. Per replica: the cap is `--hardware-ci-read-concurrency` (see [server-admin.md](server-admin.md#bulk-device-ci-read-concurrency)). No alert rule ships for it. |
+
+A sustained non-zero rate means callers are walking in parallel or the cap is too low for the workload; raise the cap only within the pool arithmetic in server-admin.md, because the cap exists to keep pool connections free for authorization and audit writes.
+
 ## Installed-software sectioned-report metrics
 
 | Metric | Type | Description |

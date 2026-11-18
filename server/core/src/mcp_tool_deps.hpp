@@ -106,6 +106,11 @@ struct ToolDeps {
     // The collation gate the bulk read consults before the store (device_ci_read_gate.hpp);
     // production wires &collation_gate_, null (tests) serves.
     const std::atomic<pg::CollationGate>* ci_collation_gate{nullptr};
+    // The bulk-read concurrency cap (bulk_read_slots.hpp, store-free), the SAME instance REST's
+    // `Deps::ci_read_slots` points at; production wires hardware_ci_read_slots_.get(), null
+    // (tests) means no cap. `ci_read_busy_fn` counts one refusal as busy (empty = not counted).
+    BulkReadSlots* ci_read_slots{nullptr};
+    std::function<void(hardware_ci_page::Surface)> ci_read_busy_fn;
     DexScoreFn dex_score_fn; // page rows only, never the whole roster (one query per call)
     QuarantineListFn quarantine_list_fn;
 

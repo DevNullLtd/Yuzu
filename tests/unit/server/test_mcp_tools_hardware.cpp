@@ -13,6 +13,7 @@
 /// failure withholds the data, strict argument bounds, REST byte identity, output-schema
 /// conformance, and the audit-row contents.
 
+#include "bulk_read_slots.hpp"
 #include "device_ci_kinds.hpp"
 #include "device_ci_section_digest.hpp"
 #include "hardware_list_model.hpp"
@@ -32,13 +33,18 @@
 #include <yuzu/metrics.hpp>
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
 #include <cstdio>
 #include <functional>
+#include <latch>
 #include <map>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <set>
 #include <string>
+#include <thread>
 #include <tuple>
 #include <unordered_set>
 #include <vector>
@@ -145,6 +151,17 @@ struct Twin {
     // The collation gate both transports hand to read_page (production wires &collation_gate_).
     // Trusted by default; Opts::wire_ci_gate = false leaves the deps pointer null (no gate).
     std::atomic<pg::CollationGate> ci_gate{pg::CollationGate::Trusted};
+    // The bulk-read concurrency cap both transports share (production: hardware_ci_read_slots_).
+    // Null unless Opts::ci_slot_cap > 0 (no cap: serves). Declared before the routes and the MCP
+    // server that borrow it, so it is destroyed after them.
+    std::unique_ptr<BulkReadSlots> ci_slots;
+    // When set, replaces the fake store's read (a concurrency test counts the calls in flight).
+    std::function<std::optional<std::vector<DeviceCiRecord>>(const DeviceCiKeysetQuery&)> ci_read_hook;
+    // Surfaces counted by the busy hook, in order.
+    std::vector<hardware_ci_page::Surface> busy_seen;
+    // Guards the vectors the audit sinks, the gate and the busy hook append to, so a test may
+    // drive either transport from several threads. Single-threaded tests never contend.
+    std::mutex mu;
 
     // Domain-verb audit sink (deps.audit_fn on both transports).
     bool domain_audit_ok = true;
@@ -172,6 +189,7 @@ struct Twin {
         bool wire_audit = true;
         bool wire_ci_page = true;
         bool wire_ci_gate = true;
+        int ci_slot_cap = 0; // > 0 wires a BulkReadSlots of this cap (30 ms wait) into both transports
     };
 
     Twin() : Twin(Opts{}) {}
@@ -180,7 +198,10 @@ struct Twin {
                                                         const std::string& securable,
                                                         const std::string& operation)
             -> authz::FleetReadGate {
-            gate_calls.push_back(securable + ":" + operation);
+            {
+                std::lock_guard lk(mu);
+                gate_calls.push_back(securable + ":" + operation);
+            }
             authz::FleetReadGate g;
             if (!allow_fleet_read) {
                 res.status = 403;
@@ -222,9 +243,20 @@ struct Twin {
                                                       const std::string& r, const std::string& tt,
                                                       const std::string& tid,
                                                       const std::string& detail) {
+            std::lock_guard lk(mu);
             domain_rows.push_back(a + "|" + r + "|" + tt + "|" + tid);
             domain_details.push_back(detail);
             return domain_audit_ok;
+        };
+
+        if (o.ci_slot_cap > 0)
+            ci_slots = std::make_unique<BulkReadSlots>(o.ci_slot_cap, std::chrono::milliseconds{30});
+        const hardware_ci_page::Reader ci_reader = [this](const DeviceCiKeysetQuery& q) {
+            return ci_read_hook ? ci_read_hook(q) : ci_store.read(q);
+        };
+        const std::function<void(hardware_ci_page::Surface)> busy_fn = [this](hardware_ci_page::Surface s) {
+            std::lock_guard lk(mu);
+            busy_seen.push_back(s);
         };
 
         // REST side.
@@ -238,9 +270,11 @@ struct Twin {
         deps.audit_fn = domain_audit;
         deps.roster_fn = roster_fn;
         deps.ci_detail_fn = ci_fn;
-        deps.ci_page_reader = ci_store.reader();
+        deps.ci_page_reader = ci_reader;
         if (o.wire_ci_gate)
             deps.ci_collation_gate = &ci_gate;
+        deps.ci_read_slots = ci_slots.get();
+        deps.ci_read_busy_fn = busy_fn;
         deps.dex_score_fn = dex_fn;
         sink.default_headers = {{"Host", "yuzu.test"}, {"Origin", "https://yuzu.test"}};
         routes.register_routes(sink, deps);
@@ -256,9 +290,11 @@ struct Twin {
         if (o.wire_ci)
             td.ci_detail_fn = ci_fn;
         if (o.wire_ci_page)
-            td.ci_page_reader = ci_store.reader();
+            td.ci_page_reader = ci_reader;
         if (o.wire_ci_gate)
             td.ci_collation_gate = &ci_gate;
+        td.ci_read_slots = ci_slots.get();
+        td.ci_read_busy_fn = busy_fn;
         if (o.wire_dex)
             td.dex_score_fn = dex_fn;
         server.set_tool_deps(std::move(td));
@@ -278,6 +314,7 @@ struct Twin {
         };
         auto generic_audit = [this](const httplib::Request&, const std::string& a, const std::string& r,
                                     const std::string&, const std::string&, const std::string& detail) {
+            std::lock_guard lk(mu);
             generic_rows.push_back(a + "|" + r);
             generic_details.push_back(detail);
             return generic_audit_ok;
@@ -2312,6 +2349,19 @@ TEST_CASE("mcp list_hardware_ci_records: serves under a Trusted gate, and with n
     }
 }
 
+TEST_CASE("mcp list_hardware_ci_records: the description names the read-capacity refusal and its hint",
+          "[mcp][hardware][ci_page][bulk_read_slots]") {
+    Twin t;
+    auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    REQUIRE(res);
+    const std::string d = tool_entry(json::parse(res->body), "list_hardware_ci_records")["description"];
+    CHECK(d.find("Read one page at a time") != std::string::npos);
+    CHECK(d.find("retry_after_ms 2000") != std::string::npos);
+    // the cap limits connections, not rows: the description must not suggest it bounds the read
+    CHECK(d.find("does not limit how many rows a read fetches") != std::string::npos);
+    CHECK(d.find("a call with agent_id never waits for or is refused on that limit") != std::string::npos);
+}
+
 TEST_CASE("mcp list_hardware_ci_records: the description names the refusal and its hint",
           "[mcp][hardware][ci_page][collation_gate]") {
     Twin t;
@@ -2324,4 +2374,320 @@ TEST_CASE("mcp list_hardware_ci_records: the description names the refusal and i
     // the confirm read is refused too (ER-1 / UP-1 / CI-7).
     CHECK(d.find("RESTART the walk from the first page") != std::string::npos);
     CHECK(d.find("the agent_id confirm read is refused with the same error") != std::string::npos);
+}
+
+// ───────────────── the bulk-read concurrency cap (#7949) and the audit-outage bound (#7951) ─────────
+
+namespace {
+
+Twin::Opts capped(int cap) {
+    Twin::Opts o;
+    o.ci_slot_cap = cap;
+    return o;
+}
+
+// The busy refusal's wire facts, the same on both transports (the failure table pins them in
+// test_bulk_ci_page_model.cpp; these assert what each transport actually sends).
+constexpr const char* kBusyMessage = "hardware CI bulk read capacity in use; retry after the hint";
+
+// One burst of `n` concurrent calls through `send`, released together. `in_flight` is the fake
+// store's own count of reads running at once; the caller reads `peak` afterwards.
+struct InFlight {
+    std::atomic<int> now{0};
+    std::atomic<int> peak{0};
+    std::mutex store_mu; // the fake store is not thread-safe
+    std::atomic<int> reads_served{0};
+};
+
+void install_counting_hook(Twin& t, InFlight& f, std::chrono::milliseconds hold) {
+    t.ci_read_hook = [&t, &f, hold](const DeviceCiKeysetQuery& q) {
+        const int cur = f.now.fetch_add(1) + 1;
+        int seen = f.peak.load();
+        while (cur > seen && !f.peak.compare_exchange_weak(seen, cur)) {
+        }
+        std::this_thread::sleep_for(hold);
+        std::optional<std::vector<DeviceCiRecord>> rows;
+        {
+            std::lock_guard lk(f.store_mu);
+            rows = t.ci_store.read(q);
+        }
+        f.reads_served.fetch_add(1);
+        f.now.fetch_sub(1);
+        return rows;
+    };
+}
+
+template <class Send>
+std::vector<std::string> burst(int n, Send send) {
+    std::vector<std::string> out(static_cast<std::size_t>(n));
+    std::latch go{n};
+    std::vector<std::thread> threads;
+    for (int i = 0; i < n; ++i)
+        threads.emplace_back([&, i] {
+            go.arrive_and_wait();
+            out[static_cast<std::size_t>(i)] = send();
+        });
+    for (auto& th : threads)
+        th.join();
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("bulk read cap: a saturated cap is a retryable 503 with Retry-After on REST, reads nothing and "
+          "writes no audit row",
+          "[hardware][route][rest][ci_page][bulk_read_slots]") {
+    Twin t(capped(1));
+    seed(t, {"a", "b"});
+    auto held = t.ci_slots->try_acquire(); // a walk holds the only slot
+    REQUIRE(held.has_value());
+
+    auto res = t.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->get_header_value("Cache-Control") != "no-store"); // nothing served
+    CHECK(res->has_header("X-Correlation-Id"));
+    const auto body = json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    CHECK_FALSE(body.contains("data"));
+    CHECK(body["error"]["code"] == 503);
+    CHECK(body["error"]["retry_after_ms"] == 2000);
+    CHECK(body["error"]["message"] == kBusyMessage);
+    CHECK(body["error"]["remediation"].get<std::string>().find("one page at a time") != std::string::npos);
+    CHECK(res->body.find("SN-a") == std::string::npos);
+    CHECK(t.ci_store.reads == 0);
+    // Nothing was read, so nothing is audited: a busy flood must not become an INSERT flood.
+    CHECK(t.domain_rows.empty());
+    CHECK(t.generic_rows.empty());
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+    REQUIRE(t.busy_seen.size() == 1);
+    CHECK(t.busy_seen[0] == hardware_ci_page::Surface::kRest);
+
+    // Even with the audit sink down the answer is the same busy 503: no row is attempted.
+    t.domain_audit_ok = false;
+    res = t.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Retry-After") == "2");
+    CHECK(res->get_header_value("Sec-Audit-Failed").empty());
+    CHECK(t.domain_rows.empty());
+
+    // The slot frees: the same request serves, and the slot is back afterwards.
+    held.reset();
+    t.domain_audit_ok = true;
+    res = t.sink.Get("/api/v1/hardware-ci");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("bulk read cap: a saturated cap is a retryable MCP error with the same hint and writes only "
+          "the generic row",
+          "[mcp][hardware][ci_page][bulk_read_slots]") {
+    Twin t(capped(1));
+    seed(t, {"a", "b"});
+    auto held = t.ci_slots->try_acquire();
+    REQUIRE(held.has_value());
+
+    const json r = t.call("list_hardware_ci_records");
+    REQUIRE(r.contains("error"));
+    CHECK_FALSE(r.contains("result"));
+    CHECK(r["error"]["code"] == mcp::kInternalError);
+    CHECK(r["error"]["data"]["retry_after_ms"] == 2000);
+    CHECK(r["error"]["message"] == kBusyMessage);
+    CHECK(r["error"]["data"]["remediation"].get<std::string>().find("one page at a time") !=
+          std::string::npos);
+    CHECK(r.dump().find("SN-a") == std::string::npos);
+    CHECK(t.ci_store.reads == 0);
+    // No domain row (nothing was read); ONE generic row, never the two-row store-unreadable answer.
+    CHECK(t.domain_rows.empty());
+    REQUIRE(t.generic_rows.size() == 1);
+    CHECK(t.generic_rows[0] == "mcp.list_hardware_ci_records|failure");
+    CHECK(t.generic_details[0] == "hardware CI records (MCP) state=read capacity in use");
+    REQUIRE(t.busy_seen.size() == 1);
+    CHECK(t.busy_seen[0] == hardware_ci_page::Surface::kMcp);
+    CHECK(r.dump().find("audit_persisted") == std::string::npos); // the generic row persisted
+
+    held.reset();
+    const json ok = t.call("list_hardware_ci_records");
+    CHECK_FALSE(ok.contains("error"));
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("bulk read cap: a flood of busy refusals writes no domain rows on either transport",
+          "[hardware][ci_page][bulk_read_slots]") {
+    Twin t(capped(1));
+    seed(t, {"a"});
+    auto held = t.ci_slots->try_acquire();
+    REQUIRE(held.has_value());
+    constexpr int kN = 25;
+    for (int i = 0; i < kN; ++i) {
+        CHECK(t.sink.Get("/api/v1/hardware-ci")->status == 503);
+        CHECK(t.call("list_hardware_ci_records").contains("error"));
+    }
+    CHECK(t.domain_rows.empty());
+    CHECK(t.generic_rows.size() == static_cast<std::size_t>(kN)); // MCP's generic row only
+    CHECK(t.ci_store.reads == 0);
+    CHECK(std::count(t.busy_seen.begin(), t.busy_seen.end(), hardware_ci_page::Surface::kRest) == kN);
+    CHECK(std::count(t.busy_seen.begin(), t.busy_seen.end(), hardware_ci_page::Surface::kMcp) == kN);
+}
+
+TEST_CASE("bulk read cap: a point read (agent_id) is served while the cap is full, on both transports",
+          "[hardware][route][mcp][ci_page][bulk_read_slots]") {
+    Twin t(capped(1));
+    seed(t, {"a", "b"});
+    auto held = t.ci_slots->try_acquire();
+    REQUIRE(held.has_value());
+
+    auto res = t.sink.Get("/api/v1/hardware-ci?agent_id=b");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(record_ids(json::parse(res->body)["data"]) == std::vector<std::string>{"b"});
+
+    const json r = t.call("list_hardware_ci_records", {{"agent_id", "b"}});
+    REQUIRE_FALSE(r.contains("error"));
+    CHECK(record_ids(r["result"]["structuredContent"]) == std::vector<std::string>{"b"});
+
+    CHECK(t.busy_seen.empty());
+    CHECK(t.ci_slots->in_use() == 1); // still only the test's own slot
+    // while a bulk read of the same instance is refused
+    CHECK(t.sink.Get("/api/v1/hardware-ci")->status == 503);
+}
+
+TEST_CASE("bulk read cap: REST and MCP draw on the one shared slot object",
+          "[hardware][route][mcp][ci_page][bulk_read_slots]") {
+    Twin t(capped(1));
+    seed(t, {"a"});
+    // A REST read that is parked inside the store holds the only slot; an MCP bulk read meanwhile
+    // is refused as busy (one cap across both transports, not one each).
+    std::atomic<bool> parked{false};
+    std::atomic<bool> release{false};
+    t.ci_read_hook = [&](const DeviceCiKeysetQuery& q) {
+        parked = true;
+        while (!release.load())
+            std::this_thread::sleep_for(std::chrono::milliseconds{2});
+        return t.ci_store.read(q);
+    };
+    std::unique_ptr<httplib::Response> rest_res;
+    std::thread rest([&] { rest_res = t.sink.Get("/api/v1/hardware-ci"); });
+    while (!parked.load())
+        std::this_thread::sleep_for(std::chrono::milliseconds{2});
+    const json mcp_busy = t.call("list_hardware_ci_records");
+    release = true;
+    rest.join();
+    REQUIRE(mcp_busy.contains("error"));
+    CHECK(mcp_busy["error"]["data"]["retry_after_ms"] == 2000);
+    REQUIRE(rest_res);
+    CHECK(rest_res->status == 200);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+// #7951. The route reads BEFORE it writes its access row, so while the audit store is down every
+// request still performs its read and discards the page. The cap bounds how many such reads run at
+// once; the fail-closed answer is unchanged. A CONCURRENCY bound only: retries are not rate
+// limited, so the number of reads over time is unbounded.
+TEST_CASE("audit outage: concurrent bulk reads on REST never exceed the cap, serve no row, and stay "
+          "the retryable fail-closed 503",
+          "[hardware][route][rest][ci_page][bulk_read_slots][security]") {
+    constexpr int kCap = 2;
+    constexpr int kBurst = 12;
+    const auto hold = std::chrono::milliseconds{50};
+    Twin t(capped(kCap));
+    seed(t, {"a", "b", "c"});
+    t.domain_audit_ok = false; // the audit store is down
+    InFlight f;
+    install_counting_hook(t, f, hold);
+
+    const auto bodies = burst(kBurst, [&] {
+        auto res = t.sink.Get("/api/v1/hardware-ci");
+        std::string s = std::to_string(res->status) + "|" + res->get_header_value("Sec-Audit-Failed") +
+                        "|" + res->get_header_value("Retry-After") + "|" + res->body;
+        return s;
+    });
+
+    CHECK(f.peak.load() >= 1);
+    CHECK(f.peak.load() <= kCap); // the bound: at most `cap` reads in the store at any instant
+    int audit_failed = 0;
+    int busy = 0;
+    for (const auto& b : bodies) {
+        INFO(b);
+        CHECK(b.rfind("503|", 0) == 0); // never a 200, never an empty page
+        CHECK(b.find("SN-a") == std::string::npos);
+        CHECK(b.find("\"data\"") == std::string::npos); // zero rows served
+        if (b.find("|true|") != std::string::npos) {     // read ran, row dropped: fail closed
+            ++audit_failed;
+            CHECK(b.find("\"retry_after_ms\":5000") != std::string::npos);
+        } else {                                         // refused before any read
+            ++busy;
+            CHECK(b.find("|2|") != std::string::npos);
+            CHECK(b.find("\"retry_after_ms\":2000") != std::string::npos);
+        }
+    }
+    CHECK(audit_failed >= 1);
+    CHECK(audit_failed + busy == kBurst);
+    // every read that ran is one the cap admitted; it ran, then its row was dropped
+    CHECK(f.reads_served.load() == audit_failed);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+TEST_CASE("audit outage: concurrent bulk reads on MCP never exceed the cap, serve no row, and stay "
+          "the retryable audit-withheld error",
+          "[mcp][hardware][ci_page][bulk_read_slots][security]") {
+    constexpr int kCap = 2;
+    constexpr int kBurst = 12;
+    const auto hold = std::chrono::milliseconds{50};
+    Twin t(capped(kCap));
+    seed(t, {"a", "b", "c"});
+    t.domain_audit_ok = false;
+    t.generic_audit_ok = false;
+    InFlight f;
+    install_counting_hook(t, f, hold);
+
+    const std::string call_body =
+        json{{"jsonrpc", "2.0"},
+             {"method", "tools/call"},
+             {"id", 7},
+             {"params", {{"name", "list_hardware_ci_records"}, {"arguments", json::object()}}}}
+            .dump();
+    const auto bodies = burst(kBurst, [&] { return t.post(call_body)->body; });
+
+    CHECK(f.peak.load() >= 1);
+    CHECK(f.peak.load() <= kCap);
+    int withheld = 0;
+    int busy = 0;
+    for (const auto& b : bodies) {
+        INFO(b);
+        const json r = json::parse(b);
+        REQUIRE(r.contains("error"));
+        CHECK_FALSE(r.contains("result")); // zero rows served
+        CHECK(r["error"]["code"] == mcp::kInternalError);
+        CHECK(b.find("SN-a") == std::string::npos);
+        const auto retry = r["error"]["data"]["retry_after_ms"].get<int>();
+        if (r["error"]["message"] == kBusyMessage) {
+            ++busy;
+            CHECK(retry == 2000);
+        } else {
+            ++withheld;
+            CHECK(r["error"]["message"] == "audit subsystem unavailable, request not served");
+            CHECK(retry == mcp::kMcpStoreFaultRetryMs);
+        }
+    }
+    CHECK(withheld >= 1);
+    CHECK(withheld + busy == kBurst);
+    CHECK(f.reads_served.load() == withheld);
+    CHECK(t.ci_slots->in_use() == 0);
+}
+
+// The control for the two tests above: the same burst with no cap reads far past the cap, so the
+// peak the bound tests assert is a measurement that can fail, not a constant.
+TEST_CASE("audit outage [control]: with no cap the same burst reads concurrently past the bound",
+          "[hardware][route][rest][ci_page][bulk_read_slots]") {
+    Twin t; // no slots wired
+    seed(t, {"a"});
+    t.domain_audit_ok = false;
+    InFlight f;
+    install_counting_hook(t, f, std::chrono::milliseconds{150});
+    (void)burst(12, [&] { return std::to_string(t.sink.Get("/api/v1/hardware-ci")->status); });
+    CHECK(f.peak.load() > 2);
 }
