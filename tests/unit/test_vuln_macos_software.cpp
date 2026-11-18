@@ -194,7 +194,8 @@ TEST_CASE("coverage: the note literals are pinned (README, YAML and cookbook quo
     CHECK(kCoverageNoteHomebrew == "Homebrew formulae and casks are not scanned");
     CHECK(kCoverageNoteUnreadable ==
           "The macOS software list could not be read completely (system_profiler failed, timed out, "
-          "exceeded the output cap or returned no applications); not a clean result");
+          "exceeded the output cap, returned no applications, or most applications had no recognised "
+          "Version line); not a clean result");
     CHECK(kCoverageNoteConfig ==
           "One or more macOS configuration checks could not be read; each is reported as an "
           "UNREADABLE row, not as a finding");
@@ -264,11 +265,14 @@ TEST_CASE("parse: a four-space Version line is not a version", "[vuln][macos]") 
 }
 
 TEST_CASE("parse: only a four-space-indent line ending in ':' is a name", "[vuln][macos]") {
+    // (padded with healthy apps: the odd-indent lines are suspect and must not outvote them)
+    const std::string pad = "    P1:\n      Version: 1\n    P2:\n      Version: 1\n    P3:\n      Version: 1\n"
+                            "    P4:\n      Version: 1\n    P5:\n      Version: 1\n    P6:\n      Version: 1\n";
     auto e = parse_system_profiler_apps(
-        "    A:\n      Sub:\n      Version: 1\n  Header:\n        Deep:\n   Three:\n", true);
-    REQUIRE(e.apps.size() == 1);
-    CHECK(e.apps[0].name == "A");
-    CHECK(e.apps[0].version == "1");
+        pad + "    A:\n      Sub:\n      Version: 1\n  Header:\n        Deep:\n   Three:\n", true);
+    REQUIRE(e.apps.size() == 7);
+    CHECK(e.apps[6].name == "A");
+    CHECK(e.apps[6].version == "1");
 }
 
 TEST_CASE("parse: non-ASCII and punctuation-leading names are names", "[vuln][macos]") {
@@ -286,9 +290,13 @@ TEST_CASE("parse: non-ASCII and punctuation-leading names are names", "[vuln][ma
 
 TEST_CASE("parse: the first Version under a name wins; version before a name is ignored",
           "[vuln][macos]") {
-    auto e = parse_system_profiler_apps("      Version: 7\n    A:\n      Version: 1\n      Version: 2\n", true);
-    REQUIRE(e.apps.size() == 1);
-    CHECK(e.apps[0].version == "1");
+    const std::string pad = "    P1:\n      Version: 1\n    P2:\n      Version: 1\n    P3:\n      Version: 1\n"
+                            "    P4:\n      Version: 1\n    P5:\n      Version: 1\n    P6:\n      Version: 1\n";
+    auto e = parse_system_profiler_apps(
+        "      Version: 7\n" + pad + "    A:\n      Version: 1\n      Version: 2\n", true);
+    REQUIRE(e.apps.size() == 7);
+    CHECK(e.apps[6].version == "1");
+    CHECK(e.suspect_lines == 2); // the orphan Version and the second Version
 }
 
 TEST_CASE("fold_backslashes: a trailing backslash cannot swallow the pipe separator",
@@ -549,10 +557,12 @@ TEST_CASE("macos config: any_config_unreadable keys on severity", "[vuln][macos]
     CHECK(any_config_unreadable(v));
 }
 
-// ── golden fixtures: REAL output measured on ONE macOS 27.0.1 host (the five status tools' good-state
-//    lines and the path-form `defaults` key-absent line). Unmeasured: the bare-domain defaults text,
-//    bad-state exit codes, the enabled-Firewall digit, `systemsetup` as a daemon and a non-English
-//    system_profiler. ───────────────────────────────────────────────────────────────────────────
+// ── golden fixtures: REAL output measured on ONE macOS 27.0.1 host: spctl `assessments enabled`,
+//    fdesetup `FileVault is On.`, csrutil `... enabled.`, systemsetup `Remote Login: Off` (each exit 0),
+//    socketfilterfw `Firewall is disabled. (State = 0)` (exit 0; the DISABLED state) and the path-form
+//    `defaults` key-absent line (exit 1). Unmeasured: the bare-domain defaults text, system-plist
+//    shadowing, bad-state exit codes, the enabled-Firewall digit, `systemsetup` as a daemon, FDA/PPPC
+//    needs and a non-English system_profiler. ─────────────────────────────────────────────────
 
 TEST_CASE("golden macOS 27.0.1: the five status tools' real lines are accepted", "[vuln][macos][golden]") {
     // MEASURED exit codes on that host: every tool below exited 0 in the state shown, so `good()`
@@ -810,4 +820,227 @@ TEST_CASE("end to end shape: Chrome and Firefox unversioned beside Safari and Zo
     CHECK(e.readable);
     REQUIRE(e.apps.size() == 4);
     CHECK(count_unusable_cve_apps(e.apps, kCveRules) == 2);
+}
+
+// ── round 8: reshaped profiler lines must not silently drop an application ──────────────────────
+
+namespace {
+// One healthy report of `n` apps in the real measured shape (4-space name, blank, 6-space props).
+std::string healthy_report(int n, const char* eol = "\n") {
+    std::string o = std::string("Applications:") + eol + eol;
+    for (int i = 0; i < n; ++i)
+        o += "    App" + std::to_string(i) + ":" + eol + eol + "      Version: 1." + std::to_string(i) + eol +
+             "      Obtained from: Apple" + eol + "      Location: /Applications/App" + std::to_string(i) +
+             ".app" + eol + eol;
+    return o;
+}
+// `n` healthy apps with `line` spliced in just before the last app's name line.
+std::string with_line(int n, const std::string& line) {
+    std::string o = healthy_report(n - 1);
+    return o + line + "\n" + "    Last:\n\n      Version: 9.9\n\n";
+}
+} // namespace
+
+TEST_CASE("reshaped lines: healthy reports have no suspect lines (controls)",
+          "[vuln][macos][reshaped]") {
+    for (int n : {1, 30, 100, 500}) {
+        const auto e = parse_system_profiler_apps(healthy_report(n), true);
+        INFO(n);
+        CHECK(e.suspect_lines == 0);
+        CHECK(e.readable);
+        CHECK(e.apps.size() == static_cast<std::size_t>(n));
+    }
+    const auto crlf = parse_system_profiler_apps(healthy_report(30, "\r\n"), true);
+    CHECK(crlf.suspect_lines == 0);
+    CHECK(crlf.apps.size() == 30);
+    const auto bom = parse_system_profiler_apps("\xEF\xBB\xBF" + healthy_report(30), true);
+    CHECK(bom.suspect_lines == 0);
+    CHECK(bom.apps.size() == 30);
+}
+
+TEST_CASE("reshaped lines: each shape in a healthy 30-app report is counted", "[vuln][macos][reshaped]") {
+    struct Shape {
+        const char* what;
+        std::string line;
+    };
+    const Shape shapes[] = {
+        {"name without colon", "    Lost name"},
+        {"tab after the indent", "    \tTabbed:"},
+        {"name at indent 0", "Lost:"},
+        {"name at indent 1", " Lost:"},
+        {"name at indent 2", "  Lost:"},
+        {"name at indent 3", "   Lost:"},
+        {"name at indent 5", "     Lost:"},
+        {"name at indent 12", "            Lost:"},
+        {"NBSP indent", "\xC2\xA0\xC2\xA0\xC2\xA0\xC2\xA0Lost:"},
+        {"orphan property after a blank", "\n      Version: 3.3"},
+    };
+    for (const auto& sh : shapes) {
+        INFO(sh.what);
+        const auto e = parse_system_profiler_apps(with_line(30, sh.line), true);
+        CHECK(e.suspect_lines >= 1); // never silent
+        CHECK(e.readable);           // one reshaped line in 30 apps keeps the list readable
+    }
+}
+
+TEST_CASE("reshaped lines: a second Version in one block and a mid-file BOM are counted",
+          "[vuln][macos][reshaped]") {
+    const auto second = parse_system_profiler_apps(
+        "    A:\n      Version: 1\n      Version: 2\n    B:\n      Version: 3\n", true);
+    CHECK(second.suspect_lines == 1);
+    const auto mid = parse_system_profiler_apps(
+        healthy_report(5) + "\xEF\xBB\xBF    Z:\n      Version: 1\n", true);
+    CHECK(mid.suspect_lines >= 1);
+}
+
+TEST_CASE("reshaped lines: the header and the real property block are not suspect",
+          "[vuln][macos][reshaped]") {
+    CHECK(parse_system_profiler_apps("Applications:\n\n    A:\n\n      Version: 1\n", true)
+              .suspect_lines == 0);
+    // the first property directly after a name's blank line is fine; contiguous props are fine
+    CHECK(parse_system_profiler_apps("    A:\n\n      Version: 1\n      Kind: x\n      Signed by:\n", true)
+              .suspect_lines == 0);
+}
+
+TEST_CASE("coverage: unrecognised software-list lines raise their own token and note",
+          "[vuln][macos][reshaped]") {
+    CoverageState c;
+    c.macos_software = true;
+    c.software_unrecognised = 3;
+    CHECK(coverage_token(c) == kMacosSoftwareListUnrecognised);
+    const auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 2); // the Homebrew gap + the new note
+    CHECK(notes[1].severity == "UNREADABLE");
+    CHECK(notes[1].text == "3 line(s) of the software list were not recognised; applications may be "
+                           "missing; not a clean result");
+    // precedence: software list > cve_input_incomplete > unrecognised > config > Homebrew
+    c.config_unreadable = true;
+    CHECK(coverage_token(c) == kMacosSoftwareListUnrecognised);
+    c.cve_inputs_unusable = 1;
+    CHECK(coverage_token(c) == kMacosCveInputIncomplete);
+    c.sp_readable = false;
+    CHECK(coverage_token(c) == kMacosSystemProfilerUnreadable);
+    CHECK(kMacosSoftwareListUnrecognised.starts_with("macos:"));
+    for (char ch : kMacosSoftwareListUnrecognised)
+        CHECK(((ch >= 'a' && ch <= 'z') || ch == '_' || ch == ':'));
+    // order of notes: every cause present
+    CoverageState all;
+    all.macos_software = true;
+    all.cve_inputs_unusable = 1;
+    all.software_unrecognised = 1;
+    all.config_unreadable = true;
+    const auto n = coverage_notes(all);
+    REQUIRE(n.size() == 4);
+    CHECK(n[0].text == std::string(kCoverageNoteHomebrew));
+    CHECK(n[1].text == cve_input_note(1));
+    CHECK(n[2].text == software_unrecognised_note(1));
+    CHECK(n[3].text == std::string(kCoverageNoteConfig));
+}
+
+// ── pure decisions the plugin body relies on ───────────────────────────────────────────────
+
+TEST_CASE("want_clean_placeholder: only a fully read, fully usable list reads clean",
+          "[vuln][macos][placeholder]") {
+    CoverageState c; // Linux / Windows: nothing declared
+    CHECK(want_clean_placeholder(c));
+    c.macos_software = true;
+    CHECK(want_clean_placeholder(c));
+    c.sp_readable = false;
+    CHECK_FALSE(want_clean_placeholder(c));
+    c.sp_readable = true;
+    c.cve_inputs_unusable = 1;
+    CHECK_FALSE(want_clean_placeholder(c));
+    c.cve_inputs_unusable = 0;
+    c.software_unrecognised = 1;
+    CHECK_FALSE(want_clean_placeholder(c));
+    // an unreadable list on a non-macOS platform flag does not suppress
+    CoverageState d;
+    d.sp_readable = false;
+    CHECK(want_clean_placeholder(d));
+}
+
+TEST_CASE("skip_unusable_for_compare: macOS software only", "[vuln][macos][placeholder]") {
+    CHECK(skip_unusable_for_compare(true, ""));
+    CHECK(skip_unusable_for_compare(true, "v100.0.1"));
+    CHECK_FALSE(skip_unusable_for_compare(true, "17.0"));
+    CHECK_FALSE(skip_unusable_for_compare(false, "v100.0.1")); // other platforms keep comparing
+    CHECK_FALSE(skip_unusable_for_compare(false, ""));
+}
+
+TEST_CASE("update_cve_inputs: sets the count on macOS software only", "[vuln][macos][placeholder]") {
+    const std::vector<MacosApp> apps = {{"Google Chrome", ""}, {"Safari", "17.0"}};
+    CoverageState mac;
+    mac.macos_software = true;
+    update_cve_inputs(mac, apps, kCveRules);
+    CHECK(mac.cve_inputs_unusable == 1);
+    CoverageState other;
+    update_cve_inputs(other, apps, kCveRules);
+    CHECK(other.cve_inputs_unusable == 0);
+    CoverageState empty_rules;
+    empty_rules.macos_software = true;
+    update_cve_inputs(empty_rules, apps, std::vector<CveRule>{});
+    CHECK(empty_rules.cve_inputs_unusable == 0);
+    CoverageState no_apps;
+    no_apps.macos_software = true;
+    update_cve_inputs(no_apps, std::vector<MacosApp>{}, kCveRules);
+    CHECK(no_apps.cve_inputs_unusable == 0);
+}
+
+TEST_CASE("usable_version: a segment too large to compare is unusable", "[vuln][macos][cveinput]") {
+    CHECK_FALSE(usable_version("1.99999999999999999999"));
+    CHECK(usable_version("1.999999999999999999"));            // 18 digits fit
+    CHECK_FALSE(usable_version("1.1000000000000000000"));     // 19 digits
+    CHECK(usable_version("1.00000000000000000000001"));       // leading zeros do not count
+    CHECK(usable_version("9"));
+    CHECK(usable_version("0.1"));
+    CHECK_FALSE(usable_version("/"));
+    CHECK_FALSE(usable_version(":"));
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"Python", "3.99999999999999999999"}}, kCveRules) == 1);
+}
+
+// ── cases added after the round-7 mutation review ───────────────────────────────────────────────
+
+TEST_CASE("count_unusable: uppercase A and Z fold like the matcher", "[vuln][macos][cveinput]") {
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"APACHE HTTP Server", ""}}, kCveRules) == 1);
+    CHECK(count_unusable_cve_apps(std::vector<MacosApp>{{"POSTGRESQL", ""}}, kCveRules) == 1);
+}
+
+TEST_CASE("coverage_notes: order with every cause and the token floor", "[vuln][macos][cveinput]") {
+    CoverageState d;
+    d.macos_software = true;
+    d.config_unreadable = true;
+    CHECK(coverage_token(d) == kMacosConfigUnreadable);
+    d.cve_inputs_unusable = 1;
+    CHECK(coverage_token(d) == kMacosCveInputIncomplete);
+    CoverageState e; // not macOS software: nothing is declared for a CVE-input count alone
+    CHECK(coverage_notes(e).empty());
+    CHECK(coverage_token(e).empty());
+}
+
+TEST_CASE("parse: each reshaped-line class is counted exactly once", "[vuln][macos]") {
+    const std::string ok = "    A:\n      Version: 1\n";
+    CHECK(parse_system_profiler_apps("     Five:\n" + ok, true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("    Version:\n" + ok, true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("    Prop only\n" + ok, true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("   Prop only\n" + ok, true).suspect_lines == 0);
+    CHECK(parse_system_profiler_apps("     Prop only\n" + ok, true).suspect_lines == 0);
+    CHECK(parse_system_profiler_apps("      Prop: x\n" + ok, true).suspect_lines == 0);
+}
+
+TEST_CASE("parse: Version at 5 spaces is a version; a name starting 'Version' is a name",
+          "[vuln][macos]") {
+    auto a = parse_system_profiler_apps("    A:\n     Version: 7\n", true);
+    REQUIRE(a.apps.size() == 1);
+    CHECK(a.apps[0].version == "7");
+    auto b = parse_system_profiler_apps("    Version Cue CS5:\n      Version: 5.5\n", true);
+    REQUIRE(b.apps.size() == 1);
+    CHECK(b.apps[0].name == "Version Cue CS5");
+    CHECK(b.suspect_lines == 0);
+}
+
+TEST_CASE("parse: a tab after the four-space indent is suspect and never a name", "[vuln][macos]") {
+    auto t = parse_system_profiler_apps("    \tTabbed:\n    A:\n      Version: 1\n", true);
+    CHECK(t.apps.size() == 1);
+    CHECK(t.apps[0].name == "A");
+    CHECK(t.suspect_lines == 1);
 }

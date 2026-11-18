@@ -73,10 +73,7 @@ bool command_exists(const char* cmd) {
 
 // ── App record ────────────────────────────────────────────────────────────
 
-struct AppInfo {
-    std::string name;
-    std::string version;
-};
+using AppInfo = yuzu::vuln::MacosApp; // {name, version}
 
 // Case-insensitive substring match
 bool icontains(std::string_view haystack, std::string_view needle) {
@@ -352,6 +349,7 @@ std::vector<AppInfo> get_installed_apps(yuzu::vuln::CoverageState* cov) {
     if (cov) {
         cov->macos_software = true;
         cov->sp_readable = parsed.readable;
+        cov->software_unrecognised = parsed.readable ? parsed.suspect_lines : 0;
     }
 
     std::vector<AppInfo> apps;
@@ -379,20 +377,15 @@ struct Finding {
 
 // ── CVE scan ──────────────────────────────────────────────────────────────
 
-std::vector<Finding> do_cve_scan_impl(yuzu::vuln::CoverageState* cov = nullptr) {
+// `cov` is required (a reference): every caller must receive the run's coverage, so a missing
+// argument cannot silently drop the unusable-CVE-input guard.
+std::vector<Finding> do_cve_scan_impl(yuzu::vuln::CoverageState& cov) {
     std::vector<Finding> findings;
-    auto apps = get_installed_apps(cov);
+    auto apps = get_installed_apps(&cov);
 
     // macOS only: an application that matches a built-in rule but has no usable version cannot be
     // compared, so the run must not read clean (see CoverageState::cve_inputs_unusable).
-    const bool mac_software = cov && cov->macos_software;
-    if (mac_software) {
-        std::vector<yuzu::vuln::MacosApp> view;
-        view.reserve(apps.size());
-        for (const auto& a : apps)
-            view.push_back({a.name, a.version});
-        cov->cve_inputs_unusable = yuzu::vuln::count_unusable_cve_apps(view, yuzu::vuln::kCveRules);
-    }
+    yuzu::vuln::update_cve_inputs(cov, apps, yuzu::vuln::kCveRules);
 
     for (const auto& rule : yuzu::vuln::kCveRules) {
         for (const auto& app : apps) {
@@ -400,7 +393,7 @@ std::vector<Finding> do_cve_scan_impl(yuzu::vuln::CoverageState* cov = nullptr) 
                 continue;
             if (app.version.empty())
                 continue;
-            if (mac_software && !yuzu::vuln::usable_version(app.version))
+            if (yuzu::vuln::skip_unusable_for_compare(cov.macos_software, app.version))
                 continue; // counted above; never string-compared
 
             // Check if installed version is below the fixed version
@@ -469,7 +462,7 @@ void emit_coverage_summary_row(yuzu::CommandContext& ctx, const yuzu::vuln::Cove
 void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings,
                      const yuzu::vuln::CoverageState& cov = {}) {
     if (findings.empty()) {
-        if (!(cov.macos_software && !cov.sp_readable) && cov.cve_inputs_unusable == 0)
+        if (yuzu::vuln::want_clean_placeholder(cov))
             ctx.write_output("INFO|scan|No vulnerabilities|No issues detected");
         return;
     }
@@ -514,7 +507,8 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never
 //     scanned (see macos_software.hpp), and the same actions report CONSTRAINED + PARTIAL at run
 //     time (declare_coverage) plus an in-band Coverage row (not inventory). config_scan reads no
-//     software list; its tool output parsing is unverified on a Mac, so it is CONSTRAINED too.
+//     software list; its tool-output parsing is measured on one host only, so it is CONSTRAINED
+//     too.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",
@@ -602,7 +596,7 @@ public:
         if (action == "scan") {
             ctx.report_progress(0);
             yuzu::vuln::CoverageState cov;
-            auto cve_findings = do_cve_scan_impl(&cov);
+            auto cve_findings = do_cve_scan_impl(cov);
             ctx.report_progress(50);
             auto config_findings = do_config_scan_impl(&cov);
             ctx.report_progress(90);
@@ -622,7 +616,7 @@ public:
         if (action == "cve_scan") {
             ctx.report_progress(0);
             yuzu::vuln::CoverageState cov;
-            auto findings = do_cve_scan_impl(&cov);
+            auto findings = do_cve_scan_impl(cov);
             output_findings(ctx, findings, cov);
             emit_coverage_row(ctx, cov);
             declare_coverage(ctx, cov);
@@ -657,7 +651,7 @@ public:
 
         if (action == "summary") {
             yuzu::vuln::CoverageState cov;
-            auto cve_findings = do_cve_scan_impl(&cov);
+            auto cve_findings = do_cve_scan_impl(cov);
             auto config_findings = do_config_scan_impl(&cov);
 
             std::vector<Finding> all;

@@ -541,21 +541,24 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
 // ONE TABLE: everything to correct from a real Mac capture lives in kMacosCheckSpecs below (expected
 // lines, state digits, severities, details, the good-state exit-zero policy, stderr merging).
 //
-// MEASURED on macOS 27.0.1 (ONE Apple Silicon host; 13-15 NOT measured):
+// MEASURED on ONE macOS 27.0.1 Apple Silicon host (13-15 NOT measured):
 //   spctl --status               -> "assessments enabled", exit 0
 //   fdesetup status              -> "FileVault is On.", exit 0
 //   csrutil status               -> "System Integrity Protection status: enabled.", exit 0
-//   socketfilterfw --getglobalstate -> "Firewall is disabled. (State = 0)", exit 0
-//   systemsetup -getremotelogin  -> "Remote Login: Off", exit 0 (run via sudo interactively)
+//   socketfilterfw --getglobalstate -> "Firewall is disabled. (State = 0)", exit 0 (the DISABLED
+//                                      state: the enabled line and its digit are NOT measured)
+//   systemsetup -getremotelogin  -> "Remote Login: Off", exit 0 (run via sudo, not as the daemon)
 //   defaults read <PATH form: /Library/Preferences/com.apple.SoftwareUpdate> AutomaticCheckEnabled
 //                                -> "Error: Could not find key ... ." (key absent), exit 1
-// NOT measured (read UNREADABLE if the text differs): the BARE-domain defaults output, any tool's
-// exit code in its BAD state, the Firewall `State` digit for the enabled text, `systemsetup` run as
-// the launchd daemon (it was run via sudo), and `system_profiler` under a non-English language. The enabled digits "12" below are UNVERIFIED (Apple's socketfilterfw documents
-// states 1 and 2 for enabled); the only measured pairing is disabled <-> 0. A digit that does not
-// agree with the text reads UNREADABLE. The bare "Firewall is enabled." line (no State suffix) is
-// ACCEPTED as good on purpose: the suffix is optional, and the line is still exact and single.
-// The update-check setting is read twice (bare domain and path form) and the worse answer wins.
+// UNMEASURED (a read whose text differs is UNREADABLE): the BARE-domain defaults text, a system plist
+// at 0, 1, absent or shadowed by a per-user/managed value as the LaunchDaemon account, any tool's
+// exit code in its BAD state, the enabled Firewall `State` digit ("12" below is accepted on Apple's
+// documentation, unverified; the only measured pairing is disabled <-> 0), `systemsetup` as the
+// launchd daemon, Full Disk Access / PPPC needs, and `system_profiler` under a non-English language.
+// A digit that does not agree with the text reads UNREADABLE. The bare "Firewall is enabled." line
+// (no State suffix) is ACCEPTED as good on purpose: the suffix is optional, and the line is still
+// exact and single. The update-check setting is read twice (bare domain and path form) and the
+// worse answer wins.
 
 struct CommandRead {
     std::string out;

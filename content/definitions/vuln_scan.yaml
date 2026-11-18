@@ -20,8 +20,10 @@ metadata:
     could not run; not an issue). On macOS, Homebrew formulae and casks are
     not scanned (use pkg_inventory.packages; restoring CVE matching is tracked in
     #8256); the run ends with a row titled
-    "Coverage" saying so (INFO, or UNREADABLE when the software list or a
-    configuration read failed), and a result with no CVE rows means only that
+    "Coverage" saying so (INFO, or UNREADABLE when the software list could not
+    be read completely, a profiler line was not recognised, an application
+    matching a built-in rule had no usable version, or a configuration read
+    failed), and a result with no CVE rows means only that
     no built-in rule matched the software enumerated. Reports progress at
     0%, 50%, 90%, 100%.
   tags: [security, vulnerability, cve, compliance, audit]
@@ -118,7 +120,10 @@ metadata:
     matched the software enumerated above; on macOS the run ends with an INFO
     row titled "Coverage" saying so, or an UNREADABLE Coverage row (and no "No
     vulnerabilities" row) when system_profiler could not be read completely or an
-    application matching a built-in rule has no usable version. Use the full "scan" action for combined
+    application matching a built-in rule has no usable version, or a profiler line was
+    not recognised. Versions are compared as dotted numbers, so a version with a
+    pre-release or letter suffix may not be ordered correctly (tracked in #8276).
+    Use the full "scan" action for combined
     results.
   tags: [security, vulnerability, cve, compliance]
 
@@ -139,7 +144,7 @@ spec:
     columns:
       - name: severity
         type: string
-        description: Finding severity assigned by the CVE rule that matched; INFO on the macOS Homebrew Coverage row and UNREADABLE on a macOS Coverage row saying the software list could not be read completely (not an issue, not a clean result).
+        description: Finding severity assigned by the CVE rule that matched; INFO on the macOS Homebrew Coverage row and UNREADABLE on a macOS Coverage row saying the software list could not be read completely, a profiler line was not recognised, or an application matching a built-in rule had no usable version (not an issue, not a clean result).
         values: [CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE]
         example: HIGH
         platforms: [windows, linux, darwin]
@@ -276,7 +281,12 @@ metadata:
     (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check
     could not run, or on macOS that a configuration read failed, and is not counted as an issue). On macOS, Homebrew formulae
     and casks are not scanned (use pkg_inventory.packages), and the output ends
-    with summary|COVERAGE|<text> rows saying so (one per cause); the counts cover only the
+    with summary|COVERAGE|<text> rows saying so (one per cause: an unreadable
+    software list, an unrecognised profiler line, an application matching a
+    rule with no usable version, an unreadable configuration read, or the
+    Homebrew gap). Monitor the COVERAGE rows, not the UNREADABLE count: the
+    UNREADABLE count includes the standing Open Ports row and excludes the
+    software-list and CVE-input causes. The counts cover only the
     software enumerated. On macOS the UNREADABLE count is at least 1 on a
     healthy host because of the standing "Open Ports" row (the open-port check
     does not exist there).
