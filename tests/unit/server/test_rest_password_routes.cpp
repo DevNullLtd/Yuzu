@@ -1282,9 +1282,11 @@ TEST_CASE("password routes: under sso-only a DISARMED break-glass session cannot
     h.wire();
     h.seed("bg", kOld, Role::admin);
     REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test(); // the gate caches the arm state (1 s)
     h.session_user = "bg"; // signed in while armed
     h.session_role = Role::admin;
     REQUIRE(h.db->disarm_break_glass("bg").has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test();
 
     const auto pbkdf2_before = h.pbkdf2_runs();
     for (int i = 0; i < 20; ++i) {
@@ -1303,6 +1305,7 @@ TEST_CASE("password routes: under sso-only a DISARMED break-glass session cannot
 
     // Re-armed: the route behaves normally again.
     REQUIRE(h.db->arm_break_glass("bg", 600).has_value());
+    h.auth_routes->reset_break_glass_arm_cache_for_test(); // the gate caches the arm state (1 s)
     auto wrong = h.change("still-not-it-123", kNew);
     REQUIRE(wrong);
     CHECK(wrong->status == 403);
