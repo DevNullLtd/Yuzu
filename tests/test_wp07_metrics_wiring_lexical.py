@@ -7,8 +7,11 @@
   2. server/core/src/server.cpp: the boot probe calls pg::report_server_encoding(...), which sets
      the `yuzu_pg_server_encoding_not_utf8` gauge (the helper itself is unit-tested).
 
-Comments are stripped before matching, and each pin is one anchored pattern. This is lexical: it
-cannot model an `#if 0` block, a backslash-continued // comment, or a call inside a string literal.
+Comments and `#if 0 ... #endif` blocks are stripped before matching, and each pin is one pattern
+anchored on the guard and on the statements around it, so wrapping the pinned statements in a dead
+branch (`if (false) { ... }`, a never-called lambda, `#if 0`) leaves the pattern unmatched. This is
+still lexical: it cannot model a backslash-continued // comment or a call inside a string literal,
+and it cannot prove the guard is reachable.
 Run: python3 tests/test_wp07_metrics_wiring_lexical.py
 """
 import pathlib
@@ -26,15 +29,23 @@ _TOKEN = re.compile(
 )
 
 
+_IF0 = re.compile(r"^[ \t]*#[ \t]*if[ \t]+0\b.*?^[ \t]*#[ \t]*endif\b[^\n]*", re.S | re.M)
+
+
 def strip_comments(text: str) -> str:
-    return _TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'" else " ", text)
+    text = _TOKEN.sub(lambda m: m.group(0) if m.group(0)[0] in "\"'" else " ", text)
+    return _IF0.sub(" ", text)
 
 
 PINS = [
     ("agent.cpp",
      "agents/core/src/agent.cpp",
-     r'metrics_\.counter\("yuzu_agent_plugin_output_dropped_total", \{\{"plugin", cmd\.plugin\(\)\}\}\)'
-     r"\s*\.increment\(\);\s*g_output_dropped_commands\.fetch_add\(1,"),
+     r"ctx_impl\.apply_output_drop\(\);\s*"
+     r"if \(ctx_impl\.output_dropped\.load\([^)]*\)\) \{\s*"
+     r'metrics_\.counter\("yuzu_agent_plugin_output_dropped_total", '
+     r'\{\{"plugin", cmd\.plugin\(\)\}\}\)\s*\.increment\(\);\s*'
+     r"g_output_dropped_commands\.fetch_add\(1, [^)]*\);\s*"
+     r"spdlog::error\(.*?\);\s*\}\s*YuzuResultStatus effective_result_status"),
     ("server.cpp report_server_encoding",
      "server/core/src/server.cpp",
      r"const bool utf8 = pg::report_server_encoding\(probe\.get\(\), metrics_, &enc\);"),
@@ -45,7 +56,7 @@ def main() -> int:
     bad = []
     for name, rel, rx in PINS:
         text = strip_comments((ROOT / rel).read_text(encoding="utf-8"))
-        n = len(re.findall(rx, text))
+        n = len(re.findall(rx, text, re.S))
         if n != 1:
             bad.append(f"{name} (matched {n}x, want exactly 1)")
     for b in bad:

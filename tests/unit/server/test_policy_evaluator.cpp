@@ -349,9 +349,11 @@ TEST_CASE("policy evaluator: wrong-typed JSON members take their defaults; a num
     CHECK(h.status_of(pid, "agentA") == "compliant");
     CHECK(h.status_of(pid, "agentB") == "non_compliant");
     CHECK(h.status_of(pid, "agentC") == "compliant");
-    // Nothing here is an unevaluable response: parse_result is total, so neither reason counts.
+    // Nothing here is an unevaluable response: parse_result is total, so none of the three
+    // reasons (depth, exception, expression) counts.
     const auto unevaluable = [&](const char* reason) {
-        return metrics.counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", reason}})
+        return metrics
+            .counter("yuzu_server_policy_unevaluable_responses_total", {{"reason", reason}})
             .value();
     };
     CHECK(unevaluable("exception") == 0);
@@ -433,6 +435,46 @@ TEST_CASE("policy evaluator: an exception in one item's response-store prelude d
     CHECK(items[p2] == 1);
     CHECK(h.status_of(p2, "agentA") == "compliant"); // the later item was still processed
     CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+              .value() == 1);
+}
+
+// The two `catch (...)` collect sites (a non-std exception) are not reached by the std::exception
+// cases above: throw an int from each hook.
+TEST_CASE("policy evaluator: a non-std exception in a target or an item is contained and counted",
+          "[pg][policy][evaluator]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.canned["agentA|checkp"] = {1, out_json("hostname", "yuzu-a")};
+    h.canned["agentB|checkp"] = {1, out_json("hostname", "yuzu-b")};
+    const auto p1 = h.author("result.hostname != ''");
+    const auto p2 = h.author("result.hostname != ''");
+
+    yuzu::MetricsRegistry metrics;
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    deps.before_evaluate_hook = [&](const std::string& tgt) {
+        if (tgt == "agentA")
+            throw 42; // target-level catch (...)
+    };
+    deps.before_item_hook = [&](const std::string& pid) {
+        if (pid == p1)
+            throw 7; // item-level catch (...)
+    };
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(ev.evaluate_now(p1).value_or("").empty());
+    REQUIRE_FALSE(ev.evaluate_now(p2).value_or("").empty());
+    h.fake_now += 20;
+    REQUIRE_NOTHROW(ev.tick(true));
+
+    // p1's whole item was skipped (item catch), p2's agentA target was skipped (target catch),
+    // and p2's agentB target was still processed.
+    CHECK(h.status_of(p1, "agentA") == "<none>");
+    CHECK(h.status_of(p2, "agentA") == "<none>");
+    CHECK(h.status_of(p2, "agentB") == "compliant");
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_item"}})
+              .value() == 1);
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "collect_target"}})
               .value() == 1);
 }
 

@@ -24,6 +24,11 @@ PROC = r"auto current = yuzu::agent::enumerate_processes\(\);\s*"
 # on a context unique to that site (never a prefix of another site's pattern), so deleting or
 # commenting out any single call leaves exactly one pattern unmatched. Each must match exactly once.
 REQUIRED = [
+    # module-load rows: four statements, each pinned with its neighbours.
+    ("module-load process_name", r"r\.is_kernel = e\.is_kernel;\s*" + S + r"\(r\.process_name\);\s*" + S + r"\(r\.module_name\);"),
+    ("module-load module_name", S + r"\(r\.process_name\);\s*" + S + r"\(r\.module_name\);\s*" + S + r"\(r\.module_dir\);"),
+    ("module-load module_dir", S + r"\(r\.module_name\);\s*" + S + r"\(r\.module_dir\);\s*" + S + r"\(r\.signer\);"),
+    ("module-load signer", S + r"\(r\.module_dir\);\s*" + S + r"\(r\.signer\);\s*mrows\.push_back"),
     ("pid_name_ map", r"std::string clean = name;\s*" + S + r"\(clean\);\s*pid_name_\[pid\]"),
     ("process stream pe.name", r"pe\.user = e\.user;\s*" + S + r"\(pe\.name\);\s*" + S + r"\(pe\.user\);"),
     ("process stream pe.user", S + r"\(pe\.name\);\s*" + S + r"\(pe\.user\);\s*pe\.exit_code"),
@@ -45,7 +50,7 @@ REQUIRED = [
     ("fleet_snapshot hostname", S + r"\(connections\);\s*" + S + r"\(hostname\);\s*" + S + r"\(local_ips\);"),
     ("fleet_snapshot local_ips", S + r"\(hostname\);\s*" + S + r"\(local_ips\);\s*auto redaction"),
 ]
-FLOOR = 15  # call sites in echo_plugin.cpp (the stream leg has two, fleet_snapshot four)
+FLOOR = 19  # call sites in echo_plugin.cpp (stream leg two, fleet_snapshot four, module rows four)
 
 
 _TOKEN = re.compile(

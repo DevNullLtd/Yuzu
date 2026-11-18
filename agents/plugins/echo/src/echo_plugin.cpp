@@ -2379,6 +2379,12 @@ private:
                 r.signed_state = std::string{yuzu::echo::module_signed_token(e.signed_state)};
                 r.signer = e.signer;
                 r.is_kernel = e.is_kernel;
+                // Module-load identity strings are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                // collection, like every other Echo identity sink (echo_wire_scrub.hpp).
+                yuzu::echo::scrub_wire_strings(r.process_name);
+                yuzu::echo::scrub_wire_strings(r.module_name);
+                yuzu::echo::scrub_wire_strings(r.module_dir);
+                yuzu::echo::scrub_wire_strings(r.signer);
                 mrows.push_back(std::move(r));
             }
             if (!mrows.empty()) {

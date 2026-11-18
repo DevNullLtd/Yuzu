@@ -3444,8 +3444,6 @@ TEST_CASE("process baseline: a scrub that cannot write leaves the row and succee
     CHECK(db.get_state("process").find("S3cret") == std::string::npos);
 }
 
-// F16: a process name is attacker-chosen bytes. Strict nlohmann dump() throws type_error 316 on
-// invalid UTF-8, which aborted every collect_fast tick; the baseline must serialise regardless.
 TEST_CASE("scrub_wire_strings(ProcessInfo) scrubs the command line too (fleet snapshot)",
           "[echo][aggregator][process-baseline]") {
     auto p = make_proc(1, 0, "n\xff", "a\xff", "u\xff");
@@ -3455,6 +3453,8 @@ TEST_CASE("scrub_wire_strings(ProcessInfo) scrubs the command line too (fleet sn
     CHECK(p.cmdline == "a?");
 }
 
+// F16: a process name is attacker-chosen bytes. Strict nlohmann dump() throws type_error 316 on
+// invalid UTF-8, which aborted every collect_fast tick; the baseline must serialise regardless.
 TEST_CASE("process baseline: invalid UTF-8 in a name does not throw on encode (F16)",
           "[echo][aggregator][process-baseline]") {
     const auto bad = make_proc(10, 1, std::string("ev\xFF\xC3il"), "", "svc");
