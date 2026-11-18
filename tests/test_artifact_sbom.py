@@ -596,6 +596,18 @@ def drifted_source_tree(src: Path) -> Path:
     return src
 
 
+def linked_source_tree(src: Path, outside: Path) -> Path:
+    """A copy of the vendored files and the manifest that agree byte for byte,
+    plus a link under server/core/vendor/ to a directory outside the tree
+    holding a .js file (os.walk does not descend into it). Raises OSError or
+    NotImplementedError where links cannot be made."""
+    drifted_source_tree(src)
+    shutil.copy2(ROOT / "server/core/vendor/echarts.min.js", src / "server/core/vendor/echarts.min.js")
+    (outside / "lodash.min.js").write_text("/* lodash */\n")
+    os.symlink(outside, src / "server/core/vendor/lodash", target_is_directory=True)
+    return src
+
+
 # ── Units: no subprocess stubs, so these run on Windows too ──────────────────
 
 class Units(unittest.TestCase):
@@ -1002,6 +1014,113 @@ class Units(unittest.TestCase):
         self.assertIn("yuzu:sbom:incomplete-reasons: image-static-cpp", lines[1:])
         self.assertEqual(m.image_marker(cdx, spdx), (["image-static-cpp"],) * 2)
 
+    def _vendored_pair(self, title: str, files: list, cstate: str, sstate: str) -> tuple:
+        """An image pair carrying yuzu-server's vendored components in each
+        half as `none`, `note` (the note only), `entries` (the entries only)
+        or `full`, whatever the image holds."""
+        m = self.mod
+        cdx, spdx = make_image_pair(title, files)
+        wcomps = m.vendored_components(VENDORED, ROOT)
+        if cstate in ("entries", "full"):
+            m.add_vendored_cdx(cdx, wcomps)
+        if cstate in ("note", "full"):
+            cdx["metadata"]["properties"].append({"name": "yuzu:sbom:vendored", "value": "10"})
+        sroot = spdx["packages"][0]
+        if sstate in ("entries", "full"):
+            m.add_vendored_spdx(spdx, sroot["SPDXID"], wcomps)
+        if sstate in ("note", "full"):
+            sroot["comment"] = "yuzu:sbom:vendored: 10"
+        return cdx, spdx
+
+    def test_vendored_state_maps_the_same_in_augment_and_the_release_check(self):
+        # (none / part / full) x (CycloneDX / SPDX) x (server / not): augment
+        # adds to an untouched server pair only and refuses any other pair
+        # carrying a vendored part; the release check passes a full server
+        # pair and an untouched non-server one only (C-2).
+        m = self.mod
+        states = ("none", "note", "entries", "full")
+        for server in (True, False):
+            files = SERVER_IMAGE_FILES if server else ["usr/bin/busybox"]
+            for cstate in states:
+                for sstate in states:
+                    with self.subTest(server=server, cdx=cstate, spdx=sstate):
+                        title = "yuzu-test-server" if server else "yuzu-test-other"
+                        cdx, spdx = self._vendored_pair(title, files, cstate, sstate)
+                        untouched = (cstate, sstate) == ("none", "none")
+                        full = (cstate, sstate) == ("full", "full")
+                        before = json.dumps([cdx, spdx])
+                        if untouched:
+                            found = m.augment_image(cdx, spdx, lambda: m.vendored_components(VENDORED, ROOT))
+                            self.assertEqual(bool(found), server)
+                            self.assertEqual(m.image_vendored_state(cdx, spdx),
+                                             (True, True) if server else (None, None))
+                            if not server:
+                                self.assertEqual(json.dumps([cdx, spdx]), before)
+                        else:
+                            with self.assertRaises(m.SbomError) as ctx:
+                                m.augment_image(cdx, spdx, lambda: self.fail("the manifest is not read"))
+                            self.assertIn("already lists yuzu-server's vendored components" if server
+                                          else "but syft lists no yuzu-server in the image", str(ctx.exception))
+                            self.assertEqual(json.dumps([cdx, spdx]), before)
+                        # The release check over the pair as it was given.
+                        cdx, spdx = self._vendored_pair(title, files, cstate, sstate)
+                        m.mark_image(cdx, spdx)
+                        d = self.tmp / f"gate-{server}-{cstate}-{sstate}"
+                        d.mkdir()
+                        (d / f"{title}-image.cdx.json").write_text(json.dumps(cdx))
+                        (d / f"{title}-image.spdx.json").write_text(json.dumps(spdx))
+                        errs = m.image_pair_errors(d)
+                        ok = full if server else untouched
+                        self.assertEqual(errs == [], ok, errs)
+
+    def test_a_failed_pair_write_leaves_both_files_or_refuses_the_torn_pair(self):
+        # _write_image_pair: a failed temporary write changes neither file and
+        # leaves no *.tmp; a failed SECOND rename leaves a torn pair (new
+        # CycloneDX, old SPDX), which the release check refuses (QE-4).
+        from unittest import mock
+        m = self.mod
+        d = self.tmp / "pair"
+        d.mkdir()
+        paths = [d / "yuzu-test-server-image.cdx.json", d / "yuzu-test-server-image.spdx.json"]
+        cdx, spdx = make_image_pair("yuzu-test-server", SERVER_IMAGE_FILES)
+        m.mark_image(cdx, spdx)
+        for p, doc in zip(paths, (cdx, spdx)):
+            p.write_text(json.dumps(doc))
+        before = [p.read_bytes() for p in paths]
+        new_cdx, new_spdx = json.loads(before[0]), json.loads(before[1])
+        m.augment_image(new_cdx, new_spdx, lambda: m.vendored_components(VENDORED, ROOT))
+
+        real_open, calls = open, []
+
+        def second_open_fails(*a, **kw):
+            calls.append(a[0])
+            if len(calls) == 2:
+                raise OSError(28, "No space left on device")
+            return real_open(*a, **kw)
+        with mock.patch.object(m, "open", second_open_fails, create=True):
+            with self.assertRaises(OSError):
+                m._write_image_pair(paths, new_cdx, new_spdx, "augment")
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([p.read_bytes() for p in paths], before)
+        self.assertEqual(list(d.glob("*.tmp")), [])
+
+        real_replace, renames = os.replace, []
+
+        def second_replace_fails(src, dst):
+            renames.append(dst)
+            if len(renames) == 2:
+                raise OSError(5, "Input/output error")
+            return real_replace(src, dst)
+        with mock.patch.object(m.os, "replace", second_replace_fails):
+            with self.assertRaises(OSError):
+                m._write_image_pair(paths, new_cdx, new_spdx, "augment")
+        self.assertEqual(list(d.glob("*.tmp")), [])
+        self.assertNotEqual(paths[0].read_bytes(), before[0])
+        self.assertEqual(paths[1].read_bytes(), before[1])
+        errs = m.image_pair_errors(d)
+        self.assertTrue(any("does not list the components compiled into it (listed (CycloneDX) / not listed "
+                            "(SPDX))" in e for e in errs), errs)
+
     def test_a_note_written_twice_is_refused(self):
         # The script writes each note once; a second copy is ambiguous (the
         # documented recipe prints both), so every reader refuses it rather
@@ -1380,6 +1499,12 @@ class Check(unittest.TestCase):
         sroot = cdx_only[1]["packages"][0]
         sroot["comment"] = "\n".join(ln for ln in sroot["comment"].split("\n")
                                      if not ln.startswith("yuzu:sbom:vendored: "))
+        # ...and in the SPDX half only.
+        spdx_only = release_image_pair("yuzu-test-server-spdx", SERVER_IMAGE_FILES)
+        spdx_only[0]["components"] = [c for c in spdx_only[0]["components"]
+                                      if not str(c.get("bom-ref", "")).startswith("vendored-")]
+        spdx_only[0]["metadata"]["properties"] = [p for p in spdx_only[0]["metadata"]["properties"]
+                                                  if p["name"] != "yuzu:sbom:vendored"]
         # yuzu-server's vendored components on an image that does not hold it.
         stray = make_image_pair("yuzu-test-stray", ["usr/bin/busybox"])
         wcomps = m.vendored_components(VENDORED, ROOT)
@@ -1412,6 +1537,8 @@ class Check(unittest.TestCase):
             # yuzu-server's vendored components listed in one format only.
             "yuzu-test-server": (cdx_only, "listed (CycloneDX) / only in part (the yuzu:sbom:vendored note or the "
                                            "vendored entries missing) (SPDX)"),
+            "yuzu-test-server-spdx": (spdx_only, "does not list the components compiled into it (not listed "
+                                                 "(CycloneDX) / listed (SPDX))"),
             # ...or on an image that does not hold yuzu-server.
             "yuzu-test-stray": (stray, "lists yuzu-server's vendored components (listed / listed), but syft lists "
                                        "no yuzu-server in the image"),
@@ -1437,10 +1564,12 @@ class Check(unittest.TestCase):
 
     def test_release_augments_every_server_image_sbom(self):
         # release.yml runs augment on the image SBOM pair of each job that can
-        # publish a yuzu-server image, before mark-image and the upload (the
-        # release check above is the backstop; this fails in PR CI instead).
+        # publish a yuzu-server image, after the image is signed and before
+        # mark-image and the upload (the release check above is the backstop;
+        # this fails in PR CI instead).
         wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
-        for stem in ("yuzu-${{ matrix.image }}-image", "yuzu-${{ matrix.image }}-chisel-image"):
+        for job, stem in (("docker-publish", "yuzu-${{ matrix.image }}-image"),
+                          ("docker-publish-chisel", "yuzu-${{ matrix.image }}-chisel-image")):
             with self.subTest(stem=stem):
                 step = (f"SBOM: {stem}\n        run: python3 scripts/ci/artifact-sbom.py augment "
                         f'--cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"')
@@ -1448,6 +1577,11 @@ class Check(unittest.TestCase):
                         f'--cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"')
                 self.assertEqual(wf.count(step), 1)
                 at = wf.index(step)
+                start = wf.index(f"\n  {job}:\n")
+                self.assertLess(start, at)
+                self.assertEqual(wf.rfind("\n  docker-publish", 0, at), start, f"augment is not in {job}")
+                self.assertLess(start, wf.index("- name: Sign image (keyless)", start))
+                self.assertLess(wf.index("- name: Sign image (keyless)", start), at)
                 self.assertLess(at, wf.index(mark))
                 self.assertLess(at, wf.index("- name: Upload image SBOM artifacts", at))
 
@@ -1696,6 +1830,20 @@ class ArtifactSbom(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("does not match the source tree", r.stderr)
         self.assertIn("echarts.min.js", r.stderr)
+        self.assertFalse((self.out / "yuzu-linux-x64.cdx.json").exists())
+
+    def test_server_with_a_linked_source_tree_fails(self):
+        make_vcpkg_tree(self.tmp)
+        (self.tmp / "outside").mkdir()
+        try:
+            src = linked_source_tree(self.tmp / "src", self.tmp / "outside")
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create a symbolic link here: {e}")
+        art = make_tar(self.tmp / "yuzu-linux-x64.tar.gz", {"y/bin/yuzu-server": b"x"})
+        r = self.generate(art, extra=("--source-root", src))
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not match the source tree", r.stderr)
+        self.assertIn("server/core/vendor/lodash is a symbolic link;", r.stderr)
         self.assertFalse((self.out / "yuzu-linux-x64.cdx.json").exists())
 
     def test_hex_purl_for_gateway(self):
@@ -2270,6 +2418,29 @@ class ImageSbomAugment(unittest.TestCase):
             self.assertEqual(self.snapshot(), before)
         finally:
             shutil.rmtree(src, ignore_errors=True)
+
+    def test_source_tree_with_a_link_fails_and_writes_nothing(self):
+        # The manifest load augment (and generate) runs refuses a tree in
+        # which a tracked root holds a symbolic link, even when every listed
+        # file matches: what is behind the link would go unchecked.
+        src = Path(tempfile.mkdtemp(prefix="yuzu_test_image_sbom_src_"))
+        outside = Path(tempfile.mkdtemp(prefix="yuzu_test_image_sbom_out_"))
+        self.addCleanup(shutil.rmtree, src, True)
+        self.addCleanup(shutil.rmtree, outside, True)
+        try:
+            linked_source_tree(src, outside)
+        except (OSError, NotImplementedError) as e:
+            self.skipTest(f"cannot create a symbolic link here: {e}")
+        before = self.snapshot()
+        r = self.augment(self.SERVER, "--source-root", src)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("does not match the source tree", r.stderr)
+        self.assertIn("server/core/vendor/lodash is a symbolic link;", r.stderr)
+        self.assertEqual(self.snapshot(), before)
+        # The same tree without the link augments.
+        (src / "server/core/vendor/lodash").unlink()
+        r = self.augment(self.SERVER, "--source-root", src)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_server_labelled_image_without_the_binary_fails(self):
         _cdx, spdx_path = self.pair(self.SERVER)

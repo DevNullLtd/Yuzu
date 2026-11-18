@@ -81,11 +81,25 @@ after any comment syft wrote; nothing else of syft's changes. It adds no
 incompleteness marker; `mark-image` decides that, and the components it adds
 are not a reason for one.
 
+The vendored entries carry fixed identifiers a consumer may rely on, in every
+SBOM that lists them (artifact and image): CycloneDX components whose
+`bom-ref` starts `vendored-` (a bundled component nested in its parent), SPDX
+packages whose SPDXID starts `SPDXRef-Package-vendored-`, the
+`yuzu:vendored:*` properties on each CycloneDX component, and the
+`yuzu:sbom:vendored` note on the root (NOTE_PREFIX). docs/ci-architecture.md
+("Release artifact gate") names the same set.
+
 `check-vendored` compares VENDORED_MANIFEST with the source tree: every file
 under its tracked roots is listed with its SHA-256 and size, first-party by
-name, or an attribution file (whose recorded SHA-256 values must each be a
-listed file's); every listed file exists with that hash. It fails on an
-unlisted, changed or missing file, so a vendor refresh cannot skip the manifest.
+name (a first_party_patterns entry: its directory exactly, its glob on the
+file name only, so nothing in a subdirectory is first-party), or an
+attribution file a component names as its `notice`; every listed file exists
+with that hash. Each NOTICE must be UTF-8, its SPDX licence line must be its
+components', and every SHA-256 it records must be one of the files of a
+component naming it. A symbolic link anywhere under a tracked root (or on the
+path of a listed file or NOTICE) and a directory the walk cannot read fail it,
+as does an unlisted, changed or missing file, so a vendor refresh cannot skip
+the manifest.
 
 `check` is the release gate: an artifact SBOM fails when it has more than
 MAX_COMPONENTS entries, has none and does not record that its file was
@@ -844,6 +858,53 @@ def _manifest_shape(m: dict) -> list[str]:
     return errs
 
 
+def _bad_relpath(rel: str) -> bool:
+    """A manifest path that is not relative to the repository root."""
+    return not rel or rel.startswith("/") or ".." in Path(rel).parts
+
+
+def _linked_part(root: Path, rel: str):
+    """The first part of `rel` (itself or a directory above it, below `root`)
+    that is a symbolic link, or None. A link would let the manifest's check
+    read bytes from outside the checkout, or skip a directory os.walk does not
+    descend into."""
+    parts = Path(rel).parts
+    for i in range(1, len(parts) + 1):
+        sub = "/".join(parts[:i])
+        if os.path.islink(root / sub):
+            return sub
+    return None
+
+
+def _link_problem(rel: str) -> str:
+    return (f"{rel} is a symbolic link; a vendored file, a NOTICE and everything under a tracked root must be a "
+            f"regular file or directory in the checkout")
+
+
+def _first_party(rel: str, patterns) -> bool:
+    """`rel` matches a first_party_patterns entry: the pattern's directory
+    exactly (no glob there), and its file-name glob on the file name alone, so
+    a `*` never crosses a `/` (static/yuzu-x/lodash.js is not `yuzu-*.js`)."""
+    rdir, _, rbase = rel.rpartition("/")
+    for p in patterns:
+        pdir, _, pbase = str(p).rpartition("/")
+        if rdir == pdir and fnmatch.fnmatchcase(rbase, pbase):
+            return True
+    return False
+
+
+def _notice_text(data: bytes):
+    """A NOTICE's text: strict UTF-8 (a leading byte-order mark is allowed), or
+    None. A NOTICE in another encoding would hide its SHA-256 and SPDX lines
+    from the checks below rather than fail them."""
+    if data.startswith(b"\xef\xbb\xbf"):
+        data = data[3:]
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
 def vendored_problems(manifest_path: Path, root: Path) -> list[str]:
     """Every way VENDORED_MANIFEST and the source tree under `root` disagree."""
     try:
@@ -863,14 +924,16 @@ def vendored_problems(manifest_path: Path, root: Path) -> list[str]:
         return any(rel.startswith(t + "/") for t in tracked)
 
     listed: set[str] = set()
-    hashes: set[str] = set()
+    comp_hashes: dict = {}   # component id -> SHA-256 of each of its files
+    notices: dict = {}       # NOTICE path -> the components naming it
     seen: set = set()
     for c in m["components"]:
+        hashes = comp_hashes.setdefault(c["id"], set())
         for f in c.get("files", []):
             rel = str(f.get("path", ""))
             syms = tuple(f.get("cpp_raw_strings") or ())
             where = f"{c['id']}: {rel}{'#' + '+'.join(syms) if syms else ''}"
-            if not rel or rel.startswith("/") or ".." in Path(rel).parts:
+            if _bad_relpath(rel):
                 errs.append(f"{where}: path must be relative to the repository root")
                 continue
             if (rel, syms) in seen:
@@ -880,16 +943,20 @@ def vendored_problems(manifest_path: Path, root: Path) -> list[str]:
                 if not under_tracked(rel):
                     errs.append(f"{where}: a vendored file must lie under {', '.join(tracked)} "
                                 f"(or name the `cpp_raw_strings` it is embedded as)")
-                if any(fnmatch.fnmatchcase(rel, p) for p in first_party):
+                if _first_party(rel, first_party):
                     errs.append(f"{where}: matches a first-party pattern but is listed as third-party")
                 listed.add(rel)
+            link = _linked_part(root, rel)
+            if link:
+                errs.append(_link_problem(link))
+                continue
             if not (root / rel).is_file():
                 errs.append(f"{where}: no such file")
                 continue
             try:
                 data = vendored_bytes(root, f)
-            except SbomError as e:
-                errs.append(str(e))
+            except (OSError, SbomError) as e:
+                errs.append(f"{where}: {e}" if isinstance(e, OSError) else str(e))
                 continue
             sha = hashlib.sha256(data).hexdigest()
             if sha != str(f.get("sha256", "")).lower() or len(data) != f.get("bytes"):
@@ -898,29 +965,76 @@ def vendored_problems(manifest_path: Path, root: Path) -> list[str]:
                             f"entry (version, version_source, sha256, bytes) together with the file")
             hashes.add(sha)
         for n in c.get("notice", []) or []:
-            if not (root / n).is_file():
-                errs.append(f"{c['id']}: notice {n} does not exist")
+            n = str(n)
+            if _bad_relpath(n):
+                errs.append(f"{c['id']}: notice {n}: path must be relative to the repository root")
                 continue
-            for lic in SPDX_LINE.findall((root / n).read_text(encoding="utf-8", errors="replace")):
+            notices.setdefault(n, []).append(c)
+
+    # Each NOTICE once, against the components that name it: its SPDX licence
+    # must be each one's, and every SHA-256 it records must be one of THEIR
+    # files' (a NOTICE carrying another component's hash vouches for nothing).
+    for n, owners in sorted(notices.items()):
+        ids = ", ".join(c["id"] for c in owners)
+        link = _linked_part(root, n)
+        if link:
+            errs.append(_link_problem(link))
+            continue
+        if not (root / n).is_file():
+            errs.extend(f"{c['id']}: notice {n} does not exist" for c in owners)
+            continue
+        try:
+            text = _notice_text((root / n).read_bytes())
+        except OSError as e:
+            errs.append(f"{n}: cannot be read ({e.strerror or e})")
+            continue
+        if text is None:
+            errs.append(f"{n} is not UTF-8 (the NOTICE of {ids}): its SHA-256 and SPDX lines cannot be checked")
+            continue
+        for c in owners:
+            for lic in SPDX_LINE.findall(text):
                 if lic != c["license"]:
                     errs.append(f"{c['id']}: {n} says SPDX-License-Identifier: {lic}, the manifest {c['license']}")
+        own = set().union(*(comp_hashes.get(c["id"], set()) for c in owners))
+        for h in NOTICE_SHA256.findall(text.encode("utf-8")):
+            if h.decode().lower() not in own:
+                errs.append(f"{n} records SHA-256 {h.decode()}, which is no file of a component naming it ({ids}): "
+                            f"a stale NOTICE, or a file missing from {manifest_path.name}")
 
     for t in tracked:
+        link = _linked_part(root, t)
+        if link:
+            errs.append(_link_problem(link))
+            continue
         base = root / t
         if not base.is_dir():
             errs.append(f"tracked root {t} does not exist")
             continue
-        for dirpath, dirs, files in os.walk(base):
+
+        def unreadable(e: OSError) -> None:
+            where = Path(e.filename).relative_to(root).as_posix() if e.filename else t
+            errs.append(f"{where}: cannot be read ({e.strerror or e}), so the files under it cannot be checked "
+                        f"against {manifest_path.name}")
+
+        for dirpath, dirs, files in os.walk(base, onerror=unreadable):
+            # os.walk lists a link to a directory in `dirs` without descending
+            # into it, and a link to a file (or a dangling one) in `files`.
+            for name in [d for d in dirs if os.path.islink(os.path.join(dirpath, d))]:
+                errs.append(_link_problem((Path(dirpath) / name).relative_to(root).as_posix()))
+                dirs.remove(name)
             dirs.sort()
             for name in sorted(files):
                 rel = (Path(dirpath) / name).relative_to(root).as_posix()
-                if rel in listed or any(fnmatch.fnmatchcase(rel, p) for p in first_party):
+                if os.path.islink(root / rel):
+                    errs.append(_link_problem(rel))
+                    continue
+                if rel in listed or _first_party(rel, first_party):
                     continue
                 if any(fnmatch.fnmatchcase(name, p) for p in attribution):
-                    for h in NOTICE_SHA256.findall((root / rel).read_bytes()):
-                        if h.decode().lower() not in hashes:
-                            errs.append(f"{rel} records SHA-256 {h.decode()}, which is no listed file's: "
-                                        f"a stale NOTICE, or a file missing from {manifest_path.name}")
+                    if rel in notices:
+                        continue  # checked above, against the components naming it
+                    errs.append(f"{rel}: an attribution file no component in {manifest_path.name} names as its "
+                                f"`notice`: name it on the component(s) it attributes")
                     continue
                 errs.append(f"{rel}: not in {manifest_path.name}. A third-party file needs an entry with its "
                             f"version, licence and SHA-256; a first-party one a name matching "
@@ -1407,9 +1521,11 @@ def augment_image(cdx: dict, spdx: dict, load_vendored) -> list[str]:
     tree, and is called only for an image holding yuzu-server. Refuses a pair
     that is not one image's, an image labelled as the release's server image
     in which syft lists no yuzu-server, and a pair already carrying any part
-    of what this adds."""
+    of what this adds (with or without yuzu-server in the image, as the
+    release check does)."""
     croot, sroot = _image_roots(cdx, spdx)
     found = image_server_paths(cdx, spdx)
+    vendored = image_vendored_state(cdx, spdx)
     title = image_title(cdx)
     m = YUZU_IMAGE_TITLE.match(title)
     if not found:
@@ -1417,8 +1533,11 @@ def augment_image(cdx: dict, spdx: dict, load_vendored) -> list[str]:
             raise SbomError(f"image {croot.get('name')} is labelled {title}, but syft lists no yuzu-server binary "
                             f"in it: refusing to publish its SBOM without the components compiled into yuzu-server "
                             f"(did syft stop listing unpackaged files?)")
+        if vendored != (None, None):
+            raise SbomError(f"the pair lists yuzu-server's vendored components ({_vendored_label(vendored[0])} / "
+                            f"{_vendored_label(vendored[1])}), but syft lists no yuzu-server in the image")
         return []
-    if image_vendored_state(cdx, spdx) != (None, None):
+    if vendored != (None, None):
         raise SbomError("the pair already lists yuzu-server's vendored components (or part of them): augment a "
                         "fresh syft scan")
     wcomps = load_vendored()
@@ -1514,7 +1633,9 @@ INSTALLER_UNLISTED = ("the installer's own InnoSetup runtime (setup loader and u
 # the prose may change. docs/user-manual/release-verification.md documents the
 # same set and tests/test_artifact_sbom.py fails if the two differ. A new
 # reason is a new token here and a new row there; never reuse one for another
-# meaning.
+# meaning. Retired, never to be reused: `server-vendored` (yuzu-server's
+# vendored code, which `generate` and `augment` now list; it was never in a
+# release).
 INCOMPLETE_REASONS = {
     "installer-runtime": INSTALLER_UNLISTED,
     "erts-static": ("the bundled Erlang runtime is listed as one component (erlang), but its emulator beam.smp "
@@ -1707,9 +1828,14 @@ def _read_image_pair(a) -> tuple[list[Path], dict, dict]:
 
 
 def _write_image_pair(paths: list[Path], cdx: dict, spdx: dict, tag: str) -> None:
-    """Rewrite an image pair in place. Both files are written out before either
-    is replaced, so a failed write leaves the pair as it was rather than one
-    file changed."""
+    """Rewrite an image pair in place. Both files are written out in full
+    before either is replaced, so a failed write leaves the pair as it was and
+    no temporary file behind. The two replacements are two renames, not one:
+    if the second fails after the first succeeded, the CycloneDX half is the
+    new one and the SPDX half the old one. That torn pair fails the job (the
+    error propagates) and, if it were uploaded anyway, the release check
+    (image_pair_errors), which refuses a pair whose halves disagree on the
+    marker or on the vendored components."""
     tmps = [p.with_name(f"{p.name}.{tag}.tmp") for p in paths]
     try:
         for t, doc in zip(tmps, (cdx, spdx)):
