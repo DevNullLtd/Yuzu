@@ -1121,16 +1121,18 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
 - *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
   and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
   image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
-  packages the scanner cannot see. The push carries no release tag; the tags move only after the
+  packages the scanner cannot see. The push carries no release tag (the agent bundle's carries a
+  `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
   pushed digest is verified to be the scanned image, signed and attested, and a write-ahead publish
   journal (`publish-<image>.attempt-<N>.txt`) records each step before it runs. What is kept: every
   report the gate wrote for a run attempt whose job reached the upload step (a pass, a refusal, a
   budget stop, or a cancel the gate caught as SIGINT or SIGTERM), with that attempt's journal when
   its gate passed, uploaded as a 90-day workflow artifact; for a release that was created, every
   attempt's files of the six release images as release assets inside `SHA256SUMS`, and the agent
-  bundle's, every attempt's, with a signed checksum list per attempt once the attach job succeeds.
+  bundle's, every attempt's, with a signed checksum list per attempt once the attach job attaches
+  them (it does so before failing on a higher attempt stopped while tagging).
   Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
-  upload, which leaves no record at all; and a refusal never followed by a release, which exists only
+  upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
   as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
 - *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
@@ -1141,6 +1143,14 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   request it, and "Require review from Code Owners" is off on the protected branches by owner
   decision, so any one approving review merges such a change and
   separation of duties is a practice, not an enforced control. Disclose it with the control.
+- *Image deletion:* no tool or workflow deletes a GHCR image. Untagged candidate digests and the
+  bundle's candidate tags are left in place (each was scanned before its push). Deleting a package
+  version removes that digest under every tag naming it, so any deletion is a manual action by a
+  package admin that the operator confirms after checking the registry's own tag list
+  (`docs/ci-architecture.md` "What the journal does not cover"); the release process never deletes
+  a published release's image, and a withdrawal would be announced
+  (`docs/user-manual/release-verification.md`). The confirmation and the registry check are
+  recorded by hand in the release's tracking issue: a practice, not an enforced control.
 - *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).

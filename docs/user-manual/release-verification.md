@@ -192,6 +192,7 @@ For each of the six images the published image is the HIGHEST attempt whose jour
 verified as above):
 
 ```bash
+OWNER=devnullltd; TAG=vX.Y.Z   # the release, as set above
 img=yuzu-server   # or yuzu-gateway, yuzu-postgres, yuzu-server-chisel, ...
 # Each attempt's last journal line, in attempt order (attempt 10 after 9):
 for f in $(ls publish-${img}.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
@@ -207,8 +208,16 @@ names: a `:candidate-<run>-<N>` tag on `yuzu-agent-bundle-chisel` (how the bundl
 it is checked), and untagged digests in every package (an attempt whose push was not verified,
 signed or tagged, or that a later attempt replaced). Do not deploy them, and do not take a
 signature on one as a release: a published image is the digest a release tag (`:X.Y.Z`) names, of a
-version with a published GitHub Release, that `cosign verify` accepts for that release's tag. Old
-candidates may be deleted later without notice.
+version with a published GitHub Release, that `cosign verify` accepts for that release's tag.
+Candidates are left in place; nothing deletes them as routine cleanup.
+
+**Release images are not deleted.** The release process never deletes an image: the digest a
+published release's `:X.Y.Z` names stays in the registry, so a deployment pinned to it keeps
+pulling. If a release image ever had to be withdrawn, the project would announce it with the
+release. If a release's `:X.Y.Z`, or a digest its journal names, stops resolving without such an
+announcement, treat it as an incident, not as a registry fault to wait out: keep running what you
+have, do not replace it with an image no release names, and report it through
+[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new).
 
 The agent-bundle image is built after the release exists, so its reports and journals are attached
 afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and
@@ -241,8 +250,9 @@ later attempt ends `tagged`. When no attempt ends `publish: tagged`, the record 
 tag names: an attempt ending `tagging` may have moved it, and so may an attempt whose record was
 never uploaded. Deploy the bundle only if the digest the last command prints is on some attempt's
 `tagging` or `tagged` line (that digest was checked and signed before any tag moved) and passes
-`cosign verify` for the release's tag; otherwise do not deploy it, and ask the project. A re-run adds new report assets and never replaces a completed one (an upload
-that was interrupted, which GitHub never served, is replaced). The reports are a point-in-time record:
+`cosign verify` for the release's tag; otherwise do not deploy it, and ask the project. A re-run
+adds new report assets and never replaces a completed one (an upload that was interrupted, which
+GitHub never served, is replaced). The reports are a point-in-time record:
 a vulnerability disclosed after the release is not in them.
 
 ## Prerequisites

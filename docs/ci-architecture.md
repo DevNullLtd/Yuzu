@@ -480,8 +480,9 @@ For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
 
-If the release cannot be fixed promptly on a stable tag, move `:latest` back
-to the previous release's images. The gate has no override; the naming forms
+If the release cannot be fixed promptly on a stable tag, move `:latest` (and
+`:X.Y`) back to the newest published stable release's images (the release
+skill's tag-repair block finds them). The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
 
@@ -1126,9 +1127,17 @@ After repeated Gate 8 governance passes kept finding orderings in which the publ
 by job outputs and the attach job disagreed with what the registry held, the enterprise-architect
 review recommended replacing further point fixes with this write-ahead journal and a closed
 definition of a defect on this path; the project owner accepted that ruling, and later passes
-judge findings on this path by it. Review this decision if a publish job gains a registry write
-the journal does not announce, or if a release tag starts moving anywhere other than
-`image-publish.sh tag`.
+judge findings on this path by it. Evidence, in the repository: the journal and this contract
+landed on branch `fix/wp15-images` in commits `6240c1f945` (the code) and `1763a7bdac` (this
+section), and the record in `1679c0f50d`; the Gate 8 findings that led to it (pass 5) and the
+later passes' verdicts judged by it (passes 6 and 7) are rows of the governance ledger
+`governance.d/0000-wp15-images.UVdbCU.jsonl`. The enterprise-architect review itself is not a
+committed artifact, and the author and the owner are the same account, so the pull request's
+approving review is the independent confirmation. Review this decision if a publish job gains a registry
+write the journal does not announce; if a release tag starts moving anywhere other than
+`image-publish.sh tag`, except the release skill's hand repair, which the operator agrees to and
+which moves a tag only to a digest that a published release's own signed journal records; or if
+any tool gains a way to delete a GHCR image.
 
 Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
 --prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
@@ -1142,7 +1151,9 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
 **What the journal does not cover** (residuals, disclosed once here):
 
 - **No evidence reaches the artifact** for an attempt when the runner is killed or lost before the
-  upload, or when the evidence upload and its retry both fail (an artifact-service outage). That
+  upload, or when the evidence upload and its retry both fail (an artifact-service outage, or a
+  first upload that failed part-way and left the artifact's name taken, which the retry, with no
+  `overwrite`, then cannot reuse). That
   is absence, not disagreement: no journal claims less than the registry holds. Its cost: for one
   of the six images the release job does not run (it needs that job green, and a re-run tags a new
   digest the release then names). For the agent bundle, if that attempt had moved `:X.Y.Z`, the
@@ -1158,29 +1169,44 @@ a release run whose attempt 3 re-ran only the Windows build created its release 
   later run's `tagged`.
 - **A re-run moves the tag to a new digest.** Each attempt pushes and tags its own build; the
   release check requires the release's assets to name the published (highest `tagged`) attempt.
-  That holds only until the release exists: re-running ONE publish job by hand ("Re-run job" on a
-  green `docker-publish`, `-postgres` or `-chisel` leg) after the release is published reuses the
-  earlier `release-guard` result, passes the tag re-check, and moves `:X.Y.Z` (and `:X.Y`,
-  `:latest`) to a new verified, signed digest that the release's SBOMs, gate reports and journals
-  do not name; its `Create Release` then fails (`already PUBLISHED`). Pre-existing (the old code
-  pushed `:X.Y.Z` directly); the release skill forbids it and gives the repair
-  (G8P6-unhappy-path-1).
+  That holds only until the release exists. When a job is re-run, GitHub also re-runs every job
+  that depends on it, but not the jobs it depends on ("Re-running workflows and jobs" in GitHub's
+  Actions docs), so `release-guard` is not repeated and each re-run publish job passes its tag
+  re-check. Once the GitHub Release exists, never re-run a build or publish job:
+
+  | Re-run, after the GitHub Release exists | What runs | |
+  |---|---|---|
+  | "Re-run all jobs", or `release-guard` alone | `release-guard`, which refuses the existing release; every other job is skipped | safe, does nothing |
+  | `build-linux`, `build-gateway`, `build-windows` or `build-macos` | that build, then every publish job (all of them need all four builds): all six images move `:X.Y.Z` (and `:X.Y`, `:latest`) to new digests the release does not name; `release` fails `already PUBLISHED` | **never** |
+  | `docker-publish`, `docker-publish-postgres` or `docker-publish-chisel` | that job's images move the same way; `release` fails `already PUBLISHED` | **never** |
+  | `release` | it refuses at `already PUBLISHED` before uploading; the bundle and attach jobs are skipped (#5479) | safe, does nothing |
+  | `docker-publish-agent-bundle` that FAILED ("Re-run failed jobs") | it and the attach job; it builds from the release's own assets and its attempt joins the attached record | safe: the recovery |
+  | `docker-publish-agent-bundle` that SUCCEEDED | moves the announced `yuzu-agent-bundle-chisel:X.Y.Z` to a new digest | **never** |
+  | `attach-bundle-gate-report` | adds missing assets, replaces only an incomplete upload | safe |
+
+  "Re-run failed jobs" is safe only when every failed job is `release`,
+  `docker-publish-agent-bundle` or `attach-bundle-gate-report`. A forbidden re-run is
+  repaired by the release skill's tag-repair block, which points `:X.Y.Z` back at the digest that
+  release's own signed journal records and `:X.Y` and `:latest` at the NEWEST published release in
+  their scope, never at an older one (G8P6-unhappy-path-1, G8P7-release-deploy-1/-2).
 - **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
   `tagged` moves all of them again.
-- **Untagged candidate digests and the bundle's candidate tag stay in GHCR.** A digest that was
-  pushed but never tagged (a verify failure, a cancel) and the `:candidate-<run id>-<attempt>` tag
-  are not deleted: GHCR deletes a package VERSION, which is the digest itself, and every tag naming
-  it goes with it. No journal can say which digests are safe (one ending `tagging` may have moved a
-  release tag to its digest, and a `tagged` attempt whose upload failed has none), so the rule is
-  the registry's, at delete time: resolve every live tag of the package and refuse any digest a tag
-  other than a `candidate-*` tag names. `scripts/ci/image-candidate-delete.sh OWNER PACKAGE
-  DIGEST...` does exactly that (it lists the tags with `gh api --paginate
-  /orgs/<owner>/packages/container/<package>/versions`, resolves each with `docker buildx
-  imagetools inspect`, refuses an index's children too, and refuses everything while a
-  `release.yml` run is queued or in progress); it only checks unless given `--delete`, re-checks
-  before each deletion, and deletes only when every named digest passes. A deleted digest's
-  signature and attestation referrers (`sha256-<hex>.sig`/`.att`) stay behind, tagged, so the
-  script refuses them; they are harmless. Confirm with the operator before any deletion.
+- **Untagged candidate digests and the bundle's candidate tags stay in GHCR (decided 2026-11-18,
+  Gate 8 round 7).** A digest that was pushed but never tagged (a verify failure, a cancel) and the
+  `:candidate-<run id>-<attempt>` tags are left in place: they are not release tags, nothing pulls
+  them by name, and each was gate-scanned before its push, so they hold no unscanned content. No
+  tool deletes an image: an earlier deletion script was withdrawn after it was shown, against a real
+  registry with a simulated lagging packages API, deleting a live release tag that the API had not
+  listed (G8P7-security-guardian-1). Deleting a GHCR package
+  version deletes that digest under EVERY tag that names it, so nobody deletes one as routine
+  cleanup. If an owner wants one removed, it is a manual action the operator confirms, taken only
+  after checking in the registry itself, never from a journal or the packages API, that no release
+  tag names that digest: list the registry's tags (`GET /v2/<owner>/<package>/tags/list`,
+  following its `Link` pages) and run `docker buildx imagetools inspect` on each (a child of an
+  index a tag names counts as named); the operator records the confirmation, the tags checked and
+  the deleted version's id in the release's tracking issue. GitHub lets a package admin restore a
+  deleted version within 30 days ("Deleting and restoring a package" in GitHub's Packages docs); it
+  does not say whether the version's tags come back with it.
 
 **Future findings on this path.** A defect is a reachable row (a gate outcome, a point where the
 job stops, a publish shape, and for attach an attempt order) in which the journal's last label
@@ -1445,10 +1471,9 @@ attest, and the publish journal is write-ahead ("The publish journal" above): on
 runs it with `exec` and it appends nothing after a SIGINT or SIGTERM, consumers read it only through
 `image-publish.sh state` or `published` (one reader), and accept only a legal prefix; the published
 image is the HIGHEST attempt ending `tagged`, and any higher attempt ending `tagging` fails both the
-release check and the attach job. A GHCR version is deleted only when no tag other than a
-`candidate-*` tag names it, decided from the registry at delete time
-(`scripts/ci/image-candidate-delete.sh`). The gate fails closed: a scan, DB, coverage or
-advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
+release check and the attach job. No tool deletes a GHCR image; a manual deletion is checked
+against the registry's own tag list, never a journal or the packages API. The gate fails closed:
+a scan, DB, coverage or advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
 SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
 never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
 the image, containing a `/` and naming no Trivy target, or a full purl with its version), it has not
