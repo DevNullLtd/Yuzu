@@ -20,6 +20,8 @@
  *   limits           -- a documented number (400,000 entries, 256 pattern bytes) drifting.
  *   escaping         -- a row built without acl::row_field (separator injection, invalid UTF-8,
  *                       a trailing backslash); the formatter's file suffix.
+ *   names            -- path_utf8 converting a Windows name with a call that throws on an unpaired
+ *                       surrogate (path::u8string()) or outside the code page (path::string()).
  *   closing rows     -- search_dir's count row carrying fbh::format_outcome_rows' default label
  *                       (matches_found) instead of its own (total_matches); the guard row, trailer
  *                       and count ORDER is pinned in test_filesystem_find_by_hash.cpp.
@@ -29,7 +31,7 @@
  *
  * UNGUARDED TU on every OS; the symlink and FIFO cases are #ifndef _WIN32, the junction case is
  * #ifdef _WIN32, the dataless-policy case is #ifdef __APPLE__ and the raw-byte-name case is
- * #ifdef __linux__.
+ * #ifdef __linux__; the path_utf8 case runs everywhere and its surrogate arm is #ifdef _WIN32.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -502,6 +504,23 @@ TEST_CASE("search_dir: result rows go through row_field", "[filesystem][search_d
           "result|/r/a\\|b  c?d/|directory");
     // the only every-OS literal pin of the file suffix at this level (row_of calls the formatter)
     CHECK(sd::format_result_row("/r/plain.txt", false) == "result|/r/plain.txt|file");
+}
+
+TEST_CASE("search_dir: path_utf8 gives a name as UTF-8 and survives any Windows name",
+          "[filesystem][search_dir]") {
+    CHECK(fbh::path_utf8(fs::path{std::u8string{u8"\u96EA.txt"}}) == "\xE9\x9B\xAA.txt");
+    CHECK(fbh::path_utf8(fs::path{}).empty());
+#ifdef _WIN32
+    // A Windows name is any run of UTF-16 units. An unpaired surrogate has no UTF-8 form:
+    // path::u8string() throws on one, path_utf8 writes U+FFFD and keeps a valid pair (U+10000).
+    const auto utf8 = [](const std::wstring& name) { return fbh::path_utf8(fs::path{name}); };
+    const wchar_t hi = static_cast<wchar_t>(0xD800);
+    const wchar_t lo = static_cast<wchar_t>(0xDC00);
+    CHECK(utf8({L'a', hi, L'b'}) == "a\xEF\xBF\xBD" "b"); // a high unit, then one that is no low
+    CHECK(utf8({L'a', lo}) == "a\xEF\xBF\xBD");           // a low unit with no high before it
+    CHECK(utf8({L'a', hi}) == "a\xEF\xBF\xBD");           // a high unit at the end
+    CHECK(utf8({hi, lo}) == "\xF0\x90\x80\x80");
+#endif
 }
 
 #ifdef __linux__

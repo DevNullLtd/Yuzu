@@ -22,10 +22,13 @@
  *   dataless policy        -- the restore after the walk; that the walk switches it off at all is
  *                             pinned at the core, test_filesystem_search_dir.cpp.
  *   trailer / status       -- a skip that is not reported, or reported with the wrong status.
+ *   unpaired surrogate     -- a name conversion that throws on a Windows name with no UTF-8 form:
+ *                             one such name ended the whole walk with an error row.
  *
  * UNGUARDED TU on every OS; the symlink, permission and live-mount cases are #ifndef _WIN32, the
- * two UNC cases are #ifdef _WIN32, the dataless-policy case is #ifdef __APPLE__, and the
- * back-reference case and one arm of the ambiguous-alternation case are #if defined(__GLIBCXX__).
+ * two UNC cases and the unpaired-surrogate case are #ifdef _WIN32, the dataless-policy case is
+ * #ifdef __APPLE__, and the back-reference case and one arm of the ambiguous-alternation case are
+ * #if defined(__GLIBCXX__).
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -376,6 +379,34 @@ TEST_CASE("filesystem search_dir: a UNC base_dir is refused on its spelling, bef
         return;
     Tree t; // a local root: only the base_dir arm can refuse this run
     check_mount_refusal(search(*plugin, t, "*", {{"base_dir", "\\\\yuzu-test-nowhere\\share"}}));
+}
+
+TEST_CASE("filesystem search_dir: a name with an unpaired surrogate does not end the walk",
+          "[filesystem][search_dir][dispatcher]") {
+    auto plugin = load_or_fail();
+    if (!plugin)
+        return;
+    Tree t;
+    const fs::path plain = t.write("plain.txt");
+    // 'a', the unpaired high surrogate U+D800, 'b.txt': a name Windows accepts and UTF-8 cannot
+    // hold. Created through the \\?\ spelling, which hands the name to the file system as it is.
+    const std::wstring odd = L"\\\\?\\" + t.root.native() + L"\\a" +
+                             std::wstring{static_cast<wchar_t>(0xD800)} + L"b.txt";
+    const HANDLE h = CreateFileW(odd.c_str(), GENERIC_WRITE, 0, nullptr, CREATE_NEW,
+                                 FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    CloseHandle(h);
+    const yuzu::test::ScopeExit cleanup{[&odd] { DeleteFileW(odd.c_str()); }};
+    // The other file is still found ...
+    const auto other = search(*plugin, t, "plain*", {{"match_type", "files"}});
+    CHECK(other.rc == 0);
+    CHECK(captured_rows(other.captured) ==
+          Rows{"result|" + plain.string() + "|file", "total_matches|1"});
+    // ... and the odd one is matched and reported with U+FFFD in the surrogate's place.
+    const auto lossy = search(*plugin, t, "a*b.txt", {{"match_type", "files"}});
+    CHECK(lossy.rc == 0);
+    CHECK(captured_rows(lossy.captured) ==
+          Rows{"result|" + t.root.string() + "\\a\xEF\xBF\xBD" "b.txt|file", "total_matches|1"});
 }
 
 #else

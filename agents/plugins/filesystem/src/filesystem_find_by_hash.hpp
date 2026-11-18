@@ -64,6 +64,7 @@
 #include <windows.h>  // must precede bcrypt.h (defines NTSTATUS)
 // clang-format on
 #include <bcrypt.h>
+#include <win_str.hpp>                // yuzu::win::from_wide (path_utf8)
 #include <yuzu/agent/confined_fs.hpp> // confined_fs::WinHandle, the shared HANDLE owner
 #pragma comment(lib, "bcrypt.lib")
 #else
@@ -226,12 +227,15 @@ format_outcome_rows(const WalkOutcome& o, std::string_view count_label = kCountL
     return std::format("match|{}|{}", acl::row_field(path), size);
 }
 
-/// The path as UTF-8 bytes for a match row. On Windows path::string() is the ANSI code page and
-/// throws for a name it cannot hold; u8string() cannot, and is byte-identical for ASCII names.
+/// The path as UTF-8 bytes, for a match row and for search_dir's name predicate. On Windows
+/// path::string() is the ANSI code page and throws for a name it cannot hold, and u8string() throws
+/// for a name with an unpaired UTF-16 surrogate, which Windows allows. from_wide, the shared
+/// converter, does neither: such a unit becomes U+FFFD and every other name gets the bytes
+/// u8string() gave.
 [[nodiscard]] inline std::string path_utf8(const fs::path& p) {
 #ifdef _WIN32
-    const auto u8 = p.u8string();
-    return std::string{reinterpret_cast<const char*>(u8.data()), u8.size()};
+    const std::wstring& wide = p.native();
+    return yuzu::win::from_wide(wide.data(), static_cast<int>(wide.size()));
 #else
     return p.string();
 #endif

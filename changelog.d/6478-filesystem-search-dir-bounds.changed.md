@@ -27,7 +27,8 @@
   mode a pattern too costly for a file name ends the run with an error row and no count (with no
   lookahead, a match on Linux takes time linear in the name's length). A name byte that is not valid
   UTF-8 now shows as `?` in `search_dir`, `find_by_hash` and `get_acl` rows instead of making the whole
-  response unreadable. Definition `device.filesystem.search_dir` is now 0.5.0 (columns `row_kind`,
+  response unreadable, and on Windows an unpaired UTF-16 surrogate in a name shows as U+FFFD, the
+  replacement character. Definition `device.filesystem.search_dir` is now 0.5.0 (columns `row_kind`,
   `path`, `entry_type`); an existing server keeps 0.4.0 until the definition is replaced (see the
   upgrade note).
 - **Breaking - a result-set `matcher` over 64 KiB is refused (#6478).** Affected: a caller of

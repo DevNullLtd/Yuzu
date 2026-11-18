@@ -17,7 +17,8 @@
 //   network_mount_guard|unavailable        (the mount table could not be read in full)
 //   truncated|<reason>|visited=N|...       (the find_by_hash trailer, when anything was skipped)
 //   total_matches|N
-// Name MATCHING uses the raw bytes of the name; only the emitted row is scrubbed.
+// Name MATCHING uses the name as fbh::path_utf8 gives it: its raw bytes on macOS and Linux, its
+// UTF-8 form on Windows (U+FFFD for an unpaired surrogate). Only the emitted row is scrubbed.
 
 #include <cstddef>
 #include <functional>
