@@ -3637,6 +3637,16 @@ test('local test runner platform selftest 3 of 3',
   timeout: 30,
 )
 
+# scripts/deploy_build_dlls.py (the Windows build's DLL deploy step) fails on
+# a DLL copy that did not happen instead of swallowing it, warns on a locked
+# destination that keeps an older copy, and copies the same DLLs as before.
+test('deploy build DLLs selftest',
+  _python3_test,
+  args: [files('test_deploy_build_dlls.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -3656,6 +3666,28 @@ test('agent installer enrollment-token lint',
   args: [files('test_agent_installer_token_lint.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Every agent plugin meson.build produces has a Source line in the Windows
+# agent installer, or a recorded `; plugin-not-installed:` exclusion (#4867).
+# The plugin set is derived from the root meson.build, not hand-kept.
+test('agent installer plugin coverage lint',
+  _python3_test,
+  args: [files('test_agent_installer_plugin_coverage_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The Windows agent payloads (zip and installer) ship the Visual C++ runtime
+# app-local, and release.yml checks every shipped binary's DLL imports against
+# each payload before ISCC runs. Behavioural over synthetic PE images (stdlib),
+# the staging script under pwsh when present, plus lexical wiring pins with a
+# mutation self-test.
+test('windows payload import closure',
+  _python3_test,
+  args: [files('test_windows_payload_imports.py')],
+  suite: 'docs',
+  timeout: 300,
 )
 
 # Compose certs volume (#5370): every tracked compose that keeps Postgres on a
