@@ -55,7 +55,10 @@ CoverageState state_of(const MacosEnumeration& e) {
 TEST_CASE("macos enumeration: a healthy read is CONSTRAINED for Homebrew only", "[vuln][macos]") {
     auto c = state_of(parse_system_profiler_apps(kSample, true));
     CHECK(coverage_token(c) == "macos:vuln_scan:homebrew_not_scanned");
-    CHECK(coverage_note(c) == "Homebrew formulae and casks are not scanned");
+    const auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].severity == "INFO");
+    CHECK(notes[0].text == "Homebrew formulae and casks are not scanned");
 }
 
 TEST_CASE("macos enumeration: empty output is unreadable, never a clean zero", "[vuln][macos]") {
@@ -78,7 +81,7 @@ TEST_CASE("macos enumeration: output with no application rows is unreadable", "[
 }
 
 TEST_CASE("macos enumeration: provenance tokens match the leg-token grammar", "[vuln][macos]") {
-    for (auto t : {kMacosHomebrewNotScanned, kMacosSystemProfilerUnreadable}) {
+    for (auto t : {kMacosHomebrewNotScanned, kMacosSystemProfilerUnreadable, kMacosConfigUnreadable}) {
         CHECK(t.starts_with("macos:"));
         for (char c : t)
             CHECK(((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == ':'));
@@ -103,6 +106,8 @@ TEST_CASE("macos commands: every argv[0] is an absolute path (no daemon-PATH res
 
 TEST_CASE("macos commands: bounds are set", "[vuln][macos]") {
     CHECK(kMacosCommandDeadlineMs == 60'000);
+    CHECK(kMacosToolDeadlineMs == 10'000);
+    CHECK(kMacosToolDeadlineMs * 6 + kMacosCommandDeadlineMs <= 120'000); // one action's budget
     CHECK(kMacosCommandMaxOutput == 8u * 1024u * 1024u);
 }
 
@@ -125,39 +130,74 @@ TEST_CASE("run_cmd: exit status is reported and the pipe is released", "[vuln][r
 
 TEST_CASE("coverage: rows match the existing row shapes", "[vuln][macos][coverage]") {
     auto c = state_of(parse_system_profiler_apps(kSample, true));
-    CHECK(coverage_row(coverage_note(c)) ==
+    const auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 1);
+    CHECK(coverage_row(notes[0]) ==
           "INFO|scan|Coverage|Homebrew formulae and casks are not scanned");
-    CHECK(coverage_summary_row(coverage_note(c)) ==
+    CHECK(coverage_summary_row(notes[0]) ==
           "summary|COVERAGE|Homebrew formulae and casks are not scanned");
-    // 4 pipe-delimited fields like every cve/config row.
-    const auto row = coverage_row(coverage_note(c));
-    CHECK(std::count(row.begin(), row.end(), '|') == 3);
+    const auto row = coverage_row(notes[0]);
+    CHECK(std::count(row.begin(), row.end(), '|') == 3); // 4 fields like every cve/config row
 }
 
-TEST_CASE("coverage: an unreadable software list says so in-band", "[vuln][macos][coverage]") {
+TEST_CASE("coverage: an unreadable software list is an UNREADABLE row and never says 'empty'",
+          "[vuln][macos][coverage]") {
     auto c = state_of(parse_system_profiler_apps("", true));
-    CHECK(coverage_note(c) == kCoverageNoteUnreadable);
-    CHECK(coverage_note(c) != kCoverageNoteHomebrew);
+    const auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].severity == "UNREADABLE");
+    CHECK(notes[0].text == kCoverageNoteUnreadable);
+    CHECK(coverage_row(notes[0]).starts_with("UNREADABLE|scan|Coverage|"));
+    // a partial read (timeout / cap) is not an empty list: the wording must not claim it is
+    CHECK(kCoverageNoteUnreadable.find("empty") == std::string_view::npos);
+    CHECK(kCoverageNoteUnreadable.find("not a clean result") != std::string_view::npos);
 }
 
 TEST_CASE("coverage: nothing declared where nothing is known to be missing", "[vuln][coverage]") {
     CoverageState c; // Linux / Windows / macOS config_scan with every read ok
     CHECK(coverage_token(c).empty());
-    CHECK(coverage_note(c).empty());
+    CHECK(coverage_notes(c).empty());
 }
 
-TEST_CASE("coverage: token precedence is software list, then config, then Homebrew",
+TEST_CASE("coverage: the status token is one slot with a documented precedence, the notes carry "
+          "every cause",
           "[vuln][coverage]") {
     CoverageState c;
     c.macos_software = true;
     c.config_unreadable = true;
     CHECK(coverage_token(c) == kMacosConfigUnreadable);
+    auto notes = coverage_notes(c);
+    REQUIRE(notes.size() == 2); // the Homebrew gap is NOT dropped by the single token slot
+    CHECK(notes[0].text == kCoverageNoteHomebrew);
+    CHECK(notes[1].text == kCoverageNoteConfig);
     c.sp_readable = false;
     CHECK(coverage_token(c) == kMacosSystemProfilerUnreadable);
-    CoverageState cfg_only; // config_scan: no software list, but a failed read
+    notes = coverage_notes(c);
+    REQUIRE(notes.size() == 2);
+    CHECK(notes[0].text == kCoverageNoteUnreadable);
+    CHECK(notes[1].text == kCoverageNoteConfig);
+}
+
+TEST_CASE("coverage: config_scan alone gets an in-band note", "[vuln][coverage]") {
+    CoverageState cfg_only;
     cfg_only.config_unreadable = true;
     CHECK(coverage_token(cfg_only) == kMacosConfigUnreadable);
-    CHECK(coverage_note(cfg_only).empty()); // config rows carry their own INFO Unknown row
+    const auto notes = coverage_notes(cfg_only);
+    REQUIRE(notes.size() == 1);
+    CHECK(notes[0].severity == "UNREADABLE");
+    CHECK(notes[0].text == kCoverageNoteConfig);
+}
+
+TEST_CASE("coverage: the note literals are pinned (README, YAML and cookbook quote them)",
+          "[vuln][coverage]") {
+    CHECK(kCoverageNoteHomebrew == "Homebrew formulae and casks are not scanned");
+    CHECK(kCoverageNoteUnreadable ==
+          "The macOS software list could not be read completely (system_profiler failed, timed out, "
+          "exceeded the output cap or returned no applications); not a clean result");
+    CHECK(kCoverageNoteConfig ==
+          "One or more macOS configuration checks could not be read; each is reported as an "
+          "UNREADABLE row, not as a finding");
+    CHECK(kConfigUnknownDetail == "Unknown (read failed)");
 }
 
 // ── parser edge cases ───────────────────────────────────────────────────────
@@ -195,73 +235,206 @@ TEST_CASE("parse: a very large application list stays linear and readable", "[vu
     CHECK(e.readable);
 }
 
+TEST_CASE("parse: a partial or failed run returns NO apps (never feeds matching)", "[vuln][macos]") {
+    // truncated mid-value: "Version: 2" would compare below a CVE fix and read as vulnerable
+    auto e = parse_system_profiler_apps("    Git:\n      Version: 2", false);
+    CHECK(e.apps.empty());
+    CHECK_FALSE(e.readable);
+    auto ok = parse_system_profiler_apps(kSample, false);
+    CHECK(ok.apps.empty());
+}
+
+TEST_CASE("parse: structural name and version lines", "[vuln][macos]") {
+    // a name that is itself "Version: 99.0" must not become a version of the previous app
+    auto e = parse_system_profiler_apps(
+        "    Git:\n      Version: 2.50.1\n    Version: 99.0:\n      Version: 1.0\n    Python:\n      Version: 3.9.6\n",
+        true);
+    REQUIRE(e.apps.size() == 2);
+    CHECK(e.apps[0].name == "Git");
+    CHECK(e.apps[0].version == "2.50.1");
+    CHECK(e.apps[1].name == "Python");
+    CHECK(e.apps[1].version == "3.9.6");
+}
+
+TEST_CASE("parse: a four-space Version line is not a version", "[vuln][macos]") {
+    auto e = parse_system_profiler_apps("    Git:\n    Version: 1.0\n      Version: 2.50.1\n", true);
+    REQUIRE(e.apps.size() == 1);
+    CHECK(e.apps[0].version == "2.50.1");
+}
+
+TEST_CASE("parse: only a four-space-indent line ending in ':' is a name", "[vuln][macos]") {
+    auto e = parse_system_profiler_apps(
+        "    A:\n      Sub:\n      Version: 1\n  Header:\n        Deep:\n   Three:\n", true);
+    REQUIRE(e.apps.size() == 1);
+    CHECK(e.apps[0].name == "A");
+    CHECK(e.apps[0].version == "1");
+}
+
+TEST_CASE("parse: non-ASCII and punctuation-leading names are names", "[vuln][macos]") {
+    auto e = parse_system_profiler_apps(
+        "    \xE5\xBE\xAE\xE4\xBF\xA1:\n      Version: 9.9\n    Python:\n      Version: 3.9.6\n"
+        "    (Beta) App:\n      Version: 1.2\n    \xC3\x89" "dit:\n      Version: 4\n",
+        true);
+    REQUIRE(e.apps.size() == 4);
+    CHECK(e.apps[0].version == "9.9");
+    CHECK(e.apps[1].name == "Python");
+    CHECK(e.apps[1].version == "3.9.6");
+    CHECK(e.apps[2].name == "(Beta) App");
+    CHECK(e.apps[3].version == "4");
+}
+
+TEST_CASE("parse: the first Version under a name wins; version before a name is ignored",
+          "[vuln][macos]") {
+    auto e = parse_system_profiler_apps("      Version: 7\n    A:\n      Version: 1\n      Version: 2\n", true);
+    REQUIRE(e.apps.size() == 1);
+    CHECK(e.apps[0].version == "1");
+}
+
+TEST_CASE("fold_backslashes: a trailing backslash cannot swallow the pipe separator",
+          "[vuln][macos]") {
+    CHECK(fold_backslashes("Git\\") == "Git/");
+    CHECK(fold_backslashes("a\\b\\") == "a/b/");
+    CHECK(fold_backslashes("plain") == "plain");
+}
+
 // ── config checks: table-driven, exact expected lines ──────────────────────
 
-namespace {
-struct Row {
-    MacosCheck check;
-    const char* healthy;  // output of the "good" state
-    const char* bad;      // output of the "bad" state
-    const char* title;
-};
-const Row kRows[] = {
-    {MacosCheck::Gatekeeper, "assessments enabled", "assessments disabled", "Gatekeeper"},
-    {MacosCheck::FileVault, "FileVault is On.", "FileVault is Off.", "FileVault Disk Encryption"},
-    {MacosCheck::Sip, "System Integrity Protection status: enabled.",
-     "System Integrity Protection status: disabled.", "System Integrity Protection (SIP)"},
-    {MacosCheck::Firewall, "Firewall is enabled. (State = 1)", "Firewall is disabled. (State = 0)",
-     "Application Firewall"},
-    {MacosCheck::RemoteLogin, "Remote Login: Off", "Remote Login: On", "Remote Login (SSH)"},
-    {MacosCheck::AutoUpdate, "1", "0", "Automatic Software Updates"},
-};
-} // namespace
-
-TEST_CASE("macos config: good and bad states read as verdicts", "[vuln][macos][config]") {
-    for (const auto& r : kRows) {
-        INFO(r.title);
-        auto good = macos_check_result(r.check, {r.healthy, true});
-        CHECK(good.severity == "INFO");
-        CHECK(good.passed);
-        CHECK(good.detail != kConfigUnknownDetail);
-        auto bad = macos_check_result(r.check, {r.bad, true});
-        CHECK(bad.severity != "INFO");
-        CHECK_FALSE(bad.passed);
+TEST_CASE("macos config table: one row per check, absolute argv, exit-zero policy explicit",
+          "[vuln][macos][config]") {
+    REQUIRE(kMacosCheckSpecs.size() == 6);
+    for (const auto& sp : kMacosCheckSpecs) {
+        INFO(sp.title);
+        REQUIRE(sp.argv != nullptr);
+        CHECK((*sp.argv)[0].front() == '/');
+        CHECK(sp.requires_exit_zero); // CURRENT behaviour, pending the Mac measurement
+        CHECK(&macos_spec(sp.check) == &sp);
     }
 }
 
-TEST_CASE("macos config: a failed or unrecognised read is INFO Unknown, never a verdict",
+namespace {
+CommandRead good(std::string out) { return {std::move(out), true, true}; }
+} // namespace
+
+TEST_CASE("macos config: good and bad states read as verdicts", "[vuln][macos][config]") {
+    for (const auto& sp : kMacosCheckSpecs) {
+        INFO(sp.title);
+        auto g = macos_check_result(sp.check, good(std::string(sp.good_line)));
+        CHECK(g.severity == "INFO");
+        CHECK(g.passed);
+        auto b = macos_check_result(sp.check, good(std::string(sp.bad_line)));
+        CHECK(b.severity == sp.bad_severity);
+        CHECK_FALSE(b.passed);
+    }
+}
+
+TEST_CASE("macos config: Firewall accepts the structural State suffix only", "[vuln][macos][config]") {
+    const auto fw = [](const char* l) { return macos_check_result(MacosCheck::Firewall, good(l)); };
+    CHECK(fw("Firewall is enabled. (State = 1)").passed);
+    CHECK_FALSE(fw("Firewall is disabled. (State = 0)").passed);
+    CHECK(fw("Firewall is enabled.").passed);
+    for (const char* bad : {"Firewall is enabled. (State = 12)", "Firewall is enabled. (State = x)",
+                            "Firewall is enabled. (State = 1) extra", "Firewall is enabledX",
+                            "Firewall is enabled (State = 1)", "Firewall is enabled. (State = 1"})
+        CHECK(fw(bad).severity == "UNREADABLE");
+}
+
+TEST_CASE("macos config: a failed or unrecognised read is UNREADABLE, never a verdict",
           "[vuln][macos][config]") {
     const CommandRead failures[] = {
-        {"", false},                        // missing tool / failed to start
-        {"command not found", false},       // non-zero exit
-        {"", true},                         // empty output, exit 0
-        {"You need administrator access to run this tool... exiting!", true}, // TCC / privilege
-        {"Statut de la protection SIP : active.", true}, // localized csrutil
-        {"assessments enabled", false},     // good-looking text but the command failed
+        {"", false, false},                  // missing tool / failed to start
+        {"command not found", false, true},  // non-zero exit
+        {"", true, true},                    // empty output, exit 0
+        {"You need administrator access to run this tool... exiting!", true, true},
+        {"Statut de la protection SIP : active.", true, true}, // localized csrutil
     };
-    for (const auto& r : kRows)
+    for (const auto& sp : kMacosCheckSpecs) {
         for (const auto& f : failures) {
-            INFO(r.title << " / " << f.out);
-            auto res = macos_check_result(r.check, f);
-            CHECK(res.severity == "INFO");
-            CHECK(res.title == r.title);
+            INFO(sp.title << " / " << f.out);
+            auto res = macos_check_result(sp.check, f);
+            CHECK(res.severity == "UNREADABLE");
+            CHECK(res.title == sp.title);
             CHECK(res.detail == kConfigUnknownDetail);
             CHECK_FALSE(res.passed);
         }
+        // good-looking text from a run that failed (exit != 0) is unreadable while exit 0 is required
+        auto res = macos_check_result(sp.check, {std::string(sp.good_line), false, true});
+        CHECK(res.severity == "UNREADABLE");
+    }
 }
 
-TEST_CASE("macos config: FileVault 'Off' and 'Not On' never read as On", "[vuln][macos][config]") {
-    CHECK_FALSE(macos_check_result(MacosCheck::FileVault, {"FileVault is Off.", true}).passed);
-    auto not_on = macos_check_result(MacosCheck::FileVault, {"FileVault is Not On.", true});
-    CHECK(not_on.detail == kConfigUnknownDetail); // unrecognised, not a green verdict
-    CHECK(macos_check_result(MacosCheck::FileVault, {"FileVault is On, but needs restart.", true}).passed);
+TEST_CASE("macos config: near-miss lines are NOT accepted (prefix matches were the defect)",
+          "[vuln][macos][config]") {
+    struct Near { MacosCheck c; const char* line; };
+    const Near near[] = {
+        {MacosCheck::Sip, "System Integrity Protection status: enabled (Custom Configuration)."},
+        {MacosCheck::Sip, "System Integrity Protection status: unknown (Custom Configuration)."},
+        {MacosCheck::Sip, "System Integrity Protection status: enabled"},
+        {MacosCheck::FileVault, "FileVault is Onward"},
+        {MacosCheck::FileVault, "FileVault is On, but needs restart."},
+        {MacosCheck::FileVault, "FileVault is Not On."},
+        {MacosCheck::Gatekeeper, "assessments enabledfoo"},
+        {MacosCheck::Gatekeeper, "assessments enabled."},
+        {MacosCheck::RemoteLogin, "Remote Login: Onward"},
+        {MacosCheck::AutoUpdate, "10"},
+    };
+    for (const auto& n : near) {
+        INFO(n.line);
+        CHECK(macos_check_result(n.c, good(n.line)).severity == "UNREADABLE");
+    }
 }
 
-TEST_CASE("macos config: any_config_unreadable sees an Unknown row", "[vuln][macos][config]") {
+TEST_CASE("macos config: only the first line is judged and it is trimmed", "[vuln][macos][config]") {
+    CHECK(macos_check_result(MacosCheck::FileVault, good("  FileVault is On.  \nextra\n")).passed);
+    CHECK(macos_check_result(MacosCheck::FileVault, good("extra\nFileVault is On.")).severity ==
+          "UNREADABLE");
+}
+
+TEST_CASE("macos config: requires_exit_zero=false would accept a completed non-zero run "
+          "(policy seam pending the Mac measurement)",
+          "[vuln][macos][config]") {
+    // The shipped table requires exit 0 for every tool; this pins the seam, not a measured fact.
+    const CommandRead ran_nonzero{"assessments disabled", false, true};
+    CHECK(macos_check_result(MacosCheck::Gatekeeper, ran_nonzero).severity == "UNREADABLE");
+}
+
+TEST_CASE("macos config: a null reader fails closed", "[vuln][macos][config]") {
+    const auto rows = run_macos_checks_table(MacosReader{});
+    REQUIRE(rows.size() == 6);
+    for (const auto& r : rows)
+        CHECK(r.severity == "UNREADABLE");
+    CHECK(any_config_unreadable(rows));
+}
+
+TEST_CASE("macos config: the table drives the reader with each check's own argv",
+          "[vuln][macos][config]") {
+    std::vector<std::string> seen;
+    const auto rows = run_macos_checks_table([&](const Argv& a) {
+        seen.push_back(a[0]);
+        return CommandRead{};
+    });
+    CHECK(rows.size() == 6);
+    CHECK(seen.size() == 6);
+    CHECK(seen[0] == "/usr/sbin/spctl");
+}
+
+TEST_CASE("macos config: an UNREADABLE row is counted in summary's UNREADABLE bucket",
+          "[vuln][macos][config]") {
+    std::vector<std::string> sev;
+    for (const auto& r : run_macos_checks_table(MacosReader{}))
+        sev.push_back(std::string(r.severity));
+    const auto rows = summary_rows(sev);
+    bool saw = false;
+    for (const auto& row : rows)
+        if (row == "summary|UNREADABLE|6")
+            saw = true;
+    CHECK(saw);
+}
+
+TEST_CASE("macos config: any_config_unreadable keys on severity", "[vuln][macos][config]") {
     std::vector<ConfigCheckResult> v;
     CHECK_FALSE(any_config_unreadable(v));
-    v.push_back(macos_check_result(MacosCheck::Gatekeeper, {"assessments enabled", true}));
+    v.push_back(macos_check_result(MacosCheck::Gatekeeper, good("assessments enabled")));
     CHECK_FALSE(any_config_unreadable(v));
-    v.push_back(macos_check_result(MacosCheck::Sip, {"", false}));
+    v.push_back(macos_check_result(MacosCheck::Sip, {"", false, false}));
     CHECK(any_config_unreadable(v));
 }

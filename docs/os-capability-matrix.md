@@ -917,7 +917,7 @@ implementation is.
 | vuln_scan | cve_scan | macos | constrained | 2 | argv(system_profiler) | Homebrew formulae and casks are not scanned |
 | vuln_scan | cve_scan | windows | supported | 1 | win32_registry | - |
 | vuln_scan | config_scan | linux | supported | 3 | popen(iptables/nft/ufw)+procfs | - |
-| vuln_scan | config_scan | macos | supported | 3 | argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat) | - |
+| vuln_scan | config_scan | macos | constrained | 3 | argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat) | output parsing unverified on macOS 13-15; unreadable tools report Unknown/UNREADABLE |
 | vuln_scan | config_scan | windows | supported | 1 | win32_registry | - |
 | vuln_scan | summary | linux | supported | 3 | popen(pkg-manager+iptables/nft/ufw) | - |
 | vuln_scan | summary | macos | constrained | 3 | argv(system_profiler+security-checks)+popen(ss/netstat) | Homebrew formulae and casks are not scanned |

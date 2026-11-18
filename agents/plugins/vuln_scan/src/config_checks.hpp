@@ -526,108 +526,124 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
 
 // ── macOS config decisions (portable, pure) ────────────────────────────────
 //
-// A check's verdict comes from ONE exact expected line of the tool's real output, and only when the
-// command started and exited 0. A missing tool, a non-zero exit, empty output, a TCC/permission
-// message or localized text is `INFO ... Unknown (read failed)`, never a severity-bearing verdict
-// (it used to read as Gatekeeper HIGH / FileVault HIGH / SIP CRITICAL). `fdesetup`'s "FileVault is
-// On." is matched as a prefix of the first line, so "FileVault is Off." and "Not On" cannot match.
+// A check's verdict comes from ONE exact expected line of the tool's real output: the whole trimmed
+// first line must EQUAL a table string (Firewall additionally allows the structural
+// ` (State = <digit>)` suffix); a prefix match is never enough ("enabled (Custom Configuration).",
+// "FileVault is Onward" and "Firewall is enabledX" are unrecognised). A missing tool, a failed or
+// cut-short run, empty output, a permission message or localized text is
+// `UNREADABLE|config|<check>|Unknown (read failed)`, never a severity-bearing verdict and never a
+// clean one.
+//
+// ONE TABLE: everything that must be corrected from a real Mac capture lives in kMacosCheckSpecs
+// below (expected lines, severities, details, and whether the tool must exit 0).
+//   requires_exit_zero: true  = a non-zero exit makes the read unreadable (the CURRENT behaviour
+//   for all six tools). PENDING THE MAC MEASUREMENT: `spctl --status` is believed to exit non-zero
+//   when Gatekeeper is disabled and `defaults read ... AutoUpdate` to exit 1 on an absent key
+//   (UNVERIFIED recollection, not measured); if so set requires_exit_zero=false for those rows and
+//   the expected line is then accepted from a run that completed (CommandRead::ran).
 
 struct CommandRead {
     std::string out;
-    bool ok = false; // started, not cut short, exit status 0
+    bool ok = false;  // started, not cut short, exit status 0
+    bool ran = false; // started and ran to completion (any exit status), not cut short
 };
 
-// Runs one pre-split argv and reports its stdout and whether it ran to a clean exit 0.
+// Runs one pre-split argv and reports its stdout and how it ended.
 using MacosReader = std::function<CommandRead(const Argv&)>;
 
 enum class MacosCheck { Gatekeeper, FileVault, Sip, Firewall, RemoteLogin, AutoUpdate };
 
+struct MacosCheckSpec {
+    MacosCheck check;
+    std::string_view title;
+    const Argv* argv;
+    std::string_view good_line;     // whole trimmed first line of the "good" state
+    std::string_view bad_line;      // whole trimmed first line of the "bad" state
+    bool state_suffix;              // line may carry " (State = <digit>)" after the text
+    bool requires_exit_zero;        // see the block comment above
+    std::string_view good_detail;
+    std::string_view bad_severity;
+    std::string_view bad_detail;
+};
+
+inline const std::array<MacosCheckSpec, 6> kMacosCheckSpecs = {{
+    {MacosCheck::Gatekeeper, "Gatekeeper", &kMacosSpctlCmd, "assessments enabled",
+     "assessments disabled", false, true, "Enabled - only verified apps can run", "HIGH",
+     "Disabled - unsigned apps can run without restriction"},
+    {MacosCheck::FileVault, "FileVault Disk Encryption", &kMacosFdesetupCmd, "FileVault is On.",
+     "FileVault is Off.", false, true, "Enabled", "HIGH", "Disabled - disk is not encrypted"},
+    {MacosCheck::Sip, "System Integrity Protection (SIP)", &kMacosCsrutilCmd,
+     "System Integrity Protection status: enabled.",
+     "System Integrity Protection status: disabled.", false, true, "Enabled", "CRITICAL",
+     "Disabled - system files are unprotected"},
+    {MacosCheck::Firewall, "Application Firewall", &kMacosSocketfilterfwCmd,
+     "Firewall is enabled.", "Firewall is disabled.", true, true, "Enabled", "MEDIUM", "Disabled"},
+    {MacosCheck::RemoteLogin, "Remote Login (SSH)", &kMacosSystemsetupCmd, "Remote Login: Off",
+     "Remote Login: On", false, true, "Disabled", "MEDIUM", "Enabled - SSH access is open"},
+    {MacosCheck::AutoUpdate, "Automatic Software Updates", &kMacosDefaultsCmd, "1", "0", false,
+     true, "Enabled", "MEDIUM", "Disabled - system may miss security patches"},
+}};
+
+inline const MacosCheckSpec& macos_spec(MacosCheck c) {
+    for (const auto& s : kMacosCheckSpecs)
+        if (s.check == c)
+            return s;
+    return kMacosCheckSpecs[0]; // unreachable: every enumerator has a row
+}
+
+// `line` equals `text`, or (state_suffix) `text` followed by exactly " (State = <digit>)".
+inline bool macos_line_matches(std::string_view line, std::string_view text, bool state_suffix) {
+    if (line == text)
+        return true;
+    if (!state_suffix || !line.starts_with(text))
+        return false;
+    const std::string_view rest = line.substr(text.size());
+    constexpr std::string_view kOpen = " (State = ";
+    return rest.size() == kOpen.size() + 2 && rest.starts_with(kOpen) && rest[kOpen.size()] >= '0' &&
+           rest[kOpen.size()] <= '9' && rest.back() == ')';
+}
+
 inline ConfigCheckResult macos_check_result(MacosCheck check, const CommandRead& r) {
+    const MacosCheckSpec& sp = macos_spec(check);
+    const ConfigCheckResult unknown{"UNREADABLE", sp.title, std::string(kConfigUnknownDetail),
+                                    false};
+    if (!(sp.requires_exit_zero ? r.ok : (r.ok || r.ran)))
+        return unknown;
     std::string_view first = r.out;
     if (const auto nl = first.find('\n'); nl != std::string_view::npos)
         first = first.substr(0, nl);
     first = detail::trim(first);
-
-    // verdict: 1 = the "good" state, 0 = the "bad" state, -1 = unrecognised
-    const auto is = [&](std::string_view prefix) { return first.starts_with(prefix); };
-    int good = -1;
-    std::string_view title;
-    switch (check) {
-    case MacosCheck::Gatekeeper:
-        title = "Gatekeeper";
-        good = is("assessments enabled") ? 1 : is("assessments disabled") ? 0 : -1;
-        break;
-    case MacosCheck::FileVault:
-        title = "FileVault Disk Encryption";
-        good = is("FileVault is On") ? 1 : is("FileVault is Off") ? 0 : -1;
-        break;
-    case MacosCheck::Sip:
-        title = "System Integrity Protection (SIP)";
-        good = is("System Integrity Protection status: enabled")    ? 1
-               : is("System Integrity Protection status: disabled") ? 0
-                                                                     : -1;
-        break;
-    case MacosCheck::Firewall:
-        title = "Application Firewall";
-        good = is("Firewall is enabled") ? 1 : is("Firewall is disabled") ? 0 : -1;
-        break;
-    case MacosCheck::RemoteLogin:
-        title = "Remote Login (SSH)";
-        good = first == "Remote Login: Off" ? 1 : first == "Remote Login: On" ? 0 : -1;
-        break;
-    case MacosCheck::AutoUpdate:
-        title = "Automatic Software Updates";
-        good = first == "1" ? 1 : first == "0" ? 0 : -1;
-        break;
-    }
-    if (!r.ok || first.empty() || good < 0)
-        return {"INFO", title, std::string(kConfigUnknownDetail), false};
-
-    const bool g = good == 1;
-    switch (check) {
-    case MacosCheck::Gatekeeper:
-        return {g ? "INFO" : "HIGH", title,
-                g ? "Enabled - only verified apps can run"
-                  : "Disabled - unsigned apps can run without restriction",
-                g};
-    case MacosCheck::FileVault:
-        return {g ? "INFO" : "HIGH", title, g ? "Enabled" : "Disabled - disk is not encrypted", g};
-    case MacosCheck::Sip:
-        return {g ? "INFO" : "CRITICAL", title,
-                g ? "Enabled" : "Disabled - system files are unprotected", g};
-    case MacosCheck::Firewall:
-        return {g ? "INFO" : "MEDIUM", title, g ? "Enabled" : "Disabled", g};
-    case MacosCheck::RemoteLogin:
-        return {g ? "INFO" : "MEDIUM", title, g ? "Disabled" : "Enabled - SSH access is open", g};
-    case MacosCheck::AutoUpdate:
-        return {g ? "INFO" : "MEDIUM", title,
-                g ? "Enabled" : "Disabled - system may miss security patches", g};
-    }
-    return {"INFO", title, std::string(kConfigUnknownDetail), false};
+    if (macos_line_matches(first, sp.good_line, sp.state_suffix))
+        return {"INFO", sp.title, std::string(sp.good_detail), true};
+    if (macos_line_matches(first, sp.bad_line, sp.state_suffix))
+        return {sp.bad_severity, sp.title, std::string(sp.bad_detail), false};
+    return unknown;
 }
 
+// True when any check could not be read (severity UNREADABLE). macOS callers only: Linux's file
+// checks also use UNREADABLE and must not raise the macOS status token.
 inline bool any_config_unreadable(const std::vector<ConfigCheckResult>& results) {
     for (const auto& r : results)
-        if (r.detail == kConfigUnknownDetail)
+        if (r.severity == "UNREADABLE")
             return true;
     return false;
 }
 
 // ── macOS config checks ───────────────────────────────────────────────────
 
+// Runs every table row through `reader`; a null reader fails closed (every check UNREADABLE).
+inline std::vector<ConfigCheckResult> run_macos_checks_table(const MacosReader& reader) {
+    std::vector<ConfigCheckResult> out;
+    for (const auto& sp : kMacosCheckSpecs)
+        out.push_back(macos_check_result(sp.check, reader ? reader(*sp.argv) : CommandRead{}));
+    return out;
+}
+
 #ifdef __APPLE__
 // `reader` runs one argv through the bounded runner (supplied by the plugin, which links
 // agent-core). A null reader fails closed: every check reads Unknown.
 inline std::vector<ConfigCheckResult> run_macos_checks(const MacosReader& reader) {
-    const auto read = [&](const Argv& a) { return reader ? reader(a) : CommandRead{}; };
-    return {
-        macos_check_result(MacosCheck::Gatekeeper, read(kMacosSpctlCmd)),
-        macos_check_result(MacosCheck::FileVault, read(kMacosFdesetupCmd)),
-        macos_check_result(MacosCheck::Sip, read(kMacosCsrutilCmd)),
-        macos_check_result(MacosCheck::Firewall, read(kMacosSocketfilterfwCmd)),
-        macos_check_result(MacosCheck::RemoteLogin, read(kMacosSystemsetupCmd)),
-        macos_check_result(MacosCheck::AutoUpdate, read(kMacosDefaultsCmd)),
-    };
+    return run_macos_checks_table(reader);
 }
 #endif
 

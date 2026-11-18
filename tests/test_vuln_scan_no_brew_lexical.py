@@ -18,10 +18,10 @@ behavioural test, so they are pinned lexically):
   (a) no string literal in the plugin sources starts with a bare macOS tool name (spctl, fdesetup,
       csrutil, socketfilterfw, systemsetup, system_profiler, defaults);
   (b) every kMacos*Cmd constant defined in macos_software.hpp is USED in another source file;
-  (c) in vuln_scan_plugin.cpp each of the five action branches calls declare_coverage exactly once
-      (five calls in all), scan/cve_scan call emit_coverage_row, summary calls
-      emit_coverage_summary_row, and inventory calls neither row emitter (its rows feed NVD
-      matching).
+  (c) in vuln_scan_plugin.cpp each of the five action branches calls declare_coverage(ctx, cov)
+      exactly once (five calls in all), every do_*_impl / get_installed_apps call is passed &cov,
+      scan/cve_scan/config_scan call emit_coverage_row, summary calls emit_coverage_summary_row,
+      and inventory calls neither row emitter (its rows feed NVD matching).
 
 Not caught (disclosed): a name built at run time, split across preprocessor macros, or reached by
 indirection. Self-test: test_vuln_scan_no_brew_lexical_selftest.py.
@@ -69,7 +69,7 @@ _IDENT = re.compile(r"[A-Za-z0-9_]")
 
 def _splice(src: str) -> str:
     """Translation phase 2: remove backslash-newline (also CRLF) before anything is lexed."""
-    return re.sub(r"\\\r?\n", "", src)
+    return re.sub(r"\\[ \t\f\v]*\r?\n", "", src)
 
 
 def lex_all(src: str):
@@ -129,7 +129,8 @@ def lex_all(src: str):
                 last_idx = len(out) - 1
             last_is_str = True
             continue
-        if c == "'" and not (i > 0 and _IDENT.match(src[i - 1])):
+        prefixed_char = re.search(r"(?:^|[^A-Za-z0-9_])(?:u8|u|U|L)$", src[max(0, i - 3):i]) is not None
+        if c == "'" and (prefixed_char or not (i > 0 and _IDENT.match(src[i - 1]))):
             # character literal (a digit separator 1'000 is excluded by the check above)
             i += 1
             while i < n and src[i] != "'" and src[i] != "\n":
@@ -155,7 +156,11 @@ def scan_source(text: str) -> list[str]:
     return sorted({m.group(0) for v in (code, dequoted) for m in BREW.finditer(v)})
 
 
-BARE_TOOL = re.compile(r"\s*(?:spctl|fdesetup|csrutil|socketfilterfw|systemsetup|system_profiler|defaults)\b")
+# A literal that STARTS a command with a bare tool name, optionally behind `env`, `/usr/bin/env` or
+# VAR=value assignments (`PATH=/x spctl`).
+BARE_TOOL = re.compile(
+    r"\s*(?:(?:/usr/bin/env|env)\s+|[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*"
+    r"(?:spctl|fdesetup|csrutil|socketfilterfw|systemsetup|system_profiler|defaults)\b")
 ACTIONS = ("scan", "cve_scan", "config_scan", "inventory", "summary")
 
 
@@ -211,10 +216,19 @@ def pin_errors(root: pathlib.Path) -> list[str]:
                 errs.append(f"{a}: must call declare_coverage(ctx, ...) exactly once")
             row = len(re.findall(r"\bemit_coverage_row\s*\(", b))
             srow = len(re.findall(r"\bemit_coverage_summary_row\s*\(", b))
-            want_row, want_srow = (1, 0) if a in ("scan", "cve_scan") else (0, 1) if a == "summary" else (0, 0)
+            want_row, want_srow = (1, 0) if a in ("scan", "cve_scan", "config_scan") else (0, 1) if a == "summary" else (0, 0)
             if (row, srow) != (want_row, want_srow):
                 errs.append(f"{a}: coverage row emitters are ({row}, {srow}), expected ({want_row}, {want_srow})"
                             + (" (inventory rows feed NVD matching; no in-band rows)" if a == "inventory" else ""))
+        # every do_*_impl / get_installed_apps call must receive the run's state (&cov), and
+        # declare_coverage must be handed that same `cov`, never a fresh CoverageState{}
+        for a, b in blocks.items():
+            for m in re.finditer(r"\b(do_cve_scan_impl|do_config_scan_impl|get_installed_apps)\s*\(([^)]*)\)", b):
+                if m.group(2).strip() != "&cov":
+                    errs.append(f"{a}: {m.group(1)}({m.group(2).strip()}) must be passed &cov")
+            for m in re.finditer(r"\bdeclare_coverage\s*\(([^)]*)\)", b):
+                if re.sub(r"\s+", "", m.group(1)) != "ctx,cov":
+                    errs.append(f"{a}: declare_coverage({m.group(1).strip()}) must be (ctx, cov)")
         if len(re.findall(r"\bdeclare_coverage\s*\(\s*ctx\b", plug[0])) != len(ACTIONS):
             errs.append(f"declare_coverage(ctx, ...) must appear exactly {len(ACTIONS)} times in vuln_scan_plugin.cpp")
     return errs

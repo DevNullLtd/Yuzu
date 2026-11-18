@@ -17,7 +17,6 @@
 #include <string>
 #include <string_view>
 #include <vector>
-#include <vector>
 
 namespace yuzu::vuln {
 
@@ -44,9 +43,14 @@ inline std::vector<const Argv*> macos_commands() {
             &kMacosSocketfilterfwCmd, &kMacosSystemsetupCmd, &kMacosDefaultsCmd};
 }
 
-// Bounds for every macOS command: a stalled tool cannot park a worker, a runaway cannot grow RSS.
-inline constexpr long long kMacosCommandDeadlineMs = 60'000;
+// Bounds: a stalled tool cannot park a pool worker, a runaway cannot grow RSS. One action's worst
+// case is the profiler (60 s) plus six status tools (10 s each) = 120 s.
+inline constexpr long long kMacosCommandDeadlineMs = 60'000; // system_profiler
+inline constexpr long long kMacosToolDeadlineMs = 10'000;    // spctl/fdesetup/csrutil/...
 inline constexpr std::size_t kMacosCommandMaxOutput = 8u * 1024u * 1024u;
+// system_profiler is run process-wide single-flight and its result (success OR failure) is reused
+// for this long, so concurrent or repeated actions neither stack subprocesses nor retry a hang.
+inline constexpr long long kMacosProfilerCacheMs = 45'000;
 
 // Result-status provenance tokens (^macos:[a-z0-9_]+(:[a-z0-9_]+)*$).
 inline constexpr std::string_view kMacosHomebrewNotScanned = "macos:vuln_scan:homebrew_not_scanned";
@@ -59,8 +63,12 @@ inline constexpr std::string_view kMacosConfigUnreadable = "macos:vuln_scan:conf
 inline constexpr std::string_view kCoverageNoteHomebrew =
     "Homebrew formulae and casks are not scanned";
 inline constexpr std::string_view kCoverageNoteUnreadable =
-    "The software list is empty because system_profiler returned no applications; this is not a clean result";
-// Detail text of a config check whose read failed (severity INFO, never a verdict).
+    "The macOS software list could not be read completely (system_profiler failed, timed out, "
+    "exceeded the output cap or returned no applications); not a clean result";
+inline constexpr std::string_view kCoverageNoteConfig =
+    "One or more macOS configuration checks could not be read; each is reported as an UNREADABLE "
+    "row, not as a finding";
+// Detail text of a config check whose read failed (severity UNREADABLE, never a verdict).
 inline constexpr std::string_view kConfigUnknownDetail = "Unknown (read failed)";
 
 struct MacosApp {
@@ -81,20 +89,41 @@ inline std::string_view trim(std::string_view v) {
     const auto b = v.find_last_not_of(" \t\r\n");
     return v.substr(a, b - a + 1);
 }
-
-inline bool is_word_char(char c) {
-    return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || c == '_';
-}
 } // namespace detail
 
-/// Parse raw `system_profiler SPApplicationsDataType -detailLevel mini` output. The line filter
-/// that used to be a `| grep -E '^ {4}\w|Version:'` pipe (which also swallowed system_profiler's
-/// exit status) is applied here. `command_ok` is false when the command failed to start or
-/// exited non-zero.
+/// Fold literal backslashes to '/' in a value bound for a pipe-delimited row. The server decoder
+/// (result_parsing.hpp) undoes only `\|`, so a trailing backslash would swallow the pipe
+/// separator; folding follows the shared `safe_output_field` convention (sdk string_utils.hpp).
+inline std::string fold_backslashes(std::string_view v) {
+    std::string out(v);
+    for (char& c : out)
+        if (c == '\\')
+            c = '/';
+    return out;
+}
+
+/// Parse raw `system_profiler SPApplicationsDataType -detailLevel mini` output structurally:
+///   - a NAME line is exactly four spaces, then a non-space byte, and ends with ':' (names may
+///     start with any non-space byte, including non-ASCII); a line whose name text starts with
+///     "Version:" is never a name;
+///   - a VERSION line is a "Version:" line indented DEEPER than four spaces, and counts only after
+///     a name (the first one per app wins).
+/// Anything else is ignored. `command_ok` is false when the command did not run to a clean end
+/// (failed, timed out, over the output cap): the apps are then DROPPED, never returned as a partial
+/// list that would feed CVE matching or inventory.
 inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool command_ok) {
     MacosEnumeration r;
     std::string current_name;
     std::string current_version;
+    bool have_name = false;
+    bool have_version = false;
+    const auto flush = [&] {
+        if (have_name)
+            r.apps.push_back({current_name, current_version});
+        current_name.clear();
+        current_version.clear();
+        have_name = have_version = false;
+    };
     size_t pos = 0;
     while (pos <= out.size()) {
         size_t nl = out.find('\n', pos);
@@ -104,27 +133,26 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         if (!raw.empty() && raw.back() == '\r')
             raw.remove_suffix(1);
 
-        const bool name_shape = raw.size() > 4 && raw.substr(0, 4) == "    " &&
-                                detail::is_word_char(raw[4]);
-        if (!name_shape && raw.find("Version:") == std::string_view::npos)
+        const auto indent = raw.find_first_not_of(' ');
+        if (indent == std::string_view::npos)
             continue;
-
-        auto start = raw.find_first_not_of(" \t");
-        if (start == std::string_view::npos)
+        const std::string_view body = detail::trim(raw.substr(indent));
+        if (body.empty())
             continue;
-        std::string_view line = detail::trim(raw.substr(start));
-
-        if (line.substr(0, 8) == "Version:") {
-            current_version = std::string(detail::trim(line.substr(8)));
-        } else if (!line.empty() && line.back() == ':') {
-            if (!current_name.empty())
-                r.apps.push_back({current_name, current_version});
-            current_name = std::string(line.substr(0, line.size() - 1));
-            current_version.clear();
+        if (indent == 4 && raw[4] != '\t' && body.back() == ':') {
+            if (body.substr(0, 8) == "Version:")
+                continue; // a name line never starts "Version:"
+            flush();
+            current_name = std::string(body.substr(0, body.size() - 1));
+            have_name = true;
+        } else if (indent > 4 && have_name && !have_version && body.substr(0, 8) == "Version:") {
+            current_version = std::string(detail::trim(body.substr(8)));
+            have_version = true;
         }
     }
-    if (!current_name.empty())
-        r.apps.push_back({current_name, current_version});
+    flush();
+    if (!command_ok)
+        r.apps.clear();
     r.readable = command_ok && !r.apps.empty();
     return r;
 }
@@ -132,13 +160,15 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
 /// What one action run learned about the completeness of what it read. Default = nothing to
 /// declare (Windows, Linux, and a macOS config_scan whose reads all succeeded).
 struct CoverageState {
-    bool macos_software = false;   // the action consumed the macOS software list
-    bool sp_readable = true;       // ... and system_profiler produced applications
-    bool config_unreadable = false; // a config check's read failed (INFO "Unknown" row emitted)
+    bool macos_software = false;    // the action consumed the macOS software list
+    bool sp_readable = true;        // ... and system_profiler ran cleanly and produced applications
+    bool config_unreadable = false; // a macOS config check's read failed (UNREADABLE row emitted)
 };
 
-/// Provenance token for the CONSTRAINED/PARTIAL status; empty = declare nothing. An unreadable
-/// software list outranks an unreadable config read, which outranks the standing Homebrew gap.
+/// Provenance token for the CONSTRAINED/PARTIAL status; empty = declare nothing. The provenance is
+/// ONE token, so when causes stack the precedence is: unreadable software list, then unreadable
+/// config read, then the standing Homebrew gap. EVERY cause is still reported in-band by
+/// coverage_notes().
 inline std::string_view coverage_token(const CoverageState& c) {
     if (c.macos_software && !c.sp_readable)
         return kMacosSystemProfilerUnreadable;
@@ -149,21 +179,30 @@ inline std::string_view coverage_token(const CoverageState& c) {
     return {};
 }
 
-/// Text of the in-band coverage row; empty = no row (non-macOS, and config_scan).
-inline std::string_view coverage_note(const CoverageState& c) {
-    if (!c.macos_software)
-        return {};
-    return c.sp_readable ? kCoverageNoteHomebrew : kCoverageNoteUnreadable;
+struct CoverageNote {
+    std::string_view severity; // "INFO" (known standing gap) or "UNREADABLE" (a read failed)
+    std::string_view text;
+};
+
+/// Every in-band coverage note for this run, in a stable order; empty = nothing to say.
+inline std::vector<CoverageNote> coverage_notes(const CoverageState& c) {
+    std::vector<CoverageNote> n;
+    if (c.macos_software)
+        n.push_back(c.sp_readable ? CoverageNote{"INFO", kCoverageNoteHomebrew}
+                                  : CoverageNote{"UNREADABLE", kCoverageNoteUnreadable});
+    if (c.config_unreadable)
+        n.push_back({"UNREADABLE", kCoverageNoteConfig});
+    return n;
 }
 
-/// `severity|category|title|detail` row for cve_scan/scan (matches the placeholder row's shape).
-inline std::string coverage_row(std::string_view note) {
-    return "INFO|scan|Coverage|" + std::string(note);
+/// `severity|category|title|detail` row (matches the placeholder row's shape).
+inline std::string coverage_row(const CoverageNote& n) {
+    return std::string(n.severity) + "|scan|Coverage|" + std::string(n.text);
 }
 
 /// `summary|<key>|<value>` row for summary (summary's own row shape; value is text, like TOTAL's).
-inline std::string coverage_summary_row(std::string_view note) {
-    return "summary|COVERAGE|" + std::string(note);
+inline std::string coverage_summary_row(const CoverageNote& n) {
+    return "summary|COVERAGE|" + std::string(n.text);
 }
 
 } // namespace yuzu::vuln

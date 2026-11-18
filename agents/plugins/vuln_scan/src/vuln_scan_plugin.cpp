@@ -12,6 +12,9 @@
  *   <severity>|config|<title>|<detail>
  *   UNREADABLE|config|<title>|<path>: <cause>   (a Linux file check that could not run; excluded from the issue tally)
  *   summary|<severity>|<count>   (CRITICAL..INFO, then UNREADABLE; TOTAL first)
+ *   <INFO|UNREADABLE>|scan|Coverage|<note>   (macOS, scan/cve_scan/config_scan: one per coverage cause)
+ *   summary|COVERAGE|<note>                   (macOS, summary: one per coverage cause)
+ *   UNREADABLE|config|<title>|Unknown (read failed)   (macOS config check whose tool could not be read)
  */
 
 #include <yuzu/plugin.hpp>
@@ -32,6 +35,9 @@
 
 #ifdef __APPLE__
 #include <yuzu/agent/subprocess_runner.hpp>
+
+#include <condition_variable>
+#include <mutex>
 #endif
 
 #ifdef _WIN32
@@ -297,24 +303,70 @@ std::vector<AppInfo> get_installed_apps([[maybe_unused]] yuzu::vuln::CoverageSta
 }
 #elif defined(__APPLE__)
 // Run one macOS command through the shared bounded runner (execve of argv[0], own process group,
-// deadline, output cap). ok = ran to completion, exit 0, output not truncated.
-yuzu::vuln::CommandRead macos_run(const yuzu::vuln::Argv& argv) {
+// deadline, output cap). ok = ran to completion, exit 0, output not cut short; ran = the same
+// without the exit-0 requirement.
+yuzu::vuln::CommandRead macos_run_for(const yuzu::vuln::Argv& argv, long long deadline_ms) {
     yuzu::agent::SubprocessOptions opts;
-    opts.deadline = std::chrono::milliseconds(yuzu::vuln::kMacosCommandDeadlineMs);
+    opts.deadline = std::chrono::milliseconds(deadline_ms);
     opts.output_cap_bytes = yuzu::vuln::kMacosCommandMaxOutput;
     opts.merge_stderr = false;
     const auto r = yuzu::agent::run_bounded_subprocess(argv, opts);
     yuzu::vuln::CommandRead out;
     out.out = r.output;
-    out.ok = r.tool_ran && !r.timed_out && !r.output_truncated &&
-             r.termination_reason == yuzu::agent::TerminationReason::exited && r.exit_code == 0;
+    out.ran = r.tool_ran && !r.timed_out && !r.output_truncated &&
+              r.termination_reason == yuzu::agent::TerminationReason::exited;
+    out.ok = out.ran && r.exit_code == 0;
     return out;
 }
 
+// The small status tools (spctl, fdesetup, ...) get a short deadline.
+yuzu::vuln::CommandRead macos_run(const yuzu::vuln::Argv& argv) {
+    return macos_run_for(argv, yuzu::vuln::kMacosToolDeadlineMs);
+}
+
+// system_profiler: process-wide single flight plus a short result cache (failures included, so a
+// hung profiler is not retried by every queued action). A waiter reuses the flight's result.
+yuzu::vuln::CommandRead macos_profiler_read() {
+    struct Flight {
+        std::mutex mu;
+        std::condition_variable cv;
+        bool running = false;
+        bool have = false;
+        std::chrono::steady_clock::time_point at{};
+        yuzu::vuln::CommandRead result;
+    };
+    static Flight f;
+    const auto ttl = std::chrono::milliseconds(yuzu::vuln::kMacosProfilerCacheMs);
+    std::unique_lock lk(f.mu);
+    for (;;) {
+        if (f.have && std::chrono::steady_clock::now() - f.at < ttl)
+            return f.result;
+        if (!f.running)
+            break;
+        f.cv.wait(lk);
+    }
+    f.running = true;
+    lk.unlock();
+    yuzu::vuln::CommandRead r;
+    try {
+        r = macos_run_for(yuzu::vuln::kMacosSystemProfilerCmd, yuzu::vuln::kMacosCommandDeadlineMs);
+    } catch (...) {
+        // leave r as the failed default; never wedge the flight
+    }
+    lk.lock();
+    f.result = r;
+    f.have = true;
+    f.at = std::chrono::steady_clock::now();
+    f.running = false;
+    f.cv.notify_all();
+    return r;
+}
+
 std::vector<AppInfo> get_installed_apps(yuzu::vuln::CoverageState* cov) {
-    // One bounded run of an absolute-path argv (no shell, no PATH search): the output goes to the
-    // pure parser, so a failed, timed-out, over-cap or empty run reads unreadable, never a clean 0.
-    const auto r = macos_run(yuzu::vuln::kMacosSystemProfilerCmd);
+    // One bounded run of an absolute-path argv (no shell, no PATH search). The pure parser drops
+    // every app unless the run completed cleanly, so a failed, timed-out, over-cap or empty run
+    // never feeds CVE matching or inventory a partial list.
+    const auto r = macos_profiler_read();
     auto parsed = yuzu::vuln::parse_system_profiler_apps(r.out, r.ok);
 
     // Homebrew is deliberately NOT enumerated here (WP13c/C-2): the agent runs as root and a
@@ -328,8 +380,10 @@ std::vector<AppInfo> get_installed_apps(yuzu::vuln::CoverageState* cov) {
 
     std::vector<AppInfo> apps;
     apps.reserve(parsed.apps.size());
+    // The server decoder undoes only `\|`: fold backslashes so a trailing one cannot swallow the
+    // pipe separator (shared safe_output_field convention).
     for (auto& a : parsed.apps)
-        apps.push_back({std::move(a.name), std::move(a.version)});
+        apps.push_back({yuzu::vuln::fold_backslashes(a.name), yuzu::vuln::fold_backslashes(a.version)});
     return apps;
 }
 #else
@@ -375,15 +429,16 @@ std::vector<Finding> do_cve_scan_impl(yuzu::vuln::CoverageState* cov = nullptr) 
 
 // ── Config scan ───────────────────────────────────────────────────────────
 
-std::vector<Finding> do_config_scan_impl(yuzu::vuln::CoverageState* cov = nullptr) {
+std::vector<Finding> do_config_scan_impl([[maybe_unused]] yuzu::vuln::CoverageState* cov = nullptr) {
     std::vector<Finding> findings;
-    #ifdef __APPLE__
+#ifdef __APPLE__
     auto checks = yuzu::vuln::run_all_config_checks(macos_run);
+    // macOS only: Linux's UNREADABLE file rows must not raise the macOS status token.
+    if (cov && yuzu::vuln::any_config_unreadable(checks))
+        cov->config_unreadable = true;
 #else
     auto checks = yuzu::vuln::run_all_config_checks();
 #endif
-    if (cov && yuzu::vuln::any_config_unreadable(checks))
-        cov->config_unreadable = true;
 
     for (const auto& check : checks) {
         // Report all checks (passed ones as INFO)
@@ -406,24 +461,27 @@ void declare_coverage(yuzu::CommandContext& ctx, const yuzu::vuln::CoverageState
                               token);
 }
 
-// cve_scan / scan: `INFO|scan|Coverage|<note>` after the findings. NEVER used by inventory, whose
-// rows feed server-side NVD matching and stay pure name|version pairs.
+// cve_scan / scan / config_scan: one `<INFO|UNREADABLE>|scan|Coverage|<note>` row per cause, after
+// the findings. NEVER used by inventory, whose rows feed server-side NVD matching and stay pure
+// name|version pairs.
 void emit_coverage_row(yuzu::CommandContext& ctx, const yuzu::vuln::CoverageState& cov) {
-    const auto note = yuzu::vuln::coverage_note(cov);
-    if (!note.empty())
+    for (const auto& note : yuzu::vuln::coverage_notes(cov))
         ctx.write_output(yuzu::vuln::coverage_row(note));
 }
 
-// summary: `summary|COVERAGE|<note>` (summary's own row shape).
+// summary: one `summary|COVERAGE|<note>` row per cause (summary's own row shape).
 void emit_coverage_summary_row(yuzu::CommandContext& ctx, const yuzu::vuln::CoverageState& cov) {
-    const auto note = yuzu::vuln::coverage_note(cov);
-    if (!note.empty())
+    for (const auto& note : yuzu::vuln::coverage_notes(cov))
         ctx.write_output(yuzu::vuln::coverage_summary_row(note));
 }
 
-void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings) {
+// The "No vulnerabilities" placeholder is a claim of a clean scan: it is suppressed when the
+// software list could not be read (the UNREADABLE Coverage row follows instead).
+void output_findings(yuzu::CommandContext& ctx, const std::vector<Finding>& findings,
+                     const yuzu::vuln::CoverageState& cov = {}) {
     if (findings.empty()) {
-        ctx.write_output("INFO|scan|No vulnerabilities|No issues detected");
+        if (!(cov.macos_software && !cov.sp_readable))
+            ctx.write_output("INFO|scan|No vulnerabilities|No issues detected");
         return;
     }
 
@@ -467,7 +525,7 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never
 //     scanned (see macos_software.hpp), and the same actions report CONSTRAINED + PARTIAL at run
 //     time (declare_coverage) plus an in-band Coverage row (not inventory). config_scan reads no
-//     software list and stays SUPPORTED; it reports CONSTRAINED only when a check's read failed.
+//     software list; its tool output parsing is unverified on a Mac, so it is CONSTRAINED too.
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "scan",
@@ -486,7 +544,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         "config_scan",
         {YUZU_SUPPORT_SUPPORTED, 3, "popen(iptables/nft/ufw)+procfs", nullptr},
-        {YUZU_SUPPORT_SUPPORTED, 3, "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat)", nullptr},
+        {YUZU_SUPPORT_CONSTRAINED, 3,
+         "argv(spctl/fdesetup/csrutil/socketfilterfw/systemsetup/defaults)+popen(ss/netstat)",
+         "output parsing unverified on macOS 13-15; unreadable tools report Unknown/UNREADABLE"},
         {YUZU_SUPPORT_SUPPORTED, 1, "win32_registry", nullptr},
     },
     {
@@ -549,7 +609,7 @@ public:
             all.insert(all.end(), cve_findings.begin(), cve_findings.end());
             all.insert(all.end(), config_findings.begin(), config_findings.end());
 
-            output_findings(ctx, all);
+            output_findings(ctx, all, cov);
             emit_coverage_row(ctx, cov);
             declare_coverage(ctx, cov);
             ctx.report_progress(100);
@@ -560,7 +620,7 @@ public:
             ctx.report_progress(0);
             yuzu::vuln::CoverageState cov;
             auto findings = do_cve_scan_impl(&cov);
-            output_findings(ctx, findings);
+            output_findings(ctx, findings, cov);
             emit_coverage_row(ctx, cov);
             declare_coverage(ctx, cov);
             ctx.report_progress(100);
@@ -571,7 +631,8 @@ public:
             ctx.report_progress(0);
             yuzu::vuln::CoverageState cov;
             auto findings = do_config_scan_impl(&cov);
-            output_findings(ctx, findings);
+            output_findings(ctx, findings, cov);
+            emit_coverage_row(ctx, cov);
             declare_coverage(ctx, cov);
             ctx.report_progress(100);
             return 0;

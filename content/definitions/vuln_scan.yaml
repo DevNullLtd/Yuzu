@@ -18,8 +18,9 @@ metadata:
     policy, remote desktop config, etc.). Each finding is classified by
     severity (CRITICAL, HIGH, MEDIUM, LOW, INFO, or UNREADABLE when the check
     could not run; not an issue). On macOS, Homebrew formulae and casks are
-    not scanned (use pkg_inventory.packages); the run ends with an INFO row
-    titled "Coverage" saying so, and a result with no CVE rows means only that
+    not scanned (use pkg_inventory.packages); the run ends with a row titled
+    "Coverage" saying so (INFO, or UNREADABLE when the software list or a
+    configuration read failed), and a result with no CVE rows means only that
     no built-in rule matched the software enumerated. Reports progress at
     0%, 50%, 90%, 100%.
   tags: [security, vulnerability, cve, compliance, audit]
@@ -54,7 +55,7 @@ spec:
       - name: title
         type: string
         description: >-
-          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing; "Coverage" on the INFO row a macOS run adds when part of the host was not scanned. Values: free text.
+          For a cve row, "<CVE-ID>: <description>" from the matched rule; for a config row, the name of the compliance check; "No vulnerabilities" on the single placeholder row emitted when a run finds nothing; "Coverage" on the INFO or UNREADABLE row a macOS run adds when part of the host was not scanned or could not be read. Values: free text.
         example: "CVE-2021-34527: PrintNightmare: RCE via Windows Print Spooler"
         platforms: [windows, linux, darwin]
       - name: detail
@@ -114,7 +115,8 @@ metadata:
     built-in CVE database. Returns only CVE findings, not configuration
     checks. A result with no CVE rows means only that no built-in rule
     matched the software enumerated above; on macOS the run ends with an INFO
-    row titled "Coverage" saying so. Use the full "scan" action for combined
+    row titled "Coverage" saying so, or an UNREADABLE Coverage row (and no "No
+    vulnerabilities" row) when system_profiler could not be read completely. Use the full "scan" action for combined
     results.
   tags: [security, vulnerability, cve, compliance]
 
@@ -193,8 +195,8 @@ metadata:
     Returns findings classified by severity. Does not include CVE
     matching; use the full "scan" action for combined results. On macOS a
     check whose system tool could not be read (missing, failed, no
-    permission, unrecognised output) is reported as an INFO row with detail
-    "Unknown (read failed)", never as a finding.
+    permission, unrecognised output) is reported as an UNREADABLE row with detail
+    "Unknown (read failed)" and severity UNREADABLE, never as a finding.
   tags: [security, compliance, configuration, hardening]
 
 spec:
@@ -272,7 +274,7 @@ metadata:
     (CRITICAL, HIGH, MEDIUM, LOW, INFO, UNREADABLE; UNREADABLE means the check
     could not run and is not counted as an issue). On macOS, Homebrew formulae
     and casks are not scanned (use pkg_inventory.packages), and the output ends
-    with a summary|COVERAGE|<text> row saying so; the counts cover only the
+    with summary|COVERAGE|<text> rows saying so (one per cause); the counts cover only the
     software enumerated.
   tags: [security, vulnerability, compliance, dashboard]
 
@@ -339,8 +341,11 @@ metadata:
     centralized vulnerability correlation against the full NVD database. On
     macOS the list is system_profiler applications only; Homebrew formulae and
     casks are not included (use pkg_inventory.packages), and a macOS run that
-    read nothing returns no rows. The rows are pure name|version pairs; the
-    coverage limit is reported in the result status, never as a row.
+    read nothing returns no rows. The rows are pure name|version pairs with no
+    coverage row, and the coverage status is visible only in the agent log (not
+    in REST, MCP or the dashboard): treat the list as "system_profiler
+    applications only, Homebrew excluded", and never read an empty macOS list
+    as "no software installed".
   tags: [security, vulnerability, inventory, software]
 
 spec:

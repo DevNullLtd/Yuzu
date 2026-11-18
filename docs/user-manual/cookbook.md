@@ -691,13 +691,25 @@ Policy: no critical vulnerabilities allowed:
 result.severity != 'critical' && result.severity != 'high'
 ```
 
-An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
+An `UNREADABLE` row means the check could not run (unreadable `/proc/sys` or `sshd_config`, or, on macOS, a status tool that could not be read); treat it as not assessed — add `&& result.severity != 'UNREADABLE'` or gate on the `summary|UNREADABLE|<n>` count — rather than letting a "no critical/high" policy pass a host it never measured.
 
 #### macOS Homebrew coverage
 
 On macOS, `vuln_scan` reads applications from `system_profiler` only. Homebrew formulae and casks are not scanned, so a macOS result with no CVE rows means only that no built-in rule matched the applications `system_profiler` listed; it says nothing about Homebrew packages, and matched Homebrew CVEs are not available. `pkg_inventory.packages` lists Homebrew packages (machine scope) but does not match them against CVE rules.
 
-The scan says so in its own output. `cve_scan` and `scan` end with an `INFO|scan|Coverage|Homebrew formulae and casks are not scanned` row, and `summary` ends with `summary|COVERAGE|<same text>`; `inventory` returns software rows only. If `system_profiler` fails, times out or returns no applications, the Coverage row instead reads `The software list is empty because system_profiler returned no applications; this is not a clean result`, and a macOS configuration check whose tool could not be read reports `INFO|config|<check>|Unknown (read failed)` rather than a finding. Treat any of these rows as "not assessed", as with `UNREADABLE`. The agent also records the result status `CONSTRAINED`/`PARTIAL` in its own log (provenance `macos:vuln_scan:homebrew_not_scanned`, `macos:vuln_scan:system_profiler_unreadable` or `macos:vuln_scan:config_unreadable`); the status is not shown in REST, MCP or the dashboard, so the rows are what operators see.
+The scan says so in its own output, and every coverage problem is an `UNREADABLE` row or an `INFO` Coverage row, so the `UNREADABLE` gate above covers the cases that mean "not assessed":
+
+- `cve_scan` and `scan` end with `INFO|scan|Coverage|Homebrew formulae and casks are not scanned` (a standing gap, present on every Mac), and `summary` ends with `summary|COVERAGE|<same text>`. `inventory` returns software rows only.
+- If `system_profiler` fails, times out (60 s), exceeds the 8 MB output cap or returns no applications, no application is matched or listed, the "No vulnerabilities" row is not printed, and the run ends with `UNREADABLE|scan|Coverage|The macOS software list could not be read completely ...` (`summary|COVERAGE|...` for `summary`).
+- A configuration check whose tool cannot be read (missing, refused, localized or unrecognised output) is `UNREADABLE|config|<check>|Unknown (read failed)`, counted in `summary|UNREADABLE|<n>`, and the run adds `UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read ...`.
+
+A gate that treats a Mac as assessed must therefore also require no row with `title == 'Coverage'` and `severity == 'UNREADABLE'`:
+
+```cel
+result.severity != 'UNREADABLE' && !(result.title == 'Coverage' && result.severity == 'UNREADABLE')
+```
+
+When the software list is empty or unreadable: do not read a macOS `cve_scan` with no rows as "no vulnerabilities" or an empty `inventory` as "no software"; do not run several macOS vulnerability actions on one host at once (the agent runs one `system_profiler` at a time and reuses its result for 45 s, so a second request inside that window repeats the same answer); retry after the window, and check that Spotlight and MDM are not holding `system_profiler`. Whether the agent needs a Full Disk Access or PPPC grant for any of these tools has not been measured. The agent also records `CONSTRAINED`/`PARTIAL` in its own log (provenance `macos:vuln_scan:homebrew_not_scanned`, `macos:vuln_scan:system_profiler_unreadable` or `macos:vuln_scan:config_unreadable`); REST, MCP and the dashboard do not show it, so the rows are what operators see.
 
 Policy: CVSS score must be below threshold:
 

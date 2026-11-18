@@ -56,27 +56,47 @@ RED = [
     ("shell quoting b''rew", "extra.cpp", 'void f(){ run_command("b\'\'rew list"); }\n'),
     ("shell quoting b\"\"rew", "extra.cpp", 'void f(){ run_command("b\\"\\"rew list"); }\n'),
     ("prefixed raw string", "extra.cpp", 'void f(){ run_command(LR"x(brew list)x"); }\n'),
+    ("char literal with u8 prefix before a brew call", "extra.cpp",
+     "void f(){ auto c = u8'\"'; run_command(\"brew list\"); }\n"),
+    ("L-prefixed char literal hides a quote", "extra.cpp",
+     "void f(){ auto c = L'\"'; run_command(\"brew list\"); }\n"),
+    ("splice with trailing spaces", "extra.cpp", 'void f(){ run_command("br\\  \new list"); }\n'),
 ]
 
+CVE_END = "            output_findings(ctx, findings, cov);\n            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"config_scan\")"
+
 # Structural pins: (name, file, old text, new text) applied to the real source; each must go RED.
+ANCHOR = "inline const MacosCheckSpec& macos_spec(MacosCheck c) {"
 PIN_MUTATIONS = [
-    ("pin a: bare tool literal", "config_checks.hpp", "macos_check_result(MacosCheck::Gatekeeper, read(kMacosSpctlCmd))",
-     'macos_check_result(MacosCheck::Gatekeeper, read({"spctl", "--status"}))'),
-    ("pin a: bare system_profiler literal", "vuln_scan_plugin.cpp", "macos_run(yuzu::vuln::kMacosSystemProfilerCmd)",
-     'macos_run({"system_profiler", "SPApplicationsDataType"})'),
-    ("pin b: constant unused", "config_checks.hpp", "read(kMacosFdesetupCmd)", 'read({"/usr/bin/fdesetup", "status"})'),
+    ("pin a: bare tool literal", "config_checks.hpp", ANCHOR,
+     'inline const char* kBad = "spctl --status";\n' + ANCHOR),
+    ("pin a: /usr/bin/env-prefixed bare tool", "config_checks.hpp", ANCHOR,
+     'inline const char* kBad = "/usr/bin/env spctl --status";\n' + ANCHOR),
+    ("pin a: env-prefixed bare tool", "config_checks.hpp", ANCHOR,
+     'inline const char* kBad = "env csrutil status";\n' + ANCHOR),
+    ("pin a: VAR= prefixed bare tool", "config_checks.hpp", ANCHOR,
+     'inline const char* kBad = "PATH=/x fdesetup status";\n' + ANCHOR),
+    ("pin a: bare system_profiler literal", "vuln_scan_plugin.cpp",
+     "macos_run_for(yuzu::vuln::kMacosSystemProfilerCmd, yuzu::vuln::kMacosCommandDeadlineMs)",
+     'macos_run_for({"system_profiler", "SPApplicationsDataType"}, 1)'),
+    ("pin b: constant unused", "config_checks.hpp", "&kMacosFdesetupCmd,", "nullptr,"),
     ("pin c: declare_coverage dropped from cve_scan", "vuln_scan_plugin.cpp",
-     "            output_findings(ctx, findings);\n            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"config_scan\")",
-     "            output_findings(ctx, findings);\n            emit_coverage_row(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"config_scan\")"),
+     CVE_END,
+     CVE_END.replace("            declare_coverage(ctx, cov);\n", "")),
     ("pin c: declare_coverage dropped from config_scan", "vuln_scan_plugin.cpp",
-     "            auto findings = do_config_scan_impl(&cov);\n            output_findings(ctx, findings);\n            declare_coverage(ctx, cov);",
-     "            auto findings = do_config_scan_impl(&cov);\n            output_findings(ctx, findings);"),
+     "            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"inventory\")",
+     "            emit_coverage_row(ctx, cov);\n            ctx.report_progress(100);\n            return 0;\n        }\n\n        if (action == \"inventory\")"),
     ("pin c: coverage row added to inventory", "vuln_scan_plugin.cpp",
      "            declare_coverage(ctx, cov);\n            return 0;\n        }\n\n        if (action == \"summary\")",
      "            emit_coverage_row(ctx, cov);\n            declare_coverage(ctx, cov);\n            return 0;\n        }\n\n        if (action == \"summary\")"),
     ("pin c: summary row emitter dropped", "vuln_scan_plugin.cpp", "            emit_coverage_summary_row(ctx, cov);\n", ""),
     ("pin c: scan row emitter dropped", "vuln_scan_plugin.cpp",
-     "            output_findings(ctx, all);\n            emit_coverage_row(ctx, cov);", "            output_findings(ctx, all);"),
+     "output_findings(ctx, all, cov);\n            emit_coverage_row(ctx, cov);", "output_findings(ctx, all, cov);"),
+    ("pin c: &cov dropped from a call", "vuln_scan_plugin.cpp", "auto findings = do_cve_scan_impl(&cov);",
+     "auto findings = do_cve_scan_impl();"),
+    ("pin c: fresh CoverageState handed to declare_coverage", "vuln_scan_plugin.cpp",
+     CVE_END,
+     CVE_END.replace("declare_coverage(ctx, cov)", "declare_coverage(ctx, yuzu::vuln::CoverageState{})")),
 ]
 
 # Texts that must stay GREEN (no false positive on the shipped wording).
