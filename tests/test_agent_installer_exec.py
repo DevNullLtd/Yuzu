@@ -23,6 +23,15 @@ def stub(bindir, name, body):
     p.chmod(0o755)
 
 
+class Snap:
+    """Existence and content of the installer's outputs, taken before the sandbox is removed."""
+    def __init__(self, sudoers_exists, sudoers_text, wrapper_exists, wrapper_text):
+        self.sudoers_exists = sudoers_exists
+        self.sudoers_text = sudoers_text
+        self.wrapper_exists = wrapper_exists
+        self.wrapper_text = wrapper_text
+
+
 def scenario(label, want, *, visudo_ok=True, getcap="empty", setcap=True, wrapper_install_ok=True,
              old_sudoers=False, check=False, sudoers_content=None, binary_exists=True):
     """want: expected exit status, or 'nonzero'."""
@@ -45,8 +54,8 @@ def scenario(label, want, *, visudo_ok=True, getcap="empty", setcap=True, wrappe
         # file for a regular file install so the sudoers content lands where the test reads it.
         stub(bindir, "install", f'''
 for a in "$@"; do last="$a"; done
-case "$last" in *yuzu-systemctl) {"exit 0" if wrapper_install_ok else "exit 1"};; esac
-if [ "$1" = "-d" ]; then exit 0; fi
+{'case "$last" in *yuzu-systemctl) exit 1;; esac' if not wrapper_install_ok else ''}
+if [ "$1" = "-d" ]; then mkdir -p "$last"; exit 0; fi
 src=""; for a in "$@"; do src="$last_prev"; last_prev="$a"; done
 # last arg = dest, second to last = source
 n=$#; i=0; for a in "$@"; do i=$((i+1)); [ $i -eq $((n-1)) ] && s="$a"; done
@@ -89,7 +98,15 @@ echo "RC=$?"
         ok = (rc not in (0, None)) if want == "nonzero" else (rc == want)
         if not ok:
             errs.append(f"{label}: expected exit {want}, got {rc}\n{r.stdout[-500:]}{r.stderr[-300:]}")
-        return d, sudoers, rc
+        # Snapshot what the installer left on disk WHILE the sandbox still exists: the
+        # TemporaryDirectory is deleted on return, so a later Path.exists() is always False.
+        snap = Snap(
+            sudoers_exists=sudoers.exists(),
+            sudoers_text=sudoers.read_text() if sudoers.exists() else "",
+            wrapper_exists=wrapper.exists(),
+            wrapper_text=wrapper.read_text() if wrapper.exists() else "",
+        )
+        return d, snap, rc
 
 
 # ── install: every failing step must make the installer exit non-zero ──────────────────────
@@ -98,15 +115,57 @@ scenario("setcap missing while the binary carries caps (N1)", 5, getcap="caps", 
 scenario("getcap missing AND setcap missing: cannot verify (N1)", 5, getcap="missing", setcap=False)
 scenario("setcap present but the capability stays live", 5, getcap="caps")  # stub setcap is a no-op
 scenario("visudo rejects the file (R1)", 3, visudo_ok=False)
-d, sud, _ = scenario("visudo rejects and a glob-carrying file exists (R1)", 3, visudo_ok=False,
-                     old_sudoers=True)
-if sud.exists():
+_, snap, _ = scenario("visudo rejects and a glob-carrying file exists (R1)", 3, visudo_ok=False,
+                      old_sudoers=True)
+if snap.sudoers_exists:
     errs.append("a failed sudoers validation left the existing glob-carrying file in place")
 scenario("wrapper install fails (N-WRAPEXIT)", 4, wrapper_install_ok=False)
-d, sud, _ = scenario("wrapper install fails: no systemctl grant is written", 4,
-                     wrapper_install_ok=False)
-if sud.exists() and "yuzu-systemctl" in sud.read_text():
+_, snap, _ = scenario("wrapper install fails: no systemctl grant is written", 4,
+                      wrapper_install_ok=False)
+if snap.sudoers_exists and "yuzu-systemctl" in snap.sudoers_text:
     errs.append("a failed wrapper install still wrote the wrapper grant")
+# The sudoers file must actually be written on a good install (so the two checks above are
+# measuring something), and must carry the wrapper grant.
+_, snap, _ = scenario("happy path writes the sudoers file with the wrapper grant", 0)
+if not snap.sudoers_exists or "yuzu-systemctl" not in snap.sudoers_text:
+    errs.append("a successful install did not write the wrapper grant into the sudoers file")
+
+# The wrapper file the installer ACTUALLY wrote (install_systemctl_wrapper(), read back from the
+# sandbox), not a regenerated copy: it must refuse every shape except `<verb> <unit>`.
+if not snap.wrapper_exists or not snap.wrapper_text.startswith("#!"):
+    errs.append("a successful install did not write the systemctl wrapper")
+else:
+    with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_wrapper_") as wd:
+        wd = pathlib.Path(wd)
+        log = wd / "calls.log"
+        fake = wd / "systemctl"
+        fake.write_text(f'#!/bin/sh\necho "$@" >> {log}\n')
+        fake.chmod(0o755)
+        if "SYSTEMCTL=/usr/bin/systemctl" not in snap.wrapper_text:
+            errs.append("installed wrapper does not pin SYSTEMCTL=/usr/bin/systemctl")
+        w = wd / "yuzu-systemctl"
+        w.write_text(snap.wrapper_text.replace("SYSTEMCTL=/usr/bin/systemctl", f"SYSTEMCTL={fake}"))
+        w.chmod(0o755)
+
+        def wrun(*args):
+            return subprocess.run([str(w), *args], capture_output=True, text=True).returncode
+
+        for a in (("enable", "ssh.service"), ("disable", "a@b_c-d.service"), ("mask", "x"),
+                  ("unmask", "-leading.service")):
+            if wrun(*a) != 0:
+                errs.append(f"installed wrapper refused a valid call {a}")
+        calls = log.read_text().splitlines() if log.exists() else []
+        if "enable -- ssh.service" not in calls:
+            errs.append(f"installed wrapper must exec `systemctl <verb> -- <unit>`, got {calls[:4]!r}")
+        before = len(calls)
+        for a in (("enable", "--now", "/tmp/x.service"), ("enable", "a", "b"), ("enable",), (),
+                  ("start", "ssh.service"), ("enable", "/tmp/x.service"), ("enable", "a;b"),
+                  ("enable", "a/../b"), ("edit", "ssh.service")):
+            if wrun(*a) != 2:
+                errs.append(f"installed wrapper must refuse (rc 2): {a!r}")
+        after = log.read_text().splitlines() if log.exists() else []
+        if len(after) != before:
+            errs.append("installed wrapper executed systemctl for a refused call")
 
 # ── --check: drift must be a non-zero exit (the case must not fall through to exit 0) ────────
 good = ("yuzu_t ALL=(root) NOPASSWD: {W}\n")

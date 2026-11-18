@@ -107,12 +107,19 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
 
 /// Does `systemctl is-enabled`'s first output line show that the requested start mode took
 /// effect (WP13 governance UP11)? A privileged wrapper that exits 0 without acting (an empty or
-/// replaced file) must not be reported as success. Empty/unrecognised output is NOT a match
-/// (fail closed). `static`/`indirect`/`alias` units cannot be enabled or disabled and are
-/// accepted for automatic/manual, as `systemctl enable` itself exits 0 for them.
-///   automatic -> anything but disabled / masked
-///   manual    -> anything but enabled / masked
-///   disabled  -> masked / masked-runtime
+/// replaced file) must not be reported as success, so the state must be a member of a CLOSED set
+/// per requested mode; anything else (empty, `not-found`, `bad`, `transient`, `linked`, or
+/// diagnostic text such as "Failed to connect to bus") is NOT a match (fail closed).
+///
+/// Derivation from systemctl's documented `is-enabled` states (systemctl(1)): `enabled`,
+/// `enabled-runtime`, `linked`, `linked-runtime`, `alias`, `masked`, `masked-runtime`, `static`,
+/// `indirect`, `disabled`, `generated`, `transient`, `bad`, `not-found`. `static`, `indirect`,
+/// `alias` and `generated` units have no [Install] enablement a verb can change, and
+/// `systemctl enable|disable` exits 0 for them, so they are the legitimate end state of either
+/// verb. `linked*` and `transient` are not end states of enable, disable or mask.
+///   automatic -> enabled, enabled-runtime, static, indirect, alias, generated
+///   manual    -> disabled, static, indirect, alias, generated
+///   disabled  -> masked, masked-runtime
 [[nodiscard]] inline bool start_mode_took_effect(std::string_view mode, std::string_view state) {
     while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
         state.remove_suffix(1);
@@ -120,15 +127,25 @@ systemctl_mutation_argv(bool euid_is_root, std::string_view systemctl_path,
         state = state.substr(0, nl);
     if (state.empty())
         return false;
-    const bool masked = state == "masked" || state == "masked-runtime";
-    const bool enabled = state == "enabled" || state == "enabled-runtime";
+    const bool unchangeable = state == "static" || state == "indirect" || state == "alias" ||
+                              state == "generated";
     if (mode == "automatic")
-        return !masked && state != "disabled";
+        return unchangeable || state == "enabled" || state == "enabled-runtime";
     if (mode == "manual")
-        return !masked && !enabled;
+        return unchangeable || state == "disabled";
     if (mode == "disabled")
-        return masked;
+        return state == "masked" || state == "masked-runtime";
     return false;
+}
+
+/// The read-back as a whole: the `is-enabled` command itself must have RUN to completion (a
+/// spawn failure, deadline, cancel or signal is not a match) and its state must match. Its exit
+/// code is not required to be 0: `is-enabled` exits non-zero for `disabled` and `masked`.
+[[nodiscard]] inline bool start_mode_readback_matches(std::string_view mode,
+                                                      const yuzu::agent::SubprocessResult& res) {
+    if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())
+        return false;
+    return start_mode_took_effect(mode, res.output);
 }
 
 /// One row of `systemctl list-units --type=service [--all|--state=running]

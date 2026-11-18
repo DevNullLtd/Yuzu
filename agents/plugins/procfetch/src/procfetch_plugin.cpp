@@ -132,12 +132,10 @@ std::string read_first_line(const std::filesystem::path& path) {
     return line;
 }
 
-std::string resolve_exe(const std::filesystem::path& link) {
-    try {
-        return std::filesystem::read_symlink(link).string();
-    } catch (const std::filesystem::filesystem_error&) {
-        return {};
-    }
+// WP13 UP14: one readlink; a refusal (EACCES/EPERM, no CAP_SYS_PTRACE) is counted from that
+// same call's errno, ENOENT/ESRCH (exited process, kernel thread) is not.
+std::string resolve_exe(const std::filesystem::path& link, yuzu::shared::ProcAccessTally& tally) {
+    return yuzu::shared::readlink_noting(tally, link.c_str());
 }
 
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
@@ -161,9 +159,7 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         if (name.empty())
             continue;
 
-        std::string exe_path = resolve_exe(entry.path() / "exe");
-        if (exe_path.empty())
-            yuzu::shared::note_exe_failure(tally, static_cast<unsigned long>(pid));
+        std::string exe_path = resolve_exe(entry.path() / "exe", tally);
         std::string sha1;
         if (!exe_path.empty()) {
             std::error_code fe;

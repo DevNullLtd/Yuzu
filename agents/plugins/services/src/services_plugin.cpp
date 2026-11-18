@@ -551,10 +551,11 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
 
     // WP13 UP11: a root-owned wrapper that exits 0 without acting (empty/replaced file) would
     // otherwise be reported as success. Read the unit's state back (no privilege needed) and
-    // require it to match the requested mode; unreadable/empty state is a failure.
+    // require it to match the requested mode; a readback that did not run, or any state outside
+    // the closed set for the mode, is a failure.
     {
         auto st = run_command({systemctl_path, "is-enabled", "--", std::string(name)});
-        if (!yuzu::services::start_mode_took_effect(mode, st.output)) {
+        if (!yuzu::services::start_mode_readback_matches(mode, st)) {
             ctx.write_output(std::format(
                 "error|set_start_mode reported success but '{}' is not in mode '{}' (is-enabled: "
                 "'{}'); the privileged helper may not have acted",

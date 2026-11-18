@@ -201,7 +201,7 @@ struct HandleGuard {
     explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
 };
 
-std::string resolve_exe_path(unsigned long pid) {
+std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::ProcAccessTally& tally) {
     HandleGuard hg(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
     if (!hg)
         return "";
@@ -216,13 +216,13 @@ std::string resolve_exe_path(unsigned long pid) {
     return path; // ~HandleGuard closes the handle on every path
 }
 #elif defined(__linux__)
-std::string resolve_exe_path(unsigned long pid) {
-    std::string link = "/proc/" + std::to_string(pid) + "/exe";
-    std::array<char, 4096> buf{};
-    ssize_t n = readlink(link.c_str(), buf.data(), buf.size() - 1);
-    if (n <= 0)
+std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::ProcAccessTally& tally) {
+    // WP13 UP14: the refusal (EACCES without CAP_SYS_PTRACE) is counted from the SAME readlink
+    // that failed; ENOENT/ESRCH (kernel threads, exited processes) are not counted.
+    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+    std::string path = yuzu::shared::readlink_noting(tally, link.c_str());
+    if (path.empty())
         return "";
-    std::string path(buf.data(), static_cast<size_t>(n));
     // A replaced/removed binary reads as "<path> (deleted)" — strip the marker;
     // sha256_file then fails honestly (the on-disk image is gone).
     if (path.ends_with(" (deleted)"))
@@ -230,7 +230,7 @@ std::string resolve_exe_path(unsigned long pid) {
     return path;
 }
 #elif defined(__APPLE__)
-std::string resolve_exe_path(unsigned long pid) {
+std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::ProcAccessTally& tally) {
     std::array<char, PROC_PIDPATHINFO_MAXSIZE> buf{};
     int n = proc_pidpath(static_cast<int>(pid), buf.data(), buf.size());
     if (n <= 0)
@@ -238,23 +238,10 @@ std::string resolve_exe_path(unsigned long pid) {
     return std::string(buf.data(), static_cast<size_t>(n));
 }
 #else
-std::string resolve_exe_path(unsigned long) {
+std::string resolve_exe_path(unsigned long, yuzu::shared::ProcAccessTally&) {
     return "";
 }
 #endif
-
-// WP13 UP14: a non-root agent without CAP_SYS_PTRACE cannot readlink another user's
-// /proc/<pid>/exe (EACCES). The row is still emitted with empty path/hash, which is how
-// kernel threads render too, so declare the gap in the result status instead of leaving a
-// clean `OK` partial list. ENOENT/ESRCH (kernel threads, exited processes) are not counted.
-void note_exe_unreadable([[maybe_unused]] yuzu::shared::ProcAccessTally& tally,
-                         [[maybe_unused]] const std::string& path,
-                         [[maybe_unused]] unsigned long pid) {
-#if defined(__linux__)
-    if (path.empty())
-        yuzu::shared::note_exe_failure(tally, pid);
-#endif
-}
 
 void report_exe_gaps(yuzu::CommandContext& ctx, const yuzu::shared::ProcAccessTally& tally) {
     if (tally.constrained())
@@ -373,8 +360,7 @@ private:
         std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
         yuzu::shared::ProcAccessTally tally; // WP13 UP14
         for (const auto& p : procs) {
-            std::string path = resolve_exe_path(p.pid);
-            note_exe_unreadable(tally, path, p.pid);
+            std::string path = resolve_exe_path(p.pid, tally);
             std::string hash;
             if (!path.empty()) {
                 auto it = hash_cache.find(path);
@@ -403,8 +389,7 @@ private:
         std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
         yuzu::shared::ProcAccessTally tally; // WP13 UP14
         for (const auto& p : procs) {
-            std::string path = resolve_exe_path(p.pid);
-            note_exe_unreadable(tally, path, p.pid);
+            std::string path = resolve_exe_path(p.pid, tally);
             std::string hash;
             if (!path.empty()) {
                 auto it = hash_cache.find(path);

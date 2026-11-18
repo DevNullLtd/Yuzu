@@ -4730,6 +4730,14 @@ test('proc access status lexical gate (WP13/UP14)',
   suite: 'docs',
   timeout: 30,
 )
+# WP13: pins that the Echo $Module drain passes the real file-version stamp (read from the open
+# image) into SigningCache (source-text only; nothing builds the Windows leg here).
+test('echo module signing wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_echo_module_signing_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
 # PluginLoader::scan and passes allowlist_required (source-text only, so Python).
 test('plugin allowlist startup wiring lexical gate',

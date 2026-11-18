@@ -59,15 +59,59 @@ def grants(out: str):
     return lines
 
 
+_MSG_CMD = re.compile(r"^\s*(?:warn|log|info|fail|echo|printf)\b")
+_TOKEN = re.compile(r"(?<![\w-])setcap\b|\$\{?SETCAP\}?(?!\w)")
+
+
+def setcap_violations(code: str) -> list[str]:
+    """Every `setcap` token in code (any position: after `command`, `sudo`, `eval`, a pipe, a
+    variable `$SETCAP`) that is not `setcap -r` or a presence probe (`command -v setcap`).
+    A line that only emits a message (warn/log/info/fail/echo/printf "...") may NAME setcap in
+    its first quoted string; anything after that string is still scanned."""
+    bad = []
+    for line in code.splitlines():
+        scan = line
+        if _MSG_CMD.match(line):
+            scan = re.sub(r'^\s*\w+\s+"(?:[^"\\]|\\.)*"', "", line, count=1)
+        for m in _TOKEN.finditer(scan):
+            before = scan[:m.start()].rstrip()
+            after = scan[m.end():]
+            if re.search(r"(?:command\s+-v|type|which)$", before):
+                continue
+            if re.match(r"\s+-r(?!\w)", after):
+                continue
+            bad.append(line.strip())
+    return bad
+
+
+def _selftest_setcap_lint() -> None:
+    """Mutation guard for the lint itself: each of these MUST be reported / accepted."""
+    must_flag = ["run setcap cap_net_raw+ep \"$B\"", "command setcap cap_net_raw+ep \"$B\"",
+                 "$SETCAP cap_net_raw+ep \"$B\"", "\"${SETCAP}\" cap_net_raw+ep \"$B\"",
+                 "eval \"setcap cap_net_raw+ep $B\"", "sudo setcap cap_net_raw+ep $B",
+                 "x && setcap cap_net_raw+ep $B", "warn \"x\"; setcap cap_net_raw+ep $B",
+                 "setcap \"$caps\" \"$B\"", "/usr/sbin/setcap cap_net_raw+ep $B"]
+    must_pass = ["run setcap -r \"$B\"", "command -v setcap >/dev/null", "if ! command -v setcap; then",
+                 "warn \"setcap not installed\"", "warn \"remove with: setcap -r $B\"",
+                 "SKIP_SETCAP=1"]
+    for l in must_flag:
+        if not setcap_violations(l):
+            fail(f"setcap lint self-test: not flagged: {l!r}")
+    for l in must_pass:
+        if setcap_violations(l):
+            fail(f"setcap lint self-test: wrongly flagged: {l!r}")
+
+
 def main() -> int:
+    _selftest_setcap_lint()
     with tempfile.TemporaryDirectory(prefix="yuzu_test_installer_lint_") as d:
         binary = pathlib.Path(d) / "yuzu-agent"
         binary.write_text("x")
 
         # ── F21: no setcap grant anywhere in the script ───────────────────────────────
         code = "\n".join(l for l in SRC.splitlines() if not l.lstrip().startswith("#"))
-        for m in re.finditer(r"(?:^|\brun\s+)\s*setcap\s+(?!-r\b)[^\n]*", code, re.M):
-            fail(f"installer invokes setcap other than `setcap -r`: {m.group(0)!r}")
+        for v in setcap_violations(code):
+            fail(f"installer invokes setcap other than `setcap -r`: {v!r}")
         if "setcap -r" not in code:
             fail("installer must strip file capabilities (`setcap -r`)")
         if re.search(r"^apply_setcap\b", code, re.M):

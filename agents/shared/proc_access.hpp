@@ -4,18 +4,19 @@
 /// /proc/<pid>/exe or /proc/<pid>/fd of another user's processes: readlink/opendir fail with
 /// EACCES. The /proc walkers (processes, procfetch, netstat) skipped those silently and still
 /// reported a clean result, so a dev/UAT agent that lost the file capability (or the packaged
-/// unit, which never had it) returned a partial list as `OK`. This tally lets each walker count
+/// unit, which carries none) returned a partial list as `OK`. This tally lets each walker count
 /// the permission refusals (and ONLY those: ENOENT/ESRCH are ordinary process churn and kernel
 /// threads) so it can declare CONSTRAINED/PARTIAL honestly.
 ///
-/// Pure + header-only; the single syscall helper is POSIX-only and failure-path only.
+/// Pure + header-only; the single syscall helper is Linux-only.
 
 #include <cerrno>
 #include <cstddef>
+#include <string>
 
 #if defined(__linux__)
 #include <unistd.h>
-#include <string>
+#include <sys/types.h>
 #endif
 
 namespace yuzu::shared {
@@ -35,14 +36,25 @@ struct ProcAccessTally {
 };
 
 #if defined(__linux__)
-/// Call AFTER a /proc/<pid>/exe readlink failed (empty result): re-reads the failure's errno
-/// from a second readlink so the walkers keep their existing helper signatures.
-inline void note_exe_failure(ProcAccessTally& tally, unsigned long pid) {
-    char buf[8];
-    const std::string link = "/proc/" + std::to_string(pid) + "/exe";
+/// Reads the symlink `link` (a /proc/<pid>/exe path) with ONE readlink call. On failure the
+/// errno of THAT call is counted (a second read could see ENOENT after the process exited, or
+/// a changed access decision, and erase a genuine EACCES) and "" is returned. `fn` is the
+/// readlink implementation, a seam for tests.
+template <class ReadlinkFn>
+[[nodiscard]] inline std::string readlink_noting_with(ProcAccessTally& tally, const char* link,
+                                                      ReadlinkFn fn) {
+    char buf[4096];
     errno = 0;
-    if (::readlink(link.c_str(), buf, sizeof(buf)) < 0)
+    const ssize_t n = fn(link, buf, sizeof(buf) - 1);
+    if (n < 0) {
         tally.note(errno);
+        return {};
+    }
+    return std::string(buf, static_cast<std::size_t>(n));
+}
+
+[[nodiscard]] inline std::string readlink_noting(ProcAccessTally& tally, const char* link) {
+    return readlink_noting_with(tally, link, ::readlink);
 }
 #endif
 

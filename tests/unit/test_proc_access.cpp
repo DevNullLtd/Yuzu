@@ -33,7 +33,40 @@ TEST_CASE("proc_access: a non-root caller reading PID 1's exe is a counted refus
         SKIP("this process can read /proc/1/exe (privileged) or /proc/1 is hidden");
     }
     ProcAccessTally t;
-    yuzu::shared::note_exe_failure(t, 1);
+    CHECK(yuzu::shared::readlink_noting(t, "/proc/1/exe").empty());
     CHECK(t.constrained());
+}
+
+TEST_CASE("proc_access: the errno of the FIRST failed readlink is counted, not a later read's",
+          "[proc_access][up14]") {
+    // A process that exits between two reads would turn a genuine EACCES into ENOENT; the
+    // helper must make exactly one call and count that call's errno.
+    int calls = 0;
+    auto eacces_then_enoent = [&calls](const char*, char*, std::size_t) -> ssize_t {
+        errno = (++calls == 1) ? EACCES : ENOENT;
+        return -1;
+    };
+    ProcAccessTally t;
+    CHECK(yuzu::shared::readlink_noting_with(t, "/proc/1/exe", eacces_then_enoent).empty());
+    CHECK(calls == 1);
+    CHECK(t.refused == 1);
+
+    // ENOENT on the first call is churn, not a refusal.
+    ProcAccessTally gone;
+    auto enoent = [](const char*, char*, std::size_t) -> ssize_t {
+        errno = ENOENT;
+        return -1;
+    };
+    CHECK(yuzu::shared::readlink_noting_with(gone, "/proc/1/exe", enoent).empty());
+    CHECK_FALSE(gone.constrained());
+
+    // A successful read returns the target and counts nothing.
+    ProcAccessTally ok;
+    auto good = [](const char*, char* buf, std::size_t) -> ssize_t {
+        buf[0] = '/'; buf[1] = 'x';
+        return 2;
+    };
+    CHECK(yuzu::shared::readlink_noting_with(ok, "/proc/1/exe", good) == "/x");
+    CHECK_FALSE(ok.constrained());
 }
 #endif

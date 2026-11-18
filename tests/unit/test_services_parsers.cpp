@@ -372,3 +372,41 @@ TEST_CASE("start_mode_took_effect: the read-back must match the requested mode, 
     CHECK_FALSE(start_mode_took_effect("automatic", "")); // a 0-byte wrapper leaves nothing to read
     CHECK_FALSE(start_mode_took_effect("bogus", "enabled"));
 }
+
+TEST_CASE("start_mode_took_effect: error text and non-end states never match (closed set)",
+          "[services][up11]") {
+    using yuzu::services::start_mode_took_effect;
+    for (const char* mode : {"automatic", "manual", "disabled"}) {
+        CHECK_FALSE(start_mode_took_effect(mode, "not-found\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "Failed to connect to bus: No such file or directory\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "bad\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "transient\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "linked\n"));
+        CHECK_FALSE(start_mode_took_effect(mode, "Unit foo.service not found.\n"));
+    }
+    for (const char* st : {"enabled", "enabled-runtime", "static", "indirect", "alias", "generated"})
+        CHECK(start_mode_took_effect("automatic", st));
+    for (const char* st : {"disabled", "static", "indirect", "alias", "generated"})
+        CHECK(start_mode_took_effect("manual", st));
+    CHECK_FALSE(start_mode_took_effect("manual", "enabled-runtime"));
+    CHECK(start_mode_took_effect("disabled", "masked-runtime"));
+    CHECK_FALSE(start_mode_took_effect("disabled", "static"));
+}
+
+TEST_CASE("start_mode_readback_matches: a readback that did not run is not a match",
+          "[services][up11]") {
+    using yuzu::services::start_mode_readback_matches;
+    yuzu::agent::SubprocessResult ran;
+    ran.tool_ran = true;
+    ran.termination_reason = yuzu::agent::TerminationReason::exited;
+    ran.exit_code = 1; // is-enabled exits non-zero for `disabled`
+    ran.output = "disabled\n";
+    CHECK(start_mode_readback_matches("manual", ran));
+    yuzu::agent::SubprocessResult not_ran = ran;
+    not_ran.tool_ran = false;
+    CHECK_FALSE(start_mode_readback_matches("manual", not_ran));
+    yuzu::agent::SubprocessResult timed = ran;
+    timed.timed_out = true;
+    timed.termination_reason = yuzu::agent::TerminationReason::deadline;
+    CHECK_FALSE(start_mode_readback_matches("manual", timed));
+}
