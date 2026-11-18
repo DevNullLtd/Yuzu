@@ -305,13 +305,15 @@ agent_map() { # container,agent id,session per agent (session via the route tabl
         sess=""
         if [ -n "$fp" ]; then
             # Exactly one route row or the whole map fails (shared with the tests, scripts/lib).
-            sess="$(route_session_for_fp "$fp")" || { echo "agent_map: cannot resolve the session for $name" >&2; return 1; }
+            sess="$(route_session_for_fp "$fp")" || { echo "agent_map: cannot resolve the session for $name" >&2; rm -f "$run/agent_map.csv.tmp"; return 1; }
         else
             echo "agent_map: no session_fp on the Registered line of $name; cannot resolve its session" >&2
+            rm -f "$run/agent_map.csv.tmp"
             return 1
         fi
         echo "$name,$c,$sess"
-    done > "$run/agent_map.csv"
+    done > "$run/agent_map.csv.tmp" || { rm -f "$run/agent_map.csv.tmp"; return 1; }
+    mv "$run/agent_map.csv.tmp" "$run/agent_map.csv"
 }
 
 # settle_fleet : undo faults and restart the agents so every scenario starts from the same shape
@@ -380,7 +382,7 @@ cmd_scenario() {
     local run="$STATE/run-$id-$(date +%H%M%S)"; mkdir -p "$run"; RUN_ACTIVE="$run"
     local total; total="$(compose ps -q agent | wc -l)"
     say "scenario $id agents=$total window=${window}s sample=$sample -> $run"
-    agent_map "$run"
+    agent_map "$run" || die "agent_map failed; refusing to measure on a partial agent map"
 
     # victim = the requested gateway, else the one holding the most agents
     local vc="$victim_c" victim_node=""

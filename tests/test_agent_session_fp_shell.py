@@ -201,6 +201,50 @@ def main():
                 bad.append(f"{name} must resolve sessions through route_session_for_fp")
             if '|| { echo "agent_map: cannot resolve the session' not in txt or "return 1; }" not in txt:
                 bad.append(f"{name}: a failed lookup must return 1")
+        # BEHAVIOURAL: the REAL agent_map function and its REAL call line, extracted from each HA
+        # script, with stubbed compose/docker/psql_q. A lookup that yields zero rows, many rows or a
+        # failure for the SECOND agent must stop the caller (non-zero, never "CALLER CONTINUED") and
+        # leave NO csv (not even a partial one); all-good must write both rows.
+        import re as _re
+        fp1, fp2 = "aaaaaaaa", "bbbbbbbb"
+        for name in ("ha-gateway-failover-spike.sh", "ha-gateway-two-replica-probe.sh"):
+            txt = (ROOT / "scripts/ha" / name).read_text()
+            m = _re.search(r"^agent_map\(\) \{.*?^\}\n", txt, _re.S | _re.M)
+            call = _re.search(r'^[ \t]*agent_map "\$run"(?=[ \t]|$).*$', txt, _re.M)
+            if not m or not call:
+                bad.append(f"{name}: agent_map or its guarded call line not found")
+                continue
+            for case, rows in (("good", "one"), ("zero", "zero"), ("many", "many"), ("failed", "failed")):
+                rd = d / f"ha-{name}-{case}"
+                rd.mkdir()
+                stub = f"""
+compose() {{ printf 'c1\\nc2\\n'; }}
+cname() {{ echo "$1"; }}
+docker() {{ case "$1" in
+  inspect) echo "/n-$3" ;;
+  logs) case "$2" in c1) echo "Registered with server (session_fp={fp1}, enrollment=e)";;
+                     *) echo "Registered with server (session_fp={fp2}, enrollment=e)";; esac ;;
+esac; }}
+psql_q() {{ case "$1" in
+  *"'{fp1}%'"*) echo s-one ;;
+  *) case "{rows}" in one) echo s-two;; zero) :;; many) printf 'x\\ny\\n';; failed) return 2;; esac ;; esac; }}
+die() {{ echo "DIE: $*" >&2; exit 2; }}
+run='{rd.as_posix()}'
+{m.group(0)}
+{call.group(0).strip()}
+echo "CALLER CONTINUED"
+"""
+                r = bash(stub)
+                csv = rd / "agent_map.csv"
+                tmpcsv = rd / "agent_map.csv.tmp"
+                if case == "good":
+                    if "CALLER CONTINUED" not in r.stdout or not csv.exists() or len(csv.read_text().splitlines()) != 2 \
+                            or "s-one" not in csv.read_text() or "s-two" not in csv.read_text():
+                        bad.append(f"{name}/good: rc={r.returncode} out={r.stdout!r} err={r.stderr!r}")
+                else:
+                    if r.returncode == 0 or "CALLER CONTINUED" in r.stdout or csv.exists() or tmpcsv.exists():
+                        bad.append(f"{name}/{case}: must stop the caller with no csv: rc={r.returncode} "
+                                   f"out={r.stdout!r} csv={csv.exists()} tmp={tmpcsv.exists()}")
     for b in bad:
         print("FAIL:", b)
     if bad:
