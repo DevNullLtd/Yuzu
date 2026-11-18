@@ -42,7 +42,9 @@ enum class GapCause {
     permission_denied,
     dataless,
     private_namespace,
-    name_too_long // an entry whose name cannot be held in a Position (too long, or a slash or NUL): not searched
+    // an entry whose name a Position cannot hold (valid_component false: over kMaxNameBytes, or
+    // holding '/' or NUL): not searched
+    name_too_long
 };
 
 [[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {

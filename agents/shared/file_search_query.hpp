@@ -125,6 +125,8 @@ public:
     [[nodiscard]] bool matches_counted(std::string_view raw_name, std::size_t& steps) const {
         return evaluate_counted(raw_name, steps) == Match::yes;
     }
+
+    /// evaluate(), also reporting the matcher's work (see matches_counted).
     [[nodiscard]] Match evaluate_counted(std::string_view raw_name, std::size_t& steps) const {
         const std::string name = canon_fn_ ? canon_fn_(raw_name) : std::string(raw_name);
         if (name.size() > kMaxCanonicalNameBytes)

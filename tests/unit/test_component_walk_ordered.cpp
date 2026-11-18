@@ -590,6 +590,22 @@ TEST_CASE("walk_ordered: unknown identities never trigger other_device; a known 
         CHECK(res.restarted);
         CHECK(r.visits == Strs{"/r/a/x"});
     }
+    SECTION("per half: a recorded device that reads unknown is a change even when the file id matches") {
+        r.ids["/r/a"] = {0, 9}; // file id reported and equal, device now unreported
+        const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 9}}, "x"}, one);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a/x"});
+    }
+    SECTION("per half: a recorded root device alone that reads unknown is a change") {
+        const auto res = slice(r, fsr::Position{4, 0, {{"a", 0, 0}}, "x"}, one);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a"});
+    }
+    SECTION("per half: a recorded root file id alone that reads unknown is a change") {
+        const auto res = slice(r, fsr::Position{0, 4, {{"a", 0, 0}}, "x"}, one);
+        CHECK(res.restarted);
+        CHECK(r.visits == Strs{"/r/a"});
+    }
     SECTION("per half: a half the record left unknown and the listing now reports is refinement") {
         r.ids["/r/a"] = {1, 9};
         const auto res = slice(r, fsr::Position{0, 0, {{"a", 1, 0}}, "x"}, one);
@@ -651,6 +667,21 @@ TEST_CASE("walk_ordered: an entry whose name a Position cannot hold is a name_to
     CHECK(rest.stop == Stop::complete);
     REQUIRE(!rest.gaps.empty());
     CHECK(rest.gaps[0].cause == Cause::name_too_long);
+}
+
+TEST_CASE("walk_ordered: a directory whose name a Position cannot hold is a gap and is not descended",
+          "[walk_ordered][file_search][component_walk]") {
+    Rig r;
+    const std::string wide = "b" + std::string(fsr::kMaxNameBytes, 'w');
+    r.dir("/r", {D("a"), D(wide), D("c")});
+    r.dir("/r/a", {F("x")});
+    r.dir("/r/c", {F("y")});
+    const auto res = slice(r, {}, {});
+    CHECK(res.stop == Stop::complete);
+    CHECK(r.visits == Strs{"/r/a", "/r/a/x", "/r/c", "/r/c/y"}); // the wide directory is not visited
+    REQUIRE(res.gaps.size() == 1);
+    CHECK(res.gaps[0].cause == Cause::name_too_long);
+    CHECK(res.gaps[0].path == "/r/" + wide);
 }
 
 TEST_CASE("walk_ordered: an unplaceable name never pins bounded continuations, whatever the budget",

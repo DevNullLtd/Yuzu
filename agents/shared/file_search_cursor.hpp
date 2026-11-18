@@ -154,8 +154,7 @@ private:
 
 /// Empty for a Cursor whose position is not valid_position (a producer bug: the ordered walker
 /// reports a listed name over kMaxNameBytes as a gap and never places it; decode_cursor of the empty
-/// token is bad_prefix), so a hostile name can never be
-/// written to the wire. Empty from a slice that did not complete is an error, never "finished".
+/// token is bad_prefix), so a hostile name can never be written to the wire. Empty from a slice that did not complete is an error, never "finished".
 [[nodiscard]] inline std::string encode_cursor(const Cursor& c) {
     if (!valid_position(c.position))
         return {};

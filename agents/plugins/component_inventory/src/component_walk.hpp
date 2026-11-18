@@ -383,13 +383,12 @@ private:
             }
 
             // A name a Position cannot hold (valid_component false: over kMaxNameBytes, or holding a
-            // slash or NUL) is never placed in one, or the
-            // cursor for this slice would be empty and every retry would stall at this directory.
-            // It is not searched and says so. It is judged BEFORE the budget checks and costs none
-            // of the entry budget: charged, it would be consumed again by every retry that stops
-            // on the next entry, with the position never moving past it. After a slice boundary
-            // right here the entry is met and reported again: the gap count may over-count, never
-            // under-count.
+            // slash or NUL) is never placed in one, or the cursor for this slice would be empty and
+            // every retry would stall at this directory. It is not searched and says so. It is judged
+            // BEFORE the budget checks and costs none of the entry budget: charged, it would be
+            // consumed again by every retry that stops on the next entry, with the position never
+            // moving past it. After a slice boundary right here the entry is met and reported again:
+            // the gap count may over-count, never under-count.
             if (!fsr::valid_component(e.name)) {
                 add_gap(walk_detail::join(path, e.name), Cause::name_too_long);
                 continue;
@@ -471,7 +470,8 @@ private:
  *
  * LISTINGS. Every listing comes from fs.list(dir, limits.max_dir_entries) and is sorted by name bytes
  * here (never trusted to arrive sorted; a repeated name keeps its first entry). Entries that are empty,
- * "." or ".." are ignored; every other entry counts one in stats.entries. Links count links_skipped;
+ * "." or ".." are ignored; every other entry counts one in stats.entries, except a name_too_long entry
+ * (a gap, not counted). Links count links_skipped;
  * a network_mount counts mounts_skipped and adds a network_mount gap; any other type is skipped. A
  * listing with error is a dir_unreadable gap. A listing that is truncated or longer than
  * max_dir_entries is a dir_truncated gap and NONE of its entries is visited (a partial listing cannot
@@ -523,8 +523,8 @@ private:
  * the resume point of a directory that kept its identity, a completed directory swapped for another of
  * the same name, and a replacement that reports the same identity as the directory it replaced (a
  * filesystem may reuse one), or differs from it only in halves (device, file id) that the RECORD left
- * unreported: the rule is per half, and a half the record knows that the replacement does not report is
- * a change, detected. Such entries are not visited. A walk of more than one slice is
+ * unreported. Entries missed that way are not visited. (The rule is per half: a half the record knows
+ * that the replacement does not report IS a change, and is detected.) A walk of more than one slice is
  * not a snapshot.
  *
  * MEMORY. The sorted listings of the directories currently entered are held and the entry budget does
