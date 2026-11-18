@@ -11,6 +11,9 @@
  *   Linux:   svc|name|status|description
  *   macOS:   svc|label|pid|status|startup_type
  *   set_start_mode success: status|ok\nservice|<name>\nmode|<mode>
+ *                           Linux also: state|<is-enabled state>, and note|<text> (with a typed
+ *                           CONSTRAINED/PARTIAL result, services:start_mode_unchangeable) when the
+ *                           unit is static, indirect, alias or generated
  *   set_start_mode failure: error|<message>
  *
  * macOS startup_type (C-1.12): derived from ONE bulk `launchctl print-disabled
@@ -522,11 +525,11 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         return 1;
     }
     std::vector<std::string> argv = std::move(*argv_opt);
-    if (mode == "manual") {
-        // If the service was previously masked, unmask it first so disable
-        // works. Best-effort, same as before: its result is intentionally
-        // not inspected (a service that was never masked has nothing to
-        // unmask, and the following disable is the actual mode change).
+    if (mode != "disabled") {
+        // `enable` and `disable` both fail on a masked unit, so for automatic and manual unmask
+        // first. Best-effort: its result is intentionally not inspected (a unit that was never
+        // masked has nothing to unmask and `unmask` exits 0 for it; the following enable or
+        // disable is the actual mode change).
         if (auto unmask = build("unmask"))
             run_command(*unmask);
     }
@@ -566,8 +569,9 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
         if (!yuzu::services::start_mode_readback_matches(mode, st)) {
             ctx.write_output(std::format(
                 "error|set_start_mode: '{}' is not in mode '{}' after the privileged helper ran "
-                "(is-enabled: '{}'); the helper may not have acted, or the change may already be "
-                "applied and the readback unreadable (re-running is idempotent)",
+                "(is-enabled: '{}'); the helper may not have acted, or the unit is in a state "
+                "that mode does not accept (for example linked). Check `systemctl is-enabled` "
+                "on the host before retrying",
                 name, mode, st.output.substr(0, st.output.find('\n'))));
             return 1;
         }

@@ -66,7 +66,7 @@ def problems(sources):
     errs = []
     for path, token in PINS.items():
         src = sources[path]
-        live = lexh.lex(lexh.drop_if0(src))  # string contents kept, comments / #if 0 removed
+        live = lexh.live_text(src)  # string contents kept, comments / #if 0 removed
         if token not in live:
             errs.append(f"{path}: missing {token}")
         if "proc_access.hpp" not in src or "ProcAccessTally" not in lexh.code_only(src):

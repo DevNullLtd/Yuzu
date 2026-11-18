@@ -124,6 +124,9 @@ jobs:
           python3 -I tests/test_plugin_allowlist_wiring_lexical.py
           python3 -I tests/test_installed_apps_no_brew_lexical.py
           python3 -I tests/test_proc_access_status_lexical.py
+          python3 -I tests/cpp_lex_helper.py
+          python3 -I tests/test_echo_module_signing_wiring_lexical.py
+          python3 -I tests/test_services_readback_wiring_lexical.py
 
       # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
       # label; no unit test builds ServerImpl, so dropping it leaves every test green.

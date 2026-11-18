@@ -42,13 +42,15 @@ def lex(src: str, keep_strings: bool = True) -> str:
         if src.startswith("//", i):
             j = src.find("\n", i)
             # a backslash-newline continues a // comment onto the next line
-            while j > 0 and src[j - 1] == "\\" and src.find("\n", j + 1) >= 0:
+            while j > 0 and (src[j - 1] == "\\" or src[j - 2:j] == "\\\r") and src.find("\n", j + 1) >= 0:
                 j = src.find("\n", j + 1)
             i = n if j < 0 else j  # newline itself handled as whitespace
             continue
         if src.startswith("/*", i):
             j = src.find("*/", i + 2)
-            i = n if j < 0 else j + 2
+            end = n if j < 0 else j + 2
+            out.append("\n" * src.count("\n", i, end))  # keep line numbers aligned
+            i = end
             continue
         if c.isspace():
             out.append(c)
@@ -67,14 +69,16 @@ def lex(src: str, keep_strings: bool = True) -> str:
             while i < n and src[i] != '"' and src[i] != "\n":
                 if src[i] == "\\" and i + 1 < n:
                     d, i = _decode_escape(src, i + 1)
-                    buf.append(d)
+                    buf.append("\\n" if d == "\n" else d)  # keep the source line count
                 else:
                     buf.append(src[i])
                     i += 1
             i += 1  # closing quote
             content = "".join(buf)
-        elif c == "'" and not (i > 0 and (src[i - 1].isalnum() or src[i - 1] == "_")):
-            # character literal (a digit separator 1'000 is excluded by the check above)
+        elif c == "'" and (not (i > 0 and (src[i - 1].isalnum() or src[i - 1] == "_"))
+                           or re.search(r"(?<![A-Za-z0-9_])(?:u8|u|U|L)$", src[max(0, i - 3):i])):
+            # character literal, plain or prefixed (u8'x', u'x', U'x', L'x'); a digit separator
+            # (1'000, 0x1'F) has an alphanumeric char before it and no such prefix
             i += 1
             while i < n and src[i] != "'" and src[i] != "\n":
                 i += 2 if src[i] == "\\" else 1
@@ -87,6 +91,7 @@ def lex(src: str, keep_strings: bool = True) -> str:
             last_is_str = False
             i += 1
             continue
+        raw_newlines = content.count("\n")
         if not keep_strings:
             content = ""
         if last_is_str:
@@ -94,38 +99,83 @@ def lex(src: str, keep_strings: bool = True) -> str:
         else:
             out.append('"' + content + '"')
             last_idx = len(out) - 1
+        if not keep_strings and raw_newlines:
+            out.append("\n" * raw_newlines)  # a multi-line raw string keeps its line count
         last_is_str = True
     return "".join(out)
 
 
-def drop_if0(src: str) -> str:
-    """Remove `#if 0 ... #endif` (nesting-aware; an `#else` branch is kept)."""
-    out, depth, skipping = [], 0, False
-    skip_depth = 0
-    for line in src.splitlines(keepends=True):
-        s = line.strip()
-        if re.match(r"#\s*if(def|ndef)?\b", s):
-            depth += 1
-            if not skipping and re.match(r"#\s*if\s+(?:0|\(\s*0\s*\)|false|FALSE)\s*(?://.*|/\*.*)?$", s):
-                skipping, skip_depth = True, depth
-                continue
-        elif re.match(r"#\s*(?:else|elif)\b", s) and skipping and depth == skip_depth:
-            skipping = False
+_ZERO = re.compile(r"#\s*if\s+(?:0[0-7]*[uUlL]*|\(\s*0[0-7]*[uUlL]*\s*\)|false|FALSE|!\s*1|!\s*\(\s*1\s*\)|!\s*true)\s*$")
+_ONE = re.compile(r"#\s*if\s+(?:1|\(\s*1\s*\)|true|TRUE|!\s*0|!\s*\(\s*0\s*\))\s*$")
+
+
+def _lines(text: str) -> list[str]:
+    """Split on '\\n' only (str.splitlines also splits on \\r, \\v, \\f and Unicode separators)."""
+    return re.findall(r"[^\n]*\n|[^\n]+", text)
+
+
+def dead_lines(masked: str) -> set[int]:
+    """Indices of lines inside a dead preprocessor branch, from COMMENT- AND STRING-FREE text
+    (lex(..., keep_strings=False)): `#if 0` / `#if (0)` / `#if 00` / `#if 0L` / `#if false` /
+    `#if !1` are dead until their `#else`/`#elif`/`#endif`; the `#else`/`#elif` branch of an
+    `#if 1` / `#if true` / `#if !0` is dead. Directive lines inside a dead branch are dead."""
+    dead: set[int] = set()
+    stack: list[dict] = []
+    for idx, line in enumerate(_lines(masked)):
+        d = line.strip()
+        top_skip = stack[-1]["skip"] if stack else False
+        if re.match(r"#\s*if(?:def|ndef)?\b", d):
+            e = {"skip": top_skip, "zero": False, "one": False, "parent": top_skip}
+            if top_skip:
+                dead.add(idx)
+            elif _ZERO.match(d):
+                e["skip"], e["zero"] = True, True
+                dead.add(idx)
+            elif _ONE.match(d):
+                e["one"] = True
+            stack.append(e)
             continue
-        elif re.match(r"#\s*endif\b", s):
-            if skipping and depth == skip_depth:
-                skipping = False
-                depth -= 1
-                continue
-            depth -= 1
-        if not skipping:
-            out.append(line)
-    return "".join(out)
+        if re.match(r"#\s*(?:else|elif)\b", d) and stack:
+            e = stack[-1]
+            if e["parent"]:
+                e["skip"] = True
+            elif e["zero"]:
+                e["skip"] = False  # the branch after a dead `#if 0` is live (an #elif is treated live)
+            elif e["one"]:
+                e["skip"] = True
+            if e["skip"]:
+                dead.add(idx)
+            continue
+        if re.match(r"#\s*endif\b", d) and stack:
+            if stack[-1]["skip"]:
+                dead.add(idx)
+            stack.pop()
+            continue
+        if top_skip:
+            dead.add(idx)
+    return dead
+
+
+def _filter(src: str, keep_strings: bool) -> str:
+    dead = dead_lines(lex(src, keep_strings=False))
+    lines = _lines(lex(src, keep_strings=keep_strings))
+    # Both lexes keep every source line (block comments and raw strings emit their newlines), so
+    # indices align; a disagreement is a tokenizer bug and fails loudly.
+    if len(lines) != len(_lines(lex(src, keep_strings=False))):
+        raise AssertionError("cpp_lex_helper: keep/blank lexes disagree on the line count")
+    return "".join(l for k, l in enumerate(lines) if k not in dead)
+
+
+def live_text(src: str) -> str:
+    """Comments (line, block, backslash-continued) and dead preprocessor branches removed,
+    string contents KEPT. Dead-branch detection runs on comment- and string-free text, so a
+    `#if 0` inside a comment or string cannot start one."""
+    return _filter(src, True)
 
 
 def code_only(src: str) -> str:
-    """Comments, `#if 0` blocks and string-literal contents removed; whitespace collapsed."""
-    return re.sub(r"\s+", " ", lex(drop_if0(src), keep_strings=False))
+    """As live_text but string-literal contents blanked to `""`; whitespace collapsed."""
+    return re.sub(r"\s+", " ", _filter(src, False))
 
 
 # Non-goals (a regex-free tokenizer cannot evaluate them): `#ifdef NEVER` / `#ifndef ALWAYS`
@@ -136,21 +186,40 @@ def code_only(src: str) -> str:
 def _selftest() -> list[str]:
     """Direct self-test of the tokenizer shapes the gates depend on; returns failure messages."""
     cases = [
+        
         ("line comment", 'a(); // b();\n', "b()", False),
         ("backslash-continued line comment", 'a(); // x \\\n b();\nc();', "b()", False),
+        ("CRLF backslash-continued comment", 'a(); // x \\\r\n b();\r\nc();', "b()", False),
         ("block comment", 'a(); /* b(); */ c();', "b()", False),
         ("string contents blanked", 'a("b();"); c();', "b()", False),
         ("string with escaped quote", 'a("x\\"y"); keep();', "keep()", True),
         ("string with escaped quote hides call", 'a("x\\" b(); "); keep();', "b()", False),
         ("raw string with quote", 'a(R"(x"y)"); keep();', "keep()", True),
         ("raw string hides call", 'a(R"(x" b(); ")"); keep();', "b()", False),
+        ("char literal quote", "a('\"'); b(); keep();", "keep()", True),
+        ("char literal quote hides nothing", "a('\"'); b(); keep();", "b()", True),
+        ("L'\"' char literal", "a(L'\"'); b(); keep();", "keep()", True),
+        ("u8'\"' char literal", "a(u8'\"'); b(); keep();", "keep()", True),
+        ("u'\"' / U'\"' char literals", "a(u'\"', U'\"'); b(); keep();", "keep()", True),
+        ("digit separator", "int x = 1'000'000; b(); keep();", "keep()", True),
+        ("hex digit separator", "int x = 0xFF'FF; b(); keep();", "keep()", True),
         ("adjacent literals joined (kept)", 'a("b" "c");', None, None),
         ("#if 0", "#if 0\nb();\n#endif\nkeep();", "b()", False),
         ("#if (0)", "#if (0)\nb();\n#endif\nkeep();", "b()", False),
         ("#if false", "#if false\nb();\n#endif\nkeep();", "b()", False),
+        ("#if 00", "#if 00\nb();\n#endif\nkeep();", "b()", False),
+        ("#if 0L", "#if 0L\nb();\n#endif\nkeep();", "b()", False),
+        ("#if !1", "#if !1\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0 else branch kept", "#if 0\nb();\n#else\nkeep();\n#endif", "keep()", True),
         ("#if 0 nested", "#if 0\n#if X\nb();\n#endif\nb();\n#endif\nkeep();", "b()", False),
         ("#if 1 kept", "#if 1\nkeep();\n#endif", "keep()", True),
+        ("#if 1 #else dropped", "#if 1\nkeep();\n#else\nb();\n#endif", "b()", False),
+        ("#if 1 #else keeps the live branch", "#if 1\nkeep();\n#else\nb();\n#endif", "keep()", True),
+        ("#if 0 inside a block comment is not a directive", "/*\n#if 0\n*/\nkeep();\nb();", "b()", True),
+        ("#if 0 inside a string is not a directive", 'a("\\n#if 0\\n");\nb();\nkeep();', "b()", True),
+        ("CRLF #if 0", "#if 0\r\nb();\r\n#endif\r\nkeep();\r\n", "b()", False),
+        ("CRLF #if 0 keeps after", "#if 0\r\nb();\r\n#endif\r\nkeep();\r\n", "keep()", True),
+        ("multi-line raw string keeps line alignment", 'a(R"(\nx\n)");\n#if 0\nb();\n#endif\nkeep();', "b()", False),
     ]
     errs = []
     for name, src, token, want in cases:
@@ -161,6 +230,20 @@ def _selftest() -> list[str]:
         got = token in code_only(src)
         if got != want:
             errs.append(f"{name}: expected {token!r} present={want}, got {got} ({code_only(src)!r})")
+    # live_text (strings kept) must agree with code_only on dead branches, even when a string
+    # holds an escaped newline or a raw string spans lines.
+    for name, src, token, want in [
+        ("live_text: escaped newline in a string", 'a("x\\ny");\n#if 0\nb();\n#endif\nkeep();', "b()", False),
+        ("live_text: raw string spans lines", 'a(R"(x\ny)");\n#if 0\nb();\n#endif\nkeep();', "b()", False),
+        ("live_text: strings kept", 'a("keepme");', "keepme", True),
+    ]:
+        try:
+            got = token in live_text(src)
+        except AssertionError as exc:  # noqa: BLE001
+            errs.append(f"{name}: {exc}")
+            continue
+        if got != want:
+            errs.append(f"{name}: expected {token!r} present={want}, got {got}")
     return errs
 
 
