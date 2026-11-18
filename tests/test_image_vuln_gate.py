@@ -213,7 +213,7 @@ class GateBehaviour(unittest.TestCase):
         self.log = self.tmp / "calls.log"
 
     def run_gate(self, *images, mode="clean", ignore=IGNORE, bad_image="", extra=(), missing="",
-                 db="fresh", os_pkgs="5", env_extra=None):
+                 db="fresh", os_pkgs="5", env_extra=None, gate=GATE):
         env = dict(os.environ)
         for k in list(env):
             if k.startswith("TRIVY_") or k.startswith("STUB_"):
@@ -237,7 +237,7 @@ class GateBehaviour(unittest.TestCase):
             if v is None:
                 del env[k]
         return subprocess.run(
-            ["bash", str(GATE), *extra, *images],
+            ["bash", str(gate), *extra, *images],
             env=env, capture_output=True, text=True, timeout=60,
         )
 
@@ -777,14 +777,22 @@ class GateBehaviour(unittest.TestCase):
                 self.assertIn(why, (rep / "trivy-img.gate.txt").read_text(encoding="utf-8"))
 
     def test_release_mode_does_not_honour_a_pending_not_covered_listing(self):
-        # The repository's list is pending today: a release refuses the chisel
-        # images as unscanned until the approving pull request is recorded.
-        nc = NOT_COVERED.read_text(encoding="utf-8")
-        if "approval_ref=pending" not in nc:
-            self.skipTest("no pending listing in the repository list")
-        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", extra=("--release",))
+        # A release refuses a chisel image as unscanned while its not-covered
+        # listing is pending. The gate reads the list beside itself, so run a
+        # copy of the gate in a scratch tree whose list holds a pending line
+        # (hermetic: independent of the repository list's current state).
+        ci = self.tmp / "tree" / "scripts" / "ci"
+        ci.mkdir(parents=True)
+        for f in (GATE, CHECKS):
+            shutil.copy2(f, ci / f.name)
+        (ci / NOT_COVERED.name).write_text(nc_line(on="-", ref="pending"), encoding="utf-8")
+        gate = ci / GATE.name
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", extra=("--release",), gate=gate)
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("approval_ref is pending", r.stderr)
+        # The same listing is honoured outside a release (local runs, the QA rescan).
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", gate=gate)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
 
     # ── G8P3-unhappy-path-1: a pre-release OS version is not covered ──

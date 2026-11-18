@@ -59,7 +59,7 @@ vulnerabilities:
       gosu. WP15/S9, reviewed 2026-11-17.
     expired_at: 2027-02-15
     approved_by: fjarvis
-    # Proposed approver; the approval is the owner's review on the pull
-    # request that adds this entry. Record approval_ref and approved_on then
+    # Approved by the owner's review on the pull request that adds this entry
     # (docs/ci-architecture.md "Recording an approval").
-    approval_ref: pending
+    approved_on: 2026-11-18
+    approval_ref: "#8315"
