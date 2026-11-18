@@ -1,14 +1,20 @@
 /**
  * test_software_export_xlsx.cpp - the XLSX writer of the installed-software export
  * (software_export_xlsx.hpp): the workbook it produces, the sheet-byte accounting that every XLSX
- * size limit rests on, the pure disk budget, and the exclusive owner-only file creation.
+ * size limit rests on, the read-back check that turns a write the library did not report into an
+ * error, the pure disk budget, and the exclusive owner-only file creation.
  *
  * File justification (the unit-test conventions forbid disk in a unit test unless unavoidable):
- * the spreadsheet library writes files by design and the accounting claim is about the bytes it
- * writes, so the fixtures are real workbooks. Each is at most a few hundred rows in a `yuzu_test_`
- * directory the TempDir removes at the end, except the sheet-limit case, whose million rows are
- * all-empty cells (the library writes nothing for them, so it costs row bookkeeping only, no disk).
- * Nothing here sleeps, spawns a process or opens a socket.
+ * the spreadsheet library writes files by design, the accounting claim is about the bytes it writes
+ * and the completeness claim is about what it does when a write fails, so the fixtures are real
+ * workbooks. Each is at most a few hundred rows in a `yuzu_test_` directory the TempDir removes at
+ * the end, except the sheet-limit case, whose million rows are all-empty cells (the library writes
+ * nothing for them, so it costs row bookkeeping only, no disk), and the three fault cases, whose
+ * ~1 MB of highly compressible cells give a row file much larger than the finished workbook.
+ * The fault is RLIMIT_FSIZE, the only way to make a real write fail without a full volume: a
+ * guard ignores SIGXFSZ, sets the soft limit for one narrow window (no assertion inside it) and
+ * restores both, so a failure cannot leak into another case. Nothing here sleeps, spawns a process
+ * or opens a socket.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -17,14 +23,19 @@
 #include "software_export_xlsx.hpp"
 
 #include <minizip/unzip.h>
+#include <minizip/zip.h>
 
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <array>
+#include <csignal>
 #include <cstdint>
+#include <expected>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -153,6 +164,104 @@ SheetSize build_sheet(Fixture& fx, const char* name, const std::vector<Cells>& r
     const auto actual = zip.usize(kSheet);
     REQUIRE(actual.has_value());
     return {static_cast<std::int64_t>(*actual), accounted};
+}
+
+// The sheet's <sheetData> content length: what the writer's row file measures before the close.
+std::int64_t data_bytes_of(const std::string& sheet_xml) {
+    const auto open = sheet_xml.find("<sheetData>");
+    const auto close = sheet_xml.find("</sheetData>");
+    REQUIRE(open != std::string::npos);
+    REQUIRE(close != std::string::npos);
+    return static_cast<std::int64_t>(close - (open + std::string_view("<sheetData>").size()));
+}
+
+// Copies `src` to `dst` part by part, with the content of the parts named in `replace` swapped for
+// the given text (an empty text empties the part) and the part named `omit` left out. Whole parts
+// are held in memory: the fixtures are well under a megabyte.
+void rewrite_zip(const fs::path& src, const fs::path& dst,
+                 const std::map<std::string, std::string>& replace, const std::string& omit = {}) {
+    ZipView in(src);
+    REQUIRE(in.ok());
+    zipFile out = zipOpen64(dst.string().c_str(), APPEND_STATUS_CREATE);
+    REQUIRE(out != nullptr);
+    int rc = unzGoToFirstFile(in.zf);
+    while (rc == UNZ_OK) {
+        std::array<char, 256> name{};
+        unz_file_info64 info{};
+        REQUIRE(unzGetCurrentFileInfo64(in.zf, &info, name.data(), name.size(), nullptr, 0, nullptr,
+                                        0) == UNZ_OK);
+        const std::string part(name.data());
+        if (part != omit) {
+            const auto original = in.read(part.c_str());
+            REQUIRE(original.has_value());
+            const auto swap = replace.find(part);
+            const std::string& body = swap == replace.end() ? *original : swap->second;
+            zip_fileinfo zi{};
+            REQUIRE(zipOpenNewFileInZip64(out, part.c_str(), &zi, nullptr, 0, nullptr, 0, nullptr,
+                                          Z_DEFLATED, Z_DEFAULT_COMPRESSION, 0) == ZIP_OK);
+            if (!body.empty())
+                REQUIRE(zipWriteInFileInZip(out, body.data(),
+                                            static_cast<unsigned>(body.size())) == ZIP_OK);
+            REQUIRE(zipCloseFileInZip(out) == ZIP_OK);
+        }
+        rc = unzGoToNextFile(in.zf);
+    }
+    REQUIRE(rc == UNZ_END_OF_LIST_OF_FILE);
+    REQUIRE(zipClose(out, nullptr) == ZIP_OK);
+}
+
+// Makes a real write fail: the soft file-size limit for one narrow window. SIGXFSZ is ignored so
+// the failing write returns EFBIG instead of killing the process, and both are restored on every
+// path. Hold it only around library calls: no assertion inside the window. (The same guard is in
+// test_software_export_routes.cpp; the shared test header is outside this change.)
+class FsizeLimit {
+public:
+    explicit FsizeLimit(std::uintmax_t bytes) {
+        if (getrlimit(RLIMIT_FSIZE, &old_) != 0)
+            return;
+        old_signal_ = std::signal(SIGXFSZ, SIG_IGN);
+        rlimit lim = old_;
+        lim.rlim_cur = static_cast<rlim_t>(bytes);
+        armed_ = setrlimit(RLIMIT_FSIZE, &lim) == 0;
+    }
+    ~FsizeLimit() {
+        if (armed_)
+            setrlimit(RLIMIT_FSIZE, &old_);
+        if (old_signal_ != SIG_ERR)
+            std::signal(SIGXFSZ, old_signal_);
+    }
+    FsizeLimit(const FsizeLimit&) = delete;
+    FsizeLimit& operator=(const FsizeLimit&) = delete;
+    [[nodiscard]] bool armed() const { return armed_; }
+
+private:
+    rlimit old_{};
+    void (*old_signal_)(int){SIG_ERR};
+    bool armed_{false};
+};
+
+// Rows of three 30,000-byte compressible cells: ~90 KB of row file each, a few KB once zipped.
+const Cells kFatRow{std::string(30'000, 'a'), std::string(30'000, 'b'), std::string(30'000, 'c')};
+constexpr int kFatRows = 12;
+
+// Builds the fat workbook at `file`; `limit_during_appends` (0 = none) is held across the appends.
+// Returns how many appends were accepted and how the first refusal read. No assertion inside the
+// window.
+struct AppendRun {
+    int accepted{0};
+    swe::XlsxSheetWriter::Append last{swe::XlsxSheetWriter::Append::ok};
+};
+AppendRun append_fat(swe::XlsxSheetWriter& w, std::uintmax_t limit_during_appends) {
+    AppendRun run;
+    std::optional<FsizeLimit> guard;
+    if (limit_during_appends != 0)
+        guard.emplace(limit_during_appends);
+    for (int i = 0; i < kFatRows && run.last == swe::XlsxSheetWriter::Append::ok; ++i) {
+        run.last = w.append(kFatRow, std::int64_t{1} << 30);
+        if (run.last == swe::XlsxSheetWriter::Append::ok)
+            ++run.accepted;
+    }
+    return run;
 }
 
 } // namespace
@@ -589,4 +698,239 @@ TEST_CASE("xlsx writer: misuse fails cleanly", "[software_export_xlsx]") {
         fs::remove(fx.file, ec);
         REQUIRE_FALSE(fs::exists(fx.file));
     }
+}
+
+namespace {
+
+// A small workbook with adversarial text; returns its path.
+fs::path build_checked_workbook(Fixture& fx, const char* name) {
+    const auto file = fx.dir.path / name;
+    auto opened = swe::XlsxSheetWriter::open(file, fx.dir.path, "Installed software", kHeader);
+    REQUIRE(opened.has_value());
+    auto w = std::move(*opened);
+    for (int rep = 0; rep < 3; ++rep) {
+        REQUIRE(w.append(Cells{"a" + std::to_string(rep), "Beta & <Co>", " 1.0 "}, 1 << 20) ==
+                swe::XlsxSheetWriter::Append::ok);
+        REQUIRE(w.append(Cells{"", "tab\there\r\nline", "=1+1"}, 1 << 20) ==
+                swe::XlsxSheetWriter::Append::ok);
+    }
+    REQUIRE(w.close().has_value()); // close() itself runs the check: a clean build passes it
+    return file;
+}
+
+} // namespace
+
+TEST_CASE("xlsx verify: a finished workbook passes at its true byte count and at no other",
+          "[software_export_xlsx][verify]") {
+    Fixture fx;
+    const auto file = build_checked_workbook(fx, "v.xlsx");
+    const auto xml = ZipView(file).read(kSheet);
+    REQUIRE(xml.has_value());
+    const auto n = data_bytes_of(*xml);
+    REQUIRE(n > 0);
+    REQUIRE(swe::xlsx_verify_workbook(file, n).has_value());
+    for (const std::int64_t off : {-12, -1, 1, 12}) {
+        const auto r = swe::xlsx_verify_workbook(file, n + off);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().find("</sheetData>") != std::string::npos);
+    }
+    REQUIRE_FALSE(swe::xlsx_verify_workbook(file, -1).has_value());
+    REQUIRE_FALSE(swe::xlsx_verify_workbook(fx.dir.path / "no-such.xlsx", n).has_value());
+}
+
+TEST_CASE("xlsx verify: a damaged or half-written workbook is refused, each defect by name",
+          "[software_export_xlsx][verify]") {
+    Fixture fx;
+    const auto good = build_checked_workbook(fx, "good.xlsx");
+    const auto sheet = ZipView(good).read(kSheet);
+    REQUIRE(sheet.has_value());
+    const auto n = data_bytes_of(*sheet);
+    const auto damaged = fx.dir.path / "damaged.xlsx";
+    const auto styles = ZipView(good).read("xl/styles.xml");
+    REQUIRE(styles.has_value());
+
+    const auto expect_refused = [&](const std::map<std::string, std::string>& replace,
+                                    std::string_view mentions, const std::string& omit = {}) {
+        fs::remove(damaged);
+        rewrite_zip(good, damaged, replace, omit);
+        const auto r = swe::xlsx_verify_workbook(damaged, n);
+        REQUIRE_FALSE(r.has_value());
+        INFO(r.error());
+        REQUIRE(r.error().find(mentions) != std::string::npos);
+    };
+
+    SECTION("the rewrite helper itself keeps a good workbook good") {
+        rewrite_zip(good, damaged, {});
+        REQUIRE(swe::xlsx_verify_workbook(damaged, n).has_value());
+        // Exactly the bytes changed by a replacement of the same text.
+        rewrite_zip(good, damaged, {{kSheet, *sheet}});
+        REQUIRE(swe::xlsx_verify_workbook(damaged, n).has_value());
+    }
+    SECTION("an emptied sheet entry") {
+        expect_refused({{kSheet, ""}}, "is empty");
+    }
+    SECTION("an emptied small part") {
+        expect_refused({{"xl/styles.xml", ""}}, "xl/styles.xml: is empty");
+    }
+    SECTION("a part cut before its root element closes") {
+        expect_refused({{"xl/styles.xml", styles->substr(0, styles->size() - 6)}},
+                       "closing tag of its root");
+    }
+    SECTION("a part with no XML declaration") {
+        expect_refused({{"docProps/app.xml", "<Properties/>"}}, "XML declaration");
+    }
+    SECTION("a sheet cut short at its end") {
+        expect_refused({{kSheet, sheet->substr(0, sheet->size() - 40)}}, "closing tag of its root");
+    }
+    SECTION("a sheet that lost its last row but kept every closing tag") {
+        // The one defect only the span check can see: the file is well formed and every tag closes.
+        const auto data_end = sheet->find("</sheetData>");
+        const auto last_row = sheet->rfind("<row ", data_end);
+        REQUIRE(last_row != std::string::npos);
+        std::string cut = *sheet;
+        cut.erase(last_row, data_end - last_row);
+        expect_refused({{kSheet, cut}}, "</sheetData>");
+    }
+    SECTION("a sheet with a row too many") {
+        const auto data_end = sheet->find("</sheetData>");
+        std::string more = *sheet;
+        more.insert(data_end,
+                    "<row r=\"99\"><c r=\"A99\" t=\"inlineStr\"><is><t>x</t></is></c></row>");
+        expect_refused({{kSheet, more}}, "</sheetData>");
+    }
+    SECTION("no sheet at all") {
+        expect_refused({}, "xl/worksheets/sheet1.xml is missing", kSheet);
+    }
+    SECTION("not a zip") {
+        {
+            std::ofstream(damaged, std::ios::binary) << "this is not a workbook";
+        }
+        const auto r = swe::xlsx_verify_workbook(damaged, n);
+        REQUIRE_FALSE(r.has_value());
+        REQUIRE(r.error().find("not a readable zip") != std::string::npos);
+    }
+    SECTION("an empty file") {
+        {
+            std::ofstream(damaged, std::ios::binary);
+        }
+        REQUIRE_FALSE(swe::xlsx_verify_workbook(damaged, n).has_value());
+    }
+}
+
+TEST_CASE("xlsx verify: a byte flipped inside the compressed sheet fails the CRC or the inflate",
+          "[software_export_xlsx][verify]") {
+    Fixture fx;
+    // Incompressible-ish text, so the compressed sheet is most of the file and its middle is
+    // inside the deflate stream (a flip in a header field would prove nothing).
+    const auto file = fx.dir.path / "crc.xlsx";
+    {
+        auto opened = swe::XlsxSheetWriter::open(file, fx.dir.path, "Installed software", kHeader);
+        REQUIRE(opened.has_value());
+        auto w = std::move(*opened);
+        std::uint32_t x = 12345;
+        const auto noise = [&x](std::size_t len) {
+            std::string out;
+            for (std::size_t i = 0; i < len; ++i) {
+                x = x * 1664525U + 1013904223U;
+                out.push_back(static_cast<char>('a' + ((x >> 24) % 26)));
+            }
+            return out;
+        };
+        for (int i = 0; i < 6; ++i)
+            REQUIRE(w.append(Cells{noise(4000), noise(4000), noise(4000)}, 1 << 24) ==
+                    swe::XlsxSheetWriter::Append::ok);
+        REQUIRE(w.close().has_value());
+    }
+    const auto n = data_bytes_of(*ZipView(file).read(kSheet));
+    REQUIRE(swe::xlsx_verify_workbook(file, n).has_value());
+    std::string bytes;
+    {
+        std::ifstream in(file, std::ios::binary);
+        bytes.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    bytes[bytes.size() / 2] = static_cast<char>(bytes[bytes.size() / 2] ^ 0x5A);
+    const auto flipped = fx.dir.path / "flipped.xlsx";
+    {
+        std::ofstream(flipped, std::ios::binary).write(bytes.data(),
+                                                       static_cast<std::streamsize>(bytes.size()));
+    }
+    REQUIRE_FALSE(swe::xlsx_verify_workbook(flipped, n).has_value());
+}
+
+TEST_CASE("xlsx writer: a volume that stops taking writes during the build ends it at once and "
+          "close() reports it",
+          "[software_export_xlsx][fault]") {
+    Fixture fx;
+    auto w = fx.writer();
+    // 64 KiB is under one fat row: the row file's flush fails inside the first appends.
+    const auto run = append_fat(w, 64 * 1024);
+    std::expected<std::uintmax_t, std::string> closed = std::unexpected("not run");
+    closed = w.close();
+    REQUIRE(run.last == swe::XlsxSheetWriter::Append::failed);
+    REQUIRE(run.accepted < kFatRows);
+    REQUIRE_FALSE(closed.has_value());
+    REQUIRE(closed.error().find("earlier write failed") != std::string::npos);
+}
+
+TEST_CASE("xlsx writer: the last buffered rows failing to reach the row file is caught before the "
+          "close",
+          "[software_export_xlsx][fault]") {
+    Fixture fx;
+    // The same rows twice: once clean, to measure the row file (the <sheetData> content length),
+    // then again with the limit one byte under it, set after the appends and before close().
+    std::int64_t span = 0;
+    {
+        auto w = fx.writer();
+        const auto run = append_fat(w, 0);
+        REQUIRE(run.accepted == kFatRows);
+        REQUIRE(w.close().has_value());
+        span = data_bytes_of(*ZipView(fx.file).read(kSheet));
+    }
+    REQUIRE(span > 1'000'000);
+    fs::remove(fx.file);
+    auto w = fx.writer();
+    REQUIRE(append_fat(w, 0).accepted == kFatRows);
+    std::expected<std::uintmax_t, std::string> closed = std::unexpected("not run");
+    bool armed = false;
+    {
+        const FsizeLimit limit(static_cast<std::uintmax_t>(span) - 1);
+        armed = limit.armed();
+        closed = w.close();
+    }
+    REQUIRE(armed);
+    REQUIRE_FALSE(closed.has_value());
+    REQUIRE(closed.error().find("row file did not take every write") != std::string::npos);
+}
+
+TEST_CASE("xlsx writer: a copy of the sheet cut short inside the library's own close is caught by "
+          "the read-back",
+          "[software_export_xlsx][fault]") {
+    Fixture fx;
+    std::int64_t span = 0;
+    std::uintmax_t clean_size = 0;
+    {
+        auto w = fx.writer();
+        REQUIRE(append_fat(w, 0).accepted == kFatRows);
+        const auto closed = w.close();
+        REQUIRE(closed.has_value());
+        clean_size = *closed;
+        span = data_bytes_of(*ZipView(fx.file).read(kSheet));
+    }
+    REQUIRE(static_cast<std::int64_t>(clean_size) < span); // the finished file is far smaller
+    fs::remove(fx.file);
+    auto w = fx.writer();
+    REQUIRE(append_fat(w, 0).accepted == kFatRows);
+    // The row file is complete (span bytes fit the limit) but the assembled sheet, which also holds
+    // the preamble and the closing tags, is cut 64 bytes past it: the library copies what it can,
+    // reports nothing, and the zip around the short sheet is well formed.
+    std::expected<std::uintmax_t, std::string> closed = std::unexpected("not run");
+    bool armed = false;
+    {
+        const FsizeLimit limit(static_cast<std::uintmax_t>(span) + 64);
+        armed = limit.armed();
+        closed = w.close();
+    }
+    REQUIRE(armed);
+    REQUIRE_FALSE(closed.has_value());
+    REQUIRE(closed.error().find("failed its check") != std::string::npos);
 }

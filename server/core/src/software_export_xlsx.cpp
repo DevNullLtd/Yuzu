@@ -48,19 +48,48 @@
 /// static counter and calls srand/rand without a lock (tmpfileplus.c:136), a data race between
 /// two exports in two threads: every call that can create a temporary file (add_worksheet and
 /// close) therefore runs under one process-wide mutex.
+///
+/// Derivation of the completeness check (what close() relies on; line numbers are 1.2.4's):
+///  * The library does not report a failed write. _worksheet_write_optimized_sheet_data
+///    (worksheet.c:2558-2595) is STATIC void and drops the result of fflush (:2572), of every fread
+///    of the row file R and of every fwrite of the assembled sheet A (its own comment: "There is no
+///    easy way to raise error"); a failed fread reads as end of file. Every row and cell reaches R
+///    through an unchecked fprintf (xmlwriter.c:53-143, :380-409). rewind() clears a stream's error
+///    flag, and R and A are both rewound before they are read (worksheet.c:2581, packager.c:2078).
+///    A fault therefore leaves a CRC-clean zip whose sheet1.xml is short or empty and a
+///    workbook_close that returns LXW_NO_ERROR (reproduced with RLIMIT_FSIZE on 1.2.4: 0 of 5,001
+///    rows delivered, no error from 115,023 string writes or from workbook_close).
+///  * R can still be inspected BEFORE workbook_close. lxw_worksheet_write_single_row (worksheet.h)
+///    is the call the packager makes first (packager.c:304) to push the row still held in memory;
+///    made here it leaves the packager's own later call nothing to write, so the bytes are the
+///    same. After it, fflush(R) and ferror(R) say whether R took every write, and ftello(R) is the
+///    exact byte length of what the library will copy between <sheetData> and </sheetData> (the
+///    two tags are written around the copy, worksheet.c:2569 and :2593).
+///  * A fault after that point (R unreadable, A or the output file unwritable) is not reported
+///    either, so the finished file is read back: each part must read to a clean CRC, be non-empty
+///    and be a whole XML document (declaration first, the root's closing tag last), and the sheet
+///    must hold </sheetData> exactly ftello(R) bytes after <sheetData>. A write that failed inside
+///    A shortens the copy or drops its tail; a read that failed in R ends the copy early; both
+///    break the span. Residual: a dropped block inside the sheet preamble alone, with every later
+///    write landing, is not seen (the preamble is a few hundred bytes, inside the first stdio
+///    block).
 
 #include "software_export_xlsx.hpp"
 
 #include "utf8_sanitize.hpp"
 
 #include <xlsxwriter.h>
+#include <minizip/unzip.h>
 
 #ifndef _WIN32
 #include <fcntl.h>
 #include <unistd.h>
 #endif
 
+#include <algorithm>
+#include <array>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <system_error>
 #include <utility>
@@ -81,7 +110,192 @@ std::mutex& library_mutex() {
     return m;
 }
 
+// Bounds of the read-back pass (constant memory whatever the sheet's size).
+constexpr std::size_t kVerifyBufferBytes = 64 * 1024; // one read of an entry
+constexpr std::size_t kVerifyHeadBytes = 512;         // the XML declaration and the root tag
+constexpr std::size_t kVerifyTailBytes = 128;         // the root's closing tag and white space
+constexpr std::size_t kVerifyPreambleBytes = 64 * 1024; // the most sheet bytes before <sheetData>
+constexpr std::string_view kSheetEntry = "xl/worksheets/sheet1.xml";
+constexpr std::string_view kSheetDataOpen = "<sheetData>";
+constexpr std::string_view kSheetDataClose = "</sheetData>";
+
+// The owner of an open zip: minizip's handle is a void pointer with a close call, nothing more.
+struct UnzCloser {
+    void operator()(void* zf) const noexcept {
+        if (zf)
+            unzClose(zf);
+    }
+};
+using UnzHandle = std::unique_ptr<void, UnzCloser>;
+
+// What one entry must look like, from its first and last bytes only.
+class EntryShape {
+public:
+    void feed(const char* data, std::size_t n) {
+        total_ += n;
+        if (head_.size() < kVerifyHeadBytes)
+            head_.append(data, std::min(n, kVerifyHeadBytes - head_.size()));
+        if (n >= kVerifyTailBytes) {
+            tail_.assign(data + (n - kVerifyTailBytes), kVerifyTailBytes);
+        } else {
+            tail_.append(data, n);
+            if (tail_.size() > kVerifyTailBytes)
+                tail_.erase(0, tail_.size() - kVerifyTailBytes);
+        }
+    }
+
+    // The first thing wrong with the entry, or nothing.
+    [[nodiscard]] std::optional<std::string> defect() const {
+        if (total_ == 0)
+            return "is empty";
+        constexpr std::string_view kDeclaration = "<?xml";
+        if (!head_.starts_with(kDeclaration))
+            return "does not begin with the XML declaration";
+        const auto decl_end = head_.find("?>");
+        const auto root_open =
+            decl_end == std::string::npos ? std::string::npos : head_.find('<', decl_end + 2);
+        if (root_open == std::string::npos)
+            return "has no root element";
+        const auto name_end = head_.find_first_of(" \t\r\n/>", root_open + 1);
+        if (name_end == std::string::npos || name_end == root_open + 1)
+            return "has no readable root element name";
+        const std::string closing =
+            "</" + head_.substr(root_open + 1, name_end - root_open - 1) + ">";
+        std::string_view tail(tail_);
+        while (!tail.empty() && (tail.back() == ' ' || tail.back() == '\t' ||
+                                 tail.back() == '\r' || tail.back() == '\n'))
+            tail.remove_suffix(1);
+        if (!tail.ends_with(closing))
+            return "does not end with the closing tag of its root element";
+        return std::nullopt;
+    }
+
+private:
+    std::uint64_t total_{0};
+    std::string head_; // the first kVerifyHeadBytes
+    std::string tail_; // the last kVerifyTailBytes
+};
+
+// Where </sheetData> must be: `data_bytes` after the end of the first <sheetData>. The preamble is
+// held until <sheetData> turns up (bounded), then only the 12 bytes at the target are kept.
+class SheetSpan {
+public:
+    explicit SheetSpan(std::uint64_t data_bytes) : data_bytes_(data_bytes) {}
+
+    void feed(const char* data, std::size_t n) {
+        if (target_) {
+            absorb(consumed_, data, n);
+            consumed_ += n;
+            return;
+        }
+        consumed_ += n;
+        if (preamble_.size() > kVerifyPreambleBytes) // no <sheetData> in a sane preamble: give up
+            return;
+        preamble_.append(data, n);
+        const auto at = preamble_.find(kSheetDataOpen);
+        if (at == std::string::npos)
+            return;
+        target_ = at + kSheetDataOpen.size() + data_bytes_;
+        absorb(0, preamble_.data(), preamble_.size()); // the bytes read before the target was known
+        std::string().swap(preamble_);
+    }
+
+    [[nodiscard]] bool closes_where_expected() const {
+        return target_ && filled_ == kSheetDataClose.size() &&
+               std::string_view(window_.data(), filled_) == kSheetDataClose;
+    }
+
+private:
+    // The bytes of [at, at + n) that fall in the 12 bytes from target_. Calls arrive in order and
+    // cover the entry without a gap, so the window fills from its first byte onwards.
+    void absorb(std::uint64_t at, const char* data, std::size_t n) {
+        const std::uint64_t lo = std::max(at, *target_);
+        const std::uint64_t hi = std::min(at + n, *target_ + kSheetDataClose.size());
+        for (std::uint64_t p = lo; p < hi; ++p) {
+            window_[static_cast<std::size_t>(p - *target_)] = data[p - at];
+            ++filled_;
+        }
+    }
+
+    std::uint64_t data_bytes_;
+    std::uint64_t consumed_{0}; // entry bytes fed so far
+    std::optional<std::uint64_t> target_;
+    std::string preamble_;
+    std::array<char, kSheetDataClose.size()> window_{};
+    std::size_t filled_{0};
+};
+
+// Offset of a stream (the row file's size once flushed); -1 when it cannot be told.
+std::int64_t stream_offset(std::FILE* f) {
+#ifdef _WIN32
+    return static_cast<std::int64_t>(_ftelli64(f));
+#else
+    return static_cast<std::int64_t>(::ftello(f));
+#endif
+}
+
 } // namespace
+
+std::expected<void, std::string> xlsx_verify_workbook(const fs::path& file,
+                                                      std::int64_t sheet_data_bytes) {
+    if (sheet_data_bytes < 0)
+        return std::unexpected("the sheet's data length is unknown");
+    const UnzHandle zf(unzOpen64(file.string().c_str()));
+    if (!zf)
+        return std::unexpected("the workbook is not a readable zip archive");
+    unz_global_info64 global{};
+    if (unzGetGlobalInfo64(zf.get(), &global) != UNZ_OK || global.number_entry == 0)
+        return std::unexpected("the workbook's zip directory is unreadable or empty");
+
+    std::vector<char> buffer(kVerifyBufferBytes);
+    std::uint64_t entries = 0;
+    bool saw_sheet = false;
+    int next = unzGoToFirstFile(zf.get());
+    for (; next == UNZ_OK; next = unzGoToNextFile(zf.get())) {
+        std::array<char, 256> name{};
+        unz_file_info64 info{};
+        if (unzGetCurrentFileInfo64(zf.get(), &info, name.data(), name.size(), nullptr, 0, nullptr,
+                                    0) != UNZ_OK ||
+            info.size_filename >= name.size())
+            return std::unexpected("a part of the workbook has an unreadable name");
+        const std::string part(name.data());
+        ++entries;
+        if (unzOpenCurrentFile(zf.get()) != UNZ_OK)
+            return std::unexpected(part + ": cannot be opened");
+        EntryShape shape;
+        std::optional<SheetSpan> span;
+        if (part == kSheetEntry)
+            span.emplace(static_cast<std::uint64_t>(sheet_data_bytes));
+        for (;;) {
+            const int n =
+                unzReadCurrentFile(zf.get(), buffer.data(), static_cast<unsigned>(buffer.size()));
+            if (n < 0) {
+                unzCloseCurrentFile(zf.get());
+                return std::unexpected(part + ": read error " + std::to_string(n));
+            }
+            if (n == 0)
+                break;
+            shape.feed(buffer.data(), static_cast<std::size_t>(n));
+            if (span)
+                span->feed(buffer.data(), static_cast<std::size_t>(n));
+        }
+        if (unzCloseCurrentFile(zf.get()) != UNZ_OK) // the CRC is checked here
+            return std::unexpected(part + ": checksum mismatch");
+        if (const auto defect = shape.defect())
+            return std::unexpected(part + ": " + *defect);
+        if (span) {
+            saw_sheet = true;
+            if (!span->closes_where_expected())
+                return std::unexpected(
+                    part + ": </sheetData> is not where the row file's size puts it");
+        }
+    }
+    if (next != UNZ_END_OF_LIST_OF_FILE || entries != global.number_entry)
+        return std::unexpected("the workbook's zip directory cannot be walked to its end");
+    if (!saw_sheet)
+        return std::unexpected(std::string(kSheetEntry) + " is missing");
+    return {};
+}
 
 std::string xlsx_clean_cell(std::string_view in, bool* truncated) {
     if (truncated)
@@ -202,7 +416,8 @@ XlsxSheetWriter::open(const fs::path& file, const fs::path& tmp_dir, std::string
     lxw_workbook_options options{};
     options.constant_memory = LXW_TRUE;
     options.tmpdir = tmp_s.c_str(); // the library copies it
-    options.use_zip64 = zip64 ? LXW_TRUE : LXW_FALSE; // only an entry that can reach 4 GiB needs it
+    // Only an entry that can reach the ZIP64 sentinel needs it.
+    options.use_zip64 = zip64 ? LXW_TRUE : LXW_FALSE;
 
     auto impl = std::make_unique<Impl>();
     impl->file = file;
@@ -266,6 +481,14 @@ XlsxSheetWriter::Append XlsxSheetWriter::append(std::span<const std::string> cel
             return Append::failed;
         }
     }
+    // The library never reports a failed write of its row file; the stream's error flag is the
+    // only trace, and it is read here (and once more in close()) because the library rewinds the
+    // file later, which clears it. A volume that has stopped taking writes ends the build now, not
+    // after the rest of the result has been read.
+    if (std::ferror(m.sheet->optimize_tmpfile) != 0) {
+        m.failed = true;
+        return Append::failed;
+    }
     ++m.rows;
     m.sheet_bytes += cost;
     m.truncated += cut_cells;
@@ -285,16 +508,38 @@ std::int64_t XlsxSheetWriter::cells_truncated() const noexcept {
 std::expected<std::uintmax_t, std::string> XlsxSheetWriter::close() {
     if (!impl_ || impl_->closed || !impl_->workbook)
         return std::unexpected("the workbook is already closed");
-    const bool was_failed = impl_->failed;
-    const lxw_error e = impl_->close_workbook();
-    if (was_failed)
-        return std::unexpected("an earlier write failed; the workbook is incomplete");
+    Impl& m = *impl_;
+
+    // Before workbook_close (see the completeness derivation at the top of this file): push the row
+    // still held in memory, flush the row file, and read its error flag and its exact size. A
+    // failure here still closes the workbook, the library's only release.
+    std::string pre_error;
+    std::int64_t data_bytes = 0;
+    if (m.failed) {
+        pre_error = "an earlier write failed; the workbook is incomplete";
+    } else if (std::FILE* rows_file = m.sheet ? m.sheet->optimize_tmpfile : nullptr; !rows_file) {
+        pre_error = "the library's row file is missing";
+    } else {
+        lxw_worksheet_write_single_row(m.sheet);
+        if (std::fflush(rows_file) != 0 || std::ferror(rows_file) != 0)
+            pre_error = "the library's row file did not take every write; the workbook is "
+                        "incomplete";
+        else if (data_bytes = stream_offset(rows_file); data_bytes < 0)
+            pre_error = "the size of the library's row file cannot be read";
+    }
+    const lxw_error e = m.close_workbook();
+    if (!pre_error.empty())
+        return std::unexpected(pre_error);
     if (e != LXW_NO_ERROR)
         return std::unexpected(std::string("cannot assemble the workbook: ") + lxw_strerror(e));
     std::error_code ec;
-    const auto size = fs::file_size(impl_->file, ec);
+    const auto size = fs::file_size(m.file, ec);
     if (ec)
         return std::unexpected("cannot read the workbook size: " + ec.message());
+    // Outside library_mutex (close_workbook released it): the read-back pass is one more read of
+    // the finished file and creates no temporary file, so it never needs to hold the lock.
+    if (auto checked = xlsx_verify_workbook(m.file, data_bytes); !checked)
+        return std::unexpected("the finished workbook failed its check: " + checked.error());
     return size;
 }
 

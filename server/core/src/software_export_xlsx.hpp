@@ -22,6 +22,25 @@
 ///  * DISK. One export holds at most kXlsxPeakDiskFactor x its sheet bytes of the data volume at
 ///    any moment (see the .cpp for the library files that are alive at once). XlsxDiskBudget is the
 ///    pure arbiter that keeps the SUM over all live exports inside the free space.
+///  * COMPLETE OR AN ERROR. close() returns a size only for a workbook it has read back and checked
+///    (xlsx_verify_workbook), because the library cannot be trusted to say a write failed. Three
+///    facts of libxlsxwriter 1.2.4 (the vcpkg port at the repo baseline) are relied on, and a
+///    library upgrade must re-read each:
+///      1. worksheet.c:2558-2595 (_worksheet_write_optimized_sheet_data, a STATIC void) ignores the
+///         results of fflush, fread and fwrite: a failed read of the row file looks like the end of
+///         the file and a failed write of the assembled sheet is dropped, so the sheet can come out
+///         short or empty while workbook_close returns LXW_NO_ERROR and the zip is well formed.
+///      2. xmlwriter.c:53-143 and :380-409 write every tag, row and cell with an unchecked
+///         fprintf, so a failed write of the row file leaves only the stream's error flag.
+///      3. worksheet.c:2581 and packager.c:2078 rewind the row file and the assembled sheet before
+///         reading them, which clears that flag: after workbook_close nothing records the failure.
+///    So the row file's error flag is read after every row, the row file is flushed and read once
+///    more BEFORE workbook_close, its exact size is taken as the byte length of the sheet's
+///    <sheetData> content, and the finished file is read back once through minizip's unzip API in
+///    constant memory (one extra read pass, no extra disk): every part reads to a clean CRC, is not
+///    empty, begins with the XML declaration and ends with its root element's closing tag,
+///    xl/worksheets/sheet1.xml exists, and </sheetData> sits exactly that many bytes after
+///    <sheetData>.
 
 #include <cstdint>
 #include <expected>
@@ -40,8 +59,10 @@ inline constexpr std::int64_t kXlsxMaxDataRows = 1'048'575;
 /// One cell's text is cut to this many bytes (at a code-point boundary). The spreadsheet limit is
 /// 32,767 CHARACTERS; a byte cap at the same number is never above it.
 inline constexpr std::int64_t kXlsxMaxCellBytes = 32'767;
-/// The largest size one zip entry can have before the container needs ZIP64 extensions; the
-/// route turns ZIP64 on when the byte limit is at or above it.
+/// The ZIP64 sentinel: 0xFFFFFFFF (4,294,967,295 bytes, one byte under 4 GiB) is the size value the
+/// zip format reserves to mean "see the ZIP64 field", so an entry that can reach it needs the ZIP64
+/// extensions (the largest plain size is 0xFFFFFFFE). The route turns ZIP64 on when the byte limit
+/// is at or above it.
 inline constexpr std::int64_t kXlsxZip64Threshold = 0xFFFFFFFFLL;
 
 /// Which cap a request's row limit resolves to, and what the 413 names as its source.
@@ -79,6 +100,16 @@ inline constexpr std::int64_t kXlsxDiskGrantBytes = std::int64_t{16} << 20;
 /// kXlsxCellOverheadBytes plus the text's length after the library's XML escaping.
 [[nodiscard]] std::int64_t xlsx_cell_cost(std::string_view cleaned);
 
+/// Reads the finished workbook `file` back once, in constant memory (a 64 KiB buffer), and
+/// returns an error naming the first defect: not a readable zip, a part that does not read to a
+/// clean CRC, is empty, does not begin with the XML declaration or does not end with its root
+/// element's closing tag (trailing white space ignored), no xl/worksheets/sheet1.xml, or
+/// `</sheetData>` not exactly `sheet_data_bytes` bytes after the sheet's `<sheetData>`.
+/// `sheet_data_bytes` is the size of the library's row file, which is the byte length of the
+/// <sheetData> content (see the rules above).
+[[nodiscard]] std::expected<void, std::string>
+xlsx_verify_workbook(const std::filesystem::path& file, std::int64_t sheet_data_bytes);
+
 /// Create `path` empty, exclusively and owner-only (O_CREAT | O_EXCL | O_CLOEXEC, mode 0600): an
 /// existing path (a link included) is refused and left untouched.
 [[nodiscard]] std::expected<void, std::string>
@@ -92,9 +123,9 @@ public:
     /// Opens a workbook that will be written to `file` (which may already exist, empty, and is
     /// truncated at close), with its temporary files in `tmp_dir`, and writes the bold, frozen
     /// header row. Nothing is read from or written to disk beyond the library's own files until
-    /// close(). `zip64` writes a ZIP64 container; it is needed only when one entry can reach 4 GiB,
-    /// and every small entry of such a container carries the extra ZIP64 fields, so it stays off
-    /// otherwise.
+    /// close(). `zip64` writes a ZIP64 container; it is needed only when one entry can reach the
+    /// ZIP64 sentinel (kXlsxZip64Threshold, one byte under 4 GiB), and every small entry of such a
+    /// container carries the extra ZIP64 fields, so it stays off otherwise.
     [[nodiscard]] static std::expected<XlsxSheetWriter, std::string>
     open(const std::filesystem::path& file, const std::filesystem::path& tmp_dir,
          std::string_view sheet_name, std::span<const std::string_view> header,
@@ -110,17 +141,19 @@ public:
 
     /// One data row. `cells` must hold exactly the header's column count. When the row's cost
     /// would take sheet_bytes() past `allowance`, nothing is written and no counter moves
-    /// (over_budget). `failed` has three causes: a library error makes the writer unusable and
-    /// close() fail; a wrong cell count fails that call only and the writer stays usable; a full
-    /// sheet (kXlsxMaxDataRows) fails every later append, and close() still succeeds.
+    /// (over_budget). `failed` has three causes: a library error, or an error on the library's row
+    /// file (a volume that stopped taking writes), makes the writer unusable and close() fail; a
+    /// wrong cell count fails that call only and the writer stays usable; a full sheet
+    /// (kXlsxMaxDataRows) fails every later append, and close() still succeeds.
     [[nodiscard]] Append append(std::span<const std::string> cells, std::int64_t allowance);
 
     [[nodiscard]] std::int64_t rows() const noexcept;            ///< data rows written
     [[nodiscard]] std::int64_t sheet_bytes() const noexcept;     ///< the accounted upper bound
     [[nodiscard]] std::int64_t cells_truncated() const noexcept; ///< cells cut to kXlsxMaxCellBytes
 
-    /// Assembles the file; returns its size. A second call, or a call after a failed append,
-    /// fails.
+    /// Assembles the file, reads it back and checks it (xlsx_verify_workbook), and returns its
+    /// size: any failed write the library did not report is an error here, never a short
+    /// workbook. A second call, or a call after a failed append, fails.
     [[nodiscard]] std::expected<std::uintmax_t, std::string> close();
 
 private:

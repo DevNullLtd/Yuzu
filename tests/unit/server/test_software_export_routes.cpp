@@ -26,7 +26,9 @@
  * through minizip. File justification: the export writes a real temporary workbook by design (the
  * property under test is that it is removed on every path), so those cases use a `yuzu_test_`
  * directory the TempDir removes at the end; the disk-free figure and the clock are injected, so
- * no case depends on the machine's disk or on time passing.
+ * no case depends on the machine's disk or on time passing. One case makes a real write fail
+ * (RLIMIT_FSIZE, the only way short of a full volume): a guard ignores SIGXFSZ, holds the soft
+ * limit across one request only, with no assertion inside the window, and restores both.
  */
 
 #include <catch2/catch_test_macros.hpp>
@@ -44,10 +46,12 @@
 
 #include <minizip/unzip.h>
 
+#include <sys/resource.h>
 #include <sys/stat.h>
 
 #include <algorithm>
 #include <cctype>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -1336,6 +1340,36 @@ std::size_t occurrences(const std::string& hay, std::string_view needle) {
     return n;
 }
 
+// Makes a real write fail: the soft file-size limit for one narrow window. SIGXFSZ is ignored so
+// the failing write returns EFBIG instead of killing the process, and both are restored on every
+// path. Hold it only around the request: no assertion inside the window. (The same guard is in
+// test_software_export_xlsx.cpp; the shared test header is outside this change.)
+class FsizeLimit {
+public:
+    explicit FsizeLimit(std::uintmax_t bytes) {
+        if (getrlimit(RLIMIT_FSIZE, &old_) != 0)
+            return;
+        old_signal_ = std::signal(SIGXFSZ, SIG_IGN);
+        rlimit lim = old_;
+        lim.rlim_cur = static_cast<rlim_t>(bytes);
+        armed_ = setrlimit(RLIMIT_FSIZE, &lim) == 0;
+    }
+    ~FsizeLimit() {
+        if (armed_)
+            setrlimit(RLIMIT_FSIZE, &old_);
+        if (old_signal_ != SIG_ERR)
+            std::signal(SIGXFSZ, old_signal_);
+    }
+    FsizeLimit(const FsizeLimit&) = delete;
+    FsizeLimit& operator=(const FsizeLimit&) = delete;
+    [[nodiscard]] bool armed() const { return armed_; }
+
+private:
+    rlimit old_{};
+    void (*old_signal_)(int){SIG_ERR};
+    bool armed_{false};
+};
+
 // Rows whose publisher is far past the cell cap: a few hundred of them fill a 16 MiB disk grant.
 void fat_rows(Harness& h, int n) {
     for (int i = 0; i < n; ++i) {
@@ -1966,7 +2000,8 @@ std::map<int, std::vector<std::string>> sheet_cells(const std::string& xml, std:
 
 } // namespace
 
-TEST_CASE("export route xlsx: ZIP64 is chosen exactly at the 4 GiB byte limit",
+TEST_CASE("export route xlsx: ZIP64 is chosen exactly at the 0xFFFFFFFF sentinel, one byte under "
+          "4 GiB",
           "[software_export][routes][xlsx][zip64]") {
     const auto param =
         GENERATE(std::pair<std::int64_t, unsigned>{swe::kXlsxZip64Threshold, 45U},
@@ -2177,6 +2212,67 @@ TEST_CASE("export route xlsx: a workbook that cannot be closed is a writer 503 w
     CHECK(x.h.held() == 0);
     x.h.on_install_read = nullptr;
     auto again = x.h.get("?format=xlsx"); // the grant went back
+    REQUIRE(again);
+    CHECK(again->status == 200);
+}
+
+TEST_CASE("export route xlsx: a volume that stops taking writes mid-build is a writer 503 with "
+          "nothing left and no success row",
+          "[software_export][routes][xlsx][build]") {
+    XlsxHarness x(1);
+    fat_rows(x.h, 40); // 40 x 32,767 compressible bytes: the row file dwarfs the finished workbook
+    x.h.disk_free = kRoomForOne;
+
+    // A clean request first, for the two sizes the limit goes between: the finished file's, and
+    // the row file's (the sheet's <sheetData> content length).
+    std::size_t finished = 0;
+    std::size_t row_file = 0;
+    {
+        auto clean = x.h.get("?format=xlsx");
+        REQUIRE(clean);
+        REQUIRE(clean->status == 200);
+        finished = clean->content_length_;
+        const auto t = drive_sized(*clean);
+        REQUIRE_FALSE(t.aborted);
+        const auto xml = sheet_xml(x.root.path / "readback", t.body);
+        REQUIRE(xml.has_value());
+        row_file = xml->find("</sheetData>") - (xml->find("<sheetData>") + 11);
+        release(*clean, true);
+    }
+    REQUIRE(finished < row_file);
+    REQUIRE(x.files_in_dir() == 0);
+    const std::size_t audit_rows = x.h.audit_log.size();
+    const int reads_before = x.h.install_reads;
+    const double completed_before = x.h.count("xlsx", "completed"); // the clean request's
+
+    // The limit is set when the first page of the second request is read and lifted when the
+    // response is back; nothing is asserted in between.
+    std::optional<FsizeLimit> limit;
+    x.h.on_install_read = [&](int n) {
+        if (n == reads_before + 1)
+            limit.emplace((finished + row_file) / 2);
+    };
+    auto res = x.h.get("?format=xlsx");
+    const bool armed = limit && limit->armed();
+    limit.reset();
+    x.h.on_install_read = nullptr;
+    REQUIRE(armed);
+
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK_FALSE(res->content_provider_); // no provider: not one byte of a short workbook is sent
+    CHECK(res->body.find("xlsx export failed on the server") != std::string::npos);
+    CHECK(x.h.count("xlsx", "degraded") == 1);
+    CHECK(x.h.count("xlsx", "completed") == completed_before); // the failed request is no success
+    REQUIRE(x.h.audit_log.size() == audit_rows + 1);
+    CHECK(x.h.audit_log.back().result == "failure");
+    CHECK(x.h.audit_log.back().detail.find("outcome=writer") != std::string::npos);
+    const auto successes = std::ranges::count_if(
+        x.h.audit_log, [](const AuditRecord& a) { return a.result == "success"; });
+    CHECK(successes == 1); // the clean request's row; the failed one wrote none
+    CHECK(x.files_in_dir() == 0);
+    CHECK(x.h.held() == 0);
+    auto again = x.h.get("?format=xlsx"); // room for one: only if the grant went back
     REQUIRE(again);
     CHECK(again->status == 200);
 }

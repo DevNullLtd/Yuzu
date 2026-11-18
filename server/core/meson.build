@@ -672,17 +672,20 @@ yuzu_server_core_cpp_args = https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128']
 yuzu_server_core_incs = include_directories('include', '../../common/include')
 # libxlsxwriter (SAM-36b, `format=xlsx` of the installed-software export), used by ONE translation
 # unit (software_export_xlsx.cpp). pkg-config only: the vcpkg port installs `xlsxwriter.pc` and NO
-# CMake package, so a cmake lookup could never succeed. The .pc lists `zlib minizip` as public
-# requirements, so the static link carries both through it; minizip is declared on its own too
-# because the server tests read the finished workbook back through minizip's unzip API. Both are
-# server-feature ports (vcpkg.json), absent from the agent-only Windows and macOS installs, and this
-# file is only processed when the server is built (Linux, ADR-0035).
+# CMake package, so a cmake lookup could never succeed. minizip is a direct dependency of that same
+# translation unit: after workbook_close it reads the finished workbook back through minizip's
+# unzip API (`xlsx_verify_workbook`), because the library does not report a failed write of its
+# temporary files. The .pc also lists `zlib minizip` as public requirements, so the static link
+# would carry minizip through it anyway; it is declared on its own because this code calls it, and
+# the server tests read workbooks back through it too. Both are server-feature ports (vcpkg.json),
+# absent from the agent-only Windows and macOS installs, and this file is only processed when the
+# server is built (Linux, ADR-0035).
 xlsxwriter_dep = dependency('xlsxwriter', method: 'pkg-config', required: true, include_type: 'system')
 minizip_dep = dependency('minizip', method: 'pkg-config', required: true, include_type: 'system')
 
 yuzu_server_core_deps = [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                          sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                         libpq_dep, yuzu_key_provider_dep, xlsxwriter_dep]
+                         libpq_dep, yuzu_key_provider_dep, xlsxwriter_dep, minizip_dep]
 yuzu_server_core_deps += auth_crypto_deps
 yuzu_server_core_deps += https_deps
 yuzu_server_core_deps += saml_deps
