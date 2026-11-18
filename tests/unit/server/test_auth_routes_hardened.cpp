@@ -34,6 +34,7 @@
 #include "pg/pg_pool.hpp"
 #include "session_store.hpp"
 #include "test_route_sink.hpp"
+#include "test_pbkdf2_budget_fill.hpp"
 #include "../../../server/core/src/totp.hpp"
 #include "test_auth_db_pg_helper.hpp"
 #include <yuzu/metrics.hpp>
@@ -381,14 +382,13 @@ TEST_CASE("sso-only: a saturated PBKDF2 budget does not tell the break-glass nam
     h.enroll_mfa("admin");
     // Fill every slot: the whole process-wide budget is in use.
     auto& budget = h.auth_routes->pbkdf2_budget();
-    budget.set_cap(2);
-    auto s1 = budget.try_acquire();
-    auto s2 = budget.try_acquire();
-    REQUIRE(s1.ok());
-    REQUIRE(s2.ok());
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    REQUIRE(held.size() == 8);
     // UNARMED break-glass name and any other name: the same generic 401, never a 429, because
-    // the sso-only gate refuses before a slot is taken. (Before the gate moved ahead of the slot,
-    // `alice` got 429 and the break-glass name got 401: an oracle for the name.)
+    // the sso-only gate refuses before a slot is taken. This pins that order: with the gate run
+    // AFTER the slot, `alice` would answer 429 here while the break-glass name answered 401,
+    // an oracle for the name (mutation-checked: moving the gate after the slot turns it RED).
     for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
         auto res = h.sink.Post("/login", form({{"username", user}, {"password", "whatever-123456"}}),
                                kFormCt);

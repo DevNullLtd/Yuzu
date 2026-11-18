@@ -1927,6 +1927,11 @@ account policy)"* — this ships **both** halves.
   at step-up): the only host-CLI remedies are `--break-glass-arm` (if that account is the
   configured break-glass user) or `--mfa-reset <user>` then re-enrol; otherwise wait out
   the window.
+- **Lock windows follow the database clock.** The MFA failure budget's `mfa_locked_until` and
+  `mfa_last_attempt_at` are authored from, and compared against, the Postgres `now()` (DB-clock
+  authority, #3715) like the password lockout and the sessions, so a step of the database clock
+  shifts the window: a forward step of at least the window voids a live lock and starts a fresh
+  count, a backward step extends it. An owner-accepted residual, not a separate control.
 - **Arming is an out-of-band host operation, never a session route.** The IdP
   being down is *why* you break the glass, so arming cannot depend on a login.
   `yuzu-server --break-glass-arm` (with `--break-glass-user` + `--postgres-dsn`

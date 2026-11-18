@@ -1114,6 +1114,20 @@ public:
                           "Password-hash requests refused 429 by the concurrency budget "
                           "(labels: route, class, reason)",
                           "counter");
+        // Pre-seed so the first lock / refusal reads as an increase from 0, not a new series.
+        for (const char* n : {"yuzu_auth_mfa_lockout_applied_total",
+                              "yuzu_auth_mfa_lockout_blocked_total",
+                              "yuzu_auth_mfa_budget_unavailable_total"})
+            metrics_.counter(n);
+        for (const char* route : {"login", "password_change", "mfa_recovery"})
+            for (const char* cls : {"unauthenticated", "authenticated", "break_glass"})
+                for (const char* reason : {"per_source", "per_principal", "class_full",
+                                           "global_full"})
+                    metrics_.counter("yuzu_auth_pbkdf2_budget_rejected_total",
+                                     {{"route", route}, {"class", cls}, {"reason", reason}});
+        metrics_.describe("yuzu_auth_pbkdf2_budget_in_flight",
+                          "Password-hash (PBKDF2) slots in use now, sampled by the periodic sweep",
+                          "gauge");
         metrics_.describe("yuzu_auth_pbkdf2_budget_capacity",
                           "Process-wide cap on concurrent password-hash (PBKDF2) work", "gauge");
         metrics_.gauge("yuzu_http_held_open_responses").set(0);
@@ -10405,6 +10419,9 @@ public:
                 // this thread's loop or terminate the process: the next tick republishes.
                 try {
                     publish_mfa_binding_gauges(metrics_, auth_db_.get(), session_store_.get());
+                    if (auth_routes_)
+                        metrics_.gauge("yuzu_auth_pbkdf2_budget_in_flight")
+                            .set(static_cast<double>(auth_routes_->pbkdf2_budget().in_flight()));
                 } catch (const std::exception& e) {
                     spdlog::warn("mfa binding gauge publish failed: {}", e.what());
                 } catch (...) {
@@ -16616,12 +16633,14 @@ private:
         // its sibling above, from the same post-clamp number.
         metrics_.gauge("yuzu_mcp_streams_cap").set(static_cast<double>(effective_streams));
         metrics_.gauge("yuzu_http_worker_pool_size").set(static_cast<double>(pool_max));
-        // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code) work at a quarter of the
-        // worker pool (min 2) so unauthenticated hashing can never pin every worker.
+        // WP03 perf-F1: cap concurrent PBKDF2 (login / recovery-code / password-change proof)
+        // work at a quarter of the worker pool so hashing can never pin every worker.
         if (auth_routes_) {
-            // Floor 8: a tiny --http-worker-threads must not shrink the cap to 2, where a single
-            // source address could otherwise fill the whole unauthenticated lane.
-            const int pbkdf2_cap = static_cast<int>(std::max<std::size_t>(8, pool_max / 4));
+            // Floor 8 so a small pool does not shrink the lanes to nothing, but never more than
+            // half the pool (a pool under 16 workers) so non-auth routes always keep workers.
+            const std::size_t cap_want = std::max<std::size_t>(8, pool_max / 4);
+            const int pbkdf2_cap =
+                static_cast<int>(std::min(cap_want, std::max<std::size_t>(4, pool_max / 2)));
             auth_routes_->set_pbkdf2_cap(pbkdf2_cap);
             auth_routes_->pbkdf2_budget().set_per_source_cap(cfg_.auth_pbkdf2_per_source_cap);
             metrics_.gauge("yuzu_auth_pbkdf2_budget_capacity").set(static_cast<double>(pbkdf2_cap));
@@ -24086,7 +24105,8 @@ private:
             // MCP tools can never disagree with the dashboard.
             network_api,
             // lockout_clear_fn — admin unlock (POST /api/v1/users/<name>/unlock).
-            // Wraps AuthDB::clear_failed_logins so RestApiV1 stays decoupled from
+            // Wraps AuthDB::clear_account_lockouts (the password lockout AND the MFA failure
+            // budget in one statement) so RestApiV1 stays decoupled from
             // AuthDB (same injection pattern as session_revoke_fn). SOC 2 CC6.3.
             // Empty/null auth_db ⇒ false ⇒ the route 500s and audits the failure.
             [this](const std::string& username) -> bool {
@@ -24960,7 +24980,7 @@ private:
                 // B4 (#2146 API-parity) — backs the unlock_account MCP tool
                 // (twin of POST /api/v1/users/{name}/unlock). Same wiring as the
                 // REST route's lockout_clear_fn above: wraps
-                // AuthDB::clear_failed_logins so McpServer stays decoupled from
+                // AuthDB::clear_account_lockouts so McpServer stays decoupled from
                 // AuthDB. SOC 2 CC6.3. Empty/null auth_db => false => the tool
                 // reports "lockout subsystem unavailable".
                 [this](const std::string& username) -> bool {

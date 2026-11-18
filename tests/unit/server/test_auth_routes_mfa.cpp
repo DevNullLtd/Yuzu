@@ -25,6 +25,7 @@
 #include "rbac_store.hpp"
 #include "auth_routes.hpp"
 #include "pbkdf2_budget.hpp"
+#include "test_pbkdf2_budget_fill.hpp"
 #include "../../../server/core/src/auth_db_sql_helpers.hpp"
 
 #include "analytics_event_store.hpp"
@@ -3158,11 +3159,9 @@ TEST_CASE("POST /login answers a uniform 429 when the PBKDF2 budget is full (per
           "[pg][mfa][routes][auth_routes][concurrency]") {
     AuthRoutesHarness h;
     auto& budget = h.auth_routes->pbkdf2_budget();
-    budget.set_cap(2);
-    auto s1 = budget.try_acquire();
-    auto s2 = budget.try_acquire();
-    REQUIRE(s1.ok());
-    REQUIRE(s2.ok());
+    budget.set_cap(8); // break-glass floor 2, main share 6 (unauthenticated 3, authenticated 3)
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    REQUIRE(held.size() == 8);
     // Same shape for a real and an unknown username: no enumeration through the refusal.
     for (const char* user : {"alice", "no-such-user-xyz"}) {
         auto r = h.sink.Post("/login", form({{"username", user}, {"password", "whatever"}}),
@@ -3172,38 +3171,12 @@ TEST_CASE("POST /login answers a uniform 429 when the PBKDF2 budget is full (per
         CHECK(r->get_header_value("Retry-After") == "2");
         CHECK(r->get_header_value("Set-Cookie").empty());
     }
-    {
-        auto released = std::move(s2); // free one slot
-        (void)released;
-    }
+    held.clear(); // free every slot
     auto ok = h.sink.Post("/login", form({{"username", "alice"}, {"password", "alicepassword1"}}),
                           "application/x-www-form-urlencoded");
     REQUIRE(ok);
     CHECK(ok->status == 200);
 }
-
-TEST_CASE("Pbkdf2Budget: concurrent acquirers never exceed the cap", "[mfa][concurrency]") {
-    yuzu::server::Pbkdf2Budget b{3};
-    std::atomic<int> peak{0}, cur{0};
-    std::vector<std::thread> ts;
-    for (int i = 0; i < 16; ++i)
-        ts.emplace_back([&] {
-            for (int k = 0; k < 200; ++k) {
-                auto slot = b.try_acquire();
-                if (!slot.ok())
-                    continue;
-                const int now = ++cur;
-                int p = peak.load();
-                while (now > p && !peak.compare_exchange_weak(p, now)) {}
-                --cur;
-            }
-        });
-    for (auto& t : ts)
-        t.join();
-    CHECK(peak.load() <= 3);
-    CHECK(b.in_flight() == 0);
-}
-
 
 TEST_CASE("reserve_mfa_attempt SQL: `reserved` comes from the pre-update lock state, not timestamps",
           "[pg][mfa][routes][auth_routes][lockout]") {
@@ -3257,11 +3230,9 @@ TEST_CASE("PBKDF2 budget exhaustion is a uniform 429 for locked and unlocked acc
     REQUIRE(h.auth_db->lockout_status("alice")->locked);
     const auto p_locked = login_pending(h, "admin", "adminpassword1"); // taken before saturating
     auto& budget = h.auth_routes->pbkdf2_budget();
-    budget.set_cap(2);
-    auto s1 = budget.try_acquire();
-    auto s2 = budget.try_acquire();
-    REQUIRE(s1.ok());
-    REQUIRE(s2.ok());
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget);
+    REQUIRE(held.size() == 8);
     // Locked password account, unlocked password account, unknown name: all 429.
     for (const char* user : {"alice", "admin", "no-such-user-xyz"}) {
         auto r = h.sink.Post("/login", form({{"username", user}, {"password", "adminpassword1"}}),
@@ -3277,65 +3248,21 @@ TEST_CASE("PBKDF2 budget exhaustion is a uniform 429 for locked and unlocked acc
     CHECK(rl->status == 429);
 }
 
-TEST_CASE("Pbkdf2Budget fairness: an unauthenticated flood cannot starve authenticated callers",
-          "[mfa][concurrency]") {
-    using namespace yuzu::server;
-    Pbkdf2Budget b{4, /*per_source_cap=*/1}; // reserve 2 for authenticated, unauth max 2
-    auto a1 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1");
-    REQUIRE(a1.ok());
-    auto a1b = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1");
-    CHECK_FALSE(a1b.ok()); // per-source sub-budget
-    CHECK(a1b.refusal() == Pbkdf2Refusal::kPerSource);
-    auto a2 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.2");
-    REQUIRE(a2.ok());
-    auto a3 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.3");
-    CHECK_FALSE(a3.ok()); // class cap: unauthenticated may hold at most cap - reserve
-    CHECK(a3.refusal() == Pbkdf2Refusal::kClassFull);
-    // The flood cannot take the reserved slots: authenticated callers still get two.
-    auto u1 = b.try_acquire(Pbkdf2Class::kAuthenticated);
-    auto u2 = b.try_acquire(Pbkdf2Class::kAuthenticated);
-    CHECK(u1.ok());
-    CHECK(u2.ok());
-    CHECK_FALSE(b.try_acquire(Pbkdf2Class::kAuthenticated).ok()); // global cap still holds
-    { auto gone = std::move(a1); }
-    CHECK(b.try_acquire(Pbkdf2Class::kUnauthenticated, "10.0.0.1").refusal() !=
-          Pbkdf2Refusal::kPerSource); // per-source entry released
-}
-
-
-TEST_CASE("Pbkdf2Budget: the break-glass lane uses the reserve but is capped at one slot",
-          "[mfa][concurrency]") {
-    using namespace yuzu::server;
-    Pbkdf2Budget b{4, 4};
-    auto u1 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "a");
-    auto u2 = b.try_acquire(Pbkdf2Class::kUnauthenticated, "b");
-    REQUIRE(u1.ok());
-    REQUIRE(u2.ok());
-    CHECK_FALSE(b.try_acquire(Pbkdf2Class::kUnauthenticated, "c").ok()); // ordinary lane full
-    auto bg = b.try_acquire(Pbkdf2Class::kBreakGlass, "x");
-    CHECK(bg.ok()); // the flood on the ordinary lane cannot lock the escape hatch out
-    auto bg2 = b.try_acquire(Pbkdf2Class::kBreakGlass, "y");
-    CHECK_FALSE(bg2.ok()); // but naming that account is not a way to take the whole reserve
-    CHECK(bg2.refusal() == Pbkdf2Refusal::kClassFull);
-    CHECK(b.try_acquire(Pbkdf2Class::kAuthenticated).ok()); // one reserved slot left
-}
-
 TEST_CASE("POST /login/mfa: a 429 on a recovery code leaves the pending token usable",
           "[pg][mfa][routes][auth_routes][concurrency]") {
     AuthRoutesHarness h;
     const auto secret = h.enroll_mfa("admin");
     const auto pending = login_pending(h, "admin", "adminpassword1");
     auto& budget = h.auth_routes->pbkdf2_budget();
-    budget.set_cap(2);
-    auto s1 = budget.try_acquire();
-    auto s2 = budget.try_acquire(); // global full
-    REQUIRE(s2.ok());
+    budget.set_cap(8);
+    auto held = yuzu::test::fill_pbkdf2_budget(budget); // every lane full
+    REQUIRE(held.size() == 8);
     auto busy = h.sink.Post("/login/mfa",
                             form({{"mfa_pending_token", pending}, {"code", "AAAA-BBBB-CCCC-DDDD"}}),
                             "application/x-www-form-urlencoded");
     REQUIRE(busy);
     CHECK(busy->status == 429);
-    { auto gone1 = std::move(s1); auto gone2 = std::move(s2); }
+    held.clear();
     auto ok = h.sink.Post("/login/mfa",
                           form({{"mfa_pending_token", pending}, {"code", h.totp_at(secret, 1)}}),
                           "application/x-www-form-urlencoded");

@@ -880,7 +880,9 @@ int main(int argc, char* argv[]) {
     bool break_glass_arm = false;
     app.add_flag("--break-glass-arm", break_glass_arm,
                  "Break-glass: arm --break-glass-user for the configured window, then exit "
-                 "(audited; enables local login under --auth-mode=sso-only)");
+                 "(audited; enables local login under --auth-mode=sso-only). Arming also resets "
+                 "the account's second-factor failure lock; the exemption is from the password "
+                 "lockout only, so the MFA failure budget still applies to it afterwards.");
 
     // NVD CVE feed options
     int nvd_sync_hours = 4;

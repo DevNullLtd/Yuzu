@@ -629,6 +629,8 @@ until `--auth-lockout-window-secs` passes (audit: `auth.mfa.lockout.applied`, th
 4. **Direct SQL** (last resort, writes no audit row; see the fallback above, which now clears the
    three MFA columns too).
 
+**Clock note.** Lock windows are measured by the Postgres clock (`now()`), so a step of the database clock shifts them: a forward step of at least the window clears a lock, a backward step lengthens one.
+
 **Sole-administrator wedge.** If the only administrator's second factor is locked, they hold no API
 token and no break-glass account is configured, options 2 and `--break-glass-arm` are unavailable:
 use `--mfa-reset <user>` and re-enrol, or wait out the window. A self-service password change does
@@ -1296,6 +1298,12 @@ only — it does not come from `yuzu-server.cfg`, so the one-shot must repeat
 whatever the running service passes in its unit file. Omit it and the command
 exits non-zero with `error: --break-glass-arm requires --break-glass-user`,
 arming nothing.
+
+The break-glass exemption is from the **password lockout only**: wrong TOTP or recovery codes still
+spend the per-account second-factor failure budget, so a break-glass login can be refused with the
+uniform `401` while that account's second factor is locked. Arming resets that lock in the same
+statement (the audit row says so), which is the host-side remedy; see
+[Second-factor (MFA) lock, `429` and `503` on sign-in](#second-factor-mfa-lock-429-and-503-on-sign-in).
 
 Arming is fail-closed on audit: the audit store is checked reachable and
 migrated *before* the mutate, and if the row fails to persist afterwards the

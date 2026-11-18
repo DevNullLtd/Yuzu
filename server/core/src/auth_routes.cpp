@@ -2198,7 +2198,8 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
         pbkdf2_slot.emplace(acquire_pbkdf2(!login_route         ? Pbkdf2Class::kAuthenticated
                                            : opts.lockout_exempt ? Pbkdf2Class::kBreakGlass
                                                                  : Pbkdf2Class::kUnauthenticated,
-                                           req, opts.metric_route));
+                                           req, opts.metric_route,
+                                           login_route ? std::string{} : "u:" + username));
         if (!pbkdf2_slot->ok())
             return {PasswordCheckOutcome::kBusy, std::nullopt, {}};
     }
@@ -2394,8 +2395,9 @@ PasswordCheckResult AuthRoutes::verify_password_with_lockout(const std::string& 
 }
 
 Pbkdf2Budget::Slot AuthRoutes::acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
-                                              const std::string& route) {
-    auto slot = pbkdf2_budget_.try_acquire(cls, req.remote_addr);
+                                              const std::string& route,
+                                              const std::string& principal) {
+    auto slot = pbkdf2_budget_.try_acquire(cls, req.remote_addr, principal);
     if (!slot.ok()) {
         if (auto* m = auth_mgr_.metrics_registry())
             m->counter("yuzu_auth_pbkdf2_budget_rejected_total",
@@ -2493,7 +2495,7 @@ PasswordVerifyFn AuthRoutes::password_change_verify_fn() {
         opts.lockout_exempt = cfg_.auth_mode == "sso-only" && !cfg_.break_glass_user.empty() &&
                               username == cfg_.break_glass_user;
         // #5342 Gate 7 (C8): the SAME hardened-mode gate /login runs, at the
-        // same point (after the lockout pre-check, before PBKDF2). Under
+        // same point (before any PBKDF2 slot and before the lockout pre-check). Under
         // sso-only only an ARMED break-glass account may have its password
         // evaluated; once disarmed, a still-live break-glass session cannot
         // use this route as a guessing oracle (no PBKDF2) or to lock the
@@ -2661,8 +2663,9 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // ~100 ms of server CPU — for a residue that leaks only operational
         // state, never a secret. Same trade-off the shipped lockout pre-check
         // already makes (see docs/auth-architecture.md "Account lockout").
-        // Runs AFTER the lockout pre-check (a locked account answers first,
-        // exactly as before the extraction) and BEFORE PBKDF2.
+        // Runs inside verify_password_with_lockout BEFORE any PBKDF2 slot is taken and BEFORE
+        // the lockout pre-check (a refused attempt never hashes, so it never needs a slot;
+        // the 401 is the same generic body either way).
         // The arm-state decision itself is the shared, response-free
         // sso_only_local_password_gate (#5342 Gate 7, C8 — the self-service
         // password change runs the SAME gate); the 401, metric and log line
@@ -3926,7 +3929,8 @@ void AuthRoutes::register_routes(HttpRouteSink& sink) {
         // accounts alike (no lock-state oracle), and nothing needs refunding.
         std::optional<Pbkdf2Budget::Slot> recovery_slot;
         if (!mfa_code_is_totp_shape(code)) {
-            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kAuthenticated, req, "mfa_recovery"));
+            recovery_slot.emplace(acquire_pbkdf2(Pbkdf2Class::kAuthenticated, req, "mfa_recovery",
+                                                   "u:" + session->username));
             if (!recovery_slot->ok()) {
                 refuse_pbkdf2_busy(res);
                 return;

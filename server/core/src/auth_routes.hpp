@@ -162,8 +162,8 @@ struct PasswordCheckOptions {
     /// break-glass exemption — see `POST /login`). The attempt is still
     /// verified; a failure is still the caller's to audit.
     bool lockout_exempt{false};
-    /// Runs AFTER the lockout pre-check and BEFORE PBKDF2, inside the
-    /// per-username stripe. Return false to refuse (having written the
+    /// Runs inside the per-username stripe BEFORE any PBKDF2 slot is taken and BEFORE the
+    /// lockout pre-check. Return false to refuse (having written the
     /// response) → `kGateRejected`. `/login` uses this for its sso-only gate.
     std::function<bool()> pre_verify_gate;
     /// Runs on a bad credential BEFORE the lockout accounting, so a route's
@@ -222,8 +222,9 @@ public:
                std::unique_ptr<oidc::OidcProvider>& oidc_provider,
                saml::SamlProvider* saml_provider = nullptr);
 
-    /// Size the process-wide PBKDF2 concurrency budget (server.cpp: a conservative fraction of
-    /// the httplib worker pool). Default is hardware_concurrency/4, min 2.
+    /// Size the process-wide PBKDF2 concurrency budget (server.cpp: a quarter of the httplib
+    /// worker pool, floor 8, never above half the pool). Default is hardware_concurrency/4, at
+    /// least 4 (the budget's own minimum).
     void set_pbkdf2_cap(int cap) { pbkdf2_budget_.set_cap(cap); }
     Pbkdf2Budget& pbkdf2_budget() { return pbkdf2_budget_; }
 
@@ -1246,7 +1247,8 @@ private:
     /// Callers take it BEFORE any account-state decision (lock, reservation) so a full budget
     /// answers 429 identically for locked and unlocked accounts (no lock-state oracle).
     Pbkdf2Budget::Slot acquire_pbkdf2(Pbkdf2Class cls, const httplib::Request& req,
-                                      const std::string& route);
+                                      const std::string& route,
+                                      const std::string& principal = {});
 
     // ── Per-account durable MFA failure budget (WP03 F8/F15) ──────────────────
     // The ONE chokepoint for second-factor guess limiting, shared by

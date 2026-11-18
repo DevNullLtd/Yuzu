@@ -2051,11 +2051,12 @@ No replacement session is issued: the caller is signed out and signs in again wi
 | `409` | `not_local` | OIDC/SAML session, or the account is SSO/SCIM-managed (nothing changed) |
 | `409` | `conflict` | The stored password changed between the check and the write (nothing changed). Sign in with the current password and retry |
 | `415` | *(not audited)* | `Content-Type` is not `application/json` |
+| `429` | `pbkdf2_busy` | The process-wide concurrent password-hash cap is full for this lane (at most 3 slots per principal): nothing was verified or counted toward lockout. Carries `Retry-After: 2` and `retry_after_ms`. Retry |
 | `503` | `verify_transient` | The current password could not be verified (store read failure, or a concurrent change). Retry |
 | `503` | `audit_unavailable` | The audit row could not be written, so the change was not made (`Sec-Audit-Failed: true`). Retry |
 | `503` | `store_unavailable` | The auth store is unavailable (`retry_after_ms: 2000`), or the server runs without the Postgres auth store (`retry_after_ms: 5000`) |
 
-Every `503` carries `retry_after_ms` and a `Retry-After` header.
+Every `429` and `503` carries `retry_after_ms` and a `Retry-After` header.
 
 **Audit:** `user.password_change`, `target_type=User`, `target_id=<caller>`, the caller as principal on every row. Success is `result=ok`, `detail=self_service sessions_revoked=<N> provisional_mfa_cleared=<true|false>`, written **in the same database transaction as the change** — the change and its evidence commit or abort together, so there is no rollback step and no "changed but unrecorded" state; there is no separate `session.revoke_all` row. Refusals are `result=denied` (`error` for `503`) with the detail tokens above. The password, its hash and its length never appear in any audit row or log line.
 
@@ -15529,7 +15530,7 @@ The endpoint distinguishes TOTP from recovery by code shape — exactly 6 ASCII 
 |---|---|---|
 | `200` + `Set-Cookie: yuzu_session=…` | Code accepted | `{"status":"ok"}` |
 | `401` | Invalid or expired pending token, or rejected code | `{"error":{"code":401,"message":"Invalid verification code"}}` — the wire body is identical for all failure modes so an attacker cannot distinguish "this pending token is valid; my code was wrong" from "this pending token is unknown." The distinguishing detail is in the audit `detail` column only (an account locked by the failure budget is the same `401`, audit `mfa.login.failed` with detail `mfa locked (failure budget exhausted)`). |
-| `429` | A recovery code was submitted while the process-wide PBKDF2 budget was full (nothing was verified or counted; the pending token is spent, sign in again). Carries `Retry-After: 2` and `retry_after_ms`. | A4 envelope |
+| `429` | A recovery code was submitted while the process-wide PBKDF2 budget was full (nothing was verified or counted, and the pending token is kept while it is within its lifetime, so the retry can use it). Carries `Retry-After: 2` and `retry_after_ms`. | A4 envelope |
 | `503` | The failed-attempt budget could not be written (`Retry-After: 2`). **Nothing was verified** and no session is minted; audit `mfa.login.failed` detail `mfa attempt could not be counted (fail-closed, nothing verified, no session minted)`. | A4 envelope |
 | `503` | The user's MFA secret could not be read/decrypted (PG outage mid-read, tamper, an unresolvable/rotated KEK, or a corrupt blob) | `{"error":{"code":503,"message":"auth_db unavailable"}}` |
 
