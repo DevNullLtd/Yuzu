@@ -318,9 +318,9 @@ jobs:
 
       # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py
       # describes one shipped file with its vcpkg closure (agent or server),
-      # never test or helper ports, and its `check` refuses a checkout-scale or
-      # checkout-path SBOM and one whose artifact hash differs. syft is stubbed.
-      # Stdlib only.
+      # never test or helper ports, and its `check` refuses a checkout-scale
+      # SBOM, one listing a checkout/build/test-tree path and one whose artifact
+      # hash differs. syft, pkgutil and rpm2cpio are stubbed. Stdlib only.
       - name: Per-artifact SBOM generator
         run: python3 -I tests/test_artifact_sbom.py
 

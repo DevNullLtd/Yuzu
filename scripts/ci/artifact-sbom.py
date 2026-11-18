@@ -8,36 +8,61 @@ sees nothing in them. This script makes one SBOM per shipped file instead.
 
 `generate` describes ONE artifact (an archive, .deb, .rpm, .pkg or installer):
 
-  1. Unpack the artifact into a fresh temporary directory (or, for an installer
-     this script cannot unpack, the archive named by --contents-from) and run
-     syft over that directory only, so the SBOM lists what is inside the file.
+  1. Unpack the artifact into a fresh temporary directory and run syft over
+     that directory only, so the SBOM lists what is inside the file. A macOS
+     .pkg is expanded with pkgutil; its payload stages the binaries under
+     hidden `.incoming` names (deploy/packaging/macos/build-pkg.sh), which are
+     read as the names they are installed under. An InnoSetup installer is
+     not unpacked here: its contents are the files of the archive named by
+     --contents-from that the installer script named by --iss installs (its
+     [Files] `Source:` lines, resolved against the archive's layout); a file
+     the installer does not install is dropped, and the SBOM root says so.
   2. If the unpacked tree holds a Yuzu C++ binary, add the vcpkg ports it is
      built from, read from the INSTALLED vcpkg tree for the release triplet
      (`vcpkg_installed/vcpkg/status` + `<triplet>/share/<port>/vcpkg.spdx.json`):
      the dependency closure of vcpkg.json's core dependencies (agent) plus its
      `server` feature (server), with the real version, licence and a
-     `pkg:github` (or `pkg:generic`) purl of the upstream source. Host-only build
-     tools and the `vcpkg-*` helper ports are left out. The closure follows every
+     `pkg:github` (or `pkg:generic`) purl of the upstream source. The
+     `vcpkg-*` helper ports are left out, and so is a dependency recorded for
+     another triplet (a host build tool when the host triplet differs from the
+     release triplet, as on Linux; on Windows and macOS the two are the same,
+     so only the `vcpkg-*` filter applies). The closure follows every
      INSTALLED feature of a reached port, so it can over-list a port a feature
-     pulled in that the binary does not end up linking; it never under-lists.
+     pulled in that the binary does not end up linking; it never under-lists a
+     vcpkg port. A port whose vcpkg SPDX file gives no licence is listed with
+     none (NOASSERTION in SPDX) and named in a warning.
   3. With --rebar-lock, an Erlang application that is a Hex package in the lock
      gets a `pkg:hex` purl (syft reports every OTP application as `pkg:otp`).
   4. Stamp the artifact's file name, version and SHA-256 on the SBOM root, write
      `<stem>.cdx.json` and `<stem>.spdx.json`, and run the `check` below on both.
 
+Not every component is listed. Code vendored into the source tree (for
+yuzu-server, server/core/vendor: qrcodegen and the embedded web assets) and an
+installer's own runtime (InnoSetup's setup loader and uninstaller) are not, so
+an SBOM for a file holding yuzu-server, and an installer's SBOM, carry a
+CycloneDX composition with `aggregate: incomplete` on the root (SPDX 2.3 has no
+such field: the root gets a `CONTAINS NOASSERTION` relationship, SPDX's way of
+saying no assertion is made that the listed elements are all it contains, and
+the reason in the root's comment).
+
 `check` is the release gate: an artifact SBOM fails when it has more than
-MAX_COMPONENTS entries or fewer than one, lists a path under one of the
-FORBIDDEN_SEGMENTS (a sign the checkout or a test tree was scanned), or (with
+MAX_COMPONENTS entries, has none and does not record that its file was
+unpacked and held files, lists a path with one of the FORBIDDEN_SEGMENTS (a
+checkout, vcpkg or build tree, the docs site or a test tree, the paths a scan of
+the wrong directory lists; a path elsewhere is not detected), or (with
 --artifacts-dir) names an artifact that is absent or whose SHA-256 differs.
 Image SBOMs (`*-image.*`) are not artifact SBOMs and are not checked.
 
-Stdlib only; needs syft for `generate`, plus dpkg-deb (.deb), rpm2cpio and cpio
-(.rpm) or pkgutil (.pkg) for those formats. Pinned by tests/test_artifact_sbom.py.
+Stdlib only (Python 3.9+, the macOS runner's); needs syft for `generate`, plus
+dpkg-deb (.deb), rpm2cpio and cpio (.rpm) or pkgutil (.pkg) for those formats.
+Every external command runs with a timeout. Pinned by
+tests/test_artifact_sbom.py.
 """
 
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -58,24 +83,47 @@ ARTIFACT_SUFFIXES = (".tar.gz", ".zip", ".deb", ".rpm", ".pkg", ".exe")
 # artifact SBOM. Measured locally on 2026-11-17 with syft 1.57.2: 16 to 22
 # CycloneDX components and 22 to 58 SPDX entries per artifact (Linux archive and
 # .debs from a partial local build, gateway tarball and .deb from a fresh prod
-# release). SPDX also lists each binary syft records as a file, so a full build
-# adds one entry per plugin: about 100 for the Windows agent archive (74
-# plugins, the agent, its core DLL, about 10 vcpkg DLLs, 16 ports; estimated,
-# not measured). The v0.15.0 workspace scans this replaces had 40,853 (Linux)
-# and 43,407 (Windows). 400 leaves about four times the largest artifact and
-# still fails any return to a checkout scan by two orders of magnitude. Raise
-# it deliberately, with a measurement, never to silence a failing scan.
+# release). syft records each Windows PE binary it sees twice in CycloneDX (an
+# application and a file component) and once in SPDX: the real v0.15.0 Windows
+# archive (server and agent, 95 .exe/.dll files) measured 212 entries in each
+# format on 2026-11-18, and its installer's SBOM 190. That archive is the
+# largest; each plugin added on Windows adds about two. The v0.15.0 workspace
+# scans this replaces had 40,853 (Linux) and 43,407 (Windows). 400 leaves
+# about twice the largest artifact and still fails any return to a checkout
+# scan by two orders of magnitude. Raise it deliberately, with a measurement,
+# never to silence a failing scan.
 MAX_COMPONENTS = 400
 
 # A path with one of these segments in an artifact SBOM means the checkout, the
-# vcpkg clone, the docs site or a test build tree was scanned, not the artifact.
+# vcpkg clone or its installed tree (vcpkg_installed/), a Meson build tree
+# (build-linux/, build-windows/, ...), a rebar3 build tree (_build/,
+# _build_eunit/, ...), the docs site or a test tree was scanned, not the
+# artifact. Only these are detected: a scan of some other wrong directory is
+# caught, if at all, by the entry bound. None of the 1,998 paths in v0.15.0's
+# archives, .debs and .pkg payload has such a segment (checked 2026-11-18; the
+# .rpms and the installer were not listed). The messages and the docs name the
+# same set as FORBIDDEN_LABEL.
 FORBIDDEN_SEGMENTS = re.compile(
-    r"(?:^|[/\\])(?:vcpkg|site|tests|_build_[^/\\]*|\.git|\.github)(?:[/\\]|$)")
+    r"(?:^|[/\\])(?:vcpkg|vcpkg_installed|site|tests|_build|_build_[^/\\]*|build-[^/\\]+|\.git|\.github)"
+    r"(?:[/\\]|$)")
+FORBIDDEN_LABEL = "vcpkg/, vcpkg_installed/, build-*/, _build/, _build_*/, site/, tests/, .git/ or .github/"
 
-# Basenames that identify the Yuzu C++ binaries in an unpacked artifact.
+# Basenames that identify the Yuzu C++ binaries in an unpacked artifact, by the
+# name each is installed under (see installed_name()).
 SERVER_NAMES = {"yuzu-server", "yuzu-server.exe"}
 AGENT_NAMES = {"yuzu-agent", "yuzu-agent.exe", "yuzu_agent_core.dll"}
 AGENT_PREFIXES = ("libyuzu_agent_core.so", "libyuzu_agent_core.dylib")
+
+# The macOS .pkg payload stages each loose binary under a hidden name that
+# postinstall renames into place (deploy/packaging/macos/build-pkg.sh):
+# usr/local/bin/.yuzu-agent.incoming and .libyuzu_agent_core.incoming.dylib.
+STAGED_NAME = re.compile(r"^\.(?P<base>[^/\\]+?)\.incoming(?P<ext>\.[A-Za-z0-9]+)?$")
+
+# Seconds an unpacking command (dpkg-deb, rpm2cpio | cpio, pkgutil) or syft may
+# run. A stalled one (a FIFO in a payload, a hung mount) would otherwise hold a
+# self-hosted runner until the job's own limit. Measured runs take seconds.
+UNPACK_TIMEOUT = 600
+SYFT_TIMEOUT = 900
 
 # NVD vendor:product for the vcpkg ports that have one, so a CPE-matching
 # scanner (grype, trivy, Dependency-Track) sees the C++ libraries: they carry no
@@ -132,31 +180,58 @@ def _extract_tar(path: Path, dest: Path) -> None:
         raise SbomError(f"{path.name}: {e}") from e
 
 
+# Python 3.12+ (and 3.8.17+/3.9.17+/3.10.12+/3.11.4+) has tarfile's "data"
+# extraction filter. The macOS runner's Apple python3 (3.9.6) does not, so the
+# fallback below is live there. A module flag so the tests can force it.
+HAS_DATA_FILTER = hasattr(tarfile, "data_filter")
+
+
 def _extract_tar_checked(path: Path, dest: Path) -> None:
     with tarfile.open(path, "r:gz") as tf:
-        if hasattr(tarfile, "data_filter"):
+        if HAS_DATA_FILTER:
             tf.extractall(dest, filter="data")
             return
-        # Older Python without extraction filters: refuse anything the "data"
-        # filter would refuse rather than extract it.
+        # No extraction filters: refuse, rather than extract, a member that is
+        # absolute, escapes `dest`, is a device or FIFO, is a link whose target
+        # is absolute or escapes, or lies under a link member. The last rule
+        # closes link chains (`a -> .` then `a/b -> ..`): each link is checked
+        # lexically before anything is written, so a member must never be
+        # reached through another member that is a link.
+        links: set[str] = set()
         for m in tf.getmembers():
-            target = dest / m.name
-            if os.path.isabs(m.name) or not _inside(dest, target):
+            name = os.path.normpath(m.name)
+            target = dest / name
+            if os.path.isabs(m.name) or Path(name).parts[:1] == ("..",) or not _inside(dest, target):
                 raise SbomError(f"{path.name}: member {m.name!r} escapes the extraction directory")
-            if m.isdev():
-                raise SbomError(f"{path.name}: member {m.name!r} is a device")
+            if m.isdev() or m.isfifo():
+                raise SbomError(f"{path.name}: member {m.name!r} is a device or FIFO")
+            parts = Path(name).parts
+            if any(str(Path(*parts[:i])) in links for i in range(1, len(parts))):
+                raise SbomError(f"{path.name}: member {m.name!r} lies under a link member")
             if m.issym() or m.islnk():
                 link = (target.parent / m.linkname) if m.issym() else (dest / m.linkname)
                 if os.path.isabs(m.linkname) or not _inside(dest, link):
                     raise SbomError(f"{path.name}: link {m.name!r} points outside the extraction directory")
-        tf.extractall(dest)
+                links.add(str(Path(name)))
+        # Rely on the checks above alone, as an old Python does (an explicit
+        # "fully_trusted" where filters exist: Python 3.14 would otherwise
+        # apply "data" here and hide a gap in them from the tests).
+        tf.extractall(dest, **({"filter": "fully_trusted"} if hasattr(tarfile, "fully_trusted_filter") else {}))
+
+
+def _timeout_error(cmd, seconds) -> SbomError:
+    return SbomError(f"{Path(cmd[0]).name} did not finish within {seconds} s (stalled? see UNPACK_TIMEOUT/SYFT_TIMEOUT)")
 
 
 def _run(cmd, **kw) -> None:
     exe = shutil.which(cmd[0])
     if not exe:
         raise SbomError(f"{cmd[0]} not found on PATH (needed to unpack the artifact)")
-    r = subprocess.run([exe] + list(cmd[1:]), capture_output=True, text=True, **kw)
+    try:
+        r = subprocess.run([exe] + list(cmd[1:]), capture_output=True, text=True,
+                           timeout=UNPACK_TIMEOUT, **kw)
+    except subprocess.TimeoutExpired as e:
+        raise _timeout_error(cmd, UNPACK_TIMEOUT) from e
     if r.returncode != 0:
         raise SbomError(f"{' '.join(cmd)} exited {r.returncode}: {r.stderr.strip()[:500]}")
 
@@ -181,10 +256,16 @@ def extract(path: Path, dest: Path) -> None:
         if not rpm2cpio or not cpio:
             raise SbomError("rpm2cpio and cpio are needed to unpack an .rpm")
         p1 = subprocess.Popen([rpm2cpio, str(path)], stdout=subprocess.PIPE)
-        p2 = subprocess.run([cpio, "-idm", "--quiet", "--no-absolute-filenames"],
-                            stdin=p1.stdout, cwd=dest, capture_output=True)
-        p1.stdout.close()
-        if p1.wait() != 0 or p2.returncode != 0:
+        try:
+            p2 = subprocess.run([cpio, "-idm", "--quiet", "--no-absolute-filenames"],
+                                stdin=p1.stdout, cwd=dest, capture_output=True, timeout=UNPACK_TIMEOUT)
+            p1.stdout.close()
+            rc1 = p1.wait(timeout=UNPACK_TIMEOUT)
+        except subprocess.TimeoutExpired as e:
+            p1.kill()
+            p1.wait()
+            raise _timeout_error(["rpm2cpio | cpio"], UNPACK_TIMEOUT) from e
+        if rc1 != 0 or p2.returncode != 0:
             raise SbomError(f"{name}: rpm2cpio|cpio failed: {p2.stderr.decode(errors='replace')[:500]}")
     elif name.endswith(".pkg"):
         # pkgutil wants a directory that does not exist yet.
@@ -193,16 +274,106 @@ def extract(path: Path, dest: Path) -> None:
         raise SbomError(f"{name}: cannot unpack this type here; pass --contents-from <archive with the same files>")
 
 
+def installed_name(f: str) -> str:
+    """The name a file in an unpacked artifact is installed under: the .pkg's
+    staged `.yuzu-agent.incoming` is `yuzu-agent`, and
+    `.libyuzu_agent_core.incoming.dylib` is `libyuzu_agent_core.dylib`. Any
+    other name is returned unchanged."""
+    m = STAGED_NAME.match(f)
+    return m.group("base") + (m.group("ext") or "") if m else f
+
+
 def yuzu_binaries(root: Path) -> tuple[bool, bool]:
     """(has_agent, has_server) for an unpacked tree."""
     agent = server = False
     for _dirpath, _dirs, files in os.walk(root):
-        for f in files:
+        for f in map(installed_name, files):
             if f in SERVER_NAMES:
                 server = True
             if f in AGENT_NAMES or f.startswith(AGENT_PREFIXES):
                 agent = True
     return agent, server
+
+
+def count_files(root: Path) -> int:
+    return sum(len(files) for _d, _s, files in os.walk(root))
+
+
+# ── InnoSetup installer contents ─────────────────────────────────────────────
+
+ISS_ENTRY = re.compile(r'\s*([A-Za-z]+)\s*:\s*("(?:[^"]|"")*"|[^;]*)\s*(?:;|$)')
+
+
+def iss_file_entries(iss: Path) -> list[tuple[str, str]]:
+    """[(dest_dir_below_app, source_basename_glob)] for each `Source:` line of
+    the [Files] section of an InnoSetup script, e.g.
+      Source: "{#BuildDir}\\agents\\plugins\\x\\x.dll"; DestDir: "{app}\\plugins"
+    -> ("plugins", "x.dll"). Fails on anything this cannot map onto the
+    archive layout without guessing: a preprocessor directive inside [Files],
+    a DestDir outside {app}, a recursive or DestName entry."""
+    entries, section = [], None
+    for lineno, raw in enumerate(iss.read_text(encoding="utf-8-sig").splitlines(), 1):
+        line = raw.strip()
+        if line.startswith("[") and line.endswith("]"):
+            section = line[1:-1].strip().lower()
+            continue
+        if section != "files" or not line or line.startswith(";"):
+            continue
+        where = f"{iss.name}:{lineno}"
+        if line.startswith("#"):
+            raise SbomError(f"{where}: preprocessor directive inside [Files]; this script does not evaluate ISPP")
+        fields = {}
+        pos = 0
+        while pos < len(line):
+            m = ISS_ENTRY.match(line, pos)
+            if not m or m.end() == pos:
+                raise SbomError(f"{where}: cannot parse [Files] line {line!r}")
+            val = m.group(2).strip()
+            if val.startswith('"') and val.endswith('"') and len(val) >= 2:
+                val = val[1:-1].replace('""', '"')
+            fields[m.group(1).lower()] = val
+            pos = m.end()
+        if "source" not in fields:
+            raise SbomError(f"{where}: [Files] line without Source: {line!r}")
+        flags = fields.get("flags", "").lower().split()
+        if "recursesubdirs" in flags or "destname" in fields:
+            raise SbomError(f"{where}: recursesubdirs/DestName entries are not mapped onto the archive")
+        dest = fields.get("destdir", "").replace("/", "\\")
+        if dest.lower() != "{app}" and not dest.lower().startswith("{app}\\"):
+            raise SbomError(f"{where}: DestDir {dest!r} is not under {{app}}")
+        sub = "/".join(p for p in dest[len("{app}"):].split("\\") if p)
+        entries.append((sub, fields["source"].replace("/", "\\").rsplit("\\", 1)[-1]))
+    if not entries:
+        raise SbomError(f"{iss.name}: no Source: lines in a [Files] section")
+    return entries
+
+
+def keep_installed(contents: Path, entries: list[tuple[str, str]]):
+    """Delete from the unpacked archive every file the installer does not
+    install. The archive holds one top-level directory standing for {app}
+    (yuzu-agent-<version>-windows-x64/), so {app}\\plugins is <top>/plugins.
+    Returns (kept, dropped, unmatched_entries) as sorted relative paths."""
+    tops = [p for p in contents.iterdir()]
+    if len(tops) != 1 or not tops[0].is_dir():
+        raise SbomError("--contents-from archive must hold exactly one top-level directory (the install root)")
+    top = tops[0]
+    kept, dropped, used = [], [], set()
+    for dirpath, _dirs, files in os.walk(top):
+        rel_dir = Path(dirpath).relative_to(top).as_posix()
+        rel_dir = "" if rel_dir == "." else rel_dir
+        for f in files:
+            hit = [i for i, (sub, pat) in enumerate(entries)
+                   if sub.lower() == rel_dir.lower() and fnmatch.fnmatch(f.lower(), pat.lower())]
+            rel = f"{rel_dir}/{f}" if rel_dir else f
+            if hit:
+                kept.append(rel)
+                used.update(hit)
+            else:
+                dropped.append(rel)
+                os.remove(os.path.join(dirpath, f))
+    unmatched = [f"{{app}}\\{sub.replace('/', chr(92))}\\{pat}" if sub else f"{{app}}\\{pat}"
+                 for i, (sub, pat) in enumerate(entries) if i not in used]
+    return sorted(kept), sorted(dropped), unmatched
 
 
 # ── vcpkg ────────────────────────────────────────────────────────────────────
@@ -364,13 +535,19 @@ def _hex_purl(purl: str, hexmap: dict):
 # ── Merging ──────────────────────────────────────────────────────────────────
 
 def merge_cdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
-              vcomps: list[dict], hexmap: dict) -> dict:
+              vcomps: list[dict], hexmap: dict, incomplete: bool = False) -> dict:
     meta = doc.setdefault("metadata", {})
     root = meta.setdefault("component", {})
     root.update({"type": "application", "name": artifact, "version": version,
                  "hashes": [{"alg": "SHA-256", "content": sha}]})
+    root.setdefault("bom-ref", "artifact")
     meta["properties"] = meta.get("properties", []) + [
         {"name": f"yuzu:sbom:{k}", "value": v} for k, v in notes.items()]
+    if incomplete:
+        # The artifact holds components this SBOM does not list (notes say
+        # which kind): machine-readable, not only prose.
+        doc["compositions"] = (doc.get("compositions") or []) + [
+            {"aggregate": "incomplete", "assemblies": [root["bom-ref"]]}]
     comps = doc.setdefault("components", [])
     for c in comps:
         new = _hex_purl(c.get("purl"), hexmap)
@@ -413,11 +590,17 @@ def _spdx_root(doc: dict) -> dict:
 
 
 def merge_spdx(doc: dict, artifact: str, version: str, sha: str, notes: dict,
-               vcomps: list[dict], hexmap: dict) -> dict:
+               vcomps: list[dict], hexmap: dict, incomplete: bool = False) -> dict:
     root = _spdx_root(doc)
     root.update({"name": artifact, "versionInfo": version,
                  "checksums": [{"algorithm": "SHA256", "checksumValue": sha}],
                  "comment": "; ".join(f"{k}: {v}" for k, v in notes.items())})
+    if incomplete:
+        # SPDX 2.3 has no completeness field; NOASSERTION as the related
+        # element says no assertion is made that the listed ones are all.
+        doc.setdefault("relationships", []).append(
+            {"spdxElementId": root["SPDXID"], "relationshipType": "CONTAINS",
+             "relatedSpdxElement": "NOASSERTION"})
     for p in doc.get("packages", []):
         for ref in p.get("externalRefs", []) or []:
             if ref.get("referenceType") == "purl":
@@ -456,8 +639,17 @@ def _cdx_components(comps):
         yield from _cdx_components(c.get("components"))
 
 
+def _unpacked_files(value) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
 def inspect(doc: dict):
-    """(format, entry_count, paths, described_name, described_sha256)."""
+    """(format, entry_count, paths, described_name, described_sha256,
+    unpacked_files): the last is the number of files `generate` recorded it
+    unpacked from the artifact (0 when the SBOM records none)."""
     if doc.get("bomFormat") == "CycloneDX":
         comps = list(_cdx_components(doc.get("components")))
         paths = []
@@ -469,36 +661,46 @@ def inspect(doc: dict):
                     paths.append(p.get("value", ""))
             for occ in (c.get("evidence") or {}).get("occurrences", []) or []:
                 paths.append(occ.get("location", ""))
-        root = (doc.get("metadata") or {}).get("component") or {}
+        meta = doc.get("metadata") or {}
+        root = meta.get("component") or {}
         sha = next((h.get("content") for h in root.get("hashes", []) or [] if h.get("alg") == "SHA-256"), None)
-        return "cdx", len(comps), paths, root.get("name"), sha
+        unpacked = next((_unpacked_files(p.get("value")) for p in meta.get("properties", []) or []
+                         if p.get("name") == "yuzu:sbom:unpacked-files"), 0)
+        return "cdx", len(comps), paths, root.get("name"), sha, unpacked
     if "spdxVersion" in doc:
         root = _spdx_root(doc)
         pkgs = [p for p in doc.get("packages", []) if p is not root]
         files = doc.get("files", []) or []
-        paths = [f.get("fileName", "") for f in files] + [p.get("sourceInfo", "") for p in pkgs]
+        # sourceInfo is prose ("acquired package info from ... file: /path",
+        # or a comma-separated path list): each word holding a path separator
+        # is checked as a path (the vcpkg ports' own sourceInfo has none).
+        paths = [f.get("fileName", "") for f in files] + [
+            w for p in pkgs for w in re.split(r"[\s,]+", p.get("sourceInfo") or "") if "/" in w or "\\" in w]
         sha = next((c.get("checksumValue") for c in root.get("checksums", []) or []
                     if c.get("algorithm") == "SHA256"), None)
-        return "spdx", len(pkgs) + len(files), paths, root.get("name"), sha
+        m = re.search(r"(?:^|; )unpacked-files: (\d+)(?:;|$)", root.get("comment") or "")
+        return "spdx", len(pkgs) + len(files), paths, root.get("name"), sha, _unpacked_files(m and m.group(1))
     raise SbomError("neither a CycloneDX nor an SPDX JSON document")
 
 
 def check_file(path: Path, artifacts_dir: Path | None, max_components: int) -> list[str]:
     try:
         doc = json.loads(path.read_text(encoding="utf-8"))
-        fmt, count, paths, name, sha = inspect(doc)
+        fmt, count, paths, name, sha, unpacked = inspect(doc)
     except (OSError, ValueError, SbomError) as e:
         return [f"{path.name}: {e}"]
     errs = []
     if count > max_components:
         errs.append(f"{path.name}: {count} entries, more than the bound of {max_components} "
                     f"(a checkout or build-tree scan, not an artifact scan?)")
-    if count < 1:
-        errs.append(f"{path.name}: no components at all")
+    if count < 1 and unpacked < 1:
+        # A file whose contents no scanner recognises (a plugins-only package)
+        # legitimately has no components; an SBOM that records no unpacked
+        # files as well is a scan of nothing.
+        errs.append(f"{path.name}: no components at all, and no record that its file was unpacked and held files")
     bad = sorted({p for p in paths if FORBIDDEN_SEGMENTS.search(p)})
     if bad:
-        errs.append(f"{path.name}: {len(bad)} path(s) under vcpkg/, site/, tests/, _build_*, .git or .github, "
-                    f"e.g. {bad[:3]}")
+        errs.append(f"{path.name}: {len(bad)} path(s) under {FORBIDDEN_LABEL} e.g. {bad[:3]}")
     if artifacts_dir is not None:
         if not name or not sha:
             errs.append(f"{path.name}: the SBOM root carries no artifact name and SHA-256")
@@ -525,6 +727,90 @@ def is_image_sbom(name: str) -> bool:
 
 # ── Commands ─────────────────────────────────────────────────────────────────
 
+# What a file holding yuzu-server carries that no SBOM lists yet.
+SERVER_UNLISTED = ("yuzu-server compiles in vendored C++ (server/core/vendor: qrcodegen) and embeds web "
+                   "assets (htmx, ECharts, three.js, Cytoscape, IBM Plex fonts) that this SBOM does not list")
+INSTALLER_UNLISTED = "the installer's own InnoSetup runtime (setup loader and uninstaller) is not listed"
+
+
+def _syft(a, contents: Path, artifact: Path, syft_cdx: Path, syft_spdx: Path) -> None:
+    env = dict(os.environ, SYFT_CHECK_FOR_APP_UPDATE="false")
+    try:
+        r = subprocess.run([a.syft, "scan", f"dir:{contents}", "--source-name", artifact.name,
+                            "--source-version", a.version, "-q",
+                            "-o", f"cyclonedx-json={syft_cdx}", "-o", f"spdx-json={syft_spdx}"],
+                           capture_output=True, text=True, env=env, timeout=SYFT_TIMEOUT)
+    except subprocess.TimeoutExpired as e:
+        raise _timeout_error([a.syft], SYFT_TIMEOUT) from e
+    if r.returncode != 0:
+        raise SbomError(f"syft exited {r.returncode}: {r.stderr.strip()[:1000]}")
+
+
+def _describe(a, artifact: Path, tmp: Path):
+    """Unpack, scan and merge; returns (cdx, spdx, vcomps)."""
+    contents = tmp / "contents"
+    contents.mkdir()
+    source = Path(a.contents_from) if a.contents_from else artifact
+    extract(source, contents)
+    incomplete: list[str] = []
+    if a.contents_from is None:
+        notes = {"artifact": artifact.name, "contents": f"unpacked from {source.name}"}
+    else:
+        iss = Path(a.iss)
+        kept, dropped, unmatched = keep_installed(contents, iss_file_entries(iss))
+        contents_note = (f"{artifact.name} is not unpacked here; its contents are the {len(kept)} file(s) of "
+                         f"{source.name}, built from the same output, that {iss.name} installs (its [Files] "
+                         f"Source: lines, resolved against the archive's layout)")
+        if dropped:
+            shown = ", ".join(dropped[:20]) + (f" and {len(dropped) - 20} more" if len(dropped) > 20 else "")
+            contents_note += f"; {len(dropped)} file(s) of the archive the installer does not install are left out: {shown}"
+            print(f"::warning::{artifact.name}: {len(dropped)} file(s) of {source.name} are not installed by "
+                  f"{iss.name} and are left out of its SBOM: {shown}", file=sys.stderr)
+        notes = {"artifact": artifact.name, "contents": contents_note}
+        incomplete.append(INSTALLER_UNLISTED)
+        if unmatched:
+            incomplete.append(f"{iss.name} installs {', '.join(unmatched)}, which {source.name} does not hold, "
+                              f"so it is not listed")
+            print(f"::warning::{artifact.name}: {iss.name} installs {', '.join(unmatched)}, which {source.name} "
+                  f"does not hold; not listed", file=sys.stderr)
+    files = count_files(contents)
+    if files < 1:
+        raise SbomError(f"{artifact.name}: unpacked to no files")
+    notes["unpacked-files"] = str(files)
+    agent, server = yuzu_binaries(contents)
+    vcomps: list[dict] = []
+    if agent or server:
+        if not a.vcpkg_installed:
+            raise SbomError(f"{artifact.name} ships a Yuzu C++ binary: pass --vcpkg-installed, --triplet and --manifest")
+        installed = Path(a.vcpkg_installed)
+        ports = installed_ports(parse_status(installed / "vcpkg" / "status"), a.triplet)
+        manifest = json.loads(Path(a.manifest).read_text(encoding="utf-8"))
+        names = vcpkg_closure(ports, manifest, a.triplet, agent, server)
+        vcomps = vcpkg_components(installed, a.triplet, names, ports)
+        notes["vcpkg"] = (f"{len(vcomps)} ports from the installed {a.triplet} tree for the "
+                          f"{'+'.join(x for x, y in (('agent', agent), ('server', server)) if y)} build")
+        noassert = sorted(v["port"] for v in vcomps if not v["license"])
+        if noassert:
+            notes["licence-noassertion"] = ", ".join(noassert)
+            print(f"::warning::{artifact.name}: {len(noassert)} vcpkg port(s) have no licence in their vcpkg "
+                  f"SPDX file and are listed without one (NOASSERTION): {', '.join(noassert)}", file=sys.stderr)
+    elif a.vcpkg_installed:
+        raise SbomError(f"{artifact.name}: --vcpkg-installed given but no Yuzu C++ binary found in it")
+    if server:
+        incomplete.insert(0, SERVER_UNLISTED)
+    if incomplete:
+        notes["incomplete"] = " | ".join(incomplete)
+    hexmap = hex_packages(Path(a.rebar_lock)) if a.rebar_lock else {}
+    syft_cdx, syft_spdx = tmp / "syft.cdx.json", tmp / "syft.spdx.json"
+    _syft(a, contents, artifact, syft_cdx, syft_spdx)
+    sha = sha256_of(artifact)
+    cdx = merge_cdx(json.loads(syft_cdx.read_text(encoding="utf-8")), artifact.name, a.version,
+                    sha, notes, vcomps, hexmap, incomplete=bool(incomplete))
+    spdx = merge_spdx(json.loads(syft_spdx.read_text(encoding="utf-8")), artifact.name, a.version,
+                      sha, notes, vcomps, hexmap, incomplete=bool(incomplete))
+    return cdx, spdx, vcomps
+
+
 def cmd_generate(a) -> int:
     artifact = Path(a.artifact)
     if not artifact.is_file():
@@ -532,53 +818,27 @@ def cmd_generate(a) -> int:
     stem = artifact_stem(artifact.name)
     out_dir = Path(a.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
-    tmp_parent = os.environ.get("RUNNER_TEMP") or None
-    with tempfile.TemporaryDirectory(prefix="yuzu_sbom_", dir=tmp_parent) as tmp:
-        tmp = Path(tmp)
-        contents = tmp / "contents"
-        contents.mkdir()
-        source = Path(a.contents_from) if a.contents_from else artifact
-        extract(source, contents)
-        notes = {"artifact": artifact.name,
-                 "contents": f"unpacked from {source.name}" if a.contents_from is None else
-                             f"{artifact.name} is not unpacked here; contents taken from {source.name}, "
-                             f"which carries the same build output"}
-        agent, server = yuzu_binaries(contents)
-        vcomps: list[dict] = []
-        if agent or server:
-            if not a.vcpkg_installed:
-                raise SbomError(f"{artifact.name} ships a Yuzu C++ binary: pass --vcpkg-installed, --triplet and --manifest")
-            installed = Path(a.vcpkg_installed)
-            ports = installed_ports(parse_status(installed / "vcpkg" / "status"), a.triplet)
-            manifest = json.loads(Path(a.manifest).read_text(encoding="utf-8"))
-            names = vcpkg_closure(ports, manifest, a.triplet, agent, server)
-            vcomps = vcpkg_components(installed, a.triplet, names, ports)
-            notes["vcpkg"] = (f"{len(vcomps)} ports from the installed {a.triplet} tree for the "
-                              f"{'+'.join(x for x, y in (('agent', agent), ('server', server)) if y)} build")
-        elif a.vcpkg_installed:
-            raise SbomError(f"{artifact.name}: --vcpkg-installed given but no Yuzu C++ binary found in it")
-        hexmap = hex_packages(Path(a.rebar_lock)) if a.rebar_lock else {}
-        syft_cdx, syft_spdx = tmp / "syft.cdx.json", tmp / "syft.spdx.json"
-        env = dict(os.environ, SYFT_CHECK_FOR_APP_UPDATE="false")
-        r = subprocess.run([a.syft, "scan", f"dir:{contents}", "--source-name", artifact.name,
-                            "--source-version", a.version, "-q",
-                            "-o", f"cyclonedx-json={syft_cdx}", "-o", f"spdx-json={syft_spdx}"],
-                           capture_output=True, text=True, env=env)
-        if r.returncode != 0:
-            raise SbomError(f"syft exited {r.returncode}: {r.stderr.strip()[:1000]}")
-        sha = sha256_of(artifact)
-        cdx = merge_cdx(json.loads(syft_cdx.read_text(encoding="utf-8")), artifact.name, a.version,
-                        sha, notes, vcomps, hexmap)
-        spdx = merge_spdx(json.loads(syft_spdx.read_text(encoding="utf-8")), artifact.name, a.version,
-                          sha, notes, vcomps, hexmap)
-    outs = []
-    for fmt, doc in (("cdx.json", cdx), ("spdx.json", spdx)):
-        p = out_dir / f"{stem}.{fmt}"
-        p.write_text(json.dumps(doc, indent=2) + "\n", encoding="utf-8")
-        outs.append(p)
+    # mkdtemp + a cleanup that cannot fail the run: on Windows an indexer or
+    # Defender handle on an unpacked DLL makes removal raise PermissionError
+    # after the SBOMs are already made (and TemporaryDirectory's
+    # ignore_cleanup_errors needs Python 3.10; the macOS runner has 3.9).
+    tmp = Path(tempfile.mkdtemp(prefix="yuzu_sbom_", dir=os.environ.get("RUNNER_TEMP") or None))
+    try:
+        cdx, spdx, vcomps = _describe(a, artifact, tmp)
+        outs = []
+        for fmt, doc in (("cdx.json", cdx), ("spdx.json", spdx)):
+            p = out_dir / f"{stem}.{fmt}"
+            # newline="\n": the same bytes on every OS (no CRLF on Windows).
+            with open(p, "w", encoding="utf-8", newline="\n") as f:
+                f.write(json.dumps(doc, indent=2) + "\n")
+            outs.append(p)
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+        if tmp.exists():
+            print(f"::warning::could not remove the temporary directory {tmp}", file=sys.stderr)
     errs = [e for p in outs for e in check_file(p, artifact.parent, MAX_COMPONENTS)]
     for p in outs:
-        _fmt, count, _paths, _n, _s = inspect(json.loads(p.read_text(encoding="utf-8")))
+        count = inspect(json.loads(p.read_text(encoding="utf-8")))[1]
         print(f"{p.name}: {count} entries ({len(vcomps)} vcpkg ports)")
     for e in errs:
         print(f"::error::{e}", file=sys.stderr)
@@ -599,7 +859,7 @@ def cmd_check(a) -> int:
     for e in errs:
         print(f"::error::{e}", file=sys.stderr)
     print(f"artifact SBOM check: {len(files)} file(s), {'FAILED' if errs else 'OK'} "
-          f"(bound {a.max_components} entries; no vcpkg/, site/, tests/, _build_* paths)")
+          f"(bound {a.max_components} entries; no path under {FORBIDDEN_LABEL})")
     return 1 if errs else 0
 
 
@@ -611,7 +871,10 @@ def main(argv=None) -> int:
     g.add_argument("--version", required=True)
     g.add_argument("--syft", required=True)
     g.add_argument("--out-dir", required=True)
-    g.add_argument("--contents-from", help="an archive with the same contents, for an installer that cannot be unpacked here")
+    g.add_argument("--contents-from", help="an archive built from the same output, for an installer that cannot be "
+                                           "unpacked here (needs --iss)")
+    g.add_argument("--iss", help="the InnoSetup script that built the installer: only the archive files its "
+                                 "[Files] section installs are described")
     g.add_argument("--vcpkg-installed", help="the vcpkg_installed directory (holds vcpkg/status)")
     g.add_argument("--triplet")
     g.add_argument("--manifest", help="vcpkg.json")
@@ -621,14 +884,21 @@ def main(argv=None) -> int:
     c.add_argument("--max-components", type=int, default=MAX_COMPONENTS)
     c.add_argument("sboms", nargs="*")
     a = ap.parse_args(argv)
+    label = Path(a.artifact).name if a.cmd == "generate" else "artifact SBOM check"
     try:
         if a.cmd == "generate":
             if a.vcpkg_installed and not (a.triplet and a.manifest):
                 raise SbomError("--vcpkg-installed needs --triplet and --manifest")
+            if bool(a.contents_from) != bool(a.iss):
+                raise SbomError("--contents-from and --iss go together: the installer's SBOM lists only "
+                                "the archive files its script installs")
             return cmd_generate(a)
         return cmd_check(a)
     except SbomError as e:
         print(f"::error::{e}", file=sys.stderr)
+        return 1
+    except Exception as e:  # noqa: BLE001 - one annotated line, not a traceback
+        print(f"::error::{label}: unexpected {type(e).__name__}: {e}", file=sys.stderr)
         return 1
 
 

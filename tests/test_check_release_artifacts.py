@@ -101,13 +101,18 @@ class CheckReleaseArtifacts(unittest.TestCase):
     def test_orphan_sbom_is_refused(self):
         # An SBOM for a package this release does not carry (a leftover from an
         # earlier build) would be signed into SHA256SUMS: refuse it.
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
-            d = Path(t)
-            make_artifacts(d)
-            (d / "yuzu-agent_0.14.0-rc8_amd64.cdx.json").write_text("{}")
-            r = self.run_script(d)
-            self.assertNotEqual(r.returncode, 0, "orphan SBOM present but the gate passed")
-            self.assertIn("SBOM describes no artifact of this release", r.stderr)
+        # Both formats, and a stem of each package kind, so neither the
+        # *.spdx.json glob nor one extension's lookup can quietly drop out.
+        for orphan in ("yuzu-agent_0.14.0-rc8_amd64.cdx.json", "yuzu-agent_0.14.0-rc8_amd64.spdx.json",
+                       "yuzu-server-0.14.0-0.1.rc8.x86_64.spdx.json", "YuzuAgentSetup-0.14.0_rc8.cdx.json",
+                       "YuzuAgent-0.14.0_rc8-arm64.spdx.json"):
+            with self.subTest(orphan=orphan), tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                d = Path(t)
+                make_artifacts(d)
+                (d / orphan).write_text("{}")
+                r = self.run_script(d)
+                self.assertNotEqual(r.returncode, 0, f"orphan SBOM {orphan} present but the gate passed")
+                self.assertIn(f"file={orphan}::SBOM describes no artifact of this release", r.stderr)
 
     def test_retired_assets_are_refused(self):
         # ADR-0035 step 2: a server installer or an old-name Windows/macOS
