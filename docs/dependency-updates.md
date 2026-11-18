@@ -357,6 +357,26 @@ CI on the PR, once approved, re-resolves every downstream vcpkg port against
 the new baseline — if anything breaks, the PR is left open for manual
 investigation instead of silently merging a broken build.
 
+**Reviewing a baseline bump: check `overrides`.** The workflow rewrites
+only the baseline SHA. It does not touch `vcpkg.json`'s `overrides`, which
+pin security fixes above the baseline. An override is an exact pin, so
+once the baseline passes it, the override holds the port back. Before
+merging a baseline bump:
+
+- [ ] For each `overrides` entry in `vcpkg.json`, compare the pinned
+      version with that port's version at the new baseline
+      (`versions/<first letter>-/<port>.json` in the vcpkg registry at
+      the new SHA).
+- [ ] Delete every entry the new baseline has reached or passed. In the
+      same change, delete its row in `docs/build-guide.md`'s
+      [Security dependency pins](build-guide.md#security-dependency-pins)
+      table and raise the `[deps][security]` version floors in the unit
+      tests that table names, if they lag.
+- [ ] Keep every entry the baseline has not reached yet.
+
+`tests/test_vcpkg_overrides_documented.py` fails when an `overrides`
+entry has no row in that table, or a row has no entry.
+
 When adding a new active file that pins the vcpkg baseline SHA (e.g., a new CI
 workflow or Dockerfile), **add it to the `files` array in
 `.github/workflows/vcpkg-baseline-update.yml`** and to the list in the PR body
@@ -739,6 +759,7 @@ Yuzu embeds third-party JavaScript at build time via `embed_js.py` (chunked raw-
 | IBM Plex Mono webfont (400, 500) | `server/core/vendor/ibm-plex/ibm-plex-mono-latin-{400,500}-normal.woff2` | `kIbmPlexMono{400,500}Woff2` | https://www.npmjs.com/package/@ibm/plex-mono (IBM's own prebuilt `fonts/split/woff2/IBMPlexMono-{Regular,Medium}-Latin1.woff2`, same rule) | 2.5.0, 17,544 / 17,868 bytes |
 | Three.js (ES module) | `server/core/vendor/three.module.min.js` | `kThreeJs` | https://unpkg.com/three@0.168.0/build/three.module.min.js | r168, 685,408 bytes |
 | Three.js OrbitControls | `server/core/vendor/three-orbit-controls.js` | `kThreeOrbitJs` | https://unpkg.com/three@0.168.0/examples/jsm/controls/OrbitControls.js | r168, 32,134 bytes |
+| Cytoscape.js (ES module) | `server/core/static/cytoscape.min.js` (NOTICE: `server/core/static/cytoscape-NOTICE.txt`) | `kCytoscapeJs` | npm `cytoscape@3.33.3`, `dist/cytoscape.esm.min.mjs` (byte-identical) | 3.33.3, 432,844 bytes |
 | Yuzu chart adapter | `server/core/src/charts_js_bundle.cpp` (hand-written) | `kYuzuChartsJs` | first-party | n/a |
 | Yuzu fleet renderer | `yuzu_viz_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-viz.js`) | `kYuzuVizJs` | first-party | n/a |
 | Yuzu access page glue | `yuzu_access_js_bundle.cpp` (generated at build time from `server/core/static/yuzu-access.js`) | `kYuzuAccessJs` | first-party | n/a |
