@@ -25288,7 +25288,8 @@ McpServer::HandlerFn McpServer::build_handler(
             // Destructive (Security:Execute) — approval-gated on supervised, so
             // it only reaches here after a consumed ticket. Records the
             // quarantine (mirror POST /api/v1/quarantine) AND dispatches the live
-            // quarantine-plugin isolation via the same DispatchFn chain.
+            // firewall containment action (`firewall.quarantine`) via the same
+            // DispatchFn chain.
             if (tool_name == "quarantine_device") {
                 // Parsed before the is_open() check below (pure arg-map
                 // reads, no failure mode) so a store-outage audit row can
@@ -25432,7 +25433,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 }
                 // Server-side input validation BEFORE any store write or dispatch
                 // (governance cppsafety-SHOULD-1 / UP-7). The whitelist ultimately
-                // reaches the agent's netsh/iptables/pf sink; the agent already
+                // reaches the agent's firewall sink (the Windows firewall COM API, or
+                // pf / iptables on macOS / Linux); the agent already
                 // allow-lists each IP (is_safe_ip), but this PR opens the FIRST
                 // reachable path to that sink (REST /quarantine is record-only), so
                 // we validate at the server edge too (deploy-path precedent: reject
@@ -25443,10 +25445,10 @@ McpServer::HandlerFn McpServer::build_handler(
                         "application/json");
                     return;
                 }
-                if (whitelist.size() > 512) {
-                    res.set_content(
-                        error_response(id, kInvalidParams, "whitelist exceeds 512 characters"),
-                        "application/json");
+                if (whitelist.size() > kQuarantineWhitelistMaxLen) {
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kWhitelistTooLongMessage)),
+                                    "application/json");
                     return;
                 }
                 // The firewall plugin's exception grammar takes bare IPv4/IPv6 literals, at most
@@ -25457,11 +25459,9 @@ McpServer::HandlerFn McpServer::build_handler(
                 // (rest_api_v1.cpp's POST /api/v1/quarantine) all call, so this check exists
                 // in exactly one place rather than N hand-rolled copies.
                 if (!map_whitelist_to_exceptions(whitelist)) {
-                    res.set_content(
-                        error_response(id, kInvalidParams,
-                                       "whitelist must be comma-separated IPv4/IPv6 literals, "
-                                       "at most 32"),
-                        "application/json");
+                    res.set_content(error_response(id, kInvalidParams,
+                                                   std::string(kWhitelistInvalidMessage)),
+                                    "application/json");
                     return;
                 }
                 // NOTE (governance sec-LOW-1 / UP-6): this call sends no server address — but
@@ -25476,6 +25476,10 @@ McpServer::HandlerFn McpServer::build_handler(
                 // 1. Persist the quarantine record (store row only; mirror REST).
                 auto quar_res =
                     quarantine_store->quarantine_device(agent_id, session->username, reason, whitelist);
+                // The record this call acts on, for the success audit row (#7628): the new row's
+                // id on `created`, replaced below by the stored row's id when the record was
+                // already there.
+                std::int64_t record_id = quar_res ? *quar_res : 0;
                 // #3127: classify the write onto the pure decision enum
                 // (quarantine_dispatch_decision.hpp). The store emits exactly
                 // one business/state error ("device is already quarantined",
@@ -25609,7 +25613,11 @@ McpServer::HandlerFn McpServer::build_handler(
                             // Not a transient fault: a release is in flight for this record, and
                             // containment is not re-applied under it. The request is refused for
                             // the state the resource is in (kInvalidParams, as the REST twin's
-                            // 400), not a service fault. No retry hint.
+                            // 400), not a service fault. No retry hint. #7588(b), ruled keep: the
+                            // closed code set (mcp_jsonrpc.hpp) has no conflict class, and a
+                            // release can stay pending for as long as the device stays
+                            // unreachable, so no retry interval would be honest; the caller
+                            // reads `GET /api/v1/quarantine` (status releasing) for its end.
                             mcp_audit("failure", "agent_id=" + agent_id +
                                                      ", release in progress; isolation not "
                                                      "dispatched");
@@ -25619,17 +25627,33 @@ McpServer::HandlerFn McpServer::build_handler(
                                 "application/json");
                             return;
                         }
-                        // store_error / no_active_record: both leave nothing
-                        // durable to dispatch against — retry the whole
-                        // request rather than report isolated on a record
-                        // that turned out not to be there.
+                        // store_error / no_active_record: nothing was dispatched
+                        // by this call — retry the whole request rather than
+                        // report isolated on a record that turned out not to be
+                        // there. no_active_record also covers a refused claim:
+                        // the record is there and another apply holds it, and
+                        // that apply is dispatching the containment or has not had
+                        // its reply read yet, so this call has not contained the
+                        // device. The retry is still right. (An apply that reached
+                        // the device keeps its claim until its reply is consumed or
+                        // the claim window passes, so a retry inside that window is
+                        // refused this way; this path consumes no reply and leaves it to expire.)
                         mcp_audit("failure", "agent_id=" + agent_id + ", " + err.detail +
                                                  (record_pre_existing ? "" : " record_persisted=1"));
-                        res.set_content(a4_error(kInternalError, err.detail, "retry the request",
-                                                 /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
-                                        "application/json");
+                        // A refused claim on a record that already existed is held for the claim
+                        // window (an upper bound: the reconciler's claim clears sooner), so the
+                        // honest hint is that window, not the store-fault 5 s.
+                        const bool claim_held =
+                            err.kind == ContainmentReapplyErrorKind::no_active_record &&
+                            record_pre_existing;
+                        res.set_content(
+                            a4_error(kInternalError, err.detail, "retry the request",
+                                     /*retry_after_ms=*/claim_held ? kApplyClaimTtlSecs * 1000
+                                                                   : mcp::kMcpStoreFaultRetryMs),
+                            "application/json");
                         return;
                     }
+                    record_id = stored.id;
                     effective_by = stored.quarantined_by;
                     effective_reason = stored.reason;
                     effective_whitelist = stored.whitelist;
@@ -25755,7 +25779,8 @@ McpServer::HandlerFn McpServer::build_handler(
                 // device was actually isolated (agents_reached>0) vs recorded-only
                 // (agents_reached=0, agent offline) — governance comp-SHOULD-1.
                 bool audit_ok = mcp_audit(
-                    "success", "agent_id=" + agent_id + " command_id=" + command_id +
+                    "success", "agent_id=" + agent_id + " record_id=" + std::to_string(record_id) +
+                                   " command_id=" + command_id +
                                    " agents_reached=" + std::to_string(agents_reached) +
                                    (record_pre_existing ? " record_pre_existing=1" : "") +
                                    (whitelist_request_ignored ? " whitelist_ignored=1" : ""));
