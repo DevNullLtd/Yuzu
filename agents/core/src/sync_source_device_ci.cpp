@@ -59,7 +59,10 @@ std::vector<std::string_view> split_lines(std::string_view out) {
 // `unescaped_only` splits only on a '|' that is not preceded by a backslash. The plugins write a
 // literal pipe as `\|` and fold every literal backslash to '/' (yuzu::util::safe_output_field), so
 // a backslash before a '|' is always the escape. Tokens stay escaped; unescape_pipes undoes it.
-// The v1 positions keep the raw split: their bytes are frozen.
+// The v1 cpu and dimm aggregations use the unescaped split (#7040): a pipe inside a CPU model or a
+// DIMM locator no longer shifts the core, thread or size columns. The other v1 positions (disks,
+// adapters, the key|value scalars) keep the raw split; their bytes are frozen (see the pin in
+// test_device_ci_sync.cpp).
 std::vector<std::string_view> split_pipe(std::string_view line, bool unescaped_only = false) {
     std::vector<std::string_view> tok;
     std::size_t fp = 0;
@@ -543,14 +546,15 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
 
     // processors: `cpu|<id>|<model>|<cores>|<threads>|<mhz>[|<socket_designation>|<stepping>]`
     // (trailing columns are placeholders and ignored here) — model from the first CPU,
-    // cores/threads summed across sockets.
+    // cores/threads summed across sockets. Split on an UNESCAPED pipe (#7040) and unescape the
+    // model; a model with no `\|` is byte-identical to before, so no other device's v1 hash moves.
     long long cores = 0;
     long long threads = 0;
     for (auto line : split_lines(out.processors)) {
-        auto t = split_pipe(line);
+        auto t = split_pipe(line, /*unescaped_only=*/true);
         if (t.size() >= 5 && t[0] == "cpu") {
             if (rec.cpu_model.empty() && !t[2].empty())
-                rec.cpu_model = std::string(t[2]);
+                rec.cpu_model = unescape_pipes(t[2]);
             cores += to_ll(t[3]);
             threads += to_ll(t[4]);
         }
@@ -559,10 +563,11 @@ CiRecord build_device_ci_record(const CiPluginOutputs& out) {
     rec.cpu_threads = std::to_string(threads);
 
     // memory: `dimm|<slot>|<size_mb>|<type>|<speed_mhz>[|<manufacturer>|<part_number>|<serial>]`
-    // (trailing columns are placeholders and ignored here) — sum size_mb → bytes.
+    // (trailing columns are placeholders and ignored here) — sum size_mb → bytes. Unescaped split
+    // for the same reason as the processors above (#7040).
     long long total_mb = 0;
     for (auto line : split_lines(out.memory)) {
-        auto t = split_pipe(line);
+        auto t = split_pipe(line, /*unescaped_only=*/true);
         if (t.size() >= 3 && t[0] == "dimm")
             total_mb += to_ll(t[2]);
     }

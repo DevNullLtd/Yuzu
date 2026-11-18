@@ -22,6 +22,8 @@
 // is a predefined macro under non-strict-ISO GNU extension modes on some
 // toolchains, and this header must compile cleanly wherever it's included.
 
+#include <yuzu/string_utils.hpp> // yuzu::util::safe_output_field
+
 #include <functional>
 #include <sstream>
 #include <string>
@@ -77,7 +79,11 @@ inline std::vector<std::string> parse_dmidecode_memory(const std::string& dmi) {
         sp = speed.find(' ');
         if (sp != std::string::npos)
             speed_mhz = speed.substr(0, sp);
-        rows.push_back("dimm|" + slot + "|" + size_mb + "|" + type + "|" + speed_mhz + "|-|-|-");
+        // slot, type and speed are firmware text: escape a pipe so the device-CI parse (which splits
+        // on an unescaped pipe) cannot read a shifted column (#7040). size_mb is digits only.
+        rows.push_back("dimm|" + yuzu::util::safe_output_field(slot) + "|" + size_mb + "|" +
+                       yuzu::util::safe_output_field(type) + "|" +
+                       yuzu::util::safe_output_field(speed_mhz) + "|-|-|-");
     };
 
     while (std::getline(ss, line)) {

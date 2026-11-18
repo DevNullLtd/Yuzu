@@ -803,7 +803,11 @@ operator action; the operator-triggered `volumes` action still works there.
 **Pipes inside a field.** The plugins write a literal `|` as `\|` and fold a literal `\` to `/`
 (`safe_output_field`). The writer splits the list rows and the three scalar groups on an unescaped
 pipe and unescapes before the clamp, so a pipe in a label or a firmware string stays in its field and
-moves no later column. The 22 v1 positions keep the raw split: their bytes are frozen.
+moves no later column. The v1 cpu and dimm aggregations (`cpu_model`, `cpu_cores`, `cpu_threads`,
+`ram_bytes`) split on an unescaped pipe too since #7040, and the Linux and macOS legs escape at the
+source as the Windows leg already did; a device whose fields hold no pipe, backslash or line break
+produces the same bytes as before. The disk, adapter and key|value positions of the 22 keep the raw
+split: their bytes are frozen.
 
 **Caps and the reserved reason slot.** Rows are projected to the wire columns, sorted
 lexicographically on the wire row (so the blob and its hash do not depend on the plugin's
