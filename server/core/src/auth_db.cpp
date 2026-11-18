@@ -2818,25 +2818,6 @@ std::expected<bool, StoreError> AuthDB::revoke_token(const std::string& token_id
     return found;
 }
 
-std::expected<bool, StoreError> AuthDB::refund_token_use(const std::string& token_id) {
-    if (token_id.empty() || !text_ok(token_id, kMaxEnrollmentTextLength))
-        return std::unexpected(StoreError::InvalidInput);
-    auto lease = impl_->pool.try_acquire_for(kWriteTimeout);
-    if (!lease)
-        return std::unexpected(StoreError::Unavailable);
-    pg::PgResult res = pg::exec_params(
-        lease.get(),
-        "UPDATE auth.enrollment_tokens SET use_count = use_count - 1 "
-        "WHERE token_id = $1 AND use_count > 0 RETURNING token_id",
-        std::vector<std::string>{token_id});
-    if (res.status() != PGRES_TUPLES_OK)
-        return std::unexpected(StoreError::QueryFailed);
-    const bool refunded = PQntuples(res.get()) > 0;
-    if (refunded)
-        spdlog::info("Enrollment token {}: one use returned (leaf issuance failed)", token_id);
-    return refunded;
-}
-
 std::expected<std::vector<auth::EnrollmentToken>, StoreError> AuthDB::list_tokens() {
     auto lease = impl_->pool.try_acquire_for(kReadTimeout);
     if (!lease)
