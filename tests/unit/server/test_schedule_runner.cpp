@@ -1750,6 +1750,28 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the auto (no-approval)
     CHECK(h.get(id).next_execution_at > 1); // advanced — must not spin
 }
 
+TEST_CASE("ScheduleRunner: an UNAVAILABLE arming answer (auth-store fault) HOLDS the schedule: "
+          "it is not advanced, nothing is enqueued, and the next tick retries (WP06 F53)",
+          "[schedule][runner][d7][pg]") {
+    bool fault = true;
+    Harness h([&](const std::string&, const std::string&, const std::string&)
+                  -> std::expected<bool, std::string> {
+        if (fault)
+            return std::unexpected(std::string("auth store error"));
+        return true;
+    });
+    auto id = h.make_due("test.def", "interval");
+    const auto before = h.get(id).next_execution_at;
+
+    h.runner.tick();
+    CHECK(h.enqueues.empty());
+    CHECK(h.get(id).next_execution_at == before); // NOT advanced: the occurrence is not lost
+
+    fault = false; // the store recovers
+    h.runner.tick();
+    CHECK(h.enqueues.size() == 1); // the held occurrence fires
+}
+
 TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fire path",
           "[schedule][runner][d7][approval][pg]") {
     Harness h([](const std::string&, const std::string&, const std::string&) { return false; });

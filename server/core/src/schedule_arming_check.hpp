@@ -32,14 +32,14 @@
 ///     provenance is still known;
 ///   * a missing or unopened `RbacStore`.
 ///
-/// RBAC legacy-open (`rbac_enforcement_in_effect()` false) mirrors `require_permission`'s
-/// legacy rule: a READ-class pair admits any human, but every NON-Read pair needs the
-/// principal's CURRENT legacy admin role (WP06 F53: before this, a creator demoted from admin
-/// - or whose JIT elevation had lapsed - kept firing mutating schedules with fleet reach
-/// forever). An engine principal (`engine:<slug>`) is never admitted there: its only authority
-/// is an explicit RBAC grant (#6204). The admin bit is a RESOLVED INPUT (the caller reads the
-/// creator's role from the auth store AT FIRE TIME, never cached, unresolvable = false), which
-/// keeps this function pure. This is the ONLY place the schedule seam applies that rule: the
+/// RBAC legacy-open (`rbac_enforcement_in_effect()` false) applies the legacy rule of
+/// `require_permission` for non-Read operations (a mirror of it for this seam, not a call into
+/// it): a READ-class pair admits any human, but every NON-Read pair needs the
+/// principal's CURRENT legacy admin role (a creator demoted from admin, or whose JIT elevation
+/// lapsed, no longer arms a mutating schedule). An engine principal (`engine:<slug>`) is never admitted there: its only authority
+/// is an explicit RBAC grant (#6204). The admin answer is a LAZY INPUT (`LegacyAdminFn`: the caller reads the
+/// creator's role from the auth store AT FIRE TIME, never cached, only when needed) and the
+/// result is tri-state - `unexpected` means the store could not answer and the caller HOLDS. This is the ONLY place the schedule seam applies that rule: the
 /// dispatch permission binder's and the visibility composer's legacy-open admits are
 /// deliberately left as they are (other surfaces rely on route-level gates), because this check
 /// runs first at every fire and `derive_dispatch_caller_for_username` stamps
@@ -48,20 +48,33 @@
 #include "command_capability.hpp"
 #include "rbac_store.hpp"
 
+#include <expected>
+#include <functional>
 #include <string>
 
 namespace yuzu::server {
 
+/// The arming decision: `true` = may arm, `false` = DENIED, `unexpected(why)` = the answer could NOT
+/// be determined (a transient auth-store fault): the caller HOLDS the occurrence and retries, it
+/// never records "authority denied" for an infrastructure fault. A plain `bool` converts to it, so
+/// a callback returning `bool` is a valid arming check.
+using ArmingResult = std::expected<bool, std::string>;
+
+/// The creator's CURRENT legacy admin role, evaluated LAZILY (only when the decision needs it:
+/// RBAC off, a non-Read pair, a non-engine principal), so the auth store is not read for a Read
+/// pair or under enforced RBAC. `unexpected` = the store could not answer.
+using LegacyAdminFn = std::function<ArmingResult()>;
+
 /// Decide whether `principal` may still arm `plugin.action`. `rbac` may be
-/// null (denies). `principal_is_legacy_admin`: the principal's current legacy role is admin. Pure with respect to its inputs — no metrics, no logging,
+/// null (denies). Pure with respect to its inputs - no metrics, no logging,
 /// no audit: the caller owns those, so this can be exercised directly in a
 /// unit test with a real registry and a `:memory:` store.
-[[nodiscard]] inline bool schedule_arming_permitted(const CommandCapabilityRegistry& registry,
-                                                    const RbacStore* rbac,
-                                                    const std::string& principal,
-                                                    const std::string& plugin,
-                                                    const std::string& action,
-                                                    bool principal_is_legacy_admin) {
+[[nodiscard]] inline ArmingResult schedule_arming_permitted(const CommandCapabilityRegistry& registry,
+                                                            const RbacStore* rbac,
+                                                            const std::string& principal,
+                                                            const std::string& plugin,
+                                                            const std::string& action,
+                                                            const LegacyAdminFn& legacy_admin) {
     const auto classified = registry.classify(plugin, action);
     if (!classified)
         return false;
@@ -69,12 +82,16 @@ namespace yuzu::server {
         return false;
     if (rbac == nullptr || !rbac->is_open())
         return false;
-    if (!rbac_enforcement_in_effect(rbac))
-        // Legacy-open (RBAC off): never an engine principal; a non-Read pair needs the
-        // creator's CURRENT admin role (mirrors require_permission's legacy rule, WP06 F53).
-        return !yuzu::server::authz::is_engine_principal_name(principal) &&
-               (classified->operation == yuzu::server::authz::Operation::Read ||
-                principal_is_legacy_admin);
+    if (!rbac_enforcement_in_effect(rbac)) {
+        // Legacy-open (RBAC off): never an engine principal; a non-Read pair needs the creator's
+        // CURRENT admin role (the same rule `require_permission`'s legacy branch applies to
+        // non-Read operations). Read pairs never consult the auth store.
+        if (yuzu::server::authz::is_engine_principal_name(principal))
+            return false;
+        if (classified->operation == yuzu::server::authz::Operation::Read)
+            return true;
+        return legacy_admin ? legacy_admin() : ArmingResult{false};
+    }
     return rbac->check_permission(principal, std::string(classified->securable),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }

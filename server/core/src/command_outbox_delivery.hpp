@@ -101,6 +101,7 @@
 
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -142,7 +143,7 @@ public:
 
     /// Re-verify the principal's CURRENT authority to fire one plugin.action at
     /// send time. Fail-closed: an unset callback denies every delivery.
-    using ArmingCheckFn = std::function<bool(const std::string& principal,
+    using ArmingCheckFn = std::function<std::expected<bool, std::string>(const std::string& principal,
                                              const std::string& plugin,
                                              const std::string& action)>;
 

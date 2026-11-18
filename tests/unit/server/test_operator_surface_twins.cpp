@@ -96,7 +96,10 @@ bool compose_arming_check(const CommandCapabilityRegistry& registry, const RbacS
                           const std::string& principal, const std::string& plugin,
                           const std::string& action, bool legacy_admin = true) {
     return yuzu::server::schedule_arming_permitted(registry, rbac, principal, plugin, action,
-                                                   legacy_admin);
+                                                   [legacy_admin]() -> ArmingResult {
+                                                       return legacy_admin;
+                                                   })
+        .value_or(false);
 }
 
 } // namespace
@@ -239,6 +242,37 @@ TEST_CASE("arming_check composition: RBAC off, a creator who is no longer admin 
                                      /*legacy_admin=*/true));
     CHECK_FALSE(compose_arming_check(registry, &rbac, "engine:vuln", "filesystem", "create_temp",
                                      /*legacy_admin=*/true));
+}
+
+TEST_CASE("arming_check composition: tri-state - an auth-store fault is UNAVAILABLE, and the "
+          "admin lookup is lazy (WP06 F53)",
+          "[server][routes][mcp][pg]") {
+    CommandCapabilityRegistry registry{capdecls::plugin_action_catalogue_a()};
+    TWINS_RBAC(rbac);
+    rbac.set_rbac_enabled(false);
+    int lookups = 0;
+    auto fault = [&]() -> ArmingResult {
+        ++lookups;
+        return std::unexpected(std::string("auth store error"));
+    };
+    // Non-Read pair, RBAC off: the lookup runs and its fault is reported as UNAVAILABLE.
+    auto r = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", fault);
+    CHECK_FALSE(r.has_value());
+    CHECK(lookups == 1);
+    // Read pair: never consults the auth store.
+    auto rd = schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "exists", fault);
+    REQUIRE(rd.has_value());
+    CHECK(*rd);
+    CHECK(lookups == 1);
+    // Engine principal: denied without a lookup.
+    auto en = schedule_arming_permitted(registry, &rbac, "engine:x", "filesystem", "create_temp", fault);
+    REQUIRE(en.has_value());
+    CHECK_FALSE(*en);
+    CHECK(lookups == 1);
+    // RBAC enforced: the legacy lookup is not consulted at all.
+    rbac.set_rbac_enabled(true);
+    (void)schedule_arming_permitted(registry, &rbac, "alice", "filesystem", "create_temp", fault);
+    CHECK(lookups == 1);
 }
 
 TEST_CASE("arming_check composition: RBAC legacy-open (disabled) admits regardless of grant",

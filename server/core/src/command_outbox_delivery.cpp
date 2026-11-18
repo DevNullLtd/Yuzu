@@ -1,3 +1,4 @@
+#include <yuzu/log_token.hpp>
 #include "command_outbox_delivery.hpp"
 
 #include "audit_store.hpp"
@@ -185,7 +186,20 @@ void CommandOutboxDelivery::deliver(const OutboxCommand& c, const std::string& l
                                     std::int64_t epoch) {
     // 1. Re-authorize at SEND time — authority may have been revoked since
     //    enqueue. Fail-closed on an unset check. A denial is PERMANENT.
-    if (!d_.arming_check || !d_.arming_check(c.principal, c.plugin, c.action)) {
+    std::expected<bool, std::string> arming{false};
+    if (d_.arming_check)
+        arming = d_.arming_check(c.principal, c.plugin, c.action);
+    if (!arming) {
+        // Could not be determined (a transient auth-store fault): NOT a denial. Reschedule with
+        // back-off; never mark the occurrence failed as "authority_denied".
+        count("yuzu_server_command_outbox_deliver_arming_unavailable_total");
+        spdlog::warn("command_outbox_delivery: occurrence '{}' arming check unavailable ({}); "
+                     "rescheduling",
+                     c.occurrence_id, ::yuzu::log_token(arming.error()));
+        (void)d_.outbox->reschedule(c.occurrence_id, lock_name, epoch, d_.retry_backoff);
+        return;
+    }
+    if (!*arming) {
         count("yuzu_server_command_outbox_deliver_denied_total");
         spdlog::warn("command_outbox_delivery: occurrence '{}' arming denied at delivery — "
                      "principal='{}' target={}.{}",

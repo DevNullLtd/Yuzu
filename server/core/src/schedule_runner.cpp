@@ -1,3 +1,4 @@
+#include <yuzu/log_token.hpp>
 #include "schedule_runner.hpp"
 
 #include "dispatch_target_shape.hpp" // kBroadcastScope (#2500)
@@ -110,7 +111,20 @@ void ScheduleRunner::fire(const InstructionSchedule& s) {
     // lockdown) denies the fire exactly like an explicit `false`. Always
     // advance so a permanently-denied schedule cannot spin retrying every
     // tick forever.
-    if (!d_.arming_check || !d_.arming_check(s.created_by, def.plugin, def.action)) {
+    std::expected<bool, std::string> arming{false};
+    if (d_.arming_check)
+        arming = d_.arming_check(s.created_by, def.plugin, def.action);
+    if (!arming) {
+        // The answer could not be determined (a transient auth-store fault): NOT a denial. HOLD
+        // without advancing, so the schedule is evaluated again on the next tick and the
+        // occurrence is not lost.
+        count("yuzu_schedule_arming_unavailable_total");
+        spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check unavailable ({}); "
+                     "holding, not advancing",
+                     s.name, s.id, ::yuzu::log_token(arming.error()));
+        return;
+    }
+    if (!*arming) {
         count("yuzu_schedule_arming_denied_total");
         spdlog::warn("schedule_runner: schedule '{}' (id={}) arming check denied — "
                      "principal='{}' target={}.{}",

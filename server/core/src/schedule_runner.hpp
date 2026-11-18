@@ -107,7 +107,7 @@ public:
     /// leave every auto schedule dispatching under stale authority. This
     /// package owns only the fail-closed seam and its tests: an UNSET
     /// callback denies every fire. p14 wires the real RBAC/arming lookup.
-    using ArmingCheckFn = std::function<bool(const std::string& principal,
+    using ArmingCheckFn = std::function<std::expected<bool, std::string>(const std::string& principal,
                                              const std::string& plugin,
                                              const std::string& action)>;
 
