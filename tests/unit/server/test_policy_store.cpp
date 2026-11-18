@@ -35,6 +35,7 @@
 #include <nlohmann/json.hpp>
 
 #include <chrono>
+#include <ctime>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -2516,4 +2517,172 @@ TEST_CASE("PolicyStore: mark_blocked invalidates the fleet compliance cache",
     auto same = store.mark_blocked(pol.value(), {"agent-2"}, "check", "echo", "purge_source", "destructive");
     REQUIRE(same.has_value());
     CHECK(same->changed == 0);
+}
+
+// ----------------------------------------------------------------------------
+// `blocked` freshness (G01, B6): a refusal that still applies refreshes its rows, and a row
+// nothing refreshes decays like any other status.
+// ----------------------------------------------------------------------------
+
+namespace {
+
+// Move a row's last_check_at `seconds_ago` into the past, as if the last refresh was that long ago.
+void age_check_stamp(PgPool& pool, const std::string& pol, const std::string& agent,
+                     int64_t seconds_ago) {
+    auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+    REQUIRE(lease);
+    auto r = yuzu::server::pg::exec_params(
+        lease.get(),
+        "UPDATE policy_store.policy_status SET "
+        "last_check_at = EXTRACT(EPOCH FROM NOW())::bigint - $3::bigint "
+        "WHERE policy_id = $1 AND agent_id = $2",
+        std::vector<std::string>{pol, agent, std::to_string(seconds_ago)});
+    REQUIRE(r.status() == PGRES_COMMAND_OK);
+}
+
+int64_t check_stamp_age(PolicyStore& store, const std::string& pol, const std::string& agent) {
+    auto st = store.get_agent_status(pol, agent);
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    return static_cast<int64_t>(std::time(nullptr)) - (*st)->last_check_at;
+}
+
+constexpr int64_t kHour = 3600;
+
+} // namespace
+
+TEST_CASE("PolicyStore: a refusal that changes nothing still refreshes last_check_at",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    const std::vector<std::string> ids{"agent-1", "agent-2"};
+
+    REQUIRE(store.mark_blocked(pol.value(), ids, "check", "content_dist", "execute_staged", "gated")
+                .has_value());
+    age_check_stamp(pool, pol.value(), "agent-1", 23 * kHour);
+    age_check_stamp(pool, pol.value(), "agent-2", 23 * kHour);
+    REQUIRE(check_stamp_age(store, pol.value(), "agent-1") > 22 * kHour);
+
+    // The same refusal: no row changed (so no audit row downstream), and both stamps are fresh.
+    auto same = store.mark_blocked(pol.value(), ids, "check", "content_dist", "execute_staged", "gated");
+    REQUIRE(same.has_value());
+    CHECK(same->changed == 0);
+    CHECK(same->fenced_out == 0);
+    CHECK(check_stamp_age(store, pol.value(), "agent-1") < 60);
+    CHECK(check_stamp_age(store, pol.value(), "agent-2") < 60);
+    // Only the stamp moved: the stored reason is the same.
+    CHECK(check_result_of(store, pol.value(), "agent-1")["reason"] == "gated");
+
+    // An agent that is not a target of this call is not refreshed.
+    REQUIRE(store.mark_blocked(pol.value(), {"agent-3"}, "check", "content_dist", "execute_staged", "gated")
+                .has_value());
+    age_check_stamp(pool, pol.value(), "agent-3", 23 * kHour);
+    auto only1 = store.mark_blocked(pol.value(), {"agent-1"}, "check", "content_dist",
+                                    "execute_staged", "gated");
+    REQUIRE(only1.has_value());
+    CHECK(only1->changed == 0);
+    CHECK(check_stamp_age(store, pol.value(), "agent-3") > 22 * kHour);
+}
+
+TEST_CASE("PolicyStore: a fenced refusal that changes nothing refreshes only the rows it holds",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+    const std::vector<std::string> ids{"agent-1", "agent-2"};
+
+    auto claimA = store.claim_remediation(pol.value(), ids, 1800);
+    REQUIRE(claimA.has_value());
+    REQUIRE(claimA->ids.size() == 2);
+    REQUIRE(store.mark_blocked(pol.value(), ids, "fix", "content_dist", "execute_staged", "gated",
+                               claimA->generation)
+                .has_value());
+    age_check_stamp(pool, pol.value(), "agent-1", 23 * kHour);
+    age_check_stamp(pool, pol.value(), "agent-2", 23 * kHour);
+
+    // The holder repeats the same refusal: nothing changed, nothing fenced out, stamps fresh.
+    auto same = store.mark_blocked(pol.value(), ids, "fix", "content_dist", "execute_staged", "gated",
+                                   claimA->generation);
+    REQUIRE(same.has_value());
+    CHECK(same->changed == 0);
+    CHECK(same->fenced_out == 0);
+    CHECK(check_stamp_age(store, pol.value(), "agent-1") < 60);
+    CHECK(check_stamp_age(store, pol.value(), "agent-2") < 60);
+
+    // A holder that lost its claim neither changes nor refreshes the rows.
+    age_check_stamp(pool, pol.value(), "agent-1", 23 * kHour);
+    REQUIRE(store.release_remediation_claim(pol.value(), ids, claimA->generation).has_value());
+    auto claimB = store.claim_remediation(pol.value(), ids, 1800);
+    REQUIRE(claimB.has_value());
+    REQUIRE(claimB->generation != claimA->generation);
+    auto stale = store.mark_blocked(pol.value(), ids, "fix", "content_dist", "execute_staged", "gated",
+                                    claimA->generation);
+    REQUIRE(stale.has_value());
+    CHECK(stale->changed == 0);
+    CHECK(stale->fenced_out == 2);
+    CHECK(check_stamp_age(store, pol.value(), "agent-1") > 22 * kHour);
+
+    // A fenced write never creates a row, so there is nothing to refresh for an unknown agent.
+    auto ghost = store.mark_blocked(pol.value(), {"agent-ghost"}, "fix", "content_dist",
+                                    "execute_staged", "gated", claimB->generation);
+    REQUIRE(ghost.has_value());
+    CHECK(ghost->changed == 0);
+    CHECK(status_of(store, pol.value(), "agent-ghost") == "<none>");
+}
+
+TEST_CASE("PolicyStore: a live refusal stays in the fleet figure and an unrefreshed one decays",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto live = store.create_policy(make_policy_yaml(frag.value(), "Live Refusal"));
+    auto gone = store.create_policy(make_policy_yaml(frag.value(), "Refusal Nothing Refreshes"));
+    REQUIRE(live.has_value());
+    REQUIRE(gone.has_value());
+    REQUIRE(store.mark_blocked(live.value(), {"agent-1"}, "check", "echo", "purge_source", "destructive")
+                .has_value());
+    REQUIRE(store.mark_blocked(gone.value(), {"agent-1"}, "check", "echo", "purge_source", "destructive")
+                .has_value());
+
+    auto fresh = store.get_fleet_compliance();
+    REQUIRE(fresh.has_value());
+    CHECK(fresh->blocked == 2);
+
+    // Both rows last refreshed 25 hours ago, past the 24 hour freshness window.
+    age_check_stamp(pool, live.value(), "agent-1", 25 * kHour);
+    age_check_stamp(pool, gone.value(), "agent-1", 25 * kHour);
+
+    // The live refusal is raised again (the policy dispatched and was refused again): same
+    // pair, same reason, so no row changes, but its rows are fresh. The other policy is
+    // disabled, out of scope or its agent is gone: nothing marks it again.
+    auto again = store.mark_blocked(live.value(), {"agent-1"}, "check", "echo", "purge_source",
+                                    "destructive");
+    REQUIRE(again.has_value());
+    CHECK(again->changed == 0);
+
+    // The fleet figure is cached and ages on the real clock, so a status write on another agent
+    // (which resets the cache) stands in for the TTL passing.
+    REQUIRE(store.update_agent_status(live.value(), "agent-2", "compliant").has_value());
+    auto after = store.get_fleet_compliance();
+    REQUIRE(after.has_value());
+    CHECK(after->blocked == 1);  // the live refusal never decayed
+    CHECK(after->unknown == 1);  // the unrefreshed row decayed like any other status
+    CHECK(after->compliant == 1);
+    CHECK(after->total_checks == 3);
+
+    // The per-policy summary is not subject to the freshness rule and still shows both.
+    auto cs = store.get_compliance_summary(gone.value());
+    REQUIRE(cs.has_value());
+    CHECK(cs->blocked == 1);
 }
