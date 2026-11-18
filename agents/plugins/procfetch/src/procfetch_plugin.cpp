@@ -349,7 +349,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "procfetch_fetch",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + OpenSSL EVP SHA-1", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + OpenSSL EVP SHA-1",
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no "
+         "CAP_SYS_PTRACE): procfetch:exe_unreadable"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1",
          nullptr},

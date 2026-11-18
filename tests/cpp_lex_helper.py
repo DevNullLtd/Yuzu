@@ -106,7 +106,7 @@ def lex(src: str, keep_strings: bool = True) -> str:
     return "".join(out)
 
 
-_ZLIT = r"(?:0[xX]0+|0[0-7]*)[uUlL]*"
+_ZLIT = r"(?:0[xX]0+|0+)[uUlL]*"  # zero only: 010 is octal 8 and live
 _OLIT = r"(?:0[xX]0*1|1)[uUlL]*"
 _ZERO_C = re.compile(rf"(?:\(\s*)*(?:{_ZLIT}|false|FALSE|!\s*(?:{_OLIT}|true|TRUE))(?:\s*\))*")
 _ONE_C = re.compile(rf"(?:\(\s*)*(?:{_OLIT}|true|TRUE|!\s*(?:{_ZLIT}|false|FALSE))(?:\s*\))*")
@@ -249,6 +249,10 @@ def _selftest() -> list[str]:
         ("#if X #elif false is dead", "#if X\nkeep();\n#elif false\nb();\n#endif", "b()", False),
         ("#if X #elif 0 keeps the live branch", "#if X\nkeep();\n#elif 0\nb();\n#endif", "keep()", True),
         ("#if 0 #elif X #elif 0 keeps the unknown branch", "#if 0\nb();\n#elif X\nkeep();\n#elif 0\nb2();\n#endif", "keep()", True),
+        ("#if 010 is octal eight and live", "#if 010\nkeep();\n#endif", "keep()", True),
+        ("#if 010 is unknown so its #else stays live", "#if 010\nkeep();\n#else\nb();\n#endif", "b()", True),
+        ("#if 0777 is live", "#if 0777\nkeep();\n#endif", "keep()", True),
+        ("#if 000 is dead", "#if 000\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0x0", "#if 0x0\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0x00UL", "#if 0x00UL\nb();\n#endif\nkeep();", "b()", False),
         ("#if 0x1 is live", "#if 0x1\nkeep();\n#else\nb();\n#endif", "b()", False),

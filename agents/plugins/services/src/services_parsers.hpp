@@ -151,6 +151,28 @@ inline bool is_safe_service_name(std::string_view name) {
     return state == "masked";
 }
 
+/// The prior `is-enabled` read of a change that unmasks first: it must have RUN to completion (no
+/// spawn failure, deadline, cancel or signal) and its first line must be one of systemctl's
+/// documented states (systemctl(1): enabled, enabled-runtime, linked, linked-runtime, alias,
+/// masked, masked-runtime, static, indirect, disabled, generated, transient, bad, not-found).
+/// Its exit status is not required to be 0 (`is-enabled` exits non-zero for most states). Anything
+/// else leaves "is the unit masked?" unknown.
+[[nodiscard]] inline bool start_prior_state_known(const yuzu::agent::SubprocessResult& res) {
+    if (!res.tool_ran || res.timed_out || yuzu::agent::classify_runner_failure(res).has_value())
+        return false;
+    std::string_view state = res.output;
+    while (!state.empty() && (state.back() == '\n' || state.back() == '\r' || state.back() == ' '))
+        state.remove_suffix(1);
+    if (const auto nl = state.find('\n'); nl != std::string_view::npos)
+        state = state.substr(0, nl);
+    for (std::string_view k :
+         {"enabled", "enabled-runtime", "linked", "linked-runtime", "alias", "masked", "masked-runtime",
+          "static", "indirect", "disabled", "generated", "transient", "bad", "not-found"})
+        if (state == k)
+            return true;
+    return false;
+}
+
 /// A prior state of `masked-runtime`: masked under /run for this boot only. The helper's `unmask`
 /// removes a PERSISTENT mask only, so `enable`/`disable` would fail on such a unit and a re-mask
 /// would write a persistent mask the unit never had; `automatic` and `manual` are refused up front

@@ -896,3 +896,116 @@ TEST_CASE("set_start_mode_linux: a runner failure of the readback is forwarded o
     CHECK(forwarded == 1);
     CHECK_FALSE(ctx.has("status|ok"));
 }
+
+TEST_CASE("start_prior_state_known: only a read that ran and said a documented state", "[services][unmask]") {
+    using yuzu::services::start_prior_state_known;
+    auto ran = [](const char* out, int rc) {
+        SubprocessResult r;
+        r.tool_ran = true;
+        r.termination_reason = TerminationReason::exited;
+        r.exit_code = rc;
+        r.output = out;
+        return r;
+    };
+    for (const char* st : {"enabled\n", "disabled\n", "masked\n", "masked-runtime\n", "static\n", "alias\n",
+                           "not-found\n", "linked\n", "transient\n", "bad\n", "generated\n", "indirect\n",
+                           "enabled-runtime\n", "linked-runtime\n"})
+        CHECK(start_prior_state_known(ran(st, 1)));
+    for (const char* st : {"", "\n", "Failed to connect to bus\n", "maskedx\n", "MASKED\n", "unknown\n"})
+        CHECK_FALSE(start_prior_state_known(ran(st, 1)));
+    SubprocessResult not_ran = ran("masked\n", 0);
+    not_ran.tool_ran = false;
+    not_ran.termination_reason = TerminationReason::spawn_error;
+    CHECK_FALSE(start_prior_state_known(not_ran));
+    SubprocessResult timed = ran("masked\n", -1);
+    timed.timed_out = true;
+    timed.termination_reason = TerminationReason::deadline;
+    CHECK_FALSE(start_prior_state_known(timed));
+}
+
+namespace {
+// A runner whose FIRST is-enabled read is replaced by `first`; every call's verb is recorded.
+int drive_with_first_read(FakeCtx& ctx, const SubprocessResult& first, std::vector<std::string>& verbs,
+                          std::string_view mode = "automatic") {
+    int reads = 0;
+    return yuzu::services::set_start_mode_linux(
+        ctx,
+        [&](const std::vector<std::string>& a, bool = true) {
+            verbs.push_back(a.at(1));
+            SubprocessResult r;
+            r.tool_ran = true;
+            r.termination_reason = TerminationReason::exited;
+            r.exit_code = 0;
+            if (a.at(1) == "is-enabled") {
+                if (++reads == 1)
+                    return first;
+                r.output = "enabled\n";
+            }
+            return r;
+        },
+        [](const SubprocessResult&) {}, "/usr/bin/systemctl", "ssh.service", mode, /*euid_is_root=*/true);
+}
+bool constrained_with(const FakeCtx& ctx, std::string_view token) {
+    return ctx.statuses.size() == 1 &&
+           ctx.statuses[0] == std::format("{}/{}/{}", static_cast<int>(YUZU_RESULT_STATUS_CONSTRAINED),
+                                          static_cast<int>(YUZU_RESULT_COMPLETENESS_PARTIAL), token);
+}
+} // namespace
+
+TEST_CASE("set_start_mode_linux: a first read that did not spawn changes nothing", "[services][setmode]") {
+    for (const char* mode : {"automatic", "manual"}) {
+        FakeCtx ctx;
+        std::vector<std::string> verbs;
+        SubprocessResult first;
+        first.tool_ran = false;
+        first.termination_reason = TerminationReason::spawn_error;
+        CHECK(drive_with_first_read(ctx, first, verbs, mode) == 1);
+        CHECK(joined(verbs) == "is-enabled"); // no unmask, no enable/disable, no mask
+        CHECK(constrained_with(ctx, "services:start_mode_prior_unreadable"));
+        CHECK(ctx.has("error|"));
+        CHECK_FALSE(ctx.has("status|ok"));
+    }
+}
+
+TEST_CASE("set_start_mode_linux: a first read cut by the deadline changes nothing", "[services][setmode]") {
+    FakeCtx ctx;
+    std::vector<std::string> verbs;
+    SubprocessResult first;
+    first.tool_ran = true;
+    first.timed_out = true;
+    first.termination_reason = TerminationReason::deadline;
+    first.exit_code = -1;
+    first.output = "masked\n"; // even a plausible answer is not trusted once the deadline cut it
+    CHECK(drive_with_first_read(ctx, first, verbs) == 1);
+    CHECK(joined(verbs) == "is-enabled");
+    CHECK(constrained_with(ctx, "services:start_mode_prior_unreadable"));
+}
+
+TEST_CASE("set_start_mode_linux: a first read with an unrecognised state changes nothing", "[services][setmode]") {
+    for (const char* out : {"", "Failed to connect to bus: No such file or directory\n", "maskd\n"}) {
+        FakeCtx ctx;
+        std::vector<std::string> verbs;
+        SubprocessResult first;
+        first.tool_ran = true;
+        first.termination_reason = TerminationReason::exited;
+        first.exit_code = 1;
+        first.output = out;
+        CHECK(drive_with_first_read(ctx, first, verbs) == 1);
+        CHECK(joined(verbs) == "is-enabled");
+        CHECK(constrained_with(ctx, "services:start_mode_prior_unreadable"));
+        CHECK_FALSE(ctx.has("note|"));
+    }
+}
+
+TEST_CASE("set_start_mode_linux: disabled never reads a prior state, so its mask is never refused for one",
+          "[services][setmode]") {
+    FakeCtx ctx;
+    std::vector<std::string> verbs;
+    SubprocessResult first; // the first is-enabled of `disabled` is the READBACK; make it match
+    first.tool_ran = true;
+    first.termination_reason = TerminationReason::exited;
+    first.exit_code = 1;
+    first.output = "masked\n";
+    CHECK(drive_with_first_read(ctx, first, verbs, "disabled") == 0);
+    CHECK(joined(verbs) == "mask,is-enabled");
+}

@@ -603,7 +603,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 3,
       "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl "
       "enable|disable|mask|unmask' (a root agent runs systemctl directly)",
-      nullptr},
+      "CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or "
+      "generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked "
+      "for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read"},
      /* macos   = */
      {YUZU_SUPPORT_SUPPORTED, 3,
       "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl "

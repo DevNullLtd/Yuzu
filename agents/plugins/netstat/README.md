@@ -18,7 +18,7 @@
 
 On macOS both actions walk the same shared `agents/shared/macos_socket_walk.hpp` libproc enumeration with `dedup=true`, so a socket shared across a fork (multiple PIDs holding the same fd) collapses to one row — a deliberate match to `netstat_list`'s semantics, and a deliberate *difference* from the retired `sockwho`, which emitted one row per (pid, fd). On Linux, `attribution` builds its inode→PID and PID→process maps in one `/proc` scan rather than reusing `netstat_list`'s separate scan. On Windows, `attribution` resolves each owning PID via `QueryFullProcessImageNameW`, cached per PID for the duration of one call. `escape_pipes()` (`netstat_parsers.hpp`) escapes `|` and strips CR/LF from `process_name`/`process_path` so an attacker-controlled process name can't split one row into extra server-visible lines.
 
-Neither action takes parameters, sets a typed result status, filters by protocol/state, or schedules itself — both are one-shot, unfiltered reads dispatched on demand.
+Neither action takes parameters, filters by protocol/state, or schedules itself — both are one-shot, unfiltered reads dispatched on demand.
 
 ```mermaid
 flowchart LR
@@ -28,7 +28,7 @@ flowchart LR
   EX --> WIN["Windows leg - GetExtendedTcpTable/UdpTable + QueryFullProcessImageNameW"]
   EX --> MAC["macOS leg - libproc via macos_socket_walk.hpp"]
   EX --> LIN["Linux leg - /proc/net/tcp,udp[6] + /proc/pid/fd"]
-  WIN & MAC & LIN --> ROWS["pipe rows, UNDECLARED result status"]
+  WIN & MAC & LIN --> ROWS["pipe rows, typed status only for the Linux /proc gap"]
   ROWS -->|"CommandResponse"| RS[("ResponseStore - 90-day retention")]
   RS --> API["REST /api/responses, dashboard table"]
 ```
@@ -44,6 +44,7 @@ flowchart LR
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
 - **`attribution` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable
+- **`netstat_list` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -203,7 +204,7 @@ tcp|203.0.113.66|52785|160.79.104.10|443|ESTABLISHED|9039|claude|/Users/jsmith/.
 
 1. **UDP's remote address is not the same sentinel on every OS.** macOS and Windows report the literal `*` with `remote_port=0` for a UDP row (`macos_socket_walk.hpp:181,185`; `netstat_plugin.cpp:579,606`). Linux instead runs UDP rows through the same parser as TCP (`netstat_plugin.cpp:203-249`), so it reports the real value parsed from `/proc/net/udp*` — normally `0.0.0.0`, not `*`. The Linux sample below has no UDP rows to demonstrate this; it follows from the shared code path.
 2. **The Linux capture returned zero rows for both actions.** `docs/samples/linux.txt` was taken in a container with no active TCP/UDP connections at capture time (`euid 0`, i.e. privileged) — this is an empty result, not a failure; the plugin has no placeholder-row convention (see Outputs) so an idle host legitimately shows nothing.
-3. **`/proc/[pid]/fd` access on Linux is per-owner, not blanket-readable.** `build_inode_to_pid_map`/`build_socket_and_proc_maps` silently skip a PID whose `fd` directory they can't open (`netstat_plugin.cpp:163-165,311-313`); under the agent's default (non-root) Linux identity, sockets owned by other users resolve `pid=-1` in `netstat_list` and empty `process_name`/`process_path` in `attribution`, with no status flagging the gap. The captured sample ran as root in a container and can't show this.
+3. **`/proc/[pid]/fd` access on Linux is per-owner, not blanket-readable.** `build_inode_to_pid_map`/`build_socket_and_proc_maps` skip a PID whose `fd` directory they can't open, counting the refusal; under the agent's default (non-root) Linux identity, sockets owned by other users resolve `pid=-1` in `netstat_list` and empty `process_name`/`process_path` in `attribution`, and the action sets `CONSTRAINED`/`PARTIAL` (`netstat:proc_fd_unreadable`) so the gap is flagged (macOS and Windows do not flag a refused read). The captured sample ran as root in a container and can't show this.
 4. **TCP state name sets differ slightly per OS.** Linux's `tcp_state_str` has no `CLOSED`; Windows's `tcp_state_str_win` alone has `DELETE_TCB`; only Linux has a plain `CLOSE` (`netstat_plugin.cpp:76-103,453-482`; `macos_socket_walk.hpp:54-82`). A consumer matching on exact state strings across a mixed fleet should treat the set as a per-OS union, not one fixed enum.
 5. **`attribution`'s macOS dedup is deliberate, not inherited by accident.** `enumerate_and_stream_attribution` explicitly passes `dedup=true` to match `netstat_list`'s semantics; the retired `sockwho` used the opposite (one row per fd-holder). Do not revert this to `dedup=false` to restore sockwho's old shape (`netstat_plugin.cpp:429-435`).
 

@@ -23,7 +23,7 @@ flowchart LR
   EX --> WIN[Windows leg<br/>CreateToolhelp32Snapshot + BCrypt SHA-1]
   EX --> MAC[macOS leg<br/>libproc proc_listpids/proc_pidpath + OpenSSL EVP SHA-1]
   EX --> LIN[Linux leg<br/>/proc enumeration + OpenSSL EVP SHA-1]
-  WIN & MAC & LIN --> ROWS[rows, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  WIN & MAC & LIN --> ROWS[rows, typed status only for the Linux /proc gap] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
 ## OS capability
@@ -32,6 +32,10 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `procfetch_fetch` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + BCrypt SHA-1 | ✅ supported · rung 1 · libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | ✅ supported · rung 1 · /proc enumeration + OpenSSL EVP SHA-1 |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`procfetch_fetch` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): procfetch:exe_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -140,7 +144,7 @@ On Linux, `fetch` declares a typed status when the agent could not read another 
 ## Caveats and known gaps
 
 1. **Windows hashing opens a UTF-8 path via the ANSI `CreateFileA`.** `get_process_image_path` converts the wide image path to UTF-8 via `from_wide` (`procfetch_plugin.cpp:263`), then `sha1_of_file` passes that UTF-8 string straight to `CreateFileA` (`procfetch_plugin.cpp:267`), which interprets it as the ANSI code page, not UTF-8. A process whose executable path contains non-ASCII characters will fail to open, silently leaving `sha1` empty with no error surfaced.
-2. **This plugin never sets a typed result status.** Both captured samples read `UNDECLARED / UNKNOWN /` regardless of whether any row's path/hash resolution failed — a caller cannot distinguish "clean run" from "every row's hash silently failed" without inspecting the rows themselves.
+2. **Typed result status only for one Linux gap.** On Linux, `fetch` sets `CONSTRAINED`/`PARTIAL` (`procfetch:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable. On Windows and macOS, and for any failure of a row's hash resolution on any OS, the status stays `UNDECLARED / UNKNOWN /` (both captured samples read it), so a caller cannot distinguish "clean run" from "every row's hash silently failed" without inspecting the rows themselves.
 3. **Protected Windows processes report name only.** `OpenProcess` is refused even running as SYSTEM for a handful of processes (`[System Process]`, `System`, `Secure System`, `Registry` in the sample); those rows carry empty `path` and `sha1` with no row-level error indicator.
 4. **SHA-1, not SHA-256.** The metadata description positions this action for "security auditing" and "IOC matching" (`content/definitions/procfetch.yaml:16-17`), but the hash is SHA-1 on every leg (`EVP_sha1()` / `BCRYPT_SHA1_ALGORITHM`), which is broken for collision resistance; it remains adequate for matching against a known-hash IOC list (a preimage property SHA-1 still holds) but not for detecting a deliberately-collided binary.
 5. **Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe`; the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there.

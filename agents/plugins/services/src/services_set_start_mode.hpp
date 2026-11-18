@@ -59,6 +59,20 @@ inline int set_start_mode_linux(Ctx& ctx, Run&& run_command, Forward&& forward_f
         const auto prior = run_command({std::string{systemctl_path}, "is-enabled", "--",
                                         std::string(name)},
                                        /*merge_stderr=*/false);
+        if (!yuzu::services::start_prior_state_known(prior)) {
+            // The first read did not run, was cut by the deadline, or gave a state this plugin does
+            // not know: whether the unit is masked is UNKNOWN, and unmasking a unit that is in fact
+            // masked would leave it unmasked if the change then fails (nothing could be restored).
+            // Nothing is changed.
+            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                  "services:start_mode_prior_unreadable");
+            ctx.write_output(std::format(
+                "error|set_start_mode: could not read the current state of '{}' (is-enabled "
+                "did not run to completion or answered with an unrecognised state), so mode '{}' "
+                "was not applied and nothing was changed",
+                name, mode));
+            return 1;
+        }
         was_masked = prior.tool_ran && !prior.timed_out &&
                      yuzu::services::start_state_is_masked(prior.output);
         if (prior.tool_ran && !prior.timed_out &&

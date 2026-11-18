@@ -827,7 +827,10 @@ void enumerate_and_stream_attribution(yuzu::CommandContext& ctx) {
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "netstat_list",
-        /* .linux_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/{tcp,udp}[6]", nullptr},
+        /* .linux_leg   = */
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/{tcp,udp}[6]",
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no "
+         "CAP_SYS_PTRACE): netstat:proc_fd_unreadable"},
         /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "GetExtendedTcpTable/GetExtendedUdpTable", nullptr},
@@ -835,7 +838,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
     {
         /* .action      = */ "attribution",
         /* .linux_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/* + /proc/[pid]/{comm,exe,fd}", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 1, "/proc/net/* + /proc/[pid]/{comm,exe,fd}",
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no "
+         "CAP_SYS_PTRACE): netstat:proc_fd_unreadable"},
         /* .macos_leg   = */ {YUZU_SUPPORT_SUPPORTED, 1, "libproc", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1, "IP Helper API + QueryFullProcessImageNameW", nullptr},

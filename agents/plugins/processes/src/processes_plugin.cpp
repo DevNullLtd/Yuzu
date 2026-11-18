@@ -259,7 +259,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "list_hashed",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
-         nullptr},
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no "
+         "CAP_SYS_PTRACE): processes:exe_unreadable"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256", nullptr},
         /* .windows_leg = */
@@ -270,7 +271,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .action      = */ "list_tree",
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
-         nullptr},
+         "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no "
+         "CAP_SYS_PTRACE): processes:exe_unreadable"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 1, "sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256", nullptr},
         /* .windows_leg = */

@@ -115,7 +115,9 @@
 #   --account-name N Override the default account name (_yuzu / yuzu).
 #                    Useful for parallel test environments.
 #   --binary-path P  Override the path to the agent binary whose file capabilities
-#                    are stripped.
+#                    are stripped. On Linux, for install and --check, a P that is not a
+#                    regular file exits 2 (with or without --no-cap-cleanup). A value
+#                    that starts with "-" is refused (exit 2), as for --account-name.
 #                    Default: /usr/local/bin/yuzu-agent (Linux) or
 #                    /Library/Application\ Support/Yuzu/yuzu-agent (macOS).
 #                    On macOS this is a no-op (no file capabilities).
@@ -228,9 +230,9 @@ while [[ $# -gt 0 ]]; do
         --dry-run)        DRY_RUN=1; shift ;;
         --check)          ACTION="check"; shift ;;
         --uninstall)      ACTION="uninstall"; shift ;;
-        --account-name)   [[ $# -ge 2 ]] || { echo "--account-name needs a value; use --help for usage." >&2; exit 2; }
+        --account-name)   [[ $# -ge 2 && "$2" != -* ]] || { echo "--account-name needs a value (not an option); use --help for usage." >&2; exit 2; }
                           ACCOUNT_NAME="$2"; shift 2 ;;
-        --binary-path)    [[ $# -ge 2 ]] || { echo "--binary-path needs a value; use --help for usage." >&2; exit 2; }
+        --binary-path)    [[ $# -ge 2 && "$2" != -* ]] || { echo "--binary-path needs a value (not an option); use --help for usage." >&2; exit 2; }
                           BINARY_PATH="$2"; BINARY_PATH_EXPLICIT=1; shift 2 ;;
         --no-sudoers)     SKIP_SUDOERS=1; shift ;;
         --no-cap-cleanup) SKIP_SETCAP=1; shift ;;
@@ -244,7 +246,7 @@ BINARY_PATH="${BINARY_PATH:-$DEFAULT_BINARY_PATH}"
 # An explicit --binary-path that is not a regular file is an argument error (exit 2): the
 # file-capability strip and check would otherwise silently have nothing to look at.
 if [[ "$BINARY_PATH_EXPLICIT" -eq 1 && "$PLATFORM" == "linux" && "$ACTION" != "uninstall" \
-      && "$SKIP_SETCAP" -eq 0 && ! -f "$BINARY_PATH" ]]; then
+      && ! -f "$BINARY_PATH" ]]; then
     echo "--binary-path $BINARY_PATH is not a regular file" >&2
     exit 2
 fi

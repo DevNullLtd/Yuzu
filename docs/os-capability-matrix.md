@@ -607,7 +607,7 @@ implementation is.
 | netprobe | dns | linux | supported | 1 | getaddrinfo | - |
 | netprobe | dns | macos | supported | 1 | getaddrinfo | - |
 | netprobe | dns | windows | supported | 1 | getaddrinfo | - |
-| netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
+| netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
 | netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable |
@@ -724,7 +724,7 @@ implementation is.
 | processes | query | linux | supported | 1 | /proc enumeration | - |
 | processes | query | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
-| procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
+| procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): procfetch:exe_unreadable |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
@@ -802,7 +802,7 @@ implementation is.
 | services | running | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | running | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | running | windows | supported | 1 | win32_service_api | - |
-| services | set_start_mode | linux | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly); then an unprivileged `systemctl is-enabled` readback | CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units |
+| services | set_start_mode | linux | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) | CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read |
 | services | set_start_mode | macos | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | shares | list | linux | supported | 1 | bounded no-follow reads of /etc/exports, /etc/exports.d/*.exports and /etc/samba/smb.conf (pure parsers); one lstat of the usershares directory | configured shares as written, not live nfsd/smbd state; Samba registry backend, include= files and usershares are not read (constrained token); a symlinked config file or exports.d is refused |

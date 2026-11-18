@@ -70,7 +70,7 @@ sequenceDiagram
   P-->>S: status ok, service, mode (Linux adds state, and note for some units)  or  one error line
 ```
 
-The plugin validates input first, then makes exactly one start-setting change per call (Linux `automatic` and `manual` add a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces one `error|` line and none of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|` and, for a unit that cannot be enabled or disabled, `note|`). On Linux that `error|` line can be followed by one `note|` line: when `automatic` or `manual` found the unit masked, unmasked it and the change then failed, the plugin puts the mask back and writes `note|remasked: ...` (or `note|remask_failed: ...` if the mask could not be restored, in which case the unit may be left unmasked), so a failed call does not leave a masked unit less restricted.
+The plugin validates input first, then makes exactly one start-setting change per call (Linux `automatic` and `manual` add a best-effort `unmask` beforehand). Nothing starts or stops the service, and a failure produces one `error|` line and none of the success lines (`status|`, `service|`, `mode|`, and on Linux `state|` and, for a unit that cannot be enabled or disabled, `note|`). On Linux that `error|` line can be followed by one `note|` line: when `automatic` or `manual` found the unit masked, unmasked it and the change then failed, the plugin puts the mask back and writes `note|remasked: ...` (or `note|remask_failed: ...` if the mask could not be restored, in which case the unit may be left unmasked), so a failed call does not leave a masked unit less restricted. If the first state read cannot be trusted (it did not run, hit the deadline or gave an unknown state) `automatic` and `manual` are refused before anything is changed.
 
 ```mermaid
 flowchart TD
@@ -94,11 +94,11 @@ This shows why the two families of legs fail differently: Windows has no way to 
 |---|---|---|---|
 | `list` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
 | `running` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 2 · runner argv 'launchctl list' | ✅ supported · rung 2 · runner argv 'systemctl list-units' |
-| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly); then an unprivileged `systemctl is-enabled` readback |
+| `set_start_mode` | ✅ supported · rung 1 · win32_service_api | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | ✅ supported · rung 3 · sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) |
 
 **Declared limits per leg** (descriptor fallback text, verbatim):
 
-- **`set_start_mode` / Linux** — CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units
+- **`set_start_mode` / Linux** — CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -162,6 +162,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 | `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows read (including a failed one), every Linux/macOS read that completed cleanly, a successful `set_start_mode` on Windows and macOS and on Linux for a unit whose state can change, and every `set_start_mode` validation or platform-decision error (missing `name`/`mode`, unsafe name, invalid mode, macOS `manual`, a command that ran and exited non-zero). The plugin sets no status on these paths. |
 | `UNAVAILABLE` | PARTIAL | `subprocess_runner:spawn_error` | Linux/macOS `list`/`running`/`set_start_mode`: `systemctl`/`launchctl` (or `sudo`) could not be started or was not found; shown in `docs/samples/linux.txt` |
 | `CONSTRAINED` | PARTIAL | `services:start_mode_unchangeable` | Linux `set_start_mode` succeeded (exit 0, `status\|ok`) but the unit's `systemctl is-enabled` state is `static`, `indirect`, `alias` or `generated`: `systemctl` cannot enable or disable such a unit, so the requested mode does not change whether it starts at boot. `state\|` and `note\|` lines say which. The typed status is stored with the result and carried on the event payload; it is not yet shown on the REST, MCP or dashboard surfaces. |
+| `CONSTRAINED` | PARTIAL | `services:start_mode_prior_unreadable` | Linux `set_start_mode` `automatic` or `manual`: the first `systemctl is-enabled` read (taken before the unmask) did not run, was cut by the 20 second deadline, or answered with a state this plugin does not know, so whether the unit is masked is unknown. Refused with rc 1 before any change, so a masked unit is never unmasked on a guess. |
 | `CONSTRAINED` | PARTIAL | `services:start_mode_runtime_mask` | Linux `set_start_mode` `automatic` or `manual` on a unit whose `systemctl is-enabled` state is `masked-runtime` (masked for this boot only): refused up front with rc 1 and nothing changed, because the helper's `unmask` removes a persistent mask only. Remove the runtime mask on the host (`systemctl unmask --runtime` as root) or reboot. |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:deadline` | The 20 second runner deadline elapsed and the child was killed |
 | `CONSTRAINED` | PARTIAL | `subprocess_runner:cancelled` | The `systemctl`/`launchctl` run was cancelled before it finished |
@@ -181,7 +182,7 @@ Rows are pipe-delimited, prefixed `svc|`, one per service. The row **shape** dif
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2429cf4b9745
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash d88afd69bd6a
 
 ```
 == action=list
@@ -222,7 +223,7 @@ error|missing required parameter: name
 [rc] 1
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2429cf4b9745
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash d88afd69bd6a
 
 ```
 == action=list

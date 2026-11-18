@@ -23,7 +23,7 @@ flowchart LR
   EX --> WIN[Windows leg<br/>CreateToolhelp32Snapshot<br/>+ QueryFullProcessImageNameW]
   EX --> MAC[macOS leg<br/>sysctl KERN_PROC_ALL<br/>+ proc_pidpath]
   EX --> LIN[Linux leg<br/>/proc enumeration<br/>+ readlink /proc/pid/exe]
-  WIN & MAC & LIN --> ROWS[rows, no typed result status] --> RS[(ResponseStore)] --> API[REST /api/responses · /api/v1/dex/devices/id/live]
+  WIN & MAC & LIN --> ROWS[rows, typed status only for the Linux /proc gap] --> RS[(ResponseStore)] --> API[REST /api/responses · /api/v1/dex/devices/id/live]
 ```
 
 ## OS capability
@@ -260,7 +260,7 @@ proc|1|sh
 
 ## Caveats and known gaps
 
-1. **No typed result status, ever.** Every action on every OS reports `UNDECLARED / UNKNOWN /` in every capture — the plugin has no `set_result_status` call at all, so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir("/proc")`) and "this host genuinely has zero processes" are indistinguishable on the wire.
+1. **Typed result status only for one Linux gap.** On Linux, `list_hashed` and `list_tree` set `CONSTRAINED`/`PARTIAL` (`processes:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable; for an unprivileged agent that is the steady state. Every other action and OS reports `UNDECLARED / UNKNOWN /` in every capture (Windows and macOS `list_hashed`/`list_tree` included), so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir("/proc")`) and "this host genuinely has zero processes" are indistinguishable on the wire, and on Windows and macOS a refused image-path read blanks a row's `path`/`sha256` without any status.
 2. **`list_hashed`/`list_tree` have no privilege-model row.** `docs/agent-privilege-model.md:83` covers `processes.fetch`/`echo.process_tree` (needing `cap_sys_ptrace` on Linux to inspect non-child processes) — that is a different action id, not present in this plugin's descriptor, so it must not be read as documenting `list_hashed`/`list_tree`. Both were captured only as root/SYSTEM/unprivileged-but-same-user, so a production unprivileged Linux capture (where `readlink(/proc/<pid>/exe)` on another user's process would be denied) has not been taken; add the row when it is.
 3. **512 MiB hash cap refuses, not truncates.** `sha256_file()` returns an empty hash for any image over the cap rather than hashing a truncated prefix (`agents/core/src/plugin_loader.cpp:79-95`) — an empty `sha256` on a real, resolved `path` can mean "oversized," not just "unreadable."
 4. **Row fields are neutralised, and only a trailing backslash is folded.** Every action (`list`, `query`, `list_hashed`, `list_tree`) builds its rows in `processes_rows.hpp`: `|`, CR and LF in a name or path become a space and a trailing backslash becomes `/` (it would otherwise glue onto the next `|`). Interior backslashes are kept, so a Windows path stays readable (the same backslash rule as `procfetch`, `wmi`, `installed_apps`, `network_config` and `filesystem`; unlike them, `processes` folds a `|` to a space because its consumers split rows on a raw `|`). An agent on a build before this change still emits unsanitised `query` rows and glues a trailing backslash until it is upgraded.

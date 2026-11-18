@@ -92,6 +92,15 @@ def problems(src):
             out.append(f"sign_cache_.get is passed `{m_get.group(1)}`, not the stamp `{var}` read from the image")
         if m_get.start() < m_stamp.start():
             out.append("sign_cache_.get runs BEFORE the stamp is read from the open image")
+    # 3b. exactly ONE cache lookup, and the verifier receives the SAME open handle that was stamped
+    # (a second lookup, or a verifier on another handle, signs a different file than was stamped)
+    if len(re.findall(r"sign_cache_\.get\(", body)) != 1:
+        out.append("drain() must call sign_cache_.get exactly once")
+    vers = re.findall(r"verify_image_signature_win\( ?(\w+)\.get\(\), ?full ?\)", body)
+    if len(vers) != 1:
+        out.append(f"drain() must call verify_image_signature_win(<image>.get(), full) exactly once, found {len(vers)}")
+    elif vers[0] != h:
+        out.append(f"verify_image_signature_win receives `{vers[0]}`, not the stamped handle `{h}`")
     # 4. a default-built / hand-filled stamp anywhere in drain(): `FileVersionStamp{}`,
     # `FileVersionStamp x{}`, `FileVersionStamp x;`, `FileVersionStamp x = {}`, `.usn =` ...
     for bad in (r"FileVersionStamp ?\{", r"FileVersionStamp \w+ ?\{", r"FileVersionStamp \w+ ?;",
@@ -144,6 +153,12 @@ def selftest(src):
          lambda s: s.replace("sign_cache_.get(full, stamp,", "stamp = weak_stamp(full); sign_cache_.get(full, stamp,", 1)),
         ("stamp made non-const",
          lambda s: s.replace("const FileVersionStamp stamp = read_image_version_stamp(img.get());", "FileVersionStamp stamp = read_image_version_stamp(img.get());", 1)),
+        ("verifier on a different handle",
+         lambda s: s.replace("return verify_image_signature_win(img.get(), full);", "return verify_image_signature_win(other.get(), full);", 1)),
+        ("a second cache lookup",
+         lambda s: s.replace("e.signed_state = v.state;", "e.signed_state = v.state; (void)sign_cache_.get(full, stamp, nullptr);", 1)),
+        ("verifier called outside the cache lambda twice",
+         lambda s: s.replace("e.signer = v.signer;", "e.signer = v.signer; (void)verify_image_signature_win(img.get(), full);", 1)),
         ("usn forced",
          lambda s: s.replace("sign_cache_.get(full, stamp,", "x.usn = 1; sign_cache_.get(full, stamp,", 1)),
     ]

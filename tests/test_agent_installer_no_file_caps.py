@@ -199,6 +199,16 @@ def check(script: pathlib.Path, uat_text=None) -> list[str]:
         r = run_installer(script, [flag], caps=False, setcap=True, binary_arg=False)
         if r.returncode != 2 or "needs a value" not in r.stderr:
             errs.append(f"{flag} with no value: expected exit 2 and a usage message, got {r.returncode}")
+    # a value-taking flag must not swallow the next option as its value
+    for flag in ("--binary-path", "--account-name"):
+        r = run_installer(script, [flag, "--check"], caps=False, setcap=True, binary_arg=False)
+        if r.returncode != 2 or "needs a value" not in r.stderr:
+            errs.append(f"{flag} --check: the option was taken as the value (expected exit 2, got {r.returncode})")
+    # a bad explicit --binary-path exits 2 whether or not the cleanup is skipped
+    r = run_installer(script, ["--binary-path", "/nonexistent/yuzu-agent", "--no-cap-cleanup"], caps=False,
+                      setcap=True, binary_arg=False)
+    if r.returncode != 2:
+        errs.append(f"--binary-path <missing> --no-cap-cleanup: expected exit 2, got {r.returncode}")
     r = run_installer(script, ["--no-setcap"], caps=False, setcap=True)
     if r.returncode != 2 or "unknown arg" not in r.stderr:
         errs.append(f"--no-setcap must be an unknown argument (exit 2), got {r.returncode}")
@@ -280,7 +290,13 @@ def selftest() -> list[str]:
         "no-binary check silent": (
             'log "file-capability check skipped: no binary at $BINARY_PATH', 'true "file-capability check skipped: no binary at $BINARY_PATH'),
         "missing flag value unbound": (
-            "--binary-path)    [[ $# -ge 2 ]] || { echo \"--binary-path needs a value; use --help for usage.\" >&2; exit 2; }", "--binary-path) "),
+            "--binary-path)    [[ $# -ge 2 && \"$2\" != -* ]] || { echo \"--binary-path needs a value (not an option); use --help for usage.\" >&2; exit 2; }", "--binary-path) "),
+        "option-shaped value accepted": (
+            '[[ $# -ge 2 && "$2" != -* ]] || { echo "--account-name needs a value',
+            '[[ $# -ge 2 ]] || { echo "--account-name needs a value'),
+        "bad --binary-path ignored with --no-cap-cleanup": (
+            '&& "$ACTION" != "uninstall" \\\n      && ! -f "$BINARY_PATH" ]]; then',
+            '&& "$ACTION" != "uninstall" \\\n      && "$SKIP_SETCAP" -eq 0 && ! -f "$BINARY_PATH" ]]; then'),
         "warning silenced": (
             'warn "--no-cap-cleanup: file capabilities are STILL LIVE', 'log "--no-cap-cleanup: file capabilities are STILL LIVE'),
     }
