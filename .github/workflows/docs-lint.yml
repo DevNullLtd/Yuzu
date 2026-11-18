@@ -343,6 +343,20 @@ jobs:
       - name: Server feature option lint
         run: python3 -I tests/test_server_feature_option.py
 
+      # Security dependency pins: every vcpkg.json `overrides` entry has a row
+      # (what it fixes, when to delete it) in docs/build-guide.md "Security
+      # dependency pins", and every row an entry. Mutation-tests itself.
+      # Stdlib only.
+      - name: vcpkg overrides documented
+        run: python3 -I tests/test_vcpkg_overrides_documented.py
+
+      # Every SHA-256 a vendored *-NOTICE.txt under server/core/{static,vendor}
+      # records is the hash of the file it names (a same-size vendor edit keeps
+      # test_static_js_bundle.cpp's byte pin green). Mutation-tests itself on a
+      # scratch copy. Stdlib only.
+      - name: Vendored NOTICE hashes
+        run: python3 -I tests/test_vendored_notice_hashes.py
+
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
       # ratcheted against a by-name baseline that only
