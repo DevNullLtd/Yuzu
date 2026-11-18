@@ -58,8 +58,9 @@ certificate at build time and cannot be restamped.
 | CycloneDX SBOMs | `yuzu-*.cdx.json`, including the images: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `yuzu-*.spdx.json`, including the same image set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` per asset (also in GitHub's attestation registry) | `gh attestation verify` |
-| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
+| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
 | Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.{json,txt,gate.txt}` (from the first release built with the pre-push scan) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.{json,txt,gate.txt}`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS` and `.sigstore` (from the first release built with this attachment) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list |
 
 **Do not trust an image tag that has no GitHub Release.** The images are pushed and signed before the
 GitHub Release is created, and a failed publish job stops the release. So a `:X.Y.Z` tag can exist in
@@ -70,31 +71,52 @@ passes `cosign verify` (step 3) with the exact release identity.
 ## Image vulnerability scan before publishing
 
 Before `release.yml` pushes an image, it scans the locally built image (by image ID) with a pinned
-Trivy and refuses to push it when the image has a **CRITICAL vulnerability that has a fix available**
-and is not an accepted finding. Accepted findings are listed in `.trivyignore.yaml` in the repository at
-the release tag, each with a package scope, a statement of why it does not apply, an expiry at most 92
-days out and the approver's GitHub login. The scan also refuses to run on a vulnerability database
-older than 72 hours. After the release, the pre-release QA workflow scans the published tags again with a
-newer database; a finding there is reported, it cannot unpublish anything.
+Trivy and refuses to push it when the scanner finds a **CRITICAL vulnerability that has a fix
+available** in what it can see and the finding is not an accepted one. "What it can see" is narrower
+than the image: the list below says what it does not cover. Accepted findings are listed in
+`.trivyignore.yaml` in the repository at the release tag; the release scan honours an entry only when
+it names one concrete file path or one package at one version (never a pattern or a bare
+vulnerability id), states why the finding does not apply, expires at most 92 days out, and records
+who approved it, when, and in which pull request.
+
+The release scan also refuses to push, rather than report a clean scan, when:
+
+- the scanner sees no operating-system package in an image that is not on the reviewed not-covered
+  list (the chiselled images are on it, below);
+- the image's operating-system release is one the scanner's vulnerability database holds no
+  advisories for (a release past its end of life, or an unreleased or rolling one such as Debian
+  testing): a scan of such an image finds nothing whatever it contains;
+- the vulnerability database is older than 72 hours, or was not downloaded by that run.
+
+After the release, the pre-release QA workflow scans the published tags again with a newer database;
+a finding there is reported, it cannot unpublish anything.
 
 What this does **not** gate:
 
 - HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
   refused.
-- The OS packages of the chiselled images (`yuzu-*-chisel`, and the agent-bundle delivery image): they
-  are built from Ubuntu package slices with no package database the scanner can read, so their OS
-  packages are not scanned at all. Each report's `.gate.txt` says `coverage: not-covered` for them.
+- The operating-system packages of the chiselled images (`yuzu-*-chisel`, and the agent-bundle delivery
+  image): they are built from Ubuntu package slices with no package database the scanner can read, so
+  their OS packages are not scanned at all. Each report's `.gate.txt` says `coverage: not-covered` for
+  them. Choose the non-chisel image if you need its OS packages covered by this scan.
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - The gateway's bundled Erlang/OTP runtime, and anything statically linked into the server and agent
   binaries.
+- The integrity of the vulnerability database itself: its publisher does not sign it. Each report
+  records the database's registry digest, so the database a scan used can be identified afterwards,
+  but a database altered before the download is not detected.
 
 Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
 `trivy-<image>.json` (the full report, including the image ID, the layer digests and every package),
-`trivy-<image>.txt` (the same as a table) and `trivy-<image>.gate.txt` (the Trivy version, the database
-date, the OS package count, the coverage and the result, and the check that the pushed image has the
-scanned image's layers). The reports are a point-in-time record: a vulnerability disclosed after the
-release is not in them.
+`trivy-<image>.txt` (the same as a table) and `trivy-<image>.gate.txt` (the Trivy version, the
+database's digest and date, the OS, the OS package count, the coverage, the advisory-data check, the
+accepted-findings file's hash and the result, and the check that the pushed image has the scanned
+image's layers). The agent-bundle image is built after the release exists, so its reports are attached
+afterwards with their own signed checksum list (table above); verify that list the way step 2
+verifies `SHA256SUMS`, with the same `--certificate-identity`, then run `sha256sum -c
+yuzu-agent-bundle-chisel-image-vuln-gate.SHA256SUMS`. The reports are a point-in-time record: a
+vulnerability disclosed after the release is not in them.
 
 ## Prerequisites
 
