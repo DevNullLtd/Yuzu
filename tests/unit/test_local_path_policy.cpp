@@ -21,6 +21,7 @@
 #include <sha256.hpp>
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
@@ -28,10 +29,12 @@
 #include <fstream>
 #include <iterator>
 #include <string>
+#include <thread>
 #include <vector>
 
 #ifndef _WIN32
 #include <fcntl.h>
+#include <sys/syscall.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -95,6 +98,18 @@ TEST_CASE("local_path: a drive letter must be a fixed disk", "[shared][local_pat
     CHECK(win("1:file") == lp::Refusal::none); // not a drive letter: an ordinary relative name
 }
 
+TEST_CASE("local_path: Windows spellings normalise to one drive-letter form", "[shared][local_path]") {
+    CHECK(lp::win_normalise_spelling("C:\\a\\b.txt") == "C:\\a\\b.txt");
+    CHECK(lp::win_normalise_spelling("C:/a/b.txt") == "C:\\a\\b.txt");
+    CHECK(lp::win_normalise_spelling("\\\\?\\C:\\a\\b.txt") == "C:\\a\\b.txt");
+    CHECK(lp::win_normalise_spelling("C:\\a\\.\\b\\..\\c.txt") == "C:\\a\\c.txt");
+    CHECK(lp::win_normalise_spelling("C:\\a\\\\b") == "C:\\a\\b");
+    CHECK(lp::win_normalise_spelling("C:\\..\\..\\x") == "C:\\x");   // never above the root
+    CHECK(lp::win_normalise_spelling("C:\\") == "C:\\");
+    CHECK(lp::win_normalise_spelling("rel\\x") == "rel\\x");           // caller absolutises first
+    CHECK(lp::win_normalise_spelling("\\\\?\\UNC\\h\\s") == "\\\\?\\UNC\\h\\s"); // untouched: still refused
+}
+
 TEST_CASE("local_path: relative and current-drive-rooted Windows paths pass", "[shared][local_path]") {
     CHECK(win("logs\\app.log") == lp::Refusal::none);
     CHECK(win("..\\up\\f") == lp::Refusal::none);
@@ -136,6 +151,34 @@ TEST_CASE("network_fstype: network-capable FUSE clients and the legacy network t
     for (const char* t : {"ext4", "xfs", "btrfs", "tmpfs", "overlay", "fuse", "fuse.portal",
                           "fuse.lxcfs", "fuse.gvfsd-fuse", "proc", "sysfs"})
         CHECK_FALSE(yuzu::shared::is_network_fstype(t));
+}
+
+TEST_CASE("network_fstype: the strict reading adds unlisted FUSE and overlays over network mounts",
+          "[shared][network_fstype]") {
+    const std::string text =
+        "30 22 0:25 / /mnt/nfs rw - nfs4 srv:/e rw\n"
+        "31 22 0:26 / /mnt/gcs rw - fuse.gcsfuse bucket rw\n"
+        "32 22 0:27 / /mnt/unknown rw - fuse.chaosfs chaos rw\n"
+        "33 22 0:28 / /mnt/plain rw - fuse plain rw\n"
+        "34 22 0:29 / /run/portal rw - fuse.portal portal rw\n"
+        "35 22 0:30 / /var/lib/ctr rw - overlay overlay rw,lowerdir=/mnt/nfs/lower:/ro,upperdir=/var/up,workdir=/var/w\n"
+        "36 22 0:31 / /var/lib/ok rw - overlay overlay rw,lowerdir=/usr/share/lower,upperdir=/var/up2,workdir=/var/w2\n"
+        "37 22 0:32 / /srv/uponfs rw - overlay overlay rw,lowerdir=/ro,upperdir=/mnt/nfs/up,workdir=/mnt/nfs/w\n";
+    const auto lax = yuzu::shared::network_mount_points(text);
+    CHECK(std::find(lax.begin(), lax.end(), "/mnt/nfs") != lax.end());
+    CHECK(std::find(lax.begin(), lax.end(), "/mnt/gcs") != lax.end());       // listed suffix
+    CHECK(std::find(lax.begin(), lax.end(), "/mnt/unknown") == lax.end());   // unchanged for others
+    CHECK(std::find(lax.begin(), lax.end(), "/var/lib/ctr") == lax.end());
+    const auto strict = yuzu::shared::network_mount_points(text, /*strict=*/true);
+    const auto has = [&](const char* m) { return std::find(strict.begin(), strict.end(), m) != strict.end(); };
+    CHECK(has("/mnt/nfs"));
+    CHECK(has("/mnt/gcs"));
+    CHECK(has("/mnt/unknown"));   // unlisted FUSE subtype
+    CHECK(has("/mnt/plain"));     // bare fuse
+    CHECK_FALSE(has("/run/portal")); // known-local FUSE
+    CHECK(has("/var/lib/ctr"));   // overlay lowerdir on NFS
+    CHECK(has("/srv/uponfs"));    // overlay upperdir/workdir on NFS
+    CHECK_FALSE(has("/var/lib/ok")); // overlay over local dirs
 }
 
 TEST_CASE("local_path: a leading control character or space is refused rather than guessed at",
@@ -259,6 +302,105 @@ TEST_CASE("local_path: a symlinked PARENT that points under a network mount is r
     // An empty mount list never refuses.
     CHECK(lp::posix_judge((tmp.path / "link" / "a").string(), {}).refusal == lp::Refusal::none);
 }
+
+TEST_CASE("local_path: a `..` after a missing component cannot expose un-stat'ed links",
+          "[shared][local_path]") {
+    yuzu::test::TempDir tmp{"yuzu_test_lp_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto mount = fs::canonical(tmp.path) / "mnt_nfs";
+    REQUIRE(fs::create_directory(mount));
+    fs::create_directory_symlink(mount, tmp.path / "lnk");
+    const std::vector<std::string> mounts{mount.string()};
+    // d/missing/../lnk/a: lexically that is d/lnk/a-less; physically `missing` does not exist, so
+    // the `..` cannot be resolved and the walk must not guess. (Before the fix the splice cancelled
+    // `missing` and returned refusal=none with resolved=<tmp>/lnk/a, an un-judged link into the mount.)
+    const auto j = lp::posix_judge((tmp.path / "missing" / ".." / "lnk" / "a").string(), mounts);
+    CHECK(j.refusal == lp::Refusal::unresolvable);
+    CHECK(j.resolved.empty());
+    // A `..` BEFORE any missing component is resolved physically as before.
+    fs::create_directory(tmp.path / "real");
+    CHECK(lp::posix_judge((tmp.path / "real" / ".." / "lnk" / "a").string(), mounts).refusal ==
+          lp::Refusal::network_or_device);
+}
+
+TEST_CASE("local_path: the checked open refuses a swapped component and a pseudo filesystem",
+          "[shared][local_path]") {
+    yuzu::test::TempDir tmp{"yuzu_test_lp_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto base = fs::canonical(tmp.path);
+    { std::ofstream(base / "f.txt") << "plain"; }
+    auto ok = lp::posix_open_checked((base / "f.txt").string(), O_RDONLY | O_NONBLOCK);
+    CHECK(ok.opened());
+    CHECK(ok.refusal == lp::Refusal::none);
+
+    // Absent is a definitive answer, distinct from every refusal.
+    auto gone = lp::posix_open_checked((base / "nope.txt").string(), O_RDONLY);
+    CHECK_FALSE(gone.opened());
+    CHECK(gone.absent);
+    CHECK(gone.refusal == lp::Refusal::none);
+    auto gone_dir = lp::posix_open_checked((base / "nodir" / "f").string(), O_RDONLY);
+    CHECK(gone_dir.absent);
+
+    // A symlink in the path (a component swapped in after judging) is refused, never followed.
+    fs::create_directory(base / "real");
+    { std::ofstream(base / "real" / "f.txt") << "real"; }
+    fs::create_directory_symlink(base / "real", base / "swapped");
+    auto via_link = lp::posix_open_checked((base / "swapped" / "f.txt").string(), O_RDONLY);
+    CHECK_FALSE(via_link.opened());
+    CHECK(via_link.refusal == lp::Refusal::unresolvable);
+    fs::create_symlink(base / "f.txt", base / "leaf_link");
+    auto leaf = lp::posix_open_checked((base / "leaf_link").string(), O_RDONLY);
+    CHECK_FALSE(leaf.opened());
+    CHECK(leaf.refusal == lp::Refusal::unresolvable);
+
+#ifdef __linux__
+    // The OPENED file's filesystem decides, not the path text: /proc is pseudo.
+    auto proc = lp::posix_open_checked("/proc/version", O_RDONLY | O_NONBLOCK);
+    CHECK_FALSE(proc.opened());
+    CHECK(proc.refusal == lp::Refusal::pseudo_filesystem);
+#endif
+}
+
+#ifdef __linux__
+TEST_CASE("local_path: a rename-swap race never opens through the swapped-in link",
+          "[shared][local_path]") {
+    // A component is exchanged (renameat2 RENAME_EXCHANGE) between a real directory and a symlink
+    // to ANOTHER directory while the checked open runs. Every open must see the real file or be
+    // refused; none may land on the other directory's file.
+    yuzu::test::TempDir tmp{"yuzu_test_lp_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto base = fs::canonical(tmp.path);
+    fs::create_directory(base / "p");
+    fs::create_directory(base / "other");
+    { std::ofstream(base / "p" / "f") << "real"; }
+    { std::ofstream(base / "other" / "f") << "FORBIDDEN"; }
+    fs::create_directory_symlink(base / "other", base / "q");
+    std::atomic<bool> stop{false};
+    std::thread flipper([&] {
+        const std::string a = (base / "p").string(), b = (base / "q").string();
+        while (!stop.load()) {
+            if (::syscall(SYS_renameat2, AT_FDCWD, a.c_str(), AT_FDCWD, b.c_str(), 2 /*RENAME_EXCHANGE*/) != 0)
+                break;
+        }
+    });
+    int landed_forbidden = 0, opened_real = 0;
+    const std::string target = (base / "p" / "f").string();
+    for (int i = 0; i < 4000; ++i) {
+        auto o = lp::posix_open_checked(target, O_RDONLY | O_NONBLOCK);
+        if (!o.opened())
+            continue;
+        char buf[16]{};
+        const auto n = ::read(o.file.fd(), buf, sizeof(buf));
+        const std::string got(buf, n > 0 ? static_cast<std::size_t>(n) : 0);
+        if (got == "FORBIDDEN") ++landed_forbidden;
+        if (got == "real") ++opened_real;
+    }
+    stop = true;
+    flipper.join();
+    CHECK(landed_forbidden == 0);
+    INFO("opened_real=" << opened_real);
+}
+#endif
 
 TEST_CASE("local_path: a symlink loop fails closed", "[shared][local_path]") {
     yuzu::test::TempDir tmp{"yuzu_test_lp_"};
@@ -770,6 +912,66 @@ TEST_CASE("ioc plugin: a complete run says so, and a /proc file is never hashed"
     CHECK(r2.rc == 0);
     CHECK(contains(r2.captured, "coverage|/proc/kmsg|not_examined|pseudo_filesystem"));
     CHECK(contains(r2.captured, "coverage|*|partial|0 of 1 file path(s) examined"));
+}
+
+TEST_CASE("ioc plugin: an absent file is a definitive answer and does not make a clean run partial",
+          "[shared][local_path][ioc]") {
+    auto plugin = load_or_fail("ioc");
+    yuzu::test::TempDir tmp{"yuzu_test_iocabs_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    const auto regular = tmp.path / "real.txt";
+    { std::ofstream(regular, std::ios::binary) << "hello world"; }
+    const std::string want = yuzu::shared::sha256_hex("hello world");
+    const std::string paths = (tmp.path / "absent.bin").string() + "," + regular.string();
+    std::vector<YuzuParam> params{{"file_hashes", want.c_str()}, {"file_paths", paths.c_str()}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
+    CHECK(r.rc == 0);
+    CHECK(contains(r.captured, "hash|" + want + "|true|"));
+    CHECK(contains(r.captured, "file|" + (tmp.path / "absent.bin").string() + "|false|File not found"));
+    // The absent path is examined (definitively not there): nothing is "not_examined".
+    CHECK_FALSE(contains(r.captured, "not_examined"));
+    CHECK(contains(r.captured, "coverage|*|complete|2 of 2 file path(s) examined"));
+
+    // Hash that matches nothing, only an absent path: still a clean miss, not "NOT examined".
+    const std::string only_absent = (tmp.path / "absent.bin").string();
+    std::vector<YuzuParam> p2{{"file_hashes", want.c_str()}, {"file_paths", only_absent.c_str()}};
+    const auto r2 = dispatcher.run(plugin.descriptor, "check", p2);
+    CHECK(contains(r2.captured, "hash|" + want + "|false|No matching files found"));
+    CHECK_FALSE(contains(r2.captured, "NOT examined"));
+}
+
+TEST_CASE("ioc plugin: an unreadable path is not examined (EACCES), not a clean absence",
+          "[shared][local_path][ioc]") {
+    if (::getuid() == 0)
+        SKIP("root bypasses permission checks: EACCES cannot be provoked");
+    auto plugin = load_or_fail("ioc");
+    yuzu::test::TempDir tmp{"yuzu_test_iocacc_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    fs::create_directory(tmp.path / "locked");
+    { std::ofstream(tmp.path / "locked" / "f.txt") << "x"; }
+    fs::permissions(tmp.path / "locked", fs::perms::none);
+    const std::string p = (tmp.path / "locked" / "f.txt").string();
+    std::vector<YuzuParam> params{{"file_paths", p.c_str()}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
+    fs::permissions(tmp.path / "locked", fs::perms::owner_all);
+    CHECK(contains(r.captured, "coverage|" + p + "|not_examined|unreadable"));
+    CHECK(contains(r.captured, "coverage|*|partial|0 of 1 file path(s) examined"));
+    CHECK_FALSE(contains(r.captured, "|false|File not found"));
+}
+
+TEST_CASE("ioc plugin: a `..` after a missing component is not examined",
+          "[shared][local_path][ioc]") {
+    auto plugin = load_or_fail("ioc");
+    yuzu::test::TempDir tmp{"yuzu_test_iocdd_"};
+    REQUIRE(fs::create_directory(tmp.path));
+    { std::ofstream(tmp.path / "f.txt") << "x"; }
+    const std::string p = (tmp.path / "missing" / ".." / "f.txt").string();
+    std::vector<YuzuParam> params{{"file_paths", p.c_str()}};
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto r = dispatcher.run(plugin.descriptor, "check", params);
+    CHECK(contains(r.captured, "coverage|" + p + "|not_examined|unresolvable"));
 }
 
 TEST_CASE("ioc plugin: a symlinked leaf is hashed through its resolved target",

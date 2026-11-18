@@ -13,9 +13,11 @@
 //                          for `/proc/<pid>/exe`, a magic link whose open IS the kernel's own
 //                          reference to the running image).
 //
-// The deadline is checked between 64 KiB reads. A read that blocks inside the kernel (a hung
-// network mount) is not interruptible from here; callers refuse network paths first
-// (local_path_policy.hpp), which is what keeps the bound honest.
+// The deadline is checked between 64 KiB reads, so it is COOPERATIVE: a read or open that blocks
+// inside the kernel (a hung network or FUSE mount) is not interruptible from here. The real bound
+// is the caller's: run the whole examine/hash on a bounded helper (bounded_wait.hpp's
+// bounded_call_ex) so the command worker gives up at the deadline, and refuse network paths first
+// (local_path_policy.hpp) so a stall is the exception.
 #pragma once
 
 #include <algorithm>
@@ -33,7 +35,15 @@
 
 namespace yuzu::shared {
 
-enum class HashStatus : std::uint8_t { ok, unreadable, not_regular, oversize, timeout, symlink_refused };
+enum class HashStatus : std::uint8_t {
+    ok,
+    unreadable,
+    not_regular,
+    oversize,
+    timeout,
+    symlink_refused,
+    absent ///< ENOENT/ENOTDIR: a definitive "no such file", not a coverage gap
+};
 
 struct BoundedHash {
     HashStatus status{HashStatus::unreadable};

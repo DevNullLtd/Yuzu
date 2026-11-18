@@ -23,9 +23,14 @@
 //   POSIX -- RESOLVING: the absolute path is walked component by component (`lstat`/`readlink`, at
 //     most 40 symlink hops, never a stat below a network mount: each accumulated prefix is judged
 //     against the mount table BEFORE it is stat'ed), so a symlink anywhere in the path, the leaf
-//     included, that points under an NFS/CIFS/autofs/... mount (network_fstype.hpp) is refused.
-//     The resolved path is returned so a caller can apply a further policy to it (ioc refuses
-//     /proc /sys /dev for hashing).
+//     included, that points under a network mount (network_fstype.hpp; the guard reads the table
+//     in its strict form: unlisted FUSE and an overlay over a network mount count) is refused.
+//     A `..` that follows a missing component cannot be resolved and fails closed. The resolved
+//     path is returned so a caller can apply a further policy to it (ioc refuses /proc /sys /dev
+//     for hashing). A caller that OPENS the file uses `posix_open_checked`, which has no window
+//     between judging and opening: the path is opened component by component relative to its
+//     parent descriptor (O_NOFOLLOW|O_PATH|O_DIRECTORY), and the OPENED file's filesystem type is
+//     checked (network, FUSE and pseudo filesystems are refused whatever the path text said).
 //
 // WHAT IT DOES NOT DECIDE (residuals, stated so no caller or document claims more):
 //   * Windows link traversal. A junction or directory symlink to a share is FOLLOWED by a path-
@@ -60,8 +65,16 @@
 #include "network_fstype.hpp"
 
 #ifndef _WIN32
+#include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <sys/vfs.h>
+#elif defined(__APPLE__)
+#include <sys/mount.h>
+#include <sys/param.h>
+#endif
+#include "posix_secure_read.hpp" // yuzu::shared::ScopedFile
 #endif
 
 #if defined(_WIN32)
@@ -88,7 +101,8 @@ enum class Refusal : std::uint8_t {
     network_or_device,       ///< UNC / device namespace / reserved device name / network mount
     non_fixed_drive,         ///< a drive letter whose type is not DRIVE_FIXED
     mount_table_unreadable,  ///< POSIX only: the mount table could not be read (fail closed)
-    unresolvable,            ///< POSIX only: the path could not be made absolute (fail closed)
+    unresolvable,            ///< POSIX only: the path could not be resolved, or changed while opened
+    pseudo_filesystem,       ///< POSIX only: the opened file lives on proc/sys/debugfs/cgroup/...
 };
 
 [[nodiscard]] constexpr bool refused(Refusal r) noexcept { return r != Refusal::none; }
@@ -106,6 +120,8 @@ enum class Refusal : std::uint8_t {
         return "path_refused:mount_table_unreadable";
     case Refusal::unresolvable:
         return "path_refused:unresolvable";
+    case Refusal::pseudo_filesystem:
+        return "path_refused:pseudo_filesystem";
     }
     return "path_refused";
 }
@@ -168,6 +184,46 @@ namespace detail {
     if (path.size() >= 2 && detail::ascii_alpha(path[0]) && path[1] == ':')
         return path[0];
     return 0;
+}
+
+/// A drive-letter Windows path in ONE canonical spelling: the `\\?\` long-path prefix before a drive
+/// letter is dropped, `/` becomes `\`, and `.` / `..` segments are collapsed lexically (never above
+/// the drive root; empty segments dropped). A path that does not start with a drive letter after the
+/// prefix is returned with only the slash conversion (the caller makes a relative path absolute
+/// first). Pure: it exists so a handle-relative open (win_no_reparse_open.hpp, which accepts only
+/// `X:\a\b`) is not refused for an ordinary spelling.
+[[nodiscard]] inline std::string win_normalise_spelling(std::string_view path) {
+    std::string n(path);
+    for (auto& c : n)
+        if (c == '/')
+            c = '\\';
+    std::string_view v = n;
+    if (v.starts_with("\\\\?\\") && win_drive_letter(v.substr(4)) != 0)
+        v.remove_prefix(4);
+    if (win_drive_letter(v) == 0 || v.size() < 3 || v[2] != '\\')
+        return std::string(v);
+    std::vector<std::string> keep;
+    std::size_t start = 3;
+    while (start <= v.size()) {
+        const auto sep = v.find('\\', start);
+        const auto seg = v.substr(start, sep == std::string_view::npos ? std::string_view::npos : sep - start);
+        if (seg == "..") {
+            if (!keep.empty())
+                keep.pop_back();
+        } else if (!seg.empty() && seg != ".") {
+            keep.emplace_back(seg);
+        }
+        if (sep == std::string_view::npos)
+            break;
+        start = sep + 1;
+    }
+    std::string out(v.substr(0, 3));
+    for (std::size_t i = 0; i < keep.size(); ++i) {
+        if (i)
+            out += '\\';
+        out += keep[i];
+    }
+    return out;
 }
 
 /// The Windows-spelling decision. `drive_type_of_letter(char)` returns the OS drive type of
@@ -274,6 +330,7 @@ template <class DriveTypeFn>
 struct Judged {
     Refusal refusal{Refusal::none};
     std::string resolved; ///< the fully resolved absolute path (POSIX, only when refusal == none)
+    int err{0};           ///< errno of the failing lstat/readlink when refusal == unresolvable (0 otherwise)
 };
 
 /// The POSIX decision with symlink resolution (see the banner). `network_mounts` are mount points
@@ -319,7 +376,7 @@ struct Judged {
         struct stat st{};
         if (::lstat(next.c_str(), &st) != 0) {
             if (errno != ENOENT && errno != ENOTDIR)
-                return {Refusal::unresolvable, {}};
+                return {Refusal::unresolvable, {}, errno};
             // Nothing exists from here down: the remainder cannot be a link. Judge it lexically.
             cur = std::move(next);
             while (!pending.empty()) {
@@ -327,10 +384,12 @@ struct Judged {
                 pending.pop_front();
                 if (r == "." || r.empty())
                     continue;
+                // A `..` after a missing component would cancel it and expose components that
+                // exist but were never lstat'ed (`d/missing/../lnk/a`): the walk cannot say what
+                // that path names, so it fails closed instead of guessing lexically.
                 if (r == "..")
-                    parent_of(cur);
-                else
-                    cur = cur == "/" ? "/" + r : cur + "/" + r;
+                    return {Refusal::unresolvable, {}};
+                cur = cur == "/" ? "/" + r : cur + "/" + r;
             }
             if (posix_under_mount(cur, network_mounts))
                 return {Refusal::network_or_device, {}};
@@ -366,6 +425,144 @@ struct Judged {
     return {Refusal::none, std::move(cur)};
 }
 
+/// The file the judged path names, opened WITHOUT a window between judging and opening: every
+/// component of the (already resolved, symlink-free) path is opened relative to its parent
+/// descriptor with O_NOFOLLOW|O_DIRECTORY|O_PATH, so a component swapped for a symlink or a
+/// directory renamed away after the judgement fails the open (`unresolvable`) instead of being
+/// followed; the final component is opened with `final_flags | O_NOFOLLOW`; and the OPENED file's
+/// filesystem is checked with fstatfs/fstatfs-equivalents: a network, FUSE or pseudo filesystem is
+/// refused whatever the path text said (this also catches an unlisted network mount and an
+/// overlay the mount table could not name). `absent` distinguishes a clean ENOENT/ENOTDIR (a
+/// definitive "not there") from every refusal.
+#if defined(O_PATH)
+inline constexpr int kPathFlag = O_PATH; // Linux: a directory handle that needs no read permission
+#else
+inline constexpr int kPathFlag = O_RDONLY; // macOS: no O_PATH; a directory is opened for reading
+#endif
+
+struct CheckedOpen {
+    yuzu::shared::ScopedFile file;
+    Refusal refusal{Refusal::none};
+    bool absent{false};
+    int err{0};
+    [[nodiscard]] bool opened() const noexcept { return file.valid(); }
+};
+
+namespace detail {
+
+#if defined(__linux__)
+[[nodiscard]] inline Refusal refusal_for_fs_type(unsigned long f_type) noexcept {
+    switch (f_type) {
+    case 0x6969:     // NFS
+    case 0x517B:     // SMB
+    case 0xFE534D42: // SMB2
+    case 0xFF534D42: // CIFS
+    case 0x73757245: // CODA
+    case 0x564C:     // NCP
+    case 0x5346414F: // AFS
+    case 0x01021997: // 9P
+    case 0x00C36400: // CEPH
+    case 0x65735546: // FUSE (the subtype is not visible here: refused, see the banner)
+    case 0x0BD00BD0: // LUSTRE
+    case 0x47504653: // GPFS
+    case 0x7461636f: // OCFS2
+    case 0x01161970: // GFS2
+        return Refusal::network_or_device;
+    case 0x9fa0:     // PROC
+    case 0x62656572: // SYSFS
+    case 0x64626720: // DEBUGFS
+    case 0x27e0eb:   // CGROUP
+    case 0x63677270: // CGROUP2
+    case 0x73636673: // SECURITYFS
+    case 0x74726163: // TRACEFS
+    case 0xcafe4a11: // BPF
+        return Refusal::pseudo_filesystem;
+    default:
+        return Refusal::none;
+    }
+}
+#endif
+
+} // namespace detail
+
+[[nodiscard]] inline CheckedOpen posix_open_checked(const std::string& resolved, int final_flags) {
+    CheckedOpen out;
+    if (resolved.empty() || resolved.front() != '/') {
+        out.refusal = Refusal::unresolvable;
+        return out;
+    }
+    std::vector<std::string> parts;
+    for (std::size_t start = 1; start <= resolved.size();) {
+        const auto slash = resolved.find('/', start);
+        const auto comp = resolved.substr(start, slash == std::string::npos ? std::string::npos : slash - start);
+        if (comp == "..") { // a resolved path has none: refuse rather than interpret
+            out.refusal = Refusal::unresolvable;
+            return out;
+        }
+        if (!comp.empty() && comp != ".")
+            parts.push_back(comp);
+        if (slash == std::string::npos)
+            break;
+        start = slash + 1;
+    }
+    yuzu::shared::ScopedFile dir{::open("/", kPathFlag | O_DIRECTORY | O_CLOEXEC)};
+    if (!dir.valid()) {
+        out.err = errno;
+        out.refusal = Refusal::unresolvable;
+        return out;
+    }
+    for (std::size_t i = 0; i < parts.size(); ++i) {
+        const bool last = i + 1 == parts.size();
+        const int flags = last ? (final_flags | O_NOFOLLOW | O_CLOEXEC | O_NOCTTY)
+                               : (kPathFlag | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        yuzu::shared::ScopedFile next{::openat(dir.fd(), parts[i].c_str(), flags)};
+        if (!next.valid()) {
+            out.err = errno;
+            if (errno == ENOENT || (errno == ENOTDIR && !last)) {
+                // ENOTDIR on a non-final component with O_DIRECTORY|O_NOFOLLOW is also what a
+                // component swapped for a symlink reports: tell them apart by looking.
+                struct stat lst{};
+                if (errno == ENOENT || ::fstatat(dir.fd(), parts[i].c_str(), &lst, AT_SYMLINK_NOFOLLOW) != 0) {
+                    out.absent = true;
+                    return out;
+                }
+                out.refusal = Refusal::unresolvable; // exists but is a link / not a directory
+                return out;
+            }
+            out.refusal = (errno == ELOOP || errno == ENOTDIR) ? Refusal::unresolvable : Refusal::none;
+            return out; // EACCES/EIO/...: err carries it, refusal none, absent false
+        }
+        dir = std::move(next);
+    }
+    out.file = std::move(dir); // the opened leaf (or the root itself for "/")
+#if defined(__linux__)
+    struct statfs sfs{};
+    if (::fstatfs(out.file.fd(), &sfs) != 0) {
+        out.err = errno;
+        out.file = yuzu::shared::ScopedFile{};
+        out.refusal = Refusal::unresolvable;
+        return out;
+    }
+    if (const auto r = detail::refusal_for_fs_type(static_cast<unsigned long>(sfs.f_type)); r != Refusal::none) {
+        out.file = yuzu::shared::ScopedFile{};
+        out.refusal = r;
+    }
+#elif defined(__APPLE__)
+    struct statfs sfs{};
+    if (::fstatfs(out.file.fd(), &sfs) != 0) {
+        out.err = errno;
+        out.file = yuzu::shared::ScopedFile{};
+        out.refusal = Refusal::unresolvable;
+        return out;
+    }
+    if (yuzu::shared::is_network_mount_fstype(sfs.f_fstypename)) {
+        out.file = yuzu::shared::ScopedFile{};
+        out.refusal = Refusal::network_or_device;
+    }
+#endif
+    return out;
+}
+
 #endif // !_WIN32
 
 // -- OS glue ------------------------------------------------------------------------------------
@@ -385,7 +582,7 @@ public:
         const auto table = yuzu::shared::read_file_no_follow("/proc/self/mountinfo", kMountinfoCap);
         table_ok_ = table.ok();
         if (table_ok_)
-            mounts_ = yuzu::shared::network_mount_points(table.data);
+            mounts_ = yuzu::shared::network_mount_points(table.data, /*strict=*/true);
 #elif defined(__APPLE__)
         const auto mounts = yuzu::shared::read_macos_network_mounts();
         table_ok_ = mounts.has_value();
