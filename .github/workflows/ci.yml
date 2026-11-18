@@ -448,19 +448,16 @@ jobs:
       # whether that account is an independent person.
       # The dev ruleset's merge rule (the most recent push must be approved by
       # someone other than its pusher) is a review rule, not a security
-      # control for this step. Today a write collaborator can defeat it: a
-      # workflow pushed to any branch can read CLA_REPO_ACCESS_TOKEN (cla.yml:
-      # a classic `repo`-scope PAT kept as a repository secret) and push or
-      # approve as that token's owner; accepted by the project owner on
-      # 2026-11-18 pending replacement of the archived CLA action (#8230).
-      # Organisation admins can bypass it: the OrganizationAdmin bypass on
-      # Protect Dev and Protect Main is a deliberate break-glass route,
-      # accepted by the project owner on 2026-11-18, and its use is visible in
-      # the audit log. The bump App's private key is kept in the
-      # `vcpkg-baseline` environment, which only `main` may use, so that it
-      # does not add another such route; that does not make the merge rule a
-      # control (docs/dependency-updates.md, "Self-hosted CI is held until a
-      # maintainer approves the head").
+      # control for this step. Organisation admins can bypass it: the
+      # OrganizationAdmin bypass on Protect Dev and Protect Main is a
+      # deliberate break-glass route, accepted by fjarvis (project owner) on
+      # 2026-11-18 (review by 2027-05-18, tracked in #8228), and its use is
+      # visible in the audit log. CLA_REPO_ACCESS_TOKEN is stored in the
+      # `cla` environment, which only the default branch may use, so a
+      # workflow on another branch cannot read it; the bump App's private key
+      # is kept the same way, in the `vcpkg-baseline` environment. That does
+      # not make the merge rule a control (docs/dependency-updates.md,
+      # "Self-hosted CI is held until a maintainer approves the head").
       #
       # A later CHANGES_REQUESTED review, or a dismissal, withdraws an
       # approval. The approval is therefore bound to the reviewed head: a new
@@ -823,6 +820,7 @@ jobs:
           bash tests/shell/test_fork_dynamic_review_validate.sh  # quarantine-ref guard on the hosted fork review (#4471)
           bash tests/shell/test_trusted_fork_purge.sh            # trusted-fork cache-scope purge job (#4471)
           bash tests/shell/test_vcpkg_baseline_bump.sh           # vcpkg bump PR: self-hosted approval gate + bump inventory
+          bash tests/shell/test_cla_environment.sh               # CLA_REPO_ACCESS_TOKEN read only by cla.yml's job in the cla environment
           bash tests/shell/test_check_elf_floor.sh               # Linux ELF floor gate, ADR-2003 S0 (builds fixtures with gcc)
           bash tests/shell/test_integration_port_retry.sh        # integration-test.sh lost-port-race classifier + process-ownership guard (#7538)
           python3 tests/test_extract_run_block.py
