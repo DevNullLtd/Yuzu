@@ -1009,7 +1009,9 @@ reports, within its budget plus a few seconds (the 2 s `--kill-after`, the clean
 for checkout and the seven pulls before it; the `release.yml` jobs that run it have 60 to 120 minute
 timeouts, but each builds its image first, so a slow build can still bring the job timeout before the
 gate's budget, which is then a cancel (next paragraph). `tests/test_image_vuln_gate.py` checks that
-every call names a deadline and that each job's budget plus 5 minutes fits its `timeout-minutes`.
+every call names a deadline and that each call's budget (or the default), plus 10 minutes for the
+job's other work before it, fits its job's `timeout-minutes`; mutants of the pre-release call (raised,
+dropped, moved to a continuation line) must fail that check.
 
 **Where.** `docker-publish` and `docker-publish-chisel` scan the image their healthcheck
 verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
@@ -1035,37 +1037,107 @@ it, and the script runs each long child (Trivy, curl, the digest lookup) in the 
 SIGTERM about 7.5 s later, then SIGKILL: on the first signal the trap ignores any further SIGINT or
 SIGTERM, writes the reports at once, then stops the child (SIGTERM, SIGKILL after 3 s at most) and
 exits 130 or 143, well inside the 7.5 s. A SIGKILL, or a usage error before the image list is read,
-leaves no report. After the push the job appends the `verify-pushed` result to its attempt's
-`.gate.txt`. The upload, as the `<image>-image-vuln-gate-attempt-<N>` artifact (for example
+leaves no report. The `.gate.txt` is the gate script's alone: no other step writes to it. The
+upload, as the `<image>-image-vuln-gate-attempt-<N>` artifact (for example
 `yuzu-server-image-vuln-gate-attempt-1`) with
 `retention-days: 90` (the repository's maximum) and no `overwrite`, runs whenever the gate step ran,
 passed, failed or was cancelled (`if: always() && (steps.gate.outcome == 'success' ||
 steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled')`), so a refusal, the control
 operating, is retained too, and **a re-run adds its attempt's reports beside the refused attempt's
-instead of replacing them**. The `release` job downloads every `yuzu-*` artifact of the run, every
-attempt's gate reports included, and attaches them to the GitHub Release, inside the signed
-`SHA256SUMS`, the same way it ships the image SBOMs. `scripts/check-release-artifacts.sh` refuses a
-release in which a gate report is not named per attempt, or, for one of the six images, the HIGHEST
-attempt present lacks Trivy's three reports, or the highest attempt's `*.gate.txt` (whichever
-scanner wrote it) lacks a `gate: pass` line or has any other gate line; an earlier attempt's report
-may record a failure, and is kept as the evidence that the gate refused it. The highest attempt is
-the one the published image passed: a publish job succeeds only when its gate passed in that
-attempt, and the `release` job needs every publish job's latest attempt to have succeeded. The agent
-bundle's job runs after the release exists, so its report cannot be inside `SHA256SUMS`;
-`attach-bundle-gate-report` attaches it to the GitHub Release afterwards (pass, refusal or
-cancellation), downloading exactly the attempt the bundle job reports (`gate_attempt`), with its own
-checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the
-same `release.yml` identity and verified in-job.
+instead of replacing them**. The same artifact carries the attempt's publish journal (next
+paragraph) when its gate passed; the upload is the job's last publishing-related step, after the tags
+move. The `release` job downloads every attempt's gate artifact of the run (`pattern:
+'*-image-vuln-gate-attempt-*'` with `merge-multiple`; an artifact an earlier run attempt uploaded is
+listed in a re-run, which "Re-run failed jobs" already relies on for the build artifacts) and
+attaches every file to the GitHub Release, inside the signed `SHA256SUMS`, the same way it ships the
+image SBOMs. `scripts/check-release-artifacts.sh` refuses a release in which a gate report or a
+journal is not named per attempt, any journal is not a legal prefix (below) or sits beside a gate
+report that does not record exactly `gate: pass`, or, for one of the six images, no attempt's journal
+ends `tagged`, an attempt above the published one ends `tagging`, or the published attempt lacks
+Trivy's three non-empty reports. Earlier and later attempts' reports may record a failure; they are
+kept as the evidence. The agent bundle's job runs after the release exists, so its reports cannot be
+inside `SHA256SUMS`; `attach-bundle-gate-report` attaches them to the GitHub Release afterwards. It
+runs whenever the bundle job ran at all (`needs.docker-publish-agent-bundle.result != 'skipped'`),
+downloads every attempt's bundle gate artifact the same way, fails when there is none, and attaches,
+per attempt, its reports, its journal and a checksum list
+`yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the same
+`release.yml` identity and verified in-job. Each run of it converges: after the last one, every
+attempt's files are on the release.
 
-The attached report is tied to the push. The bundle job's `pushed_ref` output is
-`<image>@<digest>`, set only after "Verify the pushed image is the scanned one" passes, and empty when
-that attempt pushed nothing. The attach job refuses a report that disagrees with it: with a
-`pushed_ref`, the `.gate.txt` must record `gate: pass` and `verify-pushed: ok, <that exact ref> ...`;
-without one, it must record no `verify-pushed` line. So an attached report names the digest its
-attempt published, or records that it published nothing. The highest attempt on the release is NOT
-necessarily the published image: attempt N can pass and push, and a re-run attempt N+1 can refuse or
-be cancelled before its push, leaving attempt N's image published. The published image is the one
-whose attempt's `.gate.txt` has the `verify-pushed` line naming the digest the tag resolves to.
+**The publish journal** (`scripts/ci/image-publish.sh`). A release tag (`:X.Y.Z`, and on a stable
+tag `:X.Y` and `:latest`) is public the moment it moves, so it moves LAST, and every step that
+touches the registry is announced before it runs. The contract:
+
+- The journal is `publish-<image>.attempt-<N>.txt`, beside the gate's reports. Only
+  `image-publish.sh` writes it, appending one line per completed step; it is never rewritten, and
+  its LAST line is the state. The only legal contents are a prefix of exactly this sequence, with
+  one digest throughout:
+  1. `publish: none`, written when the gate passed (the script refuses unless every
+     `<scanner>-<image>.attempt-<N>.gate.txt`, Trivy's and any future scanner's, records exactly
+     `gate: pass`);
+  2. `publish: push-started <candidate>`, appended BEFORE the push (`<candidate>` is the
+     repository for a push by digest, or `<repository>:candidate-<run id>-<N>` for the agent
+     bundle's `docker push`);
+  3. `publish: verified <repository>@<digest>`, after `image-identity.sh verify-pushed` proves the
+     digest has the scanned image's layers;
+  4. `publish: signed-attested <repository>@<digest>`, after the SBOMs, the provenance attestation
+     and the cosign signature are made BY DIGEST and the signature verifies for the workflow's
+     identity;
+  5. `publish: tagging <tags> <digest>`, appended BEFORE the first tag moves;
+  6. `publish: tagged <tags> <digest>`, once every tag, applied with `docker buildx imagetools
+     create --prefer-index=false -t <tag> <repository>@<digest>`, resolves to the digest.
+- No journal means nothing was pushed by that attempt: the gate refused the image, or the job
+  stopped before the journal was opened. With no journal the `.gate.txt` is not `pass` (or the run
+  stopped between the two); either way it is the record of a refusal or of nothing pushed.
+- A failure or a cancellation simply stops the journal. There is no failure label and no trap. So
+  a journal's last label claims at least what the registry holds: `push-started` may have pushed an
+  untagged digest (or the bundle's candidate tag), `tagging` may have moved some of the tags.
+- The pushes carry no release tag: the buildx jobs push with `outputs:
+  type=image,name=<repository>,push-by-digest=true,name-canonical=true,push=true` and no `tags:`,
+  and the agent bundle pushes `:candidate-<run id>-<attempt>` and resolves its digest. The tags are
+  applied only by `image-publish.sh tag`, which moves every one of them from the digest; a failed
+  check that a tag resolves to the digest leaves the journal at `tagging`.
+- The journal is uploaded with the gate reports under the same `if: always()` status function.
+  Job outputs carry no publish state; consumers read the journal through `image-publish.sh state`
+  (one attempt) or `published` (all attempts), and accept only a legal prefix.
+- Across attempts, the published image is the HIGHEST attempt whose journal ends `tagged`. The
+  release check and the attach job fail when any attempt above it ends `tagging`: a tag may then
+  name either digest. A re-run that completes `tagged` heals it.
+
+Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
+--prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
+for byte (a local `registry:2`, both a `docker push`ed Docker v2 manifest and a buildx push-by-digest
+OCI manifest; without `--prefer-index=false` it wraps the manifest in a new index with another
+digest), and a cosign signature made by digest before the tag existed verifies against the new tag;
+`actions/download-artifact` v8 lists the run's artifacts through the runtime token's run scope, and
+a release run whose attempt 3 re-ran only the Windows build created its release from attempt 1's
+`yuzu-*` artifacts (v0.11.0-rc1).
+
+**What the journal does not cover** (residuals, disclosed once here):
+
+- **A runner killed before the upload** (SIGKILL, a lost runner) leaves no evidence for that
+  attempt. That is absence, not disagreement: no journal claims less than the registry holds.
+- **A re-run moves the tag to a new digest.** Each attempt pushes and tags its own build; the
+  release check requires the release's assets to name the published (highest `tagged`) attempt.
+- **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
+  `tagged` moves all of them again.
+- **Untagged candidate digests and the bundle's candidate tag stay in GHCR.** A digest that was
+  pushed but never tagged (a verify failure, a cancel) and the `:candidate-<run id>-<attempt>` tag
+  are not deleted: GHCR deletes a package VERSION, which is the digest itself, so deleting the
+  candidate of a published bundle would delete the published image. Clean them up by hand, by
+  digest, only for digests no journal ends `tagged` with.
+
+**Future findings on this path.** A defect is a reachable row (a gate outcome, a point where the
+job stops, a publish shape, and for attach an attempt order) in which the journal's last label
+claims LESS than the registry holds, or in which the attach job or `check-release-artifacts.sh`
+accepts an illegal sequence. Anything else on this path is non-blocking.
+`tests/test_image_publish.py` is the table: gate pass, fail, SIGINT, SIGTERM and budget, times
+stop points before the push, mid-push, a verify failure or cancel, an attest or sign failure,
+before the tags, mid-tag with and without a tag applied, after the tags before `tagged`, and
+complete, for both the buildx and the bundle shapes, run in `release.yml`'s own step order against
+a stub registry; cross-attempt rows with the attach job interrupted at each attempt; and mutants
+(adjacent step swaps, named reorders, a dropped intent line, `tagged` recorded early) that must be
+killed.
 
 It never replaces a completed asset. For each name already on the release (the attach job re-run
 for the same attempt) it reads GitHub's asset `state`, `size` and `digest`: an asset whose state is
@@ -1082,10 +1154,13 @@ which is shorter than a SOC 2 Type II observation window:
   cancel during `gh release upload`): "Re-run failed jobs" re-runs the attach job (and any other job
   that failed); it replaces the incomplete assets and adds the rest. Dispatch `pre-release.yml` with
   the tag if QA still has not started once the run is green.
-- **A refusal** (`already on the release with different content`, `does not verify`, or a report
-  that does not record the pushed digest): a re-run fails the same way. A completed asset under
+- **A refusal** (`already on the release with different content`, `does not verify`, or a publish
+  journal that is not a legal prefix): a re-run fails the same way. A completed asset under
   this attempt's name with other content means something other than this job wrote it; do not
   delete it to make the job pass. Investigate it as a release-integrity incident with the owner.
+- **A higher attempt stopped while tagging** (`stopped while moving the bundle's tag`): the record is
+  attached, then the job fails, because `:X.Y.Z` may name either attempt's digest. "Re-run failed
+  jobs" re-runs the bundle job; once an attempt ends `tagged`, this job passes.
 
 Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle job never
 uploaded a report there is nothing to attach; its job log is the record. The report globs
@@ -1104,9 +1179,11 @@ being fetched from a registry and scanned. The push build is a second build that
 reuses the scanned build's layers, but nothing forces it to: right after the push, before any
 SBOM, attestation or signature, `image-identity.sh verify-pushed` reads the pushed digest's
 layer diff IDs from the registry and fails the job unless they equal the scanned image's (the
-image config, with its labels and timestamps, legitimately differs). The agent bundle is
-pushed from the scanned local image itself, after checking its tag still names the scanned ID.
-A mismatch after the push leaves that tag in GHCR unsigned, and the release job does not run.
+image config, with its labels and timestamps, legitimately differs); `image-publish.sh verified`
+runs it and records the result. The agent bundle is pushed from the scanned local image itself,
+under its candidate tag, after checking its local tag still names the scanned ID. A mismatch leaves
+an untagged digest (or the bundle's candidate tag) in GHCR, unsigned; no release tag names it, the
+journal stays at `push-started`, and the release job does not run.
 
 **Current packages.** The Debian and Alpine images upgrade their packages in the final stage
 (`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
@@ -1171,7 +1248,7 @@ with a date passes it exactly like a real approval. They are not a verified appr
 document may present them as one. The control is human review of every change to
 `.trivyignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
 (`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
-`scripts/ci/image-identity.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
+`scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
 (`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
 changes the entry, and the fields record where to find it. That review is as strong as the branch
 protection that requires it.
@@ -1180,13 +1257,14 @@ protection that requires it.
 `approved_by` from naming the person who wrote the entry. GitHub does not let a pull request's
 author approve it, but nothing ties `approved_by` to whoever did review it, and without branch
 protection that requires a review the pull request can merge with none. Separation of duties
-therefore rests entirely on that branch protection and on `CODEOWNERS`: a
-separate change (not in this one) adds `.github/CODEOWNERS` entries owned by `@fjarvis` and `@Tr3kkR`
-for `.trivyignore.yaml`, `scripts/ci/image-vuln-gate*` and the workflows, which with "Require review
-from Code Owners" on the protected branches makes a code owner's review required for any change to an
-acceptance, a not-covered listing or the gate. Until that change merges and the setting is on, an
-acceptance can be authored and "approved" by one person. When one of the two owners writes the
-entry, the other approves it.
+therefore rests entirely on that branch protection, and it is not enforced: the `.github/CODEOWNERS`
+entries for these paths (PR #8243, owners `@fjarvis` and `@Tr3kkR`) only REQUEST a review from either
+owner, "Require review from Code Owners" is off on the Protect Dev and Protect Main rulesets by owner
+decision (2026-11-18), and both owners can bypass the rulesets as organisation admins. So any one
+approval merges a change to an acceptance, a not-covered listing or the gate, and an approver
+recorded in `approved_by` may be the change's own author. By practice, when one of the two owners
+writes an entry, the other approves it; a reviewer of these paths checks that the named approver
+actually approved.
 
 **Recording an approval.** For an acceptance or a not-covered listing:
 
@@ -1214,8 +1292,8 @@ Whoever audits an acceptance later follows `approval_ref` to the pull request an
 approving review there; the gate does not.
 
 **When it fails.** The leg whose gate failed pushed nothing (a failure in "Verify the pushed image
-is the scanned one" is different: see that paragraph and the release skill). Its sibling matrix
-legs are `fail-fast: false`, so they may already have pushed `:X.Y.Z` (and, on a stable tag,
+is the scanned one" pushed an untagged digest: see that paragraph and the release skill). Its sibling matrix
+legs are `fail-fast: false`, so they may already have moved `:X.Y.Z` (and, on a stable tag,
 `:X.Y` and `:latest`, leaving those tags on a mix of this release and the previous one), and the
 release job does not run (same state as any other publish failure; the release skill's Recovery
 covers it, including moving `:latest` back). Read the step log first. For every publish job
@@ -1256,8 +1334,9 @@ re-tagging it is forbidden (#5282), and `release-guard` refuses a fresh run of i
 from the tag's own checkout, so a fix that needs a commit (a new `.trivyignore.yaml` entry, a new
 base digest, a list entry) cannot reach this release's bundle at all. So:
 
-- **A distro package with a fix, or a stale DB**: "Re-run failed jobs" on that run (the only
-  recovery the release skill allows for this job); the chisel cut takes the current archive.
+- **A distro package with a fix, a stale DB, the gate's budget running out, or a cancel**: "Re-run
+  failed jobs" on that run (the only recovery the release skill allows for this job); the chisel
+  cut takes the current archive.
 - **Anything that needs a commit**: this version ships without the agent-bundle image. The
   release itself is complete and its other images are signed; say so in the release notes or
   announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
@@ -1289,7 +1368,10 @@ published images (a tracked gap).
 
 **Routed-concern invariants** (the `.claude/routed-concerns.md` row points here). Every publish
 job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
-BEFORE any SBOM, attestation or signature. The gate fails closed: a scan, DB, coverage or
+BEFORE any SBOM, attestation or signature. The release tag moves only after verify, sign and
+attest, and the publish journal is write-ahead ("The publish journal" above): only
+`image-publish.sh` writes it, only `image-publish.sh tag` moves a release tag, and a consumer
+accepts only a legal prefix. The gate fails closed: a scan, DB, coverage or
 advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
 SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
 never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
@@ -1299,8 +1381,9 @@ same holds for a not-covered listing. Those fields are a recorded reference, che
 the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
 file, and the DB only from this run's fresh cache, pinned by digest. Widening any of these (a glob
 or one-word scope, a bare id, an honoured pending approval, an inherited cache, a second coverage
-reader that is not Trivy's report, an overwritten or clobbered report) is a security decision, not a
-fix.
+reader that is not Trivy's report, an overwritten or clobbered report, a push that carries a
+release tag, a second journal writer, a consumer that accepts an illegal sequence) is a security
+decision, not a fix.
 
 ### Pre-release QA (`pre-release.yml`)
 

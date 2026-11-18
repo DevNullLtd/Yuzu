@@ -1121,16 +1121,25 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
 - *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
   and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
   image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
-  packages the scanner cannot see. Each run attempt's reports (`trivy-<image>.attempt-<N>.*`,
-  passes and refusals, cancellations included) are kept: as release assets inside `SHA256SUMS`
-  for a release that was created (the agent bundle's with its own signed checksum list), and as
-  90-day workflow artifacts otherwise. A refusal never followed by a release exists only as that
-  90-day artifact, shorter than a Type II window: export it if the period needs it.
+  packages the scanner cannot see. The push carries no release tag; the tags move only after the
+  pushed digest is verified to be the scanned image, signed and attested, and a write-ahead publish
+  journal (`publish-<image>.attempt-<N>.txt`) records each step before it runs. What is kept: every
+  report the gate wrote for a run attempt whose job reached the upload step (a pass, a refusal, a
+  budget stop, or a cancel the gate caught as SIGINT or SIGTERM), with that attempt's journal when
+  its gate passed, uploaded as a 90-day workflow artifact; for a release that was created, every
+  attempt's files of the six release images as release assets inside `SHA256SUMS`, and the agent
+  bundle's, every attempt's, with a signed checksum list per attempt once the attach job succeeds.
+  Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
+  upload, which leaves no record at all; and a refusal never followed by a release, which exists only
+  as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
 - *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
-  Owner action: a `CODEOWNERS` entry for those paths with required code-owner review.
+  An approver may be the change's author: the `CODEOWNERS` entries for those paths (PR #8243) only
+  request a review from a release owner, and "Require review from Code Owners" is off on the
+  protected branches by owner decision, so any one approving review merges such a change and
+  separation of duties is a practice, not an enforced control. Disclose it with the control.
 - *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
   in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
   findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
