@@ -40953,6 +40953,11 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             CHECK(body["error"]["message"].get<std::string>().find("matcher") !=
                   std::string::npos);
         }
+        // None of those refusals is the size bound, so none is counted as an input bound.
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "create_result_set_from_instruction_result"},
+                           {"reason", "arg_too_large"}})
+                  .value() == 0.0);
     }
 
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
@@ -40999,6 +41004,18 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
                               {{"tool", "create_result_set_from_instruction_result"},
                                {"reason", "arg_too_large"}})
                       .value() == 1.0);
+            // An input bound is audited as one: a denied row that names the envelope's
+            // correlation id. The refusal is permanent, so the retry hint is null.
+            const auto cid = body["error"]["data"].at("correlation_id").get<std::string>();
+            CHECK_FALSE(cid.empty());
+            CHECK(body["error"]["data"].at("retry_after_ms").is_null());
+            const auto row =
+                std::find(ts.audit_details.begin(), ts.audit_details.end(),
+                          "input bound exceeded: RESULT_SET_BAD_REQUEST: matcher exceeds 65536 "
+                          "bytes as compact JSON correlation_id=" + cid);
+            REQUIRE(row != ts.audit_details.end());
+            CHECK(ts.audit_log[row - ts.audit_details.begin()] ==
+                  "mcp.create_result_set_from_instruction_result|denied");
         }
         SECTION("params value (Gate 2 MEDIUM finding: matches execute_instruction's "
                 "65536-byte params-value convention)") {

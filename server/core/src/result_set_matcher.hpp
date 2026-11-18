@@ -106,14 +106,15 @@ private:
     std::unique_ptr<const nlohmann::json> matcher_;
 };
 
-/// The largest caller matcher admission accepts: 64 KiB of compact JSON text (the form the
-/// routes pass to `validate_matcher`), the bound the same routes put on one `params` value. It
-/// bounds what a matcher can cost each stored row the members read evaluates.
+/// The largest caller matcher admission accepts: 64 KiB as compact JSON, the bound the same routes
+/// put on one `params` value. It bounds the cost of evaluating a large matcher. The server-authored
+/// keys are stored after the check and are not counted, so a stored matcher can be longer by them.
 inline constexpr std::size_t kMatcherMaxBytes = 65536;
 /// The 400 / -32602 message for a matcher over that bound (REST and MCP share it).
 inline constexpr std::string_view kMatcherTooLargeMessage =
     "matcher exceeds 65536 bytes as compact JSON";
-static_assert(kMatcherMaxBytes == 65536, "kMatcherTooLargeMessage states the bound");
+static_assert(kMatcherMaxBytes == 65536,
+              "the message, the MCP schema description and the OpenAPI path item state the bound");
 
 /// Admission check for a caller-supplied matcher (#4644): nullopt when acceptable, else the 400
 /// message. A present `kind` must be a string; on a kind-less matcher a present `column`, `op`

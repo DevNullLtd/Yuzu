@@ -1166,8 +1166,8 @@ TEST_CASE("from-instruction-result: a column matcher is bound to the declared co
 // #4644: an echo_rows_ge matcher's `n` is stored on the pending row and read by the maintenance
 // tick. A wrong-typed n used to throw out of that tick on every pass; -1 admitted every responder.
 // It is now refused here, before anything is dispatched or stored.
-TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 and dispatches "
-          "nothing (#4644)",
+TEST_CASE("from-instruction-result: a malformed or oversized matcher is refused with 400 and "
+          "dispatches nothing (#4644, #6478)",
           "[pg][result_set][async][instruction][numeric_params]") {
     YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
     PgPool pool{{.conninfo = db.dsn(), .size = 4}};
@@ -1198,9 +1198,11 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
         CHECK(status == 400);
         CHECK(j["error"]["message"].get<std::string>().find("matcher") != std::string::npos);
     }
-    // A matcher over the size bound is refused with the one text the MCP twin also sends.
-    {
-        const std::string body = R"({"instruction_id":")" + iid +
+    // A matcher over the size bound is refused with the one text the MCP twin also sends: a
+    // permanent input error, answered before the definition is looked up (an unknown id too).
+    for (const std::string& id : {iid, std::string("no-such-instruction")}) {
+        INFO(id);
+        const std::string body = R"({"instruction_id":")" + id +
                                  R"(","matcher":{"column":"c","op":"in","value_set":[")" +
                                  std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}})";
         int status = 0;
@@ -1208,6 +1210,8 @@ TEST_CASE("from-instruction-result: a malformed matcher n is refused with 400 an
         CHECK(status == 400);
         CHECK(j["error"]["message"] ==
               "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+        CHECK_FALSE(j["error"]["correlation_id"].get<std::string>().empty());
+        CHECK(j["error"].at("retry_after_ms").is_null());
     }
     CHECK(h.calls.empty());
     CHECK(h.store->list_pending().empty());
