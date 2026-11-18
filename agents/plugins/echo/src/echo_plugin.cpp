@@ -64,6 +64,7 @@
 #include <format>
 #include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -1298,6 +1299,15 @@ public:
         health_.record(registry_name, token, now);
     }
 
+    // Publish (or clear, with nullopt) when a backed-off cursor source is next attempted.
+    void note_next_retry(std::string_view registry_name, std::optional<int64_t> next_attempt_ts) {
+        std::lock_guard lock(health_mu_);
+        if (next_attempt_ts)
+            health_.set_next_retry(registry_name, *next_attempt_ts);
+        else
+            health_.clear_next_retry(registry_name);
+    }
+
     // ── pid -> name map (pid_name_) ───────────────────────────────────────────
     // Callers hold collect_mu_ (init runs before any trigger can fire).
     // `ts` (the event or tick time, epoch seconds) only ages out exited pids at the cap.
@@ -1527,6 +1537,10 @@ private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::mutex health_mu_;
     yuzu::echo::SourceHealthLedger health_;
+    // Cursor-driver retry backoff per source (echo_cursor.hpp CursorRetry). Guarded by
+    // collect_mu_: touched by the cursor loop in collect_slow_impl and erased at a cursor
+    // source's enable/disable edge in do_configure.
+    std::map<std::string, yuzu::echo::CursorRetry> cursor_retry_;
     std::atomic<int64_t> procperf_procs_seen_{0};
     // Set when the stream-fallback baseline seed failed: the poll must re-seed
     // (no diff) on the next tick instead of diffing against a stale baseline.
@@ -2842,13 +2856,37 @@ private:
         // `<name>_enabled` the same way every other source above does
         // (registry default via source_enabled -- power/removable default
         // TRUE per the Alex ruling, echo_schema_registry.cpp).
+        // Backoff (CursorRetry): a source whose ticks keep failing is not re-read every tick.
+        // The tick period is read once, outside every catch arm below.
+        const int cursor_tick_s =
+            cursor_sources_.empty()
+                ? 0
+                : yuzu::echo::parse_tick_seconds(db_->get_config("slow_interval_seconds", "300"));
         for (auto& src : cursor_sources_) {
             const std::string src_name = src->name();
             const auto src_state = yuzu::echo::source_enabled_state(*db_, src_name);
             if (!src_state.value_or(false)) {
+                // A pause or a re-enable never inherits a backoff.
+                cursor_retry_.erase(src_name);
+                note_next_retry(src_name, std::nullopt);
                 note_health(src_name, skip_token(src_state));
                 ctx.write_output(
                     std::format("echo|collect_{}|0|{}", src_name, skip_token(src_state)));
+                continue;
+            }
+            auto& retry = cursor_retry_[src_name];
+            // Not-attempted ticks are reported but never recorded in the health ledger:
+            // last_status / last_status_at / consecutive_failures keep describing the last
+            // real attempt, and `<src>_next_retry_at` says when the next one is due.
+            const auto back_off = [&] {
+                retry.note_failure(ts, cursor_tick_s);
+                note_next_retry(src_name, retry.next_attempt_ts);
+            };
+            if (!retry.due(ts)) {
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
+                                             yuzu::echo::kCollectStatusRetryBackoff));
                 continue;
             }
             auto cursor_read = db_->get_cursor(src_name);
@@ -2862,6 +2900,7 @@ private:
                 spdlog::warn("ECHO: {} cursor read failed ({}) -- retaining cursor, skipping tick",
                             src_name, cursor_read.error());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2881,6 +2920,11 @@ private:
                 // driver only orchestrates the enable gate, cursor load, the
                 // transient-failure skip (rule 1), and the status line.
                 auto result = src->collect(*db_, cursor);
+                // Any tick that returns is a success for backoff purposes, CursorLost
+                // included: the source committed a re-baseline and there is nothing to
+                // re-read (the ledger still counts `cursor_lost` as a failure status).
+                retry.note_success();
+                note_next_retry(src_name, std::nullopt);
                 total_events += static_cast<int>(result.events_emitted);
                 std::string_view token;
                 switch (result.outcome) {
@@ -2913,6 +2957,7 @@ private:
                 spdlog::warn("ECHO: {} cursor collect incomplete ({}) -- retaining cursor",
                             src_name, e.what());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2945,6 +2990,7 @@ private:
                               "CursorOutcome::CursorLost, never throw",
                               src_name, e.what());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2959,6 +3005,7 @@ private:
                 spdlog::error("ECHO: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -4414,6 +4461,16 @@ private:
             ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
         }
         if (slow_secs > 0) {
+            // A stored back-off deadline was computed from the old tick period. A changed
+            // period ends every back-off, so the next tick retries and the schedule restarts
+            // at the new period (a re-assert of the same value keeps it).
+            if (yuzu::echo::parse_tick_seconds(db_->get_config("slow_interval_seconds", "300")) !=
+                slow_secs) {
+                std::lock_guard lock(collect_mu_);
+                for (const auto& [name, retry] : cursor_retry_)
+                    note_next_retry(name, std::nullopt);
+                cursor_retry_.clear();
+            }
             if (!persist("slow_interval_seconds", std::string{slow_interval}))
                 return key_failed("slow_interval_seconds");
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
@@ -4588,6 +4645,12 @@ private:
                             // outcome, and it is logged loudly because a source
                             // that throws here has an un-honoured P-002 contract.
                             try {
+                                // A real enable/disable edge ends any retry backoff, as
+                                // the collect-time disabled gate does: a pause shorter than
+                                // one slow tick never reaches that gate, and the next
+                                // enable must not inherit the old backoff.
+                                cursor_retry_.erase(src_name);
+                                note_next_retry(src_name, std::nullopt);
                                 cs->on_enabled_changed(v == "true");
                             } catch (const std::exception& e) {
                                 spdlog::error("ECHO: {} on_enabled_changed threw ({}) -- the "

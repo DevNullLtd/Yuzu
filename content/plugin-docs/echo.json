@@ -1425,7 +1425,7 @@
     {
       "columns": [
         {
-          "description": "Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable. Values: non-negative integer.",
+          "description": "Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable / retry_backoff (retry_backoff only on a cursor source's own collect_<source> line). Values: non-negative integer.",
           "example": "-",
           "name": "events_recorded",
           "platforms": [
@@ -2835,8 +2835,11 @@
       "changelog.d/2155-echo-corrupt-copies-bound-configure-partial.fixed.md",
       "changelog.d/5033-echo-corruption-audit-gate-per-agent.fixed.md",
       "changelog.d/6386-echo-tests-windows-honesty.fixed.md",
+      "changelog.d/6513-echo-child-key-names.fixed.md",
+      "changelog.d/6517-echo-cursor-commit-backoff.fixed.md",
       "changelog.d/7037-echo-rollup-only-v10.changed.md",
       "changelog.d/7075-echo-security-batch.security.md",
+      "changelog.d/7173-echo-registry-live-etw-skip.fixed.md",
       "changelog.d/7285-echo-fold-substrate-bounds.fixed.md",
       "changelog.d/7286-echo-db-open-hardening.security.md",
       "changelog.d/7288-echo-purge-sweep-bounds.fixed.md",

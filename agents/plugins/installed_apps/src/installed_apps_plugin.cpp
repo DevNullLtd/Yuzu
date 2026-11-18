@@ -1194,10 +1194,15 @@ private:
             ctx.write_output("error|profile_list_unreadable");
             return 1;
         }
-        const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
+        const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+        if (!hku.error.empty()) {
+            spdlog::warn("installed_apps: HKEY_USERS listing incomplete ({})", hku.error);
+            ctx.write_output("error|hku_list_incomplete");
+            return 1;
+        }
         // System SIDs are filtered here, BEFORE any per-profile read, rather
         // than after reading ProfileImagePath as the old walk did.
-        const auto profiles = yuzu::profiles::build_profile_list(records, hku_subkeys);
+        const auto profiles = yuzu::profiles::build_profile_list(records, hku.names);
 
         std::size_t privilege_missing = 0;
         std::size_t hive_read_failed = 0;
