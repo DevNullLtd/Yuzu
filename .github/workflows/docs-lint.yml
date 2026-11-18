@@ -310,6 +310,27 @@ jobs:
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
 
+      # Every plugin the root meson.build builds has a Source line in the
+      # Windows agent installer (yuzu-agent.iss) or a recorded
+      # `; plugin-not-installed:` exclusion (#4867). The release zip takes
+      # plugins by glob, so a missing line ships in the zip and silently not
+      # in the installer. Mutation-tests itself. Stdlib only.
+      - name: Agent installer plugin coverage lint
+        run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
+
+      # The Windows agent zip and installer ship the Visual C++ runtime
+      # app-local (deploy/packaging/windows/stage-msvc-runtime.ps1), and
+      # release.yml's build-windows checks every shipped binary's DLL imports
+      # against both payloads (scripts/ci/check-windows-payload-imports.py)
+      # before ISCC runs. Behavioural over synthetic PE images, the staging
+      # script under pwsh, and lexical wiring pins with mutants.
+      - name: Windows payload import closure
+        env:
+          # The runner image ships pwsh: require it so the staging-script
+          # behaviour cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
+        run: python3 -I tests/test_windows_payload_imports.py
+
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
       # gateway's metrics port. Stdlib only.
@@ -357,6 +378,20 @@ jobs:
       # --suite docs`.
       - name: Server feature option lint
         run: python3 -I tests/test_server_feature_option.py
+
+      # Security dependency pins: every vcpkg.json `overrides` entry has a row
+      # (what it fixes, when to delete it) in docs/build-guide.md "Security
+      # dependency pins", and every row an entry. Mutation-tests itself.
+      # Stdlib only.
+      - name: vcpkg overrides documented
+        run: python3 -I tests/test_vcpkg_overrides_documented.py
+
+      # Every SHA-256 a vendored *-NOTICE.txt under server/core/{static,vendor}
+      # records is the hash of the file it names (a same-size vendor edit keeps
+      # test_static_js_bundle.cpp's byte pin green). Mutation-tests itself on a
+      # scratch copy. Stdlib only.
+      - name: Vendored NOTICE hashes
+        run: python3 -I tests/test_vendored_notice_hashes.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,

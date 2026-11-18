@@ -880,6 +880,14 @@ jobs:
           # Plugin DLLs
           Get-ChildItem -Path build-windows/agents/plugins -Filter "*.dll" -Recurse | Copy-Item -Destination "${staging}/plugins/"
 
+          # Third-party attribution, including the Visual C++ runtime staged
+          # below (yuzu-agent.iss installs the same file into {app}).
+          Copy-Item "NOTICE" "${staging}/"
+          # The installer packs the same file from the build directory: the
+          # installer SBOM step refuses a manifest row outside it, and
+          # yuzu-agent.iss would otherwise reach out to the repository root.
+          Copy-Item "NOTICE" "build-windows/NOTICE"
+
           # Runtime DLLs from vcpkg that plugins/binaries need. This copies
           # every DLL vcpkg installed; since ADR-0035 step 3 the install above
           # is agent-only, so the server-only DLLs (libpq and its libecpg/
@@ -889,6 +897,18 @@ jobs:
           if (Test-Path $vcpkgBin) {
             Get-ChildItem -Path $vcpkgBin -Filter "*.dll" | Copy-Item -Destination "${staging}/bin/"
           }
+
+          # The Microsoft Visual C++ runtime (vcruntime140*.dll, msvcp140*.dll),
+          # deployed app-local: every binary above imports it, and up to v0.15.0
+          # neither payload carried it, so the agent ran only where something
+          # else had installed the VC++ Redistributable (this runner has, which
+          # is why nothing here noticed). Copied from this runner's own Visual
+          # Studio redistributable directory into the zip's bin/ and into
+          # build-windows/msvc-runtime, which yuzu-agent.iss installs into
+          # {app}\bin. The script throws if the directory or a required DLL is
+          # missing. Pinned by tests/test_windows_payload_imports.py.
+          & ./deploy/packaging/windows/stage-msvc-runtime.ps1 -Destination "${staging}/bin", "build-windows/msvc-runtime"
+          if ($LASTEXITCODE -ne 0) { Write-Error "stage-msvc-runtime.ps1 failed"; exit 1 }
 
           Compress-Archive -Path "${staging}" -DestinationPath "yuzu-agent-windows-x64.zip"
 
@@ -900,10 +920,11 @@ jobs:
       # extracted archive with PATH cut down to the Windows directories. That
       # catches a DLL that yuzu-agent.exe or yuzu_agent_core.dll imports at
       # load time and the archive lacks. It does NOT cover DLLs only a plugin
-      # imports (--help loads no plugin), or the MSVC runtime, which resolves
-      # from System32 here because the runner has the VC++ runtime installed
-      # (the archive does not ship it). The agent is killed if it has not
-      # exited within 60 s. Pinned by tests/test_release_agent_only.py.
+      # imports (--help loads no plugin), or a missing MSVC runtime, which
+      # would resolve from System32 here because the runner has the VC++
+      # runtime installed; the import-closure step below covers both. The
+      # agent is killed if it has not exited within 60 s. Pinned by
+      # tests/test_release_agent_only.py.
       - name: Verify the agent runs from the packaged archive
         shell: pwsh
         timeout-minutes: 5
@@ -935,6 +956,25 @@ jobs:
           if (-not $p.WaitForExit(60000)) { $p.Kill(); Write-Error "yuzu-agent.exe --help did not exit within 60 s"; exit 1 }
           if ($p.ExitCode -ne 0) { Write-Error "yuzu-agent.exe --help exited $($p.ExitCode) from the packaged archive"; exit 1 }
           Write-Host "yuzu-agent.exe --help ran from the packaged archive ($packed plugin DLLs)"
+
+      # Every DLL a shipped .exe or .dll imports must be in that payload's bin/,
+      # be an API set, or be an OS DLL in System32 - except the Visual C++
+      # runtime, which counts as missing unless the payload carries it (this
+      # runner's System32 has it; a customer's need not). Checked for the zip
+      # as built and for the installer payload, the files yuzu-agent.iss packs
+      # from build-windows, before ISCC runs. It reads PE import tables, so it
+      # also covers DLLs only a plugin imports, which the step above cannot.
+      # Pinned by tests/test_windows_payload_imports.py.
+      - name: Check the DLL import closure of both payloads
+        shell: pwsh
+        timeout-minutes: 5
+        run: |
+          python scripts/ci/check-windows-payload-imports.py `
+            --zip yuzu-agent-windows-x64.zip `
+            --iss deploy/packaging/windows/yuzu-agent.iss `
+            --build-dir build-windows `
+            --system-dir "$env:SystemRoot\System32"
+          if ($LASTEXITCODE -ne 0) { Write-Error "check-windows-payload-imports.py failed (exit $LASTEXITCODE); see the errors above"; exit 1 }
 
       - name: Build Windows installers (InnoSetup)
         shell: pwsh

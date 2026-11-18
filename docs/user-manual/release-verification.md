@@ -643,6 +643,30 @@ jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxEl
 
 ### CycloneDX
 
+From 0.16.0, the Windows agent archive and installer also carry Microsoft's
+Visual C++ runtime in the agent's `bin` directory, unmodified and signed by
+Microsoft: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
+`msvcp140_atomic_wait.dll` and any other `vcruntime140_*.dll` or
+`msvcp140_*.dll` the build machine's Visual Studio redistributable directory
+holds. Each Windows SBOM describes its own artifact: the archive's SBOM
+is made from the unpacked archive, which holds these DLLs in `bin`, and the
+installer's SBOM lists the files its installer packs, with the runtime DLLs at
+`msvc-runtime\...` (see "What a file's SBOM lists" above). The cataloguer that
+makes the archive's SBOM (syft, through the pinned `anchore/sbom-action`)
+lists each native DLL it finds as an application component, named and versioned from the DLL's version resource (for a
+Microsoft DLL, its file description), with a CPE and no package URL (purl), so
+a runtime DLL can appear more than once. A scanner or policy that matches
+components on purl does not see them. No release SBOM has yet been inspected
+for these entries. The authoritative version of the runtime a release shipped
+is the file version of the Microsoft-signed DLLs in its payload (the archive's
+`bin` directory, or `bin` under the installed agent's directory). The
+`Build Windows x64` job's step summary lists the staged DLLs and their file
+versions for that workflow run and is kept only as long as the run is. The
+version follows the Visual C++ toolset the release is pinned to
+(`deploy/packaging/windows/msvc-toolset.pin`). Their licence terms are in
+`NOTICE`. Windows Update does not service this copy; see "Windows agent:
+Visual C++ runtime" in the [user manual](README.md#windows-agent-visual-c-runtime).
+
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
 jq -r '.components[] | "\(.name)\t\(.version)\t\(.purl // "")"' yuzu-linux-x64.cdx.json | column -t
