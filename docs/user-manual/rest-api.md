@@ -2217,6 +2217,12 @@ costs neither a per-record permission check nor an audit row.
 
 **Permission:** `Security:Read`, resolved once through the fleet-read list gate. MCP twin: `list_quarantined_devices` (capped at 500 records per call; this route returns the complete list; see `docs/user-manual/mcp.md`).
 
+**Query parameter:** `include` (optional). `release_owed` also lists, after the active records, the records an
+operator ended by force (`DELETE ...?force=true`) whose device has not yet confirmed a release, so a device
+that may still be contained can be found after its record left the active list. The same scope, the same
+gate and the same `503` on a degraded read apply to them. **Any other value, an empty one included, is a
+`400`** (`include must be release_owed`), and nothing is read. Without it the body is unchanged.
+
 > **Fail-closed on a degraded read (ADR-0047).** A store/pool/query failure
 > returns `503` (`"quarantine list unavailable — try again"`), never a
 > silently-empty list — a device could still be actively contained while the
@@ -2254,7 +2260,7 @@ costs neither a per-record permission check nor an audit row.
 > re-applies a device's own firewall on reconnect. `last_applied_at` means a system re-dispatch of
 > the stored whitelist was accepted (`agents_reached > 0`) — NOT proof of containment (a
 > gateway-attached agent's `send_to` only queues the frame). `last_confirmed_at` is set only after
-> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`) — but that read is the target
+> a follow-up `firewall.quarantine_status` read reports the device's rules in force (`status|active`, or `status|active_unproven` when no probe target is stored, which is what the server's own applies return) — but that read is the target
 > agent's own self-report (cert-bound to its identity, not independently corroborated by any
 > network-side signal), so treat it as strong operational evidence of containment, not proof. See
 > `docs/user-manual/security-hardening.md` "Reconnect re-application (#3425)" for the full trust
@@ -2264,7 +2270,11 @@ costs neither a per-record permission check nor an audit row.
 > again.
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
-> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed.
+> progress (the record stays listed and keeps the dispatch refusal). Ended records are not listed,
+> except with `?include=release_owed`: those rows read `release_owed` and carry two more keys,
+> `released_at` (when the record was ended) and `release_owed_since` (when the device became owed a
+> release); an active or releasing row never has them. A `release_owed` row means the device **may still
+> be contained** and is released by the reconciler when it next connects.
 
 ---
 
@@ -2361,7 +2371,7 @@ Quarantine a device.
 |---|---|---|---|
 | `agent_id` | string | Yes | Target device ID |
 | `reason` | string | No | Human-readable reason for quarantine |
-| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400` (`whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32`), not written. |
+| `whitelist` | string | No | Comma-separated bare IPv4 or IPv6 addresses (at most 32, and at most 512 characters in total) still allowed to communicate; each is sent to the firewall plugin as an outbound and an inbound exception. Validated server-side by the one rule the reconciler and MCP's `quarantine_device` also apply before dispatching a stored whitelist: a port, a prefix length, an IPv4-mapped form, a leading-zero octet or any other token the plugin's exception grammar cannot express is refused. Rejected with `400`, not written: `whitelist exceeds 512 characters` when the list is too long, otherwise `whitelist must be comma-separated IPv4 or IPv6 addresses, at most 32 and 512 characters in total`. |
 
 **Response (201):**
 
@@ -2374,7 +2384,7 @@ Quarantine a device.
 
 > **`400` vs `503` (ADR-0047).** A `400` means a business/state error (a
 > missing `agent_id`, the device is already quarantined, or `whitelist` fails
-> server-edge validation) — retrying the identical request will not succeed,
+> server-edge validation, its length included) — retrying the identical request will not succeed,
 > and `error.retry_after_ms` is
 > `null`. A `503` means a genuine store/pool failure — retrying is
 > reasonable, and `error.retry_after_ms` carries a concrete `5000`
@@ -2571,9 +2581,24 @@ session-stamped audit rows are exactly as for `POST` above, with the audit verb
 
 `202` covers every outcome short of the device's `inactive`: the device is offline, the dispatch was
 refused or threw, no reply arrived in 5 seconds, or the reply was anything else (a privilege refusal
-such as `status|refused|privilege_unavailable`, a partial release). The wait shares the 4-slot live
-in-flight budget with the DEX live route; with no slot free the release is dispatched and the answer
-is `202` without waiting.
+such as `status|refused|privilege_unavailable`, a partial release). It is also the answer when the
+device did say `inactive` but the record could not end on that word: an apply reached, or was being
+sent to, the device after the observation, or an apply sent before the release has no reply read
+yet (after a reconciler apply, until its reply is read; after an MCP `quarantine_device` call that
+reached the device, for up to 120 seconds; the audit row's `detail` then ends `apply_in_flight=1`, or
+`fence_unread=1` when the check could not be read), or the store could not record the end. In those
+cases the record stays `releasing` and the server reads the device again, so a retry is not needed.
+The wait shares the 4-slot live in-flight budget with the DEX live route; with no slot free the
+release is dispatched and the answer is `202` without waiting.
+
+**How a `202` finishes.** There is no callback: the record leaves `GET /api/v1/quarantine` (its
+`status` reads `releasing` until then) when the device confirms. A `DELETE` repeated after that answers
+`400` (`device is not quarantined`), the same as for a device that was never quarantined, so poll the
+list, not the `DELETE`. A `202` within about two minutes of a quarantine call is the normal wait for
+that call's apply (the end lands once its claim window has passed and the next status read has run), so
+poll and do not repeat the `DELETE`. A device that never confirms stays `releasing`; once the record is
+still `releasing` after that window and a few reconciler passes, or the device refuses the release with
+`privilege_unavailable`, the way out is `?force=true`.
 
 **Forced end (`?force=true`, REST only).** For a device that will not return, or one that cannot finish
 a release (a Linux host on the packaged systemd unit refuses every mutating firewall action), the
@@ -2583,7 +2608,7 @@ call would answer `202` it ends the record at once:
 ```json
 {
   "data": {
-    "released": true, "state": "released", "forced": true, "device_confirmed": false,
+    "released": false, "state": "released", "forced": true, "device_confirmed": false,
     "message": "Record ended without the device's confirmation. The device may still be contained.",
     "command_id": "..."
   },
@@ -2591,10 +2616,14 @@ call would answer `202` it ends the record at once:
 }
 ```
 
+`released` is the device's word, so a forced end answers `false` even though `state` says the record
+ended; read `forced` and `device_confirmed` for the detail.
+
 A forced end **does not release the device**. The device may still be contained; the server stops
 refusing commands to it, so the operator has chosen to treat it as reachable; and the reconciler still
-owes it a release, which it reads and sends once per reconnect (`yuzu_server_quarantine_forced_release_owed`),
-and a `firewall.release` sent through any generic route reaches it at any time. A reachable device is
+owes it a release, which it reads and sends once per reconnect and once per server start
+(`yuzu_server_quarantine_forced_release_owed`), and a `firewall.release` sent through any generic route
+reaches it at any time. `GET /api/v1/quarantine?include=release_owed` lists the devices that still owe one. A reachable device is
 still released for real: if it answers `inactive` within the wait the answer says `forced: false,
 device_confirmed: true`. The authority is the release's own (the scoped `Security:Execute` gate, the
 same-principal check and the dispatch check for `firewall.release`); no new permission or approval
@@ -9443,29 +9472,32 @@ Collection health per facet across the fleet: how many devices are in each statu
 
 #### `GET /api/v1/inventory/software/export`
 
-Streams every installed-software row that matches the filters, as a file, up to a size limit (see Size limits below). Use it to move the whole inventory (or a filtered slice of it) into another system; for browsing, use `GET /api/v1/inventory/software`, which pages.
+Exports every installed-software row that matches the filters, as a file, up to a size limit (see Size limits below): streamed as JSONL or CSV, or built as a one-sheet XLSX workbook a person can open. Use it to move the whole inventory (or a filtered slice of it) into another system or into a spreadsheet; for browsing, use `GET /api/v1/inventory/software`, which pages.
 
 **Permission and scope:** `Inventory:Read` through the fleet-read check, which is the only check. Rows are confined to the caller's scope (management groups, and for a service-scoped token its tagged devices) on every read the stream makes. A scope of up to 10,000 devices is applied in the query. For a wider scope the server reads the rows and drops the out-of-scope ones before they are written, so no byte of one reaches the response, but those rows are read from the store; the stream carries on through stretches that hold none of the caller's rows until it reaches the end, and the 900-second limit below is its only bound on a scope with few rows. No MCP tool offers this download: a streamed file is not a tool call (see ADR-1005's exception ledger).
 
-**Query parameters:** `format` (required: `jsonl` or `csv`; the `json` of the list route is not accepted here) plus the filters of `GET /api/v1/inventory/software`: `name`, `match`, `version`, `version_min`, `version_max`, `vers`, `agent_id`, `purl`, `status`, `q`, `kind`, `ecosystem`, `source`, with the same rules. `cursor` and `limit` are refused with `400`: the server walks its own cursors, and a stream has no pages of its own to resume. It is bounded by the size limits below.
+**Query parameters:** `format` (required: `jsonl`, `csv` or `xlsx`; the `json` of the list route is not accepted here) plus the filters of `GET /api/v1/inventory/software`: `name`, `match`, `version`, `version_min`, `version_max`, `vers`, `agent_id`, `purl`, `status`, `q`, `kind`, `ecosystem`, `source`, with the same rules. `cursor` and `limit` are refused with `400`: the server walks its own cursors, and a stream has no pages of its own to resume. It is bounded by the size limits below.
 
-**Response (200):** a chunked body with no `Content-Length`.
+**Response (200):** for `jsonl` and `csv`, a chunked body with no `Content-Length`; for `xlsx`, a body with a `Content-Length` (see XLSX below).
 
 - `format=jsonl`: `Content-Type: application/x-ndjson`, `Content-Disposition: attachment; filename="software-installs.jsonl"`, one JSON object per line. Each object is the row of `GET /api/v1/inventory/software` (`agent_id`, `name`, `version`, `publisher`, `install_date`, `kind`, `ecosystem`, `epoch`, `release`, `arch`, `signature_status`, `distro_id`, `distro_version`, `source`, `hostname`, `last_seen`, `status`, `last_confirmed_at`, `install_type`, `install_scope`, `install_location`, `instance_key`, `purl`). An empty result is an empty body.
 - `format=csv`: `Content-Type: text/csv; charset=utf-8`, `Content-Disposition: attachment; filename="software-installs.csv"`, a header row of 23 columns and then one row per record. The header is written once, even when there are no rows. A cell that begins with `=`, `+`, `-`, `@`, a tab or a carriage return is prefixed with an apostrophe, so a spreadsheet reads it as text.
+- `format=xlsx`: `Content-Type: application/vnd.openxmlformats-officedocument.spreadsheetml.sheet`, `Content-Disposition: attachment; filename="software-installs.xlsx"`, one sheet ("Installed software") with the same 23 columns as the CSV in the same order, a bold header row that stays frozen while scrolling, and one row per record. Every cell is text, never a formula, number or date, so a value that begins with `=`, `+`, `-` or `@` is shown as it is and is not evaluated (no apostrophe prefix is added, unlike the CSV). An empty result is a workbook with the header row only. A cell longer than 32,767 bytes is cut at a character boundary, and invalid UTF-8 and the control characters XML does not allow are replaced or removed; the audit row counts the cut cells.
 - Every response carries `X-Correlation-Id` and `X-Content-Type-Options: nosniff`. `Sec-Audit-Failed: true` is present when the audit row could not be stored; the file is still served.
 
-**Concurrency.** Each open export holds one HTTP worker until it ends, and is one lease from the server's held-open stream budget (`--max-sse-streams`), so at most `--inventory-export-concurrency` (default 2, range 1 to 16; see [Server administration](server-admin.md)) run at once, server-wide, with no per-principal share. A request over that limit, or one that arrives when the whole held-open budget is full, is `503` with `retry_after_ms` `5000` and a `Retry-After: 5` header, nothing is streamed, and an audit row with `result=denied` is written (its detail says which limit refused). Retry when a running export has finished, or shortly.
+**XLSX is built before it is sent.** A workbook cannot be sent before it is finished, so unlike JSONL and CSV the server builds the whole file first (in constant memory, into a temporary file under `<data dir>/export-tmp`) and only then sends it with a `Content-Length`. So every failure before the first byte is an ordinary error response with the standard envelope: `413` when the result passes a limit (the sheet's own limit of 1,048,575 data rows, `--inventory-export-max-rows`, or `--inventory-export-max-bytes`), with the remediation "narrow the filters, or use format=jsonl or csv"; `503` with `retry_after_ms` when a store read fails, `503` with no retry hint when the 900-second deadline passes during the build, `503` with `retry_after_ms` when the server is shutting down, `503` "not enough free disk space on the server for an xlsx export" (remediation: use format=jsonl or csv, or ask the administrator to free space on the data volume) when the data volume cannot hold the file, `503` "xlsx export is not configured on this server" when the temporary directory cannot be used (JSONL and CSV are unaffected), and `503` "xlsx export failed on the server" (remediation: retry the request, or use format=jsonl or csv; no retry hint) when the workbook could not be written completely. The server does not take the spreadsheet library's word that a write succeeded: that library does not report a write its temporary volume refused, so it would hand back a well-formed workbook with rows missing. Instead the row file is checked as it is written, and the finished file is read back once before the response starts (one extra read pass, inside the same 900-second deadline): every part must read cleanly, be a whole XML document, and the sheet's row data must be exactly as long, in bytes, as the row file the writer produced (the library's own count of what it wrote). A workbook that fails the check is not served. A `200` whose body reaches its `Content-Length` is a whole workbook; a transfer ended by the deadline or by a shutdown stops short of its `Content-Length`, which an HTTP client reports as a failed download. There is ONE 900-second deadline, set when the request is admitted, and it covers the build and the delivery together: a very large workbook over a slow link can be cut where a longer window would have finished, and the remedy is the same (narrow the filters, or use JSONL or CSV). A build can take minutes before the first byte, which a reverse proxy's idle timeout can cut. An export that fails before its first byte writes one `failure` audit row naming the outcome, and the metric counts it under the same `result` labels.
+
+**Concurrency.** Each open export holds one HTTP worker until it ends, and is one lease from the server's held-open stream budget (`--max-sse-streams`), so at most `--inventory-export-concurrency` (default 2, range 1 to 16; see [Server administration](server-admin.md)) run at once, server-wide, with no per-principal share (an XLSX export holds its worker, its lease and its disk grant from admission to its last byte or the deadline, whichever comes first). A request over that limit, or one that arrives when the whole held-open budget is full, is `503` with `retry_after_ms` `5000` and a `Retry-After: 5` header, nothing is streamed, and an audit row with `result=denied` is written (its detail says which limit refused). Retry when a running export has finished, or shortly.
 
 **Failure signal for client authors.** The status line and headers are sent before the first row, so a failure after that point cannot change the status. If a store read fails mid-stream, the transfer is still running 900 seconds after it started, the export reaches its size limit (`--inventory-export-max-rows`, default 5,000,000 rows, or `--inventory-export-max-bytes`, default 1 GiB, whichever comes first; the page that would pass it is not written), or the server begins shutting down, the server ends the response without the final chunk, and an HTTP client reports a truncated or aborted transfer (an error from the client library or tool, not an HTTP status). Treat any aborted transfer as an incomplete file and start again; a clean end means the file is complete. There is no trailer record and no count to compare. A client that closes its connection frees its lease on the held-open budget within one read step, because the server checks the connection before each step, including steps that find none of the caller's rows. A connection lost without being closed (a crashed client or a dropped network path) is noticed only when a write to it fails or at the 900-second limit.
 
-**Size limits.** One export writes at most `--inventory-export-max-rows` rows (default 5,000,000) and `--inventory-export-max-bytes` bytes (default 1 GiB), in JSONL and CSV alike. Past either the transfer is cut as described above and counted as `limit`. To get more than a limit allows, narrow the filters (`name`, `q`, `kind`, `source`, a device scope or a version range) and export in parts, or page with `GET /api/v1/inventory/software`. A spreadsheet program may also stop reading a CSV at its own row limit (commonly 1,048,576 rows) without any error from the server.
+**Size limits.** One export writes at most `--inventory-export-max-rows` rows (default 5,000,000) and `--inventory-export-max-bytes` bytes (default 1 GiB). Past either a JSONL or CSV transfer is cut as described above and counted as `limit`; an XLSX export is answered `413` instead, counted as `limit` too. For XLSX the byte limit bounds the UNCOMPRESSED SHEET as the server accounts it (the cell text plus the markup around every cell and the XML escaping of `&`, `<` and `>`), not the cell text and not the finished file, which is much smaller; at the 1 GiB default a typical export of very roughly 500,000 to 700,000 rows fits (an estimate from the markup size, not a measurement), so a larger one is refused until the flag is raised. XLSX also stops at the format's own 1,048,575 data rows regardless of the flag. The disk an XLSX export uses is bounded too: while it is built and sent it holds at most 3 times its accounted sheet bytes of the data volume, so at most 3 times `--inventory-export-max-bytes` per export (3 GiB at the default) and 6 GiB at the default concurrency of 2, and it is never started or grown when that could leave the data volume with under 1 GiB free. To get more than a limit allows, narrow the filters (`name`, `q`, `kind`, `source`, a device scope or a version range) and export in parts, or page with `GET /api/v1/inventory/software`. A spreadsheet program may also stop reading a CSV at its own row limit (commonly 1,048,576 rows) without any error from the server.
 
 **Consistency.** The stream is a keyset walk over live data, not a snapshot. A device that reports while the export runs can have rows repeated or missed, as with paging the list route; an export that must be exact for a device is taken after that device has reported.
 
-**Audit:** one `inventory.software.export` row with `stream=true`, stored before the first byte (see [Audit log](audit-log.md)).
+**Audit:** for `jsonl` and `csv`, one `inventory.software.export` row with `stream=true`, stored before the first byte; for `xlsx`, one row with `stream=false`, stored after the build and before the first byte, and a `failure` row instead of a success row when the workbook is not served (see XLSX above and the [Audit log](audit-log.md)).
 
-**Errors:** `400` (`format` missing or not `jsonl` or `csv`, `cursor` or `limit` supplied, an invalid filter, or a version range not resolvable for the title), `401`, `403`, `503` (store or fleet-read check unavailable, or the export cap or the server's held-open budget is full; `retry_after_ms` set), never an empty 200.
+**Errors:** `400` (`format` missing or not `jsonl`, `csv` or `xlsx`, `cursor` or `limit` supplied, an invalid filter, or a version range not resolvable for the title), `401`, `403`, `413` (`xlsx` only: the result passes the sheet's 1,048,575 data rows, `--inventory-export-max-rows` or `--inventory-export-max-bytes`), `503` (store or fleet-read check unavailable, or the export cap or the server's held-open budget is full: `retry_after_ms` set; for `xlsx` also a degraded read or a server that is shutting down, with `retry_after_ms`, and the 900-second deadline, a data volume that cannot hold the file, an export directory that cannot be used, or a workbook that could not be written completely, with no retry hint), never an empty 200.
 
 #### `GET /api/v1/inventory/software/collection-settings`
 

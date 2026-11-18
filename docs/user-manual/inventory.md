@@ -1075,9 +1075,10 @@ a statement timeout there degrades the page to a 503 (tracked in #5698). A conti
 
 ### Exporting the installed-software inventory
 
-`GET /api/v1/inventory/software/export?format=jsonl|csv` writes every installed-software row
+`GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` writes every installed-software row
 that matches your filters as one download, with no paging: JSONL is one JSON object per line,
-CSV is the 23 columns of the list under a single header row. It takes the filters of the
+CSV is the 23 columns of the list under a single header row, and XLSX is the same 23 columns as a
+one-sheet workbook you can open directly (a bold, frozen header row, every cell text). It takes the filters of the
 route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
 confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
 server, so those exports read more rows than they return.
@@ -1087,6 +1088,10 @@ server, so those exports read more rows than they return.
 curl -H "Authorization: Bearer $TOKEN" -o software.csv \
   "$SERVER/api/v1/inventory/software/export?format=csv"
 
+# The same, as a workbook
+curl -H "Authorization: Bearer $TOKEN" -o software.xlsx \
+  "$SERVER/api/v1/inventory/software/export?format=xlsx"
+
 # One title, as lines for a script
 curl -H "Authorization: Bearer $TOKEN" \
   "$SERVER/api/v1/inventory/software/export?format=jsonl&name=OpenSSL"
@@ -1094,9 +1099,10 @@ curl -H "Authorization: Bearer $TOKEN" \
 
 A few rules for what you build on it:
 
+- **XLSX is built first, then sent.** A workbook cannot be sent before it is finished, so the server builds the whole file before the first byte (it can take minutes for a large estate) and a problem shows up as an ordinary error instead of a cut transfer: `413` when the result is over the sheet's limit of 1,048,575 rows or over a size limit (narrow the filters, or use JSONL or CSV), `503` when the server cannot read the data, is shutting down, is out of disk space for the file, has no usable export directory, or could not write the workbook completely (the server reads the finished file back and checks it before it sends a byte). A `200` is a complete workbook. A cell that begins with `=`, `+`, `-` or `@` is shown as text and never evaluated.
 - **A cut-short transfer is an incomplete file.** The server cannot change the status after the first byte, so a failed read, a run past 900 seconds or a server shutdown ends the response without its final chunk and your HTTP client reports an aborted transfer. Start again; do not use the partial file. A clean end means complete.
 - **Two exports at a time by default.** Each open export holds a server worker and one lease from the server's held-open stream budget, so a third request gets `503` with `retry_after_ms` 5000. The limit is `--inventory-export-concurrency`, shared by every caller of the server ([Server administration](server-admin.md)). The same `503` is returned when the server's whole held-open budget (`--max-sse-streams`) is full; retry shortly.
-- **There is a size limit.** One export writes at most 5,000,000 rows and 1 GiB by default (`--inventory-export-max-rows`, `--inventory-export-max-bytes`, [Server administration](server-admin.md)). Past either, the transfer is cut like any other failure, so an over-large request never produces a file that looks complete. Narrow the filters and export in parts. A spreadsheet may stop at its own row limit (commonly 1,048,576 rows) with no error from the server.
+- **There is a size limit.** One export writes at most 5,000,000 rows and 1 GiB by default (`--inventory-export-max-rows`, `--inventory-export-max-bytes`, [Server administration](server-admin.md)). Past either, a JSONL or CSV transfer is cut like any other failure, so an over-large request never produces a file that looks complete, and an XLSX request is refused with `413`. For XLSX the byte limit counts the uncompressed sheet including its markup, so it is reached well before the cell text alone would reach it. Narrow the filters and export in parts. A spreadsheet may stop at its own row limit (commonly 1,048,576 rows) with no error from the server.
 - **It is a live walk, not a snapshot.** A device that reports while the export runs can have rows repeated or missed.
 - **Audited once, up front** as `inventory.software.export` (see [Audit log](audit-log.md)), and counted in `yuzu_server_software_export_total` ([Metrics](metrics.md)).
 - **REST only.** A streamed file is not a tool call, so there is no MCP tool; an agentic worker pages the same rows with `query_installed_software`.
