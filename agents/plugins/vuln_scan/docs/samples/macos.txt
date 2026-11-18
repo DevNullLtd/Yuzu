@@ -326,6 +326,9 @@ Wish|8.5.9
 CinematicFramingOnboardingUI|1.0
 ContinuityCaptureOnboardingUI|1.0
 System Speech|9.2.22
+Raspberry Pi Imager|1.8.5
+Camera Settings|3.0.23
+OpenCPN|5.8.4-0+1637c28
 Perspective Efex Launcher|
 nondestructive_util|
 Amphetamine|5.3.2
@@ -353,11 +356,13 @@ Sheets|
 Gmail|
 Slides|
 Docs|
+CCXP_7_17_0|6.11.0.478
 Claude|6.6395.0
 Microsoft OneNote|16.115.1
 Microsoft PowerPoint|16.115.1
 Microsoft Word|16.115.1
 WhatsApp|26.46.17
+Developer|11.1.2
 iMovie|10.4.3
 Keynote|14.4
 Numbers|14.4
@@ -369,9 +374,6 @@ AdpSDKUtil|4.5.0.0
 PHSPBETA_27_6_32|6.9.0.618
 Uninstall_Citrix_Endpoint_Analysis|26.07.20
 RealVNC Connect Viewer|8.5.0
-Raspberry Pi Imager|1.8.5
-Camera Settings|3.0.23
-OpenCPN|5.8.4-0+1637c28
 Spotify|1.3.9.2055
 ChatGPT|26.1106.51428
 Hermes|0.0.1
@@ -533,12 +535,10 @@ Uninstaller|6.11.0.478
 Install|6.11.0.478
 Adobe Creative Cloud Diagnostics|1.4.0.15
 Tailscale|1.104.6
-CCXP_7_17_0|6.11.0.478
 OneDrive|26.189.0928
 Orca|2026.44.1
 XProtect|170
 Microsoft Teams|26289.204.5281.6363
-Developer|11.1.2
 1Password|8.12.44
 iTerm|3.7.7
 claude|2.1.326
@@ -551,5 +551,37 @@ GoogleUpdater|159.0.8140.0
 Microsoft Excel|16.115
 VictronConnect|6.43.1
 Spotify|1.3.10.2586
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+
+== action=scan
+HIGH|cve|CVE-2023-24329: urllib.parse URL parsing bypass via leading whitespace|Python 3.9.6 (fixed in 3.11.4)
+MEDIUM|cve|CVE-2024-0450: zipfile quoted-overlap zipbomb protection bypass|Python 3.9.6 (fixed in 3.12.2)
+HIGH|cve|CVE-2023-44487: HTTP/2 Rapid Reset denial of service|NodeMCU PyFlasher 5.0.0 (fixed in 20.8.1)
+HIGH|cve|CVE-2024-22019: Reading unprocessed HTTP request with unbounded chunk extension|NodeMCU PyFlasher 5.0.0 (fixed in 20.11.1)
+CRITICAL|cve|CVE-2024-29944: Privileged JavaScript execution via event handler|Firefox 106.0.5 (fixed in 124.0.1)
+CRITICAL|cve|CVE-2024-9680: Animation timeline use-after-free|Firefox 106.0.5 (fixed in 131.0.2)
+INFO|config|Gatekeeper|Enabled - only verified apps can run
+INFO|config|FileVault Disk Encryption|Enabled
+INFO|config|System Integrity Protection (SIP)|Enabled
+MEDIUM|config|Application Firewall|Disabled
+UNREADABLE|config|Remote Login (SSH)|Unknown (read failed)
+INFO|config|Automatic update check|Automatic update check: not set (macOS default applies)
+UNREADABLE|config|Open Ports|open-port check is not available on macOS
+INFO|scan|Coverage|Homebrew formulae and casks are not scanned
+UNREADABLE|scan|Coverage|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
+UNREADABLE|scan|Coverage|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
+[result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
+
+== action=summary
+summary|TOTAL|13 findings (7 issues)
+summary|CRITICAL|2
+summary|HIGH|3
+summary|MEDIUM|2
+summary|LOW|0
+summary|INFO|4
+summary|UNREADABLE|2
+summary|COVERAGE|Homebrew formulae and casks are not scanned
+summary|COVERAGE|4 line(s) of the software list were not recognised; applications may be missing; not a clean result
+summary|COVERAGE|One or more macOS configuration checks could not be read; each is reported as an UNREADABLE row, not as a finding
 [result_status] CONSTRAINED / PARTIAL / macos:vuln_scan:software_list_unrecognised
 
