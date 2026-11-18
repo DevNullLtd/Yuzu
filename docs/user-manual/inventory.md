@@ -509,17 +509,19 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
 - **What a row holds.** Kind (`native`), name (the SONAME on Linux or the install name on macOS,
   without its suffix and version), version, where the version came from (`filename`, `elf`, `macho`
   or `unreadable`), path, size, modification time and the application folder it sits under.
-- **How the version is read.** From the file name (`libssl.so.3.0.13` reads `3.0.13`); when the
-  name gives none, from the library's SONAME suffix (Linux) or its `current_version` (macOS, when
-  it is not `0.0.0`). A library whose header cannot be read inside the fixed bounds, or that names
-  no version, is still listed from its file name with `version_source` `unreadable`; that is a gap
-  in one row and does not make the scan incomplete. A file whose name looks like a library but
-  whose header says it is not one is not listed.
+- **How the version is read.** On Linux, from the file name's `.so.<version>` suffix
+  (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
+  Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
+  (`libfoo.1.2.dylib` reads `1.2`). A library whose header cannot be read inside the fixed
+  bounds, or that names no version, is still listed from its file name with `version_source`
+  `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
+  looks like a library but whose header says it is not one is not listed.
 - **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
   directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
-  ELF program headers, 64 KiB of dynamic section, a 255-byte name, 16 fat slices and 4,096 load
-  commands in 256 KiB; a count past one of those makes that library `unreadable`, never a partial
-  answer. A fat Mach-O file is read through its first slice only.
+  ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
+  commands in 512 KiB; a count past one of those makes that library `unreadable`, never a partial
+  answer. A universal Mach-O file is read through its first slice that has no error and is a
+  dynamic library.
 - **When the list may be incomplete.** The status row reads `constrained` for the same causes as
   `scan` (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`, `dir_unreadable`,
   `dir_truncated`, `mount_table_unreadable`), and `archive_changed` when a library changed or

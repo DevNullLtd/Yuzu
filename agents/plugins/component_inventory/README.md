@@ -33,7 +33,7 @@ A candidate is a file named `<stem>.so` or `<stem>.so.<digits and dots>` (Linux)
 
 - A file whose name matches but whose header says it is not a shared library (a script called `libfoo.so`, an executable) gives no row.
 - A shared library whose header cannot be read inside the bounds still gives a row, named from its file name, with the version the file name carries or `unreadable`. That is a gap in one row; the scan stays complete.
-- The name is the SONAME stem (Linux) or the install-name leaf (macOS) without its `.so` or `.dylib` suffix and version. The version is the file name's (`libssl.so.3.0.13` reads `3.0.13`, `version_source` `filename`), else the SONAME's suffix (`elf`), else, on macOS, the library's `current_version` when it is not `0.0.0` (`macho`).
+- The name is the SONAME stem (Linux) or the install-name leaf (macOS) without its `.so` or `.dylib` suffix and version. On Linux the version is the file name's `.so.<version>` suffix (`libssl.so.3.0.13` reads `3.0.13`, `version_source` `filename`), else the SONAME's suffix (`elf`). On macOS it is the Mach-O `current_version` when that is not `0.0.0` (`macho`), else the file name's version (`libfoo.1.2.dylib` reads `1.2`, `filename`).
 
 #### Switching `native` on
 
@@ -108,7 +108,7 @@ Every row is pipe-delimited. The first row is always `status|<action>|<level>|<t
 | `row_kind` | string | `status` `comp` | macOS, Linux | `comp` | Row shape discriminator (the wire row's leading tag). Values: status (exactly one per result, always first), comp (one per shared library found). |
 | `kind` | string | - | macOS, Linux | `native` | Component kind. Values: native. Status rows: the action name (native). |
 | `name` | string | - | macOS, Linux | `libssl` | Library name: the SONAME (Linux) or install-name leaf (macOS) without its .so or .dylib suffix and version, or the file name's equivalent when the library declares none (libssl.so.3 reads libssl). A name with bytes outside printable ASCII is kept with those bytes shown as ?; pipes, backslashes and line breaks are escaped or flattened on the wire. Status rows: the level (supported, constrained or unsupported). |
-| `version` | string | - | macOS, Linux | `3.0.13` | Version from the file name (libssl.so.3.0.13 reads 3.0.13); when the name gives none, from the SONAME suffix (Linux) or the Mach-O current_version when it is not 0.0.0 (macOS); empty when none gives one. Status rows: the comma-joined cause tokens, or -. |
+| `version` | string | - | macOS, Linux | `3.0.13` | Linux: the version in the file name (libssl.so.3.0.13 reads 3.0.13), else the SONAME suffix. macOS: the Mach-O current_version when it is not 0.0.0, else the version in the file name (libfoo.1.2.dylib reads 1.2). Empty when none gives one. Status rows: the comma-joined cause tokens, or -. |
 | `version_source` | string | `filename` `elf` `macho` `unreadable` | macOS, Linux | `filename` | Where the version came from. Values: filename, elf (the SONAME, Linux), macho (current_version, macOS), unreadable (no source gave a version, or the header could not be read inside the fixed bounds; the row is still listed and the scan is not made incomplete by it). |
 | `path` | string | - | macOS, Linux | `/opt/app/lib/libssl.so.3.0.13` | Absolute path of the library file. A NUL, another control character or a byte outside valid UTF-8 in a folder or file name is shown as ?. |
 | `size` | int64 | - | macOS, Linux | `3086784` | Size of the library file in bytes. |

@@ -174,8 +174,9 @@ status:
 ## cannot be read inside those bounds still gives a row, named from its file name, with the version
 ## the file name carries or `unreadable`. Extension-less macOS framework binaries are not read.
 ## The name is the SONAME (Linux) or install name (macOS) without its .so or .dylib suffix and
-## version. The version is the file name's, else the SONAME's (Linux) or the library's
-## current_version (macOS, when it is not 0.0.0).
+## version. Linux: the version is the file name's .so.<version> suffix, else the SONAME's suffix.
+## macOS: the version is the Mach-O current_version when it is not 0.0.0, else the file name's
+## version (libfoo.1.2.dylib reads 1.2).
 ##
 ## BOUNDS: 400,000 directory entries, 45 seconds for the whole scan, 32 directory levels, 50,000
 ## entries per directory listing, 3,000 rows per top-level application folder, 5,000 rows in all.
@@ -252,7 +253,7 @@ spec:
         platforms: [darwin, linux]
       - name: version
         type: string
-        description: 'Version from the file name (libssl.so.3.0.13 reads 3.0.13); when the name gives none, from the SONAME suffix (Linux) or the Mach-O current_version when it is not 0.0.0 (macOS); empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
+        description: 'Linux: the version in the file name (libssl.so.3.0.13 reads 3.0.13), else the SONAME suffix. macOS: the Mach-O current_version when it is not 0.0.0, else the version in the file name (libfoo.1.2.dylib reads 1.2). Empty when none gives one. Status rows: the comma-joined cause tokens, or -.'
         example: 3.0.13
         platforms: [darwin, linux]
       - name: version_source
