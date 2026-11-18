@@ -209,17 +209,24 @@ in it:
   `pkg:hex` purl) and the Erlang runtime, as one `erlang` component.
 - **Anything else a scanner recognises in the unpacked file.**
 
-The Windows installer is not unpacked by the release: its SBOM lists the files
-of `yuzu-agent-windows-x64.zip` (built from the same output) that the
-installer's script, `yuzu-agent.iss`, installs, and leaves out any file of the
-archive the installer does not install. The SBOM says so in its
-`yuzu:sbom:contents` note, while its root names the installer and its
-SHA-256.
+The Windows installer is not unpacked by the release. When the Inno Setup
+compiler builds it, the compiler also writes a manifest: the list of files it
+packed into the installer, with the SHA-256 of each. The installer's SBOM
+lists those files. Each one is read from the build directory and must match
+the SHA-256 the compiler recorded, or the release fails. The files are listed
+at their paths in the build directory (for example
+`agents/plugins/status/status.dll`), not at the paths the installer puts them
+(`plugins\status.dll` under the install directory). The SBOM lists every
+file the installer holds, whichever components an installation selects, and
+does not record which component installs each one. The SBOM says this in its
+`yuzu:sbom:contents` note, and its root names the installer and its SHA-256.
 
 Not listed yet, though the file holds it: code vendored into the source tree
 and compiled into `yuzu-server` (qrcodegen, and the web assets it embeds: htmx,
 ECharts, three.js, Cytoscape, IBM Plex fonts; see `NOTICE`), the Windows
-installer's own InnoSetup runtime, and the code the gateway's bundled Erlang
+installer's own InnoSetup runtime and what the compiler embeds beside the
+packed files (the licence text, the icon and the installer's compiled script),
+and the code the gateway's bundled Erlang
 runtime links into its emulator, `beam.smp` (PCRE2, asmjit, zstd, Ryu and an
 MD5 implementation taken from OpenSSL; the SBOM lists the runtime as one
 `erlang` component). An SBOM whose file holds something it does not list says
@@ -254,9 +261,7 @@ existing token keeps its meaning. Read the tokens, not the prose, in a script.
 | Token | On | What the SBOM does not list |
 |---|---|---|
 | `server-vendored` | a file or image holding `yuzu-server` | qrcodegen and the web assets compiled into it |
-| `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller |
-| `installer-wildcard` | the Windows installer | a file the installer's `*.dll` entry took from the build directory beyond those in the agent zip (the SBOM lists the zip's matching files; on v0.15.0 the two sets were the same) |
-| `installer-file-missing` | the Windows installer | a file `yuzu-agent.iss` installs that the agent zip does not hold (named in the prose) |
+| `installer-runtime` | the Windows installer | InnoSetup's setup loader and uninstaller, and the licence text, icon and compiled installer script the compiler embeds |
 | `erts-static` | a gateway file or image | what the Erlang emulator `beam.smp` vendors: PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5 |
 | `image-static-cpp` | a server or agent image | the vcpkg libraries linked statically into `yuzu-server` or `yuzu-agent`, which the image scan cannot see (the matching package's SBOM lists them) |
 | `pgvector-source` | the `yuzu-postgres` image | pgvector, which the image builds from source, so it has no package record for the scan to read |

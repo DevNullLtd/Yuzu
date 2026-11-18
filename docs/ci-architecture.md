@@ -481,14 +481,17 @@ release when:
   that script: each artifact is unpacked and scanned on its own with syft
   pinned to v1.57.2 (the image SBOM steps pin the same version), and the vcpkg
   ports its binaries are built from are added from the installed tree for the
-  release triplet; the Windows installer's SBOM lists the archive files
-  `yuzu-agent.iss` installs. Each `generate` command runs with a timeout, and
-  `tests/test_artifact_sbom.py` (Docs Lint, every PR) parses the real
-  `yuzu-agent.iss` under the installer-script contract below, so an
-  installer-script edit outside it fails there rather than at the release's
-  Windows SBOM step (the `CBOM schema` job runs the same suite with
+  release triplet; the Windows installer's SBOM lists the files the Inno
+  Setup compiler's own manifest says it packed, each checked against the
+  build directory by SHA-256 (the installer manifest contract below). Each
+  `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  (Docs Lint, every PR) pins that contract against a fixture in the
+  compiler's format; the `CBOM schema` job runs the same suite with
   `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
-  vendored CycloneDX 1.7 and SPDX 2.3 schemas);
+  vendored CycloneDX 1.7 and SPDX 2.3 schemas. **Owner item:** `CBOM schema`
+  is not a required check, so a schema-validation failure does not block a
+  merge; making it required is a decision on the branch ruleset, not taken
+  here;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
@@ -519,50 +522,104 @@ commands, and the `X.Y.0` case where no earlier `:X.Y` exists). The gate has
 no override; the naming forms it checks are a second copy of the builders'
 naming, and its header lists where each lives.
 
-#### The installer-script contract (`yuzu-agent.iss`)
+#### The installer manifest contract (`OutputManifestFile`)
 
-The Windows installer's SBOM lists the archive files the `[Files]` section of
-`deploy/packaging/windows/yuzu-agent.iss` installs. `scripts/ci/artifact-sbom.py`
-does not emulate the Inno Setup preprocessor (ISPP) or compiler (ISCC) to read
-it. It accepts one fixed shape, the script's shape today, and refuses every
-line outside it with an error naming the line, so the release fails loudly
-instead of listing the wrong files. The contract, stated in full at the top of
-the parser's `.iss` section:
+The Windows installer's SBOM is made from the file list the Inno Setup
+compiler (ISCC) writes when it builds the installer. The installer script is
+never parsed. `deploy/packaging/windows/yuzu-agent.iss` sets
+`OutputManifestFile=YuzuAgentSetup.manifest.txt`. In `release.yml`, the
+"Build Windows installers (InnoSetup)" step deletes any old manifest, runs
+ISCC, fails if that run wrote none, and copies it beside the installer as
+`YuzuAgentSetup-<version>.manifest.txt`. "Generate per-artifact SBOMs" then
+runs `artifact-sbom.py generate --inno-manifest <that copy> --build-dir
+build-windows --inno-build-dir <the /DBuildDir that ISCC run was given>`. The
+script reads each listed file from `build-windows`, checks its SHA-256, copies
+the checked bytes into a scratch tree at the file's path below the build
+directory, and runs syft and the vcpkg closure over that tree, as for any
+other artifact. The manifest is not a release asset (it records the runner's
+paths); the Windows job keeps it for three days as the
+`windows-installer-manifest` workflow artifact.
 
-1. Lines split at CR, LF or CR LF; any other control byte is refused. With a
-   UTF-8 byte order mark the script is UTF-8 with no C1 control and no
-   whitespace but space and tab; without one, a mapped line (a `#` line, a
-   section header, a `[Files]` entry) is ASCII.
-2. A line whose first non-blank character is `#` is accepted only before the
-   first section, and only as the block `#ifndef <Name>` /
-   `#define <Name> "<literal>"` / `#endif` on consecutive lines, one space
-   between the parts, `<Name>` one of `AppVersion` and `BuildDir` (each once),
-   the literal made of letters, digits, `.`, `_`, `-` and `\`. Every other `#`
-   line is refused wherever it is, including `#include`, the one-character
-   forms (`#+`, `#=`, `#:`, `#?`) and a Pascal `#13` that starts a `[Code]`
-   line.
-3. `{#` is accepted only as exactly `{#AppVersion}` or `{#BuildDir}`, and in
-   `[Files]` only in the directory part of a quoted `Source`; every other `{#`
-   is refused, on any line, comments included.
-4. A line whose first non-blank character is `[` must be exactly one of the
-   script's eleven section headers as written (`[Setup]`, `[Files]`, ...):
-   `[ Files ]`, `[FILES]`, `[/Files]` or a section the script does not use
-   are refused. Before the first section only blank lines, `;` comments and
-   the header blocks are accepted.
-5. A line ending in a backslash is refused.
-6. In `[Files]`, an entry maps only when its `DestDir` is `{app}` or a literal
-   path below it, its `Source` name is a literal name or `*.<ext>`, and it uses
-   no flag or parameter that installs a tree, renames or takes the file from
-   elsewhere (`recursesubdirs`, `external`, `dontcopy`, `DestName`, `Excludes`,
-   ...).
+**The format,** read from Inno Setup's source at tag `is-6_7_3`, the version
+v0.15.0 was built with:
 
-It assumes ISCC runs with the preprocessor's defaults, as `release.yml` runs it
-(only `/DAppVersion` and `/DBuildDir`). `test_the_real_iss_parses` pins that
-the allowlists are exactly the names and sections the script uses, and
-`ISS_REFUSED` in the test lists every refused form found so far. **Extend the
-allowlist deliberately; never emulate more ISPP.** A script change that needs
-a new header name, section or form is a change to the contract, the test and
-this section together.
+- UTF-8 with a byte order mark, and every line, the last included, ends in
+  CR LF: `TTextFileWriter` (`Projects/Src/Shared.FileClass.pas`, 508-573)
+  encodes with `Utf8Encode`, writes the mark at the start of a new file, and
+  `WriteLine` appends CR LF.
+- A tab-separated header, exactly `Index`, `SourceFilename`, `TimeStamp`,
+  `Version`, `SHA256Sum`, `OriginalSize`, `FirstSlice`, `LastSlice`,
+  `StartOffset`, `ChunkSuboffset`, `ChunkCompressedSize`, `Encrypted`,
+  `ISSigKeyID`, then one row per file location, `Index` counting from 0
+  (`Projects/Src/Compiler.SetupCompiler.pas`, `CreateManifestFile`,
+  7942-8005).
+- `SourceFilename` is the source path as ISCC built it at compile time: the
+  `[Files]` `Source` with `{#BuildDir}` expanded, joined to the file name it
+  found, not normalised. ISCC merges two entries naming the same path
+  (compared case-insensitively) into one location, so it lists a file once.
+- `SHA256Sum` is 64 lowercase hex digits (`SHA256DigestToString`,
+  `Components/SHA256.pas`) over the file's own bytes, taken before any
+  compression transform (`Compiler.CompressionHandler.pas`, 243-260).
+
+**Path mapping.** A `SourceFilename` and `--inno-build-dir` are both read as
+drive-absolute Windows paths (Python's `ntpath`) and normalised with
+`normpath`, so a `..` that stays inside the build directory is resolved and
+`/` reads as `\`. The drive and every component are compared
+case-insensitively, as Windows compares them. The components after the build
+directory's are the file's build-relative path, looked up under
+`--build-dir`; the file's real location, with symlinks and junctions
+resolved, must be inside `--build-dir`.
+
+**Refused.** `generate` fails, naming the manifest line and the problem, on:
+
+- an encoding other than ISCC's: no UTF-8 byte order mark, or bytes after it
+  that are not UTF-8;
+- a line not ended by CR LF, or a bare CR or LF;
+- a header that is not exactly the one above;
+- no rows;
+- a row with a column count other than 13, an `Index` out of sequence, or a
+  `SHA256Sum` that is not 64 lowercase hex digits;
+- a `SourceFilename` not strictly inside the build directory after
+  normalisation: a `..` out of it, another drive, a UNC or `\\?\` path, a
+  relative path, or the build directory itself; or a component Windows reads
+  differently (a reserved character such as an NTFS stream colon, a trailing
+  dot or space);
+- the same path listed twice with two hashes;
+- a file missing from `--build-dir`, not a regular file, or resolving outside
+  it (a symlink or junction);
+- a SHA-256 that differs from the one ISCC recorded.
+
+**Residuals** (stated, not fixed):
+
+- The installer's InnoSetup runtime (setup loader and uninstaller) and what
+  the compiler embeds beside the packed files (the licence text, the icon and
+  the compiled `[Code]` script) are not listed. The SBOM is marked incomplete
+  for them (`installer-runtime`).
+- A `[Files]` entry that takes its file at install time (`external`, or Inno
+  Setup 6.5's `download`) has no file location, so ISCC does not list it. The
+  script has none today.
+- Install paths and components are not recorded: the paths are
+  build-relative.
+- The manifest is trusted as ISCC's statement of what it packed. The hash
+  proves that each listed file is the file in the build directory, not that
+  the list is complete.
+- The compiler version is not pinned: `release.yml` uses whichever Inno Setup
+  6 the runner has, and installs the current one with winget only when it
+  finds none. A version that writes another header fails the release's
+  Windows SBOM step until the contract and its fixture are updated, after
+  reading the new format in that version's source.
+- **No real manifest has been checked yet.** The contract and its fixture
+  come from issrc's source; the first real verification is the Windows job
+  of the first tag that carries this, which should be a pre-release
+  (`-rcN`, the release skill's first-run advice).
+
+**Future findings.** A defect in this contract is an accepted row whose listed
+file differs from the bytes the installer packs, or a residual not stated
+above. A manifest shape the contract refuses is an expected refusal, not a
+finding, and so is any `.iss` edit, including one that makes ISCC write a
+manifest the contract refuses (the script is not parsed). Extend the contract
+deliberately: a change of format is a change to `artifact-sbom.py`, its
+fixture in `tests/test_artifact_sbom.py` and this section together.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 

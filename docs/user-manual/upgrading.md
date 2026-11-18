@@ -19,7 +19,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 |---|---|
 | `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` | same names as before: `<archive without .tar.gz/.zip>.{cdx,spdx}.json` |
 | each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
-| `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files of the agent zip the installer installs |
+| `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files the installer packs, as the Inno Setup compiler's own manifest names them, at their paths in the build directory (not where they are installed) |
 | `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
 | container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list |
 
