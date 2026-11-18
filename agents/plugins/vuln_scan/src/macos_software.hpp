@@ -181,9 +181,15 @@ inline std::string fold_backslashes(std::string_view v) {
 ///     a name (the first one per app wins).
 /// Lines that do not fit (a name without ':' or at an odd indent, a leading tab, a second Version in
 /// a block, a Version before any name or not directly after its name line, indent 0 other than the
-/// "Applications:" header, indent 1-2, and a property-indent line after a blank that does not follow
-/// a name) are counted in
-/// `suspect_lines`; they never become apps. `command_ok` is false when the command did not run to a clean end
+/// "Applications:" header, indent 1-2, a property-indent line after a blank that does not follow
+/// a name, and a property-indent line after TWO OR MORE blank lines that follow a name) are counted in
+/// `suspect_lines`; they never become apps. One shape at indent 0 is legitimate and not counted: a
+/// non-blank line that directly follows a property line with no blank between (a property value that
+/// wraps onto further lines, as the multi-line `Get Info String` of a real application does); it is
+/// part of that property, and the lines after it keep the property context. Measured on macOS 27.0.1
+/// (529 application blocks): every name line is followed by exactly ONE blank line, so a name line
+/// followed by two or more is the shape a dropped line leaves. A lost name line that takes its
+/// adjacent blank line with it leaves a block byte-identical to a canonical one and cannot be told. `command_ok` is false when the command did not run to a clean end
 /// (failed, timed out, over the output cap): the apps are then DROPPED, never returned as a partial
 /// list that would feed CVE matching or inventory.
 inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool command_ok) {
@@ -194,6 +200,7 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
     bool have_version = false;
     char last_kind = 'H'; // kind of the last non-blank line: H header, N name, P anything else
     bool blank_since = false;
+    int blank_run = 0; // consecutive blank lines directly before the current line
     const auto flush = [&] {
         if (have_name)
             r.apps.push_back({bound_text(current_name, kMaxNameBytes),
@@ -216,24 +223,30 @@ inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool co
         const auto indent = raw.find_first_not_of(' ');
         if (indent == std::string_view::npos) {
             blank_since = true;
+            ++blank_run;
             continue;
         }
         const std::string_view body = detail::trim(raw.substr(indent));
         if (body.empty()) {
             blank_since = true;
+            ++blank_run;
             continue;
         }
         // Grammar guards: a line the real report never contains means a name or property may have
         // been dropped or reshaped, so the list may be missing an application.
         const bool tab = raw[indent] == '\t';
-        if (tab || (indent == 0 && body != "Applications:") || indent == 1 || indent == 2 ||
-            ((indent > 4 || indent == 3) && blank_since && last_kind != 'N'))
+        // A wrapped property value: indent 0, directly after a property line, no blank between.
+        const bool wrapped = indent == 0 && !tab && last_kind == 'P' && !blank_since;
+        if (tab || (indent == 0 && body != "Applications:" && !wrapped) || indent == 1 || indent == 2 ||
+            ((indent > 4 || indent == 3) && blank_since && last_kind != 'N') ||
+            (indent > 4 && last_kind == 'N' && blank_run >= 2))
             ++r.suspect_lines;
         const char prev_kind = last_kind; // the kind of the previous non-blank line
         last_kind = (indent == 4 && !tab && body.back() == ':' && body.substr(0, 8) != "Version:") ? 'N'
-                    : indent == 0                                                                   ? 'H'
+                    : indent == 0 && !wrapped                                                       ? 'H'
                                                                                                     : 'P';
         blank_since = false;
+        blank_run = 0;
         if (tab)
             continue;
         if (indent == 4 && raw[4] != '\t' && body.back() == ':') {

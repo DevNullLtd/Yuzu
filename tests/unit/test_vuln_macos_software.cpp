@@ -1121,3 +1121,97 @@ TEST_CASE("lost name: tiny reports with the lost-name shapes are unreadable, not
     CHECK(y.suspect_lines >= 1);
     CHECK_FALSE(y.readable); // the one app is unversioned (its Version is not directly after the name)
 }
+
+// ── a property value that wraps onto further lines at indent 0 ───────────────────────────────────
+
+namespace {
+// Real `system_profiler SPApplicationsDataType -detailLevel mini` text (macOS 27.0.1): the Wish
+// application's Get Info String wraps onto four indent-0 lines with no blank line between, and the
+// next application block follows.
+const std::string kWishWrapped =
+    "Applications:\n"
+    "\n"
+    "    Wish:\n"
+    "\n"
+    "      Version: 8.5.9\n"
+    "      Obtained from: Apple\n"
+    "      Last Modified: 24/09/2026, 08:10\n"
+    "      Kind: iOS\n"
+    "      Signed by: macOS Software Signing, Apple Code Signing Certification Authority, Apple Root CA\n"
+    "      Location: /System/Library/Frameworks/Tk.framework/Versions/8.5/Resources/Wish.app\n"
+    "      Get Info String: Wish Shell 8.5.9,\n"
+    "Copyright \xC2\xA9 1989-2026 Tcl Core Team,\n"
+    "Copyright \xC2\xA9 2002-2026 Daniel A. Steffen,\n"
+    "Copyright \xC2\xA9 2001-2009 Apple Inc.,\n"
+    "Copyright \xC2\xA9 2001-2002 Jim Ingham & Ian Reid\n"
+    "\n"
+    "    CinematicFramingOnboardingUI:\n"
+    "\n"
+    "      Version: 1.0\n";
+
+CoverageState plugin_state(const MacosEnumeration& e) { // what get_installed_apps copies over
+    CoverageState c;
+    c.macos_software = true;
+    c.sp_readable = e.readable;
+    c.software_unrecognised = e.readable ? e.suspect_lines : 0;
+    return c;
+}
+} // namespace
+
+TEST_CASE("wrapped property value: the real Wish text is clean and the clean path survives",
+          "[vuln][macos][wrapped]") {
+    const auto e = parse_system_profiler_apps(kWishWrapped, true);
+    REQUIRE(e.apps.size() == 2);
+    CHECK(e.apps[0].name == "Wish");
+    CHECK(e.apps[0].version == "8.5.9");
+    CHECK(e.apps[1].name == "CinematicFramingOnboardingUI");
+    CHECK(e.apps[1].version == "1.0");
+    CHECK(e.suspect_lines == 0);
+    CHECK(e.readable);
+    CHECK(want_clean_placeholder(plugin_state(e)));
+    CHECK(coverage_token(plugin_state(e)) == "macos:vuln_scan:homebrew_not_scanned");
+}
+
+TEST_CASE("wrapped property value: only a line directly after a property line is exempt",
+          "[vuln][macos][wrapped]") {
+    const std::string pre = "Applications:\n\n    A:\n\n      Version: 1\n";
+    // after a blank line: counted
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x\n\nStray\n", true).suspect_lines == 1);
+    // directly after a name line: counted
+    CHECK(parse_system_profiler_apps("Applications:\n\n    A:\nStray\n", true).suspect_lines >= 1);
+    // after the header, and before any block: counted
+    CHECK(parse_system_profiler_apps("Applications:\nStray\n", true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps("Stray\n", true).suspect_lines == 1);
+    // a tab, or indent 1 or 2, is never a wrapped value
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n\tcont\n", true).suspect_lines >= 1);
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n cont\n", true).suspect_lines == 1);
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n  cont\n", true).suspect_lines == 1);
+    // the exemption is not a second `Version:` window: a wrapped value then a Version is still one
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x,\ncont\n      Version: 2\n", true).suspect_lines >= 1);
+}
+
+// ── two or more blank lines after a name line ────────────────────────────────────────────────────
+
+TEST_CASE("blank run: a name line followed by two blank lines then a property is counted",
+          "[vuln][macos][blankrun]") {
+    const std::string t3 =
+        "Applications:\n\n    A:\n\n      Version: 1\n\n    B:\n\n\n      Version: 2\n";
+    const auto e = parse_system_profiler_apps(t3, true);
+    CHECK(e.suspect_lines == 1);
+    CHECK(e.readable);
+    CHECK_FALSE(want_clean_placeholder(plugin_state(e)));
+    CHECK(coverage_token(plugin_state(e)) == "macos:vuln_scan:software_list_unrecognised");
+}
+
+TEST_CASE("blank run: canonical blocks, a name-only block and an intact successor are clean",
+          "[vuln][macos][blankrun]") {
+    const std::string t =
+        "Applications:\n\n    A:\n\n      Version: 1\n      Kind: x\n\n"
+        "    NameOnly:\n\n"
+        "    B:\n\n      Version: 2\n";
+    const auto e = parse_system_profiler_apps(t, true);
+    CHECK(e.suspect_lines == 0);
+    CHECK(e.apps.size() == 3);
+    CHECK(want_clean_placeholder(plugin_state(e)));
+    CHECK(parse_system_profiler_apps(kSample, true).suspect_lines == 0);
+}
