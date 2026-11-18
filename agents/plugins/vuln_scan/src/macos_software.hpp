@@ -1,7 +1,7 @@
 #pragma once
 
 /**
- * macos_software.hpp — portable decisions for the macOS software enumeration (WP13c).
+ * macos_software.hpp — portable decisions for the macOS software enumeration.
  *
  * Pure code (no I/O, no subprocess) so the status contract is testable on every host even though
  * the system_profiler call itself only runs under __APPLE__.
@@ -40,7 +40,8 @@ inline const Argv kMacosSocketfilterfwCmd = {"/usr/libexec/ApplicationFirewall/s
 inline const Argv kMacosSystemsetupCmd = {"/usr/sbin/systemsetup", "-getremotelogin"};
 // The update-check setting is read TWICE and the worse answer wins (see macos_check_result_dual):
 //   - the BARE domain goes through CFPreferences and may see a managed (MDM) or per-user value;
-//     its output text is NOT measured, and it may or may not cascade to the system plist;
+//     its key-absent text WAS measured (macOS 27.0.1, euid 501 only), and whether it cascades to
+//     the system plist is not;
 //   - the /Library/Preferences PATH form reads only the system plist; its output WAS measured
 //     (macOS 27.0.1, one host: key absent -> the absent-key line, exit 1).
 // A read whose text is not one the table recognises is UNREADABLE, never a pass.
@@ -58,8 +59,9 @@ inline std::vector<const Argv*> macos_commands() {
 
 // Bounds: a stalled tool cannot park a pool worker, a runaway cannot grow RSS. One action's worst
 // case is the profiler (60 s) plus seven 10 s status reads (five tools, the update-check `defaults`
-// read twice) = 130 s nominal, about 146 s with the runner's 2 s drain grace per command. A
-// waiter behind an overdue flight waits at most 75 s.
+// read twice) = 130 s ceiling if every command runs to its deadline (about 146 s with the runner's
+// 2 s drain grace per command); the typical time is not measured. A waiter behind an overdue
+// flight waits at most 75 s.
 inline constexpr long long kMacosCommandDeadlineMs = 60'000; // system_profiler
 inline constexpr long long kMacosToolDeadlineMs = 10'000;    // spctl/fdesetup/csrutil/...
 inline constexpr std::size_t kMacosCommandMaxOutput = 8u * 1024u * 1024u;
@@ -182,15 +184,17 @@ inline std::string fold_backslashes(std::string_view v) {
 /// Lines that do not fit (a name without ':' or at an odd indent, a leading tab, a second Version in
 /// a block, a Version before any name or not directly after its name line, indent 0 other than the
 /// "Applications:" header, indent 1-2, a property-indent line after a blank that does not follow
-/// a name, and a property-indent line after TWO OR MORE blank lines that follow a name) are counted in
-/// `suspect_lines`; they never become apps. One shape at indent 0 is legitimate and not counted: a
-/// non-blank line that directly follows a property line with no blank between (a property value that
-/// wraps onto further lines, as the multi-line `Get Info String` of a real application does); it is
-/// part of that property, and the lines after it keep the property context. Measured on macOS 27.0.1
-/// (529 application blocks): every name line is followed by exactly ONE blank line, so a name line
-/// followed by two or more is the shape a dropped line leaves. A lost name line that takes its
-/// adjacent blank line with it leaves a block byte-identical to a canonical one and cannot be told. `command_ok` is false when the command did not run to a clean end
-/// (failed, timed out, over the output cap): the apps are then DROPPED, never returned as a partial
+/// a name, and a line at indent 5 or deeper after TWO OR MORE blank lines that follow a name) are
+/// counted in `suspect_lines`; they never become apps. One shape at indent 0 is legitimate and not
+/// counted: a non-blank line that directly follows a property line with no blank between (a
+/// property value that wraps onto further lines, as the multi-line `Get Info String` of a real
+/// application does); it is part of that property, and the lines after it keep the property
+/// context. Measured on macOS 27.0.1 (529 application blocks): every name line is followed by
+/// exactly ONE blank line, so a name line followed by two or more is the shape a dropped line
+/// leaves. A lost name line that takes its adjacent blank line with it leaves a block
+/// byte-identical to a canonical one and cannot be told.
+/// `command_ok` is false when the command did not run to a clean end (failed, timed out, over the
+/// output cap): the apps are then DROPPED, never returned as a partial
 /// list that would feed CVE matching or inventory.
 inline MacosEnumeration parse_system_profiler_apps(std::string_view out, bool command_ok) {
     MacosEnumeration r;

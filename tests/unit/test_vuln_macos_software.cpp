@@ -1,5 +1,5 @@
 /**
- * test_vuln_macos_software.cpp — WP13c: macOS software-enumeration coverage contract.
+ * test_vuln_macos_software.cpp — macOS software-enumeration coverage contract.
  *
  * The system_profiler call only runs under __APPLE__, so the decisions live in the portable
  * macos_software.hpp and are pinned here on every host.
@@ -108,7 +108,7 @@ TEST_CASE("macos commands: every argv[0] is an absolute path (no daemon-PATH res
 TEST_CASE("macos commands: bounds are set", "[vuln][macos]") {
     CHECK(kMacosCommandDeadlineMs == 60'000);
     CHECK(kMacosToolDeadlineMs == 10'000);
-    CHECK(kMacosToolDeadlineMs * 7 + kMacosCommandDeadlineMs == 130'000); // one action, nominal
+    CHECK(kMacosToolDeadlineMs * 7 + kMacosCommandDeadlineMs == 130'000); // one action, ceiling
     CHECK(kMacosCommandMaxOutput == 8u * 1024u * 1024u);
 }
 
@@ -1186,6 +1186,9 @@ TEST_CASE("wrapped property value: only a line directly after a property line is
     CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n\tcont\n", true).suspect_lines >= 1);
     CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n cont\n", true).suspect_lines == 1);
     CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n  cont\n", true).suspect_lines == 1);
+    // a tab line is never a wrapped value and does not leave the property context behind: the
+    // indent-0 line after it is counted too
+    CHECK(parse_system_profiler_apps(pre + "      Kind: x,\n\tcont\nnext\n", true).suspect_lines == 2);
     // the exemption is not a second `Version:` window: a wrapped value then a Version is still one
     CHECK(parse_system_profiler_apps(pre + "      Kind: x,\ncont\n      Version: 2\n", true).suspect_lines >= 1);
 }

@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""WP13c/C-2 lexical tripwire: the vuln_scan plugin must never execute Homebrew's brew.
+"""Lexical tripwire: the vuln_scan plugin must never execute Homebrew's brew.
 
 The macOS agent runs as root and a Homebrew prefix is owned by the installing (non-root) user,
-so running `brew` executes a user-controlled script as root (same defect as WP13/F19 in
-installed_apps). The macOS enumeration is `#elif defined(__APPLE__)`, so a behavioural test cannot
+so running `brew` executes a user-controlled script as root (installed_apps has the same
+defect, tracked in #8184). The macOS enumeration is `#elif defined(__APPLE__)`, so a behavioural test cannot
 run on Linux; pin the source text instead (best-effort lexical backstop, not a proof).
 
 Method: backslash-newline splices are removed first; a small C++ tokenizer strips comments WITHOUT
@@ -263,7 +263,9 @@ def pin_errors(root: pathlib.Path) -> list[str]:
             errs.append(f"declare_coverage(ctx, ...) must appear exactly {len(ACTIONS)} times in vuln_scan_plugin.cpp")
     # (f) no process-spawning call on a line a macOS build compiles
     for name, (code, _lits) in lexed.items():
-        for ln in apple_compiled_lines(code):
+        lines, struct_errs = apple_compiled_lines(code)
+        errs.extend(f"{name}: preprocessor structure: {e}" for e in struct_errs)
+        for ln in lines:
             m = SPAWN_CALL.search(re.sub(r'"[^"\n]*"', '""', ln))  # string contents are not calls
             if m:
                 errs.append(f"{name}: `{m.group(0)}` on a line a macOS build compiles "
@@ -272,44 +274,61 @@ def pin_errors(root: pathlib.Path) -> list[str]:
 
 
 # Calls that start a shell or a child process. A match is `name(` as a whole word.
-SPAWN_CALL = re.compile(r"\b(?:popen|system|fork|vfork|execl|execlp|execle|execv|execvp|execve|execvpe"
-                        r"|posix_spawn|posix_spawnp)\s*\(")
-_DIRECTIVE = re.compile(r"^[ \t]*#[ \t]*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+SPAWN_CALL = re.compile(r"\b(?:popen|system|fork|vfork|forkpty|wordexp|execl|execlp|execle|execv|execvp|execve"
+                        r"|execvpe|fexecve|execveat|posix_spawn|posix_spawnp)\s*\(")
+_DIRECTIVE = re.compile(r"^[ \t]*(?:#|%:)[ \t]*(if|ifdef|ifndef|elif|else|endif)\b(.*)$")
+_NON_APPLE_TEST = re.compile(r"^\s*(?:defined\s*\(\s*(?:__linux__|_WIN32)\s*\)|defined\s+(?:__linux__|_WIN32))\s*$")
+_APPLE_TEST = re.compile(r"^\s*(?:defined\s*\(\s*__APPLE__\s*\)|defined\s+__APPLE__)\s*$")
 
 
-def _may_compile_on_macos(kind: str, cond: str) -> bool:
-    """Whether a conditional branch can be compiled for macOS. Unknown conditions say yes."""
-    if kind == "ifndef" or "!" in cond or "__APPLE__" in cond:
-        return True
-    if "__linux__" in cond or "_WIN32" in cond:
+def _is_non_apple_test(kind: str, cond: str) -> bool:
+    """True only for an EXACT `__linux__` / `_WIN32` test (an `&&` chain with one such conjunct
+    also excludes macOS). Anything else (`||`, `!`, an unknown macro, `1`) may compile there."""
+    if kind == "ifdef":
+        return cond.strip() in ("__linux__", "_WIN32")
+    if kind not in ("if", "elif") or "||" in cond:
         return False
-    return True
+    return any(_NON_APPLE_TEST.match(part) for part in cond.split("&&"))
 
 
-def apple_compiled_lines(code: str) -> list[str]:
-    """The lines of (lexed) source that a macOS build compiles. A stack of conditional frames
-    tracks whether every enclosing branch can compile there; `#else` after an `__APPLE__` branch
-    is off, `#else` after only Linux/Windows branches is on."""
+def _is_apple_test(kind: str, cond: str) -> bool:
+    """True only for an EXACT `__APPLE__` test: the sole shape whose `#else` is off for macOS."""
+    if kind == "ifdef":
+        return cond.strip() == "__APPLE__"
+    return kind in ("if", "elif") and bool(_APPLE_TEST.match(cond))
+
+
+def apple_compiled_lines(code: str):
+    """(lines, errors): the lines of (lexed) source that a macOS build compiles, and structural
+    errors (an `#endif`/`#else`/`#elif` with no `#if`, an `#if` never closed). A stack of
+    conditional frames tracks whether every enclosing branch can compile there; `#else` after an
+    exact `__APPLE__` test is off, `#else` after anything else is on."""
     out: list[str] = []
-    stack: list[list] = []  # [branch_on, apple_branch_seen_in_chain]
+    errors: list[str] = []
+    stack: list[list] = []  # [branch_on, exact_apple_branch_seen_in_chain]
     for line in code.split("\n"):
         m = _DIRECTIVE.match(line)
         if m:
             kind, cond = m.group(1), m.group(2)
-            apple = "__APPLE__" in cond and "!" not in cond and kind != "ifndef"
+            apple = _is_apple_test(kind, cond)
+            on = not _is_non_apple_test(kind, cond)
             if kind in ("if", "ifdef", "ifndef"):
-                stack.append([_may_compile_on_macos(kind, cond), apple])
-            elif kind == "elif" and stack:
-                stack[-1][0] = _may_compile_on_macos(kind, cond) and not stack[-1][1]
+                stack.append([on if kind != "ifndef" else True, apple])
+            elif not stack:
+                errors.append(f"`#{kind}` with no open `#if`")
+            elif kind == "elif":
+                stack[-1][0] = on and not stack[-1][1]
                 stack[-1][1] = stack[-1][1] or apple
-            elif kind == "else" and stack:
+            elif kind == "else":
                 stack[-1][0] = not stack[-1][1]
-            elif kind == "endif" and stack:
+            else:  # endif
                 stack.pop()
             continue
         if all(f[0] for f in stack):
             out.append(line)
-    return out
+    if stack:
+        errors.append("an `#if` is never closed")
+    return out, errors
 
 
 # Lines the Apple glue must keep, pinned verbatim (whitespace-insensitive): (pattern, what breaks).

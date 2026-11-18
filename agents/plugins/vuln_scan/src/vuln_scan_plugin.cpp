@@ -342,7 +342,7 @@ std::vector<AppInfo> get_installed_apps(yuzu::vuln::CoverageState* cov) {
     const auto r = macos_profiler_read();
     auto parsed = yuzu::vuln::parse_system_profiler_apps(r.out, r.ok);
 
-    // Homebrew is deliberately NOT enumerated here (WP13c/C-2): the agent runs as root and a
+    // Homebrew is deliberately NOT enumerated here: the agent runs as root and a
     // Homebrew prefix is owned by the installing user, so exec'ing its `brew` script would run
     // a user-controlled file as root. Homebrew formulae and casks are listed by
     // pkg_inventory.packages (no subprocess); this plugin does not scan them.
@@ -503,7 +503,7 @@ void output_summary(yuzu::CommandContext& ctx, const std::vector<Finding>& findi
 //     actually exercised, so rung 3.
 //   - macOS: get_installed_apps and run_macos_checks run absolute-path argvs
 //     (/usr/sbin/system_profiler, spctl, fdesetup, csrutil, socketfilterfw, systemsetup, defaults)
-//     through yuzu::agent::run_bounded_subprocess — rung 2, an 8 MB output cap, a 60 s deadline
+//     through yuzu::agent::run_bounded_subprocess — rung 2, an 8 MiB output cap, a 60 s deadline
 //     for system_profiler and 10 s for each status read (seven: five tools, `defaults` twice). There is no open-port check on macOS
 //     (reported as an UNREADABLE row), so no macOS leg uses popen.
 //     cve_scan/scan/summary/inventory are CONSTRAINED: Homebrew formulae and casks are never

@@ -278,7 +278,7 @@ agent_test_exe = executable(
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
     'unit/test_vuln_single_flight.cpp', # vuln_scan single-flight/cache helper cannot wedge (portable)
-    'unit/test_vuln_macos_software.cpp', # WP13c: macOS enumeration status/abs-path contract (macos_software.hpp), portable
+    'unit/test_vuln_macos_software.cpp', # macOS enumeration status/abs-path contract (macos_software.hpp), portable
     'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
@@ -5190,7 +5190,7 @@ test('plugin init failed wiring lexical selftest',
   timeout: 30,
 )
 
-# WP13c/C-2: vuln_scan never executes Homebrew's brew (the macOS agent is root; a Homebrew prefix is
+# vuln_scan never executes Homebrew's brew (the macOS agent is root; a Homebrew prefix is
 # user-owned). String-literal-aware lexical gate over agents/plugins/vuln_scan/src/**; the selftest
 # injects each evasion shape (URL-in-string, "br" "ew", .mm, absolute path) and requires RED.
 test('vuln_scan no-brew lexical',
