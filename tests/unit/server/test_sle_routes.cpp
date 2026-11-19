@@ -27,6 +27,10 @@
 #include "test_route_sink.hpp"
 
 #include "agent_decommission.hpp" // DecommissionResult (the DELETE route)
+#include "audit_store.hpp"
+#include "auth_routes.hpp" // the REAL scoped gate (S1 route pin)
+#include "oidc_provider.hpp"
+#include "tag_store.hpp"
 #include "device_ci_read_gate.hpp" // kOrderingRetryAfterMs
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
@@ -34,15 +38,22 @@
 
 #include "pg/pg_pool.hpp"
 #include "../test_helpers.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePg
 #include "test_mgmt_group_pg_helper.hpp" // PG-backed ManagementGroupStore
+
+#include <yuzu/server/auth.hpp>
+#include <yuzu/server/server.hpp> // Config (AuthRoutes ctor)
 
 #include <catch2/catch_test_macros.hpp>
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdint>
 #include <functional>
+#include <memory>
 #include <optional>
+#include <shared_mutex>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -194,6 +205,58 @@ yuzu::test::PgTestTemplate sle_route_tpl{
         if (!store.is_open())
             throw std::runtime_error("sle_routes template: store failed to migrate");
     }};
+
+// Full-stack rig for the S1 ROUTE pin: a real RbacStore (enforcement on, seeded ITServiceOwner
+// ceiling), a real TagStore, a real ManagementGroupStore, a real ApiTokenStore and a real
+// AuthRoutes wired as ServerImpl wires it, so `require_scoped_permission` is the production gate
+// and not a stub.
+struct ServiceScopeRig {
+    Config cfg{};
+    auth::AuthManager auth_mgr{};
+    yuzu::server::pg::PgPool pool;
+    RbacStore rbac;
+    yuzu::test::ManagementGroupStorePg mgmt_bundle;
+    ManagementGroupStore& mgmt = *mgmt_bundle;
+    yuzu::test::ApiTokenStorePg api_tokens;
+    TagStore tags;
+    yuzu::server::pg::PgPool audit_pool;
+    AuditStore audit_store;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<oidc::OidcProvider> oidc_provider; // empty
+    std::unique_ptr<AuthRoutes> ar;
+
+    explicit ServiceScopeRig(const std::string& dsn)
+        : pool{{.conninfo = dsn, .size = 4}}, rbac{pool}, tags{pool},
+          audit_pool{{.conninfo = dsn, .size = 2}}, audit_store{audit_pool} {
+        REQUIRE(pool.valid());
+        REQUIRE(rbac.is_open());
+        REQUIRE(tags.is_open());
+        REQUIRE(audit_store.is_open());
+        rbac.set_rbac_enabled(true); // enforcement in effect: a service token is not legacy-open
+        REQUIRE(auth_mgr.upsert_user("minter", "correct-horse-battery-staple", auth::Role::admin));
+        ar = std::make_unique<AuthRoutes>(cfg, auth_mgr, &rbac, api_tokens.get(), &audit_store,
+                                          &mgmt, &tags, /*analytics_store=*/nullptr, oidc_mu,
+                                          oidc_provider);
+    }
+
+    std::string group(const std::string& name) {
+        ManagementGroup g;
+        g.name = name;
+        g.membership_type = "static";
+        const auto id = mgmt.create_group(g);
+        REQUIRE(id.has_value());
+        return *id;
+    }
+
+    std::string mint_service_token(const std::string& service) {
+        const auto now = std::chrono::duration_cast<std::chrono::seconds>(
+                             std::chrono::system_clock::now().time_since_epoch())
+                             .count();
+        const auto raw = api_tokens->create_token("s1-route-pin", "minter", now + 3600, service);
+        REQUIRE(raw.has_value());
+        return *raw;
+    }
+};
 
 } // namespace
 
@@ -595,6 +658,104 @@ TEST_CASE("sle erase: a real cascade writes the groups the device left into the 
     // The effect: agent-1 left both groups, the bystander kept its own.
     CHECK(mg.get_agent_groups("agent-1").value().empty());
     CHECK(mg.get_agent_groups("agent-2").value() == std::vector<std::string>{*edge});
+}
+
+// Governance S1 ROUTE pin (ADR-0024 Decision 9, owner ruling 2026-11-17). A service-scoped API
+// token passes `DELETE /api/v1/sle/agents/{id}` for a device carrying its service tag (the seeded
+// ITServiceOwner ceiling admits Decommission:Delete), and the cascade then removes that device's
+// memberships in EVERY group, including groups the token holds no authority over. The test drives
+// the REAL `AuthRoutes::require_scoped_permission` and the REAL cascade, so a change to the gate,
+// the ceiling, the tag check or the cascade shows here.
+TEST_CASE("sle erase: a service-scoped token through the real gate drops the device's memberships "
+          "in every group (S1 route pin)",
+          "[pg][sle_routes][authz][decommission][service_scope]") {
+    YUZU_REQUIRE_PG_DB_TPL(rbac_db_, rbac_tpl);
+    ServiceScopeRig r{rbac_db_.dsn()};
+
+    const auto edge = r.group("Edge");
+    const auto core = r.group("Core");
+    REQUIRE(r.tags.set_tag("svc-dev", "service", "printers").has_value());
+    REQUIRE(r.tags.set_tag("other-dev", "service", "billing").has_value());
+    for (const auto& g : {edge, core})
+        REQUIRE(r.mgmt.add_member(g, "svc-dev").has_value());
+    REQUIRE(r.mgmt.add_member(edge, "other-dev").has_value());
+    REQUIRE(r.mgmt.add_member(edge, "untagged-dev").has_value());
+
+    const auto token = r.mint_service_token("printers");
+
+    int cascade_calls = 0;
+    AgentDecommission cascade{AgentDecommissionStores{.management_group_memberships = &r.mgmt}};
+    yuzu::server::test::TestRouteSink sink;
+    SleRoutes routes;
+    routes.register_routes(
+        sink,
+        // Exactly the production wrapper in ServerImpl (sle_scoped_perm_fn) minus the store-usable
+        // probe: the gate under test is the real AuthRoutes::require_scoped_permission.
+        [&](const httplib::Request& req, httplib::Response& res, const std::string& type,
+            const std::string& op, const std::string& agent_id) {
+            return r.ar->require_scoped_permission(req, res, type, op, agent_id);
+        },
+        [](const std::string&) -> std::optional<std::vector<AgentLicenseRow>> {
+            return std::vector<AgentLicenseRow>{};
+        },
+        [&](const std::string& id) {
+            ++cascade_calls;
+            return cascade.decommission(id);
+        },
+        [](const httplib::Request&, const std::string&, const std::string&, const std::string&,
+           const std::string&, const std::string&) { return true; });
+    sink.default_headers["Authorization"] = "Bearer " + token;
+
+    // The asymmetry the ruling accepts: the same token cannot remove a member through the global
+    // ManagementGroup:Write gate (empty kServiceScopeGlobalSafe), yet the decommission below does.
+    {
+        httplib::Request req;
+        req.headers.emplace("Authorization", "Bearer " + token);
+        httplib::Response res;
+        CHECK_FALSE(r.ar->require_permission(req, res, "ManagementGroup", "Write"));
+        CHECK(res.status == 403);
+    }
+
+    SECTION("a device outside the token's service is refused and nothing is removed") {
+        const auto res = sink.Delete("/api/v1/sle/agents/other-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("other-dev").value() == std::vector<std::string>{edge});
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("an untagged device is refused and nothing is removed") {
+        const auto res = sink.Delete("/api/v1/sle/agents/untagged-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("untagged-dev").value() == std::vector<std::string>{edge});
+    }
+    SECTION("revoking the ITServiceOwner ceiling refuses the same request") {
+        REQUIRE(r.rbac.remove_permission("ITServiceOwner", "Decommission", "Delete").has_value());
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("a request with no credential is refused and nothing is removed") {
+        sink.default_headers.erase("Authorization");
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 401);
+        CHECK(cascade_calls == 0);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().size() == 2);
+    }
+    SECTION("a device in the token's service leaves every group; bystanders keep theirs") {
+        const auto res = sink.Delete("/api/v1/sle/agents/svc-dev");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(cascade_calls == 1);
+        CHECK(r.mgmt.get_agent_groups("svc-dev").value().empty());
+        CHECK(r.mgmt.get_agent_groups("other-dev").value() == std::vector<std::string>{edge});
+        CHECK(r.mgmt.get_agent_groups("untagged-dev").value() == std::vector<std::string>{edge});
+    }
 }
 
 // A write pause (a collation mismatch) is a Failed store with a DISTINCT reason: the 500 keeps its

@@ -872,14 +872,15 @@ TEST_CASE("authz_model decommission memberships: a group-scoped Decommission:Del
 }
 
 // Governance S1 pin (ADR-0024 Decision 9, owner ruling 2026-11-17). `Decommission:Delete` is the
-// authority to remove the device's membership rows in EVERY group, including groups the caller could
-// not otherwise write. This pins the INGREDIENTS of that asymmetry, not the route: the grant is
-// split from `ManagementGroup:Write` (check_permission), the seeded ITServiceOwner ceiling admits the
-// decommission pair, the seeded-empty global allow-list refuses the write, and the cascade (which
-// takes no caller) removes the memberships. It does not drive a service-scoped session through
-// `DELETE /api/v1/sle/agents/{id}`; that route-level test is a planned follow-up. The seeded ITServiceOwner ceiling admits `Decommission:Delete` for a service-scoped token (the
-// device's service tag must also match, a separate check), while the empty
-// `kServiceScopeGlobalSafe` keeps that same token out of the global ManagementGroup:Write gate.
+// authority to remove the device's membership rows in EVERY group, including groups the caller
+// could not otherwise write. This pins the INGREDIENTS of that asymmetry: the grant is split from
+// `ManagementGroup:Write` (check_permission), the seeded ITServiceOwner ceiling admits the
+// decommission pair for a service-scoped token (the device's service tag must also match, a
+// separate check), the seeded-empty `kServiceScopeGlobalSafe` keeps that same token out of the
+// global ManagementGroup:Write gate, and the cascade (which takes no caller) removes the
+// memberships. The ROUTE composition (a service-scoped token through the real
+// `AuthRoutes::require_scoped_permission` and `DELETE /api/v1/sle/agents/{id}`) is pinned in
+// test_sle_routes.cpp.
 TEST_CASE("authz_model: Decommission:Delete removes memberships without ManagementGroup:Write "
           "(S1 pin)",
           "[pg][authz][decommission]") {
