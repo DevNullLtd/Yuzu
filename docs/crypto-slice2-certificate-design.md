@@ -1167,11 +1167,12 @@ follow it with the name filters to cover those.
   fleet and a retry repeats it.
 - **A per-principal cap on caller-priced reads.** A substring read is a certificate read whose cost
   the caller picks by its needle, and a summary's cost grows with the visible fleet up to its wall
-  budget; the shared `/crypto` read gate has two slots. So at most **one** summary, or page carrying
-  `issuer_dn_contains` or `subject_dn_contains`, is in flight per principal (the session username); a
-  second answers a retryable 503 (cause capacity, reason `principal_busy`, `retry_after_ms` 5000) and
-  takes no gate slot. Callers whose identity cannot be resolved share one slot. An ordinary page
-  (keyset, index-backed) is never counted.
+  budget, and a page whose filter matches a rare value can walk the table up to the same budget; the
+  shared `/crypto` read gate has two slots. So at most **one** summary, or page carrying any filter
+  other than `agent_id`, `sha256` or `scope`, is in flight per principal (the session username); a
+  second answers a retryable 503 (cause capacity, reason `principal_busy`, `retry_after_ms` 15000)
+  and takes no gate slot. Callers whose identity cannot be resolved share one slot. An unfiltered or
+  key-addressed page is never counted. The cap is per server process.
 - **The `pg_trgm` decision rests on the worst-case needle, not p95.** A needle that matches nothing,
   or a short one that matches a little of everything, must read the whole dictionary; that is the
   worst case, because the dictionary has no index a substring can use without `pg_trgm`. At 100,000

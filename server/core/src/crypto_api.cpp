@@ -694,8 +694,9 @@ private:
     }
 
     /// The per-principal lease (CertPrincipalReadCap): a read the caller prices - any summary, or a
-    /// page carrying a substring filter - takes the principal's ONE slot; an ordinary page gets a
-    /// truthy, empty lease without touching the cap. Taken before cert_lease, so a refused read
+    /// page carrying any filter beyond agent_id/sha256/scope (cert_read::caller_priced_page) - takes
+    /// the principal's ONE slot; an unfiltered or key-addressed page gets a truthy, empty lease
+    /// without touching the cap. Taken before cert_lease, so a refused read
     /// never holds a shared gate slot.
     struct PrincipalLease {
         CertPrincipalReadCap::Lease lease;
@@ -705,7 +706,7 @@ private:
     PrincipalLease principal_lease(const CertReadFilter& f, const std::string& principal,
                                    bool summary) const {
         PrincipalLease out;
-        out.needed = summary || f.issuer_dn_contains.has_value() || f.subject_dn_contains.has_value();
+        out.needed = summary || cert_read::caller_priced_page(f);
         if (out.needed) {
             out.lease = (principal_cap_ext_ ? *principal_cap_ext_ : principal_cap_).try_acquire(principal);
             if (!out.lease)
@@ -716,10 +717,9 @@ private:
 
     static CryptoReadError principal_busy() {
         CryptoReadError e = capacity_in_use();
-        e.message = "another certificate summary or substring-filtered (issuer_dn_contains or "
-                    "subject_dn_contains) certificate read of yours is still running; retry when it "
-                    "completes";
-        e.retry_after_ms = 5000;
+        e.message = "another certificate summary or filtered certificate page of yours is still "
+                    "running (one at a time per user); retry when it completes";
+        e.retry_after_ms = 15000; // a read can hold the slot up to its 15 s wall budget
         return e;
     }
 

@@ -80,13 +80,14 @@ private:
 
 /// The per-principal bound on in-flight CALLER-PRICED certificate reads (#6333): every summary
 /// (`certificate_summary`, whose cost grows with the visible fleet, up to its 15 s wall budget)
-/// and every page that carries a substring filter (`issuer_dn_contains`, `subject_dn_contains`,
-/// whose cost the caller chooses by its needle). `CryptoReadGate` has only two process-wide
+/// and every page carrying a filter beyond `agent_id`/`sha256`/`scope`
+/// (`cert_read::caller_priced_page`: a rare value or a substring needle can make the keyset walk
+/// scan the table up to the wall budget). `CryptoReadGate` has only two process-wide
 /// slots: without this bound one principal could hold both with two such reads and shed every
 /// other `/crypto` read for up to two wall budgets. At most ONE such read per principal is in
 /// flight; a second is refused (the caller answers a retryable 503, cause capacity, reason
-/// `principal_busy`). An ordinary page (keyset, index-backed, no substring) never touches this
-/// bound, so one principal can still hold one caller-priced read plus one ordinary page. An empty
+/// `principal_busy`, retry hint 15 s). An unfiltered or key-addressed page never touches this
+/// bound, so one principal can still hold one caller-priced read plus one such page. An empty
 /// principal (a caller whose identity could not be resolved) shares ONE slot with every other
 /// such caller, so an unresolved identity is capped more tightly, never exempted. Taken BEFORE the
 /// shared gate lease, so a refused read never occupies a gate slot.

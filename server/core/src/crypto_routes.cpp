@@ -166,13 +166,13 @@ void api_unwired(httplib::Response& res) {
 /// caller is withheld - 403 naming no permission (none would admit them), audited `denied`.
 /// Returns true when the request may proceed (unconfined); otherwise the answer is written.
 /// The REST certificate reads' principal for the per-principal read cap (#6333): resolved for
-/// a summary, and for a page only when a substring filter is present (an ordinary page leaves it
-/// empty and never consults the cap). The fleet-read gate already authenticated the request, so a failed re-resolution is a
+/// a summary, and for a page only when it is caller-priced (cert_read::caller_priced_page; an
+/// unfiltered or key-addressed page leaves it empty and never consults the cap). The fleet-read gate already authenticated the request, so a failed re-resolution is a
 /// session that ended between the two calls; auth_fn then wrote the 401 and this returns false.
 bool cert_principal(const CryptoRoutes::Deps& d, const httplib::Request& req,
                     httplib::Response& res, const CertReadFilter& f, bool summary,
                     std::string& out) {
-    if (!summary && !f.issuer_dn_contains && !f.subject_dn_contains)
+    if (!summary && !cert_read::caller_priced_page(f))
         return true;
     if (!d.auth_fn)
         return true; // unwired (tests): "" shares the unresolved callers' single slot

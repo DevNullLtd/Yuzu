@@ -11,9 +11,11 @@
 /// WALL DEADLINE. `statement_timeout` bounds ONE statement, and a read runs several. So the whole
 /// transaction carries a steady_clock budget (`kReadTxnBudget`): before EVERY statement `run()`
 /// re-sets `statement_timeout` to the budget that remains, and a statement started with none left
-/// fails the read (a 503 upstream; a SUMMARY's, a non-retryable scale limit). One transaction
-/// therefore holds its pool lease and the vacuum horizon for at most the budget plus one round trip,
-/// however many statements it needs. A page makes TWO transactions (the page, then the coverage
+/// fails the read (a 503 upstream; a SUMMARY's, a non-retryable scale limit). The budget is enforced
+/// SERVER-side (statement_timeout), so with a reachable server one transaction holds its pool lease
+/// and the vacuum horizon for at most the budget plus one round trip, however many statements it
+/// needs; on a dead network path there is no client-side deadline and the wait is bounded only by
+/// the pool's tcp_user_timeout / keepalive settings (tens of seconds). A page makes TWO transactions (the page, then the coverage
 /// denominator), so a page request holds its admission slot for at most two budgets; a summary is one. (No reliance on `transaction_timeout`, which needs PG17+.)
 
 #include "certificate_inventory_store.hpp"
@@ -702,9 +704,14 @@ CertificateInventoryStore::summarize_certificates(const CertSummaryQuery& query,
                                    // A self-signed END-ENTITY certificate repeats its subject (which can
                                    // be a person's name) as its issuer: it is never an issuer GROUP.
                                    // Self-issued (issuer == subject) counts too, so a certificate
-                                   // whose self_signed the collector left unknown (NULL) is excluded.
+                                   // whose self_signed the collector left unknown (NULL) is excluded;
+                                   // with NO subject and self_signed not known false, it cannot be
+                                   // shown to differ from its subject, so it is excluded as well. A
+                                   // certificate whose is_ca is unknown is treated as not a CA.
                                    "f.issuer_dn IS NOT NULL AND NOT ((f.self_signed IS TRUE OR "
-                                   "(f.issuer_dn = f.subject_dn) IS TRUE) AND f.is_ca IS NOT TRUE)");
+                                   "(f.issuer_dn = f.subject_dn) IS TRUE OR "
+                                   "(f.subject_dn IS NULL AND f.self_signed IS NOT FALSE)) "
+                                   "AND f.is_ca IS NOT TRUE)");
             if (r.status() != PGRES_TUPLES_OK)
                 return false;
             const auto n = cap_flag(PQntuples(r.get()), kCertSummaryIssuerMax);
@@ -816,7 +823,9 @@ CertificateInventoryStore::fleet_status_counts(const std::vector<std::string>& a
     if (agent_ids.size() != os_buckets.size())
         return std::unexpected(fail(CertReadError::Kind::kInvalid, "agent_ids and os_buckets differ in length"));
     CertFleetStatusCounts out;
-    const std::vector<std::string> params = {pg::to_text_array(agent_ids), pg::to_text_array(os_buckets)};
+    const std::vector<std::string_view> id_views(agent_ids.begin(), agent_ids.end());
+    const std::vector<std::string_view> os_views(os_buckets.begin(), os_buckets.end());
+    const std::vector<std::string> params = {pg::to_text_array(id_views), pg::to_text_array(os_views)};
     const auto err = bounded(pool_, "fleet_status_counts", [&](PGconn* c, std::string& e) -> bool {
         // Folded entirely in SQL: at most (5 OS buckets x 5 statuses) rows come back, whatever the
         // fleet size. A device missing from the snapshot joins no row and is `unknown`.
@@ -831,7 +840,7 @@ CertificateInventoryStore::fleet_status_counts(const std::vector<std::string>& a
         if (r.status() != PGRES_TUPLES_OK)
             return false;
         for (int i = 0; i < PQntuples(r.get()); ++i)
-            out[{cell_s(r, i, 0), cell_s(r, i, 1)}] += cell_i64(r, i, 2);
+            out[std::make_pair(cell_s(r, i, 0), cell_s(r, i, 1))] += cell_i64(r, i, 2);
         return true;
     }, acquire_timeout, budget);
     if (err)

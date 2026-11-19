@@ -837,6 +837,13 @@ std::string_view degraded_message(CryptoReadCause cause) {
                                                     : "certificate inventory read degraded";
 }
 
+bool caller_priced_page(const CertReadFilter& f) {
+    return f.store || f.key_alg_oid || f.sig_alg_oid || f.ec_curve_oid || f.not_after_before ||
+           f.not_after_after || f.not_before_after || f.rsa_modulus_bits_lt || f.ec_order_bits_lt ||
+           f.is_ca || f.self_signed || f.issuer_dn || f.issuer_dn_contains || f.subject_dn_contains ||
+           f.spki_sha256 || f.aki_key_id;
+}
+
 std::string fleet_os_bucket(std::string_view reported_os) {
     if (reported_os == "windows" || reported_os == "linux" || reported_os == "darwin")
         return std::string(reported_os);

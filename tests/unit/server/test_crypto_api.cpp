@@ -2193,7 +2193,7 @@ TEST_CASE("CryptoApi certificates: one in-flight caller-priced read (summary or 
         CHECK(r.error().cause == CryptoReadCause::kCapacity);
         CHECK_FALSE(r.error().unavailable_until_restart);
         REQUIRE(r.error().retry_after_ms.has_value());
-        CHECK(*r.error().retry_after_ms == 5000);
+        CHECK(*r.error().retry_after_ms == 15000);
         CertSummaryQuery s;
         s.filter.subject_dn_contains = "test";
         s.filter.is_ca = true;

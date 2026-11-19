@@ -10673,9 +10673,11 @@ public:
                     certificate_inventory_store_->refresh_substring_index_state();
                     metrics_.gauge("yuzu_server_cert_inventory_substring_index_available")
                         .set(certificate_inventory_store_->substring_index_available() ? 1.0 : 0.0);
-                    // Worst case this pass holds the sweep thread for TWO 250 ms acquires (the
-                    // readiness re-check above and the rollup) plus the connect timeout (a pool that
-                    // must open a new connection) plus the 500 ms WALL budget of the rollup. The
+                    // With a reachable server this pass holds the sweep thread for at most TWO 250 ms
+                    // acquires (the readiness re-check above and the rollup) plus the connect timeout
+                    // (a pool that must open a new connection) plus the 500 ms WALL budget of the
+                    // rollup; the budget is server-side, so a dead network path is bounded only by
+                    // the pool's tcp_user_timeout / keepalive settings, as for the freshness gauges. The
                     // registry snapshot is two string copies per agent (id_os_snapshot, never the
                     // per-agent JSON build under the heartbeat mutex, gov perf-S2), and the fold is
                     // in SQL, so at most 25 rows come back whatever the fleet size.

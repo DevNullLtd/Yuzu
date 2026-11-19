@@ -888,7 +888,7 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
         h += "<span class=\"cry-grey\">" + std::to_string(layout.preserved_unknown) +
              (layout.preserved_unknown == 1 ? " widget" : " widgets") +
              " from another server version kept but not shown.</span>";
-    // The fleet certificate drill's entry point (slice-2 PR 2a-2b). Offered only to a caller the
+    // The fleet certificate drill's entry point. Offered only to a caller the
     // non-auditing probe says holds CertificateInventory:Read (confined included); the fragment
     // behind it gates again. It loads into the ONE drill panel, so no widget is added here.
     if (const auto ca = access(cw::WidgetGate::kFleetRead, "CertificateInventory", "Read");
@@ -896,7 +896,7 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
         h += "<button type=\"button\" class=\"cry-btn\" "
              "hx-get=\"/fragments/crypto/certificates\" hx-target=\"#" +
              std::string(kDrillPanelId) +
-             "\" hx-swap=\"innerHTML\" "
+             "\" hx-swap=\"innerHTML\" hx-disabled-elt=\"this\" "
              "title=\"Raw certificate facts from every device's machine certificate stores\">"
              "Fleet certificates</button>";
     h += "</div><div id=\"cry-dash-err\" class=\"cry-err\" role=\"alert\" hidden></div>";
@@ -1324,7 +1324,7 @@ std::string render_certificate_summary(const CertSummaryQuery& q, const CertSumm
     h += "<div><button type=\"button\" class=\"cry-btn pri\" "
          "hx-get=\"" + esc(certificates_page_url(CertQuery{.filter = q.filter})) +
          "\" hx-target=\"next .cry-cert-rows\" "
-         "hx-swap=\"innerHTML\">Show certificates</button><div class=\"cry-cert-rows\"></div></div>";
+         "hx-swap=\"innerHTML\" hx-disabled-elt=\"this\">Show certificates</button><div class=\"cry-cert-rows\"></div></div>";
     if (s.result_truncated)
         h += "<div class=\"cry-caveat\">Some groups were capped (row ceiling); counts of the "
              "groups shown are unaffected.</div>";

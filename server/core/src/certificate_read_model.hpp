@@ -134,6 +134,13 @@ inline constexpr std::string_view kAuditTarget = "fleet_certificates";
 /// SQL). The label set is bounded whatever an agent reports.
 [[nodiscard]] std::string fleet_os_bucket(std::string_view reported_os);
 
+/// True when a certificate PAGE's cost is the caller's to choose: it carries any filter beyond
+/// `agent_id`, `sha256` and `scope` (the key-addressed and closed ones). A rare value on any other
+/// filter can make the keyset walk scan the table up to the wall budget, so such a page takes the
+/// per-principal read slot (CertPrincipalReadCap) like a summary; an unfiltered or key-addressed
+/// page never does.
+[[nodiscard]] bool caller_priced_page(const CertReadFilter& f);
+
 // ── JSON ─────────────────────────────────────────────────────────────────────
 
 [[nodiscard]] nlohmann::json row_json(const CertReadRow& r);
