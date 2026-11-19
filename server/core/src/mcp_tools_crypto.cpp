@@ -667,6 +667,9 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
             refuse_input(read.error().message);
             return;
         }
+        (void)domain_row(ctx, "crypto.certificates.view", "failure", "CertificateInventory",
+                         std::string(crt::kAuditTarget),
+                         crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
         mcp_row(ctx, "failure",
                 crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
         if (read.error().unavailable_until_restart) { // pool too small, substring dictionary failed/absent
@@ -683,10 +686,15 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
                                  {}, true));
         return;
     }
-    const bool audit_ok =
-        mcp_row(ctx, "success",
-                crt::audit_detail("", parsed->filter, read->rows.size(), read->result_truncated,
-                                  !parsed->cursor.empty(), confined));
+    // The domain verb REST and the fragments write, so a verb-based audit of certificate
+    // reads sees agentic-worker reads too; the generic mcp.<tool> row is kept alongside.
+    const std::string ok_detail = crt::audit_detail("", parsed->filter, read->rows.size(),
+                                                    read->result_truncated,
+                                                    !parsed->cursor.empty(), confined);
+    const bool audit_ok = domain_row(ctx, "crypto.certificates.view", "success",
+                                     "CertificateInventory", std::string(crt::kAuditTarget),
+                                     ok_detail);
+    mcp_row(ctx, "success", ok_detail);
     auto payload = crt::list_json(*read);
     if (!audit_ok)
         payload["audit_persisted"] = false;
@@ -730,6 +738,9 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
             refuse_input(read.error().message);
             return;
         }
+        (void)domain_row(ctx, "crypto.certificates.summary", "failure", "CertificateInventory",
+                         std::string(crt::kAuditTarget),
+                         crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
         mcp_row(ctx, "failure",
                 crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
         if (read.error().unavailable_until_restart) { // pool too small, substring dictionary failed/absent, or a summary scale limit
@@ -746,10 +757,14 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
                                  {}, true));
         return;
     }
-    const bool audit_ok = mcp_row(
-        ctx, "success",
-        crt::audit_detail("", parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
-                          read->result_truncated, false, confined));
+    // Domain verb as on REST and the fragment; the generic mcp.<tool> row is kept alongside.
+    const std::string ok_detail = crt::audit_detail(
+        "", parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
+        read->result_truncated, false, confined);
+    const bool audit_ok = domain_row(ctx, "crypto.certificates.summary", "success",
+                                     "CertificateInventory", std::string(crt::kAuditTarget),
+                                     ok_detail);
+    mcp_row(ctx, "success", ok_detail);
     auto payload = crt::summary_json(*read);
     if (!audit_ok)
         payload["audit_persisted"] = false;
@@ -1042,12 +1057,12 @@ constexpr ToolRecord kToolRecords[] = {
      R"j({"type":"object","properties":{)j"
      R"j("store":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact store_id (free text, no enum): certificates with a location in this store, e.g. LocalMachine\\Root or a Linux trust-file root"},)j"
      R"j("scope":{"type":"string","enum":["machine"],"description":"Certificate scope; only machine stores are read in this release"},)j"
-     R"j("key_alg_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
-     R"j("sig_alg_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
-     R"j("ec_curve_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
-     R"j("not_after_before":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
-     R"j("not_after_after":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
-     R"j("not_before_after":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
+     R"j("key_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
+     R"j("sig_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
+     R"j("ec_curve_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
+     R"j("not_after_before":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
+     R"j("not_after_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
+     R"j("not_before_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
      R"j("rsa_modulus_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"RSA certificates whose modulus is smaller than this many bits (your threshold)"},)j"
      R"j("ec_order_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"EC certificates whose curve order is smaller than this many bits (your threshold)"},)j"
      R"j("is_ca":{"type":"boolean","description":"The certificate's own basic-constraints CA claim"},)j"
@@ -1056,9 +1071,9 @@ constexpr ToolRecord kToolRecords[] = {
      R"j("issuer_dn":{"type":"string","maxLength":1024,"description":"Exact issuer DN (RFC 4514 string); empty string selects certificates with an empty issuer"},)j"
      R"j("issuer_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of issuer_dn (% and _ are not wildcards). Finds a CA's certificates under any of its names, e.g. eMudhra then emSign"},)j"
      R"j("subject_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of subject_dn. Accepted ONLY together with is_ca=true (a subject search over end-entity certificates would be a search for a person); otherwise refused naming is_ca"},)j"
-     R"j("sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
-     R"j("spki_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
-     R"j("aki_key_id":{"type":"string","pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
+     R"j("sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
+     R"j("spki_sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
+     R"j("aki_key_id":{"type":"string","maxLength":128,"pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
      R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the filter set (refused if reused with other filters). Paged reads make no cross-page consistency promise"},)j"
      R"j("limit":{"type":"integer","minimum":1,"maximum":500,"default":100,"description":"Page size"})j"
      R"j(},"additionalProperties":false})j",
@@ -1092,12 +1107,12 @@ constexpr ToolRecord kToolRecords[] = {
      R"j({"type":"object","properties":{)j"
      R"j("store":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact store_id (free text, no enum): certificates with a location in this store, e.g. LocalMachine\\Root or a Linux trust-file root"},)j"
      R"j("scope":{"type":"string","enum":["machine"],"description":"Certificate scope; only machine stores are read in this release"},)j"
-     R"j("key_alg_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
-     R"j("sig_alg_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
-     R"j("ec_curve_oid":{"type":"string","pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
-     R"j("not_after_before":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
-     R"j("not_after_after":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
-     R"j("not_before_after":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
+     R"j("key_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
+     R"j("sig_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
+     R"j("ec_curve_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
+     R"j("not_after_before":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
+     R"j("not_after_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
+     R"j("not_before_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
      R"j("rsa_modulus_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"RSA certificates whose modulus is smaller than this many bits (your threshold)"},)j"
      R"j("ec_order_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"EC certificates whose curve order is smaller than this many bits (your threshold)"},)j"
      R"j("is_ca":{"type":"boolean","description":"The certificate's own basic-constraints CA claim"},)j"
@@ -1106,10 +1121,10 @@ constexpr ToolRecord kToolRecords[] = {
      R"j("issuer_dn":{"type":"string","maxLength":1024,"description":"Exact issuer DN (RFC 4514 string); empty string selects certificates with an empty issuer"},)j"
      R"j("issuer_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of issuer_dn (% and _ are not wildcards). Finds a CA's certificates under any of its names, e.g. eMudhra then emSign"},)j"
      R"j("subject_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of subject_dn. Accepted ONLY together with is_ca=true (a subject search over end-entity certificates would be a search for a person); otherwise refused naming is_ca"},)j"
-     R"j("sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
-     R"j("spki_sha256":{"type":"string","pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
-     R"j("aki_key_id":{"type":"string","pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
-     R"j("not_after_edges":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string","pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},"description":"Your bucket edges for the not_after histogram: strictly ascending RFC 3339 UTC instants. No edge is chosen for you; omit for no histogram"})j"
+     R"j("sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
+     R"j("spki_sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
+     R"j("aki_key_id":{"type":"string","maxLength":128,"pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
+     R"j("not_after_edges":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},"description":"Your bucket edges for the not_after histogram: strictly ascending RFC 3339 UTC instants. No edge is chosen for you; omit for no histogram"})j"
      R"j(},"additionalProperties":false})j",
      R"j({"type":"object","properties":{"totals":{"type":"object","properties":{"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}},"key_algorithms":{"type":"array","items":{"type":"object","properties":{"key_alg_oid":{"type":"string"},"rsa_modulus_bits":{"type":["integer","null"]},"ec_order_bits":{"type":["integer","null"]},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"signature_algorithms":{"type":"array","items":{"type":"object","properties":{"sig_alg_oid":{"type":"string"},"pss_hash_oid":{"type":["string","null"]},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"ec_curves":{"type":"array","items":{"type":"object","properties":{"ec_curve_oid":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"issuers":{"type":"array","items":{"type":"object","properties":{"issuer_dn":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"stores":{"type":"array","items":{"type":"object","properties":{"store_id":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"store_statuses":{"type":"array","items":{"type":"object","properties":{"status":{"type":"string"},"store_count":{"type":"integer"},"device_count":{"type":"integer"}}}},"not_after_histogram":{"type":"array","items":{"type":"object","properties":{"from":{"type":["string","null"]},"to":{"type":["string","null"]},"unknown":{"type":"boolean"},)j"
      R"j("device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"not_read":{"type":"array","items":{"type":"string"},"description":"What the collector does not read; an empty result is not proof of absence"},"coverage":{"type":"object","properties":{"devices_reporting":{"type":"integer","description":"In-scope devices with a certificate report"},"devices_included":{"type":"integer"},"confined":{"type":"boolean"}},"required":["devices_reporting","devices_included","confined"]},"issuers_note":{"type":"string","description":"Why self-signed or self-issued non-CA certificates are never an issuer group"},"result_truncated":{"type":"boolean","description":"True when ANY cut happened (see truncated_parts)"},"truncated_parts":{"type":"array","items":{"type":"string","enum":["page_limit","row_ceiling","byte_budget","locations_cap","sans_cap","constrained_store","constrained_certificate"]}},"blob_versions":{"type":"array","items":{"type":["integer","string"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["totals","key_algorithms","signature_algorithms","ec_curves","issuers","stores","store_statuses","not_after_histogram","not_read","coverage","result_truncated","truncated_parts","blob_versions"]})j",

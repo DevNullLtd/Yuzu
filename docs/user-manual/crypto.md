@@ -619,7 +619,10 @@ such condition; a self-signed end-entity certificate repeats its subject as its 
 reach a person's name, but it reaches nothing the exact `issuer_dn` filter does not already return to
 the same caller. This residual is disclosed, not owner-accepted: the owner ruling is pending (#8343). Both substring filters resolve through a distinct-DN dictionary (a table of every distinct issuer DN and CA
 subject DN), so they cost a scan of thousands of rows plus an index lookup, not a scan of every certificate. A
-substring matching more than 20,000 distinct names is refused with a `400` asking for a longer one. Until the
+substring matching more than 20,000 distinct names is refused with a `400` asking for a longer one. The
+20,000 is counted over the whole fleet's dictionary, not only the devices the caller can see, so a
+caller confined to part of the fleet can be refused because of names held elsewhere, and the refusal
+shows that more than 20,000 names across the fleet contain that substring. Until the
 background build has completed after a server start the two filters are refused with a retryable `503` (with a retry hint; non-retryable only if the dictionary failed deterministically)
 (see [server-admin.md](server-admin.md#the-substring-filter-dictionary-fleet-certificate-substring-filters)).
 
@@ -629,8 +632,12 @@ Each summary group (key algorithm, signature algorithm, curve, store) is capped 
 the issuer groups at 50; a capped summary sets `result_truncated` and `truncated_parts:
 ["row_ceiling"]`. A self-signed or self-issued (issuer equal to subject) certificate that is not a CA
 is never an issuer group, because its issuer repeats its subject, which can be a person's name; the response says so in `issuers_note`.
-A whole read, however many statements it needs, has a 15-second wall budget; past it the read is
-a `503` with a retry hint. String filter lengths are counted in **bytes**. `blob_versions` lists
+A whole read, however many statements it needs, has a 15-second wall budget; past it a page read is
+a `503` with a retry hint. A **summary** that reaches the budget is instead the non-retryable
+`scale_limit` `503` (no retry hint): narrow it with `agent_id`, `store` or another filter. A briefly
+overloaded database reaching the same deadline cannot be told apart from a scan that is too large,
+so one later retry of an unchanged summary may still succeed. A query cancelled well before the
+deadline is an ordinary retryable `503`. String filter lengths are counted in **bytes**. `blob_versions` lists
 the blob versions of the devices in the result (integers when numeric).
 
 ### Truncation never looks complete
@@ -674,8 +681,8 @@ release are the path for fleet-wide figures. Everything marked "no" carries no `
 
 ### Audit and degrade
 
-Every read is audited (`crypto.certificates.view`, `crypto.certificates.summary`; MCP
-`mcp.list_crypto_certificates`, `mcp.get_crypto_certificate_summary`). The detail records
+Every read is audited (`crypto.certificates.view`, `crypto.certificates.summary`, on every surface;
+MCP also writes its generic `mcp.list_crypto_certificates` / `mcp.get_crypto_certificate_summary` row). The detail records
 `scope=fleet|confined`, the row count, whether the result was truncated and the **names and operators**
 of the filters applied (for example `filters=issuer_dn=eq,not_after_before=lt`), **never a value, a
 subject or a SAN**. A DN typed into a filter can carry a person's name, so it never enters an audit row.
@@ -785,8 +792,8 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families), plus ` serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row, tying the audit row to the exact document handed out. |
 | `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
 | `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` (filtered or not), the drill with every Load more page, and `list_issued_certs` (filtered or not), under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. On the route and the tool a confined caller's or no-grant caller's refusal is a `denied` row with `withheld=confined` or `withheld=refused` (target `filtered` or `inventory`), and an access check that could not be completed is a `failure` row; the drill and the Settings panel write **no** `denied` row for a refused caller and the drill writes none when its access check is unavailable. That is tracked by #6384. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` write the same verb with target `Security` / `inventory` and detail `inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`. On the route and the tool every success row, filtered or not, ends `standing=available` (the only standing that is served; a caller with no `Inventory:Read` grant is refused and a failed access check is a `503`, see [Access](#access)). The Settings certificate panel is not audited. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every `Security:Read` holder whose `Inventory:Read` is unconfined (a global grant, or RBAC enforcement off); a confined caller and a caller with no `Inventory:Read` grant are refused. |
-| `crypto.certificates.view` | A page of fleet certificates is served (`GET /api/v1/crypto/certificates`, the `/fragments/crypto/certificates/devices` drill). MCP writes `mcp.list_crypto_certificates`. **REST fails closed** if the row cannot be written. See "Fleet certificates". |
-| `crypto.certificates.summary` | The certificate rollups are served (`GET /api/v1/crypto/certificates/summary`, the `/fragments/crypto/certificates` fragment). MCP writes `mcp.get_crypto_certificate_summary`. **REST fails closed.** |
+| `crypto.certificates.view` | A page of fleet certificates is served (`GET /api/v1/crypto/certificates`, the `/fragments/crypto/certificates/devices` drill). MCP writes this verb too, plus its generic `mcp.list_crypto_certificates` row. **REST fails closed** if the row cannot be written. See "Fleet certificates". |
+| `crypto.certificates.summary` | The certificate rollups are served (`GET /api/v1/crypto/certificates/summary`, the `/fragments/crypto/certificates` fragment). MCP writes this verb too, plus its generic `mcp.get_crypto_certificate_summary` row. **REST fails closed.** |
 | `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
 | `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 

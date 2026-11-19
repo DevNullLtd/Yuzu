@@ -137,8 +137,8 @@ shipped default). A service-scoped API token is refused 403 in both RBAC states,
 management-group-confined holder sees only its visible devices. An auditor testing the control
 should attempt `GET /api/v1/crypto/certificates` with a non-admin session on an RBAC-off install and
 expect `403` with the permission named in the body. Every read writes an audit row
-(`crypto.certificates.view`, `crypto.certificates.summary`; MCP `mcp.list_crypto_certificates`,
-`mcp.get_crypto_certificate_summary`) recording `scope=fleet|confined`, the row count, whether the
+(`crypto.certificates.view`, `crypto.certificates.summary` on every surface, MCP included; MCP also
+writes its generic `mcp.list_crypto_certificates` / `mcp.get_crypto_certificate_summary` row) recording `scope=fleet|confined`, the row count, whether the
 result was truncated and the NAMES and operators of the filters applied; **never a filter value, a
 subject or a SAN**. The REST routes **fail closed**: if the audit row cannot be written the response is
 503 with `Sec-Audit-Failed: true` and no data. The dashboard fragment and the MCP tools proceed with a

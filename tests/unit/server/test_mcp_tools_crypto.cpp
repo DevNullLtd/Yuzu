@@ -1132,6 +1132,33 @@ TEST_CASE("mcp crypto tools: the certificate reads key the per-principal read ca
     CHECK(audit_count(t.generic_rows, "mcp.list_crypto_certificates|failure") == 1);
 }
 
+TEST_CASE("mcp crypto tools: the certificate reads write the domain audit verb REST writes, plus the "
+          "generic mcp row",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    t.clear_audit();
+    REQUIRE_FALSE(t.call("list_crypto_certificates", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.view|success|CertificateInventory|fleet_certificates") == 1);
+    CHECK(audit_count(t.generic_rows, "mcp.list_crypto_certificates|success") == 1);
+    t.clear_audit();
+    REQUIRE_FALSE(t.call("get_crypto_certificate_summary", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.summary|success|CertificateInventory|fleet_certificates") == 1);
+    CHECK(audit_count(t.generic_rows, "mcp.get_crypto_certificate_summary|success") == 1);
+
+    t.api->cert_page = std::unexpected(degraded(CryptoReadCause::kCapacity));
+    t.api->cert_summary = std::unexpected(degraded(CryptoReadCause::kCapacity));
+    t.clear_audit();
+    REQUIRE(t.call("list_crypto_certificates", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.view|failure|CertificateInventory|fleet_certificates") == 1);
+    t.clear_audit();
+    REQUIRE(t.call("get_crypto_certificate_summary", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.summary|failure|CertificateInventory|fleet_certificates") == 1);
+}
+
 TEST_CASE("mcp crypto tools: the certificate reads refuse a bare subject substring, is_ca=false and a NUL "
           "needle before any read (guards 21/22)",
           "[mcp][crypto][certs]") {

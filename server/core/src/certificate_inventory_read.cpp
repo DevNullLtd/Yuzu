@@ -195,7 +195,9 @@ CertReadError as_summary_failure(CertReadError e) {
     if (e.kind == CertReadError::Kind::kQueryError && e.timed_out) {
         e.kind = CertReadError::Kind::kScaleLimit;
         e.message = "the summary exceeded its read budget for this many devices; narrow it with "
-                    "agent_id, store or another filter (the fleet-wide counts are a later release)";
+                    "agent_id, store or another filter (the fleet-wide counts are a later release). "
+                    "A briefly overloaded database can also cause this, so one later retry may "
+                    "succeed";
     }
     return e;
 }
