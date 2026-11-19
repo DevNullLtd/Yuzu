@@ -495,7 +495,8 @@ release when:
   adds or changes a file under `server/core/vendor/` or `server/core/static/`
   without its entry. Two kinds of file there are not held to an entry's
   SHA-256: a NOTICE a component names is checked only for its SPDX and
-  SHA-256 lines (its other text can change freely), and the first-party
+  SHA-256 lines (its other text can change freely, provided it stays UTF-8
+  with no NUL byte and holds no run of more than 64 hex digits), and the first-party
   `server/core/static/yuzu-*.js` and `yuzu.css` files (`first_party_patterns`,
   the directory itself only, never a subdirectory) are exempt. The image SBOMs stay a syft scan of the pushed image, but
   `docker-publish` and `docker-publish-chisel` then run `artifact-sbom.py

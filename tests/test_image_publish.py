@@ -1030,6 +1030,12 @@ def sbom_edit_order_errors(text, job):
     errs = [f"{job}: {r} appears {roles.count(r)} times, not once" for r in want if roles.count(r) != 1]
     if "augment" not in want and "augment" in roles:
         errs.append(f"{job}: runs augment, which this image does not take")
+    # An edit that may be skipped or fail without failing the job would let
+    # the tags move over an SBOM it never wrote (the release job's pair check
+    # would still refuse it, but only after the tags moved).
+    for st in load_steps(text, job):
+        if step_key(st) in ("augment", "mark-image"):
+            errs += [f"{job}: {step_key(st)} carries `{k}`" for k in ("if", "continue-on-error") if k in st]
     if errs:
         return errs
     at = {r: roles.index(r) for r in want}
@@ -1080,6 +1086,23 @@ class SbomEditOrder(unittest.TestCase):
                 self.assertNotEqual(mutant, text)
                 yaml.safe_load(mutant)   # still a workflow
                 self.assertTrue(sbom_edit_order_errors(mutant, job), f"{job}: {label} survived")
+
+    def test_a_skippable_or_soft_edit_step_is_refused(self):
+        text = RELEASE.read_text(encoding="utf-8")
+        for job in SBOM_EDIT_ORDER:
+            for role in ("augment", "mark-image"):
+                if role not in SBOM_EDIT_ORDER[job]:
+                    continue
+                lines, blocks, roles = _job_blocks(text, job)
+                s, _e = blocks[roles.index(role, roles.index("gate"))]
+                self.assertTrue(lines[s].startswith("      - name: "), lines[s])
+                for key in ("        if: always()", "        if: steps.gate.outcome == 'success'",
+                            "        continue-on-error: true"):
+                    with self.subTest(job=job, role=role, key=key):
+                        mutant = "\n".join(lines[:s + 1] + [key] + lines[s + 1:])
+                        yaml.safe_load(mutant)
+                        errs = sbom_edit_order_errors(mutant, job)
+                        self.assertTrue(any(f"{role} carries" in e for e in errs), errs)
 
     def test_a_dropped_or_added_augment_is_refused(self):
         text = RELEASE.read_text(encoding="utf-8")

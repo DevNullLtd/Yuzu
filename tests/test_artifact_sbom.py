@@ -1142,6 +1142,9 @@ class Units(unittest.TestCase):
                                                                                  SPDXID="SPDXRef-Package-vendored-"
                                                                                         "leftpad"))),
                                          "not in the manifest: leftpad"),
+            "one listed twice (CycloneDX)": (lambda c, s: c["components"].append(
+                next(x for x in c["components"] if x.get("bom-ref") == "vendored-three")),
+                                             "CycloneDX: listed twice: three"),
             "one listed twice (SPDX)": (lambda c, s: s["packages"].append(
                 next(p for p in s["packages"] if p["SPDXID"] == "SPDXRef-Package-vendored-htmx")),
                                         "SPDX: listed twice: htmx"),

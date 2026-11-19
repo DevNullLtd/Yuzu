@@ -337,7 +337,7 @@ class ScratchCopy(unittest.TestCase):
         # The id is used as it is in the CycloneDX bom-ref and the SPDXID, and
         # SPDX allows only [A-Za-z0-9.-]: anything else would make the two
         # halves name the component differently, so the manifest refuses it.
-        for bad in ("qr_codegen", "qr codegen", "qrcodegen/2", "qrcödegen"):
+        for bad in ("qr_codegen", "qr codegen", "qrcodegen/2", "qrcödegen", "qrcodegen\n", "qrcodegen:", ""):
             with self.subTest(id=bad):
                 def rename(m, bad=bad):
                     next(c for c in m["components"] if c["id"] == "qrcodegen")["id"] = bad
