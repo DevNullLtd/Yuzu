@@ -41,12 +41,14 @@
 ///    read. See ADR-0039.
 
 #include <atomic>
+#include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #include "bounded_audit_budget.hpp"
@@ -125,6 +127,22 @@ inline constexpr const char* kFacetDropBatchFailed = "batch_failed";
 /// server exports the series. Called once at startup from `ServerImpl`.
 void seed_response_facet_metrics(yuzu::MetricsRegistry& m);
 
+/// What `ResponseStore::store` did with a frame. A refusal of a TERMINAL frame by the per-pair cap
+/// is separate from a refusal of a non-terminal one: the first leaves the pair's terminal answer
+/// durable (the cap admits only while no terminal row exists), the second drops a frame whose
+/// output may carry membership.
+enum class StoreOutcome {
+    Stored,         ///< the frame is persisted
+    CappedTerminal, ///< a terminal frame the cap refused: the pair already holds a terminal row
+    CappedRunning,  ///< a non-terminal frame the cap refused: its output is not stored
+    Failed          ///< not persisted (store closed, a NUL in an identity field, or the transaction)
+};
+
+/// True when nothing the frame carried is lost: it is stored, or it is a refused terminal frame.
+[[nodiscard]] constexpr bool store_outcome_durable(StoreOutcome o) noexcept {
+    return o == StoreOutcome::Stored || o == StoreOutcome::CappedTerminal;
+}
+
 struct StoredResponse {
     int64_t id{0};
     std::string instruction_id;
@@ -183,6 +201,12 @@ struct ResponseQuery {
     std::optional<int64_t> until;
     int limit{100};
     int offset{0};
+    /// `query_by_execution` only: continue a newest-first read past the row with this
+    /// (`timestamp`, `id`), the last row of the previous page. Only rows that sort after it in
+    /// that read's order (`timestamp DESC, id DESC`) are returned, so a page boundary inside a
+    /// tied timestamp, or a row reaped between two pages, never skips or repeats a row (an
+    /// `offset` walk can do both). The other reads do not honour it.
+    std::optional<std::pair<int64_t, int64_t>> continue_after;
 };
 
 /// Management-group scope filter for `aggregate()`, `query()`, and
@@ -311,7 +335,9 @@ public:
     /// the pair's newest retained row (the one before the gap) so a reader can tell the tail
     /// was dropped.
     /// Exact semantics: response_cap_rules.hpp.
-    void store(const StoredResponse& resp);
+    /// Returns the outcome (see `StoreOutcome`; `store_outcome_durable` is the one-bit view the
+    /// ingest sites record as a lost answer). Callers that do not need it may ignore it.
+    StoreOutcome store(const StoredResponse& resp);
 
     /// Tri-state outcome of `finalize_terminal_status` so callers can
     /// distinguish "we updated rows in place" from "no matching RUNNING
@@ -346,6 +372,17 @@ public:
                                             const std::string& error_detail,
                                             const std::string& execution_id,
                                             int plugin_result_status);
+
+    /// Shortens the lifetime of the rows stored for `instruction_id` from `agent_id` so they expire
+    /// `keep` from now: one UPDATE of `ttl_expires_at` to the store's own clock (the source
+    /// `compute_ttl_epoch` uses) plus `keep`, only where the row has a LATER expiry, so it never
+    /// extends a lifetime and never gives a row kept forever (`ttl_expires_at = 0`, a server set to
+    /// keep responses forever) an expiry: such a row is left alone. For the quarantine
+    /// reconciler's recurring status replies, which would otherwise accumulate at the default
+    /// retention (#7627). Bounded acquire; returns false on any failure (the rows then keep the
+    /// lifetime they had). Not a read.
+    [[nodiscard]] bool shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
+                                   std::chrono::seconds keep);
 
     // -- Reads: the Forensics tier (#4990) -------------------------------------------------------
     //
@@ -400,6 +437,7 @@ public:
     /// `execution_id` is rejected (returns an engaged empty vector, NOT
     /// nullopt) — that sentinel is the legacy path; callers must fall back
     /// to `query()` if they support pre-PR-2 data. `scope`: see `query()`.
+    /// Order is `timestamp DESC, id DESC` (total); `q.continue_after` pages it by keyset.
     [[nodiscard]] std::optional<std::vector<StoredResponse>>
     query_by_execution(const std::string& execution_id, const ResponseTierFilter& tier,
                        const ResponseQuery& q = {},

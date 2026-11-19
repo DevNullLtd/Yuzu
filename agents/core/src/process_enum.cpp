@@ -8,6 +8,8 @@
 
 #include <yuzu/agent/process_enum.hpp>
 
+#include <wire_utf8.hpp> // yuzu::shared::utf8_scalar_len: the cap must not split a scalar
+
 #include <charconv>
 #include <cstdint>
 #include <iterator>
@@ -149,12 +151,32 @@ namespace detail {
 std::string read_proc_bytes(std::istream& in) noexcept {
     std::string out;
     try {
-        for (std::istreambuf_iterator<char> it(in), end; it != end; ++it)
+        for (std::istreambuf_iterator<char> it(in), end; it != end && out.size() < kProcReadCap;
+             ++it)
             out.push_back(*it);
     } catch (...) {
         // Keep what was read before the failure (see the declaration).
     }
+    if (out.size() == kProcReadCap)
+        trim_incomplete_utf8_tail(out);
     return out;
+}
+
+void trim_incomplete_utf8_tail(std::string& s) noexcept {
+    // A UTF-8 scalar is at most 4 bytes, so only the last 3 can be an unfinished one. Walk back
+    // over continuation bytes to the lead byte; a lead whose sequence does not complete inside
+    // `s` is cut off with its continuations. ASCII or a complete scalar at the end: untouched.
+    for (std::size_t k = 1; k <= 3 && k <= s.size(); ++k) {
+        const std::size_t i = s.size() - k;
+        const auto c = static_cast<unsigned char>(s[i]);
+        if (c < 0x80)
+            return;
+        if ((c & 0xC0u) == 0x80u)
+            continue; // continuation byte: keep walking back to its lead
+        if (yuzu::shared::utf8_scalar_len(s, i) == 0)
+            s.resize(i);
+        return;
+    }
 }
 
 #if defined(__linux__) || defined(__APPLE__)
@@ -183,6 +205,11 @@ void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
                 const auto pos = line.find_first_not_of(" \t", 5);
                 if (pos != std::string::npos)
                     pi.name = line.substr(pos);
+                // F16: the name is attacker-chosen bytes (prctl(PR_SET_NAME), the
+                // exe file name; the kernel escapes only '\n' and '\\'). Scrub to
+                // well-formed UTF-8 at collection so no downstream JSON/proto
+                // serialiser can be made to throw on it.
+                yuzu::shared::scrub_wire_bytes(pi.name);
                 got_name = true;
             } else if (!got_ppid && line.starts_with("PPid:")) {
                 if (const auto ppid = status_u32(line, 5))
@@ -195,7 +222,9 @@ void parse_proc_status(std::istream& in, ProcessInfo& pi) noexcept {
                     pi.user = uid_to_username(static_cast<uid_t>(*uid));
                 got_uid = true;
             }
-            // No early exit: the whole file is read so later fields stay reachable.
+            // No early exit (#6895, kept on purpose): the whole file is read so later fields stay
+            // reachable; /proc/<pid>/status is kernel-generated and about a kilobyte, so stopping
+            // after Uid: would save nothing measurable.
         }
     } catch (...) {
         // A failed read or an allocation failure keeps whatever parsed so far.
@@ -294,6 +323,7 @@ std::vector<ProcessInfo> enumerate_processes() {
                 // Trim trailing space
                 while (!raw.empty() && raw.back() == ' ')
                     raw.pop_back();
+                yuzu::shared::scrub_wire_bytes(raw); // F16: argv bytes are process-controlled
                 pi.cmdline = std::move(raw);
             }
         }
@@ -349,6 +379,7 @@ std::vector<ProcessInfo> enumerate_processes() {
         pi.pid = static_cast<uint32_t>(kprocs[i].kp_proc.p_pid);
         pi.ppid = static_cast<uint32_t>(kprocs[i].kp_eproc.e_ppid);
         pi.name = kprocs[i].kp_proc.p_comm;
+        yuzu::shared::scrub_wire_bytes(pi.name); // F16
 
         // User from credential UID
         uid_t uid = kprocs[i].kp_eproc.e_ucred.cr_uid;

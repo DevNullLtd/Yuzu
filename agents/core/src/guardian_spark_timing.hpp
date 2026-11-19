@@ -109,9 +109,14 @@
  *         sent=1  the local write succeeded, which is NOT receipt. A retried send produces
  *                 several T_wire lines for one event_id.
  *       domain=legacy (the non-Spark drift-sink path: no outbox, no T_detect):
- *         sent=0  the event was DROPPED (link down or Write() failed). There is no retry.
- *                 A legacy detection made before the sink is wired is dropped with NO line
- *                 at all, so the absence of a legacy T_wire does not prove nothing fired.
+ *         sent=0  the event was DROPPED: the link was down, Write() failed, or the event was
+ *                 refused locally as unsendable (an empty rule_id; no producer reaches this
+ *                 today; refused before any Write, so the executor treats it as Sent: no gap,
+ *                 no retry). There is no retry. A legacy detection made before the sink is
+ *                 wired is dropped with NO line at all, so the absence of a legacy T_wire does
+ *                 not prove nothing fired.
+ *         sent=1  the local write succeeded, which is NOT receipt.
+ *       A refused Spark entry logs no T_wire line at all, where a refused legacy event logs sent=0.
  *   - A T_wire line with no T_detect is normal, not an orphan: domain=lifecycle (armed,
  *     disarmed and errored events - a subscription LOSS produces a lifecycle "errored"
  *     entry - and journal replays from this or an earlier process), domain=health raised by

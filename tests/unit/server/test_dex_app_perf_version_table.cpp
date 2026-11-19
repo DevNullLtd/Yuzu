@@ -444,8 +444,9 @@ TEST_CASE("renderer source pins: no markup sinks, escaped agent strings, slate t
                                "--bad", "--warn", "gp-ok", "gp-err"})
         CHECK_FALSE(has(region, banned));
     // Every agent-controlled string goes through esc() or url_encode().
-    CHECK(has(region, "esc(r.perf.version)"));
-    CHECK(has(region, "esc(r.previous_version)"));
+    // (esc_text is the text-node form: the same escape plus visible markers for control characters.)
+    CHECK(has(region, "esc_text(r.perf.version)"));
+    CHECK(has(region, "esc_text(r.previous_version)"));
     CHECK(has(region, "url_encode(app_name)"));
     CHECK(has(region, "url_encode(active_version)"));
 }

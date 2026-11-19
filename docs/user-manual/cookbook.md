@@ -1000,9 +1000,10 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `security.vuln_scan.scan` | vuln scan | Q | WLM | *(none)* | severity:string, category:string, title:string, detail:string |
 | `security.vuln_scan.summary` | vuln summary | Q | WLM | *(none)* | severity:string, count:int32 |
 | `security.encryption.state` | bitlocker | Q | WLM | *(none)* | volume:string, protection_status:string, encryption_method:string |
-| `security.quarantine.status` | status | Q | WLM | *(none)* | state:string, whitelist:string |
-| `security.quarantine.isolate` | isolate | A | WLM | server_ip:string, whitelist_ips:string | status:string, rules_applied:int32 |
-| `security.quarantine.release` | release | A | WLM | *(none)* | status:string |
+| `security.firewall.quarantine_status` | quarantine status | Q | WLM | *(none)* | row:string, value:string |
+| `security.firewall.quarantine` | quarantine | A | WLM | exceptions:string, ttl_seconds:string, probe_target:string | row:string, value:string |
+| `security.firewall.release` | release | A | WLM | *(none)* | row:string, value:string |
+| `security.firewall.quarantine_allow` | quarantine allow | A | WLM | op:string (req), exceptions:string (req) | row:string, value:string |
 | `security.sccm.client_version` | sccm version | Q | W | *(none)* | installed:bool, version:string, service_status:string |
 
 ### File System

@@ -62,6 +62,19 @@
 /// existing admin-only posture across a gate migration, OR it returns the
 /// audit evidence itself. A new entry must fit one of the three.
 ///
+/// ADR-0070 R1 (revocation sources, slice 2b-1a) added a further inclusion class: an
+/// OPERATOR-REGISTERED EGRESS TARGET. `RevocationSource:Read` returns the CRL URLs an
+/// administrator registered for the server to fetch, with their confirmed address classes and
+/// per-URL fetch status, and the registered URLs map internal network topology (an internal CDP
+/// host name, an RFC 1918 address). The read is not authorization topology, not a gate migration
+/// and not audit evidence, so the test is now: the read discloses authorization topology, OR it
+/// preserves an existing admin-only posture across a gate migration, OR it returns the audit
+/// evidence itself, OR it discloses operator-registered egress targets. (A certificate-inventory
+/// PR that lands alongside adds its own class for new fleet-wide copies of endpoint data; the
+/// classes are independent, and a new entry must fit at least one.) The pair is ALSO behind the
+/// durable-administrator predicate (`revocation_source_admin_gate.hpp`) in BOTH RBAC states, so
+/// this floor is the RBAC-off half of a two-part control and the predicate is the RBAC-on half.
+///
 /// EXTEND this set, never fork it — a second copy of a floor set is exactly
 /// the kind of drift the repo's other chokepoints (`dispatch_confined_arms.hpp`,
 /// `principal_quota_gate.hpp`) exist to prevent.
@@ -132,6 +145,12 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     // PlatformEngineer, Operator, ITServiceOwner, Viewer, or a custom role)
     // still admits: the floor never runs ahead of the RBAC-on branch.
     {"AuditLog", "Read"},
+    // ADR-0070 R1 (slice 2b-1a) — registered CRL sources: operator-registered egress targets (see
+    // the file-header note above). Write is already admin-only in the legacy branch (any non-Read
+    // operation needs admin), so only Read needs a floor entry. A live RBAC grant still admits
+    // here - and the surface's own administrator predicate then refuses every non-administrator,
+    // so no grant of this pair is ever enough on its own.
+    {"RevocationSource", "Read"},
 };
 
 /// True when `(securable, operation)` is in the topology floor, i.e. the

@@ -18,9 +18,7 @@
  * ZERO SUBPROCESS. Every fact is a directory name or a metadata file read
  * (rung 1); no `java` or `dotnet` process is ever started.
  *
- * SHIPPED LEGS. Linux (all three actions); macOS and Windows ship `python` only. Their dotnet and
- * jvm legs are declared PLANNED in the table below (the mechanism string names the planned read);
- * until they ship they report `status|<action>|unsupported|<macos|windows>:planned`.
+ * SHIPPED LEGS. All three actions on Linux, macOS and Windows.
  *
  * This TU is portable except for its single dispatch #if, which selects the
  * one host leg to call -- so a single-OS build never links the other two
@@ -43,7 +41,6 @@ namespace {
 
 // The nine per-action per-OS legs (three actions x three OSes) are FIXED and
 // never wrapped in a preprocessor conditional.
-constexpr const char* kPlannedNote = "planned; the action answers a single unsupported status row on this OS";
 
 const YuzuActionDescriptor kActionDescriptors[] = {
     {
@@ -54,10 +51,15 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "and sdk/<version> directory walk; network mounts skipped via /proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1, "/usr/local/share/dotnet/shared walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/usr/local/share/dotnet (and x64/) shared/<framework>/<version> and sdk/<version> "
+         "directory walk; network mounts skipped via getmntinfo_r_np",
+         nullptr},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "NDP release-key table + dotnet InstalledVersions + Program Files walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM\\SOFTWARE\\dotnet\\Setup\\InstalledVersions\\<arch>\\{sharedfx,sdk} values + "
+         "NDP v4 Full Release key table and v3.5 Version, both registry views; no filesystem walk",
+         nullptr},
     },
     {
         /* .action      = */ "jvm",
@@ -68,12 +70,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "/proc/self/mountinfo",
          nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_PLANNED, 1,
-         "/Library/Java/JavaVirtualMachines/*/Contents/Info.plist JavaVM dict + "
-         "Contents/Home/release",
-         kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "/Library/Java/JavaVirtualMachines/*/Contents/Home/release read (Contents/Info.plist "
+         "JavaVM dict fallback); network mounts skipped via getmntinfo_r_np",
+         "fixture-verified only: no JDK is installed on the macOS development host, so this leg "
+         "rests on trees built from the documented bundle layout"},
         /* .windows_leg = */
-        {YUZU_SUPPORT_PLANNED, 1, "JavaSoft keys + Program Files\\Java walk", kPlannedNote},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "HKLM JavaSoft, Eclipse Adoptium, Microsoft JDK and Azul Zulu keys (both views) + one "
+         "<home>\\release read; no Program Files walk",
+         nullptr},
     },
     {
         /* .action      = */ "python",

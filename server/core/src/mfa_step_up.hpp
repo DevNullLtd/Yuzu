@@ -36,12 +36,20 @@
 ///   - `window_secs <= 0`: operator-disabled the gate (escape hatch
 ///     for diagnostic / break-glass scenarios; emits a startup WARN
 ///     in main.cpp).
+/// Two rows are the exception to the first and third skips (`StepUpClass::kFactorCredential`:
+/// recovery codes, disable MFA): the window is the approver window whatever is configured (the
+/// hatch never applies), and only a LOCAL session may pass (any other auth source, a bearer
+/// principal included, is a 403, `reason=factor_credential_requires_local_session`). The
+/// un-enrolled skip is NOT excepted: `decide_step_up` still passes a local caller with no enrolled
+/// factor and returns the admission, so a provisional enrolment can be cancelled.
 ///
 /// Requires step-up (returns false) when:
 ///   - principal is a local session ("local" auth_source) AND user is
 ///     MFA-enrolled, OR principal is an OIDC session (PR3 — no local
 ///     enrollment lookup; gated on the `amr`-seeded timestamp); AND
-///   - `now - session.mfa_verified_at > window_secs`
+///   - for a local session, the stored proof is missing, not bound to the factor enrolled now
+///     (401 with a `reason`, see below), or older than `window_secs` on the cached anchor or on
+///     the database clock; for OIDC, `now - session.mfa_verified_at > window_secs`
 ///
 /// OIDC interop (PR3): an OIDC session carries no local `users` row, so
 /// the enrollment lookup is skipped for it. Its `mfa_verified_at` is
@@ -67,7 +75,8 @@
 ///     and `/auth/oidc/start` for OIDC sessions.
 ///   - emits audit row: `mfa.step_up.required`, result=`error`,
 ///     target_type=`Endpoint`, target_id=`<action_label>`, detail=
-///     stale or absent proof: `user=<name> age_secs=<n> window_secs=<n>`; every other refusal:
+///     stale or absent proof: `user=<name> age_secs=<n> window_secs=<n>` (plus ` reason=<token>`
+///     when the proof was refused for its binding); every other refusal:
 ///     `user=<name> reason=<token>`. A central-chokepoint row appends ` cid=<id>
 ///     stage=pre_authz`; a row written by an in-handler call carries neither.
 
@@ -109,13 +118,26 @@ using StepUpAuditFn = std::function<bool(const httplib::Request&,
 /// `yuzu_auth_secret_unavailable_total{route="mfa_stepup"}` on the fail-
 /// closed 503 branch (store/decrypt outage), so an operator can see this
 /// gate's outage rate on the same series as the other fail-closed auth
-/// routes (sre BLOCKING, governance hardening round).
+/// routes (sre BLOCKING, governance hardening round); a binding decision that
+/// could not be made (unreadable stored proof, unenforced generation trigger)
+/// counts on `route="mfa_binding"` instead.
+///
+/// `durable_proof` is the per-request read of the session's stored proof
+/// (`AuthRoutes::durable_mfa_proof_for`). A LOCAL ENROLLED caller is judged on it
+/// (`judge_local_mfa_binding`: the proof must be bound to the factor enrolled now, and
+/// inside the window on the database clock as well as the cached anchor); no other caller
+/// ever reads it. Null (or empty) is fail-closed: such a caller is refused 503, never
+/// judged without the proof. `admitted`, when not null, receives what a PASS admitted for
+/// a local account (`StepUpAdmission`); pass nullptr for the 39 `kRequired` rows. The row's
+/// class is resolved from `action_label` (`step_up_policy_for_label`), so the two
+/// `kFactorCredential` labels get the approver window with no hatch, the local-session-only
+/// rule and the admission here exactly as the central chokepoint gives them; an unknown
+/// label is `kRequired`.
 bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
-                         const auth::Session& session, AuthDB& auth_db,
-                         int window_secs, const StepUpAuditFn& audit_fn,
-                         const std::string& action_label,
-                         std::string_view mfa_enforcement = "optional",
-                         yuzu::MetricsRegistry* metrics = nullptr);
+                         const auth::Session& session, AuthDB& auth_db, int window_secs,
+                         const StepUpAuditFn& audit_fn, const std::string& action_label,
+                         std::string_view mfa_enforcement, yuzu::MetricsRegistry* metrics,
+                         const DurableProofFn* durable_proof, StepUpAdmission* admitted);
 
 /// Classify the second factor `session` stands on (see `MfaFactorState`). The
 /// session's OWN factor only: an OIDC or bearer session is never looked up by
@@ -128,8 +150,11 @@ bool require_mfa_step_up(const httplib::Request& req, httplib::Response& res,
 /// proof no older than `approver_step_up_window(configured_window_secs)`. Unlike
 /// `require_mfa_step_up` there is no `window_secs <= 0` escape hatch, no bearer
 /// exemption, no pass for an un-enrolled account and no enforcement-dependent OIDC
-/// pass. A local proof stamped before the current enrolment (the factor was cleared
-/// and re-enrolled since) does not count.
+/// pass. A local proof must belong to the factor enrolled now: a proof bound to a factor
+/// generation is judged by equality with the account's current generation
+/// (`judge_local_mfa_binding`; a mismatch is a 401 with `reason=proof_factor_mismatch`, an
+/// unreadable read or an unenforced binding trigger a 503). A proof with no generation is
+/// refused too (a 401 with `reason=proof_factor_unbound`): there is no instant rule.
 ///
 /// The ceiling is hard and measured on the database clock. `durable` is the caller's
 /// authoritative read of the session's stored proof (`AuthManager::read_durable_mfa_proof`):
@@ -187,9 +212,7 @@ struct ProofAge {
     long long age_secs{-1}; ///< whole seconds on the monotonic anchor; -1 when `no_proof`
     /// Milliseconds on the monotonic anchor; -1 when `no_proof`. `fresh` compares the
     /// whole-second age (a proof 300.5 s old is still fresh in a 300 s window); a caller
-    /// needing a hard ceiling compares this instead. The approver gate compares it (with
-    /// `no_proof`) and adds its own durable, database-clock ceiling; it does not consult
-    /// `wall_stale`.
+    /// needing a hard ceiling compares this instead, as the approver gate does.
     long long age_ms{-1};
     bool wall_stale{false}; ///< the absolute (wall) proof age is grossly past the window
 };
@@ -201,13 +224,13 @@ struct ProofAge {
                                      std::chrono::seconds effective_window);
 
 /// Write the 401 step-up envelope (challenge_url differs for OIDC vs local) and emit
-/// one `mfa.step_up.required` row. `extra_detail`, when non-empty, is appended to the
-/// row's detail. An audit failure or throw is logged and otherwise ignored.
+/// one `mfa.step_up.required` row. `reason`, when non-empty, is the refusal token the row
+/// appends as ` reason=<token>` (a static literal: the verdict only views it). An audit
+/// failure or throw is logged and otherwise ignored.
 void write_step_up_challenge(const httplib::Request& req, httplib::Response& res,
                              const auth::Session& session, bool is_oidc,
                              const StepUpAuditFn& audit_fn, const std::string& action_label,
-                             long long age_secs, int window_secs,
-                             std::string_view extra_detail = {});
+                             long long age_secs, int window_secs, std::string_view reason = {});
 
 } // namespace detail
 

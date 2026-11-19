@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""test_instructions_runner_hardening.py - the destructive/forensic path of the /test
---instructions runner against a fake Yuzu server (#5261, governance rounds).
+"""Instruction-runner broadcast verdicts and destructive/forensic safeguards.
+
+Broadcast grading drives exercise() with a fake client/clock and also checks pagination
+through the real HTTP client. The targeted tests retain the #5261 governance coverage.
 
 A targeted run changes or reads a real device, so these tests drive ir.main() end to end against
 an in-process HTTP server on an ephemeral 127.0.0.1 port and assert what the server SAW: which
@@ -65,9 +67,10 @@ class FakeYuzu:
                         "agent_version": "9.9.9"}]
         self.agents_code = 200
         self.agents_raw = None         # bytes: replaces the /api/agents body
-        self.polls = lambda command_id, n: GOOD      # -> rows for poll number n of a command
+        self.polls = lambda command_id, n: [{**row(), "instruction_id": command_id}]      # -> rows for poll number n of a command
         self.responses_raw = None      # bytes: replaces the /api/responses body
         self.responses_code = 200
+        self.response_pages = None     # offset -> rows, for the real client's pagination path
         self.poll_script = None        # callable(command_id, n) -> (http code, body bytes)
         self.execute_headers = {}      # headers on the execute answer (e.g. a Location)
         self.execute_mode = ""         # "rst" or "close": drop the connection after reading the request
@@ -104,15 +107,19 @@ class FakeYuzu:
                         json.dumps(fake.agents).encode()
                     self._send(fake.agents_code, body)
                 elif self.path.startswith("/api/responses/"):
-                    cid = self.path.rsplit("/", 1)[1]
+                    parsed = ir.urllib.parse.urlsplit(self.path)
+                    cid = parsed.path.rsplit("/", 1)[1]
+                    offset = int(ir.urllib.parse.parse_qs(parsed.query).get("offset", [0])[0])
                     with fake._lock:
                         n = fake._polled[cid] = fake._polled.get(cid, 0) + 1
                     if fake.poll_script:
                         code, body = fake.poll_script(cid, n)
                         self._send(code, body)
                         return
+                    rows = (fake.response_pages[offset] if fake.response_pages is not None
+                            else fake.polls(cid, n))
                     body = fake.responses_raw if fake.responses_raw is not None else \
-                        json.dumps({"responses": fake.polls(cid, n)}).encode()
+                        json.dumps({"responses": rows}).encode()
                     self._send(fake.responses_code, body)
                 else:
                     self._send(404, b"{}")
@@ -144,7 +151,7 @@ class FakeYuzu:
                         self.close_connection = True
                         return
                     code, body, delay = fake.execute(post) if fake.execute else \
-                        (200, json.dumps({"command_id": "c-" + post["id"]}).encode(), 0.0)
+                        (200, json.dumps({"command_id": "c-" + post["id"], "agents_reached": 1}).encode(), 0.0)
                     self._send(code, body, delay, fake.execute_headers)
                 finally:
                     with fake._lock:
@@ -545,7 +552,7 @@ class Attribution(RunnerCase):
 
     def test_targeted_definitions_run_one_at_a_time(self):
         defs = [definition(f"t.d{i}", "destructive") for i in range(4)]
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.1)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.1)
         r = self.run_runner(defs, overrides={d["id"]: {} for d in defs}, extra=["--parallelism", "4"])
         self.assertEqual(r.rc, 0, r.err)
         self.assertEqual(self.fake.max_inflight, 1)
@@ -555,7 +562,7 @@ class Attribution(RunnerCase):
         defs = [definition("t.clear", "destructive"), definition("t.path", "destructive", required=["p"]),
                 definition("t.appr", "destructive")]
         self.fake.execute = lambda post: (202, b'{"status": "pending_approval", "approval_id": "a1"}', 0) \
-            if post["id"] == "t.appr" else (200, json.dumps({"command_id": "c"}).encode(), 0)
+            if post["id"] == "t.appr" else (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0)
         r = self.run_runner(defs, overrides={"t.clear": {}, "t.appr": {}})
         self.assertIn("TARGETED RUN target=agent-under-test host=Box-1 os=linux version=9.9.9", r.out)
         self.assertIn("covered=2 skipped=1", r.out)
@@ -784,7 +791,7 @@ class ErrorsAndAbort(RunnerCase):
         self.assertEqual(self.fake.posted_ids(), ["t.d0", "t.d2"])
 
     def slow_posts(self, delay=0.4):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), delay)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), delay)
 
     def test_interrupt_stops_dispatch_and_keeps_the_record(self):
         defs = [definition(f"t.q{i}", "destructive") for i in range(12)]
@@ -858,7 +865,7 @@ class ErrorsAndAbort(RunnerCase):
 
         class Client:
             def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+                return 200, {"command_id": "c", "agents_reached": 1}
 
             def get_responses(self, command_id):
                 control.request_stop()
@@ -873,7 +880,7 @@ class ErrorsAndAbort(RunnerCase):
 
     def test_an_interrupt_during_a_stalled_dispatch_reports_it_as_in_flight(self):
         defs = [definition(f"t.q{i}", "destructive") for i in range(3)]
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 1.6)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 1.6)
         with self.interrupt_after_posts(1):
             r = self.run_runner(defs, overrides={d["id"]: {} for d in defs})
         self.assertEqual(r.rc, 130)
@@ -889,7 +896,7 @@ class ErrorsAndAbort(RunnerCase):
     @unittest.skipIf(sys.platform == "win32", "os.kill(SIGTERM) terminates a Windows process")
     @unittest.skipUnless(threading.current_thread() is threading.main_thread(), "signals need the main thread")
     def test_sigterm_takes_the_same_path_as_ctrl_c(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 1.6)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 1.6)
         # A no-op baseline: if main() installed nothing, the SIGTERM below is swallowed and the
         # assertions fail, instead of the signal killing the test process.
         self.addCleanup(signal.signal, signal.SIGTERM, signal.getsignal(signal.SIGTERM))
@@ -1159,7 +1166,7 @@ class Supplemental(RunnerCase):
         def execute(post):
             c = next(codes)
             body = b'{"error": {"code": 401, "message": "no"}}' if c == 401 else \
-                json.dumps({"command_id": "c"}).encode()
+                json.dumps({"command_id": "c", "agents_reached": 1}).encode()
             return c, body, 0
 
         self.fake.execute = execute
@@ -1193,44 +1200,170 @@ class Supplemental(RunnerCase):
         self.assertNotIn("warning: override for t.d1", r.err)
 
 
-class SafeGradingUnchanged(unittest.TestCase):
-    """Safe/mutating grading is deliberately the original one (a separate follow-up)."""
+class BroadcastGrading(unittest.TestCase):
+    """Drive the real exercise path with production-shaped rows and a deterministic clock."""
 
-    def grade(self, rows, timeout=2):
+    def setUp(self):
+        self.now = 0.0
+        self.calls = []
+        self.addCleanup(ir._INTERRUPT.clear)
+        ir._INTERRUPT.clear()
+        for name, value in (("monotonic", lambda: self.now), ("sleep", self.advance)):
+            patch = mock.patch.object(ir.time, name, value)
+            patch.start()
+            self.addCleanup(patch.stop)
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    def grade(self, *polls, risk="safe", reached=1, timeout=2, payload=None):
+        owner = self
+
+        class Client:
+            n = -1
+
+            def execute_instruction(self, def_id, params):
+                return 200, payload if payload is not None else {"command_id": "c", "agents_reached": reached}
+
+            def get_responses(self, command_id, *, offset=0):
+                owner.calls.append((command_id, offset))
+                if offset == 0:
+                    self.n += 1
+                answer = polls[min(self.n, len(polls) - 1)]
+                if callable(answer):
+                    return answer(offset)
+                return {"responses": answer} if isinstance(answer, list) else answer
+
         d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
-                          result_columns=[], approval_mode="auto", risk="safe", file="g.yaml")
+                          result_columns=[], approval_mode="auto", risk=risk, file="g.yaml")
+        return ir.exercise(Client(), d, {}, timeout)
 
-        class C:
-            def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+    def test_success_including_empty_or_error_looking_output_passes(self):
+        for risk in ("safe", "mutating"):
+            for output in ("", "error|0|legitimate data"):
+                with self.subTest(risk=risk, output=output):
+                    self.assertEqual(self.grade([row(output=output)], risk=risk).status, "pass")
 
-            def get_responses(self, command_id):
-                return {"responses": rows}
+    def test_each_terminal_failure_fails_even_without_output_or_beside_success(self):
+        for risk in ("safe", "mutating"):
+            for status in (FAILURE, TIMEOUT, REJECTED):
+                for output in ("", "some output"):
+                    with self.subTest(risk=risk, status=status, output=output):
+                        result = self.grade([row(), row(status=status, output=output)], risk=risk)
+                        self.assertEqual(result.status, "fail")
+                        self.assertIn(ir.STATUS_NAMES[status], result.note)
 
-        return ir.exercise(C(), d, {}, timeout)
+    def test_running_output_waits_for_terminal_and_historical_chunks_are_allowed(self):
+        running = row(status=RUNNING, output="partial")
+        terminal = {**row(), "id": 2}
+        result = self.grade([running], [terminal, running])  # API's descending-time order
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(len(self.calls), 2)
+        self.assertGreater(self.now, 0)
 
-    def test_mixed_rows_pass_as_on_origin_dev(self):
-        rows = [{"status": "error", "rc": 1, "output": "b"}, {"status": "ok", "rc": 0, "output": "a"}]
-        self.assertEqual(self.grade(rows).status, "pass")
+    def test_in_place_finalization_of_empty_terminal_frame_passes(self):
+        self.assertEqual(self.grade([row(status=RUNNING)], [row()]).status, "pass")
+        self.assertEqual(len(self.calls), 2)
 
-    def test_an_integer_running_status_with_output_passes(self):
-        self.assertEqual(self.grade([row(status=RUNNING, output="x")]).status, "pass")
+    def test_every_reached_agent_must_finish_including_quiet_agents(self):
+        for pending in ([], [row(status=RUNNING, agent_id="other")]):
+            with self.subTest(pending=pending):
+                result = self.grade([row(), *pending], reached=2)
+                self.assertEqual(result.status, "fail")
+                self.assertIn("1/2 agents", result.note)
 
-    def test_a_safe_row_does_not_wait_for_running_rows_to_finish(self):
-        polls = []
+    def test_multiple_chunks_never_count_as_multiple_completed_agents(self):
+        self.assertEqual(self.grade([row(), {**row(), "id": 2}], reached=2).status, "fail")
 
-        class C:
-            def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+    def test_second_agent_terminal_arriving_later_completes_broadcast(self):
+        result = self.grade([row()], [row(), row(agent_id="other")], reached=2)
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(len(self.calls), 2)
 
-            def get_responses(self, command_id):
-                polls.append(1)
-                return {"responses": [row(status=RUNNING)]}
+    def test_running_forever_and_no_rows_reach_deadline_without_passing(self):
+        for rows in ([], [row(status=RUNNING)]):
+            with self.subTest(rows=rows):
+                start = self.now
+                result = self.grade(rows)
+                self.assertEqual(result.status, "fail")
+                self.assertGreaterEqual(self.now - start, 2)
 
-        d = ir.Definition(id="g", plugin="p", action="a", type="action", platforms=[], parameters={},
-                          result_columns=[], approval_mode="auto", risk="safe", file="g.yaml")
-        self.assertEqual(ir.exercise(C(), d, {}, 5).status, "pass")
-        self.assertEqual(len(polls), 1)
+    def test_terminal_result_on_final_poll_is_not_lost(self):
+        result = self.grade(*([[]] * 4), [row()])
+        self.assertEqual(result.status, "pass")
+        self.assertEqual(self.now, 2)
+
+    def test_malformed_status_or_identity_is_never_success(self):
+        bad = [None, True, False, "ok", "error", "running", 1.0, -1, 5]
+        rows = [{**row(), "status": status} for status in bad]
+        rows += [{**row(), "agent_id": agent} for agent in (None, "", " ", 7, [])]
+        rows += [{**row(), "instruction_id": "another-command"}, "not-an-object"]
+        for response in rows:
+            with self.subTest(response=response):
+                self.assertEqual(self.grade([response]).status, "fail")
+
+    def test_error_detail_or_legacy_nonzero_rc_can_only_add_failure(self):
+        for response in ({**row(), "error_detail": "boom"}, {**row(), "error_detail": None},
+                         {**row(), "rc": 2}, {**row(), "return_code": 3}):
+            with self.subTest(response=response):
+                self.assertEqual(self.grade([response]).status, "fail")
+
+    def test_missing_or_invalid_reached_count_fails_before_polling(self):
+        for reached in (None, True, 0, -1, "1", 1.0):
+            with self.subTest(reached=reached):
+                self.calls.clear()
+                self.assertEqual(self.grade([row()], reached=reached).status, "fail")
+                self.assertEqual(self.calls, [])
+
+    def test_more_agents_than_dispatched_is_invalid_evidence(self):
+        self.assertEqual(self.grade([row(), row(agent_id="other")]).status, "fail")
+
+    def test_malformed_or_failed_poll_body_never_becomes_empty_success(self):
+        for answer in ({}, "html", {"responses": None}, {"responses": {}},
+                       {"error": "HTTP 503"}, {"responses": [row()], "result_truncated_by_cap": True}):
+            with self.subTest(answer=answer):
+                self.assertEqual(self.grade(answer).status, "fail")
+
+    def test_full_pages_are_followed_before_success_or_failure_verdict(self):
+        first = [{**row(), "id": i + 1} for i in range(100)]
+        for terminal in (SUCCESS, FAILURE):
+            with self.subTest(terminal=terminal):
+                self.calls.clear()
+                result = self.grade(lambda offset: {"responses": first if offset == 0 else
+                                                   [row(status=terminal, agent_id="other")]}, reached=2)
+                self.assertEqual(result.status, "pass" if terminal == SUCCESS else "fail")
+                self.assertEqual(self.calls, [("c", 0), ("c", 100)])
+
+    def test_full_success_page_still_needs_a_complete_read(self):
+        first = [row() for _ in range(100)]
+        result = self.grade(lambda offset: {"responses": first} if offset == 0 else
+                            {"error": "HTTP 503"})
+        self.assertEqual(result.status, "fail")
+        self.assertIn("poll failed", result.note)
+
+    def test_pagination_is_bounded_even_when_every_page_is_full(self):
+        def full_page(offset):
+            self.advance(1)
+            return {"responses": [row() for _ in range(100)]}
+        result = self.grade(full_page)
+        self.assertEqual(result.status, "fail")
+        self.assertIn("pagination", result.note)
+        self.assertEqual(len(self.calls), 2)
+
+
+class BroadcastPagination(RunnerCase):
+    def test_real_client_reads_later_page_before_grading_broadcast(self):
+        self.fake.execute = lambda post: (200, json.dumps(
+            {"command_id": "c", "agents_reached": 2}).encode(), 0.0)
+        self.fake.response_pages = {
+            0: [{**row(), "id": i + 1} for i in range(100)],
+            100: [row(status=FAILURE, agent_id="other")],
+        }
+        result = self.run_runner([definition("t.safe", "safe")], risks=("safe",), targeted=False)
+        self.assertEqual(result.rc, 1)
+        self.assertEqual(result.outcome("t.safe")["status"], "fail")
+        self.assertIn("FAILURE", result.outcome("t.safe")["note"])
+        self.assertIn("/api/responses/c?offset=100", [path for method, path, ua in self.fake.requests])
 
 
 class VerdictlessRowsStopTheRun(RunnerCase):
@@ -1476,7 +1609,7 @@ class RunLevelAccounting(RunnerCase):
     def pending(self, post):
         if post["id"].startswith("t.d"):
             return 202, b'{"status": "pending_approval", "approval_id": "a"}', 0
-        return 200, json.dumps({"command_id": "c"}).encode(), 0
+        return 200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0
 
     def test_a_safe_row_that_ran_does_not_hide_that_no_destructive_row_did(self):
         self.fake.execute = self.pending
@@ -1588,6 +1721,24 @@ class BashEntry(unittest.TestCase):
         i = argv.index("--risks")
         self.assertEqual(argv[i + 1:i + 3], ["destructive", "forensic"])
         self.assertTrue(argv[i + 3].startswith("--"))
+
+    def test_network_disrupt_runs_the_containment_ceremony_against_the_one_target(self):
+        argv = self.run_bash("--risks", "network-disrupt", "--target-agent-id", "id 1")
+        self.assertTrue(argv[0].endswith("instructions_firewall_containment.py"), argv)
+        self.assertIn("--apply-containment", argv)
+        self.assertEqual(argv[argv.index("--agent-id") + 1], "id 1")
+        self.assertNotIn("p", argv)  # the password goes by environment, not argv
+
+    def test_network_disrupt_without_a_target_or_beside_another_class_is_refused(self):
+        env = dict(os.environ, PATH=f"{self.tmp}{os.pathsep}{os.environ['PATH']}", REC=str(self.rec))
+        for extra in (["--risks", "network-disrupt"],
+                      ["--risks", "safe,network-disrupt", "--target-agent-id", "a"]):
+            with self.subTest(extra=extra):
+                r = subprocess.run(["bash", str(ROOT / "scripts" / "test" / "instructions-tests.sh"),
+                                    "--dashboard", "http://127.0.0.1:1", "--password", "p", *extra],
+                                   env=env, capture_output=True, text=True, timeout=60)
+                self.assertEqual(r.returncode, 2, r.stderr)
+                self.assertFalse(self.rec.exists())  # nothing was started
 
     def test_values_with_spaces_arrive_as_single_arguments(self):
         argv = self.run_bash("--confirm-target", "Host name 1", "--manifest", "/tmp/a b/m.jsonl",
@@ -1802,7 +1953,7 @@ class DoubleSignal(RunnerCase):
 
     def trial(self, first, second):
         self.fake.posts.clear()
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.15)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.15)
 
         def send():
             deadline = time.monotonic() + 5
@@ -1832,7 +1983,7 @@ class DoubleSignal(RunnerCase):
         sentinel = lambda signum, frame: None   # noqa: E731
         signal.signal(signal.SIGINT, sentinel)
         with self.interrupt_after_posts(1):
-            self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)
+            self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.3)
             self.run_runner(self.DEFS, overrides=self.OV)
         self.assertIs(signal.getsignal(signal.SIGINT), sentinel)
         self.assertEqual(ir._GUARD._depth, 0)
@@ -1848,7 +1999,7 @@ class SigbreakRouting(RunnerCase):
     DEFS = [definition("t.d0", "destructive")]
 
     def test_a_sigbreak_aborts_with_130_names_it_and_is_restored(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.4)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.4)
         stand_in = signal.SIGUSR1
         before = signal.getsignal(stand_in)
         self.addCleanup(signal.signal, stand_in, before)
@@ -1904,7 +2055,7 @@ class WindowsConsoleBreak(RunnerCase):
     DEFS = [definition("t.d0", "destructive")]
 
     def test_ctrl_break_aborts_with_130_and_writes_the_output(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 3.0)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 3.0)
         content, table = write_content(self.tmp, self.DEFS)
         overrides = self.tmp / "overrides.json"
         overrides.write_text(json.dumps({"t.d0": {}}))
@@ -2195,7 +2346,7 @@ class OutputHardening(RunnerCase):
     @unittest.skipIf(sys.platform == "win32", "os.kill(SIGINT) semantics")
     @unittest.skipUnless(threading.current_thread() is threading.main_thread(), "signals need the main thread")
     def test_a_second_sigint_during_the_abort_handler_still_writes_the_output(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 1.2)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 1.2)
         real = ir.concurrent.futures.ThreadPoolExecutor.shutdown
 
         def shutdown_then_signal(self_, *a, **k):
@@ -2285,7 +2436,7 @@ class OutputHardening(RunnerCase):
 
     def test_outcomes_are_recorded_in_submission_order(self):
         defs = [definition(f"t.s{i}", "safe") for i in range(6)]
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(),
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(),
                                           (5 - int(post["id"][-1])) * 0.05)
         r = self.run_runner(defs, risks=("safe",), targeted=False, extra=["--parallelism", "4"])
         self.assertEqual([o["id"] for o in r.summary["outcomes"]], [d["id"] for d in defs])
@@ -2321,7 +2472,7 @@ class EscapingAndFinalPoll(RunnerCase):
                 return [{"agent_id": AGENT, "hostname": HOSTNAME, "os": "linux", "agent_version": "1"}]
 
             def execute_instruction(self, def_id, params, agent_ids=None):
-                return 200, {"command_id": "c"}
+                return 200, {"command_id": "c", "agents_reached": 1}
 
             def get_responses(self, command_id):
                 return {"responses": [row()]}
@@ -2339,7 +2490,7 @@ class EscapingAndFinalPoll(RunnerCase):
 
         class Client:
             def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+                return 200, {"command_id": "c", "agents_reached": 1}
 
             def get_responses(self, command_id):
                 calls.append(now[0])
@@ -2362,7 +2513,7 @@ class EscapingAndFinalPoll(RunnerCase):
 
         class Client:
             def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+                return 200, {"command_id": "c", "agents_reached": 1}
 
             def get_responses(self, command_id):
                 now[0] += 0.3          # every poll takes 0.3 s; the 4th ends past the 1.0 s deadline
@@ -2432,7 +2583,7 @@ class Grading(unittest.TestCase):
             self.polls, self.n = polls, 0
 
         def execute_instruction(self, def_id, params, agent_ids=None):
-            return 200, {"command_id": "c"}
+            return 200, {"command_id": "c", "agents_reached": 1}
 
         def get_responses(self, command_id):
             rows = self.polls[min(self.n, len(self.polls) - 1)]
@@ -2492,7 +2643,7 @@ class Grading(unittest.TestCase):
             n = 0
 
             def execute_instruction(self, *a, **k):
-                return 200, {"command_id": "c"}
+                return 200, {"command_id": "c", "agents_reached": 1}
 
             def get_responses(self, command_id):
                 Quiet.n += 1
@@ -2539,15 +2690,6 @@ class Grading(unittest.TestCase):
             self.assertEqual(self.grade("destructive", [row(status=status, output="")]).status, "fail")
         self.assertEqual(self.grade("destructive", [row(status=RUNNING, output="part")], timeout=0.3).status, "fail")
 
-    def test_safe_and_mutating_grading_is_the_original_one(self):
-        # Unchanged on purpose (a separate follow-up): it reads a string status and an `rc`.
-        for risk in ("safe", "mutating"):
-            with self.subTest(risk=risk):
-                self.assertEqual(self.grade(risk, [row(status=RUNNING, output="part")]).status, "pass")
-                self.assertEqual(self.grade(
-                    risk, [{"status": "error", "rc": 1, "output": "boom"}]).status, "fail")
-                self.assertEqual(self.grade(
-                    risk, [{"status": "error", "rc": 1, "output": ""}]).status, "pass")
 
 
 class RunWiring(unittest.TestCase):
@@ -2568,10 +2710,10 @@ class RunWiring(unittest.TestCase):
 
         def execute_instruction(self, def_id, params, agent_ids=None):
             RunWiring.FakeClient.calls.append((def_id, agent_ids))
-            return 200, {"command_id": "c-" + def_id}
+            return 200, {"command_id": "c-" + def_id, "agents_reached": 1}
 
         def get_responses(self, command_id):
-            return {"responses": GOOD}
+            return {"responses": [{**row(), "instruction_id": command_id}]}
 
     def test_run_threads_the_target_to_opt_in_classes_only(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_runner_") as tmp:
@@ -2634,7 +2776,7 @@ class TimingWritesWaitForDispatch(RunnerCase):
     OV = {f"t.q{i}": {} for i in range(3)}
 
     def test_no_timing_is_written_until_every_post_has_been_made(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.1)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.1)
         seen = []
         with mock.patch.object(ir, "db_record_timing",
                                lambda root, run_id, gate, step, ms: seen.append((step, len(self.fake.posts)))):
@@ -2644,7 +2786,7 @@ class TimingWritesWaitForDispatch(RunnerCase):
 
     def test_an_untargeted_run_records_one_timing_per_row_after_dispatch(self):
         defs = [definition(f"t.s{i}", "safe") for i in range(3)]
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.05)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.05)
         seen = []
         with mock.patch.object(ir, "db_record_timing",
                                lambda root, run_id, gate, step, ms: seen.append((step, len(self.fake.posts)))):
@@ -2672,7 +2814,7 @@ class TimingWritesWaitForDispatch(RunnerCase):
                 self.assertIn("interrupted while recording timings", r.err)
 
     def test_an_aborted_run_writes_no_timings(self):
-        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c"}).encode(), 0.3)
+        self.fake.execute = lambda post: (200, json.dumps({"command_id": "c", "agents_reached": 1}).encode(), 0.3)
         seen = []
         with mock.patch.object(ir, "db_record_timing", lambda *a: seen.append(a)), \
                 self.interrupt_after_posts(1):

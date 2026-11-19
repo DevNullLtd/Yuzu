@@ -10,7 +10,7 @@
  *
  * Schema:
  *   echo_state  — last-known state per collector for diff computation
- *   echo_config — key/value config (retention_days, redaction patterns, etc.)
+ *   echo_config — key/value config (the per-source switches, intervals, redaction patterns, etc.)
  *   echo_cursor — last-persisted cursor JSON per cursor-model source
  *                (echo_cursor.hpp: power, removable, registry)
  *   <src>_<tier>_r, echo_dict, echo_fold_seen — the roll-up tables, and the
@@ -41,9 +41,14 @@
 #include <string_view>
 #include <vector>
 
+#include <sqlite_quarantine.hpp> // FsOps, the quarantine's filesystem seam carried by OpenSeams
+
 struct sqlite3; // Forward declaration
 
 namespace yuzu::echo {
+
+/// Default wall-clock bound on one operator statement (execute_user_query).
+inline constexpr std::chrono::milliseconds kUserQueryDeadline{10'000};
 
 class EchoFold; // echo_fold.hpp: the roll-up writer every fold_* wrapper below drives
 
@@ -431,7 +436,8 @@ struct RemovableEvent {
 /// change the key watch observed (echo_registry_parsers.hpp). The actor fields hold
 /// the writer correlated to the change (a lead to verify, not proof): actor_pid is 0
 /// and actor_image '' when no writer is named, and `detail` says why (attr:*).
-/// `data` is the UNMASKED rendered new value; `prev_data` is empty for an event this build
+/// `data` is the rendered new value, except under a sensitive value name (is_sensitive_reg_value),
+/// where it is the fixed placeholder kRegistryMaskedData; `prev_data` is empty for an event this build
 /// makes (the old value is not carried; `prev_data_type`/`prev_data_size` are). The fold keeps
 /// only hive, key_path, value_name, action, a count, the newest data (512 bytes), its type,
 /// the actor image and ts; actor_pid, `detail`, `source` (notify | reconcile | offline),
@@ -477,7 +483,6 @@ struct EchoStats {
     /// the WAL file. Free pages are excluded because they are reusable, so this is the figure
     /// the byte budget is enforced against; it is NOT the on-disk file size.
     int64_t db_size_bytes{0};
-    int retention_days{7};
 };
 
 /// Room the WAL file is allowed beyond the data pages: `PRAGMA journal_size_limit` at open, and
@@ -533,7 +538,54 @@ struct OpenSeams {
     /// Called inside the v10 transaction right after the retired tables are dropped; an error it
     /// returns rolls the whole migration back (the crash/rollback test's fault point).
     std::function<std::expected<void, std::string>()> v10_after_drop;
+    /// Called after a corrupt database was quarantined and before the names are checked for a
+    /// link again and reopened (the link-swap test's fault point, #1527).
+    std::function<void()> after_quarantine;
+    /// Called right before every sqlite3_open_v2 on the database name: the main open, the reopen
+    /// after a quarantine and the read-only query connection. It stands in for a swap made after
+    /// the last name check, which is what SQLITE_OPEN_NOFOLLOW closes (#1527). Production never
+    /// sets it.
+    std::function<void()> before_sqlite_open;
+    /// Called after the main connection opened and its file's identity was read, right before
+    /// `PRAGMA integrity_check` runs. It stands in for a name swapped while the check runs: the
+    /// quarantine must then refuse, because the file at the name is not the one SQLite judged
+    /// (#1527). Production never sets it.
+    std::function<void()> before_integrity_check;
+    /// The filesystem steps of the quarantine that follows a corrupt verdict (the hard-link
+    /// claim, a sidecar move, a remove), forwarded to `quarantine_corrupt_db`. An empty member is
+    /// the real call. A test's `link` runs between the verdict and the claim, which is where a
+    /// swapped-in link has to be caught (#1527). Production never sets one.
+    yuzu::shared::sqlite_quarantine::FsOps quarantine_ops;
+    /// Called by the v10 migration after its pre-transaction reads, right before BEGIN IMMEDIATE,
+    /// with the migrating connection. It stands in for another process acting in the gap between
+    /// the pre-checks and the write lock (a second opener, a held lock, a full volume). Production
+    /// never sets it.
+    std::function<void(sqlite3*)> v10_before_begin;
+    /// Override of the v10 migration's wall-clock deadline (default: v10_migration_deadline of the
+    /// file size). A test sets 0 to hit it at once; production leaves it empty.
+    std::optional<std::chrono::milliseconds> v10_deadline;
+    /// True = abandon the v10 migration (rolled back, the file untouched). Production: the open
+    /// retry loop's stop flag, so a shutdown does not wait out a long attempt.
+    std::function<bool()> v10_cancel;
 };
+
+/// What `PRAGMA integrity_check` says about echo.db at open (#559, #7286). Only `corrupt` moves the
+/// file aside; `busy` and `unreadable` refuse to open and quarantine nothing (a quarantine plus a
+/// fresh file would re-enable every source an operator paused).
+enum class IntegrityCheck {
+    ok,        ///< the check passed
+    busy,      ///< another connection holds the file past the busy timeout (BUSY / LOCKED)
+    corrupt,   ///< a non-"ok" integrity row, or SQLITE_CORRUPT / SQLITE_NOTADB
+    unreadable ///< any other failure to read the file (IOERR, CANTOPEN, PERM, READONLY, FULL, ...)
+};
+
+/// Classify the sqlite result code that a failed `PRAGMA integrity_check` (prepare or step) ended
+/// with. Pure; `rc` may be an extended code, only its primary (low) byte counts. Never returns `ok`.
+IntegrityCheck classify_integrity_rc(int rc) noexcept;
+
+/// The integer in an echo_config `schema_version` value; an unparseable one reads as 0. Shared by
+/// the open path and the v10 migration's in-transaction re-read so both agree on malformed text.
+int parse_schema_version(const std::string& text);
 
 class EchoDatabase {
 public:
@@ -544,7 +596,9 @@ public:
      *
      * On failure the error text says WHY and, where there is one, the remedy: the directory
      * cannot be created, SQLite cannot open the file, a corrupt echo.db could not be moved aside
-     * (#559, refused rather than trusted), a schema transaction wedged, or -- on Windows only --
+     * (#559, refused rather than trusted), the file is busy or could not be read for a reason
+     * that is not corruption (refused, nothing quarantined, retried on the next start, #7286), a
+     * schema transaction wedged, or -- on Windows only --
      * a planted echo.db (refused) or a planted -wal, -shm or -journal that could not be replaced
      * (foreign owner or extra hard link), or -- for a database that still holds the retired raw
      * tables -- a volume with less than twice the file's size (plus its log) free, or a v10 migration that
@@ -857,9 +911,16 @@ public:
      * Recovery: if the read-only connection cannot be opened at startup it stays
      * unavailable for the process lifetime (fail closed); restart the agent to
      * retry.
+     *
+     * `deadline` is elapsed time on the steady clock, checked every 1000 VM
+     * instructions. It does not include the wait for query_mu_ (bounded by the
+     * holder's own deadline and busy wait) or a busy wait (bounded by busy_timeout).
+     * A hit returns an error and discards any rows read so far; a short result is
+     * never presented as complete.
      */
-    std::expected<QueryResult, std::string> execute_user_query(const std::string& sql,
-                                                               int max_rows = 10000);
+    std::expected<QueryResult, std::string>
+    execute_user_query(const std::string& sql, int max_rows = 10000,
+                       std::chrono::milliseconds deadline = kUserQueryDeadline);
 
     /**
      * Execute arbitrary DDL/DML SQL (for rollup inserts, retention deletes).
@@ -997,22 +1058,30 @@ public:
      * referenced. Backs the `echo.purge_source` action (retention-paused frame, Phase 15.A): it
      * drops a deliberately paused source's accumulated forensic data WITHOUT re-enabling
      * collection. The rows go in one transaction (all or none); the dictionary sweep follows
-     * it under `dictionary_deadline` (60 s: operator-initiated and rare) and, if it outruns the
-     * deadline or fails, the strings stay until the weekly GC: that is REPORTED
+     * it under `dictionary_deadline` (kPurgeDictionaryDeadline: operator-initiated and rare) and,
+     * if it outruns the deadline or fails, the strings stay until the weekly GC: that is REPORTED
      * (`dictionary_pending`, counted in `dict_gc_starved_total`), never a silent success, since
      * the purge is promised as forensic erasure and the strings of the purged rows are forensic
      * data too. The deadline is a parameter so a test can drive that path (gc_dictionary's
-     * deadline is the seam).
-     * @return the rows deleted and whether the dictionary sweep is pending, or an error string
-     *         (unknown source / SQL error).
+     * deadline is the seam). `cancelled`, when set, is the caller's stop request (agent
+     * shutdown): the sweep gives up at its next check, as at a deadline, and the TRUNCATE
+     * checkpoint is skipped, both reported as pending. A sweep ended by a stop request is not
+     * counted in `dict_gc_starved_total`: it was not starved. The final TRUNCATE checkpoint never
+     * waits (busy timeout 0): a reader that pins the WAL leaves the pre-delete page images in the
+     * -wal file, which is REPORTED too (`wal_pending`), as the forensic residue it is.
+     * @return the rows deleted and whether the dictionary sweep and the WAL checkpoint are
+     *         pending, or an error string (unknown source / SQL error).
      */
     struct PurgeResult {
         int rows_deleted{0};
         bool dictionary_pending{false}; ///< strings of the purged rows remain until the weekly GC
+        bool wal_pending{false};        ///< the WAL was not truncated: purged pages may linger in it
     };
+    static constexpr std::chrono::seconds kPurgeDictionaryDeadline{60};
     std::expected<PurgeResult, std::string> purge_source(
         const std::string& source,
-        std::chrono::steady_clock::duration dictionary_deadline = std::chrono::seconds(60));
+        std::chrono::steady_clock::duration dictionary_deadline = kPurgeDictionaryDeadline,
+        const std::function<bool()>& cancelled = {});
 
 private:
     explicit EchoDatabase(sqlite3* db);

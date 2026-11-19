@@ -92,6 +92,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <algorithm>
+#include <array>
 #include <filesystem>
 #include <map>
 #include <optional>
@@ -687,7 +688,8 @@ TEST_CASE("step-up route inventory: every kRequired row is registered (its handl
     for (const auto& k : l3_scanned())
         registered.insert(k);
     for (const auto& e : kStepUpPolicy) {
-        if (e.cls != StepUpClass::kRequired && e.cls != StepUpClass::kOwnGate)
+        if (e.cls != StepUpClass::kRequired && e.cls != StepUpClass::kOwnGate &&
+            e.cls != StepUpClass::kFactorCredential)
             continue;
         INFO(std::string(e.method) << " " << std::string(e.pattern));
         CHECK(registered.contains({std::string(e.method), std::string(e.pattern)}));
@@ -722,9 +724,10 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
         }
     }
 
-    std::map<std::string, int> table_labels; // label -> kRequired rows carrying it
+    std::map<std::string, int>
+        table_labels; // label -> kRequired / kFactorCredential rows carrying it
     for (const auto& e : kStepUpPolicy) {
-        if (e.cls == StepUpClass::kRequired)
+        if (e.cls == StepUpClass::kRequired || e.cls == StepUpClass::kFactorCredential)
             ++table_labels[std::string(e.action_label)];
     }
     REQUIRE_FALSE(table_labels.empty());
@@ -751,6 +754,241 @@ TEST_CASE("step-up route inventory (lexical): kRequired labels equal the in-hand
     INFO("step_up_fn labels with no kRequired row (the handler drifted from the table):\n"
          << join(handler_only));
     CHECK(handler_only.empty());
+}
+
+// -- Factor-credential coverage (lexical) -----------------------------------------------------
+
+// The only code that may regenerate an account's recovery codes or clear its second factor on a
+// request's behalf is a handler registered on one of the two `kFactorCredential` rows: those are
+// the rows the chokepoint evaluates with the approver window, no hatch, the local-session-only rule
+// and the admitted-generation carry. A third caller (a new route, a refactored helper) would
+// mutate a factor under a weaker gate, so it fails here until it is a kFactorCredential row too.
+// Since #6079 PR 2c the Settings disable clears the factor through `AuthManager::commit_mfa_disable`
+// (the one-transaction `MfaDisableOwner`), so that is the call matched for it; the AuthDB clears
+// (`mfa_disable_report` and `mfa_disable`) have NO production caller outside auth_db.cpp any more,
+// and are listed so one that reappears fails here. `--mfa-reset` (main.cpp) is break-glass with no
+// session: it drives the owner directly, which this member-call scan cannot see, so the companion
+// test below pins which files may include the owner's header at all. LEXICAL: a call spelled
+// `->name(` or `.name(` outside auth_db.cpp.
+TEST_CASE("step-up route inventory (lexical): only the two kFactorCredential handlers mutate a "
+          "second factor",
+          "[stepup][inventory][factor_credential]") {
+    namespace text_scan = ::yuzu::test::source_scan;
+    namespace linear = ::yuzu::test::route_scan;
+    constexpr std::array<std::string_view, 4> kMutations{"mfa_regenerate_recovery_codes",
+                                                         "commit_mfa_disable", "mfa_disable_report",
+                                                         "mfa_disable"};
+
+    // A call spelled `->name(` or `.name(`, spaces allowed on either side of the name; true when
+    // `name` starts at `at` in `text`.
+    const auto is_member_call = [](std::string_view text, std::size_t at, std::string_view name) {
+        std::size_t before = at;
+        while (before > 0 && linear::is_space(text[before - 1]))
+            --before;
+        const bool member = (before >= 1 && text[before - 1] == '.') ||
+                            (before >= 2 && text[before - 1] == '>' && text[before - 2] == '-');
+        std::size_t after = at + name.size();
+        while (after < text.size() && linear::is_space(text[after]))
+            ++after;
+        return member && after < text.size() && text[after] == '(';
+    };
+
+    std::vector<std::string> not_a_factor_credential_row;
+    std::vector<std::string> callers;
+    for (const auto& [file, text] :
+         scan::read_all_cpp_files(std::filesystem::path(YUZU_SERVER_SRC_DIR))) {
+        if (file == "auth_db.cpp" || file.ends_with("/auth_db.cpp"))
+            continue;
+        const auto registrations = linear::find_route_registrations(text, linear::kMutatingMethods);
+        for (const std::string_view name : kMutations) {
+            for (std::size_t pos = text.find(name); pos != std::string::npos;
+                 pos = text.find(name, pos + 1)) {
+                if (!is_member_call(text, pos, name))
+                    continue;
+                const std::string where = file + ":" +
+                                          std::to_string(text_scan::line_of(text, pos)) + " " +
+                                          std::string(name);
+                callers.push_back(where);
+                // The route this call sits in: the nearest registration before it.
+                std::string pattern;
+                for (const auto& r : registrations) {
+                    if (r.pos < pos)
+                        pattern = r.raw_path;
+                }
+                const auto* row = pattern.empty() ? nullptr : step_up_policy_for("POST", pattern);
+                if (row == nullptr || row->cls != StepUpClass::kFactorCredential)
+                    not_a_factor_credential_row.push_back(where + " (route '" + pattern + "')");
+            }
+        }
+    }
+    INFO("calls found:\n" << join(callers));
+    // The recovery-code regeneration and the owner-backed disable are each called exactly once
+    // (the AuthDB clears are not called at all), so the scan cannot pass vacuously.
+    CHECK(callers.size() == 2);
+    int regenerate = 0, disable = 0;
+    for (const auto& c : callers) {
+        if (c.ends_with(" mfa_regenerate_recovery_codes"))
+            ++regenerate;
+        if (c.ends_with(" commit_mfa_disable"))
+            ++disable;
+    }
+    CHECK(regenerate == 1);
+    CHECK(disable == 1);
+    INFO("mutation call sites that are not inside a kFactorCredential handler:\n"
+         << join(not_a_factor_credential_row));
+    CHECK(not_a_factor_credential_row.empty());
+}
+
+// Every path that clears a second factor is accounted for (#6079 PR 2c). `MfaDisableOwner` is the
+// only code that clears one for the Settings disable and the break-glass CLI, and a class cannot be
+// used without its header: the files that include it are the owner itself, the manager that
+// delegates to it, the wiring in server.cpp, the Settings disable handler and the `--mfa-reset`
+// one-shot. A new includer is a new factor-clearing path and fails here until it is reviewed and
+// added, with its own gate, to this list.
+TEST_CASE("step-up route inventory (lexical): only the reviewed files include MfaDisableOwner",
+          "[stepup][inventory][factor_credential]") {
+    const std::set<std::string> allowed{"mfa_disable_owner.cpp", "mfa_disable_owner.hpp", "auth.cpp",
+                                        "server.cpp",            "settings_routes.cpp",    "main.cpp"};
+    const std::filesystem::path dir(YUZU_SERVER_SRC_DIR);
+    std::set<std::string> found;
+    std::vector<std::string> unexpected;
+    const auto scan_files = [&](const std::vector<std::pair<std::string, std::string>>& files) {
+        for (const auto& [file, text] : files) {
+            if (text.find("#include \"mfa_disable_owner.hpp\"") == std::string::npos)
+                continue;
+            found.insert(file);
+            if (!allowed.contains(file))
+                unexpected.push_back(file);
+        }
+    };
+    scan_files(scan::read_all_cpp_files(dir));
+    scan_files(scan::read_all_header_files(dir));
+    INFO("files including mfa_disable_owner.hpp that are not on the reviewed list:\n"
+         << join(unexpected));
+    CHECK(unexpected.empty());
+    // The scan cannot pass vacuously: the break-glass CLI and the Settings handler both include it.
+    CHECK(found.contains("main.cpp"));
+    CHECK(found.contains("settings_routes.cpp"));
+}
+
+// Who may HOLD an `MfaDisableOwner` and who may call `commit` on one (#6079 PR 2c). The include
+// test above bounds which files can name the class; this one bounds what they do with it:
+//  - the `mfa_disable_owner_` member (a borrowed pointer in `AuthManager`, whose declaration is in
+//    include/yuzu/server/auth.hpp and so outside this scan; a `unique_ptr` in `ServerImpl`) is
+//    spelled only in auth.cpp and server.cpp, and server.cpp only constructs, injects and resets
+//    it;
+//  - a `commit(` member call on a receiver whose name contains "owner" appears only in auth.cpp
+//    (`AuthManager::commit_mfa_disable`, and the sibling `commit_password_change`) and main.cpp
+//    (the `--mfa-reset` one-shot, which has no session). In particular settings_routes.cpp, which
+//    includes the owner's header for the request and result types, must never call it: the route
+//    reaches the owner only through `AuthManager::commit_mfa_disable`, so the cache work that
+//    follows the commit cannot be skipped.
+// Comments are stripped first, so a commented-out call neither satisfies nor trips the scan.
+//
+// LEXICAL LIMITS, stated plainly: the scan reads server/core/src only (a call from
+// server/core/include is not seen); the include spelling is matched as the substring
+// `mfa_disable_owner.hpp` on an `#include` line, which covers a quoted, angle-bracket or relative
+// spelling but not an include reached transitively through another header; the allow-lists are
+// FILE-granular, by basename (a second file with an allowed basename in another directory would be
+// admitted, and an unallowed call inside an allowed file is not seen); a receiver that does not
+// contain "owner" in its name (an alias, a reference named otherwise) is not seen. It is a
+// tripwire that makes a NEW caller a reviewed decision, not a proof that none exists.
+TEST_CASE("step-up route inventory (lexical): only the reviewed files hold or call an "
+          "MfaDisableOwner",
+          "[stepup][inventory][factor_credential]") {
+    namespace text_scan = ::yuzu::test::source_scan;
+    const std::set<std::string> include_allowed{"mfa_disable_owner.cpp", "mfa_disable_owner.hpp",
+                                                "auth.cpp",              "server.cpp",
+                                                "settings_routes.cpp",   "main.cpp"};
+    const std::set<std::string> member_allowed{"auth.cpp", "server.cpp"};
+    const std::set<std::string> commit_allowed{"auth.cpp", "main.cpp"};
+
+    const auto is_ident = [](char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') ||
+               c == '_';
+    };
+
+    std::set<std::string> include_files, member_files, commit_files;
+    std::vector<std::string> unexpected;
+    const auto scan_files = [&](const std::vector<std::pair<std::string, std::string>>& files) {
+        for (const auto& [file, raw] : files) {
+            const std::string text = text_scan::strip_comments(raw);
+
+            // 1. Any #include line naming the owner header, whatever the spelling.
+            for (std::size_t at = text.find("mfa_disable_owner.hpp"); at != std::string::npos;
+                 at = text.find("mfa_disable_owner.hpp", at + 1)) {
+                const std::size_t bol = text.rfind('\n', at);
+                const std::string_view line(text.data() + (bol == std::string::npos ? 0 : bol + 1),
+                                            at - (bol == std::string::npos ? 0 : bol + 1));
+                if (line.find("#include") == std::string_view::npos)
+                    continue;
+                include_files.insert(file);
+                if (!include_allowed.contains(file))
+                    unexpected.push_back(file + ": includes mfa_disable_owner.hpp");
+                break;
+            }
+
+            // 2. The `mfa_disable_owner_` member as a whole identifier.
+            for (std::size_t at = text.find("mfa_disable_owner_"); at != std::string::npos;
+                 at = text.find("mfa_disable_owner_", at + 1)) {
+                const std::size_t end = at + std::string_view("mfa_disable_owner_").size();
+                if ((at > 0 && is_ident(text[at - 1])) || (end < text.size() && is_ident(text[end])))
+                    continue;
+                member_files.insert(file);
+                if (!member_allowed.contains(file))
+                    unexpected.push_back(file + ":" + std::to_string(text_scan::line_of(text, at)) +
+                                         ": uses the mfa_disable_owner_ member");
+                break;
+            }
+
+            // 3. A `commit(` member call whose receiver identifier contains "owner".
+            for (std::size_t at = text.find("commit"); at != std::string::npos;
+                 at = text.find("commit", at + 1)) {
+                if (at > 0 && is_ident(text[at - 1]))
+                    continue; // part of a longer name (`precommit`, `try_commit`)
+                std::size_t after = at + std::string_view("commit").size();
+                while (after < text.size() && (text[after] == ' ' || text[after] == '\t'))
+                    ++after;
+                if (after >= text.size() || text[after] != '(')
+                    continue;
+                std::size_t before = at;
+                while (before > 0 && (text[before - 1] == ' ' || text[before - 1] == '\t'))
+                    --before;
+                std::size_t recv_end = std::string::npos;
+                if (before >= 1 && text[before - 1] == '.')
+                    recv_end = before - 1;
+                else if (before >= 2 && text[before - 1] == '>' && text[before - 2] == '-')
+                    recv_end = before - 2;
+                if (recv_end == std::string::npos)
+                    continue;
+                std::size_t recv_start = recv_end;
+                while (recv_start > 0 && is_ident(text[recv_start - 1]))
+                    --recv_start;
+                const std::string receiver = text.substr(recv_start, recv_end - recv_start);
+                if (receiver.find("owner") == std::string::npos)
+                    continue;
+                commit_files.insert(file);
+                if (!commit_allowed.contains(file))
+                    unexpected.push_back(file + ":" + std::to_string(text_scan::line_of(text, at)) +
+                                         ": " + receiver + ".commit(");
+            }
+        }
+    };
+    const std::filesystem::path dir(YUZU_SERVER_SRC_DIR);
+    scan_files(scan::read_all_cpp_files(dir));
+    scan_files(scan::read_all_header_files(dir));
+
+    INFO("owner holders/callers outside the reviewed lists:\n" << join(unexpected));
+    CHECK(unexpected.empty());
+    // The scan cannot pass vacuously: every reviewed site below is present today.
+    CHECK(include_files.contains("main.cpp"));
+    CHECK(include_files.contains("settings_routes.cpp"));
+    CHECK(member_files.contains("auth.cpp"));
+    CHECK(member_files.contains("server.cpp"));
+    CHECK(commit_files.contains("auth.cpp"));
+    CHECK(commit_files.contains("main.cpp"));
+    // And the Settings route never commits the owner itself (it goes through AuthManager).
+    CHECK_FALSE(commit_files.contains("settings_routes.cpp"));
 }
 
 // -- L4: the boot sweep's refusal decision -----------------------------------------------------

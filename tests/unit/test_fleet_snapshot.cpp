@@ -377,6 +377,53 @@ TEST_CASE("read_proc_bytes reads a whole stream and an empty one", "[echo][fleet
     CHECK(yuzu::agent::detail::read_proc_bytes(empty).empty());
 }
 
+TEST_CASE("read_proc_bytes stops at the cap and keeps the prefix", "[echo][fleet][procread]") {
+    constexpr auto cap = yuzu::agent::detail::kProcReadCap;
+    // A distinct final byte past the cap: if the reader ever looked beyond it, 'Z' would appear.
+    std::string big(cap + 4096, 'a');
+    big.back() = 'Z';
+    std::istringstream in(big);
+    std::string got;
+    REQUIRE_NOTHROW(got = yuzu::agent::detail::read_proc_bytes(in));
+    CHECK(got.size() == cap);
+    CHECK(got == big.substr(0, cap));
+    CHECK(got.find('Z') == std::string::npos);
+
+    // Just under the cap is returned whole.
+    std::istringstream under(std::string(cap - 1, 'b'));
+    CHECK(yuzu::agent::detail::read_proc_bytes(under).size() == cap - 1);
+}
+
+TEST_CASE("read_proc_bytes cuts at a UTF-8 boundary when a multi-byte character straddles the cap",
+          "[echo][fleet][procread]") {
+    constexpr auto cap = yuzu::agent::detail::kProcReadCap;
+    const std::string euro = "\xE2\x82\xAC"; // U+20AC, three bytes
+    const std::string face = "\xF0\x9F\x98\x80"; // U+1F600, four bytes
+
+    // Two of the three bytes fall inside the cap: the whole character goes, nothing else.
+    std::istringstream split3(std::string(cap - 2, 'a') + euro + "tail");
+    CHECK(yuzu::agent::detail::read_proc_bytes(split3) == std::string(cap - 2, 'a'));
+    // Three of four bytes inside the cap.
+    std::istringstream split4(std::string(cap - 3, 'a') + face + "tail");
+    CHECK(yuzu::agent::detail::read_proc_bytes(split4) == std::string(cap - 3, 'a'));
+    // Only the lead byte inside the cap.
+    std::istringstream lead(std::string(cap - 1, 'a') + euro + "tail");
+    CHECK(yuzu::agent::detail::read_proc_bytes(lead) == std::string(cap - 1, 'a'));
+    // A character that ends exactly at the cap is kept whole.
+    std::istringstream whole(std::string(cap - 3, 'a') + euro + "tail");
+    CHECK(yuzu::agent::detail::read_proc_bytes(whole) == std::string(cap - 3, 'a') + euro);
+    // The trim applies only to a capped read; a short stream ending mid-character is unchanged.
+    std::istringstream uncapped(std::string("ab") + "\xE2\x82");
+    CHECK(yuzu::agent::detail::read_proc_bytes(uncapped) == std::string("ab") + "\xE2\x82");
+
+    std::string s = "x\xE2\x82";
+    yuzu::agent::detail::trim_incomplete_utf8_tail(s);
+    CHECK(s == "x");
+    s = "\xE2\x82"; // nothing but the fragment
+    yuzu::agent::detail::trim_incomplete_utf8_tail(s);
+    CHECK(s.empty());
+}
+
 #if defined(__linux__) || defined(__APPLE__)
 
 TEST_CASE("parse_proc_status: Name, PPid and Uid parse with many trailing lines",

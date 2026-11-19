@@ -90,7 +90,8 @@ inline std::uint64_t process_random_salt() {
 }
 
 /// The name prefix of every scratch registry key the registry plugin's Windows tests create under HKLM\SOFTWARE or
-/// HKCU\Software: `YuzuTest-<scope>-` when YUZU_TEST_REGISTRY_SCOPE is set and non-empty, else `YuzuTest-`. CI sets the
+/// HKCU\Software (and the Echo bam-exclusion live case under HKLM\SYSTEM\CurrentControlSet\Services\bam and
+/// ...\bam\State\UserSettings): `YuzuTest-<scope>-` when YUZU_TEST_REGISTRY_SCOPE is set and non-empty, else `YuzuTest-`. CI sets the
 /// scope per job (run id, attempt, build type), so its leftover-key tripwire can tell this job's keys from a
 /// concurrent job's on the same box (two test phases may share one runner machine); the per-process salt the fixtures
 /// append is unchanged. The scope must be registry-name-safe (no backslash). `scope` is a parameter only so a pure
@@ -281,6 +282,48 @@ template <typename F> ScopeExit(F) -> ScopeExit<F>;
 inline const char* pg_admin_dsn_env() {
     const char* v = std::getenv("YUZU_TEST_POSTGRES_DSN");
     return (v != nullptr && v[0] != '\0') ? v : nullptr;
+}
+
+/// Clone-strategy knob for the template clone (PostgresTestDb's
+/// `CREATE DATABASE ... TEMPLATE`): YUZU_TEST_PG_CLONE_STRATEGY selects the
+/// PostgreSQL 15+ `STRATEGY` clause. Pure parse of the raw env value:
+///   - nullptr or ""                    -> ok, empty clause (SQL byte-identical
+///                                         to the knob not existing; the server
+///                                         default, WAL_LOG on PG 15+, applies);
+///   - "wal_log" / "file_copy", any case -> ok, " STRATEGY WAL_LOG" / " STRATEGY FILE_COPY";
+///   - anything else                     -> NOT ok, with a message naming the
+///                                         variable and the accepted values.
+/// An invalid value fails the fixture (PostgresTestDb::error(), surfaced by the
+/// YUZU_REQUIRE_PG_DB* macros' REQUIRE) rather than being silently ignored, so
+/// a typo can never silently run the default strategy instead.
+/// The Linux CI test step's pg half sets it to file_copy; no other CI job sets
+/// it (tests/unit/server/test_pg_template_cleanup.cpp sets it per case with
+/// ScopedEnv; docs/testing/unit-test-conventions.md).
+struct PgCloneStrategy {
+    bool ok = true;
+    std::string clause; ///< appended verbatim after the TEMPLATE clause
+    std::string error;  ///< set when !ok
+};
+
+inline PgCloneStrategy parse_pg_clone_strategy(const char* raw) {
+    PgCloneStrategy out;
+    if (raw == nullptr || raw[0] == '\0')
+        return out;
+    std::string v{raw};
+    std::transform(v.begin(), v.end(), v.begin(), [](unsigned char c) {
+        return static_cast<char>((c >= 'A' && c <= 'Z') ? c - 'A' + 'a' : c);
+    });
+    if (v == "wal_log") {
+        out.clause = " STRATEGY WAL_LOG";
+    } else if (v == "file_copy") {
+        out.clause = " STRATEGY FILE_COPY";
+    } else {
+        out.ok = false;
+        out.error = std::string("YUZU_TEST_PG_CLONE_STRATEGY='") + raw +
+                    "' is not a clone strategy; accepted: wal_log or file_copy "
+                    "(case-insensitive), or unset for the server default";
+    }
+    return out;
 }
 
 /// ── Stale test-database sweeping ─────────────────────────────────────────
@@ -667,8 +710,17 @@ private:
             return;
         }
         std::string create = "CREATE DATABASE \"" + db_name_ + "\"";
-        if (tpl_name != nullptr)
+        if (tpl_name != nullptr) {
             create += " TEMPLATE \"" + *tpl_name + "\"";
+            // Clone-strategy knob: unset -> no clause, SQL unchanged.
+            const PgCloneStrategy strategy =
+                parse_pg_clone_strategy(std::getenv("YUZU_TEST_PG_CLONE_STRATEGY"));
+            if (!strategy.ok) {
+                error_ = strategy.error;
+                return;
+            }
+            create += strategy.clause;
+        }
         // Clone-from-template refuses while ANY connection to the template
         // is open (SQLSTATE 55006). The builder's PgPool has PQfinish()ed by
         // the time ensure() returns, but the backend teardown can lag a

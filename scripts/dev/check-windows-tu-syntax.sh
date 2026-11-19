@@ -63,11 +63,15 @@ tus=(
     agents/plugins/update_source_trust/src/update_source_trust_win.cpp
     agents/plugins/mgmt_posture/src/mgmt_posture_win.cpp
     agents/plugins/shares/src/shares_win.cpp
+    agents/plugins/virtualization/src/virtualization_win.cpp
+    agents/plugins/firewall/src/firewall_plugin.cpp # the containment legs' Windows COM block (WinLeg)
     agents/plugins/remote_access_audit/src/remote_access_audit_win.cpp
     agents/plugins/runtimes/src/runtimes_win.cpp
     agents/plugins/runtimes/src/runtimes_linux.cpp # empty on Windows: checks the portable half of the Linux walk header
     agents/plugins/middleware/src/middleware_win.cpp
     agents/plugins/middleware/src/middleware_linux.cpp # empty on Windows: checks the portable half
+    agents/plugins/component_inventory/src/component_inventory_plugin.cpp # Windows answers planned; checks the portable scan headers
+    agents/plugins/process_introspect/src/process_introspect_plugin.cpp # Windows answers planned; checks the portable parsers and seam headers
     agents/core/src/dism_bounded_call.cpp
     agents/plugins/windows_optional_features/src/windows_optional_features_plugin.cpp
     agents/plugins/firmware_posture/src/firmware_posture_win.cpp
@@ -81,6 +85,8 @@ tus=(
     agents/plugins/privacy_permissions/src/privacy_permissions_win.cpp
     agents/plugins/privacy_permissions/src/privacy_permissions_plugin.cpp
      agents/plugins/license_scan/src/licensing_win.cpp agents/plugins/registry/src/registry_plugin.cpp agents/plugins/registry/src/registry_win.cpp agents/plugins/installed_apps/src/installed_apps_plugin.cpp agents/plugins/echo/src/echo_mapdrive_collector.cpp agents/plugins/users/src/users_plugin.cpp
+    agents/plugins/ioc/src/ioc_plugin.cpp # DnsCacheTableOwner / once-per-command resolver-cache read (WP12)
+    agents/plugins/network_config/src/network_config_plugin.cpp # do_dns_cache's Windows block (WP12)
 )
 [ "$#" -gt 0 ] && tus+=("$@")
 

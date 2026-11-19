@@ -1,8 +1,9 @@
 # ClusterFuzzLite — continuous fuzzing of Yuzu's untrusted-input parsers
 
 `cflite-pr.yml` builds this directory's `Dockerfile` + `build.sh` on any PR
-touching the fuzzed compile closure — six parser families under
-`server/core/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
+touching the fuzzed compile closure — the parser families under `server/core/src/`
+and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` (see the
 workflow's `paths:`) — and fuzzes **what the PR changed** for a short budget
 (code-change mode, ASan). Findings surface as the workflow's SARIF / crash
 artifacts — file them as issues; don't fix them inside unrelated PRs.
@@ -35,9 +36,16 @@ download-miss warnings in the job logs.
 | Target | Parses | Why it's fuzzed |
 |---|---|---|
 | `fuzz_preflight_parse` | pipe-delimited plugin output → pre-flight verdicts | agent/plugin-controlled bytes decide go/no-go |
+| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a forged cursor must be refused before any filesystem call |
+| `fuzz_file_search_names` | the reversible name encoding of result rows | file names are attacker-chosen bytes and must round-trip exactly |
+| `fuzz_file_search_glob` | the leaf-name pattern compiler and matcher | operator patterns meet attacker-chosen file names; matching must stay bounded |
 | `fuzz_deployment_parse` | deployment config fields + content_dist output | operator strings + agent bytes gate the mutating deploy step |
 | `fuzz_yaml_scan` | the in-tree YAML-subset scanner | only runtime consumer of `yaml_source`; authorization-load-bearing since #1215 |
 | `fuzz_guardian_rule_spec` | Guardian rule bodies + `dangerous_enforce_*` chokepoints | network-supplied specs gate enforce-mode promotion |
+| `fuzz_component_zip` | a Java archive's end-of-central-directory record and central directory | a planted jar's bytes decide what the agent reads and lists |
+| `fuzz_binary_header_pe` | a Windows executable's headers, section table, resource directory and version resource | any file under a searched root can be handed to the reader, so every offset and count is attacker-chosen |
+| `fuzz_binary_header_elf` | an ELF file's header, program headers, notes and dynamic section | same: a planted file decides what the agent reads |
+| `fuzz_binary_header_macho` | a Mach-O thin or universal file's headers and load commands | same: a planted file decides what the agent reads |
 
 Every target is deliberately **closure-light** (STL + nlohmann only) so this
 container needs no meson/vcpkg. The same sources build two ways:

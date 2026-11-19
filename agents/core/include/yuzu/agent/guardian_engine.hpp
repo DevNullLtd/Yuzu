@@ -40,6 +40,7 @@
 #include <yuzu/agent/kv_store.hpp> // kKvStoreStopBusyTimeout (#5604)
 #include <yuzu/agent/guard.hpp>  // IGuard, GuardDrift (guard abstraction)
 #include <yuzu/agent/guardian_preserved_tally.hpp> // #4415: per-full_sync skipped-rule record
+#include <yuzu/agent/guardian_rebuild_tally.hpp> // #5719: per-full_sync rebuild-reason record
 #include <yuzu/agent/spark.hpp> // SparkType (for the classify() capability set)
 
 namespace yuzu::agent {
@@ -80,6 +81,7 @@ struct GuardianHealthStats;
 class GuardianStateReader;
 class GuardianSparkEngineBackend;
 class GuardianLegacySinkExecutor;
+struct GuardianEmitSeqSource;
 struct OutboxEntry;
 enum class SendResult;
 enum class LegacySendOutcome : std::uint8_t;
@@ -160,7 +162,15 @@ public:
     /// `false` (legacy stays the observable default); rung 12's "default
     /// flip" changes that one literal. Tests pass `true` to exercise the
     /// spark path.
-    GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false);
+    ///
+    /// `boot_epoch` (UP-14): the high half of the (boot_epoch, emit_seq) event-order pair,
+    /// claimed once at agent boot by claim_guardian_boot_epoch() (guardian_boot_epoch.hpp)
+    /// and passed in so this constructor stays I/O-free. 0 (the default, and what every
+    /// test using the 2- or 3-argument form gets) means "unordered": events still draw an
+    /// emit_seq internally but the wire carries 0/0 (a server that compares the pair
+    /// ignores a 0/0 pair and keeps ordering by the census ordering key).
+    GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark = false,
+                   std::uint64_t boot_epoch = 0);
     ~GuardianEngine();
 
     GuardianEngine(const GuardianEngine&) = delete;
@@ -210,15 +220,16 @@ public:
     /// part (c) — never the kick's own wall-clock `now`; a real verdict delivered
     /// between two losses is legitimately older than the SECOND loss and should
     /// still be overwritten by a repair covering that second loss, which stamping
-    /// with `now` instead of `last_lost` would otherwise let a stale repair do to
-    /// a NEWER, already-delivered real verdict, via the server's own
-    /// census ordering key — belt-and-braces alongside the executor's own
-    /// seq-guarded clearing and dequeue-time supersession check, see
+    /// with `now` instead of `last_lost` would otherwise let a stale repair overwrite
+    /// a NEWER, already-delivered real verdict through the server's own
+    /// census ordering key; the executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence, see
     /// guardian_legacy_sink_executor.hpp's class doc comment). The server's
     /// census goes fail-closed (errored) for a gapped rule until either the
     /// repair is confirmed delivered or the rule's next real verdict clears it
-    /// (a verdict with a later census ordering key, per D11's "first verdict clears"
-    /// semantics, docs/spark-legacy-delta-registry.md); locally, the executor's
+    /// (today the verdict with the later census ordering key, and with the later pair once
+    /// the server compares it; D11's "first verdict clears" semantics,
+    /// docs/spark-legacy-delta-registry.md); locally, the executor's
     /// own gap ledger can ALSO be cleared by that same next real verdict, before
     /// any repair for it is ever dispatched — see
     /// guardian_legacy_sink_executor.hpp's SEQ-GUARDED CLEARING section. noexcept:
@@ -321,14 +332,15 @@ public:
     /// and drain worker), staging attempts that failed (an allocation failure, once per
     /// attempt) or displaced a capture (a retarget that replaced a still-unpersisted capture;
     /// GuardianSparkRuntime::staged_baseline_drops), and passes that found a capture staged
-    /// with no KV store to write it to. A stop-time loss that is not a failed write (the stop
-    /// flush ran out of wall budget, or was skipped because it started late AND this stop had
-    /// shown a slow store) is logged, NOT counted here. A capture that could not be
-    /// staged again at stop IS counted (per failed attempt, like any staging failure) and
-    /// logged, but the count dies with the exiting process, so the log line is the evidence;
-    /// the same holds for a flush cut short by a firewalled throw (counted in the persister's
-    /// firewalled-exception count, and logged). A stop cut off by the shutdown watchdog leaves
-    /// not even a log line (exit code 4). Zero while
+    /// with no KV store to write it to (defence in depth: production cannot reach it, because
+    /// an engine without a store arms no rule, so nothing is staged). A stop-time loss that is
+    /// not a failed write (the stop flush ran out of wall budget, or was skipped because it
+    /// started late AND this stop had shown a slow store) is logged, NOT counted here. A
+    /// capture that could not be staged again at stop IS counted (per failed attempt, like any
+    /// staging failure) and logged, but the count dies with the exiting process, so the log
+    /// line is the evidence; the same holds for a flush cut short by a firewalled throw
+    /// (counted in the persister's firewalled-exception count, and logged). A stop cut off by
+    /// the shutdown watchdog leaves not even a log line (exit code 4). Zero while
     /// healthy, quiescent, or inert (prefer_spark off). Surfaced SPARSELY as
     /// `yuzu.guardian_baseline_persist_failures` via emit_guardian_baseline_persist_heartbeat_tags.
     /// Spark path ONLY: a legacy FileGuard persist failure is logged, not counted. Because it
@@ -340,6 +352,35 @@ public:
     /// GuardianEngine getters (policy_generation(), journal_stats(), ...) DO take mtx_, so the
     /// tick as a whole can still wait behind apply_rules; only this read cannot.
     [[nodiscard]] std::uint64_t baseline_persist_failures() const;
+    /// #5605: the number of Spark baseline-on-arm captures CURRENTLY staged on this agent and not
+    /// yet written to its local KV baseline record (the persister's pending_captures(), the
+    /// runtime's staging-map size mirrored). A CURRENT value that falls as captures are written,
+    /// not a cumulative count: unlike baseline_persist_failures() it reads the open backlog even
+    /// when every pass throws before its first write. std::nullopt (tag omitted, the arm_stats()
+    /// dormancy pattern) when no persister is published: prefer_spark_ is false (every released
+    /// agent), wire_spark_engine has not run or ran after stop(), --spark-disable, a null engine,
+    /// or a wiring that failed before the persister was published, or failed after it and was
+    /// rolled back (rollback_spark_wiring_locked unpublishes it). A present 0 means "no capture
+    /// waiting at this persister", NOT "Spark is healthy". After stop() the persister stays
+    /// published, so a heartbeat tick before the thread joins reads the residual the Stop pass
+    /// could not write (captures this process will lose). A capture that could not even be staged
+    /// is not counted here (see baseline_persist_failures()), and a legacy FileGuard persist
+    /// failure is counted nowhere. Lock-free (never mtx_), like baseline_persist_failures().
+    [[nodiscard]] std::optional<std::uint64_t> baseline_unpersisted() const;
+    /// #5605: the number of `file-hash-equals` rules with no authored expected_hash whose boot
+    /// re-arm seed lookup (start_local's walk over the cached rules) found NO persisted baseline
+    /// record, counted once per rule per boot, on BOTH detection backends (the lookup precedes
+    /// the backend choice). Each such rule re-arms, and where the file mechanism can arm
+    /// (Windows today) re-captures the file's CURRENT content as its baseline at that boot. It
+    /// is NOT proof that a capture was lost: a rule never captured, a prior failed arm, a
+    /// platform whose file mechanism cannot arm (the seed read runs before placement is decided,
+    /// so nothing is re-captured there) and a genuinely lost capture all read the same. A read
+    /// error, a malformed record, a fingerprint mismatch (a retarget), a disabled rule and any
+    /// apply_rules after boot are not counted. Written only under mtx_ during the one start_local
+    /// walk (a second start_local is a no-op), so it is a per-boot constant afterwards; read
+    /// lock-free.
+    /// Live on every agent today (not gated on prefer_spark_).
+    [[nodiscard]] std::uint64_t baseline_rebaselined_at_boot() const noexcept;
     /// #4045: cumulative count of staged captures the #4021 overwrite guard REFUSED to write
     /// because a same-target record already existed (first capture wins). Not a failure and not
     /// part of baseline_persist_failures(). DIAGNOSTIC accessor with no production consumer and
@@ -849,8 +890,8 @@ public:
         stop_busy_timeout_ms_.store(budget.count(), std::memory_order_relaxed);
     }
     /// TEST-ONLY (#4045): forget the published persister pointer, as if stop() had read it just
-    /// before wire_spark_engine published it. The heartbeat getters then read 0. No production
-    /// caller.
+    /// before wire_spark_engine published it. baseline_unpersisted() then reads nullopt and
+    /// baseline_persist_failures() reads 0. No production caller.
     void unpublish_baseline_persister_for_test() noexcept {
         baseline_persister_published_.store(nullptr, std::memory_order_release);
     }
@@ -872,6 +913,18 @@ public:
     void set_post_attach_hook_for_test(std::function<void(const std::string& rule_id)> hook) {
         std::lock_guard lock(mtx_);
         post_attach_hook_for_test_ = std::move(hook);
+    }
+
+    /// TEST-ONLY (#5719): records `why` as the cause a full_sync's scoped detach forced for
+    /// `rule_id`, exactly as apply_rules does from detach_rules_except's return. Takes NO lock:
+    /// call it only from a hook that already runs under mtx_ on the apply thread
+    /// (set_post_attach_hook_for_test). It exists to reach the engine's decision to consult that
+    /// record only when attach_rule reported a reason, which no runtime state a Rig can build
+    /// pairs with a forced entry. No production caller.
+    /// `key` is the spark key the forced entry was recorded against (empty matches nothing).
+    void force_rebuild_reason_unlocked_for_test(const std::string& rule_id,
+                                                GuardianRebuildReason why, std::string key = {}) {
+        forced_rebuilds_[rule_id] = ForcedRebuildEntry{std::move(key), why};
     }
 
     /// TEST-ONLY (#4783 Gate 8 re-review): arms legacy_sink_persist_race_hook_for_test_ -
@@ -931,6 +984,11 @@ public:
     /// emission, not observed via spdlog, for the same cross-image reason as the accessors above.
     /// Locked, returned by value. No production caller.
     [[nodiscard]] std::string last_full_sync_preserved_line_for_test() const;
+
+    /// TEST-ONLY (#5719): the exact `Guardian: full_sync rebuilt N rule(s) ...` line the most
+    /// recent full_sync apply_rules emitted (empty before the first). Same contract as
+    /// last_full_sync_preserved_line_for_test(). Locked, returned by value. No production caller.
+    [[nodiscard]] std::string last_full_sync_rebuild_line_for_test() const;
 
     /// #4021: the `expected_hash` a file-hash-equals rule's most recent legacy arm
     /// attempt ended up with — empty if never armed as file-hash-equals, the
@@ -1000,6 +1058,17 @@ public:
     /// may otherwise already have live queued/in-flight state once guards can run.
     /// No production caller.
     void set_legacy_sink_max_events_for_test(std::size_t max_events);
+
+    /// UP-14: the boot epoch this engine was constructed with (0 = unordered; the wire pair
+    /// is then 0/0). Immutable for the engine's lifetime.
+    [[nodiscard]] std::uint64_t boot_epoch() const noexcept;
+
+    /// TEST-ONLY (UP-14): the engine-owned emit-order source the legacy sink executor and
+    /// the Spark runtime both draw from. Returned by shared_ptr so a test can take a
+    /// weak_ptr and observe the source's lifetime; a test using the complete type must
+    /// `#include "guardian_emit_seq.hpp"` itself (this header only forward-declares it).
+    /// No production caller.
+    [[nodiscard]] std::shared_ptr<GuardianEmitSeqSource> emit_seq_source_for_test() const;
 
 private:
     KvStore* kv_;
@@ -1271,10 +1340,17 @@ private:
     /// `first_lost` — a real verdict delivered between two losses is legitimately
     /// older than the SECOND loss and should still be overwritten by a repair
     /// covering that second loss); every real guard callsite leaves it at
-    /// nullopt and keeps stamping `now`. This is belt-and-braces alongside the
-    /// executor's own seq-guarded clearing and dequeue-time supersession check —
-    /// it lets the server's census ordering key independently
-    /// reject a stale repair, even if it somehow still reached the wire.
+    /// nullopt and keeps stamping `now`. The executor's own seq-guarded clearing and
+    /// dequeue-time supersession check are the agent-side stale-repair defence; the
+    /// backdated timestamp is an input to the server's census ordering key, which
+    /// sees the repair at the time of the loss rather than the time of the repair.
+    /// UP-14: the backdated stamp is an input to that key, not an ordering authority the
+    /// agent can rely on (the key is capped at receipt plus 300 s, and a tie is decided by
+    /// arrival). A repair goes through offer() like
+    /// any event and draws a FRESH (boot_epoch, emit_seq) pair at admission; the pair and
+    /// the timestamp are both inputs, a server that compares the pair orders the repair
+    /// against other verdicts by it, and one that does not (or sees 0/0) falls back to
+    /// the census ordering key.
     ///
     /// `expected_gap_lost_seq` (adversarial-review finding, 2026-09-24): threaded
     /// straight through to offer()'s own parameter of the same name — see
@@ -1293,8 +1369,9 @@ private:
     // shape (the #1307 agent_id fold) has no cross-platform test path without
     // this. The helper drives emit_guard_event() with a synthetic GuardDrift;
     // a sink installed via set_event_sink() captures the resulting event.
-    friend YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
-                                                         const GuardDrift& drift);
+    friend YUZU_EXPORT void guardian_emit_drift_for_test(
+        GuardianEngine& engine, const GuardDrift& drift,
+        std::optional<std::chrono::system_clock::time_point> timestamp_override);
 
     // event_sink_ is guarded by its own mutex (not mtx_) so a guard worker can
     // deliver an event without contending with — or deadlocking against — the
@@ -1303,6 +1380,24 @@ private:
     mutable std::mutex sink_mtx_;
     EventSink event_sink_;
     std::atomic<std::uint64_t> event_seq_{0};
+    /// UP-14: the ONE emit-order source (boot_epoch fixed at construction) both emit paths
+    /// stamp the wire (boot_epoch, emit_seq) pair from: the legacy sink executor (built by
+    /// make_legacy_sink_executor, which hands it over) and, via wire_spark_engine(), the
+    /// Spark runtime. Never null. A shared_ptr, not a value member lent out by pointer: the
+    /// runtime (detached SparkEngine handler) and the executor's detached worker can outlive
+    /// this engine's frame, so each co-owns it. It lives HERE rather than in the runtime
+    /// because the runtime can be absent (SparkDisabled / SparkFailed) while the legacy path
+    /// is always live. Declared BEFORE legacy_sink_executor_ (the member-init list passes it
+    /// to the executor); distinct from event_seq_ above, which only mints event ids.
+    std::shared_ptr<GuardianEmitSeqSource> emit_seq_source_;
+    /// Build a legacy sink executor that carries emit_seq_source_. The ONE construction
+    /// path: the constructor's member-init list and set_legacy_sink_max_events_for_test()
+    /// both use it, so a rebuilt executor can never silently drop the source. Reads only
+    /// emit_seq_source_, which is initialized before legacy_sink_executor_. `max_events`
+    /// overrides GuardianLegacySinkExecutor::Config::max_events when set (the Config type is
+    /// not nameable in this header, see set_legacy_sink_max_events_for_test).
+    [[nodiscard]] std::unique_ptr<GuardianLegacySinkExecutor>
+    make_legacy_sink_executor(std::optional<std::size_t> max_events = std::nullopt) const;
     /// #4783: count of emit_guard_event() calls that bailed because no sink was wired
     /// yet (event_sink_ null - the pre-network-arm A3 drop, unchanged semantics).
     /// Previously a silent, uncounted return; now countable so "the sink was never
@@ -1388,12 +1483,24 @@ private:
     /// both into the single operator-facing guardian_journal_maint_exceptions tag.
     std::atomic<std::uint64_t> journal_maint_exceptions_{0};
     /// #4045: the persister, published for lock-free readers (baseline_persist_failures /
-    /// baseline_persist_refusals). Stored with release by wire_spark_engine (under mtx_) right
-    /// after the persister is constructed, never cleared or replaced (wire is once-only and
-    /// rollback_spark_wiring_locked leaves the persister alone), and the object lives until
-    /// this engine's destructor, so an acquire load that sees non-null may dereference it for
-    /// as long as the engine is alive. Every other member read still needs mtx_.
+    /// baseline_persist_refusals / baseline_unpersisted). Stored with release by
+    /// wire_spark_engine (under mtx_) right after the persister is constructed and never
+    /// replaced (wire is once-only). #5605: rollback_spark_wiring_locked UNPUBLISHES it (stores
+    /// nullptr here) so a wiring that failed after this point reads as "no persister" (the
+    /// Spark path is SparkFailed and nothing can stage), not as a live zero; it leaves the
+    /// persister OBJECT (baseline_persister_) alone, which lives until this engine's destructor,
+    /// so a reader that loaded the pointer before the clear still dereferences a live object,
+    /// and an acquire load that sees non-null may dereference it for as long as the engine is
+    /// alive. Every other member read still needs mtx_.
     std::atomic<GuardianBaselinePersister*> baseline_persister_published_{nullptr};
+    /// #5605: true only while start_local's boot re-arm walk runs. mtx_-guarded (both callers of
+    /// reconcile_rule_locked hold mtx_), set before the walk and cleared by a GuardianRollback
+    /// scope guard on every exit, so apply_rules never sees it set.
+    bool boot_rearm_walk_{false};
+    /// #5605: rules whose boot seed lookup found no persisted baseline (see
+    /// baseline_rebaselined_at_boot()). Incremented only at reconcile_rule_locked's shared seed
+    /// block with boot_rearm_walk_ set (mtx_ held); atomic so the heartbeat reads it lock-free.
+    std::atomic<std::uint64_t> boot_rebaselined_{0};
     /// TEST-ONLY (#4045): see set_apply_post_drain_hook_for_test / set_seed_read_hook_for_test.
     /// mtx_-guarded; null = no-op.
     std::function<void()> apply_post_drain_hook_for_test_;
@@ -1426,6 +1533,20 @@ private:
     GuardianPreservedTally preserved_tally_;
     /// TEST-ONLY (see last_full_sync_preserved_line_for_test); empty = none emitted yet.
     std::string last_full_sync_preserved_line_for_test_;
+    /// #5719: why each rule the current apply_rules rebuilt was rebuilt (mtx_-guarded; reset at the
+    /// start of each apply_rules' rule loop).
+    GuardianRebuildTally rebuild_tally_;
+    /// #5719: rule_id -> the cause a full_sync's scoped detach forced, with the spark key whose
+    /// fault it records (mtx_-guarded; cleared at the top of every apply_rules; installed from
+    /// detach_rules_except's return on a full_sync). The cause is applied only when the rule's
+    /// attach targets that same key: a rule retargeted to another key is a first attach there.
+    struct ForcedRebuildEntry {
+        std::string key;
+        GuardianRebuildReason why{GuardianRebuildReason::None};
+    };
+    std::unordered_map<std::string, ForcedRebuildEntry> forced_rebuilds_;
+    /// TEST-ONLY (see last_full_sync_rebuild_line_for_test); empty = none emitted yet.
+    std::string last_full_sync_rebuild_line_for_test_;
     /// TEST-ONLY (see last_file_expected_hash_for_test); empty = no file-hash-equals
     /// arm attempt has run yet.
     std::string last_file_expected_hash_for_test_;
@@ -1557,8 +1678,12 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 /// captured by a sink installed via set_event_sink(). Intended ONLY for unit
 /// tests — production drift originates inside Windows-only guard workers. Used
 /// by the #1307 regression test to assert the event_id embeds the agent_id.
-YUZU_EXPORT void guardian_emit_drift_for_test(GuardianEngine& engine,
-                                              const GuardDrift& drift);
+/// `timestamp_override` (UP-14) is threaded to emit_guard_event() so a test can backdate
+/// the wire timestamp deterministically (the same parameter legacy_sink_kick() uses for a
+/// gap repair); the default leaves every existing caller unchanged.
+YUZU_EXPORT void guardian_emit_drift_for_test(
+    GuardianEngine& engine, const GuardDrift& drift,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override = std::nullopt);
 
 /// Test-support helpers (#4021 adversarial-review K1/C2-1 regression net): reach
 /// the persist-side overwrite guard and the seed-side lookup directly, since the

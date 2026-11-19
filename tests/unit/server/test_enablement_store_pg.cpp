@@ -325,8 +325,17 @@ TEST_CASE("EnablementStore: schema v3 applies over an existing v2 plugin_config_
         };
         REQUIRE(pg::PgMigrationRunner::run(lease.get(), "plugin_config_store", v1v2));
     }
-    CHECK(query1(db.dsn(), "SELECT to_regclass('plugin_config_store.enablement_meta') IS NULL") == "t");
-    CHECK(query1(db.dsn(), "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") == "2");
+    // The v1/v2 text above is a hand copy, not the store's own bytes, so its hashes differ
+    // from the store's (#7158 would read that as drift). This models a database that applied
+    // v1/v2 before `public.yuzu_schema_migrations` existed: drop the rows the runner just wrote,
+    // and the store records its own text as first seen.
+    exec_sql(db.dsn(),
+             "DELETE FROM public.yuzu_schema_migrations WHERE store = 'plugin_config_store'");
+    CHECK(query1(db.dsn(), "SELECT to_regclass('plugin_config_store.enablement_meta') IS NULL") ==
+          "t");
+    CHECK(query1(db.dsn(),
+                 "SELECT version FROM public.schema_meta WHERE store='plugin_config_store'") ==
+          "2");
 
     // Representative v2 data - a config, a sealed secret and a per-OS kill switch - that the
     // additive v3 migration must leave exactly as it found it.

@@ -156,23 +156,42 @@ TEST_CASE("CommandCapabilityRegistry: too many sources throws rather than silent
     // literal at the call site, so exceeding kMaxSources means literally
     // writing kMaxSources + 1 elements. The static_assert keeps that literal
     // count honest if kMaxSources ever changes.
-    static_assert(CommandCapabilityRegistry::kMaxSources == 32,
-                 "this test hardcodes 33 literal sources (kMaxSources + 1); update the "
+    static_assert(CommandCapabilityRegistry::kMaxSources == 48,
+                 "this test hardcodes 49 literal sources (kMaxSources + 1); update the "
                  "literal list below if kMaxSources changes");
     const auto s = std::span<const CommandCapability>(kFragmentAlpha);
     CHECK_THROWS_AS(
         CommandCapabilityRegistry({s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
-                                    s, s, s, s, s, s, s, s, s, s, s, s}),
+                                    s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s, s,
+                                    s, s, s, s, s, s, s}),
         std::invalid_argument);
+}
+
+TEST_CASE("CommandCapabilityRegistry: exactly kMaxSources sources construct and the last one "
+          "still classifies",
+          "[server][dispatch][capability]") {
+    // The acceptance side of the ceiling: a cutoff below kMaxSources would pass the 49-source
+    // rejection case above, so pin that the final slot is usable. 47 empty sources, then one
+    // populated source in slot 48.
+    static_assert(CommandCapabilityRegistry::kMaxSources == 48,
+                 "this test hardcodes 48 literal sources (kMaxSources); update the literal "
+                 "list below if kMaxSources changes");
+    const auto e = std::span<const CommandCapability>{};
+    const auto s = std::span<const CommandCapability>(kFragmentAlpha);
+    CommandCapabilityRegistry registry({e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, e,
+                                        e, e, e, e, e, e, e, e, e, e, e, e, e, e, e, s});
+    auto result = registry.classify("echo", "collect_inventory");
+    REQUIRE(result.has_value());
 }
 
 // ── core_dispatch_capabilities() ─────────────────────────────────────────
 
-TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiated dispatches, "
+TEST_CASE("capdecls::core_dispatch_capabilities: exactly the five system-initiated dispatches, "
           "all system_reserved",
           "[server][dispatch][capability]") {
     auto rows = capdecls::core_dispatch_capabilities();
-    REQUIRE(rows.size() == 4);
+    REQUIRE(rows.size() == 5);
     for (const auto& row : rows)
         CHECK(row.system_reserved);
 
@@ -202,6 +221,18 @@ TEST_CASE("capdecls::core_dispatch_capabilities: exactly the four system-initiat
     CHECK(sync->operation == authz::Operation::Read);
     CHECK(sync->system_reserved);
     CHECK(sync->execute_gate == ExecuteGate::None);
+
+    // Heartbeat-driven collection settings (__sync__.settings, SAM-39): mutating but
+    // reversible, system-reserved, lands under Inventory.
+    auto settings = registry.classify("__sync__", "settings");
+    REQUIRE(settings.has_value());
+    CHECK(settings->dispatch_class == DispatchClass::Mutating);
+    CHECK(settings->mutability == Mutability::Reversible);
+    CHECK(settings->securable == "Inventory");
+    CHECK(settings->operation == authz::Operation::Write);
+    CHECK(settings->risk_tier == authz::RiskTier::Medium); // the Write floor
+    CHECK(settings->system_reserved);
+    CHECK(settings->execute_gate == ExecuteGate::None);
 }
 
 // ── normalize_action_key ─────────────────────────────────────────────────

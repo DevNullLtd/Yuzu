@@ -42,6 +42,7 @@
 #include <optional>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <vector>
 
 namespace yuzu::server {
@@ -75,6 +76,14 @@ inline std::string_view strip_db_error_prefix(std::string_view msg) {
 
 // ── PolicyStore ──────────────────────────────────────────────────────────────
 
+/// One policy that uses a fragment, as `PolicyStore::policies_using_fragments` answers it: just
+/// the three columns a refusal names, no trigger/input/binding rows.
+struct FragmentUse {
+    std::string fragment_id;
+    std::string policy_id;
+    std::string policy_name; ///< may be empty
+};
+
 class PolicyStore {
 public:
     explicit PolicyStore(pg::PgPool& pool);
@@ -92,6 +101,33 @@ public:
     [[nodiscard]] std::expected<std::optional<PolicyFragment>, PolicyReadError>
     get_fragment(const std::string& id) const;
     [[nodiscard]] bool delete_fragment(const std::string& id);
+    /// Ids of the fragments whose check, fix or post-check names `instruction_id` (an instruction
+    /// DEFINITION id), at most `limit` of them. The evaluator resolves those three fields by
+    /// definition id, so a fragment pointing at a deleted definition silently stops maturing
+    /// verdicts. `exclude_ids` are left out INSIDE the query, so an excluded row never takes one
+    /// of the `limit` slots. `kDegraded` = the question could not be answered; it is never an
+    /// empty list.
+    [[nodiscard]] std::expected<std::vector<std::string>, PolicyReadError>
+    fragments_referencing_instruction(
+        const std::string& instruction_id, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
+    /// The same question for ANY of `instruction_ids` at once (one read for the whole list); each
+    /// fragment is listed once however many of the ids its three fields name. An empty list
+    /// answers an empty vector without a read. `fragments_referencing_instruction` above is the
+    /// one-element call of this method.
+    [[nodiscard]] std::expected<std::vector<std::string>, PolicyReadError>
+    fragments_referencing_instructions(
+        const std::vector<std::string>& instruction_ids, int limit,
+        const std::unordered_set<std::string>& exclude_ids = {}) const;
+    /// The policies that use any of `fragment_ids`, at most `per_fragment_limit` for each fragment
+    /// (ordered by name, then id as a stable tiebreak; `query_policies` orders by name only), in
+    /// ONE read of the policy rows only (no trigger/input/binding detail is loaded, so a bad
+    /// detail row cannot fail it). A
+    /// fragment no policy uses is simply absent. An empty list answers an empty vector without a
+    /// read. `kDegraded` = the question could not be answered; it is never an empty list.
+    [[nodiscard]] std::expected<std::vector<FragmentUse>, PolicyReadError>
+    policies_using_fragments(const std::vector<std::string>& fragment_ids,
+                             int per_fragment_limit) const;
 
     /// Extract the operator-facing fragment name from a YAML source string
     /// without parsing the entire fragment. Used by route handlers that

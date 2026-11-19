@@ -32,6 +32,16 @@ Meson is the sole build system. **Every time you add, remove, or rename a source
 (`--native-file meson/native/*.ini` / `--cross-file meson/cross/*.ini` select compilers / cross targets.)
 The script runs `vcpkg install` then `meson setup` automatically.
 
+### Following `dev`: what changed since your last pull
+Unreleased changes are only collated into `CHANGELOG.md` at release. After `git pull`, run:
+```bash
+python3 scripts/whats-new.py                          # since your last pull
+python3 scripts/whats-new.py --since "2 weeks ago"    # or a tag, branch, commit or YYYY-MM-DD
+python3 scripts/whats-new.py --versions               # version bumps, rebuild notes, Docker image bumps (and any `!` notice)
+```
+On Windows use the launcher, `py -3 scripts\whats-new.py` (Python 3.9 or later). The header counts `**Breaking` entries, and an entry a release in the range already moved into `CHANGELOG.md` ends `[released X.Y.Z]`, or `[released]` when its version cannot be told.
+It lists version bumps first (project version, plugin ABI, vcpkg baseline and dependencies, gateway packages, latest released changelog version), the surfaces that may need a rebuild (a vcpkg change means re-running the setup script above, with `--wipe` if a library version does not update), `build(deps)`/`chore(deps)` dependency bumps, then the `changelog.d/` fragments the range adds. A fresh clone, a new branch or an expired reflog has no pull to read; pass `--since` there. Details: `changelog.d/README.md`.
+
 ### Manual configure
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=.
@@ -56,7 +66,7 @@ pointing at a populated `vcpkg_installed`.
 | Set | Ports | Selected by |
 |---|---|---|
 | base (always) | grpc[codegen], protobuf, abseil, spdlog, nlohmann-json, cli11, cpp-httplib, sqlite3, openssl, zlib (Windows hand-wired grpc link, `_libzlib` in the root `meson.build`; also server/core), libxml2 (autoruns plugin) | always |
-| `server` | libpq, xmlsec, drogon | default feature |
+| `server` | libpq, xmlsec, drogon, libxlsxwriter (pulls in minizip) | default feature |
 | `tests` | catch2 (`x64 \| arm64` only) | default feature |
 | `agent` | none today (placeholder) | explicit `--x-feature=agent` |
 
@@ -64,26 +74,26 @@ pointing at a populated `vcpkg_installed`.
 
 ```bash
 vcpkg install --triplet x64-linux --x-manifest-root=. --x-no-default-features
-meson setup build-linux -Dbuild_server=false ...   # -Dbuild_tests=false (default)
+meson setup build-linux -Dserver=disabled ...   # -Dbuild_tests=false (default)
 # agent-only WITH tests: re-add the tests feature
 vcpkg install --triplet x64-linux --x-manifest-root=. --x-no-default-features --x-feature=tests
 ```
 
-Planned (`vcpkg install --dry-run`, not built) on `x64-linux`: 23 → 16 target-triplet ports. The opt-out drops catch2, drogon, libpq, xmlsec, jsoncpp, libuuid and trantor, and libpq's bison/flex/autoconf build prerequisites are no longer needed either. `zlib` is declared in the base, not in `server`: the agent's Windows link requires it (`required: true`), so it must not depend on a grpc transitive happening to supply it. `brotli` stays (cpp-httplib's default `brotli` feature).
+Planned (`vcpkg install --dry-run`, not built) on `x64-linux`: 25 → 16 target-triplet ports. The opt-out drops catch2, drogon, libpq, xmlsec, libxlsxwriter, minizip, jsoncpp, libuuid and trantor, and libpq's bison/flex/autoconf build prerequisites are no longer needed either. `zlib` is declared in the base, not in `server`: the agent's Windows link requires it (`required: true`), so it must not depend on a grpc transitive happening to supply it. `brotli` stays (cpp-httplib's default `brotli` feature).
 
-**Shared trees and caches.** An agent-only and a full install of one triplet fill the same path, `vcpkg_installed/<triplet>/`, but vcpkg re-plans on every `install` and reconciles the tree in both directions: a default install onto an agent-only tree adds the server ports, and `--x-no-default-features` onto a full tree removes them (reproduced on `arm64-osx` with a scratch manifest on one `--x-install-root`; expected, not exercised, on Windows). A persistent self-hosted tree therefore needs no extra key, and `scripts/ci/vcpkg-triplet-sentinel.sh` deliberately takes no install profile: it would turn that incremental fix into a full wipe each time two jobs of different shapes share a runner.
+**Shared trees and caches.** An agent-only and a full install of one triplet fill the same path, `vcpkg_installed/<triplet>/`, but vcpkg re-plans on every `install` and reconciles the tree in both directions: a default install onto an agent-only tree adds the server ports, and `--x-no-default-features` onto a full tree removes them (reproduced on `arm64-osx` with a scratch manifest on one `--x-install-root`, and on `x64-windows` in the ADR-0035 step-3 rehearsal; one exception: a vcpkg killed while removing `libpq` leaves it half-purged and a re-run does not finish it, so delete `vcpkg_installed` and re-install, see `docs/windows-build.md`). A persistent self-hosted tree therefore needs no extra key, and `scripts/ci/vcpkg-triplet-sentinel.sh` deliberately takes no install profile: it would turn that incremental fix into a full wipe each time two jobs of different shapes share a runner.
 
 The remaining hazard is cost, not correctness: a GHA `actions/cache` key that saves `vcpkg_installed` (the `canary` job). A job that opts out and saves such a cache must put its install profile in the key, or an exact hit of the other shape skips that job's own save, so the wrong-shape tree stays in the cache and every run reconciles it again. The canary is a default (full) install, so its key needs no profile. Its `vcpkg.json` hash still changes once on merge, and the sentinel (which hashes `vcpkg.json`) then wipes the prefix-restored tree, so the first canary run after merge is one cold build (the canary has no binary cache).
 
 When you opt out:
 
-- `-Dbuild_server=false -Dbuild_tests=true` also needs `--x-feature=tests` (tests/meson.build requires Catch2).
-- `scripts/setup.sh` always installs the default set, so run vcpkg yourself as above.
+- `-Dserver=disabled -Dbuild_tests=true` also needs `--x-feature=tests` (tests/meson.build requires Catch2).
+- `scripts/setup.sh` installs the full default set on Linux (and for any `--cross-file`, every one of which targets Linux), so for an agent-only Linux install run vcpkg yourself as above. On a Windows or macOS host with no cross file it installs the agent-only profile for you, always with `--x-feature=tests`.
 - vcpkg only *warns* on an unknown `--x-feature=` name (names are case-sensitive) and exits 0, and `--x-feature=agent` alone does not opt out of the defaults, so read the plan.
-- Only `Dockerfile.agent` and `Dockerfile.agent.chisel` opt out today. The one other agent-only leg, the Windows ASan job in `nightly.yml` (`-Dbuild_server=false -Dbuild_tests=true`), still installs the default set; switching it needs `--x-no-default-features --x-feature=tests`.
+- **Who installs which profile (ADR-0035 ladder step 3).** Agent-only (`--x-no-default-features --x-feature=tests`, or without `tests` where no test is built): the Windows and macOS legs of `ci.yml`, the Windows ASan job in `nightly.yml`, the Windows row of `codeql.yml`, the Windows and macOS jobs of `release.yml` (no `tests`), `scripts/setup.sh` on a Windows or macOS host, and `Dockerfile.agent` / `Dockerfile.agent.chisel` (Linux). Full default set: everything that builds the server on Linux. Each self-hosted Wee Tam runner keeps its own persistent `vcpkg_installed/x64-windows` tree in its workspace, and the CI, nightly and CodeQL Windows jobs that runner picks up reuse it with the same `+tests` agent-only profile, so those are not reconciled between shapes in steady state (a changed sentinel key, for example main versus dev `VCPKG_COMMIT`, wipes the tree instead; `release.yml` installs without `tests` from a clean checkout); the `server` feature option (below) is `auto`, so none of them passes a server switch to Meson either.
 
 ### Build options
-`-Dbuild_agent` / `-Dbuild_server` / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a gateway that cannot be built - no `rebar3`, or no Erlang/OTP 28.4 or later 28.x - is a configure error instead of skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
+`-Dbuild_agent` / `-Dserver` (feature, default `auto`: built on a Linux target, skipped on any other, `enabled` on a non-Linux target is a configure error, `disabled` never builds it; the older boolean `-Dbuild_server` is DEPRECATED but still honoured, `false` turns the server off, and it goes in ADR-0035 step 4, which means deleting or renaming the build dirs that passed it; `--wipe` replays stored options and does not help) / `-Dbuild_examples` (default true — gates only the four demo plugins: `example`, `chargen`, `procfetch`, `netprobe`; every other plugin builds under `-Dbuild_agent` regardless) / `-Dbuild_tests` (default false) / `-Drequire_gateway` (default false; when true, a gateway that cannot be built - no `rebar3`, or no Erlang/OTP 28.4 or later 28.x - is a configure error instead of skipping the Erlang gateway build and its `gateway eunit`/`gateway ct` tests — for local fresh setups; CI legs instead run `scripts/ci/assert-gateway-tests.py` after configure, because a non-default option stored in a persistent CI build dir breaks older branches' reconfigures (see the comment above the `require_gateway` error in `meson.build` and PR #4851; #4841 is the separate macOS gap, where CI had no Erlang at all). The CI check guards only the workflow files: a local or shared build dir that has stored `-Drequire_gateway=true` must be reset to `false` from a checkout that still has the option (`meson configure -Drequire_gateway=false <dir>`) or wiped (`./scripts/setup.sh --wipe`) before another branch reconfigures it, because Meson validates `-D` against the dir's stored options and a branch whose `meson.options` lacks the option then fails with `Unknown options`), and the Meson built-ins `-Db_lto`, `-Db_sanitize=address,undefined` (ASan+UBSan) or `-Db_sanitize=thread` (TSan).
 
 ### Per-OS build directory convention
 
@@ -106,6 +116,20 @@ Every test target carries a `suite:` label (`agent`, `echo`, `server`, `proto`, 
 meson test -C build-linux --suite <server|agent|echo> --print-errorlogs   # omit --suite for everything
 ```
 
+### The `/test` pre-push gate and its tooling
+
+`/test` (default and `--full`) installs two things the C++ build does not need, in its Phase 0b
+(`.claude/skills/test/SKILL.md`): the headless browser for the dashboard gates (`scripts/test/ensure-puppeteer.sh`)
+and `gcovr` for the coverage gate (`scripts/test/ensure-gcovr.sh`, Linux). They need **Node 22.12 or newer**,
+**python3 3.10 or newer with `venv`/`ensurepip`** (on Debian/Ubuntu `apt install python3-venv`) and `~/.local/bin`
+on `PATH`, plus network access to registry.npmjs.org, pypi.org and Google's Chrome for Testing CDN, and about
+0.5 GB of disk on the first run. A Puppeteer install that cannot finish (no Node, no route to the npm
+registry or the Chrome CDN) stops the run before the build, and so does a gcovr install that cannot finish in
+`--full`; in default mode a failed gcovr install is only a WARN and the coverage gate measures nothing.
+`PUPPETEER_EXECUTABLE_PATH` skips the browser download only: `npm ci` still runs whenever `node_modules` is
+missing or its lockfile stamp is absent or different.
+Details, recovery and the integrity posture: `tests/puppeteer/README.md` and `docs/ci-architecture.md`.
+
 Tests require `-Dbuild_tests=true`. vcpkg installs Catch2 (the default-on `tests` feature, see "Dependency features") only on `x64 | arm64`; the ARM64 cross-compile CI job intentionally skips tests.
 
 ### Direct binary invocation
@@ -125,13 +149,90 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 
 ## vcpkg
 
-- Manifest `vcpkg.json`; pinned baseline `4b77da7fed37817f124936239197833469f1b9a8` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
+- Manifest `vcpkg.json`; pinned baseline `9eec002df1cd109f8f104cd966a763daf9751489` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
+- **`overrides` (security pins above the baseline).** `vcpkg.json` pins `brotli` 1.2.1 and `sqlite3` 3.54.1 without moving the baseline. Which CVEs each pin fixes, the decisions behind them, how to confirm the linked versions and when to delete each entry: [Security dependency pins](#security-dependency-pins) below.
 - OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
-- **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), shipped via the release zip's vcpkg-DLL sweep; `libpq_dep` is gated on `build_server` (agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly.
+- **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), a server-only concern since ADR-0035 step 3 (the release zip's vcpkg-DLL sweep no longer sees it, and `release.yml`'s `build-windows` "Verify the agent runs from the packaged archive" step refuses any of the nine server DLLs, i.e. the `libpq*`, `libecpg*`, `libpgtypes*`, `drogon*`, `trantor*`, `jsoncpp*` and `*xmlsec*` families, in the agent archive); `libpq_dep` is gated on the server being built (the `build_server` variable; agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly. libpq 18 no longer installs `libpgcommon.lib`/`libpgport.lib` on Windows, so only `libpq.lib` is required there; the other two are linked when present.
+- **libxlsxwriter (SAM-36b, `format=xlsx` of the installed-software export):** a server-only port (the `server` feature), so the Windows and macOS agent-only legs never install it, and `x64-linux` gains two target-triplet ports (libxlsxwriter 1.2.4 port-version 2 and minizip 1.3.2; zlib is already there), checked with `vcpkg install --dry-run` at the pinned baseline. The port installs only a pkg-config module (`xlsxwriter`, which lists `zlib minizip` as public requirements) and no CMake package, so `server/core/meson.build` uses pkg-config alone and the static link carries minizip and zlib through it. It is used in constant-memory mode through one translation unit (`software_export_xlsx.cpp`); its library licence is BSD-2-Clause and minizip's is the zlib licence (both in `NOTICE`). Because `vcpkg.json` changed, the first CI run after the change is one cold vcpkg build.
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline; the configuration is permanent — the #376 QUIC escape was withdrawn, ADR-0066). Linux/macOS unaffected.
 - **Linux sanitizer triplets (`x64-linux-asan`/`x64-linux-tsan`) are STATIC (#4019), matching the stock `x64-linux` triplet.** Dynamic linkage (the setting from each triplet's introduction through #4019) split grpc/protobuf/re2 into separate `.so` images in the sanitizer test binaries, each independently embedding abseil's `MixingHashState::kSeed` (self-referential, so copies legitimately diverge) — a `protobuf::Map` populated via one image's hash and queried via another's silently missed an existing key, corrupting Guardian spark-validation lookups nondeterministically under both ASan and TSan. Don't revert to dynamic linkage without reading the triplet files' own header comments — the `-fsanitize=...` flag propagation both triplets exist for works identically under static linkage. This is CI/test-tooling only; no shipped artifact is built from these triplets.
 - **TSan on vendored libpq**: `pqSaveParameterStatus` (`fe-exec.c`) races two connections' initial `ParameterStatus` writes into two process-wide statics; suppressed via a compiled-in `__tsan_default_suppressions` hook in `tests/unit/test_runner_main.cpp`, kept honest by the `tests/test_no_connless_pq_escape.py` tripwire (#1611).
+
+### Security dependency pins
+
+`vcpkg.json`'s `overrides` hold a port at a fixed version above the `builtin-baseline`, so a
+security fix lands without moving the baseline. Moving the baseline would also take protobuf 6 → 7,
+gRPC 1.81 → 1.84 and zlib 1.3 → 1.4 across the #375 Windows stack. Every `overrides` entry has a
+row in the table below; `tests/test_vcpkg_overrides_documented.py` fails when one does not.
+
+| Port | Pinned | Fixes | Delete the override when |
+|---|---|---|---|
+| `brotli` | 1.2.1 | CVE-2026-111497 (decoder buffer overflow) | the baseline's `brotli` is 1.2.1 or later |
+| `sqlite3` | 3.54.1 | CVE-2026-119371 to CVE-2026-119379, CVE-2026-119586 and CVE-2026-119591 (fixed in 3.54.0) | the baseline's `sqlite3` is 3.54.1 or later |
+
+An override is an **exact** pin, port-version included. It also holds the port back once the
+baseline passes it, so the baseline bump that reaches the pinned version (normally the monthly
+`vcpkg-baseline-update.yml` PR) deletes the entry and its table row in the same change. See the
+checklist in [`docs/dependency-updates.md`](dependency-updates.md#vcpkg-baseline). vcpkg resolves an
+override from the registry's versions database. The first resolve after the manifest changes needs
+network access to fetch the registry; after that, the install root's `vcpkg-lock.json` refreshes on
+its own.
+
+**Brotli reach (CVE-2026-111497).** cpp-httplib decodes a `Content-Encoding: br` response in any
+client compiled with `CPPHTTPLIB_BROTLI_SUPPORT` unless that client calls `set_decompress(false)`.
+This applies whatever the request's `Accept-Encoding` header said, because the peer chooses the
+encoding.
+
+- **Server.** Every `server/core` source is compiled with `CPPHTTPLIB_BROTLI_SUPPORT`, and no server
+  client disables decompression. The decoder therefore runs on responses from:
+  - the OIDC provider: discovery, JWKS and token endpoint (`oidc_provider.cpp`);
+  - the NVD feed (`nvd_client.cpp`);
+  - webhook targets (`webhook_store.cpp`) and offload targets (`offload_target_store.cpp`);
+  - the directory-sync provider (`directory_sync.cpp`);
+  - analytics sinks (`analytics_sinks.cpp`);
+  - health-check targets (`healthcheck_probe.cpp`).
+
+  Inbound requests do not reach the decoder. The pre-routing body-cap gate refuses any
+  non-identity `Content-Encoding` with 415 before the body is read (`evaluate_body_cap` in
+  `body_cap_policy.hpp`).
+- **Agent.** The agent core is not compiled with Brotli support. Three plugins decode `br`:
+  - `http_client` and `content_dist`, which fetch operator-supplied URLs;
+  - `printing`, which talks to the local CUPS daemon.
+
+  The `virtualization` plugin links Brotli but calls `set_decompress(false)`, so it never decodes.
+
+**SQLite.** The agent's SQLite is in `libyuzu_agent_core` (`.so`, `.dll` or `.dylib`). The server
+also links it.
+
+**Decisions** (Fraser, project owner, 2026-11-18):
+
+| Decision | Reason | Revisit when |
+|---|---|---|
+| The one-month minimum release age is waived for `brotli` 1.2.1 and `sqlite3` 3.54.1. The project normally takes only releases at least a month old (Dependabot `cooldown`, the rebar3 checklist). | Both are security fixes. | The baseline passes the pin: delete the override (tracked in #8221). |
+| `libpq` stays at 18.4. | vcpkg has no libpq 18.6 port, so there is nothing to override to. The owner's assessment is that the PostgreSQL CVEs fixed in 18.6 are server-side issues, not defects in the libpq client library Yuzu links. The `yuzu-postgres` image moves to PostgreSQL 18.6 in a separate change. | vcpkg ships libpq 18.6: bump it (tracked in #8222). |
+
+**Version evidence.** To confirm what a tree links:
+
+- the SQLite header: `grep -E 'SQLITE_(VERSION|SOURCE_ID)' vcpkg_installed/<triplet>/include/sqlite3.h`;
+- the Brotli package: `grep Version vcpkg_installed/<triplet>/lib/pkgconfig/libbrotlidec.pc`;
+- the SQLite source id in a built binary: `strings <build-dir>/agents/core/libyuzu_agent_core.so | grep '^2026-10-16 14:45:20'`.
+
+Observed on `x64-linux` on 2026-11-18:
+
+- SQLite 3.54.1, source id `2026-10-16 14:45:20 555e07ef…`, in `libyuzu_agent_core.so` and
+  `yuzu-server`;
+- Brotli 1.2.1.
+
+The `[deps][security]` unit cases check the same floors at compile time and at run time:
+
+- `yuzu_server_tests`: `test_sqlite_raii.cpp` and `test_http_response_policy.cpp`;
+- `yuzu_agent_tests`: `test_kv_store.cpp`.
+
+A tree that links an older SQLite or Brotli fails them. Container scanners such as grype and syft
+find no packages under `vcpkg_installed`, because static vcpkg libraries carry no package
+metadata. Scanner evidence therefore comes from the per-artifact SBOMs added on branch
+`fix/wp15-sbom`. The CVE list and the reach analysis come from the 2026-11-17 supply-chain review.
 
 ## Instruction Engine build-time dependency
 

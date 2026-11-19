@@ -475,7 +475,8 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
 `deb`, `apk`, `pacman`, `snap`, `flatpak`, `windows`, `macos`, `macos_pkgutil`, `brew`,
-`optional_feature`, `msi`, `python` and `ibm_mq`.
+`optional_feature`, `msi`, `python`, `ibm_mq`, `dotnet`, `jvm`, `chocolatey`, `winget`, `appx` and
+`kernel_module`.
 
 Every tool here is read-only except `set_crypto_dashboard_layout`, which replaces the caller's
 own layout and is annotated destructive for that reason (it overwrites the previous layout; no
@@ -924,9 +925,26 @@ worst-case test at 15M rows / 30k names, 16 simultaneous live reads on one datab
 replicas with both slots busy) timed out about half the time, so size the replica count and the
 catalogue refresh together.
 
+## Registered CRL sources
+
+An administrator can register a certificate authority's CA certificates and the CRL URLs it
+publishes (ADR-0070 R1), through `POST /api/v1/crypto/revocation-sources` and the MCP tool
+`register_revocation_source`, with list, read, replace, remove and high-water-reset twins. The
+`/crypto` dashboard does not show them. The surface is admin-only whether RBAC is on or off and
+cannot be granted to a custom role, because the URL list and its fetch status map internal hosts.
+
+**This release registers sources only.** It fetches no CRL, verifies none and judges no
+certificate: every source reads `crl_status: no_crl_fetched` and every URL
+`fetch_status.state: never_fetched`. A registered source is not evidence that any certificate was
+checked. Revocation of fleet certificates against these CRLs is planned (see [Roadmap](#roadmap)).
+
+The registration steps, the address checks a CRL host must pass and the limits are in
+[Registering a CRL source](server-admin.md#registering-a-crl-source); the request and response
+shapes are in [REST API: Revocation sources](rest-api.md#revocation-sources-registered-crl-sources).
+
 ## Roadmap
 
-The following are planned and not yet available. No dates are committed.
+The following are planned and not yet available, unless marked available. No dates are committed.
 
 - A fleet certificate inventory with full X.509 fields. Certificate data is not available on
   this page until that slice ships (the endpoint `certificates` plugin already lists system store
@@ -939,20 +957,22 @@ The following are planned and not yet available. No dates are committed.
   as they are collected, still carrying inventory facts only, with no security-level fields.
 
 This page reports facts (libraries and versions today; certificates and keys later). The library
-view labels nothing as weak, outdated or unsupported. A small, fixed set of built-in checks is
-planned, and no others:
+view labels nothing as weak, outdated or unsupported. The built-in checks are a small, fixed
+set and no others. Only the counts of Yuzu's own CA are available today; the rest are planned:
 
 - four named weak-key rules: `sig_md5` (MD5 signature), `sig_sha1` (SHA-1 signature),
   `rsa_lt_2048` (RSA key under 2048 bits) and `ec_lt_224` (EC key on a curve whose group order
   is under 224 bits);
 - certificates active, expiring within, expired within and revoked within fixed numbers of
   days, and issued within the last 7 days, plus issued and revoked per week;
-- counts of active, expiring, expired, issued and revoked certificates of Yuzu's own CA, with
+- available today (see [Yuzu-issued certificates](#yuzu-issued-certificates)): counts of active,
+  expiring, expired, issued and revoked certificates of Yuzu's own CA, with
   revocations in three groups
   (superseded, unpublished, and other as recorded). An account whose view is confined to some devices sees "not available to this
   account" instead of these counts;
-- revocations of other certificates, read only from CRLs an administrator has registered.
-  OCSP is not consulted. A certificate reads "not listed on <CA>'s CRL of <thisUpdate>, next
+- revocations of other certificates, read only from CRLs an administrator has registered
+  (registration is available, see [Registered CRL sources](#registered-crl-sources); fetching
+  and checking are not). OCSP is not consulted. A certificate reads "not listed on <CA>'s CRL of <thisUpdate>, next
   update <nextUpdate>", never "valid" or "not revoked", only when all of these hold:
   - the CRL verified against the registered CA's key;
   - the CRL covers that certificate (a CRL that covers only some revocation reasons names
@@ -1004,6 +1024,7 @@ available until the certificate view ships. The placement of each part is record
 
 - [Inventory](inventory.md): the installed-software data this page reads
 - [REST API: Crypto](rest-api.md#crypto)
+- [Registering a CRL source](server-admin.md#registering-a-crl-source)
 - [MCP tools](mcp.md)
 - [Audit log](audit-log.md)
 - [Device management](device-management.md)

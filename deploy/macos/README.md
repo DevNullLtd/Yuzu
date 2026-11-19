@@ -124,7 +124,7 @@ never run two cold builds at once:
 export VCPKG_ROOT=/opt/ci/vcpkg VCPKG_DEFAULT_BINARY_CACHE=/opt/ci/tool_cache/yuzu-vcpkg-binary-cache-macos
 export X_VCPKG_ASSET_SOURCES="clear;x-script,/opt/ci/vcpkg-fetch.sh {url} {sha512} {dst};x-block-origin"
 git clone https://github.com/microsoft/vcpkg /opt/ci/vcpkg
-git -C /opt/ci/vcpkg checkout 4b77da7fed37817f124936239197833469f1b9a8
+git -C /opt/ci/vcpkg checkout 9eec002df1cd109f8f104cd966a763daf9751489
 /opt/ci/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 # in tmux, under caffeinate, from a Yuzu checkout:
 ./scripts/setup.sh --tests --native-file meson/native/macos-appleclang.ini
@@ -250,7 +250,7 @@ Planned shape:
 ```json
 {
   "generated": "<date>", "host": "BIGMAGS", "runner_count": 2,
-  "pins": { "vcpkg_baseline": "4b77da7f…", "cmake": "4.3.4", "meson": "1.11.2",
+  "pins": { "vcpkg_baseline": "9eec002df1cd", "cmake": "4.3.4", "meson": "1.11.2",
             "pyyaml": "6.0.3", "build_jobs": 6 },
   "env": { "RUNNER_TOOL_CACHE": "/opt/ci/tool_cache",
            "VCPKG_BINARY_CACHE": "/opt/ci/tool_cache/yuzu-vcpkg-binary-cache-macos" },

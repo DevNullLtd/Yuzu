@@ -36,6 +36,7 @@
 #include "guardian_backend.hpp" // GuardianBackend, guardian_backend_from_state/label (F7)
 #include "guardian_convergence_scheduler.hpp"
 #include "guardian_drift_event.hpp" // apply_drift_to_event (shared with the spark path)
+#include "guardian_emit_seq.hpp"    // GuardianEmitSeqSource (UP-14)
 #include "guardian_health_heartbeat.hpp" // GuardianHealthStats, guardian_spark_claim_health_stats (#5404)
 #include "guardian_detached_worker_role.hpp" // rung 9c R5.1: executor workers
 #include "guardian_joined_thread_role.hpp"
@@ -305,10 +306,18 @@ BaselineReadOutcome read_baseline_record(KvStore& kv, const std::string& rule_id
 /// KV-backed read in this file already degrades-and-logs on (put_rule_locked's own
 /// json_to_rule parse-failure sites), not a new weaker posture introduced for
 /// baselines specifically.
+/// `outcome` (#5605), when non-null, receives the raw read outcome so a caller can tell a
+/// genuinely Absent record from a read error, a malformed record or a fingerprint mismatch
+/// (which stays Ok); the return value and logging are unchanged. Only the shared seed block in
+/// reconcile_rule_locked passes it.
 std::optional<std::string> guardian_seed_baseline(KvStore& kv, const std::string& rule_id,
-                                                   const std::string& fingerprint) {
+                                                   const std::string& fingerprint,
+                                                   BaselineReadOutcome* outcome = nullptr) {
     BaselineRecord rec;
-    switch (read_baseline_record(kv, rule_id, rec)) {
+    const BaselineReadOutcome read = read_baseline_record(kv, rule_id, rec);
+    if (outcome)
+        *outcome = read; // #5605: the RAW read outcome (a fingerprint mismatch below stays Ok)
+    switch (read) {
     case BaselineReadOutcome::Absent:
         return std::nullopt; // genuinely no baseline yet - first-ever arm for this rule_id
     case BaselineReadOutcome::ReadError:
@@ -946,10 +955,29 @@ GuardianBaselinePersister::persist_staged(GuardianSparkRuntime& rt, Trigger trig
     return out;
 }
 
-GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark)
+GuardianEngine::GuardianEngine(KvStore* kv, std::string agent_id, bool prefer_spark,
+                               std::uint64_t boot_epoch)
     : kv_{kv}, agent_id_{std::move(agent_id)},
-      legacy_sink_executor_{std::make_unique<GuardianLegacySinkExecutor>()},
-      prefer_spark_{prefer_spark}, ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+      emit_seq_source_{std::make_shared<GuardianEmitSeqSource>(boot_epoch)},
+      legacy_sink_executor_{make_legacy_sink_executor()}, prefer_spark_{prefer_spark},
+      ack_ledger_{std::make_unique<GuardianArmAckLedger>()} {}
+
+std::unique_ptr<GuardianLegacySinkExecutor>
+GuardianEngine::make_legacy_sink_executor(std::optional<std::size_t> max_events) const {
+    GuardianLegacySinkExecutor::Config cfg;
+    if (max_events)
+        cfg.max_events = *max_events;
+    cfg.emit_seq_source = emit_seq_source_;
+    return std::make_unique<GuardianLegacySinkExecutor>(std::move(cfg));
+}
+
+std::uint64_t GuardianEngine::boot_epoch() const noexcept {
+    return emit_seq_source_->boot_epoch;
+}
+
+std::shared_ptr<GuardianEmitSeqSource> GuardianEngine::emit_seq_source_for_test() const {
+    return emit_seq_source_;
+}
 
 GuardianEngine::~GuardianEngine() {
     // Explicit (not = default): join the guard worker threads here via stop().
@@ -1128,6 +1156,19 @@ std::expected<void, std::string> GuardianEngine::start_local() {
             journal_maint_exceptions_.fetch_add(1, std::memory_order_relaxed);
         }
     };
+
+    // #5605: mark the boot re-arm walk so reconcile_rule_locked's shared seed block counts a
+    // rule whose boot seed lookup found no persisted baseline (boot_rebaselined_). The flag is
+    // mtx_-guarded (start_local and apply_rules both hold it), so apply_rules can never see it
+    // set. The scope guard is function-scoped, so it clears the flag when start_local returns
+    // (including on the catch arms below and an un-firewalled throw; the journal_flush pattern
+    // above; declared after it, so it fires first, with mtx_ still held). The flag therefore
+    // stays set through the summary logging after the loop, which never reaches
+    // reconcile_rule_locked. The handler is assigned BEFORE the flag is set: a throwing
+    // std::function assignment would otherwise leave the flag set with no guard to clear it.
+    GuardianRollback boot_walk_clear;
+    boot_walk_clear.fn = [this] { boot_rearm_walk_ = false; };
+    boot_rearm_walk_ = true;
 
     std::size_t rearmed = 0;
     std::size_t boot_rearm_failed = 0; // #5513: synchronous failures only (Failed or a throw)
@@ -2069,6 +2110,23 @@ std::uint64_t GuardianEngine::baseline_persist_failures() const {
     return p ? p->failure_signals() : 0;
 }
 
+std::optional<std::uint64_t> GuardianEngine::baseline_unpersisted() const {
+    // Lock-free by design (never mtx_), like baseline_persist_failures(): prefer_spark_ is a
+    // const bool and the published pointer is atomic, so no lock is needed for the dormancy
+    // gate. nullopt (not 0) when dormant, so the heartbeat omits the tag rather than reporting
+    // a fabricated "live, nothing pending" (the arm_stats() false-present trap).
+    if (!prefer_spark_)
+        return std::nullopt;
+    const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
+    if (!p)
+        return std::nullopt;
+    return p->pending_captures();
+}
+
+std::uint64_t GuardianEngine::baseline_rebaselined_at_boot() const noexcept {
+    return boot_rebaselined_.load(std::memory_order_relaxed);
+}
+
 std::uint64_t GuardianEngine::baseline_persist_refusals() const {
     const auto* p = baseline_persister_published_.load(std::memory_order_acquire);
     return p ? p->persist_refusals() : 0;
@@ -2145,6 +2203,12 @@ std::map<SparkType, std::uint64_t> GuardianEngine::unsupported_counts_by_type() 
 std::expected<std::size_t, std::string>
 GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     std::lock_guard lock(mtx_);
+    // #5719: the forced-rebuild record of the previous push survives until here (it is not
+    // cleared when its own push ends), so it is cleared first thing, before ANY early return
+    // below (stopped, no kv, lower generation, invalid id, a later put_rule_locked failure): a
+    // push that follows one which bailed out can then never consume stale reasons. noexcept
+    // (unordered_map::clear), so it cannot itself throw before the lock is released.
+    forced_rebuilds_.clear();
     if (stopped_)
         return std::unexpected("guardian engine stopped");
     if (!kv_)
@@ -2408,11 +2472,13 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // wipe every kBaselinePrefix baseline record, reintroducing exactly the
         // silent-relaunder bug this file's baseline persistence exists to close (a
         // rule's captured "known good" state must survive a full_sync). Scoped to
-        // kRulePrefix keys only — the ONLY other keys ever written under this
-        // namespace are kKeyGen (rewritten unconditionally just below regardless)
-        // and kBaselinePrefix records (deliberately untouched by full_sync — see
-        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep
-        // a baseline either).
+        // kRulePrefix keys only: this sweep is `rule:`-prefixed and must never become a
+        // blanket clear, because other keys live in the same namespace - kKeyGen
+        // (meta:policy_generation, rewritten unconditionally just below regardless),
+        // kBaselinePrefix records (deliberately untouched by full_sync: see
+        // guardian_seed_baseline's doc for why absence-from-a-push must not sweep a
+        // baseline either), and, UP-14, meta:boot_epoch, whose loss would drop the boot
+        // epoch back to the wall clock.
         // #4415: within kRulePrefix the sweep removes only the rows the push OMITS
         // (absent from push_ids). A row the push still carries is left in place and
         // put_rule_locked rewrites it only when the stored bytes differ, so an identical
@@ -2531,8 +2597,40 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
         // then proceed to re-arm what we can.
         try {
             stop_all_guards_locked();
-            if (spark_runtime_)
-                spark_runtime_->detach_rules_except(push_ids);
+            if (spark_runtime_) {
+                // #5719: the scoped detach returns the kept rules it tore down because their key
+                // was faulted, dead or unreadable, each with the cause recorded for the key. It is
+                // installed as the engine's override so that, for such a rule whose attach is then
+                // rebuilt and reports a reason, reconcile_rule_locked tallies THAT cause, but only
+                // when the attach targets the key the cause was recorded against (a rule the same
+                // push moves to another key is a first attach of that key). The override exists
+                // because, after the detach, the kept rule's own attach sees KeyBusy (an io-class
+                // mechanism whose disarm claim is still queued) or FirstAttach (an inline type, or
+                // a disarm that already completed) depending on timing, not the key's cause. The
+                // local map is built first and installed with a move-assign (noexcept), in its
+                // own firewall below. The record is diagnostic only: no arm, skip or generation decision reads
+                // it, and it is cleared at the top of the next apply_rules.
+                const auto forced = spark_runtime_->detach_rules_except(push_ids);
+                // The map is diagnostic only, so it is built in its OWN firewall: an allocation
+                // failure here must not count a reconcile failure or hold the generation (the
+                // detach above has already succeeded, so a throw here would only mislabel a
+                // completed teardown as a failed one). On failure forced_rebuilds_ stays empty
+                // and the affected rules are reported under whichever reason their own attach
+                // observes.
+                // This catch is DELIBERATELY uncounted and unlogged (owner ruling: in-process
+                // counters only, no new counter surface). The record is diagnostic only, and an
+                // allocation failure here changes only the label of the affected kept rules in
+                // the rebuild line, to key_busy or first_attach instead of their faulted/dead
+                // cause. No arm, skip or generation decision depends on the map.
+                try {
+                    std::unordered_map<std::string, ForcedRebuildEntry> forced_map;
+                    forced_map.reserve(forced.size());
+                    for (const auto& f : forced)
+                        forced_map.emplace(f.rule_id, ForcedRebuildEntry{f.key, f.why});
+                    forced_rebuilds_ = std::move(forced_map); // noexcept: only after a full build
+                } catch (...) {
+                }
+            }
             // F7: deliberately NOT unsupported_rules_.clear() here - that would make
             // every rule the loop below re-classifies Unsupported look "newly"
             // unsupported (the per-outcome erase/insert in reconcile_rule_locked can't
@@ -2552,6 +2650,7 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
     }
 
     preserved_tally_.reset(); // #4415: this push's skipped-rule record starts empty
+    rebuild_tally_.reset();   // #5719: this push's rebuilt-rule record starts empty
     for (const auto& rule : push.rules()) {
         // #4665: an empty rule_id is one shape of an invalid rule_id, already
         // rejected for the WHOLE push by the pre-validation scan at the top of
@@ -2629,6 +2728,40 @@ GuardianEngine::apply_rules(const gpb::GuaranteedStatePush& push) {
             auto line = preserved_tally_.format();
             spdlog::info("{}", line);
             last_full_sync_preserved_line_for_test_ = std::move(line);
+        } catch (...) {
+        }
+        // #5719: one bounded line per full_sync naming WHY each carried rule was rebuilt rather
+        // than preserved. In its OWN try so a throw formatting one line never suppresses the
+        // other. Notes the reader needs:
+        //  - It prints `path=legacy ... rebuilt 0` on a legacy-path agent (prefer_spark_ false,
+        //    the production default): the only note() site is in the Spark branch of
+        //    reconcile_rule_locked, which that agent never reaches. `rebuilt 0` there does NOT
+        //    mean nothing was rebuilt: the legacy guards were all stopped and every carried rule
+        //    that has a legacy guard was armed again (a disabled or invalid rule, or one whose
+        //    guard cannot start on the host, has none). The line itself is NOT gated on
+        //    prefer_spark_.
+        //  - The count includes Pending/Accepted outcomes that may still fail asynchronously
+        //    (hence "rebuild attempted"): there is no pending split.
+        //  - Only a full_sync logs it. A delta push and the boot re-arm loop populate the tally
+        //    but never log it, and an apply_rules that returns early logs neither this line nor
+        //    the preserved one: a persist failure (the put_rule_locked return above), a
+        //    rejection (engine stopped, a generation that moves backwards, an invalid or
+        //    duplicate rule id), or a push decide_retry() Suppresses as an identical retry,
+        //    which returns before the rule loop runs.
+        //  - A wedge re-observation carries no reason and appears in neither line.
+        try {
+            // The path marker uses the SAME expression reconcile_rule_locked uses to choose the
+            // Spark attach path (its try_spark), so `path=spark` is exactly the case in which the
+            // tally can have been fed. `path=legacy` means it was not: in production
+            // (prefer_spark_ false) the legacy guards were stopped and every carried rule that
+            // has a legacy guard was armed again; with prefer_spark_ set but Spark Unwired or
+            // SparkFailed the carried rules are armed on neither backend.
+            const auto path = prefer_spark_ && spark_availability_ == SparkAvailability::Available
+                                  ? GuardianRebuildPath::Spark
+                                  : GuardianRebuildPath::Legacy;
+            auto line = rebuild_tally_.format(path);
+            spdlog::info("{}", line);
+            last_full_sync_rebuild_line_for_test_ = std::move(line);
         } catch (...) {
         }
         // F7: a rule_id that was Unsupported before this full_sync but is absent from
@@ -2927,6 +3060,11 @@ std::string GuardianEngine::last_rearm_degrade_message_for_test() const {
 std::string GuardianEngine::last_full_sync_preserved_line_for_test() const {
     std::lock_guard lock(mtx_);
     return last_full_sync_preserved_line_for_test_;
+}
+
+std::string GuardianEngine::last_full_sync_rebuild_line_for_test() const {
+    std::lock_guard lock(mtx_);
+    return last_full_sync_rebuild_line_for_test_;
 }
 
 GuardianEngine::UnsupportedLogRecord GuardianEngine::last_unsupported_log_for_test() const {
@@ -3253,9 +3391,9 @@ std::uint64_t GuardianEngine::legacy_sink_dropped_unwired() const {
 void GuardianEngine::set_legacy_sink_max_events_for_test(std::size_t max_events) {
     assert(!started_ &&
            "set_legacy_sink_max_events_for_test: must be called before start_local()");
-    GuardianLegacySinkExecutor::Config cfg;
-    cfg.max_events = max_events;
-    legacy_sink_executor_ = std::make_unique<GuardianLegacySinkExecutor>(cfg);
+    // UP-14: through the shared builder so the rebuilt executor still carries the engine's
+    // emit-order source (a bare Config would silently revert it to a private epoch-0 source).
+    legacy_sink_executor_ = make_legacy_sink_executor(max_events);
 }
 
 // #4783 TEST-ONLY seams (see guardian_engine.hpp's own doc comments). None of these
@@ -3627,8 +3765,19 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (auto it = rule.assertion().params().find("path"); it != rule.assertion().params().end())
             path = it->second;
         const auto fingerprint = guardian_baseline_fingerprint("file-hash-equals", path);
-        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint))
+        // #5605: the ONE place a boot re-arm's "no persisted baseline" is counted. This block is
+        // before the backend fork, so it runs once per rule on BOTH backends (the legacy branch
+        // seeds a second time inside start_guard_for_rule_locked, which is deliberately NOT
+        // instrumented: counting there would double-count) and before the Unwired/SparkFailed
+        // return below. Only a genuinely Absent record counts. A read error and a malformed
+        // record already log, and a fingerprint mismatch (a retarget) reads as Ok here and is
+        // not counted; a retarget whose new capture was never persisted before a crash reads
+        // the same way, so a lost capture of that kind moves no signal (documented gap).
+        BaselineReadOutcome seed_outcome = BaselineReadOutcome::Ok;
+        if (auto seeded = guardian_seed_baseline(*kv_, rule.rule_id(), fingerprint, &seed_outcome))
             assertion->expected_hash = *seeded;
+        else if (boot_rearm_walk_ && seed_outcome == BaselineReadOutcome::Absent)
+            boot_rebaselined_.fetch_add(1, std::memory_order_relaxed);
         if (seed_read_hook_for_test_)
             seed_read_hook_for_test_(rule.rule_id());
     }
@@ -3670,6 +3819,16 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
         if (placement == RulePlacement::Arm) {
             withdraw_legacy_guard_locked(rule.rule_id());
             unsupported_rules_.erase(rule.rule_id()); // F7: about to arm (or fail arming) - not Unsupported either way
+            // #5719: the key this attach targets, taken BEFORE `spec` is moved. A forced cause (the
+            // scoped detach's record for a kept rule on a faulted key) applies only when it was
+            // recorded against this same key. Diagnostic only: a failure to build it leaves it
+            // empty, which matches no forced entry, so the rule is reported under its own
+            // attach's reason.
+            std::string forced_target_key;
+            try {
+                forced_target_key = spark_key(*spec);
+            } catch (...) {
+            }
             // rung 9c PR-2 Unit 6: non-waiting entry point - attach_rule() no longer blocks
             // for its own claim's outcome. `res` resolves to Armed (already committed,
             // synchronously - an inline-type arm, or a same-key claim whose owner already
@@ -3722,6 +3881,30 @@ GuardianEngine::reconcile_rule_locked(const gpb::GuaranteedStateRule& rule) {
                     preserved_tally_.note(rule.rule_id());
                 else
                     preserved_tally_.note_pending(rule.rule_id());
+            } else {
+                // #5719: a NON-skipped Armed or Accepted outcome is a rule the runtime (re)built.
+                // Why: the cause a full_sync's scoped detach forced for this rule, if any (the
+                // override), else the reason attach_rule reported. The override wins because,
+                // after a scoped detach, the kept rule's attach sees KeyBusy (io-class mechanism,
+                // disarm still queued) or FirstAttach (inline type, or disarm complete) depending
+                // on timing, never the key's faulted/dead/unknown cause. Same thread and lock as
+                // the preserved tally above (apply_rules or start_local under mtx_). note() with
+                // None is a no-op, so a wedge re-observation (reason None) appears in neither
+                // line. A skipped outcome is never noted here: it is the preserved tally's.
+                // The override is consulted ONLY when attach_rule reported a reason: a wedge
+                // re-observation carries None and must appear in neither line, even for a kept
+                // rule whose key the scoped detach recorded as faulted.
+                if (res->rebuild_reason != GuardianRebuildReason::None) {
+                    // Only when this attach targets the key the cause was recorded against: a
+                    // rule kept on a faulted key and retargeted in the same push is a first
+                    // attach of its new key.
+                    const auto forced = forced_rebuilds_.find(rule.rule_id());
+                    const bool forced_applies = forced != forced_rebuilds_.end() &&
+                                                !forced_target_key.empty() &&
+                                                forced->second.key == forced_target_key;
+                    rebuild_tally_.note(rule.rule_id(),
+                                        forced_applies ? forced->second.why : res->rebuild_reason);
+                }
             }
             if (res->kind == GuardianSparkRuntime::ArmOutcomeKind::Armed)
                 return ReconcileOutcome::Armed; // attach_rule already enqueued its own "armed" audit entry,
@@ -3882,6 +4065,11 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         GuardianSparkRuntime::Config spark_runtime_cfg{};
         if (test_spark_backend_op_deadline_)
             spark_runtime_cfg.backend_op_deadline = *test_spark_backend_op_deadline_;
+        // UP-14: the runtime co-owns the engine's emit-order source (shared_ptr, per the
+        // own-everything-borrow-nothing rule below) so Spark lifecycle entries and legacy
+        // events draw from ONE sequence. The source lives in the engine, not here, because
+        // this runtime can be absent (SparkDisabled / SparkFailed).
+        spark_runtime_cfg.emit_seq_source = emit_seq_source_;
         spark_runtime_ = std::make_shared<GuardianSparkRuntime>(spark_reader_, spark_backend_,
                                                                 spark_runtime_cfg);
         // Provider captures a COPY of agent_id_, never `this` (#2237): the runtime is the
@@ -3912,8 +4100,10 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
                       "anything but a real KvStore (see kv_store.hpp's IJournalStore doc)");
         lifecycle_journal_ = std::make_shared<GuardianLifecycleJournal>(kv_);
         baseline_persister_ = std::make_shared<GuardianBaselinePersister>(
-            kv_, spark_runtime_->staged_baseline_drops_source()); // #4045
-        // Published for the lock-free heartbeat getters; never cleared (see the member's doc).
+            kv_, spark_runtime_->staged_baseline_drops_source(),
+            spark_runtime_->staged_baseline_count_source()); // #4045, #5605
+        // Published for the lock-free heartbeat getters; only rollback_spark_wiring_locked ever
+        // unpublishes it (see the member's doc).
         baseline_persister_published_.store(baseline_persister_.get(), std::memory_order_release);
 
         auto id = engine->register_consumer("guardian-spark",
@@ -3929,9 +4119,12 @@ void GuardianEngine::wire_spark_engine(SparkEngine* engine, bool spark_disabled_
         spark_backend_->bind_consumer(consumer_id);
 
         spark_scheduler_ = std::make_unique<ConvergenceScheduler>(*spark_runtime_);
-        // Wrap the send so that after a PAGED batch's LAST entry is delivered, its best-effort
-        // sent-label is written (item 7 PR-Ag). Live / compliance / health entries carry no
-        // batch key → no-op.
+        // Wrap the send so that after a batch's LAST entry is delivered, its best-effort
+        // sent-label is written (item 7 PR-Ag). That covers PAGED entries AND live lifecycle
+        // entries once their batch is persisted (backfill_batch_provenance stamps the key on
+        // them too); compliance / health entries never carry a batch key → no-op. The key is
+        // therefore NOT a replay marker: whether an entry carries a wire ordering pair is
+        // decided by OutboxEntry::boot_epoch (0 on paged entries), not by this key.
         //
         // Captures the journal HANDLE, not `this` (C0 #2298): re-reading the lifecycle_journal_
         // member from wherever this wrap runs would be an unlocked read of engine state, and
@@ -4017,6 +4210,11 @@ void GuardianEngine::rollback_spark_wiring_locked(SparkEngine* engine, bool regi
     spark_runtime_.reset();
     spark_backend_.reset();
     spark_reader_.reset();
+    // #5605: unpublish the persister (the object, baseline_persister_, stays alive until the
+    // destructor). A wiring that failed AFTER the publish leaves this agent SparkFailed, where
+    // nothing can ever stage: the lock-free heartbeat getters must read "no persister", not a
+    // live 0 that baseline_unpersisted() would report as "Spark path live, nothing pending".
+    baseline_persister_published_.store(nullptr, std::memory_order_release);
     if (registered)
         engine->unregister_consumer(consumer_id);
     spark_engine_ = nullptr;
@@ -4078,8 +4276,10 @@ guardian_dispatch_push_bytes_for_test(GuardianEngine& engine,
 // Test-support helper — see guardian_engine.hpp. Friend of GuardianEngine so it
 // can reach the private emit_guard_event(); production drift only ever enters
 // that method from a guard worker's sink lambda (see start_guard_for_rule_locked).
-void guardian_emit_drift_for_test(GuardianEngine& engine, const GuardDrift& drift) {
-    engine.emit_guard_event(drift);
+void guardian_emit_drift_for_test(
+    GuardianEngine& engine, const GuardDrift& drift,
+    std::optional<std::chrono::system_clock::time_point> timestamp_override) {
+    engine.emit_guard_event(drift, /*is_gap_repair=*/false, timestamp_override);
 }
 
 // Test-support helpers — see guardian_engine.hpp (#4021 adversarial-review

@@ -34,6 +34,15 @@ bool contains(const std::string& hay, const std::string& needle) {
     return hay.find(needle) != std::string::npos;
 }
 
+// Wording that named the removed plugin's actions. Assembled in pieces so this test is not itself a
+// hit for the removal's lexical gate.
+const std::vector<std::string>& kRemovedWording() {
+    static const std::vector<std::string> v{std::string("un") + "quarantine",
+                                            std::string("status ") + "action",
+                                            std::string("quarantine") + " plugin"};
+    return v;
+}
+
 QuarantineRecord rec(const std::string& id, std::int64_t applied = 0, std::int64_t confirmed = 0) {
     QuarantineRecord r;
     r.agent_id = id;
@@ -205,6 +214,39 @@ TEST_CASE("containment_state: record, applied and confirmed are distinct", "[qua
     CHECK(containment_state(rec("a", 0, 200)) == ContainmentState::Confirmed);
 }
 
+// Kills: a record with a release in flight reading as Recorded/Applied/Confirmed, which would hide
+// that the device has not yet confirmed the release.
+TEST_CASE("containment_state: a requested release reads Releasing whatever else is stamped",
+          "[quarantine][render]") {
+    auto r = rec("a");
+    r.release_requested_at = 300;
+    CHECK(containment_state(r) == ContainmentState::Releasing);
+    r.last_applied_at = 100;
+    r.last_confirmed_at = 200;
+    CHECK(containment_state(r) == ContainmentState::Releasing);
+}
+
+TEST_CASE("containment lens and panel: a record with a release requested renders the Releasing state line",
+          "[quarantine][render]") {
+    auto r = rec("agent-1", 100, 200);
+    r.release_requested_at = 300;
+    ContainmentLensView v;
+    v.agent_id = "agent-1";
+    v.hostname = "HOST-1";
+    v.online = true;
+    v.identity_known = true;
+    v.can_execute = true;
+    v.record = r;
+    const auto lens = render_containment_lens(v);
+    CHECK(contains(lens, "Releasing: waiting for the device to confirm"));
+    CHECK_FALSE(contains(lens, "Containment was confirmed on the device"));
+    QuarantinePanelView pv;
+    QuarantinePanelRow row;
+    row.record = r;
+    pv.rows.push_back(row);
+    CHECK(contains(render_quarantine_panel(pv), "Releasing: waiting for the device to confirm"));
+}
+
 TEST_CASE("quarantine panel: escapes every agent-supplied string", "[quarantine][render]") {
     QuarantinePanelView v;
     QuarantinePanelRow row;
@@ -266,7 +308,9 @@ TEST_CASE("containment lens: states and honest copy", "[quarantine][render]") {
     {
         auto html = render_containment_lens(v); // no record
         CHECK(contains(html, "No active quarantine record."));
-        CHECK(contains(html, "does not show whether the device's firewall rules were removed"));
+        CHECK(contains(html, "A quarantine record normally ends when the device confirms its firewall "
+                             "rules were removed. A forced end does not wait for the device, which "
+                             "may still be contained."));
         CHECK(contains(html, "data-act=\"quarantine\""));
         CHECK_FALSE(contains(html, "data-act=\"release\""));
         CHECK_FALSE(contains(html, "Not quarantined"));
@@ -304,7 +348,7 @@ TEST_CASE("containment lens: no Security:Execute disables both actions and names
     CHECK(contains(rel, "needs the Security:Execute permission"));
 }
 
-TEST_CASE("containment lens: states that quarantine and release need an administrator and that release ends the record only",
+TEST_CASE("containment lens: states that quarantine and release need an administrator and that the record ends when the device confirms",
           "[quarantine][render]") {
     ContainmentLensView v;
     v.agent_id = "a";
@@ -312,8 +356,9 @@ TEST_CASE("containment lens: states that quarantine and release need an administ
     CHECK(contains(html, "console has no approval step"));
     CHECK(contains(html, "refused unless you are an administrator"));
     CHECK_FALSE(contains(html, "do not go through the approval step"));
-    CHECK(contains(html, "Releasing ends the record only"));
-    CHECK(contains(html, "lens=actions"));
+    CHECK(contains(html, "Releasing lifts the device's firewall rules; the record ends when the "
+                         "device confirms."));
+    CHECK_FALSE(contains(html, "Releasing ends the record only"));
     CHECK_FALSE(contains(html, "always reachable"));
 }
 
@@ -689,6 +734,63 @@ TEST_CASE("yuzu-estate.js: no markup sinks, encoded ids, one delegated listener"
     // no path interpolates a raw id
     CHECK_FALSE(contains(js, "/api/v1/quarantine/' + agent"));
     CHECK_FALSE(contains(js, "id=' + agent"));
+}
+
+// Kills: UI copy that still names the removed plugin's actions, and a release dialog that claims
+// the record ends at once (it ends when the device confirms).
+TEST_CASE("yuzu-estate.js: the release dialog says the record ends when the device confirms; no removed-plugin wording",
+          "[quarantine][static-js]") {
+    const std::string& js = yuzu::server::kYuzuEstateJs;
+    CHECK(contains(js, "This lifts the device's firewall rules. The quarantine record ends when the device "
+                       "confirms, "));
+    CHECK(contains(js, "and instructions stay withheld until then."));
+    CHECK(contains(js, "If the device is offline, the release is applied when it next connects."));
+    CHECK(contains(js, "submitLabel: 'Release device'"));
+    CHECK_FALSE(contains(js, "Release record"));
+    // The whitelist hint names the security-hardening heading as it is written (#7641): the old
+    // title no longer exists, so a reader searching for it found nothing.
+    CHECK(contains(js, "The whitelist (read ' +\n                'this before quarantining a dual-stack host)"));
+    CHECK_FALSE(contains(js, "Whitelisting on a "));
+    CHECK(contains(js, "except the addresses you list, the Yuzu server, "));
+    CHECK(contains(js, "DHCP and the device's DNS resolvers."));
+    for (const auto& removed : kRemovedWording())
+        CHECK_FALSE(contains(js, removed));
+    CHECK_FALSE(contains(js, "pf rules")); // the macOS pf hint is gone
+    // The page-session "released" message is gone: the panel is refreshed from the server after
+    // either answer (200 released, 202 releasing), so it shows the real state.
+    CHECK_FALSE(contains(js, "showReleased"));
+    const auto rel = js.find("function release(btn)");
+    REQUIRE(rel != std::string::npos);
+    const auto rel_end = js.find("// Stored data.", rel);
+    REQUIRE(rel_end != std::string::npos);
+    const std::string release_fn = js.substr(rel, rel_end - rel);
+    CHECK(contains(release_fn, "if (done) refresh(agent);"));
+}
+
+// Kills: any rendered containment fragment naming the removed plugin's actions.
+TEST_CASE("containment renderers: no fragment names the removed plugin's actions",
+          "[quarantine][render]") {
+    ContainmentLensView v;
+    v.agent_id = "agent-1";
+    v.hostname = "HOST-1";
+    v.online = true;
+    v.identity_known = true;
+    v.can_execute = true;
+    std::string all = render_containment_lens(v); // no record
+    v.record = rec("agent-1", 100, 200);
+    all += render_containment_lens(v);
+    all += render_containment_banner(v);
+    auto released = rec("agent-1");
+    released.release_requested_at = 300;
+    v.record = released;
+    all += render_containment_lens(v);
+    QuarantinePanelView pv;
+    QuarantinePanelRow row;
+    row.record = released;
+    pv.rows.push_back(row);
+    all += render_quarantine_panel(pv);
+    for (const auto& removed : kRemovedWording())
+        CHECK_FALSE(contains(all, removed));
 }
 
 // ───────────────────────── Stored data panel ──────────────────────────────────

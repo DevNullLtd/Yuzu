@@ -1,6 +1,8 @@
-## Firewall Status and Rules Definitions
-## Queries firewall state and enumerates rules across platforms.
-## Plugin: firewall | Actions: state, rules
+## Firewall Status, Rules and Device Containment Definitions
+## Queries firewall state, enumerates rules, and contains or releases a device
+## across platforms.
+## Plugin: firewall | Actions: state, rules, quarantine, release,
+## quarantine_status, quarantine_allow
 ##
 ## Sources by platform (see agents/plugins/firewall/README.md):
 ##   Windows: INetFwPolicy2 COM (Domain/Private/Public profiles; INetFwRules
@@ -217,6 +219,338 @@ spec:
 
   permissions:
     executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.quarantine
+  displayName: Quarantine Device
+  version: 1.0.0
+  description: >
+    Isolate the device from the network: block all inbound and outbound
+    traffic except loopback, the agent's own control channel to the Yuzu server,
+    DHCP, DNS to the host's configured resolvers, IPv6 neighbour discovery and
+    any exceptions listed. An optional time limit ends the containment on the
+    device's own clock (a host the server holds a record for is contained
+    again by the server); an optional probe target proves the block. On Windows
+    the block is a rule group plus a per-profile default-block; on Linux an own
+    nftables table (iptables generation chain without nft); on macOS an own pf
+    sub-anchor. Reports active only when the block is verified and
+    active_unproven when it could not be proven. Waits up to 2s for any other
+    in-flight containment change on this device. The Linux packaged unit
+    refuses every containment action (privilege_unavailable).
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: quarantine
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties:
+      exceptions:
+        type: string
+        displayName: Allowed Addresses
+        description: >
+          Comma-separated exceptions (for example DNS server, SIEM collector),
+          each addr[/prefix][:port][/tcp|udp][/in|out]. At most 64 across the
+          quarantine's life.
+      ttl_seconds:
+        type: string
+        displayName: Time Limit (seconds)
+        description: >
+          Optional, 60 to 2592000. The containment ends by itself on the
+          device's clock when it passes (the clock is not synchronised while
+          contained). A device the server holds a quarantine record for is
+          contained again: the server reads that end as drift and re-applies
+          the stored allow set.
+      probe_target:
+        type: string
+        displayName: Probe Target
+        description: >
+          Optional IP literal as ip:port (or [v6]:port) that answered before the
+          change and must time out after it, to prove the block.
+
+  result:
+    columns:
+      - name: row
+        type: string
+        description: >-
+          The row key. `status` carries the verdict (active, active_unproven,
+          inactive, partial, degraded, refused, busy, or rolled_back, update_failed
+          where the action can end that way) and, after a second pipe, a reason token
+          where there is one; `verify` carries the proof of the block (control channel
+          and probe target); `allow` rows list what stays reachable; `note` rows carry
+          a key=value detail, among them `ttl_expires` (the time limit, epoch seconds)
+          and `probe_target` when one is stored. The server clamps this plugin to two
+          fields, so everything after the key lands in the value column.
+        values: [status, verify, allow, rolled_back, refused, note]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: >-
+          The remainder of the row after the key. For a `status` row: the verdict
+          token, optionally followed by `|` and a reason token (for example
+          `active_unproven`, `inactive`, `refused|privilege_unavailable`).
+        example: inactive
+        platforms: [windows, linux, darwin]
+
+  readablePayload: >
+    Quarantine device (exceptions=${exceptions}, ttl_seconds=${ttl_seconds})
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.release
+  displayName: Release Device from Quarantine
+  version: 1.0.0
+  description: >
+    Remove the device's quarantine containment and restore network access:
+    the own rules are removed, the captured firewall policy is restored and
+    any rule disabled for the containment is re-enabled. Reports inactive when
+    nothing of ours is left and partial when a step could not be confirmed.
+    Connections cut by the apply-time state flush on macOS are not restored.
+    The Linux packaged unit refuses it (privilege_unavailable).
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: release
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: row
+        type: string
+        description: >-
+          The row key. `status` carries the verdict (active, active_unproven,
+          inactive, partial, degraded, refused, busy, or rolled_back, update_failed
+          where the action can end that way) and, after a second pipe, a reason token
+          where there is one; `verify` carries the proof of the block (control channel
+          and probe target); `allow` rows list what stays reachable; `note` rows carry
+          a key=value detail, among them `ttl_expires` (the time limit, epoch seconds)
+          and `probe_target` when one is stored. The server clamps this plugin to two
+          fields, so everything after the key lands in the value column.
+        values: [status, verify, allow, rolled_back, refused, note]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: >-
+          The remainder of the row after the key. For a `status` row: the verdict
+          token, optionally followed by `|` and a reason token (for example
+          `active_unproven`, `inactive`, `refused|privilege_unavailable`).
+        example: inactive
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Release device from quarantine"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.quarantine_status
+  displayName: Quarantine Status
+  version: 1.0.0
+  description: >
+    Re-read the device's containment from its record and the live firewall
+    and report the verdict (active, active_unproven, inactive, partial or
+    degraded) with the allow list in force and any time limit. Always runs
+    immediately, even while a containment change is in flight on the same
+    device. The server confirms a quarantine and a release from this read.
+  tags: [security, quarantine, diagnostics]
+
+spec:
+  type: question
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: quarantine_status
+    concurrency: per-device
+
+  parameters:
+    type: object
+    properties: {}
+
+  result:
+    columns:
+      - name: row
+        type: string
+        description: >-
+          The row key. `status` carries the verdict (active, active_unproven,
+          inactive, partial, degraded, refused, busy, or rolled_back, update_failed
+          where the action can end that way) and, after a second pipe, a reason token
+          where there is one; `verify` carries the proof of the block (control channel
+          and probe target); `allow` rows list what stays reachable; `note` rows carry
+          a key=value detail, among them `ttl_expires` (the time limit, epoch seconds)
+          and `probe_target` when one is stored. The server clamps this plugin to two
+          fields, so everything after the key lands in the value column.
+        values: [status, verify, allow, rolled_back, refused, note]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: >-
+          The remainder of the row after the key. For a `status` row: the verdict
+          token, optionally followed by `|` and a reason token (for example
+          `active_unproven`, `inactive`, `refused|privilege_unavailable`).
+        example: inactive
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Query quarantine status"
+
+  gather:
+    ttlSeconds: 60
+
+  approval:
+    mode: auto
+
+  permissions:
+    executeRoles: [endpoint-admin, endpoint-operator, security-admin]
+    authorRoles: [content-author]
+
+  compatibility:
+    minAgentVersion: 0.1.0
+    requiredPlugins: [firewall]
+
+status:
+  phase: active
+
+---
+apiVersion: yuzu.io/v1alpha1
+kind: InstructionDefinition
+metadata:
+  id: security.firewall.quarantine_allow
+  displayName: Modify Quarantine Allow List
+  version: 1.0.0
+  description: >
+    Add or remove exceptions on an active quarantine without releasing or
+    re-applying it: a new generation is applied and the old one removed last,
+    so an update only tightens in between. Refuses (not_active) when no
+    containment is in force. Loopback, the control channel, resolvers and DHCP
+    can never be removed. The server's stored whitelist is not updated by this
+    action.
+  tags: [security, quarantine, incident-response, network]
+
+spec:
+  type: action
+  platforms: [windows, linux, darwin]
+
+  execution:
+    plugin: firewall
+    action: quarantine_allow
+    concurrency: per-device
+
+  parameters:
+    type: object
+    required: [op, exceptions]
+    properties:
+      op:
+        type: string
+        displayName: Operation
+        description: Whether to add or remove the listed exceptions.
+        validation:
+          enum: ["add", "remove"]
+      exceptions:
+        type: string
+        displayName: Exceptions
+        description: >
+          Comma-separated exceptions, each addr[/prefix][:port][/tcp|udp][/in|out].
+
+  result:
+    columns:
+      - name: row
+        type: string
+        description: >-
+          The row key. `status` carries the verdict (active, active_unproven,
+          inactive, partial, degraded, refused, busy, or rolled_back, update_failed
+          where the action can end that way) and, after a second pipe, a reason token
+          where there is one; `verify` carries the proof of the block (control channel
+          and probe target); `allow` rows list what stays reachable; `note` rows carry
+          a key=value detail, among them `ttl_expires` (the time limit, epoch seconds)
+          and `probe_target` when one is stored. The server clamps this plugin to two
+          fields, so everything after the key lands in the value column.
+        values: [status, verify, allow, rolled_back, refused, note]
+        example: status
+        platforms: [windows, linux, darwin]
+      - name: value
+        type: string
+        description: >-
+          The remainder of the row after the key. For a `status` row: the verdict
+          token, optionally followed by `|` and a reason token (for example
+          `active_unproven`, `inactive`, `refused|privilege_unavailable`).
+        example: inactive
+        platforms: [windows, linux, darwin]
+
+  readablePayload: "Quarantine allow list: ${op} ${exceptions}"
+
+  gather:
+    ttlSeconds: 120
+
+  approval:
+    mode: role-gated
+
+  permissions:
+    executeRoles: [endpoint-admin, security-admin]
     authorRoles: [content-author]
 
   compatibility:

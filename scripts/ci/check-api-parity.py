@@ -136,7 +136,7 @@ WHAT IT CHECKS
      triple -> number of calls); and the refusal / confinement evidence above.
      A route with no recognisable gate (auth_fn
      only, a helper closure, a member-function gate) fails CLOSED unless named in the
-     size-pinned, shrink-only GATE_PARITY_NO_GATE_ALLOWED; a mismatch is an error unless
+     size-pinned GATE_PARITY_NO_GATE_ALLOWED (its table size must equal GATE_PARITY_NO_GATE_MAX, raised only by a dated ADR-1005 ruling); a mismatch is an error unless
      named, with its exact gates and a reason, in GATE_PARITY_KNOWN_MISMATCHES (the table size
      must EQUAL its pin, GATE_PARITY_KNOWN_MISMATCHES_MAX: it is a pin, not a shrink-only cap.
      It was raised 6 -> 7 by owner ruling 2026-10-31; raising it again needs a ruling recorded
@@ -236,7 +236,7 @@ MCP_REGISTRY_DIR = None
 # with the C++ twin constant `kRegistryDomainFiles` in tests/unit/server/test_mcp_dispatch_coverage.cpp;
 # a new mcp_tool*.hpp header needs `kToolHeaderFiles` there instead (this script does not count headers).
 # tests/test_docs_drift_selftest.py builds its --root fixture from this value, so it self-adjusts.
-MIN_REGISTRY_FILES = 4
+MIN_REGISTRY_FILES = 5
 LEDGER_DOC = ROOT / "docs" / "api-parity-ledger.md"
 
 DOC_BEGIN = ("<!-- BEGIN GENERATED: check-api-parity.py - do not hand-edit; "
@@ -480,8 +480,8 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 #
 # 227 (origin/dev) -> 228 (Users and roles page): GET /fragments/access/enforcement has only the REST twin
 # GET /api/v1/me, which omits the unconfirmed (degraded) bit (`twinned-rest-only`). The MCP tool
-# get_me is the twin of the raw flag only, so this row still needs the degraded-bit read tracked in
-# #6033.
+# get_me is the twin of the raw flag only, so this row needed the degraded-bit read tracked in
+# #6033 (since delivered: see the 206 -> 205 line below).
 #
 # 228 -> 225 (Seam PR2): the three hardware rows (get.fragments-hardware-list, -hardware-ci,
 # -hardware-quarantine) gained MCP twins (list_hardware_ci, get_hardware_ci, list_quarantined_devices).
@@ -505,7 +505,21 @@ VERBS = ("Get", "Post", "Put", "Delete", "Patch", "Options")
 # get.api-agents and get.fragments-devices-list left their dated exception and are twinned to it.
 # The two 212-origin steps above ran on separate branches. Merged: 4 rows flipped by twin batch B and
 # 2 by #4041, the sets are disjoint, so 212 - 4 - 2 = 206.
-BASELINE_UNTWINNED = 206
+# 206 -> 205 (workflow execute twins, #2146 batch B): post.api-workflows-param-execute flipped from
+# planned to twinned (POST /api/v1/workflows/{id}/execute + the execute_workflow MCP tool).
+# 206 -> 205 (enforcement read twins, ADR-1005 2026-11-03 entry): get.fragments-access-enforcement flipped from
+# `twinned-rest-only` to `twinned` (GET /api/v1/rbac/enforcement + the get_rbac_enforcement MCP tool, #6033).
+# 204 -> 208 (DEX Scoring tab): four dashboard routes (GET /fragments/dex/scoring and the save,
+# preview and reset POSTs) born `planned:#6087`, each with its merged REST v1 twin named and the MCP twin owed.
+# 208 -> 204 (#6087): get_/set_/reset_dex_score_policy retire all four (preview twins onto the dry-run PUT).
+# 204 -> 195 (instruction authoring twins, #2146 batch C): nine rows flipped from planned to twinned
+# (POST/PUT/DELETE /api/v1/instructions*, import, yaml, validate-yaml and the three /api/v1/instruction-sets
+# routes, with their nine MCP tools).
+# 195 -> 196 (streamed software export, SAM-36): GET /api/v1/inventory/software/export is a v1-keyed
+# `exception:#7955` row. It streams a file, which is not a tool call, so it has no MCP twin by design.
+# 196 -> 197 (fleet application usage, ADR-1005 2026-11-17 entry): GET /api/v1/dex/apps/usage is a
+# v1-keyed `exception:#8096` row. Its MCP twin is owed; the row is retired when that tool lands.
+BASELINE_UNTWINNED = 197
 
 # The generic "planned:#2146" placeholder means "tracked by nobody in particular". It may only
 # SHRINK (a row flipped to a specific issue, a twin, or an exception); a new row names a specific
@@ -518,7 +532,9 @@ GENERIC_PLANNED_ISSUE = 2146
 # 84 -> 83 (MCP twin get_me, ADR-1005 2026-10-24 entry): get.api-me became twinned.
 # 83 -> 80 (twin batch B: commands, execution cancel/rerun): three rows became twinned.
 # 80 -> 79 (instruction-definition execute twins): post.api-instructions-param-execute became twinned.
-BASELINE_GENERIC_PLANNED = 79
+# 79 -> 78 (workflow execute twins, #2146 batch B): post.api-workflows-param-execute became twinned.
+# 78 -> 69 (instruction authoring twins, #2146 batch C): nine rows became twinned.
+BASELINE_GENERIC_PLANNED = 69
 
 # A revisit date outside this window is a typo (9999-12-31), a shape error. A date at or before
 # today + REVISIT_WARN_DAYS only produces ONE aggregated warning, never a failure.
@@ -617,6 +633,10 @@ STRICT_EXCEPTION_PINS = {
     "post.api-settings-updates-param-param-param-rollout": (6325, "2027-03-31"),
     "post.api-settings-updates-upload": (6325, "2027-03-31"),
     "post.api-settings-users": (6325, "2027-03-31"),
+    # #7955: the streamed software export is a chunked file download, not a tool call; ADR-1005 exception entry (SAM-36).
+    "get.api-v1-inventory-software-export": (7955, "2027-05-31"),
+    # #8096: the MCP twin of the fleet application usage read is owed; ADR-1005 exception entry (2026-11-17).
+    "get.api-v1-dex-apps-usage": (8096, "2026-12-31"),
 }
 
 # `exception:` rows must read `exception:#<issue> revisit:<YYYY-MM-DD> <reason>`. The rows named
@@ -2381,8 +2401,17 @@ GATE_PARITY_KNOWN_MISMATCHES = {
 # holds no gate call this script recognises (owner-only reads that call auth_fn alone, helper
 # gates such as sw_admit, member-function gates) cannot be compared, so it fails closed unless it
 # is named here.
-GATE_PARITY_NO_GATE_MAX = 13
+GATE_PARITY_NO_GATE_MAX = 16
 GATE_PARITY_NO_GATE_ALLOWED = {
+    ("DELETE", "/api/v1/dex/score-policy", "reset_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: REST already applies the MCP "
+        "tier ladder to an MCP-tier token (AuthRoutes::require_tier_policy), so the tool's "
+        "Infrastructure:Delete row (stricter than REST DELETE, which needs Infrastructure:Write "
+        "only) ADDS only a loud GuaranteedState:Read gate and the generic supervised approval "
+        "ticket for a Delete (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 "
+        "for this pair)"),
     ("DELETE", "/api/v1/result-sets/{param}", "delete_result_set"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent, kToolSecurityRows comment)"),
@@ -2404,6 +2433,15 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "`denied`, a documented asymmetry; an explicit self-only service-scope policy is a "
         "follow-up recorded as exception:#6432 revisit:2026-11-30, confirmed "
         "by the ADR owner (ADR-1005 2026-10-24 entry)"),
+    ("GET", "/api/v1/rbac/enforcement", "get_rbac_enforcement"): (
+        "session-only for parity with its HTML fragment and GET /api/v1/me: the route calls auth_fn "
+        "behind a service-scope refusal and holds no RBAC gate call, because a "
+        "perm_fn(Infrastructure, Read) gate would make the machine twin stricter than its fragment "
+        "and invent an authority the route does not have. The RBAC store is the data the route "
+        "reads, not its gate; the tool is gated at Infrastructure:Read for the MCP tier ladder and "
+        "the default-denied service-scope class only; retiring or making permanent this and the "
+        "get_me session-only entry together is tracked as exception:#6984 revisit:2026-11-30 "
+        "(ADR-1005 2026-11-03 entry)"),
     ("GET", "/api/v1/result-sets", "list_result_sets"): (
         "owner-scoped on the session via auth_fn behind a service-scope refusal; no RBAC gate "
         "call (result-set precedent)"),
@@ -2419,6 +2457,14 @@ GATE_PARITY_NO_GATE_ALLOWED = {
         "owner-scoped on the session via auth_fn; no RBAC gate call (result-set precedent)"),
     ("POST", "/api/v1/scope/validate", "validate_scope"): (
         "auth_fn only: validates an expression the caller supplied and reads no fleet data"),
+    ("PUT", "/api/v1/dex/score-policy", "set_dex_score_policy"): (
+        "the REST handler's Infrastructure:Write check lives in the shared `score_policy_write` "
+        "lambda (perm_fn at its top, rest_api_v1.cpp), which this script's per-route lexical read "
+        "cannot see from the registration lambda. Read in review: the tool's Infrastructure:Write "
+        "row matches the REST gate, REST already applies the MCP tier ladder to an MCP-tier token "
+        "(AuthRoutes::require_tier_policy), and the tool ADDS only a loud GuaranteedState:Read "
+        "gate (ADR-1005 2026-11-09 entry; raised GATE_PARITY_NO_GATE_MAX 14 -> 16 for this "
+        "pair)"),
 }
 
 # Check 7 allowlist: registry tool -> reason, for a tool whose domain test file lacks the
@@ -2582,8 +2628,8 @@ def gate_parity_findings(ledger_rows, mcp_tools, rest_gates, mcp_security, mcp_e
 
 
 def _pinned_table_errors(label, const, table, limit, live):
-    """Shrink-only, size-pinned allowlist errors shared by checks 6 and 7: the table's size must
-    equal its MAX and every entry must still match a live finding (`live` = the set of keys, or
+    """Size-pinned allowlist errors shared by checks 6 and 7 (a pin, not a shrink-only cap): the
+    table's size must equal its MAX, raised only by a ruling recorded in ADR-1005, and every entry must still match a live finding (`live` = the set of keys, or
     for the mismatch table a {key: value} dict checked by the caller)."""
     errors = []
     n = len(table)

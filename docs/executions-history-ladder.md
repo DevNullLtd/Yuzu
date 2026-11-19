@@ -295,8 +295,8 @@ dispatched itself from a fixed non-Forensics plugin (the pre-flight check collat
 containment poll, the `echo.fleet_snapshot` topology poll and the deployment collect), none of which returns raw rows
 to an operator. The server-side consumers that used to read the store unfiltered now apply the tier
 through a real filter: the policy evaluator excludes the Forensics plugins outright (such a check
-scores `unknown`), the result-set materializer does the same (a set sourced from such a command
-materializes empty for every creator), and bundle collation applies the caller's own decision
+scores `unknown`), the result-set materializer does the same (and the result-set producers refuse
+such a command as a source), and bundle collation applies the caller's own decision
 (approval to dispatch a step does not imply reading its output; a step the caller may not read stays
 `pending` with an empty output; a collation that serves a Forensics-tier step's output writes the
 `response.forensics.read` row with `surface=bundle`, REST fail-closed and MCP `audit_persisted:false`).
@@ -355,7 +355,7 @@ status, exit code and a failure text (`error_detail`). For a command of a Forens
 text is reduced, when it is stored and again when the tracker reads it, to a bounded machine token
 (`^[a-z0-9_]{1,32}(:[a-z0-9_.-]{1,48}){1,3}$`, at most 96 bytes) or to the fixed `forensics_error`
 (`forensics_error_detail.hpp`); status and exit code are unchanged, and other plugins' text is not
-touched when it is stored or published (the transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
+touched when it is stored or published, except that a NUL byte in it is replaced by U+FFFD (a text column cannot hold one) before it reaches any of the sinks above. The response store replaces a NUL in the stored response row at its own bind. (The transition event of a mixed execution is built from the persisted text and can carry the reduced form). The tracker's reads decide per execution, not per command: in an
 execution that ran at least one Forensics-tier command, every agent's failure text is reduced on read,
 including the text of an ordinary plugin's command in the same execution (an over-reduction that
 exposes nothing). The same pure function (`AgentServiceImpl::failure_text_for_sinks`), evaluated once per frame on each ingest path
@@ -404,9 +404,13 @@ a confined caller does not pull every agent row of a fleet-wide execution; `exec
 `confined_projection` still do the redaction, and the served result is identical because both
 ignore out-of-scope rows. **Never use a filtered read where the complete cohort is needed**
 (`admit_confined_mutation` must see every agent row to decide a mutation). Service-scoped sessions
-get no owner disjunct on the fragment, because a service-scoped token's session username is its
-minter; the other surfaces that read the disjunct still show a minter's executions to a
-service-scoped token (#5557). Full account: `docs/auth-architecture.md`'s "Sixth migration".
+get no owner disjunct on any execution surface (#5557), because a service-scoped token's session
+username is its minter: every visibility and mutation-admission decision takes its ownership key from
+`execution_owner_key(session)` (`execution_scope_rules.hpp`), which is empty for such a session, so it
+sees an execution only once an agent in its service scope has a status row for it (a row is written
+when an agent's response arrives; the cohort rule above is unchanged). Real dispatch attribution and
+audit identity still use the session's own username. A service scope with no tagged agent is an
+engaged-empty scope and sees nothing. Full account: `docs/auth-architecture.md`'s "Sixth migration".
 
 **#3526 (per-agent execution-statistics rollup):** REST `GET /api/v1/execution-statistics/agents` and
 MCP `get_execution_statistics_by_agent` gate on `fleet_read_fn` and pass the visible set as
@@ -546,8 +550,9 @@ and the collapsed responses list at 50; the drawer's default view is unchanged a
 
 ### Audit policy
 
-`execution.live_subscribe` audits on first connect per session-per-execution
-(deduped). SSE auto-reconnect inside the dedup window does NOT re-audit.
+`execution.live_subscribe` audits every successful subscribe, with no per-session-per-execution
+dedup (tracked as #700), so an SSE auto-reconnect writes another row; a not-found subscribe is
+audited as `denied`.
 The forensic-grade audit on read remains on
 `/fragments/executions/{id}/detail`'s `execution.detail.view`.
 
@@ -579,7 +584,9 @@ consumer reads. The three live consumers are (1) the dashboard SSE route
 progress bridge** (track 2f, `McpStreamBridge`), a *consumer-side
 projection only*: it maps the same bus events onto an MCP session as
 `notifications/progress` + a final JSON-RPC response, adds **no bus event
-type** and renames no step. Which wire carries those frames is a per-request
+type** and renames no step, and it applies the same confined projection as
+the other two (see "Bridge as a projected consumer (#7817)" below). Which
+wire carries those frames is a per-request
 client choice and changes nothing here — the session's `GET` stream (PR 3a)
 or the `tools/call` POST response held open as SSE (PR 3b) — because both
 read the same subscription off the same bus. The bridge subscribes via
@@ -680,11 +687,29 @@ principal — REST `/api/v1/events`, the dashboard `/sse/executions/{id}`, and a
 MUST route every event through `execution_event_scope.hpp`'s
 `classify_execution_event_for_scope` / `sanitize_execution_event_for_scope`. A consumer that reads
 the bus directly without this call leaks agent-transition and progress events to an out-of-scope
-subscriber.
+subscriber. The MCP stream bridge (`McpStreamBridge`) is the third consumer and follows the same rule
+(see "Bridge as a projected consumer (#7817)" below).
 
-Both call sites are pinned by source-tripwire tests
-(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted.
+The REST and dashboard call sites are pinned by source-tripwire tests
+(`tests/unit/server/test_response_execution_scope_authz.cpp`) that fail if either call is deleted; the
+bridge is pinned by `tests/test_execution_owner_key_tripwire.py` CHECK 9 (the
+classifier call and its `kDrop` return inside the listener, both sanitize
+sites, the normalised scope store in `reserve()`, the handler's derivation
+arms, and the frozen set of files that hold the bridge).
 **A NEW bus consumer needs its own tripwire** — never an assumption that the existing ones cover it.
+
+**Limit (b): withheld-event counts are inferable.** Bus ids are per-execution counters (one per event, for all agents) sent raw, so a confined subscriber can infer how many events were withheld from gaps in the ids, the sanitized terminal frame's id and the replay-gap `missing_to`; no content or attribution leaks. A dense per-connection id would break `Last-Event-ID` resume; an opaque resumable cursor is tracked as #7816.
+
+**Bridge as a projected consumer (#7817).** `McpStreamBridge` relays `execution-progress` counts and the terminal event to the session that armed it, and it applies the same projection as the REST and dashboard consumers: its listener calls `classify_execution_event_for_scope` against the DISPATCHING session's fleet-read scope. `execute_instruction` derives that scope from the `Execution:Read` gate (`fleet_read_fn_`, the gate `get_execution_status` uses), hands it to `McpStreamBridge::reserve`, and the record keeps whether it was confined, immutable, like the listener it feeds. One bus and one taxonomy: no bridge-specific event type or format was added. The cases:
+
+- **Unrestricted** (the gate admits with no scope): nothing changes. The frames are byte-identical to what the bridge emitted before the rule; a unit test pins the exact strings.
+- **Confined** (an engaged scope): `execution-progress` is dropped before it is latched, so the session receives no progress notification; the terminal is latched as `sanitize_execution_event_for_scope(ev)`, so the final result carries the real `status` (a cancelled or failed execution is not reported as a success) and neither `agents_success` nor `agents_failure`. An absent count is omitted, never shown as 0. The pressure visitor's buffered terminal (a terminal-flagged `execution-progress`, which carries the counts) is sanitized the same way; one with no string `status` latches `unknown`, the default an unrestricted record's final gets.
+- **Unresolved** (the gate refuses, is unwired or throws): the handler passes `deny_all()`, which is confined, never `nullopt`. An unwired gate or a throw also writes a server error log line; no metric counts it. The record keeps only engaged-or-not (`deny_all()` or `nullopt`), never the caller's agent ids.
+- **A terminal payload with no string `status` is not a real case, and the two paths differ on it.** The pressure visitor's buffered terminal latches `status:"unknown"` (the default an unrestricted record's final gets), while the listener path, like REST and SSE, uses the shared sanitizer's fixed `completed`. Neither is reachable in practice because every terminal publisher stamps `status`: `refresh_counts` on both its terminal-flagged `execution-progress` and its `execution-completed` (`execution_tracker.cpp` lines 1651 and 1656), `mark_cancelled` (line 1769, `cancelled`) and the stuck-execution reaper (line 3390, `cancelled`).
+- `agent-transition` is not latched or emitted by the bridge in either mode (the listener returns before it), so the classifier's per-agent verdict has nothing to decide there.
+
+This closes the case a principal holding global `Execution:Execute` but only scoped `Execution:Read` exposed: its own fleet-wide dispatch used to report fleet-wide counts on the bridge that the REST events route withheld. A service-scoped session is unchanged: `Execution:Execute` is not on the empty `kServiceScopeGlobalSafe` table, so it never reaches `execute_instruction`. `agents_reached` in the dispatcher's own plain tool result is unchanged: it is the caller's own dispatch response, not a bus event.
+
 ## HA WS-2a — durable event outbox (ADR-2002 §5)
 
 The "Restart loss" characteristic above is what WS-2a closes. `ExecutionTracker`
@@ -749,3 +774,60 @@ LISTEN/NOTIFY-plus-cursor-poll loop from it.
   not compliance evidence; the reap never touches authoritative state). Metrics:
   `yuzu_exec_outbox_reap_total`, `yuzu_exec_outbox_reap_clock_anomaly_total`,
   `yuzu_exec_outbox_store_degrade_total`.
+
+## Response frames the response store did not keep
+
+The tracker counts an agent as responded when its terminal `agent_exec_status` row is written, and
+the response rows are separate writes that can fail. `ResponseStore::store` therefore returns a
+`StoreOutcome`: a frame is lost when the write failed, or when the per-pair cap refused a
+non-terminal frame (a capped terminal frame stays durable, since the cap admits one only while no
+terminal row exists). The ingest sites in `agent_service_impl.cpp` (Subscribe and the gateway path,
+for streaming and terminal frames alike) pass that loss, or a failed finalize of a terminal answer,
+to `notify_exec_tracker`, which sets `AgentExecStatus::response_dropped` in the SAME upsert as the
+status (migration v10). The flag is sticky: the stored value is the OR of every write for the
+agent, so a later write, terminal or not, never clears it (a stored later frame cannot restore a
+lost earlier one). It is not part of any event payload, so the outbox contract is unchanged.
+`ExecutionTracker::count_response_dropped` returns the count (`nullopt` when it cannot be read), and
+the result-set fill asks for it only once the execution is terminal or the set has timed out, adds
+it to the unanswered agents, and retries on the next tick when the count is unreadable (after
+three pending timeouts it fills the set with one unanswered agent instead, so it reads incomplete
+rather than staying pending). A set whose
+member answer was lost is therefore recorded as incomplete. A new response-ingest site must pass the
+same fact.
+
+A non-terminal frame whose provenance lookup failed (`ProvenanceOutcome::kLookupDegraded`) is
+stored under the unverified label, which the fill never reads, and reaches no tracker row (it
+carries no execution id). Each ingest path records such a frame per (command id, agent id) in an
+in-memory registry (`unverified_frame_registry.hpp`); a frame with no dispatch record at all is not
+recorded, because it can never reach a tracker row. The same pair's terminal frame checks the
+record without erasing it and reports `response_dropped`; the record is erased only after the
+tracker row has been written with that flag, so a terminal frame whose own lookup or tracker write
+fails leaves the record for a replayed terminal frame. A lost answer whose tracker row could not be
+written (`update_agent_status` returned false) is recorded in the same registry, so a later terminal
+or replayed frame of the pair still reports it. The registry keys on the exact agent id and a
+salted digest of the command id, so one agent's frames never read or erase another agent's record.
+It is bounded (about 4 MiB worst case, an estimate) and fails closed: 64 entries per agent, 4,096
+in all, one hour per entry. Markers, remembered commands and the latch are set again on each
+eviction they stand for, so each lasts for an hour after the last eviction (or after the over-long
+agent id, for the latch). An agent past its own 64 is marked (at most 1,024 markers), and every
+answer of that agent then reports
+`response_dropped`: a flooding agent affects only its own answers. An entry evicted by the 4,096
+cap has its command id remembered (at most 1,024 commands), and every agent of that command then
+reports `response_dropped`. When the marker set or the command set is full, the oldest member is
+dropped and a latch is set that makes every terminal answer report `response_dropped`; an agent id
+longer than 256 bytes is never stored and sets the latch too (Register and ProxyRegister refuse
+such an id; the ingest paths check no length themselves). Only the latch and a remembered command
+reach other agents.
+Over-reporting a set as partial is the safe direction. Evictions, and an over-long agent id, count
+as `yuzu_server_response_ingest_dropped_total{reason="unverified_registry_overflow"}`. Evidence for
+a failed provenance lookup is `yuzu_server_response_provenance_total{outcome="lookup_degraded"}`;
+for an answer the store did not keep (for example `per_agent_cap`, `malformed_identity_field`, a
+failed terminal finalize) whose tracker write failed (closed, or failed twice) it is
+`yuzu_server_response_ingest_dropped_total` by reason and, for a write that failed twice only, the
+"upsert failed twice" log line (a closed tracker, or a response store that is not open, logs nothing
+and leaves only the `store_not_open` count); a
+failed terminal finalize is counted in no `ingest_dropped` reason, and its evidence is the
+`finalize_terminal_status` log line. Check PostgreSQL health and
+`yuzu_exec_correlation_read_degrade_total{reason}` first. Residual: the
+record is held in the server process, so a restart, or a terminal frame served by a different
+replica than the non-terminal one, loses it and the set can read as complete without that frame's output.

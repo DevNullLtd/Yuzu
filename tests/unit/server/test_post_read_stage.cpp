@@ -16,8 +16,11 @@
 #include "../../../server/core/src/http_route_sink.hpp"
 #include "../../../server/core/src/post_read_stage.hpp"
 #include "../../../server/core/src/route_inventory.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+
+#include <brotli/decode.h>
 
 #include <algorithm>
 #include <atomic>
@@ -336,6 +339,91 @@ TEST_CASE("post-read stage: Handled from the stage answers the request and skips
     CHECK(s.stage_calls.load() == 6);
 }
 
+TEST_CASE("post-read stage: HEAD on a dynamic route is refused and brotli is applied once, through "
+          "real httplib routing",
+          "[postread][wiring][response_policy]") {
+    httplib::Server svr;
+    Clean clean(&svr);
+    std::atomic<int> stage_calls{0};
+    std::atomic<int> handler_calls{0};
+    PostReadStageRegistry::instance().install(&svr, [&](const httplib::Request&, httplib::Response&) {
+        stage_calls.fetch_add(1);
+        return Handled::Unhandled;
+    });
+    std::string page;
+    while (page.size() < 100'000)
+        page += "<tr><td>row " + std::to_string(page.size() % 997) + "</td></tr>\n";
+    {
+        HttplibRouteSink sink(svr, StageRequirement::Required);
+        sink.Get("/yuzu_test_page", [&](const httplib::Request&, httplib::Response& res) {
+            handler_calls.fetch_add(1);
+            res.set_content(page, "text/html; charset=utf-8");
+        });
+        sink.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
+            handler_calls.fetch_add(1);
+            res.set_content("ok", "text/plain");
+        });
+    }
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            th.join();
+        }
+    }};
+    svr.wait_until_ready();
+    REQUIRE(svr.is_running());
+
+    {
+        httplib::Client cli("127.0.0.1", port);
+        cli.set_decompress(false); // see the bytes the server sent
+
+        // HEAD on a dynamic route: the stage ran (first in order), the handler did not.
+        auto head = cli.Head("/yuzu_test_page");
+        REQUIRE(head);
+        CHECK(head->status == 405);
+        CHECK(head->get_header_value("Allow") == "GET");
+        CHECK(stage_calls.load() == 1);
+        CHECK(handler_calls.load() == 0);
+
+        // HEAD on an exempt path still runs its handler.
+        auto probe = cli.Head("/health");
+        REQUIRE(probe);
+        CHECK(probe->status == 200);
+        CHECK(handler_calls.load() == 1);
+
+        // GET with br: exactly one Content-Encoding, a correct Content-Length, a body that decodes.
+        httplib::Headers h{{"Accept-Encoding", "br"}};
+        auto r = cli.Get("/yuzu_test_page", h);
+        REQUIRE(r);
+        CHECK(r->status == 200);
+        CHECK(r->get_header_value_count("Content-Encoding") == 1);
+        CHECK(r->get_header_value("Content-Encoding") == "br");
+        CHECK(r->get_header_value("Content-Length") == std::to_string(r->body.size()));
+        CHECK(r->body.size() < page.size());
+        std::string out(page.size(), '\0');
+        size_t n = out.size();
+        REQUIRE(BrotliDecoderDecompress(r->body.size(), reinterpret_cast<const uint8_t*>(r->body.data()),
+                                        &n, reinterpret_cast<uint8_t*>(out.data())) ==
+                BROTLI_DECODER_RESULT_SUCCESS);
+        out.resize(n);
+        CHECK(out == page);
+    }
+    {
+        // A client that decodes for itself gets the original, i.e. nothing was encoded twice.
+        httplib::Client cli("127.0.0.1", port);
+        auto r = cli.Get("/yuzu_test_page");
+        REQUIRE(r);
+        CHECK(r->body == page);
+    }
+}
+
 TEST_CASE("post-read stage: an exempt server with no stage installed serves its handlers "
           "as registered",
           "[postread][wiring]") {
@@ -349,6 +437,126 @@ TEST_CASE("post-read stage: an exempt server with no stage installed serves its 
     CHECK(s.handler_calls.load() == 1);
     CHECK(s.stage_calls.load() == 0);
     CHECK(PostReadStageRegistry::instance().stage_for(&s.svr) == nullptr);
+}
+
+TEST_CASE("post-read stage: the two process-global registries are safe under concurrent "
+          "install, record, lookup and forget on distinct servers",
+          "[postread][registry][concurrency]") {
+    // Socket-free: the registry and the inventory are process-wide. A production boot registers
+    // the main listener and the plaintext redirect listener (two server keys) from one thread,
+    // and tests or a later listener may touch them from others. Each worker owns its own
+    // never-listening server. A start gate makes the workers overlap, so a plain (non-TSan)
+    // build also has a chance to see a lost update; TSan is the detector that proves the
+    // mutexes do their job.
+    constexpr int kThreads = 8;
+    constexpr int kRounds = 100;
+    std::atomic<bool> go{false};
+    std::atomic<int> failures{0};
+    std::vector<std::thread> workers;
+    workers.reserve(kThreads);
+    // Joins every started worker on every exit, including a failed thread start part-way through
+    // the loop: a joinable std::thread destroyed during unwinding would terminate the whole test
+    // binary. (No std::jthread: Apple libc++ lacks it.)
+    yuzu::test::ScopeExit joiner{[&] {
+        go = true;
+        for (auto& w : workers)
+            if (w.joinable())
+                w.join();
+    }};
+    for (int t = 0; t < kThreads; ++t) {
+        workers.emplace_back([&] {
+            try {
+                httplib::Server svr;
+                auto& reg = PostReadStageRegistry::instance();
+                Clean clean(&svr);
+                while (!go.load())
+                    std::this_thread::yield();
+                for (int r = 0; r < kRounds; ++r) {
+                    reg.install(&svr, pass_stage());
+                    HttplibRouteSink sink(svr);
+                    sink.Get("/yuzu_test_concurrent_registry", kNoop);
+                    if (reg.stage_for(&svr) == nullptr ||
+                        RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                    RouteInventory::instance().forget(&svr);
+                    reg.forget(&svr);
+                    if (reg.stage_for(&svr) != nullptr ||
+                        !RouteInventory::instance().routes_for(&svr).empty())
+                        failures.fetch_add(1);
+                }
+            } catch (...) {
+                failures.fetch_add(1);
+            }
+        });
+    }
+    go = true;
+    for (auto& w : workers)
+        w.join();
+    CHECK(failures.load() == 0);
+}
+
+TEST_CASE("post-read stage: a regex route does not match a path longer than httplib's regex "
+          "route path limit, so neither the stage nor the handler runs for it",
+          "[postread][wiring][regex_cap][body_cap][bounds][integration]") {
+    // From cpp-httplib 0.59.0 a regex route (any pattern with a capture group, `(.+)` included)
+    // is skipped for a path longer than CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH (256 bytes by
+    // default), where 0.37.1 had no such limit. An unmatched path never reaches a handler, so the
+    // effect on the routes that carry an id in the path (`/api/v1/tokens/(.+)` and the like) is a
+    // refusal (httplib's own 404), never an ungated pass. The upgrade guide and the changelog
+    // state the number, so a httplib that changes the limit, or a build that sets the macro, must
+    // fail here before that text goes stale.
+    REQUIRE(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH == 256);
+
+    httplib::Server svr;
+    Clean clean(&svr);
+    std::atomic<int> stage_calls{0};
+    std::atomic<int> handler_calls{0};
+    PostReadStageRegistry::instance().install(
+        &svr, [&](const httplib::Request&, httplib::Response&) {
+            stage_calls.fetch_add(1);
+            return Handled::Unhandled;
+        });
+    HttplibRouteSink sink(svr);
+    sink.Get(R"(/yuzu_test_re/(.+))", [&](const httplib::Request&, httplib::Response& res) {
+        handler_calls.fetch_add(1);
+        res.set_content("ok", "text/plain");
+    });
+    const int port = svr.bind_to_any_port("127.0.0.1");
+    REQUIRE(port > 0);
+    std::thread th([&] { svr.listen_after_bind(); });
+    // Stops and joins on every exit, including a failed REQUIRE below: a joinable std::thread
+    // destroyed during unwinding would terminate the whole test binary. The wait sits inside the
+    // joinable() test because stop() is a no-op until the accept loop is running.
+    yuzu::test::ScopeExit joiner{[&] {
+        if (th.joinable()) {
+            svr.wait_until_ready();
+            svr.stop();
+            th.join();
+        }
+    }};
+    svr.wait_until_ready();
+
+    const std::string prefix = "/yuzu_test_re/";
+    const auto at_limit =
+        prefix + std::string(CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH - prefix.size(), 'a');
+    const auto over_limit = at_limit + "a";
+    REQUIRE(at_limit.size() == CPPHTTPLIB_REGEX_ROUTE_PATH_MAX_LENGTH);
+
+    httplib::Client cli("127.0.0.1", port);
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(5);
+    const auto shortp = cli.Get(prefix + std::string(40, 'a'));
+    const auto atp = cli.Get(at_limit);
+    const auto overp = cli.Get(over_limit);
+
+    REQUIRE(shortp);
+    CHECK(shortp->status == 200);
+    REQUIRE(atp);
+    CHECK(atp->status == 200);
+    REQUIRE(overp);
+    CHECK(overp->status == 404);
+    CHECK(handler_calls.load() == 2);
+    CHECK(stage_calls.load() == 2);
 }
 
 TEST_CASE("post-read stage: a sink on a server with no stage installed refuses every verb and "

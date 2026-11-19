@@ -132,6 +132,31 @@ TEST_CASE("normalize_vendor strips legal suffixes and applies aliases", "[normal
     }
 }
 
+TEST_CASE("an agent origin label (via:<ecosystem>) is no vendor", "[normalize][vendor]") {
+    CHECK(yuzu::server::kOriginLabelPrefix == "via:");
+    SECTION("normalize_vendor returns empty for every label") {
+        for (const char* label : {"via:brew", "via:snap", "via:flatpak", "via:deb", "via:rpm",
+                                  "via:macos_pkgutil", "via:", "via:Microsoft"})
+            CHECK(normalize_vendor(label).empty());
+    }
+    SECTION("a labelled title keys exactly like a vendorless one") {
+        CHECK(norm_key("Foo", "via:snap") == norm_key("Foo", ""));
+        CHECK(norm_key("Foo", "via:brew") == norm_key("Foo", "via:snap"));
+        // ...and not like one with a real vendor
+        CHECK(norm_key("Foo", "via:snap") != norm_key("Foo", "Acme"));
+    }
+    SECTION("only a RAW prefix counts: case-sensitive, exact, at byte 0") {
+        // the agent emits the label in lower case, so these are vendors and normalise as such
+        CHECK(normalize_vendor("VIA:Acme") == "via:acme");
+        CHECK(normalize_vendor("Via:Acme") == "via:acme");
+        // a vendor merely containing "via:" is not a label
+        CHECK(normalize_vendor("Acme via:brew") == "acme via:brew");
+        CHECK(normalize_vendor(" via:brew") == "via:brew"); // leading blank: not the raw prefix
+        CHECK(normalize_vendor("via") == "via");
+        CHECK(normalize_vendor("Viacom Inc.") == "viacom");
+    }
+}
+
 TEST_CASE("norm_key is deterministic and stable across raw form variants", "[normalize]") {
     // Key shape: <vendor>:<title> with an optional :<edition> suffix.
     const std::string k =

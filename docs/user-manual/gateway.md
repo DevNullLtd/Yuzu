@@ -439,7 +439,7 @@ from those two settings, not an observed figure. Plan for these requirements:
   containment). Use addresses that stay the same (a virtual IP or fixed node addresses) for
   gateway-fronted fleets; if the addresses behind the name change, a quarantined agent
   cannot reach any node and cannot be released remotely.
-- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051; what to configure instead is tracked in #7062). Until then, use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried, and the server's management channel sets no keepalive.
+- **Management address.** The server reaches a gateway cluster's management plane (`:50063`) through one address, `--gateway-command-addr`. With several gateway nodes and that address naming one node, killing that node left the whole fleet undispatchable in two HA WS-13 spike runs although every agent had re-attached (a control run is still owed, #7051). Use the shape the spike exercised: one address in front of all the gateway nodes that passes TCP through without terminating TLS and is reachable only from the server hosts. Every node's management certificate must carry that name, because the server checks it against the address it dials, and every node must admit the server (the same management peer settings on each). The nodes must be clustered. Spike finding 10: some commands to re-attached agents were accepted and never delivered behind that address. A multi-address DNS name was not tried. The server's management channel now sends an HTTP/2 keepalive ping every 30 s, idle or not, and treats the node as down if it is not answered within 10 s (about 40 s to detect a node that stops answering without closing the connection); before this, such a node held every forward to its 300 s deadline. This is expected from the code, with a unit test that the keepalive arguments reach the channel-creation call (the last call into gRPC is checked by inspection), and has not been measured against a real silent-drop fault; a forward that fails this way is retried up to 3 times with the same command id, which the agent's dedup store makes effectively-once. It adds no second address and no failover: surviving a dead node still depends on the one address resolving to a live node. Decision (HA WS-13 slice 13.7, #7062): the supported shape is one name in front of all the gateway nodes, and a list of addresses in `--gateway-command-addr` is deferred until a spike measures it.
 - **A node that is up but has lost its server.** Failover does not cover this case. From
   the sources, the gateway acknowledges proxied heartbeats from its own node-local state
   whatever the state of its upstream (an unknown session gets `NOT_FOUND`), and the agent
@@ -515,13 +515,17 @@ default settings) did not notice the lost `Subscribe` stream across that restart
 heartbeats got `NOT_FOUND`, and rc6 and v0.13.0 then wedged as described above (restart
 them). A `GOAWAY` originating from the gateway on its own was not observed.
 
-*On the Cowboy listeners.* Read from the Cowboy 2.19.0 source (`cowboy_http2`), not
+*On the Cowboy listeners.* Read from the Cowboy 2.21.0 source (`cowboy_http2.erl`, `initiate_closing/2`, `closing/2`, `terminate/2` and `loop/2`, re-read in full against 2.21.0), not
 measured: when the listener's supervisor stops its connection processes (a gateway stop,
 or a listener restart), each HTTP/2 connection sends a first `GOAWAY` with last stream id
 2^31-1 and `NO_ERROR`, waits `goaway_initial_timeout` (1 s), sends a second `GOAWAY` with
 the real last stream id, and, if streams are still open (a `Subscribe` stream always is),
 waits up to `goaway_complete_timeout` (3 s) before closing. The two options are not set by
-the gateway, so these are Cowboy's defaults. The listeners are the last children of the
+the gateway, so these are Cowboy's defaults. When the connection finally closes, Cowboy shuts the
+socket's write side, then sets `{linger, {true, 0}}` on the socket, then waits up to
+`linger_timeout` (1 s) for the peer; the close then releases the socket with a reset and discards
+unsent data; what an
+agent sees from that was not measured. The listeners are the last children of the
 supervision tree, so they stop first. The gateway's own 10 s wait for in-flight commands
 (`drain_pending`, in `yuzu_gw_app:stop/1`) runs after the tree is down (INFERRED from OTP,
 which calls `stop/1` after the application's processes have stopped), so it does not hold
@@ -608,6 +612,10 @@ on a restarted node reconnect and re-register on their back-off (agents with the
 fix; released agents may need a restart, see [Heartbeat admission](#heartbeat-admission)).
 Multi-node behaviour
 is not tested.
+
+**Hot code loading is unsupported.** Never run `l(yuzu_gw_agent)` or `code:load_file` on a live
+gateway node: a raw load can crash agent owners or leave a malformed registry row. A build starts
+by restarting the node, which disconnects its agents.
 
 **Upgrading.** A rejected agent re-registers on its own only in a build that includes
 the #2182 fix, or with `--no-auto-update` on v0.13.0 and v0.14.0-rc6 (see Heartbeat
@@ -858,11 +866,12 @@ and counts in `yuzu_server_gateway_route_desync_total` under the outcome named, 
 
 | Server WARN line (start) | Outcome | Event | Kind |
 |---|---|---|---|
-| `NotifyStreamStatus: CONNECTED for session ... refused — the directory read degraded and this replica holds no matching local session` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; the same notification is accepted once it reads again |
+| `NotifyStreamStatus: CONNECTED for session ... (agent ...) refused — the directory read degraded; the gateway sends the notice again and it is accepted once the directory reads` | `connected_unverified` | CONNECTED | Transient: the route store could not be read; every CONNECTED is refused while it cannot, and the gateway's resend (#5695) is accepted once it reads again |
 | `NotifyStreamStatus: unknown session ... for agent ...` | `unknown_session` | both | Definitive for that session: the server lost its state or never saw the registration. For a live session the heartbeat verdict names it and the replay re-registers it |
 | `NotifyStreamStatus: CONNECTED for session ... but the directory names a different session — rejecting`, or `NotifyStreamStatus: CONNECTED for session ... is no longer the currently-installed session` | `stale_connected_session` | CONNECTED | Definitive: a newer registration owns the agent |
 | `NotifyStreamStatus: CONNECTED for agent ... claims cluster_id ..., which differs from this agent's already-bound cluster affinity` | `cluster_affinity_violation` (op `announce_connected`) | CONNECTED | Definitive until the cluster configuration is fixed |
 | `NotifyStreamStatus: CONNECTED for agent ... presents session ... that another agent's route already holds (#5683)` | `session_held_by_other_agent` (op `announce_connected`; audit `gateway.session_held_by_other_agent`; alert `YuzuGatewaySessionHeldByOtherAgent`) | CONNECTED | Definitive while the other agent's route holds the session, but the gateway cannot tell it from the others (the answer carries no reason, #6059), so it keeps resending for as long as it holds the session (at the ordinary retry cadence for the first 15 minutes, then in the slow phase at intervals of up to 10 minutes): the WARN and the audit row repeat with each resend, and the alert stays active, until the presenting agent's session ends at the gateway or the other agent's route releases the session id. See [Forged or colliding session ids](#forged-or-colliding-session-ids) |
+| `GatewayRouteStore session lookup: N session id(s) name a different agent in this replica's session map than in the directory; refused and listed for replay` | `agent_mismatch` (op `session_lookup`) | BatchHeartbeat, ProxyInventory | Self-resolving: the id is not acknowledged or ingested and the gateway replays `ProxyRegister`, which decides who holds the id (ProxyInventory refuses the report and logs its own line, `ProxyInventory: session ... names a different agent here than in the route directory; refusing`; the next BatchHeartbeat lists the id for replay). Not alerted. A persistent count means two replicas disagree about a session or the directory was edited by hand |
 
 A failed directory write is answered `true` by this server (the write is
 fail-open); a server change in review (#5961) answers it `UNAVAILABLE` instead,
@@ -1060,7 +1069,7 @@ an agent against the durable route directory in Postgres (batched reads of up to
 answer for it; a session the replica holds no local entry for is still ingested
 and is also reported in the `BatchHeartbeat` unknown-session list below. Run
 exactly one server replica until the HA safe-to-scale gate lifts
-([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c).
+([ADR-2002](../adr/2002-high-availability-architecture.md) section 7c). With a second replica (unsupported), a `plugin_not_found` for a plugin an agent lacks is reported by a replica that does not hold the agent's session only for gateway-fronted agents, and only while the agent's route-directory row confirms it; otherwise the command is sent and the agent answers for itself (`yuzu_server_plugin_absence_confirm_total`).
 
 ### RPCs
 
@@ -1273,7 +1282,7 @@ This is the production shape, from `gateway/config/sys.config.prod` (comments sh
 | `auth_fun` | Management listener only: `fun(Der) -> {true, Id} \| true \| false`, run by the stream handler on the peer certificate before a handler exists. Needs `tls`. **Boot refuses an `auth_fun` on any listener that serves the agent service** (`auth_fun_on_agent_listener`), that is, whose `service_protos` include `agent_pb` **or** whose `services` map has `'yuzu.agent.v1.AgentService'` as a key (the management proto embeds the AgentService definition, so `service_protos` alone would miss it), including a combined agent-and-management listener that has one; a combined listener without an `auth_fun` is valid (the integration test uses one). That refusal and the boot and `/readyz` rule are two different tests: the refusal asks whether the entry *serves* the agent service by either route, while boot and `/readyz` require at least one entry that *routes* it (the `services` key). |
 | `origin` | Keys: `mode`, `sources`, `trusted_hops`. How the caller's address is decided; default `#{mode => transport}`. See [Client addresses behind a proxy](#client-addresses-behind-a-proxy). |
 | `acceptors` | Acceptor processes, a positive integer (default 4). `sys.config.prod` and the reference configs give the agent listener 32 for reconnect storms; the plaintext default, demo and UAT configs set nothing and so run 4. |
-| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client does not ping, so it keeps ten minutes. |
+| `http2` | Overrides of the Cowboy HTTP/2 options, by Cowboy's own option names; the options the layer owns and any unknown name are refused. Defaults: `idle_timeout` 600000 ms, `max_concurrent_streams` 1024, `max_frame_size_received` 16384, `linger_timeout` 1000, and, on a listener whose `services` map has `'yuzu.server.v1.ManagementService'` as a key (a combined agent-and-management listener included), `max_received_frame_rate` `{100000, 10000}`: 100000 received frames per 10 s. A listener that routes only the AgentService leaves `max_received_frame_rate` unset and so keeps Cowboy's own `{10000, 10000}`, the flood guard for the agents' unauthenticated connections. The management value is ten times Cowboy's because the server sends every command of a fan-out over its one connection to the management listener, at about 2 received frames per call: Cowboy's ceiling is about 5000 calls per 10 s, and past it Cowboy closes the whole connection with GOAWAY `enhance_your_calm` and every call in flight on it fails (`stream_error`). `{100000, 10000}` is about 5000 calls per second, far above the ~205 responses per second measured per server channel even with 8 channels to one gateway, and it is still finite. Raising `max_concurrent_streams` does not help: the ceiling counts frames, not streams. A listener that routes the `ManagementService` also defaults `max_concurrent_streams` to 4096 instead of 1024. The server sends each forwarded command as its own call over its one connection and queues the calls past the cap, so a fan-out takes about the agents' answer time or (agents x mean answer time / cap), whichever is longer. Measured over one loopback connection with 5,000 agents answering uniformly in 0 to 10 s: 30.7 s at 1024, 18.8 s at 2048, 11.9 s at 4096 and 10.1 s at 8192 (25,000 agents: 37.1 s at 4096, 21.7 s at 8192). 4096 brings 5,000 agents to within about 2 s of the answer time. It is not higher because the cap also bounds the memory the management connection can hold: each call in flight can have one response waiting to be written when agents answer faster than the server reads, and 5,000 answers of 256 KiB inside 1 s peaked at about 1 GB in the connection at 4096 and 1.2 GB at 8192. Past 5,000 agents per gateway, more server connections or one message per fan-out (#5956) is the way forward, not a larger cap. The measurement used a gun client that keeps at most the cap in flight, as the server's gRPC C++ client does; it was not repeated with the server itself. `sys.config.prod` and `deploy/docker/reference-gateway-sys.config` set `max_received_frame_rate => {100000, 10000}` and `max_concurrent_streams => 4096` on the management listener explicitly; every other shipped config gets them from the default. `sys.config.prod` and the reference configs set the agent listener's `idle_timeout` to 180000 because agents ping every 60 s (the 60 s default would race the ping) and `max_concurrent_streams` to 32. The shipped plaintext default, demo and UAT configs set neither and so inherit 600000 ms and 1024 streams. The management client pings every 30 s, idle or not, so its connection never reaches the idle timeout. Header-list bound: cowlib 2.22.0 enforces `max_header_list_size` on every request header block (CVE-2026-113431) at 32768 octets (RFC 9113 sizing: name + value + 32 per header). A larger list is refused with a stream error `enhance_your_calm`; see "Connection ceilings and the unauthenticated ports" for what a burst of refusals does to the connection. The gateway sets nothing, so every listener has the bound; `http2` deliberately does NOT accept `max_header_list_size` (a tunable could only weaken it), and `max_headers` (Cowboy's count limit, 100) and `max_fragmented_header_block_size` are accepted keys that no shipped config sets, and they must stay unset, because the bound is the three together. Pins in `yuzu_grpc_listener_tests` and `yuzu_grpc_wire_tests` fail if the listener defaults for any of that change; they do not stop an operator setting either key. |
 | `limits` | Keys: `max_connections` (a positive integer or `infinity`, the default; the most simultaneous connections the listener holds, over which Ranch stops accepting until one closes), `max_message_bytes` (a positive integer, default 4194304), `send_timeout_ms` (a positive integer or `infinity`, default 30000), `max_connection_memory_bytes` (a positive integer at least 1048576, or `infinity`; default eight times `max_message_bytes`, i.e. 32 MiB for the 4 MiB default, except on a listener that routes the `ManagementService` and does not serve the agent service, where the default is no ceiling) and `request_timeout_ms` (a positive integer or `infinity`, default 30000). A request message larger than `max_message_bytes` is refused before it is buffered, but a message that fits is decoded in full, so a smaller `max_message_bytes` also bounds the memory one stream can make the gateway decode. `max_connection_memory_bytes` caps a single connection's memory (a `max_heap_size` on the Cowboy connection process that counts the refc buffers its streams hold); a connection that buffers more than this of half-finished requests is killed by the VM and the kill is counted in `yuzu_gw_grpc_connection_killed_total`. The VM checks the ceiling when the connection collects its garbage and counts the binaries that are already dead, so the default is sized from what one well-behaved connection was measured to reach, not from the bytes in flight alone: one message of `max_message_bytes` costs the connection three times its size at its peak (the received chunks, the joined message and the decoded request) plus under 1 MiB, so the 32 MiB default lets two full-size messages complete at once with room to spare and kills a peer holding half-sent full-size streams at about the eighth. Do not set it below about four times `max_message_bytes`: an agent sending one full-size message can then be killed. The ceiling also counts the responses waiting to be written, which is why the management listener has none by default: its one peer is the pinned server sending a whole fan-out over one connection, and when the agents answered together with large responses the ceiling (then 16 MiB, equal to Cowboy's own 16 MB output-buffer alarm) killed that connection, and every call on it, before Cowboy's backpressure could act. Without it, Cowboy's buffer alarm paces the senders and the connection holds about 16 MB plus one response per stream in flight; set `max_connection_memory_bytes` on the management listener to keep a hard cap anyway. A combined agent-and-management listener serves anonymous agents and keeps the ceiling. `request_timeout_ms` is how long a unary or server-streaming stream may buffer its one request before it is aborted `DEADLINE_EXCEEDED` (counted in `yuzu_gw_grpc_recv_timeout_total`) and its buffer dropped; it never cuts a bidirectional or client-streaming handler (an agent's long-lived `Subscribe`), which runs before any message, and a `grpc-timeout` the client sent runs alongside it with the earlier of the two winning. The gateway ends a call that carries a `grpc-timeout` with `DEADLINE_EXCEEDED` a tenth of that timeout early, at most 1 s early (299 s for the server's 300 s calls), so the client receives the status before its own deadline instead of resetting the stream: when thousands of the server's calls expire together, their resets exceed Cowboy's `max_cancel_stream_rate` (500 per 10 s) and Cowboy closes the whole management connection. Tested with a gun client; that the server's gRPC C++ client then sends no reset is standard gRPC behaviour but was not observed against the server. Together these two bound an unauthenticated peer that opens streams and stalls them half-sent (see "Connection ceilings and the unauthenticated ports" below). `max_connections` bounds the file descriptors a listener's connections can take. It is **not protection against a hostile peer**: see that same section for what it does and does not do on each listener. `sys.config.prod`, the reference configs and the packaged release config (`gateway/config/sys.config`, the one the release packages and the systemd unit run) set `max_connections => 60000` on the agent listener (the systemd unit's `LimitNOFILE` of 65536 less about 5500 of headroom for the upstream channel, the health and metrics ports, the management listener, Erlang distribution and files, so it holds to a fleet of about 30000 agents; raise it together with `LimitNOFILE` and keep about 5500 below it, lower it if the limit is lower) and `max_connections => 256` on the management listener. Both set `max_message_bytes => 4194304` explicitly, which is the default and gRPC's default receive limit: it is not lowered on the agent listener because an agent's installed-software inventory blob may be 3 MiB by design. The agent listener also sets `max_connection_memory_bytes => 33554432` and `request_timeout_ms => 30000` explicitly (both the defaults). The demo and UAT configs set no `limits`, so `max_connections` is `infinity` there, but the memory ceiling and request deadline still apply at their defaults. Size the file-descriptor limit for the listener's `max_connections` plus the other sockets (about 1.5 to 2 times the agent count plus 200 in use). |
 
 **Connection ceilings and the unauthenticated ports (known residual risk).**
@@ -1290,7 +1299,7 @@ peer that wants to hold connections, and this is what it does on each listener:
   (about 1 s) or the TLS handshake (10 s) is closed on those timers, and one that then sends
   nothing is closed by the listener's `idle_timeout`. A connection that keeps sending is
   **not**: any received data, a `PING` included, resets Cowboy's idle counter
-  (`cowboy_http2.erl` in Cowboy 2.19.0, read from the source, not measured), so a peer that
+  (`cowboy_http2.erl` `loop/2` in Cowboy 2.21.0, read from the source, not measured), so a peer that
   has completed the handshake can hold the connection open for as long as it likes. A peer that holds
   60000 of them fills the ceiling; new connections then wait in the kernel's listen
   backlog while the agents already connected are unaffected until they reconnect, and
@@ -1305,6 +1314,22 @@ peer that wants to hold connections, and this is what it does on each listener:
   single stalled request, and node-wide memory shedding (below) suspends the whole listener
   before the node runs out. A held but quiet connection still occupies a slot; those three
   stop a held connection from being turned into a memory-exhaustion attack.
+- *Header-list refusals on the agent listener (`:50051`) and the management listener (`:50063`).*
+  A request whose decoded header list is over 32768 octets is refused as a **stream error**
+  (RST_STREAM `enhance_your_calm`, the handler never runs) and the connection keeps serving. A
+  burst is different: Cowboy's `max_reset_stream_rate` (default 10 resets per 10 s) closes the
+  whole connection with GOAWAY `enhance_your_calm` at about the tenth refusal in 10 s, and every
+  stream in flight on that connection dies with it. Behind an L7 HTTP/2 load balancer that shares
+  one upstream connection across agents, one agent's refusals therefore kill the other agents'
+  streams on it: such a proxy must not share one upstream connection across agents. The closure
+  shows as `yuzu_gw_grpc_connections_closed_total{reason="enhance_your_calm"}`; a single
+  refusal has no counter. Measured bounds (one-off runs, not part of the test suite): a flood of 200 connections x 8 streams x 90 headers x 4000 B peaked at 163 MB over a
+  107 MB baseline with 0 handler calls, (a comparison run without the bound reached 713 MB and
+  1600 handler runs); `max_headers` (100) closes the connection at 98 to 101 headers (the count is
+  every decoded field, pseudo-headers included); a header block over 16384 octets gets
+  `FRAME_SIZE_ERROR`. The limit is deliberately not tunable: `max_header_list_size` is refused by
+  the `http2` allow-list, which fails safe (`max_headers` and `max_fragmented_header_block_size`
+  stay accepted keys; see the `http2` row).
 - *Management listener (`:50063`), 256.* The only peers that need it are the server's
   replicas, one connection each. Who can hold the other slots depends on how far the
   connection gets. **Before the TLS handshake**, anyone with layer-4 reach to the port can
@@ -1781,7 +1806,8 @@ identity](#authorizing-the-server-by-its-identity)):
 | `mgmt_peer_denied` | `[]` | a list of `{serial, Hex}`, `Hex` being 1 to 40 hexadecimal digits in either case, no `0x`, no colons. A decimal serial is read as hex | Certificate serial numbers the gateway refuses in **every** mode, even when the certificate carries the identity or a pinned key (`revoked`). It is keyed on the serial and never on the key: the server re-issues its leaf over the same key, so a key-based entry would also refuse the replacement. Read at boot only. A malformed entry **refuses boot**; so does a list of more than 4096 entries. |
 | `mgmt_crl_source` | not set (no CRL is read; the boot logs a WARN when the mode is `identity` or `identity_or_pin`; the shipped reference gateway config, `deploy/docker/reference-gateway-sys.config`, sets it) | `{url, "https://host:port/path"}`, `{url, Url, #{cacertfile => Path}}` or `{file, Path}` | Where the gateway reads the CA's CRL. The URL form fetches over verified TLS, trusting the management listener's `cacertfile` unless the three-element form names the CA that issued the server's HTTPS certificate; the URL host must be one of that certificate's names. Only `https` is accepted: no `http`, no userinfo, no fragment, no unknown option. Any defect refuses boot. Read at boot |
 | `mgmt_crl_grace_s` | `86400` | an integer 0 to 604800 | How long past the CRL's `nextUpdate` the gateway keeps admitting before it refuses every stream as `revocation_stale`. Read at boot |
-| `mgmt_crl_refresh_ms` | `5000` | an integer 1000 to 3600000 | How often the gateway fetches or re-reads the CRL (each fetch is bounded at 3 s). Read at boot |
+| `mgmt_crl_refresh_ms` | `5000` | an integer 1000 to 3600000 | How often the gateway fetches or re-reads the CRL (each fetch is bounded at 3 s). Each wait is shortened by a random 0 to 10 percent (down only, never longer), so a fleet restarted together does not poll the server in one burst; a withdrawal reaches a gateway within one `mgmt_crl_refresh_ms` of the server publishing it, plus the time the previous load takes (the next wait starts after the load). Read at boot |
+| `mgmt_crl_max_validity_s` | not set (no bound). The shipped reference gateway config (`deploy/docker/reference-gateway-sys.config`) sets `691200` (8 days); `sys.config.prod` carries it as a commented example | an integer 3600 to 31536000 | The widest `nextUpdate` minus `thisUpdate` a CRL may carry. A validly signed CRL wider than this is refused `validity_too_long` and the CRL held stays in force. Without it a CRL with a far-future `nextUpdate` is believed until that date and keeps `YuzuGatewayMgmtCrlStale` quiet. The width is read from the CRL's own two dates and is **never compared with the gateway's clock**. Keep it above the widest CRL your feed publishes (a server that publishes 7-day CRLs backdated 300 seconds needs more than 7 days plus 300 seconds, or every CRL is refused); the Yuzu server publishes 48 hours. **A bound below the width of the CRLs the server publishes (172,800 s plus the 300 s backdate, so anything under about 173,100 s) refuses every CRL the server publishes and fails the management plane closed** (`revocation_unknown` once any held CRL expires, immediately on a restart). A float, or any other value, refuses boot. Read at boot |
 
 **Heartbeat batching interval** (read by the heartbeat buffer at start; unlike
 the replay keys above, it also has an environment override):
@@ -2625,17 +2651,20 @@ applying a change restarts the gateway, which disconnects the node's agents, and
 certificates in the management listener's `cacertfile` (a matching issuer name or key id is not
 enough). It is refused if it is malformed, larger than 16 MiB, signed by another key
 (`unverified`), issued under a name other than that of the certificate that verified it
-(`issuer_mismatch`), dated more than an hour in the future (`future_dated`), or older than the one
+(`issuer_mismatch`), wider than `mgmt_crl_max_validity_s` (`validity_too_long`, decided only after
+the signature verifies), dated more than an hour in the future (`future_dated`), or older than the one
 already loaded: a new CRL replaces the held one only when its `thisUpdate` is later or its
 `cRLNumber` is higher, and never when it is already past its own `nextUpdate` plus
 `mgmt_crl_grace_s` while the held one is still believed (`replay` in each case; so is a CRL with the
 same number and time as the held one but a different revoked set, which the server never publishes:
 it numbers each publish one higher under a table lock). A CRL whose `nextUpdate` is not after its
-`thisUpdate`, or that lists a serial that is negative or longer than 20 octets, is refused as
-`malformed`; so is a CRL that is not the issuer's complete list (a delta CRL, or one with an
-`issuingDistributionPoint`, a `certificateIssuer` entry or a `removeFromCRL` reason) and one with an
-extension the gateway does not understand that the CA marked critical. The Yuzu server publishes
-none of these. A base CRL from a CA that also publishes deltas (`freshestCRL`) is accepted as the
+`thisUpdate`, or that lists a serial that is negative or longer than 20 octets, or that does not
+decode, is refused as `malformed`. A CRL that decodes but is not the issuer's complete list (a delta
+CRL, or one with an `issuingDistributionPoint`, a `certificateIssuer` entry or a `removeFromCRL`
+reason) and one with an extension the gateway does not understand that the CA marked critical is
+refused `unsupported`: well formed, and refused by policy (`malformed` is kept for input that does not
+decode, so a corrupt file and a policy refusal can be told apart). The Yuzu server
+publishes none of these. A base CRL from a CA that also publishes deltas (`freshestCRL`) is accepted as the
 complete list as of its `thisUpdate`; the gateway never fetches or applies deltas. A loaded CRL covers
 a peer only if the peer's certificate verifies under a key that signed the CRL: a different root with
 the same subject name gets `revocation_unknown`, not the other root's revocations. A CA whose key is
@@ -2644,6 +2673,27 @@ evicts the loaded one. The high-water mark lives in the gateway process: the wat
 its own restart, but a gateway process that starts afresh has nothing held and accepts the first
 validly signed CRL it is given (see "Limits"). Each refusal is counted on
 `yuzu_gw_mgmt_crl_rejected_total{reason}` and logged when the reason changes.
+
+**Rejected bytes are remembered.** When the bytes alone (with the verification certificates) decide a
+refusal (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`), the gateway keeps a hash of the bytes and of the certificates and does not
+decode and verify the same bytes again on every refresh: it does so again only when the bytes or the
+certificates change, the `mgmt_crl_max_validity_s` in force changes, an hour passes (the memory lasts
+one hour, so a refusal pinned by a transient fault is looked at again and a persistent one is
+repeated hourly), or another CRL is accepted. A remembered refusal is **reported
+exactly as a fresh one**: the state gauges say the latest attempt obtained nothing usable, so
+`yuzu_gw_mgmt_crl_last_success_timestamp_seconds` does not advance and
+`YuzuGatewayMgmtCrlRefreshStalled` and `YuzuGatewayMgmtCrlNotLoaded` still fire. What changes is the
+counter: `yuzu_gw_mgmt_crl_rejected_total` counts such a refusal **once per distinct rejection in a
+row, repeated hourly while it persists, not once per refresh**, so a steady non-zero `rate()` is no
+longer the signature of a file refused on every tick; read the gauges, the log (which names each
+change of reason and repeats an hour later) and `increase()` over a window longer than an hour. The
+memory saves the decode and verify, not the download: the body is still fetched in full on every
+refresh (the server sets no `ETag` on the CRL, so there is no 304). The memory has one slot: a source that alternates two different refused bodies (G, X, G, X) is decoded and counted on every refresh, and a good CRL between two refusals of the same bytes ends the memory, so the same bytes are then counted again. `future_dated` (it
+clears when the clock catches up), `replay` (it depends on the CRL held and on how stale it is: a
+CRL refused as `replay` while the held one is believed is taken once the held one is itself stale)
+and the fetch failures are never remembered and are counted on every attempt, and so is `too_large`
+in practice: an oversized body is cut off by the fetch before there is anything to hash. No shipped
+alert rates on this counter.
 
 **What it does to each stream.** Once a source is set, **every** admitted peer is checked, in every
 mode including `pin`, after admission and the deny-list. Three more reasons join the closed set
@@ -2681,7 +2731,8 @@ fails `crl_revoked` and `YuzuGatewayMgmtIdentityOutage` pages. Re-key the defaul
 
 **Limits.**
 
-- **Latency.** A gateway between a server's publish and its next fetch (up to `mgmt_crl_refresh_ms`)
+- **Latency.** A gateway between a server's publish and its next fetch (up to `mgmt_crl_refresh_ms`,
+  plus the time the loads around it take: the next wait starts after a load ends)
   still admits the withdrawn certificate. A server that cannot publish (no elected leader, or no
   access to the CA key) leaves the gateway on the held CRL, which keeps being believed until its
   `nextUpdate` plus the grace.
@@ -2703,15 +2754,40 @@ fails `crl_revoked` and `YuzuGatewayMgmtIdentityOutage` pages. Re-key the defaul
   behind publishes CRLs that are already stale; the gateway does not let them replace a CRL still in
   force, so the revocations such a CRL carries (including a server re-issue) do not land either, and
   the held CRL is believed until its own `nextUpdate` plus the grace. The log names both CRLs'
-  numbers and times when it refuses one. Fix the server's clock.
-- **Size.** A CRL larger than 16 MiB (about 470,000 revoked certificates, which never leave the
-  list) is refused `too_large` on every fetch (a validly signed CRL packed to the 16 MiB bound costs
-  about half a gibibyte of memory while it is parsed); the held one keeps being believed until its
-  `nextUpdate` plus the grace, then every stream is refused.
-- **Trust.** The gateway believes the validity the CRL states: it does not impose the server's
-  48-hour lifetime itself, so a validly signed CRL with a far-future `nextUpdate` (only the CA's
-  signing key can make one) keeps being believed, and keeps `YuzuGatewayMgmtCrlStale` quiet, until
-  that date. A holder of the install CA key can mint a certificate and a CRL that omits it. The
+  numbers and times when it refuses one. Fix the server's clock, then restart a server replica that
+  has the correct clock (a restart republishes the CRL at startup); see `docs/pki-architecture.md`,
+  "CRL dated in the future" (added with the CRL future-dated alert change).
+- **Size.** A CRL larger than 16 MiB (about 470,000 revoked certificates of the server's 36 bytes
+  each, which never leave the list; at most about 840,000 of the smallest possible 20-byte entries) is
+  refused `too_large` on every fetch; the held one keeps being believed until its
+  `nextUpdate` plus the grace, then every stream is refused. There is no separate cap on the entry
+  count: the byte bound limits it. The gateway logs a WARNING once a fetched CRL passes 12 MiB (75
+  percent of the bound), at most once an hour, saying how large it is; there is no metric for it, so
+  watch the log, and plan a raise of the bound before it is crossed.
+- **Parse cost near the bound.** The OTP decoder holds the whole decoded list, so parsing a CRL near
+  16 MiB costs the watcher process **about 1.1 GiB of transient memory (1,111 to 1,153 MiB measured; plan for 1.2 GiB) and 2 to 2.5 seconds**
+  (measured on OTP 28.5.0.1: 465,916 server-shaped entries, 16.00 MiB, 1.9 s and a 1,153 MiB peak;
+  755,405 smallest entries, 15.82 MiB, 2.5 s and a 1,111 MiB peak), after which the loaded CRL is about 21 to 24 MiB per copy and **two copies stay resident** (the watcher's state and `persistent_term`), about 45 to 50 MiB. The garbage of the parse is collected as soon as it returns. A
+  container or VM memory limit below that kills the gateway when a CRL of that size arrives, so size
+  it for the CRL you can reach, not for the CRL you have: about 2.5 KB per entry at the server's entry
+  size is the planning figure. The memory shedder (`yuzu_gw_memory_shedder`, described with the `memory_shedding` keys) counts `erlang:memory(total)`
+  against the cgroup limit, so on a limit below about 1.6 GiB (its default high-water mark is 0.75 of
+  the limit) a near-bound parse suspends the agent listeners and turns `/readyz` not-ready **before** an
+  out-of-memory kill; where the limit is below the peak the VM is killed, and because the boot load
+  parses synchronously it is killed again on every restart. The decode happens **before** the signature is verified (the verifier
+  decodes the CRL itself and no cheaper check exists), so unsigned bytes of that size cost the same;
+  it is paid in the watcher, never on the stream path, and once per distinct bytes (a CRL identical
+  to the held one, and bytes already refused, are not parsed again for an hour). Not saved: a source
+  serving different bytes every refresh is parsed every refresh, and so are **identical** bytes that
+  are never remembered, a validly signed CRL refused `future_dated` or `replay` (each costs the full
+  decode, about 2 s at the bound, on every tick for as long as it is served). A refused body is also
+  still **downloaded in full** on every refresh: the memory saves CPU, not bandwidth.
+- **Trust.** The gateway believes the validity the CRL states, up to `mgmt_crl_max_validity_s`. The
+  shipped reference config sets it to 8 days, so a validly signed CRL wider than that (only the CA's
+  signing key can make one) is refused `validity_too_long`; where the key is **not set** (the code
+  default, and `sys.config.prod` until you add it) a CRL with a far-future `nextUpdate` keeps being
+  believed, and keeps `YuzuGatewayMgmtCrlStale` quiet, until that date. Even with the bound, a CRL
+  of the full allowed width is believed for that long plus the grace. A holder of the install CA key can mint a certificate and a CRL that omits it. The
   revocation is by serial, not by key: a re-issue over the same key is not blocked by the old
   serial's entry.
 - **Network.** The gateway needs an outbound path to the server's HTTPS port (a flow that did not
@@ -2860,9 +2936,9 @@ someone has something to do:
 |---|---|---|
 | `YuzuGatewayMgmtAuthRejected` (warning) | a management peer was refused for any reason **other than** `pin_mismatch`, in the last hour | `missing_server_auth_eku`, `bad_peer_cert`: a holder of an install-CA certificate that is not the server reached `:50063`, or the server's leaf lacks the serverAuth usage; investigate the source, fix the server certificate. `no_pins_resolved`, `no_pins_configured`, `bad_pin_config`: the pins admit nobody and every forwarded command fails; restore the pinned file or correct `mgmt_peer_pins`. `no_uri_san`: the peer's certificate carries no server identity URI; read `yuzu_server_identity_uri_present` on the server. `0`: the in-place re-issue was skipped or failed (see `YuzuServerIdentityUriAbsent`; fix the cause, then restart the server so it re-issues). `1`: the certificate the server presents to the gateway is not `default-server.pem` (a server run with its own `--cert`/`--key`; the gauge describes the built-in file): set `{mgmt_peer_auth_mode, pin}` with that certificate's pin. Absent: either the server runs a release that does not mint the identity, or is not being scraped (upgrade the server first, it must re-issue its certificate; THEN restart the gateway only if it is not already on the shipped `identity` config and only if its agents can take the disconnect, because agents without the #5183 fix stay wedged; a gateway already on `identity` needs only the server upgrade and restart), or no surface uses the built-in certificates (own certificates: set `pin`). Do not put a gateway in `identity` until the server is upgraded and the gauge reads `1`; a gateway already in `identity` that refuses with `no_uri_san` needs the server to re-issue, or your server certificate's pin added with `identity_or_pin` set until it does (with no pin, `identity_or_pin` is still identity-only). This setting is read at boot, so applying it restarts the gateway and disconnects its agents (see "Rolling it out"; restart only if they can take it, because agents without the #5183 fix stay wedged). In `identity_or_pin` with pins configured this reason is not reported: a peer that fails both paths shows as `pin_mismatch` or `no_pins_resolved`. `identity_mismatch` (with pins configured in `identity_or_pin` it shows as `pin_mismatch`): the certificate names another install or another role (a certificate of a different CA, or an agent-style URI): treat it as a security incident unless the server was just re-keyed under another CA. `identity_unresolved`: this gateway could not work out the install identity (its management listener's `cacertfile` is a bundle, or is empty, unreadable or half-written): set `mgmt_peer_identity` (over such a file it also needs mode `identity` with a pin). It is reported as itself in `identity_or_pin` too, when the pin does not admit the peer. `mgmt_peer_identity` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `revoked`: the peer presented a certificate whose serial is in `mgmt_peer_denied`: either the server is still using a withdrawn certificate (re-key it) or a holder of that certificate is connecting. Editing `mgmt_peer_denied` is read at boot, so applying it restarts the gateway and disconnects its agents (restart only if they can take it, because agents without the #5183 fix stay wedged). `crl_revoked`: the CA's CRL lists the peer's serial: the server is presenting a certificate the CA withdrew (a replica that has not restarted since a re-issue; see "Withdrawing a server certificate" for the renewal and the by-hand revoke recovery), or a holder of that certificate is connecting. `revocation_unknown` or `revocation_stale`: this gateway cannot vouch for the CRL (none loaded, or past `nextUpdate` plus `mgmt_crl_grace_s`); see `YuzuGatewayMgmtCrlNotLoaded` and `YuzuGatewayMgmtCrlStale`. `mgmt_crl_source` is read at boot, so applying it restarts the gateway (restart only if its agents can take it, because agents without the #5183 fix stay wedged). `internal_error`: collect the log, report it. A rotation does not produce these, except `crl_revoked` from a server replica still presenting a superseded certificate, and `identity_unresolved` in `identity_or_pin` with an unresolved identity (a rotation then shows as that configuration defect, not as `pin_mismatch`). |
 | `YuzuGatewayMgmtIdentityOutage` (critical, 1 m) | `no_uri_san`, `identity_mismatch`, `revocation_unknown`, `revocation_stale` or `crl_revoked` rejections **and no admission by any method** (`yuzu_gw_mgmt_auth_admitted_total`) on the same gateway in the same five minutes, so a refusal amid normal traffic does not page | Commands to this gateway's agents are failing (`gateway_unauthenticated`, no server retry). It fires together with `YuzuGatewayMgmtAuthRejected` for the same cause. Under the shipped `identity` config: a server with no identity in its certificate (read `yuzu_server_identity_uri_present`: 0 means the re-issue failed, so fix the cause per `YuzuServerIdentityUriAbsent` and restart the server, which needs no gateway restart; absent means an old server binary or an unscraped server: upgrade the server first), or a server with its own certificates: set `{mgmt_peer_auth_mode, pin}` with that certificate's pin (read at boot: it applies when the gateway is restarted, which disconnects the node's agents; do it only if they can take the disconnect, because agents without the #5183 fix stay wedged). `identity_mismatch` is a security incident unless the server was just re-keyed under another CA. In `identity_or_pin` with pins configured these reasons are reported as `pin_mismatch` and raise `YuzuGatewayMgmtPinMismatch` instead. |
-| `YuzuGatewayMgmtCrlNotLoaded` (critical, 10 m) | `yuzu_gw_mgmt_crl_enforced == 1` and `yuzu_gw_mgmt_crl_loaded == 0` for ten minutes: a CRL source is set and no CRL has verified, so every stream is refused `revocation_unknown` (the ten minutes absorb a server that is still starting) | Read the gateway log's `mgmt_crl_source:` lines and `yuzu_gw_mgmt_crl_rejected_total{reason}`. `fetch_tls`: the TLS to the server's 8443 failed, because its certificate is not issued by the CA the gateway verifies it with (name the issuing CA in the three-element `mgmt_crl_source`, or use `{file, Path}`) **or** the host in the URL is not one of that certificate's names (`--cert-san`). `fetch_connect`: unreachable. `fetch_timeout`: no answer in time. `fetch_status`: a status other than 200 (503 is "CRL not yet published": the server is still starting or its CA is unavailable). `malformed`, `too_large`: the bytes are not a usable CRL (`malformed` also covers a well-formed one that is not the issuer's complete base list: a delta, a scoped or indirect CRL, or one with an extension the gateway cannot process; the Yuzu server publishes none of these). `unverified`, `issuer_mismatch`: the CRL was not signed by the CA the management listener trusts, or by a CA whose key type the gateway cannot bind (RSA, EC and EdDSA are supported). `future_dated`: dated more than an hour ahead of this gateway's clock (check the clock here and on the server). `file_unreadable`: a `{file, Path}` source or a `cacertfile` cannot be read |
-| `YuzuGatewayMgmtCrlStale` (warning, 5 m) | the loaded CRL is past its `nextUpdate` (`time() > yuzu_gw_mgmt_crl_next_update_timestamp_seconds`) | The gateway still admits until `nextUpdate` plus `mgmt_crl_grace_s` (24 h by default). Find why the CRL is not refreshing (the server's leader stopped publishing, or this gateway cannot fetch it) and restore it before the grace ends |
-| `YuzuGatewayMgmtCrlRefreshStalled` (warning, 10 m) | a CRL is held but `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` is more than 30 minutes old: the watcher is stuck or every fetch is failing behind a still-valid CRL | A revocation published now will not reach this gateway, and nothing else alerts until `nextUpdate` (up to 48 h). Read `yuzu_gw_mgmt_crl_rejected_total{reason}` and the `mgmt_crl_source:` log lines; a stuck `{file, Path}` source or `cacertfile` shows as `file_unreadable`, and only a wedged watcher process shows nothing new at all. The rule compares the Prometheus clock with the gateway's, so keep both on NTP (`YuzuGatewayMgmtCrlStale` has the same dependency). Raise the 1800 in the rule if you raised `mgmt_crl_refresh_ms` above 15 minutes |
+| `YuzuGatewayMgmtCrlNotLoaded` (critical, 10 m) | `yuzu_gw_mgmt_crl_enforced == 1` and `yuzu_gw_mgmt_crl_loaded == 0` for ten minutes: a CRL source is set and no CRL has verified, so every stream is refused `revocation_unknown` (the ten minutes absorb a server that is still starting) | Read the gateway log's `mgmt_crl_source:` lines and `yuzu_gw_mgmt_crl_rejected_total{reason}`. `fetch_tls`: the TLS to the server's 8443 failed, because its certificate is not issued by the CA the gateway verifies it with (name the issuing CA in the three-element `mgmt_crl_source`, or use `{file, Path}`) **or** the host in the URL is not one of that certificate's names (`--cert-san`). `fetch_connect`: unreachable. `fetch_timeout`: no answer in time. `fetch_status`: a status other than 200 (503 is "CRL not yet published": the server is still starting or its CA is unavailable). `malformed`, `too_large`: the bytes are not a usable CRL. `unsupported`: a well-formed one the gateway refuses by policy (not the issuer's complete base list: a delta, a scoped or indirect CRL, or one with an extension the gateway cannot process; the Yuzu server publishes none of these). `validity_too_long`: a CRL wider than `mgmt_crl_max_validity_s`. `unverified`, `issuer_mismatch`: the CRL was not signed by the CA the management listener trusts, or by a CA whose key type the gateway cannot bind (RSA, EC and EdDSA are supported). `future_dated`: dated more than an hour ahead of this gateway's clock (check the clock here and on the server; after fixing the server's clock restart a server replica that has the correct clock, see `docs/pki-architecture.md`, "CRL dated in the future", added with the CRL future-dated alert change). `file_unreadable`: a `{file, Path}` source or a `cacertfile` cannot be read. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
+| `YuzuGatewayMgmtCrlStale` (warning, 5 m) | the loaded CRL is past its `nextUpdate` (`time() > yuzu_gw_mgmt_crl_next_update_timestamp_seconds`) | The gateway still admits until `nextUpdate` plus `mgmt_crl_grace_s` (24 h by default). Find why the CRL is not refreshing (the server's leader stopped publishing, or this gateway cannot fetch it) and restore it before the grace ends. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
+| `YuzuGatewayMgmtCrlRefreshStalled` (warning, 10 m) | a CRL is held but `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` is more than 30 minutes old: the watcher is stuck or every fetch is failing behind a still-valid CRL | A revocation published now will not reach this gateway, and nothing else alerts until `nextUpdate` (up to 48 h). Read `yuzu_gw_mgmt_crl_rejected_total{reason}` and the `mgmt_crl_source:` log lines; a stuck `{file, Path}` source or `cacertfile` shows as `file_unreadable`, and only a wedged watcher process shows nothing new at all. The rule compares the Prometheus clock with the gateway's, so keep both on NTP (`YuzuGatewayMgmtCrlStale` has the same dependency). Raise the 1800 in the rule if you raised `mgmt_crl_refresh_ms` above 15 minutes. A CRL refused because of its bytes (`malformed`, `unsupported`, `unverified`, `issuer_mismatch`, `validity_too_long`) is counted on `yuzu_gw_mgmt_crl_rejected_total` once in a row and again once an hour, not once per refresh: read its value or `increase()` over a long window, not its rate. |
 | `YuzuGatewayMgmtPinMismatch` (critical) | `pin_mismatch` rejections that no pin rotation on this gateway explains: rejections are read one minute late and ignored for 4 minutes after `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` moves (the server's `YuzuGatewayForwardUnauthenticated` is not suppressed, see above) | Commands to this gateway's agents are failing. If the server's certificate changed, update the pinned file (picked up within one interval). If it did not change, someone is presenting another serverAuth certificate (for example the gateway's own key) to the command plane: treat it as a security incident. In `identity_or_pin` the peer also failed the identity check (a pin reason is only reported when both paths fail): check `yuzu_server_identity_uri_present` on the server before changing a pin. |
 | `YuzuServerIdentityUriAbsent` (warning, 15 m; a **server** alert, group `yuzu-pki`) | `yuzu_server_identity_uri_present == 0`: the built-in `default-server.pem` lacks the URI SAN `yuzu://<install>/server`, because the in-place re-issue was skipped or failed. The gauge is set whenever ANY surface (for example the HTTPS listener) runs on the built-in certificates, and is absent, not 0, only when none does; it describes the file, so it can read 1 while the gRPC/gateway-command certificate (`--cert`/`--key`) carries no identity. An installation whose surfaces all use its own certificates never fires it | The server log says why on every boot: the server key was withdrawn (re-key the set, which also changes the key every gateway `mgmt_peer_pins` entry refers to), the certificate directory is read-only, the CA key is not in it, or the CA inventory is unreachable. A gateway in `pin`, or in `identity_or_pin` with a pin listed, still admits the server by its pin, so nothing is failing; a gateway in `identity` (what the shipped configs set) refuses it (`no_uri_san`). Do not put a gateway in `identity` until the server is upgraded and this reads 1 on every server replica and real command traffic has been admitted by identity (see "Rolling it out"; the gauge describes the file, not the certificate the server presents). A gateway already in `identity` that refuses with `no_uri_san` needs the server to re-issue (fix the cause above, then restart the server), or your server certificate's pin added with `identity_or_pin` set until it does (with no pin, `identity_or_pin` is still identity-only; the mode is read at boot, so applying it restarts the gateway: only if its agents can take the disconnect, because agents without the #5183 fix stay wedged). |
 | `YuzuGatewayMgmtPinUnresolved` (warning, 2 m) | a configured pin has never resolved, or a pin file's latest read failed (`yuzu_gw_cert_file_readable{role="mgmt_peer_pin"} == 0`) | In `identity_or_pin` and `identity` this fires even while the identity is admitting the traffic: the pin is the fallback, and it is better to learn it is dead now. Correct the fingerprint, or put the server's current certificate back in the pinned file (owner, mode, contents). The fix is picked up within one interval. The key last read stays pinned meanwhile: deleting or damaging the file does not revoke it (see above). |
@@ -3315,12 +3391,67 @@ Supply it at boot from the `YUZU_GW_COOKIE` environment variable:
 export YUZU_GW_COOKIE="$(openssl rand -hex 32)"   # strong, unique per cluster
 ```
 
-If `YUZU_GW_COOKIE` is unset, `vm.args.src` falls back to the historical
-default and the boot guard (`yuzu_gw_app:check_distribution_cookie/0`)
-**refuses to start** — it fails closed, because a known cookie is
-unauthenticated RCE (#659). For local dev/CI where distribution is not
-exposed, override the guard with `YUZU_GW_ALLOW_DEFAULT_COOKIE=1`. All nodes
-in a cluster must share the same cookie.
+`vm.args.src` carries **no fallback cookie**. A cookie committed to the
+repository is unauthenticated RCE (#659), and the in-VM boot guard
+(`yuzu_gw_app:check_distribution_cookie/0`) only runs after distribution is
+already listening, so the refusal is made **before the VM starts**. One shell
+policy, `deploy/docker/gateway-cookie-policy.sh` (installed as
+`/opt/yuzu_gw/gateway-cookie-policy.sh`), is shared by both callers: the cookie
+must be 32 to 255 characters from `[A-Za-z0-9._~+=-]`, must not start with `-`
+or `+`, and must not be the published default. (Whitespace, CR/LF, backslash,
+`&` and `$` are refused: busybox and GNU awk disagree on a backslash, so
+replicas would compute different cookies, and a `\&` makes the release start
+script loop forever.)
+
+- The container entrypoint (`deploy/docker/gateway-entrypoint.sh`) exits 1 with
+  the reason when the cookie breaks the policy.
+- The systemd unit refuses the same in an `ExecStartPre`, with **no override**.
+- `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` (single ephemeral dev/CI node only) does not
+  restore a known cookie: when the cookie is empty or *exactly* the published
+  default, the entrypoint substitutes a fresh random per-boot cookie that is never
+  logged. The override replaces nothing else: a custom cookie that is shorter
+  than 32 characters, or that **starts with** the published literal, is refused
+  like any other weak cookie. A real shared cookie that contains the literal
+  elsewhere is kept, so replicas still agree. **N replicas on the override are N singletons that cannot
+  cluster** (each draws its own cookie). A node advertising `127.0.0.1` (the
+  single-node default) also has its distribution listener and EPMD bound to
+  loopback; a node advertising a routable address is protected by the random
+  cookie only.
+- **Tarball / manual installs:** the unit needs `/opt/yuzu_gw/gateway-cookie-policy.sh`.
+  The release tarball ships it (and `yuzu-gateway.service`) inside its single
+  top-level directory `yuzu-gateway-<version>-linux-x64/`, so extract it with
+  `mkdir -p /opt/yuzu_gw && tar xzf yuzu-gateway-linux-x64.tar.gz -C /opt/yuzu_gw --strip-components=1`
+  and install the bundled unit to `/etc/systemd/system/` (then `systemctl daemon-reload`)
+  (or copy `deploy/docker/gateway-cookie-policy.sh` from the source tree into
+  `/opt/yuzu_gw/`). If it is missing the unit fails with
+  `.: cannot open /opt/yuzu_gw/gateway-cookie-policy.sh: No such file` (exit 2)
+  and, after the restart limit, `start-limit-hit`.
+- A start that bypasses both (running `bin/yuzu_gw` by hand, the
+  `Dockerfile.gateway.chisel` demo image, which has no entrypoint) boots with
+  OTP's own per-host random `~/.erlang.cookie` (the empty `-setcookie` line that
+  `vm.args.src` leaves when `YUZU_GW_COOKIE` is unset is accepted by the VM, which
+  creates that 20-character file, mode 0400, and uses it; checked against a real
+  release boot and by case V of `tests/shell/test_gateway_entrypoint_cookie.sh`),
+  which the in-VM guard then refuses (too short) unless the override is set. If `$HOME` is unwritable the VM
+  cannot create that file and crash-loops; supply `YUZU_GW_COOKIE`. On these
+  paths there is also no character check: a cookie containing `\&` makes the
+  release script's `replace_os_vars` awk loop forever at 100% CPU with no log, and
+  a backslash is dropped by busybox awk but kept by GNU awk. Keep `YUZU_GW_COOKIE`
+  to `[A-Za-z0-9._~+=-]` there too.
+
+All nodes in a cluster must share the same `YUZU_GW_COOKIE`. A single-node
+deployment sets either a strong cookie, or `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` for
+a throwaway rig.
+
+**Distribution is not encrypted.** Erlang distribution here is plain TCP: the
+cookie authenticates the connection handshake only, it gives no confidentiality
+or per-message integrity. Cross-node command traffic (including plugin
+parameters) therefore must only cross a network you trust. Keep EPMD and the
+distribution range on a dedicated cluster network and firewalled to the other
+gateway nodes. There is no encryption and the cluster network must be trusted and
+firewalled; TLS distribution (`-proto_dist inet_tls`) is not shipped and is
+tracked as #8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). Do not run
+a multi-node gateway cluster across an untrusted network.
 
 The same guard also **refuses a cookie shorter than 32 characters** (HA WS-4
 `#4555`): DNS-based cluster discovery means a node dials addresses it did not
@@ -3328,8 +3459,15 @@ choose by hand, and the distribution handshake's initiator sends the cookie
 hash first — a short cookie is brute-forceable offline from a
 legitimately-dialing node, a materially different exposure than a hand-typed
 static seed list carried. `openssl rand -hex 32` above already clears this
-floor with room to spare; the same `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` override
-bypasses the length check too.
+floor with room to spare. The in-VM guard
+(`yuzu_gw_app:evaluate_cookie`) under `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` tolerates
+an **empty, short, exactly-default or literal-containing** cookie on an
+entrypoint-less start (`docker run --entrypoint`, a hand-run `bin/yuzu_gw`, the
+chisel image). The container entrypoint is stricter, and the systemd unit has no
+override: the entrypoint replaces only an empty or exactly-default cookie and
+refuses a short cookie or one that starts with the literal even with the
+override. A unit test pins the in-VM tolerance, so changing it is a visible
+decision.
 
 **Firewall ports for multi-node clustering (HA WS-4 `#4555`).** Alongside
 EPMD (TCP 4369, above), a clustered gateway also needs the Erlang
@@ -3352,8 +3490,9 @@ network is still the first line of defense.
 > at 0 is the signal to check for this. AAAA support is tracked as a
 > follow-up.
 
-> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It disables the
-> boot guard and restores the unauthenticated inter-node RPC surface (#659); it
+> **Never set `YUZU_GW_ALLOW_DEFAULT_COOKIE=1` in production.** It lets a node
+> start without an operator-supplied cookie (a random per-boot one is used by the
+> entrypoint; the in-VM guard only warns for a start that bypasses the entrypoint); it
 > exists only for ephemeral dev/CI stacks (where it appears in the UAT compose
 > files). On `.deb`/`.rpm` installs the cookie is auto-generated into
 > `/etc/yuzu/gateway.env`. **Rotate** it by writing a new value there — and to
@@ -3494,10 +3633,12 @@ do not.
 | gateway | WARN | `mgmt_peer_pins: the certificate at <path> cannot be read or is not a PEM certificate; the key last read from it stays pinned and is still admitted (deleting or damaging the file does not revoke it). Fix the file before the server rotates; to change or revoke the pin, replace the file with the new certificate` | The same failure on a pin file that was read before. The key last read stays pinned, so commands still flow; `yuzu_gw_cert_file_readable{role="mgmt_peer_pin"}` reads 0 and `YuzuGatewayMgmtPinUnresolved` fires after 2 minutes. Fix the file before the server's next rotation, which would otherwise be refused. Deleting, emptying or corrupting the file does not revoke the pinned key; see "Certificate rotation and expiry". |
 | gateway | WARN | `{yuzu_gw, mgmt_crl_source} is not set: this gateway does not read the install CA's revocation list, so a server certificate the CA has revoked is still admitted ...` | The mode is `identity` or `identity_or_pin` and no CRL source is set, so a withdrawn server certificate is still admitted. Set `mgmt_crl_source` (see "Withdrawing a server certificate"); a later release will refuse to start without it |
 | gateway | WARN | `{yuzu_gw, mgmt_crl_source} is set while mgmt_peer_auth_mode is pin: the revocation check applies to the pinned server certificate too ...` | In `pin` mode the CRL check still applies to every admitted peer, so the pinned certificate must be issued by the CA that signs the CRL, or every management stream is refused `revocation_unknown` |
-| gateway | INFO | `Management CRL source: <source>; grace <n>s; refresh <n>ms` | The resolved source at boot: for a URL, the host and path and the CA the gateway trusts to have issued the certificate presented there |
-| gateway | CRITICAL | `Refusing to start: invalid management CRL configuration: <defects>` | `mgmt_crl_source` is not one of the three accepted forms, uses `http`, carries userinfo or a fragment, has an unknown option, names a missing `cacertfile` or has none to default to, or `mgmt_crl_grace_s` or `mgmt_crl_refresh_ms` is out of range |
+| gateway | INFO | `Management CRL source: <source>; grace <n>s; refresh <n>ms; maximum validity <n>s` (or `not bounded`) | The resolved source at boot: for a URL, the host and path and the CA the gateway trusts to have issued the certificate presented there, and the `mgmt_crl_max_validity_s` in force (`not bounded` when unset) |
+| gateway | NOTICE | `{yuzu_gw, mgmt_crl_max_validity_s} is set but mgmt_crl_source is not: no CRL is read, so the key has no effect.` | The validity bound is set and no CRL source is configured, so nothing reads a CRL and the key is inert. Logged once at boot at NOTICE, so it is visible at the default log level |
+| gateway | WARN | `mgmt_crl_source: the CA's CRL is <n> bytes, <p>% of the <max> byte bound; past it every fetch is refused (too_large) ...` | A fetched CRL has passed 75 percent of the 16 MiB bound (12 MiB). Logged at most once an hour. The CRL only grows; plan a raise of the bound before it is crossed, and size the gateway's memory for parsing it (see "Limits", "Parse cost near the bound") |
+| gateway | CRITICAL | `Refusing to start: invalid management CRL configuration: <defects>` | `mgmt_crl_source` is not one of the three accepted forms, uses `http`, carries userinfo or a fragment, has an unknown option, names a missing `cacertfile` or has none to default to, or `mgmt_crl_grace_s`, `mgmt_crl_refresh_ms` or `mgmt_crl_max_validity_s` is out of range |
 | gateway | NOTICE | `mgmt_crl_source: loaded the CA's CRL number <n> (thisUpdate <t>, nextUpdate <t>, <n> revoked serial(s))` | A new CRL verified and replaced the held one (`<t>` is seconds since the epoch) |
-| gateway | WARN | `mgmt_crl_source: the CRL was not loaded (<reason>); ...` | A fetch or read was refused for `<reason>` (one of the twelve on `yuzu_gw_mgmt_crl_rejected_total`). Logged when the reason changes, not on every tick. With no CRL held, every stream is refused `revocation_unknown` until one loads; with one held, it stays in force until `nextUpdate` plus the grace |
+| gateway | WARN | `mgmt_crl_source: the CRL was not loaded (<reason>); ...` | A fetch or read was refused for `<reason>` (one of the fourteen on `yuzu_gw_mgmt_crl_rejected_total`). Logged when the reason changes, not on every tick. With no CRL held, every stream is refused `revocation_unknown` until one loads; with one held, it stays in force until `nextUpdate` plus the grace |
 | gateway | INFO | `mgmt_peer_pins: the certificate at <path> is readable again; the pinned key is unchanged` | A pin file that had failed is readable again with the key already pinned. No action. |
 | gateway | NOTICE | `mgmt_peer_pins: the certificate at <path> changed; the new key is pinned` | The pin watcher picked up a rotated server leaf and set `yuzu_gw_mgmt_pin_rotated_timestamp_seconds`. Management streams made with the old leaf are refused from now on (`pin_mismatch`). |
 | gateway | WARN | `certificate expiry refresh failed: <class>:<reason>; the expiry gauges keep their last values` | The expiry refresh on the pin watcher's tick raised. The pins are unaffected; the expiry and readable gauges stop updating until it succeeds. Not expected: collect the log line and report it. |
@@ -3848,8 +3989,8 @@ failures now count toward the shared breaker (see below).
   record a notification"); an older gateway ignores `acknowledged=false` and does
   not retry. The server counts it under
   `yuzu_server_gateway_route_desync_total{op="notify_stream_status"}` with
-  outcome `connected_unverified` (the directory read failed and this replica
-  holds no matching local session) or `stale_connected_session` (the directory
+  outcome `connected_unverified` (the directory read failed; a CONNECTED is never
+  accepted unverified, whatever this replica holds locally) or `stale_connected_session` (the directory
   row or the local registry names a different session). The same holds for the
   `op="announce_connected"` refusals `session_held_by_other_agent` and the
   affinity pre-check `cluster_affinity_violation`, which answer
@@ -4329,21 +4470,26 @@ that the replica does not hold is neither acknowledged nor listed (so the
 gateway does not re-register in a storm). `ProxyInventory` for a session id the
 directory does not know keeps `received=false` (the agent retries); a local
 hint helps only on a degraded read or for a session that lost a race.
-`NotifyStreamStatus` CONNECTED, when the directory read fails, is accepted only
-if this replica holds the matching local session (the session it registered
-for that agent, which the directory confirmed at `ProxyRegister`), and is
-otherwise rejected (`acknowledged=false`) and counted under
+`NotifyStreamStatus` CONNECTED, when the directory read fails, is always
+rejected (`acknowledged=false`), whatever session this replica holds locally,
+and counted under
 `yuzu_server_gateway_route_desync_total{op="notify_stream_status",outcome="connected_unverified"}`.
-A delayed CONNECTED for a session this replica has since superseded is counted
-the same way (a successful read counts it as `stale_connected_session`).
+A replica cannot tell from its own state whether another replica has since
+registered the agent again, so it does not guess. A successful read counts a
+delayed CONNECTED for a session this replica has since superseded as
+`stale_connected_session`.
 `yuzu_gw_upstream_notify_dropped_total` does not count a rejected CONNECTED.
 A gateway that includes #5695 counts it in
 `yuzu_gw_upstream_notify_unacknowledged_total{event="connected"}` and sends it
 again after a backoff while it holds the session, so a `connected_unverified`
 rejection is put right once the directory reads again (see "When the server
-does not record a notification"). An older gateway does not retry it: that
-server counter is then the only signal, and an agent whose current session was
-rejected keeps heartbeating but cannot receive commands until it reconnects. When the read succeeds, the local fallback applies only if
+does not record a notification"). Until then the agent keeps heartbeating but
+is not dispatchable from that replica, for the outage plus up to 60 s (the
+gateway's resend backoff cap), or up to 10 minutes once the refusal has lasted
+15 minutes (the gateway's slow phase, "When the server does not record a
+notification"); both are derived from the documented backoff, not measured. An older gateway does not retry it: that
+server counter is then the only signal, and the agent cannot receive commands
+until it reconnects. When the read succeeds, the local fallback applies only if
 the directory row is absent or tombstoned, or the session is one this replica
 recorded as having lost a race; a row with a different session id rejects the
 CONNECTED (`stale_connected_session`). A DISCONNECTED proceeds on the local
@@ -5320,8 +5466,8 @@ This starts the gateway with all applications loaded, useful for debugging.
 
 | Dependency | Version | Purpose |
 |---|---|---|
-| cowboy / ranch | 2.19.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
-| gun | 2.5.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib, which cowboy brings too |
+| cowboy / cowlib / ranch | 2.21.0 / 2.22.0 / 2.3.0 | HTTP/2 server and listener behind the gateway's own gRPC layer (`yuzu_grpc*`) |
+| gun | 2.8.0 | HTTP/2 client behind the upstream gRPC client (`yuzu_grpc_client`); needs cowlib 2.22.0 or later (pinned explicitly so the lock cannot resolve a cowlib below 2.22.0) |
 | ctx | 0.6.0 | The request-context type of the gRPC layer |
 | gpb | 4.21.7 | Protobuf compiler and runtime |
 | telemetry | 1.3.0 | Metrics event API |
@@ -5488,7 +5634,7 @@ that are actually emitted are listed.
 | `yuzu_gw_mgmt_crl_next_update_timestamp_seconds` | gauge | `nextUpdate` (Unix seconds) of the held CRL; 0 when none. Alert: `YuzuGatewayMgmtCrlStale` |
 | `yuzu_gw_mgmt_crl_last_success_timestamp_seconds` | gauge | Unix seconds of the last successful read of the CRL source; 0 until then; not advanced by a failed fetch. Alert: `YuzuGatewayMgmtCrlRefreshStalled` |
 | `yuzu_gw_mgmt_crl_revoked_entries` | gauge | Revoked serials in the held CRL; 0 when none |
-| `yuzu_gw_mgmt_crl_rejected_total` | counter | CRLs not obtained or refused, by `reason` (closed set of twelve: `malformed`, `too_large`, `unverified`, `issuer_mismatch`, `future_dated`, `replay`, `fetch_timeout`, `fetch_connect`, `fetch_tls`, `fetch_status`, `fetch_error`, `file_unreadable`; all created at 0 at start) |
+| `yuzu_gw_mgmt_crl_rejected_total` | counter | CRLs not obtained or refused, by `reason` (closed set of fourteen: `malformed`, `unsupported`, `too_large`, `unverified`, `issuer_mismatch`, `validity_too_long`, `future_dated`, `replay`, `fetch_timeout`, `fetch_connect`, `fetch_tls`, `fetch_status`, `fetch_error`, `file_unreadable`; all created at 0 at start) |
 | `yuzu_gw_mgmt_auth_admitted_total` | counter | Management-listener streams let in, by `method` (`identity` or `pin`; both created at 0 at start). Which path carries the traffic. `mgmt_peer_auth_mode` can move from `identity_or_pin` to `identity` only after real command traffic has moved `method="identity"` while `method="pin"` stood still; `pin` standing still on an idle gateway proves nothing (see [Authorizing the server by its identity](#authorizing-the-server-by-its-identity)) |
 | `yuzu_gw_mgmt_auth_pin_unresolved_total` | counter | Management auth attempts during which at least one configured `mgmt_peer_pins` entry did not resolve (a typo'd fingerprint, or a pin file never readable since start). Counted in every mode that evaluates the pin, including `identity_or_pin` attempts the identity admits |
 | `yuzu_gw_mgmt_pin_rotated_timestamp_seconds` | gauge | Unix time at which the pin watcher last published a different key for a `{cert_file, Path}` pin; 0 until the first such change in the process (created at 0 at start). Used by `YuzuGatewayMgmtPinMismatch` to stay quiet through a rotation |

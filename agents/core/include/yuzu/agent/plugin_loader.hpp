@@ -135,11 +135,11 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
     return false;
 }
 
-/// True if `name` is the pre-rename name of the Echo plugin (`tar`). Upgrade-window guard,
-/// removed with the other legacy-name shims: first-file-wins dedup is by declared NAME and `tar`
-/// differs from `echo`, so a stale tar.<ext> left beside echo.<ext> (an OTA that replaced only the
-/// binary, a --plugin-dir or tarball install, a failed installer delete) would otherwise load
-/// as a second plugin - and the server would relabel every Echo command to the retired binary.
+/// True if `name` is the pre-rename name of the Echo plugin (`tar`). Guard for installs that
+/// still carry the old binary: first-file-wins dedup is by declared NAME and `tar` differs from
+/// `echo`, so a stale tar.<ext> left beside echo.<ext> (an OTA that replaced only the binary, a
+/// --plugin-dir or tarball install, a failed installer delete) would otherwise load as a second
+/// plugin beside the real one.
 /// Deliberately NOT in kReservedPluginNames: that list is also the KV-namespace contract
 /// (guardian_lifecycle_journal.cpp, agent.cpp pin it), and `tar` is a namespace the agent
 /// re-keys to `echo`, not one it reserves.
@@ -155,7 +155,7 @@ verify_plugin_signature(const std::filesystem::path& plugin_path,
 /// (allowlist miss or hash mismatch, signature failure) carries that earlier reason, not
 /// kRetiredNameReason: the file stem identifies it without opening it. Pure so the decision is
 /// unit-tested; the one caller is the agent boot step in agent.cpp (pinned by
-/// tests/test_echo_adoption_wiring_lexical.py). Removed with the other legacy-name shims.
+/// tests/test_echo_adoption_wiring_lexical.py). Kept while a pre-rename tar.db can still exist.
 [[nodiscard]] inline bool
 defer_legacy_echo_adoption(const std::vector<LoadError>& errors,
                            std::span<const std::string_view> loaded_names) {

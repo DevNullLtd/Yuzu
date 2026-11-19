@@ -35,9 +35,9 @@
 ///
 /// TWIN: `rest_method`/`rest_pattern` name the REST route the tool mirrors, byte-for-byte as
 /// registered, so the self-check can prove the twin exists in `kStepUpPolicy` and that the
-/// tool is never classified weaker than its twin: a tool whose twin is kRequired or
-/// kPendingRuling is itself kRequired or kPendingRuling, never kExempt. Both are empty for a
-/// tool with no single REST route.
+/// tool is never classified weaker than its twin: a tool whose twin is kRequired,
+/// kFactorCredential or kPendingRuling is itself kRequired or kPendingRuling, never kExempt. Both
+/// are empty for a tool with no single REST route.
 ///
 /// Self-checks (`consteval`, so a bad edit is a BUILD FAILURE): no duplicate tool name, every
 /// kExempt reason from the named list, the pending literal on every kPendingRuling row, every
@@ -62,11 +62,13 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 7> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 11> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
     step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
-    kReadOnlyOperation,
+    kReadOnlyOperation,                 step_up_detail::kContentAuthoring,
+    step_up_detail::kCollectionSettings, step_up_detail::kLifecycleRules,
+    step_up_detail::kReferenceDataReplace,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -107,6 +109,10 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("execute_instruction_definition",       step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/instructions/([^/]+)/execute)"),
     step_up_mcp_detail::exempt ("reevaluate_result_set",                step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/re-eval)"),
     step_up_mcp_detail::exempt ("sync_hardware_software",               step_up_detail::kSyncTrigger,       "POST",   R"(/api/v1/hardware/sync)"),
+    // ManagementGroup:Write (SAM-35): the REST twin is exempt (kCollectionSettings, owner decision). The
+    // MCP tier ladder is stricter: ticketed at the supervised tier (requires_approval keys on the
+    // (ManagementGroup, Write) pair), audited ahead of the write.
+    step_up_mcp_detail::exempt ("set_software_collection_settings",     step_up_detail::kCollectionSettings, "PUT",   R"(/api/v1/inventory/software/collection-settings/([a-f0-9]+))"),
     // GuaranteedState:Delete / Push / Write
     step_up_mcp_detail::pending("delete_guardian_rule",                 "DELETE", R"(/api/v1/guaranteed-state/rules/([A-Za-z0-9._\-]+))"),
     step_up_mcp_detail::pending("push_guardian_rules",                  "POST",   R"(/api/v1/guaranteed-state/push)"),
@@ -117,13 +123,35 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("create_offload_target",                "POST",   R"(/api/v1/offload-targets)"),
     step_up_mcp_detail::exempt ("create_result_set",                    step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets)"),
     step_up_mcp_detail::exempt ("set_crypto_dashboard_layout",          step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/crypto/dashboard/layout)"),
+    step_up_mcp_detail::exempt ("reset_dex_score_policy",               step_up_detail::kOperationalData,   "DELETE", R"(/api/v1/dex/score-policy)"),
+    step_up_mcp_detail::exempt ("set_dex_score_policy",                 step_up_detail::kOperationalData,   "PUT",    R"(/api/v1/dex/score-policy)"),
     // On kMcpPendingBecauseRestTwinRequired: the twin is kRequired (an administrator can write the plugin-signing and audit-retention keys through it).
     step_up_mcp_detail::pending("set_runtime_config",                   "PUT",    R"(/api/v1/config/([a-z_]+))"),
     step_up_mcp_detail::pending("delete_offload_target",                "DELETE", R"(/api/v1/offload-targets/(\d+))"),
     step_up_mcp_detail::exempt ("pin_result_set",                       step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/pin)"),
     step_up_mcp_detail::exempt ("unpin_result_set",                     step_up_detail::kOperationalData,   "POST",   R"(/api/v1/result-sets/(rs_[0-9a-f]+)/unpin)"),
+    // InstructionDefinition:Delete / Write (#2146 batch C): content authoring, the REST twins' class.
+    // The MCP tier ladder is stricter than the REST row: each of these is ticketed at the
+    // supervised tier (mcp_policy.hpp requires_approval), so a human approves each write.
+    step_up_mcp_detail::exempt ("create_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions)"),
+    step_up_mcp_detail::exempt ("delete_definition",                    step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instructions/([^/]+))"),
+    step_up_mcp_detail::exempt ("import_definition",                    step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/import)"),
+    step_up_mcp_detail::exempt ("save_definition_yaml",                 step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instructions/yaml)"),
+    step_up_mcp_detail::exempt ("update_definition",                    step_up_detail::kContentAuthoring,  "PUT",    R"(/api/v1/instructions/([^/]+))"),
+    // InstructionSet:Delete / Write (#2146 batch C). delete_instruction_set is ticketed at the
+    // supervised tier; create_instruction_set is NOT (InstructionSet:Write is deliberately not
+    // gated, see mcp_policy.hpp).
+    step_up_mcp_detail::exempt ("create_instruction_set",               step_up_detail::kContentAuthoring,  "POST",   R"(/api/v1/instruction-sets)"),
+    step_up_mcp_detail::exempt ("delete_instruction_set",               step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instruction-sets/([^/]+))"),
     // Inventory:Write
     step_up_mcp_detail::exempt ("create_result_set_from_inventory_query", step_up_detail::kOperationalData, "POST",   R"(/api/v1/result-sets/from-inventory-query)"),
+    // Inventory:Write (SAM-29): the REST twins' classes and exact patterns. Each REST reason itself says
+    // the MFA step-up question awaits an owner ruling; when it comes, REST and MCP rows move together.
+    step_up_mcp_detail::exempt ("import_software_lifecycle_rules",      step_up_detail::kLifecycleRules,    "POST",   R"(/api/v1/inventory/software/lifecycle/rules)"),
+    step_up_mcp_detail::exempt ("delete_software_lifecycle_rules",      step_up_detail::kLifecycleRules,    "DELETE", R"(/api/v1/inventory/software/lifecycle/rules)"),
+    step_up_mcp_detail::exempt ("curate_software_alias",                step_up_detail::kReferenceDataReplace, "POST", R"(/api/v1/inventory/software/normalization/aliases)"),
+    step_up_mcp_detail::exempt ("reject_software_curation",             step_up_detail::kOperationalData,   "POST",   R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)"),
+    step_up_mcp_detail::exempt ("replace_software_normalization_pack",  step_up_detail::kReferenceDataReplace, "POST", R"(/api/v1/inventory/software/normalization/pack)"),
     // License:Write
     step_up_mcp_detail::pending("activate_platform_license",            "POST",   R"(/api/v1/license)"),
     // ManagementGroup:Write
@@ -151,6 +179,11 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("mint_engine_credential",               "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials)"),
     // On kMcpPendingBecauseRestTwinRequired: added after the baseline was frozen; the twin is kRequired.
     step_up_mcp_detail::pending("raise_guardian_policy_generation",     "POST",   R"(/api/v1/guaranteed-state/policy-generation/raise)"),
+    // ADR-0070 R1 (slice 2b-1a), likewise added after the baseline was frozen; each twin is kRequired.
+    step_up_mcp_detail::pending("register_revocation_source",           "POST",   R"(/api/v1/crypto/revocation-sources)"),
+    step_up_mcp_detail::pending("remove_revocation_source",             "DELETE", R"(/api/v1/crypto/revocation-sources/([0-9]+))"),
+    step_up_mcp_detail::pending("reset_revocation_source_high_water",   "POST",   R"(/api/v1/crypto/revocation-sources/([0-9]+)/reset-high-water)"),
+    step_up_mcp_detail::pending("update_revocation_source",             "PUT",    R"(/api/v1/crypto/revocation-sources/([0-9]+))"),
     step_up_mcp_detail::pending("revoke_engine_principal",              "DELETE", R"(/api/v1/engine-principals/([^/]+))"),
     step_up_mcp_detail::pending("rewrap_secrets",                       "POST",   R"(/api/v1/secrets/kek/rewrap)"),
     step_up_mcp_detail::pending("rotate_engine_credential",             "POST",   R"(/api/v1/engine-principals/([^/]+)/credentials/rotate)"),
@@ -171,6 +204,8 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::pending("mint_upload_grant",                    "POST",   R"(/api/v1/upload-grants)"),
     // UserManagement:Write
     step_up_mcp_detail::pending("unlock_account",                       "POST",   R"(/api/v1/users/([^/]+)/unlock)"),
+    // Workflow:Execute
+    step_up_mcp_detail::exempt ("execute_workflow",                     step_up_detail::kExecutionDispatch, "POST",   R"(/api/v1/workflows/([^/]+)/execute)"),
 };
 // clang-format on
 
@@ -185,9 +220,13 @@ inline constexpr std::size_t kMcpPendingBaselineMax = 44;
 /// kRequired cannot be listed here and must be kExempt. Many baseline tools also have a kRequired
 /// twin; this list is not the only such group. The class of these entries needs a maintainer
 /// ruling once an MCP step-up consumer exists. Sorted, unique.
-inline constexpr std::array<std::string_view, 2> kMcpPendingBecauseRestTwinRequired = {
+inline constexpr std::array<std::string_view, 6> kMcpPendingBecauseRestTwinRequired = {
     "raise_guardian_policy_generation",
+    "register_revocation_source",
+    "remove_revocation_source",
+    "reset_revocation_source_high_water",
     "set_runtime_config",
+    "update_revocation_source",
 };
 
 /// True when `tool` is on `kMcpPendingBecauseRestTwinRequired`.
@@ -203,7 +242,7 @@ inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy)
 
 namespace step_up_mcp_detail {
 /// Slots of the tool-name index a check builds locally; kept at least 3x the row count.
-inline constexpr std::size_t kMcpKeySlots = 256;
+inline constexpr std::size_t kMcpKeySlots = 512;
 } // namespace step_up_mcp_detail
 static_assert(kMcpStepUpPolicyCount * 3 <= step_up_mcp_detail::kMcpKeySlots,
               "step_up_mcp_policy.hpp: the table outgrew its tool-name index; raise kMcpKeySlots "
@@ -334,8 +373,15 @@ template <std::size_t Begin, std::size_t End>
         if (found < 0)
             return false;
         const StepUpPolicyEntry& twin = kStepUpPolicy[static_cast<std::size_t>(found)];
-        const bool twin_gates_or_pending =
-            twin.cls == StepUpClass::kRequired || twin.cls == StepUpClass::kPendingRuling;
+        // kFactorCredential twins gate too (local session only, #6079): an MCP tool that twins
+        // one of those two REST rows may not be declared kExempt. The MCP table has no
+        // factor-credential class of its own and a new pending row counts against the pending
+        // ceiling, so no class is admissible for such a twin today: adding one is a build or
+        // test failure until a local-session-only MCP class is designed. No MCP tool twins those
+        // routes now (a forward guard).
+        const bool twin_gates_or_pending = twin.cls == StepUpClass::kRequired ||
+                                           twin.cls == StepUpClass::kFactorCredential ||
+                                           twin.cls == StepUpClass::kPendingRuling;
         if (twin_gates_or_pending && a.cls == StepUpClass::kExempt)
             return false;
     }

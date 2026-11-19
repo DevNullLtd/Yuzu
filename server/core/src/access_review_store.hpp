@@ -41,19 +41,68 @@
 /// reviewed decision, not a default cadence inherited from an unrelated
 /// store.
 ///
-/// Two tables (schema-qualified at runtime, unqualified in the migration —
+/// Three tables (schema-qualified at runtime, unqualified in the migration —
 /// the runner sets `search_path` for the migration transaction):
 ///   * access_review_campaign    — one row per opened review campaign.
 ///   * access_review_attestation — one row per (campaign, principal, role)
 ///     grant frozen at open; PK is the full 4-tuple so a decision can only
 ///     ever be recorded against a grant that was actually in the frozen
 ///     population (an unknown/foreign key never matches — see
-///     `record_attestation`).
+///     `record_attestation`). Holds the CURRENT decision and `decision_seq`,
+///     the count of decisions recorded for the grant (0 while pending).
+///   * access_review_attestation_history: one row per recorded decision,
+///     keyed by the 4-tuple and `seq` (schema v3, #4752). Every decision is
+///     kept: a later decision for the same grant appends at seq+1 and never
+///     replaces the earlier one, and a reviewer cannot decide a `user` grant
+///     that names them. Ordering is by `seq`, never by time.
+///
+/// Append-only history, honestly bounded. The STORE writes the history row
+/// inside the same transaction as the state change (`record_attestation`);
+/// the database GUARDS (schema v3): triggers refuse a state change that is
+/// not exactly one appended, matching history row, refuse any update or
+/// delete of a history row and any delete of an attestation row (so of a
+/// campaign that has one: the v1 cascade reaches the same trigger), and a
+/// deferred constraint trigger refuses a commit in which the history and the
+/// state did not advance together. That holds against the application path
+/// and ordinary SQL, including an older binary's bare UPDATE during a mixed-
+/// version window (it fails, SQLSTATE class 23, it does not bypass the
+/// reviewer rule). It does NOT hold against the application credential: the
+/// migration runner creates the schema under that role, so the owner can
+/// DISABLE TRIGGER USER (DISABLE TRIGGER ALL is refused to a non-superuser,
+/// because of the foreign keys' system triggers), drop a trigger, replace the
+/// guard function, forge a matching history row, TRUNCATE or DROP TABLE, and
+/// a role granted TRUNCATE can truncate. A data-only restore into a migrated
+/// schema is refused by the guard, so restore schema and data together. A
+/// future migration that touches attestation rows must DISABLE TRIGGER USER
+/// inside its own transaction. The audit store is
+/// evidence independent of these tables but not of the database credential: it
+/// is in the same database with no guard triggers, so it is independent only to
+/// the extent audit rows are exported.
+///
+/// A decision event is ONE COMMITTED decision transaction. When the
+/// connection drops after COMMIT was sent, the caller cannot tell whether the
+/// decision was recorded (`PgPool`'s lost-COMMIT ambiguity) and is answered
+/// with a write failure. GET the campaign and compare `decision_seq` before
+/// retrying: a retry after an unacknowledged commit appends an identical
+/// decision at seq+1, which is kept and visible (an earlier entry shows at most
+/// its first 64 characters, so match on the rest), not an error, until the
+/// grant's 100th decision.
+///
+/// Close starvation: a queued `close_campaign` does not block a NEW
+/// attestation's `FOR SHARE` on the campaign row, so under a continuous
+/// stream of attestations a close can wait up to 3 s (the `SET LOCAL
+/// lock_timeout` of the write transactions) and answer a write failure (503).
+/// Nothing was committed on that path. Retry it.
+///
+/// Schema v3 REFUSES a database that holds a decision recorded by the
+/// subject of the grant (an earlier build allowed it): the store is
+/// `!is_open()`, naming the cause and the number of rows, and the version stays 2. Fresh-database
+/// only (docs/user-manual/upgrading.md, "Deployment contract").
 
+#include <cstddef>
 #include <cstdint>
 #include <expected>
 #include <string>
-#include <string_view>
 #include <vector>
 
 namespace yuzu::server::pg {
@@ -61,6 +110,17 @@ class PgPool;
 }
 
 namespace yuzu::server {
+
+/// Longest `justification` `record_attestation` accepts, in bytes; a longer one is refused with
+/// `bad_request:` so no stored decision row is unbounded.
+inline constexpr std::size_t kMaxJustificationBytes = 4096;
+
+/// Most characters (not bytes) of a SUPERSEDED history entry's justification that
+/// `get_campaign(id, true)` returns; the grant's latest entry is always returned in full. The
+/// full text stays in the database. Together with `kMaxDecisionsPerGrant` this bounds what one
+/// grant adds to a response, so a campaign with many grants cannot make it grow by
+/// 4 KiB x 100 x grants.
+inline constexpr std::int32_t kHistoryJustificationPreviewChars = 64;
 
 /// One grant to freeze into a campaign at `open_campaign` time — the shape
 /// `access_review_model::AccessReviewRow` is expanded into (one `GrantRef`
@@ -72,8 +132,11 @@ struct GrantRef {
     std::string role_name;
     /// Caller-serialized snapshot of the grant as observed at freeze time
     /// (e.g. principal display_name/source/classification/lifecycle_state at
-    /// that instant) — opaque to this store, stored and returned verbatim.
-    /// Free-form (typically JSON), never parsed here.
+    /// that instant), stored and returned verbatim and immutable once written.
+    /// Free-form (typically JSON) EXCEPT for one key: for an ENGINE grant,
+    /// `record_attestation` parses the snapshot and reads `kSnapshotOwnerKey`
+    /// (the owner frozen at open) for its frozen-owner refusal. Both open-campaign
+    /// builders (REST, MCP) must keep writing it under that name.
     std::string grant_snapshot;
 };
 
@@ -99,6 +162,27 @@ struct AccessReviewCampaignRow {
     std::string rbac_enforcement;
 };
 
+/// One recorded decision for a grant: a row of `access_review_attestation_history`.
+struct AttestationHistoryRow {
+    std::int32_t seq{0};           ///< 1 for the first decision; ordering is by this, never time
+    std::string decision;          ///< "attested" | "flagged_revoke"
+    std::string previous_decision; ///< "pending" | "attested" | "flagged_revoke"; "" for a row
+                                   ///< backfilled by schema v3 (not recorded, NOT pending)
+    std::string reviewer;
+    /// The grant's latest entry in full; a superseded entry carries at most its first
+    /// `kHistoryJustificationPreviewChars` characters (the full text stays in the database).
+    std::string justification;
+    /// True only for a superseded entry whose stored text was longer than the preview.
+    bool justification_truncated{false};
+    std::int64_t decided_at_ms{0}; ///< the DATABASE clock at the write transaction's start
+};
+
+/// What `record_attestation` appended: the decision it superseded and the new `seq`.
+struct AttestationOutcome {
+    std::string previous_decision; ///< "pending" for a grant's first decision
+    std::int32_t seq{0};           ///< 1 for the first decision, then 2, 3, ...
+};
+
 /// One persisted (campaign, principal, role) attestation row.
 struct AccessReviewAttestationRow {
     std::string campaign_id;
@@ -110,6 +194,12 @@ struct AccessReviewAttestationRow {
     std::int64_t decided_at_ms{0}; ///< 0 until decided
     std::string justification;    ///< "" until decided (or never required)
     std::string grant_snapshot;   ///< verbatim from the freezing `GrantRef`
+    /// Decisions recorded for this grant; 0 exactly while `decision == "pending"`.
+    std::int32_t decision_seq{0};
+    /// The latest (at most `kMaxDecisionsPerGrant`) decisions for this grant in `seq` order, every
+    /// entry but the latest with its justification cut to a preview. Filled only by
+    /// `get_campaign(id, include_history=true)`; empty otherwise (not a claim that none exist).
+    std::vector<AttestationHistoryRow> history;
 };
 
 /// A campaign's full evidentiary state: metadata + every frozen attestation
@@ -148,61 +238,80 @@ public:
     /// field existed (schema migration 2), never as a value a live caller
     /// may supply. Returns the minted `campaign_id` on success;
     /// `unexpected(msg)` if the transaction did not commit (nothing is
-    /// left half-open — the whole freeze is atomic).
+    /// left half-open — the whole freeze is atomic). An embedded NUL in
+    /// `title` or `created_by` (libpq binds `c_str()`, so it would truncate
+    /// the stored value) returns `unexpected("bad_request: ...")` before the
+    /// pool is touched and no campaign is created.
     [[nodiscard]] std::expected<std::string, std::string>
     open_campaign(std::string title, std::string created_by,
                  const std::vector<GrantRef>& frozen_population,
                  std::string rbac_enforcement);
 
-    /// Record a reviewer's decision for one frozen grant, ONCE. `decision`
-    /// must be `"attested"` or `"flagged_revoke"` — NEVER `"pending"` (that is
-    /// the frozen-at-open default only). A decision is FINAL (#4752): the
-    /// first Attest/Flag on a grant sticks, so neither a second reviewer nor
-    /// the subject can replace it while the campaign is open. A mis-click is
-    /// fixed by opening a new campaign. Stamps `decided_at_ms = now`
-    /// (caller-independent — this store reads the wall clock, matching
-    /// `EnginePrincipalStore`'s `now_epoch` idiom) and the given
-    /// `reviewer`/`justification`. `reviewer` must be non-empty.
-    ///
-    /// SEPARATION OF DUTIES (#4752), enforced in the SAME statement as the
-    /// write so every caller (MCP, REST, any future one) inherits it and no
-    /// handler can forget it: the reviewer may not be the subject of the grant
-    /// (`principal_type == "user"`, exact byte comparison) nor the owner of an
-    /// engine principal as FROZEN into `grant_snapshot` at campaign open.
-    /// `group` subjects are NOT covered (no owner; membership is a
-    /// cross-store read) — a documented limit. There is ONE copy of the rule
-    /// (`kSelfSubject` in the .cpp); extend it, never fork it.
-    ///
-    /// Errors carry a machine-checkable prefix so a transport can map them
-    /// without parsing prose:
-    ///   * `not_found: ...`        — tuple not in the frozen population, OR the
-    ///                               campaign is not open (closed campaigns are
-    ///                               immutable evidence — see `close_campaign`).
-    ///                               REST 404.
-    ///   * `already_decided: ...`  — the grant already has a decision (the
-    ///                               message names it). REST 409.
-    ///   * `self_attestation: ...` — reviewer is the subject / engine owner.
-    ///                               REST 403. Outranks `already_decided:`.
-    ///   * `bad_request: ...`      — a NUL byte / over-long (> 512 bytes)
-    ///                               identifier, a justification with a NUL byte
-    ///                               or over 8192 bytes, an empty reviewer, or an
-    ///                               invalid decision. REST 400. (Scoped to this
-    ///                               method: the other methods do not take
-    ///                               caller-supplied evidence text.)
-    /// Any other `unexpected(msg)` is a genuine write failure (503/retry); the
-    /// libpq text is LOGGED server-side and never returned.
-    [[nodiscard]] std::expected<void, std::string>
+    /// Record a reviewer's decision for one frozen grant. A later decision for
+    /// the same grant is APPENDED to the grant's history (seq+1, with the
+    /// decision it superseded), never an overwrite; an identical repeat appends
+    /// too. `decision` must be `"attested"` or `"flagged_revoke"`, NEVER
+    /// `"pending"` (that is the frozen-at-open default only; there is no route
+    /// back to pending once a reviewer has spoken). Stamps `decided_at_ms` with the
+    /// DATABASE clock (the write transaction's `now()`, never a replica's system clock: the
+    /// campaign `created_at_ms` and `closed_at_ms` are authored the same way) and the given
+    /// `reviewer`/`justification`. Returns the superseded decision and the new
+    /// `seq`. The history row and the state change commit together or not at all.
+    /// Errors carry a machine-checkable prefix so a REST caller can map them
+    /// without parsing prose, in this precedence:
+    /// `unexpected("bad_request: ...")` (400) when `campaign_id` fails
+    /// `valid_campaign_id` (`access_review_model.hpp`; an empty id included),
+    /// when `principal_type`/`principal_id`/`role_name`/`justification`/
+    /// `reviewer` holds an embedded NUL (libpq binds `c_str()`, so a NUL would
+    /// silently truncate the value), when `reviewer` is empty, when
+    /// `principal_type`/`principal_id`/`role_name` exceeds its cap
+    /// (`kPrincipalIdMaxLen`/`kRoleNameMaxLen`), or when `justification` exceeds
+    /// `kMaxJustificationBytes`, all checked before the pool is touched;
+    /// `unexpected("forbidden: ...")` (403) when `principal_type == "user"` and
+    /// `principal_id == reviewer` (byte-exact), also decided before the pool is
+    /// touched, so it precedes `not_found`; `unexpected("not_found: ...")` (404)
+    /// when the (campaign_id, principal_type, principal_id, role_name) tuple is
+    /// not in the frozen population, OR the campaign is not open (the
+    /// application refuses further decisions on a closed campaign, see
+    /// `close_campaign`; the campaign row itself has no database guard);
+    /// `unexpected(kStoreForbiddenEngineOwner)` (403) when `principal_type ==
+    /// "engine"` and the owner frozen into the grant's snapshot at campaign open
+    /// is the reviewer, decided inside the transaction under the row lock, after
+    /// `not_found` and BEFORE the cap (nothing is written); a snapshot with no
+    /// usable owner has nothing to compare and is admitted;
+    /// `unexpected("bad_request: " + kDecisionCapMessage)` (400) when the grant
+    /// already holds `kMaxDecisionsPerGrant` decisions, decided inside the
+    /// transaction under the row lock (nothing is written). Any other
+    /// `unexpected(msg)` is a genuine write failure (503/retry). The LIVE
+    /// engine-owner and the group-member rules are NOT enforced here (they need
+    /// other stores, ADR-0012 s2(c)); the route layer's gate owns them.
+    [[nodiscard]] std::expected<AttestationOutcome, std::string>
     record_attestation(const std::string& campaign_id, const std::string& principal_type,
                        const std::string& principal_id, const std::string& role_name,
                        std::string decision, std::string reviewer, std::string justification);
 
     /// Full evidentiary state for one campaign: metadata + every frozen
-    /// attestation row + `pending_count`. `unexpected("not_found: ...")`
+    /// attestation row + `pending_count`. With `include_history` each row also
+    /// carries its `history` (the recorded decisions in `seq` order), read in
+    /// the same REPEATABLE READ snapshot, capped at the latest
+    /// `kMaxDecisionsPerGrant` entries per grant (a backstop: the write cap keeps
+    /// a grant at or under it, so `decision_seq > history.size()` means rows were
+    /// added by other means). The cap holds for rows written through the application path;
+    /// rows added by other means (owner-level SQL with the guard triggers disabled, which can
+    /// forge a state row) are outside the guarantee. Every entry except the grant's latest (`seq ==
+    /// decision_seq`) carries at most its first `kHistoryJustificationPreviewChars` characters of
+    /// justification, cut in SQL on a character boundary, with `justification_truncated` set when
+    /// the stored text was longer; the latest entry is whole. The two bounds together cap what one
+    /// grant adds to a response; a superseded entry's full text is in the database only. It
+    /// defaults to false so a caller that shows only the latest decision stays one cheap read.
+    /// `unexpected("bad_request: ...")`
+    /// when `campaign_id` fails `valid_campaign_id` (empty included), checked
+    /// before the pool is touched. `unexpected("not_found: ...")`
     /// (machine-checkable prefix, as `record_attestation` above) when no
     /// campaign with this id exists; any other `unexpected(msg)` is a
     /// genuine read failure (503/retry).
     [[nodiscard]] std::expected<CampaignView, std::string>
-    get_campaign(const std::string& campaign_id);
+    get_campaign(const std::string& campaign_id, bool include_history = false);
 
     /// Close an open campaign (`status='open' -> 'closed'`, stamps
     /// `closed_by`/`closed_at_ms`). Does NOT touch attestation rows — a
@@ -211,22 +320,17 @@ public:
     /// this store silently launders by forcing completion). Idempotent-
     /// rejecting: closing an already-closed or unknown campaign returns
     /// `unexpected("not_found: ...")` (machine-checkable prefix, as above);
-    /// any other `unexpected(msg)` is a genuine write failure (the libpq text
-    /// is logged on the server and never returned).
-    ///
-    /// LOCK CONTRACT (#4752): `record_attestation` takes a `FOR SHARE` lock on
-    /// the campaign row inside its write, so this UPDATE waits for attestations
-    /// already in flight and a later attestation re-checks the new status. The
-    /// order is campaign row (share) -> attestation row, and this method locks
-    /// ONLY the campaign row. If you change it to also touch attestation rows,
-    /// re-derive that order first or you can create a lock cycle.
+    /// a `campaign_id` that fails `valid_campaign_id` (empty included)
+    /// returns `unexpected("bad_request: ...")` before the pool is touched, as
+    /// does a `closed_by` holding an embedded NUL; any other `unexpected(msg)`
+    /// is a genuine write failure.
     [[nodiscard]] std::expected<void, std::string>
     close_campaign(const std::string& campaign_id, const std::string& closed_by);
 
     /// Every campaign's metadata row (NOT its attestations — call
-    /// `get_campaign` for those), newest-first by `created_at_ms`. This is
-    /// the surface an auditor needs to prove reviews ran on cadence — "list
-    /// every campaign that ever ran" — so unlike the operational `/auto`
+    /// `get_campaign` for those), newest-first by `created_at_ms`. Campaign
+    /// metadata only, with no decided or pending counts (read a campaign for
+    /// those); unlike the operational `/auto`
     /// pre-flight/deployment run stores, nothing here is pruned. Bounded to
     /// the most recent 500 campaigns (a monthly-cadence program takes ~40
     /// years to reach that; a higher-frequency one is exactly the case an
@@ -240,50 +344,5 @@ private:
     pg::PgPool& pool_;
     bool open_{false};
 };
-
-/// Machine-checkable error prefixes `record_attestation` produces. ONE
-/// definition each, used by BOTH the producer (access_review_store.cpp) and the
-/// classifiers below, so a typo is a compile error rather than a deliberate
-/// refusal silently degrading to a generic 503. (`not_found:` predates this and
-/// stays a literal at its existing sites.)
-inline constexpr std::string_view kSelfAttestationPrefix = "self_attestation:";
-inline constexpr std::string_view kAlreadyDecidedPrefix = "already_decided:";
-/// Client-caused input error the transport did not pre-validate (a NUL byte or
-/// over-long identifier, an empty reviewer). REST 400 / MCP invalid-params.
-inline constexpr std::string_view kBadRequestPrefix = "bad_request:";
-
-/// How `record_attestation` refused a decision on purpose (#4752), as opposed
-/// to a missing row (`not_found:`) or a store fault. The ONE place the store's
-/// error prefixes are turned into a transport-neutral verdict, so the REST and
-/// MCP handlers cannot disagree about which refusals are audited `denied`.
-enum class AttestationRefusal { None, SelfAttestation, AlreadyDecided };
-
-[[nodiscard]] inline AttestationRefusal classify_attestation_refusal(std::string_view err) noexcept {
-    if (err.starts_with(kSelfAttestationPrefix))
-        return AttestationRefusal::SelfAttestation;
-    if (err.starts_with(kAlreadyDecidedPrefix))
-        return AttestationRefusal::AlreadyDecided;
-    return AttestationRefusal::None;
-}
-
-/// True for a client-input error from any AccessReviewStore method.
-[[nodiscard]] inline bool is_bad_request_error(std::string_view err) noexcept {
-    return err.starts_with(kBadRequestPrefix);
-}
-
-/// Short, stable audit `detail` token for a refusal ("" for `None`). A token,
-/// not the store's prose, so the audit stream stays queryable and carries
-/// nothing caller-controlled.
-[[nodiscard]] inline const char* attestation_refusal_token(AttestationRefusal r) noexcept {
-    switch (r) {
-    case AttestationRefusal::SelfAttestation:
-        return "self_attestation_blocked";
-    case AttestationRefusal::AlreadyDecided:
-        return "already_decided";
-    case AttestationRefusal::None:
-        break;
-    }
-    return "";
-}
 
 } // namespace yuzu::server

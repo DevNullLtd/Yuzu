@@ -7,20 +7,23 @@ owner's decisions for slice 2 are under [Decisions](#decisions), each with the d
 (2026-10-19 to 2026-10-28). Where possible it states outcomes and leaves mechanisms to the
 implementation PRs, which get their own governance.
 
-**Only 2a-1 of slice 2 is on `dev`** (checked 2026-10-28): 2a-1 merged as PR #6563, so
-`certificate_inventory` is in the typed set, and this design's PR split merged as PR #6597. No
-certificate store, ingest or `server_capabilities` code is on `dev`: `RegisterResponse` in
-`proto/yuzu/agent/v1/agent.proto` ends at field 8. Where this doc says a PR "does" something, it
-describes that PR's plan. Where it says "on the 2a-2a branch" (or another PR's branch), it describes
-that PR's unmerged implementation, recorded so this design matches it; it becomes fact only when
-that PR merges. Since the owner's 2026-10-28 split, "the 2a-2a branch" (`feat/cert-inventory-store-v2`)
-covers the certificate store and ingest only; the capability and gateway enforcement are 2a-2a-cap's.
-2b-1a is PR #6583 and 2a-1b (`feat/typed-source-background-purge`) is PR #6676, both open. Other
-work so far is on local branches that are not pushed: 2a-2a `feat/cert-inventory-store-v2`,
-2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstones`, 2a-2d
+**On `dev`** (checked 2026-11-18 against `origin/dev` and GitHub): 2a-1 (PR #6563), this design's
+PR split (PR #6597), 2a-1b (PR #6676), 2a-2a (PR #6684, the certificate store and ingest) and 2b-1a
+(PR #6583, the registered-CRL source registry, register-only) have merged, and so has a hardening
+of 2b-1a's address checks and its create read-back (PR #8141). Nothing else in slice 2 is on `dev`:
+there is no `server_capabilities` code (`RegisterResponse` in `proto/yuzu/agent/v1/agent.proto`
+ends at field 8), no agent collector, no certificate read surface and no CRL fetcher. Where this
+doc says a PR "does" something, it describes that PR's plan. Where it says "on the 2a-2b branch"
+(or another PR's branch), it describes that PR's unmerged implementation, recorded so this design
+matches it; it becomes fact only when that PR merges. Since the owner's 2026-10-28 split, the
+capability and gateway enforcement are 2a-2a-cap's, not 2a-2a's. Work not yet raised is on local
+branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstones`, 2a-2d
 `feat/cert-inventory-prune`, 2a-2e `feat/cert-inventory-agent-linux`, 2a-2f
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
+The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see
+[Decisions](#decisions)); the changes they make land as the CRL store's migration v2 before 2b-1b
+(keeping the per-row `config_version` changes nothing).
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -636,7 +639,7 @@ the PR chooses). A report from such an agent is acknowledged, writes no row, and
 (`reason=decommissioned`).
 - **No race.** Ingest (`pg_try_advisory_xact_lock`, deferring when busy) and `delete_agent` (the same lock, waited for under a bounded `lock_timeout`) both take the same per-agent lock first, on a hash of the agent id, so a decommission cannot commit between the
   ingest's tombstone read and its commit.
-- **What decommission does today (verified).** The decommission cascade erases seven data stores on `dev` today, and **eight once 2a-2a merges** (the certificate inventory is the eighth; `agent_decommission.cpp` on the 2a-2a branch)
+- **What decommission does today (verified).** The decommission cascade erases seven data stores on `dev` today, and **eight once 2a-2a merges** (the certificate inventory is the eighth; `agent_decommission.cpp` on the 2a-2a branch; update 2026-11-09: the cascade is now nine stores, the Guardian compliance census `guaranteed_state` (#5675) being the ninth)
   and no auth store (`server.cpp:10019-10029`, `agent_decommission.hpp:117-125`); the only
   `pending_agents` delete is pending-only (`auth_db.cpp:2765`). So an approved agent's enrolment
   record survives decommission. If that agent is still running, it re-registers through the
@@ -1070,8 +1073,10 @@ errors such as non-object arguments, an unwired gate or a parse error):
 | 409 / `conflict` (register of an already-registered CA) | no | the existing source id |
 | 503 / store degraded, admission shed, or audit write failed | yes | `retry_after_ms` |
 
-The `POST` and `PUT` bodies get an entry in `kBodyCapTable` (`body_cap_policy.hpp:179`), as the
-pre-auth body-cap routed concern requires for a new mutating route. The proposed cap is 128 KiB.
+The `POST` and `PUT` bodies get an entry in `kBodyCapTable` (`body_cap_policy.hpp`), as the
+pre-auth body-cap routed concern requires for a new mutating route. 2b-1a shipped a cap of 192 KiB
+on `/api/v1/crypto/revocation-sources`, equal to `revocation_source::kBodyMaxBytes`
+(`revocation_source_service.hpp`): the largest valid body, JSON-escaped, is about 151 KiB.
 
 ### Parameters: strict or free text, the same on both twins
 
@@ -1336,6 +1341,33 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
 **Decided (ADR-0070 §D5 as amended by R1; §D12 "Registered-CRL revocation
 (R1)"):** everything R1 requires is binding. This section designs it.
 
+### Standing invariants
+
+The routed-concern row for this surface (`.claude/routed-concerns-security-posture.md`) is the
+review trigger; these are the invariants it routes to. Each holds for 2b-1a as shipped and binds
+every later 2b PR.
+
+1. **Admin-only in both RBAC states, not grantable.** Every route and MCP tool passes
+   `revocation_source_admin_gate.hpp` (the `is_rbac_administrator` predicate, extended never
+   forked, with the regime re-check on writes) as well as the `RevocationSource` securable. A
+   custom role holding the securable is refused: the URL list and fetch status would make the
+   fetcher a request-forgery and port-scan oracle.
+2. **A registered CA certificate is data, never a trust anchor.** A CRL is checked against it; the
+   surface never touches `ca_store` or any PKI decision path (ADR-0070 D6).
+3. **Every host is classified through `oidc_egress_policy.hpp`** at registration, and the 2b-1b
+   fetcher must classify it again on every fetch. The never-allowed tier, loopback and every
+   address the server is bound to are refused with no override; an embedded-IPv4 form is judged
+   by the address it embeds (an SIIT or IPv4-compatible form never as more open than
+   `non-global`); an undeclared local-use NAT64 address is refused; every other class must be in
+   `confirmed_address_classes`. Only registered URLs are fetched, never one a
+   certificate names.
+4. **Anti-rollback marks survive a remove.** `rollback_high_water` is keyed by the CA, not the
+   source; only the audited high-water reset clears it.
+5. **Audit first.** Every mutation writes its `attempted` audit row before the store call and
+   changes nothing when that row cannot be stored.
+
+Owed before the fetcher: the CRL store's migration v2 for the three #6590 rulings ([Decisions](#decisions), 2026-11-18).
+
 ### Registration
 
 **Decided:**
@@ -1383,6 +1415,23 @@ A caller holding `Inventory:Read` but not `CertificateInventory:Read` gets the l
   refusal covers only the fetching replica's own addresses, not the other replicas'; reaching
   another replica's listener needs a registered URL naming it, which only an administrator can
   register. That classifier is hoisted to a shared pure header rather than copied.
+- **IPv6 at registration: declared prefixes only** (owner ruling on #6583, 2026-11-04). An IPv6
+  address that embeds an IPv4 address is judged by that IPv4 address for the well-known
+  `64:ff9b::/96`, 6to4, IPv4-mapped and the operator-declared (`--oidc-nat64-prefix`) prefixes.
+  Registration does **no RFC 7050 discovery**, so it refuses only as far as the declared prefixes
+  allow: an address behind a prefix the network advertises but the operator did not declare is
+  judged as plain IPv6 at registration (the local-use block is the exception, next bullet). That
+  is safe because nothing fetches at registration and the fetcher re-classifies every address
+  (below). The MCP and REST descriptions both state it as "Declared prefixes only at
+  registration".
+- **Two more embedded forms, and the local-use block** (2026-11-17 hardening, after the ruling
+  above). SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are judged by the
+  embedded IPv4 address too, never as more open than `non-global`, so an embedded never-allowed,
+  loopback or own address is refused like its plain form. A local-use NAT64 address
+  (`64:ff9b:1::/48`) that no declared prefix covers is refused with no override, because its
+  embedded position depends on a prefix length the address does not carry: an operator whose CRL
+  host sits behind a local-use prefix declares it, with its exact length (a wrong length decodes
+  the wrong IPv4 address).
 - **`PUT` replaces** the source's name, keys and URLs. This is how a renewed CA key is added. A
   `PUT` that drops a URL deletes that URL's `source_url` and `fetch_status` rows, and every held
   `crl` row fetched from it, in the same transaction. A `PUT` that drops a key deletes every held
@@ -1428,6 +1477,18 @@ review, as a new egress surface.
   elsewhere. The OIDC client already pins this way with httplib's `set_hostname_addr_map`
   (`oidc_provider.cpp:1468`, `:2275`) and turns off redirect following (`:2296`); that
   resolve-classify-pin helper is hoisted to a shared place and reused, not copied.
+- **NAT64 discovery belongs to the fetcher (2b-1b).** The fetcher, not registration, discovers the
+  network's NAT64 prefixes (RFC 7050) and:
+  - judges the declared and the discovered views **separately**, never merged, so a discovered
+    prefix can only tighten a verdict;
+  - refuses the never-allowed tier and loopback **regardless of any confirmation**;
+  - decides the **never-answered** case explicitly (no lookup has ever answered for this
+    process): fail closed at the fetcher, with an audit mark, rather than a blanket refusal of
+    every IPv6 target at registration.
+
+  A class confirmed at registration (judged on declared prefixes only) may therefore be refused
+  at the first fetch once discovery is on (`address_class_changed`), so 2b-1b needs a
+  **re-confirm path** for the administrator, not only a refusal.
 - **Cleartext.** Plain `http` is allowed to any confirmed address class, unlike the OIDC policy's
   refusal of cleartext to a public address (`oidc_egress_policy.hpp:25-30`). A CRL's integrity comes
   from its signature, not the transport, and most CDPs are `http`. A tampered response fails
@@ -1477,11 +1538,14 @@ review, as a new egress surface.
   `distributionPoint`, `onlySomeReasons`, `onlyContainsUserCerts` and `onlyContainsCACerts`. An
   indirect CRL (`indirectCRL`) or `onlyContainsAttributeCerts` is recorded and never used (cause
   `out_of_scope`).
-- **Source configuration check.** Source ids are never reused (they come from a sequence that is
-  never reset), and every `source` row carries a `config_version` taken from one global Postgres
-  sequence (`revocation_source.config_seq`) in the same transaction as the register, `PUT`,
-  `DELETE` or high-water reset that changes it. So a `DELETE` followed by a re-register can never
-  reproduce an earlier (source id, `config_version`) pair. Before a fetch, the
+- **Source configuration check.** Source ids are never reused (an identity column that is never
+  reset), and every `source` row carries a `config_version`. 2b-1a ships it as a per-row counter:
+  1 at register, raised by one in the same transaction as a `PUT` that changes the source or a
+  high-water reset (`revocation_source_store.cpp`), not the global sequence
+  (`revocation_source.config_seq`) this design first proposed. Because ids are never reused, a
+  `DELETE` followed by a re-register still cannot reproduce an earlier (source id,
+  `config_version`) pair. The owner kept the per-row counter on 2026-11-18 (#6590); this design
+  no longer proposes the global sequence. Before a fetch, the
   job snapshots the source's `config_version`, the URL and the key set. The acceptance transaction
   locks the `source` row (`FOR UPDATE`) and stores the CRL only if `config_version` is unchanged and
   the URL is still registered; otherwise it discards the CRL, records cause `config_changed`,
@@ -1512,8 +1576,11 @@ review, as a new egress surface.
 - **A reset cannot be replayed into.** Plain `http` is allowed, so after a reset an on-path
   attacker or a stale mirror could serve an older CRL that still verifies, possibly one from before
   the rebuild with a higher number. So:
-  - the reset body lists the source's keys after the rebuild. Every key not listed is removed, and
-    every held CRL of the CA is deleted, in the same transaction as the reset;
+  - the reset body lists the source's keys after the rebuild, and every key not listed is removed,
+    in the same transaction as the reset. **Deferred (#6590, ruled 2026-11-18), not in 2b-1a:**
+    the shipped reset accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this
+    must land before 2b-1b accepts any CRL. Shipped in 2b-1a: every held CRL of the CA is deleted
+    in the reset's transaction;
   - the reset clears each scope's number and `this_update` but writes `reset_at` (Postgres `now()`
     at the reset) on every high-water row of the CA, and on a CA-level row that scopes first seen
     later inherit. **`reset_at` is kept permanently**: every CRL accepted afterwards, not only the
@@ -1546,8 +1613,9 @@ review, as a new egress surface.
 - The **last good CRL** is kept on every failure. A failure, including `over_size_bound`, updates
   only the URL's fetch status. A certificate reads `over_size_bound` only when no verified CRL is
   held for its scope; otherwise it is judged on the held CRL, with that CRL's `nextUpdate` shown.
-- **The cost of a replace.** A new CRL for a scope is written in one transaction that inserts the
-  new entries before deleting the old, so a scope never reads with no entries. It runs only in the
+- **The cost of a replace.** A new CRL for a scope replaces the held one by delete-then-insert
+  (the owner's #6590 ruling) in one transaction, so a reader sees either the old CRL or the new
+  one and a scope never reads with no entries. It runs only in the
   refresh job, off every request path, under its own statement timeout. An unchanged CRL (a 304, or
   the same number and bytes) writes nothing, so a large, stable CRL costs one conditional GET per
   cadence. A CA that reissues a 1M-entry CRL hourly costs a 1M-row insert and delete per hour; the
@@ -1576,7 +1644,7 @@ separate from `ca_store`, in the readiness conjunction.
 | `fetch_status` | `url_id` | `last_attempt_at`, `last_success_at`, `last_failure_cause`, `consecutive_failures`, `next_attempt_at`, `etag`, `last_modified` |
 | `crl` | `id` | `source_id`, `scope_key`, `url_id`, `crl_number`, `this_update`, `next_update`, `is_delta`, `base_crl_number`, `idp_reasons`, `expired_certs_on_crl`, `verified_key_sha256`, `der_sha256`, `entry_count`, `fetched_at` |
 | `crl_entry` | (`crl_id`, `serial`) | `revocation_date`, `reason`, `invalidity_date` |
-| `rollback_high_water` | (`ca_subject_name_sha256`, `scope_key`; `scope_key = '*'` is the CA-level row) | `crl_number`, `this_update`, `reset_at` (permanent once set) |
+| `rollback_high_water` | (`ca_subject_name_sha256`, `scope_key`; `scope_key = '*'` is the CA-level row) | `crl_number`, `this_update`, `reset_at` (permanent once set), `pinned_crl_sha256` |
 | `cert_signature_check` (2b-2) | (`cert_sha256`, `ca_key_sha256`) | `source_id`, `verified` |
 
 - `this_update`, `next_update` and `revocation_date` are the CA's own times, from the CRL.
@@ -1983,6 +2051,41 @@ Decided by ADR-0070 R1 (recorded here so no section reads otherwise):
    by the same pass. The owner confirmed this reading of D12's store-grain condition over a
    per-store ceiling ([Retention and the prune](#retention-and-the-prune)). This is ADR-0070 R15.
    R16 (decision 7) later superseded its predicate.
+
+**Decided by the owner, 2026-11-18** (the three CRL store contract questions of #6590, each as
+recommended; the changes they make land as the CRL store's migration v2, before 2b-1b accepts any
+CRL, and keeping the per-row `config_version` changes nothing):
+
+- **Reset names the surviving keys by hash.** The high-water reset body (REST
+  `POST .../reset-high-water` and MCP `reset_revocation_source_high_water`) gains a required,
+  non-empty `keep_key_sha256` list. Each entry must name a key already registered on the source
+  (an operator adds the rebuilt CA's certificates with `PUT` first); every other key and every
+  held CRL of the CA are removed in the reset's transaction. A body without the list is refused.
+- **One encoded scope key, replaced delete-then-insert.** `scope_key` is `full` or
+  `idp:<64 lowercase hex of the IDP DER SHA-256>`, followed by `:base` or `:delta`, pinned by a
+  `CHECK` and used identically in `crl` and `rollback_high_water`. The encoded column carries only
+  the IDP and base-or-delta parts; the CA is in the table's own column (`source_id`,
+  `ca_subject_name_sha256`). `rollback_high_water`'s `CHECK` also accepts `'*'`, the CA-level row
+  whose permanent `reset_at` scopes first seen later inherit; `crl`'s does not. `crl.is_delta`
+  becomes a column generated from the suffix, so the two cannot disagree. A newer CRL replaces the
+  held one by delete-then-insert inside the acceptance transaction, so `UNIQUE (source_id,
+  scope_key, is_delta)` stays and a reader sees the old CRL or the new one, never both.
+- **`config_version` stays a per-row counter.** Source ids come from an identity column that is
+  never reset, so a delete and re-register cannot reproduce an earlier (source id,
+  `config_version`) pair; the global `revocation_source.config_seq` is not built.
+- **CRL URLs are stored in one canonical form.** One canonicaliser at the service lowercases the
+  scheme and host, drops the default port, strips leading zeros from the port, writes an IPv6
+  literal in RFC 5952 form and stores an empty path as `/`; the path and query keep their case and
+  percent-encoding is left as sent. The canonical form is what is stored, what `UNIQUE (source_id,
+  url)` and replace compare, and what responses return, so a cosmetic `PUT` keeps the URL's fetch
+  state.
+- **Proposed, for the migration v2 PR** (implementation points the rulings leave open; a reviewer
+  can change them without re-opening #6590): `keep_key_sha256` names `source_ca_key.cert_sha256`
+  values, the key's identity everywhere else on this surface; the reset body also takes the
+  required `expected_config_version` that `PUT` takes, so a reset built from a stale read cannot
+  delete a key another administrator has just added; and v2 rewrites each stored URL to the
+  canonical form when it opens, refusing to open (naming the source) when two URLs of one source
+  collapse into one, since 2b-1a is in no release and only development databases hold v1 rows.
 
 **Decided by the owner, 2026-10-26 and 2026-10-27** (items raised by governance on 2a-2d, 2a-2e, 2a-3 and 2a-4; the owner took the recommendations on all; each item carries its own date):
 

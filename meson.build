@@ -116,9 +116,35 @@ vcs_tag(
 
 # ── Feature summary ───────────────────────────────────────────────────────────
 build_agent    = get_option('build_agent')
-build_server   = get_option('build_server')
+# The server is Linux-only (ADR-0035 Decision 4). `server` is a feature option:
+# auto builds it on a Linux TARGET (a Linux-target cross build from any machine
+# stays legal) and skips it on any other, enabled on a non-Linux target is an
+# error, disabled never builds it. The deprecated boolean `build_server` is
+# still honoured as an extra off-switch, because build dirs and branches from
+# before ADR-0035 step 3 store or pass -Dbuild_server=false; a stored true
+# cannot turn the server on off Linux. Pinned by tests/test_server_feature_option.py.
+# These checks must stay before the first vcpkg/dependency lookup below, so a
+# non-Linux misconfiguration fails here with the ADR-0035 message.
+# Meson keeps a cross file's `system = 'Linux'` verbatim, so compare a lowercased copy.
+_server_host = host_machine.system().to_lower()
+_server_opt = get_option('server').disable_auto_if(_server_host != 'linux')
+if _server_opt.enabled() and _server_host != 'linux'
+  error('-Dserver=enabled: the Yuzu server is Linux-only and cannot be built for a ' + _server_host + ' target (ADR-0035). Build the agent here, and the server on Linux.')
+endif
+if _server_opt.enabled() and not get_option('build_server')
+  error('-Dserver=enabled contradicts the deprecated -Dbuild_server=false passed or stored for this build dir (ADR-0035 step 3). Delete the build dir and configure again (`--wipe` replays the stored options, so it does not clear this), or pass -Dbuild_server=true as well.')
+endif
+build_server   = _server_opt.allowed() and get_option('build_server')
+if not build_server and _server_host != 'linux'
+  message('Server: off (the Yuzu server is Linux-only, ADR-0035; this ' + _server_host + ' build is agent-only)')
+elif _server_opt.allowed() and not build_server
+  message('Server: off because the deprecated -Dbuild_server=false is set (use -Dserver=disabled; ADR-0035 step 3)')
+endif
 build_examples = get_option('build_examples')
 build_tests    = get_option('build_tests')
+if get_option('build_contract_tests') and not build_tests
+  error('build_contract_tests requires build_tests=true')
+endif
 
 # ── Dependencies ──────────────────────────────────────────────────────────────
 # All third-party includes are marked `include_type: 'system'` so the compiler
@@ -248,7 +274,12 @@ if host_os == 'windows'
   # (same name in both variant dirs). Check `debug/lib/` layout via the
   # inspect-vcpkg.sh diagnostic if a new transitive lib surfaces and you
   # aren't sure which convention it follows.
-  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  # zlib 1.3.2 (vcpkg 2026.10.16 baseline) renamed these to z.lib / zd.lib (the same `d` debug
+  # suffix); older baselines ship zlib.lib / zlibd.lib. Try the old name first, then the new one.
+  _libzlib = _cxx.find_library('zlib' + _pbd, dirs: [_vcpkg_lib_win], required: false)
+  if not _libzlib.found()
+    _libzlib = _cxx.find_library('z' + _pbd, dirs: [_vcpkg_lib_win], required: true)
+  endif
 
   # Construct the meson dep objects yuzu's build graph consumes. These
   # REPLACE the `dependency('protobuf', method: 'cmake')` / `dependency('gRPC',
@@ -282,14 +313,31 @@ else
   # don't have MSVC's runtime-library variant ABI — debug user code can
   # safely link against release-built .a static libs, and the cmake dep
   # translator's IMPORTED_LOCATION_RELEASE bias is harmless.
+  # On a tree installed for a triplet other than the host's (x64-linux-asan/-tsan/-static, the
+  # RHEL 8 triplet; host != target by design there) the Protobuf CMake probe fails even though
+  # this tree's tools/protobuf/protoc exists: "Could NOT find Protobuf (missing:
+  # Protobuf_PROTOC_EXECUTABLE)", raised from share/protobuf/protobuf-module.cmake via
+  # protobuf-config.cmake, so gRPC's CMake config is reported "not found". Hand the probe the
+  # protoc from this tree's own tools directory, found the same way proto/meson.build finds it.
+  # Measured with the protobuf 6.33.4 port at vcpkg 2026.10.16 (port-version 2); the port's
+  # vcpkg-cmake-wrapper.cmake is byte-identical to the one at the previous baseline, so which
+  # change in the port moved this was not established. Without the argument meson falls back to
+  # grpc.pc, which in vcpkg's grpc 1.81.1 names a library that does not exist
+  # (-lutf8_range_lib) and fails to link.
+  _protoc_hint_dirs = []
+  foreach _prefix : get_option('cmake_prefix_path')
+    _protoc_hint_dirs += _prefix / 'tools' / 'protobuf'
+  endforeach
+  _protoc_probe = find_program('protoc', dirs: _protoc_hint_dirs, required: false)
+  _protoc_cmake_args = _protoc_probe.found() ? ['-DProtobuf_PROTOC_EXECUTABLE=' + _protoc_probe.full_path()] : []
   grpcpp_dep = dependency('gRPC', method: 'cmake', modules: ['gRPC::grpc++'],
-    required: false, include_type: 'system')
+    required: false, include_type: 'system', cmake_args: _protoc_cmake_args)
   if not grpcpp_dep.found()
     grpcpp_dep = dependency('grpc++', method: 'pkg-config', required: true,
       include_type: 'system')
   endif
   protobuf_dep = dependency('protobuf', method: 'cmake', modules: ['protobuf::libprotobuf'],
-    required: false, include_type: 'system')
+    required: false, include_type: 'system', cmake_args: _protoc_cmake_args)
   if not protobuf_dep.found()
     protobuf_dep = dependency('protobuf', method: 'pkg-config', required: true,
       include_type: 'system')
@@ -330,13 +378,15 @@ endif
 
 # libpq — Postgres client library for the server storage substrate (ADR-0006/
 # ADR-0008). Server-only: the agent stays SQLite (ADR-0006), so agent-only
-# (-Dbuild_server=false) and cross builds must not require libpq at configure.
+# configures (-Dserver=disabled, or any non-Linux target) and cross builds must
+# not require libpq at configure.
 #
 # Linkage per platform: static .a on Linux/macOS (vcpkg static triplets);
 # **dynamic DLL on Windows** — triplets/x64-windows.cmake's base linkage is
 # dynamic and its static override is scoped to the grpc stack only, so vcpkg
-# produces libpq.dll + import lib, same as sqlite3/openssl. The release zip's
-# vcpkg-DLL sweep (release.yml `Get-ChildItem $vcpkgBin *.dll`) bundles it.
+# produces libpq.dll + import lib, same as sqlite3/openssl. Since ADR-0035 step 3
+# the release install is agent-only, so libpq is not installed there and the release
+# zip's vcpkg-DLL sweep no longer sees it (release.yml refuses it in the archive).
 # Static libpq (unix) needs the companion libpgcommon/libpgport archives
 # (scram/auth helpers) that neither cmake's FindPostgreSQL nor any imported
 # target carries — only libpq.pc's Libs.private lists them, and pkg-config
@@ -352,8 +402,12 @@ if not build_server
   libpq_dep = disabler()
 elif host_os == 'windows'
   _libpq_libs = []
+  # libpq 18 (meson-based vcpkg port) no longer installs libpgcommon.lib / libpgport.lib on
+  # Windows (only libpgcommon_shlib.a / libpgport_shlib.a, which MSVC cannot link); libpq 16 did.
+  # They are only needed for a static libpq, so require libpq alone.
   foreach _pq_name : ['libpq', 'libpgcommon', 'libpgport']
-    _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win], required: true)
+    _libpq_libs += _cxx.find_library(_pq_name, dirs: [_vcpkg_lib_win],
+                                     required: _pq_name == 'libpq')
   endforeach
   # With dynamic libpq (the current triplet posture) the DLL self-contains
   # these; they are listed so a future flip of libpq to the static override
@@ -492,8 +546,13 @@ subdir('sdk')
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')
-  # build_examples gates ONLY the four genuinely decorative demo plugins
-  # below -- every other plugin is a real, shipped capability (several are
+  # build_examples gates ONLY the four plugins below: the three demo plugins
+  # (example, chargen, procfetch) and netprobe, which is NOT a demo -- it is
+  # active network measurement (ICMP/TCP round-trip, DNS timing) and the
+  # Windows installer installs it with the Network component. build_examples
+  # defaults to true and the release does not turn it off, so all four ship
+  # (tests/test_agent_installer_plugin_coverage_lint.py pins that). Every
+  # other plugin is a real, shipped capability (several are
   # unconditional link_depends of tests/meson.build's yuzu_agent_tests
   # target) and must build regardless of this flag (#4262). Verified via
   # a grep sweep of every subdir name against the rest of the tree before
@@ -537,7 +596,6 @@ if build_agent
   subdir('agents/plugins/vuln_scan')
   subdir('agents/plugins/tags')
   subdir('agents/plugins/asset_tags')
-  subdir('agents/plugins/quarantine')
   subdir('agents/plugins/certificates')
   subdir('agents/plugins/ioc')
   subdir('agents/plugins/storage')
@@ -569,7 +627,10 @@ if build_agent
   subdir('agents/plugins/mgmt_posture')  # management-plane posture (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/shares')  # configured SMB/NFS shares (Linux, macOS and Windows legs)
   subdir('agents/plugins/remote_access_audit')  # SSH inbound-access audit (Linux + macOS legs; Windows planned)
+  subdir('agents/plugins/process_introspect')  # per-process introspection of one pid (Linux leg; macOS and Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
+  subdir('agents/plugins/component_inventory')  # SAM-16: Java components found in application trees (Linux + macOS legs; Windows planned)
+  subdir('agents/plugins/virtualization')  # PR12.1-a: VM / hypervisor / container facts (Linux, macOS and Windows legs)
   subdir('agents/plugins/middleware')  # SAM.2: table-driven middleware inventory (Linux leg; Windows + macOS planned)
   subdir('agents/plugins/browser_inventory')  # Wave 10 P2a
   subdir('agents/plugins/local_security_policy')  # Wave 8 PR8.3
@@ -714,7 +775,7 @@ if _gw_otp_bin != ''
   # back if Linux kernel semantics ever change. `test_gateway.py`
   # honors REBAR_BASE_DIR when computing the ebin wipe path.
   #
-  # EUnit runs as SHARDS (`gateway eunit shard A`, `... shard B`), each a
+  # EUnit runs as SHARDS (`gateway eunit shard A`, `... B`, `... C`), each a
   # deterministic share of the top-level apps/yuzu_gw/test modules
   # (`test_gateway.py ... eunit --shard K/N`; partition, and why the shards
   # together run exactly what `rebar3 eunit --dir apps/yuzu_gw/test` does,
@@ -723,7 +784,11 @@ if _gw_otp_bin != ''
   # the Windows MSVC leg at 56f3e0df6 (85% of the wrapper's 540s deadline)
   # and then exceeded it as PR #5695 added modules (runs 39078203756,
   # 39103378230); compile is ~14s of that, the rest is test time (#2093:
-  # split the suite). Adding a shard: add an entry here (next letter,
+  # split the suite). On the Linux CI leg the two shards then took about
+  # 250s and 200s (2026-11); turning cover off in the shards (most of the
+  # cut), measured weights and this third shard bring the expected cost to
+  # about 100s each (measurements in scripts/gateway_eunit_shards.py).
+  # Adding a shard: add an entry here (next letter,
   # K/N with the new N on EVERY entry, its own _build_eunit_<K>) and to
   # REQUIRED in scripts/ci/assert-gateway-tests.py; the self-test checks
   # the entries stay consistent. Each shard compiles the whole test dir
@@ -740,11 +805,12 @@ if _gw_otp_bin != ''
   # the Linux cheap-suites invocation (about 111 to 122 s unsharded over eleven
   # runs on the self-hosted Linux runner, 2026-10-24) and, defined last, it used
   # to start last. 120 sits between the pg shards (160-260, a sparse rank
-  # scale) and the non-pg shards (10-50) in tests/meson.build, so both eunit
+  # scale) and the non-pg shards (10-50) in tests/meson.build, so the eunit
   # shards start first and overlap the other entries instead of trailing them.
   # Priority only orders starts: it moves no case and cannot change the total
   # work (at --num-processes 1 the order changes, the wall time does not).
-  _gw_eunit_shards = {'A': '1/2', 'B': '2/2'}
+  # `gateway ct` below carries the same priority for the same reason.
+  _gw_eunit_shards = {'A': '1/3', 'B': '2/3', 'C': '3/3'}
   foreach _gw_shard_name, _gw_shard_spec : _gw_eunit_shards
     test('gateway eunit shard ' + _gw_shard_name,
       _python3,
@@ -753,6 +819,7 @@ if _gw_otp_bin != ''
       timeout: 600,
       priority: 120,
       env: {'REBAR_BASE_DIR': _gw_src / ('_build_eunit_' + _gw_shard_spec.split('/')[0]),
+            'YUZU_GATEWAY_TEST_LOG_DIR': meson.project_build_root() / 'meson-logs',
             'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
     )
   endforeach
@@ -763,14 +830,37 @@ if _gw_otp_bin != ''
   # 2026-09-23 with the suites actually running (52 cases, cold _build_ct,
   # self-hosted CI concurrently busy on the same host): 65s Windows, 44s
   # Linux. Change this and the wrapper's value together.
+  #
+  # priority 120, as the eunit shards: at the default 0, and defined after
+  # every tests/meson.build entry, `gateway ct` (about 130s on the Linux CI
+  # leg) is queued behind the whole cheap-suites invocation, and it was the
+  # last entry of that invocation to finish in all 22 Linux CI runs sampled
+  # in 2026-11. Started with the eunit shards, it overlaps them instead.
   test('gateway ct',
     _python3,
     args: [_gw_test_script, _gw_src, 'ct'],
     suite: 'gateway',
     timeout: 600,
-    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct', 'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
+    priority: 120,
+    env: {'REBAR_BASE_DIR': _gw_src / '_build_ct',
+          'YUZU_GATEWAY_TEST_LOG_DIR': meson.project_build_root() / 'meson-logs',
+          'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin},
   )
   message('Erlang gateway: enabled, ' + _gw_otp_desc)
+  if get_option('build_contract_tests')
+    # Direct Meson runs share the caller's REBAR_BASE_DIR. Serialize these
+    # wrappers so their rebar compiles cannot rewrite the same BEAMs concurrently.
+    test('contract.GW-HB-RETRY-001', _python3,
+      args: [meson.project_source_root() / 'scripts/test/gateway-contract.py',
+             _gw_src, 'yuzu_gw_upstream_tests', 'heartbeat_retry_lifecycle_test_', '--id', 'GW-HB-RETRY-001'],
+      suite: 'contracts', timeout: 330, is_parallel: false,
+      env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin})
+    test('contract.GW-REGISTRY-OWNER-DOWN-001', _python3,
+      args: [meson.project_source_root() / 'scripts/test/gateway-contract.py',
+             _gw_src, 'yuzu_gw_registry_tests', 'registry_owner_down_lifecycle_test_', '--id', 'GW-REGISTRY-OWNER-DOWN-001'],
+      suite: 'contracts', timeout: 330, is_parallel: false,
+      env: {'YUZU_OTP_BIN': _gw_otp_bin, 'YUZU_OTP_VERSION': _gw_otp_pin})
+  endif
 else
   if get_option('require_gateway')
     # A skipped gateway is invisible: the build and every test leg stay green
@@ -822,8 +912,17 @@ if host_machine.system() == 'windows'
     _deploy_args += ['--debug']
   endif
 
-  # Run at configure time so a fresh setup has all DLLs immediately
-  run_command(_python3, _deploy_script, _deploy_args, check: false)
+  # Run at configure time so a fresh setup has all DLLs immediately. Not
+  # fatal here (plugins are not built yet, and the build-time target below
+  # runs again), but a copy that failed is reported instead of dropped.
+  _deploy_run = run_command(_python3, _deploy_script, _deploy_args, check: false)
+  if _deploy_run.returncode() != 0
+    warning('deploy_build_dlls.py failed at configure time; the build-time '
+            + 'deploy_dlls target will retry and fail the build if it still '
+            + 'cannot copy:\n' + _deploy_run.stderr())
+  elif _deploy_run.stderr().strip() != ''
+    message(_deploy_run.stderr().strip())
+  endif
 
   # Run at build time so rebuilt plugins are always copied to plugins/
   custom_target('deploy_dlls',

@@ -976,6 +976,104 @@ message GuaranteedStateRuleStatus {
 }
 ```
 
+The block above is the original sketch; the proto file is the source of truth for the
+fields. `GuaranteedStateEvent` fields 24 and 25, `boot_epoch` and `emit_seq`, carry the
+agent-asserted order of an event as the pair `(boot_epoch, emit_seq)`, compared
+lexicographically. They are ordinals, not timestamps: 0 means unset, and the agent sets
+both or neither. `boot_epoch` is claimed once at agent boot as the larger of the persisted
+counter plus one and the boot time in unix seconds, stored in the agent KV store under
+namespace `__guardian__`, key `meta:boot_epoch`; a stored value that cannot be parsed, or is
+at or above 2^62 - 1, is re-claimed from the clock and overwritten (the agent emits nonzero
+pairs again, which does not by itself restore order relative to epochs issued before the loss),
+and a KV failure leaves the epoch 0, so the pair is sent as 0/0. The agent logs one
+`Guardian boot_epoch claim` line per boot, which also prints `synchronous=` (expected 2, FULL;
+a lower level fails the claim). `emit_seq` is drawn from one
+source owned by the engine and shared by both emit paths: the legacy sink executor draws it
+at admission, under the executor lock, and the Spark runtime draws it when it enqueues an
+outbox entry. Entries re-sent from the lifecycle journal carry 0/0, because their original
+position is not journalled; DEX observations also carry 0/0. 0/0 means unordered, not oldest.
+The regime rule for a receiver: compare the pair when both sides carry one; hold an unpaired
+event against a paired verdict (refused, flagged, counted) while the agent's pair clock is
+fresh, and apply it by arrival, flagged, once the clock is stale; order two unpaired events by
+the census ordering key. A lower pair is a regression candidate, not proof of order: it is
+refused and flagged, and the receiver re-bases to it only after the stale window. A server
+that does not compare the pair ignores it and keeps ordering by the census ordering key.
+The server stores and counts the pair on the event and census rows and in the per-agent order
+row (schema v5, section 9), and decides the census verdict by it as the regime rule says. The
+agent's pair clock is fresh for one hour (database time) after an event of a higher epoch, or of
+a higher sequence in the live epoch, or a re-base, last advanced it. While it is fresh a lower
+epoch, a same-epoch lower sequence, an equal pair and an unpaired event against a paired verdict
+are refused and flag the row; once it is stale an event of a lower epoch, or of the live epoch
+with a sequence not above the highest seen, re-bases the clock and is applied by arrival, flagged
+(an equal pair is still refused as a duplicate), and a re-base to a lower epoch retires the former
+epoch so that its late events are refused (the fence is one slot and permanent: it ignores the
+clock's freshness, and a second re-base to a lower epoch replaces it). An unpaired event against a
+paired verdict, once the clock is stale, is applied by arrival, flagged, and does not move the
+clock. The two transitions between the regimes run in opposite directions and are fenced
+differently. Pair to key is fenced by the hold (fresh clock) and applies by arrival once the clock
+is stale. Key to pair is not fenced by the clock or by arrival: a paired event whose mode is a
+current-epoch one applies over a census row that holds no pair whatever the unpaired verdict's key
+or arrival, flagged (only a regression or a retired-epoch event is refused over it), so a late
+repair of an older paired event can replace a newer unpaired verdict. A pair far above any honest one (`emit_seq` of 2^40 or more, or a
+`boot_epoch` over ten years past receipt) is dropped at ingest like an out-of-range one and the
+event is judged as an unpaired event. The server owns the comparison and the recovery path for a pinned or lost epoch; the
+operator reading is in `docs/user-manual/guaranteed-state.md`, "Running the pair regime".
+Acceptance list for the server change: see the UP-14 entry in `docs/spark-flip-gate.md` and
+issue #5690.
+
+Known limits of the boot epoch:
+
+- If the KV row is wiped and the agent restarts within the same second as the previous boot,
+  the new epoch equals the previous one and `emit_seq` restarts at 1 (accepted by the UP-14
+  residual-acceptance ruling; the equal epoch is pinned by a test).
+- A single writer is enforced for processes that run this code (UP-9): the agent holds an
+  exclusive lock on `<data-dir>/guardian_boot_epoch.lock` (advisory `flock` on POSIX, an open
+  with share mode 0 on Windows) for the life of the process, waiting up to 5 s for a previous
+  process to exit. A process that cannot take it claims no epoch (`instance_lock_not_held`,
+  with `instance_lock=contended` or `failed`) and emits unordered 0/0 events instead of
+  colliding with the holder. The lock guards only the epoch claim, not the rest of the data
+  directory. Limits:
+  - it is a same-host guard;
+  - the 5 s wait is shorter than the agent's worst-case shutdown, so a restart that overlaps a
+    slow teardown runs unordered until its next restart;
+  - on Linux and macOS a lock file removed or replaced after the claim is not detected (it
+    needs write access to the data directory; a file replaced before the lock is detected and
+    re-locked); on Windows share mode 0 forbids removing the held file;
+  - on Windows any other program holding the file open (a backup or security product) is
+    reported as `contended` with `native_error=32`;
+  - a local principal that can open the file before the agent starts can hold it (POSIX: lock
+    it; Windows: keep it open) and leave the agent at 0/0 for that process lifetime (accepted:
+    the result is an unordered agent, not a wrong verdict: the server decides its events as unpaired events by the regime rule above, it shows in `unordered_agents`, and the agent logs `contended`; on POSIX
+    the requested mode 0600 limits this to the agent's account and root unless the mode was
+    changed or the file already existed with a looser one; on Windows it depends on the data
+    directory ACL, which was not measured);
+  - a file system that does not support the lock, or a lock file the agent's account cannot
+    open, is `failed`.
+
+  The recovery is a restart with the cause fixed; the process does not retry.
+- A clock wrongly ahead at boot pins the epoch ahead, and it does not self-heal because the
+  claim tracks the persisted value rather than the clock. A burst of restarts or a crash loop
+  within the same second also pushes the epoch ahead of a correct clock until the clock catches
+  up (n boots in one second give clock + n - 1). A lost or corrupt row after such a pin
+  re-claims from the clock and can land below epochs already issued. A deleted or
+  restored-from-backup `kv_store.db` likewise loses the ordering history; restoring an older
+  copy is normally safe because the clock term wins, unless the agent restarted repeatedly
+  within a few seconds before the restore or the epoch had been pinned ahead of the clock. A VM
+  memory-snapshot revert continues with the same epoch and a lower `emit_seq` and involves no
+  boot, so no claim runs.
+- An agent whose epoch claim fails (no store, a read or write failure, a store that reports a
+  `PRAGMA synchronous` level below FULL (outcome `durability_below_full`, not expected for the
+  agent's own store, which sets FULL at open; an unreadable pragma is `read_failed`), a clock reading at or above the 2^62 ceiling, or the data-directory lock not held (`instance_lock_not_held`)) sends the pair as 0/0 for the whole process lifetime, and the server decides its
+  events as unpaired events by the regime rule above. This is visible as an error-level
+  `Guardian boot_epoch claim` log line on the agent and, on the server, in `unordered_agents` (an
+  agent whose first deliveries all fail the per-agent order step is the one exception, see the
+  Guaranteed State guide, "Running the pair regime").
+- Events replayed from the lifecycle journal carry 0/0, so a replayed event is not
+  byte-identical to its live original in fields 24 and 25.
+- The pair is agent-asserted and not authenticated: a local administrator or a compromised
+  agent can set any epoch, for that agent's own events only, provided the server keys
+  ordering per agent.
+
 ### 7.2 Wire integration
 
 Uses existing `CommandRequest` with reserved plugin name `__guard__`:
@@ -1210,6 +1308,26 @@ CREATE INDEX idx_gars_rule ON guardian_agent_rule_status(rule_id);
 -- event, 0 = unusable key); proj_key_capped BOOLEAN; projection_pending BOOLEAN. The partial
 -- index idx_gse_pending ON (rule_id, agent_id) WHERE projection_pending serves the pair lock,
 -- the readers and delete_rule.
+
+-- schema v5 (UP-14, #5690): guaranteed_state_events and guardian_agent_rule_status each gain
+-- boot_epoch BIGINT and emit_seq BIGINT (both NULL = unpaired; no default, no backfill), and the
+-- per-agent order table is added. kV5Ddl in guaranteed_state_store.cpp is the authoritative text.
+CREATE TABLE guardian_agent_order (
+    agent_id          TEXT NOT NULL,
+    epoch             BIGINT,
+    emit_seq_hwm      BIGINT,
+    epoch_recv_ns     BIGINT,
+    retired_epoch     BIGINT,
+    unpaired_recv_ns  BIGINT,
+    unpaired_events   BIGINT NOT NULL DEFAULT 0,
+    unpaired_held     BIGINT NOT NULL DEFAULT 0,
+    pair_regressions  BIGINT NOT NULL DEFAULT 0,
+    pair_stragglers   BIGINT NOT NULL DEFAULT 0,
+    pair_recoveries   BIGINT NOT NULL DEFAULT 0,
+    pair_duplicates   BIGINT NOT NULL DEFAULT 0,
+    retired_events    BIGINT NOT NULL DEFAULT 0,
+    CONSTRAINT guardian_agent_order_pkey PRIMARY KEY (agent_id)
+) WITH (fillfactor = 70);
 ```
 
 The census row is written in the same transaction as the event that causes it, under its own
@@ -1220,15 +1338,32 @@ ordering tuple `(key, ingest_seq)`, the key being the agent stamp limited to rec
 exception: a later arrival with a usable key below the high-water mark takes the row once the mark has been
 stale for an hour of database time); an event whose
 census write failed stays stored with `projection_pending`, and a redelivery of it repairs the census from its
-stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Under one `census_upsert`
-savepoint a writer locks every pending event of the pair in `ingest_seq` order in one statement, then the census
-row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
+stored ordering inputs. `order_uncertain` is sticky and disclosed on every read. Schema v5 (UP-14) stores the
+event's `(boot_epoch, emit_seq)` pair on the event row and the census row (NULL when
+unpaired), adds the per-agent table `guardian_agent_order`, and rejects a half-set or
+out-of-range or implausible pair at ingest as unpaired, counted; the census
+verdict is decided by the pair so stored (see section 7.1). A census-bearing first delivery locks the agent's order row first, in its own
+savepoint (a repair runs no such step: it takes the order row `FOR SHARE` to read the pair clock and never writes the clock or a counter). Under one `census_upsert`
+savepoint a writer then locks every pending event of the pair in `ingest_seq` order in one
+statement, then the census row; `delete_rule` locks the rule's pending events the same way before it retires them and deletes the rule. The
 event-row waits of single-event ingest, repair and `delete_rule` are acyclic; the batch path (no production
 caller) carries no such guarantee. Every census read that returns per-pair state, or a rollup of it, discloses
-`order_uncertain` and `projection_pending` (or `uncertain_rules`), with one named exception: the device-compliance
-read covers represented pairs only and does not yet report them. A pending event whose pair has no census row is
-visible only on `yuzu_server_guardian_census_pending_events`. See the user manual's Compliance overview for the
-operator-facing contract.
+`order_uncertain` and `projection_pending` (or `uncertain_rules`); the device-compliance read, which was the one
+named exception, now reports the two flags per guard and an `uncertain_guards` rollup (#7217). A pending event
+whose pair has no census row has no row to carry the flags: both per-device reads (device-compliance and the
+all-guards read) report such pairs as `unrepresented_pending_guards` and a bounded `unrepresented_pending_rule_ids`
+list (first 50 in ascending byte order of the rule id; the ids are agent-reported identifiers), and they are also
+counted on `yuzu_server_guardian_census_pending_events`. The count is read before the census rows and the two are
+non-atomic observations: a pair repaired between them can appear in both the guards list and the unrepresented list
+for one request, never in neither. The count read runs under a 5 s statement timeout; its expiry (most likely a large
+retained pending backlog; a lock wait, a loaded database or an administrator cancel is reported the same way) is a non-transient failure, reported separately from an ordinary store degrade and counted on the
+`guardian_census_device` source of `yuzu_server_guardian_read_degrade_total`. See the user manual's Compliance
+overview for the operator-facing contract. A device decommission (the ninth agent-decommission cascade store, key
+`guaranteed_state`, #5675), for one agent and in one transaction, deletes the agent's `guardian_agent_order` row first (the
+row a census-bearing first delivery also takes first; no other lock is added and it takes no rule row), then locks the agent's
+pending events in `ingest_seq` order and sets `projection_pending` false on them, then deletes the agent's census rows;
+the event log and DEX observations are not erased by it and expire by retention (30 days by default; rows written while the retention setting is 0 or below never expire),
+so the erasure is partial.
 
 ### 9.2 REST API endpoints
 
@@ -1602,7 +1737,7 @@ The worst-case race is: the guard fires between steps 2 and 3 (SQLite updated, p
 
 **Why instructions that update Guardian, not direct policy edits:** Policy modifications go through the two-person approval flow, which adds delay during an active incident. Instructions are faster (separate approval tier system), but by routing them through GuardianEngine's desired state, the instruction never bypasses enforcement. The instruction is the delivery mechanism; Guardian is always the enforcer.
 
-**Quarantine is a terminal state** — once activated, it persists until an administrator explicitly lifts it. The agent does not auto-unquarantine even if the underlying rule becomes compliant, because quarantine typically indicates a sustained compromise attempt that warrants human investigation.
+**Quarantine is a terminal state** — once activated, it persists until an administrator explicitly lifts it. The agent does not auto-release even if the underlying rule becomes compliant, because quarantine typically indicates a sustained compromise attempt that warrants human investigation.
 
 **Audit:** Quarantine activation and deactivation are `critical` severity audit events. Exception additions and IP re-resolution updates are `high` severity events.
 
@@ -2721,7 +2856,16 @@ Guardian ladder must check these.
   KV seed read (empty, before the write) and attach_core's staged read (empty,
   after the erase), and neither read would see it. Do not replace either piece
   with a bare earlier drain. Lock order `mtx_` -> `persist_mu_` -> `registry_mu_`;
-  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. Because every
+  the worker takes `persist_mu_` -> `registry_mu_` and never `mtx_`. (#5605) The
+  heartbeat reads the CURRENT unpersisted backlog without any of those three locks: the
+  runtime mirrors `staged_baselines_.size()` into the atomic `staged_baseline_count_`
+  (written only under `registry_mu_`, by `store(size())` at the two sites that change the
+  size; a mismatch found when a snapshot or an erase runs is repaired there by the same
+  `store(size())` under `registry_mu_`, counted and logged once, and never aborts the
+  agent), which the persister co-owns by `shared_ptr` and reads relaxed through
+  `pending_captures()`, reached via the atomic `baseline_persister_published_` (a
+  `rollback_spark_wiring_locked` unpublishes that pointer, leaving the persister object
+  alive, so a failed wiring reads as no persister and never as a live zero). Because every
   pass is budgeted, a Worker pass yields, and the worker backs off after a failed
   pass (5 s doubling to 60 s; `apply_rules` and `stop()` ignore the backoff), a
   seed fence waits for ONE in-flight write behind a Worker pass and for at most
@@ -2876,12 +3020,18 @@ Guardian ladder must check these.
   deliberate fail-open (the rule keeps its in-memory baseline): the capture stays
   staged and is retried, counted, error-logged, and exported on the sparse
   heartbeat tag `yuzu.guardian_baseline_persist_failures` (Spark path only,
-  cumulative, readable from the per-agent heartbeat only: no server gauge exists,
-  so the agent error log is the primary signal), never silent. The tag counts
+  cumulative; the server rolls it up into the monitor-only fleet gauge
+  `yuzu_fleet_guardian_baseline_persist_failures` (#5605), and the CURRENT backlog is the
+  separate heartbeat tag `yuzu.guardian_baseline_unpersisted` with its own gauge and the
+  `YuzuGuardianBaselineUnpersisted` warning alert; the agent error log remains the
+  per-incident evidence, and a legacy-path persist failure is logged and counted nowhere),
+  never silent. The tag counts
   failed persist passes, firewalled throws, each failed ATTEMPT to stage a capture
   (an allocation failure) or capture displaced from staging (a retarget over a
-  still-unpersisted capture) and a capture staged with no KV store (logged once,
-  kept). Stop-time losses that are NOT counted: a stop flush that ran out of its wall
+  still-unpersisted capture) and, as defence in depth that production cannot reach (an
+  engine without a KV store arms no rule, so nothing is staged; only a test exercises it), a
+  capture staged with no KV store (logged once, kept). Stop-time losses that are NOT counted:
+  a stop flush that ran out of its wall
   budget with captures left, and one skipped (it started 18 s or more after the mark and this
   stop had shown a slow store: a slow failed write or a stage that ran slow), each logged with
   its own
@@ -3015,7 +3165,7 @@ heartbeat tags unless noted (sparse-emit: a zero counter ships no tag; writer
 |---|---|---|---|
 | stage-drop | `pending_journal_` reserve exhausted under sustained write failure | `stage_dropped` | integrity gap, alert |
 | stage-failure | a disarm record could not be built after the rule was already torn down | `stage_failures` | integrity gap, alert |
-| field rejection | NUL / oversized / non-UTF-8 field kept a record out of the journal | `field_rejected` | integrity gap, alert |
+| field rejection | NUL / oversized / non-UTF-8 field or empty rule_id kept a record out of the journal | `field_rejected` | integrity gap, alert |
 | skewed-clock reject | normalized event timestamp floors to `seconds <= 0` (would replay as server-receipt-now and false-conflict) | `clock_rejected` | integrity gap, alert |
 | write failure | a `set()` failed; per-push circuit-broken, retried by the maintenance tick | `write_failures` | integrity gap, alert |
 | write-capacity reject | a new batch refused because the journal is at its byte/count cap | `write_capacity_rejected` | integrity gap, alert (UP-1) |

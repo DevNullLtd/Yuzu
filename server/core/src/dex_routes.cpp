@@ -2,6 +2,8 @@
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
+#include "dex_apps_ui.hpp"
+#include "dex_pane.hpp"
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
@@ -21,6 +23,7 @@
 #include <string_view>
 #include <vector>
 
+#include <spdlog/spdlog.h>
 #include <yuzu/version_string.hpp> // canon_version — the perf trend's `version` filter
                                    // must match the SAME canonical key the store filters on
 
@@ -54,6 +57,11 @@ std::string esc(const std::string& s) {
     }
     return out;
 }
+
+// Text-node twin of `esc` for an agent-reported or stored name: bidirectional-control and zero-width
+// characters print as visible `<U+XXXX>` markers. Used ONLY where the value is printed as text; every
+// attribute value keeps `esc`, because the browser sends such values back (#7535).
+std::string esc_text(const std::string& s) { return html_escape_marked(s); }
 
 std::string num(int64_t n) { return std::to_string(n); }
 
@@ -232,8 +240,7 @@ bool valid_tag_key(const std::string& key) {
 // page mount. htmx core attrs only (CSP-safe; no hx-on). `disp` is already
 // html-escaped; `qs` is the already-encoded query string.
 std::string drill_link(const std::string& path, const std::string& qs, const std::string& disp) {
-    return "<a hx-get=\"" + path + "?" + qs + "\" hx-target=\"#guardian-detail\" "
-           "hx-swap=\"innerHTML\" style=\"cursor:pointer;\">" + disp + "</a>";
+    return dex_pane_link(path + "?" + qs, disp);
 }
 
 // A stat tile. `n`/`sx` callers pass already-escaped content.
@@ -251,9 +258,7 @@ std::string mk_tile(const char* cls, const std::string& n, const std::string& la
 // from (drill-downs are window-scoped; governance C-S1/UP-11).
 std::string back_to_overview(const std::string& window) {
     const std::string qs = window.empty() ? std::string{} : "?window=" + window;
-    return "<a class=\"gp-back\" hx-get=\"/fragments/dex/overview" + qs +
-           "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\" "
-           "style=\"cursor:pointer;\">&larr; Reliability overview</a>";
+    return dex_pane_link("/fragments/dex/overview" + qs, "&larr; Reliability overview", "gp-back");
 }
 
 // ISO-8601 UTC cutoff for "N days ago" / the window→day-count map — the REAL
@@ -367,10 +372,10 @@ std::string history_detail(const GuardianObservationRow& r) {
     if (r.obs_type == "os.boot" && r.metric > 0)
         return esc(fmt_ms(r.metric));
     if (!r.symbolic.empty() && !r.reason.empty() && r.symbolic != r.reason)
-        return esc(r.symbolic + " " + r.reason);
+        return esc_text(r.symbolic + " " + r.reason);
     if (!r.symbolic.empty())
-        return esc(r.symbolic);
-    return esc(r.reason);
+        return esc_text(r.symbolic);
+    return esc_text(r.reason);
 }
 
 } // namespace
@@ -402,8 +407,17 @@ input.dx-ctl{min-width:220px}
 .dx-cols{display:grid;grid-template-columns:repeat(auto-fit,minmax(min(420px,100%),1fr));gap:22px;align-items:start}
 .dx-in{margin:12px -16px -14px;border-width:1px 0 0;border-radius:0}
 .dx-sechl{display:flex;align-items:baseline;gap:10px}
-.dx-sechl a{margin-left:auto;color:var(--primary);font-size:13px;font-weight:500;cursor:pointer}
-.dx-sechl a:hover{text-decoration:underline}
+.dx-sechl :is(a,.dx-lk){margin-left:auto;color:var(--primary);font-size:13px;font-weight:500;cursor:pointer}
+.dx-sechl :is(a,.dx-lk):hover{text-decoration:underline}
+:where(button.dx-lk,.gp-subnav button){all:unset}
+:where(.dx-lk){cursor:pointer;color:var(--primary)}
+.gp-subnav button{padding:8px 14px;font-weight:500;color:var(--mut);cursor:pointer;border-bottom:2px solid transparent;margin-bottom:-1px}
+.gp-subnav button:hover{color:var(--ink)}
+.gp-subnav button.on{color:var(--ink);font-weight:600;border-bottom-color:var(--hl)}
+.gp-table .dx-lk:not(.gp-mute){color:var(--ink);font-weight:600}
+.gp-table .dx-lk:not(.gp-mute):hover{color:var(--primary-h)}
+button.gp-chip{line-height:inherit;font-variant-numeric:inherit}
+.gp-chip:focus-visible,.dx-lk:focus-visible,.gp-subnav button:focus-visible{outline:2px solid var(--focus);outline-offset:2px}
 .gp-stack>span{background:var(--c4)}
 .gp-stack>.health{background:var(--line2);color:var(--ink)}
 .gp-ded .bar.zero{background:var(--line2)}
@@ -458,7 +472,7 @@ std::string dex_fragment_style() {
 }
 
 // Shared DEX sub-nav (Overview · Apps · Catalogue · Health score · Trends ·
-// Performance · App Performance · Network · Alerts). htmx core attrs into the page mount —
+// Performance · App Performance · Network · Scoring · Alerts). htmx core attrs into the page mount —
 // CSP-safe (no hx-on). The Network tab loads the /fragments/network/* renderers
 // (network_ui.cpp), which render this same sub-nav with "network" active — so
 // Network sits UNDER DEX rather than as its own top-level nav item. The network
@@ -470,9 +484,7 @@ std::string dex_fragment_style() {
 std::string dex_subnav(const std::string& active, int window_days) {
     const std::string w = dex_window_token(window_days);
     auto tab = [&](const char* id, const char* label, const char* frag) {
-        const std::string on = (active == id) ? " class=\"on\"" : "";
-        return "<a" + on + " hx-get=\"" + frag + "?window=" + w +
-               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        return dex_pane_tab(std::string(frag) + "?window=" + w, label, active == id);
     };
     return dex_fragment_style() + "<div class=\"gp-subnav\">" +
            tab("overview", "Overview", "/fragments/dex/overview") +
@@ -485,7 +497,8 @@ std::string dex_subnav(const std::string& active, int window_days) {
            tab("network", "Network", "/fragments/network/overview") +
            // Rendered statically for every viewer: no capability probe here (each
            // failed probe would write a denied audit row per sub-nav render). The
-           // Alerts fragment itself shows the Administrator-role note.
+           // Scoring and Alerts fragments themselves show their own permission note.
+           tab("scoring", "Scoring", "/fragments/dex/scoring") +
            tab("alerts", "Alerts", "/fragments/dex/alerts") + "</div>";
 }
 
@@ -493,9 +506,7 @@ std::string dex_subnav(const std::string& active, int window_days) {
 std::string dex_window_chips(const char* frag, int window_days) {
     const std::string cur = dex_window_token(window_days);
     auto chip = [&](const char* w, const char* label) {
-        const std::string on = (cur == w) ? " on" : "";
-        return "<a class=\"gp-chip" + on + "\" hx-get=\"" + frag + "?window=" + w +
-               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        return dex_pane_chip(std::string(frag) + "?window=" + w, label, cur == w);
     };
     return "<div class=\"gp-filters\">" + chip("24h", "24h") + chip("7d", "7d") +
            chip("30d", "30d") + chip("all", "All") + "</div>";
@@ -588,10 +599,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
     // OS filter (Catalogue-style, shared with the device/overview surfaces).
     {
         auto chip = [&](const char* val, const char* label) {
-            const std::string on = (osf == val) ? " on" : "";
-            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/catalogue?window=" + w +
-                   "&os=" + val + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
-                   label + "</a>";
+            return dex_pane_chip("/fragments/dex/catalogue?window=" + w + "&os=" + val, label, osf == val);
         };
         h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">OS</span>" +
              chip("all", "All connected") + chip("windows", "Windows") + chip("linux", "Linux") +
@@ -615,8 +623,7 @@ std::string render_dex_catalogue_fragment(const GuaranteedStateStore* store,
             score < 0 ? "" : (score >= 90 ? "ok" : (score >= 75 ? "warn" : "bad"));
         h += "<a class=\"gp-fcard" + std::string(dark ? " quiet" : "") +
              "\" hx-get=\"/fragments/dex/catalogue/group?name=" + url_encode(g.name) +
-             "&window=" + w + "&os=" + osf +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
+             "&window=" + w + "&os=" + osf + "\"" + std::string(kDexPaneSwapAttrs) + ">";
         h += "<div class=\"fn\">" + esc(g.name) + "<span class=\"cnt\">" + num(mon) + " of " +
              num(static_cast<int64_t>(g.types.size())) + " monitored</span></div>";
         // UP-8: three distinct states, not two. `dark` = the family is not
@@ -795,8 +802,8 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
 
     std::string h;
     // Back-link carries the OS lens so the grid restores it (filter persists on drill).
-    h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w + "&os=" + osf +
-         "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; All families</a>";
+    h += dex_pane_link("/fragments/dex/catalogue?window=" + w + "&os=" + osf, "&larr; All families",
+                       "gp-back");
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(group_name) +
          "</h1></div><div class=\"gp-sub\"><b>" + num(mon) + "</b> of " +
@@ -810,10 +817,9 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
     // filter both persists AND is changeable in place.
     {
         auto chip = [&](const char* val, const char* label) {
-            const std::string on = (osf == val) ? " on" : "";
-            return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/catalogue/group?name=" +
-                   url_encode(group_name) + "&window=" + w + "&os=" + val +
-                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+            return dex_pane_chip("/fragments/dex/catalogue/group?name=" + url_encode(group_name) +
+                                     "&window=" + w + "&os=" + val,
+                                 label, osf == val);
         };
         h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">OS</span>" +
              chip("all", "All connected") + chip("windows", "Windows") + chip("linux", "Linux") +
@@ -857,8 +863,8 @@ std::string render_dex_catalogue_group_fragment(const GuaranteedStateStore* stor
         // Every row drills into the per-signal-type view (View 3), carrying the OS
         // lens so View3's back-link restores the filtered family.
         const std::string drill = " hx-get=\"/fragments/dex/catalogue/signal?type=" +
-                                  url_encode(t) + "&window=" + w + "&os=" + osf +
-                                  "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\"";
+                                  url_encode(t) + "&window=" + w + "&os=" + osf + "\"" +
+                                  std::string(kDexPaneSwapAttrs);
         const std::string cov =
             mon_t ? "<span class=\"gp-pill dep\">monitored</span> <span class=\"gp-mute\">" +
                         esc(coverage_label(t)) + "</span>"
@@ -974,13 +980,12 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
 
     std::string h;
     if (family)
-        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue/group?name=" +
-             url_encode(family) + "&window=" + w + "&os=" + osf +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; " + esc(family) +
-             "</a>";
+        h += dex_pane_link("/fragments/dex/catalogue/group?name=" + url_encode(family) +
+                               "&window=" + w + "&os=" + osf,
+                           "&larr; " + esc(family), "gp-back");
     else
-        h += "<a class=\"gp-back\" hx-get=\"/fragments/dex/catalogue?window=" + w + "&os=" + osf +
-             "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">&larr; Catalogue</a>";
+        h += dex_pane_link("/fragments/dex/catalogue?window=" + w + "&os=" + osf, "&larr; Catalogue",
+                           "gp-back");
     h += dex_subnav("catalogue", window_days);
     h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + dex_signal_label(obs_type) +
          " <span class=\"dx-code\">" +
@@ -1018,7 +1023,7 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
         h += "<table class=\"gp-table\"><thead><tr><th>Subject</th><th class=\"gp-num\">Events</th>"
              "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
         for (const auto& s : subjects)
-            h += "<tr><td>" + esc(s.subject) + "</td><td class=\"gp-num\">" + num(s.count) +
+            h += "<tr><td>" + esc_text(s.subject) + "</td><td class=\"gp-num\">" + num(s.count) +
                  "</td><td class=\"gp-num\">" + num(s.distinct_devices) + "</td><td class=\"gp-mute\">" +
                  esc(s.last_seen) + "</td></tr>";
         h += "</tbody></table>";
@@ -1049,7 +1054,7 @@ std::string render_dex_catalogue_signal_fragment(const GuaranteedStateStore* sto
         for (const auto& d : devices) {
             if (visible && !visible->count(d.agent_id))
                 continue; // out-of-scope device — don't enumerate its id to this operator
-            h += "<tr><td>" + esc(d.agent_id) + "</td><td class=\"gp-num\">" + num(d.crashes) +
+            h += "<tr><td>" + esc_text(d.agent_id) + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
         }
         h += "</tbody></table>";
@@ -1150,10 +1155,7 @@ std::string render_dex_health_fragment(const GuaranteedStateStore* store, const 
          num(N) + "</b> reporting agents. Disarmed + offline are excluded, not scored healthy "
          "&mdash; unknown, not 100.</div>";
     auto pchip = [&](const char* p, const char* label) {
-        const std::string on = (preset == p) ? " on" : "";
-        return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/health?window=" + w +
-               "&weighting=" + p + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" +
-               label + "</a>";
+        return dex_pane_chip("/fragments/dex/health?window=" + w + "&weighting=" + p, label, preset == p);
     };
     h += "<div class=\"gp-filters\"><span class=\"dx-lbl\">weighting:"
          "</span>" + pchip("default", "Default") + pchip("stability", "Stability") +
@@ -1412,9 +1414,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                             : window_days == 0  ? "all"
                                                 : "7d";
     auto chip = [&](const char* w, const char* label) {
-        const std::string on = (cur == w) ? " on" : "";
-        return "<a class=\"gp-chip" + on + "\" hx-get=\"/fragments/dex/overview?window=" + w +
-               "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + label + "</a>";
+        return dex_pane_chip(std::string("/fragments/dex/overview?window=") + w, label, cur == w);
     };
     std::string head;
     head += "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
@@ -1607,8 +1607,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                                            : seg_os[i] == "macos"   ? "macos"
                                                                     : "all";
                 h += "<a class=\"gp-fcard\" hx-get=\"/fragments/hardware/list?os=" +
-                     url_encode(hw_os) +
-                     "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">";
+                     url_encode(hw_os) + "\"" + std::string(kDexPaneSwapAttrs) + ">";
                 h += "<div class=\"fn\">" + oslbl(seg_os[i]) + "<span class=\"cnt\">" +
                      num(seg_n[i]) + " device(s)</span></div>";
                 h += "<div class=\"fev " + std::string(ft) + "\">" +
@@ -1682,7 +1681,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
         auto xcard = [&](const char* frag, const std::string& title, const std::string& big,
                          const char* bigcls, const std::string& desc) {
             return "<a class=\"gp-fcard\" hx-get=\"" + std::string(frag) + "?window=" + cur +
-                   "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\"><div class=\"fn\">" +
+                   "\"" + std::string(kDexPaneSwapAttrs) + "><div class=\"fn\">" +
                    title + "<span class=\"cnt\">open &rarr;</span></div><div class=\"fev " +
                    std::string(bigcls) + "\">" + big + "</div><div class=\"ftop\">" + desc +
                    "</div></a>";
@@ -1723,8 +1722,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
     // 16KB page-shell literal untouched.
     auto sech_link = [&](const std::string& title, const std::string& url,
                          const std::string& cta) {
-        return "<div class=\"gp-sech dx-sechl\">" + title + " <a hx-get=\"" + url + "\" hx-target=\"#guardian-detail\" hx-swap=\"innerHTML\">" + cta +
-               "</a></div>";
+        return "<div class=\"gp-sech dx-sechl\">" + title + " " + dex_pane_link(url, cta) + "</div>";
     };
 
     // ── Crashes per day (compact trend) — inline bars, no extra shell CSS. ──
@@ -1770,7 +1768,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                     ? std::string("&lt;unknown&gt;")
                     : drill_link("/fragments/dex/app",
                                  "name=" + url_encode(a.subject) + "&window=" + cur,
-                                 esc(a.subject));
+                                 esc_text(a.subject));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(a.crashes) +
                  "</td><td class=\"gp-num\">" + num(a.hangs) + "</td><td class=\"gp-num\">" +
                  num(a.distinct_devices) + "</td><td class=\"gp-mute\">" + esc(a.last_seen) +
@@ -1798,7 +1796,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
                 continue; // out-of-scope device — don't enumerate its id to this operator
             const std::string label = drill_link("/fragments/dex/device",
                                                  "id=" + url_encode(d.agent_id) + "&window=" + cur,
-                                                 esc(d.agent_id));
+                                                 esc_text(d.agent_id));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
         }
@@ -1819,7 +1817,7 @@ std::string render_dex_overview_fragment(const GuaranteedStateStore* store,
             return "macOS";
         if (p == "linux")
             return "Linux";
-        return p.empty() ? std::string("&lt;unknown&gt;") : esc(p);
+        return p.empty() ? std::string("&lt;unknown&gt;") : esc_text(p);
     };
     h += sech_link("By operating system", "/fragments/dex/trends?window=" + cur,
                    "full cross-OS &amp; trends &rarr;");
@@ -1869,13 +1867,15 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
     // Window-scoped to match the overview row that linked here (C-S1/UP-11): the
     // token (e.g. "7d") resolves to the same `since` cutoff the overview used.
     const std::string since = iso_days_ago(window_to_days(window));
+    // The back and drill links are text-link buttons: the shared style block rides in this
+    // fragment (a pane swap drops the previous one), on every return path.
+    const std::string head = dex_fragment_style() + back_to_overview(window);
     if (!store)
-        return back_to_overview(window) +
-               placeholder("Reliability data unavailable", "The signal store is not open.");
+        return head + placeholder("Reliability data unavailable", "The signal store is not open.");
 
     const auto s = store->dex_app_summary(process_name, since);
-    std::string h = back_to_overview(window);
-    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(process_name) +
+    std::string h = head;
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(process_name) +
          "</h1></div><div class=\"gp-sub\">Crash &amp; hang blast radius across the "
          "fleet.</div></div></div>";
     // Cross-link to the per-version performance trend — same process-image key
@@ -1914,7 +1914,7 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
              "<th class=\"gp-num\">Crashes</th></tr></thead><tbody>";
         for (const auto& m : modules) {
             const std::string label =
-                m.component.empty() ? std::string("&lt;unknown&gt;") : esc(m.component);
+                m.component.empty() ? std::string("&lt;unknown&gt;") : esc_text(m.component);
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(m.crashes) + "</td></tr>";
         }
         h += "</tbody></table>";
@@ -1927,7 +1927,7 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
         h += "<table class=\"gp-table\"><thead><tr><th>Code</th><th>Name</th>"
              "<th class=\"gp-num\">Crashes</th></tr></thead><tbody>";
         for (const auto& e : exceptions) {
-            h += "<tr><td>" + esc(e.reason) + "</td><td>" + esc(e.symbolic) +
+            h += "<tr><td>" + esc_text(e.reason) + "</td><td>" + esc_text(e.symbolic) +
                  "</td><td class=\"gp-num\">" + num(e.crashes) + "</td></tr>";
         }
         h += "</tbody></table>";
@@ -1944,7 +1944,7 @@ std::string render_dex_app_fragment(const GuaranteedStateStore* store,
                 continue; // out-of-scope device — don't enumerate its id to this operator
             const std::string label =
                 drill_link("/fragments/dex/device",
-                           "id=" + url_encode(d.agent_id) + "&window=" + window, esc(d.agent_id));
+                           "id=" + url_encode(d.agent_id) + "&window=" + window, esc_text(d.agent_id));
             h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(d.crashes) +
                  "</td><td class=\"gp-mute\">" + esc(d.last_seen) + "</td></tr>";
         }
@@ -1961,9 +1961,12 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
     // open audit-logged (dex.device.view) — without an on-page banner.
     // Window-scoped to match the linking overview row (C-S1/UP-11).
     const std::string since = iso_days_ago(window_to_days(window));
+    // The back link is a text-link button: the shared style block rides in this fragment (a pane
+    // swap drops the previous one), on every return path. The page also hosts the click-to-load
+    // perf panels (dx-perfrow / dx-strips).
+    const std::string head = dex_fragment_style() + back_to_overview(window);
     if (!store)
-        return back_to_overview(window) +
-               placeholder("Reliability data unavailable", "The signal store is not open.");
+        return head + placeholder("Reliability data unavailable", "The signal store is not open.");
 
     // A4: click-to-load device perf panel. Deliberately NOT auto-loaded: the
     // route behind the hx-get dispatches a real echo.sql to the device AND
@@ -2016,9 +2019,8 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
         "usage-class, audited</span></div>";
 
     const auto s = store->dex_device_summary(agent_id, since);
-    // The device page hosts the click-to-load perf panels (dx-perfrow / dx-strips).
-    std::string h = dex_fragment_style() + back_to_overview(window);
-    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc(agent_id) +
+    std::string h = head;
+    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>" + esc_text(agent_id) +
          "</h1></div><div class=\"gp-sub\">Device signal history.</div></div></div>";
     if (s.signals == 0)
         return h + placeholder("No signals", "No reliability signals recorded for this device.") +
@@ -2046,8 +2048,8 @@ std::string render_dex_device_fragment(const GuaranteedStateStore* store,
              url_encode(agent_id) + "&amp;event_id=" + url_encode(r.event_id) +
              "\" hx-target=\"#dex-obs-detail\" hx-swap=\"innerHTML\">"
              "<td class=\"gp-mute\">" + esc(r.observed_at) + "</td><td>" +
-             dex_signal_label(r.obs_type) + "</td><td>" + esc(r.subject) +
-             "</td><td class=\"gp-drift\">" + history_detail(r) + "</td><td>" + esc(r.component) +
+             dex_signal_label(r.obs_type) + "</td><td>" + esc_text(r.subject) +
+             "</td><td class=\"gp-drift\">" + history_detail(r) + "</td><td>" + esc_text(r.component) +
              "</td></tr>";
     }
     h += "</tbody></table>";
@@ -2068,7 +2070,7 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
     h += "<div class=\"gp-spec\">";
     auto row = [&](const char* k, const std::string& v) {
         h += "<span class=\"k\">" + std::string(k) + "</span><code>" +
-             (v.empty() ? std::string("&mdash;") : esc(v)) + "</code>";
+             (v.empty() ? std::string("&mdash;") : esc_text(v)) + "</code>";
     };
     row("When", r.observed_at);
     row("Subject", r.subject);
@@ -2080,43 +2082,6 @@ std::string render_dex_observation_fragment(const GuardianObservationRow& r) {
     row("Platform", r.platform);
     row("Event id", r.event_id);
     h += "</div>";
-    return h;
-}
-
-std::string render_dex_apps_fragment(const GuaranteedStateStore* store, const std::string& since,
-                                     int window_days) {
-    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
-    h += dex_subnav("apps", window_days);
-    h += "<div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
-         "<div class=\"gp-sub\">Stability per application across the fleet &mdash; crashes &amp; "
-         "hangs, keyed on the process image.</div></div></div>";
-    h += dex_window_chips("/fragments/dex/apps", window_days);
-    if (!store)
-        return h + placeholder("Apps unavailable", "The signal store is not open.");
-    const auto apps = store->dex_top_apps(since, 100);
-    if (apps.empty())
-        return h + placeholder("No data", "No app crashes or hangs recorded in this window.");
-    const std::string w = dex_window_token(window_days);
-    h += "<table class=\"gp-table\"><thead><tr><th>Application</th>"
-         "<th class=\"gp-num\">Crashes</th><th class=\"gp-num\">Hangs</th>"
-         "<th class=\"gp-num\">Devices</th><th>Last seen</th></tr></thead><tbody>";
-    for (const auto& a : apps) {
-        const std::string label =
-            a.subject.empty()
-                ? std::string("&lt;unknown&gt;")
-                : drill_link("/fragments/dex/app", "name=" + url_encode(a.subject) + "&window=" + w,
-                             esc(a.subject));
-        h += "<tr><td>" + label + "</td><td class=\"gp-num\">" + num(a.crashes) +
-             "</td><td class=\"gp-num\">" + num(a.hangs) + "</td><td class=\"gp-num\">" +
-             num(a.distinct_devices) + "</td><td class=\"gp-mute\">" + esc(a.last_seen) +
-             "</td></tr>";
-    }
-    h += "</tbody></table>";
-    h += "<div class=\"gp-note\">Stability by application (crashes + hangs). Devices = blast radius "
-         "(distinct devices); row &rarr; app detail, which cross-links to per-version CPU &amp; "
-         "memory performance. Repository / install / other reliability signals attribute to an app "
-         "once per-event app capture lands (Option&nbsp;D); per-version crash/hang counts on the "
-         "performance page remain a follow-on slice.</div>";
     return h;
 }
 
@@ -2541,11 +2506,44 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     sink.Get("/fragments/dex/apps", [this](const httplib::Request& req, httplib::Response& res) {
         if (!perm_fn_(req, res, "GuaranteedState", "Read"))
             return;
+        // Canonical window and platform only: the raw params never reach the API or the markup.
+        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
+        // permission keeps perm_fn_'s status.
         const int window_days =
             window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        const std::string since = iso_days_ago(window_days);
-        res.set_content(render_dex_apps_fragment(store_, since, window_days),
-                        "text/html; charset=utf-8");
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+        // Nothing escapes this handler: a throwing DexApi or renderer still answers 200 with a
+        // visible panel (htmx drops a 5xx body, which would leave the pane blank), and the cause is
+        // logged once per interval, never once per request.
+        const auto fail = [&](const char* reason, const std::string& what) {
+            if (apps_error_log_.should_warn(reason))
+                spdlog::error("GET /fragments/dex/apps: {} ({})", ::yuzu::log_key_token(what), reason);
+            DexAppsModel m;
+            m.degraded = true;
+            m.degraded_reason = reason;
+            return render_dex_apps_fragment(m, window_days, scope);
+        };
+        std::string html;
+        try {
+            if (!scope.empty() && !dex_api_) {
+                html = fail("not_wired", "no DexApi is wired for the Apps page");
+            } else {
+                DexAppsModel model;
+                if (scope.empty()) {
+                    model.degraded = true;
+                    model.degraded_reason = "invalid_scope";
+                } else {
+                    model = dex_api_->apps(dex_window_token(window_days), scope);
+                }
+                html = render_dex_apps_fragment(model, window_days, scope);
+            }
+        } catch (const std::exception& e) {
+            html = fail("internal_error", e.what());
+        } catch (...) {
+            html = fail("internal_error", "unknown exception");
+        }
+        res.set_content(html, "text/html; charset=utf-8");
     });
 
     // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --

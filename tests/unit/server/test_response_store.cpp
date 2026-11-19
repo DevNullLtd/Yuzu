@@ -24,7 +24,9 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <chrono>
 #include <cstdint>
+#include <ctime>
 #include <filesystem>
 #include <format>
 #include <fstream>
@@ -133,8 +135,9 @@ TEST_CASE("ResponseStore: bad-path constructor (unroutable DSN) is closed",
     // Reads degrade to nullopt; ingest/reap are silent no-ops.
     CHECK_FALSE(store.query("cmd-x", kAllRows).has_value());
     CHECK(store.total_count(kAllRows) == 0);
-    store.store(StoredResponse{}); // must not throw/crash
-    store.reap_expired();          // must not throw/crash
+    // Not persisted: no throw, and the caller is told.
+    CHECK(store.store(StoredResponse{}) == StoreOutcome::Failed);
+    store.reap_expired(); // must not throw/crash
 }
 
 TEST_CASE("ResponseStore: store and retrieve", "[pg][response_store]") {
@@ -783,6 +786,78 @@ TEST_CASE("ResponseStore: custom ttl_expires_at preserved", "[pg][response_store
     CHECK((*results)[0].ttl_expires_at == 999999);
 }
 
+// shorten_ttl (#7627): the quarantine reconciler's recurring status replies are kept for a day.
+TEST_CASE("ResponseStore: shorten_ttl lowers ttl_expires_at for that command and agent only, and never "
+          "raises an earlier expiry",
+          "[pg][response_store][shorten_ttl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/30);
+
+    const auto put = [&](const std::string& command, const std::string& agent, std::int64_t ttl = 0) {
+        StoredResponse resp;
+        resp.instruction_id = command;
+        resp.agent_id = agent;
+        resp.status = 1;
+        resp.output = "status|active";
+        resp.ttl_expires_at = ttl; // 0 = the default retention (30 days from now)
+        store.store(resp);
+    };
+    const auto ttl_of = [&](const std::string& command, const std::string& agent) {
+        auto rows = store.query(command, kAllRows, ResponseQuery{.agent_id = agent});
+        REQUIRE(rows.has_value());
+        REQUIRE(rows->size() == 1);
+        return rows->front().ttl_expires_at;
+    };
+    const std::int64_t before = static_cast<std::int64_t>(std::time(nullptr));
+    put("cmd-a", "agent-1");
+    put("cmd-a", "agent-2");
+    put("cmd-b", "agent-1");
+    put("cmd-early", "agent-1", /*ttl=*/before + 3600); // already expires in an hour
+    const auto thirty_days = before + 30 * 86400;
+    REQUIRE(ttl_of("cmd-a", "agent-1") >= thirty_days);
+
+    REQUIRE(store.shorten_ttl("cmd-a", "agent-1", std::chrono::hours(24)));
+    const std::int64_t after = static_cast<std::int64_t>(std::time(nullptr));
+    CHECK(ttl_of("cmd-a", "agent-1") >= before + 86400);
+    CHECK(ttl_of("cmd-a", "agent-1") <= after + 86400);
+    // the same command for another agent, and another command for the same agent, are untouched
+    CHECK(ttl_of("cmd-a", "agent-2") >= thirty_days);
+    CHECK(ttl_of("cmd-b", "agent-1") >= thirty_days);
+
+    // never raises: an expiry already earlier than the new one stays
+    REQUIRE(store.shorten_ttl("cmd-early", "agent-1", std::chrono::hours(24)));
+    CHECK(ttl_of("cmd-early", "agent-1") == before + 3600);
+
+    // an unknown command is a successful no-op, not a failure
+    CHECK(store.shorten_ttl("cmd-none", "agent-1", std::chrono::hours(24)));
+}
+
+TEST_CASE("ResponseStore: shorten_ttl leaves a row kept forever (retention 0) alone",
+          "[pg][response_store][shorten_ttl]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool, /*retention_days=*/0);
+    StoredResponse resp;
+    resp.instruction_id = "cmd-forever";
+    resp.agent_id = "agent-1";
+    resp.status = 1;
+    resp.output = "status|active";
+    store.store(resp);
+    auto rows = store.query("cmd-forever", kAllRows, ResponseQuery{.agent_id = "agent-1"});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().ttl_expires_at == 0); // never expires
+
+    // A server set to keep responses forever keeps these too: the call succeeds and changes nothing,
+    // so the reaper (which takes only ttl_expires_at > 0) never sees the row.
+    REQUIRE(store.shorten_ttl("cmd-forever", "agent-1", std::chrono::hours(24)));
+    rows = store.query("cmd-forever", kAllRows, ResponseQuery{.agent_id = "agent-1"});
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 1);
+    CHECK(rows->front().ttl_expires_at == 0);
+}
+
 // ============================================================================
 // PR 2 — execution_id column + query_by_execution exact correlation.
 // ============================================================================
@@ -856,6 +931,166 @@ TEST_CASE("ResponseStore PR2: query_by_execution returns only matching exec",
     REQUIRE(from_b.has_value());
     REQUIRE(from_b->size() == 1);
     CHECK((*from_b)[0].output == "from-exec-B");
+}
+
+TEST_CASE("ResponseStore: query_by_execution pages by keyset over a tied timestamp and past a "
+          "row reaped between two pages",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Five rows at ONE timestamp (epoch seconds; a fleet answers in bursts).
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "cmd-keyset";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-keyset";
+        r.timestamp = 1700000000;
+        store.store(r);
+    }
+    ResponseQuery q;
+    q.limit = 2;
+    auto page1 = store.query_by_execution("exec-keyset", kAllRows, q);
+    REQUIRE(page1.has_value());
+    REQUIRE(page1->size() == 2);
+    // The order is total: newest first, then id descending inside the tie.
+    CHECK((*page1)[0].id > (*page1)[1].id);
+
+    // A row of the first page is reaped before the second page is read. An offset walk would
+    // shift the remaining rows up by one and skip the first unread row; the keyset read does
+    // not, because it continues from the last row seen, not from a position.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult del = pg::exec_params(
+            lease.get(), "DELETE FROM response_store.responses WHERE id = $1",
+            std::vector<std::string>{std::to_string((*page1)[0].id)});
+        REQUIRE(del.status() == PGRES_COMMAND_OK);
+    }
+
+    std::set<std::string> seen{(*page1)[0].agent_id, (*page1)[1].agent_id};
+    int64_t last_id = (*page1)[1].id;
+    q.continue_after = {(*page1)[1].timestamp, (*page1)[1].id};
+    for (int pages = 0; pages < 10; ++pages) {
+        auto page = store.query_by_execution("exec-keyset", kAllRows, q);
+        REQUIRE(page.has_value());
+        for (const auto& r : *page) {
+            CHECK(r.id < last_id); // strictly after the cursor in read order, never a repeat
+            last_id = r.id;
+            CHECK(seen.insert(r.agent_id).second);
+        }
+        if (page->size() < 2)
+            break;
+        q.continue_after = {page->back().timestamp, page->back().id};
+    }
+    CHECK(seen == std::set<std::string>{"agent-0", "agent-1", "agent-2", "agent-3", "agent-4"});
+
+    // The same walk by offset, for contrast, skips the row that moved up into page one.
+    ResponseQuery by_offset;
+    by_offset.limit = 2;
+    by_offset.offset = 2;
+    auto offset_page2 = store.query_by_execution("exec-keyset", kAllRows, by_offset);
+    REQUIRE(offset_page2.has_value());
+    std::set<std::string> offset_seen{(*page1)[1].agent_id};
+    for (const auto& r : *offset_page2)
+        offset_seen.insert(r.agent_id);
+    by_offset.offset = 4;
+    auto offset_page3 = store.query_by_execution("exec-keyset", kAllRows, by_offset);
+    REQUIRE(offset_page3.has_value());
+    for (const auto& r : *offset_page3)
+        offset_seen.insert(r.agent_id);
+    CHECK(offset_seen.size() == 3); // four rows remain; one was skipped
+}
+
+TEST_CASE("ResponseStore: query_by_execution breaks a timestamp tie by id descending whatever "
+          "the heap order",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    for (int i = 0; i < 5; ++i) {
+        StoredResponse r;
+        r.instruction_id = "cmd-tie";
+        r.agent_id = "agent-" + std::to_string(i);
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-tie";
+        r.timestamp = 1700000000;
+        store.store(r);
+    }
+    auto before = store.query_by_execution("exec-tie", kAllRows);
+    REQUIRE(before.has_value());
+    REQUIRE(before->size() == 5);
+    int64_t lowest = before->front().id;
+    for (const auto& r : *before)
+        lowest = std::min(lowest, r.id);
+    // Move the lowest-id row to the end of the heap (an UPDATE writes a new tuple version). A
+    // read ordered by timestamp alone returns the tie in heap or index-entry order, which now
+    // places that row first or last and never in id order; only `, id DESC` keeps the order
+    // total. The read is one query with a limit above the row count, so no page boundary and
+    // no cursor is involved.
+    {
+        auto lease = pool.try_acquire_for(std::chrono::seconds(5));
+        REQUIRE(lease);
+        pg::PgResult upd = pg::exec_params(
+            lease.get(), "UPDATE response_store.responses SET output = 'moved' WHERE id = $1",
+            std::vector<std::string>{std::to_string(lowest)});
+        REQUIRE(upd.status() == PGRES_COMMAND_OK);
+    }
+    ResponseQuery q;
+    q.limit = 100;
+    auto rows = store.query_by_execution("exec-tie", kAllRows, q);
+    REQUIRE(rows.has_value());
+    REQUIRE(rows->size() == 5);
+    for (std::size_t i = 1; i < rows->size(); ++i) {
+        INFO("row " << i);
+        CHECK((*rows)[i - 1].id > (*rows)[i].id);
+    }
+    CHECK(rows->back().id == lowest);
+}
+
+TEST_CASE("ResponseStore: the keyset cursor orders by timestamp before id across distinct "
+          "timestamps",
+          "[pg][response_store][execution_id][keyset]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    // Timestamps are agent-supplied, so an older answer stored later carries a higher id than
+    // a newer one. Stored in this order: newest (lowest id), oldest, middle (highest id).
+    auto seed = [&](const std::string& agent, int64_t ts) {
+        StoredResponse r;
+        r.instruction_id = "cmd-cursor";
+        r.agent_id = agent;
+        r.status = 1;
+        r.output = "ok";
+        r.execution_id = "exec-cursor";
+        r.timestamp = ts;
+        store.store(r);
+    };
+    seed("agent-newest", 1700000300);
+    seed("agent-oldest", 1700000100);
+    seed("agent-middle", 1700000200);
+    ResponseQuery q;
+    q.limit = 1;
+    std::vector<std::string> walked;
+    for (int pages = 0; pages < 5; ++pages) {
+        auto page = store.query_by_execution("exec-cursor", kAllRows, q);
+        REQUIRE(page.has_value());
+        if (page->empty())
+            break;
+        REQUIRE(page->size() == 1);
+        walked.push_back(page->front().agent_id);
+        // After the newest row (the lowest id) the cursor must still reach the middle row,
+        // whose id is the highest: a cursor on `id` alone, or on `timestamp <= ts AND id < id`,
+        // drops it.
+        q.continue_after = {page->front().timestamp, page->front().id};
+    }
+    CHECK(walked == std::vector<std::string>{"agent-newest", "agent-middle", "agent-oldest"});
 }
 
 TEST_CASE("ResponseStore PR2: query_by_execution rejects empty sentinel (engaged-empty, not "
@@ -3914,6 +4149,53 @@ TEST_CASE("ResponseStore: a capped stream finalizes in place and replay cannot g
     f.store.store(cap_frame("cmd-fin", "agent-1", 0, "exec-1"));
     CHECK(cap_rows(f.store, "cmd-fin", "agent-1") == 4);
     CHECK(cap_dropped(f.metrics) == 3.0);
+}
+
+// The durable view of each outcome: only a lost frame (a failed write, or a cap-refused
+// non-terminal frame) counts as dropped; a cap-refused terminal frame leaves its answer durable.
+TEST_CASE("StoreOutcome: only a lost frame is not durable", "[response_store][store_outcome]") {
+    CHECK(store_outcome_durable(StoreOutcome::Stored));
+    CHECK(store_outcome_durable(StoreOutcome::CappedTerminal));
+    CHECK_FALSE(store_outcome_durable(StoreOutcome::CappedRunning));
+    CHECK_FALSE(store_outcome_durable(StoreOutcome::Failed));
+}
+
+// store() reports what it did with the frame: the ingest sites record a lost answer from it.
+// Failed when the store is closed (see the bad-path test), a NUL is in an identity field or the
+// transaction fails; CappedTerminal for a terminal frame the cap refused because the pair already
+// holds its terminal row; CappedRunning for a non-terminal frame the cap refused (its output is
+// lost).
+TEST_CASE("ResponseStore: store reports the outcome of the frame",
+          "[pg][response_store][cap]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    CapFixture f(db.dsn(), 4);
+
+    CHECK(f.store.store(cap_frame("cmd-ret", "agent-1", 1, "exec-1")) == StoreOutcome::Stored);
+    CHECK(cap_rows(f.store, "cmd-ret", "agent-1") == 1);
+
+    auto nul = cap_frame("cmd-ret", "agent-2", 1);
+    nul.agent_id = std::string("agent") + '\0' + "2";
+    CHECK(f.store.store(nul) == StoreOutcome::Failed);
+    auto nul_instruction = cap_frame("cmd-ret", "agent-3", 1);
+    nul_instruction.instruction_id = std::string("cmd-ret") + '\0' + "x";
+    CHECK(f.store.store(nul_instruction) == StoreOutcome::Failed);
+
+    // Fill the pair with RUNNING rows: a further RUNNING frame is refused and its output is lost.
+    for (int i = 0; i < 4; ++i)
+        REQUIRE(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")) ==
+                StoreOutcome::Stored);
+    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 0, "exec-2")) ==
+          StoreOutcome::CappedRunning);
+    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4); // refused, not grown
+
+    // Finalize the retained rows in place, then replay a terminal frame: the cap refuses it, but
+    // the pair already holds a terminal row, so the answer is durable.
+    REQUIRE(f.store.finalize_terminal_status("cmd-ret-cap", "agent-1", 1, "", "exec-2", 0) ==
+            ResponseStore::FinalizeResult::Updated);
+    CHECK(f.store.store(cap_frame("cmd-ret-cap", "agent-1", 1, "exec-2")) ==
+          StoreOutcome::CappedTerminal);
+    CHECK(cap_rows(f.store, "cmd-ret-cap", "agent-1") == 4);
+    CHECK(cap_dropped(f.metrics) == 2.0);
 }
 
 TEST_CASE("ResponseStore: the row cap is per (instruction, agent) pair",

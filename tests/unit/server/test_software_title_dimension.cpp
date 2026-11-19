@@ -668,6 +668,48 @@ TEST_CASE("owner tick re-queues an unknown title that returns to the fleet witho
     CHECK(dim(pool, "Gone Tool", "updated_at") == "1");
 }
 
+TEST_CASE("a title keyed under an empty publisher re-keys under its via: label: the open row is "
+          "pruned, a rejected row stays and the label's row is queued open",
+          "[pg][product_registry][normalization][vendor]") {
+    TD_ENV(db, pool, inv, reg, metrics, owner);
+    // Keyed on the raw (name, publisher, ecosystem) triple: a vendorless brew title is keyed ''.
+    triple(pool, "Mystery Tool", "", "brew", 5);
+    triple(pool, "Rejected Tool", "", "brew", 4);
+    REQUIRE_FALSE(owner.run_tick().errored);
+    REQUIRE(scalar(pool, "SELECT count(*) FROM product_registry_store.curation_queue "
+                         "WHERE raw_publisher = ''") == "2");
+    sql(pool, "UPDATE product_registry_store.curation_queue SET status = 'rejected' "
+              "WHERE raw_name = 'Rejected Tool'");
+
+    // The rollup is rebuilt from the live inventory: the same two titles keyed `via:brew`.
+    sql(pool, "DELETE FROM software_inventory_store.title_triples");
+    triple(pool, "Mystery Tool", "via:brew", "brew", 5);
+    triple(pool, "Rejected Tool", "via:brew", "brew", 4);
+    REQUIRE_FALSE(owner.run_tick().errored);
+
+    const auto queue = [&](const std::string& name, const std::string& publisher,
+                           const std::string& column) {
+        return scalar(pool,
+                      "SELECT coalesce(max(" + column + ")::text, 'absent') FROM "
+                      "product_registry_store.curation_queue WHERE raw_name = $1 AND "
+                      "raw_publisher = $2",
+                      {name, publisher});
+    };
+    // The open '' row left the queue with its triple; the label's row is queued open.
+    CHECK(queue("Mystery Tool", "", "status") == "absent");
+    CHECK(queue("Mystery Tool", "via:brew", "status") == "open");
+    CHECK(queue("Mystery Tool", "via:brew", "device_count") == "5");
+    // A rejected '' row stays, and the rejection is NOT carried over to the label's row.
+    CHECK(queue("Rejected Tool", "", "status") == "rejected");
+    CHECK(queue("Rejected Tool", "via:brew", "status") == "open");
+    // Dimension rows are permanent: the '' keys keep their rows and the label keys have their own
+    // unnormalized rows.
+    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
+                       "WHERE raw_publisher = ''") == "2");
+    CHECK(scalar(pool, "SELECT count(*) FROM product_registry_store.title_dimension "
+                       "WHERE raw_publisher = 'via:brew' AND norm_status = 'unnormalized'") == "2");
+}
+
 TEST_CASE("gauges report normalized unnormalized and pending titles and the install-weighted ratio",
           "[pg][product_registry][normalization]") {
     TD_ENV(db, pool, inv, reg, metrics, owner);

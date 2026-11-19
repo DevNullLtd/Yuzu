@@ -42,11 +42,33 @@ pass()   { PASS=$((PASS + 1)); echo "  ✓ $1"; }
 fail()   { FAIL=$((FAIL + 1)); echo "  ✗ $1"; }
 skip()   { SKIP=$((SKIP + 1)); echo "  ⊘ $1 (skipped)"; }
 
+# Native server targets are available only on Linux (ADR-0035).
+server_supported() { [[ "$(uname -s)" == "Linux" ]]; }
+
+# Resolve a working Python 3 once, on first use, into $YUZU_RUN_PYTHON: try
+# `python3`, then `python`, and keep the first that actually runs. A Windows
+# runner has no `python3`, or only the Store stub, which exists but fails to
+# run, so a lookup by name alone is not enough. Returns 1 with a loud error
+# when neither works; the calling tier then fails rather than skipping.
+YUZU_RUN_PYTHON=""
+resolve_python() {
+    [[ -n "$YUZU_RUN_PYTHON" ]] && return 0
+    local candidate
+    for candidate in python3 python; do
+        if "$candidate" -c 'import sys; sys.exit(0 if sys.version_info[0] == 3 else 1)' >/dev/null 2>&1; then
+            YUZU_RUN_PYTHON="$candidate"
+            return 0
+        fi
+    done
+    echo "  ERROR: no working Python 3 interpreter (tried python3, python)" >&2
+    return 1
+}
+
 # ── Tier 1: C++ Unit Tests ──────────────────────────────────────────
 run_checks() {
     banner "STATIC CHECKS"
     echo "  Validating hookify guardrail rules..."
-    if python3 "$PROJECT_ROOT/scripts/check-hookify-rules.py"; then
+    if resolve_python && "$YUZU_RUN_PYTHON" "$PROJECT_ROOT/scripts/check-hookify-rules.py"; then
         pass "hookify rules valid"
     else
         fail "hookify rules invalid"
@@ -63,24 +85,34 @@ run_cpp_unit() {
 
     # Compile tests
     echo "  Building test executables..."
-    if ! meson compile -C "$BUILDDIR" yuzu_agent_tests yuzu_server_tests 2>&1 | tail -5; then
+    local targets=(yuzu_agent_tests)
+    if server_supported; then
+        targets+=(yuzu_server_tests)
+    fi
+    if ! meson compile -C "$BUILDDIR" "${targets[@]}" 2>&1 | tail -5; then
         fail "C++ test compilation failed"
         return
     fi
 
+    # Bind fixture discovery to this build, including when the caller exports
+    # MESON_BUILD_ROOT for an unrelated checkout.
     # Run agent tests
     echo ""
     echo "  Running agent unit tests..."
-    if "$BUILDDIR/tests/yuzu_agent_tests" --reporter compact 2>&1; then
+    if MESON_BUILD_ROOT="$BUILDDIR" "$BUILDDIR/tests/yuzu_agent_tests" --reporter compact 2>&1; then
         pass "Agent unit tests"
     else
         fail "Agent unit tests"
     fi
 
     # Run server tests
+    if ! server_supported; then
+        skip "Server unit tests (native server is Linux-only, ADR-0035)"
+        return
+    fi
     echo ""
     echo "  Running server unit tests..."
-    if "$BUILDDIR/tests/yuzu_server_tests" --reporter compact 2>&1; then
+    if MESON_BUILD_ROOT="$BUILDDIR" "$BUILDDIR/tests/yuzu_server_tests" --reporter compact 2>&1; then
         pass "Server unit tests"
     else
         fail "Server unit tests"
@@ -135,12 +167,9 @@ run_erlang_unit() {
     fi
 
     echo "  Running EUnit tests..."
-    # eunit-gate.sh wraps rebar3 eunit so the script's exit code reflects
-    # the EUnit summary (Failed: N), not rebar3's process-exit-on-cancel
-    # behavior. Cancellations come from EUnit discovering non-test helper
-    # modules and from order-dependent registry_tests flakes — they're
-    # not regressions worth gating on. See scripts/test/eunit-gate.sh for
-    # the full rationale (#1005).
+    # eunit-gate.sh requires successful process exit and a nonempty passing
+    # summary. Cancellation means incomplete execution and fails this gate,
+    # even when all cases that actually ran passed.
     if bash "$PROJECT_ROOT/scripts/test/eunit-gate.sh" 2>&1 | tail -20; then
         pass "Erlang EUnit tests"
     else
@@ -149,83 +178,63 @@ run_erlang_unit() {
     cd "$PROJECT_ROOT"
 }
 
+# A successful rebar exit alone does not establish that CT executed anything.
+# Keep a unique full transcript on failure; judge the entire capture before
+# displaying its tail so diagnostics cannot become the execution evidence.
+run_ct_suite() {
+    local label="$1" suite="$2" capture rc
+    shift 2
+    if ! capture=$(mktemp "${TMPDIR:-/tmp}/yuzu_test_ct_gate.XXXXXX"); then
+        fail "$label (cannot capture output)"
+        return
+    fi
+    if (cd "$GATEWAY_DIR" && rebar3 ct --dir apps/yuzu_gw/test/ct --suite="$suite" "$@") >"$capture" 2>&1; then
+        rc=0
+    else
+        rc=$?
+    fi
+    tail -10 "$capture"
+    if resolve_python && "$YUZU_RUN_PYTHON" "$SCRIPT_DIR/gateway_test_summary.py" strict "$suite" "$rc" "$capture"; then
+        rm -f "$capture"
+        pass "$label"
+    else
+        echo "  Full Common Test output: $capture"
+        fail "$label"
+    fi
+}
+
 # ── Tier 3: Erlang Common Test Suites ───────────────────────────────
 run_erlang_ct() {
     banner "ERLANG COMMON TEST SUITES"
-
     if ! command -v rebar3 &>/dev/null; then
         skip "rebar3 not found"
         return
     fi
-
-    cd "$GATEWAY_DIR"
-
-    # #1005: CT *_SUITE.erl files live in test/ct/ (separate from
-    # *_tests.erl in test/) so EUnit's dir-scan no longer discovers
-    # them and emits "tests were cancelled" trailers that fail the gate.
-    CT_DIR="apps/yuzu_gw/test/ct"
-
-    # E2E suite
-    echo "  Running e2e suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_e2e_SUITE 2>&1 | tail -10; then
-        pass "Gateway E2E suite"
-    else
-        fail "Gateway E2E suite"
-    fi
-
-    # Integration suite
-    echo ""
-    echo "  Running integration suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_integration_SUITE 2>&1 | tail -10; then
-        pass "Gateway integration suite"
-    else
-        fail "Gateway integration suite"
-    fi
-
-    # Metrics E2E suite
-    echo ""
-    echo "  Running metrics E2E suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_metrics_e2e_SUITE 2>&1 | tail -10; then
-        pass "Gateway metrics E2E suite"
-    else
-        fail "Gateway metrics E2E suite"
-    fi
-
-    # Prometheus endpoint suite
-    echo ""
-    echo "  Running Prometheus endpoint suite..."
-    if rebar3 ct --dir "$CT_DIR" --suite=yuzu_gw_prometheus_SUITE 2>&1 | tail -10; then
-        pass "Gateway Prometheus endpoint suite"
-    else
-        fail "Gateway Prometheus endpoint suite"
-    fi
-
-    cd "$PROJECT_ROOT"
+    run_ct_suite "Gateway E2E suite" yuzu_gw_e2e_SUITE
+    run_ct_suite "Gateway integration suite" yuzu_gw_integration_SUITE
+    run_ct_suite "Gateway metrics E2E suite" yuzu_gw_metrics_e2e_SUITE
+    run_ct_suite "Gateway Prometheus endpoint suite" yuzu_gw_prometheus_SUITE
 }
 
 # ── Tier 4: Erlang Performance Tests ───────────────────────────────
 run_erlang_perf() {
     banner "ERLANG PERFORMANCE TESTS"
-
     if ! command -v rebar3 &>/dev/null; then
         skip "rebar3 not found"
         return
     fi
-
-    cd "$GATEWAY_DIR"
-    echo "  Running performance suite (this may take several minutes)..."
     echo "  Configure with: YUZU_PERF_AGENTS=N YUZU_PERF_HEARTBEATS=N"
-    if rebar3 ct --suite=yuzu_gw_perf_SUITE --verbose 2>&1 | tail -30; then
-        pass "Gateway performance tests"
-    else
-        fail "Gateway performance tests"
-    fi
-    cd "$PROJECT_ROOT"
+    run_ct_suite "Gateway performance tests" yuzu_gw_perf_SUITE --verbose
 }
 
 # ── Tier 5: Full-Stack Integration Tests ────────────────────────────
 run_integration() {
     banner "FULL-STACK INTEGRATION TESTS"
+
+    if ! server_supported; then
+        skip "Full-stack integration test (native server is Linux-only, ADR-0035)"
+        return
+    fi
 
     if [[ ! -x "$SCRIPT_DIR/integration-test.sh" ]]; then
         fail "integration-test.sh not found"

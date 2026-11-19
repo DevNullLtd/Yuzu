@@ -7,7 +7,7 @@ metadata:
   description: >
     A collection of security incident response and compliance verification
     instructions. Includes device quarantine (network isolation with
-    whitelisting), indicator of compromise checking (IPs, domains, hashes,
+    exceptions, through the firewall plugin), indicator of compromise checking (IPs, domains, hashes,
     files, ports), certificate inventory and management, and SCCM/ConfigMgr
     client status queries.
   platforms: [windows, linux, darwin]
@@ -20,10 +20,10 @@ metadata:
   contents:
     instructionDefinitions:
       # Quarantine (network isolation)
-      - security.quarantine.isolate
-      - security.quarantine.release
-      - security.quarantine.status
-      - security.quarantine.whitelist
+      - security.firewall.quarantine
+      - security.firewall.release
+      - security.firewall.quarantine_status
+      - security.firewall.quarantine_allow
       # Indicator of Compromise checking
       - security.ioc.check
       # Certificate inventory and management

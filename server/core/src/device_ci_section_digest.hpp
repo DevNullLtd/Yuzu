@@ -32,13 +32,14 @@
 ///     value, garbage, a malformed version (`v:`, `vx:`, `v0:`, `v01:`, `v1` with no colon, more
 ///     than six digits), a
 ///     different layout version with nothing after the colon. A damaged column must never read as
-///     "unverified" and let a same-count edit through as complete. See the warning in
+///     "unchecked" and let a same-count edit through as complete. See the warning in
 ///     `device_ci_kinds.hpp`.
 ///
 /// Pure: no store, no PG, no I/O. The digest provider is OpenSSL's one-shot SHA-256
 /// (`sha256_hex`), which reports failure rather than returning a zero digest.
 
 #include "device_ci_kinds.hpp"
+#include "digest_fn.hpp"
 #include "sha256_hex.hpp"
 
 #include <cstddef>
@@ -112,10 +113,10 @@ inline void digest_put_cell(std::string& out, std::string_view s) {
 /// The layout version this build writes and recomputes.
 inline constexpr std::string_view kSectionDigestPrefix = "v1:";
 
-/// What a non-NULL stored digest is, for the verifier. Only `kOtherLayout` is unverified.
+/// What a non-NULL stored digest is, for the verifier. Only `kOtherLayout` is left unchecked.
 enum class StoredDigestForm {
     kCurrent,     ///< starts with `v1:`: compare it with the recomputed digest
-    kOtherLayout, ///< a well-formed digest of a layout version other than 1: unverified
+    kOtherLayout, ///< a well-formed digest of a layout version other than 1: left unchecked
     kMalformed,   ///< anything else: a mismatch
 };
 
@@ -149,10 +150,16 @@ inline constexpr std::size_t kMaxDigestLayoutDigits = 6;
 /// kind - the one entry point the writer and the read mapping both call, so the kind name and
 /// column count always come from the registry. nullopt when the digest provider fails. Callers
 /// treat nullopt as "cannot verify": the writer aborts the ingest (never stores a section without
-/// its digest by accident), the reader serves the section as a mismatch.
+/// its digest by accident), the reader serves the section `constrained` with
+/// `server:content_digest_unverifiable` (a server-side fault, not a mismatch).
+/// `digest` is the provider (#7163): production callers take the default (`sha256_hex`); a test
+/// passes a failing one to reach the provider-failure branches.
 [[nodiscard]] inline std::optional<std::string>
-section_content_digest(const DeviceCiSectionDef& def, const std::vector<std::vector<std::string>>& rows) {
-    auto hex = sha256_hex(section_content_preimage(def.section, static_cast<std::size_t>(def.n_fields), rows));
+section_content_digest(const DeviceCiSectionDef& def,
+                       const std::vector<std::vector<std::string>>& rows,
+                       DigestFn digest = &sha256_hex) {
+    auto hex =
+        digest(section_content_preimage(def.section, static_cast<std::size_t>(def.n_fields), rows));
     if (!hex)
         return std::nullopt;
     std::string out{kSectionDigestPrefix};

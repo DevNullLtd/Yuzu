@@ -25,25 +25,37 @@
  * SKIPs when YUZU_TEST_POSTGRES_DSN is unset and FAILs when it is set but broken.
  */
 
+#include "mgmt_group_error.hpp"
 #include "management_group_store.hpp"
 #include "rbac_store.hpp"
 #include "rest_api_v1.hpp"
+#include "test_api_token_pg_helper.hpp" // ApiTokenStorePgShared
 #include "test_mgmt_group_pg_helper.hpp"
 #include "test_rbac_store_pg_helper.hpp" // PG-backed RbacStore (ADR-0041)
 #include "test_route_sink.hpp"
 
 #include "../test_helpers.hpp"
 
+#include "pg/pg_raii.hpp"
+
 #include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <ctime>
+#include <filesystem>
+#include <fstream>
 #include <functional>
+#include <memory>
+#include <regex>
+#include <sstream>
 #include <optional>
 #include <set>
 #include <string>
+#include <vector>
 
 using namespace yuzu::server;
 
@@ -53,6 +65,9 @@ struct GroupRolesHarness {
     yuzu::test::ManagementGroupStorePg mgmt_bundle; // SKIPs without a PG DSN
     yuzu::test::RbacStorePg rbac_bundle;             // SKIPs without a PG DSN
     RbacStore& rbac = *rbac_bundle;
+    /// Only the token-mint cases wire a token store (CRUD-only, so the process-wide shared clone
+    /// is enough); every other case leaves the route's token_store null as before.
+    std::optional<yuzu::test::ApiTokenStorePgShared> api_tokens;
     yuzu::MetricsRegistry metrics;
     RestApiV1 api;
     yuzu::server::test::TestRouteSink sink;
@@ -66,8 +81,34 @@ struct GroupRolesHarness {
     /// fallback is skipped for a service-scoped token.
     std::string mock_token_scope_service;
 
-    GroupRolesHarness() {
+    /// Owner-arm eligibility inputs (mgmt_group_owner_gate.hpp): the MCP tier and the
+    /// principal class the mock session carries. Defaults are an ordinary human session.
+    std::string mock_mcp_tier;
+    std::string mock_principal_kind{"human"};
+
+    /// Every audit row the routes wrote, in order (the audit callback always reports success).
+    struct AuditRow {
+        std::string action;
+        std::string result;
+        std::string target_id;
+        std::string detail;
+    };
+    std::vector<AuditRow> audits;
+
+    /// Number of recorded rows for `action` with the given `result`.
+    [[nodiscard]] std::size_t audit_count(const std::string& action,
+                                          const std::string& result) const {
+        std::size_t n = 0;
+        for (const auto& a : audits)
+            if (a.action == action && a.result == result)
+                ++n;
+        return n;
+    }
+
+    explicit GroupRolesHarness(bool with_token_store = false) {
         REQUIRE(rbac.is_open());
+        if (with_token_store)
+            api_tokens.emplace();
 
         auto auth_fn = [this](const httplib::Request&,
                               httplib::Response&) -> std::optional<auth::Session> {
@@ -75,6 +116,8 @@ struct GroupRolesHarness {
             s.username = "tester";
             s.role = auth::Role::user;
             s.token_scope_service = mock_token_scope_service;
+            s.mcp_tier = mock_mcp_tier;
+            s.principal_kind = mock_principal_kind;
             return s;
         };
         auto perm_fn = [this](const httplib::Request&, httplib::Response& res,
@@ -86,14 +129,17 @@ struct GroupRolesHarness {
             }
             return true;
         };
-        auto audit_fn = [](const httplib::Request&, const std::string&, const std::string&,
-                           const std::string&, const std::string&,
-                           const std::string&) -> bool { return true; };
+        auto audit_fn = [this](const httplib::Request&, const std::string& action,
+                               const std::string& result, const std::string&,
+                               const std::string& target_id, const std::string& detail) -> bool {
+            audits.push_back({action, result, target_id, detail});
+            return true;
+        };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac,
                             /*mgmt_store=*/&*mgmt_bundle,
-                            /*token_store=*/nullptr,
+                            /*token_store=*/api_tokens ? api_tokens->get() : nullptr,
                             /*quarantine_store=*/nullptr,
                             /*response_store=*/nullptr,
                             /*instruction_store=*/nullptr,
@@ -169,9 +215,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
         // no UserManagement grant at all, while the POST/DELETE handlers on this same
         // path already let it MUTATE assignments via an ITServiceOwner fallback. A
         // read-denied/write-allowed posture is both a broken workflow and incoherent.
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -184,9 +231,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
     SECTION("a non-owner is still denied even when someone ELSE owns the group") {
         // The fallback must be scoped to the CALLER, not merely to the group having
         // an owner — otherwise any group with an ITServiceOwner would be world-readable.
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "someone-else", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "someone-else", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -207,9 +255,10 @@ TEST_CASE("GET /management-groups/{id}/roles requires the floored UserManagement
 
     SECTION("guardian-confinement-2298 §3e: ITServiceOwner OF THIS GROUP does NOT "
              "save a service-scoped token") {
-        auto assigned = h.mgmt_bundle->assign_role(
-            GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-        REQUIRE(assigned.has_value());
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+        // and this test.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
         h.perm_override = [](const std::string& securable, const std::string& op) {
             return !(securable == "UserManagement" && op == "Read");
@@ -336,9 +385,10 @@ TEST_CASE("POST /management-groups/{id}/roles: ITServiceOwner OF THIS GROUP is "
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -360,9 +410,10 @@ TEST_CASE("POST /management-groups/{id}/roles: a service-scoped token is denied 
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -409,9 +460,10 @@ TEST_CASE("DELETE /management-groups/{id}/roles: a service-scoped token is denie
     auto grp = h.mgmt_bundle->create_group(g);
     REQUIRE(grp.has_value());
     const std::string gid = *grp;
-    auto assigned = h.mgmt_bundle->assign_role(
-        GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
-    REQUIRE(assigned.has_value());
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm
+    // and this test.
+    yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
 
     h.perm_override = [](const std::string& securable, const std::string& op) {
         return !(securable == "ManagementGroup" && op == "Write");
@@ -422,4 +474,891 @@ TEST_CASE("DELETE /management-groups/{id}/roles: a service-scoped token is denie
                                "application/json");
     REQUIRE(res);
     CHECK(res->status == 403);
+}
+
+// ---------------------------------------------------------------------------
+// One owner-arm predicate (mgmt_group_owner_gate.hpp): the ITServiceOwner-of-this-group
+// fallback on GET/POST/DELETE refuses MCP-tier and engine-classed sessions, and DELETE limits
+// a caller admitted ONLY by that arm to the roles POST can delegate.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct OwnerArmFixture {
+    GroupRolesHarness h;
+    std::string gid;
+
+    OwnerArmFixture(const char* group_name, bool caller_is_owner = true,
+                    bool with_token_store = false)
+        : h(with_token_store) {
+        ManagementGroup g;
+        g.name = group_name;
+        g.membership_type = "static";
+        g.created_by = "tester";
+        auto grp = h.mgmt_bundle->create_group(g);
+        REQUIRE(grp.has_value());
+        gid = *grp;
+        if (caller_is_owner) {
+            // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes the
+            // owner arm and these tests.
+            yuzu::test::plant_group_role_row(
+                h.mgmt_bundle.dsn(), GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+        }
+    }
+
+    // The fleet-wide arm is denied for every case below, so only the owner arm can admit.
+    void deny_fleet_wide() {
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !((securable == "ManagementGroup" && op == "Write") ||
+                     (securable == "UserManagement" && op == "Read"));
+        };
+    }
+
+    std::unique_ptr<httplib::Response> del(const std::string& body) {
+        return h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles", body,
+                               "application/json");
+    }
+};
+
+constexpr const char* kViewerRow = R"({"principal_id":"someone","role_name":"Viewer"})";
+
+} // namespace
+
+TEST_CASE("management-group roles routes: the owner arm refuses an MCP-tier session on REST",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-tier");
+    f.deny_fleet_wide();
+    f.h.mock_mcp_tier = "readonly";
+
+    auto get = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(get);
+    CHECK(get->status == 403);
+
+    auto post = f.h.sink.Post("/api/v1/management-groups/" + f.gid + "/roles", kViewerRow);
+    REQUIRE(post);
+    CHECK(post->status == 403);
+
+    auto del = f.del(kViewerRow);
+    REQUIRE(del);
+    CHECK(del->status == 403);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 1); // only the owner row
+
+    // The same caller without a tier is still admitted: the refusal is the tier.
+    f.h.mock_mcp_tier.clear();
+    auto ok = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+}
+
+TEST_CASE("management-group roles routes: the owner arm refuses an engine-classed session",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-engine");
+    f.deny_fleet_wide();
+    f.h.mock_principal_kind = "engine";
+
+    auto get = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(get);
+    CHECK(get->status == 403);
+
+    auto post = f.h.sink.Post("/api/v1/management-groups/" + f.gid + "/roles", kViewerRow);
+    REQUIRE(post);
+    CHECK(post->status == 403);
+
+    auto del = f.del(kViewerRow);
+    REQUIRE(del);
+    CHECK(del->status == 403);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 1);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: an owner-arm caller removes only Operator and "
+          "Viewer rows",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-delete");
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner (the DELETE path stays
+    // unrestricted so an existing row is removable).
+    yuzu::test::plant_group_role_row(f.h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"});
+    REQUIRE(f.h.mgmt_bundle->assign_role(GroupRoleAssignment{f.gid, "user", "op1", "Operator"})
+                .has_value());
+    f.deny_fleet_wide();
+
+    // A peer owner row is refused with removal wording (not POST's "delegated" text);
+    // nothing is removed.
+    auto refused = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
+    REQUIRE(refused);
+    CHECK(refused->status == 403);
+    CHECK(refused->body.find("can remove only Operator and Viewer roles") != std::string::npos);
+    CHECK(refused->body.find("can be delegated") == std::string::npos);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 3);
+
+    // An Operator row is removed.
+    auto removed = f.del(R"({"principal_id":"op1","role_name":"Operator"})");
+    REQUIRE(removed);
+    CHECK(removed->status == 200);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).size() == 2);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: a fleet-wide ManagementGroup:Write holder may "
+          "still remove an ITServiceOwner row",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-delete-fleet", /*caller_is_owner=*/false);
+    // Planted by SQL: the store refuses a group-scoped ITServiceOwner (the DELETE path stays
+    // unrestricted so an existing row is removable).
+    yuzu::test::plant_group_role_row(f.h.mgmt_bundle.dsn(),
+                                     GroupRoleAssignment{f.gid, "user", "peer", "ITServiceOwner"});
+
+    auto res = f.del(R"({"principal_id":"peer","role_name":"ITServiceOwner"})");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(f.h.mgmt_bundle->get_group_roles(f.gid).empty());
+}
+
+TEST_CASE("GET /management-groups/{id}/roles: a human session without a tier is still admitted "
+          "by the owner arm (positive pin)",
+          "[pg][rest][mgmt_group][authz][owner_gate]") {
+    OwnerArmFixture f("owner-gate-positive");
+    f.deny_fleet_wide();
+    auto res = f.h.sink.Get("/api/v1/management-groups/" + f.gid + "/roles");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+}
+
+// ---------------------------------------------------------------------------
+// The REST service-scoped token mint (POST /api/v1/tokens with scope_service) decides the SAME
+// owner arm, against the "Service: <name>" group, with the fleet-wide ManagementGroup:Write
+// denied. The arm is reached only with RBAC enabled.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+constexpr const char* kServiceGroup = "Service: payroll";
+
+struct MintFixture : OwnerArmFixture {
+    explicit MintFixture(bool caller_is_owner = true)
+        : OwnerArmFixture(kServiceGroup, caller_is_owner, /*with_token_store=*/true) {
+        REQUIRE(h.rbac.set_rbac_enabled(true).has_value());
+        deny_fleet_wide();
+    }
+};
+
+auto mint_service_token(MintFixture& f) {
+    const auto expires_at = static_cast<std::int64_t>(std::time(nullptr)) + 3600;
+    return f.h.sink.Post("/api/v1/tokens",
+                         R"({"name":"owner-gate-mint","scope_service":"payroll","expires_at":)" +
+                             std::to_string(expires_at) + "}");
+}
+
+} // namespace
+
+TEST_CASE("POST /tokens: an ITServiceOwner of the service group mints a service-scoped token",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    const auto tokens = f.h.api_tokens.value()->list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->size() == 1);
+}
+
+TEST_CASE("POST /tokens: a caller who does not own the service group is refused",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f(/*caller_is_owner=*/false);
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
+    const auto tokens = f.h.api_tokens.value()->list_tokens();
+    REQUIRE(tokens.has_value());
+    CHECK(tokens->empty());
+}
+
+TEST_CASE("POST /tokens: the owner arm refuses an MCP-tier session on REST",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    f.h.mock_mcp_tier = "readonly";
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
+
+    // The same caller without a tier is admitted: the refusal above is the tier.
+    f.h.mock_mcp_tier.clear();
+    auto ok = mint_service_token(f);
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+}
+
+TEST_CASE("POST /tokens: the owner arm refuses an engine-classed session",
+          "[pg][rest][token][authz][owner_gate]") {
+    MintFixture f;
+    f.h.mock_principal_kind = "engine";
+    auto res = mint_service_token(f);
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(res->body.find("ITServiceOwner authority required") != std::string::npos);
+}
+
+// Member and role writes: text validation first, then the store result decides the answer.
+// A NUL or other control byte in an identifier is a 400 with a denied audit row and no change;
+// a store error is a 503 with a failure audit row; the success row and the 2xx body appear only
+// after the store call reported success.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+/// Create a static group for a test and return its id.
+std::string make_group(GroupRolesHarness& h, const std::string& name) {
+    ManagementGroup g;
+    g.name = name;
+    g.membership_type = "static";
+    g.created_by = "tester";
+    auto grp = h.mgmt_bundle->create_group(g);
+    REQUIRE(grp.has_value());
+    return *grp;
+}
+
+/// Drop one table of the per-test management-group schema so the next write to it fails.
+void drop_mgmt_table(GroupRolesHarness& h, const char* qualified_table) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.mgmt_bundle.dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult d{
+        PQexec(conn.get(), (std::string("DROP TABLE ") + qualified_table).c_str())};
+    REQUIRE(d.ok());
+}
+
+} // namespace
+
+TEST_CASE("POST /management-groups/{id}/members: a control byte in agent_id is refused 400 with a "
+          "denied row and no member added",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-add");
+
+    for (const char* body : {R"({"agent_id":"a\u0000b"})", R"({"agent_id":"a\tb"})",
+                             R"({"agent_id":"a\u001bb"})", R"({"agent_id":"a\u007fb"})"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"added\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_members(gid).empty());
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.add_member");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_agent_id");
+    }
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a clean agent_id is added and audited as success",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-add-ok");
+
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members",
+                           R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 201);
+    CHECK(res->body.find("\"added\":true") != std::string::npos);
+    CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+    // Audit-first (#7074): an `attempted` row precedes the success row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "management_group.add_member");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.add_member");
+    CHECK(h.audits[1].result == "success");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "agent-1 agent_known=unreadable"); // this harness wires no AuthDB
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a store error answers 503 with a failure row, "
+          "never the added body or a success row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-add-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_members");
+
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members",
+                           R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"added\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audit_count("management_group.add_member", "success") == 0);
+    // Audit-first (#7074): an `attempted` row precedes the failure row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "management_group.add_member");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.add_member");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error agent-1");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a control byte in the agent id is "
+          "refused 400 with a denied row and the member is kept",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-remove");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    const std::vector<std::string> ids = {
+        std::string("agent") + '\0' + "x" + "1",
+        std::string("agent") + '\t' + "1",
+        std::string("agent") + '\x1b' + "1",
+        std::string("agent") + '\x7f' + "1",
+    };
+    for (const auto& id : ids) {
+        INFO("agent id length " << id.size());
+        h.audits.clear();
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/" + id);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"removed\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.remove_member");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_agent_id");
+    }
+
+    // A clean id removes the member and audits success.
+    h.audits.clear();
+    auto ok = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/agent-1");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body.find("\"removed\":true") != std::string::npos);
+    CHECK(h.mgmt_bundle->get_members(gid).empty());
+    // Audit-first (#7074): an `attempted` row precedes the success row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].result == "success");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: a store error answers 503 with a "
+          "failure row, never the removed body or a success row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-remove-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_members");
+
+    auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/agent-1");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"removed\":true") == std::string::npos);
+
+    CHECK(h.audit_count("management_group.remove_member", "success") == 0);
+    // Audit-first (#7074): an `attempted` row precedes the failure row.
+    REQUIRE(h.audits.size() == 2);
+    CHECK(h.audits[0].action == "management_group.remove_member");
+    CHECK(h.audits[0].result == "attempted");
+    CHECK(h.audits[1].action == "management_group.remove_member");
+    CHECK(h.audits[1].result == "failure");
+    CHECK(h.audits[1].target_id == gid);
+    CHECK(h.audits[1].detail == "store_error agent-1");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: a control byte in a field is refused 400 with a "
+          "denied row and the grant is kept",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-unassign");
+    REQUIRE(h.mgmt_bundle->assign_role(GroupRoleAssignment{gid, "user", "someone", "Viewer"})
+                .has_value());
+
+    struct Case {
+        const char* body;
+        const char* detail;
+    };
+    const Case cases[] = {
+        {R"({"principal_id":"someone","role_name":"View\u0000er"})", "invalid_role_name"},
+        {R"({"principal_id":"someone","role_name":"View\ter"})", "invalid_role_name"},
+        {R"({"principal_id":"some\u0000one","role_name":"Viewer"})", "invalid_principal_id"},
+        {R"({"principal_id":"some\u001bone","role_name":"Viewer"})", "invalid_principal_id"},
+        {R"({"principal_type":"us\u0000er","principal_id":"someone","role_name":"Viewer"})",
+         "invalid_principal_type"},
+    };
+    for (const auto& c : cases) {
+        INFO(c.body);
+        h.audits.clear();
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles", c.body,
+                                   "application/json");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"unassigned\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.unassign_role");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == c.detail);
+    }
+
+    // A clean request removes the grant and audits success.
+    h.audits.clear();
+    auto ok = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                              R"({"principal_id":"someone","role_name":"Viewer"})",
+                              "application/json");
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(ok->body.find("\"unassigned\":true") != std::string::npos);
+    CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].detail == "someone:Viewer");
+}
+
+TEST_CASE("DELETE /management-groups/{id}/roles: a store error answers 503 with a failure row, "
+          "never the unassigned body or a success row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-unassign-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_roles");
+
+    auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"Viewer"})",
+                               "application/json");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"unassigned\":true") == std::string::npos);
+
+    CHECK(h.audit_count("management_group.unassign_role", "success") == 0);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "management_group.unassign_role");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id == gid);
+    CHECK(h.audits[0].detail == "store_error");
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a control byte in principal_id is refused 400 with "
+          "a denied row and nothing is stored",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-assign");
+
+    for (const char* body : {R"({"principal_id":"some\u0000one","role_name":"Viewer"})",
+                             R"({"principal_id":"some\tone","role_name":"Viewer"})",
+                             R"({"principal_id":"some\u007fone","role_name":"Operator"})"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"assigned\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.assign_role");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_principal_id");
+    }
+
+    // The clean control still assigns and audits success.
+    h.audits.clear();
+    auto ok = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                          R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+    CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].result == "success");
+}
+
+// ---------------------------------------------------------------------------
+// A well-formed id that names no group is a 404 (the caller's mistake), not a retryable 503,
+// and it writes no failure row. Ids that are not valid UTF-8 are refused 400 before the store.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("POST /management-groups/{id}/members: a group id naming no group answers 404 with no "
+          "audit row and no retry hint",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+
+    auto res = h.sink.Post("/api/v1/management-groups/deadbeef0000/members",
+                           R"({"agent_id":"agent-1"})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->body.find("\"added\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "group not found");
+    CHECK_FALSE(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audits.empty());
+    CHECK(h.mgmt_bundle->get_members("deadbeef0000").empty());
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a group id naming no group answers 404 with no "
+          "audit row and no retry hint",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+
+    auto res = h.sink.Post("/api/v1/management-groups/deadbeef0000/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 404);
+    CHECK(res->body.find("\"assigned\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["message"] == "group not found");
+    CHECK_FALSE(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audits.empty());
+    CHECK(h.mgmt_bundle->get_group_roles("deadbeef0000").empty());
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a store error on an existing group still answers "
+          "503 with a failure row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-assign-fault");
+    drop_mgmt_table(h, "management_group_store.management_group_roles");
+
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                           R"({"principal_id":"someone","role_name":"Viewer"})");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->body.find("\"assigned\":true") == std::string::npos);
+    auto body = nlohmann::json::parse(res->body);
+    CHECK(body["error"]["retry_after_ms"].is_number());
+
+    CHECK(h.audit_count("management_group.assign_role", "success") == 0);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "management_group.assign_role");
+    CHECK(h.audits[0].result == "failure");
+    CHECK(h.audits[0].target_id == gid);
+    CHECK(h.audits[0].detail == "store_error");
+}
+
+TEST_CASE("POST /management-groups/{id}/roles: a role name with a control byte is refused 400 "
+          "with a denied row, not a 403",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-assign-role");
+
+    for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                             R"({"principal_id":"someone","role_name":"View\ter"})",
+                             R"({"principal_id":"someone","role_name":"View\u001ber"})"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("role name must be valid text without control characters") !=
+              std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.assign_role");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_role_name");
+    }
+}
+
+TEST_CASE("POST /management-groups/{id}/members: a body that is not valid UTF-8 JSON is refused "
+          "400 and nothing is added",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-add-utf8");
+
+    const std::string body = std::string(R"({"agent_id":"a)") + "\xff" + R"(b"})";
+    auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members", body);
+    REQUIRE(res);
+    CHECK(res->status == 400);
+    CHECK(res->body.find("\"added\":true") == std::string::npos);
+    CHECK(h.mgmt_bundle->get_members(gid).empty());
+    CHECK(h.audit_count("management_group.add_member", "success") == 0);
+    CHECK(h.audit_count("management_group.add_member", "failure") == 0);
+}
+
+TEST_CASE("DELETE /management-groups/{id}/members/{agent}: an agent id that is not valid UTF-8 is "
+          "refused 400 with a denied row and the member is kept",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-validate-remove-utf8");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+
+    const std::vector<std::string> ids = {
+        std::string("agent") + "\xff" + "1",         // stray byte
+        std::string("agent") + "\xc0\x80" + "1",     // overlong NUL
+        std::string("agent") + "\xed\xa0\x80" + "1", // surrogate
+        std::string("agent") + "\xf4\x90\x80\x80",   // above U+10FFFF
+    };
+    for (const auto& id : ids) {
+        INFO("agent id length " << id.size());
+        h.audits.clear();
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/" + id);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"removed\":true") == std::string::npos);
+        CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "management_group.remove_member");
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].target_id == gid);
+        CHECK(h.audits[0].detail == "invalid_agent_id");
+    }
+}
+
+// Dave's review of #7376, item 1: the audit write for a refused value comes AFTER the permission
+// gate on every management-group mutation, so a caller with no rights on the group adds no
+// audit rows for it. Each case sends a value the handler would otherwise refuse and audit.
+TEST_CASE("management-group mutations: a caller without ManagementGroup:Write gets 403 and no "
+          "audit row, whatever the body holds",
+          "[pg][rest][mgmt_group][validation][authz]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-gate-before-audit");
+    REQUIRE(h.mgmt_bundle->add_member(gid, "agent-1").has_value());
+    REQUIRE(h.mgmt_bundle->assign_role(GroupRoleAssignment{gid, "user", "someone", "Viewer"})
+                .has_value());
+    h.perm_override = [](const std::string& securable, const std::string& op) {
+        return !(securable == "ManagementGroup" && op == "Write");
+    };
+
+    SECTION("assign role: a role name with a control byte") {
+        for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                                 R"({"principal_id":"some\u0000one","role_name":"Viewer"})",
+                                 R"({"principal_type":"us\u0000er","principal_id":"someone",)"
+                                 R"("role_name":"Viewer"})"}) {
+            INFO(body);
+            auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(h.audits.empty());
+        }
+    }
+
+    SECTION("unassign role: a field with a control byte") {
+        for (const char* body : {R"({"principal_id":"someone","role_name":"View\u0000er"})",
+                                 R"({"principal_id":"some\u0000one","role_name":"Viewer"})"}) {
+            INFO(body);
+            auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/roles",
+                                       body, "application/json");
+            REQUIRE(res);
+            CHECK(res->status == 403);
+            CHECK(h.audits.empty());
+        }
+        CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+    }
+
+    SECTION("add member: an agent id with a control byte") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/members",
+                               R"({"agent_id":"a\u0000b"})");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("remove member: an agent id that is not valid UTF-8") {
+        auto res = h.sink.dispatch("DELETE", "/api/v1/management-groups/" + gid + "/members/agent" +
+                                                 std::string("\xff") + "1");
+        REQUIRE(res);
+        CHECK(res->status == 403);
+        CHECK(h.audits.empty());
+        CHECK(h.mgmt_bundle->get_members(gid).size() == 1);
+    }
+
+    SECTION("an ITServiceOwner of the group still gets the 400 and the denied row") {
+        // Planted by SQL: the store refuses a group-scoped ITServiceOwner. PR-1b deletes this arm.
+        yuzu::test::plant_group_role_row(h.mgmt_bundle.dsn(),
+                                         GroupRoleAssignment{gid, "user", "tester", "ITServiceOwner"});
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"View\u0000er"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].result == "denied");
+        CHECK(h.audits[0].detail == "invalid_role_name");
+    }
+}
+
+// Dave's review of #7376, item 2: RbacStore::validate_assignment echoes the caller's
+// principal_type, so a value holding the word "failed" must be a 400 with no store-fault row.
+TEST_CASE("POST /management-groups/{id}/roles: a principal_type containing 'failed' is a 400, "
+          "never a retryable 503 with a failure row",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-classifier");
+
+    for (const char* type : {"failed", "unfailed", "login failed"}) {
+        INFO(type);
+        h.audits.clear();
+        const std::string body = std::string(R"({"principal_type":")") + type +
+                                 R"(","principal_id":"someone","role_name":"Viewer"})";
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // The route's own closed-set check answered, not the store's echo of the value.
+        CHECK(res->body.find("principal_type must be user or group") != std::string::npos);
+        CHECK(res->body.find(type) == std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("engine passes the route's check and is refused by the store with a 400") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_type":"engine","principal_id":"engine:x",)"
+                               R"("role_name":"Viewer"})");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("engine principals cannot hold scoped role assignments") !=
+              std::string::npos);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audit_count("management_group.assign_role", "failure") == 0);
+    }
+}
+
+// The classifier REST and MCP share. Pure (no database).
+TEST_CASE("mgmt_group_error: store faults are the fixed messages, matched at the start",
+          "[rest][mcp][mgmt_group][validation][mgmt_group_error]") {
+    using yuzu::server::mgmt_group_error_is_store_fault;
+
+    SECTION("every store fault message is a fault") {
+        for (const char* msg : {"database not open", "pool acquire timed out",
+                                "failed to resolve ancestor chain (store degraded)",
+                                "failed to create group: connection lost", "query failed: boom",
+                                "update failed: boom", "delete failed: boom",
+                                "add_member failed: boom", "remove_member failed: boom",
+                                "assign_role failed: boom", "unassign_role failed: boom"}) {
+            INFO(msg);
+            CHECK(mgmt_group_error_is_store_fault(msg));
+        }
+    }
+
+    SECTION("a validation message is not, even when it echoes the word failed") {
+        for (const char* msg : {"unrecognized principal_type 'failed'",
+                                "unrecognized principal_type 'assign_role failed: x'",
+                                "unrecognized principal_type 'database not open'",
+                                "group name cannot be empty", "parent group not found",
+                                "maximum hierarchy depth (5) exceeded",
+                                "re-parenting would create a cycle",
+                                "engine principals cannot hold scoped role assignments in this "
+                                "release",
+                                "principal_id in the reserved 'engine:' namespace may only be "
+                                "assigned under principal_type=\"engine\"",
+                                "engine principals cannot be granted the admin/full-access role "
+                                "'failed' — no admin, ever (design §4.2)",
+                                "group not found", "a group with that name already exists",
+                                "this role cannot be assigned at management-group scope", ""}) {
+            INFO(msg);
+            CHECK_FALSE(mgmt_group_error_is_store_fault(msg));
+        }
+    }
+}
+
+// Tripwire, closed-world: every string literal handed to std::unexpected in
+// management_group_store.cpp is either classified as a store fault by the shared classifier or is
+// named below as a validation message / a read-path fault no classifier call site reaches. A new
+// message of ANY wording written as a literal here therefore forces a decision. (A message built another way,
+// std::format or a named constant, is not seen by the scan; the floors below fail the test if
+// the literal shapes change enough to drop the scan's coverage.)
+TEST_CASE("mgmt_group_error: every std::unexpected literal in management_group_store.cpp is "
+          "classified or named",
+          "[rest][mcp][mgmt_group][validation][mgmt_group_error]") {
+    namespace fs = std::filesystem;
+    std::ifstream in(fs::path(YUZU_SERVER_SRC_DIR) / "management_group_store.cpp",
+                     std::ios::binary);
+    REQUIRE(in);
+    std::ostringstream ss;
+    ss << in.rdbuf();
+    const std::string src = ss.str();
+
+    // Validation answers: the caller's mistake, never retryable.
+    const std::set<std::string> validation = {
+        "group name cannot be empty",
+        "group cannot be its own parent",
+        "parent group not found",
+        "maximum hierarchy depth (5) exceeded",
+        "re-parenting would create a cycle",
+        "group not found",
+        "cannot delete root group",
+        "engine principals cannot hold scoped role assignments in this release",
+        "a group with that name already exists",
+        "this role cannot be assigned at management-group scope",
+    };
+    // Faults of the read paths (get_assignments_for_principal, get_member_agents_in_subtrees),
+    // which count their own degrade metric and never reach the REST/MCP write classifier.
+    const std::set<std::string> read_path_faults = {
+        "management group store not open",
+        "management group store: pool acquire timed out",
+    };
+
+    const std::regex re(R"re(std::unexpected\(\s*(?:std::string\()?\s*"((?:[^"\\]|\\.)*)")re");
+    std::size_t seen = 0, faults = 0, validations = 0, reads = 0;
+    for (std::sregex_iterator it(src.begin(), src.end(), re), end; it != end; ++it) {
+        const std::string lit = (*it)[1].str();
+        ++seen;
+        INFO("literal: " << lit);
+        if (yuzu::server::mgmt_group_error_is_store_fault(lit)) {
+            ++faults;
+        } else if (validation.count(lit) != 0) {
+            ++validations;
+        } else if (read_path_faults.count(lit) != 0) {
+            ++reads;
+        } else {
+            FAIL_CHECK("an unclassified store message: add its prefix to mgmt_group_error.hpp "
+                       "or name it in this test");
+        }
+    }
+    // The file holds 47 literals today (28 faults, 15 validation occurrences of 10 distinct
+    // messages, 4 read-path). Minimum floors equal to those counts, so a change in literal shape
+    // cannot silently shrink what the scan sees. Messages RbacStore::validate_assignment returns
+    // through `v.error()` are not literals in this file and are outside the scan.
+    CHECK(seen >= 47);
+    CHECK(faults >= 28);
+    CHECK(validations >= 15);
+    CHECK(reads >= 4);
+}
+
+// Dave's review of #7376, item 2 (the REST pre-validation of principal_type): a body field of
+// the wrong JSON type must answer 400 before the gate, never throw out of the accessor as a 500,
+// and never degrade to the default (a numeric principal_type must not become "user").
+TEST_CASE("POST /management-groups/{id}/roles: a wrong-typed or non-object body is a 400 with no "
+          "audit row and nothing assigned",
+          "[pg][rest][mgmt_group][validation]") {
+    GroupRolesHarness h;
+    const std::string gid = make_group(h, "mg-body-types");
+
+    for (const char* body : {R"({"principal_type":5,"principal_id":"someone","role_name":"Viewer"})",
+                             R"({"principal_type":null,"principal_id":"someone","role_name":"Viewer"})",
+                             R"({"principal_type":["user"],"principal_id":"someone",)"
+                             R"("role_name":"Viewer"})",
+                             R"({"principal_id":7,"role_name":"Viewer"})",
+                             R"({"principal_id":"someone","role_name":{"a":1}})",
+                             R"(["user"])", R"("user")", "5", "null"}) {
+        INFO(body);
+        h.audits.clear();
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", body);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).empty());
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("a caller without rights gets the same 400 for a body that is not an object") {
+        h.perm_override = [](const std::string& securable, const std::string& op) {
+            return !(securable == "ManagementGroup" && op == "Write");
+        };
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles", R"(["user"])");
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(h.audits.empty());
+    }
+
+    SECTION("a well-typed body is unchanged") {
+        auto res = h.sink.Post("/api/v1/management-groups/" + gid + "/roles",
+                               R"({"principal_id":"someone","role_name":"Viewer"})");
+        REQUIRE(res);
+        CHECK(res->status == 201);
+        CHECK(h.mgmt_bundle->get_group_roles(gid).size() == 1);
+    }
 }

@@ -9,7 +9,8 @@ re-run the suite binary with Catch2's junit reporter -> isolated case retries.
 Scenarios: green pass (including an unavailable telemetry-report path), a
 listed flake that recovers on retry, a listed flake that fails all retries
 (blocks), an unlisted failure (blocks), and a non-classifiable (non-Catch2)
-suite (blocks).
+suite (blocks), and the red path under a non-default `--logbase` (the Linux
+test step's concurrent halves).
 
 POSIX-only (the fakes are chmod +x shebang scripts); skipped on Windows, where
 the real CI exercises the binary-execution mechanics anyway.
@@ -54,7 +55,8 @@ if a and a[0] == "introspect":
 if a and a[0] == "test":
     builddir = a[a.index("-C") + 1]
     logs = os.path.join(builddir, "meson-logs"); os.makedirs(logs, exist_ok=True)
-    j = os.path.join(logs, "testlog.junit.xml")
+    logbase = a[a.index("--logbase") + 1] if "--logbase" in a else "testlog"
+    j = os.path.join(logs, logbase + ".junit.xml")
     if os.environ.get("FAKE_MESON_TEST_PASS") == "1":
         open(j, "w").write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" time="1.0"/></testsuite></testsuites>')
         if os.environ.get("FAKE_REPORT_PATH_IS_FILE") == "1":
@@ -209,6 +211,76 @@ def run_meson_contract_scenario(label, known_flaky):
         return ok
 
 
+def run_logbase_red_scenario(label, known_flaky):
+    """Concurrent invocations in one build dir (the Linux test step's halves)
+    each pass meson's own --logbase. On the RED path main() must classify the
+    junit of THAT base, write its report to <base>-flake-retry.json, keep the
+    enumeration junit under <base>-flake-retry-enum-*, and sweep only its own
+    stale enum files. A decoy GREEN default-base junit is planted: classifying
+    it instead would find nothing to block on and report under the default
+    name, so the assertions below tell the two apart."""
+    with tempfile.TemporaryDirectory() as d:
+        binroot = os.path.join(d, "bin"); os.makedirs(binroot)
+        meson = os.path.join(binroot, "meson")
+        catch2 = os.path.join(binroot, "yuzu_fake_tests")
+        _write_exe(meson, FAKE_MESON)
+        _write_exe(catch2, FAKE_CATCH2)
+        builddir = os.path.join(d, "build")
+        logs = os.path.join(builddir, "meson-logs"); os.makedirs(logs)
+        with open(os.path.join(logs, "testlog.junit.xml"), "w") as f:  # decoy, green
+            f.write('<testsuites><testsuite><testcase name="fake - yuzu:fake unit tests" '
+                    'time="1.0"/></testsuite></testsuites>')
+        other_enum = os.path.join(logs, "flake-retry-enum-other.catch2.xml")
+        own_stale = os.path.join(logs, "testlog-pg-flake-retry-enum-stale.catch2.xml")
+        for p in (other_enum, own_stale):
+            open(p, "w").write("<testsuites/>")
+        kf = os.path.join(d, "known-flaky.json")
+        with open(kf, "w") as f:
+            json.dump(known_flaky, f)
+        env = dict(os.environ)
+        env.pop("GITHUB_STEP_SUMMARY", None)
+        env["PATH"] = binroot + os.pathsep + env["PATH"]
+        env["FAKE_CATCH2_BIN"] = catch2
+        env["FAKE_FAIL_CASES"] = "RealBug"
+        r = subprocess.run(
+            [sys.executable, WRAPPER, "--builddir", builddir, "--known-flaky", kf,
+             "--", "--no-rebuild", "--logbase", "testlog-pg", "--print-errorlogs"],
+            env=env, capture_output=True, text=True,
+        )
+        report_path = os.path.join(logs, "testlog-pg-flake-retry.json")
+        report = None
+        if os.path.exists(report_path):
+            with open(report_path) as f:
+                report = json.load(f)
+        names = sorted(os.listdir(logs))
+        problems = []
+        if r.returncode == 0:
+            problems.append("exit 0 on a red run")
+        if report is None:
+            problems.append("no testlog-pg-flake-retry.json")
+        elif report.get("blocked") != ["RealBug"]:
+            problems.append(f"blocked={report.get('blocked')!r}, expected ['RealBug'] "
+                            "(classified the wrong junit?)")
+        if "flake-retry.json" in names:
+            problems.append("report written under the DEFAULT name")
+        if not any(n.startswith("testlog-pg-flake-retry-enum-") and n != os.path.basename(own_stale)
+                   for n in names):
+            problems.append("no testlog-pg-flake-retry-enum-* evidence file")
+        if os.path.exists(own_stale):
+            problems.append("own stale enum file not swept")
+        if not os.path.exists(other_enum):
+            problems.append("another base's enum file was swept")
+        ok = not problems
+        status = "PASS" if ok else "FAIL"
+        print(f"[{status}] {label}: exit={r.returncode}")
+        if not ok:
+            print("  problems:", "; ".join(problems))
+            print("  meson-logs:", names)
+            print("  stdout:", r.stdout.strip().replace("\n", "\n  "))
+            print("  stderr:", r.stderr.strip().replace("\n", "\n  "))
+        return ok
+
+
 def run_validation_failure(label, known_flaky):
     """An invalid registry must fail before it invokes the Meson executable."""
     with tempfile.TemporaryDirectory() as d:
@@ -277,6 +349,9 @@ def main():
         # masked-green hole governance UP-1 closed.
         run_scenario("suite fails, enumeration reproduces nothing -> block",
                      {"FAKE_FAIL_CASES": ""}, listed, False),
+        run_logbase_red_scenario(
+            "--logbase red path: classifies, reports and keeps evidence under its own base",
+            listed),
         run_validation_failure("expired registry entry blocks before Meson",
                                [{**listed[0], "added": "1999-01-01", "expires": "2000-01-01"}]),
     ]

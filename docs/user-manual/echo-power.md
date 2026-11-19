@@ -105,9 +105,11 @@ first transition).
 
 ## Data captured
 
-One row per transition in the `$Power_Live` warehouse table: `ts`, `action`
-(`sleep`, `wake`, `ac_attached`, `ac_detached`, or `capture_gap`), and
-`detail` (a free-form reason string — the pmset log's own reason text on
+One row per hour and transition kind in the `$Power_Hourly` roll-up table:
+`hour_ts` (the start of the hour), `action`
+(`sleep`, `wake`, `ac_attached`, `ac_detached`, or `capture_gap`),
+`event_count`, `last_ts` and `last_detail` (a free-form reason string for the
+latest transition in the hour — the pmset log's own reason text on
 macOS, or a description of what happened on Windows/Linux/for a
 `capture_gap`). No process, user, or location information is ever attached
 to a power event.

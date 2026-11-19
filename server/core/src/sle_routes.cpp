@@ -14,11 +14,13 @@
 
 #include "sle_routes.hpp"
 
+#include "device_ci_read_gate.hpp" // kOrderingRetryAfterMs (the recheck-derived retry hint)
 #include "http_route_sink.hpp"
 #include "rest_audit.hpp" // detail::try_persist_audit / emit_behavioral_audit (#1647)
 
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token: agent_id is a caller-supplied path parameter (CWE-117)
 
 #include <atomic>
 #include <chrono>
@@ -169,7 +171,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                                         "licence data without durable evidence",
                                         cid, 5000, "retry the request"));
                      spdlog::warn("sle.agent.view audit fail-closed (503) cid={} agent_id={}", cid,
-                                  agent_id);
+                                  ::yuzu::log_id_token(agent_id));
                      return;
                  }
 
@@ -200,12 +202,13 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
 
     // ── DELETE /api/v1/sle/agents/{agent_id} — audited durable-erasure trigger (D-11) ──
     // The agent-decommission cascade's production caller: fans delete_agent across
-    // every registered per-agent store, durably erasing the machine's stored rows
+    // every registered per-agent store, durably erasing the rows each store deletes for the machine
+    // (the Guardian store keeps its event log and DEX observations until retention expiry)
     // (including the Decision-11 user_ref personal data — the reason this route
     // exists). Gate: ONE SCOPED securable, `Decommission:Delete` (ADR-0024 Decision
     // 9, amended Wave 7 PR7.2) — a device-level erasure grant that authorizes for
     // the cascade's WHOLE blast radius, not the individual securables that govern
-    // each store's READ. The radius is EIGHT stores: InventoryStore,
+    // each store's READ. The radius is NINE stores: InventoryStore,
     // SoftwareInventoryStore, DeviceInventoryStore (all three read-gated by
     // `Inventory`), AppPerfDailyStore (read-gated by `GuaranteedState` — DEX
     // behavioural PII), SoftwareLicensingStore (read-gated by
@@ -213,7 +216,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
     // Wave 7 PR7.2), and OfflineEndpointStore (#5682: the endpoint_state
     // presence row, read on /hardware under `Inventory` and /viz/fleet under
     // `Response`), and CertificateInventoryStore (slice-2 PR 2a-2a: fleet certificate
-    // inventory; read securable arrives in PR 2a-2b).
+    // inventory; read securable arrives in PR 2a-2b), and GuaranteedStateStore (#5675: the
+    // Guardian compliance census, read-gated by `GuaranteedState`; the device's pending census
+    // evidence is retired, its Guardian event log and DEX observations are not erased).
     // Compat: the seeded
     // matrix is unchanged (Administrator + ITServiceOwner keep the ability, granted
     // via seed_defaults() with no migration); an operator-authored custom role that
@@ -251,8 +256,9 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
             // ONE scoped gate for the cascade's whole blast radius (ADR-0024
             // Decision 9, amended Wave 7 PR7.2). Keep this in lockstep with
             // AgentDecommissionStores (the drift guard in test_agent_decommission.cpp
-            // pins the COUNT of registered targets via kCascadeStoreCount; it does
-            // not verify that every member is wired).
+            // pins the COUNT of registered targets via kCascadeStoreCount;
+            // tests/test_decommission_wiring_lexical.py verifies every member is wired in
+            // ServerImpl::decommission_agent).
             if (!scoped_perm_fn_(req, res, "Decommission", "Delete", agent_id))
                 return; // the gate wrote its own 401/403
             if (!decommission_fn_) {
@@ -269,7 +275,7 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                                    cid, 5000, "retry the request"));
                 spdlog::warn("sle.agent.decommission audit fail-closed (503, no erase) cid={} "
                              "agent_id={}",
-                             cid, agent_id);
+                             cid, ::yuzu::log_id_token(agent_id));
                 return;
             }
 
@@ -277,11 +283,20 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
 
             std::string breakdown;
             json stores = json::object();
+            json paused = json::array(); // stores whose removal was not attempted: write pause
             for (const auto& s : r.stores) {
                 stores[s.store] = to_string(s.outcome);
                 breakdown += s.store;
                 breakdown += '=';
                 breakdown += to_string(s.outcome);
+                breakdown += ' ';
+                if (s.write_paused)
+                    paused.push_back(s.store);
+            }
+            if (!paused.empty()) {
+                breakdown += "write_paused=";
+                for (const auto& n : paused)
+                    breakdown += n.get<std::string>() + ",";
                 breakdown += ' ';
             }
             // The attempt row above is the fail-closed evidence; a lost OUTCOME row is
@@ -299,16 +314,48 @@ void SleRoutes::register_routes(HttpRouteSink& sink, ScopedPermFn scoped_perm_fn
                 // see WHICH store failed (and which already erased) from the response
                 // itself — not only by pulling the audit log. Idempotent re-DELETE
                 // then targets the remaining failures.
+                // A write pause is not a database fault: say so, and say when to retry. The
+                // status stays 500 (the cascade is incomplete either way). The pause names only
+                // the device_inventory store; any OTHER failed store is a different fault and is
+                // worded separately, so the message never blames every failure on the pause.
+                const std::int64_t paused_n = static_cast<std::int64_t>(paused.size());
+                const std::int64_t failed_n = static_cast<std::int64_t>(r.failed);
+                const std::int64_t other_failed = failed_n > paused_n ? failed_n - paused_n : 0;
+                std::string msg;
+                if (paused.empty()) {
+                    msg = "agent decommission incomplete — one or more stores failed (" +
+                          std::to_string(r.failed) +
+                          " failed); re-issue the DELETE (the cascade is idempotent)";
+                } else {
+                    msg = "agent decommission incomplete: the removal was not attempted for " +
+                          paused.dump() +
+                          " because device-CI writes are paused by a PostgreSQL collation "
+                          "mismatch. Retrying before the collation repair is finished and the "
+                          "pause has lifted (the server rechecks about once a minute) will fail "
+                          "the same way; re-issue the DELETE only AFTER the repair (the cascade "
+                          "is idempotent).";
+                    if (other_failed > 0)
+                        msg += " " + std::to_string(other_failed) +
+                               " other store(s) also failed for a different reason (see "
+                               "details.stores); the re-issued DELETE retries them too.";
+                }
+                json details{{"stores", stores},
+                             {"deleted", static_cast<std::int64_t>(r.deleted)},
+                             {"skipped", static_cast<std::int64_t>(r.skipped)},
+                             {"failed", static_cast<std::int64_t>(r.failed)}};
+                if (!paused.empty())
+                    details["write_paused"] = paused;
+                // A pause clears only when the recheck next concludes Trusted, so the hint is the
+                // recheck's unsettled interval (the read gate's refusal hint, derived from the
+                // same constant), not the 5 s of a transient fault: a shorter hint would re-run
+                // the whole cascade and its fail-closed attempt audit row for the same cause.
+                const bool is_paused = !paused.empty();
                 send_json(res, 500,
-                          a4_error(500,
-                                   "agent decommission incomplete — one or more stores failed (" +
-                                       std::to_string(r.failed) +
-                                       " failed); re-issue the DELETE (the cascade is idempotent)",
-                                   cid, 5000, "retry the request", /*permission=*/{},
-                                   json{{"stores", stores},
-                                        {"deleted", static_cast<std::int64_t>(r.deleted)},
-                                        {"skipped", static_cast<std::int64_t>(r.skipped)},
-                                        {"failed", static_cast<std::int64_t>(r.failed)}}));
+                          a4_error(500, msg, cid,
+                                   is_paused ? device_ci_read_gate::kOrderingRetryAfterMs : 5000,
+                                   is_paused ? "retry after the PostgreSQL collation repair"
+                                             : "retry the request",
+                                   /*permission=*/{}, std::move(details)));
                 return;
             }
             json data;

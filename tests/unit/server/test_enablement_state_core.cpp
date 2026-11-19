@@ -300,8 +300,8 @@ TEST_CASE("enablement state: unresolved_units uses resolve()'s predicate and is 
     std::vector<Rule> rules;
     rules.push_back(*load_rule_row(stored("a", {"gone.z", "wol.wake"}, R"(ostype == "linux")"), kinds()));
     rules.push_back(*load_rule_row(stored("b", {"gone.a", "gone.z"}, "__all__"), kinds()));
-    // quarantine.whitelist is a recorded non-unit (protective): known, so not unresolved.
-    rules.push_back(*load_rule_row(stored("c", {"quarantine.whitelist"}, "__all__"), kinds()));
+    // firewall.quarantine_allow is a recorded non-unit (protective): known, so not unresolved.
+    rules.push_back(*load_rule_row(stored("c", {"firewall.quarantine_allow"}, "__all__"), kinds()));
     CHECK(unresolved_units(rules, real_overlay()) == std::vector<std::string>{"gone.a", "gone.z"});
     CHECK(unresolved_units({}, real_overlay()).empty());
 }

@@ -168,8 +168,9 @@ end_per_suite(_Config) ->
                 catch yuzu_gw_registry:deregister_agent(Id)
             end, yuzu_gw_registry:all_agents())
     end,
-    %% Unload global mock.
+    %% Unload every global mock before the next suite uses the real modules.
     catch meck:unload(yuzu_gw_upstream),
+    catch meck:unload(yuzu_gw_heartbeat_buffer),
     catch meck:unload(yuzu_gw_conn),
     ok.
 
@@ -194,26 +195,23 @@ init_per_group(upstream, Config) ->
     %% Start real upstream and heartbeat buffer (unlink so they outlive CT process).
     {ok, Pid} = yuzu_gw_upstream:start_link(),
     unlink(Pid),
-    case whereis(yuzu_gw_heartbeat_buffer) of
+    OwnedHBPid = case whereis(yuzu_gw_heartbeat_buffer) of
         undefined ->
             {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
-            unlink(HBPid);
-        _ -> ok
+            unlink(HBPid),
+            HBPid;
+        _ -> undefined
     end,
-    [{upstream_pid, Pid} | Config];
+    [{upstream_pid, Pid}, {owned_heartbeat_pid, OwnedHBPid} | Config];
 
 init_per_group(_Group, Config) ->
     Config.
 
 end_per_group(upstream, Config) ->
-    Pid = proplists:get_value(upstream_pid, Config),
-    case is_pid(Pid) andalso is_process_alive(Pid) of
-        true ->
-            exit(Pid, shutdown),
-            timer:sleep(50);
-        false ->
-            ok
-    end,
+    %% Stop the owned timer-bearing process before replacing its code with a
+    %% mock. Await termination rather than hoping a sleep is long enough.
+    stop_owned_process(proplists:get_value(owned_heartbeat_pid, Config)),
+    stop_owned_process(proplists:get_value(upstream_pid, Config)),
     catch meck:unload(yuzu_grpc_client),
     %% Reinstall the global upstream mock for subsequent groups.
     catch meck:unload(yuzu_gw_upstream),
@@ -232,6 +230,15 @@ end_per_group(upstream, Config) ->
 
 end_per_group(_Group, Config) ->
     Config.
+
+stop_owned_process(undefined) -> ok;
+stop_owned_process(Pid) ->
+    try gen_server:stop(Pid, shutdown, 5000)
+    catch
+        %% It may have exited before (or during) the stop request. All other
+        %% errors, including timeout, must still fail teardown.
+        exit:noproc -> ok
+    end.
 
 init_per_testcase(_TestCase, Config) ->
     %% Ensure required processes are running (they may have been killed by CT teardown).

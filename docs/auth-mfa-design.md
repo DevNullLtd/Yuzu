@@ -3,8 +3,8 @@
 Status: **PR 1 + PR 2 + PR 3 of 3 shipped (v0.13+), plus the at-rest
 encryption follow-up SHIPPED (2026-07-16)** — self-service
 enrollment, login challenge, recovery codes (PR 1); step-up on 11
-high-risk REST + Settings surfaces (PR 2; since extended to 37 mutating
-routes, 37 enforced at one chokepoint, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
+high-risk REST + Settings surfaces (PR 2; since extended to 44 mutating
+routes, 41 enforced at one chokepoint and three by their own JIT-elevation gate, see "Step-up chokepoint" below); OIDC `amr` short-circuit plus
 enforcement modes (`admin-only` / `required`) with login-time enrollment
 bootstrap (PR 3). The MFA ladder is complete. `mfa_totp_secret` at-rest
 encryption landed as part of the `AuthDB`/`ScimStore` ADR-0006 Postgres
@@ -231,20 +231,20 @@ password store: 100 000 iterations).
 Single-use enforcement: `mfa_consume_recovery_code` finds every unconsumed
 row for the user, constant-time-compares the salted hash against each
 candidate (bounded wall time regardless of which row matches — no early
-break, avoids leaking match position via timing), then on a Postgres schema
-`UPDATE auth.mfa_recovery_codes SET consumed_at = now() WHERE id = $1 AND
-consumed_at IS NULL RETURNING id` (abbreviated: the real statement also
-carries the `is_active` guard described below; originally, on SQLite, a
-`sqlite3_changes()` check served the same role — see the root `CLAUDE.md`
-`sqlite3_changes()` race note, #1033; Postgres's `RETURNING` was adopted
-directly rather than porting that idiom). The `WHERE consumed_at IS NULL`
-guard plus a zero-row `RETURNING` result means a concurrent consume that
-wins the race is treated as no-match by the loser — race-safe without an
-explicit transaction. Both the candidate `SELECT` and the consuming `UPDATE`
-also require the owning `auth.users` row to be `is_active = TRUE` (#4058), so
-a code on a deactivated account is refused as no-match and left unconsumed,
-matching the TOTP path. This is a statement-level guard, deliberately not a
-`FOR UPDATE` lock: the user row is not held across the PBKDF2 walk.
+break, avoids leaking match position via timing), then consumes the matched
+row in ONE statement inside a bounded transaction: a CTE locks the owning
+`auth.users` row `FOR UPDATE` (requiring `is_active = TRUE` and a non-NULL
+`mfa_enrolled_at`) and returns its factor generation, and the code row is
+set `consumed_at = now()` only if it is still unconsumed
+(`... WHERE c.id = $1 AND c.username = $2 AND c.consumed_at IS NULL RETURNING u.gen`).
+Lock order is the users row, then the code row, the order regeneration,
+enrolment and disable use. A concurrent consume that wins the race, a
+regeneration that deleted the candidate, or an account deactivated or cleared
+between the scan and the lock returns zero rows, which the loser treats as
+no-match. The candidate `SELECT` is the lock-free half: it also requires the
+owning row to be `is_active = TRUE` (#4058), so a code on a deactivated account
+is refused as no-match and left unconsumed, matching the TOTP path, and the
+user row is not held across the PBKDF2 walk.
 
 `mfa_regenerate_recovery_codes` deletes every row for the user (consumed
 or otherwise) and issues 10 fresh ones. The UI surfaces this when
@@ -373,7 +373,7 @@ destructive as updating one), keeping the count at eleven.
 The eleven-site count above describes PR 2. The gated set has since grown
 (engine-principal, RBAC assignment and enforcement toggle, password reset,
 unlock, Guardian guard update / delete, MFA recovery-code regeneration and
-MFA disable, and others) to 40 mutating routes, 37 enforced by one
+MFA disable, and others) to 44 mutating routes, 41 enforced by one
 chokepoint and three, the JIT-elevation routes, by their own stricter
 handler gate. Other mutating routes (73 REST rows are still
 `kPendingRuling`) and all MCP tools are not MFA-step-up gated in this
@@ -583,11 +583,11 @@ Every transition writes to `AuditStore` via `AuthRoutes::audit_log`
 |---|---|
 | `mfa.enroll.initiated` | `POST /api/settings/mfa/init` — secret generated |
 | `mfa.enroll.required` | `POST /login` blocked an un-enrolled login under enforcement and issued an enrollment-pending token (PR 3) |
-| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped (bearer principal, absent or mismatched cookie, or a store failure) |
-| `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled). A CSPRNG fault minting a recovery code or its salt is audited with `detail` starting `csprng_unavailable: ` and, at the login bootstrap, event `reason=csprng_unavailable` (earlier builds: `store_unavailable`) (#6995). |
+| `mfa.enroll.verified` | `POST /api/settings/mfa/verify` or `POST /login/mfa/enroll`: first code accepted. A Settings confirm also stamps a step-up proof on the confirming session; the detail is `step_up_proof=stamped`, or `step_up_proof=not_stamped` when the session could not be stamped. With a session store wired a Settings confirm needs a durable session row (a bearer or cookie-less caller is refused `401` `session_not_durable` before the code is checked), so the remaining `not_stamped` causes are a session that ended between that check and the commit, a stamp refusal (`;factor_changed`, `;verification_future_dated`) and a stamp store failure; a no-store wiring (tests and legacy only) skips the check |
+| `mfa.enroll.failed` | First code rejected (Settings or login bootstrap); or, detail `credential_changed` (#5342 F4), an enrolment write — Settings init/verify, the `POST /login` bootstrap init, or `POST /login/mfa/enroll` — found the account's password changed since its credential anchor was established (nothing revealed, written or enrolled); or, on a Settings confirm only (#6079 PR 2c), detail `session_not_durable` (`401`) or `session_store_unavailable` (`503`, `Retry-After: 5`): the confirming session is not a valid stored session, or the session store could not be read, checked just before the enrolment commits (outside the account's row lock), so nothing is enrolled and the provisional secret is untouched. A CSPRNG fault minting a recovery code or its salt is audited with `detail` starting `csprng_unavailable: ` and, at the login bootstrap, event `reason=csprng_unavailable` (earlier builds: `store_unavailable`) (#6995). |
 | `mfa.enroll.race` | Result `ok` — a concurrent verify already resolved enrollment; the benign loser, kept out of the `mfa.enroll.failed` bad-code population (#3777, CC7.2) |
 | `mfa.enroll.cancelled` | Result `ok` — "benign, nothing enrolled", not "enrollment succeeded". The provisional secret the first code was verified against was no longer the stored one when the enrollment was committed (#3808). The store cannot tell why — a disable, a re-init, the stale-provisional sweep, `--mfa-reset` or an online KEK rewrap all look the same — so the detail states only the fact: `reason=provisional_secret_changed; nothing enrolled`. Not a bad code (`mfa.enroll.failed`) and not a store outage (no 503, no `yuzu_auth_secret_unavailable_total`). `POST /login/mfa/enroll` answers 409 and the pending token is spent (sign in again); Settings shows "Enrollment was cancelled or replaced. Start enrollment again." with the Set-up button |
-| `mfa.disabled` | `POST /api/settings/mfa/disable` (an `attempted` + `MFA clear requested via Settings` intent row first, written before the factor is touched and fail-closed: the route answers `503` and changes nothing if it is not accepted; then the outcome row: `ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `partial` + `sessions_ended=failed` when the factor was cleared but its sessions were not ended; `error` + `disable failed (sessions_ended=<n>\|failed)` when the clear itself failed (its sessions are still ended); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires) |
+| `mfa.disabled` | `POST /api/settings/mfa/disable` (an `attempted` + `MFA clear requested via Settings` intent row first, written before the factor is touched and fail-closed: the route answers `503` and changes nothing if it is not accepted; then the outcome row, which for a successful clear is written in the same transaction as the clear, the recovery-code delete and the session delete (`MfaDisableOwner`, #6079 PR 2c): `ok` + `sessions_ended=<n>`; `ok` + `no verified factor to clear` when an unfinished enrolment was cancelled and no session ended; `denied` + `reason=factor_changed expected_gen=<n>` when the account's factor changed after the step-up check admitted the request (nothing was changed); `error` + `disable failed` when the store failed or the account went away mid-request (`503`, nothing changed); `error` + `blocked: mfa_enforcement=<mode>` when the self-target guard fires. There is no `partial` outcome, and an outcome row the transaction cannot store rolls the whole clear back (`503`, `Sec-Audit-Failed: true`). An `attempted` row with no outcome row means the clear did not commit, except for a connection lost at the instant of COMMIT) |
 | `mfa.login.required` | `POST /login` returned a pending token |
 | `mfa.login.verified` | `POST /login/mfa` TOTP code accepted |
 | `mfa.login.failed` | `POST /login/mfa` rejected (TOTP or recovery) |
@@ -698,7 +698,7 @@ regress:
    destructive UPDATE clears both the secret and all recovery codes;
    any concurrent verify either sees the old state (and matches) or the
    new state (and fails). No half-disabled "secret cleared but
-   recovery codes still active" state. An enroll-verify whose loaded provisional secret is no
+   recovery codes still active" state. The Settings disable and `--mfa-reset` extend that atomicity to the account's durable sessions and the outcome audit row (`MfaDisableOwner`, #6079 PR 2c): the clear, the recovery-code delete, the session delete and the outcome row commit or roll back as one transaction. An enroll-verify whose loaded provisional secret is no
    longer the stored one returns `MfaEnrollmentCancelled` (#3808): a benign
    outcome outside `is_store_unavailable()` that is audited
    `mfa.enroll.cancelled` and gives no 503. The store cannot tell which of a
@@ -781,7 +781,7 @@ regress:
    reads the MFA store). The order is: after the pre-routing
    gates, a null auth store answers `503` for every caller class first, then an engine is `403` with no
    store read, ahead of the window-disabled hatch, which in turn precedes the
-   SAML denial and the store read (so a window of 0 or less lets SAML through);
+   SAML denial and the store read (so a window of 0 or less lets SAML through the 39 `kRequired` rows). A `kFactorCredential` row takes a different order: after the engine denial its window becomes the approver window, so the hatch is unreachable for it, and any non-local session is refused `403` before the store read;
    (g) a gated request authorised by a principal other than the one the check passed:
    the binding removed while handlers still resolve more than once. One principal per request: once the central check passes a gated request,
    every `AuthRoutes::resolve_session` call for that request yields the same principal or
@@ -808,8 +808,8 @@ regress:
    that the decision exempts (both `api_token` and `mcp_token`) before it reads role, scope
    or proof. Chokepoint PR 2: the pass and the in-handler calls may be deleted once handlers
    consume the centrally resolved session or the repeated resolves are removed (#6200); the
-   binding stays until then, and ideally then carries the resolved session itself.
-   Also: (h) a route served with no stage, or a stage that runs before the body is read: a stage
+   binding stays until then, and ideally then carries the resolved session itself. (h) a local enrolled proof judged anywhere but `judge_local_mfa_binding` (`mfa_factor_state.hpp`, shared by the central check and the approver gate); a `kFactorCredential` row made hatch-exempt or admitting a non-local session; a binding read that ignores `binding_enforced`; a Settings Disable clear that does not compare the admitted factor generation under the row lock (`MfaDisableOwner::commit`, through `auth_sql::clear_mfa_factor_in_txn`, with the Settings handler passing `admission->factor_gen`).
+   Also: (i) a route served with no stage, or a stage that runs before the body is read: a stage
    not installed for the server (or installed after the first route, so that route is left
    unwrapped), a registration that bypasses the sink, or an `ExemptNoStage` beyond the plaintext
    redirect listener. The sink throws on a stageless server and `install` throws once a route

@@ -45,7 +45,8 @@ struct SyncSource {
 
     /// Why the most recent collect() returned nullopt — a bounded token the
     /// scheduler persists as sync.<name>.last_skip; sources that cannot classify
-    /// leave it unset.
+    /// leave it unset. No in-tree source sets it at present, and emit_sync_skip_tags
+    /// publishes the skip tags only with a reason, so none are published.
     std::function<std::string()> skip_reason;
 
     /// Retry a skipped cycle on the bounded phase-aligned backoff
@@ -60,14 +61,62 @@ struct SyncSource {
     /// and every skip-ladder cap lands at the agent's stable moment inside the
     /// window (next_window_fire) instead of the next phase slot of `interval`.
     /// Unset (the default) keeps the interval/phase-slot cadence unchanged. A
-    /// compile-time default per source: no settings channel pushes it yet.
+    /// compile-time default per source; installed_software's is replaced by the fleet settings
+    /// (SyncScheduler::apply_settings, collection_settings_agent.hpp).
     std::optional<SyncWindow> window;
+
+    /// Exempt this source from the weekly forced full (kFullFloor). Only for a source whose
+    /// payload heals divergence by itself, section by section: installed_software (blob v3)
+    /// names the facets it holds in its report hash, and the server refuses a delta over a base
+    /// that no longer matches (`installed_software:<facet>` nack -> that facet is resent in
+    /// full), so a weekly blanket resend of every facet would only add load. A force, a
+    /// whole-source nack and a never-acknowledged hash still send full (decide_full).
+    bool no_full_floor{false};
+
+    /// A source that keeps its own per-section state (installed_software, blob v3) is told when
+    /// the scheduler is about to send FULL regardless of what it collects: the operator forced
+    /// the source (request_now), the server nacked the whole source (force_full), or the weekly
+    /// floor is due (never for a no_full_floor source). Called on the ticking thread immediately
+    /// BEFORE collect(), in both tick passes, so a forced send always carries a full payload.
+    /// A never-acknowledged hash does NOT call it: the blob still goes (decide_full), and a
+    /// section the source holds no acknowledged set for is full by the source's own rule, so a
+    /// per-section nack in that window cannot re-force the sections already acknowledged.
+    /// Unset for every other source.
+    std::function<void()> on_force_full;
+
+    /// OR-ed into the full decision after the hash comparison: true when the payload this
+    /// source just collected must reach the server even though its content hash did not move
+    /// (a section whose status or token changed). A source that returns true MUST have put
+    /// something the server can parse in the blob. Unset = the hash alone decides.
+    std::function<bool()> wants_blob;
+
+    /// The acknowledgement of one report that carried this source: the `need_full` tokens that
+    /// name it (the source name itself, or `<name>:<detail>`), empty on a clean acknowledgement.
+    /// Called on the ticking thread BEFORE the scheduler persists its own state, on both the
+    /// clean and the nacked branch. Unset = nothing to commit.
+    std::function<void(const std::vector<std::string>&)> on_ack;
+
+    /// True when the last collect() deliberately left part of the payload for the next one
+    /// (a first contact split over several calls). A clean acknowledgement then re-fires the
+    /// source after kMinTickSeconds instead of at its next regular slot. Unset = false.
+    std::function<bool()> has_more;
 };
 
 /// Sanitise a skip reason for the KV / heartbeat tag: keep [A-Za-z0-9_.:=,-],
 /// replace any other byte with '_', truncate to kPluginHeartbeatMaxValueBytes
 /// (64) bytes.
 YUZU_EXPORT std::string sanitize_skip_reason(std::string_view reason);
+
+/// True for a non-empty run of ASCII digits, at most `max_len` long, with a value above zero
+/// (leading zeros allowed). Gates every KV counter that is published as a heartbeat tag.
+inline bool positive_digits(std::string_view s, std::size_t max_len) {
+    return s.size() <= max_len && s.find_first_not_of("0123456789") == std::string_view::npos &&
+           s.find_first_not_of('0') != std::string_view::npos;
+}
+
+/// The installed_software `__sync__` KV field holding the completeness-unknown count: written by
+/// the collector, read by emit_sync_completeness_unknown_tag.
+inline constexpr char kCompletenessUnknownTotalKey[] = "completeness_unknown_total";
 
 class YUZU_EXPORT SyncScheduler {
 public:
@@ -116,6 +165,19 @@ public:
     request_now(std::string_view sources_csv_or_all,
                 std::chrono::seconds delay_max = std::chrono::seconds{0});
 
+    /// Fleet collection settings for one source (the `__sync__.settings` reserved command): its
+    /// cadence `interval` and maintenance `window` (nullopt = no window). Thread-safe like
+    /// request_now(): it only appends to the mutex-guarded pending list (the latest request per
+    /// source wins), applied at the top of the next tick(). It never forces a sync and never sets
+    /// force_full. An unknown `source` is ignored. When the interval or the window actually
+    /// changes and the source has a FUTURE next_fire, that fire is re-placed to next_due() under
+    /// the new values (the agent's own next slot); a fire already due is left alone, and
+    /// re-applying identical values changes nothing. A multi-day interval on a windowed source is
+    /// placed by next_after_sync() (see there). The same caveat as request_now(): add_source
+    /// must not be called after the ticking thread starts.
+    void apply_settings(std::string_view source, std::chrono::seconds interval,
+                        std::optional<SyncWindow> window);
+
     /// Registered source names, in registration order (for the agent's error text, and
     /// the heartbeat thread's emit_sync_skip_tags). Like request_now(), safe from another
     /// thread only because sources_ is append-only and complete before the scheduler is
@@ -125,7 +187,8 @@ public:
     static constexpr std::string_view kAllSources{"all"};
 
     /// Hard floor: even with hash-skip, send a full payload at least this often
-    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4). A
+    /// (defense-in-depth against server cold-cache / agent hash bugs — ADR-0016 §4), except
+    /// for a source that sets SyncSource::no_full_floor. A
     /// windowed source fires at a local-time moment, so across a spring-forward the 7th
     /// day's fire is an hour short of this floor and the full send lands on the 8th.
     static constexpr std::chrono::seconds kFullFloor{7 * 24 * 60 * 60};
@@ -198,16 +261,33 @@ private:
     /// The next regular fire after `now_secs`: the source's window placement when it
     /// has one, else the next phase-aligned slot of its interval.
     std::int64_t next_due(std::size_t idx, std::int64_t now_secs) const;
+    /// Where a CLEAN sync at `now_secs` puts the next one. next_due() fires a windowed source
+    /// every day whatever its interval, so a windowed source whose interval is over a day is
+    /// placed at the window slot of the day one interval later: the slot is looked up from
+    /// now + interval - 12 h, the margin absorbing a DST shift (an hour either way never moves
+    /// the answer across the slot). An interval of a day or less is next_due() exactly. A skip
+    /// retry (note_skip) keeps using next_due(): a skipped run retries in the next daily window.
+    std::int64_t next_after_sync(std::size_t idx, std::int64_t now_secs) const;
+    /// Apply every pending apply_settings() request to its source (on the ticking thread).
+    void drain_settings(std::int64_t now_secs);
     /// Re-arm a LOADED source whose next_fire is more than kMaxTickSeconds in the
-    /// past (a live agent never is: it wakes at least every clamped sleep) OR more than
-    /// two days in the future (no interval plus window reaches that) to now + a stable
+    /// past (a live agent never is: it wakes at least every clamped sleep) OR further in the
+    /// future than any schedule this source could write (two days; a source whose interval is
+    /// over a day, one interval plus a day) to now + a stable
     /// offset in [0, kCatchUpWindow), and persist it. last_hash and force_full are
     /// left untouched.
     void catch_up_if_overdue(std::size_t idx, std::int64_t now_secs);
+    /// The blanket part of the full decision that does not depend on the collected hash: an
+    /// operator force or a whole-source nack, or the weekly floor. Computed BEFORE collect() so a
+    /// source can be told (SyncSource::on_force_full) and therefore produces a full payload for
+    /// every one of these. decide_full also sends the blob when no hash has ever been
+    /// acknowledged, which is not part of this blanket (see the definition).
+    bool forced_full_due(std::size_t idx, const State& st, std::int64_t now_secs) const;
     /// Hash-skip decision for one source at `now_secs`, given its freshly
     /// collected `hash` — factored out of tick() so the forced-source (pass 1)
     /// and batched (pass 2) paths make the identical decision.
-    bool decide_full(const State& st, const std::string& hash, std::int64_t now_secs) const;
+    bool decide_full(std::size_t idx, const State& st, const std::string& hash,
+                     std::int64_t now_secs) const;
     /// Apply one source's ReportInventory outcome (a name lookup against the
     /// ack's need_full list) to its persisted State — the exact success/nack
     /// state-transition tick() ran inline before this factor-out, now shared by
@@ -230,9 +310,17 @@ private:
 
     // request_now() (any thread) -> drain_pending() (ticking thread). {index into
     // sources_, delay_max seconds}; deduplicated on index on insert, keeping the
-    // smaller delay. The ONLY cross-thread state in this class.
+    // smaller delay. With pending_settings_ below, the ONLY cross-thread state in this class.
     std::mutex pending_mu_;
     std::vector<std::pair<std::size_t, std::int64_t>> pending_;
+
+    // apply_settings() (any thread) -> drain_settings() (ticking thread), under the same mutex.
+    struct PendingSettings {
+        std::size_t idx;
+        std::chrono::seconds interval;
+        std::optional<SyncWindow> window;
+    };
+    std::vector<PendingSettings> pending_settings_;
 };
 
 /// Publish the persisted skip state of each source as heartbeat tags
@@ -254,16 +342,25 @@ void emit_sync_skip_tags(TagMap& tags, const std::vector<std::string>& sources,
         const auto reason = get_fn(SyncScheduler::kv_key(name, "last_skip"));
         if (!streak || !reason || reason->empty() || sanitize_skip_reason(*reason) != *reason)
             continue;
-        if (streak->empty() || streak->size() > 6)
-            continue;
-        bool digits = true;
-        for (char c : *streak)
-            digits = digits && c >= '0' && c <= '9';
-        if (!digits || std::stol(*streak) <= 0)
+        if (!positive_digits(*streak, 6))
             continue;
         tags["yuzu.sync." + name + ".skip_streak"] = *streak;
         tags["yuzu.sync." + name + ".last_skip"] = *reason;
     }
+}
+
+/// Publish the installed_software collector's count of answers that declared no completeness
+/// as the heartbeat tag `yuzu.sync.installed_software.completeness_unknown_total`, read from the
+/// `__sync__` KV the collector persists it in. Emitted only for a positive value of at most nine
+/// ASCII digits; no protobuf field is added (#1567), the same pattern as emit_sync_skip_tags.
+template <typename TagMap>
+void emit_sync_completeness_unknown_tag(
+    TagMap& tags,
+    const std::function<std::optional<std::string>(const std::string& key)>& get_fn) {
+    const auto total =
+        get_fn(SyncScheduler::kv_key("installed_software", kCompletenessUnknownTotalKey));
+    if (total && positive_digits(*total, 9))
+        tags["yuzu.sync.installed_software.completeness_unknown_total"] = *total;
 }
 
 } // namespace yuzu::agent

@@ -14,6 +14,13 @@ copy is invisible without it. This gate pins the source shape:
        /fragments/settings/access-reviews          verb access_review.list
        /fragments/settings/access-reviews/campaign verb access_review.get
   3. The literal `engine_session_denied` appears only in the helper.
+  4. The two access-reviews fragments call `no_store_private(res)` AFTER the belt and before the
+     render (#6940): a cached copy of the grant evidence is the leak, and a call before the belt
+     would stamp the headers on a refusal that already sets its own `no-store`.
+  5. `valid_campaign_id(` is called AT MOST ONCE in the file (the campaign renderer's single
+     validator, #7315): a second call is a duplicate validator, for example from a stale port of
+     an older change. Deleting the call is caught by behaviour (the malformed-id case of
+     test_settings_access_review_engine_authz.cpp), not by this gate.
 
 Source-text only, no build. Carries its own mutation self-test.
 """
@@ -81,6 +88,9 @@ def problems(raw):
         out.append("is_engine() is called outside refuse_engine_session: a forked copy of the belt")
     if "engine_session_denied" in outside:
         out.append("engine_session_denied appears outside refuse_engine_session: a forked copy")
+    if t.count("valid_campaign_id(") > 1:
+        out.append("valid_campaign_id( is called more than once: the campaign renderer has one "
+                   "validator call (#7315)")
     for route, perm, verb in FRAGMENTS:
         h = handler_text(t, route)
         if h is None:
@@ -98,6 +108,14 @@ def problems(raw):
             out.append(f"{route}: order must be permission gate, auth_fn_, refuse_engine_session")
         if i_render >= 0 and not i_belt < i_render:
             out.append(f"{route}: refuse_engine_session must run before any render/set_content")
+        if route != "/fragments/settings/engine-principals":
+            i_nostore = h.find("no_store_private(res)")
+            if i_nostore < 0:
+                out.append(f"{route}: needs no_store_private(res) after the belt (#6940)")
+            elif not i_belt < i_nostore:
+                out.append(f"{route}: no_store_private(res) must come after the belt (#6940)")
+            elif i_render >= 0 and not i_nostore < i_render:
+                out.append(f"{route}: no_store_private(res) must come before the render (#6940)")
         if not ACTED_ON.search(h):
             out.append(f"{route}: the belt's result must be acted on: "
                        "if (refuse_engine_session(...)) return;")
@@ -133,6 +151,16 @@ MUTATIONS = [
     (r'auto session = auth_fn_\(req, res\);\s*if \(!session\)\s*return;\s*// #6744: as every /api/v1/access-reviews twin',
      '// #6744: as every /api/v1/access-reviews twin',
      "needs"),
+    # #6940: the campaign fragment's no_store_private dropped
+    (r'(access_review\.get",\s*"AccessReview"\)\)\s*return;\s*)no_store_private\(res\);[^\n]*\n',
+     r'\1', "campaign: needs no_store_private(res)"),
+    # #6940: no_store_private moved ahead of the belt on the main fragment
+    (r'(auto session = auth_fn_\(req, res\);\s*if \(!session\)\s*return;\s*)(// #6744: as every /api/v1/access-reviews twin)',
+     r'\1no_store_private(res);\n                 \2', "no_store_private(res) must come after the belt"),
+    # #7315: a second validator call (a stale port of an older change)
+    (r'if \(!valid_campaign_id\(campaign_id\)\) \{',
+     'if (!valid_campaign_id(campaign_id) || !valid_campaign_id(campaign_id)) {',
+     "valid_campaign_id( is called more than once"),
     # a second inline copy of the belt
     (r"(bool SettingsRoutes::refuse_cross_site\()",
      "static bool inline_copy(const auth::Session& s) { return s.is_engine(); }\n\\1",

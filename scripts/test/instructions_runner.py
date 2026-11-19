@@ -14,14 +14,12 @@ scripts/test/synthetic-uat-tests.sh:
 Per-instruction outcome (recorded to the test-runs DB as both timing
 and gate_notes):
 
-  pass              dispatch returned 200 and an agent answered within the timeout
-                    (dispatched and answered; no check of the result shape). A
-                    destructive/forensic row passes only when every response row
-                    is terminal SUCCESS with an empty error_detail.
-  fail              dispatch error, no response within timeout, or every
-                    answer errored (a destructive/forensic row also fails on
-                    any errored answer, any error_detail, or a row still running
-                    at the poll deadline)
+  pass              dispatch returned 200 and every reached agent has a terminal
+                    SUCCESS with empty error_detail. Historical RUNNING chunks from
+                    those agents are allowed. The destructive/forensic path retains
+                    its stricter rule: every response row must be terminal SUCCESS.
+  fail              dispatch error, incomplete completion at the poll deadline,
+                    any failed response, error_detail, or malformed response evidence
   pending_approval  HTTP 202 with status=pending_approval - the approval mode
                     is always, role-gated for a non-admin caller, or an
                     unrecognised approval mode; never auto. Not a failure, but
@@ -41,6 +39,12 @@ Definitions whose id is NOT in the override map are classified by plugin, then s
                                            dispatch chokepoint denies them)
   type=question/query                   -> safe
   type=action                           -> mutating
+
+Untargeted dispatches (safe/mutating by default) use agents_reached from the POST response
+and paginate the command's response rows. Every reached agent must have a terminal SUCCESS;
+any FAILURE/TIMEOUT/REJECTED, error_detail, malformed identity/status or incomplete read fails.
+Historical RUNNING output from an agent with a terminal result is allowed. These are execution
+verdict checks, not validation of the instruction's result columns or output content.
 
 The runner broadcasts: it sends no agent_ids and no scope. The exception is the opt-in classes
 destructive and forensic (a Destructive or Forensics capability row). The server refuses a
@@ -448,6 +452,7 @@ _PATTERN_FALLBACKS = (
     "true",                                  # boolean string
     "00000000-0000-0000-0000-000000000000",  # UUID
     "00:00:00:00:00:00",                     # MAC
+    "00000000.1",                            # process start-time token
 )
 
 
@@ -644,9 +649,10 @@ class YuzuClient:
                 payload = {}
             return e.code, payload
 
-    def get_responses(self, command_id: str) -> dict:
+    def get_responses(self, command_id: str, *, offset: int = 0) -> dict:
         req = urllib.request.Request(
-            f"{self.base}/api/responses/{urllib.parse.quote(command_id)}")
+            f"{self.base}/api/responses/{urllib.parse.quote(command_id)}"
+            + (f"?offset={offset}" if offset else ""))
         try:
             with self.opener.open(req, timeout=self.timeout) as resp:
                 return json.loads(resp.read() or b"{}")
@@ -950,13 +956,15 @@ def row_in_flight(r: Any) -> bool:
     return _int_status(r) == 0
 
 
-def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
+def grade_targeted(responses: list, target: str = "", *, strict_running: bool = False) -> tuple[str, bool, bool]:
     """(why it is a fail, any row running, any row unrecognised).
 
     The wire row is {id, instruction_id, agent_id, timestamp, status, output, error_detail} with
     an integer status 0-4. A row that is not an object, has any other status, or names an agent
     other than the target is UNRECOGNISED: something is not as the runner assumes, so the caller
     stops the run. A row with no agent_id is tolerated. A legacy `rc` can only add a failure.
+    Broadcast history also validates RUNNING rows (strict_running), whose terminal
+    rows may arrive beside them rather than replace them.
     """
     problems: list[str] = []
     running = False
@@ -973,13 +981,14 @@ def grade_targeted(responses: list, target: str = "") -> tuple[str, bool, bool]:
             continue
         if row_in_flight(r):
             running = True
-            continue
+            if not strict_running:
+                continue
         reasons: list[str] = []
         s = _int_status(r)
         if s is None or not 0 <= s <= 4:
             reasons.append(f"unrecognised status {clip(r.get('status'), 40)!r}")
             odd = True
-        elif s != 1:
+        elif s not in (0, 1):
             reasons.append(STATUS_NAMES[s])
         rc = r.get("rc", r.get("return_code", 0))
         if isinstance(rc, int) and not isinstance(rc, bool) and rc != 0:
@@ -1040,6 +1049,106 @@ def exercise(client: YuzuClient, defn: Definition,
                     manifest, accepted, control or RunControl(), targeted_poll_timeout_s)
     out.dispatched = accepted[0]
     return out
+
+
+def _broadcast_verdict(rows: list, command_id: str, expected: int) -> tuple[str, int]:
+    """Return a failure reason and the number of agents with terminal SUCCESS.
+
+    response_routes.cpp returns command-filtered rows, not one mutable row per agent.
+    A terminal frame carrying output is inserted beside historical RUNNING chunks;
+    an empty terminal frame instead updates those chunks (agent_service_impl.cpp).
+    Row order/timestamps are therefore not a completion signal. Require a terminal
+    result per distinct agent and reject every conflicting failure, never pick the
+    newest-looking success. No output text is interpreted as a verdict.
+    """
+    agents: set[str] = set()
+    completed: set[str] = set()
+    for r in rows:
+        if not isinstance(r, dict):
+            return "a response row is not an object", 0
+        agent = r.get("agent_id")
+        if not isinstance(agent, str) or not agent.strip():
+            return "unrecognised response agent_id", 0
+        if r.get("instruction_id") != command_id:
+            return "response instruction_id does not match the dispatched command", 0
+        agents.add(agent)
+        status = _int_status(r)
+        if status == 1:
+            completed.add(agent)
+    reason, _, _ = grade_targeted(rows, strict_running=True)
+    if reason:
+        return reason, 0
+    if len(agents) > expected:
+        return "response agent count exceeds dispatch agents_reached", 0
+    return "", len(completed)
+
+
+def _poll_broadcast(client: YuzuClient, defn: Definition, control: RunControl,
+                    timeout: int, payload: dict, ms: Any) -> Outcome:
+    """Safe/mutating (and other untargeted) dispatches need complete fleet evidence.
+
+    The response API defaults to 100 rows, with offset pagination and no total.
+    Read to a short page before grading; an incomplete/error page cannot pass.
+    Pages are not a snapshot, so every poll starts over. The distinct-agent count
+    from the dispatch prevents duplicate rows/pages from completing a broadcast.
+    Targeted refusal accounting/stop policy remains in _poll_targeted.
+    """
+    command_id = payload.get("command_id")
+    execution_id = payload.get("execution_id", "")
+
+    def outcome(status: str, note: str = "", count: int = 0) -> Outcome:
+        return Outcome(defn.id, defn.risk, status, ms(), http_code=200,
+                       command_id=command_id if isinstance(command_id, str) else "",
+                       execution_id=execution_id, response_count=count, note=note)
+
+    if not isinstance(command_id, str) or not command_id:
+        return outcome("fail", "dispatch ok but no command_id returned")
+    expected = payload.get("agents_reached")
+    if not isinstance(expected, int) or isinstance(expected, bool) or expected <= 0:
+        return outcome("fail", "dispatch has no positive integer agents_reached")
+    deadline = time.monotonic() + timeout
+    final = False
+    while True:
+        rows: list = []
+        poll_error = ""
+        while True:
+            if control.stop.is_set():
+                return outcome("error", "in_flight_unknown: dispatch was sent, result not collected")
+            polled = (client.get_responses(command_id, offset=len(rows)) if rows
+                      else client.get_responses(command_id))
+            if not isinstance(polled, dict) or "responses" not in polled:
+                poll_error = (str(polled["error"]) if isinstance(polled, dict) and "error" in polled
+                              else "unrecognised response body")
+                break
+            page = polled["responses"]
+            if not isinstance(page, list):
+                return outcome("fail", "responses is not a list")
+            if "error" in polled or polled.get("result_truncated_by_cap"):
+                poll_error = "incomplete response page"
+                break
+            rows.extend(page)
+            if len(page) < 100:
+                break
+            if time.monotonic() >= deadline:
+                poll_error = "response pagination did not complete before the deadline"
+                break
+        if not poll_error:
+            problems, completed = _broadcast_verdict(rows, command_id, expected)
+            if problems:
+                return outcome("fail", problems, len(rows))
+            if completed == expected:
+                return outcome("pass", count=len(rows))
+        if final or time.monotonic() >= deadline:
+            if poll_error:
+                note = f"poll failed: {clip(poll_error)}"
+            elif not rows:
+                note = f"no response within {timeout}s"
+            else:
+                note = (f"only {completed}/{expected} agents completed successfully within {timeout}s; "
+                        "remaining agents may still be running")
+            return outcome("fail", note, len(rows))
+        time.sleep(min(POLL_INTERVAL_S, max(0, deadline - time.monotonic())))
+        final = time.monotonic() >= deadline
 
 
 def _poll_targeted(client: YuzuClient, defn: Definition, control: RunControl, poll_timeout_s: int,
@@ -1237,71 +1346,7 @@ def _exercise(client: YuzuClient, defn: Definition,
             return _dispatch_unknown(defn, control, ms(),
                                      f"after the accepted POST: {type(e).__name__}: {e}", manifest,
                                      payload)
-    command_id = payload.get("command_id", "")
-    execution_id = payload.get("execution_id", "")
-    if not command_id:
-        return Outcome(defn.id, defn.risk, "fail", ms(),
-                       http_code=code,
-                       execution_id=execution_id,
-                       note="dispatch ok but no command_id returned")
-
-    deadline = time.monotonic() + poll_timeout_s
-    last_payload: dict = {}
-    responses: list = []
-    response_count = 0
-    while time.monotonic() < deadline:
-        if control.stop.is_set():
-            return Outcome(defn.id, defn.risk, "error", ms(), http_code=code,
-                           command_id=command_id, execution_id=execution_id,
-                           note="in_flight_unknown: dispatch was sent, result not collected")
-        last_payload = client.get_responses(command_id)
-        responses = last_payload.get("responses", []) if isinstance(last_payload, dict) else []
-        response_count = len(responses)
-        if response_count > 0:  # the first answer (a targeted row waits for a verdict instead)
-            break
-        time.sleep(POLL_INTERVAL_S)
-
-    duration_ms = ms()
-
-    if response_count == 0:
-        last_err = last_payload.get("error") if isinstance(last_payload, dict) else None
-        return Outcome(defn.id, defn.risk, "fail",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id,
-                       note=f"no response within {poll_timeout_s}s"
-                            + (f" (last poll: {last_err})" if last_err else ""))
-
-    # Loose shape validation: trust the agent's structured `status` and
-    # `rc` fields rather than greping the body for "error|". Several
-    # legitimate-empty cases (event_logs.errors returning rows whose
-    # column-0 label is "error", agent_logging emitting an empty marker)
-    # would otherwise be misclassified.
-    # NOTE: this safe/mutating grading still compares a string `status` and an `rc`, neither
-    # of which the server's integer-status rows carry; tracked as a follow-up, unchanged here.
-    sane_count = 0
-    error_count = 0
-    for r in responses:
-        out = r.get("output", "")
-        if not out:
-            continue
-        status = r.get("status", "")
-        # Agent reports rc explicitly when available; non-zero rc or
-        # status=="error" is the authoritative failure signal.
-        rc = r.get("rc", r.get("return_code", 0))
-        if status == "error" or (isinstance(rc, int) and rc != 0):
-            error_count += 1
-        else:
-            sane_count += 1
-
-    if sane_count == 0 and error_count > 0:
-        return Outcome(defn.id, defn.risk, "fail",
-                       duration_ms, http_code=code, command_id=command_id,
-                       execution_id=execution_id, response_count=response_count,
-                       note=f"all {error_count} responses errored")
-
-    return Outcome(defn.id, defn.risk, "pass",
-                   duration_ms, http_code=code, command_id=command_id,
-                   execution_id=execution_id, response_count=response_count)
+    return _poll_broadcast(client, defn, control, poll_timeout_s, payload, ms)
 
 
 # ── DB writeback ───────────────────────────────────────────────────────────

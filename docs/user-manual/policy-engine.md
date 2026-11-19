@@ -275,7 +275,7 @@ The policy engine tracks compliance status per agent per policy. Each
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
 | `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
 | `fixing` | Fix instruction is currently running |
-| `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`) |
+| `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (output nested past the depth guard, an evaluation that threw, or a compliance expression that fails to evaluate, such as a division by zero; all three are counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; a numeric JSON value is compared as text and is not an error; `reason="expression"` covers an expression that evaluates to no value: a division by zero, a type error, a timeout, or an expression that does not parse or is over-long. A `result.<field>` the response lacks reads as an empty string, which is false: the verdict is `non_compliant`, not `error`, and nothing is counted; only that device is affected) |
 
 ---
 
@@ -301,14 +301,14 @@ boot after a Postgres cutover — when that table is still empty — makes every
 enabled policy due immediately (a freshly authored policy evaluates within
 ~25 seconds of creation, the same as any other newly-due policy).
 
-Verdict semantics: a plugin failure / timeout / rejection → `error`; a
+Verdict semantics: a plugin failure / timeout / rejection / unevaluable response (nested past the depth guard, a thrown evaluation or a failing compliance expression) → `error` (an unevaluable response never affects another device's verdict; to act on one, check the `yuzu_server_policy_unevaluable_responses_total` reason; for `reason="exception"` the server log has a `could not be evaluated` warning, and for `reason="depth"` a `nested past the depth guard` error; both name the device. `reason="expression"` logs nothing per device; then fix the check expression or the check plugin on that device); a
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
 **A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
 reads each check's stored response with every Forensics-tier plugin
 (`app_usage`, `browser_inventory`, `execution_artifacts`,
-`privacy_permissions`, `remote_access_audit`; the set is derived from the
+`privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
 capability catalogue) excluded, because the verdict and the first bytes of the
 check output are shown to readers who do not hold `Forensics:Read`. Such a
 policy therefore shows `unknown` for every agent with an empty `check_result`,
@@ -625,3 +625,9 @@ spec:
   inputs:
     <key>: <value>
 ```
+
+## Routed-concern invariants
+
+Moved verbatim from the `Compliance evaluation pipeline` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.
+
+Compliance evaluation pipeline — `PolicyEvaluator` background thread (10s tick, 15s grace, ≥60s floor, 3600s default) drives check→verdict→status; `policy_eval_thread_` joins before stores in `~ServerImpl`/`stop()`. Mints `polchk-*` ids `notify_exec_tracker` skips (no tracker row, no SSE — NOT in the executions drawer). Remediation is operator-gated only. Dispatch due-ness is a durable, fleet-wide single-sweeper claim on Postgres (`PolicyStore::claim_due_policies`, `policy_dispatch_state`, ADR-0056) — NOT the evaluator's own in-memory state; never fork a second claim path or reintroduce an in-memory throttle.

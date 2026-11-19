@@ -79,7 +79,7 @@ module_monthly (time-based, 12mo)
   month_ts, module_name, signer, signed_state, is_kernel, load_count
 ```
 
-- `dollar_name = "Module"` → queryable as `$Module_Live` / `$Module_Hourly` / … through the existing `echo.sql` whitelist + `$`-name map. **No new agent action and no new REST route** — registry registration is sufficient.
+- `dollar_name = "Module"` → queryable as `$Module_Hourly` / `$Module_Daily` / `$Module_Monthly` through the existing `echo.sql` whitelist + `$`-name map. **No new agent action and no new REST route** — registry registration is sufficient.
 - `os_support` records the §2 status/method per OS so the schema↔handler cross-check test (the H2/G9 pattern) binds the published capability to the actual collector.
 - Rollups group by `(module_name, signer, signed_state, is_kernel)` with a `load_count`. Risky loads (unsigned/invalid/revoked/kernel/blocked) are also retained at full fidelity in `module_live` per §5.
 - **`load_count` counts only `loaded` events.** `blocked` rows live at full fidelity in `module_live` and `seed` rows are stored once per hour like ordinary loads (unloads are not stored), but both are excluded from the aggregate count — so a `blocked` BYOVD load is preserved for forensics yet never inflates a load rate. The trade-off: an operator must query `module_live` (not the rollups) to see blocked loads. M7 may add a dedicated `blocked_count` rollup column if the aggregate tier needs it.
@@ -184,7 +184,7 @@ Both HIGH findings (NT-device-path → `\\?\GLOBALROOT` conversion, *superseded 
 - **Follow-up — boot-gap seed** (§7): enumerate already-loaded modules at start (`EnumProcessModulesEx`/Toolhelp), `action='seed'`, per-boot dedup like the process `.etl` backfill. `WinVerifyTrust` works on the seed (file still on disk).
 - **Follow-up — `module_stream_dropped` as a Prometheus counter** (`yuzu_echo_module_stream_dropped_total`) — a pre-existing pattern gap shared with the process stream (only reachable via `echo.status` today). File once, covers both.
 - **Operator docs (with the M8 doc pass)** — `docs/user-manual/echo.md`: the `WTD_REVOKE_NONE` no-revocation disclosure, the `$Module` OS-compatibility matrix (Windows supported; macOS/Linux planned M4/M5/M6 so a pilot operator knows why it's empty), and `module_live`'s row-count (not time-based) retention. The SOC 2 `$Module` data-inventory row (`docs/enterprise-readiness-soc2-first-customer.md` §3.5) is now due since data can flow on Windows.
-- **Known limitation (documented in code) — `redact_module_dir`** does not catch 8.3 short names or redirected/roaming profile roots; `$Process_Live` is the authoritative cross-reference. `pid_name` is best-effort under PID reuse (same cross-reference).
+- **Known limitation (documented in code) — `redact_module_dir`** does not catch 8.3 short names or redirected/roaming profile roots; `$Process_Hourly` is the authoritative cross-reference. `pid_name` is best-effort under PID reuse (same cross-reference).
 
 ## 14. Cross-references
 

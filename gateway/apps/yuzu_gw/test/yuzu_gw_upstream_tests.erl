@@ -40,9 +40,19 @@ upstream_test_() ->
       {"proxy_inventory returns response", fun proxy_inventory_ok/0},
       {"notify_stream_status does not crash on error", fun notify_no_crash/0},
       {"connect notification advertises command_dispatch_tag_v1", fun notify_advertises_dispatch_tag_capability/0},
-      {"buffer retained on flush failure", fun buffer_retained_on_failure/0},
       {"buffer cap prevents unbounded growth", fun buffer_cap_on_failure/0}
      ]}.
+
+%% GW-HB-RETRY-001: production contract, gateway manual "Heartbeat Batching".
+%% A transient failure retains exact payloads; success consumes them once.
+%% Give this lifecycle its own owned processes rather than inheriting a buffer
+%% populated by earlier cases in upstream_test_.
+heartbeat_retry_lifecycle_test_() ->
+    {setup, fun setup/0, fun cleanup/1,
+     fun({HBPid, _UpPid, _Saved}) ->
+         {"GW-HB-RETRY-001: retain on failure, deliver on recovery, then empty",
+          fun() -> buffer_retained_on_failure(HBPid) end}
+     end}.
 
 setup() ->
     meck:new(yuzu_grpc_client, [non_strict, no_link]),
@@ -51,26 +61,42 @@ setup() ->
     end),
     meck:new(telemetry, [passthrough, no_link]),
     meck:expect(telemetry, execute, fun(_, _, _) -> ok end),
+    Saved = [{Key, application:get_env(yuzu_gw, Key)} || Key <-
+             [heartbeat_batch_interval_ms, max_heartbeat_buffer]],
     %% Use a long interval so flushes don't happen automatically during tests.
     application:set_env(yuzu_gw, heartbeat_batch_interval_ms, 60000),
     application:set_env(yuzu_gw, max_heartbeat_buffer, 5),
     {ok, HBPid} = yuzu_gw_heartbeat_buffer:start_link(),
     {ok, UpPid} = yuzu_gw_upstream:start_link(),
-    {HBPid, UpPid}.
+    {HBPid, UpPid, Saved}.
 
-cleanup({HBPid, UpPid}) ->
+cleanup({HBPid, UpPid, Saved}) ->
     %% Synchronous stop. notify_no_crash uses spawn_monitor inside the
     %% upstream process to fan out NotifyStreamStatus RPCs; killing the
     %% upstream gen_server with exit(_, shutdown) does not wait for
     %% those children, so they keep logging into the next test module
     %% and the heartbeat buffer keeps draining failed batches. The
     %% earlier sleep(50) was not enough on busy boxes — see #336.
-    catch unlink(HBPid),
-    catch unlink(UpPid),
-    catch gen_server:stop(UpPid, shutdown, 5000),
-    catch gen_server:stop(HBPid, shutdown, 5000),
-    meck:unload([yuzu_grpc_client, telemetry]),
-    ok.
+    unlink(HBPid),
+    unlink(UpPid),
+    try
+        try stop_owned(UpPid) after stop_owned(HBPid) end
+    after
+        try meck:unload([yuzu_grpc_client, telemetry])
+        after
+            [case Value of
+                 undefined -> application:unset_env(yuzu_gw, Key);
+                 {ok, Previous} -> application:set_env(yuzu_gw, Key, Previous)
+             end || {Key, Value} <- Saved]
+        end
+    end,
+    ?assertNot(is_process_alive(HBPid)),
+    ?assertNot(is_process_alive(UpPid)).
+
+stop_owned(Pid) ->
+    try gen_server:stop(Pid, shutdown, 5000)
+    catch exit:noproc -> ok
+    end.
 
 %%%===================================================================
 %%% Tests
@@ -230,49 +256,53 @@ notify_advertises_dispatch_tag_capability() ->
     ?assert(lists:member(<<"command_dispatch_tag_v1">>,
                          maps:get(wire_capabilities, LastReq, []))).
 
-buffer_retained_on_failure() ->
-    %% First drain any existing buffer.
-    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
-        {ok, #{acknowledged_count => 0}, #{}}
-    end),
-    HBPid = whereis(yuzu_gw_heartbeat_buffer),
-    HBPid ! flush,
-    %% Barrier, not a sleep: the reply proves the drain flush was handled
-    %% before meck history is reset (see await_rpcs/1).
-    _ = sys:get_state(HBPid),
-    meck:reset(yuzu_grpc_client),
-
-    %% Queue 3 heartbeats.
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r1">>}),
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r2">>}),
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r3">>}),
-    timer:sleep(20),
-
-    %% Make flush fail.
-    meck:expect(yuzu_grpc_client, unary, fun(_, _, _, _, _) ->
+buffer_retained_on_failure(HBPid) ->
+    Parent = self(),
+    Ref = make_ref(),
+    Path = <<"/yuzu.gateway.v1.GatewayUpstream/BatchHeartbeat">>,
+    Heartbeats = [#{session_id => <<"retry-1">>,
+                    status_tags => #{<<"health">> => <<"ok">>},
+                    fleet_snapshot_json => <<"{\"host\":\"one\"}">>},
+                  #{session_id => <<"retry-2">>, status_tags => #{}}],
+    meck:expect(yuzu_grpc_client, unary, fun(_, ActualPath, Req, _, _) ->
+        Parent ! {Ref, failed_batch, ActualPath, Req},
         {error, connection_refused}
     end),
-    _ = flush_and_await(),
+    [ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(HB) || HB <- Heartbeats],
+    %% This call follows the casts from this process and returns only after
+    %% flushing, so neither a sleep nor asynchronous meck history is an oracle.
+    ?assertEqual({error, {internal, connection_refused}},
+                 yuzu_gw_heartbeat_buffer:flush_sync()),
+    assert_batch(Ref, failed_batch, Path, Heartbeats),
+    ?assertEqual(HBPid, whereis(yuzu_gw_heartbeat_buffer)),
+    ?assert(is_process_alive(HBPid)),
 
-    %% Now make flush succeed and add one more heartbeat.
-    meck:reset(yuzu_grpc_client),
-    meck:expect(yuzu_grpc_client, unary, fun(_, Path, Req, _, _) ->
-        case binary:match(Path, <<"BatchHeartbeat">>) of
-            nomatch -> {ok, #{}, #{}};
-            _ ->
-                HBs = maps:get(heartbeats, Req, []),
-                {ok, #{acknowledged_count => length(HBs)}, #{}}
-        end
+    NewHeartbeat = #{session_id => <<"retry-3">>, status_tags => #{}},
+    meck:expect(yuzu_grpc_client, unary, fun(_, ActualPath, Req, _, _) ->
+        Parent ! {Ref, recovered_batch, ActualPath, Req},
+        {ok, #{acknowledged_count => length(maps:get(heartbeats, Req))}, #{}}
     end),
-    yuzu_gw_heartbeat_buffer:queue_heartbeat(#{session_id => <<"r4">>}),
-    timer:sleep(20),
+    ok = yuzu_gw_heartbeat_buffer:queue_heartbeat(NewHeartbeat),
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    assert_batch(Ref, recovered_batch, Path, Heartbeats ++ [NewHeartbeat]),
+    ?assertEqual(HBPid, whereis(yuzu_gw_heartbeat_buffer)),
+    ?assert(is_process_alive(HBPid)),
 
-    %% Trigger flush — should include all 4 heartbeats (3 retained + 1 new).
-    BatchCalls = flush_and_await(),
-    ?assert(length(BatchCalls) > 0),
-    [LastBatch | _] = BatchCalls,
-    HBs = maps:get(heartbeats, LastBatch, []),
-    ?assertEqual(4, length(HBs)).
+    %% A second successful flush must make no RPC: acknowledgements consumed
+    %% the data, not merely reported success while leaving duplicate work.
+    ?assertEqual(ok, yuzu_gw_heartbeat_buffer:flush_sync()),
+    receive {Ref, Phase, _, _} -> error({unexpected_extra_batch, Phase})
+    after 0 -> ok
+    end.
+
+assert_batch(Ref, Phase, Path, Heartbeats) ->
+    receive
+        {Ref, Phase, ActualPath, Req} ->
+            ?assertEqual(Path, ActualPath),
+            ?assertEqual(atom_to_binary(node(), utf8), maps:get(gateway_node, Req)),
+            ?assertEqual(Heartbeats, maps:get(heartbeats, Req))
+    after 1000 -> error({missing_batch, Phase})
+    end.
 
 buffer_cap_on_failure() ->
     %% Max buffer is set to 5 in setup. First drain any existing buffer.

@@ -22,10 +22,13 @@
 #include "sync_source_installed_software.hpp"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <set>
 #include <string>
 #include <string_view>
+#include <tuple>
 #include <utility>
 #include <vector>
 
@@ -74,7 +77,8 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
     std::sort(sorted.begin(), sorted.end());
     CHECK(std::adjacent_find(sorted.begin(), sorted.end()) == sorted.end());
 
-    for (const auto& [plugin_sv, action_sv] : table) {
+    for (const auto& [plugin_sv, action_sv, limit] : table) {
+        static_cast<void>(limit);
         const std::string plugin{plugin_sv};
         const auto path = find_plugin(plugin);
         INFO("plugin=" << plugin << " action=" << action_sv << " path=" << path.string());
@@ -91,4 +95,50 @@ TEST_CASE("installed-software action table matches real plugin descriptors",
             if (std::string_view{*a} == action_sv) in_actions = true;
         CHECK(in_actions);
     }
+}
+
+TEST_CASE("the hardware drivers_inventory row is last in the table and resolves to the real plugin",
+          "[sync][table]") {
+    // hardware.drivers_inventory joined the daily sync as the LAST row: the facet order is the
+    // order sections are planned in, and the server's kSoftwareSources vocabulary follows it
+    // (tests/test_software_vocabulary_consistency.py compares the ordered lists).
+    const auto table = yuzu::agent::installed_software_actions();
+    REQUIRE_FALSE(table.empty());
+    CHECK(table.back() == std::make_tuple(std::string_view{"hardware"},
+                                          std::string_view{"drivers_inventory"},
+                                          std::chrono::seconds{120}));
+
+    auto loaded = yuzu::agent::PluginHandle::load(find_plugin("hardware"));
+    REQUIRE(loaded.has_value());
+    const YuzuPluginDescriptor* d = loaded->descriptor();
+    REQUIRE(d != nullptr);
+    CHECK(std::string_view{d->name} == "hardware");
+    bool declared = false;
+    for (const char* const* a = d->actions; a && *a; ++a)
+        declared = declared || std::string_view{*a} == "drivers_inventory";
+    CHECK(declared);
+}
+
+TEST_CASE("the action table pins each action's time limit: three slow ones at 120 s, the rest at 60 s",
+          "[sync][table]") {
+    // The limit is how long the sync thread waits for one action before reporting `timeout`; every
+    // collector test overrides it, so the table values are pinned here. The slow three are the
+    // registry walk, the DISM enumeration and the driver roster.
+    const std::set<std::string> slow = {"installed_apps.list_inventory", "windows_optional_features.list",
+                                        "hardware.drivers_inventory"};
+    std::size_t slow_seen = 0;
+    std::size_t fast_seen = 0;
+    for (const auto& [plugin, action, limit] : yuzu::agent::installed_software_actions()) {
+        const std::string source = std::string(plugin) + "." + std::string(action);
+        INFO(source);
+        if (slow.contains(source)) {
+            CHECK(limit == std::chrono::seconds{120});
+            ++slow_seen;
+        } else {
+            CHECK(limit == std::chrono::seconds{60});
+            ++fast_seen;
+        }
+    }
+    CHECK(slow_seen == 3);
+    CHECK(fast_seen == 8);
 }

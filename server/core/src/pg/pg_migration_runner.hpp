@@ -81,15 +81,64 @@ public:
     /// the WHOLE call closed rather than silently skipping whichever one
     /// loses the `<= current` race in the apply loop below.
     ///
+    /// #7158: every applied migration's SHA-256 is recorded in
+    /// `public.yuzu_schema_migrations`, and every `run()` compares the recorded hash
+    /// of each version at or below the recorded schema version with this
+    /// binary's text. A DIFFERENT hash means the database recorded a version
+    /// whose DDL is not what this build's runtime queries were written against
+    /// (an in-place edit of an already-applied migration): `run()` refuses
+    /// (returns false, one error line naming the store, the version and both
+    /// hashes) instead of letting the store open and fail at its first query.
+    /// `run()` only returns false; whether that stops the boot is the caller's call. Three
+    /// callers do not make it fatal: `analytics_event_store` (degrades for the run),
+    /// `crypto_dashboard_layout_store` (a recorded exception) and `leader_elector` (the server
+    /// boots with its leader-only loops paused; it re-runs `run()` every election cycle and
+    /// meets the same refusal, so it does not recover until the database is repaired).
+    /// Operators look for the `PgMigrationRunner: store '<store>' recorded migration` log line
+    /// and the `yuzu_server_leader_*` metrics.
+    /// Unlike the ahead check below (which only warns), a recorded text that differs from this
+    /// build's is judged on-procedure: for a database written by this build's own lineage the
+    /// refusal is the first failure, so it fails closed; there is deliberately no override.
+    /// The one sub-case this reasoning does not cover is a database that is ahead of the binary
+    /// AND carries edited text for a version both know. That is already off-procedure (#3894),
+    /// so the refusal there is a second failure rather than the first. It refuses on purpose
+    /// (fail closed, same rule as above), but #7158 recorded no separate ruling for this
+    /// sub-case; it is pinned by a test and is the owner's call to change.
+    /// A version applied before this table existed
+    /// has no recorded hash: it is recorded as it is first seen
+    /// (`recorded_by = 'tofu'`, trust on first use). That cannot detect drift
+    /// that predates the table, and it assumes one build lineage per database
+    /// (the hard-cutover deployment contract): a binary that applied different
+    /// text and was later replaced is recorded as whatever the current build
+    /// holds. This includes a version that a build predating the hash table applied
+    /// when that build wins a concurrent first boot: it is recorded as THIS build's text on
+    /// first sight, without comparison. That is the same documented one-lineage limit, not a
+    /// separate gap (a refusal there would not close the sequential variant, so it is the
+    /// owner's decision). Steady state is one lock-free read; only first sight of an
+    /// unhashed version takes the per-store lock. The table has a
+    /// Yuzu-specific name because `public` is shared with whatever else lives
+    /// in the database: a foreign `schema_migrations` (golang-migrate, Rails;
+    /// Flyway's default is `flyway_schema_history`) would make `CREATE TABLE IF NOT EXISTS` skip
+    /// silently and every store then fail on a missing column. This detects accidental or
+    /// procedural drift, NOT tampering: whoever can write the table can also
+    /// rewrite `schema_meta`, and a deleted row is simply recorded again.
+    /// A recorded hash that is not 64 lowercase hex digits (a hand-edited row)
+    /// is refused with its own message and never reaches a compare or a log.
+    /// Versions at or below the recorded version that this binary also carries
+    /// are judged even when the database is ahead of the vector (below), so a
+    /// downgrade onto edited text now refuses where it used to warn.
+    ///
     /// #3894: the complementary case — a database already AHEAD of this
     /// binary's vector (an older build started against a database a newer one
     /// migrated). That situation is outside the supported procedure (rolling
     /// upgrades and a return to an earlier build are not supported at this
-    /// stage), so this is WARN-ONLY, never a refusal: a refusal would add a
+    /// stage), so the ahead check ITSELF is WARN-ONLY, never a refusal: a refusal would add a
     /// second failure to a situation that is already off-procedure, and the
     /// owner chose to end the silence without changing what boots. `run()`
     /// applies nothing, logs one actionable warning per CALL naming the store
-    /// and both versions, and returns true. Some stores call `run()` more than
+    /// and both versions, and returns true unless the #7158 hash check that follows
+    /// refuses (a version this binary carries whose text differs from the recorded
+    /// one). Some stores call `run()` more than
     /// once per process start (the auth and secrets stores are opened twice;
     /// `LeaderElector` re-runs it on every reconnect), so the warning can
     /// repeat. A store's own constructor can still refuse afterwards (e.g. a
@@ -107,6 +156,29 @@ public:
     /// decision is testable without a database.
     [[nodiscard]] static bool is_schema_ahead(int db_version,
                                               const std::vector<PgMigration>& migrations);
+
+    /// One (version, SHA-256 hex) pair: what this binary's migration text hashes
+    /// to (`expected`) or what `public.yuzu_schema_migrations` recorded (`recorded`).
+    struct VersionHash {
+        int version;
+        std::string sha256;
+    };
+
+    /// #7158: the verdict of comparing recorded migration hashes with this
+    /// binary's. Both lists hold versions, ascending.
+    struct HashVerdict {
+        std::vector<int> missing; ///< applied (<= db_version) but no recorded hash
+        std::vector<int> drifted; ///< recorded hash differs from this binary's text
+    };
+
+    /// #7158: pure comparison, exposed so the decision is testable without a
+    /// database. Only versions at or below `db_version` are judged: a recorded
+    /// row ABOVE it (a rewound `schema_meta`) is overwritten when that version
+    /// re-applies, and a version above this binary's vector (#3894, a newer
+    /// build) has no expected hash and is ignored.
+    [[nodiscard]] static HashVerdict check_recorded_hashes(int db_version,
+                                                           const std::vector<VersionHash>& expected,
+                                                           const std::vector<VersionHash>& recorded);
 
     /// Current schema version for a store. Returns 0 if the store (or the
     /// schema_meta table itself) is untracked, -1 on query error.

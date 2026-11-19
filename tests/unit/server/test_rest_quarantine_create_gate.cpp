@@ -1,8 +1,11 @@
 /**
  * test_rest_quarantine_create_gate.cpp -- #6065 PR-Q: POST /api/v1/quarantine
- * runs the shared dispatch chokepoint for ("quarantine","quarantine"), and a
+ * runs the shared dispatch chokepoint for ("firewall","quarantine"), and a
  * denied caller reaches NO agent, end to end; DELETE (release) runs it for
- * ("quarantine","unquarantine") and a denied release leaves the record active (case j).
+ * ("firewall","release") and a denied release leaves the record active (case j).
+ * PRQ.2: the release is a real, confirmed step (cases m-o): the record ends on the
+ * device's `status|inactive`, a releasing record keeps the containment gate's refusal,
+ * and a forced end lifts it while the device is still owed a release.
  *
  * WHY THIS FILE EXISTS. test_rest_quarantine_routes.cpp pins the route WIRING
  * with an injected authorizer; an injected admission proves wiring, not
@@ -63,6 +66,7 @@
 #include "leader_gate.hpp"
 #include "management_group_store.hpp"
 #include "quarantine_containment_reconciler.hpp"
+#include "quarantine_reapply.hpp"
 #include "quarantine_store.hpp"
 #include "rbac_store.hpp"
 #include "response_store.hpp"
@@ -73,6 +77,7 @@
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
+#include "test_forensics_tier_fixture.hpp"
 #include "test_route_sink.hpp"
 
 #include "agent.pb.h"
@@ -89,6 +94,7 @@
 #include <deque>
 #include <expected>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -123,6 +129,37 @@ yuzu::test::PgTestTemplate create_gate_tpl{"restquarantinecreategate", [](const 
 constexpr const char* kAgent = "agent-1";
 constexpr const char* kDecoy = "agent-2"; // registered, never named by a record
 constexpr const char* kWhitelist = "10.0.0.1,10.0.0.2";
+// What the server sends the firewall plugin for kWhitelist (one /out and one /in per address).
+constexpr const char* kExceptions = "10.0.0.1/out,10.0.0.1/in,10.0.0.2/out,10.0.0.2/in";
+
+// The DELETE route reads the device's reply for a bounded number of polls: no sleeping between
+// them. Process-global test seams, restored on exit.
+struct ReleasePollSeams {
+    int saved_interval{detail::live_poll_interval_ms().load()};
+    int saved_polls{detail::release_confirm_max_polls().load()};
+    std::function<void()> saved_pause_hook{detail::release_confirm_pause_hook()};
+    ReleasePollSeams() {
+        detail::live_poll_interval_ms().store(0);
+        detail::release_confirm_max_polls().store(2);
+        detail::release_confirm_pause_hook() = {}; // a case installs its own, restored on exit
+    }
+    ~ReleasePollSeams() {
+        detail::live_poll_interval_ms().store(saved_interval);
+        detail::release_confirm_max_polls().store(saved_polls);
+        detail::release_confirm_pause_hook() = saved_pause_hook;
+    }
+};
+
+// The reconciler's monotonic clock (#7583): a test advances it instead of waiting. Starts an hour
+// in, so a time_point of 0 ("never claimed") is always in the past.
+struct FakeSteady {
+    std::chrono::steady_clock::time_point t =
+        std::chrono::steady_clock::time_point{} + std::chrono::hours(1);
+    void advance(std::chrono::milliseconds d) { t += d; }
+    QuarantineContainmentReconciler::SteadyNowFn fn() {
+        return [this] { return t; };
+    }
+};
 
 // What the dispatch observed: the exact agent and the exact wire command.
 struct Sent {
@@ -130,6 +167,7 @@ struct Sent {
     std::string plugin;
     std::string action;
     std::unordered_map<std::string, std::string> params;
+    std::string command_id; // the id the reply to this command is stored under
 };
 
 struct Rig {
@@ -167,6 +205,11 @@ struct Rig {
     std::int64_t command_seq{0};
     std::string last_command_id;
     std::vector<Sent> sent_log;
+    // What the device answers a firewall.release the route sends, stored under the command id as
+    // the dispatch is made ("" = the device never answers). Default: it confirms the release.
+    std::string release_reply{"status|inactive"};
+    ReleasePollSeams poll_seams;
+    FakeSteady steady; // the reconciler's monotonic clock; settle() advances it, nothing waits
 
     RestApiV1::AuthorizeDispatchFn authorize_dispatch;
     detail::KillSwitchFn kill_switch; // empty = unwired (legacy-open), as server.cpp without a store
@@ -225,6 +268,7 @@ struct Rig {
             return decision;
         };
 
+        api.set_forensics_plugin_set(&yuzu::server::test::forensics_plugin_set());
         register_routes();
         build_reconciler();
     }
@@ -331,7 +375,18 @@ struct Rig {
             res.status = 403;
             return false;
         };
-        RestApiV1::ExecVisibleFn exec_visible = [](const auth::Session&) { return authz::deny_all(); };
+        // The operator reaches agent-1 only (and never the decoy): the set a confined
+        // operator's derivation would hand the route.
+        RestApiV1::ExecVisibleFn exec_visible = [](const auth::Session&) {
+            return authz::VisibleSet{std::unordered_set<std::string>{kAgent}};
+        };
+        RestApiV1::CommandDispatchFn operator_dispatch_fn =
+            [this](const std::string& plugin, const std::string& action,
+                   const std::vector<std::string>& ids, const std::string& scope,
+                   const std::unordered_map<std::string, std::string>& params,
+                   const std::string& exec, const DispatchCaller& caller) {
+                return dispatch_as(caller, plugin, action, ids, scope, params, exec);
+            };
 
         api.register_routes(sink, auth_fn, perm_fn, audit_fn,
                             /*rbac_store=*/&rbac, /*mgmt_store=*/&mgmt,
@@ -345,7 +400,7 @@ struct Rig {
                             /*device_token_store=*/nullptr, /*license_store=*/nullptr,
                             /*guaranteed_state_store=*/nullptr, /*metrics_registry=*/&metrics,
                             /*session_revoke_fn=*/{}, /*execution_event_bus=*/nullptr,
-                            /*result_set_store=*/nullptr, /*command_dispatch_fn=*/{},
+                            /*result_set_store=*/nullptr, operator_dispatch_fn,
                             /*step_up_fn=*/{}, /*guardian_push_fn=*/{}, /*dex_perf_fn=*/{},
                             /*network_api=*/{}, /*lockout_clear_fn=*/{},
                             /*baseline_store=*/nullptr, scoped_gate_stub,
@@ -370,15 +425,27 @@ struct Rig {
         const std::vector<std::string>& agent_ids, const std::string& scope_expr,
         const std::unordered_map<std::string, std::string>& parameters,
         const std::string& execution_id) {
+        return dispatch_as(DispatchCaller{.system = true}, plugin, action, agent_ids, scope_expr,
+                           parameters, execution_id);
+    }
+
+    // The same slice for any caller: the route's operator (its own exec_visible) or the system.
+    // The containment gate is built as make_containment_gate builds it on a healthy read: the four
+    // firewall containment actions are exempt, every other pair is refused for a device with an
+    // active record (a releasing one included: it stays listed).
+    ConfinedDispatchOutcome dispatch_as(
+        const DispatchCaller& caller, const std::string& plugin, const std::string& action,
+        const std::vector<std::string>& agent_ids, const std::string& scope_expr,
+        const std::unordered_map<std::string, std::string>& parameters,
+        const std::string& execution_id) {
         auto norm_action = action;
         for (auto& c : norm_action)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
         const std::string command_id = plugin + "-cmd-" + std::to_string(++command_seq);
         last_command_id = command_id;
 
-        const DispatchCaller system_caller{.system = true};
         auto decision = detail::classify_and_authorize_dispatch(
-            caps, system_caller, plugin, norm_action,
+            caps, caller, plugin, norm_action,
             [this](std::string_view principal, std::string_view securable, authz::Operation op) {
                 return has_permission(principal, securable, op);
             });
@@ -391,18 +458,28 @@ struct Rig {
             std::string(dispatch_arm_label(arm)), execution_id);
         if (!classified)
             return ConfinedDispatchOutcome{.command_id = command_id};
-        // make_containment_gate: the quarantine plugin's own control channel is exempt.
-        const auto gate = yuzu::protective::is_quarantine_control_plugin(plugin, norm_action)
+        // make_containment_gate: the firewall plugin's containment actions are exempt.
+        std::unordered_set<std::string> quarantined;
+        if (auto active = quarantine.list_quarantined())
+            for (const auto& r : *active)
+                quarantined.insert(r.agent_id);
+        const auto gate = yuzu::protective::is_firewall_control_plugin(plugin, norm_action)
                               ? ContainmentGate::exempt_control_plugin()
-                              : ContainmentGate::enforcing(/*fail_closed_in=*/false, {});
+                              : ContainmentGate::enforcing(/*fail_closed_in=*/false,
+                                                           std::move(quarantined));
         auto noop_audit = [](const std::string&, const std::string&, const std::string&,
                              const std::string&) {};
-        return wire_and_dispatch_confined(
+        auto outcome = wire_and_dispatch_confined(
             registry, /*mgmt_group_store=*/nullptr, /*result_set_store=*/nullptr,
             /*tag_store=*/nullptr, /*custom_properties_store=*/nullptr,
             /*execution_tracker=*/nullptr, noop_audit, noop_audit, command_id, execution_id,
-            /*principal_role=*/"", agent_ids, scope_expr, system_caller.exec_visible,
+            /*principal_role=*/"", agent_ids, scope_expr, caller.exec_visible,
             /*broadcast_on_none=*/false, gate, *classified);
+        // The device answers the release the route sent (only that one).
+        if (!caller.system && plugin == "firewall" && norm_action == "release" && outcome.sent > 0 &&
+            !release_reply.empty())
+            store_response(command_id, release_reply);
+        return outcome;
     }
 
     void build_reconciler() {
@@ -420,6 +497,7 @@ struct Rig {
                     return system_dispatch(plugin, action, ids, scope, params, exec);
                 },
                 .now_fn = {},
+                .steady_now_fn = steady.fn(),
                 // Test knobs: drive the apply -> poll -> status state machine in
                 // milliseconds, not the production minutes.
                 .min_reapply_interval_override = std::chrono::milliseconds(10),
@@ -436,11 +514,36 @@ struct Rig {
         return true;
     }
 
+    // The reconciler's gates are monotonic deadlines (10 ms test knobs above, doubled on a backoff):
+    // a settle moves its clock past them.
+    void settle() { steady.advance(std::chrono::milliseconds(30)); }
+    void settle_long() { steady.advance(std::chrono::milliseconds(90)); }
+
+    // The device drops off the registry and comes back on a fresh session (gateway route again).
+    void disconnect() { registry.remove_agent(kAgent); }
+    void reconnect() {
+        ::yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id(kAgent);
+        info.set_hostname("host.local");
+        (void)registry.register_agent(info);
+        REQUIRE(registry.set_gateway_route(
+            kAgent, /*session_id=*/{}, "test-gateway",
+            {std::string(yuzu::server::detail::kGatewayWireCapabilityDispatchTagV1)}));
+    }
+
+    // An operator command to agent-1, from an administrator whose visible set names it: the
+    // outcome says whether the containment gate let it through.
+    ConfinedDispatchOutcome operator_command(const std::string& plugin, const std::string& action) {
+        DispatchCaller c = caller_for("alice", auth::Role::admin);
+        c.exec_visible = authz::VisibleSet{std::unordered_set<std::string>{kAgent}};
+        return dispatch_as(c, plugin, action, {kAgent}, "", {}, "");
+    }
+
     // Everything the transport received since the last call: the exact agent and command.
     std::vector<Sent> drain() {
         std::vector<Sent> out;
         for (auto& p : registry.drain_gateway_pending()) {
-            Sent s{p.agent_id, p.cmd.plugin(), p.cmd.action(), {}};
+            Sent s{p.agent_id, p.cmd.plugin(), p.cmd.action(), {}, p.cmd.command_id()};
             for (const auto& [k, v] : p.cmd.parameters())
                 s.params[k] = v;
             out.push_back(std::move(s));
@@ -455,7 +558,7 @@ struct Rig {
         sr.agent_id = kAgent;
         sr.status = 1; // SUCCESS
         sr.output = output;
-        sr.plugin = "quarantine";
+        sr.plugin = "firewall";
         responses.store(sr);
     }
 
@@ -465,7 +568,9 @@ struct Rig {
         return sink.Post("/api/v1/quarantine", body, "application/json");
     }
 
-    auto del() { return sink.Delete(std::string("/api/v1/quarantine/") + kAgent); }
+    auto del(const std::string& query = "") {
+        return sink.Delete(std::string("/api/v1/quarantine/") + kAgent + query);
+    }
 
     std::size_t quarantined_count() {
         auto list = quarantine.list_quarantined();
@@ -555,15 +660,10 @@ nlohmann::json err_of(const std::string& body) {
     return j.contains("error") && j["error"].is_object() ? j["error"] : j;
 }
 
-void settle() {
-    // The reconciler's gates are steady_clock deadlines (10 ms test knobs above).
-    std::this_thread::sleep_for(std::chrono::milliseconds(30));
-}
-
 } // namespace
 
 TEST_CASE("quarantine create gate (a): an admin cookie under RBAC off creates the record and the "
-          "reconciler reaches exactly agent-1 with the stored whitelist, then one status",
+          "reconciler reaches exactly agent-1 with the stored whitelist, then one quarantine_status",
           "[rest][quarantine][authz][dispatch][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
     Rig rig(db.dsn());
@@ -579,34 +679,35 @@ TEST_CASE("quarantine create gate (a): an admin cookie under RBAC off creates th
     CHECK(rig.has_audit("quarantine.enable/success"));
     CHECK_FALSE(rig.has_audit("quarantine.enable/denied"));
 
-    // Tick 1: exactly one quarantine.quarantine, to agent-1 only, with the STORED whitelist.
+    // Tick 1: exactly one firewall.quarantine, to agent-1 only, with the STORED whitelist mapped to
+    // the firewall plugin's exceptions.
     REQUIRE(rig.leader_tick());
     auto first = rig.drain();
     REQUIRE(first.size() == 1);
     CHECK(first[0].agent_id == kAgent);
-    CHECK(first[0].plugin == "quarantine");
+    CHECK(first[0].plugin == "firewall");
     CHECK(first[0].action == "quarantine");
     REQUIRE(first[0].params.size() == 1);
-    CHECK(first[0].params.at("whitelist_ips") == kWhitelist);
+    CHECK(first[0].params.at("exceptions") == kExceptions);
 
     // The agent answers the apply; the next tick schedules the verify, the one after sends
-    // exactly one quarantine.status.
-    rig.store_response(rig.last_command_id, "status|quarantined|rules_applied|1");
-    settle();
+    // exactly one firewall.quarantine_status.
+    rig.store_response(rig.last_command_id, "status|active_unproven");
+    rig.settle();
     REQUIRE(rig.leader_tick());
     CHECK(rig.drain().empty()); // polled the apply response; no dispatch yet
-    settle();
+    rig.settle();
     REQUIRE(rig.leader_tick());
     auto second = rig.drain();
     REQUIRE(second.size() == 1);
     CHECK(second[0].agent_id == kAgent);
-    CHECK(second[0].plugin == "quarantine");
-    CHECK(second[0].action == "status");
+    CHECK(second[0].plugin == "firewall");
+    CHECK(second[0].action == "quarantine_status");
 
     // Across the whole scenario: exactly those two commands, nothing else, nobody else.
     REQUIRE(rig.sent_log.size() == 2);
     CHECK(rig.sent_log[0].action == "quarantine");
-    CHECK(rig.sent_log[1].action == "status");
+    CHECK(rig.sent_log[1].action == "quarantine_status");
     for (const auto& s : rig.sent_log)
         CHECK(s.agent_id == kAgent);
 }
@@ -627,7 +728,7 @@ TEST_CASE("quarantine create gate (b): a non-admin under RBAC off is refused app
     REQUIRE(res);
     CHECK(res->status == 403);
     const auto err = err_of(res->body);
-    CHECK(err.value("message", std::string()).find("approval required for quarantine.quarantine") !=
+    CHECK(err.value("message", std::string()).find("approval required for firewall.quarantine") !=
           std::string::npos);
     CHECK_FALSE(err.contains("permission"));
     CHECK(err.contains("remediation"));
@@ -692,10 +793,10 @@ TEST_CASE("quarantine create gate (d): RBAC on, an Administrator creates the rec
     auto sent = rig.drain();
     REQUIRE(sent.size() == 1);
     CHECK(sent[0].agent_id == kAgent);
-    CHECK(sent[0].plugin == "quarantine");
+    CHECK(sent[0].plugin == "firewall");
     CHECK(sent[0].action == "quarantine");
     REQUIRE(sent[0].params.size() == 1);
-    CHECK(sent[0].params.at("whitelist_ips") == kWhitelist);
+    CHECK(sent[0].params.at("exceptions") == kExceptions);
 }
 
 TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return the SAME "
@@ -724,7 +825,7 @@ TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return 
 
         // A copy of the closure server.cpp binds to BOTH surfaces, called as MCP calls it.
         const auto mcp_view = rig.authorize_dispatch(rig.caller_for(shape.user, shape.role),
-                                                     "quarantine", "quarantine");
+                                                     "firewall", "quarantine");
         REQUIRE_FALSE(mcp_view.has_value());
         const auto& denial = mcp_view.error();
         CHECK(std::string(detail::to_string(denial.reason)) == shape.reason);
@@ -740,9 +841,9 @@ TEST_CASE("quarantine create gate (e): REST and the closure MCP receives return 
         CHECK(denial.operation == authz::Operation::Execute);
 
         // And the shared text helper renders the two surfaces identically for it.
-        const auto rest_text = describe_dispatch_denial(denial.reason, "quarantine", "quarantine",
+        const auto rest_text = describe_dispatch_denial(denial.reason, "firewall", "quarantine",
                                                         denial, DenialSurface::kRest);
-        const auto mcp_text = describe_dispatch_denial(denial.reason, "quarantine", "quarantine",
+        const auto mcp_text = describe_dispatch_denial(denial.reason, "firewall", "quarantine",
                                                        denial, DenialSurface::kMcp);
         CHECK(rest_text.message == mcp_text.message);
         CHECK(err_of(res->body).value("message", std::string()) == rest_text.message);
@@ -867,13 +968,13 @@ TEST_CASE("quarantine create gate (h): the admin test reads the ACCOUNT role, an
 }
 
 TEST_CASE("quarantine create gate (i): a degraded kill-switch read never refuses the protective "
-          "quarantine pair, end to end through the route",
+          "firewall.quarantine pair, end to end through the route",
           "[rest][quarantine][authz][dispatch][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
     Rig rig(db.dsn());
     REQUIRE(rig.elector.try_acquire());
     // nullopt = "killed for every OS OR the store is degraded" (the fail-closed collapse). For a
-    // non-protective pair that is a KillSwitched refusal; quarantine.quarantine is protective, so
+    // non-protective pair that is a KillSwitched refusal; firewall.quarantine is protective, so
     // the callback must not even be consulted.
     int consulted = 0;
     rig.kill_switch = [&consulted](std::string_view, std::string_view)
@@ -896,7 +997,7 @@ TEST_CASE("quarantine create gate (i): a degraded kill-switch read never refuses
     CHECK(sent[0].agent_id == kAgent);
 }
 
-TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quarantine.unquarantine, "
+TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for firewall.release, "
           "so a caller who cannot create a record cannot end one",
           "[rest][quarantine][authz][dispatch][integration][pg]") {
     YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
@@ -929,7 +1030,7 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         REQUIRE(res);
         CHECK(res->status == 403);
         const auto err = err_of(res->body);
-        CHECK(err.value("message", std::string()).find("approval required for quarantine.unquarantine") !=
+        CHECK(err.value("message", std::string()).find("approval required for firewall.release") !=
               std::string::npos);
         CHECK_FALSE(err.contains("permission"));
         CHECK(err.contains("remediation"));
@@ -955,7 +1056,8 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
                   .value() == 1);
     }
 
-    SECTION("an administrator releases the record: attempt then success, no denied row") {
+    SECTION("an administrator releases the record once the device confirms: attempt then success, "
+            "no denied row") {
         rig.as_admin("alice");
         auto res = rig.del();
         REQUIRE(res);
@@ -964,9 +1066,16 @@ TEST_CASE("quarantine release gate (j): DELETE runs the same chokepoint for quar
         CHECK(rig.has_audit("quarantine.disable/success"));
         CHECK_FALSE(rig.has_audit("quarantine.disable/denied"));
         CHECK(rig.quarantined_count() == 0);
+        // exactly one firewall.release, to agent-1, and nothing to the decoy
+        auto sent = rig.drain();
+        REQUIRE(sent.size() == 1);
+        CHECK(sent[0].agent_id == kAgent);
+        CHECK(sent[0].plugin == "firewall");
+        CHECK(sent[0].action == "release");
+        CHECK(sent[0].params.empty());
     }
 
-    SECTION("a degraded kill-switch read never refuses the release: quarantine.unquarantine is "
+    SECTION("a degraded kill-switch read never refuses the release: firewall.release is "
             "protective, so the callback is not even consulted (the emergency path)") {
         int consulted = 0;
         rig.kill_switch = [&consulted](std::string_view, std::string_view)
@@ -1163,4 +1272,486 @@ TEST_CASE("quarantine audit identity (l): an unwired session audit writer answer
     CHECK(rig.quarantined_count() == 1);
     CHECK(rig.audit_detail("quarantine.disable/failure") == "audit identity writer not configured");
     CHECK_FALSE(rig.has_audit("quarantine.disable/attempt"));
+}
+
+// ---------------------------------------------------------------------------
+// PRQ.2 end to end: the release is confirmed by the device, the containment gate keeps refusing a
+// releasing device, and a forced end lifts it while the device is still owed a release. Real
+// route, real stores, real chokepoint, real reconciler, real registry.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+std::vector<std::string> actions_of(const std::vector<Sent>& v) {
+    std::vector<std::string> out;
+    for (const auto& s : v)
+        out.push_back(s.plugin + "." + s.action);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("quarantine release (m): DELETE on a contained device leaves the record releasing; the "
+          "reconciler reads status, sends firewall.release only while the device is not inactive, and "
+          "the record ends only after its `inactive`",
+          "[rest][quarantine][release][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+
+    // POST, then drive the record to confirmed: one firewall.quarantine, one quarantine_status.
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    REQUIRE(rig.leader_tick());
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.quarantine"});
+    rig.store_response(rig.last_command_id, "status|active_unproven");
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.drain().empty());
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.quarantine_status"});
+    rig.store_response(rig.last_command_id, "status|active");
+    rig.settle_long();
+    REQUIRE(rig.leader_tick()); // confirms
+    CHECK(rig.drain().empty());
+
+    // DELETE while the device never answers the release within the wait: 202, releasing, listed.
+    rig.release_reply.clear();
+    rig.clear_audits();
+    auto del = rig.del();
+    REQUIRE(del);
+    CHECK(del->status == 202);
+    CHECK(rig.quarantined_count() == 1);
+    CHECK(rig.audit_detail("quarantine.disable/pending").find("state=releasing") == 0);
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.release"}); // the route's own
+
+    // The reconciler reads status FIRST (never a blind release).
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.quarantine_status"});
+    // The device is still contained: nothing ends, the next cycle sends the release.
+    rig.store_response(rig.last_command_id, "status|active");
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.drain().empty());
+    CHECK(rig.quarantined_count() == 1);
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.release"});
+    // Whatever the device says to the release, only a status read ends the record.
+    rig.store_response(rig.last_command_id, "status|inactive");
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.drain().empty());
+    CHECK(rig.quarantined_count() == 1); // the release reply alone ended nothing
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    REQUIRE(actions_of(rig.drain()) == std::vector<std::string>{"firewall.quarantine_status"});
+    rig.store_response(rig.last_command_id, "status|inactive");
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.quarantined_count() == 0);
+    CHECK(rig.drain().empty());
+}
+
+TEST_CASE("quarantine release (n): a releasing device still has other operator commands refused by the "
+          "containment gate (exact send set empty); a forced end lifts the refusal",
+          "[rest][quarantine][release][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    rig.release_reply.clear(); // the device does not answer: the record stays releasing
+    {
+        auto del = rig.del();
+        REQUIRE(del);
+        REQUIRE(del->status == 202);
+    }
+    (void)rig.drain(); // the route's own firewall.release
+
+    // An ordinary operator command to the releasing device reaches nobody.
+    const auto refused = rig.operator_command("firewall", "rules");
+    CHECK(refused.sent == 0);
+    CHECK(refused.denied_quarantined_count == 1);
+    CHECK(rig.drain().empty());
+    // ...while the containment actions stay reachable (the emergency path).
+    const auto release = rig.operator_command("firewall", "release");
+    CHECK(release.sent == 1);
+    CHECK(actions_of(rig.drain()) == std::vector<std::string>{"firewall.release"});
+
+    // Forced end: the record is gone, so the same command now reaches the device.
+    auto forced = rig.del("?force=true");
+    REQUIRE(forced);
+    CHECK(forced->status == 200);
+    CHECK(rig.quarantined_count() == 0);
+    (void)rig.drain();
+    const auto after = rig.operator_command("firewall", "rules");
+    CHECK(after.sent == 1);
+    auto sent = rig.drain();
+    REQUIRE(sent.size() == 1);
+    CHECK(sent[0].agent_id == kAgent);
+    CHECK(sent[0].plugin == "firewall");
+    CHECK(sent[0].action == "rules");
+}
+
+TEST_CASE("quarantine release (o): a forced end with the device offline; on reconnect a tick sends "
+          "firewall.quarantine_status and then firewall.release, and nothing else",
+          "[rest][quarantine][release][dispatch][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    rig.disconnect();
+    rig.release_reply.clear();
+    auto forced = rig.del("?force=true");
+    REQUIRE(forced);
+    CHECK(forced->status == 200);
+    CHECK(rig.quarantined_count() == 0);
+    {
+        auto owed = rig.quarantine.list_release_owed();
+        REQUIRE(owed.has_value());
+        CHECK(owed->size() == 1);
+    }
+    CHECK(rig.drain().empty());
+
+    // Offline: nothing is sent, and the debt shows in the gauge.
+    REQUIRE(rig.leader_tick());
+    CHECK(rig.drain().empty());
+    CHECK(rig.metrics
+              .gauge("yuzu_server_quarantine_forced_release_owed", {{"reachability", "offline"}})
+              .value() == 1);
+
+    // Reconnect: an ordinary operator command reaches the device (the refusal is lifted).
+    rig.reconnect();
+    const auto reached = rig.operator_command("firewall", "rules");
+    CHECK(reached.sent == 1);
+    CHECK(actions_of(rig.drain()) == std::vector<std::string>{"firewall.rules"});
+
+    // The reconciler's own sends from here: status, then release, then status, nothing else.
+    rig.sent_log.clear();
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    (void)rig.drain();
+    rig.store_response(rig.last_command_id, "status|active"); // still contained
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    (void)rig.drain();
+    rig.settle_long();
+    REQUIRE(rig.leader_tick()); // sends the release owed
+    (void)rig.drain();
+    rig.store_response(rig.last_command_id, "status|active"); // the release reply: not inactive
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    (void)rig.drain();
+    rig.settle_long();
+    REQUIRE(rig.leader_tick()); // status again
+    (void)rig.drain();
+    rig.store_response(rig.last_command_id, "status|inactive"); // now it is
+    rig.settle_long();
+    REQUIRE(rig.leader_tick());
+    (void)rig.drain();
+
+    CHECK(actions_of(rig.sent_log) ==
+          std::vector<std::string>{"firewall.quarantine_status", "firewall.release",
+                                   "firewall.quarantine_status"});
+    for (const auto& s : rig.sent_log)
+        CHECK(s.agent_id == kAgent);
+    auto owed = rig.quarantine.list_release_owed();
+    REQUIRE(owed.has_value());
+    CHECK(owed->empty()); // the device confirmed: nothing owed
+}
+
+// ---------------------------------------------------------------------------
+// #7613 end to end: an apply that reaches the device AFTER the observation a release rests on.
+// The device is simulated over the rig's real gateway queue: commands are delivered in the order
+// the server queued them, `quarantine` contains, `release` lifts, and each command's reply is
+// stored under its command id. The route, the chokepoint, the reconciler and the registry are
+// the production ones. The invariant after EVERY step: the device is never contained with no
+// active record and nothing owed.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct FakeDevice {
+    Rig& rig;
+    bool contained{false};
+    std::vector<std::string> delivered; // "plugin.action", in delivery order
+
+    // Runs, in queue order, every command the server has queued since the last call.
+    void deliver() {
+        for (const auto& s : rig.drain()) {
+            delivered.push_back(s.plugin + "." + s.action);
+            if (s.action == "quarantine") {
+                contained = true;
+                rig.store_response(s.command_id, "status|active_unproven");
+            } else if (s.action == "release") {
+                contained = false;
+                rig.store_response(s.command_id, "status|inactive");
+            } else if (s.action == "quarantine_status") {
+                rig.store_response(s.command_id, contained ? "status|active" : "status|inactive");
+            }
+        }
+    }
+
+    std::size_t owed_count() {
+        auto owed = rig.quarantine.list_release_owed();
+        REQUIRE(owed.has_value());
+        return owed->size();
+    }
+
+    // The property #7613 is about: a contained device always has a record that governs it.
+    void check_invariant() {
+        INFO("contained=" << contained << " records=" << rig.quarantined_count()
+                          << " owed=" << owed_count());
+        CHECK_FALSE((contained && rig.quarantined_count() == 0 && owed_count() == 0));
+    }
+};
+
+// An apply that has claimed the record and is blocked inside its dispatch, on another thread: the
+// MCP quarantine_device re-dispatch, or the reconciler's. `release()` lets the dispatch finish
+// (it queues the apply; the dispatch reached an agent, so the claim is KEPT, #8045), and joins.
+// `drop_claim()` models the consumer reading the apply's reply once the device has run it, which
+// is what the reconciler does with its own applies. The thread asserts nothing: Catch2
+// assertions are not thread-safe, so the outcome is read after the join. The constructor always
+// returns: the worker signals `in_dispatch` from inside the dispatch, or, when the chokepoint
+// refused before dispatching (a claim refused, a store error), right after it returns. The case
+// then asserts `dispatch_entered` with REQUIRE, so a failed setup is a failure and not a hang.
+struct BlockedApply {
+    Rig& rig;
+    std::promise<void> in_dispatch;
+    std::promise<void> go;
+    std::thread worker;
+    bool released{false};
+    // Written by the worker before it sets `in_dispatch`, read by the test thread after the wait.
+    bool dispatch_entered{false};
+    std::int64_t record_id{0}; // the record the apply was built from, set by the worker
+    std::expected<ContainmentReapplyResult, ContainmentReapplyError> result{
+        std::unexpected(ContainmentReapplyError{ContainmentReapplyErrorKind::store_error, "unset"})};
+
+    explicit BlockedApply(Rig& r) : rig(r) {
+        auto entered = in_dispatch.get_future();
+        worker = std::thread([this, go_future = go.get_future()]() mutable {
+            QuarantineRecord stored{};
+            result = redispatch_stored_containment(
+                rig.quarantine, kAgent,
+                [&](const std::unordered_map<std::string, std::string>& params)
+                    -> std::pair<std::string, int> {
+                    dispatch_entered = true;
+                    in_dispatch.set_value();
+                    go_future.wait();
+                    const auto out = rig.system_dispatch("firewall", "quarantine", {kAgent}, "",
+                                                         params, "");
+                    return {out.command_id, out.sent};
+                },
+                stored);
+            record_id = stored.id;
+            if (!dispatch_entered)
+                in_dispatch.set_value(); // refused before the dispatch: let the constructor go
+        });
+        entered.wait(); // the claim is live and the dispatch is blocked, or the apply did not start
+    }
+    void release() {
+        if (released)
+            return;
+        released = true;
+        go.set_value();
+        worker.join();
+    }
+    // The apply has run and its reply is consumed: the claim it kept is dropped.
+    void drop_claim() {
+        if (result.has_value() && result->held_claim_gen != 0)
+            REQUIRE(rig.quarantine.release_apply_claim(kAgent, record_id, result->held_claim_gen)
+                        .has_value());
+    }
+    ~BlockedApply() { release(); }
+};
+
+} // namespace
+
+TEST_CASE("quarantine release (p): a late apply -- the device answers inactive to the release, THEN an "
+          "apply reaches it -- cannot end the record: 202, the device stays covered, and the reconciler "
+          "settles it",
+          "[rest][quarantine][release][fence][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+    rig.release_reply.clear(); // the device answers through FakeDevice, not at dispatch
+    FakeDevice device{rig};
+
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    device.check_invariant();
+
+    BlockedApply apply(rig); // an apply holds the claim, blocked inside its dispatch
+    REQUIRE(apply.dispatch_entered);
+    // From the pause between the route's polls: the device runs the release (inactive), then the
+    // apply is let go and delivered AFTER it.
+    int pauses = 0;
+    detail::release_confirm_pause_hook() = [&] {
+        ++pauses;
+        device.deliver();          // the release: the device lifts and answers `inactive`
+        apply.release();           // the late apply is dispatched; it keeps its claim
+        device.deliver();          // ...and reaches the device, which answers it
+        apply.drop_claim();        // the reconciler reads that reply: the claim goes
+    };
+    rig.clear_audits();
+    auto del = rig.del();
+    REQUIRE(del);
+    // The route read `inactive`, but the apply followed the observation: the record must not end.
+    CHECK(del->status == 202);
+    CHECK(pauses == 1);
+    REQUIRE(apply.result.has_value());
+    CHECK(apply.result->agents_reached == 1);
+    CHECK(device.contained);                    // the late apply landed
+    CHECK(rig.quarantined_count() == 1);        // ...and the record still governs it
+    CHECK(rig.audit_detail("quarantine.disable/pending").find("apply_in_flight=1") !=
+          std::string::npos);
+    CHECK_FALSE(rig.has_audit("quarantine.disable/success"));
+    CHECK(device.delivered ==
+          std::vector<std::string>{"firewall.release", "firewall.quarantine"}); // release first
+    device.check_invariant();
+
+    // The reconciler finishes it: it reads status with a FRESH token (the device is contained),
+    // sends the release, reads status again, and only the second `inactive` ends the record.
+    for (int i = 0; i < 24 && rig.quarantined_count() > 0; ++i) {
+        rig.settle_long();
+        REQUIRE(rig.leader_tick());
+        device.deliver();
+        device.check_invariant();
+    }
+    CHECK(rig.quarantined_count() == 0);
+    CHECK_FALSE(device.contained);
+    CHECK(device.owed_count() == 0);
+}
+
+TEST_CASE("quarantine release (q): an apply already queued when the DELETE reads its token is delivered "
+          "BEFORE the release, but it has not been read back, so it keeps its claim and the DELETE answers 202; "
+          "once its reply is consumed the reconciler settles the record (#8045)",
+          "[rest][quarantine][release][fence][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+    rig.release_reply.clear();
+    FakeDevice device{rig};
+
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    // The apply has gone through the chokepoint and returned: it sits undelivered in the queue and
+    // its claim is held, because a command that was only sent has not necessarily run.
+    std::int64_t held_gen = 0;
+    std::int64_t record_id = 0;
+    {
+        QuarantineRecord stored{};
+        auto applied = redispatch_stored_containment(
+            rig.quarantine, kAgent,
+            [&](const std::unordered_map<std::string, std::string>& params)
+                -> std::pair<std::string, int> {
+                const auto out = rig.system_dispatch("firewall", "quarantine", {kAgent}, "", params, "");
+                return {out.command_id, out.sent};
+            },
+            stored);
+        REQUIRE(applied.has_value());
+        REQUIRE(applied->agents_reached == 1);
+        CHECK(applied->held_claim_gen != 0);
+        held_gen = applied->held_claim_gen;
+        record_id = stored.id;
+    }
+    CHECK_FALSE(device.contained);
+    device.check_invariant();
+
+    // The DELETE queues its release BEHIND the apply; the queue is delivered in order from the
+    // pause. No token can be read while the apply's claim is held, so the end is refused.
+    detail::release_confirm_pause_hook() = [&] { device.deliver(); };
+    auto del = rig.del();
+    REQUIRE(del);
+    CHECK(del->status == 202);
+    CHECK(device.delivered ==
+          std::vector<std::string>{"firewall.quarantine", "firewall.release"}); // apply first
+    CHECK_FALSE(device.contained);
+    CHECK(rig.quarantined_count() == 1); // the record still governs the device
+    device.check_invariant();
+
+    // The apply's reply is read back, the claim goes, and the reconciler finishes the release.
+    REQUIRE(rig.quarantine.release_apply_claim(kAgent, record_id, held_gen).has_value());
+    for (int i = 0; i < 24 && rig.quarantined_count() > 0; ++i) {
+        rig.settle_long();
+        REQUIRE(rig.leader_tick());
+        device.deliver();
+        device.check_invariant();
+    }
+    CHECK(rig.quarantined_count() == 0);
+    CHECK_FALSE(device.contained);
+    CHECK(device.owed_count() == 0);
+}
+
+TEST_CASE("quarantine release (r): the late apply with force=true: the record ends by force and is owed, "
+          "and the reconciler's owed leg releases the device and clears the mark",
+          "[rest][quarantine][release][fence][force][integration][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, create_gate_tpl);
+    Rig rig(db.dsn());
+    REQUIRE(rig.elector.try_acquire());
+    rig.set_rbac(false);
+    rig.as_admin("alice");
+    rig.release_reply.clear();
+    FakeDevice device{rig};
+
+    {
+        auto res = rig.post();
+        REQUIRE(res);
+        REQUIRE(res->status == 201);
+    }
+    BlockedApply apply(rig);
+    REQUIRE(apply.dispatch_entered);
+    detail::release_confirm_pause_hook() = [&] {
+        device.deliver();
+        apply.release();
+        device.deliver();
+        apply.drop_claim(); // the apply's reply is consumed
+    };
+    auto del = rig.del("?force=true");
+    REQUIRE(del);
+    CHECK(del->status == 200);
+    const auto body = nlohmann::json::parse(del->body);
+    CHECK(body["data"]["forced"] == true);
+    CHECK(body["data"]["released"] == false); // the device may still be contained, and is
+    CHECK(device.contained);
+    CHECK(rig.quarantined_count() == 0);       // no active record...
+    CHECK(device.owed_count() == 1);           // ...but the device is owed a release
+    device.check_invariant();
+
+    for (int i = 0; i < 24 && device.owed_count() > 0; ++i) {
+        rig.settle_long();
+        REQUIRE(rig.leader_tick());
+        device.deliver();
+        device.check_invariant();
+    }
+    CHECK(device.owed_count() == 0);
+    CHECK_FALSE(device.contained);
 }

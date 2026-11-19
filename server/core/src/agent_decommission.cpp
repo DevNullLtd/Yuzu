@@ -4,6 +4,7 @@
 #include <utility>
 
 #include <spdlog/spdlog.h>
+#include <yuzu/log_token.hpp> // log_id_token: agent_id is caller-supplied (CWE-117)
 
 #include "app_perf_daily_store.hpp"
 #include "device_inventory_store.hpp"
@@ -12,6 +13,7 @@
 #include "software_licensing_store.hpp"
 #include "app_usage_store.hpp"
 #include "certificate_inventory_store.hpp"
+#include "guaranteed_state_store.hpp"
 #include "offline_endpoint_store.hpp"
 
 namespace yuzu::server {
@@ -27,6 +29,12 @@ const char* to_string(DecommissionOutcome o) noexcept {
     }
     return "unknown";
 }
+
+namespace {
+constexpr const char* kWritePausedReason =
+    "removal not attempted because device-CI writes are paused by a PostgreSQL collation "
+    "mismatch; retry the decommission after the repair";
+} // namespace
 
 AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
     // Fixed registration order: the generic inventory store first, then each
@@ -60,6 +68,12 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                             ? Fn([p = stores.device_inventory](std::string_view id) {
                                   return p->delete_agent(id);
                               })
+                            : nullptr,
+                        // delete_agent returns false without trying while device_ci writes are
+                        // paused (a collation mismatch): report that, not a generic commit failure.
+                        stores.device_inventory
+                            ? std::function<bool()>(
+                                  [p = stores.device_inventory] { return p->writes_deferred(); })
                             : nullptr});
     // The Decision 11 store: its agent_licenses / agent_license_state rows carry
     // the per-user `user_ref` pseudonyms, so a decommission MUST reach it.
@@ -95,6 +109,17 @@ AgentDecommission::AgentDecommission(const AgentDecommissionStores& stores) {
                                   return p->delete_agent(id);
                               })
                             : nullptr});
+    // The ninth store (#5675): the Guardian compliance census. `deleted` here means the device's
+    // guardian_agent_order row and guardian_agent_rule_status rows were erased and its pending
+    // census evidence retired in one transaction. The Guardian event log and the DEX observations
+    // are NOT erased (they expire by retention), so Deleted must not be read as "every Guardian
+    // row for the device is gone".
+    targets_.push_back(
+        {"guaranteed_state", stores.guaranteed_state
+                                 ? Fn([p = stores.guaranteed_state](std::string_view id) {
+                                       return p->delete_agent(id);
+                                   })
+                                 : nullptr});
 }
 
 void AgentDecommission::add_store(std::string name, std::function<bool(std::string_view)> deleter) {
@@ -137,39 +162,49 @@ DecommissionResult AgentDecommission::decommission(std::string_view agent_id) {
             if (t.deleter(agent_id)) {
                 r.outcome = DecommissionOutcome::Deleted;
                 ++result.deleted;
+            } else if (t.write_paused && t.write_paused()) {
+                r.outcome = DecommissionOutcome::Failed;
+                r.write_paused = true;
+                r.error = kWritePausedReason;
+                ++result.failed;
+                spdlog::warn("AgentDecommission: store '{}' removal for agent={} was not attempted "
+                             "because its writes are paused (collation mismatch), recorded Failed; "
+                             "retry after the repair",
+                             t.name, ::yuzu::log_id_token(agent_id));
             } else {
                 r.outcome = DecommissionOutcome::Failed;
                 r.error = "delete_agent reported failure (delete did not commit)";
                 ++result.failed;
                 spdlog::error("AgentDecommission: store '{}' delete_agent reported failure for "
                               "agent={} (delete did not commit — recorded Failed, not Deleted)",
-                              t.name, agent_id);
+                              t.name, ::yuzu::log_id_token(agent_id));
             }
         } catch (const std::exception& e) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = e.what();
             ++result.failed;
             spdlog::error("AgentDecommission: store '{}' delete_agent threw for agent={}: {}",
-                          t.name, agent_id, e.what());
+                          t.name, ::yuzu::log_id_token(agent_id), ::yuzu::log_key_token(e.what()));
         } catch (...) {
             r.outcome = DecommissionOutcome::Failed;
             r.error = "unknown exception";
             ++result.failed;
-            spdlog::error("AgentDecommission: store '{}' delete_agent threw a non-std exception for "
-                          "agent={}",
-                          t.name, agent_id);
+            spdlog::error(
+                "AgentDecommission: store '{}' delete_agent threw a non-std exception for "
+                "agent={}",
+                t.name, ::yuzu::log_id_token(agent_id));
         }
         result.stores.push_back(std::move(r));
     }
 
     // One audit-friendly summary line per decommission.
     if (result.failed == 0)
-        spdlog::info("AgentDecommission: agent={} decommissioned (deleted={} skipped={})", agent_id,
-                     result.deleted, result.skipped);
+        spdlog::info("AgentDecommission: agent={} decommissioned (deleted={} skipped={})",
+                     ::yuzu::log_id_token(agent_id), result.deleted, result.skipped);
     else
         spdlog::warn(
             "AgentDecommission: agent={} decommission PARTIAL (deleted={} skipped={} failed={})",
-            agent_id, result.deleted, result.skipped, result.failed);
+            ::yuzu::log_id_token(agent_id), result.deleted, result.skipped, result.failed);
     return result;
 }
 

@@ -1194,8 +1194,18 @@ void enum_registry_outbound_history(MapDriveHistory& h, const std::vector<std::s
                      "profiles beyond that is not collected this cycle",
                      yuzu::win::kMaxProfiles);
     }
-    const auto profiles =
-        yuzu::profiles::build_profile_list(disc.records, yuzu::win::enumerate_hku_subkeys());
+    // A failed or unstable HKEY_USERS listing is not "no hive is loaded": a profile list built from
+    // it would send every logged-on user down the offline-mount path. Skip the per-user leg this
+    // cycle (h.complete is false) and never build the list from a guess.
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    if (!hku.error.empty()) {
+        h.complete = false;
+        spdlog::warn("Echo mapdrive: hku_list_incomplete ({}) — outbound history is not collected "
+                     "this cycle",
+                     hku.error);
+        return;
+    }
+    const auto profiles = yuzu::profiles::build_profile_list(disc.records, hku.names);
 
     // sid -> the SID-key-open rc, when that open itself failed (never the ProfileImagePath read).
     std::unordered_map<std::string, long> key_open_rc;

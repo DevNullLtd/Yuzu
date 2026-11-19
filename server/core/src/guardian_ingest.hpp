@@ -11,6 +11,7 @@
 /// gateway-asserted on the gateway path — and is NEVER read from the frame.
 
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <optional>
 #include <string>
@@ -20,6 +21,7 @@
 #include <spdlog/common.h> // spdlog::sink_ptr, spdlog::level::level_enum -- lightweight, no logger/thread_pool machinery
 
 #include "agent.pb.h"
+#include "guardian_pair_mode.hpp" // the pair limits (detail::k*), the census decision set
 
 namespace yuzu {
 class MetricsRegistry;
@@ -29,6 +31,7 @@ namespace yuzu::server {
 class GuaranteedStateStore;
 class BlastRadiusDetector;
 class DexAlertRouter;
+struct GuaranteedStateEventRow;
 }
 
 namespace spdlog {
@@ -82,6 +85,129 @@ void ingest_guardian_response(GuaranteedStateStore& store, const std::string& ag
 inline constexpr char kGuardianEventsRejectedMetric[] =
     "yuzu_server_guardian_events_rejected_total";
 
+/// The limits on a wire pair (`kPairValueLimit`, `kEmitSeqCeiling`, `kEpochSkewSeconds`) are
+/// defined once in `guardian_pair_mode.hpp` (included above), with their rationale: the store reads
+/// them too and must not include this header for them.
+
+/// Why a wire emit-order pair was not taken as a pair (D5). `None` covers both a valid pair and
+/// the legitimate unpaired 0/0 (a journal replay, or an agent whose epoch claim failed); neither is
+/// counted. `Implausible` (UP-9) is a structurally valid pair outside the absolute bound above. It
+/// is handled exactly like the other two: the pair is dropped HERE, once, and the event is judged
+/// as an unpaired one at first delivery (stored pair NULL, the normal unpaired census write). No
+/// later stage knows the reason.
+enum class PairReject { None, HalfSet, OutOfRange, Implausible };
+
+/// The wire `(boot_epoch, emit_seq)` pair as validated at the ingest boundary: `paired` is true
+/// only when BOTH are set and each is in [1, 2^62) (2^62 - 1 is accepted), so the values fit a
+/// signed BIGINT with the sign bit unreachable. Both zero is unpaired and not a rejection.
+/// Exactly one zero is `HalfSet` (checked first, so a lone value >= 2^62 beside a zero is still
+/// half-set); either value >= 2^62 beside a set partner is `OutOfRange`. Either rejection is
+/// unpaired too: the event is still stored, only the pair is withheld.
+struct WirePair {
+    bool paired{false};
+    std::int64_t boot_epoch{0};
+    std::int64_t emit_seq{0};
+    PairReject reject{PairReject::None};
+};
+/// STRUCTURE only (`_structural`): it does not apply the plausibility bound, so it is not for the
+/// ingest boundary. The name is the warning: the production caller is the receipt overload below,
+/// and a caller that reaches for this one has chosen, by name, to skip the bound (tests, and
+/// `pair_from_wire` itself).
+[[nodiscard]] WirePair pair_from_wire_structural(std::uint64_t boot_epoch,
+                                                 std::uint64_t emit_seq) noexcept;
+
+/// The production form (UP-9): the structural check above, then the absolute plausibility bound
+/// (`kEmitSeqCeiling`, `kEpochSkewSeconds`) against `receipt_unix_s`, the server's receipt time in
+/// whole Unix seconds. A pair that fails only the bound is `Implausible` (unpaired, `paired`
+/// false). The ingest boundary uses this form and never `pair_from_wire_structural`.
+[[nodiscard]] WirePair pair_from_wire(std::uint64_t boot_epoch, std::uint64_t emit_seq,
+                                      std::int64_t receipt_unix_s) noexcept;
+
+/// Counter of wire emit-order pairs the ingest boundary withheld, by `reason` (`half_set`,
+/// `out_of_range`, `implausible`). Not a refusal: the event is stored. A withheld pair of any of
+/// the three reasons is judged as an unpaired event (the census row's stored pair becomes
+/// NULL/NULL only when that unpaired verdict is applied). This is separate from
+/// `kGuardianEventsRejectedMetric`. Counted once per withheld pair: only when the store reports the
+/// event `Inserted`, so a redelivery of the same event does not count again. Pre-seeded
+/// (server.cpp) from `kGuardianPairRejectReasons` so each series reads 0, not absent. Never
+/// labelled by agent.
+inline constexpr char kGuardianPairRejectedMetric[] = "yuzu_server_guardian_pair_rejected_total";
+inline constexpr const char* kGuardianPairRejectReasons[] = {"half_set", "out_of_range",
+                                                             "implausible"};
+
+// Counter of census decisions by `decision` (the closed `CensusDecision` set,
+// `guardian_pair_mode.hpp`), one per census write whose upsert returned a labelled row and whose
+// savepoint released: a first delivery, a Repair and a batch row. A key-mode event the key rule
+// refuses has no label and counts nothing. Best-effort and counted
+// before the transaction commits, as the projection counter is. Pre-seeded (server.cpp) from
+// `kCensusDecisions` so each series reads 0, not absent. Never labelled by agent.
+// The metric name, `kGuardianCensusPairDecisionsMetric`, lives in `guardian_pair_mode.hpp`.
+
+/// The ONE place a `PairReject` becomes its label, so the counter series, the pre-seed loop and the
+/// log line cannot drift from `kGuardianPairRejectReasons`. `None` has no reason (empty).
+[[nodiscard]] constexpr const char* pair_reject_reason(PairReject r) noexcept {
+    switch (r) {
+    case PairReject::HalfSet:
+        return kGuardianPairRejectReasons[0];
+    case PairReject::OutOfRange:
+        return kGuardianPairRejectReasons[1];
+    case PairReject::Implausible:
+        return kGuardianPairRejectReasons[2];
+    case PairReject::None:
+        break;
+    }
+    return "";
+}
+static_assert(std::size(kGuardianPairRejectReasons) ==
+                  static_cast<std::size_t>(PairReject::Implausible),
+              "one reason label per PairReject value other than None");
+static_assert(std::string_view(pair_reject_reason(PairReject::HalfSet)) == "half_set" &&
+                  std::string_view(pair_reject_reason(PairReject::OutOfRange)) == "out_of_range" &&
+                  std::string_view(pair_reject_reason(PairReject::Implausible)) == "implausible",
+              "the reason labels are the documented series values");
+
+/// Validate the wire pair and, when it is a pair, set `row.boot_epoch`/`row.emit_seq`; otherwise
+/// leave both unset. Returns why the pair was withheld, or `nullopt` when it was taken or the
+/// sender is unpaired (0/0). Pure: it neither logs nor counts, because the caller must do that only
+/// once the store has accepted the event (`report_pair_reject`). Never refuses the event. STRUCTURE
+/// only, like `pair_from_wire_structural` (it applies no plausibility bound); test-only.
+[[nodiscard]] std::optional<PairReject> apply_wire_pair_structural(GuaranteedStateEventRow& row,
+                                                                   std::uint64_t boot_epoch,
+                                                                   std::uint64_t emit_seq);
+
+/// The production form (UP-9): as above with the plausibility bound applied against
+/// `receipt_unix_s`. An `Implausible` pair leaves `boot_epoch`/`emit_seq` unset and is returned as
+/// the reason, like `HalfSet` and `OutOfRange`; it is decided once, here, and nothing downstream
+/// distinguishes it (a Repair reads the stored unset pair).
+[[nodiscard]] std::optional<PairReject> apply_wire_pair(GuaranteedStateEventRow& row,
+                                                        std::uint64_t boot_epoch,
+                                                        std::uint64_t emit_seq,
+                                                        std::int64_t receipt_unix_s);
+
+/// Warn (agent and event ids sanitised) and count one withheld pair on `kGuardianPairRejectedMetric`
+/// (best-effort; `metrics` may be nullptr). Called once per pair, after the store reports the event
+/// `Inserted`; never for a redelivery, so a durable agent journal replaying the event does not
+/// inflate the series.
+void report_pair_reject(PairReject reject, const GuaranteedStateEventRow& row,
+                        yuzu::MetricsRegistry* metrics);
+
+/// Gauge of agents "currently unordered": the latest accepted unpaired census-bearing event is
+/// later than the agent's pair clock, or the pair clock is recorded more than 300 s in the
+/// database's future (the sweep reads `GuaranteedStateStore::unordered_agent_count`, the count-only
+/// twin of `unordered_agents`, and both use the one SQL predicate). The value depends on the
+/// database clock, so it can change between two sweeps with no event. Fleet-wide, no
+/// labels (never by agent: the per-agent view is the `ordering` field of the per-device read).
+/// Described in server.cpp and deliberately NOT pre-seeded, like `..._census_pending_events`: a
+/// zero before the first answered read would read as "no unordered agents".
+inline constexpr char kGuardianCensusUnorderedAgentsMetric[] =
+    "yuzu_server_guardian_census_unordered_agents";
+
+/// Periodic-sweep body for `kGuardianCensusUnorderedAgentsMetric`: reads the fleet-wide count and
+/// sets the gauge ONLY when the store answered. A store that cannot answer leaves the previous
+/// sample in place (a failed read must not publish a fresh zero).
+void publish_guardian_census_unordered_gauge(yuzu::MetricsRegistry& metrics,
+                                             const GuaranteedStateStore& store);
+
 /// Prometheus metric name for the store-operation latency histogram: server-side latency of
 /// `insert_event_classified` (the classify+store SQLite txn) for one Guardian event, split by
 /// outcome `status`. Shared by the observe site (guardian_ingest.cpp) and the describe +
@@ -93,6 +219,15 @@ inline constexpr char kGuardianEventStoreDurationMetric[] =
 /// through the seconds tail (Postgres / lock contention). Boundaries are fixed at first series
 /// creation, so warm-create and any observe MUST agree; this is the single source.
 [[nodiscard]] std::vector<double> guardian_event_store_buckets();
+
+/// Birth every `decision` series of `kGuardianCensusPairDecisionsMetric` (the closed
+/// `kCensusDecisions` set) at 0, so each reads 0 rather than absent from boot. Call once at startup
+/// (server.cpp) and in tests that assert the family.
+void preseed_census_pair_decision_metric(yuzu::MetricsRegistry& metrics);
+
+/// Birth `kGuardianRepairsShedMetric` (no labels) at 0, so it reads 0 rather than absent from
+/// boot. Call once at startup (server.cpp) and in tests that assert the series.
+void preseed_guardian_repairs_shed_metric(yuzu::MetricsRegistry& metrics);
 
 /// Birth all four `status` series (inserted|redelivered|conflict|error) with the custom ladder
 /// so the boundaries are pinned before the first observe and the series appear on /metrics from

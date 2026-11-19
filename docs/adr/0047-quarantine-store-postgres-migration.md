@@ -13,7 +13,9 @@
 `QuarantineStore` (`quarantine.db` today, `server/core/src/quarantine_store.{hpp,cpp}`, ~54 + 226
 lines) holds Guardian device-quarantine records: the server-side bookkeeping of which agents are
 currently network-isolated, who isolated them, why, and their full history. Single table
-(`quarantine_records`), two indexes, no foreign keys, no secret-bearing columns. Postgres ladder
+(`quarantine_records`), three indexes besides the primary key (`idx_quarantine_agent`, the partial unique
+`idx_quarantine_agent_active`, and from schema v4 the partial `idx_quarantine_release_owed`), no foreign keys,
+no secret-bearing columns. Postgres ladder
 Wave 2, batch 2.
 
 A quarantine record is not expendable telemetry — it is the server's only durable record of an
@@ -486,3 +488,125 @@ the server's view of containment does not include whatever the warning names, th
 firewall enforcement (§11.7, out of scope for this store) may still be independently in effect.
 The ADR-0012 §2(b) documented exception for a one-time legacy backfill's atomic
 insert-plus-completion stamp is no longer exercised by this store.
+
+## Update (2026-11-11) — schema v4: the release is a confirmed step; `release_device` removed
+
+Device containment is now the firewall plugin's four actions only, and the server records a
+release only on the device's own answer. The store changes with it, appended as migration v4
+after the already-shipped v1-v3 (never edited in place):
+
+- `release_requested_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks an active record whose
+  release was asked for and not yet confirmed. The stored `status` stays `active` or `released`;
+  the record reads `releasing` through a `CASE` in the select list, so the partial unique index
+  (`quarantine_records(agent_id) WHERE status='active'`) still allows at most one live record per
+  agent and a releasing record still holds it.
+- `device_release_owed_at` (`BIGINT NOT NULL DEFAULT 0`): non-zero marks a record an operator
+  ended by force before the device confirmed; the reconciler still owes that device a release.
+- `idx_quarantine_release_owed` (`quarantine_records(agent_id, id) WHERE status = 'released' AND
+  device_release_owed_at <> 0`): serves the owed-release read the reconciler makes on every tick.
+  It holds only force-ended records the device has not confirmed, so it stays tiny; adding it
+  after release would cost a further migration.
+- `release_device` is removed. Ending a record is `request_release` (set the marker),
+  `mark_released` with a closed reason (`device_confirmed` or `forced`) and `clear_release_owed`,
+  each a single guarded statement that updates only the row it was read for.
+
+A record ends in exactly two ways: the device answers `inactive` after a release; an operator
+forces it with `DELETE ...?force=true`. A device's own state never ends a record: `inactive` on an
+active record is drift and is re-applied. A forced end does not release the device, which may
+still be contained. Fresh-database deployment contract applies: v4 is
+applied to a new database, with no data carried from earlier builds.
+
+## Update (2026-11-14) — schema v5: the apply fence; follow-ups to the release work
+
+Appended as migration v5 after v1-v4, which stay byte-identical (`PgMigrationRunner` pins each applied
+migration's SHA-256, and v4 is on `dev` before this change, so it is recorded as shipped, never
+edited). v5 adds no index. The store's indexes are the primary key, `idx_quarantine_agent`,
+`idx_quarantine_agent_active` (the partial unique index on active records) and
+`idx_quarantine_release_owed` (v4, the partial index behind the owed list).
+
+**The two v5 columns** (`BIGINT NOT NULL DEFAULT 0`, added with `ADD COLUMN IF NOT EXISTS`):
+
+- `apply_gen`: the number of applies ever claimed for the record.
+- `apply_claimed_at`: when an apply was claimed and its reply has not yet been consumed; 0 = none. A claim older
+  than 120 seconds (`kApplyClaimTtlSecs`) is ignored by comparison, so a crashed holder needs no cleanup.
+  The 120 seconds are measured on the database's clock, not a replica's: the claim is stamped with
+  `EXTRACT(EPOCH FROM now())` and every test of it (the claim, the token read, both fenced ends) uses
+  one SQL statement of "no live claim" written against `now()` with the TTL in its text. A replica
+  whose own clock steps cannot make a live claim read expired, or a dead one live. A step of the
+  database's own clock is covered for the claims a process stamped itself: the store also keeps each
+  claim it stamped, by agent and record, with a deadline on its own monotonic clock, and `apply_fence_token`
+  returns no token while that deadline has not passed, so a forward step cannot make such a claim read
+  expired early. It only ever lengthens a hold. A release drops the entry with the database claim.
+  The entry is in memory, so after a restart (and for a claim another replica stamped) the database
+  clock alone judges the window.
+
+**The fence rule (#7613).** A record ends on the device's `inactive` answer. An apply that reaches the
+device after the observation behind that answer would leave a contained device with no record and
+nothing owed. So:
+
+1. `redispatch_stored_containment`, the one chokepoint for a stored-record apply (the reconciler and the
+   MCP `quarantine_device` call, first or retry), calls `claim_apply` before the dispatch (`apply_gen + 1` and the claim
+   stamp; refused once a release is requested, the record has ended, or another claim is live). A
+   dispatch that returned is not a delivery (the gateway path only queues) and a delivered command is not
+   a run (the agent executes commands on a thread pool, and the plugin's gate orders them by the order its
+   workers reach it, #8045). So a dispatch that reached an agent KEEPS the
+   claim and hands it back (`held_claim_gen`); the reconciler drops it with `release_apply_claim` (which
+   clears the claim only while `apply_gen` is still its own) once it has read the apply's reply, from the
+   in-flight poll or, after a release request has made the entry a releasing one, from its own look at
+   the command. An apply that threw or reached nobody drops it at once. An apply that never answers, one whose reconciler entry is gone before
+   its reply is read (a refused re-claim, a record that ended under it, a failed applied-stamp), and
+   every `quarantine_device` call on MCP (it reads no reply), leaves it to expire, so a second call or a
+   confirmed end inside those 120 seconds is held back (MCP answers a retryable fault, with the window
+   as its retry hint). The generation
+   outlives the claim.
+2. Whoever will act on an `inactive` answer reads `apply_fence_token` (the current `apply_gen`, or nothing
+   while a claim is live) **before it sends the command whose answer it will use**: the reconciler before
+   its status read, `DELETE` before its release.
+3. The write that ends the record (`mark_released(device_confirmed)`, `clear_release_owed`) presents the
+   token and succeeds only if `apply_gen` is unchanged and no claim is live, checked in the same guarded
+   `UPDATE`. A missing token fails closed. The forced end rests on no observation and ignores the fence.
+   A refused end is `apply_in_flight`: the record stays releasing and the next status read takes a fresh
+   token.
+
+**Residuals, accepted and documented rather than closed.** The rule assumes commands to one device
+arrive in the order one server dispatched them (one stream, a first-in first-out gateway queue). A
+transport that reorders them, an apply and a release dispatched by two different server replicas, an
+apply that stays unexecuted past the 120-second claim window, and a step of the database clock that
+makes a live claim read expired early after a restart or for another replica's claim (a claim this
+process stamped also reads live for 120 seconds on its own monotonic clock, and a backward step only
+lengthens a hold) can still reopen the window. `?force=true` is unfenced by design. DELETE's own release and
+the owed-release leg each check the record and then dispatch, with the same narrow window against a new
+quarantine of the same device. The operator-visible trace is a `quarantine.reapply` failure row and a
+device contained under no record or a releasing one; the way back is `firewall.release` through the generic
+routes.
+
+**The four contract rulings of #7588**, recorded here as the issue asks:
+
+- (a) *Record reason on a device-side expiry*: **keep.** No server code ends a record on a device time
+  limit (routed-concern clause 5; owner ruling), so there is no expiry reason to store:
+  `ReleaseEnd` stays `device_confirmed | forced`, and a device-reported limit is drift and is re-applied.
+- (b) *Error class for a release in progress*: **keep** `kInvalidParams` ("a release is in progress for
+  this device") with no `retry_after_ms`. The closed JSON-RPC code set (`mcp_jsonrpc.hpp`) has no
+  conflict class, and a release can stay pending for as long as the device stays unreachable, so no
+  retry interval would be honest. (The route answers `kInvalidParams`; the issue cited the earlier
+  `kInternalError`.)
+- (c) *Worker hold time on DELETE*: **keep the shared budget.** `LiveInflightGuard` is the whole-server
+  bound on workers pinned by a poll, and a second budget for DELETE would raise that bound. A request over
+  the budget skips the wait and answers `202`, never `429`.
+- (d) *Test allowlist width*: **narrowed.** `tests/test_legacy_quarantine_plugin_removed_lexical.py` now
+  exempts nine named sections of `docs/user-manual/upgrading.md`, matched by heading prefix, instead of
+  the whole file; a line under any other heading is scanned.
+
+**Related decisions in the same change.** A heartbeat only marks a device due and the reconciler thread
+acts within a second (#7619), so reconcile work is single-threaded and every write back is identity
+checked (#7620, #7645). The owed-release bookkeeping stays in memory: a restart sends one more release
+and one more `forced_release_*` row, which is harmless because a release is idempotent on the device
+(#7626). The reconciler's status replies are kept 24 hours unless they changed what the server holds
+(#7627); on a server set to keep responses forever they are kept like every other response (a row kept
+forever is never given an expiry). The `list_release_owed_in` read takes the caller's scope and limit in the query (#7624).
+
+## Routed-concern invariants
+
+Moved from the `Device quarantine / containment` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row (updated for the removal of the earlier `quarantine` plugin).
+
+Device quarantine / containment — `QuarantineStore` (Postgres, ADR-0047) + the #881 dispatch gate (`make_containment_gate`/`dispatch_confined_arms.hpp`, fail-closed on a degraded read past a 60s snapshot budget) + `QuarantineContainmentReconciler` (#3425, reconnect re-application) + the `firewall` plugin's four containment actions (the earlier `quarantine` agent plugin is removed: hard cut, no alias). CATASTROPHIC: (1) any dispatch of `firewall.quarantine` for a stored record (MCP `quarantine_device`'s already_active retry, the reconciler) uses the **stored** whitelist ONLY, mapped by the shared chokepoint `redispatch_stored_containment` (`quarantine_reapply.hpp`) — never a fresh/caller-supplied value, or a retry silently rewrites a contained device's firewall allow-list with no store update and no audit trail; (2) NO synchronous quarantine-store read on the agent registration path (`AgentServiceImpl::Register` returns before `Subscribe` establishes the stream — a dispatch fired from there is silently dropped by `send_to`); (3) `is_firewall_control_plugin` (`common/include/yuzu/protective_actions.hpp`) stays a closed four-action set on `firewall` only (`quarantine`/`release`/`quarantine_status`/`quarantine_allow`; Alex's ruling 2026-11-11) — widening it is a security decision, not a routine edit; it is BOTH the #881 containment gate's control-plugin exemption and, with `__guard__.push_rules`, the protective set (`is_protective_action`) that no enablement gate (kill switch, per-OS withhold and its presence read, plugin-presence filter, degraded store) may refuse — one predicate, never a second list; (4) a degraded containment read (gate OR reconciler) fails CLOSED / aborts observably, never silently treats a read failure as "nothing quarantined"; (5) a record ends in exactly two ways, a third is a security decision: the device's `inactive` answer after a release; an operator's `DELETE ?force=true` under DELETE's own gates. A device's own state (`inactive` on an ACTIVE record, a time limit it reports) ends nothing: it is drift and is re-applied. Alex-accepted 2026-11-11: a forced end lifts the dispatch refusal while the device may still be contained.

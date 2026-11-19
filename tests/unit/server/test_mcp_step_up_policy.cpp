@@ -107,6 +107,11 @@ TEST_CASE("mcp step-up policy: the lookup finds each row once and refuses a near
 
 TEST_CASE("mcp step-up policy: every kExempt reason is from the named class list",
           "[stepup][mcp][policy]") {
+    // The closed list: 7 reasons before #2146 batch C added kContentAuthoring for the instruction
+    // authoring writes, and SAM-35 added kCollectionSettings for set_software_collection_settings
+    // (a new reason is a reviewed addition, never a quiet one). SAM-29 added kLifecycleRules and
+    // kReferenceDataReplace, the REST twins' own reasons, for the lifecycle-rule and curation writes.
+    CHECK(step_up_mcp_detail::kMcpExemptReasons.size() == 11);
     for (const auto& e : kMcpStepUpPolicy) {
         INFO("tool: " << std::string(e.tool) << " reason: " << std::string(e.reason));
         if (e.cls == StepUpClass::kExempt) {
@@ -227,9 +232,14 @@ TEST_CASE("mcp step-up policy: the pinned baseline list is sorted, unique and mo
 TEST_CASE("mcp step-up policy: every post-baseline (second-list) tool is pending with a kRequired "
           "REST twin and is not in the baseline",
           "[stepup][mcp][policy]") {
-    REQUIRE(kMcpPendingBecauseRestTwinRequired.size() == 2);
+    REQUIRE(kMcpPendingBecauseRestTwinRequired.size() == 6);
     CHECK(kMcpPendingBecauseRestTwinRequired[0] == "raise_guardian_policy_generation");
-    CHECK(kMcpPendingBecauseRestTwinRequired[1] == "set_runtime_config");
+    // ADR-0070 R1 (slice 2b-1a): the four revocation-source mutations.
+    CHECK(kMcpPendingBecauseRestTwinRequired[1] == "register_revocation_source");
+    CHECK(kMcpPendingBecauseRestTwinRequired[2] == "remove_revocation_source");
+    CHECK(kMcpPendingBecauseRestTwinRequired[3] == "reset_revocation_source_high_water");
+    CHECK(kMcpPendingBecauseRestTwinRequired[4] == "set_runtime_config");
+    CHECK(kMcpPendingBecauseRestTwinRequired[5] == "update_revocation_source");
     std::set<std::string_view> baseline(std::begin(kBaselineMcpPending),
                                         std::end(kBaselineMcpPending));
     std::set<std::string_view> seen;
@@ -258,19 +268,55 @@ TEST_CASE("mcp step-up policy: the pending rows are the baseline plus the post-b
     // Many baseline tools ALSO have a kRequired twin (they are pending because no MCP consumer
     // enforces kRequired yet), so the second list is not the only such group. What is checked here
     // is the count identity; the second-list case above checks each entry's twin.
-    // 46 pending rows = 44 baseline + 2 second-list.
+    // 50 pending rows = 44 baseline + 6 second-list.
     CHECK(pending_rows() == kMcpPendingBaselineMax + kMcpPendingBecauseRestTwinRequired.size());
-    CHECK(pending_rows() == 46);
+    CHECK(pending_rows() == 50);
     CHECK(baseline_pending_rows() + second_list_pending_rows() == pending_rows());
     CHECK(second_list_pending_rows() == kMcpPendingBecauseRestTwinRequired.size());
-    // The MCP table shape: 68 rows, 22 exempt, 46 pending (#2146 batch B added the two
+    // The MCP table shape: 88 rows, 38 exempt, 50 pending (#6087 added the two DEX score policy
+    // write twins, both exempt kOperationalData; #2146 batch B added the two
     // execution twins, both exempt: cancel_execution kCancelsRecord, record_execution_rerun
-    // kCreatesRerunRecord; and execute_instruction_definition, exempt kExecutionDispatch).
-    CHECK(std::size(kMcpStepUpPolicy) == 68);
+    // kCreatesRerunRecord; and execute_instruction_definition and execute_workflow, both exempt
+    // kExecutionDispatch; ADR-0070 R1 added the four revocation-source mutations, all pending;
+    // #2146 batch C added the seven instruction-definition / instruction-set authoring writes,
+    // all exempt kContentAuthoring; SAM-35 added set_software_collection_settings, exempt
+    // kCollectionSettings; SAM-29 added the five lifecycle-rule and curation writes, all exempt, each
+    // with its REST twin's reason).
+    CHECK(std::size(kMcpStepUpPolicy) == 88);
     std::size_t exempt = 0;
     for (const auto& e : kMcpStepUpPolicy)
         exempt += (e.cls == StepUpClass::kExempt) ? 1 : 0;
-    CHECK(exempt == 22);
+    CHECK(exempt == 38);
+}
+
+TEST_CASE("mcp step-up policy: the SAM-29 writes are exempt with their REST twin's reason and pattern",
+          "[stepup][mcp][policy]") {
+    struct Expected {
+        std::string_view tool;
+        std::string_view reason;
+        std::string_view method;
+        std::string_view pattern;
+    };
+    const Expected expected[] = {
+        {"import_software_lifecycle_rules", step_up_detail::kLifecycleRules, "POST",
+         R"(/api/v1/inventory/software/lifecycle/rules)"},
+        {"delete_software_lifecycle_rules", step_up_detail::kLifecycleRules, "DELETE",
+         R"(/api/v1/inventory/software/lifecycle/rules)"},
+        {"curate_software_alias", step_up_detail::kReferenceDataReplace, "POST",
+         R"(/api/v1/inventory/software/normalization/aliases)"},
+        {"reject_software_curation", step_up_detail::kOperationalData, "POST",
+         R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)"},
+        {"replace_software_normalization_pack", step_up_detail::kReferenceDataReplace, "POST",
+         R"(/api/v1/inventory/software/normalization/pack)"}};
+    for (const auto& want : expected) {
+        INFO("tool: " << std::string(want.tool));
+        const auto* row = mcp_step_up_policy_for(want.tool);
+        REQUIRE(row != nullptr);
+        CHECK(row->cls == StepUpClass::kExempt);
+        CHECK(row->reason == want.reason);
+        CHECK(row->rest_method == want.method);
+        CHECK(row->rest_pattern == want.pattern);
+    }
 }
 
 TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is never weaker",
@@ -283,7 +329,8 @@ TEST_CASE("mcp step-up policy: a twin exists in the REST table and the tool is n
         INFO("twin: " << std::string(e.rest_method) << " " << std::string(e.rest_pattern));
         const auto* twin = step_up_policy_for(e.rest_method, e.rest_pattern);
         REQUIRE(twin != nullptr);
-        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kPendingRuling)
+        if (twin->cls == StepUpClass::kRequired || twin->cls == StepUpClass::kFactorCredential ||
+            twin->cls == StepUpClass::kPendingRuling)
             CHECK(e.cls != StepUpClass::kExempt);
     }
 }

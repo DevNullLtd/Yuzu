@@ -11,6 +11,7 @@
  */
 
 #include "guardian_ingest.hpp"
+#include "guardian_pair_mode.hpp"
 
 #include <yuzu/log_token.hpp>
 #include <yuzu/metrics.hpp>
@@ -32,11 +33,13 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <sstream>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 #include <spdlog/sinks/ostream_sink.h>
 #include <spdlog/sinks/sink.h>
@@ -188,11 +191,15 @@ apb::CommandResponse make_error_event(const std::string& event_id) {
 // block, which is gated on rule_id != kObservationRuleId.
 apb::CommandResponse make_rule_event(const std::string& event_id, const std::string& rule_id,
                                      std::int64_t ts_seconds = 1718000000,
-                                     std::int32_t ts_nanos = 0, bool with_timestamp = true) {
+                                     std::int32_t ts_nanos = 0, bool with_timestamp = true,
+                                     std::uint64_t boot_epoch = 0, std::uint64_t emit_seq = 0,
+                                     const char* event_type = "service.stopped") {
     gpb::GuaranteedStateEvent ev;
     ev.set_event_id(event_id);
     ev.set_rule_id(rule_id);
-    ev.set_event_type("service.stopped");
+    ev.set_boot_epoch(boot_epoch);
+    ev.set_emit_seq(emit_seq);
+    ev.set_event_type(event_type);
     ev.set_severity("high");
     ev.set_detected_value("stopped");
     ev.set_expected_value("running");
@@ -797,4 +804,464 @@ TEST_CASE("guardian ingest: the agent stamp and the receipt reach the stored ord
     const std::string future = key_of("k-future");
     CHECK(future.ends_with("|true"));
     CHECK(std::stoll(future) < 9'000'000'000LL * 1'000'000'000LL);
+}
+
+namespace {
+constexpr std::uint64_t k2p62 = std::uint64_t{1} << 62;
+
+std::int64_t pair_rejected_count(yuzu::MetricsRegistry& m, const char* reason) {
+    return m.counter(yuzu::server::detail::kGuardianPairRejectedMetric, {{"reason", reason}})
+        .value();
+}
+} // namespace
+
+TEST_CASE("guardian ingest: the Repair-shed counter is pre-seeded at 0, unlabelled",
+          "[guardian][ingest][pair]") {
+    yuzu::MetricsRegistry metrics;
+    CHECK(metrics.serialize().find(yuzu::server::detail::kGuardianRepairsShedMetric) ==
+          std::string::npos);
+    yuzu::server::detail::preseed_guardian_repairs_shed_metric(metrics);
+    CHECK(metrics.serialize().find(std::string(yuzu::server::detail::kGuardianRepairsShedMetric) +
+                                   " 0\n") != std::string::npos);
+    CHECK(std::string(yuzu::server::detail::kGuardianRepairsShedMetric) ==
+          "yuzu_server_guardian_repairs_shed_total");
+}
+
+TEST_CASE("guardian ingest: pair_from_wire validates the emit-order pair (UP-14 D5)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::detail::pair_from_wire_structural;
+    using yuzu::server::detail::PairReject;
+    // Both set and in [1, 2^62): a pair, in the order (boot_epoch, emit_seq).
+    const auto ok = pair_from_wire_structural(7, 11);
+    CHECK(ok.paired);
+    CHECK(ok.boot_epoch == 7);
+    CHECK(ok.emit_seq == 11);
+    CHECK(ok.reject == PairReject::None);
+    // 2^62 - 1 is the largest accepted value on either side; both extremes at once.
+    const auto top = pair_from_wire_structural(k2p62 - 1, k2p62 - 1);
+    CHECK(top.paired);
+    CHECK(top.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(top.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(top.reject == PairReject::None);
+    CHECK(pair_from_wire_structural(1, 1).paired); // the 1-based floor
+    // 0/0 is an unpaired sender, not a rejection.
+    const auto none = pair_from_wire_structural(0, 0);
+    CHECK_FALSE(none.paired);
+    CHECK(none.reject == PairReject::None);
+    // Exactly one set, in either direction, is half_set.
+    CHECK_FALSE(pair_from_wire_structural(5, 0).paired);
+    CHECK(pair_from_wire_structural(5, 0).reject == PairReject::HalfSet);
+    CHECK_FALSE(pair_from_wire_structural(0, 5).paired);
+    CHECK(pair_from_wire_structural(0, 5).reject == PairReject::HalfSet);
+    // half_set is decided before the range check: a lone out-of-range value beside a zero is
+    // still half_set.
+    CHECK(pair_from_wire_structural(k2p62, 0).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire_structural(0, k2p62).reject == PairReject::HalfSet);
+    // Either value at or above 2^62 beside a set partner is out_of_range, including values with
+    // the sign bit set (a wire uint64 cannot be negative; it would read as one as an int64).
+    for (const std::uint64_t big : {k2p62, k2p62 + 1, std::uint64_t{1} << 63,
+                                    std::numeric_limits<std::uint64_t>::max()}) {
+        CHECK_FALSE(pair_from_wire_structural(big, 3).paired);
+        CHECK(pair_from_wire_structural(big, 3).reject == PairReject::OutOfRange);
+        CHECK_FALSE(pair_from_wire_structural(3, big).paired);
+        CHECK(pair_from_wire_structural(3, big).reject == PairReject::OutOfRange);
+    }
+}
+
+TEST_CASE("guardian ingest: apply_wire_pair fills the row and returns why a pair was withheld "
+          "(UP-14 D5)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::apply_wire_pair_structural;
+    using yuzu::server::detail::PairReject;
+    GuaranteedStateEventRow row;
+    row.event_id = "evt-pair";
+    row.agent_id = "agent-A";
+    // The pre-seed contract (server.cpp warms one series per entry): the closed reason set is
+    // exactly the three labels this code counts on, and every reject maps to its own entry.
+    CHECK(std::vector<std::string>(std::begin(yuzu::server::detail::kGuardianPairRejectReasons),
+                                   std::end(yuzu::server::detail::kGuardianPairRejectReasons)) ==
+          std::vector<std::string>{"half_set", "out_of_range", "implausible"});
+    CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::HalfSet)) ==
+          "half_set");
+    CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::OutOfRange)) ==
+          "out_of_range");
+
+    // Both set: the pair lands on the row, not swapped, and nothing is withheld.
+    CHECK_FALSE(apply_wire_pair_structural(row, 7, 11).has_value());
+    REQUIRE(row.boot_epoch.has_value());
+    REQUIRE(row.emit_seq.has_value());
+    CHECK(*row.boot_epoch == 7);
+    CHECK(*row.emit_seq == 11);
+    // The largest accepted values.
+    CHECK_FALSE(apply_wire_pair_structural(row, k2p62 - 1, k2p62 - 1).has_value());
+    CHECK(row.boot_epoch == static_cast<std::int64_t>(k2p62 - 1));
+    CHECK(row.emit_seq == static_cast<std::int64_t>(k2p62 - 1));
+    // Both zero: unset, and not a rejection.
+    CHECK_FALSE(apply_wire_pair_structural(row, 0, 0).has_value());
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+
+    // Half set, each direction: unset, and the reason is returned.
+    CHECK(apply_wire_pair_structural(row, 5, 0) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(apply_wire_pair_structural(row, 0, 5) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    // 2^62 on either side: unset, out_of_range.
+    CHECK(apply_wire_pair_structural(row, k2p62, 5) ==
+          std::optional<PairReject>{PairReject::OutOfRange});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    CHECK(apply_wire_pair_structural(row, 5, std::numeric_limits<std::uint64_t>::max()) ==
+          std::optional<PairReject>{PairReject::OutOfRange});
+    CHECK_FALSE(row.emit_seq.has_value());
+    // A pair is cleared by a later rejection on the same row, never left half-applied.
+    CHECK_FALSE(apply_wire_pair_structural(row, 3, 4).has_value());
+    CHECK(apply_wire_pair_structural(row, 3, 0).has_value());
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+}
+
+TEST_CASE("guardian ingest: report_pair_reject warns and counts one reason per call (UP-14 D5)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::PairReject;
+    using yuzu::server::detail::report_pair_reject;
+    GuaranteedStateEventRow row;
+    row.event_id = "evt-pair";
+    row.agent_id = "agent-A";
+    yuzu::MetricsRegistry metrics;
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    report_pair_reject(PairReject::HalfSet, row, &metrics);
+    report_pair_reject(PairReject::HalfSet, row, &metrics);
+    report_pair_reject(PairReject::OutOfRange, row, &metrics);
+    cap.stop();
+    CHECK(pair_rejected_count(metrics, "half_set") == 2);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 1);
+    CHECK(cap.text().find("withholding the emit-order pair (half_set)") != std::string::npos);
+    CHECK(cap.text().find("withholding the emit-order pair (out_of_range)") != std::string::npos);
+    // Without a registry it still warns and never throws.
+    CHECK_NOTHROW(report_pair_reject(PairReject::HalfSet, row, nullptr));
+}
+
+TEST_CASE("guardian ingest: a rejected pair does not refuse the event (UP-14 D5)",
+          "[pg][guardian][ingest][pair]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, guardian_pg_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    GuaranteedStateStore store(pool);
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    // The refusal counter summed over the pair reasons too, so a pair rejection counted on the
+    // wrong family cannot hide behind the one real refusal label.
+    const auto rejected = [&] {
+        std::int64_t total = 0;
+        for (const char* reason : {"empty_rule_id", "half_set", "out_of_range"})
+            total += metrics
+                         .counter(yuzu::server::detail::kGuardianEventsRejectedMetric,
+                                  {{"reason", reason}})
+                         .value();
+        return total;
+    };
+    const auto ingest = [&](const std::string& id, std::uint64_t boot, std::uint64_t seq) {
+        ingest_guardian_response(
+            store, "agent-A",
+            make_rule_event(id, "rule-1", 1718000000, 0, true, boot, seq, "drift.detected"),
+            nullptr, nullptr, &metrics);
+    };
+    // The stored pair of an event ("-" is NULL), read back from the event row and the census row.
+    const auto scalar = [&](const std::string& sql) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string{};
+    };
+    const auto event_pair = [&](const std::string& id) {
+        return scalar("SELECT coalesce(boot_epoch::text, '-') || '/' || coalesce(emit_seq::text, "
+                      "'-') FROM guaranteed_state_store.guaranteed_state_events WHERE event_id = '" +
+                      id + "'");
+    };
+    const auto census_pair = [&](const std::string& agent) {
+        return scalar("SELECT coalesce(boot_epoch::text, '-') || '/' || coalesce(emit_seq::text, "
+                      "'-') FROM guaranteed_state_store.guardian_agent_rule_status WHERE agent_id "
+                      "= '" +
+                      agent + "' AND rule_id = 'rule-1'");
+    };
+    // The census write needs the rule to exist (an undefined rule is refused by its foreign key).
+    yuzu::server::GuaranteedStateRuleRow rule;
+    rule.rule_id = "rule-1";
+    rule.name = "Rule one";
+    rule.yaml_source = "apiVersion: yuzu.io/v1alpha1\nkind: GuaranteedStateRule\n";
+    rule.version = 1;
+    rule.enabled = true;
+    rule.enforcement_mode = "enforce";
+    rule.severity = "high";
+    rule.os_target = "windows";
+    rule.created_at = "2026-04-19T12:00:00Z";
+    rule.updated_at = "2026-04-19T12:00:00Z";
+    rule.created_by = "alice";
+    rule.updated_by = "alice";
+    REQUIRE(store.create_rule(rule).has_value());
+
+    // A pair the agent sent reaches the event row and the census row as (boot_epoch, emit_seq),
+    // in that order and not swapped, and the order row's pair clock follows it.
+    ingest("p-ok", 3, 4);
+    CHECK(event_pair("p-ok") == "3/4");
+    CHECK(census_pair("agent-A") == "3/4");
+    const auto order = store.agent_order_for_agent("agent-A");
+    REQUIRE(order.has_value());
+    REQUIRE(order->has_value());
+    CHECK((*order)->epoch == std::optional<std::int64_t>{3});
+    CHECK((*order)->emit_seq_hwm == std::optional<std::int64_t>{4});
+
+    ingest("p-none", 0, 0);
+    CHECK(pair_rejected_count(metrics, "half_set") == 0);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 0);
+    CHECK(event_pair("p-none") == "-/-");
+    ingest("p-half", 3, 0);
+    ingest("p-big", k2p62, 4);
+    CHECK(pair_rejected_count(metrics, "half_set") == 1);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 1);
+    // A withheld pair leaves the event row unpaired (NULL/NULL), never a half pair.
+    CHECK(event_pair("p-half") == "-/-");
+    CHECK(event_pair("p-big") == "-/-");
+    // Every event, rejected pair or not, is stored; the refusal counter never moved.
+    CHECK(store.event_count() == 4);
+    CHECK(rejected() == 0);
+
+    // Counted once per withheld pair, not once per delivery: a redelivery of the same event (a
+    // durable agent journal replays on reconnect) neither counts nor warns again.
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    ingest("p-half", 3, 0);
+    ingest("p-half", 3, 0);
+    ingest("p-big", k2p62, 4);
+    cap.stop();
+    CHECK(store.event_count() == 4);
+    CHECK(pair_rejected_count(metrics, "half_set") == 1);
+    CHECK(pair_rejected_count(metrics, "out_of_range") == 1);
+    CHECK(cap.text().find("withholding the emit-order pair") == std::string::npos);
+    // A different event with the same half pair is a new withheld pair and counts.
+    ingest("p-half-2", 3, 0);
+    CHECK(pair_rejected_count(metrics, "half_set") == 2);
+
+    // UP-9: an implausible pair (emit_seq at the 2^40 ceiling) is dropped at this boundary like the
+    // two above. The event is stored unpaired, counted once under `implausible`, judged as an
+    // unpaired event (no pending evidence, no hold) and a redelivery does not count again.
+    CHECK(pair_rejected_count(metrics, "implausible") == 0);
+    const auto pending = [&] {
+        return scalar("SELECT count(*) FROM guaranteed_state_store.guaranteed_state_events WHERE "
+                      "projection_pending");
+    };
+    ingest("p-implausible", 7, yuzu::server::detail::kEmitSeqCeiling);
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(event_pair("p-implausible") == "-/-");
+    CHECK(pending() == "0");
+    ingest("p-implausible", 7, yuzu::server::detail::kEmitSeqCeiling);
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(pending() == "0");
+
+    // The epoch half of the bound, through the ingest boundary, in the receipt's own UNITS: the
+    // boundary hands `pair_from_wire` its receipt in whole Unix seconds (not the nanoseconds it
+    // captures), so an epoch past receipt + ten years is dropped and one just inside it is kept.
+    // An hour of margin each side covers the seconds between this clock read and the ingest's own.
+    const auto now_s =
+        static_cast<std::uint64_t>(std::chrono::duration_cast<std::chrono::seconds>(
+                                       std::chrono::system_clock::now().time_since_epoch())
+                                       .count());
+    const auto skew = static_cast<std::uint64_t>(yuzu::server::detail::kEpochSkewSeconds);
+    ingest("p-epoch-future", now_s + skew + 3600, 5);
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    CHECK(event_pair("p-epoch-future") == "-/-");
+    CHECK(pending() == "0");
+    ingest("p-epoch-future", now_s + skew + 3600, 5); // a redelivery does not count again
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    // Just inside the bound: an accepted pair, stored as sent.
+    ingest("p-epoch-edge", now_s + skew - 3600, 5);
+    CHECK(pair_rejected_count(metrics, "implausible") == 2);
+    CHECK(event_pair("p-epoch-edge") == std::to_string(now_s + skew - 3600) + "/5");
+    CHECK(pending() == "0");
+}
+
+// ── UP-14 PR B B2: the absolute plausibility bound (UP-9) and the closed pair mode ────────────
+
+TEST_CASE("guardian ingest: pair_from_wire with a receipt applies the absolute plausibility bound "
+          "(UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::detail::kEmitSeqCeiling;
+    using yuzu::server::detail::kEpochSkewSeconds;
+    using yuzu::server::detail::pair_from_wire;
+    using yuzu::server::detail::pair_from_wire_structural;
+    using yuzu::server::detail::PairReject;
+    constexpr std::int64_t receipt = 1'800'000'000; // Unix seconds
+    const auto epoch_at = [&](std::int64_t delta) {
+        return static_cast<std::uint64_t>(receipt + kEpochSkewSeconds + delta);
+    };
+
+    // emit_seq: 2^40 - 1 is the largest plausible value, 2^40 is not.
+    CHECK(pair_from_wire(7, kEmitSeqCeiling - 1, receipt).paired);
+    CHECK_FALSE(pair_from_wire(7, kEmitSeqCeiling, receipt).paired);
+    CHECK(pair_from_wire(7, kEmitSeqCeiling, receipt).reject == PairReject::Implausible);
+    // epoch: receipt + ten years is the largest plausible value, one second more is not.
+    CHECK(pair_from_wire(epoch_at(0), 1, receipt).paired);
+    CHECK(pair_from_wire(epoch_at(1), 1, receipt).reject == PairReject::Implausible);
+    CHECK_FALSE(pair_from_wire(epoch_at(1), 1, receipt).paired);
+    // The receipt is what moves the epoch bound.
+    CHECK(pair_from_wire(epoch_at(1), 1, receipt + 1).paired);
+    // The structural checks keep their precedence: half_set, then out_of_range, then implausible.
+    CHECK(pair_from_wire(5, 0, receipt).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire(0, kEmitSeqCeiling, receipt).reject == PairReject::HalfSet);
+    CHECK(pair_from_wire(std::uint64_t{1} << 62, kEmitSeqCeiling, receipt).reject ==
+          PairReject::OutOfRange);
+    // 0/0 stays an unpaired sender, not a rejection.
+    CHECK(pair_from_wire(0, 0, receipt).reject == PairReject::None);
+    // A receipt before 1970 never lowers the bound below the skew itself.
+    CHECK(pair_from_wire(static_cast<std::uint64_t>(kEpochSkewSeconds), 1, -5).paired);
+    // The structural form is structural only: it does not apply the bound.
+    CHECK(pair_from_wire_structural(7, kEmitSeqCeiling).paired);
+
+    // A receipt at the top of the signed range must not overflow the epoch ceiling (a signed
+    // overflow is undefined behaviour): the ceiling is far above any epoch, so a pair inside
+    // the range is plausible, and only the sequence bound can refuse it.
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    CHECK(pair_from_wire(7, 11, kMax).paired);
+    CHECK(pair_from_wire((std::uint64_t{1} << 62) - 1, 11, kMax).paired);
+    CHECK(pair_from_wire(7, kEmitSeqCeiling, kMax).reject == PairReject::Implausible);
+    CHECK(pair_from_wire(7, 11, kMax - kEpochSkewSeconds).paired);
+    CHECK(pair_from_wire(7, 11, std::numeric_limits<std::int64_t>::min()).paired);
+}
+
+TEST_CASE("guardian ingest: apply_wire_pair with a receipt withholds an implausible pair and "
+          "returns its reason, exactly as for half_set and out_of_range (UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::apply_wire_pair;
+    using yuzu::server::detail::apply_wire_pair_structural;
+    using yuzu::server::detail::kEmitSeqCeiling;
+    using yuzu::server::detail::PairReject;
+    constexpr std::int64_t receipt = 1'800'000'000;
+    GuaranteedStateEventRow row;
+
+    CHECK(apply_wire_pair(row, 7, kEmitSeqCeiling, receipt) ==
+          std::optional<PairReject>{PairReject::Implausible});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK_FALSE(row.emit_seq.has_value());
+    // A later call on the same row sets the pair.
+    CHECK_FALSE(apply_wire_pair(row, 7, 11, receipt).has_value());
+    CHECK(row.boot_epoch == 7);
+    CHECK(row.emit_seq == 11);
+    // The other two reasons leave the pair unset the same way (one decision site, no other state).
+    CHECK(apply_wire_pair(row, 5, 0, receipt) == std::optional<PairReject>{PairReject::HalfSet});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    CHECK(apply_wire_pair(row, k2p62, 5, receipt) ==
+          std::optional<PairReject>{PairReject::OutOfRange});
+    CHECK_FALSE(row.boot_epoch.has_value());
+    // The three-argument form is structural only: the implausible pair is taken.
+    CHECK_FALSE(apply_wire_pair_structural(row, 7, kEmitSeqCeiling).has_value());
+    CHECK(row.emit_seq == static_cast<std::int64_t>(kEmitSeqCeiling));
+}
+
+TEST_CASE("guardian ingest: the implausible reason has its own label and is counted by "
+          "report_pair_reject (UP-9)",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::GuaranteedStateEventRow;
+    using yuzu::server::detail::PairReject;
+    using yuzu::server::detail::report_pair_reject;
+    CHECK(std::string(yuzu::server::detail::pair_reject_reason(PairReject::Implausible)) ==
+          "implausible");
+    GuaranteedStateEventRow row;
+    row.event_id = "evt-implausible";
+    row.agent_id = "agent-A";
+    yuzu::MetricsRegistry metrics;
+    yuzu::test::LogCapture cap(spdlog::level::warn);
+    report_pair_reject(PairReject::Implausible, row, &metrics);
+    cap.stop();
+    CHECK(pair_rejected_count(metrics, "implausible") == 1);
+    CHECK(cap.text().find("withholding the emit-order pair (implausible)") != std::string::npos);
+}
+
+TEST_CASE("guardian pair mode: the SQL's mode set is closed, an unknown or empty label never "
+          "parses",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::PairMode;
+    using yuzu::server::parse_pair_mode;
+    for (const char* label : {"unpaired", "unpaired_held", "refused_retired", "current",
+                              "current_straggler", "current_rebase", "refused_regression"}) {
+        INFO(label);
+        const auto m = parse_pair_mode(label);
+        REQUIRE(m.has_value());
+        CHECK(std::string(yuzu::server::pair_mode_label(*m)) == label);
+    }
+    for (const char* bad : {"", "Current", "CURRENT", "current ", " current", "current_",
+                            "refused_duplicate", "implausible_held", "unknown", "0"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(parse_pair_mode(bad).has_value());
+    }
+    CHECK(yuzu::server::default_pair_decision(false).mode == PairMode::Unpaired);
+    CHECK(yuzu::server::default_pair_decision(true).mode == PairMode::Current);
+    CHECK_FALSE(yuzu::server::default_pair_decision(true).retired_epoch.has_value());
+}
+
+TEST_CASE("guardian census decision: the label set is the closed ten, NULL is legitimate only "
+          "for an unpaired mode, and the metric is pre-seeded at 0",
+          "[guardian][ingest][pair]") {
+    using yuzu::server::CensusDecision;
+    using yuzu::server::PairMode;
+    const std::vector<std::string> expected = {
+        "applied_pair",       "applied_key",     "transition_to_pair",
+        "transition_to_key",  "rebase",          "held_unpaired",
+        "refused_regression", "refused_retired", "refused_duplicate",
+        "refused_straggler"};
+    REQUIRE(yuzu::server::kCensusDecisions.size() == expected.size());
+    for (std::size_t i = 0; i < expected.size(); ++i) {
+        INFO(expected[i]);
+        const CensusDecision d = yuzu::server::kCensusDecisions[i];
+        CHECK(std::string(yuzu::server::census_decision_label(d)) == expected[i]);
+        const auto parsed = yuzu::server::parse_census_decision(expected[i]);
+        REQUIRE(parsed.has_value());
+        CHECK(*parsed == d);
+    }
+    for (const char* bad : {"", "Applied_Pair", "applied_pair ", " applied_pair", "applied",
+                            "implausible_held", "current", "refused_", "0"}) {
+        INFO("[" << bad << "]");
+        CHECK_FALSE(yuzu::server::parse_census_decision(bad).has_value());
+    }
+
+    // NULL: only an unpaired mode may lack a label; every other mode fails the write rather than
+    // read as no decision.
+    std::optional<CensusDecision> out;
+    std::string why;
+    for (const PairMode m : {PairMode::Unpaired, PairMode::UnpairedHeld}) {
+        CHECK(yuzu::server::interpret_census_decision(std::nullopt, m, out, why));
+        CHECK_FALSE(out.has_value());
+    }
+    for (const PairMode m :
+         {PairMode::RefusedRetired, PairMode::Current, PairMode::CurrentStraggler,
+          PairMode::CurrentRebase, PairMode::RefusedRegression}) {
+        why.clear();
+        CHECK_FALSE(yuzu::server::interpret_census_decision(std::nullopt, m, out, why));
+        CHECK_FALSE(out.has_value());
+        CHECK(why.find("NULL") != std::string::npos);
+    }
+    // A label outside the set fails for every mode, an unpaired one included.
+    for (const PairMode m : {PairMode::Unpaired, PairMode::Current}) {
+        why.clear();
+        CHECK_FALSE(yuzu::server::interpret_census_decision("applied_pairs", m, out, why));
+        CHECK_FALSE(out.has_value());
+        CHECK(why.find("unknown census decision") != std::string::npos);
+    }
+    CHECK(yuzu::server::interpret_census_decision("rebase", PairMode::CurrentRebase, out, why));
+    CHECK(out == CensusDecision::Rebase);
+
+    // Pre-seeded: every series exists at 0 before any decision, so a rate over it never starts
+    // from an absent series.
+    yuzu::MetricsRegistry metrics;
+    yuzu::server::detail::preseed_census_pair_decision_metric(metrics);
+    const std::string text = metrics.serialize();
+    for (const std::string& label : expected) {
+        INFO(label);
+        CHECK(text.find(std::string(yuzu::server::detail::kGuardianCensusPairDecisionsMetric) +
+                        "{decision=\"" + label + "\"} 0\n") != std::string::npos);
+    }
 }

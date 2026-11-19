@@ -11,6 +11,7 @@
 #include "rollout_pct_reject.hpp" // the shared malformed-rollout_pct 400 + toast
 
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <format>
 
@@ -35,12 +36,18 @@
 #include "sso_boot_guard.hpp" // oidc_config_complete + publish_oidc_provider_gauges (#4160)
 #include "rbac_admin_predicate.hpp" // is_self_target — shared #397/#403 self-target comparison
 #include "rbac_store.hpp"       // access-review read-model direct-grant reads
+#include "rbac_text.hpp"        // rbac_text_is_clean: the shared clean-text predicate
+#include "session_store.hpp" // LocalMfaProof: the enrolment's verified {generation, instant} (#6079)
+#include "step_up_gate.hpp" // StepUpVerdict / render_step_up_refusal: the unwired factor-credential gate (#6079)
 #include "tag_store.hpp" // F2a PR3: TagStore::validate_key for the cohort export key
+#include "mfa_disable_owner.hpp" // #6079 PR 2c: MfaDisableRequest/Result (the Settings disable)
 #include "mfa_qr.hpp"
 #include "password_policy.hpp" // #5342 — the ONE local password length policy
 #include "plugin_signing_helpers.hpp"
 #include "rest_a4_envelope.hpp"      // #4028 — detail::error_json_a4 for the settings read-twins
 #include "audited_write.hpp"          // detail::audit_attempted — audit-first settings.mcp
+#include "mgmt_group_error.hpp"       // mgmt_group_error_is_store_fault (management-group create)
+#include "mgmt_group_limits.hpp"      // name / parent id bounds and the clean-text rule
 #include "auth_routes.hpp"           // AuthRoutes::extract_session_cookie (enrol-confirm proof stamp)
 #include "rest_a4_envelope_http.hpp" // #4028 — detail::a4_error/ensure_correlation_id
 #include "rest_audit.hpp"            // #4028 — detail::emit_behavioral_audit (fail-closed REST reads)
@@ -58,6 +65,8 @@
 #include <algorithm>
 #include <cctype>
 #include <limits>
+#include <mutex>
+#include <random>
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -144,8 +153,9 @@ std::string url_encode(const std::string& s) {
     return out;
 }
 
-// A refused MFA step-up on an htmx form: `step_up_fn_` has already written the refusal (a 401/403/503
-// A4 envelope). htmx swaps no 4xx/5xx body, so without a toast the button looks dead. Show the
+// A refused MFA step-up on an htmx form: `step_up_fn_` (or, on the two factor-credential routes,
+// their own gate) has already written the refusal (a 401/403/503 A4 envelope). htmx swaps no
+// 4xx/5xx body, so without a toast the button looks dead. Show the
 // envelope's own `error.message` (never its `remediation`, which names API-caller steps such as a
 // token or a POST route, not something the form can do); fall back to a fixed message if the body is not an envelope.
 // An in-handler refusal (require_mfa_step_up) already toasts on an htmx request via
@@ -165,6 +175,34 @@ void toast_step_up_refusal(httplib::Response& res) {
     }
     const nlohmann::json toast = {{"showToast", {{"message", message}, {"level", "error"}}}};
     res.set_header("HX-Trigger", toast.dump());
+}
+
+// #6079: the two factor-credential routes have no gate wired (a construction fault, never a
+// production shape): answer the step-up gate's own unwired 503 and mutate nothing, so a missing
+// closure can only deny, never leave the route ungated.
+void refuse_factor_credential_gate_unwired(const httplib::Request& req, httplib::Response& res,
+                                           const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: no factor-credential gate wired; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kUnwired;
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
+}
+
+// #6079: the gate hands back an admission only for a local interactive session, so a
+// non-local one here is a gate defect, never a production shape. Re-check it where the
+// admission is consumed (the generation it carries is only meaningful for a local account)
+// and answer the gate's own 403, mutating nothing.
+void refuse_factor_credential_not_local(const httplib::Request& req, httplib::Response& res,
+                                        const auth::Session& session, std::string_view label) {
+    spdlog::error("settings: factor-credential admission is not local; failing closed ({})", label);
+    StepUpVerdict v;
+    v.decision = StepUpDecision::kFactorCredentialNonLocal;
+    v.reason = "factor_credential_requires_local_session";
+    v.user = session.username;
+    render_step_up_refusal(req, res, v, StepUpSurface::kRest);
+    toast_step_up_refusal(res);
 }
 
 // True when a Content-Type header names application/json (any parameters, any case).
@@ -694,6 +732,25 @@ std::string SettingsRoutes::render_users_fragment(const std::string& current_use
     return html;
 }
 
+/// Does the registry already hold exactly what this upload wrote? The row for the
+/// package key must carry the same file name, hash, size, mandatory flag and rollout.
+/// Used after a registry write reported failure: a connection lost after the commit
+/// looks like a failed write, and the row read back tells the two apart.
+///
+/// Declared here, not in a header, so the unit test can reach it; it has no other caller.
+[[nodiscard]] bool row_carries_upload(const std::vector<UpdatePackage>& rows,
+                                      const UpdatePackage& pkg);
+bool row_carries_upload(const std::vector<UpdatePackage>& rows, const UpdatePackage& pkg) {
+    for (const auto& row : rows) {
+        if (row.platform != pkg.platform || row.arch != pkg.arch || row.version != pkg.version)
+            continue;
+        return row.sha256 == pkg.sha256 && row.filename == pkg.filename &&
+               row.mandatory == pkg.mandatory && row.rollout_pct == pkg.rollout_pct &&
+               row.file_size == pkg.file_size;
+    }
+    return false;
+}
+
 namespace {
 // #5342 Gate 8 (F4): the Settings MFA init/verify refusal when the account's
 // password changed during the enrolment (AuthDBError::CredentialChanged).
@@ -725,6 +782,267 @@ std::string bulk_audit_detail(const std::vector<std::string>& ids) {
     }
     return d;
 }
+
+/// One lock for every operation that publishes or unlinks OTA package files, so an
+/// upload's backup/restore of a filename cannot interleave with another upload or a
+/// delete of the same filename.
+std::mutex& ota_package_files_mutex() {
+    static std::mutex m;
+    return m;
+}
+
+/// Keeps the files an OTA upload is about to replace until the registry row is
+/// written, so a failed registry write puts the previously published package back
+/// instead of leaving the directory without it.
+///
+/// `preserve(path)` is called for every path the upload may replace or remove,
+/// BEFORE the first publish. A present regular file is kept under a unique name in
+/// the same directory (`<name>.yuzu_prev_<unique>`): a hard link when the
+/// filesystem allows it, otherwise a copy that never overwrites an existing name.
+/// The live name is never renamed aside, so it is never absent while the new file
+/// is published over it. A name that already exists is retried with a fresh suffix
+/// (a bounded number of times). `commit()` deletes the kept copies.
+///
+/// `rollback()` puts everything back: a path that had a predecessor gets it back
+/// (rename over whatever was published there; when the kept name and the live name
+/// are still the same file the kept name is just removed), a path that had none is
+/// removed. Paths are restored in the reverse order they were kept. It returns
+/// whether every path ended as intended; a restore that fails leaves the kept copy
+/// in place and logs its name, so a predecessor is never deleted unreplaced, and
+/// `restore_failure_text()` names the copies still on disk. The caller calls it
+/// explicitly before answering, so the answer can say whether the restore held; the
+/// destructor calls it only when neither `commit()` nor `rollback()` ran.
+class OtaPredecessorGuard {
+public:
+    OtaPredecessorGuard() { entries_.reserve(2); }
+    OtaPredecessorGuard(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard& operator=(const OtaPredecessorGuard&) = delete;
+    OtaPredecessorGuard(OtaPredecessorGuard&&) = delete;
+    OtaPredecessorGuard& operator=(OtaPredecessorGuard&&) = delete;
+    ~OtaPredecessorGuard() {
+        if (!settled_)
+            (void)rollback();
+    }
+
+    /// False when something is at `path` and cannot be kept (not a regular file, an
+    /// unreadable status, or neither a link nor a copy could be made). True when
+    /// nothing is there or the existing file is now kept. A false return leaves no
+    /// entry and no partial kept copy behind.
+    [[nodiscard]] bool preserve(const std::filesystem::path& path) {
+        constexpr int kMaxAttempts = 8;
+        std::error_code ec;
+        const auto st = std::filesystem::symlink_status(path, ec);
+        if (st.type() == std::filesystem::file_type::not_found) {
+            entries_.push_back({path, {}, Predecessor::absent});
+            return true;
+        }
+        if (ec || st.type() != std::filesystem::file_type::regular) {
+            spdlog::error("OTA upload: cannot keep the existing {} (not a readable regular file)",
+                          path.filename().string());
+            return false;
+        }
+
+        // The entry exists BEFORE any kept copy does, so an exception between the two
+        // cannot leave a copy nothing tracks. Its backup name is set only to a name
+        // this call is about to create (and cleared again when that name turned out
+        // to be someone else's), so a rollback in that state removes only our own.
+        entries_.push_back({path, {}, Predecessor::pending});
+        Entry& entry = entries_.back();
+        bool links_usable = true;
+        for (int attempt = 0; attempt < kMaxAttempts; ++attempt) {
+            auto backup = path;
+            backup += ".yuzu_prev_" + unique_suffix();
+            entry.backup = std::move(backup);
+
+            if (links_usable) {
+                std::error_code link_ec;
+                std::filesystem::create_hard_link(path, entry.backup, link_ec);
+                if (!link_ec) {
+                    entry.state = Predecessor::kept;
+                    return true;
+                }
+                if (link_ec == std::errc::file_exists) {
+                    entry.backup.clear();
+                    continue;
+                }
+                // Links are not available here (another filesystem, a refusal, a link
+                // limit): keep a copy instead.
+                links_usable = false;
+            }
+
+            std::error_code time_ec;
+            const auto mtime = std::filesystem::last_write_time(path, time_ec);
+            std::error_code copy_ec;
+            std::filesystem::copy_file(path, entry.backup, std::filesystem::copy_options::none,
+                                       copy_ec);
+            if (!copy_ec) {
+                // A copy gets a new modification time; the binary/signature pair is
+                // judged by those times, so the copy carries the original's.
+                if (!time_ec) {
+                    std::error_code set_ec;
+                    std::filesystem::last_write_time(entry.backup, mtime, set_ec);
+                    if (set_ec)
+                        spdlog::warn("OTA upload: could not carry the modification time to the "
+                                     "kept copy of {}: {}",
+                                     path.filename().string(), set_ec.message());
+                }
+                entry.state = Predecessor::kept;
+                return true;
+            }
+            if (copy_ec == std::errc::file_exists) {
+                entry.backup.clear();
+                continue;
+            }
+            spdlog::error("OTA upload: cannot keep the existing {}: {}", path.filename().string(),
+                          copy_ec.message());
+            break;
+        }
+
+        // Failed: drop a partial copy of ours (the name is cleared whenever it was
+        // not ours) and forget the entry, so the live file is untouched and untracked.
+        if (!entry.backup.empty()) {
+            std::error_code rm_ec;
+            std::filesystem::remove(entry.backup, rm_ec);
+        }
+        entries_.pop_back();
+        return false;
+    }
+
+    /// The new files stay; the kept copies are deleted. A copy that cannot be
+    /// deleted is logged by name and left, and the rest are still deleted.
+    void commit() noexcept {
+        settled_ = true;
+        for (const auto& e : entries_) {
+            if (e.state != Predecessor::kept)
+                continue;
+            std::error_code ec;
+            std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
+        }
+    }
+
+    /// True when every path was put back (or removed) as intended. Safe to call more
+    /// than once: later calls return the first result without touching the disk.
+    [[nodiscard]] bool rollback() noexcept {
+        if (settled_)
+            return restore_ok_;
+        settled_ = true;
+        // Each entry is restored on its own: one that throws is recorded as not restored
+        // and the others are still put back.
+        for (auto it = entries_.rbegin(); it != entries_.rend(); ++it) {
+            try {
+                restore_one(*it);
+            } catch (...) {
+                restore_ok_ = false;
+            }
+        }
+        return restore_ok_;
+    }
+
+    /// Settles the guard WITHOUT touching the disk: the new files stay where they are
+    /// and every kept copy stays too. Used when it cannot be known whether the registry
+    /// row was written, so neither deleting the kept copies (a commit) nor putting them
+    /// back (a rollback) is safe. The kept copies are then left for the operator.
+    void abandon() noexcept { settled_ = true; }
+
+    /// Plain text (not markup) for the answer to a request whose restore failed.
+    [[nodiscard]] std::string restore_failure_text() const {
+        std::string text = "The upload failed and the previous package could not be fully restored";
+        if (kept_names_.empty())
+            return text + "; see the server log.";
+        text += kept_names_.size() == 1 ? ". The previous file is kept as "
+                                        : ". The previous files are kept as ";
+        for (std::size_t i = 0; i < kept_names_.size(); ++i) {
+            if (i)
+                text += ", ";
+            text += kept_names_[i];
+        }
+        return text + "; see the server log.";
+    }
+
+private:
+    enum class Predecessor {
+        absent,  ///< nothing was at the path
+        pending, ///< a kept copy is being made (it may or may not exist yet)
+        kept,    ///< the previous file is kept under `backup`
+    };
+    struct Entry {
+        std::filesystem::path live;
+        std::filesystem::path backup; ///< the kept copy; empty when none is named
+        Predecessor state;
+    };
+
+    static void log_kept_copy_left(const std::filesystem::path& backup,
+                                   const std::error_code& ec) noexcept {
+        try {
+            spdlog::warn("OTA upload: the kept copy {} could not be removed: {}",
+                         backup.filename().string(), ec.message());
+        } catch (...) {
+        }
+    }
+
+    void restore_one(const Entry& e) {
+        std::error_code ec;
+        switch (e.state) {
+        case Predecessor::absent:
+            std::filesystem::remove(e.live, ec);
+            if (ec) {
+                restore_ok_ = false;
+                spdlog::error("OTA upload: the new {} could not be removed: {}",
+                              e.live.filename().string(), ec.message());
+            }
+            return;
+        case Predecessor::pending:
+            // The live file was never touched; only a partial kept copy can exist.
+            if (!e.backup.empty())
+                std::filesystem::remove(e.backup, ec);
+            return;
+        case Predecessor::kept:
+            break;
+        }
+        // Nothing was published over the path: the kept name and the live name are one
+        // file, and a rename of one onto the other would leave both. Drop the kept name.
+        std::error_code same_ec;
+        const bool same = std::filesystem::equivalent(e.backup, e.live, same_ec);
+        if (same && !same_ec) {
+            std::filesystem::remove(e.backup, ec);
+            if (ec)
+                log_kept_copy_left(e.backup, ec);
+            return;
+        }
+        std::filesystem::rename(e.backup, e.live, ec);
+        if (ec) {
+            restore_ok_ = false;
+            kept_names_.push_back(e.backup.filename().string());
+            spdlog::error("OTA upload: the previous {} could not be restored; it is kept as {}",
+                          e.live.filename().string(), e.backup.filename().string());
+        }
+    }
+
+    static std::string unique_suffix() {
+        static std::atomic<unsigned long long> seq{0};
+        const unsigned long long n = seq.fetch_add(1);
+        unsigned long long salt = 0;
+        try {
+            std::random_device rd;
+            salt = (static_cast<unsigned long long>(rd()) << 32) ^ rd();
+        } catch (...) {
+            // No entropy source: never a constant. The clock, the counter and the
+            // counter's address keep two names apart across requests and processes.
+            const auto ticks = static_cast<unsigned long long>(
+                std::chrono::steady_clock::now().time_since_epoch().count());
+            salt = ticks ^ (n * 0x9E3779B97F4A7C15ULL) ^
+                   static_cast<unsigned long long>(reinterpret_cast<std::uintptr_t>(&seq));
+        }
+        return std::format("{:016x}_{}", salt, n);
+    }
+
+    std::vector<Entry> entries_;
+    std::vector<std::string> kept_names_;
+    bool settled_{false};
+    bool restore_ok_{true};
+};
 } // namespace
 
 std::string SettingsRoutes::render_tokens_fragment(const std::string& new_raw_token) {
@@ -1287,7 +1605,7 @@ function arFeedback(msg, isError) {
   fb.textContent = msg;
   fb.style.color = isError ? 'var(--bad)' : 'var(--ok)';
 }
-function arPost(url, body, onSuccess, onRefused) {
+function arPost(url, body, onSuccess, onFailure) {
   fetch(url, {
     method: 'POST',
     credentials: 'include',
@@ -1298,12 +1616,13 @@ function arPost(url, body, onSuccess, onRefused) {
       var data = {};
       try { data = JSON.parse(t); } catch (e) {}
       if (!r.ok) {
-        // The A4 error body is {error:{code,message,...}}: read the message, never print the object.
+        // The error envelope is {error: {message, ...}}: read the message, not the object (a
+        // plain string `error` and a top-level `message` stay accepted).
         var e = data && data.error;
-        var msg = (e && typeof e === 'object' ? e.message : e) || (data && data.message) ||
+        var msg = (e && (typeof e === 'string' ? e : e.message)) || (data && data.message) ||
                   ('Action failed (' + r.status + ')');
         arFeedback(msg, true);
-        if (onRefused) onRefused(r.status);
+        if (onFailure) onFailure();
         return;
       }
       arFeedback('Done.', false);
@@ -1311,6 +1630,7 @@ function arPost(url, body, onSuccess, onRefused) {
     });
   }).catch(function () {
     arFeedback('Network error — the action may not have applied', true);
+    if (onFailure) onFailure();
   });
 }
 function arLoadCampaign(id) {
@@ -1321,7 +1641,9 @@ function arOpenCampaign(form) {
   var title = (form.elements['title'].value || '').trim();
   if (!title) return false;
   arPost('/api/v1/access-reviews', {title: title}, function (data) {
-    if (data && data.campaign_id) arLoadCampaign(data.campaign_id);
+    // The success body is the A4 envelope {data: {campaign_id, grant_count}, meta}.
+    var d = data && data.data;
+    if (d && d.campaign_id) arLoadCampaign(d.campaign_id);
   });
   return false;
 }
@@ -1334,15 +1656,27 @@ function arAttest(btn) {
   }
   var row = btn.closest('tr');
   var justEl = row ? row.querySelector('[data-ar-justification]') : null;
+  // Every extra click would be a valid request that appends another decision, so every
+  // decision button in the campaign stays disabled until the answer arrives (re-enabled only on
+  // failure; on success the campaign is re-drawn).
+  var btns = document.querySelectorAll('#ar-campaign button');
+  function arSetBusy(busy) { for (var i = 0; i < btns.length; i++) btns[i].disabled = busy; }
+  arSetBusy(true);
   arPost('/api/v1/access-reviews/' + encodeURIComponent(d.campaignId) + '/attestations', {
     principal_type: d.principalType,
     principal_id: d.principalId,
     role_name: d.roleName,
     decision: d.decision,
     justification: justEl ? justEl.value : ''
-  }, function () { arLoadCampaign(d.campaignId); },
-  // 409: another reviewer decided this grant first (decisions are final) - show the row as decided.
-  function (status) { if (status === 409) arLoadCampaign(d.campaignId); });
+  }, function (data) {
+    // The success body is the A4 envelope {data: {recorded, decision_seq, previous_decision}}.
+    // Another reviewer may have decided this grant since the page was drawn: say so.
+    var r = data && data.data;
+    if (r && typeof r.previous_decision === 'string' && r.previous_decision !== 'pending')
+      arFeedback('Done. This replaced an earlier "' + r.previous_decision + '" decision; the ' +
+                 'earlier decision stays in the history.', false);
+    arLoadCampaign(d.campaignId);
+  }, function () { arSetBusy(false); });
 }
 function arCloseCampaign(btn) {
   var id = btn.dataset.campaignId;
@@ -1472,7 +1806,7 @@ std::string SettingsRoutes::render_access_review_fragment(const httplib::Request
                 "<div class=\"mini-field\" style=\"flex:1\">"
                 "<label>Campaign title</label>"
                 "<input type=\"text\" name=\"title\" placeholder=\"e.g. Q3 2026 access review\" "
-                "required>"
+                "maxlength=\"256\" required>"
                 "</div>"
                 "<button class=\"btn btn-primary\" type=\"submit\">Open review campaign</button>"
                 "</form>";
@@ -1499,12 +1833,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
         return html;
     }
 
+    // A malformed id never reaches the store; the shared validator is the one REST, MCP and the
+    // Access page use.
+    if (!valid_campaign_id(campaign_id)) {
+        html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+        return html;
+    }
+
     auto view_res = access_review_store_->get_campaign(campaign_id);
     if (!view_res.has_value()) {
-        // Covers both the store's machine-checkable "not_found: ..." (unknown
-        // campaign id) and a genuine read failure — either way, an honest
-        // notice rather than a blank panel.
-        html += "<div class=\"feedback-error\">" + html_escape(view_res.error()) + "</div></div>";
+        // The store's machine-checkable "not_found: " prefix separates an unknown campaign id
+        // (it answered) from a genuine read failure. Neither shows the store's own text, which
+        // carries its classification prefix. A genuine read failure is logged.
+        if (view_res.error().starts_with("not_found:")) {
+            html += "<div class=\"feedback-error\">No campaign with that id.</div></div>";
+            return html;
+        }
+        spdlog::warn("settings access-review campaign: read failed: {}",
+                     ::yuzu::log_key_token(view_res.error()));
+        html += "<div class=\"feedback-error\">Access review campaign could not be read. "
+                "Please retry.</div></div>";
         return html;
     }
     const auto& view = *view_res;
@@ -1512,6 +1860,14 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     httplib::Response probe;
     bool can_attest = perm_fn_(req, probe, "AccessReview", "Attest");
     bool is_open_campaign = view.campaign.status == "open";
+    // The signed-in reviewer: the server refuses a reviewer who is the subject of a user grant,
+    // so that row shows no Attest or Flag (a courtesy, not the control), like the Access page.
+    std::string viewer;
+    if (can_attest && auth_fn_) {
+        httplib::Response who_probe;
+        if (auto who = auth_fn_(req, who_probe))
+            viewer = who->username;
+    }
 
     html += "<h4 style=\"margin:1rem 0 0.25rem\">Campaign: " + html_escape(view.campaign.title) +
             " <span class=\"role-badge " + (is_open_campaign ? "role-admin" : "role-user") +
@@ -1544,6 +1900,9 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     } else {
         for (const auto& a : view.attestations) {
             bool pending = a.decision == "pending";
+            const bool own =
+                !viewer.empty() && a.principal_type == "user" && a.principal_id == viewer;
+            const bool editable = pending && is_open_campaign && !own;
             std::string decision_cls = pending                         ? "role-user"
                                        : a.decision == "flagged_revoke" ? "role-warn"
                                                                         : "role-ok";
@@ -1563,14 +1922,16 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
                     ar_fmt_epoch_ms(a.decided_at_ms) + "</td>";
             if (can_attest) {
                 html += "<td>";
-                if (pending && is_open_campaign) {
+                if (editable) {
                     html += "<input type=\"text\" data-ar-justification placeholder=\"optional\" "
                             "style=\"width:140px\">";
                 } else {
                     html += a.justification.empty() ? "—" : html_escape(a.justification);
                 }
                 html += "</td><td>";
-                if (pending && is_open_campaign) {
+                if (pending && is_open_campaign && own) {
+                    html += "<span class=\"hint\">Another reviewer must decide</span>";
+                } else if (editable) {
                     html += "<button class=\"btn btn-primary\" "
                             "data-campaign-id=\"" +
                             html_escape(campaign_id) + "\" data-principal-type=\"" +
@@ -1596,6 +1957,26 @@ SettingsRoutes::render_access_review_campaign_fragment(const httplib::Request& r
     }
     html += "</tbody></table></div>";
     return html;
+}
+
+void SettingsRoutes::respond_mfa_factor_changed(httplib::Response& res,
+                                                const auth::Session& session,
+                                                std::string_view route) {
+    if (metrics_registry_) {
+        metrics_registry_
+            ->counter("yuzu_auth_mfa_factor_changed_total", {{"route", std::string(route)}})
+            .increment();
+    }
+    constexpr const char* kMessage =
+        "Your MFA factor changed while this request was in flight. Reload the page; if you are "
+        "asked to sign in again, do so.";
+    res.status = 409;
+    // htmx swaps no 4xx body, so say it in a toast as well (the dashboard's conflict posture,
+    // respond_last_administrator_refused). The constant is safe in the hand-built JSON.
+    const nlohmann::json toast = {{"showToast", {{"message", kMessage}, {"level", "error"}}}};
+    res.set_header("HX-Trigger", toast.dump());
+    res.set_content(render_mfa_fragment(session, {}, {}, {}, {}, kMessage),
+                    "text/html; charset=utf-8");
 }
 
 std::string SettingsRoutes::render_mfa_fragment(const auth::Session& session,
@@ -2230,9 +2611,10 @@ std::string SettingsRoutes::render_data_retention_fragment() {
 
 namespace {
 
-// Page-local rules for the DEX Alerts form body. The sub-nav's own style block
-// (dex_fragment_style) carries the DEX shell rules; these cover only the three
-// alert panels. Tokens only; one rule per line source, joined to one line.
+// Page-local rules for the DEX settings tabs' form bodies: `.dxa*` for the three alert panels
+// and `.dxs*` for the Scoring tab's form, one style block shared by both tabs. The sub-nav's own
+// style block (dex_fragment_style) carries the DEX shell rules. Tokens only; one rule per line
+// source, joined to one line.
 const char* const kDexAlertsCss = R"CSS(
 .dxa{margin-top:16px}
 .dxa .form{gap:12px}
@@ -2246,6 +2628,16 @@ const char* const kDexAlertsCss = R"CSS(
 .dxa .chk code{color:var(--mut);font-size:12.5px}
 .dxa .pb p{margin:0 0 8px}
 .dxa .pb p:last-child{margin-bottom:0}
+.dxs{margin-top:16px}
+.dxs .grp{border:0;margin:0 0 14px;padding:0}
+.dxs legend{font-weight:500;color:var(--ink2);padding:0 0 4px}
+.dxs .fld input{max-width:14rem}
+.dxs .err{display:block;margin-top:4px;color:var(--bad);font-size:12.5px}
+.dxs input[aria-invalid=true],.dxs fieldset[data-invalid="1"]{border-color:var(--bad)}
+.dxs details.ovr{border-top:1px solid var(--line)}
+.dxs details.ovr summary{cursor:pointer;padding:8px 0;color:var(--ink2)}
+.dxs .chk{display:flex;gap:8px;align-items:baseline;padding:3px 0}
+.dxs .btns{padding:0}
 )CSS";
 
 std::string dex_alerts_style() {
@@ -2382,6 +2774,280 @@ std::string SettingsRoutes::render_dex_alerts_fragment() {
     html += "<div class=\"btns\"><button type=\"submit\" class=\"btn btn-secondary\">"
             "Save routing</button></div></form></section>";
     return html;
+}
+
+namespace {
+
+// Policy in force from the writer's own reader (the one the REST GET reads); an exception from
+// the injected reader is an unreadable store.
+std::expected<DexPolicyInForce, std::string> dex_scoring_in_force(const DexScorePolicyWriteDeps& d) {
+    try {
+        const auto stored = d.read_stored();
+        if (!stored)
+            return std::unexpected(stored.error());
+        return dex_policy_in_force_from_stored(*stored);
+    } catch (const std::exception& e) {
+        return std::unexpected(std::string("read threw: ") + e.what());
+    }
+}
+
+constexpr const char* kDexScoringUnavailable =
+    "<div class=\"note warn\"><b>Config store unavailable.</b> The score policy cannot be read or "
+    "saved until the server's runtime-config store is open. Check server /healthz.</div>";
+
+const char* dex_scoring_refusal_token(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
+    case DexScorePolicyWriteStatus::IfMatchMissing: return "if_match_missing";
+    case DexScorePolicyWriteStatus::IfMatchMalformed: return "if_match_malformed";
+    case DexScorePolicyWriteStatus::Stale: return "stale";
+    case DexScorePolicyWriteStatus::Invalid: return "invalid";
+    case DexScorePolicyWriteStatus::WriterBusy: return "writer_busy";
+    case DexScorePolicyWriteStatus::StoreUnavailable: return "store_unavailable";
+    case DexScorePolicyWriteStatus::OutcomeUnknown: return "outcome_unknown";
+    case DexScorePolicyWriteStatus::AuditUnavailable: return "audit_unavailable";
+    }
+    return "invalid";
+}
+
+// Fixed text only: the toast never carries the validator's message or any submitted value.
+// Every status is listed (no default:), so a tenth one fails the build's -Wswitch rather than
+// silently reading "try again shortly". OutcomeUnknown must not say "not saved": the writer's
+// contract (dex_score_policy_writer.hpp) is that it never claims the policy was left as it was.
+const char* dex_scoring_refusal_toast(DexScorePolicyWriteStatus s) {
+    switch (s) {
+    case DexScorePolicyWriteStatus::Ok: return "";
+    case DexScorePolicyWriteStatus::Invalid: return "Score policy not saved: fix the marked field";
+    case DexScorePolicyWriteStatus::Stale: return "Score policy not saved: changed by someone else";
+    case DexScorePolicyWriteStatus::IfMatchMissing:
+    case DexScorePolicyWriteStatus::IfMatchMalformed:
+        return "Score policy not saved: reload and try again";
+    case DexScorePolicyWriteStatus::AuditUnavailable:
+        return "Score policy not saved: audit unavailable, try again shortly";
+    case DexScorePolicyWriteStatus::WriterBusy:
+    case DexScorePolicyWriteStatus::StoreUnavailable:
+        return "Score policy not saved: try again shortly";
+    case DexScorePolicyWriteStatus::OutcomeUnknown:
+        return "Save not confirmed: reload and check the policy in force";
+    }
+    return "Score policy not saved: try again shortly";
+}
+
+// The application names a Scoring render offers as image suggestions: none from a degraded model.
+std::vector<std::string> dex_scoring_subjects(const DexAppsModel& m) {
+    std::vector<std::string> out;
+    if (!m.degraded)
+        for (const auto& a : m.apps)
+            out.push_back(a.subject);
+    return out;
+}
+
+std::string dex_scoring_toast(const char* message, const char* level) {
+    return nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}.dump();
+}
+
+} // namespace
+
+std::string SettingsRoutes::render_dex_scoring_section(
+    const DexPolicyInForce& in_force, bool editable, const std::string& if_match,
+    const DexFormValues* posted, std::optional<DexFormError> error,
+    std::optional<DexTierPreview> preview, const std::string& refused,
+    const std::vector<std::string>* suggestions) {
+    DexScoringView v;
+    v.values = posted ? *posted : dex_form_values(in_force.policy);
+    v.revision = in_force.revision;
+    v.if_match = if_match;
+    v.source = in_force.source;
+    v.fault = in_force.fault;
+    v.editable = editable;
+    v.error = std::move(error);
+    v.preview = std::move(preview);
+    v.refused = refused;
+    if (suggestions)
+        v.suggestions = *suggestions;
+    else if (editable && refused != "stale" && dex_apps_fn_)
+        // Suggestions feed an input the page can use; a locked page (read-only, or a stale
+        // refusal that disables every control) has none, so it does not pay an Apps read.
+        v.suggestions = dex_scoring_subjects(dex_apps_fn_(std::nullopt));
+    return yuzu::server::render_dex_scoring_section(v);
+}
+
+// POST /api/settings/dex-scoring/{save,preview,reset}. Every outcome answers the section BODY
+// (swapped innerHTML), so no response nests a second #dex-scoring-section.
+//
+// DUAL ANSWER. The dashboard's htmx config swaps no 4xx/5xx body (static_js_bundle.cpp
+// responseHandling), so a per-field refusal could never reach the page. A request carrying
+// HX-Request therefore gets 200 with the body re-rendered, the error against its field and
+// `data-refused=<reason>`, plus an error toast; any other caller gets the real status and the A4
+// envelope, exactly as PUT/DELETE /api/v1/dex/score-policy answers it.
+void SettingsRoutes::dex_scoring_post(const httplib::Request& req, httplib::Response& res,
+                                      DexScorePolicyWriteRequest::Op op, bool dry_run) {
+    const bool put = op == DexScorePolicyWriteRequest::Op::Put;
+    const char* leaf = dry_run ? "preview" : (put ? "save" : "reset");
+    // Authority (ADR-1005 Decision 4): REST PUT/DELETE gate Infrastructure:Write alone; this tab
+    // and the MCP tools also gate GuaranteedState:Read (every answer carries application names).
+    // Here: Infrastructure:Write first, then GuaranteedState:Read, both through the loud
+    // perm_fn_. Never admin_fn_ (it bypasses RBAC, so the REST route's refusal could be written
+    // around) and never read_perm on an action route (it is quiet for a cookie session).
+    if (!perm_fn_(req, res, "Infrastructure", "Write"))
+        return;
+    if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+        return;
+    const auto session = auth_fn_(req, res);
+    if (!session)
+        return;
+    if (dex_score_policy_writer_ && !audit_as_session_fn_) {
+        // The REST twin answers 500 for an unwired session writer (authenticate_for_session_audit):
+        // an unwired audit identity is a misconfiguration, never "audit off" on a trust-boundary
+        // write. server.cpp wires it unconditionally, so this guards a future caller or a test.
+        spdlog::error("POST /api/settings/dex-scoring/{}: audit identity writer not configured; "
+                      "refusing the request", leaf);
+        res.status = 500;
+        res.set_header("HX-Trigger", dex_scoring_toast("Score policy not saved: audit not configured",
+                                                       "error"));
+        res.set_content(detail::a4_error(res, "audit identity writer not configured"),
+                        "application/json");
+        return;
+    }
+    if (refuse_cross_site(req, res, *session, std::string("POST /api/settings/dex-scoring/") + leaf))
+        return;
+    if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+        res.status = 503;
+        res.set_header("HX-Trigger", dex_scoring_toast("Config store unavailable", "error"));
+        res.set_content(detail::a4_error(res, "Config store unavailable"), "application/json");
+        return;
+    }
+    const bool htmx = req.has_header("HX-Request");
+    const auto pairs = dex_form_pairs(req.body);
+    std::optional<std::string> if_match;
+    for (const auto& [name, value] : pairs)
+        if (name == "if_match")
+            if_match = value;
+
+    // The policy in force right now, for the panel; best effort (a refusal path).
+    const auto current = dex_scoring_in_force(*dex_score_policy_writer_);
+    const DexPolicyInForce shown = current ? *current : DexPolicyInForce{};
+    const DexFormValues posted = dex_form_values(pairs);
+
+    // A refusal answers per the dual answer above.
+    const auto refuse = [&](const char* token, const char* toast, int status,
+                            const std::string& field, std::string message,
+                            std::optional<std::int64_t> retry_after_ms, std::string remediation) {
+        if (htmx) {
+            res.status = 200;
+            // With the pre-apply read failed there is no policy to show: "Shipped defaults"
+            // would be a false statement about the store, so the section is the unavailable note
+            // and the toast names that, not a field the body does not mark.
+            const char* const shown_toast = current ? toast : "Config store unavailable";
+            res.set_header("HX-Trigger", dex_scoring_toast(shown_toast, "error"));
+            res.set_content(
+                current ? render_dex_scoring_section(shown, true,
+                                                     if_match.value_or(shown.revision), &posted,
+                                                     DexFormError{field, std::move(message)},
+                                                     std::nullopt, token)
+                        : std::string(kDexScoringUnavailable),
+                "text/html; charset=utf-8");
+            return;
+        }
+        res.status = status;
+        res.set_content(detail::a4_error(res, message,
+                                         {.retry_after_ms = retry_after_ms,
+                                          .remediation = std::move(remediation)}),
+                        "application/json");
+    };
+
+    DexScorePolicyWriteRequest rq;
+    rq.op = op;
+    if (dry_run)
+        rq.dry_run = "true";
+    rq.if_match = if_match;
+    rq.actor = session->username;
+    std::vector<int> row_of_override;
+    if (put) {
+        auto doc = dex_form_to_document(pairs);
+        if (!doc) {
+            refuse("invalid", dex_scoring_refusal_toast(DexScorePolicyWriteStatus::Invalid), 400,
+                   doc.error().field, doc.error().message, std::nullopt, {});
+            return;
+        }
+        rq.body = std::move(doc->text);
+        row_of_override = std::move(doc->row_of_override);
+    }
+
+    DexScorePolicyWriteDeps deps = *dex_score_policy_writer_;
+    // Stamped from the session this handler resolved, never re-resolved from the request. The
+    // bool survives: a refused 'attempted' row is the writer's AuditUnavailable 503. A row that
+    // did not persist also marks the response Sec-Audit-Failed, as the REST twin does through
+    // emit_behavioral_audit (the writer's contract leaves that signal to the handler). The writer
+    // lets at most one row fail per request (a failed 'attempted' row ends it), so the header
+    // is set at most once.
+    deps.audit = [this, &req, &res, &session,
+                  role = auth::role_to_string(auth::effective_role(*session))](
+                     std::string_view verb, std::string_view result,
+                     const std::string& detail_json) {
+        const bool persisted =
+            audit_as_session_fn_(req, *session, role, std::string(verb), std::string(result),
+                                 "RuntimeConfig", std::string(kDexScorePolicyKey), detail_json);
+        if (!persisted)
+            res.set_header("Sec-Audit-Failed", "true");
+        return persisted;
+    };
+
+    const auto r = apply_dex_score_policy(rq, deps);
+    if (r.status != DexScorePolicyWriteStatus::Ok) {
+        std::string field = "document";
+        std::string message = r.message;
+        if (r.status == DexScorePolicyWriteStatus::Invalid && put) {
+            // The writer reports the field only in its audit detail; the validator is pure and
+            // deterministic over the same text, so asking it again yields the same field.
+            if (const auto v = dex_score_policy_validate_text(rq.body); !v) {
+                field = dex_form_remap_field(v.error().field, row_of_override);
+                if (field != v.error().field && !v.error().field.empty()) {
+                    // The message names the JSON path; name the submitted row instead.
+                    for (std::size_t at = 0;
+                         (at = message.find(v.error().field, at)) != std::string::npos;
+                         at += field.size())
+                        message.replace(at, v.error().field.size(), field);
+                }
+            }
+        }
+        refuse(dex_scoring_refusal_token(r.status), dex_scoring_refusal_toast(r.status),
+               dex_score_policy_http_status(r.status), field, std::move(message), r.retry_after_ms,
+               r.remediation);
+        return;
+    }
+
+    if (dry_run) {
+        // Nothing stored: keep the user's edits and the CURRENT revision (the REST ETag rule).
+        DexTierPreview preview;
+        preview.degraded = true;
+        // The image suggestions come from the "now" model below (the same applications, whatever
+        // the policy), so the render does not read the Apps model a third time.
+        std::optional<std::vector<std::string>> subjects;
+        // "Now" is scored under the revision this handler read (the one the form edits), through
+        // the same explicit-policy path as the proposal, never under the provider's cache, which
+        // can trail another replica's write by a refresh interval. If that read and the dry run's
+        // own disagree, a write landed between them: unavailable is the honest answer.
+        if (dex_apps_fn_ && current && current->revision == r.previous_revision) {
+            const std::optional<DexPolicyInForce> now{*current};
+            const auto now_model = dex_apps_fn_(now);
+            preview = dex_tier_preview(now_model, dex_apps_fn_(r.in_force));
+            subjects = dex_scoring_subjects(now_model);
+        }
+        res.set_header("HX-Trigger", dex_scoring_toast("Preview only: nothing saved", "success"));
+        res.set_content(render_dex_scoring_section(shown, true, r.previous_revision, &posted,
+                                                   std::nullopt, std::move(preview), "",
+                                                   subjects ? &*subjects : nullptr),
+                        "text/html; charset=utf-8");
+        return;
+    }
+    res.set_header("HX-Trigger",
+                   dex_scoring_toast(put ? "Score policy saved"
+                                         : "Score policy reset to the shipped defaults",
+                                     "success"));
+    res.set_content(render_dex_scoring_section(r.in_force, true, r.in_force.revision, nullptr,
+                                               std::nullopt, std::nullopt, ""),
+                    "text/html; charset=utf-8");
 }
 
 std::string SettingsRoutes::render_mcp_fragment() {
@@ -2833,6 +3499,17 @@ void SettingsRoutes::register_routes(
     oidc_provider_ = &oidc_provider;
     metrics_registry_ = metrics_registry;
     step_up_fn_ = std::move(step_up_fn);
+    // The closed route set of the factor-changed refusal, pre-seeded so increase() sees the first
+    // event of each series (#5177). Registered here because only this file increments it.
+    if (metrics_registry_) {
+        metrics_registry_->describe(
+            "yuzu_auth_mfa_factor_changed_total",
+            "Factor-credential requests refused 409 because the account's MFA factor changed "
+            "between the step-up gate and the mutation, by route (recovery_codes|disable)",
+            "counter");
+        for (const char* route : {"recovery_codes", "disable"})
+            metrics_registry_->counter("yuzu_auth_mfa_factor_changed_total", {{"route", route}});
+    }
 
     // -- Settings page (admin only) -------------------------------------------
     sink.Get("/settings", [this](const httplib::Request& req, httplib::Response& res) {
@@ -2923,6 +3600,7 @@ void SettingsRoutes::register_routes(
                 res.status = 500;
                 return;
             }
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
         });
 
@@ -2960,6 +3638,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -3070,6 +3749,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.list",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_fragment(req), "text/html; charset=utf-8");
              });
 
@@ -3091,6 +3771,7 @@ void SettingsRoutes::register_routes(
                  if (refuse_engine_session(req, res, *session, "access_review.get",
                                            "AccessReview"))
                      return;
+                 no_store_private(res);
                  res.set_content(render_access_review_campaign_fragment(req, id),
                                  "text/html; charset=utf-8");
              });
@@ -3189,6 +3870,7 @@ void SettingsRoutes::register_routes(
              [this](const httplib::Request& req, httplib::Response& res) {
                  if (!admin_fn_(req, res))
                      return;
+                 no_store_private(res);
                  res.set_content(render_analytics_fragment(), "text/html; charset=utf-8");
              });
 
@@ -3296,7 +3978,11 @@ void SettingsRoutes::register_routes(
                  const bool admin = session->token_scope_service.empty() &&
                                     session->mcp_tier.empty() &&
                                     auth::effective_role(*session) == auth::Role::admin;
-                 std::string html = dex_subnav("alerts", 7) + dex_alerts_style();
+                 // The sub-navigation carries the chosen window on, like the other DEX tabs; the
+                 // canonical resolver maps a missing or unknown value to 7 days.
+                 const int window_days = dex_window_to_days(
+                     req.has_param("window") ? req.get_param_value("window") : "7d");
+                 std::string html = dex_subnav("alerts", window_days) + dex_alerts_style();
                  if (!admin) {
                      html += "<div class=\"note\" data-denied=\"admin\"><b>Alert settings need the "
                              "Administrator role.</b> Ask an administrator to change DEX alert "
@@ -3525,6 +4211,57 @@ void SettingsRoutes::register_routes(
             R"({"showToast":{"message":"Cohort export key saved","level":"success"}})");
         res.set_content(render_dex_alerts_fragment(), "text/html; charset=utf-8");
     });
+
+    // -- AP-3.12: the DEX page's Scoring tab -----------------------------------------
+    // Reads gate on GuaranteedState:Read (the quiet probe server.cpp binds, else perm_fn_)
+    // BEFORE either the policy or the application names are read, exactly as GET
+    // /api/v1/dex/score-policy and /fragments/dex/apps gate. Whether the page is editable is the
+    // REST write gate (Infrastructure:Write), asked through the same quiet probe into a scratch
+    // response, so a reader without it gets the page with every control disabled and no denied
+    // row for a page view. The three POSTs gate on the loud perm_fn_ for both pairs, the write
+    // first (dex_scoring_post).
+    sink.Get("/fragments/dex/scoring", [this](const httplib::Request& req,
+                                              httplib::Response& res) {
+        if (!read_perm(req, res, "GuaranteedState", "Read"))
+            return;
+        if (!auth_fn_(req, res))
+            return;
+        httplib::Response scratch; // the probe's refusal lands here, never on the page
+        const bool editable = read_perm(req, scratch, "Infrastructure", "Write");
+        // The sub-navigation carries the chosen window on, like the other DEX tabs; the canonical
+        // resolver maps a missing or unknown value to 7 days.
+        const int window_days =
+            dex_window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        std::string html = dex_subnav("scoring", window_days) + dex_alerts_style();
+        // #dex-scoring-section is the inner swap target of every POST; the sub-nav above it is
+        // never re-rendered.
+        html += "<div id=\"dex-scoring-section\">";
+        if (!dex_score_policy_writer_ || !dex_score_policy_writer_->read_stored) {
+            html += kDexScoringUnavailable;
+        } else if (const auto in_force = dex_scoring_in_force(*dex_score_policy_writer_);
+                   !in_force) {
+            spdlog::warn("GET /fragments/dex/scoring: store read failed: {}",
+                         ::yuzu::log_key_token(in_force.error()));
+            html += kDexScoringUnavailable;
+        } else {
+            html += render_dex_scoring_section(*in_force, editable, in_force->revision, nullptr,
+                                               std::nullopt, std::nullopt, "");
+        }
+        html += "</div>";
+        res.set_content(html, "text/html; charset=utf-8");
+    });
+    sink.Post("/api/settings/dex-scoring/save",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, false);
+              });
+    sink.Post("/api/settings/dex-scoring/preview",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Put, true);
+              });
+    sink.Post("/api/settings/dex-scoring/reset",
+              [this](const httplib::Request& req, httplib::Response& res) {
+                  dex_scoring_post(req, res, DexScorePolicyWriteRequest::Op::Reset, false);
+              });
 
     sink.Get("/fragments/settings/plugin-signing",
              [this](const httplib::Request& req, httplib::Response& res) {
@@ -4526,6 +5263,7 @@ void SettingsRoutes::register_routes(
 
         if (username.empty() || password.empty()) {
             res.status = 400;
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username) +
                                 "<script>document.getElementById('user-feedback')."
                                 "className='feedback feedback-error';"
@@ -4672,6 +5410,7 @@ void SettingsRoutes::register_routes(
                                             "User", username, "role=" + role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"User created","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -4874,22 +5613,33 @@ void SettingsRoutes::register_routes(
                 // principal strings, not just the count — mirrors the SCIM
                 // seam's `revoke_linked_credentials_or_fail`.
                 enumerate_principals_for_audit(*principals);
-            if (!revoke_result.api_tokens_persisted) {
-                revoke_detail += " api_tokens_db_error=true";
-                spdlog::error("DELETE /api/settings/users: revoke_for_principal did not "
-                             "persist for one or more principals linked to '{}' — refusing to "
-                             "report a clean delete (ADR-2001 §3 fail-closed)",
+            if (!revoke_result.all_persisted()) {
+                // #4772: the durable session DELETE is held to the same fail-closed contract
+                // as the token revoke (a surviving session row is rehydrated by another
+                // replica or after a restart).
+                if (!revoke_result.api_tokens_persisted)
+                    revoke_detail += " api_tokens_db_error=true";
+                if (!revoke_result.sessions_persisted)
+                    revoke_detail += " sessions_db_error=true";
+                spdlog::error("DELETE /api/settings/users: the credential revoke did not "
+                             "persist (api_tokens={}, sessions={}) for one or more principals "
+                             "linked to '{}' — refusing to report a clean delete (ADR-2001 §3 "
+                             "fail-closed)",
+                             revoke_result.api_tokens_persisted, revoke_result.sessions_persisted,
                              username);
                 audit_fn_(req, "user.delete", "partial", "User", username, revoke_detail);
+                // A fixed literal from `failed_legs_phrase` (never user data), so it is safe
+                // inside the HX-Trigger JSON below.
+                const std::string what(failed_legs_phrase(revoke_result));
                 res.status = 500;
-                res.set_header(
-                    "HX-Trigger",
-                    R"({"showToast":{"message":"Failed to revoke API tokens for one or more )"
-                    R"(linked identities — try again","level":"error"}})");
-                res.set_content(
-                    detail::a4_error(res, "Failed to revoke API tokens for one or more linked "
-                                           "identities — try again"),
-                    "application/json");
+                res.set_header("HX-Trigger",
+                               R"({"showToast":{"message":"Failed to revoke )" + what +
+                                   R"( for one or more linked identities — try again",)"
+                                   R"("level":"error"}})");
+                res.set_content(detail::a4_error(res, "Failed to revoke " + what +
+                                                          " for one or more linked "
+                                                          "identities — try again"),
+                                "application/json");
                 return;
             }
             erase_principals = std::move(*principals);
@@ -4937,6 +5687,7 @@ void SettingsRoutes::register_routes(
             run_deprovisioned_hook(on_deprovisioned_, erase_principals);
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"User deleted","level":"success"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         case auth::RemoveUserOutcome::LastAdministratorRefused:
@@ -4969,8 +5720,9 @@ void SettingsRoutes::register_routes(
                      "credentials were revoked. Try again");
             return;
         case auth::RemoveUserOutcome::RemovedSessionWipeFailed:
-            // The account IS deactivated (committed) but the durable session wipe failed, so a
-            // live session may survive: a repeated DELETE finishes the wipe.
+            // The account IS deactivated (committed) but the durable session wipe failed, so the
+            // session row may survive (a local session is refused at validation): a repeated
+            // DELETE finishes the wipe.
             if (!auth_mgr_->save_config()) {
                 spdlog::error("Failed to save config after user removal");
             }
@@ -5159,6 +5911,7 @@ void SettingsRoutes::register_routes(
                       "same_role=" + auth::role_to_string(new_role));
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Role unchanged","level":"info"}})");
+            no_store_private(res);
             res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
             return;
         }
@@ -5242,6 +5995,7 @@ void SettingsRoutes::register_routes(
                                             "old_role=" + old_role_str + ",new_role=" + new_role_str);
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Role updated","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_users_fragment(session->username), "text/html; charset=utf-8");
     });
 
@@ -5305,6 +6059,7 @@ void SettingsRoutes::register_routes(
                            bad_input
                                ? R"({"showToast":{"message":"Invalid token parameters","level":"error"}})"
                                : R"({"showToast":{"message":"Enrollment store unavailable - token not created","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5336,6 +6091,7 @@ void SettingsRoutes::register_routes(
             res.status = bad_input ? 400 : 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - token NOT revoked","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5349,6 +6105,7 @@ void SettingsRoutes::register_routes(
             *revoked
                 ? R"({"showToast":{"message":"Enrollment token revoked","level":"success"}})"
                 : R"j({"showToast":{"message":"Token not found - nothing revoked (it may have been removed)","level":"warning"}})j");
+        no_store_private(res);
         res.set_content(render_tokens_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5656,6 +6413,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment(result.value(), filter),
                         "text/html; charset=utf-8");
     });
@@ -5802,6 +6560,7 @@ void SettingsRoutes::register_routes(
         std::string filter = auth::effective_role(*session) == auth::Role::admin
                                  ? std::string{}
                                  : session->username; // JIT elevation → admin view
+        no_store_private(res);
         res.set_content(render_api_tokens_fragment({}, filter), "text/html; charset=utf-8");
     });
 
@@ -5825,6 +6584,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing approved","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5834,6 +6594,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk approved {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) approved","level":"success"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5851,6 +6612,7 @@ void SettingsRoutes::register_routes(
             res.status = 503;
             res.set_header("HX-Trigger",
                            R"({"showToast":{"message":"Enrollment store unavailable - nothing denied","level":"error"}})");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5860,6 +6622,7 @@ void SettingsRoutes::register_routes(
         spdlog::info("Bulk denied {} pending agent(s) by {}", count, session->username);
         res.set_header("HX-Trigger", R"({"showToast":{"message":")" + std::to_string(count) +
                                          R"( agent(s) denied","level":"warning"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     });
 
@@ -5876,6 +6639,7 @@ void SettingsRoutes::register_routes(
         res.status = 400;
         res.set_header("HX-Trigger",
                        R"({"showToast":{"message":"Invalid agent id","level":"error"}})");
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
         return true;
     };
@@ -5910,6 +6674,7 @@ void SettingsRoutes::register_routes(
             toast(bad_input ? "Invalid agent id"
                             : "Enrollment store unavailable - agent NOT " + past,
                   "error");
+            no_store_private(res);
             res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
             return;
         }
@@ -5936,6 +6701,7 @@ void SettingsRoutes::register_routes(
                   "warning");
             break;
         }
+        no_store_private(res);
         res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
     };
 
@@ -5993,6 +6759,7 @@ void SettingsRoutes::register_routes(
                             break;
                         }
                     }
+                    no_store_private(res);
                     res.set_content(render_pending_fragment(), "text/html; charset=utf-8");
                 });
 
@@ -6303,6 +7070,16 @@ void SettingsRoutes::register_routes(
 
     // -- Settings API: Management Groups (HTMX) --------------------------------
 
+    // Create is audit-first (ADR-0033 section 9, "no audit row, no mutation", #7074); the twins
+    // are POST /api/v1/management-groups and the MCP create_management_group tool. Every refusal
+    // that needs no write to decide (permission, empty name, `validate_new_group`) answers first
+    // and burns no row. The `attempted` row can wait on the audit pool, so the session and the
+    // permission are decided again after it. Failure rows carry a FIXED token and the group name
+    // the `attempted` row carries (`mgmt_group_failure_detail`), never store text, and no store
+    // text reaches the page: a store fault answers a fixed message, a validation refusal echoes
+    // its own closed text, HTML-escaped. The form swaps the response body into
+    // #mgmt-groups-section (htmx drops a 4xx/5xx body), so a refusal that must be seen carries
+    // an HX-Trigger toast too.
     sink.Post("/api/settings/management-groups", [this](const httplib::Request& req,
                                                         httplib::Response& res) {
         if (!perm_fn_(req, res, "ManagementGroup", "Write"))
@@ -6315,29 +7092,138 @@ void SettingsRoutes::register_routes(
                             "text/html; charset=utf-8");
             return;
         }
+        const auto set_toast = [&res](const std::string& message, const char* level) {
+            res.set_header("HX-Trigger",
+                           nlohmann::json{{"showToast", {{"message", message}, {"level", level}}}}
+                               .dump());
+        };
+        const auto refuse_text = [&res](const std::string& text) {
+            res.set_content("<span class=\"feedback-error\">" + html_escape(text) + "</span>",
+                            "text/html; charset=utf-8");
+        };
+        // The name and the parent id are bounded and held to clean text before any store read
+        // or `attempted` row (mgmt_group_limits.hpp). Fixed text, never the caller's value.
+        if (!mgmt_group_name_ok(name)) {
+            refuse_text(std::string(kMgmtGroupNameInvalidText));
+            return;
+        }
+        if (!mgmt_group_id_ok(parent_id)) { // an id like this names no group
+            refuse_text("parent group not found");
+            return;
+        }
+        // A fault of the store itself: fixed text, never the store's own (libpq) message.
+        const auto store_fault = [&]() {
+            static const std::string kMsg = "Management group store unavailable, try again";
+            set_toast(kMsg, "error");
+            refuse_text(kMsg);
+        };
+        // No group store wired: answer the fixed store-unavailable refusal before any use of it
+        // and before any audit row (nothing can be created, so nothing is attempted).
+        if (!mgmt_group_store_) {
+            store_fault();
+            return;
+        }
         ManagementGroup g;
         g.name = name;
         g.parent_id = parent_id;
         g.membership_type = mtype.empty() ? "static" : mtype;
-        auto session = auth_fn_(req, res);
-        if (session)
-            g.created_by = session->username;
-        auto result = mgmt_group_store_->create_group(g);
-        if (!result) {
-            res.set_content("<span class=\"feedback-error\">" + result.error() + "</span>",
-                            "text/html; charset=utf-8");
+
+        // The checks create_group runs before its insert, decided here so a refusal burns no
+        // `attempted` row.
+        if (auto valid = mgmt_group_store_->validate_new_group(g); !valid) {
+            if (mgmt_group_error_is_store_fault(valid.error()))
+                store_fault();
+            else
+                refuse_text(valid.error());
             return;
         }
-        if (audit_store_) {
-            AuditEvent ae;
-            ae.principal = session ? session->username : "unknown";
-            ae.action = "management_group.create";
-            ae.target_type = "ManagementGroup";
-            ae.target_id = *result;
-            ae.detail = name;
-            ae.result = "success";
-            (void)audit_store_->log(ae);
+
+        const auto session = auth_fn_(req, res); // writes its own 401
+        if (!session)
+            return; // no caller to name: no audit row is written and nothing is created
+        g.created_by = session->username;
+        // EVERY row of this route that names the caller (the `attempted` row, the `*_revoked`
+        // failure rows and the outcome row) is stamped from the session resolved here, as the MFA
+        // disable does: each can be written after the session is gone, when the re-resolving
+        // `audit_read_fn_` would stamp an empty principal and break principal-based pairing of
+        // the rows. Without a session writer wired (tests) they use `audit_read_fn_`.
+        const AuditReadFn bound_audit = [&]() -> AuditReadFn {
+            if (!audit_as_session_fn_)
+                return audit_read_fn_;
+            return [writer = audit_as_session_fn_, who = *session,
+                    role = auth::role_to_string(auth::effective_role(*session))](
+                       const httplib::Request& r, const std::string& action,
+                       const std::string& result, const std::string& target_type,
+                       const std::string& target_id, const std::string& detail_text) {
+                return writer(r, who, role, action, result, target_type, target_id, detail_text);
+            };
+        }();
+
+        if (!detail::audit_attempted(bound_audit, req, res, "management_group.create",
+                                     "ManagementGroup", "", g.name)) {
+            // audit_attempted wrote the 503 A4 envelope + Sec-Audit-Failed; the form would show
+            // nothing for it, so add the toast.
+            set_toast("Audit log unavailable: the group was not created", "error");
+            return;
         }
+
+        // The attempted row can wait on the audit pool: authenticate and authorise again, so a
+        // session invalidated or a grant revoked during the wait creates nothing. The username
+        // is compared too: the resolver falls through its credential sources (cookie, Bearer,
+        // X-Yuzu-Token), so with the original session gone a different principal's credential
+        // on the same request would resolve, and the rows (bound to the original session) would
+        // misname the actor. A different principal counts as revoked.
+        // Both refusal arms set a toast: htmx drops a 4xx body, so the operator would otherwise
+        // see nothing.
+        const auto fresh_session = auth_fn_(req, res); // writes its own 401 when gone
+        if (!fresh_session || fresh_session->username != session->username) {
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("session_revoked",
+                                                                          g.name));
+            if (res.status < 400) { // auth_fn_ writes its own 401; cover one that did not
+                res.status = 401;
+                res.set_content(detail::a4_error(res, "authentication required"),
+                                "application/json");
+            }
+            set_toast("Session no longer valid: the group was not created", "error");
+            return;
+        }
+        if (!perm_fn_(req, res, "ManagementGroup", "Write")) { // writes its own 403
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail("permission_revoked",
+                                                                          g.name));
+            set_toast("Permission revoked: the group was not created", "error");
+            return;
+        }
+        g.created_by = fresh_session->username;
+
+        auto result = mgmt_group_store_->create_group(g);
+        if (!result) {
+            // The attempted row is stored, so it gets an outcome with a FIXED token, never the
+            // store text (which can carry database error output).
+            const auto token = create_failure_token(result.error());
+            const bool fault = token == kMgmtGroupTokenStoreError;
+            (void)detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                                "failure", "ManagementGroup", "",
+                                                mgmt_group_failure_detail(token, g.name));
+            if (fault) {
+                // The cause is logged (sanitised), never shown on the page or audited.
+                spdlog::error("management_group.create store fault: {}",
+                              ::yuzu::log_key_token(result.error()));
+                store_fault();
+            } else {
+                refuse_text(result.error()); // a name conflict or a validation literal: closed text
+            }
+            return;
+        }
+        // The group exists: a lost outcome row keeps the success response, marks it
+        // `Sec-Audit-Failed` and says so in a toast (the `attempted` row stands as "started,
+        // outcome unknown"). Nothing is rolled back.
+        if (!detail::emit_behavioral_audit(bound_audit, req, res, "management_group.create",
+                                           "success", "ManagementGroup", *result, g.name))
+            set_toast("Group created, but its audit record could not be stored", "warning");
         res.set_content(render_management_groups_fragment(), "text/html; charset=utf-8");
     });
 
@@ -6453,6 +7339,22 @@ void SettingsRoutes::register_routes(
         }
 
         auto uploaded = SETTINGS_REQ_GET_FILE(req, "file");
+
+        // The platform, arch and filename become row keys and path components:
+        // a NUL or other control byte, or a byte sequence that is not valid UTF-8,
+        // in any of them is refused before anything is written. The audit row
+        // carries a fixed token and an empty target id, never the supplied value.
+        if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+            !rbac_text_is_clean(uploaded.filename) || !is_valid_utf8(platform) ||
+            !is_valid_utf8(arch) || !is_valid_utf8(uploaded.filename)) {
+            audit_fn_(req, "ota.package.uploaded", "denied", "UpdatePackage", "",
+                      "invalid_package_field");
+            res.status = 400;
+            res.set_content("<span class=\"feedback-error\">The platform, architecture and "
+                            "filename must be valid text without control characters.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
         // Case-INSENSITIVE: the server may store packages on a case-insensitive
         // filesystem (macOS, Windows), where "foo.SIG" and "foo.sig" are the
         // same file, so a case-sensitive guard is bypassable there.
@@ -6570,12 +7472,46 @@ void SettingsRoutes::register_routes(
         const auto sidecar_path = signature_sidecar_path(out_path);
         const bool signed_upload = !signature_pem.empty();
 
+        // The files this upload replaces are kept until the registry row is
+        // written, and put back if it is not. The lock keeps another upload or a
+        // delete of the same filename out of that window; it is declared before the
+        // guard so the rollback runs while it is still held.
+        const std::lock_guard<std::mutex> package_files_lock(ota_package_files_mutex());
+        OtaPredecessorGuard predecessors;
+
+        // Every failure answer below first puts the previous files back, explicitly, so
+        // the answer can say whether that held. True: everything is as it was and the
+        // "nothing was changed" wording that follows is accurate. False: the restore
+        // failed, the response is already the 500 that names the kept file, and the
+        // caller returns without writing its own.
+        const auto restored_or_answered = [&]() -> bool {
+            if (predecessors.rollback())
+                return true;
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">" +
+                                html_escape(predecessors.restore_failure_text()) + "</span>",
+                            "text/html; charset=utf-8");
+            return false;
+        };
+
+        if (!predecessors.preserve(out_path) || !predecessors.preserve(sidecar_path)) {
+            if (!restored_or_answered())
+                return;
+            res.status = 500;
+            res.set_content("<span class=\"feedback-error\">Could not prepare the package "
+                            "directory. Nothing was changed; retry the upload.</span>",
+                            "text/html; charset=utf-8");
+            return;
+        }
+
         if (signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
             // Nothing has been written yet: the previous binary and its signature
             // are both untouched, so this is a clean refusal, not a partial state.
             spdlog::error("OTA upload for {}/{}: the signature sidecar could not be written; "
                           "the previous package is unchanged",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content("<span class=\"feedback-error\">Could not store the signature. "
                             "Nothing was changed \u2014 retry the upload.</span>",
@@ -6600,6 +7536,8 @@ void SettingsRoutes::register_routes(
         const auto fail_binary = [&](const char* msg) {
             std::error_code rm_ec;
             std::filesystem::remove(bin_tmp, rm_ec);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
             res.set_content(std::string("<span class=\"feedback-error\">") + msg + "</span>",
                             "text/html; charset=utf-8");
@@ -6639,13 +7577,14 @@ void SettingsRoutes::register_routes(
         // last, per the ordering rule above, so no failure above this line could
         // have left the served package unprotected.
         if (!signed_upload && !replace_signature_sidecar(sidecar_path, signature_pem)) {
-            spdlog::error("OTA upload for {}/{}: the stale signature could not be removed; "
-                          "the package is served with a signature that does not cover it",
+            spdlog::error("OTA upload for {}/{}: the previous signature could not be removed; "
+                          "the previous package is being restored",
                           platform, arch);
+            if (!restored_or_answered())
+                return;
             res.status = 500;
-            res.set_content("<span class=\"feedback-error\">The binary was published but its "
-                            "old signature could not be removed. Agents will refuse this "
-                            "package until you retry.</span>",
+            res.set_content("<span class=\"feedback-error\">The old signature could not be "
+                            "removed, so the upload was rolled back. Retry the upload.</span>",
                             "text/html; charset=utf-8");
             return;
         }
@@ -6670,10 +7609,58 @@ void SettingsRoutes::register_routes(
         pkg.rollout_pct = rollout_pct;
         pkg.file_size = static_cast<int64_t>(uploaded.content.size());
 
-        // Upload path: the row is best-effort here and the failure is already
-        // visible in the log; the rollout path is the one that audits a committed
-        // transition and therefore must not discard this.
-        (void)update_registry_->upsert_package(pkg);
+        // The files above are already published. If the registry row is not
+        // written, `predecessors` puts back whatever they replaced (and removes
+        // them where there was nothing), so the update directory and the registry
+        // agree again, and the request reports the failure instead of success.
+        bool recorded = update_registry_->upsert_package(pkg);
+        if (!recorded) {
+            // A connection lost after the commit looks like a failed write although the
+            // row is there, and the same fault usually makes the read-back fail too. So
+            // there are three outcomes. The row read back carries exactly what this
+            // request wrote: the upload did happen, the new files stay and the request
+            // goes down the success path. The listing was read and the row is absent or
+            // different: the write did not happen, the previous files go back. The
+            // listing could not be read: it is NOT known, and neither deleting the kept
+            // copies nor restoring them is safe, so everything is left in place for the
+            // operator and the answer says so.
+            const auto listing = update_registry_->list_packages_checked();
+            if (!listing) {
+                spdlog::error("OTA upload for {}/{}: the registry write reported failure and "
+                              "the row could not be read back; the new files and the previous "
+                              "files are both left in place",
+                              platform, arch);
+                audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                          platform + "/" + arch + "/" + version, "outcome_unknown");
+                predecessors.abandon();
+                respond_lifecycle_store_unavailable(
+                    res, "The registry did not confirm whether the package was recorded. The "
+                         "new files were kept, and the previous files are kept as copies "
+                         "named *.yuzu_prev_*. Check the package list, then retry the same "
+                         "upload: it is safe to repeat.");
+                return;
+            }
+            if (row_carries_upload(*listing, pkg)) {
+                spdlog::warn("OTA upload for {}/{}: the registry write reported failure but "
+                             "the row carries this upload; treating it as written",
+                             platform, arch);
+                recorded = true;
+            }
+        }
+        if (!recorded) {
+            spdlog::error("OTA upload for {}/{}: the registry row could not be written; the "
+                          "previous files are being restored",
+                          platform, arch);
+            audit_fn_(req, "ota.package.uploaded", "failure", "UpdatePackage",
+                      platform + "/" + arch + "/" + version, "store_error");
+            if (!restored_or_answered())
+                return;
+            respond_lifecycle_store_unavailable(
+                res, "The package could not be recorded. Nothing was changed; retry the "
+                     "upload.");
+            return;
+        }
+        predecessors.commit();
         spdlog::info("OTA package uploaded: {}/{} v{} ({}B, rollout={}%)", platform, arch, version,
                      pkg.file_size, rollout_pct);
 
@@ -6710,6 +7697,64 @@ void SettingsRoutes::register_routes(
                     auto arch = req.matches[2].str();
                     auto version = req.matches[3].str();
 
+                    // A NUL or other control byte in a key is refused up front;
+                    // the audit row carries a fixed token and an empty target id.
+                    if (!rbac_text_is_clean(platform) || !rbac_text_is_clean(arch) ||
+                        !rbac_text_is_clean(version) || !is_valid_utf8(platform) ||
+                        !is_valid_utf8(arch) || !is_valid_utf8(version)) {
+                        audit_fn_(req, "ota.package.deleted", "denied", "UpdatePackage", "",
+                                  "invalid_package_field");
+                        res.status = 400;
+                        res.set_content("<span class=\"feedback-error\">The platform, "
+                                        "architecture and version must be valid text without "
+                                        "control characters.</span>",
+                                        "text/html; charset=utf-8");
+                        return;
+                    }
+
+                    const std::lock_guard<std::mutex> package_files_lock(
+                        ota_package_files_mutex());
+
+                    // The package is looked up with a CHECKED read: a listing that
+                    // failed is not "no such package", and going on would remove the
+                    // row while leaving its files behind and audit a miss.
+                    auto listing = update_registry_->list_packages_checked();
+                    if (!listing) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the package list could "
+                                      "not be read; nothing was removed",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be looked up. Nothing was changed; "
+                                 "retry the delete.");
+                        return;
+                    }
+
+                    // The registry row goes FIRST, and the files are unlinked only
+                    // once that succeeded: a failed row delete leaves the package
+                    // exactly as it was (row, binary and sidecar all present).
+                    const auto matched_pkg = [&]() -> std::optional<UpdatePackage> {
+                        for (auto& pkg : *listing) {
+                            if (pkg.platform == platform && pkg.arch == arch &&
+                                pkg.version == version)
+                                return std::move(pkg);
+                        }
+                        return std::nullopt;
+                    }();
+
+                    if (!update_registry_->remove_package(platform, arch, version)) {
+                        spdlog::error("OTA package delete for {}/{} v{}: the registry row could "
+                                      "not be removed; the package files were left in place",
+                                      platform, arch, version);
+                        audit_fn_(req, "ota.package.deleted", "failure", "UpdatePackage",
+                                  platform + "/" + arch + "/" + version, "store_error");
+                        respond_lifecycle_store_unavailable(
+                            res, "The package could not be removed. Nothing was changed; "
+                                 "retry the delete.");
+                        return;
+                    }
+
                     PackageDeleteOutcome outcome;
                     // Each remove gets its OWN error_code. Sharing one lets the
                     // second call's result overwrite the first, so a failed
@@ -6717,31 +7762,26 @@ void SettingsRoutes::register_routes(
                     // wholly successful.
                     std::error_code bin_ec;
                     std::error_code sig_ec;
-                    auto packages = update_registry_->list_packages();
-                    for (const auto& pkg : packages) {
-                        if (pkg.platform == platform && pkg.arch == arch &&
-                            pkg.version == version) {
-                            outcome.matched = true;
-                            auto bin_path = update_registry_->binary_path(pkg);
-                            outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
-                            // Remove the signature sidecar with it. Leaving it
-                            // behind would let a later upload of a same-named
-                            // package inherit a signature made over DIFFERENT
-                            // bytes — which the agent would then reject as
-                            // tampered, with no obvious cause.
-                            outcome.signature_removed = std::filesystem::remove(
-                                update_registry_->signature_path(pkg), sig_ec);
-                            if (bin_ec) {
-                                outcome.binary_error = bin_ec.message();
-                            }
-                            if (sig_ec) {
-                                outcome.signature_error = sig_ec.message();
-                            }
-                            break;
+                    if (matched_pkg) {
+                        const auto& pkg = *matched_pkg;
+                        outcome.matched = true;
+                        auto bin_path = update_registry_->binary_path(pkg);
+                        outcome.binary_removed = std::filesystem::remove(bin_path, bin_ec);
+                        // Remove the signature sidecar with it. Leaving it
+                        // behind would let a later upload of a same-named
+                        // package inherit a signature made over DIFFERENT
+                        // bytes — which the agent would then reject as
+                        // tampered, with no obvious cause.
+                        outcome.signature_removed = std::filesystem::remove(
+                            update_registry_->signature_path(pkg), sig_ec);
+                        if (bin_ec) {
+                            outcome.binary_error = bin_ec.message();
+                        }
+                        if (sig_ec) {
+                            outcome.signature_error = sig_ec.message();
                         }
                     }
 
-                    update_registry_->remove_package(platform, arch, version);
                     spdlog::info("OTA package deleted: {}/{} v{}", platform, arch, version);
                     // Audited for the same reason as the upload: this removes a
                     // binary AND its signature from the fleet's update surface.
@@ -6903,13 +7943,15 @@ void SettingsRoutes::register_routes(
     // `target_type="user"` + `success/failure` used elsewhere in
     // auth_routes — Gate 4 consistency B1+B2 picks the spec lane.
     //
-    // `Cache-Control: no-store, private` is set on every response that
-    // contains a one-time secret (init's otpauth URI / base32 secret,
-    // verify's recovery codes, recovery-codes regenerate) so the
-    // browser/proxy/CDN cannot retain the material past the response
-    // lifetime (Gate 4 unhappy-path UP-9).
+    // `Cache-Control: no-store, private` and `Vary: Cookie` are set on every
+    // MFA response that renders data: the one-time secrets (init's otpauth URI / base32 secret,
+    // verify's recovery codes, recovery-codes regenerate) and the MFA state of
+    // the account (the fragment and its re-renders), so the browser/proxy/CDN
+    // cannot retain the material past the response lifetime (Gate 4
+    // unhappy-path UP-9, #6940).
     auto set_no_store = [](httplib::Response& res) {
         res.set_header("Cache-Control", "no-store, private");
+        res.set_header("Vary", "Cookie");
         res.set_header("Pragma", "no-cache");
         res.set_header("Referrer-Policy", "no-referrer");
     };
@@ -6955,7 +7997,8 @@ void SettingsRoutes::register_routes(
     // for a request the central gate admitted, or by a TestRouteSink test
     // that bypasses pre-routing.
 
-    sink.Get("/fragments/settings/mfa", [this](const httplib::Request& req, httplib::Response& res) {
+    sink.Get("/fragments/settings/mfa", [this, set_no_store](const httplib::Request& req,
+                                                            httplib::Response& res) {
         if (!admin_fn_(req, res))
             return;
         auto session = auth_fn_(req, res);
@@ -6963,6 +8006,7 @@ void SettingsRoutes::register_routes(
             res.status = 401;
             return;
         }
+        set_no_store(res);
         res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
     });
 
@@ -6981,6 +8025,7 @@ void SettingsRoutes::register_routes(
         if (!db) {
             audit_fn_(req, "mfa.enroll.initiated", "error", "User", session->username,
                       "auth_db unavailable");
+            set_no_store(res);
             res.set_content(
                 render_mfa_fragment(*session, {}, {}, {}, {}, "MFA backend unavailable"),
                 "text/html; charset=utf-8");
@@ -6998,6 +8043,7 @@ void SettingsRoutes::register_routes(
             // Settings init/verify).
             audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                       "credential_changed");
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                 kMfaCredentialChangedMsg),
                             "text/html; charset=utf-8");
@@ -7029,6 +8075,7 @@ void SettingsRoutes::register_routes(
                           ? std::string{"csprng_unavailable: mfa_enroll (mfa_init_enrollment, "
                                         "fail-closed)"}
                           : std::string{msg});
+            set_no_store(res);
             res.set_content(render_mfa_fragment(*session, {}, {}, {}, {}, msg),
                             "text/html; charset=utf-8");
             return;
@@ -7055,10 +8102,77 @@ void SettingsRoutes::register_routes(
                   auto code = extract_form_value(req.body, "code");
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
+                  }
+                  // #6079: the confirming code commits the factor, so the caller's session must be
+                  // a durable, valid row BEFORE it does; otherwise the enrolment could commit on
+                  // a session that ended, was wiped or never had a row, leaving the account
+                  // enrolled with no usable proof on that session. Only when a session store is
+                  // wired: the store-less (legacy and config-file-user) wiring has no durable
+                  // row to require, and its behaviour is unchanged. The read is the raw
+                  // `read_durable_mfa_proof` (row existence and ownership only; the rebind
+                  // guard concerns a stored generation, which is not judged here). It runs
+                  // BEFORE and OUTSIDE the `auth.users` row lock that `mfa_verify_enrollment`
+                  // takes: AuthDB must never read the session store. Residual, stated plainly:
+                  // a session that ends between this read and the commit still ends in the
+                  // best-effort stamp's `not_stamped` outcome below, and the enrolment stands.
+                  // The provisional secret is untouched on either refusal, so the same code
+                  // can be confirmed from a valid session. An API-token (bearer) caller has no
+                  // session cookie and so no durable row: it is refused here by design, and
+                  // told so (no cookie at all) rather than that a session ended.
+                  if (auth_mgr_->has_session_store()) {
+                      using Source = auth::DurableMfaProof::Source;
+                      const std::string session_cookie = AuthRoutes::extract_session_cookie(req);
+                      const auto durable =
+                          auth_mgr_->read_durable_mfa_proof(session_cookie, session->username);
+                      if (durable.source != Source::kRow) {
+                          const bool unavailable = durable.source == Source::kUnavailable;
+                          const std::string msg =
+                              unavailable
+                                  ? "Session store is temporarily unavailable. Nothing was "
+                                    "enrolled; retry shortly."
+                              : session_cookie.empty()
+                                  ? "This action needs a signed-in browser session. Nothing was "
+                                    "enrolled."
+                                  : "Your session is no longer valid. Nothing was enrolled; "
+                                    "sign in again.";
+                          // The session-bound writer (as the disable route's rows): the row is
+                          // attributed to the session this handler already resolved, not
+                          // re-resolved from the cookie, which is the very thing that may be
+                          // missing or stale here. Unwired (tests), `audit_fn_` is the fallback.
+                          const std::string refusal_detail = unavailable
+                                                                 ? "session_store_unavailable"
+                                                                 : "session_not_durable";
+                          if (audit_as_session_fn_)
+                              (void)audit_as_session_fn_(
+                                  req, *session,
+                                  auth::role_to_string(auth::effective_role(*session)),
+                                  "mfa.enroll.failed", "error", "User", session->username,
+                                  refusal_detail);
+                          else
+                              audit_fn_(req, "mfa.enroll.failed", "error", "User",
+                                        session->username, refusal_detail);
+                          res.status = unavailable ? 503 : 401;
+                          if (unavailable)
+                              res.set_header("Retry-After", "5");
+                          // htmx swaps no 4xx/5xx body, so the toast is what tells the operator.
+                          const nlohmann::json toast = {
+                              {"showToast", {{"message", msg}, {"level", "error"}}}};
+                          res.set_header("HX-Trigger", toast.dump());
+                          set_no_store(res);
+                          // A transient outage keeps the provisional form so the same code can be
+                          // confirmed on retry; a dead session shows the not-enrolled panel.
+                          res.set_content(render_mfa_fragment(*session, {}, {}, {},
+                                                              unavailable ? session->username
+                                                                          : std::string{},
+                                                              msg),
+                                          "text/html; charset=utf-8");
+                          return;
+                      }
                   }
                   auto codes_res = db->mfa_verify_enrollment(session->username, code,
                                                              /*expected_password_hash_hex=*/std::nullopt);
@@ -7070,6 +8184,7 @@ void SettingsRoutes::register_routes(
                       // the credential change); the session is being revoked.
                       audit_fn_(req, "mfa.enroll.failed", "error", "User", session->username,
                                 "credential_changed");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           kMfaCredentialChangedMsg),
                                       "text/html; charset=utf-8");
@@ -7089,6 +8204,7 @@ void SettingsRoutes::register_routes(
                       // again but offered only a confirm box that can never succeed.
                       audit_fn_(req, "mfa.enroll.cancelled", "ok", "User", session->username,
                                 "reason=provisional_secret_changed; nothing enrolled");
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "Enrollment was cancelled or replaced. "
                                                           "Start enrollment again."),
@@ -7121,6 +8237,7 @@ void SettingsRoutes::register_routes(
                           audit_fn_(req, "mfa.enroll.race", "ok", "User", session->username,
                                     "already enrolled by a concurrent verify; no duplicate "
                                     "enrollment");
+                          set_no_store(res);
                           res.set_content(
                               render_mfa_fragment(*session, {}, {}, {}, session->username,
                                                   "MFA is already enrolled on this account."),
@@ -7151,6 +8268,7 @@ void SettingsRoutes::register_routes(
                               ? "Authentication store is temporarily unavailable — retry shortly."
                               : "Code rejected. Try the next code shown by your authenticator "
                                 "(codes refresh every 30 seconds).";
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {},
                                                           session->username, msg),
                                       "text/html; charset=utf-8");
@@ -7158,7 +8276,7 @@ void SettingsRoutes::register_routes(
                   }
                   // Enrolment has just committed, and the code that committed it IS a fresh proof
                   // of the factor: stamp the CURRENT cookie session's step-up proof (the same
-                  // `mark_session_mfa_verified` as POST /login/mfa/stepup, so the DB-clock
+                  // `stamp_session_mfa_proof` as POST /login/mfa/stepup, so the DB-clock
                   // authoring and every replica's cache refresh are that primitive's), so the
                   // operator can regenerate recovery codes or disable MFA from this very session
                   // without a separate step-up. Only a local cookie session is stamped, and only
@@ -7173,9 +8291,9 @@ void SettingsRoutes::register_routes(
                   // again to earn a proof. Never reached on a failed or rejected verification (all
                   // return above).
                   // The audit row below says only `not_stamped`; this line says why. Sampled (1 in
-                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a log storm.
-                  // `what()` is text an exception chose, so it is sanitised. Guarded: a formatter
-                  // or logger throw must not escape the catch and drop the codes reveal.
+                  // kStampThrewLogEvery, the first always) so a failing auth store cannot become a
+                  // log storm. `what()` is text an exception chose, so it is sanitised. Guarded: a
+                  // formatter or logger throw must not escape the catch and drop the codes reveal.
                   const auto note_stamp_threw = [](const char* what) noexcept {
                       try {
                           static std::atomic<uint64_t> stamp_threw_hits{0};
@@ -7192,7 +8310,14 @@ void SettingsRoutes::register_routes(
                       } catch (...) { // NOLINT(bugprone-empty-catch)
                       }
                   };
+                  // #6079: the stamp carries the enrolment's own proof, the generation its UPDATE
+                  // produced and the database instant its loading statement captured before the
+                  // TOTP check (so it precedes `mfa_enrolled_at`), never the stamp's now(). The
+                  // stamp refuses a future-dated instant and, after it commits, clears itself if
+                  // the factor generation changed since (`factor_changed`); the enrolment and the
+                  // codes below stand either way.
                   bool proof_stamped = false;
+                  const char* not_stamped_why = "";
                   try {
                       if (auth_mgr_ && session->auth_source == "local") {
                           const auto cookie_token = AuthRoutes::extract_session_cookie(req);
@@ -7202,23 +8327,35 @@ void SettingsRoutes::register_routes(
                                   cookie_session->username == session->username) {
                                   if (stamp_fault_hook_) // test seam, empty in production
                                       stamp_fault_hook_();
-                                  proof_stamped = auth_mgr_->mark_session_mfa_verified(cookie_token);
+                                  using Outcome = auth::AuthManager::MfaStampOutcome;
+                                  const auto outcome = auth_mgr_->stamp_session_mfa_proof(
+                                      cookie_token,
+                                      LocalMfaProof{codes_res->factor_gen, codes_res->verified_ms});
+                                  proof_stamped = outcome == Outcome::kStamped;
+                                  if (outcome == Outcome::kFactorChanged)
+                                      not_stamped_why = ";factor_changed";
+                                  else if (outcome == Outcome::kFutureDated)
+                                      not_stamped_why = ";verification_future_dated";
                               }
                           }
                       }
                   } catch (const std::exception& ex) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(ex.what());
                   } catch (...) {
                       proof_stamped = false;
+                      not_stamped_why = "";
                       note_stamp_threw(nullptr);
                   }
                   audit_fn_(req, "mfa.enroll.verified", "ok", "User", session->username,
-                            proof_stamped ? "step_up_proof=stamped" : "step_up_proof=not_stamped");
+                            proof_stamped
+                                ? std::string("step_up_proof=stamped")
+                                : std::string("step_up_proof=not_stamped") + not_stamped_why);
                   audit_fn_(req, "mfa.recovery_codes.generated", "ok", "User",
                             session->username, "10 codes issued");
                   set_no_store(res);
-                  res.set_content(render_mfa_fragment(*session, {}, {}, *codes_res),
+                  res.set_content(render_mfa_fragment(*session, {}, {}, codes_res->recovery_codes),
                                   "text/html; charset=utf-8");
               });
 
@@ -7235,21 +8372,51 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // MFA step-up gate. Minting a fresh recovery-code set hands the caller a
-                  // credential that satisfies the step-up challenge itself, and disabling MFA removes
-                  // the factor the gate checks; both need a fresh proof first. Before any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/recovery-codes")) {
+                  // credential that satisfies the step-up challenge itself, and disabling MFA
+                  // removes the factor the gate checks; both need a fresh proof first. Before any
+                  // mutation. The gate also hands back the factor generation it admitted the
+                  // request at; the regeneration compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(
+                          req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/recovery-codes");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/recovery-codes");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
                   if (!db) {
+                      set_no_store(res);
                       res.set_content(render_mfa_fragment(*session, {}, {}, {}, {},
                                                           "MFA backend unavailable"),
                                       "text/html; charset=utf-8");
                       return;
                   }
-                  auto codes = db->mfa_regenerate_recovery_codes(session->username);
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("recovery_codes");
+                  auto codes =
+                      db->mfa_regenerate_recovery_codes(session->username, admission->factor_gen);
+                  if (!codes && codes.error() == AuthDBError::FactorChanged) {
+                      // The factor was replaced after the gate admitted this request: nothing was
+                      // regenerated, so the new factor's codes are untouched.
+                      audit_fn_(req, "mfa.recovery_codes.generated", "denied", "User",
+                                session->username,
+                                std::format("reason=factor_changed expected_gen={}",
+                                            admission->factor_gen));
+                      // #6940: every MFA fragment response is no-store; set here, not in the shared
+                      // helper (the disable handler already sets it once, and set_header appends).
+                      set_no_store(res);
+                      respond_mfa_factor_changed(res, *session, "recovery_codes");
+                      return;
+                  }
                   if (!codes) {
                       // #6995: a refused regeneration is counted like its siblings. A CSPRNG
                       // fault goes to yuzu_secure_random_failure_total; any other store fault to
@@ -7271,6 +8438,7 @@ void SettingsRoutes::register_routes(
                                       "(mfa_regenerate_recovery_codes, fail-closed, existing codes "
                                       "unchanged)"
                                     : "regeneration failed");
+                      set_no_store(res);
                       res.set_content(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Could not regenerate codes. Your existing "
@@ -7287,7 +8455,8 @@ void SettingsRoutes::register_routes(
               });
 
     sink.Post("/api/settings/mfa/disable",
-              [this, origin_safe](const httplib::Request& req, httplib::Response& res) {
+              [this, set_no_store, origin_safe](const httplib::Request& req,
+                                                httplib::Response& res) {
                   if (!origin_safe(req, res, "/api/settings/mfa/disable"))
                       return;
                   if (!admin_fn_(req, res))
@@ -7297,11 +8466,27 @@ void SettingsRoutes::register_routes(
                       res.status = 401;
                       return;
                   }
+                  // ONE call for every response path below (a repeat would append a second
+                  // Cache-Control header): the state-of-MFA fragments and the sign-out reply.
+                  set_no_store(res);
                   // MFA step-up gate (see recovery-codes above): stripping the factor the gate
                   // checks needs a fresh proof. Before the enforcement guard and any mutation.
-                  if (step_up_fn_ &&
-                      !step_up_fn_(req, res, *session, "POST /api/settings/mfa/disable")) {
+                  // The gate also hands back the factor generation it admitted the request at; the
+                  // clear compares it under the users row lock (#6079).
+                  if (!factor_credential_gate_fn_) {
+                      refuse_factor_credential_gate_unwired(req, res, *session,
+                                                            "POST /api/settings/mfa/disable");
+                      return;
+                  }
+                  const auto admission = factor_credential_gate_fn_(
+                      req, res, *session, "POST /api/settings/mfa/disable");
+                  if (!admission) {
                       toast_step_up_refusal(res);
+                      return;
+                  }
+                  if (!admission->local) {
+                      refuse_factor_credential_not_local(req, res, *session,
+                                                         "POST /api/settings/mfa/disable");
                       return;
                   }
                   auto* db = auth_mgr_ ? auth_mgr_->auth_db_ptr() : nullptr;
@@ -7335,11 +8520,16 @@ void SettingsRoutes::register_routes(
                       return;
                   }
                   // Two rows per disable: an INTENT row ("attempted") written BEFORE the factor is
-                  // touched, and an OUTCOME row after. The outcome row is written AFTER the actor's
-                  // own session is deleted, so both are attributed to the session already
-                  // resolved, not re-resolved from the cookie. Order them by the audit `id`.
+                  // touched, and an OUTCOME row after (written by `MfaDisableOwner` inside the
+                  // clear's own transaction on success, by this handler for denied/error). The
+                  // outcome row is written AFTER the actor's own session is deleted, so both are
+                  // attributed to the session already resolved, not re-resolved from the cookie.
+                  // Order them by the audit `id`.
                   // Returns whether the row persisted; the unwired fallback (tests, other callers)
                   // is a void writer and reports true, so only the production binding can refuse.
+                  // This writer serves the intent, denied and error rows only: the success row is
+                  // written by the owner inside the clear's transaction, through the
+                  // AuditEventForSessionFn seam below.
                   const auto audit = [&](const char* result, const std::string& detail) -> bool {
                       if (audit_as_session_fn_)
                           return audit_as_session_fn_(
@@ -7348,12 +8538,9 @@ void SettingsRoutes::register_routes(
                       audit_fn_(req, "mfa.disabled", result, "User", session->username, detail);
                       return true;
                   };
-                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
-                  // happen. Nothing has been cleared and no session has been ended.
-                  if (!audit("attempted", "MFA clear requested via Settings")) {
-                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
-                                    "for '{}'; MFA was NOT changed",
-                                    log_safe(session->username));
+                  // The audit-unavailable answer, shared by the intent row below and the owner's
+                  // outcome row: 503 + `Sec-Audit-Failed`, MFA untouched.
+                  const auto refuse_audit_unavailable = [&] {
                       res.status = 503;
                       res.set_header("Retry-After", "5");
                       res.set_header("Sec-Audit-Failed", "true");
@@ -7366,15 +8553,16 @@ void SettingsRoutes::register_routes(
                           render_mfa_fragment(*session, {}, {}, {}, {},
                                               "Audit store unavailable; MFA was not changed."),
                           "text/html; charset=utf-8");
+                  };
+                  // Fail closed on the intent row: an MFA clear that cannot be recorded does not
+                  // happen. Nothing has been cleared and no session has been ended.
+                  if (!audit("attempted", "MFA clear requested via Settings")) {
+                      spdlog::error("mfa.disabled: the audit store did not accept the intent row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
                   }
-                  // The clear has no undo, so a lost OUTCOME row cannot stop it; it is logged.
-                  const auto audit_outcome = [&](const char* result, const std::string& detail) {
-                      if (!audit(result, detail))
-                          spdlog::error("mfa.disabled: MFA cleared for '{}' but the outcome audit "
-                                        "row failed to persist",
-                                        log_safe(session->username));
-                  };
                   // Same exit as logout: drop the cookie and send the browser to the landing page.
                   const auto sign_out = [&] {
                       res.set_header("Set-Cookie",
@@ -7382,56 +8570,93 @@ void SettingsRoutes::register_routes(
                       res.set_header("HX-Redirect", "/home");
                       res.set_content("", "text/plain");
                   };
-                  // The pre-image comes from the clear's own row lock, so it cannot miss an
-                  // enrolment verified in between. A failed clear leaves it unknown, which counts
-                  // as enrolled: the fail-safe is to end sessions.
-                  auto r = db->mfa_disable_report(session->username);
-                  if (!r) {
-                      // The clear may have committed with its acknowledgement lost, so the
-                      // sessions end anyway (#6079).
-                      const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                      audit_outcome("error", "disable failed (sessions_ended=" +
-                                                 (ended.db_persisted ? std::to_string(ended.count)
-                                                                     : std::string("failed")) +
-                                                 ")");
-                      if (ended.db_persisted) {
-                          sign_out();
+                  // #6079 PR 2c: the factor clear, the end of EVERY durable session of the account
+                  // (the caller's included: any of them may hold an MFA proof made under the factor
+                  // just cleared, so the user signs in again) and the OUTCOME audit row commit or
+                  // abort TOGETHER in `MfaDisableOwner`'s one transaction. The `attempted` row above
+                  // stays the caller's: it is written first and stops the clear if it cannot be
+                  // stored. There is no `partial` outcome any more (a clear whose sessions could
+                  // not be ended rolls back whole), and a lost outcome row now fails the clear
+                  // closed instead of being logged after the fact.
+                  if (!audit_event_for_session_fn_) {
+                      // The outcome row cannot be built, so the clear cannot run.
+                      spdlog::error("mfa.disabled: no outcome-row builder wired for '{}'; MFA was "
+                                    "NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
+                      return;
+                  }
+                  yuzu::server::MfaDisableRequest clear;
+                  clear.username = session->username;
+                  clear.expected_factor_gen = admission->factor_gen;
+                  // action, result and identity are the caller's; the owner completes only the
+                  // detail (empty template: `sessions_ended=<n>`, the text the success row has
+                  // always carried).
+                  clear.audit_template = audit_event_for_session_fn_(
+                      req, *session, auth::role_to_string(auth::effective_role(*session)),
+                      "mfa.disabled", "ok", "User", session->username);
+                  // Cancelling an enrolment that never completed clears no usable factor, so no
+                  // proof can predate one: nothing to end, and the row says so.
+                  clear.end_sessions_if_not_enrolled = false;
+                  clear.detail_if_not_enrolled = "no verified factor to clear";
+                  if (factor_credential_barrier_)
+                      factor_credential_barrier_("disable");
+                  const auto outcome = auth_mgr_->commit_mfa_disable(clear);
+                  switch (outcome.result) {
+                  case yuzu::server::MfaDisableResult::kOk:
+                      // The outcome row is already committed with the clear.
+                      if (!outcome.was_enrolled) {
+                          res.set_content(render_mfa_fragment(*session),
+                                          "text/html; charset=utf-8");
                           return;
                       }
-                      // Neither the clear nor the delete is confirmed: say the state is unknown.
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "Could not confirm MFA was disabled, and the account's sessions "
-                              "could not be ended. Its state is unknown: ask an administrator "
-                              "to check it and end the sessions."),
-                          "text/html; charset=utf-8");
+                      sign_out();
                       return;
-                  }
-                  const bool had_factor = *r;
-                  // Cancelling an enrolment that never completed clears no usable factor, so no
-                  // proof can predate one: nothing to end.
-                  if (!had_factor) {
-                      audit_outcome("ok", "no verified factor to clear");
-                      res.set_content(render_mfa_fragment(*session), "text/html; charset=utf-8");
+                  case yuzu::server::MfaDisableResult::kFactorChanged:
+                      // The factor changed after the gate admitted this request (an enrolled
+                      // account rotated, or an un-enrolled one finished enrolling): nothing was
+                      // cleared and no session ends. The session may be legitimate after a
+                      // re-prove. The transaction wrote nothing, so the row is the caller's.
+                      audit("denied", std::format("reason=factor_changed expected_gen={}",
+                                                  admission->factor_gen));
+                      respond_mfa_factor_changed(res, *session, "disable");
                       return;
-                  }
-                  // End EVERY session of the account, the caller's included (#6079): any of them
-                  // may hold an MFA proof made under the factor just cleared. The user signs in
-                  // again; a kept session would be a surviving proof we could not tell apart.
-                  const auto ended = auth_mgr_->invalidate_user_sessions(session->username);
-                  if (!ended.db_persisted) {
-                      audit_outcome("partial", "sessions_ended=failed");
-                      res.set_content(
-                          render_mfa_fragment(
-                              *session, {}, {}, {}, {},
-                              "MFA was disabled, but the account's sessions could not be ended. "
-                              "Ask an administrator to end them."),
-                          "text/html; charset=utf-8");
+                  case yuzu::server::MfaDisableResult::kAuditUnavailable:
+                      // The outcome row could not be written, so the whole clear rolled back.
+                      spdlog::error("mfa.disabled: the audit store did not accept the outcome row "
+                                    "for '{}'; MFA was NOT changed",
+                                    log_safe(session->username));
+                      refuse_audit_unavailable();
                       return;
+                  case yuzu::server::MfaDisableResult::kNotFound:
+                  case yuzu::server::MfaDisableResult::kStoreUnavailable:
+                      break;
                   }
-                  audit_outcome("ok", std::format("sessions_ended={}", ended.count));
-                  sign_out();
+                  // No active row (the account went away mid-request) or a store fault: the
+                  // transaction normally rolled back, so the factor and the sessions are
+                  // unchanged, but a connection lost exactly at COMMIT may have committed all of
+                  // it, so the answer says the factor may not have changed and to check its state
+                  // (and AuthManager::commit_mfa_disable has already dropped this replica's cached
+                  // sessions of the account for that case). The `error` row is the caller's: the
+                  // transaction wrote none.
+                  if (!audit("error", "disable failed")) {
+                      spdlog::error("mfa.disabled: MFA was not changed for '{}' and the error "
+                                    "audit row failed to persist",
+                                    log_safe(session->username));
+                  }
+                  res.status = 503;
+                  res.set_header("Retry-After", "5");
+                  // /settings swaps no 5xx body, so the toast tells the operator on the main page.
+                  res.set_header("HX-Trigger",
+                                 R"({"showToast":{"message":"Could not confirm MFA was )"
+                                 R"(disabled; it may not have been changed. Check its )"
+                                 R"(state.","level":"error"}})");
+                  res.set_content(
+                      render_mfa_fragment(*session, {}, {}, {}, {},
+                                          "Could not disable MFA. It may not have been changed; "
+                                          "check its state and try again. If you were signed out, "
+                                          "sign in and check its state."),
+                      "text/html; charset=utf-8");
               });
 }
 

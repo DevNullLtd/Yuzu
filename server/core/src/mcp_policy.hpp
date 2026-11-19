@@ -173,17 +173,26 @@ inline bool requires_approval(std::string_view mcp_tier,
         if (securable_type == "Security" && operation == "Execute") return true;
         if (securable_type == "UserManagement" && operation == "Write") return true;
         if (securable_type == "ManagementGroup" && operation == "Write") return true;
-        // Workflow:Execute (POST /api/workflows/{id}/execute): a workflow fans several steps out
-        // to the fleet in one call with no per-step human look. Owner ruling 2026-10-30: a
-        // supervised token needs an approval ticket for it, like every other fleet execution at
-        // this tier. Before this line a supervised token passed Workflow:Execute with NO
-        // ticket. AuthRoutes::require_permission mirrors this rule on every non-MCP transport,
-        // so a supervised-tier token is refused (403) on the REST execute route. No MCP tool
-        // maps to Workflow:Execute yet (the execute_workflow tool is not implemented), so
-        // until that tool ships a supervised token has no ticket path to run a workflow. The operator
-        // tier stays DENIED by tier_allows() above, which admits only Execution:Execute among
-        // execute operations.
+        // Workflow:Execute (execute_workflow / POST /api/v1/workflows/{id}/execute and the legacy
+        // POST /api/workflows/{id}/execute): a workflow fans several steps out to the fleet in
+        // one call, with no per-step human look. Owner ruling 2026-10-30: a supervised token
+        // needs an approval ticket for it, like every other fleet execution at this tier.
+        // Before this line a supervised token passed Workflow:Execute with NO ticket. Because
+        // AuthRoutes::require_permission mirrors this rule on every non-MCP transport, a
+        // supervised-tier token is now also refused (403; use the MCP ticket flow, i.e. the
+        // execute_workflow tool) on both REST execute routes (#520). The operator tier stays DENIED by tier_allows()
+        // above, which admits only Execution:Execute among execute operations.
         if (securable_type == "Workflow" && operation == "Execute") return true;
+
+        // RevocationSource:Write (ADR-0070 R1, slice 2b-1a): register, replace, remove and reset
+        // the anti-rollback marks of a registered CRL source. Registering a source adds an
+        // egress target the server will fetch from, and a reset reopens the CRL replay window,
+        // so a supervised MCP token held by an administrator must not do either with no
+        // ticket. This is a DELIBERATE addition to the supervised list (removal, reset and
+        // registration are all a `Write`, never a `Delete`, so the `Delete` rule above does not
+        // cover them). (REST refuses an MCP-tier token outright, so on the REST routes
+        // this entry is defence in depth, not the gate.)
+        if (securable_type == "RevocationSource" && operation == "Write") return true;
 
         // ApiToken:Write (create_api_token / POST /api/v1/tokens) gates here too
         // (gov security-guardian finding, #2146 B4 fix round): minting a NEW
@@ -198,6 +207,33 @@ inline bool requires_approval(std::string_view mcp_tier,
         // MFA step-up (unlike the dashboard's own token-creation form). Adding
         // it here closes both transports via the one shared policy table.
         if (securable_type == "ApiToken" && operation == "Write") return true;
+
+        // InstructionDefinition:Write (create_definition / update_definition / import_definition /
+        // save_definition_yaml, the v1 REST routes and the legacy POST/PUT /api/instructions and
+        // /api/v1/definitions/{id}/response-templates): an unticketed update can flip a
+        // definition's approval_mode from `always` to `auto`, or repoint its plugin/action,
+        // after which an existing schedule (schedule_runner.cpp) or an operator-tier
+        // Execution:Execute run of that definition needs no human. A supervised token therefore
+        // needs a ticket for every definition write, so the write is the one place a human is
+        // asked. That holds only while no sibling path creates definitions unticketed, which is
+        // why ProductPack:Write sits directly below. Because AuthRoutes::require_permission
+        // mirrors this rule on every non-MCP transport, a supervised-tier token is also refused
+        // (403) on those REST routes; the response-templates routes have no MCP tool, so there it
+        // can only use an untiered credential or a browser session. InstructionSet:Write is
+        // deliberately NOT gated: a set carries no authorization consumer. Delete is already
+        // gated by the rule above. validate_definition_yaml is InstructionDefinition:Read and
+        // stays ungated.
+        if (securable_type == "InstructionDefinition" && operation == "Write") return true;
+
+        // ProductPack:Write (POST /api/product-packs; there is no MCP tool for it): a pack install
+        // creates instruction definitions whose approval_mode, plugin and action come from the
+        // pack's own YAML. Unticketed it would be a second way to author a definition with
+        // approval_mode `auto` that bypasses the InstructionDefinition:Write gate above (owner
+        // ruling, batch C fix round). Uninstall is ProductPack:Delete and already gated by the
+        // Delete rule. AuthRoutes::require_permission mirrors this rule, so a supervised-tier
+        // token gets a 403 on the install route and, with no MCP tool to take a ticket, can only
+        // install through an untiered credential or a browser session.
+        if (securable_type == "ProductPack" && operation == "Write") return true;
 
         // ApiToken:Rotate is DELIBERATELY ABSENT — recorded here rather than
         // left silent-by-omission (PR #2974 review).

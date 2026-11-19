@@ -220,6 +220,20 @@ new connections wait in the kernel backlog (agents already connected are unaffec
 they reconnect). Limit connections per source address at the L4 balancer or firewall; see
 [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
+**Gateway Erlang distribution is outside the PKI and unencrypted.** Between
+gateway nodes of a cluster, commands and results (including plugin parameters)
+travel over plain TCP guarded only by the shared cookie handshake; there is no
+encryption and no per-message integrity. Keep the cluster network trusted and
+firewalled to the gateway nodes only (EPMD 4369 and the distribution range
+9100-9105), and give every node a strong cookie. TLS distribution is tracked as
+#8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). If a node
+will not start and you cannot reach the vendor docs, read the
+refusal text: the container logs it on stderr (`[gateway-entrypoint] FATAL: ...`)
+and the systemd unit in the journal (`yuzu-gateway: ...`); it names the fix and
+never prints the cookie. A conforming cookie is 32 to 255 characters from
+`[A-Za-z0-9._~+=-]` (`openssl rand -hex 32`), identical on every node. See
+[Distribution Cookie](gateway.md#distribution-cookie-required-in-production).
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.
@@ -273,7 +287,7 @@ yuzu-server --rate-limit 100 --login-rate-limit 10
 ```
 
 - `--rate-limit`: Maximum API requests per second per IP (default: 100). It is also the per-source budget for `/health` and `/api/health` requests that carry a credential header; values below 1 are treated as 1
-- `--login-rate-limit`: Maximum login attempts per second per IP (default: 10)
+- `--login-rate-limit`: Maximum login attempts per second per IP (default: 10). It covers local login, SAML start and ACS, and OIDC sign-in start (`GET /auth/oidc/start`) and callback (`GET /auth/callback`), because these are unauthenticated entry points that trigger outbound requests. An OIDC sign-in uses two requests from the browser's source address, one for start and one for the callback. The same bucket carries the local MFA step-up (`POST /login/mfa/stepup`), which an approver needs for approve and reject. Behind a reverse proxy or NAT that does not preserve the client address, every user shares one source address, so raise `--login-rate-limit` to roughly twice the peak number of simultaneous sign-ins per second. Raising it loosens the only per-address limit on password guessing at `POST /login` and on TOTP guessing at `POST /login/mfa/stepup`, so keep it as low as the proxied population allows.
 
 Clients exceeding the limit receive `429 Too Many Requests` with a `Retry-After: 1` header.
 
@@ -452,6 +466,31 @@ Five classes that used to appear on this list no longer belong on it:
   one operator) or `DELETE /api/v1/sessions/me` (sign out everywhere). The
   all-operators emergency procedure is in
   [Auth database recovery](../ops-runbooks/auth-db-recovery.md#sessions-are-durable).
+
+  **Deactivated local accounts and sessions.** For accounts held in the Yuzu
+  local account store and deactivated through the product, once every server
+  replica runs this release, a session of that account is rejected on every
+  replica within about one second of the deactivation committing on a healthy
+  generation poll, even if the deactivation's session cleanup failed. Limits:
+
+  - Local accounts only. OIDC and SAML sessions are ended by the linked-identity
+    revoke of the deprovision, not by this check; API tokens and MCP tokens are
+    unchanged.
+  - Mixed-version operation and out-of-band SQL changes to `auth.users` are
+    outside the guarantee. An out-of-band change bumps no generation, so a
+    replica with a warm cache can keep serving the session until the next
+    generation change.
+  - Up to about 30 seconds while a replica's generation poll fails.
+  - Deleting an account and recreating it under the same name is keyed on the
+    username only, so a surviving session of the old account is not ended by
+    the check.
+  - The refusal writes no audit row. The evidence is the deactivation's audit
+    row plus the aggregate counter `yuzu_auth_session_account_inactive_total`.
+  - A deactivation can now fail with `503`, leaving the account active, when
+    its session write-generation write cannot complete (see
+    [Auth database recovery](../ops-runbooks/auth-db-recovery.md#scim--dashboard-deprovision-returns-500-sessions_db_error)).
+
+  Details: `docs/auth-architecture.md`, "Account state at session validation".
 - **Offload-target credentials** (`offload_target_store.offload_targets.auth_credential`)
   are `SecretCodec`-encrypted as of 2026-08-25 (ADR-0059). Same backup-pairing
   requirement as MFA TOTP secrets above: a Postgres dump alone cannot recover a
@@ -488,7 +527,7 @@ The agent deduplicates commands by `command_id` so a captured or redelivered com
   - **How you see it.** The agent logs an error naming the quarantined file, increments the agent-local counter `yuzu_agent_dedup_quarantined_total`, and reports the `yuzu.dedup_quarantined` heartbeat tag. `yuzu.dedup_degraded` stays `0` because protection is active again. The tag is a per-process value, so it returns to 0 when the agent restarts even though the quarantined files remain; the log line and the files themselves are the lasting record.
   - **What is kept.** Only the **newest 3** quarantined files are kept; older ones are removed automatically at the end of each recovery. They hold the same saved command responses as the live store (status, exit code and short error text, not streamed output), so treat them as sensitive as a precaution. Once reviewed they are safe to delete: remove every file matching `<data-dir>/command_dedup.db.corrupt-*`, which includes the `-wal`, `-shm` and `-journal` files that travelled with them. A normal uninstall does not remove them.
   - **What is not replaced.** A file that still opens but has a few damaged pages is deliberately **not** replaced (that would discard commands that are still running); the agent keeps using it and only the commands that hit a damaged page run undeduplicated, counted in `yuzu.dedup_claim_errors`.
-  - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
+  - **If it cannot recover.** If the file cannot be moved aside (for example a read-only directory, or a data directory on a filesystem without hard links, for example exFAT, or a network share whose server does not provide them: the quarantine claims its name with a hard link and never falls back to a plain rename), or the fresh store cannot be created afterwards (for example a full disk), the agent falls back to degraded mode as described above and `yuzu.dedup_degraded` is `1`; in the second case the history is already lost and the error names the kept file. Fix the directory's permissions, move the data directory to a filesystem with hard links (NTFS, ReFS, ext4, xfs or APFS), or free the space, or move the file away by hand, and restart the agent. Repeated `.corrupt-*` files on one endpoint mean the disk is corrupting the file on successive boots; check that disk.
   - **Unsupported.** Running two agent processes against one data directory is not supported; recovery protects the quarantined evidence from being overwritten, not the live store from the other process.
 
 No configuration is required — replay protection is on by default (see Degraded mode and Corrupt store recovery for the cases where it is not in force).
@@ -527,356 +566,366 @@ Because the degraded mode is fail-open, an agent can run for a long time without
 
 ## Device Quarantine
 
-The `quarantine` agent plugin isolates compromised or suspicious devices by blocking all network traffic except the Yuzu server connection. This allows continued management while preventing lateral movement.
+Device quarantine isolates a compromised or suspicious device by blocking all of its network
+traffic except the Yuzu server connection and what you list. The agent side is the `firewall`
+plugin's four containment actions; the server side is the quarantine record (`QuarantineStore`),
+the dispatch gate below, and a reconciler that keeps the two in step.
 
-### Quarantining a Device
+| Action | What it does |
+|---|---|
+| `firewall.quarantine` | Applies the containment: loopback, the agent's own control channel to the server, DHCP, DNS to the host's configured resolvers, IPv6 neighbour discovery and your exceptions stay reachable; everything else is blocked |
+| `firewall.release` | Removes the containment and restores the firewall state captured at apply time |
+| `firewall.quarantine_status` | Reads the containment from the device's record and its live firewall; never waits behind a mutation |
+| `firewall.quarantine_allow` | Adds or removes exceptions on an active containment |
 
-Execute the `quarantine` action from the `quarantine` plugin:
+The plugin uses platform-native firewalling: the Windows Firewall API (a rule group plus a
+per-profile default-block), an own `nftables` table (an `iptables`/`ip6tables` chain when `nft` is
+absent) on Linux, and an own `pf` sub-anchor on macOS. See the plugin's README for the per-OS
+mechanism, the reply rows and the limits.
+
+### Quarantining a device
+
+`POST /api/v1/quarantine` writes the record; the server's reconciler then dispatches the stored
+whitelist to the device within about one tick of it being connected. The MCP `quarantine_device`
+tool writes the record **and** dispatches at once. You can also run `security.firewall.quarantine`
+through the execution routes, but a dispatch outside the quarantine routes is not tied to a record
+(see "What confirmed means" below).
 
 ```bash
-curl -s -X POST http://localhost:8080/api/v1/executions \
+curl -s -X POST http://localhost:8080/api/v1/quarantine \
   -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
-  -d '{
-    "definition_id": "quarantine.quarantine",
-    "scope": "agent_id == \"compromised-agent-id\""
-  }'
+  -d '{"agent_id": "compromised-agent-id", "reason": "malware", "whitelist": "10.0.0.5"}'
 ```
 
-The plugin blocks all network traffic except communication with the Yuzu server using
-platform-native firewalling: `netsh` on Windows, `iptables` **and `ip6tables`** on Linux, and `pfctl` on macOS.
+### The whitelist (read this before quarantining a dual-stack host)
 
-### Whitelisting on a dual-stack host (read this before quarantining one)
+The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32 and at most 512
+characters in total**. Each address is sent to the plugin as an outbound and an inbound exception. A
+list over 512 characters is refused with `400` (`whitelist exceeds 512 characters`; about 13 full-length
+IPv6 addresses reach it, well under 32 entries). A port, a prefix length, an
+IPv4-mapped form (`::ffff:1.2.3.4`), an IPv4 octet with a leading zero or a host name is refused
+with `400`; nothing is silently dropped. Containment covers **both address families**: a v4-only
+whitelist leaves IPv6 fully contained.
 
-Containment covers **both address families**. On Linux the plugin installs the same
-`yuzu-quarantine` chain in `iptables` *and* `ip6tables`; each whitelist entry is routed to the
-chain matching its own family, so a **v4-only whitelist leaves IPv6 fully contained**.
-
-That is the correct posture — before this, an IPv6-capable host was never contained at all
-(#3282) — but it changes what a whitelist has to contain:
-
-- There is no blanket "keep existing connections alive" rule on either family — only a
-  whitelisted address's traffic survives, in any connection state (new, reconnecting, or
-  already established). The agent automatically whitelists its own configured server address
-  (`--server`) for this: an IP literal is used directly, and a hostname is resolved to its
-  address(es) **once, at agent startup** — never at quarantine time — covering whichever
-  families it resolves to at that point.
-- **Trust boundary: startup-time resolution uses the endpoint's own resolver.** This is a
-  deliberate improvement over resolving at quarantine time (which would let a host already
-  under active compromise steer its own containment exception via a poisoned `/etc/hosts` or
-  local resolver, right when quarantine is dispatched in response to that compromise) — but it
-  is not a trusted-channel guarantee against a resolver that was already compromised before or
-  at agent startup. For endpoints where containment integrity matters most, **configure `--server`
-  as an IP literal** rather than a hostname, removing DNS from the equation entirely.
-- If the agent's configured server address is a hostname that resolves to an IPv4 address but
-  the agent actually reaches the server over IPv6 through some other path (a split-horizon DNS
-  setup, a manually pinned route), or if the server's address changes after the agent last
-  started, the automatic whitelisting will not cover that path — **add the server's address to
-  the whitelist explicitly** in that case. The common case (the configured address resolves to
-  the address actually used, and doesn't change between agent restarts) needs no manual
-  whitelist entry for the server at all.
-- Whitelist entries that are neither valid IPv4 nor valid IPv6 (a hostname, a malformed literal)
-  are **skipped, and the skip is reported** — the plugin does not silently drop them and report a
-  clean success.
-- **On macOS, `whitelist` is a quarantine-time action.** It rebuilds and reloads the whole pf
-  ruleset, which includes the `block all` default-deny, and enables pf. Dispatching it at a device
-  that is *not* quarantined therefore isolates it. Use it to repair a contained device's
-  exceptions, which is what it is for; check `status` first if you are unsure of the device's
-  state.
-- If `ip6tables` is absent from the host, the v6 leg is reported as unavailable rather than
-  counted as applied.
-
-When in doubt, whitelist both families for the management server. An over-broad whitelist keeps
-the device manageable; a missing one requires physical or out-of-band access to recover.
+- There is no blanket "keep existing connections alive" rule on Linux: only an allowed address's
+  traffic survives, in any connection state. The agent allows its own control channel: the address it
+  is connected through when the quarantine is applied (published by the agent daemon from the
+  authenticated stream, never resolved on the contained host) plus every address the configured
+  server name resolved to **once, at agent startup**, on the server's port. **Configure `--server` as
+  an IP literal** on endpoints where containment integrity matters most, which removes the resolver
+  from the trust boundary entirely.
+- If the agent reaches the server by a path the startup resolution did not see (a split-horizon
+  setup, a pinned route, a server re-addressed after the agent started), **add the server's address
+  to the whitelist explicitly**: a contained device whose control channel is blocked needs
+  out-of-band recovery.
+- On macOS, `quarantine_allow` reloads the plugin's own anchor and flushes pf states once, so
+  connections the allow set does not cover are cut and **are not restored by a release**.
+- A device that cannot reach the server needs out-of-band recovery. When in doubt, whitelist both
+  families for the management server.
 
 ### Reading the result honestly
 
-The plugin reports on **two channels, and they carry different things**. `status|`/`state|` in the
-output line is the operator-readable detail; the ABI result status is what a generic
-success/failure consumer sees. Neither is allowed to say "clean" for a containment that is
-partial, unenforced, or unreadable.
+The plugin reports on two channels: the `status|<token>[|<reason>]` row in the output, and the ABI
+result status a generic consumer sees. Neither says "clean" for a containment that is partial,
+unenforced or unreadable.
 
-**Mutation actions** (`quarantine`, `unquarantine`, `whitelist`) emit `status|<token>`:
-
-| Token | Meaning | What to do |
+| `status\|` token | Meaning | What to do |
 |---|---|---|
-| `quarantined` | Every rule the host's supported families need was applied | Nothing |
-| `quarantined_partial` | Some rules applied, some did not — e.g. IPv4 contained, IPv6 not | Treat the device as **not contained**; the `note\|` field names what is missing |
-| `failed` | Nothing applied | Not contained |
-| `released` | Rules removed | Nothing |
-| `release_uncertain` | The release ran but its result could not be confirmed | Verify with `status`; the device may still be contained |
-| `updated` | *(`whitelist`)* The exception list was changed | Nothing |
-| `update_uncertain` | *(`whitelist`)* The edit ran but its result could not be confirmed | Treat the repair as **not applied**; confirm with `status` before relying on it. This is the outcome to watch for on the stranded-device recovery path above |
-| `busy` | Another mutating quarantine action on this device held the serialization gate for longer than the wait budget | Nothing was changed by this call — retry. Waiters are served in arrival order, so a release queued behind a burst of quarantines is not starved |
+| `active` | Containment is in force and the block was verified (the control channel answers, a probe target is blocked) | Nothing |
+| `active_unproven` | In force, but not proven: no probe target was given, or a verification failed | Treat as contained; supply a `probe_target` to prove it |
+| `inactive` | No containment | After a release, nothing; for a record that should be contained, the device is **not** |
+| `partial` | Contained but incomplete (a rule that would not disable, a stale rule, a state flush that failed, an operation in progress) | Treat as **not fully contained**; the `note\|` rows name the residue |
+| `degraded` | The host no longer enforces what the record says (a reboot, a flushed table, pf switched off, a Group Policy that took over) | The reconciler re-applies it; check the reason |
+| `refused`, `rolled_back`, `update_failed` | Nothing was changed, the first apply was undone, or an update failed | Read the reason token |
+| `busy` | Another containment change held the serialization gate for 2 seconds | Retry |
 
-**`quarantine.status`** emits `state|<token>`:
+Linux on the **packaged systemd unit** (`NoNewPrivileges`, no sudoers grant) refuses every mutating
+action `refused|privilege_unavailable`: `sudo` cannot elevate there, so a record on such a host stays
+unconfirmed and cannot be released from the server except by a forced end (below).
 
-| Token | Meaning |
-|---|---|
-| `active` | Containment is in force |
-| `partial` | Some of the expected rules are present and some are not — a real containment gap |
-| `degraded` | *(macOS)* A blocking pf ruleset is loaded but pf is **disabled** — traffic is not actually being blocked |
-| `uncertain` | The firewall state could not be read, so the answer is unknown |
-| `inactive` | Not quarantined |
+A result is a claim about firewall rules, not proof that traffic is blocked. For a device you
+believe is actively hostile, confirm with an independent probe.
 
-`status` returns a **non-zero exit code** on `degraded` and `uncertain`, and sets the ABI result
-status to `UNAVAILABLE`/`PARTIAL`, so automation that only inspects the return code cannot read an
-unenforced or unreadable host as a clean status. `partial` returns 0 but is reported `PARTIAL` on
-the result-status channel. `active` and `inactive` are genuine answers and return 0.
-
-A quarantine result is a claim about firewall rules, not proof that traffic is blocked — for a
-device you believe is actively hostile, confirm with an independent probe.
-
-### Checking Quarantine Status
+### Checking status
 
 ```bash
-# Execute quarantine.status to check if an agent is isolated
-curl -s -X POST http://localhost:8080/api/v1/executions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "definition_id": "quarantine.status",
-    "scope": "agent_id == \"agent-id\""
-  }'
+curl -s -X POST http://localhost:8080/api/v1/commands \
+  -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
+  -d '{"plugin": "firewall", "action": "quarantine_status", "agent_ids": ["agent-id"]}'
 ```
 
-### Releasing a Device
+### What confirmed means
 
-Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
-Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
-fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
-contained and confirm with `status`.
+The server **confirms** a record from `firewall.quarantine_status`: `status|active`, or
+`status|active_unproven` when the reply carries no `note|probe_target=` row (the server sends no probe
+target, so its own applies always read unproven; where a probe target is stored on the device, only a
+verified proof confirms). Confirmed means **the device reports its rules in force and enforcing**:
 
-You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
-releasing — the usual repair when a device has been contained without a reachable management
-address. `whitelist` is exempt from the dispatch gate below precisely so that repair stays possible.
+- it is the target agent's own self-report (bound to its certificate identity, so another agent cannot
+  forge it, but not independently corroborated by any network-side signal);
+- it is **not a reachability proof**;
+- the server does **not compare** the device's allow-list with the stored whitelist: a
+  `firewall.quarantine_allow` sent outside the quarantine routes changes the device and not the record,
+  and the record still reads confirmed;
+- the one difference the device itself reports is on a **new record for a device that is already
+  contained**. `firewall.quarantine` to a contained device keeps the exceptions already in force, and
+  when the request's exceptions differ from them (as a set, order aside) the reply carries
+  `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
+  server then does **not** confirm it and does not read status: the device is contained, but not under
+  this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
+  restart) is written, and
+  `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
+  the device.** To get it there, release the device and quarantine it again (the release ends the record
+  once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
+  earlier exceptions). A record that was confirmed once keeps the behaviour above: later allow-list
+  drift is not detected.
 
-### Checking Quarantine Status
+### Releasing a device
 
-```bash
-# Execute quarantine.status to check if an agent is isolated
-curl -s -X POST http://localhost:8080/api/v1/executions \
-  -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "definition_id": "quarantine.status",
-    "scope": "agent_id == \"agent-id\""
-  }'
-```
+`DELETE /api/v1/quarantine/{agent_id}` asks the device to lift its rules and waits up to 5 seconds:
+`200` when the device answers `status|inactive`, `202` otherwise. **A record ends only on the device's
+word, or by an operator's forced end** (below). Until then it
+reads `releasing`, stays listed, and keeps the dispatch refusal, so a device that still holds the
+containment is never treated as free. The reconciler reads the device's status first (`inactive` ends
+the record), otherwise sends `firewall.release` and reads status again, and no answer to the release
+itself ends anything. A record that cannot finish stays listed with commands refused until it is forced,
+and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device. That gauge carries no
+device label: find the devices with `GET /api/v1/quarantine` and read the records whose `status` is
+`releasing`.
 
-### Releasing a Device
+**How a `202` finishes.** There is no callback. The record leaves `GET /api/v1/quarantine` when the
+device confirms, and a `DELETE` repeated after that answers `400` (`device is not quarantined`), the
+same as for a device that was never quarantined: poll the list. A `202` is also the answer when the
+device did say `inactive` but an apply reached it, or was being sent to it, after that observation: the
+record could not end on a word the apply may have overtaken, so it stays `releasing` and the next
+status read settles it (the audit row's `detail` says `apply_in_flight=1`). The same holds for an apply
+sent before the release whose reply the reconciler has not read yet: about a minute after a reconciler
+apply, and up to 120 seconds after an MCP `quarantine_device` call, which reads no reply.
 
-Execute the `unquarantine` action to remove quarantine rules and restore normal network access. On
-Linux this tears down both the `iptables` and `ip6tables` chains; a release whose teardown does not
-fully succeed reports `release_uncertain`, not `released` — treat the device as possibly still
-contained and confirm with `status`.
+**The two ways a record ends, and no other:**
 
-You can also use `whitelist` to add exceptions (IP or CIDR range) to the quarantine rules before
-releasing — the usual repair when a device has been contained without a reachable management
-address. `whitelist` is the repair path for a device whose exceptions are wrong.
+1. The device answers `status|inactive` to a release (audit `quarantine.disable`, `confirmed`).
+2. An operator forces it with `DELETE ...?force=true` (audit names the operator and `reason=forced`).
+
+A device that reads `inactive` while its record is **active** ends nothing: it is read as drift (one
+`quarantine.reapply` failure row, `drift status=inactive`) and containment is re-applied. A time limit
+set on the device by a `firewall.quarantine` dispatch outside the quarantine routes (`ttl_seconds`) does
+not end the record either; the quarantine routes set no time limit.
+
+**Forced end (`?force=true`, REST only).** Use it for a device that will not return, or one that cannot
+finish a release (such as the Linux packaged unit, which refuses mutation). Authority is the release's
+own: scoped `Security:Execute`, the same-principal check and the dispatch check for `firewall.release`.
+It **does not release the device**: the device may still be contained, the server stops refusing
+commands to it, the reconciler sends the release it owes once per reconnect and once per server start
+(the bookkeeping is in memory, and a restart drops every device's stream anyway) and then parks the
+device after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert
+fires on it), and an operator can send `firewall.release` through the generic routes at any time.
+A forced end answers `released: false`, because the device's word is what `released` reports.
+`GET /api/v1/quarantine?include=release_owed` (MCP `list_quarantined_devices` with
+`include=release_owed`) lists the records that were ended by force and whose device has not yet
+confirmed a release, so the forced-end runbook can find them: each has `status: "release_owed"`. A device
+whose firewall plugin does not load cannot be released from the server at all (#7444).
+
+Until the device confirms that owed release, **the release lifts whatever containment the device holds,
+including one applied directly with `firewall.quarantine` after the forced end.** A containment sent
+outside the quarantine routes is not recorded, listed, re-applied or protected by the server. To keep
+the device contained, quarantine it again through the quarantine routes: the new record stops the owed
+release.
 
 ### Containment from the Hardware page
 
-> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and Containment tab) are not shown until an approval workflow for containment actions is added to the dashboard. Creating a quarantine record through `POST /api/v1/quarantine` (which the **Quarantine device** button calls) now runs the same dispatch approval check as the quarantine plugin's `quarantine` action, so with RBAC on only an administrator (account role `admin`) who also holds `Security:Execute` globally in their own right can create one through REST or the dashboard today (a JIT elevation supplies the administrator role but not the grant; with RBAC off the legacy gate already requires the `admin` role); there is no approval-request path on those surfaces yet, which is planned follow-up work. Releasing a record (`DELETE /api/v1/quarantine/{agent_id}`, the **Release from quarantine** button) is likewise administrator-only under the same conditions. The MCP tools and the quarantine plugin's actions on the Instructions page (role-gated approval) are unchanged.
+> **Hidden in this release.** The Hardware page controls described below (pill, panel, banner and
+> Containment tab) are not shown until an approval workflow lands; REST and MCP are unchanged.
 
-The dashboard shows and drives quarantine records without a separate page:
-
-- **Quarantined devices** panel on `/hardware` lists the active records you may read
-  (newest first, at most 200), with who quarantined the device, when, why, the whitelist and
-  how far containment has been shown to reach it: *Recorded* (the server holds the record),
-  *Applied, not confirmed* (a re-dispatch was accepted) or *Confirmed on device at the last status read* (a status
-  read reported the quarantine active; it is a point-in-time reading, not a live one). A read that cannot be completed is a banner, never
-  "no device is quarantined".
-- A **Quarantined** pill marks rows on the Hardware list, and the record header carries a
-  banner while the device has an active record. Instructions to a quarantined device are
-  withheld until it is released; Sync now still works.
-- The record's **Containment** tab shows the same state and offers **Quarantine device**
-  (a reason is required in the dialog) and **Release from quarantine**. Both call
-  `POST /api/v1/quarantine` and `DELETE /api/v1/quarantine/{agent_id}` and need
-  `Security:Execute` on the device. **Quarantine device** then also runs the dispatch
-  approval check for the `quarantine.quarantine` pair, before any record is written: the
-  caller must be an administrator or carry an approved request. REST has no ticket path today,
-  so with RBAC on a non-administrator who holds `Security:Execute` on the device is refused with
-  `403` (`approval_required`), and a caller who holds it only through a management group is
-  refused with `403` (`forbidden`), exactly as at the MCP `quarantine_device` pre-check; an
-  MCP supervised token remains the approved path for a non-administrator. A refused request
-  writes no record. **Release from quarantine** runs the same check for the `quarantine.unquarantine`
-  pair, so a caller who cannot create a record cannot end one: the same `403` answers apply, the
-  record stays active, and the refusal is audited as `quarantine.disable` with `result=denied`.
-  There is no REST or MCP path for a non-administrator to end a record; an administrator
-  releases it (a JIT elevation counts only if the account also holds `Security:Execute`
-  globally, otherwise the release is refused `forbidden`).
-- **Release ends the server record only.** It does not remove the device's firewall rules;
-  run the plugin's `unquarantine` action from the Actions tab for that. The reverse also
-  holds: the plugin's `unquarantine` alone does not end the record, and only an administrator
-  can (release through REST needs one), so while the record stays active the device is still
-  withheld from other instructions and the reconciler re-applies the stored isolation when it
-  next reconnects. Once the record is
-  released the lens reads "No active quarantine record" and cannot say whether the rules
-  were removed, so check the plugin's `status` action.
-- An offline device can be quarantined: the record is stored now and applied when the device
-  next connects.
+- **Quarantined devices** panel on `/hardware` lists the active records you may read (newest first,
+  at most 200) with who quarantined the device, when, why, the whitelist and how far containment has
+  been shown to reach it: *Recorded*, *Applied, not confirmed*, *Confirmed on device at the last status
+  read* (point-in-time) or *Releasing: waiting for the device to confirm*. A read that cannot be
+  completed is a banner, never "no device is quarantined".
+- A **Quarantined** pill marks rows on the Hardware list; the record header carries a banner while the
+  device has an active record. Instructions to a quarantined device are withheld until it is released;
+  Sync now still works.
+- The record's **Containment** tab offers **Quarantine device** and **Release device**. Both call the
+  REST routes and need `Security:Execute` on the device. They run the dispatch approval check for the
+  `firewall.quarantine` and `firewall.release` pairs before any record is written or release requested:
+  the caller must be an administrator or carry an approved request. REST has no ticket path today, so
+  with RBAC on a non-administrator who holds `Security:Execute` on the device is refused `403`
+  (`approval_required`), and a caller who holds it only through a management group `403` (`forbidden`).
+  A refused request writes no record and the record stays as it was. There is no forced end in the UI
+  or on MCP.
+- The release dialog says the record ends when the device confirms, and that an offline device is
+  released when it next connects.
+- An offline device can be quarantined: the record is stored now and applied when the device next
+  connects.
+- **The Actions lens.** While the containment UI is hidden, the Actions lens does not list the four
+  firewall containment actions (they are controls for the quarantine); `firewall.state` and
+  `firewall.rules` stay listed.
 
 **Diagnosing an unexpected `403` on quarantine creation or release.** Search the audit log for action
-`quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type `Security`, target id the device's agent id;
-`detail` holds `reason=<label> securable=<name>`. A `denied` row whose `detail` is `authenticated principal changed during the request now=<account>` is the `401` for a request whose two session look-ups named different principals, not an approval refusal. A refusal by the scoped permission gate itself
-(the caller has no `Security:Execute` on the device) is audited by that gate, not under
+`quarantine.enable` (create) or `quarantine.disable` (release), result `denied`, target type
+`Security`, target id the device's agent id; `detail` holds `reason=<label> securable=<name>`. A
+`denied` row whose `detail` is `authenticated principal changed during the request now=<account>` is a
+session that changed between the route's two look-ups. A refusal by the per-device scoped permission
+gate (the caller has no `Security:Execute` on the device) is audited by that gate, not under
 `quarantine.enable`. `yuzu_server_dispatch_denied_total{reason}` shows the fleet-wide trend only.
 
 | Reason label | What it means | What to do |
 |---|---|---|
-| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account, or MCP `quarantine_device` on the supervised tier. A JIT elevation that lapsed between the route's two checks reads the same way |
-| `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally; if the grant exists, check `yuzu_server_rbac_read_degrade_total` first, because a transient RBAC failure reads as a denial and retrying later can succeed |
-| `unclassified`, `ambiguous` | The quarantine action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
+| `approval_required` | RBAC is on and the account role is not `admin` (the RBAC `Administrator` role alone does not count) | Use an administrator account |
+| `forbidden` | The caller's own `Security:Execute` grant is not global (group-only, or administrator only through a JIT elevation), or the RBAC store could not be read | Grant it globally, or retry if the store was unavailable |
+| `unclassified`, `ambiguous` | The containment action could not be matched to one catalogue entry | Report it: this is a defect, not a permission problem |
 | (a `500`, no label) | The dispatch check is not wired on this server | Report it; the route fails closed and writes no record |
 
 ### Quarantine now blocks instruction dispatch (#881)
 
 A quarantined device is refused at the **server's dispatch chokepoint**, not only at its own
-firewall: any instruction targeting it — by id, by scope, by management group, or by broadcast —
-is dropped before it reaches the agent, and the refusal is audited as
-`quarantine.dispatch_denied`. Before this, quarantine isolated the network while the control
-plane carried on issuing commands to the device.
+firewall: any instruction targeting it, by id, by scope, by management group or by broadcast, is
+dropped before it reaches the agent, and the refusal is audited as `quarantine.dispatch_denied`.
 
 Two consequences worth planning for:
 
-- **The quarantine plugin's own actions are exempt** — `quarantine`, `unquarantine`, `status` and
-  `whitelist` still reach a contained device, so release stays possible. The exemption is keyed on
-  the action, not the plugin, so a future fifth action would be gated until it is deliberately
-  added. These four actions, and the Guardian rule push `__guard__.push_rules`, are also exempt
-  from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
-  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a
-  contained device. A kill-switch row for one of these pairs is still accepted and displayed, but
-  it is informational only and has no dispatch effect. To stop Guardian rule delivery during an
-  incident, disable or remove the rules instead; see
-  [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
+- **The firewall plugin's four containment actions are exempt**: `quarantine`, `release`,
+  `quarantine_status` and `quarantine_allow` still reach a contained device, so release stays possible.
+  The exemption is keyed on the `(plugin, action)` pair, so `firewall.state`, `firewall.rules` and any
+  later action are gated. These four actions, and the Guardian rule push `__guard__.push_rules`, are also
+  exempt from the per-plugin/action kill switch, the per-OS kill switch (and its agent-presence read),
+  the plugin-presence filter and a degraded plugin-config store, so none of them can strand a contained
+  device. **A plugin-level `firewall` kill-switch row never stops those four and still stops `state`
+  and `rules`**, so `protective_exempt=partial` on that row means "covers a protective action", not "gates
+  nothing". A kill-switch row for one of these pairs is still accepted and displayed, but it is
+  informational only. To stop Guardian rule delivery during an incident, disable or remove the rules
+  instead; see [Guaranteed State](guaranteed-state.md#baselines--how-guards-reach-agents).
 - **Four server-internal pushes are also exempt, and you should know they exist.** The Echo
   fleet-topology snapshot request (`echo.fleet_snapshot`), the Guardian rule push
-  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory
-  sync (`__sync__.now`) continue to reach a contained device. This is deliberate — gating the Guardian push would stop a quarantined device
-  receiving the enforcement rules that make containment meaningful — but it means the containment
-  boundary is not total, and a security review of the containment surface has to account for
-  those four channels. They are a closed set in code (`SystemReservedPush`) and are counted by
-  `yuzu_server_system_reserved_push_total{capability,result}`; a new one cannot be added without
-  appearing in that set. **They are counted, not audited** — there is no per-event row saying a
-  particular push reached a particular contained device, so this is a fleet-level signal rather
-  than per-device evidence. **Nothing outside that set and the plugin's own four actions reaches a
+  (`__guard__.push_rules`), the asset-tag sync (`asset_tags.sync`) and the on-demand inventory sync
+  (`__sync__.now`) continue to reach a contained device. This is deliberate (gating the Guardian push
+  would stop a quarantined device receiving the enforcement rules that make containment meaningful),
+  but it means the containment boundary is not total. They are a closed set in code
+  (`SystemReservedPush`) counted by `yuzu_server_system_reserved_push_total{capability,result}`. **They
+  are counted, not audited.** **Nothing outside that set and the four containment actions reaches a
   quarantined device.**
-
-  What that means for your threat model, channel by channel:
 
   | Channel | What it can do on a contained device |
   |---|---|
   | `echo.fleet_snapshot` | Requests a read-only topology/process snapshot. No state change. |
   | `asset_tags.sync` | Writes device tags. No code execution. |
-  | `__sync__.now` | Requests an on-demand inventory sync — it arms the agent's existing sync scheduler and nothing else. No code execution beyond the plugin's existing daily-sync path. |
-  | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**: the assertion vocabulary is a closed five-value set — file present/absent, file hash, registry value, service running, service stopped — and dangerous registry keys and service names are refused at the `dangerous_enforce_in_spec` chokepoint before a push is ever built. So an operator with Guardian deploy rights can still change *typed, bounded* state on a contained device while their `execute_instruction` is refused. That is deliberate — enforcing a security baseline on a compromised host is the point — but it is the one exempt channel that mutates the endpoint, so scope it accordingly. |
-- **If containment state becomes unreadable, dispatch fails closed** — the server refuses *every*
-  target rather than guess who is contained. A short store outage is absorbed by a 60-second
-  last-known-good snapshot; past that, instruction dispatch stops fleet-wide until the store
-  recovers. Alert on `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` — see
-  [Metrics](metrics.md) — because that series is an outage signal, not a quarantine signal.
+  | `__sync__.now` | Requests an on-demand inventory sync: it arms the agent's existing sync scheduler and nothing else. |
+  | `__sync__.settings` | Delivers the software collection settings that apply to the device: how often installed software is collected, in which window, and which collectors run. It changes only the agent's own collection schedule and collector switches, and the agent refuses any document that is not exactly the expected shape. No code execution. |
+  | `__guard__.push_rules` | Delivers Guardian baseline rules, which the agent may *enforce*. Enforcement is **not arbitrary command execution**. |
+- **If containment state becomes unreadable, dispatch fails closed**: the server refuses *every* target
+  rather than guess who is contained. A short store outage is absorbed by a 60-second last-known-good
+  snapshot; past that, instruction dispatch stops fleet-wide until the store recovers. Alert on
+  `yuzu_server_quarantine_gate_total{outcome="fail_closed"}` (see [Metrics](metrics.md)): that series is
+  an outage signal, not a quarantine signal.
 
-### Reconnect re-application (#3425)
+### Reconnect re-application (#3425), re-verify and drift
 
-A device quarantined while **offline** is contained at the control plane immediately (the #881
-dispatch gate above refuses it), but its own firewall cannot be touched until a dispatch actually
-reaches it — and an offline device cannot be reached. Before #3425, that gap was permanent until
-an operator noticed and manually re-issued the quarantine after the device came back.
+A device quarantined while **offline** is contained at the control plane immediately (the gate above
+refuses it), but its own firewall cannot be touched until a dispatch reaches it. The
+`QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:
 
-`QuarantineContainmentReconciler` closes it automatically. For every device with an active
-quarantine record whose endpoint containment is not yet confirmed:
+- **Trigger.** A heartbeat from the device (the fast path) or a periodic ~20-second tick (the
+  backstop). A heartbeat only **marks** the device due; it reads no store and dispatches nothing, so
+  heartbeat ingest never waits on the database. The reconciler thread, which does all of this work,
+  acts on the marks every second. Deliberately **not** agent registration itself: the command stream
+  does not exist yet there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
+  short grace window, confirm), so it spans a few heartbeat intervals from reconnect to a confirmed
+  record.
+- **What it dispatches.** The **stored** whitelist, mapped to the plugin's `exceptions` (`<ip>/out,<ip>/in`
+  per address): the same rule the MCP `quarantine_device` retry path follows, because dispatching
+  anything else would silently rewrite a contained device's allow-list with no store update and no
+  audit trail. It never dispatches a quarantine for a releasing record. A stored whitelist the mapper
+  refuses is not sent: it is audited (`quarantine.reapply` failure, the value never echoed) and counted
+  `validation_failed`.
+- **Re-verify and drift.** A confirmed record is re-read every 5 minutes while its device is connected,
+  and stays confirmed meanwhile (the unconfirmed gauge and its alert do not blink); the CONFIRMED audit
+  row is written once per transition. A re-verify that no longer confirms is read against the store
+  again before it is called **drift** (the record may have ended or begun releasing while the status
+  command was in flight): a failed read writes no row and re-verifies, a release requested in the
+  meantime makes it a release, and only a record that still reads active gets one `quarantine.reapply`
+  failure row (`drift status=<name>`, counted as `result="drift"`), then the next cycle re-applies
+  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires at three drift rows in an hour across
+  the server's devices (the counter has no device label; the audit rows name each device). A device whose live session changes (a reboot) re-verifies via status first, and a
+  record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
+  fresh apply. A confirm is checked against the session that was live when the verifying status was
+  sent. A restarted server applies first (its in-memory state starts empty), then reads status.
+- **A new record on a contained device.** See "What confirmed means": when the device says it kept
+  other exceptions, a record that was never confirmed is left unconfirmed, audited and alerted, and the
+  remedy is a release followed by a new quarantine.
+- **Release driving.** See "Releasing a device" above.
+- **The owed release.** A record ended by force before the device confirmed stays on a list until the
+  device does. Per agent session the reconciler reads status (`inactive` clears it, audited
+  `forced_release_confirmed`), otherwise sends `firewall.release` once (and only while a fresh read shows
+  no active record for the device: a device quarantined again is governed by its new record), reads
+  status again, and, if the device still does not read `inactive` after a release it answered, writes one
+  `forced_release_unconfirmed` failure row and parks it: a status-only read every 15 minutes and a new
+  release only on a new session. A `busy` answer (the device's mutation gate was held, so the release
+  did not run) does not spend the session's release: the reconciler waits an escalating backoff, reads
+  status and sends the release again, so a gate that stays busy costs at most one release and one
+  `forced_release_sent` row per 15 minutes. The bookkeeping that remembers a session's release is in
+  memory: a server restart sends the release once more (and writes the `forced_release_*` rows again),
+  which is harmless because a release is idempotent on the device.
+- **What the server keeps as evidence.** The reconciler's re-verify replies are working data, kept 24 hours (or forever on a server set to keep responses forever). What lasts is the record's `last_confirmed_at` stamp, which every confirming re-verify moves, the audit rows written on each change (`CONFIRMED`, `drift`, the release rows, `forced_release_unconfirmed`) and the counters; no reply is kept as proof that re-verify kept running. The lasting evidence for a parked owed release is its `forced_release_unconfirmed status=<name>` row, not the reply.
+- **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
+  trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
+  rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
+  release-then-requarantine race stays distinguishable.
+- **Observability.** `yuzu_server_quarantine_endpoint_unconfirmed{reachability}`,
+  `yuzu_server_quarantine_release_pending{reachability}` and
+  `yuzu_server_quarantine_forced_release_owed{reachability}` are per-replica gauges, never summed across
+  instances; `offline` is expected and not alerted on, a sustained `connected` count is the signal
+  (`YuzuQuarantineEndpointUnconfirmed`, `YuzuQuarantineReleasePending` in [Metrics](metrics.md)).
+  `yuzu_server_quarantine_reapply_total{result}` breaks down every outcome (`reapplied`, `confirmed`,
+  `unconfirmed`, `drift`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
+  `validation_failed`, `dispatch_error`, `release_sent`, `released`).
+  `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes an empty queue from a tick that
+  could not read at all: check it first when a gauge looks suspiciously static.
+  `yuzu_server_quarantine_reconciler_last_tick_unixtime` is when a tick last finished, and
+  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for about ten minutes
+  (five minutes stale, held for five): while it fires, the gauges above are frozen at their last values.
 
-- **Trigger.** A heartbeat from the device (the fast path — the reconciler no longer holds a
-  reconnecting device to a stale offline-tick's claim window, so the first
-  post-reconnect heartbeat is eligible to dispatch immediately) or a periodic ~20-second tick (the
-  backstop — catches anything the heartbeat path missed, and everything before the reconciler's
-  heartbeat hook was wired). Deliberately **not** agent registration/reconnect itself: the gRPC
-  command stream is not yet established at that point, so a dispatch fired from there would be
-  silently dropped. Full end-to-end confirmation is **not** one heartbeat interval — it is a real
-  state machine (apply, a follow-up `quarantine.status` verify after a short grace window, then
-  confirm), so it typically spans a few heartbeat intervals from reconnect to a confirmed record,
-  not one; the `#881` gate holds containment at the control plane for the entire span regardless.
-- **What it dispatches.** The **stored** `reason`/`whitelist` — the same rule the MCP
-  `quarantine_device` retry path (#3127) follows, for the same reason: dispatching anything else
-  would silently rewrite a contained device's firewall allow-list with no store update and no
-  audit trail.
-- **Confirmation.** Dispatch acceptance alone is not proof of containment (a gateway-attached
-  agent's `send_to` only queues the frame). The reconciler follows up with a `quarantine.status`
-  read and only marks the device confirmed once it answers `state|active`. **This is the target
-  agent's own self-report** — cert-bound to the correct agent identity (a different agent cannot
-  forge it), but not independently corroborated by any network-side signal. A device whose
-  quarantine plugin or execution environment is itself tampered could in principle reply
-  `state|active` regardless of its true firewall state; the `#881` dispatch-confinement gate does
-  not key off `last_confirmed_at`, so a false confirmation narrows to false operator/audit
-  assurance rather than widening what commands can reach that device. This is the same trust
-  boundary #3127's MCP `already_active` retry path already relies on, not new to this feature. A
-  previously-confirmed device re-verifies on either of two independent signals checked every
-  tick: its live agent session changes (a reboot, a service restart — the firewall rules from
-  before the restart are gone — re-verifies via `status` first, rather than blindly
-  re-applying), or its active `QuarantineStore` record is replaced (released, then
-  requarantined — possibly with a different whitelist — while the agent stayed connected the
-  whole time, so a session change alone would never have caught it — resets straight to a fresh
-  apply instead, since a status check would say nothing about whether the NEW record's whitelist
-  was ever applied). A
-  confirm is additionally checked against the session that was live when the verifying `status`
-  dispatch was actually sent, not just whatever session is live at confirm time, closing a narrow
-  reboot window in between that would otherwise attribute a stale session's status read to a new
-  one. **Confirmation is point-in-time, not continuous**: once confirmed, a device is not asked
-  again unless one of those two signals fires — if something *other* than a session or record
-  change clears its firewall rules out-of-band (an OS firewall daemon restart, an unrelated admin
-  `iptables -F`/`netsh advfirewall reset`), this component does not notice and does not re-verify.
-  Ongoing drift detection outside those cases is Guardian/DEX's domain, not this component's.
-- **Concurrency.** The shipped agent-side quarantine plugin's `do_status` answers `active`/`inactive`,
-  and a `status|busy` response is possible on all three platforms once a mutating action (`quarantine`/
-  `unquarantine`/`whitelist`) is already in flight (#3429's mutation-serialization gate). The
-  reconciler parses `busy` defensively (`quarantine_reapply.hpp`) and treats it as "already being
-  handled," not a failure. Either way, the reconciler does not retry until its own per-agent backoff
-  (starting at 60s, doubling up to a 15-minute cap on repeated non-confirmation, reset on confirm)
-  elapses.
-- **Audit.** A system-initiated re-application is audited under `quarantine.reapply`
-  (`principal: system`), distinct from an operator-initiated `quarantine.enable`/`quarantine.disable`
-  — detail carries `record_id=<id> command_id=<id> trigger=tick|heartbeat`, or
-  `CONFIRMED record_id=<id> command_id=<id>` once containment is verified. `record_id` is the
-  internal `QuarantineRecord::id` the reapply cycle was built from — it keeps a
-  release-then-requarantine race for the same device distinguishable across the two quarantine
-  episodes in the audit trail, matching the record-identity scoping the store write itself
-  already applies.
-- **Observability.** `yuzu_server_quarantine_endpoint_unconfirmed{reachability="connected"|"offline"}`
-  is a per-replica gauge — never sum it across server instances — counting active records not yet
-  confirmed contained. `reachability="offline"` is expected and not alerted on (a device quarantined
-  while off is legitimately unconfirmed for its whole offline duration); a sustained
-  `reachability="connected"` count is the genuine divergence signal — see
-  `YuzuQuarantineEndpointUnconfirmed` in [Metrics](metrics.md). `yuzu_server_quarantine_reapply_total{result}`
-  breaks down every outcome (`reapplied`, `confirmed`, `unconfirmed`, `busy`, `offline`,
-  `not_reached`, `rate_limited`, `pending`, `degraded`, `validation_failed`, `dispatch_error`).
-  `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes a genuinely-empty confirm
-  queue from a tick that couldn't read at all — check it first when
-  `yuzu_server_quarantine_endpoint_unconfirmed` looks suspiciously static, since that gauge
-  freezes rather than reflecting an outage.
+**The apply fence, and what it does not close.** A record ends on the device's `inactive` answer, and an
+apply that reaches the device after the observation that produced that answer would leave the device
+contained with no record naming it. Two parts close that:
 
-A manual re-issue of `quarantine_device` (MCP) still works and re-drives the same stored intent —
-it is redundant with the automatic reconciler, never required, and never harmful.
+- Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
+  record, which moves a durable apply generation. A dispatch that returned is not a delivery (a gateway
+  only queues the command), and a delivered command is not a run (the agent executes commands on a
+  thread pool, and the firewall plugin takes its own gate in the order its workers reach it). So an apply
+  that reached a device **keeps its claim** until the reconciler has read the apply's reply, and
+  otherwise until the claim stops counting; while it is held no generation is issued and no end is
+  accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
+  reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
+  120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The
+  server also keeps the claims it stamped on its own monotonic clock for the same 120 seconds, so a
+  step of the database's clock cannot make one of them read expired early; after a restart (or for a
+  claim another replica stamped) the database clock alone judges the window. MCP
+  `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
+  release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
+  seconds; the second call answers a retryable fault.
+- Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
+  answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
+  write that ends the record presents it. The store refuses the end when an apply was claimed since
+  (`apply_in_flight`). The record then stays `releasing` and the next status read takes a fresh
+  generation and settles it. A forced end rests on no observation and is not refused.
 
-**Known limitation.** A device released (`DELETE /api/v1/quarantine/{agent_id}`) at the exact moment
-the reconciler is mid-reapply for it can end up re-firewalled just after its record becomes released —
-a narrow timing window, not a routine occurrence. If nothing else happens to the device, this is
-over-containment, not a containment gap: the device stays isolated a cycle longer than intended, never
-less isolated than the record says.
+This relies on commands to one device arriving in the order one server dispatched them (one stream, a
+first-in first-out gateway queue). **Still open:** a transport that reorders commands to one device;
+an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (an
+apply that stays unexecuted that long is ignored); and the two check-then-dispatch windows below. In each the
+trace is the same, a `quarantine.reapply` failure row and a device that is contained under no record or
+a releasing one, and the way back is `firewall.release` sent through the generic command routes.
 
-If the device is instead **immediately re-quarantined with a different whitelist** — not just
-released — the guarantee weakens: the reconciler already read the OLD record's whitelist and may
-dispatch it to the endpoint after the NEW record (a different reason, a different whitelist)
-becomes active. The store write is still safe (the id-scoped guarded update refuses to stamp
-the stale dispatch onto the new record, and the `quarantine.reapply` audit row now names the OLD
-record's `record_id` so the episode is distinguishable after the fact) —
-but for up to one reconciler cycle the *endpoint* can be enforcing a whitelist that is looser or
-tighter than the one the active record currently states, until the next tick/heartbeat notices the
-new record is unconfirmed and re-dispatches its real whitelist. If you release and immediately
-re-quarantine the same device with a different whitelist, a follow-up `quarantine.status` check is a
-reasonable sanity step until this closes. Tracked for a proper fix (a claim/generation token on the
-active record, extended to cover this dispatch-time case as well as the store-write case it was
-originally scoped for).
+The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
+same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
+within 5 minutes). The same outcome follows when a release sent earlier is run by the device after a later
+record's apply, because commands are not ordered on the device: the new record can be confirmed and the
+device then released, uncontained until the re-verify re-applies it. If you release and immediately
+re-quarantine the same device with a different whitelist, a follow-up `firewall.quarantine_status` check
+is a reasonable sanity step.
 
 ## IOC Checking
 
@@ -909,6 +958,8 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
   }'
 ```
 
+**Domain checks and the Windows DNS cache.** On Windows a `domains` check reads the resolver cache once per command. If the cache cannot be read (the DNS API is unavailable, or returns failure, which some Windows 11 builds do on every call), the result is marked **constrained / partial** with provenance `windows:ioc:dns_cache_unreadable`, and each domain row says `DNS resolver cache could not be read`. Treat that as **unknown, not clean**: a constrained domain answer says nothing about whether the endpoint resolved the domain. Earlier builds reported `Not in DNS cache` in this case. At most 100 domains are accepted per command; more is refused whole with `error|domains|false|Too many domains (N, max 100)`.
+
 IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
 
 ## Certificate Inventory
@@ -937,7 +988,7 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
 - **Use an `https` issuer only, and never `--oidc-skip-tls-verify` outside a lab.** The server fetches the issuer's JWKS and trusts it as the signature key for every ID token, and sends the client secret to the token endpoint, both over the issuer's own scheme. With an `http://` issuer, or with TLS verification off, anyone who can sit on the network path (or poison the issuer's DNS name) can substitute the keys and mint a sign-in for any user, up to the administrator group, and can read the client secret. The server logs a warning for an `http://` issuer on a non-loopback host. Plain `http://` to a PUBLIC address is refused outright (no switch; the error is `plain http is not permitted to a public address`), which closes the internet man-in-the-middle case; `http://` to a loopback or private address is allowed only with `--oidc-allow-private-networks` and stays exposed to anyone on that network path (keys, token response and client secret in the clear), so it is a lab setup.
-- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
+- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the IPv4 address they embed too, never as more open than non-global, and plain http to such a form of a public address is refused by the cleartext rule; a local-use NAT64 address (`64:ff9b:1::/48`) that no configured or learned prefix covers is refused whatever the switch says. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. On Linux and macOS the OIDC name lookups run in a pool of 16 slots (gauge `yuzu_server_oidc_resolver_in_flight`), a lookup the resolver does not finish keeps its slot until the resolver returns, and further lookups fail closed at once while the pool is full, while the name already has 8 lookups outstanding, while lookups for 64 names are outstanding, when the admission check does not complete, and for 3 s after a lookup of the same name was refused or timed out (a refusal is never an allow; the pool, the name limit and the memory are per server process, so under high availability each replica has its own; the `ipv4only.arpa` prefix lookup is exempt from the name limit and the 3 s memory, and the pool's cap is its only bound); a known residual is that a failed or timed-out `ipv4only.arpa` prefix lookup is remembered as failed for 1 minute, during which IPv6 destinations are classified with the prefixes already learned (none on a fresh start; on a DNS64 network set `--oidc-nat64-prefix`); a translated private address inside a prefix the server has not learned is classified as public while the prefix lookup is unanswered, and while the probe is refused (the pool is full or no worker could be started), IPv6 destinations are classified with the prefixes already learned (none on a fresh start) and without a fresh probe, which is tried again on the next fetch. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
 
 > **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
 > Releases up to and including v0.13.0 emitted the value in the clear to three places - the

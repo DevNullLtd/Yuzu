@@ -19,9 +19,11 @@
  * scope expansion that PR 3 wires into /push.
  */
 
+#include "agent_decommission.hpp"
 #include "auth_routes.hpp"
 #include "baseline_store.hpp"
 #include "dex_app_perf_model.hpp" // the app-perf read types (slice-2)
+#include "dispatch_denial.hpp"    // #7114: the chokepoint refusal the live stub can return
 #include "guaranteed_state_store.hpp"
 #include "management_group_store.hpp"
 #include "mfa_step_up.hpp"
@@ -32,9 +34,12 @@
 #include "rbac_store.hpp"
 #include "response_store.hpp"
 #include "dex_api_local.hpp" // ADR-0031 WS-A4: wire the real DexApi seam so the DEX REST cases exercise it
+#include "guardian_order_json.hpp" // UP-14 A5a: the shared rendering of the ordering block
 #include "guardian_api_local.hpp" // ADR-0031 WS-A4 (ninth family): wire the real GuardianApi seam
+#include "mcp_retry.hpp" // kGuardianCensusDeviceTimeoutMessage/Remedy: the 57014 response wording (#7217)
 #include "rest_api_v1.hpp"
 #include "test_dex_perf_api_double.hpp"
+#include "test_events_table_lock.hpp"
 #include "test_forensics_tier_fixture.hpp" // #4990
 #include "test_guardian_api_double.hpp" // ADR-0031 WS-A4 (ninth family): FnGuardianApi
 #include "test_network_api_double.hpp"
@@ -58,9 +63,11 @@
 #include "test_rbac_store_pg_helper.hpp" // RbacStorePg — RbacStore is PG-only (ADR-0041)
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <expected>
 #include <filesystem>
+#include <format>
 #include <memory>
 #include <shared_mutex>
 #include <stdexcept>
@@ -145,6 +152,10 @@ struct RestGsHarness {
     // response row. live_sent toggles the offline path.
     std::unique_ptr<ResponseStore> resp_store;
     int live_sent{1};
+    /// #7114: when set, the dispatch stub answers as the chokepoint does for a refused pair (sent 0,
+    /// the denial on the outcome); `live_dispatches` counts the dispatches the route made.
+    std::optional<yuzu::server::detail::DispatchDenial> live_denied;
+    int live_dispatches{0};
     std::string last_live_plugin, last_live_action;
     /// #1788: the confinement set the /live handler derived and threaded into
     /// dispatch. The per-device scoped_perm_fn gate remains this route's
@@ -244,6 +255,11 @@ struct RestGsHarness {
     // still fails closed with Sec-Audit-Failed rather than letting it escape.
     bool audit_throws{false};
 
+    // Runs inside every audit write with its result: the window in which production lets a
+    // grant, an elevation or a session move between the route's first decision and its dispatch
+    // (#7110).
+    std::function<void(const std::string& result)> on_audit;
+
     // When false, the live deps (response_store + command_dispatch_fn) are left
     // unwired so a test can prove /live → 503 when the substrate is unavailable.
     bool wire_live_deps{true};
@@ -275,6 +291,16 @@ struct RestGsHarness {
     // (the stub, not elevation) — see those tests' own comments. Default
     // false: every pre-existing test in this file is unaffected.
     bool wire_real_dex_perm_{false};
+
+    // GET /api/v1/dex/apps/usage: what the usage read returns, read lazily at request time like
+    // dex_fleet_override_ (empty = an engaged empty read). `usage_reads` counts the reads that
+    // reached it, so a refused request can prove the read never ran; `last_usage_query` is the
+    // query the model built.
+    std::function<std::expected<yuzu::server::DexUsageRead, std::string>(
+        const yuzu::server::DexUsageQuery&)>
+        usage_read_for_test;
+    int usage_reads{0};
+    yuzu::server::DexUsageQuery last_usage_query;
 
     std::vector<AuditRecord> audit_log;
 
@@ -452,9 +478,12 @@ struct RestGsHarness {
                    const std::unordered_map<std::string, std::string>&, const std::string&,
                    const yuzu::server::DispatchCaller& caller)
             -> yuzu::server::ConfinedDispatchOutcome {
+            ++live_dispatches;
             last_live_plugin = plugin;
             last_live_action = action;
             last_live_exec_visible = caller.exec_visible;
+            if (live_denied)
+                return {.command_id = plugin + "-live", .denied = live_denied};
             // Model what the production seam does to the Ids arm rather than
             // ignoring the set the route just derived — otherwise this fake
             // reports a successful dispatch whatever confinement decided, which
@@ -495,7 +524,8 @@ struct RestGsHarness {
                               const std::string& operation) -> bool {
             if (wire_real_dex_perm_ && securable_type == "GuaranteedState" &&
                 operation == "Read" &&
-                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview"))
+                (req.path == "/api/v1/dex/app" || req.path == "/api/v1/dex/overview" ||
+                 req.path == "/api/v1/dex/apps/usage"))
                 return auth_routes_->require_permission(req, res, securable_type, operation);
             if (grant_perms)
                 return true;
@@ -575,6 +605,8 @@ struct RestGsHarness {
             if (audit_throws)
                 throw std::runtime_error("audit store unavailable (test)");
             audit_log.push_back({action, result, target_type, target_id, detail});
+            if (on_audit)
+                on_audit(result);
             return audit_succeeds;
         };
 
@@ -631,14 +663,49 @@ struct RestGsHarness {
         // exercise the SEAM path (production wires it identically). Gated on
         // store presence exactly like server.cpp — null store → null api → 503.
         std::shared_ptr<yuzu::server::DexApi> dex_api_local;
-        if (store && wire_dex_api_)
+        if (store && wire_dex_api_) {
+            // The usage reads behind GET /api/v1/dex/apps/usage. group_members mirrors server.cpp's
+            // closure over this harness's management group store, in the same order (members
+            // first, then the group's existence): unknown_group (no such group) is told apart from
+            // group_unavailable (a failed read).
+            yuzu::server::DexUsageWiring usage;
+            usage.read = [this](const yuzu::server::DexUsageQuery& q)
+                -> std::expected<yuzu::server::DexUsageRead, std::string> {
+                ++usage_reads;
+                last_usage_query = q;
+                if (usage_read_for_test)
+                    return usage_read_for_test(q);
+                return yuzu::server::DexUsageRead{};
+            };
+            usage.group_members = [this](const std::string& id)
+                -> std::expected<std::vector<std::string>, std::string> {
+                const auto members = mgmt_.get_members_checked(id);
+                if (!members)
+                    return std::unexpected(std::string("group_unavailable"));
+                const auto group = mgmt_.get_group_checked(id);
+                if (!group)
+                    return std::unexpected(std::string("group_unavailable"));
+                if (!*group)
+                    return std::unexpected(std::string("unknown_group"));
+                std::vector<std::string> ids;
+                for (const auto& m : *members)
+                    ids.push_back(m.agent_id);
+                return ids;
+            };
+            usage.tag_values = [](const std::string&)
+                -> std::optional<std::unordered_map<std::string, std::string>> {
+                return std::unordered_map<std::string, std::string>{};
+            };
+            usage.observation_retention_days = 30;
             dex_api_local = yuzu::server::make_local_dex_api(
                 store.get(), [this]() { return dex_fleet_override_; },
                 [this]() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
                     if (dex_policy_fn_for_test)
                         return dex_policy_fn_for_test();
                     return yuzu::server::DexPolicyInForce{};
-                });
+                },
+                /*observer_fn=*/{}, std::move(usage));
+        }
 
         // ADR-0031 WS-A4 (sixth family): the REAL DexPerfApi seam wrapping
         // this harness's existing dex_perf_fn_/app_perf_providers_ function
@@ -2861,8 +2928,20 @@ TEST_CASE("OpenAPI lists /dex/devices/{id} and the whole spec still parses",
     // The operation description names the policy block, the profile marker, the
     // refused-policy fault and the 60 s staleness bound behind the 503.
     const auto op_desc = spec["paths"]["/dex/apps"]["get"]["description"].get<std::string>();
-    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)"})
+    for (const char* concept_word : {"data.policy", "profile", "fault", "staleness bound (60 s)",
+                                     "observer_state", "statement_timeout", "interval_confidence"})
         CHECK(op_desc.find(concept_word) != std::string::npos);
+    // The schemas the payload keys belong to describe them (#7504, #7519, #7537).
+    const auto& schemas = spec["components"]["schemas"];
+    CHECK(schemas["DexAppsList"]["properties"].contains("observer_state"));
+    CHECK(schemas["DexAppsList"]["properties"]["policy"]["properties"].contains("interval_confidence"));
+    CHECK(schemas["DexAppsStabilityScore"]["properties"].contains("tier"));
+    const auto withheld = schemas["DexAppsStabilityScore"]["properties"]["withheld"]["description"].get<std::string>();
+    for (const char* token : {"no_population", "invalid_weights", "invalid_edges", "invalid_model", "inconsistent",
+                              "below_floor", "offline_affected"})
+        CHECK(withheld.find(token) != std::string::npos);
+    CHECK(schemas["DexAppPerfInterval"]["properties"]["reliable"]["description"].get<std::string>().find(
+              "affected online devices") != std::string::npos);
 }
 
 // ═══ #4035 (api-parity #2146 Batch A): the 8 genuinely-new DEX REST twins ═══
@@ -3039,6 +3118,16 @@ TEST_CASE("REST dex/apps: app-centric stability list, no audit (aggregate)",
         CHECK(policy["tiers"][t]["edge"].is_number());
         CHECK(policy["tiers"][t]["name"].is_string());
     }
+    // #7504, #7519: the interval level, the resolved tier name per score, the live observer split.
+    CHECK(policy["interval_confidence"].get<double>() == Catch::Approx(0.95));
+    REQUIRE(j["data"].contains("observer_state"));
+    CHECK(j["data"]["observer_state"].is_null()); // no observer source in this harness
+    for (const auto& a : j["data"]["apps"]) {
+        REQUIRE(a["score"].contains("tier"));
+        CHECK((a["score"]["tier"].is_string() == !a["score"]["score"].is_null()));
+        for (const auto& v : a["versions"])
+            CHECK(v["score"].contains("tier"));
+    }
 }
 
 TEST_CASE("REST dex/apps: an intact empty store is a 200 with an empty list, not a 503",
@@ -3072,6 +3161,8 @@ TEST_CASE("REST dex/apps: a degraded store read -> 503 with retry_after_ms, neve
     CHECK(j["error"]["code"] == 503);
     CHECK(j["error"]["retry_after_ms"] == 2000);
     CHECK(res->body.find("\"apps\"") == std::string::npos);
+    // The message names the cause (#7520): a dropped table is a query error.
+    CHECK(j["error"]["message"].get<std::string>().find("(query_error)") != std::string::npos);
 }
 
 TEST_CASE("REST dex/apps: an unreadable score policy -> 503 naming the reason and never an empty list",
@@ -3131,6 +3222,455 @@ TEST_CASE("REST dex/apps: an unknown platform is a 400 with no retry hint",
         CHECK(j["error"]["retry_after_ms"].is_null());
         CHECK(res->get_header_value("Retry-After").empty());
     }
+}
+
+// ── GET /api/v1/dex/apps/usage ───────────────────────────────────────────────
+//
+// Gate 1 is perm_fn(GuaranteedState, Read) and gate 2 is the REAL require_fleet_read(Forensics,
+// Read), so every request below carries a real session (status_route_headers()). The harness
+// stub grants gate 1 unless a case flips grant_perms or wire_real_dex_perm_.
+
+namespace {
+
+constexpr const char* kUsageRoute = "/api/v1/dex/apps/usage";
+
+// One application (chrome.exe) with crash observations on two online devices.
+void seed_usage_fixture(RestGsHarness& h) {
+    h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    h.seed_obs("u2", "WS-2", "process.crashed", "chrome.exe", "windows", "2026-06-10T11:00:00Z");
+    h.dex_fleet_override_.connected_agents = {{"WS-1", "windows"}, {"WS-2", "windows"}};
+    h.dex_fleet_override_.total_online = 2;
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        yuzu::server::DexUsageRead r;
+        r.cells.push_back({0, 0, 2, 2, 0, 10, 7200});
+        r.events.push_back({0, 2, 0});
+        r.reporting_devices = 2;
+        r.stale_devices = 0;
+        return r;
+    };
+}
+
+} // namespace
+
+TEST_CASE("REST dex/apps/usage: an administrator gets the aggregate, one audit row, no agent id",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto apps_before = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(apps_before);
+
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    const auto j = nlohmann::json::parse(res->body);
+    const auto& d = j["data"];
+    CHECK(d["window"] == "all");
+    CHECK(d["platform_scope"] == "all");
+    CHECK(d["slice"]["kind"] == "fleet");
+    CHECK(d["slice"]["key"].is_null());
+    CHECK(d["basis"] == "estimated_from_30_day_usage");
+    CHECK(d["freshness_window_hours"] == 48);
+    CHECK(d["floor"] == 1);
+    CHECK(d["floor_scope"] == "per_table");
+    CHECK(d["population"] == 2);
+    CHECK(d["reporting_devices"] == 2);
+    CHECK(d["stale_devices"] == 0);
+    CHECK(d["as_of"].is_string());
+    REQUIRE(d["apps"].size() == 1);
+    CHECK(d["apps"][0]["subject"] == "chrome.exe");
+    CHECK(d["apps"][0]["state"] == "matched");
+    CHECK(d["apps"][0]["devices"] == 2);
+    CHECK(d["apps"][0]["run_seconds_30d"] == 7200);
+    CHECK(d["apps"][0]["launches_30d"] == 10);
+    // Window all has no length, so the rate is withheld by name, never reported as zero.
+    CHECK(d["apps"][0]["exposure_rate"].is_null());
+    CHECK(d["apps"][0]["rate_withheld"] == "unbounded_window");
+    // No agent id anywhere in the body.
+    CHECK(res->body.find("WS-1") == std::string::npos);
+    CHECK(res->body.find("WS-2") == std::string::npos);
+
+    // The rows are the Apps rows, in order.
+    const auto apps = nlohmann::json::parse(apps_before->body)["data"]["apps"];
+    REQUIRE(apps.size() == d["apps"].size());
+    for (std::size_t i = 0; i < apps.size(); ++i)
+        CHECK(apps[i]["subject"] == d["apps"][i]["subject"]);
+
+    // Exactly one audit row, before the read, naming the request shape and no agent.
+    REQUIRE(h.audit_log.size() == 1);
+    const auto& a = h.audit_log[0];
+    CHECK(a.action == "dex.apps.usage.view");
+    CHECK(a.result == "success");
+    CHECK(a.target_type == "Forensics");
+    CHECK(a.target_id.empty());
+    CHECK(a.detail.find("cid=") != std::string::npos);
+    CHECK(a.detail.find("window=all") != std::string::npos);
+    CHECK(a.detail.find("platform=all") != std::string::npos);
+    CHECK(a.detail.find("slice=fleet") != std::string::npos);
+    CHECK(a.detail.find("floor=1") != std::string::npos);
+    CHECK(a.detail.find("WS-") == std::string::npos);
+    CHECK(h.usage_reads == 1);
+
+    // The Apps list itself is unchanged by the new route, and still unaudited.
+    const auto apps_after = h.sink.Get("/api/v1/dex/apps?window=all");
+    REQUIRE(apps_after);
+    CHECK(apps_after->body == apps_before->body);
+    CHECK(h.audit_log.size() == 1);
+}
+
+TEST_CASE("REST dex/apps/usage: zero devices online is a 200 of no usage, not a refusal",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    h.seed_obs("u1", "WS-1", "process.crashed", "chrome.exe", "windows", "2026-06-10T10:00:00Z");
+    // dex_fleet_override_ stays empty: nothing is online.
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["population"] == 0);
+    REQUIRE_FALSE(d["apps"].empty());
+    for (const auto& a : d["apps"]) {
+        CHECK(a["state"] == "no_usage");
+        CHECK(a["run_seconds_30d"].is_null());
+    }
+}
+
+TEST_CASE("REST dex/apps/usage: a non-administrator is refused by the Forensics floor, with no audit and no read",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.session_user = "plain_user";
+    h.session_role = auth::Role::user;
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+}
+
+TEST_CASE("REST dex/apps/usage: a caller without GuaranteedState:Read is refused before the Forensics gate",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.grant_perms = false; // gate 1 (the stub) refuses
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+// Gate composition with the REAL require_permission at gate 1 (wire_real_dex_perm_) and RBAC on:
+// both gates must pass. The positive control comes first so the refusals below are not a stub.
+TEST_CASE("REST dex/apps/usage: RBAC on needs BOTH GuaranteedState:Read and Forensics:Read",
+          "[pg][rest][dex][apps][usage][adr0017]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    h.session_role = auth::Role::user;
+
+    REQUIRE(h.rbac_.create_role({"UsageBoth", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageBoth", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageBoth", "Forensics", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "both_user", "UsageBoth"}).has_value());
+    h.session_user = "both_user";
+    auto ok = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(ok);
+    CHECK(ok->status == 200);
+    CHECK(h.audit_log.size() == 1);
+    CHECK(h.usage_reads == 1);
+
+    // Viewer-shaped: GuaranteedState:Read only. Gate 2 refuses; no audit row, no read.
+    REQUIRE(h.rbac_.create_role({"UsageViewer", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageViewer", "GuaranteedState", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "viewer_user", "UsageViewer"}).has_value());
+    h.session_user = "viewer_user";
+    auto viewer = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(viewer);
+    CHECK(viewer->status == 403);
+
+    // ForensicsAnalyst-shaped: Forensics:Read without GuaranteedState:Read. Gate 1 refuses.
+    REQUIRE(h.rbac_.create_role({"UsageForensics", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"UsageForensics", "Forensics", "Read", "allow"}).has_value());
+    REQUIRE(h.rbac_.assign_role({"user", "forensics_user", "UsageForensics"}).has_value());
+    h.session_user = "forensics_user";
+    auto forensics = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(forensics);
+    CHECK(forensics->status == 403);
+
+    CHECK(h.audit_log.size() == 1); // only the admitted request left a row
+    CHECK(h.usage_reads == 1);      // and only it reached the read
+}
+
+TEST_CASE("REST dex/apps/usage: a service-scoped token is refused with no audit row",
+          "[pg][rest][dex][apps][usage][adr0017]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.wire_real_dex_perm_ = true;
+    h.rbac_.set_rbac_enabled(true);
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all",
+                          h.service_scoped_token_headers("printers"));
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+TEST_CASE("REST dex/apps/usage: a failed audit write is a 503 and the read never runs",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    h.audit_succeeds = false;
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    const auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    CHECK(h.usage_reads == 0);
+}
+
+// The audit row is written before the read, so a model already cached from an earlier request
+// cannot be served once the audit sink is down.
+TEST_CASE("REST dex/apps/usage: a failed audit write refuses even a request the cache could answer",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto url = std::string(kUsageRoute) + "?window=all";
+    auto warm = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(warm);
+    REQUIRE(warm->status == 200);
+    REQUIRE(h.usage_reads == 1);
+    REQUIRE(h.audit_log.size() == 1);
+
+    h.audit_succeeds = false;
+    auto res = h.sink.Get(url, h.status_route_headers());
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+    CHECK(res->body.find("chrome.exe") == std::string::npos);
+    CHECK(res->body.find("\"apps\"") == std::string::npos);
+    CHECK(h.audit_log.size() == 2); // the write was attempted, before anything was served
+    CHECK(h.usage_reads == 1);
+}
+
+TEST_CASE("REST dex/apps/usage: omitted parameters reach the model and the audit row as their defaults",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    // The fixture's crashes are older than the 7d default window, and the fixture's read names
+    // subject 0; this one is inside the window, so the Apps list has that subject.
+    h.seed_obs("u3", "WS-1", "process.crashed", "fresh.exe", "windows",
+               yuzu::server::dex_iso_since(2));
+    auto res = h.sink.Get(kUsageRoute, h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["window"] == "7d");
+    CHECK(d["platform_scope"] == "all");
+    CHECK(d["slice"]["kind"] == "fleet");
+    CHECK(d["floor"] == 1);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("window=7d") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("platform=all") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("slice=fleet") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("floor=1") != std::string::npos);
+
+    // A tag slice with no tag_key is the default cohort key.
+    auto tagged = h.sink.Get(std::string(kUsageRoute) + "?slice=tag", h.status_route_headers());
+    REQUIRE(tagged);
+    REQUIRE(tagged->status == 200);
+    const auto t = nlohmann::json::parse(tagged->body)["data"];
+    CHECK(t["slice"]["kind"] == "tag");
+    CHECK(t["slice"]["key"] == yuzu::server::kDexDefaultCohortKey);
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].detail.find(std::string("key=") + yuzu::server::kDexDefaultCohortKey) !=
+          std::string::npos);
+}
+
+TEST_CASE("REST dex/apps/usage: a failed read is a retryable 503 that names the reason, never zero figures",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const auto get = [&] {
+        auto res = h.sink.Get(std::string(kUsageRoute) + "?window=all", h.status_route_headers());
+        REQUIRE(res);
+        return res;
+    };
+
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        return std::unexpected(std::string("statement_timeout"));
+    };
+    auto timeout = get();
+    CHECK(timeout->status == 503);
+    auto j = nlohmann::json::parse(timeout->body);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (usage_unavailable: statement_timeout)");
+    CHECK(timeout->body.find("\"apps\"") == std::string::npos);
+
+    // Sustained timeouts: no retry hint, and a remediation that says retrying does not help.
+    h.usage_read_for_test = [](const yuzu::server::DexUsageQuery&)
+        -> std::expected<yuzu::server::DexUsageRead, std::string> {
+        return std::unexpected(std::string("fleet_too_large"));
+    };
+    auto too_large = get();
+    CHECK(too_large->status == 503);
+    j = nlohmann::json::parse(too_large->body);
+    CHECK(j["error"]["retry_after_ms"].is_null());
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (usage_unavailable: fleet_too_large)");
+    CHECK(j["error"]["remediation"].get<std::string>().find("retrying does not help") != std::string::npos);
+    CHECK(j["error"]["remediation"].get<std::string>().find("index") == std::string::npos);
+    CHECK(too_large->body.find("\"apps\"") == std::string::npos);
+
+    // An Apps read that cannot be had is a retryable 503 too.
+    h.usage_read_for_test = nullptr;
+    h.dex_policy_fn_for_test = []() -> std::expected<yuzu::server::DexPolicyInForce, std::string> {
+        return std::unexpected(std::string("store down"));
+    };
+    auto policy = get();
+    CHECK(policy->status == 503);
+    j = nlohmann::json::parse(policy->body);
+    CHECK(j["error"]["retry_after_ms"] == 2000);
+    CHECK(j["error"]["message"] ==
+          "fleet application usage unavailable (apps_degraded: score_policy_unavailable)");
+
+    // Every refusal above was an admitted request that left its audit row.
+    CHECK(h.audit_log.size() == 3);
+}
+
+TEST_CASE("REST dex/apps/usage: the group slice is a 400 for an unknown group and a cell for a real one",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    const auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "WS-1").has_value());
+
+    // An unknown group is never a 200 with the whole population in `other`.
+    auto unknown = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=no-such-group",
+                              h.status_route_headers());
+    REQUIRE(unknown);
+    CHECK(unknown->status == 400);
+    const auto j = nlohmann::json::parse(unknown->body);
+    CHECK(j["error"]["message"] == "unknown management group");
+    CHECK(unknown->body.find("\"apps\"") == std::string::npos);
+    CHECK(h.audit_log.size() == 1); // the request was admitted; the row records that
+
+    // A 256-byte id is within the documented bound: validation accepts it, so it reaches the
+    // group lookup and is the same unknown-group 400, with its audit row (a 257-byte id is refused
+    // by validation instead, with no row: see the parameter case below).
+    auto longest = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" +
+                                  std::string(256, 'g'),
+                              h.status_route_headers());
+    REQUIRE(longest);
+    CHECK(longest->status == 400);
+    CHECK(nlohmann::json::parse(longest->body)["error"]["message"] == "unknown management group");
+    CHECK(h.audit_log.size() == 2);
+
+    auto ok = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=group&group=" + *gid,
+                         h.status_route_headers());
+    REQUIRE(ok);
+    REQUIRE(ok->status == 200);
+    const auto d = nlohmann::json::parse(ok->body)["data"];
+    CHECK(d["slice"]["kind"] == "group");
+    CHECK(d["slice"]["key"] == *gid);
+    // WS-1 is in the group (cell 0), WS-2 is not (the residual cell).
+    int in_group = 0;
+    for (const auto& dev : h.last_usage_query.devices)
+        in_group += dev.cell == 0 ? 1 : 0;
+    CHECK(in_group == 1);
+    REQUIRE(d["apps"][0]["cells"].size() == 1);
+    CHECK(d["apps"][0]["cells"][0]["kind"] == "named");
+    CHECK(d["apps"][0]["cells"][0]["label"] == *gid);
+}
+
+TEST_CASE("REST dex/apps/usage: every off-enum, out-of-range or out-of-slice parameter is a 400",
+          "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    const std::string too_long_group(257, 'g');
+    const std::string too_long_key(65, 'k');
+    for (const std::string& q : {
+             std::string("window=bogus"), std::string("window="), std::string("platform=darwin"),
+             std::string("platform="), std::string("slice=bogus"), std::string("slice="),
+             std::string("floor=0"), std::string("floor=-3"), std::string("floor=10001"),
+             std::string("floor=abc"), std::string("floor="), std::string("floor=1.5"),
+             std::string("floor=5x"),
+             // A parameter outside its slice.
+             std::string("group=g1"), std::string("slice=platform&group=g1"),
+             std::string("tag_key=ring"), std::string("slice=group&group=g1&tag_key=ring"),
+             // The slice's own parameter is required, bounded and valid.
+             std::string("slice=group"), std::string("slice=group&group="),
+             std::string("slice=group&group=") + too_long_group,
+             // A group id that cannot name a group is refused here, before the audit row and the
+             // read (not a retryable 503 from the store): NUL, a newline, DEL, bytes that are not
+             // UTF-8 (a lone 0xFF, an overlong 0xC0 0x80, a truncated sequence).
+             std::string("slice=group&group=%00"), std::string("slice=group&group=a%00b"),
+             std::string("slice=group&group=a%0Ab"), std::string("slice=group&group=%7F"),
+             std::string("slice=group&group=%FF"), std::string("slice=group&group=%C0%80"),
+             std::string("slice=group&group=ab%C3"),
+             std::string("slice=tag&tag_key=bad$key"), std::string("slice=tag&tag_key=") + too_long_key,
+             std::string("slice=tag&tag_key=")}) {
+        CAPTURE(q);
+        auto res = h.sink.Get(std::string(kUsageRoute) + "?" + q, h.status_route_headers());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(res->body.find("\"apps\"") == std::string::npos);
+    }
+    // Validation precedes the audit row and the read: nothing was admitted.
+    CHECK(h.audit_log.empty());
+    CHECK(h.usage_reads == 0);
+}
+
+TEST_CASE("REST dex/apps/usage: valid parameters reach the model", "[pg][rest][dex][apps][usage]") {
+    RestGsHarness h;
+    seed_usage_fixture(h);
+    // The fixture's crashes are old; this one is inside a 30-day window.
+    h.seed_obs("u3", "WS-1", "process.crashed", "fresh.exe", "windows",
+               yuzu::server::dex_iso_since(2));
+    auto res = h.sink.Get(std::string(kUsageRoute) + "?window=30d&platform=windows&slice=tag&tag_key=ring&floor=2",
+                          h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["window"] == "30d");
+    CHECK(d["platform_scope"] == "windows");
+    CHECK(d["slice"]["kind"] == "tag");
+    CHECK(d["slice"]["key"] == "ring");
+    CHECK(d["floor"] == 2);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].detail.find("slice=tag") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("key=ring") != std::string::npos);
+    CHECK(h.audit_log[0].detail.find("floor=2") != std::string::npos);
+    // A 30-day window on a 30-day retention is bounded, so the rate is reported: 7,200 run
+    // seconds over a 30-day basis is 2 process-hours, and the fixture's read holds 2 crashes.
+    REQUIRE(d["apps"].size() == 1);
+    CHECK(d["apps"][0]["subject"] == "fresh.exe");
+    CHECK(d["apps"][0]["rate_withheld"].is_null());
+    CHECK(d["apps"][0]["exposure_rate"]["crashes"] == 2);
+    CHECK(d["apps"][0]["exposure_rate"]["hours"].get<double>() == Catch::Approx(2.0));
+
+    // The documented maxima are accepted: floor 10000 and a 64-byte tag key.
+    auto top_floor = h.sink.Get(std::string(kUsageRoute) + "?window=all&floor=10000", h.status_route_headers());
+    REQUIRE(top_floor);
+    REQUIRE(top_floor->status == 200);
+    CHECK(nlohmann::json::parse(top_floor->body)["data"]["floor"] == 10000);
+    auto long_key = h.sink.Get(std::string(kUsageRoute) + "?window=all&slice=tag&tag_key=" + std::string(64, 'k'),
+                               h.status_route_headers());
+    REQUIRE(long_key);
+    REQUIRE(long_key->status == 200);
+    CHECK(nlohmann::json::parse(long_key->body)["data"]["slice"]["key"] == std::string(64, 'k'));
+    CHECK(h.audit_log.size() == 3);
 }
 
 TEST_CASE("REST dex/apps: the platform scope selects the population and the coverage",
@@ -3665,6 +4205,14 @@ TEST_CASE("REST dex/devices/{id}/live: unknown kind → 400, no dispatch",
     REQUIRE(res);
     CHECK(res->status == 400);
     CHECK(h.last_live_plugin.empty()); // never dispatched
+    // The metric label is the closed set: an unresolved kind is counted as `unknown`, never as
+    // the caller's own text (one series per distinct string a caller sends).
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "unknown"}, {"outcome", "400"}})
+              .value() == 1.0);
+    CHECK(h.metrics
+              .counter("yuzu_server_live_requests_total", {{"kind", "bogus"}, {"outcome", "400"}})
+              .value() == 0.0);
 }
 
 TEST_CASE("REST dex/devices/{id}/live: out-of-scope device → 403, no dispatch",
@@ -4502,6 +5050,114 @@ TEST_CASE("REST dex/devices/{id}/live: Execute denied but Read allowed → 403, 
     CHECK(h.last_live_plugin.empty()); // the Execute gate denied before any dispatch
 }
 
+TEST_CASE("REST dex/devices/{id}/live: a scoped gate or the caller withdrawn inside the requested-row "
+          "write dispatches nothing; 403 / failure row (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    struct Withdrawal {
+        const char* name;
+        std::function<void(RestGsHarness&)> mutate; // runs INSIDE the `requested` audit write
+        std::optional<int> status; // nullopt: this harness's auth_fn writes none (production's 401)
+        const char* detail;
+    };
+    const std::vector<Withdrawal> withdrawals = {
+        {"Execution:Execute withdrawn", [](RestGsHarness& h) { h.deny_scoped_op = "Execute"; }, 403,
+         "permission_revoked"},
+        {"GuaranteedState:Read withdrawn (every scoped gate refuses)",
+         [](RestGsHarness& h) { h.grant_perms = false; }, 403, "permission_revoked"},
+        {"the session no longer resolves", [](RestGsHarness& h) { h.session_user.clear(); },
+         std::nullopt, "caller_unresolved"},
+    };
+    for (const auto& w : withdrawals) {
+        DYNAMIC_SECTION(w.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.on_audit = [&](const std::string& result) {
+                if (result == "requested")
+                    w.mutate(h);
+            };
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            if (w.status)
+                CHECK(res->status == *w.status);
+            CHECK(h.last_live_plugin.empty()); // nothing dispatched
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(w.detail) == 0);
+        }
+    }
+}
+
+// Kills: reverting the recheck's `fail` lambda to a bare audit_fn call. The failure row is the
+// only evidence the probe was NOT sent (the success path writes no outcome row), so its loss
+// must be on the answer.
+TEST_CASE("REST dex/devices/{id}/live: a lost failure row after a recheck refusal is flagged "
+          "Sec-Audit-Failed; the 403 and the no-dispatch hold (#7110)",
+          "[pg][rest][dex][device][live][scope][7110]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    RestGsHarness h(true, true, true, true, &pool);
+    h.on_audit = [&](const std::string& result) {
+        if (result == "requested")
+            h.deny_scoped_op = "Execute"; // withdrawn INSIDE the row write
+        if (result == "failure")
+            h.audit_succeeds = false; // the outcome row alone is lost
+    };
+    auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+    REQUIRE(res);
+    CHECK(res->status == 403);
+    CHECK(h.last_live_plugin.empty());
+    REQUIRE(h.audit_log.size() == 2);
+    CHECK(h.audit_log[1].result == "failure");
+    CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+}
+
+TEST_CASE("REST dex/devices/{id}/live: a chokepoint refusal is a dispatch_denied answer, never a "
+          "retryable 'device offline' (#7114)",
+          "[pg][rest][dex][device][live][7114]") {
+    struct Case {
+        const char* name;
+        yuzu::server::detail::DispatchDenialReason reason;
+        int status;
+        const char* token;
+    };
+    using R = yuzu::server::detail::DispatchDenialReason;
+    // The pair comes from the server's own kind table: a permission-class refusal is the caller's
+    // 403, an Unclassified one is a server catalogue fault (500), unlike the 400 a caller-named
+    // pair would get.
+    const Case cases[] = {
+        {"approval_required is a 403", R::ApprovalRequired, 403, "approval_required"},
+        {"forbidden is a 403", R::Forbidden, 403, "forbidden"},
+        {"unclassified is a 500 (server-named pair)", R::Unclassified, 500, "unclassified"},
+    };
+    for (const auto& c : cases) {
+        DYNAMIC_SECTION(c.name) {
+            YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+            PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+            RestGsHarness h(true, true, true, true, &pool);
+            h.live_denied = yuzu::server::detail::DispatchDenial{c.reason, "Inventory",
+                                                                 yuzu::server::authz::Operation::Read};
+            auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
+            REQUIRE(res);
+            CHECK(res->status == c.status);
+            const auto j = nlohmann::json::parse(res->body);
+            CHECK(j["error"]["message"].get<std::string>() ==
+                  std::string("dispatch denied: reason=") + c.token);
+            CHECK(res->body.find("offline") == std::string::npos);
+            CHECK(h.live_dispatches == 1); // refused once, never retried or re-sent
+            REQUIRE(h.audit_log.size() == 2);
+            CHECK(h.audit_log[0].result == "requested");
+            CHECK(h.audit_log[1].action == "device.live.uptime");
+            CHECK(h.audit_log[1].result == "failure");
+            CHECK(h.audit_log[1].target_id == "WS-1");
+            CHECK(h.audit_log[1].detail.find(std::string("dispatch_denied reason=") + c.token) == 0);
+        }
+    }
+}
+
 TEST_CASE("REST dex/devices/{id}/live: live substrate unavailable → 503",
           "[pg][rest][dex][device][live]") {
     RestGsHarness h{/*live_deps=*/false}; // no response_store + no command_dispatch_fn
@@ -4558,12 +5214,14 @@ TEST_CASE("REST dex/devices/{id}/live: a different agent's response row is never
     other.instruction_id = "os_info-live";
     other.agent_id = "OTHER";
     other.status = kStatusSuccess;
-    other.output = "uptime_display|99d";
+    // A marker the 504 body cannot contain: its hex correlation id (req-<hex>-<hex>) could hold
+    // "99d" by chance.
+    other.output = "uptime_display|OTHER_AGENT_UPTIME_MARKER";
     h.resp_store->store(other);
     auto res = h.sink.Post("/api/v1/dex/devices/WS-1/live?kind=uptime", "");
     REQUIRE(res);
     CHECK(res->status == 504);
-    CHECK(res->body.find("99d") == std::string::npos); // OTHER's data never leaked
+    CHECK(res->body.find("OTHER_AGENT_UPTIME_MARKER") == std::string::npos); // never leaked
 }
 
 TEST_CASE("REST dex/devices/{id}/live uptime: success terminal, no output → 200 empty",
@@ -5928,8 +6586,10 @@ TEST_CASE("REST gs.agents/{id}/rules (seam-bypass tripwire): answers via Guardia
         yuzu::server::test::FnGuardianApi::StatusFn{},
         yuzu::server::test::FnGuardianApi::AgentStatusFn{},
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
-        [seam_row](const std::string&) -> std::optional<std::vector<GuardianDeviceGuardRow>> {
-            return std::vector<GuardianDeviceGuardRow>{seam_row};
+        [seam_row](const std::string&, GuardianReadFault*) -> std::optional<GuardianDeviceGuardsReport> {
+            GuardianDeviceGuardsReport report;
+            report.guards = {seam_row};
+            return report;
         });
     RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
     // Real store has NO guards reported for WS-1 — a revert would answer an
@@ -5961,7 +6621,8 @@ TEST_CASE("REST gs.device-compliance (seam-bypass tripwire): answers via Guardia
         yuzu::server::test::FnGuardianApi::RuleStatusFn{},
         yuzu::server::test::FnGuardianApi::DeviceGuardsFn{},
         [seam_rollup](const std::string&, const std::string&, bool* store_degraded,
-                     bool* pii_access_began) -> std::optional<GuardianDeviceComplianceRollup> {
+                     bool* pii_access_began,
+                     GuardianReadFault*) -> std::optional<GuardianDeviceComplianceRollup> {
             *store_degraded = false;
             *pii_access_began = true;
             return seam_rollup;
@@ -6129,6 +6790,621 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
     CHECK(get("/api/v1/guaranteed-state/status", true)["data"]["uncertain_rules"].get<int>() == 1);
 }
 
+// ── #7217: ordering uncertainty and unrepresented pending pairs on the two per-device reads ──
+//
+// The census flags (order_uncertain / projection_pending) already travel on the row routes. These
+// cases pin the two per-device reads: device-compliance gains the flags per guard, `uncertain_guards`
+// and the unrepresented summary; the per-device all-guards read gains the unrepresented summary.
+// An UNREPRESENTED pair is a (device, rule) with retained projection-pending evidence and no census
+// row: it is not a guard, so it is excluded from guards[], total_guards and every verdict count.
+namespace {
+
+// The trigger the #5690 case uses: it refuses the census write of any verdict stamped with the marker
+// timestamp, leaving that event stored with pending evidence. When the refused write is the FIRST
+// delivery of a pair there is no census row at all, which is the unrepresented shape.
+constexpr const char* kFailMarkedTs = "2026-06-20T10:02:00Z";
+
+void install_fail_marked_trigger(RestGsHarness& h) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(
+        conn.get(),
+        "CREATE FUNCTION guaranteed_state_store.yuzu_test_fail_marked() RETURNS trigger "
+        "LANGUAGE plpgsql AS $$ BEGIN IF NEW.updated_at = '2026-06-20T10:02:00Z' THEN "
+        "RAISE EXCEPTION 'forced census failure' USING ERRCODE = 'XX000'; END IF; "
+        "RETURN NEW; END $$; "
+        "CREATE TRIGGER yuzu_test_fail_marked BEFORE INSERT OR UPDATE ON "
+        "guaranteed_state_store.guardian_agent_rule_status FOR EACH ROW EXECUTE FUNCTION "
+        "guaranteed_state_store.yuzu_test_fail_marked()")};
+    REQUIRE(r.ok());
+}
+
+constexpr const char* kOrderingBaseline = "Ordering B";
+constexpr const char* kComplianceUrl =
+    "/api/v1/guaranteed-state/device-compliance?baseline=Ordering%20B&agent_id=WS-1";
+constexpr const char* kAllGuardsUrl = "/api/v1/guaranteed-state/agents/WS-1/rules";
+
+// WS-1 against the Baseline snapshot {r1, r2, r3, r4}:
+//   r1  compliant at 10:01, then an OLDER-key drift arrives later: order_uncertain, still compliant
+//   r2  compliant at 10:01 (represented), then a 10:02 drift the trigger refuses: projection_pending
+//   r3  clean
+//   r4  first delivery refused by the trigger: pending evidence, NO census row (unrepresented)
+//   r5  as r4 but not a snapshot member (unrepresented on the all-guards read only)
+// WS-3 holds only an r4 pending event (no census row of any kind).
+void seed_ordering_uncertainty(RestGsHarness& h) {
+    h.seed_rule("r1", "guard-one");
+    h.seed_rule("r2", "guard-two");
+    h.seed_rule("r3", "guard-three");
+    h.seed_rule("r4", "guard-four");
+    h.seed_rule("r5", "guard-five");
+    install_fail_marked_trigger(h);
+    h.seed_deployed_baseline(kOrderingBaseline, {"r1", "r2", "r3", "r4"});
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z");
+    h.seed_status("b1", "WS-1", "r2", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("b2", "WS-1", "r2", "drift.detected", kFailMarkedTs);
+    h.seed_status("c1", "WS-1", "r3", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("d1", "WS-1", "r4", "guard.compliant", kFailMarkedTs);
+    h.seed_status("f1", "WS-1", "r5", "guard.compliant", kFailMarkedTs);
+    h.seed_status("p1", "WS-3", "r4", "guard.compliant", kFailMarkedTs);
+}
+
+nlohmann::json get_ok_json(RestGsHarness& h, const std::string& url) {
+    auto res = h.sink.Get(url);
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    return nlohmann::json::parse(res->body);
+}
+
+const nlohmann::json& guard_row(const nlohmann::json& guards, const char* rule_id) {
+    for (const auto& g : guards)
+        if (g["rule_id"].get<std::string>() == rule_id)
+            return g;
+    FAIL("no guard row for " << rule_id);
+    return guards;
+}
+
+std::vector<std::string> string_array(const nlohmann::json& a) {
+    REQUIRE(a.is_array());
+    std::vector<std::string> out;
+    for (const auto& x : a)
+        out.push_back(x.get<std::string>());
+    return out;
+}
+
+// ── #7217 fault-injection helpers ──
+
+// What a fault-seam closure shares with its test. The closure captures the shared_ptr BY VALUE, so
+// it can never dangle, and a test turns the fault off by clearing `fail` instead of replacing the
+// std::function while the store may still read it.
+struct PendingFaultSeam {
+    std::atomic<int> calls{0};
+    std::atomic<bool> fail{true};
+};
+
+std::shared_ptr<PendingFaultSeam> install_pending_fault(GuaranteedStateStore& store) {
+    auto seam = std::make_shared<PendingFaultSeam>();
+    store.set_unrepresented_pending_fault_for_test([seam] {
+        seam->calls.fetch_add(1);
+        return seam->fail.load();
+    });
+    return seam;
+}
+
+// yuzu_server_guardian_read_degrade_total{source, reason}. counter() creates the series on first use,
+// so an absent series reads 0.
+double degrade_count(yuzu::MetricsRegistry& m, const char* source, const char* reason) {
+    return m.counter("yuzu_server_guardian_read_degrade_total",
+                     {{"reason", reason}, {"source", source}})
+        .value();
+}
+
+// guardian.device.view rows with this result for THIS device: the target_id check keeps a row for
+// the wrong device from satisfying a fault test.
+int device_view_audits(const RestGsHarness& h, const char* result, const char* agent_id) {
+    return static_cast<int>(std::count_if(
+        h.audit_log.begin(), h.audit_log.end(), [result, agent_id](const AuditRecord& a) {
+            return a.action == "guardian.device.view" && a.result == result &&
+                   a.target_id == agent_id;
+        }));
+}
+
+} // namespace
+
+TEST_CASE("REST gs.device-compliance: the old verdict counts stay put while the flags, "
+          "uncertain_guards and the unrepresented summary are reported (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    RestGsHarness h;
+    seed_ordering_uncertainty(h);
+
+    const auto j = get_ok_json(h, kComplianceUrl);
+    const auto& d = j["data"];
+    // OLD fields: unchanged by the new evidence (only represented pairs are counted).
+    CHECK(d["total_guards"].get<int>() == 3);
+    CHECK(d["compliant"].get<int>() == 3);
+    CHECK(d["drifted"].get<int>() == 0);
+    CHECK(d["errored"].get<int>() == 0);
+    CHECK(d["pending"].get<int>() == 0);
+    CHECK(d["snapshot_total"].get<int>() == 4);
+    CHECK(d["assessable"].get<bool>());
+
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 3);
+    const auto& r1 = guard_row(d["guards"], "r1");
+    CHECK(r1["status"].get<std::string>() == "compliant"); // the older drift did not win
+    CHECK(r1["order_uncertain"].get<bool>());
+    CHECK_FALSE(r1["projection_pending"].get<bool>());
+    const auto& r2 = guard_row(d["guards"], "r2");
+    CHECK(r2["status"].get<std::string>() == "compliant"); // the refused drift did not land
+    CHECK_FALSE(r2["order_uncertain"].get<bool>());
+    CHECK(r2["projection_pending"].get<bool>());
+    const auto& r3 = guard_row(d["guards"], "r3");
+    CHECK_FALSE(r3["order_uncertain"].get<bool>());
+    CHECK_FALSE(r3["projection_pending"].get<bool>());
+
+    // r4 (pending-only, in the snapshot) and r5 (pending-only, outside it) are not guards.
+    for (const auto& g : d["guards"]) {
+        CHECK(g["rule_id"].get<std::string>() != "r4");
+        CHECK(g["rule_id"].get<std::string>() != "r5");
+    }
+
+    CHECK(d["uncertain_guards"].get<int>() == 2); // r1 and r2; r3 is clean
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 1);
+    CHECK(string_array(d["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r4"});
+}
+
+TEST_CASE("REST gs.device-compliance: a guard with both flags is counted once in uncertain_guards "
+          "(#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    install_fail_marked_trigger(h);
+    h.seed_deployed_baseline(kOrderingBaseline, {"r1"});
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r1", "drift.detected", "2026-06-20T10:00:00Z"); // order_uncertain
+    h.seed_status("a3", "WS-1", "r1", "drift.detected", kFailMarkedTs);          // projection_pending
+
+    const auto j = get_ok_json(h, kComplianceUrl);
+    const auto& d = j["data"];
+    REQUIRE(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["order_uncertain"].get<bool>());
+    CHECK(d["guards"][0]["projection_pending"].get<bool>());
+    CHECK(d["uncertain_guards"].get<int>() == 1);
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 0);
+    CHECK(d["unrepresented_pending_rule_ids"].empty());
+}
+
+TEST_CASE("REST gs.device-compliance: a draft Baseline reports zeros for the new summary and never "
+          "reads the store for it (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    install_fail_marked_trigger(h);
+    Baseline b;
+    b.name = kOrderingBaseline;
+    auto bid = h.baseline_store->create_baseline(b);
+    REQUIRE(bid.has_value());
+    REQUIRE(h.baseline_store->set_members(*bid, {"r1"}).has_value());
+    // Pending-only evidence exists for the device, but a draft Baseline has no snapshot to
+    // intersect it with.
+    h.seed_status("d1", "WS-1", "r1", "guard.compliant", kFailMarkedTs);
+
+    auto seam = install_pending_fault(*h.store);
+    seam->fail = false;
+    const auto j = get_ok_json(h, kComplianceUrl);
+    const auto& d = j["data"];
+    CHECK_FALSE(d["deployed"].get<bool>());
+    CHECK_FALSE(d["assessable"].get<bool>());
+    CHECK(d["total_guards"].get<int>() == 0);
+    CHECK(d["uncertain_guards"].get<int>() == 0);
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 0);
+    CHECK(d["unrepresented_pending_rule_ids"].is_array());
+    CHECK(d["unrepresented_pending_rule_ids"].empty());
+    CHECK(seam->calls.load() == 0);
+}
+
+TEST_CASE("REST gs.device-compliance and all-guards: a device with ONLY pending evidence has no "
+          "guards and is not assessable, but the evidence is reported (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    RestGsHarness h;
+    seed_ordering_uncertainty(h);
+
+    const auto c = get_ok_json(
+        h, "/api/v1/guaranteed-state/device-compliance?baseline=Ordering%20B&agent_id=WS-3");
+    const auto& cd = c["data"];
+    CHECK(cd["deployed"].get<bool>());
+    CHECK(cd["total_guards"].get<int>() == 0);
+    CHECK_FALSE(cd["assessable"].get<bool>());
+    CHECK(cd["snapshot_total"].get<int>() == 4);
+    CHECK(cd["guards"].empty());
+    CHECK(cd["uncertain_guards"].get<int>() == 0);
+    CHECK(cd["unrepresented_pending_guards"].get<int>() == 1);
+    CHECK(string_array(cd["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r4"});
+
+    const auto g = get_ok_json(h, "/api/v1/guaranteed-state/agents/WS-3/rules");
+    const auto& gd = g["data"];
+    CHECK(gd["guards"].empty());
+    CHECK(gd["total_guards"].get<int>() == 0);
+    CHECK(gd["unrepresented_pending_guards"].get<int>() == 1);
+    CHECK(string_array(gd["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r4"});
+}
+
+TEST_CASE("REST gs.device-all-guards: unrepresented pending pairs are reported for any rule, "
+          "sorted, and total_guards stays the length of guards[] (#7217)",
+          "[pg][rest][guaranteed_state][ordering][device_guards]") {
+    RestGsHarness h;
+    seed_ordering_uncertainty(h);
+
+    const auto j = get_ok_json(h, kAllGuardsUrl);
+    const auto& d = j["data"];
+    REQUIRE(d["guards"].is_array());
+    CHECK(d["guards"].size() == 3); // r1, r2, r3; r4 and r5 have no census row
+    CHECK(d["total_guards"].get<std::size_t>() == d["guards"].size());
+    CHECK(guard_row(d["guards"], "r1")["order_uncertain"].get<bool>());
+    CHECK(guard_row(d["guards"], "r2")["projection_pending"].get<bool>());
+    // Not limited to a Baseline: r5 is reported here although no Baseline names it.
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 2);
+    CHECK(string_array(d["unrepresented_pending_rule_ids"]) ==
+          std::vector<std::string>{"r4", "r5"});
+}
+
+TEST_CASE("REST gs.device-all-guards: a device with no evidence reports zero unrepresented pairs "
+          "(#7217)",
+          "[pg][rest][guaranteed_state][ordering][device_guards]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    h.seed_status("e1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:00:00Z");
+
+    const auto j = get_ok_json(h, kAllGuardsUrl);
+    const auto& d = j["data"];
+    CHECK(d["total_guards"].get<int>() == 1);
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 0);
+    REQUIRE(d["unrepresented_pending_rule_ids"].is_array());
+    CHECK(d["unrepresented_pending_rule_ids"].empty());
+}
+
+
+// The existing DROP SCHEMA degrade cases fail an EARLIER read (rule_names_for) first, so they prove
+// nothing about the new read. The store seam fails ONLY the unrepresented-pending read while every
+// other read keeps working, so a 503 here can only come from that read.
+TEST_CASE("REST gs.device-compliance: a failed unrepresented-pending read is a retryable 503 with a "
+          "failure audit, never zeros, and the route recovers (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    yuzu::MetricsRegistry m; // before the harness: the store holds a raw pointer to it
+    RestGsHarness h;
+    h.store->set_metrics(&m);
+    seed_ordering_uncertainty(h);
+
+    auto seam = install_pending_fault(*h.store);
+    auto res = h.sink.Get(kComplianceUrl);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(j.contains("data"));
+    CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+    CHECK(seam->calls.load() == 1);
+    CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+    CHECK(device_view_audits(h, "success", "WS-1") == 0); // the failed read is never audited as served
+    // Counted on the per-device source with the generic reason; the gauge-count source never moved.
+    CHECK(degrade_count(m, "guardian_census_device", "query_error") == 1.0);
+    CHECK(degrade_count(m, "guardian_census_device", "statement_timeout") == 0.0);
+    CHECK(degrade_count(m, "guardian_census", "query_error") == 0.0);
+    // The fault arm leaked no pool lease.
+    CHECK(h.gs_pool->in_use() == 0);
+
+    seam->fail = false;
+    h.audit_log.clear();
+    const auto ok = get_ok_json(h, kComplianceUrl);
+    CHECK(ok["data"]["unrepresented_pending_guards"].get<int>() == 1);
+    CHECK(seam->calls.load() == 2); // consulted on the second request, answered "no fault"
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+    // The pool still serves a read (above) and a write.
+    h.seed_status("w1", "WS-9", "r3", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(h.gs_pool->in_use() == 0);
+}
+
+TEST_CASE("REST gs.device-all-guards: a failed unrepresented-pending read is a retryable 503 with a "
+          "failure audit, never zeros, and the route recovers (#7217)",
+          "[pg][rest][guaranteed_state][ordering][device_guards]") {
+    yuzu::MetricsRegistry m;
+    RestGsHarness h;
+    h.store->set_metrics(&m);
+    seed_ordering_uncertainty(h);
+
+    auto seam = install_pending_fault(*h.store);
+    auto res = h.sink.Get(kAllGuardsUrl);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    auto j = nlohmann::json::parse(res->body);
+    CHECK(j["error"]["retry_after_ms"] == 5000);
+    CHECK_FALSE(j.contains("data"));
+    CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+    CHECK(seam->calls.load() == 1);
+    CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+    CHECK(device_view_audits(h, "success", "WS-1") == 0);
+    CHECK(degrade_count(m, "guardian_census_device", "query_error") == 1.0);
+    CHECK(degrade_count(m, "guardian_census", "query_error") == 0.0);
+    CHECK(h.gs_pool->in_use() == 0);
+
+    seam->fail = false;
+    h.audit_log.clear();
+    const auto ok = get_ok_json(h, kAllGuardsUrl);
+    CHECK(ok["data"]["unrepresented_pending_guards"].get<int>() == 2);
+    CHECK(seam->calls.load() == 2);
+    REQUIRE(h.audit_log.size() == 1);
+    CHECK(h.audit_log[0].result == "success");
+    h.seed_status("w1", "WS-9", "r3", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(h.gs_pool->in_use() == 0);
+}
+
+// The store fails AND the failure-audit row cannot persist. The audit outage supersedes the
+// data fault (REST fails closed with Sec-Audit-Failed): no data, no zeros, on either route.
+TEST_CASE("REST gs.device-compliance and all-guards: a store fault with a failing audit write is "
+          "an audit-unavailable 503, never data or zeros (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    RestGsHarness h;
+    seed_ordering_uncertainty(h);
+    auto seam = install_pending_fault(*h.store);
+    h.audit_succeeds = false;
+
+    for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("audit subsystem unavailable") != std::string::npos);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("data"));
+        CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+        CHECK(h.gs_pool->in_use() == 0);
+    }
+    CHECK(seam->calls.load() == 2);
+}
+
+// The route-level shape of a statement timeout, driven through the GuardianApi double (the real
+// 57014 path is the next case). Both routes: 503, retry_after_ms null, the shared wording, the
+// failure audit written exactly as for any degrade.
+TEST_CASE("REST gs.device-compliance and all-guards: a pending-read statement timeout is a "
+          "non-retryable 503 with the same failure audit, and a transient degrade keeps its hint "
+          "(#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    // 0 = answer the statement timeout, 1 = answer a transient degrade (the fault stays kNone, which
+    // the double documents as an unnamed degrade and the handlers treat as transient).
+    auto mode = std::make_shared<std::atomic<int>>(0);
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [mode](const std::string&, GuardianReadFault* fault)
+            -> std::optional<GuardianDeviceGuardsReport> {
+            if (mode->load() == 0)
+                *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        },
+        [mode](const std::string&, const std::string&, bool* store_degraded,
+               bool* pii_access_began, GuardianReadFault* fault)
+            -> std::optional<GuardianDeviceComplianceRollup> {
+            *store_degraded = true;
+            *pii_access_began = true;
+            if (mode->load() == 0)
+                *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+
+    for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
+        INFO(url);
+        mode->store(0);
+        h.audit_log.clear();
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+        const auto j = nlohmann::json::parse(res->body);
+        CHECK_FALSE(j.contains("data"));
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(j["error"]["message"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutMessage));
+        CHECK(j["error"]["remediation"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
+        CHECK(j["error"]["remediation"].get<std::string>().find("statement_timeout") !=
+              std::string::npos);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+        CHECK(device_view_audits(h, "success", "WS-1") == 0);
+
+        // The same route on an ordinary degrade: the retry hint is back.
+        mode->store(1);
+        h.audit_log.clear();
+        auto transient = h.sink.Get(url);
+        REQUIRE(transient);
+        CHECK(transient->status == 503);
+        CHECK(nlohmann::json::parse(transient->body)["error"]["retry_after_ms"] == 5000);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+    }
+}
+
+// With the audit write failing too, the audit outage supersedes the timeout answer on both routes.
+TEST_CASE("REST gs.device-compliance and all-guards: a pending-read statement timeout with a "
+          "failing audit write is an audit-unavailable 503 (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    auto seam_api = std::make_shared<yuzu::server::test::FnGuardianApi>(
+        yuzu::server::test::FnGuardianApi::ListRulesFn{},
+        yuzu::server::test::FnGuardianApi::GetRuleFn{},
+        yuzu::server::test::FnGuardianApi::StatusFn{},
+        yuzu::server::test::FnGuardianApi::AgentStatusFn{},
+        yuzu::server::test::FnGuardianApi::RuleStatusFn{},
+        [](const std::string&, GuardianReadFault* fault) -> std::optional<GuardianDeviceGuardsReport> {
+            *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        },
+        [](const std::string&, const std::string&, bool* store_degraded, bool* pii_access_began,
+           GuardianReadFault* fault) -> std::optional<GuardianDeviceComplianceRollup> {
+            *store_degraded = true;
+            *pii_access_began = true;
+            *fault = GuardianReadFault::kStatementTimeout;
+            return std::nullopt;
+        });
+    RestGsHarness h(true, true, true, true, nullptr, true, seam_api);
+    h.audit_succeeds = false;
+    for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
+        INFO(url);
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        CHECK(res->body.find("audit subsystem unavailable") != std::string::npos);
+        CHECK_FALSE(nlohmann::json::parse(res->body).contains("data"));
+    }
+}
+
+// SQLSTATE 57014 end to end: a real backlog-shaped timeout (a lock held on the events table, a 50 ms
+// budget) through the store, the model and both REST routes.
+TEST_CASE("REST gs.device-compliance and all-guards: a real statement timeout on the pending read "
+          "is a non-retryable 503 counted as statement_timeout, and the routes recover (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    yuzu::MetricsRegistry m;
+    RestGsHarness h;
+    h.store->set_metrics(&m);
+    seed_ordering_uncertainty(h);
+    h.store->set_unrepresented_pending_timeout_ms_for_test(50);
+
+    yuzu::test::EventsTableLock lock(h.gs_db_pg->dsn());
+    int requests = 0;
+    for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
+        INFO(url);
+        h.audit_log.clear();
+        auto res = h.sink.Get(url);
+        REQUIRE(res);
+        ++requests;
+        CHECK(res->status == 503);
+        const auto j = nlohmann::json::parse(res->body);
+        CHECK_FALSE(j.contains("data"));
+        CHECK(j["error"]["retry_after_ms"].is_null());
+        CHECK(j["error"]["message"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutMessage));
+        CHECK(j["error"]["remediation"].get<std::string>() ==
+              std::string(yuzu::server::mcp::kGuardianCensusDeviceTimeoutRemedy));
+        CHECK(res->body.find("unrepresented_pending") == std::string::npos);
+        CHECK(device_view_audits(h, "failure", "WS-1") == 1);
+        CHECK(device_view_audits(h, "success", "WS-1") == 0);
+        CHECK(h.gs_pool->in_use() == 0); // the timed-out read returned its lease
+    }
+    CHECK(degrade_count(m, "guardian_census_device", "statement_timeout") ==
+          static_cast<double>(requests));
+    CHECK(degrade_count(m, "guardian_census_device", "query_error") == 0.0);
+    CHECK(degrade_count(m, "guardian_census", "statement_timeout") == 0.0);
+
+    // Release the lock: the same routes answer with the evidence, and a write succeeds.
+    lock.release();
+    h.store->set_unrepresented_pending_timeout_ms_for_test(5000);
+    h.audit_log.clear();
+    CHECK(get_ok_json(h, kComplianceUrl)["data"]["unrepresented_pending_guards"].get<int>() == 1);
+    CHECK(get_ok_json(h, kAllGuardsUrl)["data"]["unrepresented_pending_guards"].get<int>() == 2);
+    h.seed_status("w1", "WS-9", "r3", "guard.compliant", "2026-06-20T10:05:00Z");
+    CHECK(h.gs_pool->in_use() == 0);
+}
+
+// A builder that reported ids.size() as the count, or an unbounded id list, or ids in a
+// locale-dependent order, survives every case with at most 50 pending-only pairs.
+TEST_CASE("REST gs.device-compliance and all-guards: more than 50 pending-only pairs are counted "
+          "exactly, the id list is capped at 50 and in ascending byte order (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    RestGsHarness h;
+    install_fail_marked_trigger(h);
+    // 'P' sorts before 'p' in byte order but after the lowercase ids in most locales.
+    std::vector<std::string> pending_ids{"P-upper"};
+    for (int i = 0; i < 55; ++i)
+        pending_ids.push_back(std::format("p-{:02d}", i));
+    std::vector<std::string> snapshot = pending_ids;
+    snapshot.push_back("r-clean");
+    for (const auto& id : snapshot)
+        h.seed_rule(id, "guard " + id);
+    h.seed_deployed_baseline(kOrderingBaseline, snapshot);
+    h.seed_status("ok1", "WS-1", "r-clean", "guard.compliant", "2026-06-20T10:01:00Z");
+    for (const auto& id : pending_ids)
+        h.seed_status("pend-" + id, "WS-1", id, "guard.compliant", kFailMarkedTs);
+
+    // std::string orders by unsigned byte value: the expected list IS byte order.
+    auto expected = pending_ids;
+    std::sort(expected.begin(), expected.end());
+    expected.resize(kUnrepresentedPendingIdCap);
+    REQUIRE(expected.front() == "P-upper");
+
+    for (const char* url : {kComplianceUrl, kAllGuardsUrl}) {
+        INFO(url);
+        const auto j = get_ok_json(h, url);
+        const auto& d = j["data"];
+        CHECK(d["unrepresented_pending_guards"].get<int>() == 56); // exact, not the list length
+        const auto ids = string_array(d["unrepresented_pending_rule_ids"]);
+        CHECK(ids.size() == kUnrepresentedPendingIdCap);
+        CHECK(ids == expected);
+        CHECK(d["total_guards"].get<int>() == 1); // r-clean only: the pending-only pairs are no guards
+    }
+}
+
+// uncertain_guards counts the EMITTED guards. A flagged represented pair outside the Baseline
+// snapshot is not one of them (it appears on the all-guards read, not here).
+TEST_CASE("REST gs.device-compliance: a flagged represented pair outside the snapshot is not counted "
+          "in uncertain_guards (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "guard-one");
+    h.seed_rule("r9", "guard-nine");
+    h.seed_deployed_baseline(kOrderingBaseline, {"r1"});
+    h.seed_status("a1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("z1", "WS-1", "r9", "guard.compliant", "2026-06-20T10:01:00Z");
+    h.seed_status("z2", "WS-1", "r9", "drift.detected", "2026-06-20T10:00:00Z"); // order_uncertain
+
+    const auto c = get_ok_json(h, kComplianceUrl)["data"];
+    CHECK(c["total_guards"].get<int>() == 1);
+    CHECK(c["uncertain_guards"].get<int>() == 0);
+    const auto g = get_ok_json(h, kAllGuardsUrl)["data"];
+    REQUIRE(g["guards"].size() == 2);
+    CHECK(guard_row(g["guards"], "r9")["order_uncertain"].get<bool>());
+}
+
+// The pair repaired while a request is in flight. The fault seam is consulted at the START of
+// the unrepresented read, which is issued BEFORE the census read; a hook that returns false and adds
+// the missing census row at that moment therefore lands before both reads: the pair is a guard and
+// is not reported unrepresented. Under the reverse read order (census first) the same hook would fire
+// after the census read and the pair would be in neither. A hook BETWEEN the two reads does not exist
+// in the store; the over-report direction (the pair in both lists) is therefore not reachable here.
+TEST_CASE("REST gs.device-compliance and all-guards: a pair that gains a census row as the pending "
+          "read starts is reported as a guard, never lost (#7217)",
+          "[pg][rest][guaranteed_state][ordering][baseline][device_guards]") {
+    RestGsHarness h;
+    h.seed_rule("q1", "guard-q1");
+    install_fail_marked_trigger(h);
+    h.seed_deployed_baseline(kOrderingBaseline, {"q1"});
+    h.seed_status("d1", "WS-1", "q1", "guard.compliant", kFailMarkedTs); // pending-only
+
+    // Before the hook: the pair is unrepresented.
+    CHECK(get_ok_json(h, kComplianceUrl)["data"]["unrepresented_pending_guards"].get<int>() == 1);
+
+    auto fired = std::make_shared<std::atomic<bool>>(false);
+    h.store->set_unrepresented_pending_fault_for_test([&h, fired] {
+        if (!fired->exchange(true))
+            h.seed_raw_status("WS-1", "q1", "compliant", "2026-06-20T10:03:00Z");
+        return false; // no injected failure: only the side effect
+    });
+
+    const auto d = get_ok_json(h, kComplianceUrl)["data"];
+    CHECK(fired->load());
+    CHECK(d["unrepresented_pending_guards"].get<int>() == 0);
+    REQUIRE(d["guards"].size() == 1);
+    CHECK(d["guards"][0]["rule_id"].get<std::string>() == "q1");
+    CHECK(d["total_guards"].get<int>() == 1);
+    // The pair is on the all-guards read as a guard too (the row is permanent now).
+    const auto g = get_ok_json(h, kAllGuardsUrl)["data"];
+    CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+    REQUIRE(g["guards"].size() == 1);
+}
+
 TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as failure (#5690)",
           "[pg][rest][guaranteed_state][ordering]") {
     RestGsHarness h;
@@ -6153,4 +7429,336 @@ TEST_CASE("REST gs.rules: a store fault on delete answers 404 but is audited as 
     CHECK(del->status == 404); // documented: any delete failure answers 404
     REQUIRE(h.audit_log.size() == 1);
     CHECK(h.audit_log[0].result == "failure");
+}
+
+// -- #5675: a decommission erases the census, and every census read agrees afterwards --
+//
+// The census is read by the fleet rollup, the per-device rollup, the per-device guard list and (for
+// an agent that registers again under the same id) the next projection. Each of those is RE-READ
+// after the cascade ran: asserting only the cascade outcome would pass with an empty-bodied
+// `delete_agent`.
+TEST_CASE("REST gs.status: a decommission erases the device's census and pending evidence, and "
+          "a re-registered device starts clean (#5675)",
+          "[pg][rest][guaranteed_state][decommission]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    h.seed_rule("r2", "rule-2");
+    h.seed_rule("r3", "rule-3");
+    install_fail_marked_trigger(h);
+
+    // WS-1: errored on r1 and r2; a later r1 verdict the trigger refuses (pending evidence on a
+    // represented pair); a first r3 verdict the trigger refuses (pending evidence, no census row).
+    // WS-2: errored on r1 only, and it stays untouched.
+    h.seed_status("a1", "WS-1", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a2", "WS-1", "r2", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("a3", "WS-2", "r1", "guard.unhealthy", "2026-06-20T10:01:00Z");
+    h.seed_status("p1", "WS-1", "r1", "guard.unhealthy", kFailMarkedTs);
+    h.seed_status("p2", "WS-1", "r3", "guard.compliant", kFailMarkedTs);
+
+    const auto get = [&](const std::string& path, bool with_headers) {
+        auto res = with_headers ? h.sink.Get(path, h.status_route_headers()) : h.sink.Get(path);
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+    const auto fleet = [&] {
+        return get("/api/v1/guaranteed-state/status", true);
+    };
+    const auto device = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/status/") + id, false);
+    };
+    const auto device_guards = [&](const char* id) {
+        return get(std::string("/api/v1/guaranteed-state/agents/") + id + "/rules", false);
+    };
+
+    // Before: the state the cascade has to remove.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 2);   // r1 and r2
+        CHECK(f["uncertain_rules"].get<int>() == 1); // r1, through WS-1's pending evidence
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 2);
+        CHECK(d["errored_rules"].get<int>() == 2);
+        CHECK(d["uncertain_rules"].get<int>() == 1);
+        const auto g = device_guards("WS-1");
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 1);
+        CHECK(string_array(g["unrepresented_pending_rule_ids"]) == std::vector<std::string>{"r3"});
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 2);
+    }
+
+    // Decommission through the real cascade, so the registration path (store name, deleter) runs.
+    AgentDecommission cascade{AgentDecommissionStores{.guaranteed_state = h.store.get()}};
+    const DecommissionResult result = cascade.decommission("WS-1");
+    CHECK(result.ok());
+    CHECK(result.deleted == 1);
+    const auto line = std::find_if(result.stores.begin(), result.stores.end(),
+                                   [](const auto& s) { return s.store == "guaranteed_state"; });
+    REQUIRE(line != result.stores.end());
+    CHECK(line->outcome == DecommissionOutcome::Deleted);
+
+    // After: every read agrees that WS-1 is gone and WS-2 is untouched.
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // WS-2's r1 only
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 0);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        CHECK(g["guards"].empty());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+        CHECK(g["unrepresented_pending_rule_ids"].empty());
+        CHECK(device("WS-2")["errored_rules"].get<int>() == 1);
+        const auto rows = h.store->agent_rule_statuses_for_agent("WS-1");
+        REQUIRE(rows.has_value());
+        CHECK(rows->empty());
+        const auto other = h.store->agent_rule_statuses_for_agent("WS-2");
+        REQUIRE(other.has_value());
+        CHECK(other->size() == 1);
+        REQUIRE(h.store->pending_projection_count_checked().has_value());
+        CHECK(*h.store->pending_projection_count_checked() == 0);
+    }
+
+    // Re-registration under the same id: a verdict that is older than the retired evidence's
+    // ordering key creates a clean row, not one folded together with the erased evidence.
+    h.seed_status("n1", "WS-1", "r1", "guard.compliant", "2026-06-20T10:01:30Z");
+    {
+        const auto f = fleet();
+        CHECK(f["errored_rules"].get<int>() == 1); // still only WS-2's r1
+        CHECK(f["uncertain_rules"].get<int>() == 0);
+        const auto d = device("WS-1");
+        CHECK(d["total_rules"].get<int>() == 1);
+        CHECK(d["errored_rules"].get<int>() == 0);
+        CHECK(d["uncertain_rules"].get<int>() == 0);
+        const auto g = device_guards("WS-1");
+        REQUIRE(g["guards"].size() == 1);
+        CHECK(g["guards"][0]["state"].get<std::string>() == "compliant");
+        CHECK_FALSE(g["guards"][0]["order_uncertain"].get<bool>());
+        CHECK_FALSE(g["guards"][0]["projection_pending"].get<bool>());
+        CHECK(g["unrepresented_pending_guards"].get<int>() == 0);
+    }
+}
+
+// ── UP-14 server PR A5a: the stored per-agent ordering state on the fleet rollup and the per-device
+// all-guards read. The verdicts the pair decides are pinned in test_census_pair_order.cpp. ──
+namespace {
+
+// One census-bearing event for (agent, rule) through the real store. `pair` set = a paired event.
+// `n` makes the event id and the agent stamp unique, so every call is a first delivery.
+void rest_send_event(RestGsHarness& h, int n, const std::string& agent, const std::string& rule,
+                     std::optional<std::pair<std::int64_t, std::int64_t>> pair = std::nullopt) {
+    GuaranteedStateEventRow e;
+    e.event_id = "ord-" + std::to_string(n);
+    e.rule_id = rule;
+    e.agent_id = agent;
+    e.event_type = "guard.compliant";
+    e.severity = "info";
+    e.timestamp = "2026-06-20T10:00:00Z";
+    e.agent_ns = yuzu::test::iso8601_to_ns(e.timestamp) + n * 1'000'000'000LL;
+    if (pair) {
+        e.boot_epoch = pair->first;
+        e.emit_seq = pair->second;
+    }
+    REQUIRE(h.store->insert_event(e).has_value());
+}
+
+std::vector<std::string> rest_id_array(const nlohmann::json& a) {
+    REQUIRE(a.is_array());
+    std::vector<std::string> out;
+    for (const auto& x : a)
+        out.push_back(x.get<std::string>());
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("REST gs.status: unordered_agents and unordered_agent_ids report the agents whose latest "
+          "unpaired event is later than their pair clock",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U2", "r1");
+    rest_send_event(h, 2, "U1", "r1");
+    rest_send_event(h, 3, "P", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 4, "M", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 5, "M", "r1"); // unpaired after the clock: unordered again
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 3);
+    CHECK(rest_id_array(d["unordered_agent_ids"]) == std::vector<std::string>{"M", "U1", "U2"});
+    // The note says the server orders a verdict by the pair (reverting the wording must turn this
+    // red).
+    const auto note = d["note"].get<std::string>();
+    CHECK(note.find("unordered_agents counts agents") != std::string::npos);
+    CHECK(note.find("orders a census verdict by the emit-order pair") != std::string::npos);
+    CHECK(note.find("not yet compared") == std::string::npos); // the pre-B wording is gone
+}
+
+TEST_CASE("REST gs.status: the unordered ids are capped at 50 and the count is exact",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    constexpr int kAgents = 55;
+    for (int i = kAgents - 1; i >= 0; --i)
+        rest_send_event(h, i + 1, std::format("ag{:03}", i), "r1");
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == kAgents);
+    const auto ids = rest_id_array(d["unordered_agent_ids"]);
+    REQUIRE(ids.size() == yuzu::server::kUnorderedAgentIdCap);
+    CHECK(ids.front() == "ag000");
+    CHECK(ids.back() == "ag049");
+}
+
+TEST_CASE("REST gs.status: a management-group-confined caller sees only visible unordered agents "
+          "and a count that excludes the hidden ones (AdmitScoped)",
+          "[pg][rest][guaranteed_state][status][ordering][pair][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "RegionA";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "VIS").has_value());
+    REQUIRE(h.mgmt_.add_member(*gid, "VIS-PAIRED").has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "carol", "GsReader"}).has_value());
+    h.session_user = "carol";
+
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    rest_send_event(h, 1, "VIS", "r1");
+    rest_send_event(h, 2, "HIDDEN-1", "r1"); // unordered, but outside carol's scope
+    rest_send_event(h, 3, "HIDDEN-2", "r1");
+    rest_send_event(h, 4, "VIS-PAIRED", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    INFO(res->body);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 1);
+    CHECK(rest_id_array(d["unordered_agent_ids"]) == std::vector<std::string>{"VIS"});
+    // A hidden agent's id is nowhere in the body.
+    CHECK(res->body.find("HIDDEN") == std::string::npos);
+}
+
+TEST_CASE("REST gs.status: a confined caller with zero visible agents gets zero unordered agents "
+          "(INV-2), not the fleet's",
+          "[pg][rest][guaranteed_state][status][ordering][pair][adr0017]") {
+    RestGsHarness h;
+    h.rbac_.set_rbac_enabled(true);
+    REQUIRE(h.rbac_.create_role({"GsReader", "", false, 0}).has_value());
+    REQUIRE(h.rbac_.set_permission({"GsReader", "GuaranteedState", "Read", "allow"}).has_value());
+    ManagementGroup g;
+    g.name = "EmptyRegion";
+    g.membership_type = "static";
+    auto gid = h.mgmt_.create_group(g);
+    REQUIRE(gid.has_value());
+    REQUIRE(h.mgmt_.assign_role({*gid, "user", "dana", "GsReader"}).has_value());
+    h.session_user = "dana";
+    REQUIRE(h.sink.Post("/api/v1/guaranteed-state/rules", RestGsHarness::make_rule_body("r1", "rule-1"))
+                ->status == 201);
+    rest_send_event(h, 1, "WS-1", "r1");
+
+    auto res = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    const auto d = nlohmann::json::parse(res->body)["data"];
+    CHECK(d["unordered_agents"].get<int>() == 0);
+    REQUIRE(d["unordered_agent_ids"].is_array());
+    CHECK(d["unordered_agent_ids"].empty());
+}
+
+TEST_CASE("REST gs.agents/{id}/rules: ordering is the agent's order row, null for an agent with none",
+          "[pg][rest][guaranteed_state][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U", "r1");
+    rest_send_event(h, 2, "P", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 3, "M", "r1", std::pair<std::int64_t, std::int64_t>{5, 10});
+    rest_send_event(h, 4, "M", "r1");
+
+    const auto data = [&](const char* id) {
+        auto res = h.sink.Get(std::string("/api/v1/guaranteed-state/agents/") + id + "/rules");
+        REQUIRE(res);
+        INFO(res->body);
+        REQUIRE(res->status == 200);
+        return nlohmann::json::parse(res->body)["data"];
+    };
+
+    SECTION("an unpaired agent is currently unordered") {
+        const auto o = data("U")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == true);
+        CHECK(o["epoch"].is_null());
+        CHECK(o["epoch_recv_ns"].is_null());
+        CHECK(o["unpaired_events"] == 1);
+    }
+    SECTION("a paired agent is not") {
+        const auto o = data("P")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == false);
+        CHECK(o["epoch"] == 5);
+        CHECK(o["emit_seq_hwm"] == 10);
+        CHECK(o["unpaired_recv_ns"].is_null());
+        CHECK(o["unpaired_events"] == 0);
+    }
+    SECTION("a paired agent with a later unpaired event is again") {
+        const auto o = data("M")["ordering"];
+        REQUIRE(o.is_object());
+        CHECK(o["currently_unordered"] == true);
+        CHECK(o["epoch"] == 5);
+        CHECK(o["unpaired_events"] == 1);
+    }
+    SECTION("an agent with no order row has ordering null, the key still present") {
+        const auto d = data("nobody");
+        REQUIRE(d.contains("ordering"));
+        CHECK(d["ordering"].is_null());
+        CHECK(d["guards"].empty());
+    }
+    SECTION("the block is exactly the shared rendering of the store row") {
+        const auto row = h.store->agent_order_for_agent("M");
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        CHECK(data("M")["ordering"] ==
+              nlohmann::json::parse(yuzu::server::render_guardian_agent_order_json(**row)));
+    }
+}
+
+TEST_CASE("REST gs: a failed order read is a 503, never a zero or a null ordering",
+          "[pg][rest][guaranteed_state][status][ordering][pair]") {
+    RestGsHarness h;
+    h.seed_rule("r1", "rule-1");
+    rest_send_event(h, 1, "U", "r1");
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.gs_db_pg->dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult r{PQexec(
+            conn.get(), "DROP TABLE guaranteed_state_store.guardian_agent_order CASCADE")};
+        REQUIRE(r.ok());
+    }
+
+    auto fleet = h.sink.Get("/api/v1/guaranteed-state/status", h.status_route_headers());
+    REQUIRE(fleet);
+    CHECK(fleet->status == 503);
+    CHECK(fleet->body.find("unordered_agents") == std::string::npos);
+    CHECK(nlohmann::json::parse(fleet->body)["error"]["retry_after_ms"] == 5000);
+
+    auto dev = h.sink.Get("/api/v1/guaranteed-state/agents/U/rules");
+    REQUIRE(dev);
+    CHECK(dev->status == 503);
+    CHECK(dev->body.find("\"ordering\"") == std::string::npos);
+    CHECK(nlohmann::json::parse(dev->body)["error"]["retry_after_ms"] == 5000);
 }

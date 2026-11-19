@@ -8,6 +8,8 @@
  *   C. yuzu::mgmt_posture::execute_posture
  *   D. yuzu::shares::execute_list
  *   E. yuzu::remote_access_audit::execute_list
+ *   F. yuzu::virtualization::execute_action
+ *   G. yuzu::process_introspect::execute_inspect
  * Their catch arms must build a token, write a status row and set the typed
  * status without letting a second bad_alloc escape. The SDK export wrapper
  * (plugin.hpp) and the test-side LocalDispatcher::run (agent.cpp) do not catch, so an
@@ -38,7 +40,7 @@
  * surviving signal. The healthy-allocator behaviour (full `:bad_alloc` token)
  * is pinned by the two local-dispatcher tests and is not duplicated here.
  *
- * SEAMS C, D and E differ in two respects. Their recovery writes the status ROW before it sets
+ * SEAMS C, D, E, F and G differ in two respects. Their recovery writes the status ROW before it sets
  * the typed status, so under sustained failure the row build throws first and the surviving
  * signal is rc 1 (the double-throw arm), not a typed status. And their token
  * (`<os>:leg:exception`) carries no `:bad_alloc` suffix, so the provenance-shape check above
@@ -47,9 +49,11 @@
 
 #include "browser_policy_legs.hpp"
 #include "mgmt_posture_legs.hpp"
+#include "process_introspect_legs.hpp"
 #include "remote_access_audit_legs.hpp"
 #include "shares_legs.hpp"
 #include "update_source_trust_legs.hpp"
+#include "virtualization_legs.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -81,6 +85,12 @@ void reset_stubs() {
 
 int oom_leg(yuzu::CommandContext&) {
     g_fail_alloc = true; // stays set until the seam returns: the catch arm allocates under failure
+    throw std::bad_alloc{};
+}
+
+// process_introspect's leg takes the parsed request as well.
+int oom_inspect_leg(yuzu::CommandContext&, const yuzu::process_introspect::Request&) {
+    g_fail_alloc = true;
     throw std::bad_alloc{};
 }
 
@@ -238,6 +248,53 @@ TEST_CASE("remote_access_audit execute_list contains a leg that throws under sus
     int rc = -1;
     try {
         rc = yuzu::remote_access_audit::execute_list(ctx, "list", &oom_leg, "linux:leg:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    g_fail_alloc = false;
+
+    REQUIRE_FALSE(escaped);
+    // The recovery's status row must have hit the failing allocator, or this case proves
+    // nothing on a stdlib whose containment is never exercised.
+    REQUIRE(g_injected > 0);
+    CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                       g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+TEST_CASE("virtualization execute_action contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][virtualization]") {
+    for (const char* action : {"host", "wsl", "runtime_posture"}) {
+        yuzu::CommandContext ctx{nullptr};
+        reset_stubs();
+        bool escaped = false;
+        int rc = -1;
+        try {
+            rc = yuzu::virtualization::execute_action(
+                ctx, action, yuzu::virtualization::Legs{&oom_leg, &oom_leg, &oom_leg},
+                "linux:leg:exception");
+        } catch (...) {
+            escaped = true;
+        }
+        g_fail_alloc = false;
+
+        REQUIRE_FALSE(escaped);
+        // The recovery's status row must have hit the failing allocator, or this case proves
+        // nothing on a stdlib whose containment is never exercised.
+        REQUIRE(g_injected > 0);
+        CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE &&
+                           g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+    }
+}
+
+TEST_CASE("process_introspect execute_inspect contains a leg that throws under sustained OOM",
+          "[plugin][abi][oom][process_introspect]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::process_introspect::execute_inspect(ctx, "inspect", "4242", "oom", "",
+                                                       &oom_inspect_leg, "linux:leg:exception");
     } catch (...) {
         escaped = true;
     }

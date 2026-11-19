@@ -46,8 +46,11 @@ import socket
 import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
+import unittest
+from unittest import mock
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 # YUZU_MCP_ADAPTER_JS may point at a mutated copy of the script (mutation checks).
@@ -209,26 +212,98 @@ def run_adapter_staged(node, url, chunks, gap, extra=None, timeout=30):
     need the later lines to arrive measurably after the first (a pipe write is otherwise one
     burst and the margins would be a millisecond wide).
     """
-    p = subprocess.Popen([node, str(ADAPTER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, env=child_env(url, extra))
-    try:
-        for i, chunk in enumerate(chunks):
-            if i:
-                time.sleep(gap)
-            p.stdin.write(chunk.encode("utf-8"))
-            p.stdin.flush()
-        p.stdin.close()
-        out, err = p.communicate(timeout=timeout)
-    except subprocess.TimeoutExpired:
-        p.kill()
-        p.communicate()
-        return subprocess.CompletedProcess(p.args, 124, "", "adapter did not exit within %ss" % timeout)
+    with subprocess.Popen([node, str(ADAPTER)], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, env=child_env(url, extra)) as p:
+        try:
+            for i, chunk in enumerate(chunks):
+                if i:
+                    time.sleep(gap)
+                p.stdin.write(chunk.encode("utf-8"))
+                p.stdin.flush()
+            p.stdin.close()
+            # Python 3.12's communicate() otherwise flushes the already-closed pipe.
+            p.stdin = None
+            out, err = p.communicate(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            p.kill()
+            p.communicate()
+            return subprocess.CompletedProcess(p.args, 124, "", "adapter did not exit within %ss" % timeout)
+        finally:
+            # A failed write or interrupted staging must also stop and reap the child.
+            if p.poll() is None:
+                p.kill()
+            p.wait()
     return subprocess.CompletedProcess(p.args, p.returncode, out.decode("utf-8", "replace"),
                                        err.decode("utf-8", "replace"))
 
 
 def out_objs(p):
     return [json.loads(x) for x in p.stdout.splitlines() if x.strip()]
+
+
+class StagedInputTests(unittest.TestCase):
+    """Exercise the pipe helper with real children, including failure-path ownership."""
+
+    def setUp(self):
+        tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_staged_input_")
+        self.addCleanup(tmp.cleanup)
+        self.script = pathlib.Path(tmp.name) / "child.py"
+        self.child = None
+        popen = subprocess.Popen
+
+        def spawn(*args, **kwargs):
+            self.child = popen(*args, **kwargs)
+            return self.child
+
+        patch = mock.patch.object(subprocess, "Popen", side_effect=spawn)
+        patch.start()
+        self.addCleanup(patch.stop)
+        patch = mock.patch.object(sys.modules[__name__], "ADAPTER", self.script)
+        patch.start()
+        self.addCleanup(patch.stop)
+        self.addCleanup(self.reap)
+
+    def reap(self):
+        # Keep a broken helper regression from leaving its deliberately stalled child behind.
+        if self.child:
+            if self.child.poll() is None:
+                self.child.kill()
+            self.child.wait()
+            for stream in (self.child.stdin, self.child.stdout, self.child.stderr):
+                if stream:
+                    try:
+                        stream.close()
+                    except BrokenPipeError:
+                        pass
+
+    def assert_reaped(self):
+        self.assertIsNotNone(self.child.returncode, "helper did not wait for its child")
+        self.assertTrue(all(s is None or s.closed for s in
+                            (self.child.stdin, self.child.stdout, self.child.stderr)))
+
+    def test_staged_eof_drains_output_and_reaps(self):
+        self.script.write_text("import sys; print(sys.stdin.read(), end=''); print('done', file=sys.stderr)")
+        result = run_adapter_staged(sys.executable, "http://unused", ["one\n", "two\n"], 0)
+        self.assertEqual((result.returncode, result.stdout, result.stderr), (0, "one\ntwo\n", "done\n"))
+        self.assert_reaped()
+
+    def test_timeout_kills_and_reaps(self):
+        self.script.write_text("import time; time.sleep(30)")
+        result = run_adapter_staged(sys.executable, "http://unused", [], 0, timeout=0.05)
+        self.assertEqual(result.returncode, 124)
+        self.assertIn("did not exit", result.stderr)
+        self.assert_reaped()
+
+    def test_broken_pipe_reaps_before_propagating(self):
+        self.script.write_text("import os, time; os.close(0); print('ready', flush=True); time.sleep(30)")
+
+        def chunks():
+            self.assertEqual(self.child.stdout.readline(), b"ready\n")
+            yield "x" * 100000
+
+        with self.assertRaises(BrokenPipeError):
+            run_adapter_staged(sys.executable, "http://unused", chunks(), 0)
+        self.assert_reaped()
 
 
 def synthesized(rid, status):
@@ -238,6 +313,8 @@ def synthesized(rid, status):
 
 
 def main() -> int:
+    if not unittest.TextTestRunner().run(unittest.defaultTestLoader.loadTestsFromTestCase(StagedInputTests)).wasSuccessful():
+        return 1
     node = shutil.which("node")
     if not node:
         print("SKIP: node is not on PATH")
@@ -501,8 +578,14 @@ def main() -> int:
             for name in ("YUZU_MCP_MAX_INFLIGHT", "YUZU_MCP_TIMEOUT_MS", "YUZU_MCP_MAX_QUEUE"):
                 if value in ("-5", "2m", "1e3") and name != "YUZU_MCP_MAX_INFLIGHT":
                     continue  # one variable is enough for these; keeps the run short
-                p = run_adapter(node, stub.url, lines([PING]), {name: value})
-                label = "env %s=%r" % (name, value)
+                # YUZU_MCP_TIMEOUT_MS is a per-request deadline armed when the request is sent: 5 ms
+                # is a valid value but the connect and response round trip to the stub cannot be
+                # relied on to finish inside it under load, so use a generous valid one here. The
+                # in-flight and queue limits are counts, not times, so "5" tests nothing
+                # timing-sensitive there.
+                sent = "5000" if (name == "YUZU_MCP_TIMEOUT_MS" and value == "5") else value
+                p = run_adapter(node, stub.url, lines([PING]), {name: sent})
+                label = "env %s=%r" % (name, sent)
                 check(out_objs(p) == [ok] and p.returncode == 0, label + ": stdout %r" % p.stdout)
                 errs = p.stderr.splitlines()
                 if valid:

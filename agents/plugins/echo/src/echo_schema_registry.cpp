@@ -587,10 +587,11 @@ const std::vector<CaptureSourceDef>& build_sources() {
         // changes under a curated persistence/policy watch list (HKLM and each
         // profile hive, loaded or not). Roll-up tiers only, no raw capture table: a
         // bucket keys on hive, key_path, value_name and action and keeps change_count,
-        // last_data (the newest value, 512 bytes, UNMASKED and readable through
-        // echo.sql), last_data_type, last_actor_image and last_ts. The old value, the
-        // writer's pid, `detail` and `source` are decided by the collector and not
-        // stored.
+        // last_data (the newest value, 512 bytes, readable through echo.sql except under
+        // a sensitive value name -- DefaultPassword / AltDefaultPassword -- where it is
+        // the fixed placeholder; see echo_registry_parsers.hpp), last_data_type,
+        // last_actor_image and last_ts. The old value, the writer's pid, `detail` and
+        // `source` are decided by the collector and not stored.
         // Mechanism: a RegNotifyChangeKeyValue subtree watch + a per-root baseline diff
         // (echo_state `registry:<root>`) say WHAT changed; a write-only
         // Kernel-Registry ETW session says WHO, by correlation on value name, type,
@@ -707,7 +708,7 @@ const std::unordered_map<std::string, std::string>& dollar_name_map() {
         std::unordered_map<std::string, std::string> m;
         for (const auto& src : build_sources()) {
             for (const auto& g : src.granularities) {
-                // $Process_Live -> process_live
+                // $Usage_Live -> usage_live, $TCP_Hourly -> tcp_hourly
                 std::string dollar = std::format("${}_{}",
                     src.dollar_name,
                     std::string(1, static_cast<char>(std::toupper(static_cast<unsigned char>(g.suffix[0])))) +
@@ -715,9 +716,6 @@ const std::unordered_map<std::string, std::string>& dollar_name_map() {
                 std::string real = std::format("{}_{}", src.name, g.suffix);
                 m[dollar] = real;
             }
-            // $Process_Live and friends: the retired raw tables answer with an empty view.
-            if (is_legacy_live_shim(std::format("{}_live", src.name)))
-                m[std::format("${}_Live", src.dollar_name)] = std::format("{}_live", src.name);
         }
         return m;
     }();
@@ -953,13 +951,15 @@ bool is_queryable_table(std::string_view real_table_name) {
         // Reading it exposes a source name, a position and updated_at; the
         // cursor payload is the source's own bookkeeping, not captured content --
         // with two exceptions: the registry cursor row holds, for about one tick, the
-        // rendered new value of changes whose writer is not settled yet (and the old
-        // value only when the baseline came from an older build), and its
+        // rendered new value of changes whose writer is not settled yet (the placeholder
+        // under a sensitive value name; the old value too, only when the baseline came
+        // from an older build), and its
         // `offline` list holds [sid, ProfileImagePath] (the path names the user) for every
         // logged-off profile.
         // echo_state carries the registry baselines (`registry:<root>`: type, size and
-        // a hash per value; an older build also wrote a rendered prefix), readable here
-        // consistently with the registry tiers' own unmasked last_data;
+        // a hash per value, the type only under a sensitive value name; an older build
+        // also wrote a rendered prefix), readable here. The `process` baseline holds
+        // pid, ppid, name and user, never a command line;
         // purge_source("registry") erases the tiers, the cursor row and
         // every `registry:%` state row in one transaction.
         std::unordered_set<std::string> s{"echo_state", "echo_config", "echo_cursor"};
@@ -974,10 +974,6 @@ bool is_queryable_table(std::string_view real_table_name) {
         // no-oracle reasoning this function already documents.
         for (const char* usage_table : {"usage_live", "usage_daily", "usage_daily_user"})
             s.erase(usage_table);
-        // The retired raw tables' shim views: a stored `$X_Live` query still reads an (empty)
-        // relation instead of failing at the authorizer.
-        for (const auto& shim : legacy_live_shim_names())
-            s.insert(shim);
         return s;
     }();
     return allowed.contains(std::string(real_table_name));
@@ -993,14 +989,6 @@ std::vector<std::string> all_dollar_names() {
 }
 
 std::vector<std::string> columns_for_table(const std::string& real_table_name) {
-    if (is_legacy_live_shim(real_table_name)) {
-        // `process_live` -> the source `process`: the legacy column list, `id` first.
-        std::vector<std::string> cols{"id"};
-        for (const auto& c : legacy_live_columns(
-                 std::string_view{real_table_name}.substr(0, real_table_name.size() - 5)))
-            cols.emplace_back(c.name);
-        return cols;
-    }
     auto& refs = table_ref_map();
     auto it = refs.find(real_table_name);
     if (it == refs.end())

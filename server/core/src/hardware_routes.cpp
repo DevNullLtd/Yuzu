@@ -1,6 +1,7 @@
 /// @file hardware_routes.cpp
 /// /hardware route registration — the page shells + the read-only HTMX fragments +
-/// the REST v1 twins (`GET /api/v1/hardware`, `GET /api/v1/hardware/{id}`), all
+/// the REST v1 twins (`GET /api/v1/hardware`, `GET /api/v1/hardware/{id}`, and the bulk
+/// `GET /api/v1/hardware-ci` keyset page of stored CI rows), all
 /// self-registered on the shared `HttpRouteSink` (the preflight_routes.cpp pattern)
 /// so this module owns its own REST surface without growing rest_api_v1.cpp's
 /// register_routes argument list. Renderers live in hardware_ui.cpp; query/sort/
@@ -10,13 +11,16 @@
 #include "query_int_parse.hpp" // parse_query_int / strict_stoi / strict_stoll (#4644)
 
 #include "app_shell.hpp"
+#include "execution_scope_rules.hpp" // execution_owner_key (the sync status route)
 #include "forensics_read_audit.hpp" // #4990: response.forensics.read
 #include "authz_model.hpp"          // authz::in_scope
+#include "hardware_ci_page_model.hpp"
 #include "http_route_sink.hpp"
+#include "model_param_helpers.hpp" // model_detail::to_params
 #include "rest_a4_envelope_http.hpp" // detail::a4_error, ensure_correlation_id
 #include "rest_audit.hpp"            // detail::emit_behavioral_audit, try_persist_audit
 
-#include <yuzu/protective_actions.hpp> // protective::is_quarantine_control_plugin
+#include <yuzu/protective_actions.hpp> // protective::is_firewall_control_plugin
 #include <yuzu/server/auth.hpp> // auth::kMaxAgentIdLength
 
 #include <nlohmann/json.hpp>
@@ -243,6 +247,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         page.containment_ui = deps_.containment_ui;
         // DEX is scored ONLY on the page's rendered rows (device_routes.cpp's own
         // "score only rendered rows" rule) — a GROUP-BY per device is too costly to
@@ -286,7 +291,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list: devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         (void)persisted; // HTML fragment: set-and-proceed — the header is the signal
 
         send_html(res, render_hardware_list_fragment(page, all.ci_degraded, false, results_only, all.tags_degraded));
@@ -349,7 +355,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         // No sections: the fragment (and its sync-now poll) never renders them.
-        const HardwareCiDetail detail = deps_.ci_detail_fn(id, /*with_sections=*/false);
+        const HardwareCiDetail detail = deps_.ci_detail_fn(id, CiRead::RecordOnly);
         HwCiAffordances aff = affordances_for(req, id, detail);
         if (lens == "tags")
             aff.can_delete_tags = deps_.scoped_probe_fn && deps_.scoped_probe_fn(req, "Tag", "Delete", id);
@@ -522,6 +528,19 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                             "application/json");
             return;
         }
+        // #7110: the `requested` row is stored, so decide the per-device gate AGAIN: a grant or a
+        // JIT elevation withdrawn while the row was being written dispatches nothing. The dispatch
+        // below authorizes as the system caller, so no layer past this one can see the operator's
+        // grant. On a false return the gate has written its own refusal (403, or the 404 an
+        // out-of-scope id collapses to); the row that exists gets its outcome, flagged with
+        // `Sec-Audit-Failed` when it cannot be stored, since it is the only evidence the sync was
+        // NOT requested of the agent. This recheck has no catch: a gate that throws (a store
+        // fault) unwinds to the generic 500 and leaves the `requested` row with no outcome row.
+        if (!deps_.scoped_perm_fn(req, res, "Execution", "Execute", id)) {
+            (void)detail::emit_behavioral_audit(deps_.audit_fn, req, res, "inventory.sync.request",
+                                                "failure", "Agent", id, "permission_revoked");
+            return;
+        }
         const auto r = deps_.sync_dispatch_fn(id, source);
         if (!r.sent) {
             // No second audit row here — matching the /api/v1/dex/devices/{id}/live
@@ -550,18 +569,26 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // -- REST v1: POST /api/v1/hardware/sync — "Sync now" for a scope (the Software page) --
     // One click, many devices. `scope` is __all__ / group:<id> / an agent id; `scope_expression`
     // is a scope DSL expression (software_sync_decision.hpp owns the request grammar and every
-    // bound below).
+    // rule below). `confirm: true` is required for a whole group and the whole fleet;
+    // `last_synced_before` (epoch seconds) asks only the devices whose last accepted report is older.
     // GATE: the type-level Execution:Execute check (sync_perm_fn = require_permission), which reads
     // GLOBAL grants only, so an operator whose Execute is limited to management groups gets 403
     // for every scope kind; then the same-site write gate (a cookie-session write must name this
-    // site; token callers are exempt). WHO IS REACHED is decided by `dispatch_confined_arms`
-    // (the system-reserved fan-out arm): the id list is intersected with the caller's own
-    // Execution:Execute visible set at SEND time, so a hidden device is never sent to. The
-    // resolver's narrowing (software_sync::resolve_targets) and the fleet-wide refusal for a
-    // filtered caller keep the counts, the 413 cap and the audit row from describing devices the
-    // caller may not see; with a global grant none of them changes the outcome today.
-    // The sequence (cooldown, in-flight lease, partition + cap, audit, dispatch, stamp) is
-    // software_sync::Runner, shared with the MCP tool sync_hardware_software.
+    // site; token callers are exempt). The WHOLE FLEET also needs a fleet administrator: an
+    // unfiltered Execution:Execute AND the global ManagementGroup:Write grant. WHO IS REACHED is
+    // decided by `dispatch_confined_arms` (the system-reserved fan-out arm): the id list is
+    // intersected with the caller's own Execution:Execute visible set at SEND time, so a hidden
+    // device is never sent to. The resolver's narrowing (software_sync::resolve_targets) keeps the
+    // counts and the audit row from describing devices the caller may not see.
+    // The sequence (confirmation, run key and join, resolve, pacing admission, cooldown, audit,
+    // dispatch) is software_sync::Runner, shared with the MCP tool sync_hardware_software.
+    // There is no ceiling on the number of devices: the run is PACED. The agents are asked to fire
+    // inside `delay_max_s` seconds under one per-process budget, so a large run is spread, not
+    // refused; `delay_max_s` and `estimated_completion_at` are ESTIMATES (an agent whose own
+    // scheduled sync is due sooner reports then, as a full send), and the budget bounds what the
+    // server ASKS for, not the rate reports arrive at. A repeat of a request whose run is still
+    // spreading JOINS it (202, `joined: true`, nothing sent); the cooldown (per group, per
+    // operator's expression, or fleet) starts when the run does.
     // REACH: this server process only. Sessions and sends are per process, so an agent attached to
     // another replica has no session here and is not sent to. skipped_offline = candidates this
     // process did not reach that are not too old: no live session here (disconnected, or attached
@@ -569,12 +596,13 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
     // disconnected members too; __all__ and a scope expression list only this process's sessions
     // plus the shared presence record, so a device offline everywhere is never counted. The counts
     // describe what THIS server could reach, not the fleet.
-    // Audit BEFORE dispatch, fail closed. 202 means REQUESTED: `agents_reached` is sessions that
-    // accepted the frame, not devices that have synced.
+    // Audit BEFORE dispatch, fail closed (the whole-fleet row under its own verb). 202 means
+    // REQUESTED: `agents_reached` is sessions that accepted the frame, not devices that have synced.
     static_assert(software_sync::kMaxIdLen == auth::kMaxAgentIdLength);
     sink.Post("/api/v1/hardware/sync", [this](const httplib::Request& req, httplib::Response& res) {
         namespace ss = software_sync;
         constexpr const char* kAction = "inventory.sync.request";
+        constexpr const char* kFleetAction = "software_estate.sync.fleet_wide";
         detail::ensure_correlation_id(res);
         if (!deps_.sync_perm_fn || !deps_.auth_fn || !deps_.sync_runner) {
             // The derivation of "which devices may this caller sync" is this route's only
@@ -618,10 +646,17 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kAction, std::string(result),
                                                  std::string(type), id, detail_text);
         };
+        // A whole-fleet run is its own audit verb: it is the one request that touches every device.
+        audit.persist_fleet_wide = [&](std::string_view result, std::string_view type, const std::string& id,
+                                       const std::string& detail_text) {
+            return detail::emit_behavioral_audit(deps_.audit_fn, req, res, kFleetAction,
+                                                 std::string(result), std::string(type), id, detail_text);
+        };
         const auto out = deps_.sync_runner->run(*session, *parsed, audit);
         if (out.status != ss::Status::Accepted) {
-            if (out.status == ss::Status::Cooldown)
-                res.set_header("Retry-After", std::to_string(*out.retry_after_ms / 1000));
+            // Both 429 refusals say how long to wait, rounded UP so a client never retries early.
+            if (out.status == ss::Status::Cooldown || out.status == ss::Status::BudgetBusy)
+                res.set_header("Retry-After", std::to_string((out.retry_after_ms.value_or(1000) + 999) / 1000));
             res.status = out.http;
             res.set_content(detail::a4_error(res, out.message, {.retry_after_ms = out.retry_after_ms}),
                             "application/json");
@@ -629,6 +664,60 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         nlohmann::json body = {{"data", out.summary}, {"meta", {{"api_version", "v1"}}}};
         res.status = 202;
+        res.set_content(body.dump(), "application/json");
+    });
+
+    // -- REST v1: GET /api/v1/hardware/sync/{execution_id} — how a sync run is going --
+    // The execution record `POST /api/v1/hardware/sync` returns the id of. Same type-level
+    // Execution:Execute gate as the POST. A caller reads only the runs it started, or any run when
+    // its Execution:Execute is unfiltered; an unknown id, a run somebody else started and an
+    // execution that is not a sync run are the SAME 404, so the route is not an oracle for ids.
+    // A tracker read that fails is a retryable 503, never an empty 200.
+    // `targeted` is the frames the registry accepted; `acknowledged` the agents that armed the
+    // sync and `failed` the agents that answered with a failure. An agent answers when it ARMS the
+    // sync, not when its report lands, so this counts requests taken up, not reports received
+    // (a count of reports per run is not built here).
+    sink.Get(R"(/api/v1/hardware/sync/([A-Za-z0-9_-]{1,128}))",
+             [this](const httplib::Request& req, httplib::Response& res) {
+        namespace ss = software_sync;
+        detail::ensure_correlation_id(res);
+        if (!deps_.sync_perm_fn || !deps_.auth_fn) {
+            res.status = 500;
+            res.set_content(detail::a4_error(res, "sync status is not configured on this server"),
+                            "application/json");
+            return;
+        }
+        if (!deps_.sync_perm_fn(req, res, "Execution", "Execute")) return;
+        const auto session = deps_.auth_fn(req, res);
+        if (!session) return;
+        if (!deps_.sync_status_fn) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "sync status is unavailable on this server",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+        const auto read = deps_.sync_status_fn(req.matches[1].str());
+        const bool unfiltered =
+            read && deps_.sync_unfiltered_fn && deps_.sync_unfiltered_fn(*session);
+        // Visibility and the body are software_sync::sync_status's, the same function the MCP
+        // tool get_software_sync_status calls.
+        const bool owned = read && *read && execution_owner_key(*session).owns(**read);
+        const auto status = ss::sync_status(read, owned, unfiltered);
+        if (!status) {
+            if (status.error() == ss::SyncStatusFault::kUnavailable) {
+                res.status = 503;
+                res.set_content(detail::a4_error(res, "sync status is unavailable right now",
+                                                 {.retry_after_ms = 5000}),
+                                "application/json");
+                return;
+            }
+            res.status = 404;
+            res.set_content(detail::a4_error(res, "sync run not found"), "application/json");
+            return;
+        }
+        const nlohmann::json body = {{"data", *status}, {"meta", {{"api_version", "v1"}}}};
+        res.status = 200;
         res.set_content(body.dump(), "application/json");
     });
 
@@ -678,6 +767,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         HardwareListPage page = build_hardware_list_page(std::move(scoped), *normalised);
+        page.roster_truncated = all.roster_truncated; // #5712: typed partial, served + flagged
         if (deps_.dex_score_fn)
             for (auto& row : page.rows)
                 row.dex_score = deps_.dex_score_fn(row.agent_id);
@@ -685,7 +775,8 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         const bool persisted = detail::emit_behavioral_audit(
             deps_.audit_fn, req, res, "inventory.devices", "success", "Inventory", "fleet",
             "hardware list (REST): devices=" + std::to_string(page.total_matching) +
-                " omitted=" + std::to_string(omitted));
+                " omitted=" + std::to_string(omitted) +
+                (page.roster_truncated ? " roster_truncated=1" : ""));
         if (!persisted) {
             res.status = 503;
             res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
@@ -702,6 +793,110 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             {"meta", {{"api_version", "v1"}}},
         };
         res.set_content(out.dump(), "application/json");
+    });
+
+    // -- REST v1: GET /api/v1/hardware-ci: the bulk CI read, one keyset page per call --
+    // A sibling segment, not a child of `/api/v1/hardware`: `GET /api/v1/hardware/{id}` matches any
+    // single segment, so the bulk read keeps its own prefix and a device whose agent_id is literally
+    // `ci` stays reachable through the per-id route.
+    //
+    // Reads the stored `device_ci` rows directly (NOT the 30-day roster `GET /api/v1/hardware`
+    // rebuilds on every request), ordered by agent_id, with the caller's scope pushed into SQL
+    // (a scope over hardware_ci_page::kMaxPushdownScopeIds ids with no agent_id is a 400, never a
+    // post-filtered read); the page logic is hardware_ci_page_model.hpp. SOLE gate: fleet_read_fn
+    // (never stacked).
+    // Serial / system UUID / MAC / chassis and board serials are behavioural PII, so each served
+    // page is ONE `inventory.devices.ci` audit row written AFTER the read (it carries the row
+    // count) and FAIL-CLOSED: a row that does not persist withholds the page.
+    sink.Get("/api/v1/hardware-ci", [this](const httplib::Request& req, httplib::Response& res) {
+        detail::ensure_correlation_id(res);
+        if (!deps_.fleet_read_fn) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware service unavailable"), "application/json");
+            return;
+        }
+        auto gate = deps_.fleet_read_fn(req, res, "Inventory", "Read");
+        if (!gate.admitted) return;
+
+        if (!deps_.ci_page_reader) {
+            (void)detail::try_persist_audit(deps_.audit_fn, req, "inventory.devices.ci", "failure",
+                                            "Inventory", "fleet", "hardware CI provider unwired");
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "hardware CI records unavailable"), "application/json");
+            return;
+        }
+        const auto parsed = hardware_ci_page::parse_params(model_detail::to_params(req.params));
+        if (!parsed) {
+            res.status = 400;
+            res.set_content(detail::a4_error(res, parsed.error()), "application/json");
+            return;
+        }
+        const hardware_ci_page::Request& rq = *parsed;
+        // `deps_.ci_collation_gate` is the collation gate (device_ci_read_gate.hpp): not Trusted
+        // refuses the page before the store is asked. Null means no gate was wired (tests only).
+        const auto read = hardware_ci_page::read_page(deps_.ci_page_reader, rq, gate.scope,
+                                                      deps_.ci_collation_gate);
+        if (!read) {
+            // ONE answer per failure, shared with MCP (hardware_ci_page::describe_read_error): a
+            // scope too wide is TERMINAL (400, no retry hint, audited as a refusal with no count),
+            // a refused cursor is a 400 with no row, and a failed store read is a 503 with a retry
+            // hint and is never an empty page (ADR-0016 section 7). The domain row is best effort
+            // (nothing is served, and a row that does not persist still marks the response
+            // Sec-Audit-Failed).
+            const auto f = hardware_ci_page::describe_read_error(read.error(),
+                                                                 hardware_ci_page::Surface::kRest);
+            if (f.domain_audit_row)
+                (void)detail::emit_behavioral_audit(
+                    deps_.audit_fn, req, res, "inventory.devices.ci", std::string(f.audit_outcome),
+                    hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
+                    f.audit_detail);
+            res.status = f.unavailable ? 503 : 400;
+            // The unverified-ordering refusal clears on the recheck's schedule, so the header
+            // agrees with the body's retry_after_ms (the other refusals send the body hint only).
+            if (read.error() == hardware_ci_page::ReadError::kOrderingUnverified)
+                res.set_header("Retry-After", std::to_string(f.retry_after_ms / 1000));
+            detail::A4ErrorOpts opts;
+            if (f.retry_after_ms >= 0)
+                opts.retry_after_ms = f.retry_after_ms;
+            opts.remediation = f.remediation;
+            res.set_content(detail::a4_error(res, std::string(f.message), opts), "application/json");
+            return;
+        }
+        const hardware_ci_page::Page& page = *read;
+
+        // A confined caller never receives an out-of-scope row, id or count: the scope is applied
+        // in SQL, so no row is filtered after the read and neither the body, the cursor nor the
+        // audit detail has anything to carry. Confinement is reported as a status instead
+        // (hardware_ci_page::apply_scope_disclosure, shared with MCP). A named device outside the
+        // scope gets the same empty page as a device with no record; only the audit outcome
+        // differs: one `denied` row instead of a `success` row.
+        const bool confined = gate.scope.has_value();
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "inventory.devices.ci", page.target_denied ? "denied" : "success",
+            hardware_ci_page::audit_target_type(rq), hardware_ci_page::audit_target_id(rq),
+            page.target_denied ? hardware_ci_page::audit_detail_target_denied("REST")
+                               : hardware_ci_page::audit_detail(page, rq, "REST", confined));
+        if (!persisted) {
+            res.status = 503;
+            res.set_content(detail::a4_error(res, "audit subsystem unavailable — request not served",
+                                             {.retry_after_ms = 5000}),
+                            "application/json");
+            return;
+        }
+
+        nlohmann::json data = hardware_ci_page::page_json(page);
+        hardware_ci_page::apply_scope_disclosure(data, confined);
+        // Element assignment, not a braced list: a braced list deep-copies the 1000-row page.
+        nlohmann::json out = {{"meta", {{"api_version", "v1"}}}};
+        out["data"] = std::move(data);
+        // The body carries serials, UUIDs and MACs: no cache (shared or private) may keep it. Set
+        // on the served page only; the refusals above carry no device data, and the per-id route
+        // and the neighbouring REST reads set none.
+        res.set_header("Cache-Control", "no-store");
+        // The scalar fields are agent-supplied bytes: a byte that is not valid UTF-8 must not
+        // throw out of dump() AFTER the access audit row persisted (the per-id route's rule).
+        res.set_content(out.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace),
+                        "application/json");
     });
 
     // -- REST v1: GET /api/v1/hardware/{id} --
@@ -739,7 +934,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             res.set_content(detail::a4_error(res, "hardware CI record unavailable"), "application/json");
             return;
         }
-        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id, /*with_sections=*/true);
+        const HardwareCiDetail detail = deps_.ci_detail_fn(agent_id, CiRead::WithSections);
         const HardwareCiRead read = classify_hardware_ci_read(detail);
         if (read == HardwareCiRead::RosterUnreadable) {
             // A failed roster read is never a 404 (#5531).
@@ -758,7 +953,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        if (hardware_ci_sections_unreadable(detail)) {
+        if (read == HardwareCiRead::SectionsUnreadable) {
             // The record's v2 sections (the REPEATABLE READ sections reader) could not be read:
             // a store error is never an empty 200 (H.7). Unlike `ci` / `software` / `tags`, which
             // degrade one part at a time, an unreadable sections read withholds the whole record -
@@ -833,7 +1028,7 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         std::string hostname = id;
         std::string agent_os;
         if (deps_.ci_detail_fn) {
-            auto ident = deps_.ci_detail_fn(id, /*with_sections=*/false).identity; // identity only
+            auto ident = deps_.ci_detail_fn(id, CiRead::RecordOnly).identity; // identity only
             if (ident) {
                 if (!ident->hostname.empty()) hostname = ident->hostname;
                 agent_os = ident->os;
@@ -848,11 +1043,12 @@ void HardwareRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             const std::optional<std::string> manifest =
                 deps_.manifest_fn ? deps_.manifest_fn(plugin.name) : std::nullopt;
             for (const auto& action : plugin.actions) {
-                // Hidden with the rest of the containment UI: a Run button on the quarantine
-                // plugin's own actions is a quarantine control. REST, MCP and the Instructions
-                // page are unchanged.
+                // Hidden with the rest of the containment UI: a Run button on the four
+                // firewall containment actions (quarantine, release, quarantine_status,
+                // quarantine_allow) is a quarantine control; firewall.state and firewall.rules
+                // stay listed. REST, MCP and the Instructions page are unchanged.
                 if (!deps_.containment_ui &&
-                    yuzu::protective::is_quarantine_control_plugin(plugin.name, action))
+                    yuzu::protective::is_firewall_control_plugin(plugin.name, action))
                     continue;
                 HwActionRow row;
                 row.plugin = plugin.name;

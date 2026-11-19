@@ -13,13 +13,14 @@
  *   query         -- Query events by time range with optional type filter
  *   export        -- Export events as JSON array
  *   snapshot      -- Force an immediate full snapshot (all 4 collectors)
- *   configure     -- Update retention_days, intervals, redaction patterns
+ *   configure     -- Update intervals, redaction patterns
  *
  * Data flow:
  *   trigger fires -> enumerate current state -> load previous state from echo_state
  *   -> compute diff -> insert events -> save current state
  */
 
+#include "echo_wire_scrub.hpp" // scrub identity strings at collection (baseline round-trip)
 #include "echo_capture_status.hpp" // yuzu::echo::collect_or_retain
 #include "echo_collectors.hpp"
 #include "echo_cursor.hpp" // yuzu::echo::CursorSource, make_cursor_sources
@@ -33,6 +34,7 @@
 #include "echo_fold_schema.hpp"
 #include "echo_usage.hpp"
 #include "echo_fleet_snapshot.hpp"
+#include "echo_open_retry.hpp"
 #include "echo_source_health.hpp"
 #include "echo_status_format.hpp"
 #include "echo_netconn.hpp"
@@ -47,6 +49,7 @@
 
 #include <yuzu/agent/network_interfaces.hpp>
 #include <yuzu/agent/process_enum.hpp>
+#include <yuzu/agent/subprocess_runner.hpp> // subprocess_cancel_requested: the agent stop latch
 #include <yuzu/plugin.hpp>
 #include <yuzu/echo_retention_tick.hpp> // kEchoRollupTickSeconds (shared with the data-retention API)
 
@@ -60,7 +63,9 @@
 #include <chrono>
 #include <filesystem>
 #include <format>
+#include <functional>
 #include <iterator>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -104,37 +109,6 @@ int64_t netconn_lookback_seconds(yuzu::echo::EchoDatabase& db) {
 }
 
 // ── State serialization helpers ──────────────────────────────────────────────
-
-json processes_to_json(const std::vector<yuzu::agent::ProcessInfo>& procs) {
-    json arr = json::array();
-    for (const auto& p : procs) {
-        arr.push_back({{"pid", p.pid},
-                       {"ppid", p.ppid},
-                       {"name", p.name},
-                       {"cmdline", p.cmdline},
-                       {"user", p.user}});
-    }
-    return arr;
-}
-
-std::vector<yuzu::agent::ProcessInfo> json_to_processes(const std::string& s) {
-    std::vector<yuzu::agent::ProcessInfo> result;
-    if (s.empty())
-        return result;
-    try {
-        auto arr = json::parse(s);
-        for (const auto& j : arr) {
-            yuzu::agent::ProcessInfo p;
-            p.pid = j.value("pid", 0u);
-            p.ppid = j.value("ppid", 0u);
-            p.name = j.value("name", "");
-            p.cmdline = j.value("cmdline", "");
-            p.user = j.value("user", "");
-            result.push_back(std::move(p));
-        }
-    } catch (...) {}
-    return result;
-}
 
 json connections_to_json(const std::vector<yuzu::echo::NetConnection>& conns) {
     json arr = json::array();
@@ -599,6 +573,14 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& ctx) override {
         plugin_ctx_ = ctx.raw();
+        // The plugin object outlives shutdown (one instance per process), so a re-init starts from
+        // a closed gate and a clean offline state.
+        online_.store(false, std::memory_order_release);
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_ = {};
+        }
+        deadline_hits_ = 0;
 
         // Determine data directory
         auto data_dir = ctx.get_config("agent.data_dir");
@@ -613,26 +595,50 @@ public:
             db_dir = std::string{data_dir};
         }
 
-        auto db_path = std::filesystem::path{db_dir} / "echo.db";
-        db_path_ = db_path;
-        auto result = yuzu::echo::EchoDatabase::open(db_path);
+        db_path_ = std::filesystem::path{db_dir} / "echo.db";
+        // The first attempt is synchronous, so the agent registers only after the migration (the
+        // documented contract); it is bounded by the migration's own deadline. A failure that is
+        // not one of the retried kinds fails the plugin as it always did.
+        auto result = yuzu::echo::EchoDatabase::open(db_path_);
         if (!result) {
             // The ABI carries only the code, so this line is where the cause (a refused planted
             // file, its owner and the remedy; a corrupt-and-unmovable db) reaches the log.
             spdlog::error("ECHO: failed to open db: {}", result.error());
-            if (yuzu::echo::is_free_space_refusal(result.error())) {
-                // The v10 roll-up migration needs twice the file's size (plus its log) free and the volume has
-                // less. Nothing was changed. The plugin LOADS, offline, so `echo.status` can say why
-                // (`storage_state|offline|free_space`); no trigger is registered and nothing
-                // collects until the agent restarts with the space freed.
-                offline_detail_ = result.error();
-                return {};
+            const auto reason = yuzu::echo::classify_open_failure(result.error());
+            if (reason == yuzu::echo::OfflineReason::none) {
+                ctx.storage_delete(yuzu::echo::kStorageOfflineKey);
+                return std::unexpected(yuzu::PluginError{
+                    1, std::format("ECHO: failed to open db: {}", result.error())});
             }
-            return std::unexpected(
-                yuzu::PluginError{1, std::format("ECHO: failed to open db: {}", result.error())});
+            // The v10 roll-up migration failed or lacks the free space it needs. Nothing was
+            // changed. The plugin LOADS, offline, so `echo.status` can say why
+            // (`storage_state|offline|<reason>`); no trigger is registered and nothing collects
+            // until a background retry opens the database (owner ruling 2026-11-16, #7290).
+            if (yuzu::echo::is_deadline_hit(result.error()))
+                ++deadline_hits_;
+            go_offline(reason, result.error(), 1);
+            open_retry_.start([this](unsigned attempt, const std::function<bool()>& cancelled) {
+                return retry_open(attempt, cancelled);
+            });
+            return {};
         }
         db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
+        return start_collection(ctx);
+    }
+
+    // Everything init does once the database is open: health replay, config, triggers, the
+    // collectors and the cursor sources. Runs on the plugin-init thread, or on the retry thread
+    // when the open succeeded late. `online_` is stored LAST (release): init holds no collect_mu_,
+    // so the gate is the only guard between this thread's writes (db_, proc_stream_,
+    // nstat_client_, module_stream_, cursor_sources_, stream_active_, the triggers) and the
+    // dispatch threads that read them. No reader touches any of those before loading online_
+    // (acquire); until then dispatch answers with the offline refusal.
+    yuzu::Result<void> start_collection(yuzu::PluginContext& ctx) {
+        const auto db_dir = db_path_.parent_path();
         reconcile_db_health_publish(ctx); // #1567: replay any unpublished quarantine fact
+        // #3864: a process baseline left by an earlier build holds command lines; rewrite it
+        // before any trigger can run. The result is advisory (logged inside, retried next start).
+        (void)yuzu::echo::scrub_process_baseline(*db_);
 
         // Load config
         int fast_interval = 60;
@@ -770,7 +776,7 @@ public:
                     spdlog::info(
                         "ECHO: boot-backfill already done this boot (agent restart) — skipped");
                 } else {
-                    const auto etl = (std::filesystem::path{db_dir} / "procboot.etl").string();
+                    const auto etl = (db_dir / "procboot.etl").string();
                     std::error_code ec;
                     if (!std::filesystem::exists(etl, ec)) {
                         // Normal on any install without the boot AutoLogger — e.g.
@@ -1094,11 +1100,28 @@ public:
         std::erase_if(cursor_sources_, [](const auto& s) { return s == nullptr; });
 
         spdlog::info("Echo plugin initialized (fast={}s, slow={}s, db={})", fast_interval,
-                     slow_interval, db_path.string());
+                     slow_interval, db_path_.string());
+        // Leave the offline state and open the dispatch gate, in that order, last. A failed tag
+        // delete never keeps Echo offline: the slow collect replays it (do_collect_slow), because
+        // the heartbeat bridge re-reads the key on every beat and would keep reporting offline.
+        if (!ctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+            spdlog::warn("ECHO: the storage-offline heartbeat tag was not cleared; retried on the "
+                         "slow collect");
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_ = {};
+        }
+        online_.store(true, std::memory_order_release);
         return {};
     }
 
     void shutdown(yuzu::PluginContext& ctx) noexcept override {
+        // FIRST: end the open-retry thread (it cancels a migration in flight). After the join no
+        // other thread writes db_ or the collector members.
+        open_retry_.stop();
+        // Close the dispatch gate before anything below is torn down: a late action answers
+        // "not initialized" instead of reading a collector that is being stopped.
+        online_.store(false, std::memory_order_release);
         ctx.unregister_trigger("echo.fast");
         ctx.unregister_trigger("echo.slow");
         ctx.unregister_trigger("echo.perf");
@@ -1190,7 +1213,7 @@ public:
         // Ask for the rollback FIRST (it is noexcept and logs its own result): the logger and
         // the output sink can throw, and a swallowed throw must not skip the rollback request
         // for a transaction the unwind left open on the shared connection.
-        if (db_)
+        if (online_.load(std::memory_order_acquire) && db_)
             db_->rollback_open_transaction();
         try {
             // what() stays in the log only; the wire line is a fixed token because the text can
@@ -1204,12 +1227,26 @@ public:
     }
 
     int execute_dispatch(yuzu::CommandContext& ctx, std::string_view action, yuzu::Params params) {
-        if (!db_) {
-            if (!offline_detail_.empty()) {
-                // Loaded but offline (the migration was refused): `status` explains, every other
-                // action refuses with the same error. `error|` leads, as format_storage_*_lines
-                // pins.
-                const auto lines = yuzu::echo::format_storage_refused_lines(offline_detail_);
+        if (!online_.load(std::memory_order_acquire)) {
+            OfflineState offline;
+            {
+                std::lock_guard lock(offline_mu_);
+                offline = offline_;
+            }
+            if (offline.reason != yuzu::echo::OfflineReason::none) {
+                // Loaded but offline (the open failed and is being retried): `status` explains,
+                // every other action refuses with the same error. `error|` leads, as
+                // format_storage_*_lines pins. While an attempt is running next_attempt is in the
+                // past, so the wait clamps to 0 and line 0 reads "Retrying now." Once the retry
+                // loop has ended (collection failed to start after a late open) there is no next
+                // attempt: no wait, and line 0 asks for a restart.
+                std::optional<std::chrono::seconds> wait;
+                if (offline.retry_scheduled)
+                    wait = std::max(std::chrono::duration_cast<std::chrono::seconds>(
+                                        offline.next_attempt - std::chrono::steady_clock::now()),
+                                    std::chrono::seconds{0});
+                const auto lines = yuzu::echo::format_storage_refused_lines(
+                    offline.reason, offline.detail, wait);
                 for (std::size_t i = 0; i < lines.size(); ++i)
                     if (i == 0 || action == "status")
                         ctx.write_output(lines[i]);
@@ -1263,6 +1300,15 @@ public:
         health_.record(registry_name, token, now);
     }
 
+    // Publish (or clear, with nullopt) when a backed-off cursor source is next attempted.
+    void note_next_retry(std::string_view registry_name, std::optional<int64_t> next_attempt_ts) {
+        std::lock_guard lock(health_mu_);
+        if (next_attempt_ts)
+            health_.set_next_retry(registry_name, *next_attempt_ts);
+        else
+            health_.clear_next_retry(registry_name);
+    }
+
     // ── pid -> name map (pid_name_) ───────────────────────────────────────────
     // Callers hold collect_mu_ (init runs before any trigger can fire).
     // `ts` (the event or tick time, epoch seconds) only ages out exited pids at the cap.
@@ -1280,7 +1326,11 @@ public:
             if (pid_name_.size() >= kPidNameCap)
                 pid_name_.clear(); // wholesale flush, as the ETW consumer's cache does
         }
-        pid_name_[pid] = yuzu::echo::PidName{name, 0};
+        // The stream leg's image names are raw OS bytes; this map labels connection rows that
+        // are then diffed and dumped with replace, so keep it well-formed (see echo_wire_scrub.hpp).
+        std::string clean = name;
+        yuzu::echo::scrub_wire_strings(clean);
+        pid_name_[pid] = yuzu::echo::PidName{std::move(clean), 0};
     }
     // A stop never erases: loads and sockets of a just-exited process still resolve inside
     // kPidNameGraceSec, while a reused pid whose start was missed resolves to "" after it.
@@ -1381,21 +1431,145 @@ public:
             spdlog::warn("ECHO: failed to publish db quarantine identity; will retry");
     }
 
+    // Record the offline state (the reason `status` reports and the time of the next attempt), publish
+    // the heartbeat tag the fleet gauge reads, and log one line. `failed_attempts` counts the
+    // attempts that have failed so far (init's own is 1), which also picks the next back-off.
+    // `retry_scheduled` is false only when the retry loop is ending on this failure (collection
+    // failed to start after a late open): `status` then asks for a restart instead of promising a
+    // retry.
+    void go_offline(yuzu::echo::OfflineReason reason, std::string detail, unsigned failed_attempts,
+                    bool retry_scheduled = true) {
+        const auto delay = yuzu::echo::open_retry_delay(failed_attempts);
+        {
+            std::lock_guard lock(offline_mu_);
+            offline_.reason = reason;
+            offline_.detail = detail;
+            offline_.next_attempt = std::chrono::steady_clock::now() + delay;
+            offline_.retry_scheduled = retry_scheduled;
+        }
+        yuzu::PluginContext pctx{plugin_ctx_};
+        if (!pctx.storage_set(yuzu::echo::kStorageOfflineKey, yuzu::echo::offline_reason_token(reason)))
+            spdlog::warn("ECHO: failed to publish the storage-offline heartbeat tag");
+        spdlog::warn("ECHO: storage offline ({}): {}; the open is {}", yuzu::echo::offline_reason_token(reason),
+                     detail,
+                     retry_scheduled ? std::format("retried in {} s", delay.count())
+                                     : std::string{"not retried, restart the agent"});
+    }
+
+    // One background open attempt (the retry thread). Returns true when the loop should end: the
+    // database opened and collection started, or start_collection threw (a second start over a
+    // half-started source set would double-start sources; a restart recovers and `status` says why).
+    bool retry_open(unsigned attempt, const std::function<bool()>& cancelled) {
+        // An earlier attempt assigned db_ and then threw (go_offline allocates inside the catch
+        // handlers below, and the loop counts a throw as a failed attempt). A second open would
+        // assign db_ over collectors that already hold it, so the loop ends here. Test db_, not
+        // online_: the half-started case (db_ set, gate closed) is the one to protect. Only this
+        // thread writes db_ while the loop runs, and shutdown joins the loop before db_.reset().
+        if (db_) {
+            if (!online_.load(std::memory_order_acquire)) {
+                // Without this `status` could keep saying "Retrying now." after the loop has ended.
+                go_offline(yuzu::echo::OfflineReason::open_failed,
+                           "collection start failed after the database opened", attempt,
+                           /*retry_scheduled=*/false);
+            }
+            return true;
+        }
+        yuzu::echo::OfflineReason prior;
+        {
+            std::lock_guard lock(offline_mu_);
+            prior = offline_.reason;
+        }
+        std::error_code ec;
+        const auto file_bytes = std::filesystem::file_size(db_path_, ec);
+        const std::int64_t size = ec ? 0 : static_cast<std::int64_t>(file_bytes);
+        if (prior == yuzu::echo::OfflineReason::free_space && !ec) {
+            // Skip the open while the space is still short: every open runs a whole-file
+            // integrity_check first, which a full-disk agent would repeat for nothing. The need is
+            // the migration's own: twice the file plus its write-ahead log.
+            const auto wal = static_cast<std::uintmax_t>(
+                yuzu::echo::wal_file_bytes(db_path_).value_or(0));
+            std::error_code space_ec;
+            const auto space = std::filesystem::space(db_path_.parent_path(), space_ec);
+            if (!space_ec && yuzu::echo::free_space_still_short(space.available, file_bytes, wal)) {
+                // The figures are this attempt's own, not the first refusal's: the free space
+                // changes between attempts and `status` shows this text.
+                go_offline(yuzu::echo::OfflineReason::free_space,
+                           std::format("{}: {} bytes free, {} needed",
+                                       yuzu::echo::kFreeSpaceRefusalPrefix, space.available,
+                                       2 * file_bytes + wal),
+                           attempt);
+                return false;
+            }
+        }
+
+        yuzu::echo::OpenSeams seams;
+        seams.v10_cancel = cancelled;
+        seams.v10_deadline = std::chrono::duration_cast<std::chrono::milliseconds>(
+            yuzu::echo::v10_migration_deadline(size, deadline_hits_));
+        auto result = yuzu::echo::EchoDatabase::open(db_path_, seams);
+        if (cancelled())
+            return true; // shutting down: drop the result (closing it), start nothing
+        if (!result) {
+            if (yuzu::echo::is_deadline_hit(result.error()))
+                ++deadline_hits_;
+            go_offline(yuzu::echo::retry_failure_reason(result.error()), result.error(), attempt);
+            return false;
+        }
+        db_ = std::make_unique<yuzu::echo::EchoDatabase>(std::move(*result));
+        yuzu::PluginContext pctx{plugin_ctx_};
+        try {
+            if (auto started = start_collection(pctx); !started) {
+                go_offline(yuzu::echo::OfflineReason::open_failed,
+                           "collection start failed after the database opened", attempt,
+                           /*retry_scheduled=*/false);
+                return true;
+            }
+        } catch (const std::exception& e) {
+            go_offline(yuzu::echo::OfflineReason::open_failed,
+                       std::format("collection start failed: {}", e.what()), attempt,
+                       /*retry_scheduled=*/false);
+            return true;
+        } catch (...) {
+            go_offline(yuzu::echo::OfflineReason::open_failed, "collection start failed", attempt,
+                       /*retry_scheduled=*/false);
+            return true;
+        }
+        spdlog::info("ECHO: the database opened on retry {}; Echo is online", attempt - 1);
+        return true;
+    }
+
 private:
     YuzuPluginContext* plugin_ctx_{nullptr};
     std::mutex health_mu_;
     yuzu::echo::SourceHealthLedger health_;
+    // Cursor-driver retry backoff per source (echo_cursor.hpp CursorRetry). Guarded by
+    // collect_mu_: touched by the cursor loop in collect_slow_impl and erased at a cursor
+    // source's enable/disable edge in do_configure.
+    std::map<std::string, yuzu::echo::CursorRetry> cursor_retry_;
     std::atomic<int64_t> procperf_procs_seen_{0};
     // Set when the stream-fallback baseline seed failed: the poll must re-seed
     // (no diff) on the next tick instead of diffing against a stale baseline.
     // Guarded by collect_mu_.
     bool proc_poll_seed_pending_{false};
     std::unique_ptr<yuzu::echo::EchoDatabase> db_;
-    // Set when the database could not be opened because the v10 migration needs more free disk
-    // space than the volume has (the plugin loads, offline): the open error's text, which `status`
-    // reports as `storage_state|offline|free_space`. Empty on every other path. Written once in
-    // init(), before any action runs.
-    std::string offline_detail_;
+    // The dispatch gate. False until start_collection has finished (see the invariant there): while
+    // false every action answers with the offline refusal (or "not initialized") and nothing reads
+    // db_ or a collector member. Stored true (release) exactly once, as start_collection's last
+    // statement.
+    std::atomic<bool> online_{false};
+    // Why the plugin is offline and when the retry thread next tries, for `status`. Guarded by
+    // offline_mu_ (written by init and the retry thread, read by dispatch threads).
+    struct OfflineState {
+        yuzu::echo::OfflineReason reason{yuzu::echo::OfflineReason::none};
+        std::string detail; // the open error's text
+        std::chrono::steady_clock::time_point next_attempt{};
+        bool retry_scheduled{true}; // false: the retry loop has ended; only a restart recovers
+    };
+    std::mutex offline_mu_;
+    OfflineState offline_;
+    // Attempts that ended on the migration deadline; each doubles the next deadline. Touched by init
+    // (before the retry thread starts) and then only by the retry thread.
+    unsigned deadline_hits_{0};
     std::mutex collect_mu_; // Protects the state read-diff-write sequence in collect methods
     // Separate mutex for the software source: its state read-diff-write touches
     // only the "software" KV state (never prev_perf_/prev_proc_/proc_stream_), and
@@ -1510,9 +1684,10 @@ private:
     // kPidNameCap, cleared when the process source is confirmed disabled.
     std::unordered_map<std::uint32_t, yuzu::echo::PidName> pid_name_;
     static constexpr std::size_t kPidNameCap = 65536;
-    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters against a COPY and
-    // keeps it only once the rows are committed, so a rolled-back tick re-derives the same
-    // rows. Guarded by collect_mu_. The overflow counters mirror the committed sets for status.
+    // Hourly de-duplication sets (echo_hour_dedup.hpp). Each tick filters IN PLACE inside a
+    // BatchScope and keeps the admitted keys only once the rows are committed, so a rolled-back
+    // tick re-derives the same rows. Guarded by collect_mu_. The overflow counters mirror the
+    // committed sets for status.
     yuzu::echo::HourlySeenSet tcp_closing_seen_;
     yuzu::echo::HourlySeenSet module_seen_;
     std::atomic<std::uint64_t> tcp_closing_overflows_{0};
@@ -1632,6 +1807,10 @@ private:
                     pe.ppid = e.ppid;
                     pe.name = e.image_name;
                     pe.user = e.user;
+                    // Stream-leg image names/users are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                    // collection, like every other Echo identity string (echo_wire_scrub.hpp).
+                    yuzu::echo::scrub_wire_strings(pe.name);
+                    yuzu::echo::scrub_wire_strings(pe.user);
                     pe.exit_code = e.exit_code;
                     pe.parent_name = yuzu::echo::pid_name_lookup(pid_name_, e.ppid, e.ts_unix);
                     typed.push_back(std::move(pe));
@@ -1695,6 +1874,7 @@ private:
                     // since the fallback. (Mirrors the poll branch's enumerate +
                     // stabilization-exclusion filter, minus the diff/insert.)
                     auto current = yuzu::agent::enumerate_processes();
+                    yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                     note_pid_names(current, ts);
                     if (!stab_excl.empty()) {
                         std::erase_if(current, [&](const auto& p) {
@@ -1704,7 +1884,7 @@ private:
                     // Checked (#1654): a failed seed must not be followed by a diff
                     // against a stale/empty baseline (ghost `started` storm), so the
                     // poll re-seeds WITHOUT diffing on the next tick.
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline seed failed after stream "
                                       "fallback; will re-seed next tick");
                         ctx.write_output("error|process state_save_failed");
@@ -1716,6 +1896,7 @@ private:
                 // No active stream (poll-only platform, or stream unavailable):
                 // snapshot-diff poll.
                 auto current = yuzu::agent::enumerate_processes();
+                yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
                 // Before the exclusions: a noisy process still names its sockets.
                 note_pid_names(current, ts);
 
@@ -1734,7 +1915,7 @@ private:
                 if (proc_poll_seed_pending_) {
                     // A previous stream-fallback seed failed: re-seed the baseline
                     // without diffing (no ghost `started` for every process).
-                    if (!db_->set_state(proc_key, processes_to_json(current).dump())) {
+                    if (!db_->set_state(proc_key, yuzu::echo::encode_process_baseline(current))) {
                         spdlog::error("ECHO: process poll-baseline re-seed failed");
                         ctx.write_output("error|process state_save_failed");
                         note_health("process", "state_save_failed");
@@ -1744,7 +1925,7 @@ private:
                     note_health("process", "baseline");
                 } else {
                     auto prev_json = db_->get_state(proc_key);
-                    auto previous = json_to_processes(prev_json);
+                    auto previous = yuzu::echo::decode_process_baseline(prev_json);
 
                     auto typed = yuzu::echo::compute_process_events(previous, current, ts, snap_id,
                                                                    redaction);
@@ -1754,7 +1935,7 @@ private:
                     // Events + baseline commit in ONE transaction (#1654): a failed
                     // baseline save can no longer leave events durable with a stale
                     // baseline that the next tick would re-diff and double-emit.
-                    const std::string state_json = processes_to_json(current).dump();
+                    const std::string state_json = yuzu::echo::encode_process_baseline(current);
                     const bool ok =
                         typed.empty()
                             ? db_->set_state(proc_key, state_json)
@@ -1807,6 +1988,7 @@ private:
             // Label sockets the collector could not name (TIME_WAIT sockets have pid 0 and stay
             // unnamed; the rest resolve through the process source's pid -> name map).
             yuzu::echo::fill_process_names(current, pid_name_, ts);
+            yuzu::echo::scrub_wire_strings(current); // AFTER the fill: baseline round-trips losslessly
 
             // macOS (roadmap 2.2): nstat is the PRIMARY tcp lifecycle source
             // when the plugin's NstatClient is live and system-wide — its
@@ -1840,6 +2022,9 @@ private:
                     // remote_host stays empty: nstat is a lifecycle event stream, not the
                     // DNS-resolving poll (resolve_hostnames), the same simplification the ES
                     // process stream makes for cmdline.
+                    // Closing-state opens follow the poll leg's once-per-hour rule (#6899).
+                    flow_events = yuzu::echo::nstat_dedupe_closing_opens(std::move(flow_events),
+                                                                         tcp_closing_seen_);
                     for (const auto& e : flow_events)
                         typed.push_back(yuzu::echo::network_event_from_nstat_flow(e, snap_id));
                     if (!pending_nstat_evs_.empty()) {
@@ -1858,9 +2043,15 @@ private:
                         pending_nstat_evs_ = std::move(typed);
                         if (pending_nstat_evs_.size() > kPendingStreamCap) {
                             const auto excess = pending_nstat_evs_.size() - kPendingStreamCap;
-                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(),
-                                                     pending_nstat_evs_.begin() +
-                                                         static_cast<std::ptrdiff_t>(excess));
+                            const auto cut = pending_nstat_evs_.begin() +
+                                             static_cast<std::ptrdiff_t>(excess);
+                            // The rows cut here are never stored: give their hourly keys back
+                            // so the next closing-state sighting this hour is not read as a
+                            // repeat of a row that was lost (the drain admitted them above).
+                            yuzu::echo::nstat_release_closing_keys(
+                                pending_nstat_evs_.data(), pending_nstat_evs_.data() + excess,
+                                tcp_closing_seen_);
+                            pending_nstat_evs_.erase(pending_nstat_evs_.begin(), cut);
                         }
                     } else {
                         total_events += static_cast<int>(typed.size());
@@ -1901,6 +2092,9 @@ private:
                     // already-typed pending_nstat_evs_ from an earlier failed
                     // insert rather than let it sit stuck-forever bounded.
                     nstat_client_->drain(); // discard — untrustworthy bytes
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                     spdlog::warn("ECHO: nstat layout mismatch on stream death — discarding "
                                  "the buffered tcp lifecycle ring");
@@ -1952,11 +2146,13 @@ private:
             // back fallback tick must re-prime next tick, not diff a udp-only
             // baseline against the full snapshot (#1654).
 
-            // Filter against a COPY of the closing-socket seen set and keep it only once the rows
-            // commit below, so a rolled-back tick re-derives the same rows.
-            yuzu::echo::HourlySeenSet closing_seen = tcp_closing_seen_;
+            // Filter in place inside a batch: the keys it admits are kept once the rows commit
+            // below and erased if they do not (the scope rolls back on any exit without a
+            // commit, an exception included), so a rolled-back tick re-derives the same rows
+            // without copying the whole set every tick.
+            yuzu::echo::BatchScope tcp_batch{tcp_closing_seen_};
             auto typed = yuzu::echo::compute_network_events(*diff_previous, *diff_current, ts,
-                                                            snap_id, closing_seen);
+                                                            snap_id, tcp_closing_seen_);
 
             // While nstat is primary, persist the udp-only view so the next
             // tick's poll diff stays apples-to-apples (never mistakes
@@ -1964,12 +2160,13 @@ private:
             // otherwise persist the full snapshot as before (the poll owns
             // both protocols). Events + baseline commit in ONE transaction.
             const std::string state_json =
-                connections_to_json(nstat_primary ? *diff_current : current).dump();
+                connections_to_json(nstat_primary ? *diff_current : current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(net_key, state_json)
                                 : db_->fold_network_events(
                                       typed, yuzu::echo::StateWrite{net_key, state_json});
             if (!ok) {
+                tcp_batch.rollback();
                 const char* tok = typed.empty() ? "state_save_failed" : "insert_failed";
                 spdlog::error("ECHO: network {} — nothing persisted, next tick re-diffs", tok);
                 ctx.write_output(typed.empty() ? "error|network state_save_failed"
@@ -1981,7 +2178,7 @@ private:
                 return 1;
             }
             nstat_tcp_primary_prev_ = nstat_primary;
-            tcp_closing_seen_ = std::move(closing_seen);
+            tcp_batch.commit();
             tcp_closing_overflows_.store(tcp_closing_seen_.overflows(), std::memory_order_relaxed);
             total_events += static_cast<int>(typed.size());
             note_health("tcp", yuzu::echo::tcp_tick_status(nstat_insert_failed, "events_recorded"));
@@ -2002,6 +2199,9 @@ private:
             // an unreadable flag skips the tick via the plain branch below and
             // leaves the ring buffering rather than discarding live lifecycle events.
             nstat_client_->drain();
+            yuzu::echo::nstat_release_closing_keys(
+                pending_nstat_evs_.data(), pending_nstat_evs_.data() + pending_nstat_evs_.size(),
+                tcp_closing_seen_);
             pending_nstat_evs_.clear();
         } else {
             note_health("tcp", skip_token(tcp_state));
@@ -2076,12 +2276,13 @@ private:
                 }
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 auto previous = json_to_arp(db_->get_state("arp"));
                 auto typed = yuzu::echo::compute_arp_events(previous, *current, ts, snap_id);
                 // Events + baseline in one transaction (#1654); non-fatal, so a
                 // failure emits no `error|` line (the tick's events_recorded
                 // contract holds) and the ledger records the token.
-                const std::string state_json = arp_to_json(*current).dump();
+                const std::string state_json = arp_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state("arp", state_json)
                                     : db_->fold_arp_events(
@@ -2107,9 +2308,10 @@ private:
         const auto dns_state = yuzu::echo::source_enabled_state(*db_, "dns");
         if (dns_state.value_or(false)) {
             auto current = dns_pre ? std::move(*dns_pre) : yuzu::echo::enumerate_dns();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto previous = json_to_dns(db_->get_state("dns"));
             auto typed = yuzu::echo::compute_dns_events(previous, current, ts, snap_id);
-            const std::string state_json = dns_to_json(current).dump();
+            const std::string state_json = dns_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state("dns", state_json)
                                 : db_->fold_dns_events(
@@ -2173,10 +2375,11 @@ private:
                     e.process_name = yuzu::echo::pid_name_lookup(pid_name_, e.pid, e.ts_unix);
             }
             // §5 edge filter: unloads dropped, every risky load kept, other loads once per hour
-            // per (action, loader, module, folder). Filter against a COPY of the seen set and
-            // keep it only once the rows commit, so a failed insert re-filters identically.
-            yuzu::echo::HourlySeenSet module_seen = module_seen_;
-            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen);
+            // per (action, loader, module, folder). Filter in place inside a batch and keep the
+            // admitted keys only once the rows commit, so a failed insert re-filters identically
+            // (the scope rolls back on any exit without a commit, an exception included).
+            yuzu::echo::BatchScope module_batch{module_seen_};
+            mevs = yuzu::echo::apply_module_risk_filter(std::move(mevs), module_seen_);
             std::vector<yuzu::echo::ModuleRow> mrows;
             mrows.reserve(mevs.size());
             for (const auto& e : mevs) {
@@ -2191,6 +2394,12 @@ private:
                 r.signed_state = std::string{yuzu::echo::module_signed_token(e.signed_state)};
                 r.signer = e.signer;
                 r.is_kernel = e.is_kernel;
+                // Module-load identity strings are raw OS bytes (ETW / ES): well-formed UTF-8 at
+                // collection, like every other Echo identity sink (echo_wire_scrub.hpp).
+                yuzu::echo::scrub_wire_strings(r.process_name);
+                yuzu::echo::scrub_wire_strings(r.module_name);
+                yuzu::echo::scrub_wire_strings(r.module_dir);
+                yuzu::echo::scrub_wire_strings(r.signer);
                 mrows.push_back(std::move(r));
             }
             if (!mrows.empty()) {
@@ -2199,6 +2408,7 @@ private:
                     // other legs already committed). Re-queue the filtered
                     // batch for the next tick, bounded, and log.
                     module_tok = "insert_failed";
+                    module_batch.rollback();
                     spdlog::error("ECHO: module stream insert failed — re-queuing {} events",
                                   mevs.size());
                     pending_module_evs_ = std::move(mevs);
@@ -2210,9 +2420,11 @@ private:
                     }
                 } else {
                     total_events += static_cast<int>(mrows.size());
-                    module_seen_ = std::move(module_seen);
                 }
             }
+            // Keeps the admitted keys on success or an empty batch; after the rollback above the
+            // scope is already closed, so this is a no-op there.
+            module_batch.commit();
             module_overflows_.store(module_seen_.overflows(), std::memory_order_relaxed);
             if (auto d = module_stream_->dropped(); d > last_module_dropped_) {
                 spdlog::warn("ECHO: module stream ring overflow — {} dropped (+{} since last drain)",
@@ -2494,13 +2706,14 @@ private:
                 note_health("service", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string svc_key{yuzu::echo::diff_state_key("service")}; // #538
                 auto prev_json = db_->get_state(svc_key);
                 auto previous = json_to_services(prev_json);
 
                 auto typed = yuzu::echo::compute_service_events(previous, *current, ts, snap_id);
                 // Events + baseline in ONE transaction (#1654).
-                const std::string state_json = services_to_json(*current).dump();
+                const std::string state_json = services_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(svc_key, state_json)
                                     : db_->fold_service_events(
@@ -2525,12 +2738,13 @@ private:
         if (user_state.value_or(false)) {
             const std::string usr_key{yuzu::echo::diff_state_key("user")}; // #538
             auto current = yuzu::echo::enumerate_users();
+            yuzu::echo::scrub_wire_strings(current); // baseline round-trips losslessly
             auto prev_json = db_->get_state(usr_key);
             auto previous = json_to_users(prev_json);
 
             auto typed = yuzu::echo::compute_user_events(previous, current, ts, snap_id);
             // Events + baseline in ONE transaction (#1654).
-            const std::string state_json = users_to_json(current).dump();
+            const std::string state_json = users_to_json(current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
             const bool ok = typed.empty()
                                 ? db_->set_state(usr_key, state_json)
                                 : db_->fold_user_events(
@@ -2635,10 +2849,11 @@ private:
                 note_health("mapdrive", "capture_incomplete");
             }
             if (current) {
+                yuzu::echo::scrub_wire_strings(*current); // baseline round-trips losslessly
                 const std::string md_key{yuzu::echo::diff_state_key("mapdrive")}; // #538
                 auto previous = json_to_mapdrive(db_->get_state(md_key));
                 auto typed = yuzu::echo::compute_mapdrive_events(previous, *current, ts, snap_id);
-                const std::string state_json = mapdrive_to_json(*current).dump();
+                const std::string state_json = mapdrive_to_json(*current).dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
                 const bool ok = typed.empty()
                                     ? db_->set_state(md_key, state_json)
                                     : db_->fold_mapdrive_events(
@@ -2664,13 +2879,37 @@ private:
         // `<name>_enabled` the same way every other source above does
         // (registry default via source_enabled -- power/removable default
         // TRUE per the Alex ruling, echo_schema_registry.cpp).
+        // Backoff (CursorRetry): a source whose ticks keep failing is not re-read every tick.
+        // The tick period is read once, outside every catch arm below.
+        const int cursor_tick_s =
+            cursor_sources_.empty()
+                ? 0
+                : yuzu::echo::parse_tick_seconds(db_->get_config("slow_interval_seconds", "300"));
         for (auto& src : cursor_sources_) {
             const std::string src_name = src->name();
             const auto src_state = yuzu::echo::source_enabled_state(*db_, src_name);
             if (!src_state.value_or(false)) {
+                // A pause or a re-enable never inherits a backoff.
+                cursor_retry_.erase(src_name);
+                note_next_retry(src_name, std::nullopt);
                 note_health(src_name, skip_token(src_state));
                 ctx.write_output(
                     std::format("echo|collect_{}|0|{}", src_name, skip_token(src_state)));
+                continue;
+            }
+            auto& retry = cursor_retry_[src_name];
+            // Not-attempted ticks are reported but never recorded in the health ledger:
+            // last_status / last_status_at / consecutive_failures keep describing the last
+            // real attempt, and `<src>_next_retry_at` says when the next one is due.
+            const auto back_off = [&] {
+                retry.note_failure(ts, cursor_tick_s);
+                note_next_retry(src_name, retry.next_attempt_ts);
+            };
+            if (!retry.due(ts)) {
+                if (skipped_sources)
+                    skipped_sources->push_back(src_name);
+                ctx.write_output(std::format("echo|collect_{}|0|{}", src_name,
+                                             yuzu::echo::kCollectStatusRetryBackoff));
                 continue;
             }
             auto cursor_read = db_->get_cursor(src_name);
@@ -2684,6 +2923,7 @@ private:
                 spdlog::warn("ECHO: {} cursor read failed ({}) -- retaining cursor, skipping tick",
                             src_name, cursor_read.error());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2703,6 +2943,11 @@ private:
                 // driver only orchestrates the enable gate, cursor load, the
                 // transient-failure skip (rule 1), and the status line.
                 auto result = src->collect(*db_, cursor);
+                // Any tick that returns is a success for backoff purposes, CursorLost
+                // included: the source committed a re-baseline and there is nothing to
+                // re-read (the ledger still counts `cursor_lost` as a failure status).
+                retry.note_success();
+                note_next_retry(src_name, std::nullopt);
                 total_events += static_cast<int>(result.events_emitted);
                 std::string_view token;
                 switch (result.outcome) {
@@ -2735,6 +2980,7 @@ private:
                 spdlog::warn("ECHO: {} cursor collect incomplete ({}) -- retaining cursor",
                             src_name, e.what());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2767,6 +3013,7 @@ private:
                               "CursorOutcome::CursorLost, never throw",
                               src_name, e.what());
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2781,6 +3028,7 @@ private:
                 spdlog::error("ECHO: {} cursor collect threw a non-std exception -- source "
                               "skipped this tick", src_name);
                 note_health(src_name, yuzu::echo::kCollectStatusCaptureIncomplete);
+                back_off();
                 if (skipped_sources)
                     skipped_sources->push_back(src_name);
                 // Say so on the collect stream too. do_collect_slow passes
@@ -2933,6 +3181,13 @@ private:
         {
             yuzu::PluginContext pctx{plugin_ctx_};
             reconcile_db_health_publish(pctx);
+            // Replay a storage-offline tag delete that failed when the open recovered. Stateless
+            // and safe: this tick runs only past the online_ gate, where nothing legitimately
+            // sets the key (go_offline runs only while offline).
+            if (pctx.storage_exists(yuzu::echo::kStorageOfflineKey) &&
+                !pctx.storage_delete(yuzu::echo::kStorageOfflineKey))
+                spdlog::warn("ECHO: the storage-offline heartbeat tag is still set after "
+                             "recovery and could not be cleared; retried on the next slow collect");
         }
         // §3.8 bounded mapdrive-backfill retry (related issue #5291): above collect_mu_, same as
         // init()'s call site, so hive I/O never runs under the shared lock. Cheap when nothing is
@@ -3091,7 +3346,6 @@ private:
         ctx.write_output(std::format("oldest_timestamp|{}", s.oldest_timestamp));
         ctx.write_output(std::format("newest_timestamp|{}", s.newest_timestamp));
         ctx.write_output(std::format("db_size_bytes|{}", s.db_size_bytes));
-        ctx.write_output(std::format("retention_days|{}", s.retention_days));
         // Byte budget (db_budget_bytes): db_size_bytes above is used pages + WAL, the figure the
         // budget is enforced against. budget_over_bytes is how far data + WAL sit above it right
         // now (measured here, not cached, so it is true before the first pass too); it can be
@@ -3114,12 +3368,13 @@ private:
                 ctx.write_output("budget_over_bytes|unknown");
             }
             ctx.write_output(std::format(
-                "budget_evicted_raw_rows_total|{}",
-                db_->get_config(std::string{yuzu::echo::kBudgetEvictedRawKey}, "0")));
-            ctx.write_output(std::format(
                 "budget_evicted_hourly_rows_total|{}",
                 db_->get_config(std::string{yuzu::echo::kBudgetEvictedHourlyKey}, "0")));
             ctx.write_output(std::format("dict_gc_last_ts|{}", db_->get_config("dict_gc_last_ts", "0")));
+            ctx.write_output(std::format("dict_gc_last_attempt_ts|{}",
+                                         db_->get_config("dict_gc_last_attempt_ts", "0")));
+            ctx.write_output(std::format("dict_gc_starved_streak|{}",
+                                         db_->get_config("dict_gc_starved_streak", "0")));
             ctx.write_output(
                 std::format("dict_gc_starved_total|{}", db_->get_config("dict_gc_starved_total", "0")));
             // incremental: auto_vacuum is on. deferred: a conversion VACUUM was wanted but the
@@ -3141,9 +3396,7 @@ private:
         // see the steady-state behavior. rows / oldest_ts are queried from the source's
         // FINEST physical tier (the roll-up has no raw table to count): `<src>_hourly_r`, or
         // `usage_daily` for usage. A bucket is its hour's (day's) start, not an event's own time.
-        // `<src>_live_rows` is the same figure under its old name for ONE release, so the server
-        // readers (dashboard_routes, device_routes, echo_process_tree) keep working until they
-        // move to `<src>_rows`; an empty table reports 0 / 0.
+        // An empty table reports 0 / 0.
         for (const auto& src : yuzu::echo::capture_sources()) {
             std::string enabled_key = std::format("{}_enabled", src.name);
             // Default to the source's declared default so a fresh agent
@@ -3175,19 +3428,23 @@ private:
             int64_t rows = 0;
             int64_t oldest_ts = 0;
             if (!tier_table.empty()) {
-                auto count_q =
-                    db_->execute_query(std::format("SELECT COUNT(*), IFNULL(MIN({}), 0) FROM {}",
-                                                   bucket_col, tier_table),
-                                       /*max_rows=*/1);
-                if (count_q.has_value() && !count_q->rows.empty() && count_q->rows[0].size() == 2) {
-                    try {
-                        rows = std::stoll(count_q->rows[0][0]);
-                        oldest_ts = std::stoll(count_q->rows[0][1]);
-                    } catch (...) {}
-                }
+                // Two statements, not one: a lone COUNT(*) sums each b-tree page's cell count
+                // without decoding rows and a lone MIN() is one index seek, but the pair in one
+                // SELECT scans the whole index (#7123; measured in docs/echo-implementer.md).
+                const auto scalar = [&](std::string_view expr) -> std::int64_t {
+                    auto q = db_->execute_query(std::format("SELECT {} FROM {}", expr, tier_table),
+                                                /*max_rows=*/1);
+                    if (q.has_value() && !q->rows.empty() && q->rows[0].size() == 1) {
+                        try {
+                            return std::stoll(q->rows[0][0]);
+                        } catch (...) {}
+                    }
+                    return 0;
+                };
+                rows = scalar("COUNT(*)");
+                oldest_ts = scalar(std::format("IFNULL(MIN({}), 0)", bucket_col));
             }
             ctx.write_output(std::format("config|{}_rows|{}", src.name, rows));
-            ctx.write_output(std::format("config|{}_live_rows|{}", src.name, rows)); // one-release alias
             ctx.write_output(std::format("config|{}_oldest_ts|{}", src.name, oldest_ts));
             if (src.name == "netqual") {
                 // The per-boot baseline is a plain table beside the roll-up tiers.
@@ -3238,18 +3495,10 @@ private:
             }
             ctx.write_output(std::format("config|usage_lifecycle_state|{}", lifecycle));
         }
-        ctx.write_output(
-            std::format("config|usage_gap_count|{}", db_->get_config("usage_gap_count", "0")));
-        ctx.write_output(std::format("config|usage_gap_lost_events|{}",
-                                     db_->get_config("usage_gap_lost_events", "0")));
-        ctx.write_output(
-            std::format("config|usage_gap_last_ts|{}", db_->get_config("usage_gap_last_ts", "-")));
         ctx.write_output(std::format("config|usage_expiry_declined_count|{}",
                                      db_->get_config("usage_expiry_declined_count", "0")));
         ctx.write_output(std::format("config|usage_coverage_since|{}",
                                      db_->get_config("usage_coverage_since", "-")));
-        ctx.write_output(
-            std::format("config|usage_lag_events|{}", db_->get_config("usage_lag_events", "0")));
 
         // Currently-configured network capture method (defaults to "polling").
         auto net_method = db_->get_config("network_capture_method", "polling");
@@ -3258,7 +3507,7 @@ private:
         // Software source pacing + heartbeat. software_last_run_ts is the wall-clock
         // of the last collect_software tick (0 if it has never run) — the operator's
         // signal that the hourly trigger is alive even on a host with no software
-        // changes (where software_live_rows stays 0).
+        // changes (where software_rows stays 0).
         ctx.write_output(std::format("config|software_interval_seconds|{}",
                                      db_->get_config("software_interval_seconds", "3600")));
         ctx.write_output(std::format("config|software_last_run_ts|{}",
@@ -3642,7 +3891,7 @@ private:
             arr.push_back(std::move(obj));
         }
 
-        ctx.write_output(arr.dump());
+        ctx.write_output(arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace));
         return 0;
     }
 
@@ -3801,6 +4050,13 @@ private:
             // nothing to widen it with and `fleet_snapshot_window_seconds` no longer has an effect.
             connections = std::move(live);
         }
+        // The snapshot carries identity strings (host name, process names/users/command lines,
+        // socket owners, local addresses) as raw OS bytes: well-formed UTF-8 at collection, like
+        // every other Echo identity sink (echo_wire_scrub.hpp).
+        yuzu::echo::scrub_wire_strings(processes);
+        yuzu::echo::scrub_wire_strings(connections);
+        yuzu::echo::scrub_wire_strings(hostname);
+        yuzu::echo::scrub_wire_strings(local_ips);
 
         // Redaction defaults are now unioned inside load_redaction_patterns (so
         // every collect path — collect_fast, procperf, and this snapshot — is
@@ -3878,7 +4134,10 @@ private:
                 "error|source_not_paused: {} is enabled; disable it before purging", source));
             return 1;
         }
-        auto res = db_->purge_source(source);
+        // The agent's stop latch (raised when the stop is requested, before the agent joins its
+        // command workers) ends the dictionary sweep at its next check; see purge_source.
+        auto res = db_->purge_source(source, yuzu::echo::EchoDatabase::kPurgeDictionaryDeadline,
+                                     yuzu::agent::subprocess_cancel_requested);
         if (!res) {
             ctx.write_output(std::format("error|{}", res.error()));
             return 1;
@@ -3905,17 +4164,23 @@ private:
         // reported, so "purged" alone would overstate it. (The server's `echo.source.purge` audit
         // row is written at dispatch and carries no reply; only the status enum reaches the
         // server, the detail text stays in the agent log.)
-        if (res->dictionary_pending)
+        // The same holds for a WAL the final checkpoint could not truncate: the pre-delete page
+        // images of the purged rows stay in the -wal file until a later checkpoint truncates it (a
+        // rerun of this purge does). The dictionary outranks it in the status detail; the reply
+        // carries both flags.
+        if (res->dictionary_pending || res->wal_pending)
             ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  "echo:purge_dictionary_pending");
-        ctx.write_output(std::format(
-            R"({{"source":"{}","rows_deleted":{},"status":"purged","dictionary_pending":{}}})", source,
-            res->rows_deleted, res->dictionary_pending ? "true" : "false"));
+                                  res->dictionary_pending ? "echo:purge_dictionary_pending"
+                                                          : "echo:purge_wal_pending");
+        ctx.write_output(std::format(R"({{"source":"{}","rows_deleted":{},"status":"purged",)"
+                                     R"("dictionary_pending":{},"wal_checkpoint_pending":{}}})",
+                                     source, res->rows_deleted,
+                                     res->dictionary_pending ? "true" : "false",
+                                     res->wal_pending ? "true" : "false"));
         return 0;
     }
 
     int do_configure(yuzu::CommandContext& ctx, yuzu::Params params) {
-        auto retention = params.get("retention_days");
         auto fast_interval = params.get("fast_interval");
         auto slow_interval = params.get("slow_interval");
         auto software_interval = params.get("software_interval");
@@ -3930,7 +4195,6 @@ private:
         std::optional<int64_t> budget_bytes;
         int fast_secs = 0;
         int slow_secs = 0;
-        int days = 0;
         // Software interval accepts 0 (disable the trigger) or 300–86400, so it
         // needs a "was it provided" flag distinct from the 0 sentinel.
         int software_secs = 0;
@@ -3962,16 +4226,6 @@ private:
         // the "Phase 2" block below; every path before it only reads + validates.
 
         // ── Phase 1: validate everything (no writes) ─────────────────────────
-        if (!retention.empty()) {
-            try {
-                days = std::stoi(std::string{retention});
-            } catch (...) {}
-            if (days < 1 || days > 365) {
-                ctx.write_output("error|retention_days must be 1-365");
-                return 1;
-            }
-        }
-
         if (!db_budget.empty()) {
             budget_bytes = yuzu::echo::parse_budget_bytes(db_budget);
             if (!budget_bytes) {
@@ -4199,62 +4453,87 @@ private:
         }
 
         // ── Phase 2: persist (every parameter above is already validated) ────
-        if (budget_bytes) {
-            // The only checked write, so it goes FIRST: this control gates deletes, a value that
-            // did not persist must not be reported as applied, and its failure must leave nothing
-            // else half-applied (retention_days below is unchecked and cannot fail the call).
-            if (!db_->set_config(std::string{yuzu::echo::kDbBudgetKey},
-                                 std::to_string(*budget_bytes))) {
-                ctx.write_output("error|db_budget_bytes could not be saved");
-                return 1;
+        // Every write below is checked (#2155). `applied` is the keys that persisted, in order:
+        // exit code and status agree, non-zero = at least one requested change did not persist,
+        // PARTIAL = some did. Nothing applied is the flat error alone.
+        std::vector<std::string> applied;
+        const auto persist = [&](const std::string& key, const std::string& value) {
+            if (!db_->set_config(key, value))
+                return false;
+            applied.push_back(key);
+            changed = true;
+            return true;
+        };
+        const auto fail = [&](const std::string& error_line) {
+            if (!applied.empty()) {
+                ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED,
+                                      YUZU_RESULT_COMPLETENESS_PARTIAL,
+                                      "echo:configure_partial_commit");
+                ctx.write_output(yuzu::echo::format_configure_partial(applied));
             }
+            ctx.write_output(error_line);
+            return 1;
+        };
+        const auto key_failed = [&](const std::string& key) {
+            return fail(std::format("error|{} could not be saved", key));
+        };
+        if (budget_bytes) {
+            // The budget goes FIRST: this control gates deletes, a value that did not persist
+            // must not be reported as applied, and its failure must leave nothing else
+            // half-applied.
+            if (!persist(std::string{yuzu::echo::kDbBudgetKey}, std::to_string(*budget_bytes)))
+                return key_failed(std::string{yuzu::echo::kDbBudgetKey});
             ctx.write_output(std::format("config|db_budget_bytes|{}", *budget_bytes));
-            changed = true;
-        }
-        if (days > 0) {
-            db_->set_config("retention_days", std::string{retention});
-            ctx.write_output(std::format("config|retention_days|{}", retention));
-            changed = true;
         }
         if (fast_secs > 0) {
-            db_->set_config("fast_interval_seconds", std::string{fast_interval});
+            if (!persist("fast_interval_seconds", std::string{fast_interval}))
+                return key_failed("fast_interval_seconds");
             ctx.write_output(std::format("config|fast_interval_seconds|{}", fast_interval));
-            changed = true;
         }
         if (slow_secs > 0) {
-            db_->set_config("slow_interval_seconds", std::string{slow_interval});
+            // A stored back-off deadline was computed from the old tick period. A changed
+            // period ends every back-off, so the next tick retries and the schedule restarts
+            // at the new period (a re-assert of the same value keeps it).
+            if (yuzu::echo::parse_tick_seconds(db_->get_config("slow_interval_seconds", "300")) !=
+                slow_secs) {
+                std::lock_guard lock(collect_mu_);
+                for (const auto& [name, retry] : cursor_retry_)
+                    note_next_retry(name, std::nullopt);
+                cursor_retry_.clear();
+            }
+            if (!persist("slow_interval_seconds", std::string{slow_interval}))
+                return key_failed("slow_interval_seconds");
             ctx.write_output(std::format("config|slow_interval_seconds|{}", slow_interval));
-            changed = true;
         }
         if (software_provided) {
-            db_->set_config("software_interval_seconds", std::to_string(software_secs));
+            if (!persist("software_interval_seconds", std::to_string(software_secs)))
+                return key_failed("software_interval_seconds");
             ctx.write_output(std::format("config|software_interval_seconds|{}", software_secs));
-            changed = true;
         }
         if (netconn_lookback_provided) {
             // Persist the CLAMPED value so the stored config and the echo agree
             // with what the collect legs will actually read (nq_clamp_lookback is
             // applied again on read, defensively). 0 => forward-only.
-            db_->set_config("netconn_lookback_seconds", std::to_string(netconn_lookback_secs));
+            if (!persist("netconn_lookback_seconds", std::to_string(netconn_lookback_secs)))
+                return key_failed("netconn_lookback_seconds");
             ctx.write_output(
                 std::format("config|netconn_lookback_seconds|{}", netconn_lookback_secs));
-            changed = true;
         }
         if (power_lookback_provided) {
-            db_->set_config("power_lookback_seconds", std::to_string(power_lookback_secs));
+            if (!persist("power_lookback_seconds", std::to_string(power_lookback_secs)))
+                return key_failed("power_lookback_seconds");
             ctx.write_output(std::format("config|power_lookback_seconds|{}", power_lookback_secs));
-            changed = true;
         }
         if (removable_lookback_provided) {
-            db_->set_config("removable_lookback_seconds", std::to_string(removable_lookback_secs));
+            if (!persist("removable_lookback_seconds", std::to_string(removable_lookback_secs)))
+                return key_failed("removable_lookback_seconds");
             ctx.write_output(
                 std::format("config|removable_lookback_seconds|{}", removable_lookback_secs));
-            changed = true;
         }
         if (have_redaction) {
-            db_->set_config("redaction_patterns", std::string{redaction});
+            if (!persist("redaction_patterns", std::string{redaction}))
+                return key_failed("redaction_patterns");
             ctx.write_output(std::format("config|redaction_patterns|{}", redaction));
-            changed = true;
         }
         for (const auto& [src_name, v] : source_toggles) {
             bool transition_ok;
@@ -4356,6 +4635,11 @@ private:
                 if (transition_ok && src_name == "tcp" && nstat_client_ &&
                     (v == "true") != tcp_prev_enabled) {
                     nstat_client_->drain();
+                    // The backlog rows are dropped unstored: give their hourly keys
+                    // back (the drain's own events were never admitted).
+                    yuzu::echo::nstat_release_closing_keys(
+                        pending_nstat_evs_.data(),
+                        pending_nstat_evs_.data() + pending_nstat_evs_.size(), tcp_closing_seen_);
                     pending_nstat_evs_.clear();
                 }
                 // Cursor-model sources (echo_cursor.hpp, P-002): forward the
@@ -4391,6 +4675,12 @@ private:
                             // outcome, and it is logged loudly because a source
                             // that throws here has an un-honoured P-002 contract.
                             try {
+                                // A real enable/disable edge ends any retry backoff, as
+                                // the collect-time disabled gate does: a pause shorter than
+                                // one slow tick never reaches that gate, and the next
+                                // enable must not inherit the old backoff.
+                                cursor_retry_.erase(src_name);
+                                note_next_retry(src_name, std::nullopt);
                                 cs->on_enabled_changed(v == "true");
                             } catch (const std::exception& e) {
                                 spdlog::error("ECHO: {} on_enabled_changed threw ({}) -- the "
@@ -4412,12 +4702,12 @@ private:
                 // is one transaction, so a failure leaves the source in its previous
                 // state. This is an apply-time I/O failure (a busy DB), not a
                 // validation failure -- Phase 1 already validated every parameter.
-                ctx.write_output(std::format(
+                return fail(std::format(
                     "error|{}_enabled transition failed: could not persist (database busy); "
                     "source left in its previous state",
                     src_name));
-                return 1;
             }
+            applied.push_back(src_name + "_enabled");
             ctx.write_output(std::format("config|{}_enabled|{}", src_name, v));
             // Consent clarity (#1831 review): enabling procperf does more than
             // collect on-device — the top-N per-app names + versions feed the
@@ -4448,14 +4738,14 @@ private:
                                 "implemented; collector will continue polling",
                                 net_method));
             }
-            db_->set_config("network_capture_method", net_method);
+            if (!persist("network_capture_method", net_method))
+                return key_failed("network_capture_method");
             ctx.write_output(std::format("config|network_capture_method|{}", net_method));
-            changed = true;
         }
         if (have_excl) {
-            db_->set_config("process_stabilization_exclusions", std::string{excl_param});
+            if (!persist("process_stabilization_exclusions", std::string{excl_param}))
+                return key_failed("process_stabilization_exclusions");
             ctx.write_output(std::format("config|process_stabilization_exclusions|{}", excl_param));
-            changed = true;
         }
 
         // Phase 1 returns early on any invalid parameter, so reaching here with
@@ -4552,13 +4842,13 @@ private:
         return 0;
     }
 
-    // The dictionary sweep: weekly, 2 s of steady clock (the PR 2 measurement: the live-set scan
-    // alone took about 1.6 s of the 2 s at 3.92 M roll-up rows). A pass whose scan outruns the
-    // deadline deletes nothing and is counted in `dict_gc_starved_total`; it is retried at the next
-    // maintenance pass, not in a week. The caller holds rollup_mu_.
+    // The dictionary sweep: weekly (dict_gc_plan). A pass whose live-set scan outruns its deadline
+    // deletes nothing, is counted in `dict_gc_starved_total`, and is retried a day later with a
+    // doubled deadline (2, 4, then 8 s; the PR 2 measurement: the scan alone took about 1.6 s of
+    // the 2 s at 3.92 M roll-up rows), so a starved database neither holds the database lock on
+    // every maintenance pass nor stays starved forever. Both markers are durable; a crash between
+    // the sweep and the marker writes repeats one attempt. The caller holds rollup_mu_.
     void run_dictionary_gc(std::int64_t now_ts) {
-        constexpr std::int64_t kDictGcIntervalSec = 7 * 86400;
-        constexpr auto kDictGcDeadline = std::chrono::seconds(2);
         // A stored integer; unset or unparsable reads as 0.
         const auto read_i64 = [this](const char* key) -> std::int64_t {
             const auto text = db_->get_config(key, "0");
@@ -4566,24 +4856,40 @@ private:
             const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), v);
             return ec == std::errc{} && p == text.data() + text.size() ? v : 0;
         };
-        const std::int64_t last = read_i64("dict_gc_last_ts");
-        // A marker ahead of the clock was written during a forward excursion: stale, never a reason
-        // to wait.
-        if (last > 0 && last <= now_ts && now_ts - last < kDictGcIntervalSec)
+        const std::int64_t streak = read_i64("dict_gc_starved_streak");
+        const auto plan = yuzu::echo::dict_gc_plan(now_ts, read_i64("dict_gc_last_ts"),
+                                                   read_i64("dict_gc_last_attempt_ts"), streak);
+        if (!plan.due)
             return;
-        const auto swept = db_->fold().gc_dictionary(*db_, yuzu::echo::EchoFold::Clock::now() + kDictGcDeadline);
+        // The agent's stop latch ends the sweep at its next check, so a stop never waits out the
+        // 8 s ladder rung while this holds rollup_mu_.
+        const auto swept = db_->fold().gc_dictionary(
+            *db_, yuzu::echo::EchoFold::Clock::now() + plan.deadline,
+            yuzu::agent::subprocess_cancel_requested);
         if (!swept) {
             spdlog::warn("ECHO: dictionary sweep failed: {}", swept.error());
             return;
         }
         if (!swept->live_set_built) {
+            // A scan the stop ended was not starved: no count, no attempt stamp, no streak bump.
+            if (yuzu::agent::subprocess_cancel_requested())
+                return;
             const auto total = std::to_string(read_i64("dict_gc_starved_total") + 1);
             db_->set_config("dict_gc_starved_total", total);
+            // A clock at or before the epoch cannot be stored as a marker (it reads as unset), so
+            // the streak stays 0 and the pass behaves as it did before the ladder: the done
+            // marker below is guarded the same way.
+            if (now_ts > 0) {
+                db_->set_config("dict_gc_last_attempt_ts", std::to_string(now_ts));
+                db_->set_config("dict_gc_starved_streak", std::to_string(streak + 1));
+            }
             spdlog::warn("ECHO: the dictionary sweep's scan did not finish inside its {} s deadline "
-                         "(starved {} time(s)); retrying at the next maintenance pass",
-                         kDictGcDeadline.count(), total);
+                         "(starved {} time(s)); retrying in a day with a longer deadline",
+                         plan.deadline.count(), total);
             return;
         }
+        if (streak > 0)
+            db_->set_config("dict_gc_starved_streak", "0");
         if (swept->deleted > 0)
             spdlog::info("ECHO: dictionary sweep removed {} unreferenced strings", swept->deleted);
         // Done for the week only when nothing is left to delete; a deadline hit mid-delete leaves
@@ -4644,8 +4950,8 @@ private:
         if (maintenance_pass && res.exhausted) {
             spdlog::warn("ECHO: echo.db data ({} bytes) is above its {} byte target and nothing "
                          "more is eligible to evict (hourly rows under 48 h (5 d for procperf), "
-                         "daily and monthly rows, the usage tables, netqual_boot and paused or "
-                         "errored sources are never evicted)",
+                         "daily and monthly rows, the usage tables, netqual_boot and paused "
+                         "sources (and errored sources that were paused) are never evicted)",
                          res.data_bytes_after, target);
         }
 
@@ -4849,18 +5155,6 @@ private:
         }
         auto& result = *query_result;
 
-        // A retired `$X_Live` name answers with no rows (an empty shim view, never an error), so
-        // a stored query, schedule or result-set producer would read the empty answer as "nothing
-        // happened". The typed status says what it is: CONSTRAINED, `retired_table:<name>`. The
-        // rows and the __total__ line are unchanged; refusing the name is a separate decision.
-        if (const auto retired = yuzu::echo::referenced_legacy_live_shims(*validated); !retired.empty()) {
-            std::string detail = "retired_table:";
-            for (std::size_t i = 0; i < retired.size(); ++i)
-                detail += (i ? "," : "") + retired[i];
-            ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
-                                  detail);
-        }
-
         // Output schema line
         std::string schema_line = "__schema__";
         for (const auto& col : result.columns)
@@ -4881,6 +5175,10 @@ private:
         ctx.write_output(std::format("__total__|{}", result.rows.size()));
         return 0;
     }
+
+    // Declared LAST so it is destroyed first: its destructor joins the retry thread, which uses
+    // the members above.
+    yuzu::echo::OpenRetryLoop open_retry_;
 };
 
 YUZU_PLUGIN_EXPORT(EchoPlugin)

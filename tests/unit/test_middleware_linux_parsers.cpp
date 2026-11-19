@@ -512,7 +512,7 @@ TEST_CASE("middleware linux: an embedded NUL in installer text is replaced and d
           "[middleware][linux][ibm_mq]") {
     // SYNTHETIC: a root-owned mqinst.ini whose Name carries a NUL. The row crosses the plugin ABI as
     // a C string, so an unscrubbed NUL would end it at the host's strlen while the status row still
-    // says `supported`, and the collector would then drop the source and erase its stored rows.
+    // says `supported`, and the collector would then drop the malformed row and report an empty `supported` source, erasing its stored rows.
     yuzu::test::TempDir dir{"yuzu_test_middleware_nul_"};
     write_text(dir.path / enumerator_rel(), mq_stanza(std::string{"In\0st", 5}, "/opt/mqm"));
     const auto run = run_leg(dir.path);
@@ -591,7 +591,7 @@ TEST_CASE("middleware linux: a stanza without FilePath beside valid ones is logg
     yuzu::test::TempDir dir{"yuzu_test_middleware_mqdrop_"};
     // SYNTHETIC: the Broken stanza (second of three) has a Name and no FilePath. A data-shape fault
     // of one stanza is not an access fault, so the answer stays supported with both valid rows --
-    // the collector withholds a source only when it answers constrained.
+    // the collector sends a status-only section for a source only when it answers constrained.
     write_text(dir.path / enumerator_rel(),
                mq_stanza("A", "/opt/a") + "Installation:\n   Name=Broken\n" + mq_stanza("C", "/opt/c"));
     touch_names(dir.path / "opt/a/swidtag", {swidtag_of(kTag935)});

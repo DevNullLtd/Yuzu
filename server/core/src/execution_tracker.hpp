@@ -80,7 +80,10 @@ struct ExecutionQuery {
     std::string definition_id;
     std::string status;
     /// #1634: restricts to executions dispatched by this exact principal.
-    /// Empty (the default) is unrestricted. Used by MCP `list_executions`
+    /// Empty (the default) is unrestricted. The value is the ExecutionOwnerKey-derived key
+    /// (`owner_only_filter`, `execution_scope_rules.hpp`), never a raw session `username`:
+    /// a service-scoped session's key is EMPTY, which here would mean "no filter", so such a
+    /// session is admitted through `ExecutionListScope` instead. Used by MCP `list_executions`
     /// for a management-group-confined caller — executions carry no single
     /// `agent_id` to filter by (they fan out to many), so "own dispatches
     /// only" is the cheap, provably-safe confinement until a real per-row
@@ -114,13 +117,17 @@ struct ExecutionQuery {
 /// `visible_agents` empty means "visible to nobody" (every row excluded),
 /// matching `response_store.cpp`'s `append_scope_clause` engaged-empty
 /// convention. This is a plain data type with no authz dependency — the
-/// route layer derives it from `authz::VisibleSet`/the session username.
+/// route layer derives it with `confined_list_scope` (`execution_scope_rules.hpp`) from
+/// `authz::VisibleSet` and the session's `ExecutionOwnerKey`: `owner` is that key, EMPTY
+/// for a service-scoped session (whose `username` is its minting account), so such a
+/// session is admitted only through `visible_agents`.
 struct ExecutionListScope {
     std::string owner;
     std::vector<std::string> visible_agents;
 };
-/// `nullopt` = unrestricted (TOP, no pushdown) — every existing caller of
-/// `query_executions`/`query_executions_checked`'s default keeps this.
+/// `nullopt` = unrestricted (TOP, no pushdown). `query_executions` keeps it;
+/// `query_executions_checked` takes the scope as a REQUIRED argument (#5557), so an omitted
+/// scope is a compile error.
 using ExecutionScope = std::optional<ExecutionListScope>;
 
 struct ExecutionSummary {
@@ -149,6 +156,11 @@ struct AgentExecStatus {
     /// sdk/include/yuzu/plugin.h). 0 (PLUGIN_RESULT_UNDECLARED) for legacy
     /// rows and for any response whose plugin never reported a typed status.
     int plugin_result_status{0};
+    /// True when the frame this status came from was NOT kept by the response store (an ingest-time
+    /// failure, or a cap refusal of a non-terminal frame). Written in the same upsert as the
+    /// status and STICKY: the stored value is the OR of every write, so no later write clears it.
+    /// Not part of the event payload.
+    bool response_dropped{false};
 };
 
 // ── Execution statistics (capability 1.9) ────────────────────────────
@@ -385,8 +397,7 @@ public:
     /// `ExecutionQuery::dispatched_by`'s doc comment above rejects (one
     /// statement, planner-optimizable to a semi-join).
     std::optional<std::vector<Execution>>
-    query_executions_checked(const ExecutionQuery& q = {},
-                             const ExecutionScope& scope = std::nullopt) const;
+    query_executions_checked(const ExecutionQuery& q, const ExecutionScope& scope) const;
     std::optional<Execution> get_execution(const std::string& id) const;
     /// #3789: degrade-distinguishable twin of `get_execution`. That method
     /// collapses "row absent" and "read degraded" to the same `nullopt`
@@ -400,6 +411,12 @@ public:
     [[nodiscard]] std::expected<std::optional<Execution>, std::string>
     get_execution_checked(const std::string& id) const;
     ExecutionSummary get_summary(const std::string& id) const;
+    /// Agents of `execution_id` whose response the response store did not fully keep (their status
+    /// row says `response_dropped`: a terminal answer or a streamed frame is missing). Their answer
+    /// is missing from every stored-response read, so a consumer building membership from stored
+    /// rows must treat each as unanswered. `nullopt` when the count could not be read (store not
+    /// open, no connection, query failure): the caller must not read that as zero.
+    [[nodiscard]] std::optional<int64_t> count_response_dropped(const std::string& execution_id) const;
     std::vector<AgentExecStatus> get_agent_statuses(const std::string& execution_id) const;
     /// #1634 (Doomgoose review finding, important) — degrade-distinguishable
     /// twin of `get_agent_statuses`, for the #1634 visibility/audit call
@@ -502,8 +519,9 @@ public:
     /// not re-reduce a value equal to the persisted text, so a caller that passes raw Forensics
     /// text publishes it to the outbox and the bus on its first write. A lexical gate
     /// (`tests/test_forensics_tier_wiring_lexical.py`) pins exactly one caller; a second caller
-    /// needs a reviewed edit there.
-    void update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
+    /// needs a reviewed edit there. True when the status row was written (false when the tracker
+    /// is closed or the upsert failed twice).
+    bool update_agent_status(const std::string& execution_id, const AgentExecStatus& status);
     void refresh_counts(const std::string& execution_id);
 
     /// PR 2: set agents_targeted post-creation. Used by the workflow execute

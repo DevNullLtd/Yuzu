@@ -64,12 +64,15 @@
 /// `session_meta` or a `sessions` row and then waits on an `auth.users` row or
 /// `audit_events`; no audit writer touches `session_store`; the
 /// post-mint re-read takes `auth.users` only AFTER its session INSERT has
-/// committed (releasing `session_meta`); `RbacAdminAuthorityOwner` takes
-/// `principal_roles` → `auth.users` and never a `session_store`/`audit_store`
-/// lock. Safe ONLY because `AuthDB`, `SessionStore` and `AuditStore` share ONE
-/// PgPool/database (ADR-0006; server.cpp constructs all three on `*pg_pool_`)
-/// — a split onto separate databases fails every statement here closed (SQL
-/// error → rollback → 503), never a silent partial write, but still needs this
+/// committed (releasing `session_meta`); `MfaDisableOwner` (#6079 PR 2c) takes
+/// the same four in the same order (`auth.users` row, `sessions` rows, the `audit_events` INSERT,
+/// the `session_meta` row; its banner), so it adds no edge; `RbacAdminAuthorityOwner` takes
+/// `principal_roles` → `auth.users` and, for `deactivate_account` with a `SessionStore`
+/// wired, the `session_meta` row last (same relative order as here: `auth.users` before
+/// `session_meta`), and never an `audit_store` lock or a `sessions` row. Safe ONLY because
+/// `AuthDB`, `SessionStore` and `AuditStore` share ONE PgPool/database (ADR-0006; server.cpp
+/// constructs all three on `*pg_pool_`) — a split onto separate databases fails every statement
+/// here closed (SQL error → rollback → 503), never a silent partial write, but still needs this
 /// owner re-plumbed.
 ///
 /// Holds no in-process lock and never calls back into `AuthManager`; it borrows
@@ -77,6 +80,7 @@
 /// owner after them and nulls `AuthManager`'s pointer at teardown).
 
 #include "audit_store.hpp" // AuditEvent
+#include "auth_lock_bounds.hpp" // kAuthRecheckLockTimeout
 
 #include <chrono>
 #include <cstdint>
@@ -137,9 +141,11 @@ class CredentialChangeOwner {
 public:
     /// Bounded acquire for the one lease, and the txn-scoped `lock_timeout`.
     /// MUST stay strictly below `AuthDB::recheck_role_locked`'s lock_timeout
-    /// (auth_db.cpp kWriteTimeout, 2000 ms): a same-account sign-in queued behind
-    /// a stalled change must wait out the change's abort, never fail closed and
-    /// sweep the account's sessions (#5342 Gate 8 R22e).
+    /// (auth_db.cpp kWriteTimeout, 2000 ms, `kAuthRecheckLockTimeout`): a same-account
+    /// sign-in queued behind a stalled change must wait out the change's abort, never
+    /// fail closed and sweep the account's sessions (#5342 Gate 8 R22e). The bound is
+    /// per WAIT (see auth_lock_bounds.hpp), and is enforced by the static_assert below
+    /// the class.
     static constexpr std::chrono::milliseconds kWriteTimeout{1500};
 
     /// `audit` may be null (an audit-off wiring) — then every `commit()` answers
@@ -173,5 +179,9 @@ private:
     AuditStore* audit_;
     std::function<void()> pre_commit_hook_for_test_;
 };
+
+static_assert(CredentialChangeOwner::kWriteTimeout < kAuthRecheckLockTimeout,
+              "CredentialChangeOwner::kWriteTimeout must stay strictly below AuthDB's write "
+              "timeout (kAuthRecheckLockTimeout, the recheck_role_locked lock_timeout)");
 
 } // namespace yuzu::server

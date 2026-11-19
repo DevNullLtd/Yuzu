@@ -89,7 +89,7 @@ All shapes carry enough information to **re-evaluate the query against the curre
 
 // source_kind = "echo_query"
 {
-  "sql": "SELECT DISTINCT pid FROM process_live WHERE name = 'chrome.exe'",
+  "sql": "SELECT DISTINCT name FROM $Process_Hourly WHERE name = 'chrome.exe'",
   "scope_input_id": "rs_01HXYZ...",
   "evaluated_at": 1735689600,
   "result_columns_used": ["__device_id"]
@@ -161,6 +161,20 @@ rs_01HXYZ resolved to 2,798 devices (3 dropped: 2 offline > 24h, 1 decommissione
 
 `from_result_set:` never errors on stale members — operators iterating an IR chain need progress, not a stop. The audit row records the dropped IDs and reasons so the chain remains forensically complete.
 
+A result set can be used as scope only when it is ready: a `pending` or `failed` set aborts the evaluation (`result_set_unusable`). An incomplete set (`agents_failed` or `agents_unanswered` above zero) can only under-match, so a positive `from_result_set:<id>` reference still resolves, but a reference where a missing member would match (under `NOT`, `LEN` or `STARTSWITH`) aborts with `result_set_unusable`. A pending set may still fill, so that abort is transient (`retry_after_ms` 5000); a failed set, or an incomplete set under `NOT`, `LEN` or `STARTSWITH`, will not change by retrying, so that abort is permanent (`retry_after_ms` null): re-run the producer that created the set. The preview response (`POST /api/v1/scope/preview`, MCP `preview_scope_targets`) and the server log name the set and the cause (`pending`, `failed` or `incomplete`); the set passed the caller's owner check first. A producer refuses a Forensics-tier plugin as its source (`RESULT_SET_SOURCE_NOT_SUPPORTED`, before any dispatch), because that plugin's stored responses are withheld from result-set membership and a set built from it would read as complete and empty. A set can seed a child (`parent_id`, or `from_result_set:<parent>` on a producer) only when it is `materialized`: a `pending` or `failed` parent is refused with `RESULT_SET_NOT_READY` (REST `409`, MCP `-32602`) before any of its members are read; the message says to wait for a pending parent and to re-create a failed one. A child inherits its parent's incompleteness: every producer whose members come from the parent's (the inventory producers and the asynchronous producers) copies the parent's `agents_failed` and `agents_unanswered` onto the child when the child is created, and an asynchronous producer's fill then adds its own counts to them. A materialized parent's counters never change, so the snapshot is exact, and deleting the parent afterwards changes nothing on the child. A child is therefore never more complete than the parent it was narrowed from, so an incomplete parent cannot yield a complete child. Because the counters are inherited and summed, along a lineage they total the chain rather than count one execution's agents: only `partial` (either counter above zero) is a reliable signal, not the exact values. Direct creation (`POST /api/v1/result-sets`, MCP `create_result_set`) does not inherit: its members are the caller's explicit `device_ids`, not a narrowing of the parent's members, so `parent_id` there is lineage only. Lineage itself carries no flag; the counters on each set are the record.
+
+### 4.4 Carriage returns in matcher cells (three splitters, one deliberate difference)
+
+Three different functions split a plugin's newline-joined output into lines, and they treat a carriage return (CR) differently on purpose:
+
+| Splitter | CR handling | Used for |
+|---|---|---|
+| `split_output_lines` (`result_parsing.hpp`) | deletes **every** CR | row text on the SSE stream, dashboard fragments, facets |
+| `live::split_lines` (`live_kinds.hpp`) | drops only a **trailing** CR | the device-page live snapshots |
+| `rs_matcher` (`result_set_matcher.cpp`) | keeps **every** CR | the membership matcher |
+
+The matcher keeps CR because its cell text decides which devices are MEMBERS of a result set (`eq`, `in`, `contains` compare the cell text). Making it delete CR like `split_output_lines` would change which devices match: for an answer whose last cell is CRLF-terminated, `eq` against the value without the CR would start matching devices it does not match today. The owner decision is to leave the matcher unchanged. A matcher author whose plugin emits CRLF should match with `contains`, or the plugin should stop emitting CR. The three behaviours are pinned by tests in `tests/unit/server/test_result_set_matcher.cpp`.
+
 ## 5. Materialisation vs. lazy evaluation
 
 The default is **materialisation at create time** — the device IDs are written to `result_set_members` and never re-derived from the source query. An operator can run a live re-eval, which creates a new sibling set and leaves the original unchanged (only `echo_query` and `instruction_result` sets can be re-run). Trade-offs:
@@ -183,15 +197,15 @@ Base path: `/api/v1/result-sets`. All routes require an authenticated session an
 | `POST` | `/api/v1/result-sets/from-echo-query` | `{name?, sql, parent_id?}` | `202` and the full set record (`status` shows progress) | Dispatches the SQL to Echo agents in `parent_id`'s scope; the device-ID set is the union of agents that returned ≥1 row (default) or all agents that responded (`include_empty=true`). |
 | `POST` | `/api/v1/result-sets/from-instruction-result` | `{name?, instruction_id, params, matcher, parent_id?}` | `202` and the full set record (`status` shows progress) | Runs the instruction in `parent_id`'s scope; the device set is filtered by `matcher`. Mirrors the Chrome hash-check step. |
 | `GET` | `/api/v1/result-sets` | — | `{result_sets: [...], next_cursor}` | Pagination by `?cursor=`. Default sort: `created_at DESC`. |
-| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count}` | |
+| `GET` | `/api/v1/result-sets/{id}` | — | `{id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, source_kind, status, source_execution_id, device_count, agents_failed, agents_unanswered, partial}` | |
 | `GET` | `/api/v1/result-sets/{id}/members` | — | `{device_ids: [...], next_cursor}` | Pagination by `?cursor=`. |
 | `GET` | `/api/v1/result-sets/{id}/lineage` | — | `{chain: [{id, name, source_kind, device_count}, ...]}` | Walks `parent_id` to root. The dashboard breadcrumb does **not** call this REST route — it is rendered server-side via `/fragments/result-sets/*`, which calls the plain `lineage()` store wrapper directly, with no HTTP hop through the REST API. |
 | `POST` | `/api/v1/result-sets/{id}/pin` | — | the full set record | |
 | `POST` | `/api/v1/result-sets/{id}/unpin` | — | the full set record | |
-| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `echo_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. |
+| `POST` | `/api/v1/result-sets/{id}/re-eval` | — | `202` and the full set record of the new set | Re-runs `source_payload` and creates a new set with `parent_id = original.parent_id` (sibling, not child). Only `echo_query` and `instruction_result` sets can be re-run; any other source kind is refused with `400`. A set whose stored SQL reads a raw Echo capture table (`$<Source>_Live` or `<source>_live`) is refused with `400 RESULT_SET_REEVAL_STALE_SOURCE` and nothing is dispatched; `from-echo-query` and `from-instruction-result` (an `echo.sql` definition whose `params.sql`, else its default, reads one) refuse such a query at create with the same code. |
 | `DELETE` | `/api/v1/result-sets/{id}` | — | `{deleted: true}` | Pinned sets must be unpinned first. |
 
-**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
+**Shipped behaviour (the table above is brought in line with it).** Every route answers inside the usual `{data, meta}` envelope. Create answers `201` with the full set record (`id`, `name`, `owner_principal`, `created_at`, `ttl_at`, `last_used_at`, `pinned`, `parent_id`, `source_kind`, `status`, `source_execution_id`, `device_count`, `agents_failed`, `agents_unanswered`, `partial`); the two producers that dispatch to agents and `re-eval` answer `202` with that record while the set fills. `GET /api/v1/result-sets/{id}` does not return `source_payload`. `agents_failed` counts the agents whose dispatch failed (a non-success status, output starting `error|`, or a success answer whose `__schema__` header lacks the column matcher's column) and never produced a matching row; `agents_unanswered` counts the targeted agents that never answered before the fill, or whose answer was not fully stored (1 can mean not known complete); `partial` is `true` when either counter is above zero. An agent that never answered is neither a member nor an `agents_failed` agent, so a set filled at the five-minute timeout reflects the rows stored by then. The fill pages through every stored row of the execution (500 per read) up to 100,000 rows and marks the set `failed` past that bound instead of filling it as partial. Both are `0` / `false` for a set created from explicit device ids; a set created from a parent's members carries the parent's counters from creation (`rest-api.md`, Result sets). `DELETE` answers `200` with `{"deleted": true}`; an unknown id is `404` and a pinned set `409`. Lineage nodes carry `id`, `name`, `source_kind` and `device_count` but no `narrowing`. `re-eval` writes the audit verb `result_set.create`; the `result_set.live_reeval` verb in the audit table below is not written by any handler.
 
 **`parent_id` is a targeting argument, and omitted is not the same as empty (#2500).** Omit
 `parent_id` to run against `__all__` deliberately. A **supplied** `parent_id` that is an empty
@@ -377,6 +391,8 @@ Prometheus metrics:
 | `yuzu_result_set_quota_rejected` | counter | |
 
 Enforcement of the per-operator 10,000 cap and the per-operator pin cap fires `result_set_quota_rejected` so SREs can see runaway scripts before they wedge the table.
+
+`yuzu_result_sets_total{result="count_unreadable"}` counts a pending set the fill pass filled as incomplete because the tracker's dropped-answer count stayed unreadable for three pending timeouts (15 minutes) after the set was created. It is counted once, when that fill succeeds, beside `materialized`; a fill that fails counts only `materialize_failed`. Until then the pass retries the set on each tick, logging at most one warning per set every 30 seconds (the log can be throttled away; the counter is the record).
 
 ## 10. Reference walkthrough — Chrome IR
 

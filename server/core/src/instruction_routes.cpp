@@ -1,11 +1,14 @@
 #include "instruction_routes.hpp"
 
 #include "http_route_sink.hpp"
+#include "instruction_definition_model.hpp"
 #include "instruction_extras_render.hpp"
+#include "instruction_referrers.hpp"
 #include "instruction_store.hpp"
 #include "query_int_parse.hpp" // strict_stoi/strict_stoll (#4644)
 #include "instruction_yaml.hpp"
 #include "json_extract.hpp"
+#include "mcp_jsonrpc.hpp" // json_exceeds_depth / kMcpMaxJsonDepth: the shared #2437 guard
 #include "rest_a4_envelope_http.hpp"
 #include "store_errors.hpp"
 #include "web_utils.hpp"
@@ -17,7 +20,10 @@
 #include <charconv>
 #include <cstdint>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
+#include <unordered_map>
 
 // Editor fragment HTML templates — defined in instruction_ui.cpp (a
 // separate, build-time-embedded TU) and forward-declared here at global
@@ -48,7 +54,132 @@ bool refuse_cross_site_write(const Deps& deps, const httplib::Request& req, http
     res.set_content(detail::a4_error(res, "cross-site request refused"), "application/json");
     return true;
 }
+
+/// The legacy import body with `created_by` set to the authenticated caller. The document's own
+/// `created_by` is unsigned (the signature covers `yaml_source` only), so a caller could name any
+/// creator in the audit-relevant column; the v1 and MCP twins overwrite it the same way. A body
+/// that is not a depth- and breadth-safe JSON object (nesting and value budget) is returned
+/// unchanged: the store then refuses it exactly as before (same status, same audit row).
+/// `username` is empty when no session resolves, as for the POST create route.
+std::string stamp_import_creator(const std::string& body, const std::string& username) {
+    if (mcp::json_exceeds_depth(body, mcp::kMcpMaxJsonDepth) || json_exceeds_value_budget(body))
+        return body;
+    auto doc = nlohmann::json::parse(body, nullptr, /*allow_exceptions=*/false);
+    if (doc.is_discarded() || !doc.is_object())
+        return body;
+    doc["created_by"] = username;
+    return doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
+}
+
+/// The v1 routes' plugin / action identifier rule (`check_dispatch_identifier`, the one shared
+/// helper) on a legacy JSON route: a non-empty `value` that fails it is answered `400
+/// {"error": "<field> ..."}` and true is returned. An empty value passes here: an empty action is
+/// legal, and an empty plugin is refused by the caller (the PUT below) or by the store (a create).
+bool refuse_bad_dispatch_identifier(httplib::Response& res, std::string_view field,
+                                    const std::string& value) {
+    if (value.empty())
+        return false;
+    const auto err = check_dispatch_identifier(field, value);
+    if (!err)
+        return false;
+    res.status = 400;
+    res.set_content(nlohmann::json({{"error", *err}}).dump(), "application/json");
+    return true;
+}
 } // namespace
+
+std::string render_instruction_editor(std::string_view tmpl,
+                                      const InstructionDefinition* def) {
+    // SINGLE pass over the ORIGINAL template (F13/F14): substituted values are never
+    // rescanned, so a stored field containing a `{{...}}` token renders as literal text and
+    // cannot re-expand or loop. Every value is HTML-escaped except the pre-built fifth
+    // concurrency <option> (its only variable part is escaped when built).
+    struct Val {
+        std::string text;
+        bool raw{false};
+    };
+    std::unordered_map<std::string, Val> vals;
+    auto put = [&](const char* key, std::string v) { vals[key] = Val{html_escape(v), false}; };
+    auto sel = [&](const char* key, bool on) { put(key, on ? "selected" : ""); };
+
+    if (def) {
+        put("TITLE", "Edit Definition");
+        put("DEF_ID", def->id);
+        put("DEF_UPDATED_AT", std::to_string(def->updated_at));
+        put("DEF_NAME", def->name);
+        put("DEF_VERSION", def->version);
+        put("DEF_PLUGIN", def->plugin);
+        put("DEF_ACTION", def->action);
+        put("DEF_DESCRIPTION", def->description);
+        put("DEF_PLATFORMS", def->platforms);
+        put("YAML_SOURCE", def->yaml_source);
+        sel("SEL_QUESTION", def->type == "question");
+        sel("SEL_ACTION", def->type == "action");
+        sel("SEL_APPR_AUTO", def->approval_mode == "auto");
+        sel("SEL_APPR_ROLE", def->approval_mode == "role-gated");
+        sel("SEL_APPR_ALWAYS", def->approval_mode == "always");
+        sel("SEL_CC_UNLIM", def->concurrency_mode == "unlimited");
+        sel("SEL_CC_DEV", def->concurrency_mode == "per-device");
+        sel("SEL_CC_DEF", def->concurrency_mode == "per-definition");
+        sel("SEL_CC_SET", def->concurrency_mode == "per-set");
+        // Fifth, dynamic option (PR #3784 fix round): the four static options cover every
+        // ENFORCED/documented mode, but the content library also ships `global` /
+        // `global-singleton` (ADR-1007). Without a matching <option> the browser would
+        // display "Unlimited" and a Convert-to-YAML + Save would silently overwrite the real
+        // concurrency_mode. Emitted at the template's own slot only.
+        std::string other_option;
+        if (!def->concurrency_mode.empty() && def->concurrency_mode != "unlimited" &&
+            def->concurrency_mode != "per-device" && def->concurrency_mode != "per-definition" &&
+            def->concurrency_mode != "per-set") {
+            const auto escaped = html_escape(def->concurrency_mode);
+            other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
+                           " (unrecognized, not enforced)</option>";
+        }
+        vals["SEL_CC_OTHER_OPTION"] = Val{std::move(other_option), true};
+    } else {
+        put("TITLE", "New Definition");
+        for (const char* k : {"DEF_ID", "DEF_UPDATED_AT", "DEF_NAME", "DEF_VERSION",
+                              "DEF_PLUGIN", "DEF_ACTION", "DEF_DESCRIPTION", "DEF_PLATFORMS",
+                              "SEL_ACTION", "SEL_APPR_ROLE", "SEL_APPR_ALWAYS", "SEL_CC_DEV",
+                              "SEL_CC_DEF", "SEL_CC_SET", "SEL_CC_OTHER_OPTION"})
+            put(k, "");
+        put("YAML_SOURCE",
+            "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
+            "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
+            "  plugin: \"\"\n  action: \"\"\n  type: question\n"
+            "  description: \"\"\n  concurrency: unlimited\n"
+            "  approval: auto\n  parameters:\n    type: object\n"
+            "    additionalProperties:\n      type: string\n"
+            "  results:\n    - name: output\n      type: string\n");
+        sel("SEL_QUESTION", true);
+        sel("SEL_APPR_AUTO", true);
+        sel("SEL_CC_UNLIM", true);
+    }
+
+    std::string out;
+    out.reserve(tmpl.size() + 512);
+    std::size_t pos = 0;
+    while (pos < tmpl.size()) {
+        const auto open = tmpl.find("{{", pos);
+        if (open == std::string_view::npos) {
+            out.append(tmpl.substr(pos));
+            break;
+        }
+        const auto close = tmpl.find("}}", open + 2);
+        if (close == std::string_view::npos) {
+            out.append(tmpl.substr(pos));
+            break;
+        }
+        out.append(tmpl.substr(pos, open - pos));
+        const auto it = vals.find(std::string(tmpl.substr(open + 2, close - open - 2)));
+        if (it != vals.end())
+            out += it->second.text;
+        else
+            out.append(tmpl.substr(open, close + 2 - open)); // unknown token: literal
+        pos = close + 2;
+    }
+    return out;
+}
 
 void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
     // -- Instruction Definitions API --------------------------------------
@@ -131,6 +262,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         try {
+            if (json_exceeds_value_budget(req.body))
+                throw std::invalid_argument("request body holds too many values");
             auto j = nlohmann::json::parse(req.body);
             InstructionDefinition def;
             // #402 / iter-H1: honor caller-supplied `id` so the
@@ -163,6 +296,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                     "application/json");
                 return;
             }
+
+            // The v1 twins' plugin / action identifier rule (<= 128 of A-Za-z0-9._-).
+            if (refuse_bad_dispatch_identifier(res, "plugin", def.plugin) ||
+                refuse_bad_dispatch_identifier(res, "action", def.action))
+                return;
 
             if (auto session = deps.resolve_session_fn(req))
                 def.created_by = session->username;
@@ -293,6 +431,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
 
         auto id = req.matches[1].str();
         try {
+            if (json_exceeds_value_budget(req.body))
+                throw std::invalid_argument("request body holds too many values");
             auto j = nlohmann::json::parse(req.body);
 
             // Read existing definition to preserve fields not in the update.
@@ -328,6 +468,14 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 // Normalize action to lowercase
                 for (auto& c : def.action)
                     c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                // Restating the stored value in another case is not a change: keep the stored
+                // spelling (a legacy row may hold a mixed-case action), so it neither rewrites the
+                // column nor clears a stored YAML below.
+                std::string stored_lower = (*existing_result)->action;
+                for (auto& c : stored_lower)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                if (def.action == stored_lower)
+                    def.action = (*existing_result)->action;
             }
             if (j.contains("description"))
                 def.description = j["description"].get<std::string>();
@@ -350,12 +498,34 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 }
             }
 
+            // The identifier rule applies only to a plugin / action this request CHANGES, so a
+            // stored row with an odd value stays editable through its other fields.
+            // A present plugin must stay usable: the store's update never checks it, so an empty
+            // value would blank the column (the v1 and MCP updates refuse it the same way).
+            if (j.contains("plugin") && def.plugin.empty() &&
+                !(*existing_result)->plugin.empty()) {
+                res.status = 400;
+                res.set_content(
+                    nlohmann::json({{"error", *check_dispatch_identifier("plugin", def.plugin)}})
+                        .dump(),
+                    "application/json");
+                return;
+            }
+            if ((def.plugin != (*existing_result)->plugin &&
+                 refuse_bad_dispatch_identifier(res, "plugin", def.plugin)) ||
+                (def.action != (*existing_result)->action &&
+                 refuse_bad_dispatch_identifier(res, "action", def.action)))
+                return;
+
             // This route edits other fields on a copy it loaded moments ago. An empty
             // parameter_schema means "keep the stored column" (update_definition), so blank
             // the copy rather than write it back: that would revert a schema replaced
             // between the load and this write, and would re-run the write-time schema check
             // on a legacy row.
             def.parameter_schema.clear();
+            // UP-5: a changed column the YAML merge takes (clear_stale_yaml_source) makes a stored
+            // YAML stale; clear it (the success row below describes the clear).
+            (void)clear_stale_yaml_source(**existing_result, def);
             // Optimistic concurrency: only apply if the row is still the one loaded above, so
             // a concurrent edit is a 409 rather than silently overwritten by this stale copy.
             auto result = deps.store->update_definition(def, def.updated_at);
@@ -365,7 +535,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 // error. Previously not_found fell through to the 400 branch, indistinguishable
                 // from a validation failure (consistency-auditor Gate 8 finding).
                 bool db_error = result.error().rfind(kInstructionStoreDbErrorPrefix, 0) == 0;
-                bool not_found = !db_error && result.error().rfind("not_found: ", 0) == 0;
+                bool not_found = !db_error && result.error().rfind(kNotFoundPrefix, 0) == 0;
                 // Audited on db_error (existing convention) and not_found (matches the
                 // DELETE route's audited not_found branch just below); a plain validation
                 // 400 stays unaudited, matching create_definition's equivalent branch.
@@ -393,8 +563,12 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                 "application/json");
                 return;
             }
+            // The detail records a change to plugin/action/approval_mode/enabled (old -> new; this
+            // route never changes concurrency_mode), so an approval downgrade or a repoint is
+            // visible here as it is on the YAML save and the v1 twin, and a `yaml_source cleared`
+            // note when the edit cleared a stored YAML; empty when neither happened.
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition", id,
-                                "");
+                                describe_dispatch_binding_change(**existing_result, def));
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", id}});
             res.set_header(
                 "HX-Trigger",
@@ -422,6 +596,67 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         }
 
         auto id = req.matches[1].str();
+        // The pre-image, for the success row's detail (once the row is gone nothing else records
+        // what it ran), and whether the id exists at all (the referrer check below runs only for
+        // one that does). An ABSENT definition leaves the detail empty and keeps the 404; an
+        // UNREADABLE one cannot be checked for referrers, so it is a 503 (see below).
+        std::string preimage;
+        bool exists = false;
+        auto stored = deps.store->get_definition(id);
+        if (stored && *stored) {
+            preimage = describe_deleted_definition(**stored);
+            exists = true;
+        }
+        // UP-6 (the v1 DELETE's guard, applied to this released route): a definition other things
+        // name by id is not deleted out from under them. Only an id that exists is checked (a
+        // missing one keeps the 404 below). An unwired or failing lookup is a 503 and nothing is
+        // deleted, never read as "no referrers". The check is advisory-not-transactional: a
+        // schedule created between it and the delete is not seen.
+        if (exists || !stored) {
+            const auto refuse = [&](int status, const char* audit_result, const char* audit_detail,
+                                    std::string_view message) {
+                if (!deps.audit_fn(req, "instruction.delete", audit_result, "InstructionDefinition",
+                                   id, audit_detail))
+                    res.set_header("Sec-Audit-Failed", "true");
+                res.status = status;
+                res.set_content(detail::a4_error(res, message), "application/json");
+                // The Instructions page's Delete button is a plain hx-delete and htmx swaps no
+                // 4xx/5xx body, so the refusal is also a toast (an HX-Trigger header is processed
+                // whatever the status). ensure_ascii keeps the header 7-bit, and the toast text is
+                // cut to kToastMaxBytes (on a character boundary) so a long referrer list cannot
+                // outgrow a proxy's response-header buffer; the body keeps the full text.
+                constexpr std::size_t kToastMaxBytes = 600;
+                std::string toast_text(message);
+                if (toast_text.size() > kToastMaxBytes) {
+                    std::size_t cut = kToastMaxBytes;
+                    while (cut > 0 && (static_cast<unsigned char>(toast_text[cut]) & 0xC0) == 0x80)
+                        --cut;
+                    toast_text.resize(cut);
+                    toast_text += "...";
+                }
+                const nlohmann::json trigger = {
+                    {"showToast", {{"message", toast_text}, {"level", "error"}}}};
+                res.set_header("HX-Trigger",
+                               trigger.dump(-1, ' ', true,
+                                            nlohmann::json::error_handler_t::replace));
+            };
+            if (!stored)
+                return refuse(503, "error", "db_error",
+                              "instruction store unavailable; nothing was deleted");
+            if (!deps.referrers_fn)
+                return refuse(503, "error", "referrer_check_unwired",
+                              "definition reference check not configured; nothing was deleted");
+            auto referrers = deps.referrers_fn(id);
+            if (!referrers)
+                return refuse(503, "error", "referrer_check_unavailable",
+                              "definition reference check unavailable; nothing was deleted");
+            if (!referrers->empty())
+                return refuse(409, "denied", "referenced",
+                              describe_definition_referrers(*referrers));
+        }
+        // The packs that contain the definition are noted on the success row, never a reason to
+        // block; read BEFORE the delete so no lookup sits between the delete and its row.
+        const std::string packs = exists ? pack_advisory_note(deps.pack_advisory_fn, id) : "";
         // ADR-0058: delete_definition now returns std::expected<void, std::string> —
         // a genuine DB error 503s distinctly; "not_found: " -> 404 (mirrors
         // ProductPackStore::uninstall's identical REST contract change,
@@ -436,6 +671,8 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                "db_error"))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 503;
+            res.set_header("HX-Trigger",
+                           R"({"showToast":{"message":"Instruction store delete failed","level":"error"}})");
             res.set_content(
                 R"({"error":{"code":503,"message":"instruction store delete failed"},"meta":{"api_version":"v1"}})",
                 "application/json");
@@ -446,12 +683,18 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                                "not_found"))
                 res.set_header("Sec-Audit-Failed", "true");
             res.status = 404;
+            res.set_header(
+                "HX-Trigger",
+                R"({"showToast":{"message":"Instruction definition not found","level":"error"}})");
             res.set_content(
                 R"({"error":{"code":404,"message":"instruction definition not found"},"meta":{"api_version":"v1"}})",
                 "application/json");
             return;
         }
-        (void)deps.audit_fn(req, "instruction.delete", "success", "InstructionDefinition", id, "");
+        if (!packs.empty())
+            preimage += (preimage.empty() ? "" : " ") + packs;
+        (void)deps.audit_fn(req, "instruction.delete", "success", "InstructionDefinition", id,
+                            preimage);
         deps.emit_event_fn("instruction.deleted", req, {}, {{"instruction_id", id}});
         res.set_header(
             "HX-Trigger",
@@ -501,7 +744,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
 
-        auto result = deps.store->import_definition_json(req.body);
+        std::string creator;
+        if (deps.resolve_session_fn)
+            if (auto session = deps.resolve_session_fn(req))
+                creator = session->username;
+        auto result = deps.store->import_definition_json(stamp_import_creator(req.body, creator));
         if (!result) {
             // ADR-0058: a genuine DB/lease failure 503s — never falls through to the
             // conflict/validation split below. R4: audited the same as every other
@@ -763,105 +1010,11 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // form falls back to unreplaced placeholders), same as a not-found inner
             // optional did pre-migration.
             auto def_result = deps.store->get_definition(def_id);
-            if (def_result && *def_result) {
-                const auto& def = **def_result;
-                auto replace = [&](const std::string& key, const std::string& val) {
-                    for (auto pos = tmpl.find(key); pos != std::string::npos;
-                         pos = tmpl.find(key))
-                        tmpl.replace(pos, key.size(), html_escape(val));
-                };
-                replace("{{TITLE}}", "Edit Definition");
-                replace("{{DEF_ID}}", def.id);
-                replace("{{DEF_UPDATED_AT}}", std::to_string(def.updated_at));
-                replace("{{DEF_NAME}}", def.name);
-                replace("{{DEF_VERSION}}", def.version);
-                replace("{{DEF_PLUGIN}}", def.plugin);
-                replace("{{DEF_ACTION}}", def.action);
-                replace("{{DEF_DESCRIPTION}}", def.description);
-                replace("{{DEF_PLATFORMS}}", def.platforms);
-                replace("{{YAML_SOURCE}}", def.yaml_source);
-                // Set dropdowns
-                replace("{{SEL_QUESTION}}", def.type == "question" ? "selected" : "");
-                replace("{{SEL_ACTION}}", def.type == "action" ? "selected" : "");
-                replace("{{SEL_APPR_AUTO}}", def.approval_mode == "auto" ? "selected" : "");
-                replace("{{SEL_APPR_ROLE}}",
-                        def.approval_mode == "role-gated" ? "selected" : "");
-                replace("{{SEL_APPR_ALWAYS}}",
-                        def.approval_mode == "always" ? "selected" : "");
-                replace("{{SEL_CC_UNLIM}}",
-                        def.concurrency_mode == "unlimited" ? "selected" : "");
-                replace("{{SEL_CC_DEV}}",
-                        def.concurrency_mode == "per-device" ? "selected" : "");
-                replace("{{SEL_CC_DEF}}",
-                        def.concurrency_mode == "per-definition" ? "selected" : "");
-                replace("{{SEL_CC_SET}}", def.concurrency_mode == "per-set" ? "selected" : "");
-                // Fifth, dynamic option (Gate 6 enterprise-readiness finding, PR #3784 fix
-                // round): the four static options above cover every ENFORCED/documented
-                // mode, but the real content library also ships `global`/`global-singleton`
-                // (42 catalog-only `plugin: server` definitions, ADR-1007) — neither matches
-                // any static <option>, so none was ever `selected` and the browser silently
-                // defaulted to displaying "Unlimited". Form-mode "Convert to YAML" then baked
-                // that displayed default into the generated YAML, so an ordinary Save on one
-                // of those 42 definitions silently overwrote its real concurrency_mode. Fixed
-                // by emitting a raw <option> carrying the actual stored value whenever it
-                // doesn't match one of the four known modes, so round-tripping never discards
-                // it. NOT run through the escaping `replace()` lambda above (it HTML-escapes
-                // the whole substituted string, which would mangle this option's own tags) —
-                // only the stored value itself is escaped, everything else is a literal
-                // template.
-                {
-                    static const std::string kOtherPlaceholder = "{{SEL_CC_OTHER_OPTION}}";
-                    std::string other_option;
-                    if (!def.concurrency_mode.empty() && def.concurrency_mode != "unlimited" &&
-                        def.concurrency_mode != "per-device" &&
-                        def.concurrency_mode != "per-definition" &&
-                        def.concurrency_mode != "per-set") {
-                        const auto escaped = html_escape(def.concurrency_mode);
-                        other_option = "<option value=\"" + escaped + "\" selected>" + escaped +
-                                      " (unrecognized, not enforced)</option>";
-                    }
-                    for (auto pos = tmpl.find(kOtherPlaceholder); pos != std::string::npos;
-                         pos = tmpl.find(kOtherPlaceholder))
-                        tmpl.replace(pos, kOtherPlaceholder.size(), other_option);
-                }
-            }
+            if (def_result && *def_result)
+                tmpl = render_instruction_editor(tmpl, &**def_result);
+            // else: leave the template's placeholders unreplaced (best-effort pre-fill).
         } else {
-            // New definition — clear all placeholders
-            auto clear = [&](const std::string& key) {
-                for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                    tmpl.replace(pos, key.size(), "");
-            };
-            auto replace = [&](const std::string& key, const std::string& val) {
-                for (auto pos = tmpl.find(key); pos != std::string::npos; pos = tmpl.find(key))
-                    tmpl.replace(pos, key.size(), val);
-            };
-            replace("{{TITLE}}", "New Definition");
-            clear("{{DEF_ID}}");
-            clear("{{DEF_UPDATED_AT}}");
-            clear("{{DEF_NAME}}");
-            clear("{{DEF_VERSION}}");
-            clear("{{DEF_PLUGIN}}");
-            clear("{{DEF_ACTION}}");
-            clear("{{DEF_DESCRIPTION}}");
-            clear("{{DEF_PLATFORMS}}");
-            replace("{{YAML_SOURCE}}",
-                    "apiVersion: yuzu.io/v1alpha1\nkind: InstructionDefinition\n"
-                    "metadata:\n  name: \"\"\n  version: \"1.0.0\"\nspec:\n"
-                    "  plugin: \"\"\n  action: \"\"\n  type: question\n"
-                    "  description: \"\"\n  concurrency: unlimited\n"
-                    "  approval: auto\n  parameters:\n    type: object\n"
-                    "    additionalProperties:\n      type: string\n"
-                    "  results:\n    - name: output\n      type: string\n");
-            replace("{{SEL_QUESTION}}", "selected");
-            clear("{{SEL_ACTION}}");
-            replace("{{SEL_APPR_AUTO}}", "selected");
-            clear("{{SEL_APPR_ROLE}}");
-            clear("{{SEL_APPR_ALWAYS}}");
-            replace("{{SEL_CC_UNLIM}}", "selected");
-            clear("{{SEL_CC_DEV}}");
-            clear("{{SEL_CC_DEF}}");
-            clear("{{SEL_CC_SET}}");
-            clear("{{SEL_CC_OTHER_OPTION}}");
+            tmpl = render_instruction_editor(tmpl, nullptr);
         }
         res.set_content(tmpl, "text/html; charset=utf-8");
     });
@@ -890,7 +1043,10 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
         // Save shares one contract with /api/instructions/validate-yaml
         // (#1993): YAML that passes validation always carries what Save
         // needs, and a failing Save names the actual missing field
-        // instead of a blanket "Missing required fields" for all three.
+        // instead of a blanket "Missing required fields" for all three. (The plugin / action
+        // identifier rule is applied by validate-yaml and by a CREATE below, not by an update: a
+        // save re-states a stored row's plugin and action from its YAML, so refusing an odd
+        // stored value would make the row uneditable.)
         auto errors = validate_yaml_source(yaml_source);
         if (!errors.empty()) {
             std::string html =
@@ -963,7 +1119,7 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
             // concurrency, approval). A degraded read refuses the save: writing
             // a fresh definition over an unread row is exactly the data loss
             // this merge exists to prevent.
-            std::string approval_detail;
+            std::string change_detail;
             // The editor sends the updated_at it LOADED; a save is applied only if the row is
             // still at that version (409 otherwise), so two operators cannot silently overwrite
             // each other's approval/enabled/set changes. A caller that sends none (API use) is
@@ -993,9 +1149,10 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                     expected_updated_at = stored.updated_at;
                 def = instruction_extras::merge_yaml_into_stored(stored, fields, yaml_source,
                                                                  session->username);
-                if (def.approval_mode != stored.approval_mode)
-                    approval_detail = "approval_mode: " + stored.approval_mode + " -> " +
-                                      def.approval_mode;
+                // plugin / action / approval_mode / concurrency_mode (old -> new): the YAML can
+                // repoint a definition or downgrade its approval, so the row records it as the
+                // PUT route and the v1 twins do. (enabled is carried forward, never changed here.)
+                change_detail = describe_dispatch_binding_change(stored, def);
             }
             def.id = def_id;
             auto result = deps.store->update_definition(def, expected_updated_at);
@@ -1020,13 +1177,19 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
                 return;
             }
             (void)deps.audit_fn(req, "instruction.update", "success", "InstructionDefinition",
-                                def_id, approval_detail);
+                                def_id, change_detail);
             deps.emit_event_fn("instruction.updated", req, {}, {{"instruction_id", def_id}});
             respond("Definition updated", true);
         } else {
             // A canonical definition names itself via metadata.id — honor
             // it (the store 409s on conflict), matching bundled-importer
             // semantics; without one the store generates an id.
+            // The plugin / action identifier rule validate-yaml and the v1 YAML save apply, on a
+            // CREATE only (an update keeps a stored row with an odd value editable).
+            if (auto err = check_yaml_dispatch_fields(fields)) {
+                respond("Create failed: " + *err, false);
+                return;
+            }
             def.id = fields.id;
             auto result = deps.store->create_definition(def);
             if (!result) {
@@ -1073,6 +1236,12 @@ void register_instruction_routes(HttpRouteSink& sink, Deps deps) {
 
         auto yaml_source = req.get_param_value("yaml_source");
         auto errors = validate_yaml_source(yaml_source);
+        // The plugin / action identifier rule the v1 validate-yaml applies. A source refused on
+        // its bytes (NUL, over the size cap) is never parsed.
+        if (!yaml_source_byte_refusal(yaml_source))
+            if (auto err = check_yaml_dispatch_fields(
+                    instruction_yaml::parse_definition_yaml(yaml_source)))
+                errors.push_back(std::move(*err));
 
         if (errors.empty()) {
             res.set_content("<div class=\"alert alert-success\">YAML validation passed</div>",

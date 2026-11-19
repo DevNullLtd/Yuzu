@@ -30,9 +30,10 @@
 /// fail-closed posture `member_set_owned` already holds for result-set
 /// membership. `evaluate_scope_local` never calls into presence at all and so
 /// can never fail this way (see its own doc comment). `query_stale_within`
-/// (the roster read: Hardware list/record, viz, MCP, and the Software page's
+/// (the roster read: Hardware list, viz, MCP, and the Software page's
 /// hostname map) is typed the same way (#5531) — a failed read is
-/// `std::unexpected`, never an empty roster.
+/// `std::unexpected`, never an empty roster — and a read past `kQueryRowCap` is a typed
+/// PARTIAL success (`OfflineRoster::truncated`, #5712), never the `Truncated` error.
 ///
 /// Substrate contract (ADR-0008): the store holds a `PgPool&` (not a
 /// `sqlite3*`), runs its schema migration at construction on a pinned lease,
@@ -68,8 +69,10 @@ namespace yuzu::server {
 /// not in that replica's own local live registry, local always winning on
 /// conflict). Deliberately excludes `session_id` and plugin capability: a
 /// merge caller has no session concept of its own (that's WS-4's fenced
-/// `GatewayRouteStore`), and plugin-capability cross-replica visibility
-/// (`ids_missing_plugin`) is out of this slice's scope — see WS-5's plan doc.
+/// `GatewayRouteStore`), and plugin capability is NOT carried here (a list per
+/// identity would make this fleet-sized cache enormous): cross-replica plugin
+/// visibility (`ids_missing_plugin`) reads the side table `endpoint_plugins`
+/// through `query_live_ids_without_plugin` instead (migration v5, #5685 follow-up).
 struct PresenceIdentity {
     std::string agent_id;
     std::string hostname;
@@ -154,9 +157,11 @@ public:
     /// Hard cap on rows materialised by `query_stale_within`/`query_live_ids`
     /// (gov sec-LOW / UP-5): the viz machines_max ceiling, so the store can
     /// never allocate more than the page could ever serve even if the table
-    /// has grown large. Public so tests can size a truncation fixture against
-    /// the real value rather than a hardcoded duplicate.
-    static constexpr int kQueryRowCap = 100000;
+    /// has grown large. Both reads fetch ONE row past it to DETECT a cap hit:
+    /// `query_live_ids` fails closed (`Truncated`), `query_stale_within` serves
+    /// the cap's worth flagged `truncated` (#5712). Public so tests can size a
+    /// truncation fixture against the real value rather than a hardcoded duplicate.
+    static constexpr int kQueryRowCap = kOfflineRosterRowCap;
 
     /// #5678 / #1545 UP-4 endpoint prune: rows are deleted only once unseen for
     /// the roster read window PLUS this margin. The prune keys on the PG-authored
@@ -191,7 +196,7 @@ public:
     /// startup, before serving threads read it without synchronisation —
     /// same idiom as `AppPerfDailyStore::set_metrics` and its siblings. Null
     /// (the default, e.g. unit tests / pre-WS-5 callers) disables emission.
-    void set_metrics(yuzu::MetricsRegistry* m) noexcept { metrics_ = m; }
+    void set_metrics(yuzu::MetricsRegistry* m);
 
     /// Upsert one agent's last-known identity + last-seen. Best-effort: returns
     /// false (logged at debug) on an empty lease or a query error so a slow or
@@ -220,22 +225,95 @@ public:
                 std::string_view agent_version = {}, std::string_view arch = {},
                 std::string_view session_id = {});
 
-    /// Every endpoint whose last heartbeat is within `window` of now, newest
-    /// first. Its consumers (Hardware list/record, viz, MCP, and the Software
-    /// page's display-only hostname map) render those NOT currently online as
+    /// Caps on one published plugin list (an agent reports its own list, so bound it before it is
+    /// persisted): at most this many names, each non-empty and at most this many bytes. A list
+    /// outside them is NOT stored in part (a missing name would read as absent): it publishes
+    /// nothing and the agent reads as unknown.
+    static constexpr std::size_t kMaxPublishedPlugins = 256;
+    static constexpr std::size_t kMaxPluginNameBytes = 64;
+
+    /// Records the plugin names the session `session_id` of `agent_id` reported at registration
+    /// (migration v5, `endpoint_plugins`, one row per agent, written ONCE per session by the
+    /// owning replica's heartbeat after its `upsert`). Names are capped and quoted (see the
+    /// caps above). Returns false when nothing was written (store not open, blank ids, an empty
+    /// list, a failed write: counted `op="publish_plugins"`); the caller retries on its next
+    /// heartbeat. A list is served by `query_live_ids_without_plugin` only while its session is the
+    /// endpoint's current one, so a newer session with no published list reads as unknown.
+    bool publish_plugins(std::string_view agent_id, std::string_view session_id,
+                         const std::vector<std::string>& plugin_names);
+
+    /// The ARRIVAL mirror of `remove_if_session`: when `agent_id`'s stream for `current_session_id`
+    /// is established (direct Subscribe, gateway CONNECTED), deletes any plugin list published by
+    /// a DIFFERENT session, so a stale row is not left behind to be joined again. HYGIENE: the
+    /// verdict does not depend on it, because `AgentRegistry::ids_missing_plugin` withholds an
+    /// agent only while its directory row still names the session that published the list.
+    /// Best effort (250 ms acquire, counted `op="clear_plugins"`). Returns true when the
+    /// statement ran.
+    bool clear_plugins_of_other_sessions(std::string_view agent_id,
+                                         std::string_view current_session_id);
+
+    /// Agents (each with the session that published the list) that are LIVE (the `query_live_ids`
+    /// predicate) AND have a published plugin list that does NOT contain `plugin`, where the list's
+    /// session equals the ENDPOINT ROW's session. That row's session only advances at the new
+    /// session's first heartbeat, so after a re-registration the OLD session's list still joins
+    /// until then: the result is only a set of CANDIDATES, which `AgentRegistry::ids_missing_plugin`
+    /// confirms against the agent's route-directory row before withholding anything. An agent with
+    /// no list (a pre-v5 row, an agent with no inventory) is absent from the result: unknown is
+    /// not absent, so the caller fails open for it. Typed failure like `query_live_ids`
+    /// (`Truncated` past `kQueryRowCap`); counted on
+    /// `yuzu_server_agent_presence_store_failed_total{op="query_without_plugin"}`. Identity read
+    /// only: it grants no authority.
+    [[nodiscard]] std::expected<std::vector<PluginAbsence>, PresenceReadError>
+    query_live_ids_without_plugin(std::chrono::seconds ttl, std::string_view plugin);
+
+    /// The newest `kQueryRowCap` endpoints whose last heartbeat is within `window` of now, newest
+    /// first. Its consumers (Hardware list, viz, MCP, and the Software page's
+    /// display-only hostname map) render those NOT currently online as
     /// offline rows / stale cubes; rows older than `window` are withheld so a
     /// long-departed host eventually stops cluttering the view. #5531: typed —
     /// `std::unexpected` (`StoreUnavailable`: no connection in time; `DbError`:
-    /// the query failed) on a failed read, never an empty vector; an empty success
-    /// means "no rows". `Truncated` is never produced: the read keeps
-    /// `LIMIT kQueryRowCap` newest-first and serves the capped set. A failure
-    /// is counted on `yuzu_server_agent_presence_store_failed_total`
-    /// (`op=query_stale_within`) and logged at warn once per failed call (a
-    /// store that never opened — boot-time migration failure — answers
-    /// `StoreUnavailable` without a count or warn, as `query_live_ids` does).
-    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window);
+    /// the query failed) on a failed read, never an empty roster; an empty success
+    /// means "no rows". #5712: a fleet past the cap is a typed PARTIAL success, not an
+    /// error — the query runs at `LIMIT kQueryRowCap + 1`, the extra row is discarded and
+    /// `OfflineRoster::truncated` is set. `Truncated` is NEVER returned here: a display read that
+    /// refused past the cap would be a refusal that never clears (#5371). The flag is recomputed on
+    /// every read, so it clears the moment the fleet is back under the cap. A truncated roster is a
+    /// LOWER BOUND — `find_within` is the exact answer for one agent. Ties on `last_heartbeat_ms`
+    /// at the cut are broken arbitrarily (no composite index; a tiebreak could force a full sort
+    /// at fleet scale). A failure is counted on `yuzu_server_agent_presence_store_failed_total`
+    /// (`op=query_stale_within`) and logged at warn once per failed call (a store that never
+    /// opened — boot-time migration failure — answers `StoreUnavailable` without a count or
+    /// warn, as `query_live_ids` does). A truncated read increments
+    /// `yuzu_server_agent_presence_roster_truncated_total` (a steady state on a fleet over the cap,
+    /// so it is a counter and a debug log, not a per-read warn).
+    ///
+    /// `live_ttl` (#7566) asks the same statement which of those rows are connected now, so the
+    /// Online/Offline view needs no second presence read that can fail or be truncated on its own:
+    /// each row's `OfflineEndpoint::live` is `session_id <> '' AND last_seen_at >= now() - TTL` on the
+    /// database clock (the predicate `query_live_ids` and `fleet_state_counts` use). The default
+    /// `0` means "not asked": `live` is `false` for every row, which is what the viz and
+    /// hostname-map consumers, who never read it, get. The TTL is a presence TTL, normally
+    /// `Config::session_timeout`.
+    [[nodiscard]] OfflineRosterRead query_stale_within(std::chrono::seconds window,
+                                                       std::chrono::seconds live_ttl = {});
 
-    /// Fleet tallies over the same roster window `query_stale_within` serves,
+    /// One agent's endpoint row if its last heartbeat is within `window` of now (#5712) — the same
+    /// window predicate as `query_stale_within`, answered by a primary-key lookup, so it is EXACT
+    /// at any fleet size where a roster scan is a lower bound past `kQueryRowCap`. An engaged
+    /// optional is the row; an empty one is a CONFIRMED absence from the window (never a failed
+    /// read); a failed read is `std::unexpected` (`StoreUnavailable` / `DbError`, counted on
+    /// `yuzu_server_agent_presence_store_failed_total{op=find_within}`), never "absent".
+    /// `Truncated` is never produced: one row is read. Display/identity read only — it grants no
+    /// authority, and the callers authorise the id BEFORE calling it.
+    /// `live_ttl` is the same optional presence TTL as `query_stale_within`'s (#7566, which also
+    /// fixed #7551): with a non-zero value the row's `live` says whether the agent is connected to
+    /// ANY replica, so the per-device record no longer reads a device that is live on another
+    /// replica as offline.
+    [[nodiscard]] OfflineEndpointRead find_within(std::string_view agent_id,
+                                                  std::chrono::seconds window,
+                                                  std::chrono::seconds live_ttl = {});
+
+    /// Fleet tallies over the same roster window `query_stale_within` serves (exact past the cap),
     /// computed in ONE `COUNT(*) [FILTER ...] ... GROUP BY lower(os)` statement.
     /// `now_ms` is injected (the caller's clock); `stale_after` is the "not seen"
     /// threshold; `live_ttl` is the presence TTL for `FleetStateCounts::live`

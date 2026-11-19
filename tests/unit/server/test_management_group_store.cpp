@@ -19,10 +19,13 @@
 
 #include "management_group_store.hpp"
 
+#include "mgmt_group_error.hpp"
+
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "test_mgmt_group_pg_helper.hpp" // plant_group_role_row (test-only raw group-role insert)
 
 #include <yuzu/metrics.hpp>
 
@@ -145,6 +148,44 @@ TEST_CASE("ManagementGroupStore: duplicate name rejected", "[pg][management_grou
 
     auto r2 = store.create_group(g);
     REQUIRE(!r2.has_value());
+    // The caller's conflict, named as such: not one of the store-fault messages.
+    CHECK(r2.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r2.error()));
+}
+
+TEST_CASE("ManagementGroupStore: renaming onto an existing name is a name conflict, not a fault",
+          "[pg][management_group][crud]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup a;
+    a.name = "First";
+    a.membership_type = "static";
+    REQUIRE(store.create_group(a).has_value());
+    ManagementGroup b;
+    b.name = "Second";
+    b.membership_type = "static";
+    auto bid = store.create_group(b);
+    REQUIRE(bid.has_value());
+
+    auto fetched = store.get_group(*bid);
+    REQUIRE(fetched.has_value());
+    fetched->name = "First";
+    auto r = store.update_group(*fetched);
+    REQUIRE(!r.has_value());
+    CHECK(r.error() == "a group with that name already exists");
+    CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+
+    // A different unique-constraint hit (the generated id) is still a store fault: a retry mints
+    // a new id, so it is the one case where retrying is right.
+    ManagementGroup c;
+    c.id = *bid;
+    c.name = "Third";
+    c.membership_type = "static";
+    auto dup_id = store.create_group(c);
+    REQUIRE(!dup_id.has_value());
+    CHECK(mgmt_group_error_is_store_fault(dup_id.error()));
 }
 
 TEST_CASE("ManagementGroupStore: update group", "[pg][management_group][crud]") {
@@ -366,6 +407,97 @@ TEST_CASE("ManagementGroupStore: engine principals cannot hold scoped role assig
     REQUIRE(!r.has_value());
 }
 
+// PR-1a: the store refuses a group-scoped ITServiceOwner grant. EXACT byte match (no case
+// folding, no trimming); a variant is an ordinary custom role. Rows already stored stay readable
+// and removable.
+TEST_CASE("ManagementGroupStore: assign_role refuses a group-scoped ITServiceOwner grant",
+          "[pg][management_group][roles]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+
+    ManagementGroup g;
+    g.name = "ItsoGroup";
+    g.membership_type = "static";
+    auto group_id = store.create_group(g);
+    REQUIRE(group_id.has_value());
+
+    auto make = [&](const std::string& ptype, const std::string& pid, const std::string& role) {
+        GroupRoleAssignment a;
+        a.group_id = *group_id;
+        a.principal_type = ptype;
+        a.principal_id = pid;
+        a.role_name = role;
+        return a;
+    };
+    const std::string kFixed = "this role cannot be assigned at management-group scope";
+
+    SECTION("a user principal is refused with the fixed, non-fault message") {
+        auto r = store.assign_role(make("user", "alice", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK_FALSE(mgmt_group_error_is_store_fault(r.error()));
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("a group principal is refused") {
+        auto r = store.assign_role(make("group", "ops-team", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error() == kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("the engine refusal still wins over the deny-list (check order)") {
+        auto r = store.assign_role(make("engine", "engine:nvd", "ITServiceOwner"));
+        REQUIRE(!r.has_value());
+        CHECK(r.error().find("cannot hold scoped") != std::string::npos);
+        CHECK(r.error() != kFixed);
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+
+    SECTION("other roles are accepted, built-in and custom") {
+        REQUIRE(store.assign_role(make("user", "alice", "Operator")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "Viewer")).has_value());
+        REQUIRE(store.assign_role(make("user", "alice", "ForensicsScoped")).has_value());
+        CHECK(store.get_group_roles(*group_id).size() == 3);
+    }
+
+    SECTION("variants of the name are ordinary custom roles (exact byte match)") {
+        const std::string nul_form("ITServiceOwner\0", 15);
+        REQUIRE(nul_form.size() == 15);
+        const std::vector<std::string> variants = {"itserviceowner", "ITServiceOwner ", nul_form};
+        for (const auto& v : variants) {
+            INFO("variant size " << v.size());
+            REQUIRE(store.assign_role(make("user", "bob", v)).has_value());
+        }
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 3);
+        std::vector<std::string> stored;
+        for (const auto& r : roles)
+            stored.push_back(r.role_name);
+        CHECK(std::find(stored.begin(), stored.end(), "itserviceowner") != stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner ") != stored.end());
+        // sanitize_pg_text substitutes the NUL with U+FFFD (never deletes), so the stored name
+        // is a different string from the refused one.
+        CHECK(std::find(stored.begin(), stored.end(), std::string("ITServiceOwner\xEF\xBF\xBD")) !=
+              stored.end());
+        CHECK(std::find(stored.begin(), stored.end(), "ITServiceOwner") == stored.end());
+    }
+
+    SECTION("an already-stored row is still read and still removable") {
+        const auto planted = make("user", "carol", "ITServiceOwner");
+        yuzu::test::plant_group_role_row(db.dsn(), planted);
+        auto roles = store.get_group_roles(*group_id);
+        REQUIRE(roles.size() == 1);
+        CHECK(roles[0].role_name == "ITServiceOwner");
+        // The refusal does not touch it; the same assign is still refused.
+        CHECK_FALSE(store.assign_role(planted).has_value());
+        auto d = store.unassign_role(*group_id, "user", "carol", "ITServiceOwner");
+        REQUIRE(d.has_value());
+        CHECK(store.get_group_roles(*group_id).empty());
+    }
+}
+
 TEST_CASE("ManagementGroupStore: get_assignments_for_principal unions user and group arms",
           "[pg][management_group][roles]") {
     YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
@@ -468,7 +600,7 @@ TEST_CASE("ManagementGroupStore: get_visible_agents honors RBAC-disabled posture
         a.group_id = *gid_a;
         a.principal_type = "user";
         a.principal_id = "admin";
-        a.role_name = "ITServiceOwner";
+        a.role_name = "Operator";
         REQUIRE(store.assign_role(a).has_value());
         auto visible = store.get_visible_agents("admin");
         REQUIRE(visible.has_value());
@@ -844,6 +976,150 @@ TEST_CASE("ManagementGroupStore: cascade delete removes members and roles",
 
     auto roles = store.get_group_roles(*group_id);
     CHECK(roles.empty());
+}
+
+// #7074 (C1): validate_new_group exposes the pre-insert refusals of create_group so a caller can refuse
+// BEFORE writing an audit row. create_group runs the same function, so each refusal text is identical.
+TEST_CASE("ManagementGroupStore: validate_new_group refusals match create_group text, write nothing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    // Each case: the input, and the exact text create_group has always returned for it.
+    ManagementGroup empty_name;
+    empty_name.membership_type = "static";
+
+    ManagementGroup self_parent;
+    self_parent.id = "abcdef012345";
+    self_parent.parent_id = self_parent.id;
+    self_parent.name = "SelfParent";
+    self_parent.membership_type = "static";
+
+    ManagementGroup missing_parent;
+    missing_parent.name = "OrphanChild";
+    missing_parent.parent_id = "does-not-exist";
+    missing_parent.membership_type = "static";
+
+    // A chain of six groups (the deepest has five ancestors): a child below it exceeds the cap.
+    std::string prev_id;
+    for (int i = 0; i < 6; ++i) {
+        ManagementGroup g;
+        g.name = "Chain " + std::to_string(i);
+        g.membership_type = "static";
+        g.parent_id = prev_id;
+        auto r = store.create_group(g);
+        REQUIRE(r.has_value());
+        prev_id = *r;
+    }
+    ManagementGroup too_deep;
+    too_deep.name = "Chain 6";
+    too_deep.parent_id = prev_id;
+    too_deep.membership_type = "static";
+
+    const auto after_chain = store.list_groups_checked();
+    REQUIRE(after_chain.has_value());
+    REQUIRE(after_chain->size() == baseline->size() + 6);
+
+    struct Case {
+        const ManagementGroup* group;
+        const char* text;
+    };
+    const Case cases[] = {
+        {&empty_name, "group name cannot be empty"},
+        {&self_parent, "group cannot be its own parent"},
+        {&missing_parent, "parent group not found"},
+        {&too_deep, "maximum hierarchy depth (5) exceeded"},
+    };
+    for (const auto& c : cases) {
+        INFO("expected refusal: " << c.text);
+        auto v = store.validate_new_group(*c.group);
+        REQUIRE(!v.has_value());
+        CHECK(v.error() == c.text);
+
+        // create_group re-runs the same checks and returns the identical text.
+        auto created = store.create_group(*c.group);
+        REQUIRE(!created.has_value());
+        CHECK(created.error() == c.text);
+    }
+
+    // Neither call wrote a row.
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == after_chain->size());
+}
+
+TEST_CASE("ManagementGroupStore: validate_new_group accepts valid input without writing",
+          "[pg][management_group][crud][mgmt-audit-first]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, mgmt_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ManagementGroupStore store{pool};
+    REQUIRE(store.is_open());
+
+    ManagementGroup parent;
+    parent.name = "ValidateParent";
+    parent.membership_type = "static";
+    auto parent_id = store.create_group(parent);
+    REQUIRE(parent_id.has_value());
+
+    const auto baseline = store.list_groups_checked();
+    REQUIRE(baseline.has_value());
+
+    ManagementGroup root;
+    root.name = "ValidateRoot";
+    root.membership_type = "static";
+    ManagementGroup child;
+    child.name = "ValidateChild";
+    child.parent_id = *parent_id;
+    child.membership_type = "static";
+
+    CHECK(store.validate_new_group(root).has_value());
+    CHECK(store.validate_new_group(child).has_value());
+    // A name conflict is a write-time outcome, not a pre-insert check: validation does not see it.
+    ManagementGroup dup;
+    dup.name = "ValidateParent";
+    dup.membership_type = "static";
+    CHECK(store.validate_new_group(dup).has_value());
+
+    const auto after = store.list_groups_checked();
+    REQUIRE(after.has_value());
+    CHECK(after->size() == baseline->size());
+    CHECK(!store.find_group_by_name("ValidateRoot").has_value());
+    CHECK(!store.find_group_by_name("ValidateChild").has_value());
+
+    // create_group still creates on the same inputs, and still reports the conflict itself.
+    auto root_id = store.create_group(root);
+    REQUIRE(root_id.has_value());
+    auto child_id = store.create_group(child);
+    REQUIRE(child_id.has_value());
+    auto child_row = store.get_group(*child_id);
+    REQUIRE(child_row.has_value());
+    CHECK(child_row->parent_id == *parent_id);
+    auto dup_result = store.create_group(dup);
+    REQUIRE(!dup_result.has_value());
+    CHECK(dup_result.error() == "a group with that name already exists");
+}
+
+// No database: the not-open refusal comes first and is the same text from both entry points.
+TEST_CASE("ManagementGroupStore: validate_new_group and create_group refuse a closed store alike",
+          "[management_group][degrade][mgmt-audit-first]") {
+    PgPool pool{{.conninfo = "yuzu_invalid_keyword=1", .size = 1}};
+    ManagementGroupStore store{pool};
+    REQUIRE(!store.is_open());
+
+    ManagementGroup g;
+    g.name = "ClosedStore";
+    g.membership_type = "static";
+    auto v = store.validate_new_group(g);
+    REQUIRE(!v.has_value());
+    CHECK(v.error() == "database not open");
+    auto c = store.create_group(g);
+    REQUIRE(!c.has_value());
+    CHECK(c.error() == "database not open");
 }
 
 // Degrade-distinguishable fail-closed path (ADR-0042). Deliberately NOT [pg]:

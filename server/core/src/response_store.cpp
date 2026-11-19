@@ -407,8 +407,10 @@ const std::vector<pg::PgMigration>& migrations() {
         // Landed as a NEW migration, not folded into v1's CREATE TABLE:
         // PgMigrationRunner stamps schema_meta(store, version) once per
         // numbered migration and never replays a modified one, so editing
-        // v1 in place would silently no-op on any database that already
-        // ran this store's migrations (#2691, Sol plan review).
+        // v1 in place would not run on any database that already ran this
+        // store's migrations (#2691, Sol plan review); since #7158 the runner
+        // also refuses such a database at start, because the recorded hash of
+        // v1 no longer matches.
         {2, R"(
             ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT NULL DEFAULT 0;
         )"},
@@ -502,10 +504,10 @@ void seed_response_facet_metrics(yuzu::MetricsRegistry& m) {
 
 // ── Ingest (fail-soft) ────────────────────────────────────────────────────────
 
-void ResponseStore::store(const StoredResponse& resp) {
+StoreOutcome ResponseStore::store(const StoredResponse& resp) {
     if (!open_) {
         note_ingest_dropped(metrics_, kReasonStoreNotOpen);
-        return;
+        return StoreOutcome::Failed;
     }
 
     // #2691 (UP-5, widened by Gate 8 security-guardian): reject before
@@ -522,7 +524,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                      "instruction_id/execution_id/plugin/agent_id (agent={})",
                      ::yuzu::log_id_token(resp.agent_id));
         note_ingest_dropped(metrics_, kReasonMalformedIdentity);
-        return;
+        return StoreOutcome::Failed;
     }
 
     const int64_t now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
@@ -812,7 +814,7 @@ void ResponseStore::store(const StoredResponse& resp) {
                      ::yuzu::log_id_token(resp.instruction_id),
                      ::yuzu::log_id_token(resp.agent_id), pool_.last_error());
         note_ingest_dropped(metrics_, reached_txn ? kReasonQueryError : kReasonPoolTimeout);
-        return;
+        return StoreOutcome::Failed;
     }
     if (capped) {
         // The counter is unsampled; only the log line is budgeted (bounded_audit_budget.hpp), so
@@ -828,11 +830,14 @@ void ResponseStore::store(const StoredResponse& resp) {
                          "agent={}; frame dropped",
                          max_rows_per_agent_, ::yuzu::log_id_token(resp.instruction_id),
                          ::yuzu::log_id_token(resp.agent_id));
-        return;
+        // A refused TERMINAL frame means the pair already holds a terminal row (response_cap_rules),
+        // so its answer is durable; a refused non-terminal frame's output is lost.
+        return resp.status != 0 ? StoreOutcome::CappedTerminal : StoreOutcome::CappedRunning;
     }
     note_facets_dropped(metrics_, kFacetDropValueTooLong, facets_too_long);
     note_facets_dropped(metrics_, kFacetDropCap, facets_capped);
     note_facets_dropped(metrics_, kFacetDropBatchFailed, facets_batch_failed);
+    return StoreOutcome::Stored;
 }
 
 ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
@@ -877,6 +882,26 @@ ResponseStore::FinalizeResult ResponseStore::finalize_terminal_status(
         return FinalizeResult::Error;
     }
     return affected_rows(res) > 0 ? FinalizeResult::Updated : FinalizeResult::NoRow;
+}
+
+bool ResponseStore::shorten_ttl(const std::string& instruction_id, const std::string& agent_id,
+                                std::chrono::seconds keep) {
+    if (!open_)
+        return false;
+    auto lease = pool_.try_acquire_for(kIngestTimeout);
+    if (!lease)
+        return false;
+    const std::string expires = std::to_string(now_epoch() + static_cast<int64_t>(keep.count()));
+    // Only SHORTENS a lifetime. A row with an earlier expiry keeps it, and a row with no expiry
+    // (0 = kept forever, a server set to keep responses forever) is left alone: the operator's
+    // retention choice outranks this reconciler's wish to tidy its own replies. (The reaper takes
+    // only `ttl_expires_at > 0`, so giving such a row an expiry would delete it.)
+    pg::PgResult res = pg::exec_params(
+        lease.get(),
+        "UPDATE response_store.responses SET ttl_expires_at = $1::bigint WHERE instruction_id = $2 "
+        "AND agent_id = $3 AND ttl_expires_at > $1::bigint",
+        std::vector<std::string>{expires, instruction_id, agent_id});
+    return res.status() == PGRES_COMMAND_OK;
 }
 
 // ── Reads (degrade-distinguishable) ──────────────────────────────────────────
@@ -1156,9 +1181,25 @@ ResponseStore::query_by_execution(const std::string& execution_id, const Respons
                 sql += " AND timestamp <= $" + std::to_string(idx++) + "::bigint";
                 binds.push_back(std::to_string(*q.until));
             }
+            if (q.continue_after) {
+                // Keyset cursor over the read's total order (`timestamp DESC, id DESC`): the
+                // row comparison selects the rows strictly after the cursor in that order.
+                // Two placeholders: number them in separate statements, because the operand
+                // order of one `+` chain is unspecified and a swap would silently compare the
+                // id against the timestamp.
+                const int ts_idx = idx++;
+                const int id_idx = idx++;
+                sql += " AND (timestamp, id) < ($" + std::to_string(ts_idx) + "::bigint, $" +
+                       std::to_string(id_idx) + "::bigint)";
+                binds.push_back(std::to_string(q.continue_after->first));
+                binds.push_back(std::to_string(q.continue_after->second));
+            }
             append_scope_clause(sql, binds, idx, scope);
             append_tier_clause(sql, binds, idx, tier);
-            sql += " ORDER BY timestamp DESC LIMIT $" + std::to_string(idx++) + "::integer";
+            // `id DESC` makes the order total: timestamps are epoch seconds and a fleet answers
+            // in bursts, so a page boundary inside a tie must be deterministic.
+            sql += " ORDER BY timestamp DESC, id DESC LIMIT $" + std::to_string(idx++) +
+                   "::integer";
             binds.push_back(std::to_string(sanitize_limit(q.limit)));
             if (q.offset > 0) {
                 sql += " OFFSET $" + std::to_string(idx++) + "::integer";

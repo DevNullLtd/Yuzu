@@ -13,8 +13,14 @@
 /// lint-enforced: this header is itself in the family's enforced closure set,
 /// so a store `#include` added here fails CI.
 
+#include <chrono>
+#include <cstdint>
+#include <expected>
 #include <functional>
 #include <memory>
+#include <optional>
+#include <string>
+#include <vector>
 
 #include "dex_api.hpp"
 #include "dex_score_policy_provider.hpp" // DexScorePolicyProvider::ReadFn - pure, no store type
@@ -31,6 +37,38 @@ class RuntimeConfigStore;
 /// DexRoutes / RestApiV1 / mcp_server already share (see server.cpp). Kept as
 /// a callback so this core-only header needs no AgentRegistry/health includes.
 using FleetFn = std::function<DexFleet()>;
+
+/// Supplies the live observer state of the given agent ids, ALIGNED by index (one entry per id,
+/// `NoneReported` for an id with nothing to say). Called by `apps()` with exactly the ids of the
+/// requested scope, once, after a successful read. Assembled in server.cpp over the agent health
+/// store, so this header needs no registry include. Empty = no observer source (the model's
+/// `observer_state` stays unset).
+using DexObserverFn = std::function<std::vector<DexObserverState>(const std::vector<std::string>& ids)>;
+
+/// The reads behind `DexApi::apps_usage`, assembled in server.cpp (this header names no store).
+/// An empty closure is a failed read, never an empty result.
+///  - `read`: the one cross-store usage statement. The error is the detail token a surface reports
+///    (`concurrency_budget`, `pool_acquire_timeout`, `query_error`, `statement_timeout`,
+///    `fleet_too_large`, `not_wired`).
+///  - `group_members`: the member agent ids of a management group. The error is `unknown_group`
+///    when no such group exists (a 400 for the caller) or `group_unavailable` when it cannot be
+///    read (a retryable 503).
+///  - `tag_values`: agent id -> value for one tag key; nullopt when it cannot be read.
+///  - `observation_retention_days`: the observation store's retention. Unset refuses every usage
+///    read as `invalid_request`: an omitted value would turn the retention guard off.
+///  - `cache_ttl`, `now_epoch`: test-only. `cache_ttl` is how long a model is reused (production
+///    leaves the 30 s default); `now_epoch` replaces the wall clock as the API's one instant
+///    source (empty = the wall clock, which is what production wires). A test injects them to
+///    reach the cache expiry and the window cut without waiting.
+struct DexUsageWiring {
+    std::function<std::expected<DexUsageRead, std::string>(const DexUsageQuery&)> read;
+    std::function<std::expected<std::vector<std::string>, std::string>(const std::string& group_id)>
+        group_members;
+    decltype(DexUsageSources::tag_values) tag_values;
+    std::optional<int> observation_retention_days;
+    std::chrono::seconds cache_ttl{30};
+    std::function<std::int64_t()> now_epoch;
+};
 
 /// Factory for the store-backed implementation (`LocalDexApi`, dex_api.cpp —
 /// kept out of the abstract header so that header stays free of store
@@ -59,9 +97,19 @@ using FleetFn = std::function<DexFleet()>;
 /// (`dex_default_score_policy()`, source "default"). A `policy_fn` that returns
 /// an error makes `apps()` degrade with `degraded_reason`
 /// "score_policy_unavailable"; see `DexScorePolicyFn` for the contract.
+///
+/// `observer_fn` may be empty (see `DexObserverFn`). When set it is borrowed like `fleet_fn`: its
+/// captures must outlive every holder of the returned API (server.cpp declares the health store
+/// before them; tests/test_guardian_backend_wiring_lexical.py pins that order).
+///
+/// `usage` is the wiring behind `apps_usage` (see `DexUsageWiring`); a default one answers every
+/// usage read with the refusal `usage_unavailable`/`not_wired`. Its captures are borrowed like
+/// `fleet_fn`'s.
 [[nodiscard]] std::shared_ptr<DexApi> make_local_dex_api(GuaranteedStateStore* store,
                                                          FleetFn fleet_fn,
-                                                         DexScorePolicyFn policy_fn = {});
+                                                         DexScorePolicyFn policy_fn = {},
+                                                         DexObserverFn observer_fn = {},
+                                                         DexUsageWiring usage = {});
 
 /// The production `DexScorePolicyProvider::ReadFn`: reads the stored score policy
 /// document (`kDexScorePolicyKey`) from the runtime config store. A stored value is

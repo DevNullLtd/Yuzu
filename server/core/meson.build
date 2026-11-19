@@ -577,6 +577,22 @@ software_normalization_seed_embed = custom_target(
   ],
 )
 
+# SAM-23 shipped software lifecycle rules (content/software-lifecycle/rules.csv) embedded as
+# kSoftwareLifecycleSeed; the runtime parser is the authoritative floor and the server refuses to
+# start on a seed it cannot parse or load.
+software_lifecycle_seed_embed = custom_target(
+  'software_lifecycle_seed',
+  input: files('../../content/software-lifecycle/rules.csv'),
+  output: 'software_lifecycle_seed.cpp',
+  command: [
+    embed_python,
+    files('scripts/embed_binary.py'),
+    '@INPUT@',
+    '@OUTPUT@',
+    'SoftwareLifecycleSeed',
+  ],
+)
+
 # Vendored Nayuki QR-Code-generator (MIT, pinned v1.8.0; see
 # server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt). Built as its own
 # static lib with warnings off so third-party source does not trip our
@@ -654,9 +670,22 @@ yuzu_key_provider_dep = declare_dependency(
 # linker folds silently (see yuzu_server_core_dep below).
 yuzu_server_core_cpp_args = https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []) + switch_werror_args
 yuzu_server_core_incs = include_directories('include', '../../common/include')
+# libxlsxwriter (SAM-36b, `format=xlsx` of the installed-software export), used by ONE translation
+# unit (software_export_xlsx.cpp). pkg-config only: the vcpkg port installs `xlsxwriter.pc` and NO
+# CMake package, so a cmake lookup could never succeed. minizip is a direct dependency of that same
+# translation unit: after workbook_close it reads the finished workbook back through minizip's
+# unzip API (`xlsx_verify_workbook`), because the library does not report a failed write of its
+# temporary files. The .pc also lists `zlib minizip` as public requirements, so the static link
+# would carry minizip through it anyway; it is declared on its own because this code calls it, and
+# the server tests read workbooks back through it too. Both are server-feature ports (vcpkg.json),
+# absent from the agent-only Windows and macOS installs, and this file is only processed when the
+# server is built (Linux, ADR-0035).
+xlsxwriter_dep = dependency('xlsxwriter', method: 'pkg-config', required: true, include_type: 'system')
+minizip_dep = dependency('minizip', method: 'pkg-config', required: true, include_type: 'system')
+
 yuzu_server_core_deps = [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                          sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                         libpq_dep, yuzu_key_provider_dep]
+                         libpq_dep, yuzu_key_provider_dep, xlsxwriter_dep, minizip_dep]
 yuzu_server_core_deps += auth_crypto_deps
 yuzu_server_core_deps += https_deps
 yuzu_server_core_deps += saml_deps
@@ -677,6 +706,7 @@ yuzu_server_core_lib = static_library(
    echo_retention_tiers_tsv_embed,
    yuzu_css_embed, plex_embeds, content_embed, cpe_map_embed,
    software_normalization_seed_embed,
+   software_lifecycle_seed_embed,
   files(
     'src/config_secret_keys.cpp',
     'src/runtime_config_store.cpp',
@@ -696,6 +726,7 @@ yuzu_server_core_lib = static_library(
     'src/authz_gates.cpp',
     'src/mfa_step_up.cpp',
     'src/post_read_stage.cpp', # per-server post-read stage (body cap + step-up) the HttplibRouteSink wraps handlers with
+    'src/http_response_policy.cpp', # HEAD refusal on dynamic routes + measured-quality brotli, composed into HttplibRouteSink::wrap
     'src/route_inventory.cpp', # process-wide record of HttplibRouteSink registrations (boot-time step-up sweep)
     'src/step_up_gate.cpp', # MFA step-up decide/render split + request chokepoint (policy table: src/step_up_policy.hpp)
     'src/mfa_qr.cpp',
@@ -730,6 +761,8 @@ yuzu_server_core_lib = static_library(
     'src/audit_store.cpp',
     'src/credential_change_owner.cpp', # #5342: ADR-0012 §3 query owner — one-transaction
                                        # local credential change (auth + session_store + audit_store)
+    'src/mfa_disable_owner.cpp', # #6079 PR 2c: ADR-0012 §3 query owner, one-transaction
+                                 # MFA factor clear + session end + outcome audit row
     'src/tag_store.cpp',
     'src/scope_engine.cpp',
     'src/scope_preview.cpp', # #2146 Batch B2: shared REST v1 + MCP scope-preview builder
@@ -741,12 +774,14 @@ yuzu_server_core_lib = static_library(
     'src/instruction_store.cpp',
     'src/instruction_yaml.cpp',
     'src/instruction_definition_model.cpp', # #4029: shared REST v1 + MCP builder
+    'src/instruction_referrers.cpp', # #2146 UP-6: what still references a definition (delete guard)
     'src/execution_tracker.cpp',
     'src/execution_model.cpp',
     'src/healthcheck_probe.cpp', # #5906: yuzu-server --healthcheck transport
     'src/home_panels_render.cpp',
     'src/leader_elector.cpp',
     'src/pg_reachability_probe.cpp', # HA WS-8: runtime Postgres-reachability signal for /readyz
+    'src/pg_collation_recheck.cpp', # hourly repeat of the collation version check (ReplicaSafe)
     'src/command_outbox_store.cpp',
     'src/command_delivery_finalization_owner.cpp', # #4982 round 5: ADR-0012 §3 cross-schema owner
     'src/command_outbox_delivery.cpp',
@@ -820,6 +855,7 @@ yuzu_server_core_lib = static_library(
     'src/mcp_tools_hardware.cpp',
     'src/mcp_tools_containment.cpp',
     'src/mcp_tools_crypto.cpp',
+    'src/mcp_tools_dex.cpp',
     'src/mcp_transport.cpp',
     'src/compliance_model.cpp',
     'src/compliance_api.cpp', # ADR-0031 WS-A4: the third per-family in-process API seam
@@ -842,17 +878,28 @@ yuzu_server_core_lib = static_library(
     'src/group_agent_count_preview.cpp',
     'src/inventory_ci_join.cpp',
     'src/hardware_list_model.cpp',
+    'src/hardware_section_integrity.cpp', # #7159: section-integrity counter + sampled WARN (the pure model stays metrics-free)
+    'src/hardware_ci_page_model.cpp', # bulk device-CI keyset page (GET /api/v1/hardware-ci + MCP twin)
     'src/device_containment_render.cpp',
     'src/device_estate_render.cpp',
     'src/software_catalog_rollup.cpp',
     'src/software_normalization_job.cpp',
     'src/software_title_dimension.cpp',
     'src/software_catalogue_model.cpp',
+    'src/software_list_model.cpp',
+    'src/software_hosts_model.cpp',
+    'src/software_changes_model.cpp',
+    'src/software_plugin_health_model.cpp',
+    'src/software_read_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_collection_settings_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_lifecycle_api.cpp', # SAM-29: transport-neutral body shared by the REST routes and the MCP twins
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
     'src/crypto_widget_catalogue.cpp', # /crypto widgets: pure catalogue + D13 windows + JSON shapers
     'src/crypto_dashboard_layout_store.cpp', # /crypto widgets: per-operator layout (born-on-PG)
+    'src/revocation_source_store.cpp',   # R1 (slice 2b-1a): registered CRL sources (born-on-PG)
+    'src/revocation_source_service.cpp', # R1: shared REST+MCP validation, egress check, JSON views
     'src/preflight_eval.cpp',
     'src/preflight_run_store.cpp',
     'src/preflight_runner.cpp',
@@ -878,6 +925,8 @@ yuzu_server_core_lib = static_library(
     'src/workflow_model.cpp',
     'src/workflow_execution_list_model.cpp', # shared REST+MCP parser/row builder for the run list
     'src/workflow_api.cpp', # ADR-0031 WS-A4: the eighth per-family in-process API seam
+    'src/workflow_execute.cpp', # #2146 batch B: the shared workflow-execute sequence (REST v1 + MCP)
+    'src/workflow_execute_routes.cpp', # #2146 batch B: POST /api/v1/workflows/{id}/execute
     'src/product_pack_store.cpp',
     'src/product_pack_model.cpp', # #4029: shared REST v1 + MCP builder
     'src/app_perf_daily_store.cpp',
@@ -887,6 +936,8 @@ yuzu_server_core_lib = static_library(
     'src/app_perf_cohort_reader.cpp',
     'src/app_perf_ingestion.cpp',
     'src/app_perf_rollup.cpp',
+    'src/dex_app_usage_owner.cpp',
+    'src/dex_usage_json.cpp',
     'src/dex_app_version_failures_owner.cpp',
     'src/inventory_ingestion.cpp',
     'src/inventory_store.cpp',
@@ -894,6 +945,9 @@ yuzu_server_core_lib = static_library(
     'src/vuln_finding_store.cpp',
     'src/product_normalize.cpp',
     'src/product_registry_store.cpp',
+    'src/software_collection_settings_store.cpp',
+    'src/collection_settings_push.cpp', # heartbeat-driven settings push: borrows the settings, group and kill-switch stores
+    'src/software_lifecycle_store.cpp',
     'src/software_normalization_pack.cpp',
     'src/software_licensing_store.cpp',
     'src/software_licensing_ingestion.cpp',
@@ -933,6 +987,7 @@ yuzu_server_core_lib = static_library(
     'src/pg/pg_pool.cpp',
     'src/pg/pg_migration_runner.cpp',
     'src/pg/pg_retention_guard.cpp',
+    'src/pg/pg_collation_check.cpp', # collation version check, at start and then repeated; logs and exports a gauge, never stops the server
     'src/pg/multi_host_dsn.cpp', # HA WS-8: multi-host DSN must use target_session_attrs=read-write
     # SecretCodec (ADR-0010, #1320 PR 4): app-side envelope encryption for
     # secret columns. Depends on the yuzu_key_provider leaf target above.
@@ -1012,6 +1067,7 @@ yuzu_server_routes_lib = static_library(
     'src/guardian_routes.cpp',
     'src/dex_routes.cpp',
     'src/dex_app_perf_ui.cpp',
+    'src/dex_apps_ui.cpp',
     'src/dex_perf_ui.cpp',
     'src/network_routes.cpp',
     'src/network_ui.cpp',
@@ -1020,6 +1076,12 @@ yuzu_server_routes_lib = static_library(
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
+    'src/software_curation_api.cpp', # SAM-29: shared body of the curation routes and the MCP twins; routes lib because it calls the curation_keys codecs defined in software_curation_routes.cpp
+    'src/software_collection_settings_routes.cpp',
+    'src/software_lifecycle_routes.cpp',
+    'src/software_read_routes.cpp',
+    'src/software_export_routes.cpp',
+    'src/software_export_xlsx.cpp', # SAM-36b: the only TU that includes libxlsxwriter
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',
@@ -1029,6 +1091,7 @@ yuzu_server_routes_lib = static_library(
     'src/sle_routes.cpp',
     'src/crypto_routes.cpp',  # /crypto slice 1: page + fragments + REST v1 route owner
     'src/crypto_ui.cpp',      # /crypto slice 1: pure HTML renderers
+    'src/revocation_source_routes.cpp',  # R1: /api/v1/crypto/revocation-sources REST twins
     'src/preflight_routes.cpp',
     'src/preflight_ui.cpp',
     'src/verify_routes.cpp',
@@ -1075,8 +1138,10 @@ yuzu_server_routes_lib = static_library(
     'src/settings_pki_ui.cpp',
     'src/execution_mutation.cpp', # cancel/rerun REST v1 + MCP twins: one admit-audit-effect sequence
     'src/mcp_instruction_execute.cpp', # MCP twin of POST /api/instructions/{id}/execute: bounds + JSON-RPC rendering over instruction_execute
+    'src/mcp_instruction_authoring.cpp', # MCP twins of the instruction-definition / instruction-set authoring routes (#2146 batch C): store sequences + JSON-RPC rendering
     'src/command_v1_routes.cpp', # POST /api/v1/commands: the REST v1 twin of /api/command + MCP execute_instruction (#2146)
     'src/instruction_execute_routes.cpp', # POST /api/v1/instructions/{id}/execute
+    'src/instruction_authoring_routes.cpp', # v1 definition + instruction-set authoring twins (#2146 batch C)
   ),
   include_directories: yuzu_server_core_incs,
   cpp_args: yuzu_server_core_cpp_args,

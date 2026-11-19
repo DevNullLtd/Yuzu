@@ -43,6 +43,29 @@ namespace yuzu::server {
 /// non-route caller cannot store a larger interval than the route would have accepted.
 inline constexpr long long kMaxScheduleIntervalMinutes = 35791394;
 
+/// The four `create_schedule` error texts that come from the store write rather than from the
+/// engine's own request validation. The first two mean the store could not take the write and
+/// nothing was written (a route answers 503 and a retry is safe); the third means the store
+/// refused a field value as invalid text or as violating a constraint (SQLSTATE class 22 or 23):
+/// that is a client error, a route answers 400, and nothing is wrong with the store. The fourth
+/// means the INSERT ran and the transaction then did not report success: the write may or may not
+/// have landed, so a route answers 503 WITHOUT a retry hint. Every other error text
+/// `create_schedule` returns is a request-validation text (also 400).
+inline constexpr const char* kScheduleCreateNotOpenError = "database not open";
+inline constexpr const char* kScheduleCreateInsertFailedError =
+    "insert failed (pool degraded or transaction failed)";
+inline constexpr const char* kScheduleCreateValueRefusedError =
+    "a field value is not valid text for the schedule store";
+inline constexpr const char* kScheduleCreateOutcomeUnknownError =
+    "the write ran but the transaction did not report success (outcome unknown)";
+
+/// Answer of `ScheduleEngine::owned_schedule_exists_checked`.
+enum class OwnedScheduleLookup {
+    Exists,     ///< the read succeeded and `created_by` owns a schedule with this id
+    Absent,     ///< the read succeeded and no such owned schedule exists
+    Unreadable, ///< the store could not answer (not open, pool timeout, query error)
+};
+
 class ScheduleEngine {
 public:
     explicit ScheduleEngine(pg::PgPool& pool);
@@ -81,7 +104,28 @@ public:
     std::expected<ScheduleListResult, std::string>
     query_schedules_checked(const ScheduleQuery& q = {}) const;
 
+    /// Ids of the schedules whose definition is ANY of `definition_ids` (one read for the whole
+    /// list, `definition_id = ANY(...)`), at most `limit` of them, ordered by name, then id as a
+    /// stable tiebreak (`query_schedules_checked` orders by name only). Ids only, so no row is
+    /// decoded and the 5000-row listing cap does not apply. An empty `definition_ids` answers an empty list
+    /// without a read. `unexpected(msg)` (prefixed `kDbErrorPrefix`) = the question could not be
+    /// answered; never read it as "no schedule references it".
+    std::expected<std::vector<std::string>, std::string>
+    schedules_referencing_definitions(const std::vector<std::string>& definition_ids,
+                                      int limit) const;
+
+    /// On a failed insert the error is `kScheduleCreateValueRefusedError` when Postgres reported a
+    /// data exception or integrity violation (SQLSTATE class 22 or 23, for example a NUL byte or
+    /// invalid UTF-8 in a text field), `kScheduleCreateInsertFailedError` for any other failure of
+    /// the INSERT or of the connection before it, and `kScheduleCreateOutcomeUnknownError` when the
+    /// INSERT succeeded but the transaction did not (a failed or unanswered COMMIT).
     std::expected<std::string, std::string> create_schedule(const InstructionSchedule& sched);
+
+    /// Point read: does `created_by` own a schedule with this id? One owner-filtered
+    /// `SELECT 1`, independent of the listing cap. Used by the routes to tell a write that matched
+    /// no row because the schedule is absent from a write that did not apply to an existing one.
+    [[nodiscard]] OwnedScheduleLookup owned_schedule_exists_checked(const std::string& id,
+                                                                    const std::string& created_by) const;
 
     /// Owner-scoped delete (M-01, #1806): `created_by` is REQUIRED (no
     /// default) so a caller cannot accidentally pass an empty principal and

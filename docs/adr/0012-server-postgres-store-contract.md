@@ -307,7 +307,7 @@ row, then `session_store.sessions` rows, then the `audit_store.audit_events` INS
 `auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
 (`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
 and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
-audit lock. Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+audit lock (superseded for `deactivate_account` by Update 2026-11-13 below). Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
 `AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
 statement closed, never a silent partial write.
 
@@ -371,3 +371,162 @@ of `title_triples` at the rollup, because that table's primary key is a btree ov
 columns and Postgres refuses an entry beyond about 2,704 bytes, which would otherwise roll back the
 whole hourly refresh. Such a title is not normalised. The catalogue rollup's own
 `catalog_rollup_grain_key` has the same class of limit and is not changed here.
+
+## Update (2026-11-08) -- the runner records and checks each migration's hash (#7158)
+
+Decision. Option (a) of #7158: `PgMigrationRunner` records the SHA-256 of every applied
+migration's SQL in `public.yuzu_schema_migrations (store, version, sha256, recorded_by, recorded_at)`,
+written in the transaction that bumps `schema_meta` (an UPSERT, because a rewound `schema_meta`
+re-applies a version), and every `run()` compares the recorded hash of each version at or below
+the recorded schema version with this build's text. Option (b), a per-store projection smoke-read
+adopted by every store, is not mass-adopted: it needs a hand-written probe per store and detects
+only a missing column, not a changed type, constraint or index; it stays the second line of
+defence (playbook "Runner guards").
+
+A mismatch fails the store closed: `run()` returns false and the store does not open. For
+nearly every store that stops the server from starting, but three do not make a failed `run()`
+fatal: `analytics_event_store` (degraded for the run), `crypto_dashboard_layout_store` (a recorded
+exception: layouts answer 503) and `leader_elector` (the server boots with its leader-only loops
+paused; the elector re-runs `run()` every election cycle and meets the same refusal, so it does not
+recover until the database is repaired). The operator signals are the `PgMigrationRunner: store
+'<store>' recorded migration` log line and the `yuzu_server_leader_*` metrics.
+
+This is deliberately not the #3894 posture. A database ahead of the binary is off-procedure,
+and the ahead check itself does not refuse, because a refusal would be a second failure. A
+recorded version whose text differs is on-procedure (same build lineage), the build knows exactly
+what is wrong, and the alternative is the fail-open at the first query that the issue names. One
+sub-case is the exception: a database that is ahead AND carries edited text for a version this
+binary also knows does refuse (a second failure, refused on purpose, with no separate ruling
+recorded in #7158; see the `PgMigrationRunner::run` header). There is no override flag and there was
+no warn-only phase: drift can only be detected against a hash this feature wrote, so introducing
+it cannot refuse any existing database.
+
+Hash identity is the exact bytes of `PgMigration::sql`, with no normalisation, because
+normalising would hide a real change. Every migration at this change is a deterministic function
+of fixed text (52 of 58 vectors are pure literals; the other six build text from compile-time constants or,
+for `instruction_store`'s v3, generate it at first call from a fixed column list), so the bytes are
+the same in every process and deployment. A migration must stay that way: no clock, locale,
+environment, address or unordered-container iteration may reach its text.
+
+The table is named `yuzu_schema_migrations` because `public` is shared with whatever else lives in
+the database. A foreign `schema_migrations` table (golang-migrate, Rails) would make the
+`IF NOT EXISTS` skip silently and fail every store on a missing column. Flyway's default,
+`flyway_schema_history`, does not collide.
+
+Trust on first use. A version applied before the table existed has no row. It is recorded as
+first seen with `recorded_by = 'tofu'`, so an auditor can tell it from a hash verified when
+applied (`'apply'`). The write takes the per-store advisory lock and re-reads, so two processes
+cannot both believe they verified; steady state takes no lock. Not detected, and excluded by the
+hard-cutover deployment contract: drift that predates the table, and a database that two build
+lineages touched (a long-lived newer replica records whatever an older binary applied, with the
+newer text).
+
+What this is not. It detects accidental or procedural drift. It is not tamper evidence: whoever
+can write `yuzu_schema_migrations` can also rewrite `schema_meta`, a deleted row is simply recorded
+again as `'tofu'`, and `recorded_by` is not authenticated. A rewound `schema_meta` that re-applies
+an idempotent migration overwrites its recorded hash by design. A questionnaire must not cite it as
+a data-integrity control. A recorded hash that is not 64 lowercase hex digits is refused with its
+own message, never compared.
+
+A version that is at or below the recorded version and that this binary also carries is judged
+even when the database is ahead of the binary's vector (#3894), so a downgrade onto edited text now
+refuses with a diagnosed log line where it used to warn. Versions above the recorded version, and
+versions this binary does not carry, are never judged.
+
+Operator consequence: an in-place edit of an already-applied migration now refuses the boot
+(`docs/user-manual/upgrading.md`). The golden-hash CI test (#3895) is the matching author-side
+guard and should ship in the same release, so that an edit to shipped text is stopped at the
+source and not discovered at the first customer boot.
+
+## Update (2026-11-09) -- `pg::exec_params` refuses a NUL byte in a bound text parameter
+
+`pg::exec_params` (`pg/pg_exec.hpp`) binds text-format parameters, and libpq reads such a value as a
+C string, so an embedded NUL byte ended the value early instead of reaching the server. The helper
+now refuses a bound text parameter that contains a NUL byte: the call returns a failed result
+(SQLSTATE 22021, "parameter $N contains a NUL byte") and the caller's statement is not executed.
+The value is never echoed. An open transaction aborts exactly as it does for any other failed
+statement, so a caller that runs inside `with_txn_for` rolls back as it already does for a failed
+query. A caller that manages its own `BEGIN` with `pg::PgTxn` gets `false` from `commit()` when a statement aborted the transaction (the guard rolls it back at once); `PgPool::with_txn*` already refused to commit an aborted transaction. A failed statement recovered with `ROLLBACK TO SAVEPOINT` still commits. Only NUL is refused; tab, newline and the rest of the control range are valid text and are
+bound unchanged. The refusal is produced by a server-side `DO` block, so it needs `USAGE` on
+`plpgsql`, which every database has by default.
+
+A trust boundary (a route or tool that takes the value from a client) should validate first, so the
+client receives a client error (400 or -32602) rather than a store failure. `sanitize_pg_text`
+remains the rule for free text that should be kept: it replaces the byte and stores the rest. The
+only direct-bind exceptions, which call `PQexecParams` themselves and are not covered by the
+helper, are `pg/secret_codec.cpp` and `pg/pg_migration_runner.cpp`.
+
+## Update (2026-11-13) -- `RbacAdminAuthorityOwner` now takes the `session_meta` row, last, in `deactivate_account`
+
+The 2026-10-04 entry says `RbacAdminAuthorityOwner` "takes `principal_roles` before `auth.users` and
+never a session or audit lock". That is no longer true of the session half. When a `SessionStore` is
+wired, `deactivate_account` calls the session store's own one-copy helper
+`session_sql::bump_generation_in_txn` (`session_store_sql_helpers.hpp`) as the last statement of its
+transaction, so the account going inactive and the session write-generation bump commit together (a
+replica then clears its validate cache on its next generation poll whether or not the later session
+wipe succeeds). The owner therefore touches a third schema, `session_store`, but through that
+helper rather than a copy of its SQL, and it still takes no audit lock. The lock edge is the
+`auth.users` row, then the `session_store.session_meta` `write_generation` row, taken last, the same
+position `CredentialChangeOwner` takes it in. It is acyclic because no `session_store` transaction
+takes an account or RBAC lock, so nothing that holds `session_meta` waits on one after taking it.
+The wait on that row is bounded per lock by the lifecycle `lock_timeout` the owner installs; session
+create and revoke writers install no timeout of their own and run under the pool defaults.
+A failed bump aborts the deactivation (the account stays active, a store failure to the caller).
+
+## Update (2026-11-16) -- a seventh query owner: DexAppUsageOwner
+
+A seventh query owner: `DexAppUsageOwner` (`dex_app_usage_owner.{hpp,cpp}`), the read behind the
+fleet application usage model of the Digital Employee Experience (DEX) Apps list. It is a READ join
+across `app_usage_store.agent_last_used`, `app_usage_store.usage_state` and
+`guaranteed_state_store.guardian_observations` on one lease (`try_acquire_for`, then `with_txn_on` on that lease, `SET
+LOCAL statement_timeout`, one statement). One statement matters for the same reason as the fifth owner:
+usage collection can be off per device, so crashes and hangs counted on every online device over
+usage from only the reporting devices would overstate the exposure rate. The usage totals, the
+exposed events and the reporting count therefore come from one population. A device counts only when
+the server received its usage state within the last 48 hours (`usage_state.last_seen`, the server's
+receipt time, never the agent's collection time); stale devices are counted separately and add
+nothing else. Events are cut at both ends of the window, so a future-dated observation never enters
+a numerator. The owner returns aggregates per application and cell and never an agent id. A degraded
+read (no connection in the bounded acquire, a statement error or timeout, an index out of range)
+returns `std::nullopt`, distinct from an engaged empty result. Nothing about the rule changes: the
+owner borrows the pool, issues schema-qualified SQL with bound parameters, and no per-store class
+gained a cross-schema method.
+
+Update (2026-11-17): `read` now returns `std::expected<DexUsageRead, DexReadFault>` and no longer
+returns `std::nullopt`; this supersedes the `std::nullopt` sentence above. The fault is one of
+`pool_acquire_timeout` (no connection within the bounded `try_acquire_for`), `query_error` (an index
+out of range, or a failed statement, `BEGIN` or `COMMIT` on the leased connection),
+`statement_timeout` (SQLSTATE 57014) or `concurrency_budget` (an in-flight budget of 4, never wider
+than the Apps stability read's own, refused at once rather than queued behind the pool). The owner
+takes the lease with `try_acquire_for` and runs the transaction on it with `with_txn_on`, so an
+acquire timeout and a transaction failure are told apart. Each fault counts
+`yuzu_server_guardian_read_degrade_total{reason, source="dex_usage"}`. The owner also keeps a
+sustained-timeout state: three or more consecutive statement timeouts whose unbroken run is at
+least two minutes old (any success resets both) are reported to the surface as `fleet_too_large`
+instead of the retryable `statement_timeout`. A stall shorter than two minutes stays retryable; only a
+success resets the run, so a database-wide stall of two minutes or more can reach `fleet_too_large`
+too. The freshness cut is a width (48 hours) applied to the database's own `now()` inside the one
+statement, never an instant taken from a replica clock, so a replica clock that is out of step with
+the database cannot move the fresh and stale counts.
+
+## Update (2026-11-16) -- an eighth query owner: MfaDisableOwner
+
+An eighth query owner: `MfaDisableOwner` (`mfa_disable_owner.{hpp,cpp}`, #6079 PR 2c), the only
+operator-initiated path that clears an ENROLLED factor while leaving the account active (the Settings
+disable and the host break-glass `--mfa-reset`); account deactivation clears it incidentally through
+`soft_delete_user_in_txn` and ends sessions in a separate step. It copies `CredentialChangeOwner`'s shape: one `pool.with_txn_for` on one
+lease, schema-qualified SQL across `auth`, `session_store` and `audit_store`, a txn-scoped
+`lock_timeout`, and no compensating write. In one transaction it clears the factor and deletes the
+recovery codes (`auth_sql::clear_mfa_factor_in_txn` in `auth_db_sql_helpers.hpp`, the ONE copy of
+those statements, which `AuthDB::mfa_disable_report` also runs), deletes every durable session of
+the account (`session_sql::delete_user_sessions_in_txn`), inserts the OUTCOME audit row
+(`AuditStore::log_in_txn`) and LAST bumps the `session_meta` write generation
+(`session_sql::bump_generation_in_txn`). The clear, the session delete and the outcome row therefore
+commit or abort together; the caller's `attempted` intent row is written before, outside the
+transaction, and still fails closed. The one indeterminate case is a connection lost exactly at
+COMMIT. The lock order is `CredentialChangeOwner`'s, with the same acyclicity argument: the
+`auth.users` row, the `session_store.sessions` rows, the `audit_store.audit_events` INSERT, then the
+`session_meta` row last; a clear of an account with no verified factor that leaves its sessions alone
+takes only the first and the audit INSERT. As with the other owners it is correct only because
+`AuthDB`, `SessionStore` and `AuditStore` share ONE pool/database (ADR-0006); a split fails every
+statement closed, never a silent partial write.

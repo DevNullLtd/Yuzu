@@ -306,48 +306,6 @@ bool is_fold_internal_table(std::string_view name) {
     return name == kDictTable || name == kSeenTable || is_fold_row_table(name);
 }
 
-std::vector<std::string> legacy_live_shim_names() {
-    std::vector<std::string> out;
-    for (const auto& def : fold_sources())
-        if (!def.own_tables)
-            out.push_back(std::format("{}_live", def.name));
-    return out;
-}
-
-bool is_legacy_live_shim(std::string_view name) {
-    static const std::unordered_set<std::string> names = [] {
-        const auto v = legacy_live_shim_names();
-        return std::unordered_set<std::string>(v.begin(), v.end());
-    }();
-    return names.contains(std::string(name));
-}
-
-std::vector<std::string> referenced_legacy_live_shims(std::string_view sql) {
-    const auto ident = [](char c) {
-        return std::isalnum(static_cast<unsigned char>(c)) || c == '_';
-    };
-    // SQLite matches an identifier ASCII case-insensitively, so `PROCESS_LIVE`, `"Process_Live"`
-    // and `[process_live]` all reach the shim view and must all be found: the scan runs over an
-    // ASCII-lowered copy (the names are ASCII; a quote or bracket is not an identifier byte, so
-    // the whole-identifier test already admits the quoted forms).
-    std::string lower(sql);
-    for (auto& c : lower)
-        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
-    const std::string_view text = lower;
-    std::vector<std::string> out;
-    for (const auto& name : legacy_live_shim_names()) {
-        for (auto pos = text.find(name); pos != std::string_view::npos; pos = text.find(name, pos + 1)) {
-            const bool starts = pos == 0 || !ident(text[pos - 1]);
-            const bool ends = pos + name.size() == text.size() || !ident(text[pos + name.size()]);
-            if (starts && ends) {
-                out.push_back(name);
-                break;
-            }
-        }
-    }
-    return out;
-}
-
 // ── The retired raw tables' columns ─────────────────────────────────────────
 
 namespace {
@@ -421,17 +379,6 @@ std::vector<LegacyColumn> legacy_live_columns(std::string_view source) {
     return {};
 }
 
-std::string legacy_live_shim_ddl() {
-    std::string ddl;
-    for (const auto& [name, cols] : legacy_tables()) {
-        ddl += std::format("CREATE VIEW IF NOT EXISTS {}_live AS SELECT CAST(NULL AS INTEGER) AS id", name);
-        for (const auto& c : cols)
-            ddl += std::format(", CAST(NULL AS {}) AS {}", c.sql_type, c.name);
-        ddl += " WHERE 0;\n";
-    }
-    return ddl;
-}
-
 // ── The shared merge clause, the tier-to-tier roll-up, the average conversion ──
 
 std::string fold_upsert_assignments(const FoldSourceDef& def) {
@@ -446,7 +393,16 @@ std::string fold_upsert_assignments(const FoldSourceDef& def) {
         const std::string name = physical_column_name(c);
         switch (c.merge) {
         case MergeOp::kSum:
-            add(std::format("{0}={0}+excluded.{0}", name));
+            if (c.sql_type == "INTEGER")
+                // Saturate at the int64 bounds exactly as TierAccumulator::merge does: a bare
+                // `+` would overflow into a REAL and change the column's stored type.
+                add(std::format("{0}=CASE WHEN excluded.{0}>0 AND {0}>9223372036854775807-excluded.{0} "
+                                "THEN 9223372036854775807 "
+                                "WHEN excluded.{0}<0 AND {0}<(-9223372036854775807-1)-excluded.{0} "
+                                "THEN (-9223372036854775807-1) ELSE {0}+excluded.{0} END",
+                                name));
+            else
+                add(std::format("{0}={0}+excluded.{0}", name));
             break;
         case MergeOp::kMax:
             add(std::format("{0}=MAX({0},excluded.{0})", name));

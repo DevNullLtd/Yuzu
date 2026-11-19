@@ -31,6 +31,18 @@ build_target() {
 build_target fuzz_preflight_parse \
   "$SRC_DIR/tests/fuzz/fuzz_preflight_parse.cpp"
 
+build_target fuzz_component_zip \
+  "$SRC_DIR/tests/fuzz/fuzz_component_zip.cpp"
+
+build_target fuzz_binary_header_pe \
+  "$SRC_DIR/tests/fuzz/fuzz_binary_header_pe.cpp"
+
+build_target fuzz_binary_header_elf \
+  "$SRC_DIR/tests/fuzz/fuzz_binary_header_elf.cpp"
+
+build_target fuzz_binary_header_macho \
+  "$SRC_DIR/tests/fuzz/fuzz_binary_header_macho.cpp"
+
 build_target fuzz_deployment_parse \
   "$SRC_DIR/tests/fuzz/fuzz_deployment_parse.cpp"
 
@@ -43,3 +55,12 @@ build_target fuzz_guardian_rule_spec \
   "$SRC_DIR/server/core/src/guardian_rule_spec.cpp" \
   "$SRC_DIR/server/core/src/guardian_resilience_schema.cpp" \
   "$SRC_DIR/server/core/src/guardian_schema_registry.cpp"
+
+build_target fuzz_file_search_cursor \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_cursor.cpp"
+
+build_target fuzz_file_search_names \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_names.cpp"
+
+build_target fuzz_file_search_glob \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_glob.cpp"

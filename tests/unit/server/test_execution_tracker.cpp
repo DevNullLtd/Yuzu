@@ -18,6 +18,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <libpq-fe.h>
+#include <nlohmann/json.hpp>
 
 #include <yuzu/metrics.hpp>
 
@@ -1323,6 +1324,182 @@ TEST_CASE("ExecutionTracker: plugin_result_status round-trips through update/get
     CHECK(seen == 2);
 }
 
+TEST_CASE("ExecutionTracker: response_dropped is counted and is sticky",
+          "[pg][execution_tracker][response_dropped]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+
+    AgentExecStatus kept;
+    kept.agent_id = "agent-kept";
+    kept.status = "success";
+    // True once the row is written: notify_exec_tracker forgets an unverified-frame record only
+    // then, and records a lost answer itself when it is false.
+    CHECK(tracker.update_agent_status(*id_result, kept));
+
+    // A terminal write that reports a lost answer still counts as responded; the dropped count says
+    // its answer is missing.
+    AgentExecStatus lost;
+    lost.agent_id = "agent-lost";
+    lost.status = "success";
+    lost.response_dropped = true;
+    CHECK(tracker.update_agent_status(*id_result, lost));
+
+    auto summary = tracker.get_summary(*id_result);
+    CHECK(summary.agents_responded == 2);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+
+    // No later write clears it: a stale running frame, nor a redelivered terminal one whose
+    // response was stored.
+    AgentExecStatus stale;
+    stale.agent_id = "agent-lost";
+    stale.status = "running";
+    tracker.update_agent_status(*id_result, stale);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+
+    AgentExecStatus redelivered;
+    redelivered.agent_id = "agent-lost";
+    redelivered.status = "success";
+    tracker.update_agent_status(*id_result, redelivered);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+}
+
+TEST_CASE("ExecutionTracker: a lost streaming frame survives the agent's terminal write",
+          "[pg][execution_tracker][response_dropped]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto id_result = tracker.create_execution(make_execution());
+    REQUIRE(id_result.has_value());
+
+    // A RUNNING frame the store did not keep, then more RUNNING frames that were stored.
+    AgentExecStatus running;
+    running.agent_id = "agent-stream";
+    running.status = "running";
+    running.response_dropped = true;
+    tracker.update_agent_status(*id_result, running);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+
+    running.response_dropped = false;
+    tracker.update_agent_status(*id_result, running);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+
+    // The terminal write carries a stored answer; the flag still holds, because the stored
+    // terminal row cannot restore the lost frame.
+    AgentExecStatus terminal;
+    terminal.agent_id = "agent-stream";
+    terminal.status = "success";
+    tracker.update_agent_status(*id_result, terminal);
+    auto summary = tracker.get_summary(*id_result);
+    CHECK(summary.agents_responded == 1);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+
+    // An agent whose frames were all kept is unaffected.
+    AgentExecStatus clean;
+    clean.agent_id = "agent-clean";
+    clean.status = "success";
+    tracker.update_agent_status(*id_result, clean);
+    CHECK(tracker.count_response_dropped(*id_result) == 1);
+}
+
+// The dropped count is exact: zero for an execution whose agents all had their answers kept,
+// and one per agent whose answer was not (never a floor or a "not known" stand-in).
+TEST_CASE("ExecutionTracker: count_response_dropped is exact per execution",
+          "[pg][execution_tracker][response_dropped]") {
+    yuzu::test::ExecutionTrackerPg tracker_bundle;
+    ExecutionTracker& tracker = *tracker_bundle;
+
+    auto clean_exec = tracker.create_execution(make_execution());
+    auto lossy_exec = tracker.create_execution(make_execution());
+    REQUIRE(clean_exec.has_value());
+    REQUIRE(lossy_exec.has_value());
+
+    // No agent rows yet: zero, not "unknown".
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+
+    AgentExecStatus kept;
+    kept.agent_id = "agent-kept";
+    kept.status = "success";
+    tracker.update_agent_status(*clean_exec, kept);
+    AgentExecStatus clean;
+    clean.agent_id = "agent-clean";
+    clean.status = "failure";
+    tracker.update_agent_status(*clean_exec, clean);
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+
+    AgentExecStatus lost;
+    lost.agent_id = "agent-lost";
+    lost.status = "success";
+    lost.response_dropped = true;
+    tracker.update_agent_status(*lossy_exec, lost);
+    tracker.update_agent_status(*lossy_exec, kept);
+    CHECK(tracker.count_response_dropped(*lossy_exec) == 1);
+    // The other execution is unaffected by this one's lost answer.
+    CHECK(tracker.count_response_dropped(*clean_exec) == 0);
+}
+
+// Migration v10 adds response_dropped. Roll the recorded version back to 9 and drop the column, as
+// a database last opened by the previous build would be, then open the tracker twice: the first
+// open applies v10 and reads the old row as not dropped, the second applies nothing and keeps the
+// flag written after the first. A migration-in-substance case, so it takes the migration macro.
+TEST_CASE("ExecutionTracker: migration v10 applies on a v9 database and old rows read not dropped",
+          "[pg][execution_tracker][migration][response_dropped]") {
+    YUZU_REQUIRE_PG_MIGRATION_DB(db);
+    const auto scalar = [&db](const std::string& sql) {
+        pg::PgConn conn{PQconnectdb(db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        pg::PgResult r{PQexec(conn.get(), sql.c_str())};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+        return PQntuples(r.get()) > 0 ? std::string(PQgetvalue(r.get(), 0, 0)) : std::string();
+    };
+    std::string exec_id;
+    {
+        pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ExecutionTracker tracker{pool};
+        REQUIRE(tracker.is_open());
+        auto id = tracker.create_execution(make_execution());
+        REQUIRE(id.has_value());
+        exec_id = *id;
+        AgentExecStatus old_row;
+        old_row.agent_id = "agent-old";
+        old_row.status = "success";
+        tracker.update_agent_status(exec_id, old_row);
+    }
+    scalar("ALTER TABLE execution_tracker.agent_exec_status DROP COLUMN response_dropped");
+    scalar("UPDATE public.schema_meta SET version = 9 WHERE store = 'execution_tracker'");
+    const std::string column_count_sql =
+        "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
+        "'execution_tracker' AND table_name = 'agent_exec_status' AND column_name = "
+        "'response_dropped'";
+    REQUIRE(scalar(column_count_sql) == "0");
+
+    for (int open = 0; open < 2; ++open) {
+        INFO("open " << open);
+        pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+        REQUIRE(pool.valid());
+        ExecutionTracker tracker{pool};
+        REQUIRE(tracker.is_open());
+        CHECK(scalar(column_count_sql) == "1");
+        CHECK(scalar("SELECT version FROM public.schema_meta WHERE store = "
+                     "'execution_tracker'") == "10");
+        CHECK(scalar("SELECT response_dropped::text FROM execution_tracker.agent_exec_status "
+                     "WHERE agent_id = 'agent-old'") == "false");
+        if (open == 0) {
+            CHECK(tracker.count_response_dropped(exec_id) == 0);
+            AgentExecStatus lost;
+            lost.agent_id = "agent-new";
+            lost.status = "success";
+            lost.response_dropped = true;
+            tracker.update_agent_status(exec_id, lost);
+        }
+        CHECK(tracker.count_response_dropped(exec_id) == 1);
+    }
+}
+
 TEST_CASE("ExecutionTracker: a later frame overwrites the typed status via ON CONFLICT (CC-07)",
           "[pg][execution_tracker][cc07]") {
     yuzu::test::ExecutionTrackerPg tracker_bundle;
@@ -1374,7 +1551,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     // collapse to the plain methods' empty-on-degrade shape — a caller that
     // drops rows or writes `denied` audit rows off these results must be
     // able to tell "degraded" from "genuinely nothing here".
-    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}).has_value());
+    CHECK_FALSE(closed.query_executions_checked(ExecutionQuery{}, std::nullopt).has_value());
     auto exec_checked = closed.get_execution_checked("exec-1");
     REQUIRE_FALSE(exec_checked.has_value());
     CHECK(exec_checked.error() == "execution tracker not open");
@@ -1398,7 +1575,7 @@ TEST_CASE("ExecutionTracker: a store bound to an unreachable pool degrades every
     AgentExecStatus status;
     status.agent_id = "agent-1";
     status.status = "running";
-    closed.update_agent_status("exec-1", status);
+    CHECK_FALSE(closed.update_agent_status("exec-1", status)); // nothing written
     closed.refresh_counts("exec-1");
     CHECK_FALSE(closed.mark_cancelled("exec-1", "tester"));
     CHECK_FALSE(closed.set_agents_targeted("exec-1", 1));
@@ -2963,7 +3140,8 @@ TEST_CASE("ExecutionTracker: WS-2a the state write and its event append are "
     AgentExecStatus as;
     as.agent_id = "agent-1";
     as.status = "success";
-    tracker.update_agent_status(*id, as); // append fails -> whole txn rolls back
+    // The append fails, the whole txn rolls back, and the caller is told the write failed.
+    CHECK_FALSE(tracker.update_agent_status(*id, as));
 
     // Strengthened assertion (governance quality-engineer): distinguish a
     // genuine rollback (read succeeds, zero rows) from a verification read that
@@ -4482,7 +4660,9 @@ struct DegradeReader {
 std::vector<DegradeReader> degrade_readers() {
     return {
         {"query_executions",
-         [](ExecutionTracker& t) { (void)t.query_executions_checked(ExecutionQuery{}); }},
+         [](ExecutionTracker& t) {
+             (void)t.query_executions_checked(ExecutionQuery{}, std::nullopt);
+         }},
         {"get_execution", [](ExecutionTracker& t) { (void)t.get_execution_checked("exec-1"); }},
         {"get_agent_statuses",
          [](ExecutionTracker& t) { (void)t.get_agent_statuses_checked("exec-1"); }},
@@ -4725,7 +4905,7 @@ TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, 
         MetricsWire wire(tracker, m);
 
         // Populated.
-        CHECK(tracker.query_executions_checked(ExecutionQuery{}).has_value());
+        CHECK(tracker.query_executions_checked(ExecutionQuery{}, std::nullopt).has_value());
         auto found = tracker.get_execution_checked(*parent);
         REQUIRE(found.has_value());
         CHECK(found->has_value());
@@ -4740,7 +4920,7 @@ TEST_CASE("ExecutionTracker: healthy reads, including empty and not-found ones, 
         CHECK_FALSE(missing->has_value());
         ExecutionQuery matches_nothing;
         matches_nothing.definition_id = "no-such-definition";
-        auto none = tracker.query_executions_checked(matches_nothing);
+        auto none = tracker.query_executions_checked(matches_nothing, std::nullopt);
         REQUIRE(none.has_value());
         CHECK(none->empty());
         auto no_statuses = tracker.get_agent_statuses_checked("no-such-execution");
@@ -5005,4 +5185,57 @@ TEST_CASE("make_tracker_mutation_ports: a CLOSED tracker degrades every port",
                                    audit.fn())
               .status == ExecutionMutationStatus::kStoreDegraded);
     CHECK(audit.rows.empty()); // the admission read failed before any row
+}
+
+// WP07 gate-8 UP1 (independent evidence, not a fix): rows the REST handlers re-dump with a strict
+// nlohmann dump() carry text from PG TEXT columns. Show that invalid UTF-8 cannot become a stored
+// column value (the database encoding rejects it), so those dumps cannot throw on it, including
+// the tracker's `error_detail` (which the writer only NUL-guards). The agent path is also
+// already clean upstream: error_detail arrives in a proto3 `string`, which the server parses as
+// UTF-8-or-reject.
+TEST_CASE("ExecutionTracker: invalid UTF-8 never becomes a stored error_detail (strict dump safe)",
+          "[pg][execution_tracker][utf8]") {
+    YUZU_REQUIRE_PG_DB(db);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        auto enc = yuzu::server::pg::exec_params(lease.get(), "SHOW server_encoding",
+                                                  std::vector<std::string>{});
+        REQUIRE(enc.status() == PGRES_TUPLES_OK);
+        INFO("server_encoding = " << PQgetvalue(enc.get(), 0, 0));
+        CHECK(std::string(PQgetvalue(enc.get(), 0, 0)) == "UTF8");
+    }
+    ExecutionTracker tracker{pool};
+    REQUIRE(tracker.is_open());
+    auto exec = make_execution();
+    exec.agents_targeted = 1;
+    auto id = tracker.create_execution(exec);
+    REQUIRE(id.has_value());
+
+    // Control: a valid write must land, so an empty result below can only mean the invalid write
+    // was refused (never "the harness stored nothing").
+    AgentExecStatus ok_row;
+    ok_row.agent_id = "agent-valid";
+    ok_row.status = "failure";
+    ok_row.error_detail = "plain ascii detail";
+    REQUIRE(tracker.update_agent_status(*id, ok_row));
+
+    AgentExecStatus s;
+    s.agent_id = "agent-utf8";
+    s.status = "failure";
+    s.error_detail = std::string("bad\xff") + "byte";
+    const bool accepted = tracker.update_agent_status(*id, s);
+
+    std::size_t seen_valid = 0, seen_utf8 = 0;
+    for (const auto& a : tracker.get_agent_statuses(*id)) {
+        // Whatever is stored must be strict-dump safe.
+        CHECK_NOTHROW((void)nlohmann::json(a.error_detail).dump());
+        CHECK(a.error_detail.find('\xff') == std::string::npos);
+        seen_valid += a.agent_id == "agent-valid";
+        seen_utf8 += a.agent_id == "agent-utf8";
+    }
+    CHECK(seen_valid == 1);                 // the loop body ran for the control row
+    CHECK(seen_utf8 == (accepted ? 1u : 0u)); // refused write => no row; accepted => stored clean
 }

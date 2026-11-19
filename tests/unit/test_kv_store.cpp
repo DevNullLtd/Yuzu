@@ -633,6 +633,18 @@ TEST_CASE("KvStore::pragma_synchronous reports a valid level", "[kv_store][entri
     CHECK(level <= 3);
 }
 
+TEST_CASE("KvStore::open leaves synchronous at FULL or stronger", "[kv_store][entries]") {
+    // UP-14: the Guardian boot-epoch claim refuses a store that does not report FULL, so open()
+    // sets it explicitly rather than relying on SQLite's compile-time default. FULL is 2.
+    // This asserts the invariant on a real store. It also passes in a build whose SQLite default
+    // is already FULL, so it cannot show the explicit setter is present; rule R5 of
+    // tests/test_guardian_emit_stamp_lexical.py pins the setter in kv_store.cpp.
+    yuzu::test::TempDbFile db{"yuzu_test_kv_sync-"};
+    auto result = KvStore::open(db.path);
+    REQUIRE(result.has_value());
+    CHECK(result->pragma_synchronous() >= 2);
+}
+
 // ── namespace_size (#2303 C1): direct coverage of the aggregate size probe ──────
 
 TEST_CASE("KvStore::namespace_size counts rows and sums value bytes", "[kv_store][entries]") {
@@ -869,6 +881,34 @@ TEST_CASE("KvStore fallible reads surface a REAL SQLite failure as an error, not
     // this. Both report the same thing for a dropped table as for an empty namespace.
     CHECK(t.store.list("p1", "lc:").empty());
     CHECK_FALSE(t.store.get("p1", "lc:a").has_value());
+}
+
+TEST_CASE("KvStore::exists_checked tells a fault from an absent key; exists() stays fail-open",
+          "[kv_store][entries]") {
+    // The plugin C ABI documents "negative on error" for yuzu_ctx_storage_exists, and a
+    // plugin that treats "absent" as "nothing to recover" must not be handed a fault as that
+    // answer (the firewall containment record is the first such reader). exists() keeps its
+    // bool shape for the callers that can live with a fault reading as absent.
+    auto t = make_test_store();
+    REQUIRE(t.store.set("p1", "k", "v"));
+    CHECK(t.store.exists_checked("p1", "k") == std::optional<bool>{true});
+    CHECK(t.store.exists_checked("p1", "nope") == std::optional<bool>{false});
+
+    // A REAL SQLite failure (the table dropped through a second connection).
+    sqlite3* raw = nullptr;
+    REQUIRE(sqlite3_open(t.path.string().c_str(), &raw) == SQLITE_OK);
+    const int rc = sqlite3_exec(raw, "DROP TABLE kv_store", nullptr, nullptr, nullptr);
+    sqlite3_close(raw);
+    REQUIRE(rc == SQLITE_OK);
+    CHECK_FALSE(t.store.exists_checked("p1", "k").has_value()); // unknown, NOT "absent"
+    CHECK_FALSE(t.store.exists("p1", "k"));                      // the fail-open form is unchanged
+
+    // A closed (moved-from) handle is also "cannot tell".
+    auto t2 = make_test_store();
+    REQUIRE(t2.store.set("p1", "k", "v"));
+    KvStore moved = std::move(t2.store);
+    CHECK_FALSE(t2.store.exists_checked("p1", "k").has_value());
+    CHECK(moved.exists_checked("p1", "k") == std::optional<bool>{true});
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1385,4 +1425,78 @@ TEST_CASE("KvStore::rename_plugin leaves other plugins' rows untouched",
     CHECK(t.store.get("other", "a") == std::optional<std::string>{"2"});
     CHECK(t.store.get("tarsnap", "a") == std::optional<std::string>{"3"});
     CHECK(t.store.get("echo", "a") == std::optional<std::string>{"1"});
+}
+
+TEST_CASE("KvStore::rename_plugin refuses a misuse and leaves every row alone",
+          "[kv_store][rename_plugin]") {
+    auto t = make_test_store();
+    REQUIRE(t.store.set("tar", "a", "1"));
+    REQUIRE(t.store.set("__guardian__", "meta:boot_epoch", "42"));
+
+    CHECK_FALSE(t.store.rename_plugin("tar", "tar")); // from == to would delete the namespace
+    CHECK_FALSE(t.store.rename_plugin("", "echo"));
+    CHECK_FALSE(t.store.rename_plugin("tar", ""));
+    CHECK_FALSE(t.store.rename_plugin("__guardian__", "echo")); // would move the epoch row
+    CHECK_FALSE(t.store.rename_plugin("tar", "__guardian__"));  // would write into it
+
+    CHECK(t.store.get("tar", "a") == std::optional<std::string>{"1"});
+    CHECK(t.store.get("__guardian__", "meta:boot_epoch") == std::optional<std::string>{"42"});
+    CHECK_FALSE(t.store.get("echo", "meta:boot_epoch").has_value());
+    CHECK_FALSE(t.store.get("echo", "a").has_value());
+
+    // The boundary of the prefix refusal: one leading underscore is an ordinary name.
+    REQUIRE(t.store.set("_tar", "k", "v"));
+    CHECK(t.store.rename_plugin("_tar", "echo"));
+    CHECK(t.store.get("echo", "k") == std::optional<std::string>{"v"});
+    CHECK_FALSE(t.store.get("_tar", "k").has_value());
+}
+
+TEST_CASE("KvStore::rename_plugin with nothing to move does not wait for another connection's "
+          "write lock",
+          "[kv_store][rename_plugin]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    REQUIRE(t.store.set("echo", "k", "v"));
+    t.store.set_busy_timeout(150ms);
+
+    WriteLockHolder5604 holder(t.path);
+    REQUIRE(holder.locked);
+
+    // Steady state: no row under `from`, so the call is a read and returns true at once. RED if
+    // it opens a write transaction: the zero-row INSERT then waits out the 150 ms budget and the
+    // call fails with SQLITE_BUSY.
+    CHECK(t.store.rename_plugin("tar", "echo"));
+    CHECK(t.store.get("echo", "k") == std::optional<std::string>{"v"});
+}
+
+TEST_CASE("KvStore::rename_plugin with rows to move still needs the write lock",
+          "[kv_store][rename_plugin]") {
+    using namespace std::chrono_literals;
+    auto t = make_test_store();
+    REQUIRE(t.store.set("tar", "a", "1"));
+    t.store.set_busy_timeout(150ms);
+
+    WriteLockHolder5604 holder(t.path);
+    REQUIRE(holder.locked);
+
+    // The control for the case above: with work to do the call fails under the held lock, and a
+    // failure moves nothing (the transaction rolls back).
+    CHECK_FALSE(t.store.rename_plugin("tar", "echo"));
+    CHECK(t.store.get("tar", "a") == std::optional<std::string>{"1"});
+    CHECK_FALSE(t.store.get("echo", "a").has_value());
+
+    holder.release();
+    CHECK(t.store.rename_plugin("tar", "echo")); // the same store moves them once the lock is gone
+    CHECK(t.store.get("echo", "a") == std::optional<std::string>{"1"});
+    CHECK_FALSE(t.store.get("tar", "a").has_value());
+}
+
+// Security floor (docs/build-guide.md, "Security dependency pins"): the agent's SQLite lives in
+// libyuzu_agent_core and must be at least the 3.54.1 that vcpkg.json overrides sqlite3 to (the CVE
+// batch fixed in 3.54.0). Mirrors the server-side case in test_sqlite_raii.cpp. Raise both numbers
+// when the pin moves; never lower them.
+TEST_CASE("KvStore: linked SQLite is at least the security-pinned 3.54.1", "[deps][security]") {
+    STATIC_REQUIRE(SQLITE_VERSION_NUMBER >= 3054001);
+    INFO("sqlite3_libversion() = " << sqlite3_libversion());
+    CHECK(sqlite3_libversion_number() >= 3054001);
 }

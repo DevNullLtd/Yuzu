@@ -6,11 +6,14 @@
 /// no httplib, no store access -- the caller hands in already-fetched, already-scoped
 /// `QuarantineRecord`s (see quarantine_visible.hpp for the admit-then-filter read).
 ///
-/// Wire contract: exactly the eight keys below, in this order. `nlohmann::ordered_json` keeps
+/// Wire contract: exactly the eight keys below, in this order. A record ended by force whose
+/// device still owes a release (listed only on request, `include=release_owed`, #7624) reads
+/// status `release_owed` and carries two more keys after the eight, `released_at` and
+/// `release_owed_since`; an active or releasing record never does, so its bytes are unchanged. `nlohmann::ordered_json` keeps
 /// insertion order; plain `nlohmann::json` would alphabetise the keys and change the bytes the
 /// REST route has always served (pinned by `test_rest_quarantine_routes.cpp`,
-/// "body bytes are pinned"). `QuarantineRecord::id` and `released_at` are deliberately NOT
-/// exposed (see the field comment in quarantine_types.hpp).
+/// "body bytes are pinned"). `QuarantineRecord::id` is deliberately NOT exposed (see the field
+/// comment in quarantine_types.hpp), and `released_at` only on an owed row.
 ///
 /// Serialising: the REST route used a hand-rolled builder whose escaping matches nlohmann's
 /// (short escapes for \b \f \n \r \t, lowercase `\u00xx` for the other control bytes, `/` and
@@ -41,9 +44,14 @@ namespace yuzu::server {
     // #3425: endpoint-containment confirmation state (schema v2), 0 = never, matching
     // quarantined_at's own never-happened shape. last_applied_at: a system re-dispatch of the
     // stored whitelist was accepted (agents_reached > 0), NOT proof of containment.
-    // last_confirmed_at: a follow-up quarantine.status read reported state|active.
+    // last_confirmed_at: a follow-up firewall.quarantine_status read reported the device's rules in force.
     o["last_applied_at"] = r.last_applied_at;
     o["last_confirmed_at"] = r.last_confirmed_at;
+    if (r.status == "released" && r.device_release_owed_at != 0) {
+        o["status"] = "release_owed";
+        o["released_at"] = r.released_at;
+        o["release_owed_since"] = r.device_release_owed_at;
+    }
     return o;
 }
 

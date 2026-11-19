@@ -3,6 +3,7 @@
 - **Status:** Accepted — shipped PR #2663, merged 2026-08-08; `guaranteed_state_store.cpp` is
   PG-native (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified
   2026-09-07.
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-07-31
 - **Deciders:** pg workstream, security-guardian + docs-writer review (Guardian routing per CLAUDE.md)
 - **Parents:** ADR-0006/0007/0008 (+Correction), ADR-0009, ADR-0012; conventions from the
@@ -253,6 +254,260 @@ on the no-rolling-upgrade exception recorded in ADR-0008. Two classes of pending
 retired automatically (a decommissioned agent's, and one whose rule was deleted mid-ingest); they
 are listed in docs/clock-guarded-retention.md and counted on
 `yuzu_server_guardian_census_pending_events`.
+
+## Update (2026-11-09) - a decommission erases the census and retires its pending evidence (#5675)
+
+The Update (2026-11-03) above lists two classes of pending event that nothing retires. The first,
+a decommissioned agent's, is now retired by the agent decommission cascade, which gains
+`GuaranteedStateStore::delete_agent` as its ninth store (public key `guaranteed_state`). In one
+transaction it locks the agent's pending events in `ingest_seq` order, sets `projection_pending` false on exactly those
+rows (the step `delete_rule` takes for a rule), then deletes the agent's `guardian_agent_rule_status`
+rows. That is the census writers' own lock order for the event rows (pending events, then the census
+row), so it adds no new lock and event-row waits are acyclic. The census-row deletes of two overlapping
+transactions can in principle deadlock; Postgres then aborts one, the caller sees a failure and the
+re-issue is idempotent. The method is not a rule mutation: no policy-generation bump, no hook and no push.
+The second class, a first delivery whose projection failed while its rule was being deleted, is
+unchanged.
+
+Owner ruling D1, 2026-11-08: the decommission does NOT erase `guaranteed_state_events` or
+`guardian_observations`. The event log stays an immutable audit-style log and time-based expiry stays
+its single retention mechanism; the retired pending rows expire on that clock like any other event
+(30 days by default; rows stamped while `guardian_event_retention_days` is 0 or below never expire, so
+those rows are kept for good). The DEX observations are behavioural data, so retention expiry, not the decommission, is the
+erasure position for them. Widening the decommission to erase the events or the DEX observations is a
+follow-up that needs its own Update to this ADR and the store header; it is not made here and is
+tracked in #7531.
+
+Known gap (tracker #7147, which also covers the sweep of stranded pending evidence; `delete_rule` has the same list-read gap): a pending event committed after `delete_agent` read the
+agent's pending list but before it deleted the census rows is not retired by that transaction. A later
+pending event for a decommissioned agent likewise stays pending and is exempt from the events reaper
+until something retires it (a rule delete, a later decommission, a redelivery repair, or a later
+verdict that out-ranks it). A still-running agent re-creates its census row on its next
+census-bearing event (after a state change, an agent restart or a rule push; not on a schedule), and a journal replay cannot rebuild the census from retired
+evidence (the retained events are redelivered with no repair), so the agent is stopped first. The owner
+will revisit that later; it is tracked in #7532.
+
+## Update (2026-11-12) - a decommission also deletes the agent's order row, first (UP-14, H1)
+
+This is the Update the 2026-11-09 Update above calls for, in the one respect it widens. Schema v5
+adds the per-agent order table `guardian_agent_order` (one row per agent), whose row every
+census-bearing first delivery locks first, before the pair's pending events, the census row and the
+rule row. `GuaranteedStateStore::delete_agent` now deletes that agent's row as the FIRST statement of its
+existing single transaction, so the lock order of every census writer is the same: agent row, pending
+events in `ingest_seq` order, census rows, never a rule row. The delete is never a transaction of its
+own: a later statement's failure rolls it back with the rest. Without the delete a decommissioned
+agent would keep its order row; taking it after the pending events would invert the order against a
+first delivery.
+
+The 2026-11-09 sentence that `delete_agent` "adds no new lock" is therefore true of the pending-event and
+census steps and no longer of the method as a whole: it now takes the agent's order-row lock, first.
+Nothing else is added: no advisory lock, no rule-mutation hook, no policy-generation bump, no push, and no
+tenth cascade store (the order row is part of the `guaranteed_state` store, so the nine-store count
+and its pins are unchanged).
+
+Erasure of this store remains PARTIAL (owner ruling D1, unchanged): the event log and the DEX
+observations stay until retention expiry, and widening that is still tracked in #7531; the event
+log's `boot_epoch` and `emit_seq` columns stay with their events until they expire. The order row
+holds the agent's counters and pair clock only: it is device-level (keyed by `agent_id`), holds
+server receipt-time clock readings and counters, and holds no user content and no behavioural data.
+The `epoch` and `emit_seq_hwm` values are what the agent asserted (the server checks only their
+range and does not verify them otherwise), while the clock readings are server database time. The row
+is retained until the device is decommissioned, with no TTL and no prune. An agent that vanishes
+without a decommission can therefore stay counted in the unordered-agents figure (while its latest
+unpaired event is later than its pair clock) and can crowd the first-50 id list. A prune of this table would be a separate clock-guarded-retention decision, not a
+quiet addition.
+
+Known residual, accepted: a first delivery that inserts the agent's order row and has not committed is
+invisible to the DELETE, so a brand-new or just-decommissioned agent's first event can commit an order
+row after `delete_agent` returned. A running agent also re-creates its order row with its census
+row (tracker #7532), the same class as the pending-list race of #7147. The decommissioned agent then
+has an order row again. That is accepted: the row holds counters and the pair clock only, and a later
+decommission deletes it.
+
+Lock wait and pool bound of the agent step (owner decision, 2026-11-12). Every census-bearing first
+delivery of an agent queues on that agent's order row, so one transaction that holds the row
+(for example the census fold of another rule of the same agent, a stalled commit, or an operator
+session left idle in a transaction) makes the agent's other first deliveries wait. A waiter holds a
+connection lease for the whole wait, and the leases come from one shared `PgPool` (default 16
+connections, `--postgres-pool-size`) that serves every store, authentication and audit included,
+with a 500 ms acquire timeout for ingest. The step therefore bounds its own wait: it runs
+`SET LOCAL lock_timeout = 1000` after its savepoint and restores the connection's own value (its
+session reset value: the pool's startup option, 10 s by default, a DSN `options=` value, or the
+role, database or server setting) before the savepoint is released (`kAgentStepLockTimeoutMs`), so
+each lock wait in the step gives up after 1 s instead of the pool's default 10 s. The bound is
+absolute: a pool or DSN `lock_timeout` below 1 s is loosened to 1 s for the step. One step can wait
+more than once (Ensure, DECIDE and one re-run after a concurrent delete of the agent's row), so a
+pooled connection can be held for the sum of those waits. A waiter that gives up takes the existing
+failure path: the event is stored with pending census evidence, its census write is skipped, and it
+is counted as a failed census projection. Such an event is acked and nothing on the server redelivers it, and the
+reaper exempts pending rows (`NOT projection_pending`), so for a rule that never fires again on that
+agent it stays until a later verdict for that (agent, rule) retires it: the accepted pending-list
+class of #7147, now also reachable through an order-step wait of over 1 s. The census write and the
+fold keep the connection's own `lock_timeout`. The owner chose this trade on 2026-11-12, with the
+cost of faster pending growth stated in the option, over recording the pool bound alone: a waiter fails fast
+into pending instead of holding a pooled connection for 10 s, and the cost is faster pending growth
+for the waiting rules. Different agents do not wait on one another through this row, but they share
+the pool, so one agent holding its row for long can occupy leases until the shared pool saturates. Measured on one
+development host (Postgres 18.4, a pool of 8, default timeouts): the fold of one first delivery took
+about 155 ms with 10,000 pending events on one (agent, rule) pair and about 1.67 s with 100,000,
+and another rule of the same agent waited about 151 ms during the 10,000-pending fold (about 2 ms
+with the step off). The point at which the pool saturates was not measured, and neither was the
+gateway's in-flight occupancy. A redelivery repairs only the census row of such an event: a repair
+runs no order step, so the event is never counted in the agent's order clock or counters, and the
+fleet count of unordered agents can undercount for an agent whose first deliveries all failed the
+step, until its next first delivery. That gap must be closed before the comparison ships.
+
+## Update (2026-11-15) - the census decides by the agent's emit-order pair (UP-14, #5690)
+
+The Update (2026-11-03) above gave the census row one ordering rule, the key and `ingest_seq`. Schema v5
+stores the agent's `(boot_epoch, emit_seq)` pair and the per-agent order row, and this Update records that
+the census now DECIDES by the pair. It is a change of behaviour in the census statements and the order
+step, not of the schema: no column or table is added beyond the v5 text, and the lock order of every census
+writer is unchanged (agent order row, pending events in `ingest_seq` order, census row, rule row; never a rule
+row first).
+
+- The order step gives every census-bearing first delivery or batch row a mode from the agent's pair clock
+  (`unpaired`, `unpaired_held`, `current`, `current_straggler`, `current_rebase`, `refused_regression`,
+  `refused_retired`), and the census statements decide the row by it. A mode label the code does not know, or a NULL,
+  is a failure of the step, never a default. Two unpaired events keep the key rule. A decision that is not a
+  clean in-order pair apply flags the row. The decision label of each census write is a metric (it is not
+  logged), never an input to a row decision; the durable evidence is the `order_uncertain` flag and `ts_hwm`
+  on the census row. The metric resets on a server restart, and a refused event expires with the event
+  retention (30 days by default, `--guardian-event-retention-days`).
+- The pair clock is fresh for one hour (`YUZU_CENSUS_STALE_NS_`, reused) of DATABASE time and not when it is
+  recorded more than five minutes (`YUZU_CENSUS_FUTURE_SLACK_NS_`) in the database's future. Only a `current`
+  event or a re-base refreshes it; a refused, straggler or unpaired event never does. A re-base to a lower
+  epoch retires the former epoch (`retired_epoch`), after which its events are refused.
+- The two transitions between the key regime and the pair regime run in opposite directions and are fenced
+  differently (decided by the census statement, `YUZU_CENSUS_PAIR_APPLY_` and `YUZU_CENSUS_KEY_TRANS_`). Pair to
+  key, an unpaired event over a paired verdict, is fenced by the hold while the pair clock is fresh, and
+  applies by arrival, flagged, once it is stale (and only when the event is later by arrival than the
+  verdict). Key to pair, a paired event over a census row that holds no pair, is not fenced by the clock or
+  by arrival: any event whose mode is `current`, `current_straggler` or `current_rebase` applies whenever
+  the row holds no pair, whatever the unpaired verdict's key or arrival, and the row is flagged; only
+  `refused_regression` and `refused_retired` are refused over it. A Repair of an older paired event is
+  decided from the same clock (never a re-base), so a late Repair of an older paired event of the live
+  epoch can replace a newer unpaired verdict. The prototype validated this rule and the code matches it; it
+  is stated here because the earlier text of this Update gave it only as a metric label.
+- A Repair (a redelivery of an event stored with pending evidence) runs no order step and never writes the
+  pair clock or a counter. It runs the idempotent Ensure, takes the agent's order row `FOR SHARE` as its
+  first lock and reads the mode without writing it, inside its `census_upsert` savepoint under the step's 1 s
+  lock bound (restored before the census statements) and under a 2 s `statement_timeout` for EACH of its
+  census statements (`kRepairStatementTimeoutMs`, set and restored the same way, P-1), a per-statement bound that counts
+  lock waits too: a statement over it fails with SQLSTATE 57014 and the Repair is Failed with its evidence
+  kept; a stale clock gives `current_straggler` or
+  `refused_regression` where a first delivery would re-base. Everything it did to the order table is undone
+  by every exit that projects nothing, so a blank order row survives only a Repair that touched the census
+  row. A blank row is never "currently unordered". The consequence recorded in the 2026-11-12 Update stands:
+  an event whose first delivery failed the order step is never counted in the agent's clock or counters, so
+  the unordered count can undercount for an agent whose first deliveries all failed it. The sentence of the
+  2026-11-12 Update that this gap "must be closed before the comparison ships" is superseded by an owner
+  ruling of 2026-11-15: the gap ships documented, and the comparison is not held for it. The gap is this: an
+  agent whose first deliveries all failed the order step has no order row (or a blank one a Repair left),
+  so the fleet unordered count and the agent's per-agent counters do not include it, and it is not listed
+  in `unordered_agent_ids`, until its next first delivery writes the clock and counters. Its failed events
+  are stored with pending evidence, so they show on `yuzu_server_guardian_census_pending_events`. The
+  follow-up (#7959) is a fresh-database DDL change under the hard-cutover contract: a database-clock receipt column
+  (`recv_ns`) on `guaranteed_state_events` written in the event INSERT, plus a partial index leading with
+  `agent_id` on `projection_pending AND boot_epoch IS NULL` (the only pending index today is
+  `idx_gse_pending (rule_id, agent_id)`; the owner declined an `agent_id`-leading pending index on
+  2026-11-06, a ruling recorded in the comment at `unrepresented_pending_for_agent` in
+  `guaranteed_state_store.cpp`, so this reverses it), then a read-side arm in the single unordered predicate that counts an agent
+  holding such a pending unpaired event. It is not part of this change.
+- A Repair holds one pooled connection for the sum of its statements: the Ensure and the clock read, each
+  bounded by the Repair's 2 s statement bound (a lock wait is one stage of that statement and has its own 1 s
+  `lock_timeout`), then five census statements under 2 s each, about 14 s in the worst case, or about 18 s
+  when the Repair loop's one retry (the Ensure and the clock read run again when the agent's row is deleted
+  mid-Repair) is taken. A Repair can also wait on the unique index when a redelivery overlaps
+  an in-flight first delivery of the same event id (before the cap check, bounded by the other transaction). Those
+  are per-statement bounds, not a deadline for the whole Repair (a whole-Repair deadline is a follow-up, #7967). At most `kRepairMaxConcurrent` (4, a compile-time constant with no operator setting) Repairs
+  run at once in one server process, because the pool (16 connections by default) is shared with auth and
+  audit. A Repair that finds the cap full is shed at once: nothing is written, the transaction is rolled back,
+  the event stays pending, and the shed is counted as a failed Repair on
+  `census_projection_total{source="repair",outcome="failed"}` and `census_proj_failures_total`, with a
+  sampled WARN (`repair shed`; the first after a quiet minute, then every 100th). Ingest outcomes never reach
+  the agent in this tree (`ingest_guardian_response` returns void and the Guardian RPC is acknowledged
+  unconditionally), so backpressure cannot be expressed, and a shed Repair is stranded evidence of the #7147
+  class: the agent does not resend it, and a later applying verdict on that (agent, rule), a rule delete, a
+  decommission or, only when the agent's lifecycle journal is active (currently inert in production), a journal
+  replay clears it. The shed has its own counter, `yuzu_server_guardian_repairs_shed_total` (no labels, present at
+  0 from boot), which tells a shed from a fault; the failed-Repair series still counts a shed. The cap is
+  process-wide with no per-agent share (one agent's blocked or redelivered Repairs can shed other agents'
+  Repairs, and the WARN names the victim, not the slot holders); the shed is instant with no bounded wait (a
+  50-wide replay admits about 4); the cap is a fixed constant 4, not scaled to `--postgres-pool-size`, and
+  assumes the default pool of 16; first deliveries, batch rows and `delete_rule` holders are not capped.
+  Per-agent sub-cap, a pool-scaled cap, a bounded admission wait and backpressure are follow-ups (#7974, #7975, #7976, #7229). The first delivery's
+  order step also runs under `SET LOCAL statement_timeout` equal to its lock bound plus 2 s
+  (`kAgentStepStatementMarginMs`), 3 s per statement, restored like its `lock_timeout`: `lock_timeout` is per
+  wait and a `FOR SHARE` locker does not queue behind a waiting `FOR UPDATE`, so a rolling chain of Repair
+  share locks on one agent could otherwise keep a first delivery waiting past its 1 s bound. The lock bound ends a
+  single wait and the statement bound is the ceiling for each of the step's statements. The margin is 2 s because one
+  statement can wait in two stages (the tuple-lock queue, then the holder's transaction), each with its own
+  `lock_timeout`: measured on a toy schema with the real Ensure and DECIDE shapes, a 1.5 s statement bound
+  failed 12 to 37 of about 50 first deliveries on one agent row (each holding it for a 10 to 20 ms commit) with
+  57014 although every individual wait was under 1 s. A same-agent burst whose waits still exceed the ceiling
+  stores the delivery pending, and that event is stranded (acks are unconditional); backpressure is a follow-up
+  (#7229, #7980). A statement that
+  reaches either bound takes the failed-step path (the event is stored pending). No alert rule ships for any
+  of these signals.
+  Owner ruling 2026-11-15: the step's statement bound is 3 s (the lock bound plus the 2 s margin), widening the
+  1.5 s bound set at Gate 7, because 1.5 s stranded same-agent bursts as measured above. The 2026-11-12 decision set
+  only the 1 s lock bound, which is unchanged. The cost is that one first delivery's order step can hold its pooled
+  connection for up to the sum of its statements' bounds, so the statement bound above is a per-statement ceiling,
+  not a ceiling on the whole step.
+- An absolute plausibility bound at the ingest boundary (UP-9): `emit_seq` of 2^40 or more, or a `boot_epoch`
+  more than ten years past receipt, is `implausible`. The pair is dropped at the ingest boundary, exactly as an
+  `out_of_range` one is, and the event is judged as an unpaired event at first delivery: its stored pair is
+  NULL, the agent's order row counts it as an unpaired event and its pair clock does not move, and it takes
+  the normal unpaired census write (flagged by the pair rules when it is refused or replaces a paired
+  verdict). The reason is counted on `yuzu_server_guardian_pair_rejected_total{reason="implausible"}`. There
+  is no held state and no pending row: `implausible` is decided in one place, the ingest classification.
+  Revised 2026-11-15, by owner ruling after governance Gate 3: this bullet first recorded a HOLD (stored
+  pending, census untouched, a Repair judging the stored unpaired event later). That was an
+  agent-triggerable, un-reapable pending row (any enrolled agent, any rule id; the reaper skips pending
+  rows) with no durable ordering effect, so it was replaced by "judged as unpaired at first delivery".
+- The seen-events subquery of the census upsert is `max(s.ingest_seq + 0)` (P-1), a deliberate,
+  semantics-preserving departure from the validated prototype text: with the bare column the planner can scan
+  `idx_gse_ingest_seq` backward with a heap filter on `event_id`, which reads every event newer than the
+  oldest seen one (seconds at millions of events for thousands of old pending events of one pair, under the
+  agent order row a Repair holds). The departure was re-validated against the prototype and the plan
+  differential, and a plan test pins the shape.
+- "Currently unordered" has one definition, in SQL (UP-5): the latest accepted unpaired event is later than
+  the pair clock, or the pair clock is recorded more than five minutes in the database's future. The database
+  decides it on every read, so it can change with no event; no C++ copy exists.
+- The per-agent order read keeps its `503` on a degraded read (UP-12): a null `ordering` would read as "never
+  accepted". No code changed for it.
+
+Known residuals, stated rather than fixed. (1) A paired event whose Repair is decided `refused_regression`
+against an unpaired census row is acknowledged, flags the row and counts a decision, but is never retired and
+stays pending until a paired apply on that (agent, rule), the rule is deleted, or the agent is decommissioned: a
+member of the #7147 stranded-evidence class, pinned by a test. (2) The batch path does not sort its rows by agent, so two
+concurrent batches over the same agents can deadlock (no production caller; unchanged from v4). (3) Repairs of
+one agent contend with its first deliveries on the order row: measured on one development host, on a debug
+build with fsync off and not a guarantee, 8 concurrent repairs on one agent with 10,000 pending events on one
+pair delayed a first delivery by up to about 600 ms (95th percentile of that delay between 341 and 552 ms over
+the runs), on a fresh events table whose pending rows were the newest in it. The performance review measured
+how long one repair held the order row `FOR SHARE` before the P-1 fix: 275 ms (10,000 newest pending events,
+1.3 million events), 540 ms (10,000 old pending events, the same table) and 22.5 s (old pending events, 5.3
+million events); after it the census upsert over 1.3 million events with 150 old pending events measured
+0.16 ms (it was 115 ms). The margin depends on the size of the events table relative to the age of the pending
+rows, not on the pending count alone, and all of these are single measurements, to be repeated on a release
+build with fsync on. The Repair cap (above) bounds how many repairs contend at once, and the step's 3 s statement bound ends
+a wait that a chain of repair share locks would otherwise extend; a first delivery that reaches either bound
+is stored pending. (4) A pair clock pinned
+by a value inside the plausibility bound heals when the hold expires, one hour after the last accepted event.
+(5) The retired-epoch fence is permanent and holds ONE slot, with no operator clear and no TTL. It ignores the clock's freshness, so a sustained
+`refused_retired` rate can mean a live agent is fenced (an orphan process or a second sender still using the
+retired epoch, or an agent started from a restored data directory that carries it). The exits are an agent
+restart (its new epoch claim is above the retired one) or decommissioning the device; after a second re-base
+to a lower epoch the slot holds the epoch that re-base left, and the first retired epoch is no longer fenced.
+(6) The plausibility bound is read against the ingesting replica's wall clock, not the database clock (the
+rest of the pair regime uses the database clock), so a replica whose clock was set years back judges every
+honest paired event of every agent implausible, which is then decided as an unpaired event; a follow-up
+(#7971) derives it from the database `now()`. (7) The pair is agent-asserted and not
+authenticated beyond the agent identity; it steers only that agent's own census rows.
+No new background loop, reaper or job is added, so the leader fence and the retention rules are not
+touched.
 
 ## Follow-ups
 

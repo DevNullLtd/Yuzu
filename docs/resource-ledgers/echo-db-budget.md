@@ -128,19 +128,34 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
   type in `echo_hour_dedup.hpp`; consumed by `compute_network_events` (tcp closing sockets) and
   `apply_module_risk_filter` (module loads).
 - **Owner type:** the plugin object, guarded by `collect_mu_`. Each set is an
-  `std::unordered_set<std::string>` of at most `kDefaultCap` (20,000) keys.
+  `std::unordered_set<std::string>` of at most `kDefaultCap` (20,000) keys plus a batch journal
+  (`std::vector<std::string>` of the keys admitted since `begin_batch`), so a set holds at most
+  the cap plus the journal. An overflow clear inside a batch empties the set but not the
+  journal, which grows by one string per admitted key, so the journal is bounded by the tick's
+  batch, not by the cap: for tcp one snapshot diff's rows, for modules the retry backlog
+  (`kPendingStreamCap`, 100,000) plus one drain.
 - **Bound and clearing:** `first_this_hour` clears the set when the hour of the timestamp differs
   from the current hour in either direction, and clears it and counts one overflow when a new key
   would exceed the cap. Worst case after either is one repeated row per key, never a missed first
   row. A process restart empties it.
-- **Commit rule:** each tick filters against a COPY of the set. The copy replaces the member only
-  after the rows are committed: for tcp, after the `insert_network_events` / `set_state` call
-  succeeds; for modules, after `insert_module_events` succeeds (on failure the filtered batch is
-  re-queued, bounded by `kPendingStreamCap`, and the member keeps its old contents so the retry
-  re-filters identically). The overflow counters mirrored for status are `std::atomic`.
-- **Failure cleanup:** a thrown exception destroys the copy on unwind; the member is untouched.
-- **Not covered:** an empty module batch (`mrows` empty) does not assign the copy back, which is
-  harmless because an empty batch inserted no keys that matter.
+- **Commit rule:** each tick filters IN PLACE inside a `BatchScope` (`echo_hour_dedup.hpp`):
+  `begin_batch` starts the journal, `commit_batch` clears it and keeps the keys, `rollback_batch`
+  erases the journaled keys from the set. For tcp the scope commits after the
+  `insert_network_events` / `set_state` call succeeds and rolls back when it fails; for modules it
+  commits after `insert_module_events` succeeds (or on an empty batch) and rolls back on failure
+  (the filtered batch is re-queued, bounded by `kPendingStreamCap`, and the retry re-filters
+  identically). The macOS nstat drain admits keys OUTSIDE a batch, before its own insert; a typed
+  row later dropped unstored (the backlog cap, a layout mismatch, a confirmed disable, the tcp
+  enable/disable edge) gives its
+  key back through `release` (`nstat_release_closing_keys`). The overflow counters mirrored for
+  status are `std::atomic`.
+- **Failure cleanup:** `BatchScope`'s destructor rolls back unless `commit` was called, so an
+  exception between the filter and the insert erases the admitted keys and leaves no batch open
+  for the next tick; `rollback_batch` is `noexcept`. An hour change or an overflow clear inside a
+  batch is not undone (one repeated row per key, the clear's own worst case).
+- **Not covered:** a release of a key admitted in an earlier hour, after the same key was
+  admitted again in the current hour, erases the new admission and costs one repeated row (the
+  clear's own worst case).
 
 ### Pid-to-name map (`pid_name_`) and the grace window
 - **Site:** `pid_name_` (`std::unordered_map<std::uint32_t, PidName>`) in `echo_plugin.cpp`, written
@@ -198,8 +213,11 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
 - **Failure cleanup:** both are `noexcept` and catch everything, keeping the bytes or fields read
   so far; the previous unbounded `istreambuf_iterator` read could throw when a process exited
   mid-read.
-- **Not covered:** the cmdline read has no size cap of its own (the kernel bounds it by the
-  argument limit); this branch did not add one.
+- **Cap:** `read_proc_bytes` stops at `kProcReadCap` (256 KiB) and keeps the prefix, cut at a UTF-8
+  character boundary (`trim_incomplete_utf8_tail`, using the shared `utf8_scalar_len`) so the
+  snapshot's JSON serialiser never sees a split character; a result of exactly the cap means
+  possibly cut. The Echo store keeps a longer command line as its first 256 KiB, with no marker;
+  the fleet-snapshot push is clamped again to 4096 bytes on the server.
 
 ### Snapshot pump thread (`agents/core/src/agent.cpp`)
 - **Modified, not new.** The body of `snapshot_pump_thread_` now wraps one cycle in
@@ -212,14 +230,39 @@ New or modified owned resources introduced in `agents/plugins/echo/src/` (`echo_
   `getutxent` / `endutxent`), converting each `USER_PROCESS` record through
   `user_session_from_utmp` and `utmp_text`.
 - **Owner type:** the C library's login-database state, opened by the `set*` call and closed by the
-  `end*` call. Neither is wrapped in an RAII owner.
+  `end*` call. A function-local `UtmpSession` / `UtmpxSession` struct owns it (constructor calls
+  `setutent` / `setutxent`, destructor calls `endutent` / `endutxent`), so every exit path ends the
+  session. No shared scope-exit helper exists in `agents/shared` or `agents/core` to reuse.
 - **Buffers:** `utmp_text` copies at most the fixed field width (`ut_user`, `ut_line`, `ut_host`)
   with a bounded `memchr`, so a field with no terminator is not over-read. The returned strings are
   independent copies; the library's static record is not retained.
-- **Not covered:** if `sessions.push_back` or a string allocation throws `std::bad_alloc`,
-  `endutent` / `endutxent` is skipped. The state is process-global and is reset by the next
-  `setutent` / `setutxent`, so nothing accumulates, but the descriptor stays open until then. This
-  loop shape is unchanged from before this branch.
+
+### Legacy database adoption marker (`echo_db_legacy_rename.hpp`)
+- **Site:** `adopt_legacy_echo_db` writes `<data_dir>/echo.db.adopting` before the first sidecar
+  move and removes it after the main-file rename.
+- **Owner type:** the function itself, on the single boot-time call in agent core before any
+  plugin initialises. The file is written with `yuzu::shared::write_file_atomic` (temp file,
+  fsync on POSIX, rename), so no descriptor is held across the adoption. It holds one line: the
+  size and mtime of `tar.db`.
+- **Failure cleanup:** a failed marker write refuses the adoption before anything moves. A failed
+  removal after the rename logs a warning; the next boot (no `tar.db`) deletes the spent marker.
+  An interrupted adoption leaves the marker in place, which is what the resume reads.
+
+### Adoption marker read handle (`echo_db_legacy_rename.hpp`)
+- **Site:** the `std::ifstream` that reads `echo.db.adopting` in `adopt_legacy_echo_db`.
+- **Owner type:** a block-scoped local; the read is capped at 256 bytes (a fingerprint is under
+  64, so a longer file can only mismatch).
+- **Release:** closed at the end of its block, before the marker is rewritten or removed (on
+  Windows an open handle blocks both); no early return inside the block can leak it.
+
+### Directory-row flag write (`GatewayRouteStore::set_legacy_echo_wire_name`)
+- **Site:** `server/core/src/gateway_route_store.cpp`, called from the adopted-session branch of
+  ProxyRegister (`gateway_service_impl.cpp`).
+- **Owner type:** one pooled connection lease (`pool_.try_acquire_for(kWriteTimeout)`), held for
+  one parameterised `UPDATE ... WHERE agent_id = $1 AND session_id = $2` and released on return;
+  a lease timeout returns `store_unavailable` without a query.
+- **Failure cleanup:** a failed query returns `db_error`; the caller counts it under
+  `op="set_legacy_echo_wire_name"` and proceeds (fail-open). No transaction is left open.
 
 ## Not introduced
 No new socket, thread, subprocess, callback context, library handle or allocated C string. The

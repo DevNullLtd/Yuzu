@@ -43,6 +43,17 @@ Before invoking the skill, the operator should already have:
   ```
 
   It must print all six names, each `completed` with `success` or `skipped`. The ruleset that lists them is the repo's "Protect Main" setting, not this file.
+- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
+
+  ```bash
+  SHA=$(git rev-parse origin/main)
+  gh issue list --repo DevNullLtd/Yuzu --label release-legs-broken --state open
+  gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
+    [.check_runs[] | select(.name | test("^(Linux (gcc-15|clang-21)|Windows MSVC|macOS) release$"))]
+    | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)"'
+  ```
+
+  Expect four names, each `completed`/`success`. If the tip is a docs-only commit (the usual case for the final `promote --append --date` commit), it built nothing and the query prints nothing. In that case, set `SHA` to the most recent `main` commit whose push run built code (its run shows the build legs, not the `docs-required-checks` stubs) and re-run it there. No output on a code commit is a stop.
 - All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
 If any of these are missing, the skill prompts the operator to fix-and-commit-and-push before continuing. **It does NOT auto-bump versions** — bumping is a deliberate decision (which X, which Y, which Z) the operator owns.
@@ -72,7 +83,9 @@ block (`return 1 2>/dev/null || exit 1` also ends a `source`d file without closi
 **Never paste a block line by line into an interactive shell:** there a STOP's `return` ends
 only its own line, the lines after it still run, and in Phase 1 those include `git tag` and
 `git push`. A step you do by hand (an edit, a commit) always sits between two blocks, never
-inside one. If anything prints `STOP`, do not run any
+inside one. Because each block runs in its own shell, no block may rely on a variable an earlier
+block set: every block derives what it reads (`RUN_ID`, `OWNER`) itself, and a block you add
+must do the same. If anything prints `STOP`, do not run any
 later step; report to the operator. (`--ff-only`
 refuses when local `main` has a commit `origin/main` lacks — that is a STOP too. **Never
 `git reset --hard` local `main`**: the stray commit is usually an un-pushed promote or version
@@ -96,6 +109,10 @@ Preflight checks (numbered as `scripts/release-preflight.sh` numbers them):
    `origin`. **No PR-based step can make this check pass** — read Phase 0.5 before acting on
    it
 10. (`--full` only) local C++ + Erlang compile (~2 min)
+
+Windows and macOS releases are agent-only (ADR-0035 ladder step 2): `release.yml` builds no Windows or macOS server and no `YuzuServerSetup`, and the Windows and macOS archives are `yuzu-agent-windows-x64.zip` and `yuzu-agent-macos-arm64.tar.gz`. `tests/test_release_agent_only.py` (Docs Lint and `meson test`) fails if a server build or an old archive name comes back, or if the archive names in `release.yml`, `scripts/check-release-artifacts.sh` and `scripts/build-agent-bundle.sh` disagree, so there is no hand check left for this. The first release after step 2 is also the first real run of the changed Windows and macOS jobs: watch them, especially the Windows "Verify the agent runs from the packaged archive" step. Step 3 (`-Dserver`, agent-only vcpkg) adds a refusal of any server-port DLL (`libpq`, `libecpg`, `libpgtypes`, `drogon`, `trantor`, `jsoncpp`, `*xmlsec*`) in that step and makes every image-publish job wait for the builds; its first real run is the first release tag after it (an RC by plan), so watch that step and the six publish legs' start time on that run (the first-RC checks are tracked in #7597).
+
+**Windows Visual C++ toolset and runtime (manual, every release; `release-preflight.sh` does not check it).** The Windows agent carries the Visual C++ runtime of the toolset in `deploy/packaging/windows/msvc-toolset.pin` app-local, and every DLL loaded into the agent, including vendor code such as the Configuration Manager client the `sccm` plugin loads, shares that copy (decision record: "Decision record: app-local Visual C++ runtime (2026-11-18)" in `docs/windows-build.md`). Before tagging, compare the pin with the newest MSVC toolset of the Visual Studio installed on Wee Tam, which builds the release (the version directories under `C:\Program Files (x86)\Microsoft Visual Studio\2022\BuildTools\VC\Tools\MSVC\`, after checking the Visual Studio Installer for an update). This step can reach only that Visual Studio's toolsets: Visual Studio 2022 offers nothing past 14.44, so while Wee Tam has it the step finds nothing newer, and moving past 14.44 needs Wee Tam's Visual Studio upgraded first, a separate, reviewed change (`deploy/windows/README.md`) that weakens the decision record's mitigation until it is made. If a newer toolset exists, bump to it in a reviewed PR merged before the tag: install it on Wee Tam (`deploy/windows/README.md`), change `msvc-toolset.pin` and the cl.exe row of `docs/windows-build.md`'s toolchain table together (`tests/test_windows_payload_imports.py` fails when they disagree), and add the changelog fragment the pin file's comment asks for. The release fails when the runner's `VCToolsVersion` differs from the pin, so the runner and the pin move together. If you keep the older toolset, say why in the release report.
 
 **Stop** if preflight fails. Surface the failures and ask the operator how to proceed (commit fixes? bump versions? abort?).
 
@@ -454,25 +471,25 @@ echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 The jobs run with a partial DAG (simplified; the full list follows):
 
 ```
-build-linux ─┬─ build-gateway ─┐
-             │                  ├─ docker-publish ─┐
-build-windows (parallel)        │                   │
-build-macos (parallel)          │                   ├─ release
-build-linux ────────────────────┴───────────────────┘
+release-guard ─┬─ build-linux ─── build-gateway ─┐
+               ├─ build-windows ─────────────────┼─ docker-publish (2 legs) ───────┐
+               └─ build-macos ───────────────────┤  docker-publish-chisel (3 legs) ┼─ release ─ docker-publish-agent-bundle
+                                                 └─ docker-publish-postgres ───────┘
 ```
+Every image-publish job before the release (`docker-publish`, `docker-publish-chisel`, `docker-publish-postgres`) needs ALL FOUR builds (`build-linux`, `build-gateway`, `build-windows`, `build-macos`), so the images start only after the slowest build (Windows, ~40 min); `release` needs every build and every publish job.
 
 - **release-guard** (ubuntu-24.04, seconds) — fails the run if the tag already has a published release, or if the ref is not a `vX.Y.Z[-rcN]` tag (#5282); every other job waits for it
 - **build-linux** (self-hosted Linux, ~25 min) — meson release + .deb + .rpm
 - **build-gateway** (self-hosted Linux, ~10 min, needs build-linux) — rebar3 release + .deb + .rpm
-- **build-windows** (self-hosted Windows, ~40 min, parallel) — MSVC + InnoSetup + signtool
-- **build-macos** (macos-14 GitHub-hosted, ~30 min, parallel) — clang + codesign + notary
-- **docker-publish** (matrix server+gateway, ~15 min each, needs build-linux + build-gateway) — buildx + GHCR push
-- **docker-publish-postgres** (~1 min) — the `yuzu-postgres` image the composes pin
-- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux + build-gateway) — the `*-chisel` images and their SBOMs
+- **build-windows** (self-hosted Windows, ~40 min) — MSVC + InnoSetup + signtool
+- **build-macos** (self-hosted macOS, BigMags, ~30 min) — clang + codesign + notary
+- **docker-publish** (matrix server+gateway, ~15 min each, needs all four builds) — buildx + GHCR push
+- **docker-publish-postgres** (~1 min, needs all four builds as a success gate, not as an input: it holds no build artifact) — the `yuzu-postgres` image the composes pin
+- **docker-publish-chisel** (matrix server/gateway/agent, 1–16 min warm, needs build-linux, build-gateway, build-windows + build-macos) — the `*-chisel` images and their SBOMs
 - **release** (ubuntu-24.04, ~3 min, needs all of the above) — assemble artifacts, generate SHA256SUMS, cosign-sign, gh release create
 - **docker-publish-agent-bundle** (needs release) — built from the published release; its SBOM is not a release asset
 
-Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any job the release needs fails or is cancelled (a build job, `docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but every image leg that reached its push step has already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag).
+Since #5242 the release waits for `docker-publish-chisel`, so the chisel SBOMs are always in the signed `SHA256SUMS`. If any job the release needs fails or is cancelled (a build job, `docker-publish`, `docker-publish-postgres` or a `docker-publish-chisel` leg), the release job is skipped (fail-closed): no GitHub release is created, but every image leg that reached its push step has already pushed `:X.Y.Z` (and `:X.Y` and `:latest` on a stable tag). A failed build job is not such a case: all three image-publish jobs wait for all four builds, so a failed build, including a failed agent packaging step, pushes no versioned image (cost: the images start only after the slowest build, ~40 min, and a failed or cancelled Windows or macOS build blocks every image and the release; there is no sanctioned images-only publish path today, tracked in #7596). The chisel publish legs sit in a ref-and-image-keyed `cancel-in-progress: true` concurrency group with no SHA in the key, so a stale run's late chisel leg can cancel the newer run's leg for the same tag: another reason to cancel in-flight runs first. To recover, fix the cause and re-tag (cancel in-flight runs first), or "Re-run failed jobs" on the newest run.
 
 **Recovery: "Re-run failed jobs" on the NEWEST run for the tag. A fresh run is the fallback, not the default.** Re-running the newest run keeps every image digest and artifact its succeeded jobs already produced; only the failed jobs and those skipped behind them execute again, and every publishing step re-checks that the tag still points at this run's commit before it pushes (#5282), so a run whose tag has moved away refuses. That re-check cannot see a tag moved away and back again while two runs are in flight (#5478): **cancel every in-flight release run for a tag before you re-tag it.** "Newest run" means the newest run that got past `release-guard`; a run the guard refused has nothing to re-run. Never re-run an OLDER run (#5242): a newer run may have pushed different images, and a re-run does not repeat `release-guard`. Two cases:
 - **The `release` job did not run or failed** (a build, publish or Create Release failure): no release exists. "Re-run failed jobs" finishes the run in minutes. A fresh run also passes the guard but rebuilds and re-pushes everything with new digests (40+ min) — use it only when the newest run cannot be re-run. (Exception: when `Create Release`'s artifact gate rejects a stale package a self-hosted build job uploaded, re-running only the `release` job downloads the same file again; clear the runner workspace and start a fresh run — `docs/ci-architecture.md`, Release artifact gate.)
@@ -504,19 +521,59 @@ for i in $(seq 1 24); do sleep 5; RUN_ID=$(gh run list --workflow release.yml --
 echo "fresh run: ${RUN_ID:-not seen after 2 min, check the Actions page}"
 ```
 
-Start it only when step 1 prints nothing (a queued run counts as running: wait for it) and step 2 says `release not found` (any other error: stop and investigate). **The workflow enforces step 2 itself** (#5282): its first job, `release-guard`, refuses a ref that is not a `vX.Y.Z[-{alpha,beta,rc}N]` tag, then reads `GET /releases/tags/<tag>` and fails the run before any build or push when it answers HTTP 200; it proceeds only on HTTP 404, and any other answer fails the run too. Every image-publishing job and the release job need it. Step 2 is still worth running, because the guard refuses a mistaken run but cannot tell you which run to start. Limits: the guard's read-only token cannot see a **draft** release — one made by hand, or one `gh release create` leaves behind when interrupted while uploading assets (it creates a draft, uploads, then publishes). The `release` job's own check sees drafts and fails. Deleting an unpublished draft is not destructive (nothing was published): delete it, then re-run failed jobs on the newest run. A fresh run is for the newest release only: on an older stable tag, a fresh run would move `:latest` and `:X.Y` back to the older images. If the failure is deterministic, fix it and re-tag instead; a fresh run of the same tag fails the same way. If a stable release cannot be fixed promptly, move `:latest` (and `:X.Y`) back to the previous release's images meanwhile. **There is no override input, by design.** To change what a published release ships, cut a new version. Deleting a PUBLISHED release is never a recovery for a failed job; it is only for a release whose published content is itself wrong, and it is destructive and visible to anyone who downloaded it, so **confirm with the operator first**. The only way to redo a release under the same tag is to delete the GitHub release first (`gh release delete vX.Y.Z --repo DevNullLtd/Yuzu`, leaving the tag). The fresh run then rebuilds, pushes the images and recreates the release with a `SHA256SUMS` that matches them. A fresh run rebuilds everything, about 40+ minutes.
+Start it only when step 1 prints nothing (a queued run counts as running: wait for it) and step 2 says `release not found` (any other error: stop and investigate). **The workflow enforces step 2 itself** (#5282): its first job, `release-guard`, refuses a ref that is not a `vX.Y.Z[-{alpha,beta,rc}N]` tag, then reads `GET /releases/tags/<tag>` and fails the run before any build or push when it answers HTTP 200; it proceeds only on HTTP 404, and any other answer fails the run too. Every image-publishing job and the release job need it. Step 2 is still worth running, because the guard refuses a mistaken run but cannot tell you which run to start. Limits: the guard's read-only token cannot see a **draft** release — one made by hand, or one `gh release create` leaves behind when interrupted while uploading assets (it creates a draft, uploads, then publishes). The `release` job's own check sees drafts and fails. Deleting an unpublished draft is not destructive (nothing was published): delete it, then re-run failed jobs on the newest run. A fresh run is for the newest release only: on an older stable tag, a fresh run would move `:latest` and `:X.Y` back to the older images. If the failure is deterministic, fix it and re-tag instead; a fresh run of the same tag fails the same way. If a stable release cannot be fixed promptly, move `:latest` (and `:X.Y`) back to the previous release's images meanwhile ("Rolling `:latest` and `:X.Y` back", below: commands, and the `X.Y.0` case). **There is no override input, by design.** To change what a published release ships, cut a new version. Deleting a PUBLISHED release is never a recovery for a failed job; it is only for a release whose published content is itself wrong, and it is destructive and visible to anyone who downloaded it, so **confirm with the operator first**. The only way to redo a release under the same tag is to delete the GitHub release first (`gh release delete vX.Y.Z --repo DevNullLtd/Yuzu`, leaving the tag). The fresh run then rebuilds, pushes the images and recreates the release with a `SHA256SUMS` that matches them. A fresh run rebuilds everything, about 40+ minutes.
+
+**Rolling `:latest` and `:X.Y` back** (a stable tag whose images were pushed but whose release failed, when the fix will not land promptly; a pre-release moves neither tag, so there is nothing to roll back). **Confirm with the operator first**: it changes what every `:latest` and `:X.Y` puller gets, and **it can downgrade a running server onto a database schema ahead of it** (see "A rollback can downgrade a running server" below: tell such users to pin the failed release's `:X.Y.Z` instead of following `:latest` back). Six images carry the two tags: `yuzu-server`, `yuzu-gateway`, `yuzu-postgres`, `yuzu-server-chisel`, `yuzu-gateway-chisel` and `yuzu-agent-chisel`. `docker buildx imagetools create --prefer-index=false` with one source copies the manifest byte for byte, so each moved tag keeps the digest, and so the cosign signature (attached by digest), of the image it is copied from. Without `--prefer-index=false` buildx wraps a single image manifest in a new index, which has a new, unsigned digest. It needs `docker login ghcr.io` with a token that can write the packages. The block stops at the first empty lookup, failed copy or digest mismatch; it is safe to run again (a tag already moved is copied to the same digest), so after a failure fix the cause and re-run it whole.
+
+```bash
+(
+set -euo pipefail
+TAG=v0.15.1                                   # the failed stable release
+NEW=${TAG#v}; XY=${NEW%.*}; OWNER=devnullltd
+# The failed run created no GitHub release, so the newest published stable release is the one :latest named before.
+LATEST_PREV=$(gh release list --repo DevNullLtd/Yuzu --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // "" | ltrimstr("v")')
+# The newest published X.Y.* release: empty when $NEW is X.Y.0 (or no earlier X.Y release was published).
+XY_PREV=$(gh release list --repo DevNullLtd/Yuzu --exclude-drafts --exclude-pre-releases --limit 100 --json tagName --jq "[.[].tagName | ltrimstr(\"v\") | select(startswith(\"$XY.\"))][0] // \"\"")
+if [ -z "$LATEST_PREV" ] || [ "$LATEST_PREV" = "$NEW" ] || [ "$XY_PREV" = "$NEW" ]; then
+  echo "STOP: previous release lookup gave '$LATEST_PREV' / '$XY_PREV' (empty, or the failed release itself)" >&2; exit 1
+fi
+echo ":latest -> $LATEST_PREV   :$XY -> ${XY_PREV:-(no earlier $XY release: leave :$XY, see below)}"
+digest() { docker buildx imagetools inspect "ghcr.io/$OWNER/$1" --format '{{.Manifest.Digest}}'; }
+IMAGES="yuzu-server yuzu-gateway yuzu-postgres yuzu-server-chisel yuzu-gateway-chisel yuzu-agent-chisel"
+for img in $IMAGES; do
+  for pair in "latest $LATEST_PREV" ${XY_PREV:+"$XY $XY_PREV"}; do
+    read -r to from <<< "$pair"
+    want=$(digest "$img:$from")
+    case "$want" in sha256:*) ;; *) echo "STOP: no digest for $img:$from" >&2; exit 1 ;; esac
+    docker buildx imagetools create --prefer-index=false --tag "ghcr.io/$OWNER/$img:$to" "ghcr.io/$OWNER/$img:$from"
+    got=$(digest "$img:$to")
+    if [ "$got" != "$want" ]; then echo "STOP: $img:$to is $got, not $want ($img:$from)" >&2; exit 1; fi
+    echo "OK $img:$to = $img:$from = $want"
+  done
+done
+echo "rollback complete: every moved tag has the digest of the image it was copied from"
+)
+```
+
+- **An `X.Y.0` release** has no earlier `:X.Y`: the failed run created that tag, and it names the failed release's images. Leave it there until the fix ships (only someone who asks for `:X.Y` by name gets them, the same images `:X.Y.0` names), and say so wherever you announce the rollback. **Do not delete the GHCR package version** to remove the tag: that deletes the digest with every tag on it, `:X.Y.0` and its signature included.
+- **A rollback can downgrade a running server.** Anyone who pulled `:latest` while it named the failed release, and ran that server, may have a database it migrated. Following `:latest` back puts the older server on a schema ahead of it: it logs the schema-ahead warning and keeps running on a schema it was not written for (`docs/user-manual/upgrading.md`, "When a server build finds its database ahead of it (every Postgres store)"; returning to an earlier build is not a supported path). Say so in the announcement, and tell such users to stay on the image they run (pin `:X.Y.Z` of the failed release) until the fix ships rather than follow `:latest` back.
+- Re-tagging or releasing the fix moves `:latest` and `:X.Y` forward again as usual.
 
 The chisel timeout (120 min) is set in the workflow at the tagged commit, so a fresh run of the same tag cannot change it. Raising it means committing the bump and re-tagging.
 
 Watch with `gh run watch` (interactive), or poll-until-done from the LLM:
 
 ```bash
+RUN_ID=${RUN_ID:-$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')}
+[ -n "$RUN_ID" ] || { echo "STOP: no release run found for vX.Y.Z"; return 1 2>/dev/null || exit 1; }
 gh run watch "$RUN_ID" --exit-status   # blocks until terminal state, exit 0 if all green
 ```
 
 If `gh run watch` is unsuitable (long-running terminal session), poll every 60s:
 
 ```bash
+RUN_ID=${RUN_ID:-$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')}
+[ -n "$RUN_ID" ] || { echo "STOP: no release run found for vX.Y.Z"; return 1 2>/dev/null || exit 1; }
 while :; do
   STATUS=$(gh run view "$RUN_ID" --json status,conclusion --jq '.status + "/" + (.conclusion // "")')
   echo "$(date -u +%H:%M:%S) $STATUS"
@@ -535,6 +592,8 @@ Phase 2 produces: workflow URL, terminal status, per-job timing, and (on failure
 Look up the failing job and pull the last 50 lines of its log:
 
 ```bash
+RUN_ID=${RUN_ID:-$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')}
+[ -n "$RUN_ID" ] || { echo "STOP: no release run found for vX.Y.Z"; return 1 2>/dev/null || exit 1; }
 gh run view "$RUN_ID" --log-failed | tail -100
 ```
 
@@ -549,10 +608,15 @@ Match the failure against this table. **All entries have happened in real Yuzu r
 | `xcrun notarytool submit` times out (15 min) on macOS | Apple notary backlog | "Re-run failed jobs" on the newest run; see Recovery. If it keeps failing, fix the cause and re-tag: a notarize failure fails `build-macos`, which skips the release, so there is no release to upload a hand-notarized `.pkg` to, and it would sit outside the signed `SHA256SUMS`. |
 | `Build and push` fails with `unauthorized` on GHCR | `GITHUB_TOKEN` `packages: write` scope missing | Verify `permissions: packages: write` at workflow root. |
 | `vcpkg install` fails with version baseline mismatch | `VCPKG_COMMIT` env var in workflow drift from `vcpkg.json` baseline | Sync both — workflow env + manifest baseline must match. Tracked by `.github/workflows/vcpkg-baseline-update.yml`. |
-| `Run EUnit tests` fails with non-zero exit + "Failed: 0" in log | meck fixture cancellation false-positive (known #336/#337 class) | The step's parser (`scripts/gateway_test_summary.py cancel-tolerant`) tolerates this — it passes with a `::warning::` **only when the last summary is eunit's `Failed: 0` line with `Passed: N` nonzero** (some sets cancelled, the rest ran). If it doesn't, paste the eunit.log tail and check if a new module is leaking processes. |
-| `Run EUnit tests` fails with `::error::EUnit printed no recognisable test summary` | rebar3 failed before any test ran (compile/dependency error), or its summary wording changed | Read the eunit.log head for the rebar3 error; if the wording changed, update `scripts/gateway_test_summary.py` (all gateway test gates share it). |
-| `Run EUnit tests` fails with `::error::EUnit executed zero tests` | Every EUnit set was cancelled or nothing was discovered (`Failed: 0.  Skipped: 0.  Passed: 0.`). Before #4800 this passed with only a `::warning::` | **Intentional hard fail — do not work around it.** Nothing was tested. Find the setup that crashes in every module (paste the eunit.log head) or the moved test dir. |
-| `Linking target server/core/yuzu-server` fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Run EUnit tests` fails with a nonzero exit or cancellation, even when `Failed: 0` appears | Incomplete execution (including meck fixture cancellation, #336/#337/#1005) | `scripts/gateway_test_summary.py strict` preserves the native nonzero exit and rejects cancellation even with exit 0. Read `gateway/eunit.log` and the diagnostic excerpt; repair the fixture/process leak before release. The covered release suite runs once, without automatic retry; cancellation intentionally blocks the tag build. |
+| `Run EUnit tests` reports `Test run printed no recognisable test summary` | rebar3 failed before any test ran (compile/dependency error), or its summary wording changed | Read the eunit.log head for the rebar3 error; if the wording changed, update `scripts/gateway_test_summary.py` and its parser tests. Strict mode emits plain diagnostics, not the old GitHub annotation strings. |
+| `Run EUnit tests` reports `Test run executed ZERO tests` | Nothing was discovered, or every set was skipped/cancelled (`Failed: 0.  Skipped: 0.  Passed: 0.`) | Intentional failure: find the crashing setup or moved test directory in `gateway/eunit.log`. The strict parser requires at least one executed test and no failure or cancellation. |
+| `Linking target agents/core/yuzu-agent` (or `yuzu_agent_core.dll`) fails with LNK2038 on Windows | vcpkg cache poisoned with mixed runtime-libraries (the option-D issue from #375 / PR #373) | Bust the Windows vcpkg cache, then "Re-run failed jobs" on the newest run; see Recovery. Long-form: see `.claude/agents/build-ci.md` "Windows MSVC static-link history and #375". |
+| `Verify the agent runs from the packaged archive` fails on `build-windows` | The Windows agent archive lacks a DLL the agent or `yuzu_agent_core.dll` imports (exit `-1073741515`, STATUS_DLL_NOT_FOUND), lacks plugin DLLs, contains `yuzu-server.exe`, contains a server-port DLL (log line `server-only DLLs in the agent archive: <names>`: a manifest, install-profile or port change that pulled a server dependency in), or the agent hung (the step kills it after 60 s) | Read the step log. A server-port DLL refusal is deterministic: the release job installs from a clean checkout, so re-running the same tag refuses again. Fix the cause (the manifest, the install line or a port at the pinned baseline) and re-tag. "Re-run failed jobs" on the newest run is only for a transient failure such as a runner or network fault (a hang), as in Recovery above. A real packaging defect needs a commit, then re-tag as Recovery describes. No GitHub Release exists yet, and all three image-publish jobs wait for `build-windows`, so no versioned image was pushed |
+| `Notarize binaries` fails with "notarization status is 'Invalid'" on `build-macos` | Apple rejected the agent binary or a dylib (only once `MACOS_SIGNING_CERT` is set; macOS signing is dormant until then) | `xcrun notarytool log <id>` with the id printed in the step log (the step prints the notarization result). Fix the signing with a commit, then re-tag as Recovery describes. No GitHub Release exists yet, and all three image-publish jobs wait for `build-macos`, so no versioned image was pushed |
+| `docker-publish-agent-bundle` fails in `scripts/build-agent-bundle.sh` with `cosign verify-blob FAILED`, `no SHA256SUMS.sigstore`, `legacy SHA256SUMS.bundle`, `hash MISMATCH`, `malformed hash`, `no line for <file>`, `ambiguous`, `no <.deb/.rpm/.pkg/Windows> installer asset`, `no SHA256SUMS on`, `no Windows archive on` / `no macOS archive on`, `cannot determine the GitHub repo slug`, `cannot derive the signer repo`, `download missing or empty`, `need cosign`, `malformed --version`, `malformed --signer-repo`, `cannot create a staging dir` or `cannot read/hash/copy` (#7529) | The script authenticates the release's `SHA256SUMS` with cosign (exact identity `https://github.com/<signer>/.github/workflows/release.yml@refs/tags/<tag>`, issuer `https://token.actions.githubusercontent.com`) before reading it, then matches each download to ITS OWN `SHA256SUMS` line. In CI the signer is `--signer-repo ${{ github.repository }}`; by hand it comes from a fixed table (<= 0.13.x `Tr3kkR/Yuzu`, later `DevNullLtd/Yuzu`). The ONLY legitimate signers are `Tr3kkR/Yuzu` (<= 0.13.x) and `DevNullLtd/Yuzu` (after): a `cosign verify-blob FAILED` on the default path means a tampered release or the wrong download source, NOT a signer to override. Rule out first: cosign older than v2.6.2, a wrong clock, or a Sigstore/TUF network failure in cosign's output. There is no offline mode: check proxy/DNS and re-run; if it persists for about an hour, or cosign reports an expired or unverifiable trusted root, treat it as permanent and update cosign. `SHA256SUMS.sigstore` missing means a release before v0.11.0-rc1 (v0.8.0-rc0 to v0.10.0 carry neither signature file) or one assembled by hand (see Known limitations); `legacy SHA256SUMS.bundle` means a v0.7.x release (verify by hand with the exact tag-bound `--certificate-identity`); `hash MISMATCH`/`no line for` means a corrupt or tampered asset; an installer error means the release has none (or several) for the requested version (the script picks each installer by exact version-derived name, so a leftover earlier-rc installer on the same release is ignored, never bundled) | Reproduce without docker with `bash scripts/build-agent-bundle.sh --verify-only --version X.Y.Z` (needs `gh`, cosign v2.6.2 or later, `sha256sum` or `shasum`, and a git checkout; `--signer-repo owner/repo` overrides the table and prints a `[!!]` warning when it differs; **never set it to the subject cosign reports**). **Never skip the check or edit the script to get past it** and there is no skip flag by design; confirm with the operator before publishing a bundle for a release whose manifest does not verify. A transient download failure: "Re-run failed jobs" on the newest run. |
+| The `release` job's `Sign SHA256SUMS (keyless)` step fails at its own `cosign verify-blob` (#7529) | The just-made signature did not verify with the exact tag-bound `release.yml` identity. State left behind: the images are already pushed and signed (including `:latest` on a stable tag), the tag exists, NO GitHub Release was created and the agent-bundle job is skipped | "Re-run failed jobs" on the newest run (a deterministic SAN mismatch will fail again: find the cause, e.g. a changed workflow path or a moved tag). **Never widen the check to a `--certificate-identity-regexp`**; confirm with the operator before publishing a release whose manifest does not verify. |
+| `Check artifact SBOM scope` fails on the `release` job, `Generate per-artifact SBOMs` fails on a build job, or `Mark the image SBOM incomplete where the scan cannot see` fails on an image-publish job (S8; not yet seen on a release) | `scripts/ci/artifact-sbom.py`: on the `release` job a file SBOM records another file's SHA-256 or name, is over its 400-entry bound, has no entries and no record of unpacked files, or lists a path under `vcpkg/`, `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`, `.git/` or `.github/`, or an image SBOM pair lacks its CycloneDX or SPDX half or the incomplete marker (`run artifact-sbom.py mark-image`), carries the marker `only in part`, or is named as a release image without that image's title label (`carries no title label`, `its title label is`); on a build job an unpacking tool or syft is missing (`not found on PATH`), syft fails (`syft exited N`) or something `did not finish within` its timeout, an archive member is refused (`escapes the extraction directory`, `is a device or FIFO`, `lies under a link member`), an `.rpm` does not unpack (`rpm2cpio|cpio failed`, either command's exit code), a file `unpacked to no files`, a `.pkg` or archive holds no Yuzu binary it recognises (`no Yuzu C++ binary found`), the installer's ISCC manifest (`YuzuAgentSetup-<version>.manifest.txt`, `docs/ci-architecture.md`, "The installer manifest contract") is refused: `not the encoding ISCC writes a manifest in`, `does not end in CR LF` or `a CR or LF that is not part of a CR LF`, `the header is not the one Inno Setup 6.7.3 writes` (the runner's Inno Setup writes another format: read it in that version's source and update the contract and its fixture in a commit), `no file rows`, `tab-separated columns`, `Index ... not`, `not 64 lowercase hex digits`, `not a drive-absolute Windows path`, `not strictly inside the build directory`, `holds a character Windows does not allow`, `listed again with another SHA-256`, `is missing from the build directory`, `is not a regular file`, `outside the build directory (a symlink or junction)`, or `not the file the installer holds` (a file in `build-windows` changed after ISCC packed it); or the `Build Windows installers` step says `ISCC wrote no manifest`; a vcpkg port the manifest needs is not installed, or an `unexpected <Error>`; on an image-publish job the two image SBOMs `describe different images`, or an image labelled as the release's server, agent, gateway or postgres image shows syft listing no such binary; and on a build job or an image-publish job a note value holds a line break (`a value with a line break`), or on the `release` job or an image-publish job a note `appears <n> times` (more than one copy of a `yuzu:sbom:` note) | Read the `::error::` line; each names the file and the rule. **Re-run first** ("Re-run failed jobs" on the newest run) when the cause can be transient: a `did not finish within` timeout, a runner or network fault, an `unexpected PermissionError` on Windows (an antivirus or indexer holding a freshly unpacked DLL), and, on the `release` job, a SHA-256 mismatch or a missing file or half-pair (a corrupt or failed artifact transfer: the re-run downloads again). Every other rule is about the SBOM or the input itself, and a re-run of the same commit fails the same way: fix the cause in a commit and re-tag as Recovery describes. When a build job fails, no GitHub Release exists and no versioned image was pushed (every image-publish job waits for all four builds). When an image-publish job's mark step fails, or `Check artifact SBOM scope` fails, the state is the one the `Sign SHA256SUMS` row describes: the images are pushed and signed, including `:X.Y` and `:latest` on a stable tag (a mark step runs after its image's push and signing, like the SBOM upload, and the other image legs may have pushed theirs), the tag exists and NO GitHub Release was created (a failed mark step skips the release job), so anyone pulling `:latest` meanwhile gets images no release, `SHA256SUMS` or release SBOM names. In either case, if the fix will not land promptly, move `:latest` and `:X.Y` back to the previous release's images (Recovery, "Rolling `:latest` and `:X.Y` back": the commands, an `X.Y.0` release with no earlier `:X.Y`, and the downgrade warning). The mark steps and the scope check first run for real on a release tag, so cut the first release that carries them as a pre-release (`-rcN`): a pre-release pushes only `:X.Y.Z-rcN` and moves neither `:latest` nor `:X.Y`. The same goes for the installer SBOM: no real ISCC manifest has been checked yet (the contract was built from Inno Setup's source and a fixture), so that `-rcN`'s Windows job is its first real verification; read its `Generate per-artifact SBOMs` output and keep the `windows-installer-manifest` artifact until the run is judged. Re-tagging the fix (a force-moved tag: confirm with the operator, and cancel every in-flight run for the tag first) pushes a second signed digest set under `:X.Y.Z`; the first stays in GHCR, signed, with no release naming it: leave it, and say so in the release notes if anyone may have pulled it. **Never raise `MAX_COMPONENTS` or drop a forbidden segment to get past it** without a measurement showing the SBOM is a correct artifact scan, and never delete the marker or the mark step to pass the image check. |
 
 For any failure not in the table: pull `gh run view "$RUN_ID" --log-failed` in full, summarize the error, and ask the operator how to proceed ("Re-run failed jobs" on the newest run; see Recovery — or a fix and re-tag, or abort).
 
@@ -569,10 +633,9 @@ Required assets (the `--verify` mode of this skill checks each):
 ```
 yuzu-linux-x64.tar.gz
 yuzu-gateway-linux-x64.tar.gz
-yuzu-windows-x64.zip
+yuzu-agent-windows-x64.zip
 YuzuAgentSetup-X.Y.Z.exe
-YuzuServerSetup-X.Y.Z.exe
-yuzu-macos-arm64.tar.gz
+yuzu-agent-macos-arm64.tar.gz
 YuzuAgent-X.Y.Z-macos-arm64.pkg
 yuzu-server_X.Y.Z_amd64.deb
 yuzu-server-X.Y.Z-1.x86_64.rpm
@@ -581,12 +644,16 @@ yuzu-gateway-X.Y.Z-1.x86_64.rpm
 yuzu-agent_X.Y.Z_amd64.deb
 yuzu-agent-X.Y.Z-1.x86_64.rpm
 yuzu-compose-wizard-X.Y.Z.zip       ← Compose Wizard bundle (PR #405, fjarvis)
+<stem>.cdx.json + <stem>.spdx.json   ← one SBOM pair per archive, .deb, .rpm, .exe and .pkg above (S8); <stem> is the
+                                      file name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg, e.g. yuzu-linux-x64.cdx.json,
+                                      yuzu-agent_X.Y.Z_amd64.spdx.json, YuzuAgentSetup-X.Y.Z.cdx.json (none for the wizard zip)
+yuzu-{server,gateway,postgres}-image.{cdx,spdx}.json, yuzu-{server,gateway,agent}-chisel-image.{cdx,spdx}.json   ← image SBOMs
 SHA256SUMS
 SHA256SUMS.sigstore                   ← cosign keyless signature (v0.12.0+; legacy releases shipped this as SHA256SUMS.bundle)
 <artifact>.intoto.jsonl × N           ← SLSA provenance, one per binary archive/installer (v0.12.0+)
 ```
 
-On a pre-release tag (`vX.Y.Z-rcN`) the names differ: the `.deb` files are `…_X.Y.Z-rcN_amd64.deb` (the package's own `Version:` is `X.Y.Z~rcN`, so it sorts before the final release — the file name uses the tag's form because GitHub rewrites `~` in asset names, #5141), the RPMs are `…-X.Y.Z-0.1.rcN.x86_64.rpm`, and the Windows/macOS installers use `X.Y.Z_rcN`. Every name in `SHA256SUMS` must equal an asset name: `sha256sum -c SHA256SUMS` after downloading all assets is the check.
+On a pre-release tag (`vX.Y.Z-rcN`) the names differ: the `.deb` files are `…_X.Y.Z-rcN_amd64.deb` (the package's own `Version:` is `X.Y.Z~rcN`, so it sorts before the final release — the file name uses the tag's form because GitHub rewrites `~` in asset names, #5141), the RPMs are `…-X.Y.Z-0.1.rcN.x86_64.rpm`, and the Windows/macOS installers use `X.Y.Z_rcN`. Every name in `SHA256SUMS` must equal an asset name: `sha256sum -c SHA256SUMS` after downloading all assets is the check. The per-artifact SBOMs follow the package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`); each records its file's SHA-256, and the release job's "Check artifact SBOM scope" step (`scripts/ci/artifact-sbom.py check`) refuses, before the GitHub Release is created (the images are already pushed by then), any file SBOM that does not match its file, is over its entry bound or lists a path under one of the checkout, build- or test-tree segments the script names (`vcpkg/`, `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`, `.git/`, `.github/`; a scan of some other wrong directory is caught, if at all, by the entry bound), and any image SBOM pair left without the incomplete marker its image calls for.
 
 If any expected asset is missing, the workflow's `Create GitHub Release` step likely failed silently on a single asset (the `gh release create` call is one big command and a single missing asset returns non-zero). Re-upload the missing one:
 
@@ -614,6 +681,7 @@ docker image inspect "ghcr.io/$OWNER/yuzu-server:X.Y.Z" --format '{{.Config.Labe
 For non-prerelease tags, also verify the floating tags moved:
 
 ```bash
+OWNER=$(echo "DevNullLtd" | tr '[:upper:]' '[:lower:]')   # tr3kkr for releases <= 0.13.0 (see the block above)
 docker pull "ghcr.io/$OWNER/yuzu-server:latest"
 docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigests}}'
 # Expect the same digest as :X.Y.Z
@@ -622,44 +690,60 @@ docker image inspect "ghcr.io/$OWNER/yuzu-server:latest" --format '{{.RepoDigest
 Verify the cosign signature + GitHub attestation provenance. **Before running either command, gate on the client being installed** — first-time runs on a fresh dev box will hit one or both missing, and burning 30 min to discover "oh, I need cosign" post-release is exactly the gap v0.11.0-rc2 surfaced:
 
 ```bash
-# Preflight: require cosign + gh 2.50+ for attestation verify.
+# Preflight: require cosign + gh 2.102.0+ for the pinned attestation verify
+# (older gh matches --signer-workflow by prefix and --source-ref case-insensitively).
 if ! command -v cosign >/dev/null 2>&1; then
   echo "WARN: cosign not installed — Sigstore signature round-trip skipped"
   echo "     install: curl -sSL https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 -o ~/.local/bin/cosign && chmod +x ~/.local/bin/cosign"
 fi
-GH_MAJOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[1]}')
-GH_MINOR=$(gh --version | awk 'NR==1{split($3,a,"."); print a[2]}')
-if [[ "$GH_MAJOR" -lt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -lt 50 ) ]]; then
-  echo "WARN: gh $GH_MAJOR.$GH_MINOR predates attestation subcommand (need 2.50+)"
+# Same version test as release-verification.md's script and build-agent-bundle.sh:
+# plain X.Y.Z at or above 2.102.0, anything else (missing, a dev build) fails it.
+GH_VERSION=$(gh --version 2>/dev/null | awk 'NR==1 {print $3}') || GH_VERSION=""
+GH_PINNED_OK=0
+if [[ "$GH_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] \
+   && [[ "$(printf '%s\n' 2.102.0 "$GH_VERSION" | sort -V | head -1)" == 2.102.0 ]]; then
+  GH_PINNED_OK=1
+else
+  echo "WARN: gh ${GH_VERSION:-<not found>} is missing, not a release version, or older than 2.102.0:"
+  echo "     it cannot enforce --signer-workflow/--source-ref as written, so the attestation check below is SKIPPED"
   echo "     upgrade: curl -sSL https://github.com/cli/cli/releases/latest/download/gh_\$(gh api repos/cli/cli/releases/latest --jq .tag_name | sed s/v//)_linux_amd64.tar.gz -o /tmp/gh.tgz && tar xzf /tmp/gh.tgz -C /tmp && install -m755 /tmp/gh_*_linux_amd64/bin/gh ~/.local/bin/gh"
 fi
 
 gh release download "vX.Y.Z" --pattern 'SHA256SUMS*'
 sha256sum -c SHA256SUMS
 
-# cosign: verify the keyless signature on SHA256SUMS + both images
+# cosign: verify the keyless signature on SHA256SUMS + both images, with the EXACT
+# tag-bound identity (never a wildcard). Signer = the repo that ran release.yml.
+# Tr3kkR/Yuzu only for releases <= 0.13.x
+SIGNER_REPO=DevNullLtd/Yuzu
+OWNER=$(echo "DevNullLtd" | tr '[:upper:]' '[:lower:]')   # tr3kkr for releases <= 0.13.0 (see the image check above)
 if command -v cosign >/dev/null 2>&1; then
   cosign verify-blob \
     --bundle SHA256SUMS.sigstore \
-    --certificate-identity-regexp '.*' \
+    --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
     --certificate-oidc-issuer https://token.actions.githubusercontent.com \
     SHA256SUMS
   for img in yuzu-server yuzu-gateway; do
     cosign verify \
-      --certificate-identity-regexp '.*' \
+      --certificate-identity "https://github.com/$SIGNER_REPO/.github/workflows/release.yml@refs/tags/vX.Y.Z" \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
       "ghcr.io/$OWNER/$img:X.Y.Z"
   done
 fi
 
-# gh attestation: verifies SLSA build provenance bound to the exact workflow run
-if [[ "$GH_MAJOR" -gt 2 || ( "$GH_MAJOR" -eq 2 && "$GH_MINOR" -ge 50 ) ]]; then
-  gh attestation verify yuzu-linux-x64.tar.gz --repo DevNullLtd/Yuzu
-  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo DevNullLtd/Yuzu
+# gh attestation: verifies SLSA build provenance, pinned to release.yml at the tag
+# (--repo alone accepts an attestation from any workflow in the repository)
+# Best-effort, like build-agent-bundle.sh: on an unsuitable gh it says so, and
+# provenance is then NOT verified (the customer page's script refuses instead).
+if [[ "$GH_PINNED_OK" -eq 1 ]]; then
+  gh attestation verify yuzu-linux-x64.tar.gz --repo "$SIGNER_REPO" \
+    --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
+  gh attestation verify "oci://ghcr.io/$OWNER/yuzu-server:X.Y.Z" --repo "$SIGNER_REPO" \
+    --signer-workflow "$SIGNER_REPO/.github/workflows/release.yml" --source-ref refs/tags/vX.Y.Z
+else
+  echo "SKIPPED: SLSA provenance NOT verified (gh ${GH_VERSION:-<not found>} cannot enforce the pins; need 2.102.0+)"
 fi
 ```
-
-**Tighten the identity regex for an auditor-grade check** (optional but recommended once you trust the infra): replace `'.*'` with `'https://github\.com/DevNullLtd/Yuzu/\.github/workflows/release\.yml@refs/tags/vX\.Y\.Z'` — that assertion fails if the signer was anything other than this repo's release workflow on this exact tag.
 
 ## Phase 5 — Compose Wizard verification
 
@@ -777,7 +861,7 @@ Releases that hit unfamiliar failure modes (the v0.10.0 download-artifact bug) h
 - **Self-hosted runner required for Linux + Windows + gateway.** The workflow assumes the self-hosted pools (`yuzu-bigtam-linux`, `yuzu-weetam-windows`, `yuzu-bigmags-macos`) are online; the runner-inventory-sentinel workflow gates this separately. If a runner is offline at tag-push time, the build matrix will queue indefinitely. Phase 2 monitor will surface this as `status=queued` for >5 min — escalate by waking the runner.
 - **No rollback.** Once `gh release create` runs, the release is public. Untagging is technically possible but discouraged once consumers exist. Prefer a follow-up patch release (vX.Y.Z+1) over rollback.
 - **Compose Wizard requires the tag's commit to have `tools/compose-wizard/`.** PR #405 merged to `main` directly. If a future release is cut from a branch that hasn't reconciled with main, the wizard won't be in the source tree and the workflow step will skip it. Preflight does NOT currently check for this — consider adding.
-- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing and operators must verify integrity via `sha256sum -c SHA256SUMS` only.
+- **Cosign keyless signing requires GitHub Actions OIDC.** Manual asset uploads via `gh release upload` are NOT signed. If a release was assembled manually (per Phase 3 table), `SHA256SUMS.sigstore` will be missing, `scripts/build-agent-bundle.sh` refuses such a release (it never trusts an unsigned `SHA256SUMS`), and operators must say so plainly: `sha256sum -c SHA256SUMS` alone shows the files match an UNAUTHENTICATED list, not that the release is genuine.
 
 ## Files this skill touches
 

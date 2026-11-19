@@ -28,9 +28,18 @@
 %%% `cRLStreamIdentifier'), an indirect one (a `certificateIssuer' entry extension, whose serials
 %%% belong to another issuer's namespace), an entry that un-revokes (`removeFromCRL'), and any
 %%% extension it does not understand that the CA marked critical (RFC 5280 5.2: a relying party
-%%% that cannot process a critical extension MUST NOT use the CRL). Each is `malformed'. A BASE
-%%% CRL from a CA that also publishes deltas (`freshestCRL') is accepted as the complete list as of
-%%% its thisUpdate; the deltas are never consulted.
+%%% that cannot process a critical extension MUST NOT use the CRL). Each is `unsupported' (a well-formed
+%%% CRL the gateway's policy refuses; `malformed' is kept for input that does not decode or is not
+%%% internally consistent). A BASE CRL from a CA that also publishes deltas (`freshestCRL') is
+%%% accepted as the complete list as of its thisUpdate; the deltas are never consulted.
+%%%
+%%% A CRL's own validity can be bounded (parse/4, `max_validity_s'): a validly signed CRL whose
+%%% `nextUpdate - thisUpdate' is wider is refused `validity_too_long', so a far-future nextUpdate
+%%% cannot keep the staleness alerts quiet. The width is a property of the two dates in the CRL and is
+%%% never compared with the gateway's clock. Decode precedes signature verification
+%%% (public_key:pkix_crl_verify/2 decodes the CRL itself and no cheaper check exists), so a CRL of
+%%% the size bound costs a full decode before it is refused as `unverified' (ADR 2004 A6, the Update
+%%% of 2026-11-05).
 %%%
 %%% Serial numbers are only unique PER ISSUING KEY, and two CAs can carry the same subject name
 %%% (the server CA's subject is `Yuzu Install CA (<hostname>)', reused by a same-host re-root). So
@@ -57,15 +66,17 @@
 
 -include_lib("public_key/include/public_key.hrl").
 
--export([parse/3, replace/2, check/4, ca_certs/1, issuer_of_cert/1]).
--export([max_bytes/0, max_future_s/0, time_to_epoch/1]).
+-export([parse/3, parse/4, replace/2, check/4, ca_certs/1, issuer_of_cert/1]).
+-export([max_bytes/0, warn_bytes/0, max_future_s/0, time_to_epoch/1]).
 
--export_type([crl/0, load_reject/0, check_reject/0, replace_result/0]).
+-export_type([crl/0, load_reject/0, check_reject/0, replace_result/0, parse_opts/0]).
 
 %% The largest CRL read or kept. A CRL is a few hundred bytes plus about 40 per revoked
 %% certificate, so 16 MiB is hundreds of thousands of entries; over it the file is a read failure
 %% and the previous CRL stands. The fetch (yuzu_gw_mgmt_crl_source) enforces it while streaming.
 -define(MAX_BYTES, 16 * 1024 * 1024).
+%% The size at which the watcher starts to warn that the bound is near: three quarters of it.
+-define(WARN_BYTES, (?MAX_BYTES * 3 div 4)).
 %% thisUpdate this far ahead of the gateway's clock is a clock fault on one side or the other;
 %% beyond it the CRL is refused (and never evicts a loaded one).
 -define(MAX_FUTURE_S, 3600).
@@ -84,14 +95,24 @@
                  revoked := #{non_neg_integer() => true}}.
 
 %% Why a CRL was not loaded (a closed set; the label of yuzu_gw_mgmt_crl_rejected_total
-%% together with the fetch failures of yuzu_gw_mgmt_crl_source).
--type load_reject() :: malformed | too_large | unverified | issuer_mismatch
-                     | future_dated | replay.
+%% together with the fetch failures of yuzu_gw_mgmt_crl_source). `malformed': does not decode or is
+%% not internally consistent. `unsupported': well formed, and refused by policy (not the issuer's
+%% complete base list, or carries a critical extension this module cannot process).
+%% `validity_too_long': a validly signed CRL whose nextUpdate - thisUpdate exceeds the configured
+%% maximum (`max_validity_s').
+-type load_reject() :: malformed | unsupported | too_large | unverified | issuer_mismatch
+                     | validity_too_long | future_dated | replay.
+%% `max_validity_s' bounds the WIDTH of the CRL's own validity (nextUpdate - thisUpdate); it is never
+%% measured against a clock. Absent: unbounded.
+-type parse_opts() :: #{max_validity_s => pos_integer()}.
 -type check_reject() :: revocation_unknown | revocation_stale | crl_revoked | bad_peer_cert.
 -type replace_result() :: {replace, crl()} | unchanged | {reject, replay}.
 
 -spec max_bytes() -> pos_integer().
 max_bytes() -> ?MAX_BYTES.
+
+-spec warn_bytes() -> pos_integer().
+warn_bytes() -> ?WARN_BYTES.
 
 -spec max_future_s() -> pos_integer().
 max_future_s() -> ?MAX_FUTURE_S.
@@ -104,19 +125,24 @@ max_future_s() -> ?MAX_FUTURE_S.
 %% certificates the signature is checked against; `Now' is seconds since the epoch. Total: any
 %% input maps to a result, never an exception (pkix_crl_verify/2 RAISES on malformed input).
 -spec parse(term(), [binary()], integer()) -> {ok, crl()} | {error, load_reject()}.
-parse(Bin, _CaDers, _Now) when is_binary(Bin), byte_size(Bin) > ?MAX_BYTES ->
+parse(Bin, CaDers, Now) ->
+    parse(Bin, CaDers, Now, #{}).
+
+%% @doc parse/3 with options (see parse_opts()).
+-spec parse(term(), [binary()], integer(), parse_opts()) -> {ok, crl()} | {error, load_reject()}.
+parse(Bin, _CaDers, _Now, _Opts) when is_binary(Bin), byte_size(Bin) > ?MAX_BYTES ->
     {error, too_large};
-parse(Bin, CaDers, Now) when is_binary(Bin), is_list(CaDers), is_integer(Now) ->
+parse(Bin, CaDers, Now, Opts) when is_binary(Bin), is_list(CaDers), is_integer(Now), is_map(Opts) ->
     try
         Der = to_der(Bin),
         Crl = public_key:der_decode('CertificateList', Der),
         Fields = fields(Crl),
-        verified(Der, Fields, CaDers, Now)
+        verified(Der, Fields, CaDers, Now, Opts)
     catch
         throw:{reject, Reason} -> {error, Reason};
         _:_ -> {error, malformed}
     end;
-parse(_, _, _) ->
+parse(_, _, _, _) ->
     {error, malformed}.
 
 %% PEM wraps the DER in an `X509 CRL' block; anything else is taken to be DER already.
@@ -163,7 +189,7 @@ crl_extensions(Exts) when is_list(Exts) ->
                   orelse (Critical =:= true
                           andalso Id =/= ?'id-ce-cRLNumber'
                           andalso Id =/= ?'id-ce-authorityKeyIdentifier'),
-              Refuse andalso throw({reject, malformed})
+              Refuse andalso throw({reject, unsupported})
       end, Exts);
 crl_extensions(_) ->
     ok.
@@ -185,14 +211,14 @@ entry_extension_list(Exts) when is_list(Exts) ->
       fun(#'Extension'{extnID = Id, critical = Critical, extnValue = Value}) ->
               if
                   Id =:= ?'id-ce-certificateIssuer' ->
-                      throw({reject, malformed});
+                      throw({reject, unsupported});
                   Id =:= ?'id-ce-cRLReasons' ->
                       removeFromCRL =:= public_key:der_decode('CRLReason', Value)
-                          andalso throw({reject, malformed});
+                          andalso throw({reject, unsupported});
                   Id =:= ?'id-ce-invalidityDate'; Id =:= ?'id-ce-holdInstructionCode' ->
                       ok;
                   Critical =:= true ->
-                      throw({reject, malformed});
+                      throw({reject, unsupported});
                   true ->
                       ok
               end
@@ -226,19 +252,30 @@ revoked(List) when is_list(List) ->
 valid_serial(S) when is_integer(S), S >= 0, S < (1 bsl 160) -> S;
 valid_serial(_) -> throw({reject, malformed}).
 
-verified(Der, #{issuer := Issuer, this_update := This} = Fields, CaDers, Now) ->
+%% The order of the refusals after the signature is part of the contract: a CRL that is too wide is
+%% refused as such whatever its thisUpdate (the bound is a property of the CRL's own two dates, and
+%% never of the gateway's clock), and only then is a thisUpdate in the future a clock question.
+verified(Der, #{issuer := Issuer, this_update := This, next_update := Next} = Fields,
+         CaDers, Now, Opts) ->
     case verifying_ca(Der, Issuer, CaDers) of
         none ->
             {error, unverified};
         issuer_mismatch ->
             {error, issuer_mismatch};
         {ok, Signers} ->
-            case This > Now + ?MAX_FUTURE_S of
-                true  -> {error, future_dated};
-                false -> {ok, (maps:with([number, this_update, next_update, issuer, revoked],
-                                         Fields))#{signers => Signers}}
+            case too_wide(Next - This, Opts) of
+                true ->
+                    {error, validity_too_long};
+                false when This > Now + ?MAX_FUTURE_S ->
+                    {error, future_dated};
+                false ->
+                    {ok, (maps:with([number, this_update, next_update, issuer, revoked],
+                                    Fields))#{signers => Signers}}
             end
     end.
+
+too_wide(Width, #{max_validity_s := Max}) when is_integer(Max) -> Width > Max;
+too_wide(_Width, _Opts) -> false.
 
 %% Does any certificate in the verification set verify the signature? Order does not matter:
 %% every certificate is tried, each inside its own try (a CRL that raises against one

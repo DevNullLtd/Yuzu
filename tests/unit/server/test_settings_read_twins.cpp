@@ -34,6 +34,7 @@
 #include "pg/secret_codec.hpp"
 #include "test_route_sink.hpp"
 
+#include <yuzu/echo_retention_tick.hpp>
 #include <yuzu/server/auth.hpp>
 #include <yuzu/server/auto_approve.hpp>
 #include <yuzu/server/server.hpp>
@@ -326,10 +327,14 @@ TEST_CASE("GET /api/v1/settings/data-retention carries the Echo tier defaults an
     CHECK(data.at("echo").at("tick_seconds").get<int>() == 900);
     const auto& tiers = data.at("echo").at("tiers");
     REQUIRE(tiers.is_array());
+    // Roll-up only: a source's daily tier is published, and the byte budget is the agent's default.
+    CHECK(data.at("echo").at("db_budget_bytes").get<long long>() == yuzu::kEchoDbBudgetBytesDefault);
     bool found = false;
-    for (const auto& t : tiers)
+    for (const auto& t : tiers) {
         found = found || (t.at("source") == "process" && t.at("tier") == "hourly" &&
                           t.at("limit").get<long long>() == 7776000);
+        CHECK(t.contains("budget_dependent"));
+    }
     CHECK(found);
 
     auto frag = h.sink.Get("/fragments/settings/data-retention");
@@ -545,6 +550,22 @@ TEST_CASE("The analytics HTML fragment sanitizes the ClickHouse URL identically 
     CHECK(res->status == 200);
     CHECK(res->body.find("s3cr3t") == std::string::npos);
     CHECK(res->body.find("host:9000/yuzu") != std::string::npos);
+}
+
+// #6940: the fragment shows the ClickHouse username and whether a password is set; it is never
+// cached. `set_header` appends and `get_header_value` returns the first, so count them too.
+TEST_CASE("The analytics HTML fragment is Cache-Control: no-store, private with Vary: Cookie",
+          "[settings][settings-read-twins][cache]") {
+    SettingsReadTwinsHarness h;
+    h.cfg.clickhouse_url = "clickhouse://admin:s3cr3t@host:9000/yuzu";
+
+    auto res = h.sink.Get("/fragments/settings/analytics");
+    REQUIRE(res);
+    REQUIRE(res->status == 200);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK(res->get_header_value("Vary") == "Cookie");
+    CHECK(res->headers.count("Cache-Control") == 1);
+    CHECK(res->headers.count("Vary") == 1);
 }
 
 TEST_CASE("The NVD settings fragment never re-shows proxy credentials",

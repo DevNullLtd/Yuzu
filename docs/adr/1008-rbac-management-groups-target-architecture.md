@@ -19,6 +19,14 @@ supersedes: nothing (net-new target-architecture record; ADR-0017/0033/1006 rema
 
 ## Binding status
 
+> **Partial delivery while proposed (2026-11-14, against dev @ 2c49b4ea0).** The status is unchanged.
+> Part of D2 is implemented: the escalation-safe enable/disable toggle
+> (`RbacStore::set_rbac_enforcement`, the A1 delivery note under D2) and the fresh-install
+> bootstrap (`RbacStore::provision_first_admin`, called from `main.cpp`; `rbac_store.cpp` cites
+> this ADR's delivery note). The seeded-default flip stays deferred, as D2's own note says. No
+> other decision is recorded here as delivered; the `/governance` sentence below is about this
+> ADR's acceptance, not about the D2 code.
+
 **Proposed, not accepted.** Numbered ADR-1008; committed to the repo for `/governance` review;
 not yet through it. Written in the repo's ADR shape to be evaluated as one before any decision
 to accept it. If accepted, it binds **prospectively**: the "not yet built" and "non-conformance"

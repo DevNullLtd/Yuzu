@@ -9,7 +9,7 @@ Each plugin that has adopted the README standard (`docs/plugin-readme-standard.m
 The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dylib`); there is no alias, and the agent rejects a leftover `tar` plugin file. See the Echo section of [Upgrading](upgrading.md).
 
 <!-- BEGIN GENERATED: plugin-doc-gen index -->
-72 of 72 plugins document themselves this way; the rest are described in the prose below until their README lands.
+74 of 74 plugins document themselves this way; the rest are described in the prose below until their README lands.
 
 | Plugin | Platforms | What it does | Docs |
 |---|---|---|---|
@@ -25,6 +25,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
+| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives) | [README](../../agents/plugins/component_inventory/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
@@ -37,7 +38,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `execution_artifacts` | ✅ ⛔ ⛔ | Windows execution-evidence sources: ShimCache, Amcache InventoryApplicationFile, and Prefetch. Forensics-gated, single-target, default-off | [README](../../agents/plugins/execution_artifacts/README.md) |
 | `filesystem` | ✅ ✅ ✅ | Filesystem operations — exists, list_dir, file_hash, search_dir, text ops (admin-only) | [README](../../agents/plugins/filesystem/README.md) |
 | `filesystem_posture` | 🟡 ✅ 🟡 | Reports mounted filesystems, per-mount quota-subsystem state, and snapshot-capable volumes | [README](../../agents/plugins/filesystem_posture/README.md) |
-| `firewall` | ✅ ✅ ✅ | Firewall status and rule listing | [README](../../agents/plugins/firewall/README.md) |
+| `firewall` | ✅ ✅ ✅ | Firewall status, rule listing and device containment | [README](../../agents/plugins/firewall/README.md) |
 | `firmware_posture` | ✅ 🟡 🟡 | Reports firmware/BIOS vendor, version, release date and update-pending posture | [README](../../agents/plugins/firmware_posture/README.md) |
 | `hardware` | ✅ ✅ ✅ | Reports hardware inventory: manufacturer, model, BIOS, CPU, memory, disks, drivers, chassis, baseboard, swap, machine id | [README](../../agents/plugins/hardware/README.md) |
 | `http_client` | ✅ ✅ ✅ | HTTP client — download files, GET/HEAD requests with hash verification (no shell-out) | [README](../../agents/plugins/http_client/README.md) |
@@ -56,14 +57,14 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `network_diag` | ✅ ✅ ✅ | Network diagnostics — listening ports and established connections | [README](../../agents/plugins/network_diag/README.md) |
 | `os_info` | ✅ ✅ ✅ | Reports OS name, version, build, architecture, and system uptime | [README](../../agents/plugins/os_info/README.md) |
 | `peripherals` | ✅ ✅ ✅ | USB, PCI and Thunderbolt/USB4 device inventory | [README](../../agents/plugins/peripherals/README.md) |
-| `pkg_inventory` | 🟡 ✅ ✅ | Machine-scope package-manager inventory (managers, packages and store_packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
+| `pkg_inventory` | ✅ ✅ ✅ | Machine-scope package-manager inventory (managers, packages and store_packages); per-user package stores are out of scope, deferred to the user-session helper | [README](../../agents/plugins/pkg_inventory/README.md) |
 | `platform_security` | ✅ ✅ ✅ | Secure Boot and code-integrity enforcement posture (read-only) | [README](../../agents/plugins/platform_security/README.md) |
 | `power_health` | ✅ ✅ 🟡 | Battery, thermal, and power-plan inventory, plus a gated power-plan switch | [README](../../agents/plugins/power_health/README.md) |
 | `printing` | ✅ ✅ ✅ | Printer/job inventory plus a single narrowly-scoped clear_queue cancellation | [README](../../agents/plugins/printing/README.md) |
 | `privacy_permissions` | 🟡 🟡 🟡 | Per-app sensitive-permission grants -- camera, microphone, location, full-disk-access equivalents (read-only) | [README](../../agents/plugins/privacy_permissions/README.md) |
+| `process_introspect` | 🟡 🟡 🟡 | Per-process introspection of one pid, one facet per request: resource limits, signal masks, capabilities, seccomp, OOM and scheduling; numbers and masks only | [README](../../agents/plugins/process_introspect/README.md) |
 | `processes` | ✅ ✅ ✅ | Process listing — enumerate and query running processes | [README](../../agents/plugins/processes/README.md) |
 | `procfetch` | ✅ ✅ ✅ | Enumerates running processes with SHA-1 hashes of executables | [README](../../agents/plugins/procfetch/README.md) |
-| `quarantine` | ✅ ✅ ✅ | Device network isolation (quarantine) with per-IP whitelisting | [README](../../agents/plugins/quarantine/README.md) |
 | `rdp_control` | ✅ ⛔ ⛔ | Remote Desktop control — enable/disable RDP (registry + firewall + TermService) | [README](../../agents/plugins/rdp_control/README.md) |
 | `registry` | ✅ 🟡 🟡 | Windows Registry -- get, set (six types, verified), delete value, delete key (optionally recursive), enumerate, per-user reads and writes, bulk apply with an undo manifest | [README](../../agents/plugins/registry/README.md) |
 | `remote_access_audit` | 🟡 ✅ 🟡 | SSH inbound-access audit: sshd_config as written, per-account authorized_keys fingerprints, sshd service state; never key comments, option values or paths | [README](../../agents/plugins/remote_access_audit/README.md) |
@@ -79,6 +80,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `tags` | ✅ ✅ ✅ | Device tagging — set, get, delete, list tags for scope evaluation | [README](../../agents/plugins/tags/README.md) |
 | `update_source_trust` | 🟡 🟡 ✅ | Package and update-source trust posture (facts only) | [README](../../agents/plugins/update_source_trust/README.md) |
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
+| `virtualization` | 🟡 ✅ ✅ | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions, container-runtime posture | [README](../../agents/plugins/virtualization/README.md) |
 | `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
 | `wifi` | ✅ 🟡 🟡 | Scans visible WiFi networks and reports current connection status | [README](../../agents/plugins/wifi/README.md) |
 | `windows_optional_features` | ✅ ⛔ ⛔ | Windows optional OS feature state (enabled/disabled/pending) via the DISM API | [README](../../agents/plugins/windows_optional_features/README.md) |

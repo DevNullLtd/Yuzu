@@ -27,8 +27,8 @@ no pre-configuration", which has two distinct uses:
 2. **Cheap inventory snapshots.** The same data — the most recent
    process list, the open TCP connection map, the running services —
    doubles as an always-fresh inventory source for dashboards and
-   compliance evidence. Because the live tier is row-count-bounded, a
-   `SELECT * FROM $Process_Live` always returns "now-ish".
+   compliance evidence. Because every tier is bucketed and bounded, a
+   `SELECT * FROM $Process_Hourly ORDER BY hour_ts DESC LIMIT 20` always returns recent activity.
 
 What Echo is **not**:
 
@@ -113,6 +113,60 @@ Flow:
    budget from the roll-up declarations with no change (it is listed in
    `budget_hourly_eligible_sources()`, which `test_echo_aggregator.cpp` pins
    to a literal so a new source is a decision).
+5. The weekly dictionary sweep (`run_dictionary_gc`, schedule in the pure
+   `dict_gc_plan`) holds `rollup_mu_` and the fold's `op_mu_` for its whole
+   deadline, or until an agent stop (below). A pass whose live-set scan does
+   not finish deletes nothing and is a starved pass: it bumps `dict_gc_starved_total` and `dict_gc_starved_streak`
+   and stamps `dict_gc_last_attempt_ts`; the next attempt is due a day later
+   (not at the next 15-minute pass) with the deadline doubled, 2 s, 4 s, then
+   8 s. A finished scan resets the streak to 0. Both markers are durable, so a
+   restart keeps the backoff; a crash between the sweep and the marker writes
+   repeats one attempt. A marker ahead of the clock is stale and never postpones
+   a pass. The 8 s ceiling is the bound: a scan that needs longer starves
+   every day (the upgrade is to resume the scan across passes). Both the weekly
+   sweep and an operator `purge_source` (which runs the same sweep under a
+   60 s deadline) pass the agent's stop latch, `yuzu::agent::
+   subprocess_cancel_requested`, to `gc_dictionary`, which polls it where it
+   polls the deadline. The latch is one process-lifetime flag in the
+   agent-core library that `Agent::stop()` raises as soon as the stop is
+   requested, before it joins the command workers (`thread_pool_`) and before
+   the trigger engine and the plugin `shutdown()` loop, so a stop reaches a
+   sweep that those joins would otherwise wait out; a plugin-local flag set in
+   `shutdown()` would arrive too late, after the pool join. A sweep ends at its
+   next check (between batches, or inside a statement at the progress handler's
+   1000-instruction poll); the row delete, a `COMMIT` and the wait for the
+   write lock are not interruptible, and a lost server connection is not a
+   stop. A sweep a stop ended is not a starved one: it is not counted, and the
+   weekly pass stamps neither marker. The same purge reports a final
+   `TRUNCATE` checkpoint that did not complete (busy timeout 0, so a pinned
+   WAL answers at once) as `wal_pending` rather than only logging it; the
+   pages stay in the log until a later checkpoint truncates it, which a rerun
+   of the purge does, and the maintenance pass does only when it evicts rows
+   or the log outgrows its allowance (an automatic retry is not built). The
+   test that drives this wiring is the single-threaded dispatcher case in
+   `test_echo_local_dispatcher.cpp`, which raises the latch for a scope; a
+   stop racing an in-flight action is not covered by a test.
+
+**The `status` row-count scan (#7123), measured.** `status` reads each
+capture source's finest tier for its row count and oldest bucket. In one
+`SELECT COUNT(*), IFNULL(MIN(bucket), 0)` SQLite scans the whole covering
+index. As two statements, a lone `COUNT(*)` is a b-tree count (the `Count`
+opcode: SQLite sums each page's cell count without decoding rows), and the
+shipped `SELECT IFNULL(MIN(bucket), 0)` is one index seek (`EXPLAIN QUERY PLAN`:
+`SEARCH ... USING COVERING INDEX`; the bytecode stops after the first index
+entry). The plan line for the lone `COUNT(*)` still reads `SCAN ... USING
+COVERING INDEX`, because the plan does not show the `Count` opcode; its timing
+is the evidence there. Scope: the `sqlite3` CLI (library 3.51.0,
+`/usr/bin/sqlite3`) on the Mac mini `braga`, one table written to the shape
+`generate_fold_ddl` (`echo_fold_schema.cpp`) emits for `process_hourly_r` (an
+`INTEGER PRIMARY KEY` row table plus the unique `(hour_ts, name_id, user_id,
+parent_name_id)` index; written by hand from that generator, not dumped from a
+live database), 2,000,000 synthetic rows, warm cache, `/usr/bin/time` wall
+clock over three runs: the combined statement with the shipped `IFNULL`
+took 0.04 to 0.05 s (0.06 to 0.08 s with a bare `MIN`), the lone
+`COUNT(*)` 0.01 s, the shipped lone `IFNULL(MIN(...), 0)` under 0.01 s. That is
+one host, one SQLite build and one table shape, not a fleet figure, so
+`status` now issues the two statements.
 
 Two in-memory structures keep the folded event volume down. `HourlySeenSet`
 (`echo_hour_dedup.hpp`) is membership-only, holds at most 20,000 keys, is
@@ -220,6 +274,24 @@ path, value name, data type, data, data size, the previous type, data and size, 
 -- never `ts`, `actor_pid`, `actor_image` or `detail`. An empty or NUL-bearing `record_key`
 refuses the batch.
 
+The cursor driver (`collect_slow_impl`, `echo_plugin.cpp`) backs off a source whose ticks keep
+failing (`CursorRetry`, `echo_cursor.hpp`). After the n-th consecutive failed tick (a cursor read
+failure, `IncompleteCaptureError` or any other exception) the source is next attempted
+`slow_interval x min(2^(n-1), 12)` later, less half a tick of slack so jitter cannot cost a whole
+extra tick. The order per source is enable gate, backoff check, cursor read, collect. A skipped
+tick writes `echo|collect_<src>|0|retry_backoff`, adds the source to `skipped_sources`, and is NOT
+recorded in the health ledger; `status` shows `config|<src>_next_retry_at|<epoch>` for as long as
+it lasts. Any tick that returns ends the backoff, `CursorLost` included (the source has committed a
+re-baseline and there is nothing to re-read). The enable gate drops the record, and so does a real
+enable/disable edge in `do_configure` (under `collect_mu_`), so two toggles between slow ticks
+cannot inherit one. The state is in memory: a restart retries at once. A failed commit itself loses
+nothing for the log-based sources, which replay from an unchanged cursor, but a longer wait widens
+two limits: the subscription legs' `BoundedPendingQueue` drops its oldest entry at 4096 (rule 6)
+and an OS log can wrap past the cursor (rule 2); both are counted and written as a `capture_gap`
+row on the next tick that completes. `registry` re-derives its loss accounting, so its next
+committed tick after commit failures also writes one `gap:commit_stalled` row whose key carries the
+window (rule 3b), unless a restart intervened.
+
 **Event times are trusted as given.** A bucket comes from the event's own UTC stamp: no clamp, no
 counter. Accepted residual: a stamp inside the representable domain but far in the future makes a
 bucket only age-based eviction removes. The one refusal is a stamp outside 0001-01-01 ..
@@ -275,7 +347,7 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
 
 1. Pre-check: the volume holds twice the file plus its write-ahead log free, else the open fails
    with a message that begins with `kFreeSpaceRefusalPrefix`; the plugin then loads offline (`storage_state|offline|free_space`,
-   no trigger registered) instead of failing to load. A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
+   no trigger registered) instead of failing to load, and retries the open in the background (below). A free-space figure that cannot be read is a refusal too (the 2x check is mandatory, never skipped) and is logged; a database with nothing to migrate needs no room.
 2. Rename each old summary tier to `<name>_legacy`, install the roll-up schema, then convert every
    legacy row into the interned table (an average becomes `avg * samples`, a sum column is rebuilt
    from it, the keys intern through the dictionary).
@@ -347,8 +419,8 @@ retired tables just gets the roll-up schema installed. Otherwise `migrate_to_v10
    an average that is not a finite sum is refused before any write to that tier, with the table,
    column and row id named.
 4. Seed the replay ring with the newest 4096 `record_key`s of each cursor source, drop the retired
-   tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, create the empty `$X_Live`
-   shim views (`legacy_live_shim_ddl()`), and write `schema_version` 10.
+   tables, delete the rollup marks, `usage_hwm_id` and `usage_lag_events`, and write
+   `schema_version` 10. No view takes a retired table's name.
 
 A failure at any step, a crash or a power loss before the commit leaves the retired tables intact and the
 next open retries from v9. After the commit `open()` refuses if the connection is not in autocommit mode
@@ -357,9 +429,9 @@ when the volume holds twice the new file free (else it records `auto_vacuum_defe
 maintenance pass retries). The log line carries the duration, rows converted, rows folded, rows
 rejected, replay keys seeded, tables dropped, file sizes and the WAL size at commit. The migration needs
 the retired tables' own column lists, which live in `echo_fold_schema.cpp` (`legacy_live_columns`); they
-are the last copy of the raw schema and exist only to read old files and to answer `$X_Live` reads.
+are the last copy of the raw schema and exist only to read old files.
 
-Three operational facts about the migration. (1) Plugin `init()` blocks for the whole migration:
+Three operational facts about the migration. (1) Plugin `init()` blocks for the first migration attempt, which is bounded by the per-attempt deadline below:
 `agents/core/src/agent.cpp` runs every plugin's init in its load loop (about :1057-1085), before the
 Register RPC and before the heartbeat thread starts (about :2005 and :2582), so the agent registers
 after the migration, and the Windows SCM and systemd (`Type=simple`) have no readiness deadline it can
@@ -367,8 +439,8 @@ trip. Agent-level start-to-registered time is not measured. (2) The transaction'
 the file's size: 325.7 MB on a 241.8 MB file (1.35 times) in the one measurement. The free-space
 pre-check (twice the file plus the log on disk) covers that case (WAL plus new file about 404 MB under the 483 MB demanded); no
 general bound is proven. (3) A failed earlier step (v8) makes `open()` refuse before the roll-up step
-runs; the plugin's init fails (`init_failed` in the heartbeat's `yuzu.plugins_failed`) until a start
-succeeds.
+runs; the plugin loads offline (`storage_state|offline|migration_failed`) and retries the open, as for
+a failed roll-up step (below).
 
 Consequences for code that reads the store:
 - `echo_usage.cpp` is fed the process fold's events inside the process transaction
@@ -376,8 +448,7 @@ Consequences for code that reads the store:
   `PendingBaseline` stamps and folds nothing. A fault in either half rolls back both, and the retried
   tick folds both once.
 - `purge_source` deletes the source's `_r` rows and `echo_fold_seen` rows and sweeps the dictionary.
-- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier; `<src>_live_rows` prints the
-  same figure for one release.
+- The status counts (`<src>_rows`, `<src>_oldest_ts`) read the finest tier.
 - `is_fold_view` is case-sensitive: a query that names a view `Process_Hourly` does not reach it.
 - No fold view may gain a WHERE, JOIN or filter: the pinned column-less `_r` read is sound only
   while every view is a WHERE-less, JOIN-less single-table projection.
@@ -395,8 +466,53 @@ follows it: until then the Echo pages, the process-tree viewer and the canned qu
 registry row (`build_sources()`, section 8) (the tiers' `GranularityDef`s are derived from the
 roll-up declarations, so the registry's tier lists and the declarations cannot drift); a `FoldSourceDef` at the same index in
 `fold_sources()`; a `*_delta` in `echo_fold.hpp`; the count pins in `test_echo_fold.cpp` (17
-sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the regenerated
+sources, 34 tiers, 18 registry tiers); the capability TSV rows and the regenerated
 `docs/os-capability-matrix.md`.
+
+#### Migration failure: offline with retry (owner ruling 2026-11-16, #7290)
+
+A failure of the v10 step that is not a crash leaves the file exactly as found (all-or-nothing) and does
+not fail the plugin. Echo **loads offline**, answers `echo.status` with the reason, collects nothing
+and registers no trigger, and a background thread retries the whole `EchoDatabase::open`. The
+alternative that was rejected is quarantine-and-start-fresh: it would discard data a repair could save,
+break the all-or-nothing rule and re-enable every source an operator had paused.
+
+- **Reasons.** `free_space` (the pre-check refusal), `migration_failed` (the v10 step failed, ran past
+  its deadline, or an earlier step had not finished), `open_failed` (any other failure seen on a later
+  retry). `classify_open_failure` tells them apart by the open error's text prefix
+  (`echo_status_format.hpp`; `echo_db.cpp` builds the two refusals from the same constants). Every other
+  first-open failure (a planted link, a corrupt file that cannot be moved aside, a busy or unreadable
+  integrity check, an un-adopted `tar.db`) is still a plugin init failure.
+- **First attempt is synchronous.** `init()` makes the first attempt itself, so the agent still
+  registers only after the migration; it is bounded by the deadline below. Later attempts run on the
+  retry thread (`echo_open_retry.hpp`).
+- **Back-off.** 1, 5 and 15 minutes after the first failure, then hourly, for ever
+  (`open_retry_delay`). A `free_space` plugin checks the volume's free bytes against the migration's
+  need (twice the file plus its log) before each attempt and skips the open while short, because every
+  open runs a whole-file `integrity_check`. A deterministic failure (a damaged mark, an out-of-range
+  bucket) still pays a full read and a write-ahead-log write each hour until it is repaired; the repair
+  needs the agent stopped.
+- **Per-attempt deadline.** 60 s plus 2 s per MiB of the database file, doubled for every earlier
+  attempt that ended on the deadline, capped at one hour (`v10_migration_deadline`). The one measured
+  migration took 55 s on a 242 MB file, so a short fixed bound would interrupt every attempt on a
+  full-size database. A hit (or a shutdown, through `v10_cancel`) interrupts the running statement with
+  the progress handler and rolls back. The deadline covers the transaction only: a committed migration
+  is never failed for time, and the post-commit checkpoint and VACUUM are not cancellable.
+- **In-transaction re-read.** Under the write lock the migration reads `schema_version` and the
+  retired-table list again. Version 10 there means a second opener finished first and this open is a
+  no-op; a changed list fails the attempt for the retry to redo. (Two agents on one data directory
+  remain unsupported; a busy file before the migration step is still a hard init failure.)
+- **Going online.** The retry thread assigns `db_`, runs `start_collection` (everything `init` does
+  once the database is open) and only then stores `online_` (release) as that function's last
+  statement. Dispatch loads `online_` (acquire) before touching `db_` or any collector member, and
+  answers with the offline refusal until then. If `start_collection` throws on the retry thread the
+  loop ends (a second start over a half-started source set would double-start sources) and `status`
+  reports `open_failed`; a restart recovers.
+- **Fleet signal.** The plugin KV key `heartbeat.storage_offline` (set to the reason token while
+  offline, deleted when online) reaches the server as the status tag `yuzu.plugin.echo.storage_offline`;
+  the server publishes `yuzu_fleet_echo_storage_offline{reason}` and the alert `YuzuEchoStorageOffline`
+  (warning, 30 minutes) fires on it. The tokens are duplicated literals on the two sides, each pinned
+  by a test.
 
 ---
 
@@ -408,22 +524,35 @@ sources, 34 tiers, 18 registry tiers, 16 shims); the capability TSV rows and the
 | **Uninstall** (`yuzu-agent --remove-service`, MSI uninstall) | echo.db is **left in place** by design. The data dir is operator-managed; uninstall removes the binary and service registration only. To wipe Echo data, delete `<data_dir>/echo.db` explicitly. |
 | **Reinstall over an existing data dir** | The new binary opens the existing echo.db, runs migration if the schema version differs, and resumes collection. State in `echo_state` may be stale (see §5). On Windows, files left by a different agent account are refused rather than adopted (`docs/user-manual/echo.md` "Data storage"). |
 | **`data_dir` change** (config update) | The new directory has no echo.db — the next collect_fast creates it from scratch. The old echo.db at the previous path is orphaned but not deleted. Operator concern, not Echo's. |
-| **An older agent on a migrated file (not supported)** | An older agent does NOT refuse a v10 `echo.db`: no earlier build checks `schema_version` against a ceiling, so it opens the file, its warehouse DDL fails on the `<source>_live` shim views (`views may not be indexed`) and every collector write errors, so it records nothing and reads only the empty views; nothing is dropped or rewritten, but the install is useless until the file is replaced. Not supported and it will not work: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
-| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (a sidecar that can't be moved is removed so the new DB can't replay it). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the sidecar is **not** auto-deleted (operator recovers it). If the corrupt file can't be moved aside (read-only/locked/perms), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
+| **An older agent on a migrated file (not supported)** | No earlier build checks `schema_version` against a ceiling, so an older agent opens a v10 file without refusing it. Not supported: never run an older agent on a migrated file; there is no return to an earlier agent build. An automatic OTA rollback (the updater rolling back a build that failed to verify) lands on the same file and the same applies (`docs/user-manual/upgrading.md` "Returning to an earlier agent build is not supported"). |
+| **Corruption detected at open** (#559) | `EchoDatabase::open` runs `PRAGMA integrity_check`; on failure the corrupt file and its `-wal`/`-shm`/`-journal` sidecars are renamed to `echo.db.corrupt-<epoch>` in the same directory (collision-safe if a second corruption lands in the same epoch-second) and a fresh database is initialised (the move is `claim_quarantine_name` / `quarantine_corrupt_db` in `agents/shared/sqlite_quarantine.hpp`, shared with the command-dedup store; a sidecar that can't be renamed is copied to its quarantine name and then removed, so the new DB can't replay it and the evidence is kept when the copy succeeds; on Windows the copied sidecar is re-secured with the protected DACL afterwards, best effort and logged (`secure_quarantined_sidecars`; a quarantine sidecar name that is foreign-owned or carries a second hard link is skipped and logged, because re-securing a hard link would rewrite its target's DACL); a sidecar that can be neither renamed nor copied is still removed and the loss is logged; the claim is bound to the regular file the check judged: `open()` reads its `lstat` identity while the connection still holds it, the claim refuses a link at the name, releases a claim whose name is not that file after the link or whose original is not that file right before it is dropped, and the mode change never follows a link, so a swapped-in link or a second recovery's fresh file at the name is left alone and open fails closed). All `echo_state` (collector snapshots, `<source>_enabled` flags) resets to defaults; collection resumes against the empty DB. The agent logs `echo.db.corruption_detected`; the operator recovers the quarantined copy, but only the newest three `echo.db.corrupt-*` groups are kept: each quarantine deletes older ones through `prune_old_quarantines` in `agents/shared/sqlite_quarantine.hpp`, never the group just made (#2155). Groups are ordered by the number in the name, so a name left by a clock once set far ahead sorts newest and holds one of the three slots (the same statement `docs/command-dedup.md` makes for the dedup store). The prune is per file and best effort (a file that cannot be removed is logged and retried at the next recovery) and runs only after a successful quarantine, so open still fails closed. If the corrupt file can't be moved aside (read-only/locked/perms, or a data directory on a filesystem without hard links: the quarantine name is claimed with a hard link so it can never overwrite an earlier quarantine, and there is deliberately no rename fallback), open **fails closed** — Echo refuses to load rather than trust the corrupt DB. **A busy database is not a corrupt one** (#7286): `busy_timeout` is set before the integrity check, and if another connection still holds the file past it (`SQLITE_BUSY` / `SQLITE_LOCKED`) open returns a busy error, quarantines nothing and leaves the file in place; the next start retries. **Only an explicit integrity failure quarantines** (a non-`ok` integrity row, `SQLITE_CORRUPT` or `SQLITE_NOTADB`, the command-dedup store's rule): any other failure to read the file (an I/O error, `SQLITE_CANTOPEN`, permission, read-only, disk full, WAL lock `PROTOCOL`) is *unreadable*, so open refuses with `echo.db could not be checked (sqlite rc N)`, quarantines nothing and retries on the next start, because a quarantine would replace a healthy file with a fresh database that re-enables every paused source. **A symlink (or, on Windows, any reparse point such as a junction) at `echo.db` or a sidecar is refused** before anything is opened, moved or secured, and again before the reopen that follows a quarantine; both Echo connections (the main one and the read-only query connection) are opened with `SQLITE_OPEN_NOFOLLOW`, which closes the check-to-open window on POSIX (the Windows VFS ignores the flag; that residual and what bounds it are recorded in the DACL block comment in `echo_db.cpp`); the operator removes the link. **Fleet visibility:** the plugin publishes `heartbeat.db_corruption_total` / `heartbeat.db_quarantine_last`, bridged to the `yuzu.plugin.echo.*` heartbeat tags; the server exposes `yuzu_fleet_echo_db_corruption_agents` and writes an `echo.db.corruption_quarantined` audit row — see docs/user-manual/echo.md "Fleet visibility". |
 
 The "leave data on uninstall" rule is identical to other Yuzu agent
 state stores. If a customer asks for "delete echo data on uninstall",
 that is a deployment-tooling change (MSI custom action), not an Echo
 plugin change.
 
-> **Collect gate and retention share `canonical_source_enabled`.** Both
-> `source_enabled()` (`echo_aggregator.cpp`) and `run_retention()` decide a
-> source's state through it: `run_retention()` calls `source_enabled()` itself,
-> and `source_enabled()` maps the stored value through
-> `canonical_source_enabled(stored_value)`, which maps anything other than the
+> **Collect gate and retention both read `canonical_source_enabled`.**
+> `source_enabled()` (`echo_aggregator.cpp`) gates collection; retention and the
+> budget pass decide through `source_retention_exempt()`. Decision (#1572): an `errored` source that was never paused
+> (`<source>_paused_at` absent or exactly `0`) gets the normal retention
+> ceiling and budget eviction; `false`, an unreadable flag, and `errored` with
+> `paused_at` above 0, unreadable or malformed stay preserved, so a damaged hold
+> marker never ages out a forensic hold. The rule opens a release path that did
+> not exist before: a user who can write `echo_config` can release the hold on
+> an errored source by setting its flag to a bad value with `paused_at` at `0`.
+> That grants nothing a direct row delete in `echo.db` does not, and the hold on
+> a paused source holds only while its `paused_at` marker is non-zero.
+> **Accepted residual.** A source paused by an agent older than v0.12.0 carries
+> `_enabled=false` with `paused_at` absent or `0`; if its flag is later corrupted
+> to a non-canonical value, the helper cannot tell it from a fresh errored
+> never-paused source and the normal ceiling applies. Every current disable edge
+> stamps `paused_at` above 0, so the remedy is to re-issue
+> `configure <source>_enabled=false` on such a source, which stamps the marker.
+> Treating absent or `0` as a hold would undo #1572. `canonical_source_enabled(stored_value)` maps anything other than the
 > literal `"true"` to non-enabled (`"false"` → disabled, anything else →
 > `"errored"`). This is load-bearing: a value the plugin never writes fails
-> **closed** — collection stops *and* retention preserves the rows — instead of
+> **closed** — collection stops *and* retention keeps the rows of a source paused or errored while paused — instead of
 > a bare `!= "false"` that would treat a tampered/corrupt value as enabled and
 > let retention delete the paused window (#560). `source_enabled()` also fails
 > closed on a failed config read (closed database, SQL error): the registry
@@ -431,12 +560,12 @@ plugin change.
 > source, gate collection on `source_enabled(*db_, "<name>")` and do **not** add
 > a parallel `== "true"`/`== "false"` check or a raw `get_config("<src>_enabled",
 > ...)` read — every collect, retention and purge gate for every registered
-> source goes through the one helper, so the registry's `default_enabled` is
-> the only place a default lives. Collect and retention gates use
-> `source_enabled()` (an unreadable flag skips); discard, drain and purge
-> decisions use `source_enabled_state()`, which distinguishes a confirmed
-> `true`/`false` from an unreadable flag so a destructive path never acts on a
-> failed read.
+> source goes through the helpers below, so the registry's `default_enabled` is
+> the only place a default lives. The collect gate uses `source_enabled()` (an
+> unreadable flag skips); retention and the budget pass use
+> `source_retention_exempt()`; discard, drain and purge decisions use
+> `source_enabled_state()`, which distinguishes a confirmed `true`/`false` from
+> an unreadable flag so a destructive path never acts on a failed read.
 >
 > **`paused_at` is cleared on any non-`true` → `true` re-enable.**
 > `apply_source_enabled_transition` (`echo_aggregator.cpp`) canonicalises the
@@ -546,7 +675,7 @@ Routine debugging entry points:
 | "Echo isn't recording anything for source X" | `echo.status` output → `<source>_enabled` row. Then `compatibility` action to confirm OS support. Then check the agent log for "Echo plugin initialized". |
 | "Query returns 0 rows but I know the event happened" | Check the collect interval (`fast_interval` / `slow_interval`) vs the event lifetime — anything shorter than the interval is sub-resolution. |
 | "TCP collector shows a flood of `connected` events" | Almost always a restart artifact. Confirm against the agent's start time. |
-| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused or errored sources and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
+| "echo.db is huge" | `status` returns `db_size_bytes` (used pages plus the WAL, not the file size) against `db_budget_bytes`. If it's growing without bound, check that the maintenance pass (`echo.rollup`, the budget pass) is running and `budget_over_bytes`: there is no aggregation pass any more, and the tiers grow only through the folds and shrink only through retention and the byte budget; confirm the triggers registered in `init()`. A file that stays large while `db_size_bytes` is within budget is an older database waiting for its one-off `VACUUM` (`db_auto_vacuum|deferred` means a conversion was wanted and could not run: the volume lacked twice the used size free, or the `VACUUM` failed; the marker clears only when a conversion succeeds). `budget_over_bytes` above 0 has several causes: a long `echo.sql` read pinning the log (clears at the next checkpoint), an eviction pass that failed (retried next pass), a pass skipped by the retention clock guard (`retention_guard|__budget__|<n>`), an unreadable setting (`db_budget_bytes|unknown`), a catch-up still draining, or only exempt rows left (hourly rows under 48 hours, daily and monthly rows, the `usage` tables, paused sources (and errored ones that were paused) and `netconn`, `netqual`, `power`, `removable`, `registry`); see the user manual, "If `budget_over_bytes` stays above 0". |
 | "Schema migration failed at startup" | `agent.log` will show `EchoDatabase: migrated to schema version N` on success or the SQLite error on failure. Migrations are idempotent — fixing the underlying issue and restarting will retry. |
 
 For new-source bring-up, the smallest viable change is: add a
@@ -708,20 +837,35 @@ cursor.** What it adds to the pattern:
   `purge_source("registry")` erases the tiers, the replay ring, the cursor row and every
   `registry:%` baseline in one transaction.
 - **Four read statuses.** Complete, Absent, Unreadable, Capped. Removals are
-  derived only from Complete and Absent reads; an Unreadable read changes
-  nothing and a Capped one only adds and updates, so a partial read can never
-  fabricate a deletion. Unreadable means the root, or any key beneath it other
-  than an access-denied child, could not be read (an open, a query or an
-  enumeration failure there makes the whole root Unreadable). Only an
-  access-denied child is isolated: it is listed in the read's `skipped` set, the
-  rest of the root is read as usual, and the diff keeps what the baseline holds
-  beneath the denied key. That holds for up to `kSkippedCap` (32) children per
-  read; the 33rd makes the read Capped, which derives no deletion in that root.
-  A root going Unreadable, or the denied set gaining a member, writes one
-  `gap:unreadable:<root>` row; the set is kept in the cursor so a steady state,
-  a shrink or a clear writes nothing. A Capped read's list is partial, so it can
-  add to the stored set but never shrinks it, and the stored set is clamped to
-  `kSkippedCap` names so a root that stays Capped cannot grow the cursor row.
+  derived only from Complete and Absent reads that left no child unnamed; an
+  Unreadable read changes nothing and a Capped one only adds and updates, so a
+  partial read can never fabricate a deletion. Unreadable means the root, or any
+  key beneath it other than an access-denied child, could not be read (an open,
+  a query or an enumeration failure there makes the whole root Unreadable). Only
+  an access-denied child is isolated: it is listed in the read's `skipped` set,
+  the rest of the root is read as usual, and the diff keeps what the baseline
+  holds beneath the denied key. A child whose name holds U+0000 takes the same
+  path without being opened (`RegOpenKeyExW` would stop at the NUL and open a
+  different key). `read_key` names up to `kSkippedCap` (32) such children per
+  read; the 33rd and later are counted in `SubtreeRead::skipped_overflow` while
+  the walk goes on, so every later sibling is still read and its adds and
+  changes land. A read with a non-zero overflow ends Capped, and the diff checks
+  the count itself and derives no deletion, because an unnamed child's baseline
+  cannot be protected by name. Every child that takes the skip path is charged
+  to the key budget and the deadline, like a key the walk enters, so a key with a
+  huge number of unopenable children still ends at a cap. Key and value names
+  are stored through `registry_name_utf8` (injective: a lone surrogate is U+FFFD
+  plus four hex digits and a literal U+FFFD is doubled), never the lossy
+  `from_wide`; the ETW callback builds its value name through the same function,
+  so a candidate and its writer compare equal, except for a value name holding U+0000: the ETW name is cut at its first NUL while the snapshot name keeps it, so that value is not matched to its own writer and its prefix can match a sibling value (a lead, never proof). A name already present in a key
+  keeps the first entry and ends the read Capped.
+  A root going Unreadable, the denied set gaining a member, or the overflow count
+  growing writes one `gap:unreadable:<root>` row; the set and the count are kept
+  in the cursor (`skipped`, `skipped_overflow`) so a steady state, a shrink or a
+  clear writes nothing. A Capped read's list is partial, so it can add to the
+  stored set and raise the count but never shrinks either, and the stored set is
+  clamped to `kSkippedCap` names so a root that stays Capped cannot grow the
+  cursor row.
   Keys are opened with `REG_OPTION_OPEN_LINK`, so a watched key that is itself a
   symbolic link is recorded as the link (its `SymbolicLinkValue`) and its target
   is never followed: following it would let a user point this agent's SYSTEM
@@ -879,9 +1023,16 @@ cursor.** What it adds to the pattern:
     warning names the mounts), through the same gate and bounded worker as a mount. A sweep
     whose worker did not return (`sweep_pending`: gate closed, call rejected or timed out) runs
     before the first offline mount that finds the gate open. Every other outcome completes it,
-    so it is one attempt per start: a refused unload, a missing privilege, a partial HKU
-    listing (`enumerate_hku_subkeys` has no error channel) or an exception is not retried this
-    run, and what it missed waits for the next start or `reg unload`. It is process-wide, so a
+    so it is one attempt per start: a refused unload, a missing privilege or an exception is not
+    retried this run, and what it missed waits for the next start or `reg unload`. The one
+    exception is the HKU listing: the sweep lists through `enumerate_hku_subkeys_checked`
+    (`agents/shared/win_profiles.hpp`), which reports a failed or unstable walk instead of a
+    short list, and a sweep that could not list (`HiveSweepResult::listing_error`, the cause;
+    nothing offered to the unload) stays pending for exactly one retry, before the next offline
+    mount, then completes (`settle_sweep`). Each failed listing logs one `hku_list_incomplete`
+    warning naming the cause, so the second one completes the sweep; a host that never mounts a
+    logged-off hive does not retry, and what the sweep missed waits for the next start or
+    `reg unload`. It is process-wide, so a
     sibling plugin's leftover goes too; a mount of a second agent process in its handle-less
     window could also be unloaded: an out-of-process mount is unguarded (`win_reg_handle.hpp`),
     and that is the default shape on the shared CI pools.

@@ -13,6 +13,10 @@ name: Docs Lint
 # a digest-pinned Prometheus image from Docker Hub and a hash-pinned PyYAML from
 # PyPI. `definition-descriptions` reaches one, a hash-pinned PyYAML from PyPI.
 # `cbom-schema` reaches one too, a hash-pinned jsonschema from PyPI.
+# `execution-owner-key-selftest` is split off for run time, not for a registry: its
+# half minute of CPU must not eat into the required check's budget. It is advisory (only
+# "CHANGELOG order" is required here, and the owner may add it to branch protection); the
+# same self-test also gates through the meson `docs` suite on the required Linux leg.
 on:
   # No paths filter: the required CHANGELOG-order status must report on every
   # PR. push fires only on mainline branches so a feature/fix branch with an
@@ -100,6 +104,36 @@ jobs:
       - name: Forensics tier wiring gate self-test (#4990)
         run: python3 -I tests/test_forensics_tier_wiring_lexical_selftest.py
 
+      # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
+      # service-scoped session's username, and neither list gate hands a service-scoped session
+      # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by
+      # uses, scope constructions, scope arguments, predicate calls, mutation requests, raw-username
+      # guards and gate refusals are frozen exact sets. Its self-test, which mutates the sources in
+      # memory and proves every mutation is caught, runs in the separate `execution-owner-key-selftest`
+      # job below: it costs about half a minute of CPU, and this job is the required check with a
+      # five minute budget.
+      - name: Execution owner key tripwire (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire.py
+
+      # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
+      # label; no unit test builds ServerImpl, so dropping it leaves every test green.
+      - name: Plugin init failed wiring gate
+        run: python3 -I tests/test_plugin_init_failed_wiring_lexical.py
+
+      - name: Plugin init failed wiring gate self-test
+        run: python3 -I tests/test_plugin_init_failed_wiring_lexical_selftest.py
+
+      # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
+      # no source or manual claims an absent command_id proves a step was never sent.
+      - name: Workflow execute docs gate (#2146)
+        run: python3 -I tests/test_workflow_execute_docs_lexical.py
+
+      # WP11: endpoint-derived plugin result rows (processes, procfetch, wmi, filesystem,
+      # installed_apps, network_config proxy_address/bypass) are built by the neutralising
+      # formatters at every call site. Best-effort lexical tripwire, self-checked in memory.
+      - name: Plugin row formatters wiring gate (WP11)
+        run: python3 -I tests/test_plugin_row_formatters_wiring_lexical.py
+
       # Personal-data guard: no real home paths, SIDs, tailnet IPs, MACs, private
       # keys, consumer e-mail or tracked session artifacts in this PUBLIC repo.
       # Pre-existing hits live in scripts/ci/personal-data-baseline.json (counts
@@ -128,6 +162,13 @@ jobs:
       # registered in tests/meson.build for local `meson test --suite docs` parity.
       - name: RBAC cross-schema query-owner seam (ADR-0012 s3)
         run: python3 tests/test_rbac_query_owner_seam.py
+
+      # #7223: the durable-session account gate keeps its wiring shape (one soft-delete literal,
+      # the owner's session generation bump, the mode ternary, the gate position, the cache
+      # epoch guard and increment). Also registered in tests/meson.build for local
+      # `meson test --suite docs` parity.
+      - name: Session account gate wiring (#7223)
+        run: python3 -I tests/test_session_account_gate_wiring.py
 
       # #4665: the shared golden fixture (tests/unit/fixtures/spark/arm_committed_line.json)
       # still round-trips through the #3990 driver's real T2_RE, and the driver's evidence
@@ -243,10 +284,23 @@ jobs:
           node --version
           YUZU_REQUIRE_NODE=1 python3 tests/test_swagger_page_behaviour.py
 
+      # OpenAPI authoring: a dev-side author adding an operation to rest_api_v1.cpp meets the C++
+      # completeness tests one kind of mistake per full Linux build (no operationId, then the
+      # checksum pin, then an untyped success response outside kUntyped). This lexical twin reports
+      # all of them at once, plus the 15,000-byte literal segment ceiling, with no build. Stdlib
+      # only; also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: OpenAPI operation authoring (operationId, pin, typed responses)
+        run: python3 -I tests/test_openapi_operation_authoring.py
+
       # Changelog promote --append (#5221): folds post-promotion hotfix
       # fragments into an already-promoted release section. Stdlib only.
       - name: Changelog promote --append
         run: python3 tests/test_assemble_changelog_append.py
+
+      # scripts/whats-new.py: collated "what changed since my last pull" view
+      # (version bumps + changelog.d fragments). Builds a throwaway git repo.
+      - name: What's-new script
+        run: python3 tests/test_whats_new.py
 
       # Windows agent installer trust-anchor lockdown (#5196). The .iss is
       # compiled only by release.yml, never on a PR; this lints its source
@@ -255,6 +309,27 @@ jobs:
       # escaping) and mutation-tests itself. Stdlib only.
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
+
+      # Every plugin the root meson.build builds has a Source line in the
+      # Windows agent installer (yuzu-agent.iss) or a recorded
+      # `; plugin-not-installed:` exclusion (#4867). The release zip takes
+      # plugins by glob, so a missing line ships in the zip and silently not
+      # in the installer. Mutation-tests itself. Stdlib only.
+      - name: Agent installer plugin coverage lint
+        run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
+
+      # The Windows agent zip and installer ship the Visual C++ runtime
+      # app-local (deploy/packaging/windows/stage-msvc-runtime.ps1), and
+      # release.yml's build-windows checks every shipped binary's DLL imports
+      # against both payloads (scripts/ci/check-windows-payload-imports.py)
+      # before ISCC runs. Behavioural over synthetic PE images, the staging
+      # script under pwsh, and lexical wiring pins with mutants.
+      - name: Windows payload import closure
+        env:
+          # The runner image ships pwsh: require it so the staging-script
+          # behaviour cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
+        run: python3 -I tests/test_windows_payload_imports.py
 
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
@@ -267,6 +342,56 @@ jobs:
       # and a release missing one fails before publishing. Stdlib + bash.
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
+
+      # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py
+      # describes one shipped file with its vcpkg closure (agent or server),
+      # never test or helper ports, and its `check` refuses a checkout-scale
+      # SBOM, one listing a checkout/build/test-tree path and one whose artifact
+      # hash differs. syft, pkgutil and rpm2cpio are stubbed. Stdlib only (the
+      # `cbom-schema` job runs it again with jsonschema, validating the SBOMs).
+      - name: Per-artifact SBOM generator
+        run: python3 -I tests/test_artifact_sbom.py
+
+      # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
+      # server build or server installer in release.yml's Windows/macOS jobs,
+      # no old archive name, and one set of archive names across release.yml,
+      # check-release-artifacts.sh and build-agent-bundle.sh. Mutation-tests
+      # itself. Stdlib only.
+      - name: Agent-only release lint
+        env:
+          # The runner image ships pwsh and the system PyYAML: require them so
+          # the behavioural server-DLL refusal test cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
+        run: python3 -I tests/test_release_agent_only.py
+
+      # Agent-bundle release verification (#7529): build-agent-bundle.sh
+      # verifies SHA256SUMS' cosign signature (exact identity per signing era)
+      # before use and matches each file to its own line. Offline: stub gh and
+      # cosign, asserts cosign's argv; mutation-tests itself. Stdlib only.
+      - name: Agent bundle release verification
+        run: python3 -I tests/test_build_agent_bundle_verify.py
+
+      # The `server` feature option (ADR-0035 ladder step 3): lexical pins on
+      # meson.options and meson.build's guard, with a mutation self-test. The
+      # behavioural half (a real configure for Windows/macOS/Linux targets)
+      # skips here, where meson is not installed, and runs in `meson test
+      # --suite docs`.
+      - name: Server feature option lint
+        run: python3 -I tests/test_server_feature_option.py
+
+      # Security dependency pins: every vcpkg.json `overrides` entry has a row
+      # (what it fixes, when to delete it) in docs/build-guide.md "Security
+      # dependency pins", and every row an entry. Mutation-tests itself.
+      # Stdlib only.
+      - name: vcpkg overrides documented
+        run: python3 -I tests/test_vcpkg_overrides_documented.py
+
+      # Every SHA-256 a vendored *-NOTICE.txt under server/core/{static,vendor}
+      # records is the hash of the file it names (a same-size vendor edit keeps
+      # test_static_js_bundle.cpp's byte pin green). Mutation-tests itself on a
+      # scratch copy. Stdlib only.
+      - name: Vendored NOTICE hashes
+        run: python3 -I tests/test_vendored_notice_hashes.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
@@ -300,29 +425,34 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
+      # Depth 2: the base is the merge commit's FIRST PARENT, which must be in
+      # the checkout (see the step below).
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          fetch-depth: 2
           persist-credentials: false
 
       - name: Enforce README touch rule
         env:
           EVENT_NAME: ${{ github.event_name }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.sha }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PR_BODY: ${{ github.event.pull_request.body }}
         run: |
           set -euo pipefail
           case "$EVENT_NAME" in
-            pull_request) BASE="$BASE_SHA" ;;
-            *)            echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
+            pull_request) ;;
+            *) echo "Unmodelled event '$EVENT_NAME' -- nothing to compare, skipping."; exit 0 ;;
           esac
-          if [ -z "$BASE" ] || [ "$BASE" = "0000000000000000000000000000000000000000" ]; then
-            echo "Base commit unavailable -- cannot diff, skipping (the docs suite still byte-checks the fences)."
-            exit 0
-          fi
-          # A two-tree diff needs only the base commit itself, not the whole
-          # history (the changelog-fragments job above does the same).
-          git fetch --depth=1 origin "$BASE"
+          # The base is the merge commit's first parent (the target-branch tip
+          # GitHub merged this PR onto), never the event's base.sha, which can
+          # lag that tip and then blames this PR for the target branch's own
+          # changes (#8235). The helper fails closed unless HEAD is the merge of
+          # this PR's head; see its header. doc-coupling.yml takes the same base.
+          # The changelog-fragments job below still diffs from base.sha: a
+          # release promote landing in between reads as an allowed promote there.
+          bash scripts/ci/pr-merge-parent.sh --selftest
+          BASE="$(bash scripts/ci/pr-merge-parent.sh "$HEAD_SHA" "$PR_HEAD_SHA")"
           printf '%s' "${PR_BODY:-}" > "$RUNNER_TEMP/pr-body.txt"
           scripts/ci/check-plugin-readme-touch.sh "$BASE" "$HEAD_SHA" "$RUNNER_TEMP/pr-body.txt"
 
@@ -358,8 +488,10 @@ jobs:
   # (tests/fixtures/cyclonedx/golden/, kept byte-equal to cbom_json by
   # test_crypto_cbom.cpp) against the vendored official schema. jsonschema is
   # hash-pinned in requirements-ci.txt. YUZU_REQUIRE_JSONSCHEMA=1 turns the
-  # test's local skip-without-jsonschema into a hard failure here. Its own job
-  # for the same PyPI-outage reason as definition-descriptions below.
+  # test's local skip-without-jsonschema into a hard failure here. The job also
+  # schema-validates the per-artifact SBOMs tests/test_artifact_sbom.py
+  # generates (CycloneDX 1.7 and SPDX 2.3). Its own job for the same
+  # PyPI-outage reason as definition-descriptions below.
   cbom-schema:
     name: CBOM schema
     runs-on: ubuntu-24.04
@@ -378,6 +510,36 @@ jobs:
         env:
           YUZU_REQUIRE_JSONSCHEMA: "1"
         run: python3 tests/test_cbom_schema.py
+
+      # The per-artifact SBOM suite again (docs-lint's "Per-artifact SBOM
+      # generator" step runs it without jsonschema), here validating every SBOM
+      # its tests generate (syft stubbed) against the vendored CycloneDX 1.7 and
+      # SPDX 2.3 schemas (tests/fixtures/cyclonedx, tests/fixtures/spdx).
+      # YUZU_REQUIRE_JSONSCHEMA=1 makes a missing jsonschema a failure. No -I:
+      # jsonschema is in the user site the step above installs into.
+      - name: Validate generated SBOMs against CycloneDX 1.7 and SPDX 2.3
+        env:
+          YUZU_REQUIRE_JSONSCHEMA: "1"
+        run: python3 tests/test_artifact_sbom.py
+
+  # #5557: the self-test of the execution owner key tripwire that `changelog-order` runs. It mutates
+  # the server sources in memory and proves each mutation is caught. ITS OWN JOB, deliberately,
+  # for a different reason than the three above: it needs no registry, but it costs about half a
+  # minute of CPU (more on a hosted runner), which does not belong in the required "CHANGELOG
+  # order" check's five minute budget. Stdlib only, no build, no checkout history. The tripwire
+  # itself stays in `changelog-order`, where it is cheap. Also registered in tests/meson.build
+  # for local `meson test --suite docs` parity.
+  execution-owner-key-selftest:
+    name: Execution owner key tripwire self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Execution owner key tripwire self-test (#5557)
+        run: python3 -I tests/test_execution_owner_key_tripwire_selftest.py
 
   # Definition-description lint: shipped definitions (content/definitions and
   # content/packs, as embed_content.py walks them) must carry

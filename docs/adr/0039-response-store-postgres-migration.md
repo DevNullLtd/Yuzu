@@ -2,6 +2,7 @@
 
 - **Status:** Accepted — shipped PR #2691, merged 2026-08-09; `response_store.cpp` is PG-native
   (`PgPool`/`pg_exec`), zero live `sqlite3_` calls (comments only), re-verified 2026-09-07.
+- **Owner:** Nathan Dornbrook (platform)
 - **Date:** 2026-07-31
 - **Deciders:** pg workstream; security-guardian + docs-writer (Gate 2)
 - **Parents:** ADR-0006/0007/0008(+Correction), ADR-0009, ADR-0012; conventions from
@@ -40,7 +41,10 @@ cap — see the 2026-11-02 Update below.
 lands as **migration v2** (`ALTER TABLE responses ADD COLUMN plugin_result_status INTEGER NOT
 NULL DEFAULT 0`), not folded into v1's `CREATE TABLE` — `PgMigrationRunner` stamps
 `schema_meta(store, version)` once per numbered migration and never replays an edited one, so
-changing v1 in place would silently no-op on any database that already ran it.
+changing v1 in place would silently no-op on any database that already ran it. (Update
+2026-11-09, #7158: the runner now also records a SHA-256 of each applied migration and refuses a
+store whose recorded hash differs from this build's text, so such an edit is refused at start
+rather than silently ignored.)
 
 ### Posture (ADR-0012 §1)
 

@@ -256,8 +256,18 @@ public:
     /// terminates it. MCP clients authenticate with API tokens in practice; if the
     /// inactivity semantics matter for a future browser-side MCP client, the fix is
     /// a non-touching `peek_session` on AuthManager.
+    ///
+    /// `mode` has no default. `kCached` is the stream pump's question (the token and engine
+    /// liveness caches may answer). `kAuthoritative` is the workflow run's per-step question:
+    /// the API-token row (a human, MCP or engine token alike) and an engine token's backing
+    /// principal are read from Postgres, so a revoke committed on any replica before the read is
+    /// seen. It costs one indexed `api_tokens` read per call, plus one `engine_principals` read
+    /// for an engine token. A cookie session is adjudicated the same way in both modes
+    /// (`AuthManager::validate_session`: the durable generation, polled at most once per second,
+    /// and trusted for up to 30 s while that poll is failing).
     auth::CredentialCheck revalidate_stream(const httplib::Request& req,
-                                            const std::string& expected_principal);
+                                            const std::string& expected_principal,
+                                            auth::CredentialReadMode mode);
 
     /// Calls require_auth, then checks session.role == admin.
     /// Returns true if admin; sets 403 and returns false otherwise.
@@ -304,12 +314,15 @@ public:
     /// answered with a retryable 503 (`retry_after_ms`, no `permission` field) instead of the
     /// fail-closed 403 that `require_permission` gives every route (ADR-0041). Same decision path
     /// otherwise (elevation, engine principals, MCP tier, service scope, RBAC, legacy floor), same
-    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the one consumer
-    /// whose correctness depends on telling "could not determine" from "definitively denied", the
+    /// `AuditProbeScope`. NOT a parallel evaluator and NOT a gate: it exists for the consumers
+    /// whose correctness depends on telling "could not determine" from "definitively denied": the
     /// Forensics-tier resolver (`resolve_forensics_visible`), where a collapsed answer would
-    /// silently serve a 200 with the Forensics rows missing. A new caller needs the same
-    /// justification; do not switch `require_permission` itself (about a hundred routes document
-    /// the 403).
+    /// silently serve a 200 with the Forensics rows missing, and the collection settings authority
+    /// (`global_authority` in `software_collection_settings_routes.cpp`), which writes its own
+    /// audited refusal and re-checks the write grant behind its `requested` audit row, where a
+    /// collapsed answer would record an RBAC outage as a refused or withdrawn grant instead of
+    /// answering 503. A new caller needs the same justification;
+    /// do not switch `require_permission` itself (about a hundred routes document the 403).
     [[nodiscard]] bool probe_permission_unavailable_aware(const httplib::Request& req,
                                                           httplib::Response& res,
                                                           const std::string& securable_type,
@@ -507,7 +520,10 @@ public:
     /// global-grant, permission-group or subtree read: `read_failed`) is
     /// `GateFailure::Degraded` (503) too. Only a genuine
     /// `ListReadDecision::DenyAll` (real "no grant") lands on
-    /// `GateFailure::Forbidden` (403).
+    /// `GateFailure::Forbidden` (403), as does the engine-entry refusal of a
+    /// service-scoped engine session (also 403, no `.permission`); an admit that
+    /// would have been unrestricted for a service-scoped session is
+    /// `GateFailure::InvariantViolated` (500, not retryable).
     ///
     /// SELF-SUFFICIENT for the RBAC/management-group authority decision — do
     /// NOT additionally gate the same `(securable_type, operation)` on
@@ -802,6 +818,19 @@ public:
         const std::string& target_id, const std::string& detail)>;
     [[nodiscard]] AuditAsSessionFn audit_as_session_fn();
 
+    /// The `AuditEvent` `audit_log_for_session` would write for `session`, built WITHOUT writing it
+    /// (#6079 PR 2c): the template the MFA-disable owner persists INSIDE its transaction, so the
+    /// outcome row carries exactly the identity fields a session-bound row carries (principal, the
+    /// role the caller captured, the engine class, source IP, user agent, session correlator,
+    /// target). One builder, `make_audit_event_for_principal`, shared with `audit_log_for_session`.
+    /// A factory like `audit_as_session_fn()` so server.cpp wires this and never a hand-rolled
+    /// lambda. The `AuthRoutes` must outlive every call.
+    using AuditEventForSessionFn = std::function<AuditEvent(
+        const httplib::Request&, const auth::Session&, const std::string& principal_role,
+        const std::string& action, const std::string& result, const std::string& target_type,
+        const std::string& target_id)>;
+    [[nodiscard]] AuditEventForSessionFn audit_event_for_session_fn();
+
     /// The `AuditEvent` `audit_log_for_principal` would write, built WITHOUT
     /// writing it (#5342 Gate 8): the identity/request fields (principal,
     /// role, class, source IP, user agent, session correlator, target) for a
@@ -948,7 +977,11 @@ private:
     /// answer to a question that must be asked of Postgres every time. If you
     /// need the engine-principal gate somewhere new, call
     /// `EnginePrincipalStore::get_for_auth` directly — do not make this public.
-    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token) const;
+    ///
+    /// Under `kAuthoritative` it does exactly that: `get_for_auth`, the uncached chokepoint, so
+    /// the 15 s cache is bypassed and the answer is never `kValidStale`.
+    [[nodiscard]] auth::CredentialCheck engine_credential_state(const ApiToken& token,
+                                                                auth::CredentialReadMode mode) const;
 
     Config& cfg_;
     auth::AuthManager& auth_mgr_;
@@ -1070,6 +1103,29 @@ public:
         after_first_provider_check_for_test_ = std::move(fn);
     }
 
+    /// Run `fn(route, proof)` on each MFA route between the verifier's return and the session
+    /// mint or stamp it feeds (`/login/mfa` for a TOTP and for a recovery code,
+    /// `/login/mfa/enroll`, `/login/mfa/stepup`; #6079). `proof` is exactly what the verifier
+    /// produced and the mint or stamp is about to carry, so a test can assert the stored instant
+    /// equals it (never the write's `now()`) and can rotate the factor in this span to prove the
+    /// post-mint and post-stamp generation recheck refuses it. No lock is held when it runs.
+    /// Test-only seam, same shape as `set_after_first_provider_check_for_test`; never set in
+    /// production.
+    void set_mfa_verify_barrier_for_test(
+        std::function<void(std::string_view route, const yuzu::server::LocalMfaProof& proof)> fn) {
+        mfa_verify_barrier_for_test_ = std::move(fn);
+    }
+
+    /// The DURABLE MFA proof of the session that authenticated `req`, for a binding decision
+    /// (#6079): `auth_mgr_.read_durable_mfa_proof` over the request's `yuzu_session` cookie and
+    /// `session.username`, so the credential read is the one that resolved the session. Only a
+    /// LOCAL cookie session carries a stored proof; any other principal (api_token, mcp_token,
+    /// engine, OIDC, SAML) answers `kAbsent` and never reaches the store. A degraded read or an
+    /// unobserved rebind guard is `kUnavailable` (fail closed, never "no proof"). Read-only.
+    /// The one extraction site every gate shares: do not read the cookie anywhere else for this.
+    [[nodiscard]] auth::DurableMfaProof durable_mfa_proof_for(const httplib::Request& req,
+                                                              const auth::Session& session) const;
+
 private:
     /// How `require_permission_impl` answers an RBAC read that could not be completed.
     enum class RbacDegradeMapping : std::uint8_t {
@@ -1090,6 +1146,8 @@ private:
                                   const char* who);
 
     std::function<void()> after_first_provider_check_for_test_;
+    std::function<void(std::string_view, const yuzu::server::LocalMfaProof&)>
+        mfa_verify_barrier_for_test_;
 
     /// Whether `(securable_type, operation)` clears the service-scope
     /// default-deny gate: the test override if one is set, else the real
@@ -1112,6 +1170,29 @@ private:
                                   const std::string& audit_action,
                                   const std::string& audit_detail,
                                   const authz::CeilingResult& ceiling);
+
+    /// The ONE response when a list gate would hand a service-scoped session UNRESTRICTED
+    /// authority (a corrupted service-scoped engine row; minting refuses it). Shared by
+    /// `require_fleet_read` and `require_list_read`: counts
+    /// `yuzu_server_authz_service_scope_unrestricted_refused_total{gate,site}`, logs, writes one
+    /// audit row (the gate's own action, FIXED text) and answers `kEngineEntry` 403 /
+    /// `kPostcondition` 500, never naming a `.permission` (clause 5). Extend, never fork.
+    void refuse_service_scoped_unrestricted(const httplib::Request& req, httplib::Response& res,
+                                            const auth::Session& session, const std::string& perm,
+                                            authz::UnrestrictedRefusalGate gate,
+                                            authz::UnrestrictedRefusalSite site);
+
+    /// `require_fleet_read`'s one admit point: the only place a `ListAuthority` is minted.
+    [[nodiscard]] std::expected<authz::ListAuthority, authz::GateFailure>
+    admit_fleet_read(const httplib::Request& req, httplib::Response& res,
+                     const auth::Session& session, const std::string& perm,
+                     authz::VisibleSet scope);
+
+    /// `require_list_read`'s body. `require_list_read` is the ONLY caller (it applies the
+    /// service-scope postcondition to whatever this admits); never call this directly.
+    ListReadGate require_list_read_unchecked(const httplib::Request& req, httplib::Response& res,
+                                             const std::string& securable_type,
+                                             const std::string& operation);
 
     std::optional<std::vector<authz::PermPair>> service_scope_global_safe_override_for_test_;
 

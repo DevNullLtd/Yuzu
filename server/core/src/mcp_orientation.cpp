@@ -59,8 +59,14 @@ namespace {
 constexpr std::string_view kFleet[] = {"list_agents", "get_agent_details"};
 constexpr std::string_view kTags[] = {"get_tags", "search_agents_by_tag", "set_tag", "delete_tag"};
 // #4029: export_definition joins the family — same domain, same securable.
-constexpr std::string_view kDefinitions[] = {"list_definitions", "get_definition",
-                                             "export_definition", "list_schedules"};
+// #2146 batch C: the nine authoring twins (definition create/update/delete/import/YAML save and
+// validate, instruction-set list/create/delete) join the family - same domain, same securables.
+constexpr std::string_view kDefinitions[] = {
+    "list_definitions",        "get_definition",         "export_definition",
+    "list_schedules",          "create_definition",      "update_definition",
+    "delete_definition",       "import_definition",      "save_definition_yaml",
+    "validate_definition_yaml", "list_instruction_sets", "create_instruction_set",
+    "delete_instruction_set"};
 // #4029: product packs are a distinct catalog domain (installed bundles of
 // InstructionDefinition/PolicyFragment/Policy/Workflow documents), own
 // securable (ProductPack), own family.
@@ -79,7 +85,28 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
                                            "export_crypto_cbom", "list_hardware_ci",
-                                           "get_hardware_ci"};
+                                           "get_hardware_ci", "list_hardware_ci_records",
+                                           // SAM-35: the installed-software v3 reads and the
+                                           // collection settings (read, set, per-device effective).
+                                           "list_software_hosts", "get_software_host",
+                                           "list_software_changes", "get_software_summary",
+                                           "get_software_plugin_health",
+                                           "list_software_collection_settings",
+                                           "get_software_collection_settings",
+                                           "set_software_collection_settings",
+                                           "get_software_host_collection_settings",
+                                           // SAM-29: the lifecycle-rule and normalisation
+                                           // curation twins (three reads, five writes).
+                                           "list_software_lifecycle_rules",
+                                           "import_software_lifecycle_rules",
+                                           "delete_software_lifecycle_rules",
+                                           "get_software_normalization_status",
+                                           "list_software_curation_queue",
+                                           "curate_software_alias",
+                                           "reject_software_curation",
+                                           "replace_software_normalization_pack",
+                                           // SAM-21: the components lookup twin.
+                                           "query_software_components"};
 constexpr std::string_view kCompliance[] = {
     "list_policies",    "get_compliance_summary",       "get_fleet_compliance",
     "get_guardian_schemas", "get_policy", "list_policy_fragments",
@@ -106,7 +133,8 @@ constexpr std::string_view kDexSignals[] = {
     "get_dex_device_score",   "get_dex_app",              "list_dex_apps",
     "get_dex_catalogue",      // ADR-0031 WS-A4 PR-1
     "get_dex_catalogue_group", "get_dex_device_history",  "get_dex_observation",
-    "get_dex_health",         "get_dex_trends",           "get_dex_overview"};
+    "get_dex_health",         "get_dex_trends",           "get_dex_overview",
+    "get_dex_score_policy",   "set_dex_score_policy",     "reset_dex_score_policy"};
 constexpr std::string_view kDexPerf[] = {"get_dex_perf_fleet",   "get_dex_perf_cohorts",
                                          "get_dex_perf_cohort_diff", "list_dex_perf_devices",
                                          "list_dex_perf_apps",   "get_dex_app_perf",
@@ -118,7 +146,8 @@ constexpr std::string_view kNetwork[] = {"get_network_fleet", "list_network_devi
                                         "list_discovered_devices"};
 constexpr std::string_view kExecution[] = {"execute_instruction", "execute_instruction_definition",
                                            "execute_bundle", "get_bundle_result",
-                                           "sync_hardware_software"};
+                                           "sync_hardware_software",
+                                           "get_software_sync_status"}; // SAM-21
 constexpr std::string_view kRemediation[] = {"quarantine_device", "list_quarantined_devices"};
 // gap-matrix #10 (ADR-1005 A5 parity): issue_code_signing_cert joins the
 // family — same Security securable domain, same "Certificates" mental model.
@@ -186,6 +215,11 @@ constexpr std::string_view kDiscovery[] = {"discover_permissions", "discover_ins
 // #5690: get_guardian_status, get_guardian_agent_status, get_guardian_rule_status and
 // get_guardian_device_guards report order_uncertain / projection_pending per row and
 // uncertain_rules per rollup; a clean value never proves freshness or completeness.
+// #7217: get_guardian_device_compliance carries the per-guard flags and uncertain_guards too, and
+// both per-device reads (it and get_guardian_device_guards) report unrepresented_pending_guards.
+// UP-14: get_guardian_status reports unordered_agents / unordered_agent_ids and
+// get_guardian_device_guards reports its ordering block (the agent's emit-order pair clock and
+// counters, which the census ordering decides by).
 // #2146 Batch B1 extends this family with the rule CRUD/push mutations
 // (create/get/update/delete_guardian_rule, push_guardian_rules) and the two
 // per-agent reads #4037 deliberately deferred (get_guardian_agent_status,
@@ -214,8 +248,11 @@ constexpr std::string_view kPreflightDeploy[] = {"list_preflight_runs", "get_dep
 // "Executions & audit" (ExecutionTracker's single-instruction fan-out): a
 // Workflow composes multiple steps, and its execution record is a different
 // data model from an Execution (see get_workflow_execution's tool doc).
+// #2146 batch B: execute_workflow joins the family - same securable (Workflow), the run side of
+// the read tools beside it.
 constexpr std::string_view kWorkflows[] = {"list_workflows", "get_workflow",
-                                           "list_workflow_executions", "get_workflow_execution"};
+                                           "list_workflow_executions", "get_workflow_execution",
+                                           "execute_workflow"};
 // #4027 — Echo (Timeline / Activity Recorder) had zero MCP presence before this
 // read-twin batch; its own family rather than folding into an unrelated one.
 constexpr std::string_view kEcho[] = {"list_echo_process_tree_devices",
@@ -265,8 +302,10 @@ constexpr std::string_view kFleetVisualization[] = {"get_fleet_topology", "get_h
 // whole catalog + role grid) and from Engine principals' assign/unassign/
 // list_engine_roles (grant AUTHORING, not a self-check). get_me (twin of
 // GET /api/v1/me) joins it: the same kind of read, a self-description of the
-// CALLING principal that cannot name another one.
-constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me"};
+// CALLING principal that cannot name another one. get_rbac_enforcement (twin of
+// GET /api/v1/rbac/enforcement, #6033) does too: whether enforcement is on and whether the
+// caller could administer RBAC, again about the caller alone.
+constexpr std::string_view kRbacCheck[] = {"check_permission", "get_me", "get_rbac_enforcement"};
 // A2 (delivery plan §2) — global human role assignment/unassignment. Own
 // family, distinct from RBAC self-check above (a read, not an authoring
 // action) and from Engine principals' assign/unassign_engine_role (a
@@ -320,11 +359,18 @@ constexpr std::string_view kCryptoDashboard[] = {
     "list_crypto_widgets", "get_crypto_dashboard_layout", "set_crypto_dashboard_layout",
     "get_crypto_ca_stats"};
 
-constexpr std::array<ToolFamily, 42> kFamilies{{
+// ADR-0070 R1 (slice 2b-1a): registered CRL sources - a CA plus the CRL URLs the server may fetch.
+// Admin-only in both RBAC states (not grantable). Registration only: nothing is fetched yet.
+constexpr std::string_view kRevocationSources[] = {
+    "list_revocation_sources", "get_revocation_source", "register_revocation_source",
+    "update_revocation_source", "remove_revocation_source", "reset_revocation_source_high_water"};
+
+constexpr std::array<ToolFamily, 43> kFamilies{{
     {"Fleet & agents", "connected agents, their OS/arch/version, and details", kFleet},
     {"Tags", "read and write agent tags, and find agents by tag", kTags},
-    {"Instructions & schedules", "instruction definitions, their full export, and recurring "
-                                 "schedules",
+    {"Instructions & schedules", "instruction definitions (read, create, edit, delete, import, "
+                                 "YAML save and validate), instruction sets, their full export, "
+                                 "and recurring schedules",
      kDefinitions},
     {"Product packs", "installed bundles of instruction/policy/workflow content", kProductPacks},
     {"Command responses", "query and aggregate stored command/instruction responses", kResponses},
@@ -349,7 +395,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Approvals", "list pending approvals; approve_request/reject_request always refuse "
                   "(approver_assurance_required:*) -- deciding a ticket is a dashboard/REST act",
      kApprovals},
-    {"DEX signals", "digital-employee-experience reliability signals and their scope/detail",
+    {"DEX signals",
+     "digital-employee-experience reliability signals and their scope/detail, plus the customer "
+     "score policy (get_dex_score_policy; set_dex_score_policy and reset_dex_score_policy are "
+     "supervised-tier writes, reset also approval-gated)",
      kDexSignals},
     {"DEX performance", "fleet, cohort, device, and per-app performance over time", kDexPerf},
     {"Network quality", "fleet and per-device network-quality posture, and hosts found by "
@@ -410,8 +459,9 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
                             "connections, and listening sockets, fleet-wide or per-host",
      kFleetVisualization},
     {"RBAC self-check", "check whether the calling principal itself holds a specific RBAC "
-                        "permission, and describe the calling session (identity, role, tier, "
-                        "direct RBAC role names)",
+                        "permission, describe the calling session (identity, role, tier, "
+                        "direct RBAC role names), and read whether RBAC enforcement is on and "
+                        "whether the caller could administer it",
      kRbacCheck},
     {"RBAC administration", "grant or revoke one of the 7 fleet-wide-assignable built-in RBAC "
                             "roles to a human user, and switch RBAC enforcement on/off "
@@ -433,6 +483,10 @@ constexpr std::array<ToolFamily, 42> kFamilies{{
     {"Crypto dashboard", "the /crypto widget catalogue, your own widget layout, and counts of "
                          "certificates issued by Yuzu's own CA (fixed windows, with as_of)",
      kCryptoDashboard},
+    {"Revocation sources", "administrator-only registry of CRL sources: the CAs and the CRL URLs "
+                           "the server may fetch for them (registration only; nothing is fetched "
+                           "or judged yet)",
+     kRevocationSources},
 }};
 
 }  // namespace

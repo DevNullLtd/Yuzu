@@ -277,11 +277,9 @@ CREATE UNIQUE INDEX ux_agent_routes_session_id
     ON agent_routes (session_id) WHERE session_id IS NOT NULL;
 DROP INDEX IF EXISTS agent_routes_session_id_idx;
 )"},
-        // v6 (Echo rename, upgrade window): whether the agent registered with the pre-rename
-        // plugin name `tar`, so the HA directory dispatch path (which has no session to consult)
-        // can still put the legacy name on the wire. Written by register_fresh only. Removing the
-        // other legacy-name shims drops the write and the read; the column stays as an additive
-        // column (DEFAULT FALSE is harmless; this codebase has no DROP COLUMN).
+        // v6 (Echo rename): a flag for the pre-rename plugin name `tar`. Nothing writes or reads
+        // it any more; the column stays as an unused additive column (DEFAULT FALSE is harmless;
+        // this codebase has no DROP COLUMN) so an applied migration list never changes.
         {6, R"(
 ALTER TABLE agent_routes ADD COLUMN legacy_echo_wire_name BOOLEAN NOT NULL DEFAULT FALSE;
 )"},
@@ -360,8 +358,7 @@ GatewayRouteStore::GatewayRouteStore(pg::PgPool& pool) : pool_(pool) {
 }
 
 std::expected<RegisterFreshResult, GatewayRouteStoreError>
-GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view session_id,
-                                  bool legacy_echo_wire_name) {
+GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view session_id) {
     if (!open_)
         return std::unexpected(GatewayRouteStoreError::store_unavailable);
     auto lease = pool_.try_acquire_for(kWriteTimeout);
@@ -394,14 +391,11 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
     pg::PgResult res = pg::exec_params(
         lease.get(),
         "INSERT INTO gateway_route_store.agent_routes "
-        "  (agent_id, connection_epoch, session_id, updated_at, legacy_echo_wire_name) "
-        "VALUES ($1, nextval('gateway_route_store.connection_epoch_seq'), $2, now(), $3::boolean) "
+        "  (agent_id, connection_epoch, session_id, updated_at) "
+        "VALUES ($1, nextval('gateway_route_store.connection_epoch_seq'), $2, now()) "
         "ON CONFLICT (agent_id) DO UPDATE SET "
         "  connection_epoch = EXCLUDED.connection_epoch, "
         "  session_id = EXCLUDED.session_id, "
-        // Upgrade-window shim, removed with the other legacy-name shims: a new connection
-        // re-states whether this agent still speaks the pre-rename plugin name.
-        "  legacy_echo_wire_name = EXCLUDED.legacy_echo_wire_name, "
         "  cluster_id = NULL, "
         "  gateway_node = NULL, "
         "  stream_home_id = NULL, "
@@ -416,8 +410,7 @@ GatewayRouteStore::register_fresh(std::string_view agent_id, std::string_view se
         "  updated_at = now() "
         "WHERE EXCLUDED.connection_epoch > agent_routes.connection_epoch "
         "RETURNING connection_epoch",
-        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id),
-                                                 std::string(legacy_echo_wire_name ? "t" : "f")});
+        std::vector<std::optional<std::string>>{std::string(agent_id), std::string(session_id)});
     if (res.status() != PGRES_TUPLES_OK) {
         if (is_session_unique_violation(res)) {
             // A server-minted id (128 random bits) cannot collide: this is an RNG
@@ -934,7 +927,7 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
         "SELECT agent_id, cluster_id, gateway_node, connection_epoch, session_id, "
         "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
         "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
-        "       home_cluster_id, legacy_echo_wire_name "
+        "       home_cluster_id "
         "FROM gateway_route_store.agent_routes WHERE agent_id=$1",
         std::vector<std::optional<std::string>>{std::string(agent_id)});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -959,7 +952,6 @@ GatewayRouteStore::lookup_route(std::string_view agent_id) {
                               : parse_ms(PQgetvalue(res.get(), 0, 5));
     row.is_stale = std::string_view(PQgetvalue(res.get(), 0, 6)) == "t";
     row.home_cluster_id = col_opt(res.get(), 0, 7); // #4669
-    row.legacy_echo_wire_name = std::string_view(PQgetvalue(res.get(), 0, 8)) == "t";
     return std::optional<RouteRow>(std::move(row));
 }
 
@@ -990,7 +982,7 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
         "       (extract(epoch FROM lease_until) * 1000)::bigint AS lease_until_ms, "
         "       (lease_until IS NOT NULL AND lease_until < now()) AS is_stale, "
         "       (session_id IS NOT NULL AND lease_until >= now() AND cluster_id IS NOT NULL) "
-        "         AS routable, legacy_echo_wire_name "
+        "         AS routable "
         "FROM gateway_route_store.agent_routes WHERE agent_id = ANY($1::text[])",
         std::vector<std::string>{pg::to_text_array(views)});
     if (res.status() != PGRES_TUPLES_OK) {
@@ -1016,9 +1008,62 @@ GatewayRouteStore::lookup_routes(std::span<const std::string> agent_ids) {
                                        : parse_ms(PQgetvalue(res.get(), i, 5));
         rr.route.is_stale = std::string_view(PQgetvalue(res.get(), i, 6)) == "t";
         rr.routable = std::string_view(PQgetvalue(res.get(), i, 7)) == "t";
-        rr.route.legacy_echo_wire_name = std::string_view(PQgetvalue(res.get(), i, 8)) == "t";
         out.push_back(std::move(rr));
     }
+    return out;
+}
+
+std::expected<std::vector<std::string>, GatewayRouteStoreError>
+GatewayRouteStore::confirm_sessions(std::span<const PluginAbsence> claims) {
+    if (!open_)
+        return std::unexpected(GatewayRouteStoreError::store_unavailable);
+    if (claims.empty())
+        return std::vector<std::string>{};
+    std::vector<std::string_view> agents;
+    std::vector<std::string_view> sessions;
+    agents.reserve(claims.size());
+    sessions.reserve(claims.size());
+    for (const PluginAbsence& c : claims) {
+        agents.emplace_back(c.agent_id);
+        sessions.emplace_back(c.session_id);
+    }
+    // Bound the STATEMENT, not only the lease wait: `kReadTimeout` caps the acquire, and the
+    // pool's default statement_timeout is 30 s, which would pin a dispatch thread on a stalled
+    // `agent_routes`. SET LOCAL scopes the bound to this transaction, so a pooled connection is
+    // never left with it.
+    std::vector<std::string> out;
+    bool db_error = false;
+    const bool ran = pool_.with_txn_for(kReadTimeout, [&](PGconn* c) -> bool {
+        pg::PgResult t = pg::exec_params(c, "SET LOCAL statement_timeout = '2s'",
+                                         std::vector<std::string>{});
+        if (t.status() != PGRES_COMMAND_OK) {
+            db_error = true;
+            return false;
+        }
+        // The routable predicate is lookup_routes' own, in SQL, on the DB clock (#3715). Matching
+        // on `r.session_id = t.session_id` also rejects a NULL session. Returns only the matches.
+        pg::PgResult res = pg::exec_params(
+            c,
+            "SELECT r.agent_id FROM unnest($1::text[], $2::text[]) AS t(agent_id, session_id) "
+            "JOIN gateway_route_store.agent_routes r "
+            "  ON r.agent_id = t.agent_id AND r.session_id = t.session_id "
+            "WHERE r.lease_until >= now() AND r.cluster_id IS NOT NULL",
+            std::vector<std::string>{pg::to_text_array(agents), pg::to_text_array(sessions)});
+        if (res.status() != PGRES_TUPLES_OK) {
+            spdlog::debug("GatewayRouteStore::confirm_sessions: query failed: {}",
+                          PQresultErrorMessage(res.get()));
+            db_error = true;
+            return false;
+        }
+        const int n = PQntuples(res.get());
+        out.reserve(static_cast<std::size_t>(n));
+        for (int i = 0; i < n; ++i)
+            out.emplace_back(PQgetvalue(res.get(), i, 0));
+        return true;
+    });
+    if (!ran)
+        return std::unexpected(db_error ? GatewayRouteStoreError::db_error
+                                        : GatewayRouteStoreError::store_unavailable);
     return out;
 }
 

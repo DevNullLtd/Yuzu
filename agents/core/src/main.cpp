@@ -518,6 +518,13 @@ int main(int argc, char* argv[]) {
         ->default_val(21600)
         ->envname("YUZU_UPDATE_CHECK_INTERVAL");
 
+    app.add_option("--container-runtime-endpoint", cfg.container_runtime_endpoint,
+                   "Absolute path of ONE operator-provided read-only unix socket in front of a "
+                   "container runtime (virtualization.runtime_posture, Linux). Default empty: the "
+                   "plugin never opens a socket. Never the runtime's own default socket; the "
+                   "plugin refuses those and reports why.")
+        ->envname("YUZU_AGENT_CONTAINER_RUNTIME_ENDPOINT");
+
     app.add_flag("--dex-disable", cfg.dex_disable,
                  "Disable the Guardian DEX crash recorder (collect no process-crash "
                  "telemetry). Deploy-time opt-out; not a server-side runtime toggle.")
@@ -539,6 +546,22 @@ int main(int argc, char* argv[]) {
                  "start. Deploy-time opt-out; the enforcing legacy Guardian path is "
                  "unaffected. Not a server-side runtime toggle.")
         ->envname("YUZU_AGENT_SPARK_DISABLE");
+
+    app.add_option("--spark-registry-path-verify-interval",
+                   cfg.spark_registry_path_verify_interval_s,
+                   "Windows only (accepted and ignored elsewhere): how often, in seconds, the "
+                   "Registry spark re-opens each watched key by path to notice that a parent "
+                   "key was renamed away (otherwise the watch stays healthy and silent). 0 "
+                   "(default) = OFF. Each check opens the key, which on a key with an "
+                   "auditing SACL writes a Security-log event; an open per key per interval "
+                   "can evict older events, so enable it per estate. 1..4 is raised to 5; "
+                   "maximum 86400. Boot-time only, not a server-side runtime toggle. "
+                   "Env: YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL.")
+        ->default_val(0)
+        // The range is checked after the parse, NOT with ->check(CLI::Range): CLI11 runs
+        // an option's validators on an ENVIRONMENT value and silently drops a value that
+        // fails them, so an out-of-range env setting would be ignored without a word.
+        ->envname("YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL");
 
     // SLE (ADR-0024 Decision 11): how the software_licensing source records a
     // detected per-user licence's local profile name. hash (default) = a
@@ -572,6 +595,16 @@ int main(int argc, char* argv[]) {
     cfg.tls_allow_system_trust = yuzu::agent::env_truthy(std::getenv("YUZU_TLS_SYSTEM_ROOTS"));
 
     CLI11_PARSE(app, argc, argv);
+
+    // See the option's comment: refuse an out-of-range value from either source loudly.
+    if (cfg.spark_registry_path_verify_interval_s < 0 ||
+        cfg.spark_registry_path_verify_interval_s > 86400) {
+        std::cerr << "--spark-registry-path-verify-interval (or "
+                     "YUZU_AGENT_SPARK_REGISTRY_PATH_VERIFY_INTERVAL) must be between 0 and "
+                     "86400 seconds, got "
+                  << cfg.spark_registry_path_verify_interval_s << '\n';
+        return EXIT_FAILURE;
+    }
 
     if (!plugin_signature_to_verify.empty()) {
         if (cfg.plugin_trust_bundle.empty()) {
@@ -815,6 +848,12 @@ int main(int argc, char* argv[]) {
     // SLE (ADR-0024 D11): echo the effective user_ref mode ONCE at startup — the
     // per-agent HMAC key (k_agent) is NEVER logged (roadmap R16), only the mode.
     spdlog::info("software_licensing user_ref mode: {}", cfg.license_scan_user_ref);
+#ifdef __linux__
+    // virtualization.runtime_posture: record the opt-in ONCE at startup, never the path and no I/O
+    // (the plugin validates the value and reports a refusal on its own endpoint row).
+    spdlog::info("container runtime endpoint: {}",
+                 cfg.container_runtime_endpoint.empty() ? "unset" : "configured");
+#endif
     // #5249: say which OTA update-signature mode this process actually loaded
     // (off / bundle / bundle+require) and the bundle path, and warn on any
     // YUZU_UPDATE_* variable this agent does not read (a misspelt name is

@@ -443,6 +443,11 @@ TEST_CASE("hardware CI record: store degrade, not-yet-synced and found render di
     CHECK(deg.find("CI record unavailable") != std::string::npos);
     CHECK(deg.find("hw-degrade") != std::string::npos);
     CHECK(deg.find("No CI record synced") == std::string::npos);
+    // The degrade has two causes (a failed store read, or the collation gate not being Trusted):
+    // the banner names both and points at the collation section, never only "pool degraded".
+    CHECK(deg.find("collation check has not verified") != std::string::npos);
+    CHECK(deg.find("PostgreSQL collation version") != std::string::npos);
+    CHECK(deg.find("Postgres pool or query degraded") != std::string::npos);
 
     HardwareCiDetail absent;
     absent.ci = std::optional<DeviceCiRecord>{}; // read fine, device has not synced yet
@@ -651,6 +656,10 @@ TEST_CASE("hardware list fragment: degrade banners live inside #hw-results, once
         CHECK(count_occurrences(html, tags_banner) == 1);
         CHECK(html.find(ci_banner) > open);
         CHECK(html.find(tags_banner) > open);
+        // The CI degrade has two causes (a failed store read, or the collation gate not being
+        // Trusted): the banner names both and points at the collation section.
+        CHECK(html.find("collation check has not verified") != std::string::npos);
+        CHECK(html.find("PostgreSQL collation version") != std::string::npos);
     }
     SECTION("results_only: Tags banner survives the refresh") {
         const auto html = render_hardware_list_fragment(HardwareListPage{}, false, false,
@@ -698,4 +707,38 @@ TEST_CASE("software lens links into the Software host view", "[hardware][ui]") {
         CHECK(render_hardware_software_lens(id, std::nullopt, false, true, sync, std::nullopt)
                   .find("/software#host=") == std::string::npos);
     }
+}
+
+// F7: the stored output is agent bytes. A deeply nested array must never reach
+// the recursive dump() (SIGSEGV on stack exhaustion); it renders as plain text.
+TEST_CASE("hardware action result: deeply nested agent JSON is rendered as text, not dumped (F7)",
+          "[hardware][ui]") {
+    HwActionResultView v;
+    v.phase = HwActionResultView::Phase::Rendered;
+    v.output = std::string(200000, '[') + std::string(200000, ']');
+    std::string html;
+    REQUIRE_NOTHROW(html = render_hardware_action_result("filesystem", "list_dir", v));
+    CHECK(html.find("<pre>") != std::string::npos);
+    CHECK(html.find("<table>") == std::string::npos);
+
+    // Shallow JSON still gets the table / pretty-print path.
+    v.output = R"([{"a":"1","b":[1,2]}])";
+    CHECK(render_hardware_action_result("filesystem", "list_dir", v).find("<table>") !=
+          std::string::npos);
+}
+
+// F7 boundary: json_exceeds_depth(kMcpMaxJsonDepth = 32) lets depth 31 and 32 through to the
+// parser (pretty-printed <pre>, no per-line spans) and refuses 33 (plain-text line spans).
+TEST_CASE("hardware action result: depth guard boundary at 31/32/33 (F7)", "[hardware][ui]") {
+    const auto render = [](int depth) {
+        HwActionResultView v;
+        v.phase = HwActionResultView::Phase::Rendered;
+        v.output = std::string(static_cast<std::size_t>(depth), '[') +
+                   std::string(static_cast<std::size_t>(depth), ']');
+        return render_hardware_action_result("filesystem", "list_dir", v);
+    };
+    const std::string span = "<span class=\"hw-line\">";
+    CHECK(render(31).find(span) == std::string::npos);
+    CHECK(render(32).find(span) == std::string::npos);
+    CHECK(render(33).find(span) != std::string::npos);
 }

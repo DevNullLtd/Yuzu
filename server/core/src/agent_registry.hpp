@@ -13,6 +13,8 @@
 #include <mutex>
 #include <optional>
 #include <ranges>
+#include <set>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -29,6 +31,8 @@
 #include "command_capability.hpp"
 #include "command_capability_parsers.hpp"
 #include "dispatch_caller.hpp"
+#include "dex_types.hpp" // DexObserverState (pure enum)
+#include "dispatch_denial.hpp"
 #include "event_bus.hpp"
 #include "offline_endpoint_store.hpp" // HA WS-5: PresenceIdentity is a value member (presence_cache_)
 #include "scope_eval_error.hpp" // #4981 PR-1: ScopeEvalError, evaluate_scope's typed failure surface
@@ -74,86 +78,6 @@ inline constexpr std::string_view kGatewayWireCapabilityDispatchTagV1{"command_d
 // `encode_dispatch_tag` is a public, pure helper — so the guarantee below is
 // a TYPE invariant (`ClassifiedCommand`'s private constructor), never a
 // string check alone.
-
-/// Why `ServerImpl::build_classified_command` refused a dispatch. Every
-/// value is counted separately by the caller (ADR-0033 §2: "never a
-/// permissive default") — `Unclassified`/`Ambiguous` mirror
-/// `ClassificationError` 1:1; `AnonymousOperator`/`Forbidden` are this
-/// package's own authorization arm.
-enum class DispatchDenialReason : uint8_t {
-    Unclassified,      ///< No `CommandCapability` row matches `plugin.action`
-                       ///< (also raised for a row whose `execute_gate` parsed
-                       ///< as `ExecuteGate::Unspecified` — #1398 defense in
-                       ///< depth; see `command_capability.hpp`. That should be
-                       ///< IMPOSSIBLE by construction — every fragment's own
-                       ///< compile-time sweep makes an omitted `.execute_gate`
-                       ///< a build failure — so reaching this arm at runtime
-                       ///< means that sweep itself is broken, not that this
-                       ///< row is merely unclassified in the ordinary sense).
-    Ambiguous,         ///< Two+ fragments independently declared the same row.
-    AnonymousOperator, ///< `caller.system == false` with an empty `principal`.
-    Forbidden,         ///< Classified, but `caller` may not issue it — either an
-                       ///< operator lacking the resolved securable/operation, or
-                       ///< ANY operator attempting a `system_reserved` row.
-    ApprovalRequired,  ///< #1398: classified and RBAC-authorized, but `cap
-                       ///< .execute_gate` requires proof of an approval
-                       ///< decision (`DispatchCaller::approval_provenance`)
-                       ///< the caller does not carry — `AdminOrApproval`
-                       ///< additionally admits an effective-admin caller with
-                       ///< no provenance at all; `AlwaysApproval` never does.
-                       ///< Deliberately AFTER `Forbidden` in evaluation order:
-                       ///< approval is never a substitute for a missing RBAC
-                       ///< grant, only for the ADDITIONAL gate on top of one.
-    KillSwitched,      ///< Classified and authorized, but the per-action kill
-                       ///< switch is OFF for this `plugin.action` (or the config
-                       ///< store is degraded, which `action_allowed` reports as
-                       ///< disabled — never as enabled; never a protective
-                       ///< action — `yuzu::protective`). Deliberately DISTINCT
-                       ///< from `Forbidden`: this is an operator-thrown
-                       ///< emergency stop, not an authorization verdict, and an
-                       ///< incident review needs to tell the two apart.
-};
-
-/// A refused dispatch. `securable`/`operation` are populated only once
-/// classification itself succeeded — `Unclassified`/`Ambiguous` carry no
-/// resolved securable, there is nothing to name yet (a caller
-/// logging/auditing a denial must branch on `reason` before trusting
-/// `securable`). `AnonymousOperator` and `Forbidden` are raised AFTER
-/// classification resolved, so both DO name the securable the caller failed
-/// to satisfy — that is what makes the audit line actionable.
-///
-/// `securable` owns its characters rather than viewing `CommandCapability`'s
-/// static storage: a denial is the exceptional path, and the consumers
-/// concatenate it into operator-facing messages.
-struct DispatchDenial {
-    DispatchDenialReason reason;
-    std::string securable;
-    authz::Operation operation{authz::Operation::Read};
-};
-
-/// The ONE string form of a `DispatchDenialReason` — snake_case, matching
-/// the existing `yuzu_server_dispatch_denied_total{reason=...}` metric label
-/// values (unchanged by #1398; this function only deduplicates the mapping,
-/// it does not relabel anything already in production dashboards/alerts).
-/// Used for BOTH the metric label and the route-local audit detail
-/// (`server.cpp`'s `/api/command` handler) — an incident review needs the
-/// SAME string in both places to correlate a metric spike with the audit
-/// rows that produced it, and a single source avoids the two silently
-/// drifting apart the way a hand-duplicated switch invites. No `default:`
-/// case (see `authz::to_string` in `authz_model.hpp` for the same pattern)
-/// so `-Werror=switch` catches a future `DispatchDenialReason` enumerator
-/// added here without a matching label.
-[[nodiscard]] constexpr std::string_view to_string(DispatchDenialReason reason) {
-    switch (reason) {
-        case DispatchDenialReason::Unclassified: return "unclassified";
-        case DispatchDenialReason::Ambiguous: return "ambiguous";
-        case DispatchDenialReason::AnonymousOperator: return "anonymous_operator";
-        case DispatchDenialReason::Forbidden: return "forbidden";
-        case DispatchDenialReason::ApprovalRequired: return "approval_required";
-        case DispatchDenialReason::KillSwitched: return "kill_switched";
-    }
-    return "";
-}
 
 /// The pure classify+authorize DECISION `ServerImpl::build_classified_command`
 /// is built around, extracted so it is directly unit-testable without a live
@@ -375,19 +299,6 @@ private:
     std::unordered_set<std::string> kill_switched_os_;
 };
 
-/// Upgrade-window shim, removed with the other legacy-name shims. The wire command for a
-/// session that registered the pre-rename plugin name `tar` must carry `tar`, not `echo`, or the
-/// agent reports plugin-not-found. Returns the command unchanged (a copy) for every other
-/// session and every other plugin. dispatch_tag is deliberately left as computed: the agent
-/// never reads it.
-[[nodiscard]] inline pb::CommandRequest wire_for(bool legacy_echo_wire_name,
-                                                 const ClassifiedCommand& cmd) {
-    pb::CommandRequest out = cmd.wire();
-    if (legacy_echo_wire_name && out.plugin() == "echo")
-        out.set_plugin("tar");
-    return out;
-}
-
 /// #3687 (Gate 6 governance fix): the per-action kill-switch DECISION
 /// `finalize_classified_command` applies (below), extracted to its own
 /// function for the IDENTICAL reason `finalize_classified_command` itself was
@@ -422,8 +333,8 @@ private:
 /// this directly rather than re-deriving the condition.
 ///
 /// Protective-action exemption: a PROTECTIVE action
-/// (`yuzu::protective::is_protective_action` — the quarantine plugin's four
-/// actions plus `__guard__.push_rules`) is never refused here: the callback is
+/// (`yuzu::protective::is_protective_action` — the firewall plugin's four
+/// containment actions plus `__guard__.push_rules`) is never refused here: the callback is
 /// not consulted (so a degraded store's nullopt cannot refuse it) and the
 /// returned OS set is empty, which means no `ids_with_os` presence read and no
 /// send-time OS withhold downstream.
@@ -539,15 +450,19 @@ struct PluginMeta {
 // does not edit in place. Lock-free readers (scope evaluation, the DEX perf
 // provider) depend on this — NONE of them reads `gateway_node`,
 // `gateway_wire_capabilities`, or `gateway_stream_home_id` (verified: their
-// only readers are send_to/send_to_all and agent_registry.cpp's own
-// gateway_stream_home_id() accessor, all under `stream_mu`), which is
-// exactly why those three are NOT in this list. Post-publication writes are
+// readers are send_to/send_to_all, `has_remote_presence`,
+// `lacks_local_delivery_path`/`needs_directory_consult` (#5685 hp-1, via
+// `no_delivery_path`, which only TRY-locks `stream_mu`) and
+// agent_registry.cpp's own gateway_stream_home_id() accessor, all under
+// `stream_mu`), which is exactly why those three are NOT in this list.
+// Post-publication writes are
 // confined to stream/server_context/peer_cert_pem, gateway_node +
 // gateway_wire_capabilities + gateway_stream_home_id (all under stream_mu —
 // the trio published together by set_gateway_route, M1 review fix +
 // #4324; an earlier revision wrote gateway_node under the registry mu_
 // instead, which both raced stream_mu's readers and contradicted this
-// comment) and the atomic last_activity_epoch_ms. `session_id` is ALSO
+// comment) and the atomics last_activity_epoch_ms and
+// presence_plugins_published and presence_plugins_retry_after_ms (written by HeartbeatIngestion). `session_id` is ALSO
 // rewritten in place after publication, by AgentRegistry::map_session under
 // AgentRegistry::mu_ (an exception to the identity-field rule above): read
 // it only through session_is()/session_id_of(), never through a
@@ -565,10 +480,6 @@ struct AgentSession {
     std::string agent_version;
     std::vector<std::string> plugin_names;
     std::vector<PluginMeta> plugin_meta;
-    /// Upgrade-window shim, removed with the other legacy-name shims: the agent registered the
-    /// pre-rename plugin name `tar` (normalised to `echo` in plugin_names/plugin_meta). Commands
-    /// for `echo` are written to it as `tar` (see wire_for). Set only by register_agent.
-    bool legacy_echo_wire_name = false;
     std::unordered_map<std::string, std::string> scopable_tags;
     std::string gateway_node; // Non-empty if agent is connected via gateway
     /// HA WS-4 4.3: the gateway cluster this session's most recent CONNECTED
@@ -612,6 +523,14 @@ struct AgentSession {
     /// (`GatewayUpstreamServiceImpl::NotifyStreamStatus`).
     std::string gateway_stream_home_id;
     std::mutex stream_mu;
+
+    /// #5685 follow-up: set once this session's `plugin_names` reached the durable presence row
+    /// (a successful `OfflineEndpointStore::upsert` that carried them), so later heartbeats skip
+    /// re-sending a list that only changes at re-registration (a new session starts false).
+    std::atomic<bool> presence_plugins_published{false};
+    /// steady_clock ms before which a failed publish is not retried (a backoff, so an unhealthy
+    /// store or an unpublishable list costs no database round trip per heartbeat).
+    std::atomic<std::int64_t> presence_plugins_retry_after_ms{0};
 
     // Last activity timestamp -- updated on Subscribe reads and Heartbeats.
     // Atomic to avoid acquiring the registry mutex on every stream Read.
@@ -895,6 +814,10 @@ public:
     /// — no caller in `server/core/src/**` references it.
     void expire_presence_cache_for_test();
 
+    /// Test hook: age every cached plugin-capability entry by `by`, so a test can place an entry
+    /// inside or beyond `kMaxStaleServe` without sleeping.
+    void age_plugin_cache_for_test(std::chrono::seconds by);
+
     /// W1.5 / #823: install the device-token store so `register_agent`
     /// revokes any device tokens bound to a previous incarnation of the
     /// same agent_id whenever a re-registration is detected. Optional —
@@ -950,8 +873,10 @@ public:
     int send_to_all(const ClassifiedCommand& cmd);
 
     // WS-4 4.2b Task C: fallback-ONLY queue for an agent this replica has NO
-    // local session for at all (the precondition every caller must have
-    // already established — this method does not itself check `agents_`).
+    // local session for at all — or (#5685 hp-1) one whose local session
+    // `lacks_local_delivery_path` (the precondition every caller must have
+    // already established — this method does not itself check `agents_`,
+    // except to apply the #5294 per-OS kill switch to a local session's OS).
     // The caller (`GatewayRouteFallback`, dispatch_route_fallback.hpp) has
     // already resolved `cluster_id` from a BATCHED GatewayRouteStore
     // directory read. Mirrors `send_to`'s existing gateway_node branch: the
@@ -959,15 +884,12 @@ public:
     // just keyed off a directory-resolved cluster rather than a live
     // session's advertised `gateway_node`. Returns false only on a
     // malformed dispatch tag (the defensive check); queuing itself cannot
-    // fail. NEVER call this for an agent that DOES have a local session —
-    // `send_to` is the sole path for that (this method has no capability
-    // advertisement to check, because there is no session to have
-    // advertised one).
-    /// `legacy_wire` (Echo-rename upgrade window, removed with the other legacy-name shims) is
-    /// the directory row's `legacy_echo_wire_name`: the target agent registered the pre-rename
-    /// plugin name `tar`.
+    // fail. Returns false too when the #5294 kill switch withholds the local
+    // session's OS. NEVER call this for an agent whose local session CAN
+    // deliver — `send_to` is the sole path for that (this method has no
+    // capability advertisement to check).
     bool send_via_directory(const std::string& agent_id, const ClassifiedCommand& cmd,
-                            const std::string& cluster_id, bool legacy_wire);
+                            const std::string& cluster_id);
 
     struct GatewayPendingCmd {
         std::string agent_id;
@@ -1039,6 +961,14 @@ public:
     // wired), this is byte-identical to the pre-WS-5 local-only behavior.
     std::vector<std::string> all_ids() const;
 
+    // The ids of the sessions held ON THIS REPLICA only, under the same lock all_ids() takes, and
+    // with NO presence read at all: nothing here can fail, be truncated or hit Postgres. The
+    // Hardware list uses it for the part of "online" the database cannot know (a session whose
+    // row has not recorded a session id yet) and takes the rest of "online" from the roster read
+    // itself (#7566), so a failed or truncated presence read can no longer turn connected devices
+    // into Offline. Everything that must see other replicas' agents keeps using all_ids().
+    [[nodiscard]] std::vector<std::string> local_ids() const;
+
     // Count of `all_ids()` (local sessions UNION cached durable presence)
     // without materialising the id list. Unlike `all_ids()`, a degraded
     // presence read is a typed `std::unexpected` — never a silently
@@ -1077,7 +1007,31 @@ public:
     // since genuinely registered locally, this correctly reports "no longer
     // remote" and the fast path (which walks the CURRENT registry) reaches
     // it anyway.
+    //
+    // #5685 hp-1: ALSO true when an id has a local session that
+    // `lacks_local_delivery_path` — `send_to_all` skips such a session, so the
+    // unfiltered fast path would silently drop an agent the directory can reach.
     [[nodiscard]] bool has_remote_presence(const std::vector<std::string>& ids) const;
+
+    /// HA WS-5 #5685 hp-1: true iff this replica holds a session for `agent_id`
+    /// that `send_to` cannot deliver on: an EMPTY `gateway_node` AND no
+    /// Subscribe stream. That is the state a non-owning replica's CONNECTED
+    /// leaves behind (the CONNECTED was handled elsewhere, so the local
+    /// session never learns its placement), and it shadowed the directory
+    /// fallback, which used to consult the store only on a TOTAL local miss.
+    /// It is exactly the state in which `send_to` returns false, so routing
+    /// such an id to the directory can change no outcome that used to succeed:
+    /// a direct agent has a stream, a gateway agent has a `gateway_node`. False
+    /// for an unknown id (that is a plain local miss, handled by the caller).
+    /// Takes `mu_` only to copy the session pointer, then only TRY-locks
+    /// `stream_mu` (never both at once): a held `stream_mu` means a send to the
+    /// session is in flight, so it is reported as HAVING a path. A stalled
+    /// stream write therefore cannot stall a caller of this.
+    [[nodiscard]] bool lacks_local_delivery_path(const std::string& agent_id) const;
+
+    /// What `GatewayRouteFallback::prepare` asks per candidate, in ONE registry lookup: true when
+    /// there is no local session at all, or the session `lacks_local_delivery_path`.
+    [[nodiscard]] bool needs_directory_consult(const std::string& agent_id) const;
 
     // HA WS-5 (ADR-2002 §7a): wires the durable cross-replica presence store
     // that all_ids()/evaluate_scope() merge in for ids absent from the local
@@ -1096,6 +1050,23 @@ public:
     /// `has_remote_presence`) or it self-deadlocks.
     using PresenceReadFn = std::function<
         std::expected<std::vector<PresenceIdentity>, PresenceReadError>(std::chrono::seconds)>;
+    /// Injectable "live ids whose recorded plugin list lacks `plugin`" read (the
+    /// `query_live_ids_without_plugin` seam). Bound by the store overload of `configure_presence`;
+    /// tests may feed a stub through `configure_presence_plugin_reader`.
+    using PluginMissingReadFn = std::function<
+        std::expected<std::vector<PluginAbsence>, PresenceReadError>(std::chrono::seconds,
+                                                                     std::string_view)>;
+    void configure_presence_plugin_reader(PluginMissingReadFn reader,
+                                          std::chrono::seconds ttl = std::chrono::hours{1});
+    /// Injectable CONFIRMATION read for a plugin-absence verdict (#5685 follow-up): given the
+    /// (agent, session) claims of the candidates, the ids whose ROUTABLE directory row
+    /// (`agent_routes`) still names that session; `nullopt` is a degraded read. Production binds
+    /// `make_route_session_confirmer(GatewayRouteStore&)` (plugin_absence_confirmation.hpp) in
+    /// `server.cpp`. It runs with NO registry lock held and must not call back into the registry.
+    /// Unset (or degraded) means no cross-replica absence is ever withheld: fail open. Counted on
+    /// `yuzu_server_plugin_absence_confirm_total{outcome}` (seeded here).
+    using RouteSessionReadFn = RouteSessionConfirmFn;
+    void configure_route_session_reader(RouteSessionReadFn reader);
     /// Test-facing overload: assigns the reader AND the TTL it is called with.
     void configure_presence(PresenceReadFn reader, std::chrono::seconds ttl);
 
@@ -1142,6 +1113,19 @@ public:
     // quarantine/Guardian dispatch; a device that genuinely lacks the plugin
     // answers "plugin not found" itself, which is observable, unlike a
     // server-side withhold.
+    //
+    // #5685 follow-up: ALSO merges ids with NO local session whose durable presence row records a
+    // plugin list lacking `plugin` (`OfflineEndpointStore::query_live_ids_without_plugin`), so a
+    // replica that does not own an agent's session still reports plugin_not_found for it. Local
+    // wins (a local session is judged by its own list, as in `ids_with_os`); an agent with no
+    // recorded list is unknown and fails open; a degraded read fails open too (the cached
+    // failure is served for `kPresenceCacheTtl`, the store counts it).
+    //
+    // A cross-replica absence is only a CANDIDATE (cached for `kPresenceCacheTtl`): it is withheld
+    // only while the agent's ROUTABLE directory row, read per call through the
+    // `RouteSessionReadFn`, still names the session that published the list. A re-registered
+    // agent's row names the new session, so the old list stops applying at once; no row, an
+    // unroutable row, a degraded read or an unwired reader fail open.
     std::unordered_set<std::string> ids_missing_plugin(std::string_view plugin,
                                                        std::string_view action) const;
 
@@ -1357,6 +1341,39 @@ private:
         std::vector<PresenceIdentity>{}};
     mutable std::chrono::steady_clock::time_point presence_cache_at_{};
 
+    /// #5685 follow-up (plugin-capability visibility): the cross-replica "live ids whose published
+    /// plugin list lacks `plugin`" read and its per-plugin cache (a success OR a failure, held for
+    /// `kPresenceCacheTtl`). A DEDICATED mutex, never `presence_cache_mu_`: the reader is a
+    /// Postgres query and runs with NO registry lock held (single-flight per plugin through
+    /// `missing_plugin_inflight_`), so it can never stall `live_presence()` or an unrelated
+    /// dispatch. A cached failure is a null pointer (callers fail open). The result is shared, not
+    /// copied, because it can be fleet-sized.
+    using MissingPluginIds = std::shared_ptr<const std::vector<PluginAbsence>>;
+    struct MissingPluginCacheEntry {
+        std::chrono::steady_clock::time_point at{};
+        MissingPluginIds ids;
+    };
+    static constexpr std::size_t kMissingPluginCacheMax = 64;
+    /// A refresh in flight lets other callers serve the previous entry only while it is this
+    /// recent; an older one fails open instead.
+    static constexpr std::chrono::seconds kMaxStaleServe{30};
+    mutable std::mutex missing_plugin_mu_;
+    PluginMissingReadFn presence_missing_plugin_reader_;
+    RouteSessionReadFn route_session_reader_; ///< guarded by `missing_plugin_mu_`
+    /// At most this many confirmation reads may be in flight at once. Each holds a pool lease and
+    /// builds fleet-sized arrays, and the pool is shared with presence upserts, lease renewals and
+    /// registration, so a dispatch burst must not be able to take it over. A caller past the cap
+    /// is shed: it withholds nothing (fail open) and is counted `outcome="shed"`.
+    static constexpr int kMaxConcurrentConfirms = 2;
+    mutable std::atomic<int> confirms_in_flight_{0};
+    /// Steady-clock ms of the last warn for a degraded or shed confirmation (rate limit).
+    /// Starts one interval in the past so the FIRST warning is never suppressed, whatever the
+    /// steady clock reads at process start.
+    mutable std::atomic<std::int64_t> confirm_warn_at_ms_{-60'000};
+    std::chrono::seconds missing_plugin_ttl_{};
+    mutable std::unordered_map<std::string, MissingPluginCacheEntry> missing_plugin_cache_;
+    mutable std::unordered_set<std::string> missing_plugin_inflight_;
+
     /// Returns the cached (or freshly-fetched, if stale/first-call) live
     /// presence set — or the cached/fresh `PresenceReadError` on a degraded
     /// read (#4981 PR-1 Finding B). Always acquires `presence_cache_mu_` first, so
@@ -1365,6 +1382,16 @@ private:
     /// single-replica case pays one uncontended mutex acquisition plus the
     /// pointer check, and can never fail this way.
     std::expected<std::vector<PresenceIdentity>, PresenceReadError> live_presence() const;
+
+    /// Cached cross-replica "live ids lacking `plugin`" read; null when no reader is wired or the
+    /// read degraded (callers fail open). Takes only `missing_plugin_mu_`, never across the read.
+    MissingPluginIds missing_plugin_from_presence(std::string_view plugin) const;
+
+    /// Row count of the cached live-presence set (refreshing it like `live_presence()` does, but
+    /// without copying it out); 0 when presence is not wired, nullopt on a degraded read.
+    std::optional<std::size_t> presence_row_count() const;
+    /// Refreshes `presence_cache_` when stale. Caller holds `presence_cache_mu_`.
+    void refresh_presence_cache_locked() const;
 
     // #4981 PR-1 (Finding B4): which agent population evaluate_scope_impl
     // considers. `LocalOnly` skips the live_presence() call AND the
@@ -1471,6 +1498,54 @@ const std::vector<ScopeKindInfo>& scope_kind_catalog();
 // -- AgentHealthStore ---------------------------------------------------------
 // Aggregates per-agent heartbeat status_tags into fleet-wide Prometheus metrics.
 
+/// The ONE staleness window for every read of AgentHealthStore's per-agent heartbeat data: the
+/// 15 s sweep's prune (recompute_metrics), perf_snapshot, net_snapshot and the per-device
+/// guardian_backend accessors. An agent whose last heartbeat is older than this is not counted
+/// anywhere, so a gauge and the device field that mirrors it apply the same freshness test
+/// (#2240; the POPULATIONS still differ, see guardian_backend_for). A literal at each site is the
+/// drift this constant removes.
+inline constexpr std::chrono::seconds kAgentHealthStaleness{90};
+
+/// Bulk guardian_backend_for takes mu_ in slices of kGuardianBackendSlice ids and pauses
+/// kGuardianBackendPause between slices with the lock RELEASED, so a heartbeat upsert waits for one
+/// slice and not the whole list. That bounds the stall caused by THIS accessor only: the 15 s
+/// recompute_metrics sweep, perf_snapshot and net_snapshot still hold mu_ for a whole pass
+/// (recompute_metrics about 1.2 s at 500k).
+/// MEASURED on a prototype copy of this logic (not the committed code): 500k ids, 30 tags per
+/// agent, the two production files built -O2 on Linux, idle 32-core box, ONE closed-loop writer.
+/// Unsliced, one call held mu_ about 150-200 ms and stalled an upsert by about as long. Slices
+/// alone did NOT help (std::mutex is unfair: the releasing thread re-takes it before the woken
+/// writer runs) and neither did yield(). Slices plus a 50 us sleep took the worst upsert stall to
+/// 2-4 ms for about 15-20 ms more per call; that sleep actually lasted about 100 us (Linux timer
+/// slack). A separate model with 16-64 open-loop writers at the heartbeat rate gave a worst stall
+/// of 9-20 ms. The pause is therefore load-bearing: do not remove it as a dead sleep.
+/// PLATFORM: only Linux was measured; other non-Windows builds (macOS) sleep unmeasured. MSVC
+/// rounds sleep_for up to a scheduler tick (1-15.6 ms) and nothing in the server raises the timer
+/// resolution, which would add up to about 1.9 s per call at 500k, so _WIN32 busy-waits on
+/// steady_clock instead (about 6 ms of CPU per 500k call, a true 50 us window). On Linux the same
+/// spin measured somewhat worse than the sleep (worst stall about 9-22 ms at 16-64 writers).
+/// WINDOWS (MSVC 14.44, Windows 11, 16 hardware threads), measured on a MODEL of the store with
+/// 500k ids, not on the production store: sleep_for(50 us) lasted 15.8 ms, so a sleep-based pause
+/// added about 1.9 s per call; the spin lasted 50 us. With 4 writers at about 38k upserts/s the
+/// spin call took 63 ms (unsliced 55 ms) and the worst upsert stall fell from 55 ms to 1.3 ms;
+/// with 16 writers at about 32k/s, 162 ms and 4.7 ms. One writer in a tight loop, far above the
+/// heartbeat rate (about 17k/s at 500k agents on a 30 s interval), starves the reader (every
+/// slice waits for the lock): 1.5 s per call. The production store's unit tests pass on Windows.
+/// Slices are not a point-in-time snapshot, which list_devices never was (the registry lock is
+/// released before the health lock is taken).
+inline constexpr std::size_t kGuardianBackendSlice = 4096;
+inline constexpr std::chrono::microseconds kGuardianBackendPause{50};
+static_assert(kGuardianBackendSlice > 0, "a zero slice would never advance the bulk loop");
+static_assert(kGuardianBackendPause >= std::chrono::microseconds{1} &&
+                  kGuardianBackendPause <= std::chrono::milliseconds{1},
+              "the pause must be real (it is what lets ingest in) and must stay small (it is paid "
+              "once per slice on the request thread)");
+
+/// The heartbeat tag the agent's DEX crash and hang observer reports ("1" armed, "0" disarmed).
+/// Emitted on Windows, Linux and macOS agents with the observer enabled; absent otherwise. The
+/// fleet gauge and `AgentHealthStore::dex_observer_for` read this one constant.
+inline constexpr std::string_view kDexObserverArmedTag = "yuzu.dex_observer_armed";
+
 struct AgentHealthSnapshot {
     std::string agent_id;
     std::unordered_map<std::string, std::string> status_tags;
@@ -1489,8 +1564,9 @@ public:
     /// memory is per-process and pruned every ~90 s): the sink
     /// (EchoCorruptionAuditGate) owns durable dedup and its own rate limit; a
     /// failed write is retried after the gate's degraded window, and a
-    /// candidate skipped only because the gate's slot was busy is retried on
-    /// the next heartbeat -- see echo_corruption_audit.hpp for the distinction.
+    /// candidate skipped because that agent's lookup was already in flight (or
+    /// the in-flight set is at its bound) is retried on the next heartbeat --
+    /// see echo_corruption_audit.hpp for the distinction.
     /// This is the store's first plugin-specific side-effecting hook -- a
     /// second consumer of the same "surface a candidate, let an injected sink
     /// durably dedup it" shape should generalize this to a small named-sink
@@ -1500,6 +1576,15 @@ public:
         std::function<void(const std::string& agent_id, int64_t corruption_total,
                            const std::string& quarantine_last)>;
     void set_corruption_sink(CorruptionSink sink);
+
+    /// Bounds the `plugin` label of `yuzu_fleet_plugin_init_failed` to these names (lowercase, as
+    /// `catalogue_plugin_names` returns them; plugin_init_failed_labels.hpp). The heartbeat tag is
+    /// agent-supplied, so an agent must never choose the labels: a well-formed token that is not in
+    /// the set is summed under `plugin="unknown"` and counted in
+    /// `yuzu_fleet_plugin_init_failed_rejected`. A store that is never given a set (production
+    /// always gives one) fails closed: every name reads as unknown. Call once at boot, before the
+    /// first sweep.
+    void set_known_plugins(std::vector<std::string> names);
 
     void remove(const std::string& agent_id);
 
@@ -1521,10 +1606,58 @@ public:
     /// so the dashboard and the yuzu_fleet_net_* gauges see the same population).
     std::vector<AgentHealthSnapshot> net_snapshot(std::chrono::seconds staleness) const;
 
+    /// #2240: the per-device twin of the yuzu_fleet_guardian_backend gauge. Same table, same
+    /// strict parse (guardian_backend_fleet_tags.hpp) and same staleness contract as
+    /// recompute_metrics, so the gauge and the device field cannot disagree on classification or
+    /// on the freshness test; pass kAgentHealthStaleness. Two differences remain. POPULATION: the
+    /// gauge counts every health-store snapshot within the window, including an agent that has just
+    /// disconnected (remove() has no production caller, so the sweep prune is the only eviction),
+    /// while the device surfaces list only registry-connected rows. SAMPLING: the gauge is
+    /// republished every 15 s sweep, these read the live store. So after a disconnect the gauge can
+    /// still count the agent for up to about 105 s (window plus one sweep), and the two can differ in
+    /// either direction for up to one sweep (a null field does not by itself mean the gauge has
+    /// stopped counting the agent, and a non-null field can precede the gauge's first count).
+    /// CLOCK: last_seen (the tag rides every beat today; a status-beat split must move this and the
+    /// gauge together - see the header).
+    ///
+    /// `guardian_backend_for` returns one entry per input id, ALIGNED by index: the token
+    /// (a view into the header's constexpr table, static storage, safe after mu_ is released)
+    /// or nullopt for an id that is unknown to the store, stale, has no tag or an empty one, or
+    /// carries a rejected value. nullopt NEVER means `legacy`. It does one hash lookup per id with
+    /// no string copies, taking mu_ per kGuardianBackendSlice ids with a pause between slices
+    /// (kGuardianBackendPause: a sleep or a busy-wait by platform, see the constants).
+    /// Only DeviceApi::list_devices() calls it (REST /api/v1/devices and MCP list_agents); the
+    /// callers that discard the field use list_devices_basic() or connected_count().
+    /// Because mu_ is released between slices an entry can be refreshed or pruned mid-call: each
+    /// id is read consistently, the list is not one snapshot.
+    /// `guardian_backend_of` is the O(1) point lookup for lookup_device (#3564: no scan, so a miss
+    /// costs the same as a hit). Neither may be called from a hot path; both are for
+    /// Infrastructure:Read device reads.
+    [[nodiscard]] std::vector<std::optional<std::string_view>>
+    guardian_backend_for(std::span<const std::string> agent_ids,
+                         std::chrono::seconds staleness) const;
+    [[nodiscard]] std::optional<std::string_view>
+    guardian_backend_of(const std::string& agent_id, std::chrono::seconds staleness) const;
+
+    /// The DEX observer state of each input id, ALIGNED by index (duplicates and all), read with
+    /// the same slicing, pause and staleness contract as `guardian_backend_for`; pass
+    /// kAgentHealthStaleness. Tag "1" is Armed, "0" is Disarmed; an absent tag, any other value,
+    /// an unknown id or a stale snapshot is NoneReported (an agent that opted out and one on a
+    /// build with no observer are indistinguishable: neither sends the tag). Counts only reach
+    /// the Apps page, never an id. Not for a hot path.
+    [[nodiscard]] std::vector<DexObserverState>
+    dex_observer_for(std::span<const std::string> agent_ids, std::chrono::seconds staleness) const;
+
 private:
+    /// The one sliced read loop behind `guardian_backend_for` and `dex_observer_for`: for each id,
+    /// in order, `fn(snapshot_or_null, now)` runs with mu_ held, mu_ is released between slices.
+    template <typename Fn>
+    void for_each_snapshot_sliced(std::span<const std::string> agent_ids, Fn&& fn) const;
+
     mutable std::mutex mu_;
     std::unordered_map<std::string, AgentHealthSnapshot> snapshots_;
     CorruptionSink corruption_sink_;
+    std::set<std::string, std::less<>> known_plugins_; // guarded by mu_; empty = nothing known
 
     /// C1: per-OS twin of recompute_metrics' four yuzu_fleet_perf_* exports —
     /// yuzu_fleet_perf_os_{reporting,cpu_pct,commit_pct,disk_lat_ms}{os[,stat]},

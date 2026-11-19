@@ -197,18 +197,18 @@ bool UpdateRegistry::upsert_package(const UpdatePackage& pkg) {
     return true;
 }
 
-void UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
+bool UpdateRegistry::remove_package(const std::string& platform, const std::string& arch,
                                     const std::string& version) {
     if (!open_) {
         note_write_degrade(metrics_, kReasonStoreNotOpen);
-        return;
+        return false;
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         note_write_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: remove_package skipped, no connection in time ({})",
                       pool_.last_error());
-        return;
+        return false;
     }
     pg::PgResult res = pg::exec_params(
         lease.get(),
@@ -219,9 +219,10 @@ void UpdateRegistry::remove_package(const std::string& platform, const std::stri
         note_write_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: remove_package failed for {}/{}/{}: {}", platform, arch,
                       version, PQerrorMessage(lease.get()));
-        return;
+        return false;
     }
     spdlog::info("UpdateRegistry: removed package {}/{}/{}", platform, arch, version);
+    return true;
 }
 
 UpdateRegistry::RolloutChange UpdateRegistry::update_rollout_checked(const std::string& platform,
@@ -333,18 +334,17 @@ UpdateRegistry::RolloutChange UpdateRegistry::update_rollout_checked(const std::
     return out;
 }
 
-std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
-    std::vector<UpdatePackage> packages;
+std::optional<std::vector<UpdatePackage>> UpdateRegistry::list_packages_checked() const {
     if (!open_) {
         note_read_degrade(metrics_, kReasonStoreNotOpen);
-        return packages;
+        return std::nullopt;
     }
     auto lease = pool_.try_acquire_for(kAcquireTimeout);
     if (!lease) {
         note_read_degrade(metrics_, kReasonPoolTimeout);
         spdlog::error("UpdateRegistry: list_packages skipped, no connection in time ({})",
                       pool_.last_error());
-        return packages;
+        return std::nullopt;
     }
     const std::string sql = std::string("SELECT ") + kSelectCols +
                             " FROM update_registry.update_packages ORDER BY platform, arch, "
@@ -353,13 +353,20 @@ std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
     if (res.status() != PGRES_TUPLES_OK) {
         note_read_degrade(metrics_, kReasonQueryError);
         spdlog::error("UpdateRegistry: list_packages failed: {}", PQerrorMessage(lease.get()));
-        return packages;
+        return std::nullopt;
     }
+    std::vector<UpdatePackage> packages;
     const int rows = PQntuples(res.get());
     packages.reserve(static_cast<std::size_t>(rows));
     for (int i = 0; i < rows; ++i)
         packages.push_back(row_to_pkg(res.get(), i));
     return packages;
+}
+
+std::vector<UpdatePackage> UpdateRegistry::list_packages() const {
+    // Fail-soft form: a degraded read is an empty list (counted and logged by the
+    // checked read).
+    return list_packages_checked().value_or(std::vector<UpdatePackage>{});
 }
 
 std::optional<UpdatePackage> UpdateRegistry::latest_for(const std::string& platform,

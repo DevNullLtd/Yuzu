@@ -70,10 +70,12 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "dex_read_model.hpp"
 #include "dex_score_policy.hpp"
+#include "dex_usage_model.hpp" // pure and store-type free: the usage model, slice and refusal tokens
 
 namespace yuzu::server {
 
@@ -87,6 +89,19 @@ struct DexSignalDetailModel {
     std::vector<DexOsCrashCount> by_os;
     std::vector<DexDeviceCrashCount> devices;
     std::vector<DexDayCrashCount> by_day;
+};
+
+/// Why `DexApi::apps_usage` refused. `reason` is one of the usage builder's refusal tokens
+/// (invalid_request, apps_degraded, no_population, invalid_slice, group_unavailable,
+/// tag_unavailable, usage_unavailable). `detail` is a token, never caller text:
+/// `unknown_group` for a group id that names no group, the Apps model's `degraded_reason` for
+/// apps_degraded, the group read's fault for group_unavailable, and for usage_unavailable the
+/// owner's fault token (pool_acquire_timeout, query_error, statement_timeout,
+/// concurrency_budget, fleet_too_large, not_wired) or `invalid_read` when the read succeeded
+/// but could not be assembled. Empty when there is nothing more to say.
+struct DexUsageRefusal {
+    std::string reason;
+    std::string detail;
 };
 
 /// Provider of the score policy the Apps read scores under, read once per
@@ -137,7 +152,13 @@ public:
     /// GET /api/v1/dex/apps — app-centric stability list (no per-agent identity),
     /// per application and per version. `degraded` = null store, failed read,
     /// invalid score policy or unreadable stored policy: the handler must refuse
-    /// it, never render it as an empty or perfect list.
+    /// it, never render it as an empty or perfect list. `degraded_reason` names the
+    /// cause (see `DexAppsModel::degraded_reason`: a `dex_read_fault_token` or one of
+    /// invalid_scope, score_policy_unavailable, score_policy_invalid), and the page and
+    /// the REST and MCP error text each say which one. A healthy model carries
+    /// `observer_state`, the live observer counts per platform, when the implementation
+    /// has an observer source (nullopt otherwise: unknown, never zero); it is read only
+    /// after a successful read, from the same fleet snapshot as the population.
     /// Scoped to `platform_scope` (all|windows|macos|linux): the population and every
     /// figure are over that scope's online devices. An unknown token is degraded
     /// (`invalid_scope`), never defaulted to a platform.
@@ -149,6 +170,21 @@ public:
     [[nodiscard]] DexAppsModel apps(const std::string& window) const {
         return apps(window, kDexAppsScopeWindows);
     }
+
+    /// GET /api/v1/dex/apps/usage — fleet usage per Apps application: run time and launches over
+    /// the 30-day basis and the exposure rate per hour of use, in the slice's cells. The Apps
+    /// list is read and the model built at ONE request instant from ONE fleet snapshot.
+    /// `visible` is the caller's admitted device set (nullopt = unfiltered, engaged = exactly
+    /// these agents, engaged-empty = none): the usage population is the connected agents in it.
+    /// The route has already admitted the caller, validated every token and applied the
+    /// permission and audit rules; this method applies none. A refusal is never a model with
+    /// zero figures (see `DexUsageRefusal`); zero devices online or visible is a MODEL with
+    /// population 0, not a refusal. Results are cached for a short time, so `as_of_epoch` can
+    /// be older than the request.
+    [[nodiscard]] virtual std::expected<DexAppsUsageModel, DexUsageRefusal>
+    apps_usage(const std::string& window, const std::string& platform_scope,
+               const DexUsageSlice& slice, std::int64_t floor,
+               const std::optional<std::unordered_set<std::string>>& visible) const = 0;
 
     /// GET /api/v1/dex/catalogue?os=&window= — the Catalogue View 1 family
     /// cards + fleet coverage + the "Other (uncatalogued)" list (ADR-0031

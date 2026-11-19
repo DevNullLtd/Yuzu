@@ -17,9 +17,23 @@ per file:
 
 Plus the endpoint_state retention prune's host (#5678): in server.cpp the one
 `offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)` call must sit inside the
-preflight_runner_thread_ lambda, after its `tick % kOfflineEndpointPruneEveryNTicks == 1`
-condition. No unit test drives that thread, so deleting the call, dropping the cadence gate, or
-moving it onto another thread (health_recompute_thread_ shares the revocation sweep's budget)
+preflight_runner_thread_ lambda, inside the block of an `if (... && tick %
+kOfflineEndpointPruneEveryNTicks == 1)`. No unit test drives that thread, so deleting the call,
+dropping or loosening the cadence gate, changing the cadence constant, or moving the call onto
+another thread (health_recompute_thread_ shares the revocation sweep's budget) would leave every
+other test green. The software change ledger prune (SAM-14) is pinned the same way: one
+`software_inventory_store_->run_retention_prune_changes()` call, inside that lambda, in the block
+of an `if (... && tick % kSoftwareLedgerPruneEveryNTicks == 1)`. Each cadence constant is pinned to
+`constexpr int <name> = 60;`, and the condition must end the `if` exactly (`== 10` and
+`== 1 || true` fail) in a head with no `||`, so a dead `(void)(cond);` ahead of an ungated call, or a
+call moved out of the block, fails too.
+
+Plus the plugin-absence confirmation wiring (#5685 follow-up): in server.cpp the registry's confirmation
+reader must be bound exactly once, to `make_route_session_confirmer(*gateway_route_store_)` behind a
+`gateway_route_store_ && gateway_route_store_->is_open()` guard, and unwired exactly once with
+`configure_route_session_reader({})` BEFORE `gateway_route_store_.reset()`. No unit test drives
+`server.cpp`'s start/stop, so dropping the binding (every cross-replica withhold silently fails open),
+replacing the production factory with a hand-copied lambda, or unwiring after the store is destroyed
 would leave every other test green.
 
 `//` comments are stripped and whitespace runs collapsed before matching, so line wrapping and
@@ -64,48 +78,171 @@ def problems(name, gate, src):
         out.append(f"{name}: expected exactly one `{call}` (found {n}) (#5678)")
     if re.search(r"(->|\.) ?remove_if_session ?\(", t):
         out.append(f"{name}: raw remove_if_session( call bypasses mirror_departure_to_presence (#5678)")
+    # The ARRIVAL mirror (#5685 follow-up): exactly one call per file, through the helper, never a
+    # raw store call (a replica must not keep judging a restarted agent by its old plugin list).
+    arrival = normalise(f"mirror_arrival_to_presence({STORE_ARG}, agent_id, session_id);")
+    na = t.count(arrival)
+    if na != 1:
+        out.append(f"{name}: expected exactly one `{arrival}` (found {na}) (#5685 follow-up)")
+    if re.search(r"(->|\.) ?clear_plugins_of_other_sessions ?\(", t):
+        out.append(f"{name}: raw clear_plugins_of_other_sessions( call bypasses "
+                   "mirror_arrival_to_presence (#5685 follow-up)")
     return out
 
 
-PRUNE_CALL = "offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)"
-PRUNE_COND = "tick % kOfflineEndpointPruneEveryNTicks == 1"
+# Cadence of both prunes: ticks of the preflight runner thread (~1 h at 60 s/tick).
+PRUNE_EVERY_N_TICKS = 60
+# (call, tick condition, label, cadence constant): each prune hosted on the preflight runner thread.
+PRUNES = (
+    ("offline_endpoint_store_->run_retention_prune(kHardwareRosterWindow)",
+     "tick % kOfflineEndpointPruneEveryNTicks == 1", "endpoint prune (#5678)",
+     "kOfflineEndpointPruneEveryNTicks"),
+    ("software_inventory_store_->run_retention_prune_changes()",
+     "tick % kSoftwareLedgerPruneEveryNTicks == 1", "software change ledger prune (SAM-14)",
+     "kSoftwareLedgerPruneEveryNTicks"),
+)
 PRUNE_START = "preflight_runner_thread_ = std::thread("
 PRUNE_END = '"Pre-flight runner thread stopped"'
 
 
-def prune_problems(src):
-    """The prune call appears once file-wide, inside the preflight thread lambda, after its tick gate."""
-    t = normalise(src)
-    call, cond = normalise(PRUNE_CALL), normalise(PRUNE_COND)
+PRESENCE_BIND = normalise("registry_.configure_presence(offline_endpoint_store_.get(), cfg_.session_timeout);")
+PRESENCE_UNWIRE = normalise("registry_.configure_presence(nullptr, cfg_.session_timeout);")
+ROUTE_STORE_CONSTRUCT = normalise("gateway_route_store_ = std::make_unique<GatewayRouteStore>(*pg_pool_);")
+CONFIRM_BIND = normalise("registry_.configure_route_session_reader(gateway_route_store_ && "
+                         "gateway_route_store_->is_open() ? make_route_session_confirmer("
+                         "*gateway_route_store_) : detail::AgentRegistry::RouteSessionReadFn{});")
+CONFIRM_UNWIRE = normalise("registry_.configure_route_session_reader({});")
+STORE_RESET = normalise("gateway_route_store_.reset();")
+
+
+def confirm_problems(src):
+    """The confirmation reader is bound once, right after the presence bind and after the route
+    store is constructed, and unwired once, right after the presence unwire (inside stop()) and
+    before the store reset. /* */ comments are stripped so a commented-out call cannot satisfy it."""
+    t = normalise(re.sub(r"/\*.*?\*/", " ", src, flags=re.S))
     out = []
-    if t.count(call) != 1:
-        out.append(f"server.cpp: expected exactly one `{call}` (found {t.count(call)}) (#5678)")
-        return out
-    lo, hi = t.find(normalise(PRUNE_START)), t.find(PRUNE_END)
-    if lo < 0 or hi < lo:
-        out.append("server.cpp: preflight_runner_thread_ lambda not found (#5678)")
-        return out
-    body = t[lo:hi]
-    if call not in body:
-        out.append("server.cpp: the endpoint prune is not inside the preflight_runner_thread_ lambda (#5678)")
-    elif cond not in body or body.index(cond) > body.index(call):
-        out.append(f"server.cpp: the endpoint prune is not gated by `{cond}` (#5678)")
+    if t.count(CONFIRM_BIND) != 1:
+        out.append(f"server.cpp: expected exactly one `{CONFIRM_BIND}` (found {t.count(CONFIRM_BIND)}) "
+                   "(#5685 follow-up)")
+    if t.count("configure_route_session_reader(") != 2:
+        out.append("server.cpp: expected exactly two configure_route_session_reader( calls, the "
+                   "binding and the unwire (#5685 follow-up)")
+    if t.count(CONFIRM_UNWIRE) != 1:
+        out.append(f"server.cpp: expected exactly one `{CONFIRM_UNWIRE}` (found {t.count(CONFIRM_UNWIRE)}) "
+                   "(#5685 follow-up)")
+    elif t.count(STORE_RESET) != 1 or not t.index(CONFIRM_UNWIRE) < t.index(STORE_RESET):
+        out.append("server.cpp: the confirmation reader must be unwired BEFORE the one "
+                   "`gateway_route_store_.reset();` (#5685 follow-up)")
+    # Placement: the bind sits straight after the presence bind (so it runs in start(), with the
+    # store already constructed above it); the unwire sits straight after the presence unwire, so
+    # it is in stop() and not at the bind site.
+    if t.count(PRESENCE_BIND + " " + CONFIRM_BIND) != 1:
+        out.append("server.cpp: the confirmation reader must be bound immediately after "
+                   f"`{PRESENCE_BIND}` (#5685 follow-up)")
+    if t.count(PRESENCE_UNWIRE + " " + CONFIRM_UNWIRE) != 1:
+        out.append("server.cpp: the confirmation reader must be unwired immediately after "
+                   f"`{PRESENCE_UNWIRE}` in stop() (#5685 follow-up)")
+    if t.count(ROUTE_STORE_CONSTRUCT) != 1 or t.find(CONFIRM_BIND) < t.find(ROUTE_STORE_CONSTRUCT):
+        out.append("server.cpp: the confirmation reader must be bound AFTER "
+                   f"`{ROUTE_STORE_CONSTRUCT}` (#5685 follow-up)")
     return out
 
 
-# (pattern, replacement) mutations of server.cpp; each must make prune_problems() non-empty.
-PRUNE_MUTATIONS = [
-    (re.escape(PRUNE_CALL), "(void)0"),
-    (re.escape(PRUNE_COND), "true"),
-    (re.escape(PRUNE_START), "health_recompute_thread_ = std::thread("),
+# (pattern, replacement) mutations of server.cpp; each must make confirm_problems() non-empty.
+CONFIRM_MUTATIONS = [
+    (re.escape("make_route_session_confirmer(*gateway_route_store_)"),
+     "[](auto) { return std::nullopt; }"),                                   # hand-copied reader
+    (r"registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&", "(void)(gateway_route_store_ &&"),
+    (r"gateway_route_store_ && gateway_route_store_->is_open\(\)", "true"),  # unguarded
+    (re.escape("registry_.configure_route_session_reader({}); "), "(void)0; "),  # no unwire
+    (r"(registry_\.configure_route_session_reader\(\{\}\);[^\n]*\n)", r""),  # unwire deleted
+    # QE round 2: dead-code wrapping, block comments, bind moved ahead of the store, and the unwire
+    # moved to the bind site (still textually before the reset, but never in stop()).
+    (r"registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&",
+     "if (false) registry_.configure_route_session_reader(gateway_route_store_ &&"),
+    (r"(registry_\.configure_route_session_reader\(\{\}\);)", r"/* \1 */"),
+    (r"(registry_\.configure_route_session_reader\(\s*gateway_route_store_ &&)", r"/* \1"),
 ]
+
+
+def block_end(text, open_idx):
+    """Index of the `}` matching the `{` at open_idx, or -1."""
+    depth = 0
+    for i in range(open_idx, len(text)):
+        depth += (text[i] == "{") - (text[i] == "}")
+        if depth == 0:
+            return i
+    return -1
+
+
+def gate_problems(body, call, cond, label):
+    """The call sits in the block of an `if (<no ||> && cond)` whose condition ends at `cond`."""
+    gate = cond + "){"
+    if body.count(gate) != 1:
+        return [f"server.cpp: the {label} is not gated by an `if (... && {cond})` block"]
+    end = body.index(gate)
+    head = body[max(body.rfind(c, 0, end) for c in ";{}") + 1:end].lstrip()
+    if not head.startswith("if(") or "||" in head:
+        return [f"server.cpp: the {label} condition `{cond}` is not the tail of a plain `if (... && ...)`"]
+    opening = end + len(gate) - 1
+    if not opening < body.index(call) < block_end(body, opening):
+        return [f"server.cpp: the {label} is not inside the block gated by `{cond}`"]
+    return []
+
+
+def prune_problems(src):
+    """Each prune call appears once file-wide, inside the preflight thread lambda, in its gated block."""
+    t = normalise(src)
+    out = []
+    lo, hi = t.find(normalise(PRUNE_START)), t.find(PRUNE_END)
+    if lo < 0 or hi < lo:
+        return ["server.cpp: preflight_runner_thread_ lambda not found (#5678)"]
+    body = t[lo:hi]
+    for raw_call, raw_cond, label, const in PRUNES:
+        call, cond = normalise(raw_call), normalise(raw_cond)
+        decl = normalise(f"constexpr int {const} = {PRUNE_EVERY_N_TICKS};")
+        if t.count(decl) != 1:
+            out.append(f"server.cpp: expected exactly one `{decl}` (found {t.count(decl)}): {label}")
+        if t.count(call) != 1:
+            out.append(f"server.cpp: expected exactly one `{call}` (found {t.count(call)}): {label}")
+        elif call not in body:
+            out.append(f"server.cpp: the {label} is not inside the preflight_runner_thread_ lambda")
+        else:
+            out.extend(gate_problems(body, call, cond, label))
+    return out
+
+
+def gated_if(cond):
+    """Regex for the `if (... && cond) {` head holding `cond` (captures what precedes `&& cond`)."""
+    return r"if \(([^{;]*?)\s*&&\s*" + re.escape(cond) + r"\)\s*\{"
+
+
+# (pattern, replacement) mutations of server.cpp; each must make prune_problems() non-empty.
+PRUNE_MUTATIONS = []
+for _call, _cond, _, _const in PRUNES:
+    PRUNE_MUTATIONS += [
+        (re.escape(_call), "(void)0"),
+        (re.escape(_cond), "true"),
+        (re.escape(_cond), _cond[:-1] + "10"),              # == 10
+        (re.escape(_cond), _cond + " || true"),             # == 1 || true
+        (re.escape(f"constexpr int {_const} = {PRUNE_EVERY_N_TICKS};"),
+         f"constexpr int {_const} = 6;"),
+        # a dead `(void)(cond);` ahead of an ungated block
+        (gated_if(_cond), "(void)(" + _cond + ");\nif (\\1 && true) {"),
+        # the call leaves the gated block (the gated block is empty)
+        (re.escape(_cond) + r"\) \{", _cond + ") {}\n{"),
+    ]
+PRUNE_MUTATIONS.append((re.escape(PRUNE_START), "health_recompute_thread_ = std::thread("))
 
 # (file index into SITES, pattern, replacement, expected substring of the FIRST problem)
 MUTATIONS = [
     (0, r"mirror_departure_to_presence\(\s*removed_current_session,", "mirror_departure_to_presence(false,",
      "expected exactly one"),
-    (0, r"heartbeat_ingestion_ \? heartbeat_ingestion_->offline_endpoint_store\(\) : nullptr", "nullptr",
-     "expected exactly one"),
+    # Anchored on the DEPARTURE call: the arrival mirror (#5685 follow-up) spells the same store
+    # expression earlier in this file, and `count=1` would otherwise mutate that one instead.
+    (0, r"(mirror_departure_to_presence\(\s*removed_current_session,\s*)"
+        r"heartbeat_ingestion_ \? heartbeat_ingestion_->offline_endpoint_store\(\) : nullptr",
+     r"\g<1>nullptr", "expected exactly one"),
     (0, r"mirror_departure_to_presence\(", "heartbeat_ingestion_->offline_endpoint_store()->remove_if_session(",
      "expected exactly one"),
     (1, r"removed_current_session \|\| store_removed", "removed_current_session",
@@ -115,6 +252,13 @@ MUTATIONS = [
     (1, r"\n(\s*)agent_id, session_id\);", r"\n\g<1>agent_id, session_id);\n"
      r"offline_store.remove_if_session(agent_id, session_id);",
      "raw remove_if_session"),
+    # The arrival mirror: dropping either call, or bypassing the helper, must be caught.
+    (0, r"mirror_arrival_to_presence\(", "(void)(",
+     "expected exactly one"),
+    (1, r"mirror_arrival_to_presence\(", "(void)(",
+     "expected exactly one"),
+    (0, r"mirror_arrival_to_presence\(", "heartbeat_ingestion_->offline_endpoint_store()->clear_plugins_of_other_sessions(",
+     "expected exactly one"),
 ]
 
 
@@ -125,6 +269,7 @@ class PresenceDepartureWiringLexical(unittest.TestCase):
     def test_source_is_clean(self):
         p = [m for n, g, s in self.raw for m in problems(n, g, s)]
         p += prune_problems((SRC / "server.cpp").read_text(encoding="utf-8"))
+        p += confirm_problems((SRC / "server.cpp").read_text(encoding="utf-8"))
         for m in p:
             print(f"\n::error::{TAG}: {m}{HINT}", file=sys.stderr)
         self.assertEqual(p, [])
@@ -146,6 +291,24 @@ class PresenceDepartureWiringLexical(unittest.TestCase):
                 mutated, n = re.subn(pat, repl, src, count=1)
                 self.assertGreaterEqual(n, 1, "mutation changed nothing (stale pattern)")
                 self.assertTrue(prune_problems(mutated), "mutation was NOT detected by the gate")
+
+    def test_confirmation_mutations_are_caught(self):
+        src = (SRC / "server.cpp").read_text(encoding="utf-8")
+        for i, (pat, repl) in enumerate(CONFIRM_MUTATIONS, 1):
+            with self.subTest(mutation=i, pattern=pat):
+                mutated, n = re.subn(pat, repl, src, count=1)
+                self.assertGreaterEqual(n, 1, "mutation changed nothing (stale pattern)")
+                self.assertTrue(confirm_problems(mutated), "mutation was NOT detected by the gate")
+        # Unwiring AFTER the store is destroyed: move the reset ahead of the unwire.
+        mutated = src.replace("gateway_route_store_.reset();", "gateway_route_store_.reset();", 1)
+        i_unwire = mutated.index("registry_.configure_route_session_reader({});")
+        i_reset = mutated.index("gateway_route_store_.reset();")
+        self.assertLess(i_unwire, i_reset, "precondition: unwire precedes reset")
+        swapped = mutated.replace("registry_.configure_route_session_reader({});",
+                                  "(void)0;", 1).replace(
+            "gateway_route_store_.reset();",
+            "gateway_route_store_.reset();\n        registry_.configure_route_session_reader({});", 1)
+        self.assertTrue(confirm_problems(swapped), "an unwire after the reset was NOT detected")
 
 
 if __name__ == "__main__":

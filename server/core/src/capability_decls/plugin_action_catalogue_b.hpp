@@ -11,7 +11,7 @@
 /// inventory/system plugins group B declares ABI4 descriptors for
 /// (agents/plugins/hardware, users, status, os_info, storage,
 /// installed_apps, processes, procfetch, disk_space, device_identity,
-/// agent_logging, diagnostics, example, chargen) — 59 rows, one per action
+/// agent_logging, diagnostics, example, chargen) — 60 rows, one per action
 /// in each plugin's `actions()` table. Every other `capability_decls/*.hpp`
 /// fragment belongs to a different package and is composed alongside this
 /// one only at the `CommandCapabilityRegistry` construction site — never
@@ -53,10 +53,10 @@ namespace yuzu::server::capdecls {
 
 namespace detail {
 
-inline constexpr std::array<CommandCapability, 59> kPluginActionCatalogueB{{
+inline constexpr std::array<CommandCapability, 60> kPluginActionCatalogueB{{
     // ── hardware (agents/plugins/hardware/src/hardware_plugin.cpp) ────────
-    // 12 actions, all pure fact-collection (manufacturer/model/BIOS/CPU/
-    // memory/disks/drivers/serial+UUID, plus chassis/baseboard/swap/machine_id,
+    // 13 actions, all pure fact-collection (manufacturer/model/BIOS/CPU/
+    // memory/disks/drivers/drivers_inventory/serial+UUID, plus chassis/baseboard/swap/machine_id,
     // which Windows reads and Linux/macOS still answer as planned placeholders)
     // — no host-state write anywhere.
     {
@@ -128,6 +128,17 @@ inline constexpr std::array<CommandCapability, 59> kPluginActionCatalogueB{{
     {
         .plugin = "hardware",
         .action = "drivers",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "hardware",
+        .action = "drivers_inventory",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

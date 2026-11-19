@@ -12,6 +12,7 @@
 
 #include "echo_collectors.hpp"
 #include "echo_db.hpp"
+#include "echo_test_db.hpp"
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp"
@@ -128,7 +129,7 @@ struct FoldDb {
 
 std::unique_ptr<FoldDb> make_fold_db(bool install = true, EchoFold::NowFn now = nullptr) {
     const auto path = yuzu::test::unique_temp_path("yuzu_test_echo_fold_");
-    auto opened = EchoDatabase::open(path);
+    auto opened = yuzu::test::open_echo_db(path);
     REQUIRE(opened.has_value());
     auto f = std::make_unique<FoldDb>(std::move(*opened), path, std::move(now));
     if (install)
@@ -237,7 +238,7 @@ void check_zero(const TierAccumulator& a, const TierRow& r, std::initializer_lis
 // Bucket math
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("bucket_start: hour and day floor division, negative stamps included",
+TEST_CASE("bucket_start: hour and day floor division; negative stamps included",
           "[echo][fold][bucket]") {
     struct Row { int64_t ts, hour, day; };
     for (const Row& r : {Row{-1, -3600, -86400}, Row{0, 0, 0}, Row{3599, 0, 0}, Row{3600, 3600, 0}}) {
@@ -247,7 +248,7 @@ TEST_CASE("bucket_start: hour and day floor division, negative stamps included",
     }
 }
 
-TEST_CASE("bucket_start: calendar month, including a stamp before 1970", "[echo][fold][bucket]") {
+TEST_CASE("bucket_start: calendar month; including a stamp before 1970", "[echo][fold][bucket]") {
     CHECK(bucket_start(1775001599, "monthly").value() == 1772323200);  // 2026-03-31T23:59:59Z -> 2026-03-01
     CHECK(bucket_start(1793491200, "monthly").value() == 1793491200);  // a month start is its own bucket
     CHECK(bucket_start(-1, "monthly").value() == -2678400);            // 1969-12-31 -> 1969-12-01
@@ -313,7 +314,7 @@ TEST_CASE("TierAccumulator: a sum saturates; a non-finite measure rejects that e
 // Registry types and the per-source declarations
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("ColumnDef: a plain {name, type} initialiser keeps its old meaning", "[echo][fold][schema]") {
+TEST_CASE("ColumnDef: a plain {name; type} initialiser keeps its old meaning", "[echo][fold][schema]") {
     constexpr ColumnDef c{"ts", "INTEGER"};
     static_assert(c.role == ColumnRole::kMeasure);
     static_assert(c.merge == MergeOp::kNone);
@@ -322,7 +323,7 @@ TEST_CASE("ColumnDef: a plain {name, type} initialiser keeps its old meaning", "
     CHECK(c.guard.empty());
 }
 
-TEST_CASE("fold_sources: 1:1 with the registry, internally consistent", "[echo][fold][schema]") {
+TEST_CASE("fold_sources: 1:1 with the registry; internally consistent", "[echo][fold][schema]") {
     const auto& reg = capture_sources();
     const auto& fold = fold_sources();
     REQUIRE(fold.size() == 17);
@@ -447,7 +448,7 @@ TEST_CASE("fold_sources: key and measure lists are the pinned contract", "[echo]
 // Generated DDL
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the declarations say",
+TEST_CASE("generate_fold_ddl: tables; indexes and views are exactly what the declarations say",
           "[echo][fold][schema]") {
     Mem m;
     open_mem(m);
@@ -510,7 +511,7 @@ TEST_CASE("generate_fold_ddl: tables, indexes and views are exactly what the dec
     }
 }
 
-TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in order, with the same types",
+TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first; in order; with the same types",
           "[echo][fold][schema]") {
     Mem m;
     open_mem(m);
@@ -547,13 +548,7 @@ TEST_CASE("generate_fold_ddl: every view keeps the registry's columns first, in 
     CHECK(checked == 34);
 }
 
-TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[echo][fold][schema]") {
-    const auto shims = legacy_live_shim_names();
-    CHECK(shims.size() == 16);
-    CHECK(std::find(shims.begin(), shims.end(), "usage_live") == shims.end());
-    CHECK(std::find(shims.begin(), shims.end(), "process_live") != shims.end());
-    CHECK(std::find(shims.begin(), shims.end(), "netqual_live") != shims.end());
-
+TEST_CASE("is_fold_view and is_fold_internal_table", "[echo][fold][schema]") {
     CHECK(is_fold_internal_table("echo_dict"));
     CHECK(is_fold_internal_table("echo_fold_seen"));
     CHECK(is_fold_internal_table("process_hourly_r"));
@@ -575,7 +570,7 @@ TEST_CASE("is_fold_view, is_fold_internal_table and legacy_live_shim_names", "[e
 // Merge operations and the UPSERT builder
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("TierAccumulator: merge ops, and kLast never lets an older event win", "[echo][fold][merge]") {
+TEST_CASE("TierAccumulator: merge ops; and kLast never lets an older event win", "[echo][fold][merge]") {
     const FoldSourceDef def{"synthetic",
                             {"hourly"},
                             {ColumnDef{"k", "TEXT", ColumnRole::kKey, MergeOp::kNone, true},
@@ -620,28 +615,34 @@ TEST_CASE("TierAccumulator: merge ops, and kLast never lets an older event win",
     CHECK_THROWS_AS(a.add(kT0, {{"k", vt("x")}}, {{"r", vi(1)}}), std::invalid_argument);   // REAL given an int
 }
 
-TEST_CASE("tier_upsert_sql: pinned text, and it prepares against the generated schema",
+TEST_CASE("tier_upsert_sql: pinned text; and it prepares against the generated schema",
           "[echo][fold][merge]") {
+    // An INTEGER sum saturates at the int64 bounds, like TierAccumulator::merge.
+    const auto sat = [](std::string_view n) {
+        return std::format("{0}=CASE WHEN excluded.{0}>0 AND {0}>9223372036854775807-excluded.{0} "
+                           "THEN 9223372036854775807 "
+                           "WHEN excluded.{0}<0 AND {0}<(-9223372036854775807-1)-excluded.{0} "
+                           "THEN (-9223372036854775807-1) ELSE {0}+excluded.{0} END",
+                           n);
+    };
     CHECK(tier_upsert_sql(*fold_source("process"), "hourly") ==
           "INSERT INTO process_hourly_r(hour_ts,name_id,user_id,parent_name_id,start_count,stop_count,"
           "abnormal_exit_count,elevated_count,spoofed_parent_count) VALUES(?,?,?,?,?,?,?,?,?) "
-          "ON CONFLICT(hour_ts,name_id,user_id,parent_name_id) DO UPDATE SET "
-          "start_count=start_count+excluded.start_count,stop_count=stop_count+excluded.stop_count,"
-          "abnormal_exit_count=abnormal_exit_count+excluded.abnormal_exit_count,"
-          "elevated_count=elevated_count+excluded.elevated_count,"
-          "spoofed_parent_count=spoofed_parent_count+excluded.spoofed_parent_count RETURNING id");
+          "ON CONFLICT(hour_ts,name_id,user_id,parent_name_id) DO UPDATE SET " +
+              sat("start_count") + "," + sat("stop_count") + "," + sat("abnormal_exit_count") + "," +
+              sat("elevated_count") + "," + sat("spoofed_parent_count") + " RETURNING id");
     CHECK(tier_upsert_sql(*fold_source("service"), "daily") ==
           "INSERT INTO service_daily_r(day_ts,name_id,status_changes,last_status,install_count,"
           "remove_count,last_ts,last_exit_code,last_start_account,last_binary_path,failed_count) "
-          "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(day_ts,name_id) DO UPDATE SET "
-          "status_changes=status_changes+excluded.status_changes,"
-          "last_status=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_status ELSE last_status END,"
-          "install_count=install_count+excluded.install_count,remove_count=remove_count+excluded.remove_count,"
-          "last_ts=MAX(last_ts,excluded.last_ts),"
-          "last_exit_code=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_exit_code ELSE last_exit_code END,"
-          "last_start_account=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_start_account ELSE last_start_account END,"
-          "last_binary_path=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_binary_path ELSE last_binary_path END,"
-          "failed_count=failed_count+excluded.failed_count RETURNING id");
+          "VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(day_ts,name_id) DO UPDATE SET " +
+              sat("status_changes") + "," +
+              "last_status=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_status ELSE last_status END," +
+              sat("install_count") + "," + sat("remove_count") + "," +
+              "last_ts=MAX(last_ts,excluded.last_ts),"
+              "last_exit_code=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_exit_code ELSE last_exit_code END,"
+              "last_start_account=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_start_account ELSE last_start_account END,"
+              "last_binary_path=CASE WHEN excluded.last_ts>=last_ts THEN excluded.last_binary_path ELSE last_binary_path END," +
+              sat("failed_count") + " RETURNING id");
     CHECK(tier_upsert_sql(*fold_source("netqual"), "hourly").find("rtt_us_min=MIN(rtt_us_min,excluded.rtt_us_min)") !=
           std::string::npos);
 
@@ -680,7 +681,7 @@ TEST_CASE("process_delta", "[echo][fold][delta]") {
     CHECK(row_for(acc, "monthly", {{"name", "b.exe"}}).bucket == kMonth0);
 }
 
-TEST_CASE("tcp_delta: connect, disconnect, failed, listen, unknown", "[echo][fold][delta]") {
+TEST_CASE("tcp_delta: connect / disconnect / failed / listen / unknown", "[echo][fold][delta]") {
     const auto ev = [](const char* action, int local_port = 0) {
         NetworkEvent e;
         e.ts = kT0;
@@ -770,7 +771,7 @@ TEST_CASE("service_delta: the real tokens from compute_service_events", "[echo][
     CHECK(ms(acc, row_for(acc, "hourly", {{"name", "a"}}), "last_status") == "paused");
 }
 
-TEST_CASE("user, software, arp and dns deltas", "[echo][fold][delta]") {
+TEST_CASE("user / software / arp / dns deltas", "[echo][fold][delta]") {
     {
         UserEvent li, lo, dc;
         li.ts = lo.ts = dc.ts = kT0;
@@ -844,7 +845,7 @@ TEST_CASE("user, software, arp and dns deltas", "[echo][fold][delta]") {
     }
 }
 
-TEST_CASE("netconn, mapdrive, perf, procperf and netqual deltas", "[echo][fold][delta]") {
+TEST_CASE("netconn / mapdrive / perf / procperf / netqual deltas", "[echo][fold][delta]") {
     {
         NetConnRow a;
         a.ts = kT0;
@@ -968,7 +969,7 @@ TEST_CASE("netconn, mapdrive, perf, procperf and netqual deltas", "[echo][fold][
     }
 }
 
-TEST_CASE("cursor deltas: power, removable and registry clipping and digests", "[echo][fold][delta]") {
+TEST_CASE("cursor deltas: power / removable / registry clipping and digests", "[echo][fold][delta]") {
     PowerEvent pw;
     pw.ts = kT0;
     pw.snapshot_id = 1;
@@ -1047,7 +1048,7 @@ TEST_CASE("usage_delta: a pure adapter over fold_daily", "[echo][fold][delta]") 
     }
 }
 
-TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw store compared",
+TEST_CASE("identity_digest: deterministic; and covers exactly the fields the raw store compared",
           "[echo][fold][delta]") {
     CHECK(identity_digest({"a", "b"}) == identity_digest({"a", "b"}));
     CHECK(identity_digest({"a", "b"}) != identity_digest({"b", "a"}));
@@ -1150,7 +1151,7 @@ TEST_CASE("identity_digest: deterministic, and covers exactly the fields the raw
 // The fold writer
 // ═════════════════════════════════════════════════════════════════════════════
 
-TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idempotently",
+TEST_CASE("install_fold_schema: replaces a legacy tier table with its view; idempotently",
           "[echo][fold][writer]") {
     // open() has installed the schema already; put a legacy tier TABLE back where the view is, as a
     // file written before roll-up looked, and re-install.
@@ -1181,7 +1182,7 @@ TEST_CASE("install_fold_schema: replaces a legacy tier table with its view, idem
     CHECK(g->n("SELECT COUNT(*) FROM sqlite_master WHERE type='view' AND name='tcp_hourly'") == 0);
 }
 
-TEST_CASE("fold_rows: counts, text round-trip, and refusals", "[echo][fold][writer]") {
+TEST_CASE("fold_rows: counts; text round-trip; and refusals", "[echo][fold][writer]") {
     auto f = make_fold_db();
     auto acc = make_acc("process");
     process_delta({pev(kT0, "started", "a.exe"), pev(kT0, "started", "a.exe"), pev(kT0, "stopped", "a.exe"),
@@ -1258,7 +1259,7 @@ TEST_CASE("fold_rows: perf averages are weighted means across separate folds; an
     CHECK(f->n("SELECT COUNT(*) FROM perf_daily_r") == 1);
 }
 
-TEST_CASE("fold_rows: a failing statement rolls rows, dictionary, state and counter back together",
+TEST_CASE("fold_rows: a failing statement rolls rows; dictionary; state and counter back together",
           "[echo][fold][writer]") {
     auto f = make_fold_db();
     // The daily upsert fails after the hourly one succeeded and its strings were interned.
@@ -1286,7 +1287,7 @@ TEST_CASE("fold_rows: a failing statement rolls rows, dictionary, state and coun
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::optional<std::string>{"1"});
 }
 
-TEST_CASE("fold_rows: an unrepresentable stamp rejects that event, counts it, keeps the batch",
+TEST_CASE("fold_rows: an unrepresentable stamp rejects that event; counts it; keeps the batch",
           "[echo][fold][writer]") {
     auto f = make_fold_db();
     const auto counter = [&] { return f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value(); };
@@ -1313,7 +1314,7 @@ TEST_CASE("fold_rows: an unrepresentable stamp rejects that event, counts it, ke
     CHECK(counter() == std::optional<std::string>{"2"});
 }
 
-TEST_CASE("fold_cursor_rows: events, ring, baseline and cursor commit together; replays fold nothing",
+TEST_CASE("fold_cursor_rows: events; ring; baseline and cursor commit together; replays fold nothing",
           "[echo][fold][cursor]") {
     auto f = make_fold_db();
     const auto contrib = [](const char* key, const char* detail, int64_t ts = kT0) {
@@ -1363,7 +1364,7 @@ TEST_CASE("fold_cursor_rows: events, ring, baseline and cursor commit together; 
     CHECK(f->n("SELECT SUM(event_count) FROM power_hourly") == 3);
 }
 
-TEST_CASE("fold_cursor_rows: a registry replay that differs only in attribution is a replay, not a collision",
+TEST_CASE("fold_cursor_rows: a registry replay that differs only in attribution is a replay; not a collision",
           "[echo][fold][cursor]") {
     auto f = make_fold_db();
     RegistryEvent e;
@@ -1410,7 +1411,7 @@ TEST_CASE("fold_cursor_rows: an empty or NUL record_key refuses the batch with n
     }
 }
 
-TEST_CASE("fold_cursor_rows: a bad stamp drops only that contribution, the cursor still advances",
+TEST_CASE("fold_cursor_rows: a bad stamp drops only that contribution; the cursor still advances",
           "[echo][fold][cursor]") {
     auto f = make_fold_db();
     PowerEvent good, bad, good2;
@@ -1527,7 +1528,7 @@ TEST_CASE("fold_cursor_rows: a rolled-back fold publishes nothing to the id cach
     CHECK(f->n("SELECT COUNT(*) FROM power_hourly WHERE action = 'sleep' AND event_count = 1") == 1);
 }
 
-TEST_CASE("fold_cursor_rows: the replay ring prunes to its depth, per source", "[echo][fold][cursor]") {
+TEST_CASE("fold_cursor_rows: the replay ring prunes to its depth; per source", "[echo][fold][cursor]") {
     auto f = make_fold_db();
     std::vector<KeyedContribution> batch;
     for (int i = 0; i < 4200; ++i) {
@@ -1579,7 +1580,7 @@ void drop_rows_of(FoldDb& f, const char* name) {
 }
 } // namespace
 
-TEST_CASE("gc_dictionary: orphans go, referenced strings stay, a stale cache id never comes back",
+TEST_CASE("gc_dictionary: orphans go; referenced strings stay; a stale cache id never comes back",
           "[echo][fold][gc]") {
     auto f = make_fold_db();
     fold_names(*f, {"b.exe", "keep.exe", "z.exe"}); // b.exe gets a LOW id: not the table's max
@@ -1610,7 +1611,7 @@ TEST_CASE("gc_dictionary: a deadline already past deletes nothing and is not an 
     CHECK(f->n("SELECT COUNT(*) FROM echo_dict WHERE text='a.exe'") == 1);
 }
 
-TEST_CASE("gc_dictionary: a deadline that passes mid-statement rolls the batch back, then GC resumes",
+TEST_CASE("gc_dictionary: a deadline that passes mid-statement rolls the batch back; then GC resumes",
           "[echo][fold][gc]") {
     // Injected clock: the pre-batch check sees time before the deadline, every later reading
     // (the progress handler's) sees it after. No wall-clock dependence.
@@ -1648,7 +1649,7 @@ TEST_CASE("gc_dictionary: a deadline that passes mid-statement rolls the batch b
     CHECK(f->n("SELECT COUNT(*) FROM sqlite_temp_master") == 0);
 }
 
-TEST_CASE("gc_dictionary: a real failure is an error, never an empty success", "[echo][fold][gc]") {
+TEST_CASE("gc_dictionary: a real failure is an error; never an empty success", "[echo][fold][gc]") {
     auto f = make_fold_db();
     REQUIRE(f->db.execute_sql("DROP TABLE echo_dict"));
     const auto g = f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour);
@@ -1693,17 +1694,34 @@ TEST_CASE("fold_rows waits while a GC pass holds op_mu_", "[echo][fold][gc][conc
     process_delta({pev(kT0, "started", "a.exe")}, acc);
     std::atomic<bool> fold_ok{false};
     std::promise<void> folded;
-    std::thread gc([&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
-    parked.get_future().wait();
-    std::thread fold([&] {
-        fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
-        folded.set_value();
-    });
     auto folded_f = folded.get_future();
-    const auto blocked = folded_f.wait_for(std::chrono::milliseconds(150));
-    release.set_value();
-    gc.join();
-    fold.join();
+    std::future_status blocked{};
+    {
+        // Declared after what it releases and joins, so a failed REQUIRE below still frees the
+        // parked clock and joins both workers before `f`, `acc` and the promises are destroyed.
+        std::thread gc, fold;
+        const yuzu::test::ScopeExit release_and_join{[&] {
+            release.set_value();
+            if (gc.joinable())
+                gc.join();
+            if (fold.joinable())
+                fold.join();
+        }};
+        gc = std::thread(
+            [&] { (void)f->fold.gc_dictionary(f->db, std::chrono::steady_clock::now() + kHour); });
+        // 30 s is a hang backstop on an in-memory wait the code under test releases, not a
+        // performance limit, so it cites no measurement (standard rule 9): gc_dictionary takes
+        // op_mu_ and reads the clock (`expired()`) before any SQL, and that first read sets
+        // `parked`.
+        REQUIRE(parked.get_future().wait_for(std::chrono::seconds{30}) == std::future_status::ready);
+        fold = std::thread([&] {
+            fold_ok = f->fold.fold_rows(f->db, "process", acc).has_value();
+            folded.set_value();
+        });
+        // A "did not happen" can only be seen by waiting: a slow host can make this pass
+        // vacuously, never fail.
+        blocked = folded_f.wait_for(std::chrono::milliseconds(150));
+    }
     CHECK(blocked == std::future_status::timeout);
     CHECK(fold_ok);
     CHECK(integrity_violations(*f) == 0);
@@ -1790,7 +1808,7 @@ std::expected<QueryResult, std::string> plugin_sql(EchoDatabase& db, const std::
 }
 } // namespace
 
-TEST_CASE("operator SQL reads the roll-up views, never the tables behind them", "[echo][fold][authorizer]") {
+TEST_CASE("operator SQL reads the roll-up views; never the tables behind them", "[echo][fold][authorizer]") {
     auto f = make_fold_db();
     fold_names(*f, {"a.exe"});
 
@@ -2090,7 +2108,7 @@ std::string first_diffs(const std::map<std::string, int64_t>& want, const std::m
 
 } // namespace
 
-TEST_CASE("synthetic three-day run: every source, every tier equals the independent reducer",
+TEST_CASE("synthetic three-day run: every source; every tier equals the independent reducer",
           "[echo][fold][synthetic]") {
     auto f = make_fold_db();
     REQUIRE(f->db.execute_sql("PRAGMA synchronous=OFF"));
@@ -2371,22 +2389,67 @@ TEST_CASE("synthetic three-day run: every source, every tier equals the independ
     CHECK(f->db.try_get_config(std::string{kFoldRejectedCounterKey}).value() == std::nullopt);
 }
 
-TEST_CASE("referenced_legacy_live_shims names the retired tables a translated query mentions",
-          "[echo][fold][schema][shim]") {
-    using V = std::vector<std::string>;
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live WHERE ts > 1") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("select count(*) from tcp_live t join process_live p on 1") ==
-          V{"process_live", "tcp_live"}); // shim order, each once
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_hourly").empty());
-    CHECK(referenced_legacy_live_shims("SELECT * FROM my_process_live").empty());   // not a whole identifier
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_live_r").empty());    // nor this
-    CHECK(referenced_legacy_live_shims("SELECT * FROM process_livex").empty());     // nor this
-    // every spelling SQLite accepts for the same identifier reaches the shim view
-    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_LIVE") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM \"Process_Live\"") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM [process_live]") == V{"process_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM `Tcp_Live`") == V{"tcp_live"});
-    CHECK(referenced_legacy_live_shims("SELECT * FROM PROCESS_HOURLY").empty());   // an hourly query, any case
-    CHECK(referenced_legacy_live_shims("SELECT * FROM usage_live").empty());        // usage keeps its table
-    CHECK(referenced_legacy_live_shims("").empty());
+TEST_CASE("fold: an INTEGER sum pins at the int64 bounds in the stored row and stays INTEGER",
+          "[echo][fold][merge]") {
+    constexpr int64_t kMax = std::numeric_limits<int64_t>::max();
+    constexpr int64_t kMin = std::numeric_limits<int64_t>::min();
+    auto f = make_fold_db();
+    const auto fold = [&](int64_t start, int64_t stop) {
+        auto acc = make_acc("process");
+        acc.add(kT0, {{"name", vt("a.exe")}, {"user", vt("u")}},
+                {{"start_count", vi(start)}, {"stop_count", vi(stop)}});
+        REQUIRE(f->fold.fold_rows(f->db, "process", acc).has_value());
+    };
+    const auto stored = [&](const char* col) {
+        return f->q(std::format("SELECT {0}, typeof({0}) FROM process_hourly", col))[0];
+    };
+    fold(kMax - 1, kMin + 1);
+    fold(5, -5); // both overflow
+    CHECK(stored("start_count") == QueryRow{std::to_string(kMax), "integer"});
+    CHECK(stored("stop_count") == QueryRow{std::to_string(kMin), "integer"});
+    fold(1, -1); // already pinned: stays pinned
+    CHECK(stored("start_count") == QueryRow{std::to_string(kMax), "integer"});
+    CHECK(stored("stop_count") == QueryRow{std::to_string(kMin), "integer"});
+    fold(-10, 10); // a move away from the bound is exact
+    CHECK(stored("start_count") == QueryRow{std::to_string(kMax - 10), "integer"});
+    CHECK(stored("stop_count") == QueryRow{std::to_string(kMin + 10), "integer"});
+}
+
+TEST_CASE("fold: the replay ring refuses a write that would overflow its sequence and writes nothing",
+          "[echo][fold][cursor]") {
+    auto f = make_fold_db();
+    REQUIRE(f->db.execute_sql("INSERT INTO echo_fold_seen(source, record_key, digest, seq) "
+                              "VALUES ('power', 'old', 1, 9223372036854775807)"));
+    PowerEvent e;
+    e.ts = kT0;
+    e.action = "sleep";
+    e.detail = "a";
+    e.record_key = "k1";
+    const auto r = f->fold.fold_cursor_rows(f->db, "power", {power_delta({e})[0]}, "{\"v\":1,\"n\":1}", {});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().text.find("replay ring: sequence would overflow") != std::string::npos);
+    CHECK(f->n("SELECT COUNT(*) FROM echo_fold_seen WHERE source='power'") == 1);
+    CHECK(f->n("SELECT COUNT(*) FROM power_hourly") == 0);
+    CHECK_FALSE(f->db.get_cursor("power").value().has_value());
+}
+
+TEST_CASE("fold: installing over a foreign view of a roll-up name replaces it with the current definition",
+          "[echo][fold][writer]") {
+    auto f = make_fold_db(/*install=*/false);
+    REQUIRE(f->db.execute_sql("DROP VIEW process_hourly"));
+    REQUIRE(f->db.execute_sql("CREATE VIEW process_hourly AS SELECT 1 AS stale_col"));
+    REQUIRE(f->fold.install_fold_schema(f->db).has_value());
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='stale_col'") == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='start_count'") == 1);
+    REQUIRE(f->fold.install_fold_schema(f->db).has_value()); // idempotent over the current view
+}
+
+TEST_CASE("fold: a foreign view whose name differs only in case is replaced too",
+          "[echo][fold][writer]") {
+    auto f = make_fold_db(/*install=*/false);
+    REQUIRE(f->db.execute_sql("DROP VIEW process_hourly"));
+    REQUIRE(f->db.execute_sql("CREATE VIEW Process_Hourly AS SELECT 1 AS stale_col"));
+    REQUIRE(f->fold.install_fold_schema(f->db).has_value());
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='stale_col'") == 0);
+    CHECK(f->n("SELECT COUNT(*) FROM pragma_table_info('process_hourly') WHERE name='start_count'") == 1);
 }

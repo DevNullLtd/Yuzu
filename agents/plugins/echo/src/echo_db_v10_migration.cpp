@@ -39,9 +39,9 @@
  *        usage fold loses nothing it would have credited (one id-ordered walk over every row past
  *        the cursor, whatever its ts, so a run that straddles the mark pairs start first); a usage source that is
  *        disabled or awaiting its baseline would not have credited them either, and gets nothing;
- *     5. drop the 16 raw tables and every `_legacy` table, create the `$X_Live` shim views (empty,
- *        with the old columns), delete the rollup marks and the usage cursor from echo_config, and
- *        stamp schema_version 10.
+ *     5. drop the 16 raw tables and every `_legacy` table, delete the rollup marks and the usage
+ *        cursor from echo_config, and stamp schema_version 10 (no view takes a dropped raw table's
+ *        name: a query over one fails as an unknown table).
  *
  * AFTER the commit: the connection must be in autocommit (B3), the WAL is checkpointed to zero
  * (secure_delete=ON zeroes every dropped raw page into the WAL, so the WAL after COMMIT is as
@@ -51,8 +51,8 @@
  * pass retries daily.
  *
  * BOUNDS. Before it starts the migration refuses a volume with less than twice the database file
- * plus its write-ahead log already on disk free (so Echo stays offline until the space is freed and the agent restarts, rather than risking
- * the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
+ * plus its write-ahead log already on disk free (so Echo loads offline and retries rather than
+ * risking the host's disk). The transaction's WAL (the converted summary bytes plus the zeroed raw pages)
  * is NOT bounded by the file's size: it measured 1.35 times the file. The twice-the-file check
  * covers the measured case (WAL 325.7 MB plus the new file about 79 MB is about 404 MB, under the
  * 483 MB demanded for a 241.8 MB file); no general bound is proven. The WAL is checkpointed to
@@ -60,6 +60,20 @@
  * and the second free-space check bounds that phase. The write lock is held for the whole run (tens of seconds on a 250 MiB file): no
  * collector writes meanwhile, and a collector call that finds the database busy retries on its
  * next tick.
+ *
+ * FAILURE (owner ruling 2026-11-16, #7290). A failure of this step other than a crash (the free-space
+ * refusal, a damaged mark or an out-of-range bucket, a lock, a full volume, the deadline below) does
+ * not fail the plugin and does not quarantine the file: Echo loads OFFLINE
+ * (`storage_state|offline|<reason>`), no source collects, and the plugin retries the open at 1, 5 and
+ * 15 minutes and then hourly (echo_open_retry.hpp). Quarantine-and-start-fresh was rejected: it would
+ * discard data a repair could save, break the all-or-nothing rule and re-enable every source an
+ * operator had paused. Each attempt is bounded by a wall-clock deadline of 60 s plus 2 s per MiB of the
+ * file, doubled for every earlier attempt that ended on it and capped at one hour (the one measured
+ * run took 55 s on 242 MB, so a short fixed bound would interrupt every attempt and Echo would never
+ * come online); a hit or a shutdown interrupts the statement and rolls back. The deadline never
+ * covers the post-commit phase. The schema version and the retired-table list are read again
+ * INSIDE the write transaction: a second opener that finished first makes this one a no-op, and a
+ * changed list fails the attempt for the retry to redo.
  *
  * CURSOR SOURCES (power, removable, registry) change their idempotence: the raw store kept every
  * record_key forever and refused a reuse; the replay ring keeps the newest 4096 keys of a source.
@@ -71,9 +85,11 @@
 
 #include "echo_aggregator.hpp" // kAutoVacuumDeferredKey
 #include "echo_db.hpp"
+#include "echo_open_retry.hpp" // v10_migration_deadline
 #include "echo_fold.hpp"
 #include "echo_fold_schema.hpp"
 #include "echo_schema_registry.hpp" // source_default_enabled: the usage feed decision
+#include "echo_sqlite_progress.hpp" // ScopedProgressHandler: the deadline and cancel guard
 #include "echo_status_format.hpp"   // kFreeSpaceRefusalPrefix
 #include "echo_usage.hpp"           // usage_active_in, usage_fold_in: the lagged rows reach usage
 
@@ -1203,10 +1219,12 @@ private:
     Report report_;
 };
 
-// The names of the old tables a database still holds: `<src>_live` and `<src>_<tier>` for every
-// roll-up source. A lookup failure is an error, never "no tables".
-std::expected<std::pair<std::set<std::string>, std::set<std::string>>, std::string>
-find_retired_tables(EchoDatabase& db) {
+using RetiredTables = std::pair<std::set<std::string>, std::set<std::string>>; // {tiers, raw}
+
+// Sort table names into the old tables a database still holds: `<src>_live` and `<src>_<tier>`
+// for every roll-up source. Pure; shared by the pre-check and the in-transaction re-read so the
+// two cannot disagree about what counts as retired.
+RetiredTables classify_retired(const std::vector<std::string>& names) {
     std::set<std::string> tiers, raw, wanted_tiers, wanted_raw;
     for (const auto& def : fold_sources()) {
         if (def.own_tables)
@@ -1215,16 +1233,25 @@ find_retired_tables(EchoDatabase& db) {
         for (const auto tier : kTiers)
             wanted_tiers.insert(fold_view_name(def.name, tier));
     }
+    for (const auto& name : names) {
+        if (wanted_raw.contains(name))
+            raw.insert(name);
+        else if (wanted_tiers.contains(name))
+            tiers.insert(name);
+    }
+    return {std::move(tiers), std::move(raw)};
+}
+
+// The retired tables a database still holds. A lookup failure is an error, never "no tables".
+std::expected<RetiredTables, std::string> find_retired_tables(EchoDatabase& db) {
     const auto rows = db.execute_query("SELECT name FROM sqlite_master WHERE type = 'table'", 100000);
     if (!rows)
         return std::unexpected("listing tables: " + rows.error());
-    for (const auto& r : rows->rows) {
-        if (wanted_raw.contains(r.at(0)))
-            raw.insert(r.at(0));
-        else if (wanted_tiers.contains(r.at(0)))
-            tiers.insert(r.at(0));
-    }
-    return std::pair{std::move(tiers), std::move(raw)};
+    std::vector<std::string> names;
+    names.reserve(rows->rows.size());
+    for (const auto& r : rows->rows)
+        names.push_back(r.at(0));
+    return classify_retired(names);
 }
 
 std::optional<std::uintmax_t> free_bytes_of(const OpenSeams& seams, const std::filesystem::path& path) {
@@ -1253,8 +1280,8 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
     const std::set<std::string> raw_tables = retired->second;
     const bool has_retired = !legacy_tiers.empty() || !raw_tables.empty();
 
-    // 0. BEFORE any transaction: refuse a volume that cannot hold the migration. Echo stays offline
-    // until the space is freed and the agent restarted -- the alternative is a full disk under
+    // 0. BEFORE any transaction: refuse a volume that cannot hold the migration. Echo loads offline
+    // and the plugin retries the open (echo_open_retry.hpp) -- the alternative is a full disk under
     // the host. A database with nothing to migrate needs no room.
     const StorageBytes before = db.storage_bytes();
     if (has_retired) {
@@ -1282,10 +1309,64 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         }
     }
 
+    // The attempt's wall-clock bound. It covers the transaction only: a committed migration is
+    // never failed for time, so the post-commit checkpoint and VACUUM run unbounded. A hit rolls
+    // the transaction back (all-or-nothing is unchanged) and the plugin retries with a longer one.
+    const auto deadline_ms =
+        seams.v10_deadline.value_or(std::chrono::duration_cast<std::chrono::milliseconds>(
+            v10_migration_deadline(before.ok ? before.file_bytes() : 0)));
+    const auto deadline = Clock::now() + deadline_ms;
+    const auto cancelled = [&] { return seams.v10_cancel && seams.v10_cancel(); };
+    const auto expired = [&] { return Clock::now() >= deadline || cancelled(); };
+    const auto expiry_text = [&]() -> std::string {
+        if (cancelled())
+            return "the migration was cancelled by shutdown and rolled back";
+        return std::format("the migration {} {} s deadline and was rolled back", kV10DeadlineMarker,
+                           std::chrono::duration_cast<std::chrono::seconds>(deadline_ms).count());
+    };
+
+    // The gap between the pre-checks above and the write lock below is where a second opener, a
+    // lock holder or a full volume can change the picture; the transaction re-reads what it relied on.
+    if (seams.v10_before_begin)
+        seams.v10_before_begin(db.db_);
+
     // 1. ONE transaction.
     Report report;
     std::size_t dropped = 0;
+    bool already_migrated = false;
     const auto result = db.checked_transaction([&](TransactionHandle& h) -> std::expected<void, std::string> {
+        // The deadline and the cancel poll interrupt the running statement; the guard is gone
+        // before checked_transaction's COMMIT/ROLLBACK. (No other guard is installed on this path:
+        // EchoFold::gc_dictionary's is a separate transaction.)
+        ScopedProgressHandler guard(h.raw(), expired);
+
+        // Re-read, under the write lock, what the pre-checks above read without it. A second
+        // opener may have finished the migration (nothing left to do), or the retired set may have
+        // changed (the plan this attempt built no longer applies: fail, the retry starts afresh).
+        const auto version_rows =
+            read_texts(h, "SELECT value FROM echo_config WHERE key = 'schema_version'");
+        if (!version_rows)
+            return std::unexpected(h.error());
+        const int version = version_rows->empty() ? 0 : parse_schema_version(version_rows->front());
+        if (version >= 10) {
+            already_migrated = true;
+            return {};
+        }
+        if (version != 9)
+            return std::unexpected(std::format("the schema version is {} inside the migration "
+                                               "transaction; expected 9",
+                                               version));
+        const auto names = read_texts(h, "SELECT name FROM sqlite_master WHERE type = 'table'");
+        if (!names)
+            return std::unexpected(h.error());
+        const auto now_retired = classify_retired(*names);
+        if (now_retired.first != legacy_tiers || now_retired.second != raw_tables)
+            return std::unexpected(
+                std::string{"the database changed between the free-space check and the migration; "
+                            "retried"});
+        if (expired())
+            return std::unexpected(expiry_text());
+
         if (has_retired) {
             Migration m(h, *db.fold_, legacy_tiers, raw_tables, now_epoch_seconds());
             if (auto r = m.run(); !r)
@@ -1303,8 +1384,6 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         } else if (!h.exec(generate_fold_ddl())) {
             return std::unexpected(h.error()); // a fresh database: just the roll-up schema
         }
-        if (!h.exec(legacy_live_shim_ddl()))
-            return std::unexpected(h.error());
         if (!h.exec(R"(DELETE FROM echo_config WHERE key LIKE 'rollup\_%\_at' ESCAPE '\' OR key IN ('usage_hwm_id', 'usage_lag_events'))"))
             return std::unexpected(h.error());
         if (!h.exec("INSERT INTO echo_config (key, value) VALUES ('schema_version', '10') "
@@ -1313,14 +1392,22 @@ std::expected<void, std::string> EchoDatabase::migrate_to_v10(EchoDatabase& db,
         return {};
     });
     if (!result) {
-        spdlog::error("EchoDatabase v10: migration rolled back, the retired tables are intact: {}",
-                      result.error());
+        // The caller logs the wrapped text once; this branch only words the cause. An interrupted
+        // statement reads "interrupted"; say whether the deadline or a shutdown did it.
+        if (expired() && result.error().find("interrupt") != std::string::npos)
+            return std::unexpected(expiry_text());
         return std::unexpected(result.error());
     }
 
     // 2. After COMMIT: never carry on from a connection that is still inside a transaction.
     if (sqlite3_get_autocommit(db.db_) == 0)
         return std::unexpected("the connection is still inside a transaction after the v10 commit");
+    if (already_migrated) {
+        // A second opener migrated the file first; its checkpoint and VACUUM are its own.
+        spdlog::info("EchoDatabase: the file was already at schema version 10 when this open took the "
+                     "write lock; nothing to migrate");
+        return {};
+    }
     if (!has_retired) {
         spdlog::info("EchoDatabase: migrated to schema version 10 (roll-up tiers installed)");
         return {};

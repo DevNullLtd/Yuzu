@@ -10,6 +10,7 @@
 #include "authz_model.hpp"            // authz::VisibleSet / authz::in_scope
 #include "live_kinds.hpp"             // shared live-read kind table + parser (S2)
 #include "http_route_sink.hpp"
+#include "result_parsing.hpp"        // split_all_pipes (escape-aware split, #7040)
 #include "rest_a4_envelope_http.hpp"  // detail::a4_denial
 #include "rest_audit.hpp"             // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
 #include "web_utils.hpp"              // html_escape
@@ -93,10 +94,12 @@ std::optional<LiveKind> resolve_live_kind(const std::string& kind) {
                         "", "", "disk", {"index", "model", "size_gb", "media_type", "interface"}};
     if (kind == "hw_memory")
         return LiveKind{"hardware", "memory", "Memory", "device.live.hw_memory",
-                        "", "", "dimm", {"slot", "size_mb", "type", "speed_mhz"}};
+                        "", "", "dimm", {"slot", "size_mb", "type", "speed_mhz"},
+                        /*escaped_rows=*/true};
     if (kind == "hw_processors")
         return LiveKind{"hardware", "processors", "Processors", "device.live.hw_processors",
-                        "", "", "cpu", {"index", "model", "cores", "threads", "clock_mhz"}};
+                        "", "", "cpu", {"index", "model", "cores", "threads", "clock_mhz"},
+                        /*escaped_rows=*/true};
     if (kind == "hw_drivers")
         return LiveKind{"hardware", "drivers", "Drivers", "device.live.hw_drivers",
                         "", "", "driver",
@@ -385,7 +388,7 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
         return body;
     }
 
-    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_live_rows|N
+    if (kind == "capture_sources") { // echo status: config|<src>_enabled|v, config|<src>_rows|N
         // Display order + presentation metadata. The server does NOT link the agent's
         // echo_schema_registry, so source name/$-table/category are held here; we only
         // render a row for a source the agent actually reported (its `<src>_enabled` key
@@ -417,8 +420,10 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
             s.dollar = m.dollar;
             s.category = m.category;
             s.enabled = (en->second == "true");
-            if (auto it = cfg.find(std::string(m.name) + "_live_rows"); it != cfg.end()) {
-                try { s.live_rows = std::stoll(it->second); } catch (...) {}
+            // Row count: `<src>_rows` is the hourly count.
+            auto rows_it = cfg.find(std::string(m.name) + "_rows");
+            if (rows_it != cfg.end()) {
+                try { s.live_rows = std::stoll(rows_it->second); } catch (...) {}
             }
             if (s.enabled) ++on;
             rows.push_back(std::move(s));
@@ -480,7 +485,14 @@ std::string render_live_result(const std::string& kind, const LiveKind& lk,
                     raw_rows.push_back(l);
                 continue;
             }
-            auto f = pipe_fields(l);
+            // The hardware plugin's cpu and dimm rows write a literal pipe in firmware text as `\|`
+            // and fold a backslash to `/` (#7040), so those kinds declare `escaped_rows` and are
+            // split on an UNESCAPED pipe and unescaped: a CPU model or DIMM slot holding a pipe
+            // stays in its cell. Every other kind keeps the raw split, because its action writes
+            // raw text (the hardware disk and driver rows, a Windows mount point ending in a
+            // backslash) and an escape-aware split would let a trailing backslash swallow the
+            // next separator.
+            auto f = lk.escaped_rows ? split_all_pipes(l) : pipe_fields(l);
             if (f.empty()) continue;
             f.erase(f.begin()); // drop the prefix token itself
             f.resize(lk.columns.size()); // pad short / trim long rows to the declared width
@@ -506,6 +518,10 @@ nlohmann::json device_agent_row_json(const DeviceListRow& row) {
         {"os", row.os},
         {"arch", row.arch},
         {"agent_version", row.agent_version},
+        // #2240: the key is ALWAYS present. JSON null = not reported (never "legacy"); the
+        // value, when present, is already one of the server's closed token strings.
+        {"guardian_backend", row.guardian_backend ? nlohmann::json(*row.guardian_backend)
+                                                  : nlohmann::json(nullptr)},
     };
 }
 
@@ -599,7 +615,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
     // -- /fragments/devices/list — global Infrastructure:Read + per-operator scope.
     // Exact /api/agents parity: the gate admits Infrastructure:Read operators and
     // the caller's OWN confinement filter (visible_set_fn_, applied via
-    // authz::in_scope over api_->list_devices()'s unscoped rows — ADR-0031 WS-A4
+    // authz::in_scope over api_->list_devices_basic()'s unscoped rows, ADR-0031 WS-A4
     // wave 2) admits only the caller's visible devices, so an operator never
     // enumerates devices outside their scope. --
     sink.Get("/fragments/devices/list", [this, to_device_row](const httplib::Request& req,
@@ -607,7 +623,7 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
         auto session = auth_fn_(req, res);
         if (!session) { res.status = 401; res.set_content("auth required", "text/plain"); return; }
         // Fleet-wide identity/inventory disclosure (SEC-2/SEC-3 confinement-gap
-        // class, found during a docs sweep): api_->list_devices() below is
+        // class, found during a docs sweep): api_->list_devices_basic() below is
         // fleet-wide/UNSCOPED (see device_api.hpp's own banner) and does not by
         // itself confine a service-scoped API token whose principal resolves to
         // an unscoped grant — the full device roster (hostname, agent_id, OS,
@@ -639,7 +655,9 @@ void DeviceRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn p
                 : std::nullopt;
         std::vector<DeviceRow> all;
         if (api_) {
-            for (const auto& r : api_->list_devices()) {
+            // The basic list: this fragment never renders the per-device backend, so it must
+            // not pay the health-store read for it (and cannot carry it by construction).
+            for (const auto& r : api_->list_devices_basic()) {
                 if (!authz::in_scope(scope, r.agent_id)) continue;
                 all.push_back(to_device_row(r));
             }

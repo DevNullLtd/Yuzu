@@ -153,15 +153,18 @@ public:
     /// carries no tag to gate on — reconnect itself is the signal). The
     /// callee (`QuarantineContainmentReconciler::notify_agent_heartbeat`)
     /// owns its own fast-path cache lookup, so an unset or a hit-nothing fn
-    /// costs at most one branch here. Optional; unset = no reconcile.
+    /// costs at most one branch here. A hit only MARKS the device due: the call
+    /// reads no store and dispatches nothing, and the reconciler thread does the
+    /// work within a second (#7619). Optional; unset = no reconcile.
     ///
     /// Synchronized (governance Gate 3, cpp-safety, 2026-08-24) — unlike
     /// `guardian_reconcile_fn_`/`offline_store_` above, which are bare/raw
     /// and rely on the (pre-existing, out of scope for this fix) benign-
     /// aligned-pointer-store argument. That argument does not extend to a
     /// `std::function`: a live `ingest()` call on a heartbeat-handler thread
-    /// can still be INSIDE `quarantine_reconcile_fn_(...)` — doing blocking
-    /// Postgres + gRPC-dispatch I/O — when `server.cpp`'s stop() sequence
+    /// can still be INSIDE `quarantine_reconcile_fn_(...)` — a mark under a
+    /// short mutex today, and written before #7619 as blocking Postgres +
+    /// gRPC-dispatch I/O, so the barrier is kept either way — when `server.cpp`'s stop() sequence
     /// nulls the fn and then `.reset()`s the `QuarantineContainmentReconciler`
     /// the fn's closure captures. `agent_server_->Shutdown(deadline)` is a
     /// BOUNDED drain, not a quiescence guarantee (same "a handler thread can
@@ -185,6 +188,22 @@ public:
         quarantine_reconcile_fn_ = std::move(fn);
     }
 
+    /// Inventory settings reconcile (SAM-39). Invoked once per heartbeat that carries a
+    /// well-formed `yuzu.inv_settings_version` tag: `none` or 64 lower-case hex characters;
+    /// anything else is ignored. The server wires this to the pusher that compares the reported
+    /// version against the settings that apply to the agent and sends the document when they
+    /// differ. Optional; unset = no reconcile.
+    ///
+    /// Synchronized like the quarantine hook above: stop() clears the fn with the exclusive lock,
+    /// which cannot return while an `ingest()` still holds the shared lock across an in-flight
+    /// call, so the pusher the closure captures is safe to reset afterwards.
+    using InventorySettingsReconcileFn =
+        std::function<void(const std::string& agent_id, const std::string& tag)>;
+    void set_inventory_settings_reconcile_fn(InventorySettingsReconcileFn fn) {
+        std::unique_lock lock(inventory_settings_reconcile_mu_);
+        inventory_settings_reconcile_fn_ = std::move(fn);
+    }
+
 private:
     detail::AgentRegistry& registry_;
     detail::AgentHealthStore* health_store_;
@@ -194,6 +213,8 @@ private:
     GuardianReconcileFn guardian_reconcile_fn_;
     QuarantineReconcileFn quarantine_reconcile_fn_;
     std::shared_mutex quarantine_reconcile_mu_;
+    InventorySettingsReconcileFn inventory_settings_reconcile_fn_;
+    std::shared_mutex inventory_settings_reconcile_mu_;
 };
 
 } // namespace yuzu::server

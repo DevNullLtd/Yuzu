@@ -50,12 +50,12 @@
 /// assign_rbac_role's MCP tool schema role enum exactly" test asserts the
 /// two stay in sync, by parsing the SERVED schema (mcp_server_testonly.hpp's
 /// `input_schemas_for_test()`), not a second hand-copied literal.
-/// `unassign_rbac_role`'s `role` field is DELIBERATELY unrestricted (its own
-/// schema comment: unassign must stay able to clean up an out-of-band grant
-/// — e.g. ITServiceOwner, or a custom role assigned by direct SQL — that
-/// `assign_rbac_role` could never have created), so this sync guarantee is
-/// scoped to `assign_rbac_role` only; there is no enum on the unassign side
-/// for it to drift from.
+/// `unassign_rbac_role`'s `role` field accepts any role name, including one
+/// granted out of band (e.g. ITServiceOwner, or a custom role assigned by
+/// direct SQL) that `assign_rbac_role` could never have created, within the
+/// clean-text rule (`rbac_text_is_clean`, rbac_text.hpp: no NUL, other control
+/// byte or DEL). So this sync guarantee is scoped to `assign_rbac_role` only;
+/// there is no enum on the unassign side for it to drift from.
 namespace yuzu::server {
 
 inline constexpr std::string_view kRbacAssignableRoles[] = {

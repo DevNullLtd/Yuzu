@@ -13,8 +13,10 @@
 
 #include "agent_registry.hpp"
 #include "event_bus.hpp"
+#include "fleet_topology_store.hpp"
 #include "offline_endpoint_store.hpp"
 #include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
 #include "../test_log_capture.hpp"
@@ -24,16 +26,19 @@
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 
 #include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <latch>
+#include <nlohmann/json.hpp>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 using yuzu::server::HeartbeatIngestion;
@@ -65,6 +70,13 @@ yuzu::test::PgTestTemplate offline_tpl{"offline", [](const std::string& dsn) {
     if (!store.is_open())
         throw std::runtime_error("offline template: store failed to migrate");
 }};
+
+void exec_sql_hb(const std::string& dsn, const char* sql) {
+    yuzu::server::pg::PgConn conn{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+    yuzu::server::pg::PgResult r{PQexec(conn.get(), sql)};
+    REQUIRE(r.ok());
+}
 
 } // namespace
 
@@ -316,6 +328,124 @@ TEST_CASE("HeartbeatIngestion: a throwing guardian reconcile fn does not abort i
     }
 }
 
+// SAM-39: the `yuzu.inv_settings_version` tag -> inventory settings reconcile hook. Only `none`
+// or a 64-character lower-case hex version is handed on; anything else is ignored.
+namespace {
+
+::yuzu::agent::v1::HeartbeatRequest make_settings_hb(const std::string& value, bool set_tag = true) {
+    ::yuzu::agent::v1::HeartbeatRequest hb;
+    if (set_tag)
+        (*hb.mutable_status_tags())["yuzu.inv_settings_version"] = value;
+    return hb;
+}
+
+struct SettingsCapture {
+    std::vector<std::pair<std::string, std::string>> calls;
+};
+
+} // namespace
+
+TEST_CASE("HeartbeatIngestion: inventory settings reconcile fires on none and on a 64-hex version",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    SettingsCapture cap;
+    ingestion.set_inventory_settings_reconcile_fn(
+        [&](const std::string& aid, const std::string& tag) { cap.calls.emplace_back(aid, tag); });
+
+    const std::string hex(64, 'a');
+    ingestion.ingest(make_settings_hb("none"), "agent-x", "direct");
+    ingestion.ingest(make_settings_hb(hex), "agent-y", "gateway");
+
+    REQUIRE(cap.calls.size() == 2);
+    CHECK(cap.calls[0] == std::pair<std::string, std::string>{"agent-x", "none"});
+    CHECK(cap.calls[1] == std::pair<std::string, std::string>{"agent-y", hex});
+}
+
+TEST_CASE("HeartbeatIngestion: a malformed or absent inventory settings tag is ignored",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    SettingsCapture cap;
+    ingestion.set_inventory_settings_reconcile_fn(
+        [&](const std::string& aid, const std::string& tag) { cap.calls.emplace_back(aid, tag); });
+
+    for (const std::string bad : {std::string{}, std::string{"None"}, std::string{"NONE"},
+                                  std::string{"none "}, std::string(63, 'a'),
+                                  std::string(65, 'a'), std::string(64, 'A'),
+                                  std::string(63, 'a') + "g", std::string(64, 'a') + "\n",
+                                  std::string{"12345"}})
+        ingestion.ingest(make_settings_hb(bad), "agent-x", "direct");
+    ingestion.ingest(make_settings_hb("", /*set_tag=*/false), "agent-x", "direct");
+
+    CHECK(cap.calls.empty());
+}
+
+TEST_CASE("HeartbeatIngestion: no inventory settings reconcile fn set is a no-op",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+    CHECK_NOTHROW(ingestion.ingest(make_settings_hb("none"), "agent-x", "direct"));
+}
+
+TEST_CASE("HeartbeatIngestion: a throwing inventory settings reconcile does not abort ingestion "
+          "and is counted",
+          "[heartbeat_ingestion][inventory_settings]") {
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+    HeartbeatIngestion ingestion{registry, nullptr, nullptr, &metrics};
+
+    int quarantine_calls = 0;
+    ingestion.set_quarantine_reconcile_fn([&](std::string_view) { ++quarantine_calls; });
+    std::uint64_t guardian_gen = 0;
+    ingestion.set_guardian_reconcile_fn(
+        [&](std::string_view, std::uint64_t gen) { guardian_gen = gen; });
+    const auto exceptions = [&] {
+        return metrics.counter("yuzu_server_inventory_settings_reconcile_exceptions_total").value();
+    };
+
+    // One heartbeat carrying both tags: the guardian hook runs before the settings hook and the
+    // quarantine hook after it, and neither is disturbed by the throw.
+    auto hb = make_hb("9");
+    (*hb.mutable_status_tags())["yuzu.inv_settings_version"] = "none";
+
+    SECTION("std::exception") {
+        ingestion.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(ingestion.ingest(hb, "agent-x", "direct"));
+        CHECK(exceptions() == 1.0);
+        CHECK(guardian_gen == 9);
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("a non-std exception") {
+        ingestion.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw 42; });
+        CHECK_NOTHROW(ingestion.ingest(hb, "agent-x", "direct"));
+        CHECK(exceptions() == 1.0);
+        CHECK(quarantine_calls == 1);
+    }
+    SECTION("a hook that returns is not counted, and a throwing guardian hook is not counted here") {
+        ingestion.set_inventory_settings_reconcile_fn([](const std::string&, const std::string&) {});
+        ingestion.ingest(hb, "agent-x", "direct");
+        CHECK(exceptions() == 0.0);
+    }
+    SECTION("without a metrics registry a throwing hook is still contained") {
+        HeartbeatIngestion unmetered{registry, nullptr, nullptr, nullptr};
+        unmetered.set_inventory_settings_reconcile_fn(
+            [](const std::string&, const std::string&) { throw std::runtime_error("boom"); });
+        CHECK_NOTHROW(unmetered.ingest(hb, "agent-x", "direct"));
+    }
+}
+
 // #3425 governance Gate 3 (cpp-safety, 2026-08-24): `set_quarantine_reconcile_fn(nullptr)`
 // must be an actual drain barrier — it must not return while a concurrent
 // `ingest()` call is still inside the fn, or server.cpp's stop() sequence can
@@ -398,7 +528,7 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
     const auto roster = store.query_stale_within(std::chrono::hours(1));
     REQUIRE(roster.has_value()); // #5531: the read is typed
     const OfflineEndpoint* row = nullptr;
-    for (const auto& e : *roster)
+    for (const auto& e : roster->rows)
         if (e.agent_id == "yuzu_test_hb_nonowner")
             row = &e;
     REQUIRE(row != nullptr);
@@ -409,6 +539,167 @@ TEST_CASE("HeartbeatIngestion: resolved_session_id is recorded on the presence r
     // no longer matches, the resolved one does (and the clear is consumed).
     CHECK_FALSE(store.remove_if_session("yuzu_test_hb_nonowner", "sess-owner"));
     CHECK(store.remove_if_session("yuzu_test_hb_nonowner", "sess-resolved"));
+}
+
+// #5685 hp-2: a replica with no session for an agent (it sees only that agent's non-owner
+// heartbeats) used to push a fleet snapshot with a blank `os`.
+TEST_CASE("HeartbeatIngestion: a fleet snapshot with no local session takes its os from the "
+          "presence row; with no row it stays blank (#5685 hp-2)",
+          "[heartbeat_ingestion][ws5][pg][ha]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry registry{bus, metrics};
+
+    nlohmann::json snap;
+    snap["schema"] = "fleet_snapshot.v1";
+    snap["ts"] = 1;
+    snap["hostname"] = "snap-host";
+    snap["local_ips"] = nlohmann::json::array();
+    snap["processes"] = nlohmann::json::array();
+    snap["connections"] = nlohmann::json::array();
+
+    // One topology store per case: it caches its first get() for 60 s.
+    const auto pushed_os = [&](const std::string& id, HeartbeatIngestion::PresenceBatch* batch =
+                                                          nullptr) -> std::optional<std::string> {
+        yuzu::server::FleetTopologyStore topo{[](std::chrono::milliseconds) {
+            return std::vector<yuzu::server::RawAgentSnapshot>{};
+        }};
+        HeartbeatIngestion ingestion{registry, nullptr, &topo, &metrics, &store};
+        ::yuzu::agent::v1::HeartbeatRequest hb;
+        hb.set_fleet_snapshot_json(snap.dump());
+        ingestion.ingest(hb, id, "gateway", "sess-resolved", batch);
+        auto t = topo.get(false);
+        REQUIRE(t != nullptr);
+        for (const auto& m : t->machines)
+            if (m.agent_id == id)
+                return m.os;
+        return std::nullopt;
+    };
+
+    // Seeded by the OWNING replica earlier; this replica holds no session.
+    REQUIRE(store.upsert("yuzu_test_hb_snap_os", "known-host", "linux", 1, 0, "1.0.0", "arm64",
+                         "sess-owner"));
+    CHECK(pushed_os("yuzu_test_hb_snap_os") == std::optional<std::string>{"linux"});
+
+    // This heartbeat's own upsert wrote a blank-os row (the agent was never seen), so there is
+    // nothing to fall back to: unknown stays blank, never an invented platform. (The ingest
+    // upserts BEFORE the snapshot step, so a genuinely row-less read is not reachable here; a
+    // failed `find_within` takes the same blank path.)
+    CHECK(pushed_os("yuzu_test_hb_snap_noos") == std::optional<std::string>{""});
+
+    // While the batch's presence store is tripped this heartbeat's write is skipped, and so is
+    // the fallback read: the row still says linux, but a degraded store is not read once per
+    // snapshot heartbeat, so the snapshot's os stays blank.
+    REQUIRE(store.upsert("yuzu_test_hb_snap_tripped", "known-host", "linux", 1, 0, "1", "x", "s"));
+    HeartbeatIngestion::PresenceBatch tripped;
+    tripped.store_failed = true;
+    tripped.next_probe = 1000; // the next entry is NOT the half-open probe
+    CHECK(pushed_os("yuzu_test_hb_snap_tripped", &tripped) == std::optional<std::string>{""});
+    CHECK(tripped.skipped == 1);
+}
+
+// #5685 follow-up: the OWNING replica's heartbeat publishes the session's plugin list once per
+// session to its own row; a replica with no session never writes (or clobbers) it.
+TEST_CASE("HeartbeatIngestion: the owner publishes the plugin list once per session; a "
+          "non-owner heartbeat leaves it alone; a new session republishes",
+          "[heartbeat_ingestion][ws5][pg][ha][plugin_visibility]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, offline_tpl);
+    yuzu::server::pg::PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    OfflineEndpointStore store{pool};
+    REQUIRE(store.is_open());
+
+    yuzu::MetricsRegistry metrics;
+    EventBus bus;
+    AgentRegistry owner{bus, metrics};
+    AgentRegistry non_owner{bus, metrics};
+    HeartbeatIngestion owner_ing{owner, nullptr, nullptr, &metrics, &store};
+    HeartbeatIngestion other_ing{non_owner, nullptr, nullptr, &metrics, &store};
+    const auto without = [&](std::string_view plugin) {
+        auto r = store.query_live_ids_without_plugin(std::chrono::hours(1), plugin);
+        REQUIRE(r.has_value());
+        std::vector<std::string> ids;
+        for (const auto& a : *r)
+            ids.push_back(a.agent_id);
+        return ids;
+    };
+    using Ids = std::vector<std::string>;
+
+    const auto make_info = [](const std::vector<std::string>& plugins) {
+        ::yuzu::agent::v1::AgentInfo info;
+        info.set_agent_id("yuzu_test_hb_plugins");
+        info.set_hostname("h");
+        info.mutable_platform()->set_os("linux");
+        for (const auto& p : plugins)
+            info.add_plugins()->set_name(p);
+        return info;
+    };
+    (void)owner.register_agent(make_info({"os_info"}));
+    owner.map_session("sess-1", "yuzu_test_hb_plugins");
+    auto sess = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess != nullptr);
+    CHECK_FALSE(sess->presence_plugins_published.load());
+
+    // A heartbeat that resolved some OTHER session id must not publish this session's list under
+    // that id (and so must not mark it published): it costs nothing and is retried.
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-stale");
+    CHECK_FALSE(sess->presence_plugins_published.load());
+    CHECK(sess->presence_plugins_retry_after_ms.load() == 0); // not a failure: no backoff
+    CHECK(without("echo").empty());
+
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    CHECK(sess->presence_plugins_published.load()); // set only after the write succeeded
+    CHECK(without("echo") == Ids{"yuzu_test_hb_plugins"});
+
+    // A second owner heartbeat does not publish again: tamper with the stored list and see that
+    // the heartbeat leaves the tampered value alone.
+    exec_sql_hb(db.dsn(), "UPDATE endpoint_state.endpoint_plugins SET plugin_names = "
+                          "ARRAY['echo'] WHERE agent_id = 'yuzu_test_hb_plugins'");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    CHECK(without("echo").empty()); // still the tampered {echo}: not republished
+
+    // The non-owner's heartbeat (no session, no list) must not clobber it either.
+    other_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-1");
+    CHECK(without("echo").empty());
+
+    // A re-registration is a NEW session object with a changed list: it republishes.
+    (void)owner.register_agent(make_info({"os_info", "echo"}));
+    owner.map_session("sess-2", "yuzu_test_hb_plugins");
+    auto sess2 = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess2 != nullptr);
+    REQUIRE(sess2 != sess);
+    CHECK_FALSE(sess2->presence_plugins_published.load());
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-2");
+    CHECK(sess2->presence_plugins_published.load());
+    CHECK(without("echo").empty());                         // the new list has echo
+    CHECK(without("other") == Ids{"yuzu_test_hb_plugins"}); // and nothing else
+
+    // A failed write leaves the flag clear so the next heartbeat retries it.
+    (void)owner.register_agent(make_info({"os_info"}));
+    owner.map_session("sess-3", "yuzu_test_hb_plugins");
+    auto sess3 = owner.get_session("yuzu_test_hb_plugins");
+    REQUIRE(sess3 != nullptr);
+    exec_sql_hb(db.dsn(),
+                "ALTER TABLE endpoint_state.endpoint_plugins RENAME TO endpoint_plugins_x");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK_FALSE(sess3->presence_plugins_published.load());
+    // A failed write backs off: the next heartbeat does not try again at once, even though the
+    // table is back (no database round trip per heartbeat while the store is unhealthy).
+    CHECK(sess3->presence_plugins_retry_after_ms.load() > 0);
+    exec_sql_hb(db.dsn(),
+                "ALTER TABLE endpoint_state.endpoint_plugins_x RENAME TO endpoint_plugins");
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK_FALSE(sess3->presence_plugins_published.load()); // still backing off
+    // Once the backoff has passed the next heartbeat publishes.
+    sess3->presence_plugins_retry_after_ms.store(1);
+    owner_ing.ingest(make_hb("", false), "yuzu_test_hb_plugins", "gateway", "sess-3");
+    CHECK(sess3->presence_plugins_published.load());
 }
 
 TEST_CASE("HeartbeatIngestion: resolved_session_id overrides the local session's id; blank "
@@ -529,7 +820,7 @@ TEST_CASE("HeartbeatIngestion: a presence store that recovers mid-batch is detec
     auto present = [&](const std::string& agent) {
         const auto roster = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(roster.has_value());
-        for (const auto& e : *roster)
+        for (const auto& e : roster->rows)
             if (e.agent_id == agent)
                 return true;
         return false;
@@ -585,7 +876,7 @@ TEST_CASE("HeartbeatIngestion: an isolated presence failure skips nothing when t
     auto present = [&](const std::string& agent) {
         const auto roster = store.query_stale_within(std::chrono::hours(1));
         REQUIRE(roster.has_value());
-        for (const auto& e : *roster)
+        for (const auto& e : roster->rows)
             if (e.agent_id == agent)
                 return true;
         return false;
