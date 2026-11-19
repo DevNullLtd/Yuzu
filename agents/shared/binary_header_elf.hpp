@@ -68,7 +68,7 @@ struct ElfInfo {
     std::uint16_t machine{0};
     std::uint64_t entry{0};
     std::vector<ElfProgramHeader> program_headers;
-    // Not sanitised: the bytes of the file, as in PeStringTable.
+    // Not sanitised: the bytes of the file, control characters included.
     std::string interpreter;
     std::string soname;
     std::string build_id;

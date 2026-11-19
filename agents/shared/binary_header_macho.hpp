@@ -40,7 +40,7 @@ struct MachoLimits {
 };
 
 struct MachoDylibId {
-    // Not sanitised: the bytes of the file, as in PeStringTable.
+    // Not sanitised: the bytes of the file, control characters included.
     std::string name;
     std::uint32_t timestamp{0};
     std::uint32_t current_version{0};       // 16.8.8 packing, see format_dylib_version
