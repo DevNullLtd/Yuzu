@@ -691,10 +691,11 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
     const std::string ok_detail = crt::audit_detail("", parsed->filter, read->rows.size(),
                                                     read->result_truncated,
                                                     !parsed->cursor.empty(), confined);
-    const bool audit_ok = domain_row(ctx, "crypto.certificates.view", "success",
-                                     "CertificateInventory", std::string(crt::kAuditTarget),
-                                     ok_detail);
-    mcp_row(ctx, "success", ok_detail);
+    const bool domain_ok = domain_row(ctx, "crypto.certificates.view", "success",
+                                      "CertificateInventory", std::string(crt::kAuditTarget),
+                                      ok_detail);
+    const bool generic_ok = mcp_row(ctx, "success", ok_detail);
+    const bool audit_ok = domain_ok && generic_ok;
     auto payload = crt::list_json(*read);
     if (!audit_ok)
         payload["audit_persisted"] = false;
@@ -744,7 +745,7 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
         mcp_row(ctx, "failure",
                 crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
         if (read.error().unavailable_until_restart) { // pool too small, substring dictionary failed/absent, or a summary scale limit
-            answer(ctx, ctx.a4_error(kInternalError, read.error().message, read.error().remediation.empty() ? std::string(kCryptoPoolTooSmallRemedy) : read.error().remediation, -1, {}, true)); // retry-hint-exempt: lasts until an operator acts (larger pool, repaired dictionary, narrower filter); a retry fails identically
+            answer(ctx, ctx.a4_error(kInternalError, read.error().message, read.error().remediation.empty() ? std::string(kCryptoPoolTooSmallRemedy) : read.error().remediation, -1, {}, true)); // retry-hint-exempt: lasts until an operator acts (larger pool, repaired dictionary) or the caller narrows the filter; no honest retry interval exists (a summary scale limit says one later retry may succeed)
             return;
         }
         answer(ctx, ctx.a4_error(kInternalError,
@@ -761,10 +762,11 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
     const std::string ok_detail = crt::audit_detail(
         "", parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
         read->result_truncated, false, confined);
-    const bool audit_ok = domain_row(ctx, "crypto.certificates.summary", "success",
-                                     "CertificateInventory", std::string(crt::kAuditTarget),
-                                     ok_detail);
-    mcp_row(ctx, "success", ok_detail);
+    const bool domain_ok = domain_row(ctx, "crypto.certificates.summary", "success",
+                                      "CertificateInventory", std::string(crt::kAuditTarget),
+                                      ok_detail);
+    const bool generic_ok = mcp_row(ctx, "success", ok_detail);
+    const bool audit_ok = domain_ok && generic_ok;
     auto payload = crt::summary_json(*read);
     if (!audit_ok)
         payload["audit_persisted"] = false;

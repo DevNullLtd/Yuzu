@@ -57375,7 +57375,9 @@ TEST_CASE("MCP SAM-35 reads: a confined caller sees only its scope; out-of-scope
     const auto hosts = rig.mcp_data("list_software_hosts");
     REQUIRE(hosts["hosts"].size() == 1);
     CHECK(hosts["hosts"][0]["agent_id"] == "a1");
-    for (const auto& c : rig.mcp_data("list_software_changes")["changes"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_57378 = rig.mcp_data("list_software_changes");
+    for (const auto& c : range_root_57378["changes"])
         CHECK(c["agent_id"] == "a1");
 
     // An out-of-scope host (a2) and an unknown one (zz) are the same answer, and the first reads
