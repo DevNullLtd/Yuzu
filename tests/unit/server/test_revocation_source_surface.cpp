@@ -1320,7 +1320,7 @@ TEST_CASE("revocation source MCP: a supervised token needs an approval ticket fo
         {kRegister, rstest::valid_body("Another CA")},
         {kUpdate, upd},
         {kRemove, json{{"id", id}}},
-        {kReset, json{{"id", id}}},
+        {kReset, fx.with_reset_preconditions(id, {{"id", id}})},
     };
     for (const auto& [tool, args] : calls) {
         INFO(tool);
@@ -1355,7 +1355,8 @@ TEST_CASE("revocation source MCP: admin-only in both RBAC states, not grantable"
         upd["expected_config_version"] = 1;
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kRegister, rstest::valid_body("New CA"))) == code);
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kUpdate, upd)) == code);
-        CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}})) == code);
+        CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}}))) ==
+              code);
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kRemove, {{"id", id}})) == code);
         const auto all = fx.store.list();
         REQUIRE(all.has_value());
@@ -1519,7 +1520,8 @@ TEST_CASE("revocation source MCP: a DENY on the grant is honoured as on REST (se
     CHECK(fx.h.mcp_call_tool(kList, json::object())->body == R"({"error":"forbidden"})");
     CHECK(fx.h.mcp_call_tool(kGet, {{"id", id}})->body == R"({"error":"forbidden"})");
     CHECK(json::parse(fx.h.mcp_call_tool_approved(kRemove, {{"id", id}})->body).contains("error"));
-    CHECK(json::parse(fx.h.mcp_call_tool_approved(kReset, {{"id", id}})->body).contains("error"));
+    CHECK(json::parse(fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}}))->body)
+              .contains("error"));
     CHECK(fx.store.list()->size() == 1);
     for (const char* verb :
          {"crypto.revocation_source.remove", "crypto.revocation_source.reset_high_water"})
@@ -2416,7 +2418,8 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
     auto created = fx.rest_post(first);
     REQUIRE(created->status == 201);
     const auto id = data_of(*created)["data"]["id"].get<std::int64_t>();
-    const std::string old_key = data_of(*created)["data"]["ca_certificates"][0]["cert_sha256"];
+    const auto old_key =
+        data_of(*created)["data"]["ca_certificates"][0]["cert_sha256"].get<std::string>();
     // The rebuilt CA's certificate is added with PUT first (same subject, a new key).
     json both = first;
     both["ca_certificates"].push_back(rstest::make_ca_pem({.cn = "Registered Test CA"}));
@@ -2424,9 +2427,13 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
     REQUIRE(put->status == 200);
     REQUIRE(data_of(*put)["data"]["config_version"] == 2);
     std::string new_key;
-    for (const auto& k : data_of(*put)["data"]["ca_certificates"])
-        if (k["cert_sha256"] != old_key)
-            new_key = k["cert_sha256"];
+    const auto stored = fx.store.get(id);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->keys.size() == 2);
+    for (const auto& k : stored->keys)
+        if (k.cert_sha256 != old_key)
+            new_key = k.cert_sha256;
+    INFO(data_of(*put).dump());
     REQUIRE(new_key.size() == 64);
 
     const auto refused = [&](const std::string& body, int status, const std::string& param) {
@@ -2511,11 +2518,13 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
     const auto id = fx.seed();
     const auto key = fx.store.get(id)->keys.at(0).cert_sha256;
     const auto invalid = yuzu::server::mcp::kInvalidParams;
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}})) == invalid);
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+    // A body missing a required member is refused by the input schema, before any approval
+    // ticket is minted.
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(kReset, {{"id", id}})) == invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(
               kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}})) == invalid);
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
-              kReset, {{"id", id}, {"expected_config_version", 1}})) == invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(kReset, {{"id", id}, {"expected_config_version", 1}})) ==
+          invalid);
     CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
               kReset, {{"id", id},
                        {"keep_key_sha256", json::array({std::string(64, 'e')})},
@@ -2541,7 +2550,8 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
     CHECK(keep["minItems"] == 1);
     CHECK(keep["maxItems"] == 8);
     CHECK(keep["items"]["pattern"] == "^[0-9a-f]{64}$");
-    CHECK(keep["uniqueItems"] == true);
+    // Distinctness is enforced by parse_reset (a repeat is invalid_params naming its index); the
+    // MCP input-schema checker does not admit `uniqueItems`, so the schema cannot state it.
     CHECK((*reset)["inputSchema"]["properties"]["expected_config_version"]["minimum"] == 1);
     const auto& out = (*reset)["outputSchema"];
     for (const char* f : {"dropped_ca_certificates", "config_version"}) {

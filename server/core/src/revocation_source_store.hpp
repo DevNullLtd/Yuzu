@@ -51,7 +51,10 @@
 ///
 /// Concurrency: every multi-statement write is ONE transaction. `create` serialises on a
 /// transaction-scoped advisory lock so the 64-source ceiling and the one-source-per-CA rule hold
-/// across replicas; `replace`, `remove` and `reset_high_water` lock the source row first. An
+/// across replicas; `replace`, `remove` and `reset_high_water` lock the source row first. The
+/// open-time canonical URL pass reads without locks and takes the same advisory lock and every
+/// source row (under its own 10 s `lock_timeout`) only when it has rows to rewrite or an apparent
+/// refusal, so a steady-state open never waits on a writer. An
 /// ambiguous commit (connection lost after COMMIT was sent) is `kOutcomeUnknown`, never a guess.
 ///
 /// Personal data: `created_by` is the registering operator's username. URLs are operator-supplied
@@ -187,6 +190,9 @@ struct RevocationSourceUpdate {
     bool changed{false};
     std::int64_t dropped_urls{0};
     std::int64_t dropped_keys{0};
+    /// The dropped keys' cert_sha256 values, sorted: the audit evidence of WHICH keys stopped
+    /// being trusted.
+    std::vector<std::string> dropped_key_sha256;
     std::int64_t crls_deleted{0};
 };
 

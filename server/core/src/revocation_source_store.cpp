@@ -476,7 +476,8 @@ struct UrlRewrite {
 };
 
 // The rewrites the stored URLs need, or nullopt on a refusal (logged) or a read failure (logged).
-// `log_refusal` is false for the unlocked first look, whose refusal is only a reason to re-read.
+// `log_refusal` is false for the unlocked first look, whose refusal or read failure is only a
+// reason to read again under the locks.
 std::optional<std::vector<UrlRewrite>> plan_url_rewrites(PGconn* conn, bool log_refusal) {
     pg::PgResult urls = pg::exec_params(
         conn,
@@ -484,8 +485,11 @@ std::optional<std::vector<UrlRewrite>> plan_url_rewrites(PGconn* conn, bool log_
         "source_id, id",
         std::vector<std::string>{});
     if (urls.status() != PGRES_TUPLES_OK) {
-        spdlog::error("RevocationSourceStore: canonical URL pass could not read URLs (SQLSTATE {})",
-                      sqlstate(urls));
+        // The first, unlocked look only gates the locked pass, which reads again and reports.
+        if (log_refusal)
+            spdlog::error("RevocationSourceStore: canonical URL pass could not read URLs "
+                          "(SQLSTATE {})",
+                          sqlstate(urls));
         return std::nullopt;
     }
     std::vector<UrlRewrite> rewrites;
@@ -862,12 +866,15 @@ RevocationSourceStore::replace(std::int64_t id, const NewRevocationSource& src) 
         pg::PgResult d = pg::exec_params(
             conn,
             "DELETE FROM revocation_source_store.source_ca_key WHERE source_id = $1::bigint AND "
-            "cert_sha256 = $2 RETURNING 1",
+            "cert_sha256 = $2 RETURNING cert_sha256",
             std::vector<std::string>{std::to_string(id), k.cert_sha256});
         if (d.status() != PGRES_TUPLES_OK)
             return statement_error("replace drop key", conn, d, true);
         out.dropped_keys += PQntuples(d.get());
+        for (int i = 0; i < PQntuples(d.get()); ++i)
+            out.dropped_key_sha256.emplace_back(PQgetvalue(d.get(), i, 0));
     }
+    std::ranges::sort(out.dropped_key_sha256);
     for (const auto& k : src.keys)
         if (!cur_keys.contains(k.cert_sha256))
             if (auto r = insert_key(conn, id, k); !r)

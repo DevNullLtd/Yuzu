@@ -5105,7 +5105,7 @@ static const ToolDef kTools[] = {
      "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
      "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
      R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
-     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source; every other key is removed"},)j"
+     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source; every other key is removed"},)j"
      R"j("expected_config_version":{"type":"integer","minimum":1,"description":"Required: the source's config_version as you last read it; a mismatch is a conflict and changes nothing"},)j"
      R"j("reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
      R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"

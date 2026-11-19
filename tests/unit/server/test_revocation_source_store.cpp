@@ -385,6 +385,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
     CHECK(r->changed);
     CHECK(r->dropped_urls == 1);
     CHECK(r->dropped_keys == 1);
+    CHECK(r->dropped_key_sha256 == std::vector<std::string>{hex64('b')});
     CHECK(r->source.held_crl_count == 1);
     REQUIRE(r->source.urls.size() == 1);
     CHECK(r->source.urls[0].id == url_a);
@@ -402,6 +403,7 @@ TEST_CASE("RevocationSourceStore: a replace that drops a URL or a key deletes it
         *id, at_version(make_source("Corp CA", '1', {'c'}, {"http://crl.example.com/a.crl"}), 2));
     REQUIRE(r2.has_value());
     CHECK(r2->dropped_keys == 1);
+    CHECK(r2->dropped_key_sha256 == std::vector<std::string>{hex64('a')});
     CHECK(r2->crls_deleted == 1);
     CHECK(r2->source.held_crl_count == 0);
 }
@@ -957,16 +959,22 @@ TEST_CASE("RevocationSourceStore: a pass with work waits a bounded time for a he
     PgResult held{PQexec(holder.get(), ("SELECT id FROM revocation_source_store.source WHERE id = " +
                                         std::to_string(*id) + " FOR UPDATE").c_str())};
     REQUIRE(held.status() == PGRES_TUPLES_OK);
-    // The pass needs the row: it gives up after its own lock_timeout, changing nothing, rather
-    // than hanging the boot.
+    // A store on a pool with NO session timeouts (as a DSN `options` setting leaves it), so only
+    // the pass's own per-transaction lock_timeout can bound the wait: it gives up, changing
+    // nothing, rather than hanging the boot. (Constructed with the row free of work-blocking
+    // locks would not test this, so the open itself is expected to refuse here too.)
+    PgPool untimed{{.conninfo = rs_db_fx_.dsn(), .size = 2, .statement_timeout_ms = 0, .lock_timeout_ms = 0}};
+    REQUIRE(untimed.valid());
     const auto t0 = std::chrono::steady_clock::now();
-    CHECK_FALSE(store.canonicalise_stored_urls_for_test().has_value());
-    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(25));
+    RevocationSourceStore bounded{untimed};
+    CHECK_FALSE(bounded.is_open());
+    CHECK_FALSE(bounded.canonicalise_stored_urls_for_test().has_value());
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(40));
     PgResult end{PQexec(holder.get(), "ROLLBACK")};
     REQUIRE(end.status() == PGRES_COMMAND_OK);
     CHECK(store.get(*id)->urls[0].url == "HTTP://CRL.EXAMPLE.COM/a.crl");
     // With the row free, the same pass completes.
-    CHECK(store.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(1));
+    CHECK(bounded.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(1));
     CHECK(store.get(*id)->urls[0].url == "http://crl.example.com/a.crl");
 }
 

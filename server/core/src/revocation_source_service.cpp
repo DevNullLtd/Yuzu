@@ -1309,10 +1309,27 @@ std::string audit_detail_source(std::string_view cid, const RevocationSourceReco
            " name=" + ::yuzu::log_token(r.name);
 }
 
+namespace {
+// The removed keys by cert_sha256 (at most 8, each 64 hex), so the audit row names which keys
+// stopped being trusted, not only how many.
+std::string dropped_keys_part(const std::vector<std::string>& keys) {
+    if (keys.empty())
+        return {};
+    std::string out = " dropped_key_sha256=";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i)
+            out += '|';
+        out += ::yuzu::log_token(keys[i]);
+    }
+    return out;
+}
+} // namespace
+
 std::string audit_detail_update(std::string_view cid, const RevocationSourceUpdate& u) {
     return audit_detail_source(cid, u.source) + " changed=" + (u.changed ? "true" : "false") +
            " dropped_urls=" + std::to_string(u.dropped_urls) +
            " dropped_ca_certificates=" + std::to_string(u.dropped_keys) +
+           dropped_keys_part(u.dropped_key_sha256) +
            " crls_deleted=" + std::to_string(u.crls_deleted);
 }
 
@@ -1342,21 +1359,6 @@ std::string audit_detail_reset(std::string_view cid, const nlohmann::json& body)
     return out;
 }
 
-namespace {
-// The removed keys by cert_sha256 (at most 8, each 64 hex), so the audit row names which keys
-// stopped being trusted, not only how many.
-std::string dropped_keys_part(const std::vector<std::string>& keys) {
-    if (keys.empty())
-        return {};
-    std::string out = " dropped_key_sha256=";
-    for (std::size_t i = 0; i < keys.size(); ++i) {
-        if (i)
-            out += '|';
-        out += ::yuzu::log_token(keys[i]);
-    }
-    return out;
-}
-} // namespace
 
 std::string audit_detail_reset_result(std::string_view cid, const HighWaterReset& r) {
     return cid_part(cid) + " reset_at=" + rfc3339_utc(r.reset_at) +
