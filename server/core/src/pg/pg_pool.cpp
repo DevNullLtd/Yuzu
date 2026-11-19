@@ -327,11 +327,11 @@ PGconn* PgPool::connect_one() {
 
     PgConn conn{PQconnectdbParams(keys.data(), vals.data(), /*expand_dbname=*/1)};
     if (PQstatus(conn.get()) != CONNECTION_OK) {
-        // Safe to surface: connect errors from a *well-formed* conninfo name
-        // host/port and the failure cause, never credentials. The malformed
-        // case never reaches here (rejected at construction).
-        std::string err = conn ? PQerrorMessage(conn.get()) : "out of memory";
-        spdlog::warn("PgPool: connection attempt failed: {}", ::yuzu::log_key_token(err));
+        // NOT safe to surface raw (F56): libpq quotes the host/port/dbname it parsed from the DSN,
+        // and a URI password with an unescaped '/' or '@' leaks into those. Log and keep only a
+        // fixed cause chosen from the text.
+        std::string err = connect_failure_cause(conn ? PQerrorMessage(conn.get()) : "out of memory");
+        spdlog::warn("PgPool: connection attempt failed: {}", err);
         set_error(std::move(err));
         // Observer runs here: connect_one is always called WITHOUT mu_ held.
         if (observer_.on_connect_failure)

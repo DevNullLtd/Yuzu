@@ -9,6 +9,7 @@
 #include "rotation_confirm_state.hpp"
 #include "secure_random.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: principal ids derived from IdP/SCIM values in log lines
 #include <yuzu/secure_zero.hpp>
 
 #include <libpq-fe.h>
@@ -1121,7 +1122,7 @@ ApiTokenStore::list_active_for_principal_checked(const std::string& principal_id
     if (!lease) {
         spdlog::warn("ApiTokenStore::list_active_for_principal: pool lease timed out for "
                      "principal_id={}",
-                     principal_id);
+                     ::yuzu::log_key_token(principal_id));
         return std::unexpected(std::string("pool lease timed out"));
     }
 
@@ -1136,7 +1137,7 @@ ApiTokenStore::list_active_for_principal_checked(const std::string& principal_id
     if (res.status() != PGRES_TUPLES_OK) {
         spdlog::warn("ApiTokenStore::list_active_for_principal: query failed for "
                      "principal_id={}: {}",
-                     principal_id, PQerrorMessage(lease.get()));
+                     ::yuzu::log_key_token(principal_id), ::yuzu::log_key_token(PQerrorMessage(lease.get())));
         return std::unexpected(std::string("query failed"));
     }
 
