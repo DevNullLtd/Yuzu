@@ -35,6 +35,11 @@ Mutants, on scratch copies of release.yml and the scripts: adjacent swaps of
 the publish steps, named reorders, a dropped intent line, `tagged` recorded
 early. Each must be killed by some row.
 
+The two in-place edits of the local image SBOM pair (`artifact-sbom.py
+augment`, then `mark-image`) touch neither the registry nor the journal, so no
+row can see them: SbomEditOrder pins them structurally after `signed-attested`
+and before the SBOM upload and the tag move, and refuses each reorder mutant.
+
 The future-findings rule this enforces (docs/ci-architecture.md "The publish
 journal"): a defect is a reachable row where the journal's terminal label
 claims less than the registry holds, or where attach or the release check
@@ -274,6 +279,12 @@ def step_key(st):
             return v
     if st.get("id") == "gate":
         return "gate"
+    # The two in-place edits of the local image SBOM pair (scripts/ci/
+    # artifact-sbom.py): neither touches the registry or the journal, so the
+    # rig runs them as no-ops; their place is pinned by SbomEditOrder below.
+    m = re.search(r"artifact-sbom\.py (augment|mark-image) ", run)
+    if m:
+        return m.group(1)
     return "other"
 
 
@@ -503,7 +514,7 @@ class Rig:
                 return "success"
             return "success"   # sbom, cosign-install, other uploads, checkout
         run = st.get("run") or ""
-        if role in ("other", "recheck"):
+        if role in ("other", "recheck", "augment", "mark-image"):
             return "success"
         env = self.env(attempt, stub)
         for key, val in (st.get("env") or {}).items():
@@ -803,9 +814,9 @@ class CrossRun(unittest.TestCase):
 
 
 # ── Mutants ──────────────────────────────────────────────────────────────────
-def swap_steps(text, job, a, b):
-    """release.yml text with job's steps of roles a and b (first of each)
-    swapped, every other byte unchanged."""
+def _job_blocks(text, job):
+    """(lines, blocks, roles) of one job in release.yml text: each step's line
+    span (its leading comments belong to no block) and its step_key role."""
     lines = text.split("\n")
     start = next(i for i, ln in enumerate(lines) if ln == f"  {job}:")
     end = next(i for i in range(start + 1, len(lines)) if re.match(r"^  [A-Za-z0-9_-]+:$", lines[i]))
@@ -821,6 +832,13 @@ def swap_steps(text, job, a, b):
     for s, e in blocks:
         st = yaml.safe_load("\n".join(ln[6:] for ln in lines[s:e]))[0]
         roles.append(step_key(st))
+    return lines, blocks, roles
+
+
+def swap_steps(text, job, a, b):
+    """release.yml text with job's steps of roles a and b (first of each)
+    swapped, every other byte unchanged."""
+    lines, blocks, roles = _job_blocks(text, job)
     g = roles.index("gate")   # the publish steps are after the gate
     ia, ib = roles.index(a, g), roles.index(b, g)
     (sa, ea), (sb, eb) = sorted([blocks[ia], blocks[ib]])
@@ -978,6 +996,108 @@ ILLEGAL_LATE = {
     "tagged names another digest": GOOD[:5] + [f"publish: tagged {REPO}:1.2.3,{REPO}:latest {D2}"],
     "tagged names other tags": GOOD[:5] + [f"publish: tagged {REPO}:1.2.3 {D1}"],
 }
+
+
+# ── The image SBOM edits: after signed-attested, before the upload and tags ──
+# `augment` (yuzu-server's vendored components) and `mark-image` (the
+# incomplete marker) rewrite the local image SBOM pair in place. They describe
+# the digest `signed-attested` recorded, so they run after it; the upload
+# sends what they wrote, and the tags move last, so both run before those.
+# augment runs first: mark-image then marks the augmented pair. The journal
+# rig above cannot see either step (neither touches the registry or the
+# journal), so the order is pinned here, structurally, and each mutant below
+# must be refused.
+# No resume skips the syft scan: the journal is per attempt (`open` refuses an
+# existing one) and gates no step, and a re-run runs the whole job again, so
+# the SBOM steps rewrite the pair before augment reads it, or fail the job
+# first. A pair that already lists any part of the vendored set (a stale file
+# on a reused workspace) is refused by augment itself, not completed
+# (tests/test_artifact_sbom.py: the second augment run and the partly
+# augmented pair).
+SBOM_EDIT_ORDER = {
+    "docker-publish": ["signed-attested", "augment", "mark-image", "upload", "recheck", "tag"],
+    "docker-publish-chisel": ["signed-attested", "augment", "mark-image", "upload", "recheck", "tag"],
+    # No yuzu-server in the postgres image: no augment step.
+    "docker-publish-postgres": ["signed-attested", "mark-image", "upload", "recheck", "tag"],
+}
+
+
+def sbom_edit_order_errors(text, job):
+    """Why job's publish steps break SBOM_EDIT_ORDER (empty: they keep it)."""
+    want = SBOM_EDIT_ORDER[job]
+    _lines, _blocks, roles = _job_blocks(text, job)
+    roles = roles[roles.index("gate"):]
+    errs = [f"{job}: {r} appears {roles.count(r)} times, not once" for r in want if roles.count(r) != 1]
+    if "augment" not in want and "augment" in roles:
+        errs.append(f"{job}: runs augment, which this image does not take")
+    if errs:
+        return errs
+    at = {r: roles.index(r) for r in want}
+    return [f"{job}: {a} is not before {b}" for a, b in zip(want, want[1:]) if at[a] >= at[b]]
+
+
+def move_step(text, job, role, anchor, after):
+    """release.yml text with job's `role` step moved to just before (or after)
+    its `anchor` step; every other byte unchanged."""
+    lines, blocks, roles = _job_blocks(text, job)
+    g = roles.index("gate")
+    s, e = blocks[roles.index(role, g)]
+    moved = lines[s:e]
+    rest = lines[:s] + lines[e:]
+    a_s, a_e = blocks[roles.index(anchor, g)]
+    shift = (e - s) if a_s > s else 0
+    at = (a_e if after else a_s) - shift
+    return "\n".join(rest[:at] + moved + rest[at:])
+
+
+class SbomEditOrder(unittest.TestCase):
+
+    def test_the_workflow_keeps_the_order(self):
+        text = RELEASE.read_text(encoding="utf-8")
+        for job in SBOM_EDIT_ORDER:
+            with self.subTest(job=job):
+                self.assertEqual(sbom_edit_order_errors(text, job), [])
+
+    def test_reorders_are_refused(self):
+        text = RELEASE.read_text(encoding="utf-8")
+        mutants = []
+        for job in ("docker-publish", "docker-publish-chisel"):
+            mutants += [
+                (job, "augment before signed-attested", move_step(text, job, "augment", "signed-attested", False)),
+                (job, "augment after the SBOM upload", move_step(text, job, "augment", "upload", True)),
+                (job, "augment after the tag move", move_step(text, job, "augment", "tag", True)),
+                (job, "mark-image before augment", swap_steps(text, job, "augment", "mark-image")),
+            ]
+        for job in SBOM_EDIT_ORDER:
+            mutants += [
+                (job, "mark-image before signed-attested",
+                 move_step(text, job, "mark-image", "signed-attested", False)),
+                (job, "mark-image after the SBOM upload", move_step(text, job, "mark-image", "upload", True)),
+                (job, "mark-image after the tag move", move_step(text, job, "mark-image", "tag", True)),
+            ]
+        for job, label, mutant in mutants:
+            with self.subTest(job=job, mutant=label):
+                self.assertNotEqual(mutant, text)
+                yaml.safe_load(mutant)   # still a workflow
+                self.assertTrue(sbom_edit_order_errors(mutant, job), f"{job}: {label} survived")
+
+    def test_a_dropped_or_added_augment_is_refused(self):
+        text = RELEASE.read_text(encoding="utf-8")
+        for job in ("docker-publish", "docker-publish-chisel"):
+            lines, blocks, roles = _job_blocks(text, job)
+            s, e = blocks[roles.index("augment", roles.index("gate"))]
+            with self.subTest(job=job, mutant="dropped"):
+                self.assertTrue(sbom_edit_order_errors("\n".join(lines[:s] + lines[e:]), job))
+            with self.subTest(job=job, mutant="twice"):
+                self.assertTrue(sbom_edit_order_errors("\n".join(lines[:e] + lines[s:e] + lines[e:]), job))
+        # An augment step copied into the postgres job.
+        lines, blocks, roles = _job_blocks(text, "docker-publish")
+        s, e = blocks[roles.index("augment", roles.index("gate"))]
+        step = lines[s:e]
+        plines, pblocks, proles = _job_blocks(text, "docker-publish-postgres")
+        ps, _pe = pblocks[proles.index("mark-image", proles.index("gate"))]
+        self.assertTrue(sbom_edit_order_errors("\n".join(plines[:ps] + step + plines[ps:]),
+                                               "docker-publish-postgres"))
 
 
 def illegal_journals_accepted(script):

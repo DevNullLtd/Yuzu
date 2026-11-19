@@ -498,7 +498,8 @@ release when:
   `server/core/static/yuzu-*.js` and `yuzu.css` files (`first_party_patterns`,
   the directory itself only, never a subdirectory) are exempt. The image SBOMs stay a syft scan of the pushed image, but
   `docker-publish` and `docker-publish-chisel` then run `artifact-sbom.py
-  augment` on each leg's pair, before `mark-image`, which adds the same
+  augment` on each leg's pair, after "Record signed and attested" and before
+  `mark-image`, the SBOM upload and "Tag the release", which adds the same
   components to the `yuzu-server` and `yuzu-server-chisel` image SBOMs (syft
   lists the binary only as an SPDX file) and leaves the other legs' untouched.
   The entries carry fixed identifiers in every SBOM that lists them: CycloneDX
@@ -507,8 +508,10 @@ release when:
   CycloneDX component, and the `yuzu:sbom:vendored` note on the root; they are
   not an incompleteness reason (the `server-vendored` token is retired, never
   released, and never to be reused). `augment` fails the leg, before the SBOM
-  is uploaded, on a manifest that disagrees with the checkout or on an image
-  labelled as the release's server image in which syft lists no `yuzu-server`.
+  is uploaded and before any tag of that image moves (its publish journal ends
+  `signed-attested`), on a manifest that disagrees with the checkout or on an
+  image labelled as the release's server image in which syft lists no
+  `yuzu-server`.
   On an image leg, while `build-linux` passed the same check on the same tag,
   a manifest that disagrees with the checkout means the runner's reused
   (`clean: false`) workspace holds a file the tag does not: reset that

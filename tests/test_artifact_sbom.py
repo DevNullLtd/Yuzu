@@ -1580,9 +1580,10 @@ class Check(unittest.TestCase):
 
     def test_release_augments_every_server_image_sbom(self):
         # release.yml runs augment on the image SBOM pair of each job that can
-        # publish a yuzu-server image, after the image is signed and before
-        # mark-image and the upload (the release check above is the backstop;
-        # this fails in PR CI instead).
+        # publish a yuzu-server image, after `Record signed and attested` and
+        # before mark-image and the upload (the release check above is the
+        # backstop; this fails in PR CI instead; tests/test_image_publish.py
+        # SbomEditOrder pins the whole order, the tag move included).
         wf = (ROOT / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
         for job, stem in (("docker-publish", "yuzu-${{ matrix.image }}-image"),
                           ("docker-publish-chisel", "yuzu-${{ matrix.image }}-chisel-image")):
@@ -1596,8 +1597,8 @@ class Check(unittest.TestCase):
                 start = wf.index(f"\n  {job}:\n")
                 self.assertLess(start, at)
                 self.assertEqual(wf.rfind("\n  docker-publish", 0, at), start, f"augment is not in {job}")
-                self.assertLess(start, wf.index("- name: Sign image (keyless)", start))
-                self.assertLess(wf.index("- name: Sign image (keyless)", start), at)
+                self.assertLess(start, wf.index("- name: Record signed and attested", start))
+                self.assertLess(wf.index("- name: Record signed and attested", start), at)
                 self.assertLess(at, wf.index(mark))
                 self.assertLess(at, wf.index("- name: Upload image SBOM artifacts", at))
 
