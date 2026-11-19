@@ -3564,7 +3564,9 @@ test('image vulnerability gate',
   _python3_test,
   args: [files('test_image_vuln_gate.py')],
   suite: 'docs',
-  timeout: 60,
+  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
+  # limit of 60): many cases each run the gate script and a stub trivy.
+  timeout: 240,
 )
 
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
