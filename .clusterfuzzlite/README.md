@@ -36,6 +36,9 @@ download-miss warnings in the job logs.
 | Target | Parses | Why it's fuzzed |
 |---|---|---|
 | `fuzz_preflight_parse` | pipe-delimited plugin output → pre-flight verdicts | agent/plugin-controlled bytes decide go/no-go |
+| `fuzz_file_search_cursor` | the file search resume cursor (`fs1:` token) | caller-supplied bytes choose where a walk resumes; a forged cursor must be refused before any filesystem call |
+| `fuzz_file_search_names` | the reversible name encoding of result rows | file names are attacker-chosen bytes and must round-trip exactly |
+| `fuzz_file_search_glob` | the leaf-name pattern compiler and matcher | operator patterns meet attacker-chosen file names; matching must stay bounded |
 | `fuzz_deployment_parse` | deployment config fields + content_dist output | operator strings + agent bytes gate the mutating deploy step |
 | `fuzz_yaml_scan` | the in-tree YAML-subset scanner | only runtime consumer of `yaml_source`; authorization-load-bearing since #1215 |
 | `fuzz_guardian_rule_spec` | Guardian rule bodies + `dangerous_enforce_*` chokepoints | network-supplied specs gate enforce-mode promotion |
