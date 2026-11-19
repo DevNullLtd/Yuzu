@@ -233,6 +233,25 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
 
+## Behaviour change: malformed agent data is contained per device (WP07)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: everyone who runs policies or reads result rows. To do: nothing; read "Known limits" for the limits.
+
+**What the server does.** A policy check response nested past the depth guard, whose evaluation throws, or whose compliance expression fails to evaluate scores that device `error` (the check result carries `{"reason":"unevaluable_response"}` when evaluation threw) and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception|expression"}`; the collect pass carries on with every other device, and each target is its own failure domain. A numeric JSON value in a row is compared as text (`{"hostname":1}` reads as `"1"`). The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR, CRLF and LF as one line break, and result rows lose every embedded carriage return.
+
+**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings of its snapshot-diff sources, its fleet snapshot and its module-load rows at collection (its cursor-based sources keep their own codecs, replacing or allowlisted values only; removable-media events, the macOS nstat connection stream, the start-up and history backfills and the network-quality rows are stored as collected and are not scrubbed, so they can hold raw path or process-name bytes in `echo.db`).
+
+**Known limits.**
+- Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.
+- An exception in one Echo collect leg can skip the later legs of that fast tick (per-leg isolation is not done).
+- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (tracked in #8179).
+- The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row occupies a slot at full size.
+- The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
+- **A non-UTF8 PostgreSQL database.** The server only WARNS at start (log line, gauge `yuzu_pg_server_encoding_not_utf8` = 1, alert `YuzuPgServerEncodingNotUtf8`); it does not refuse to start. On such a database Postgres does not reject invalid UTF-8 agent text; see [server-admin.md](server-admin.md#postgresql-database-encoding).
+- **Where to see the signals.** A command whose plugin output was lost to an allocation failure reports `constrained`/`partial` (provenance `host:output_dropped`); the agent also reports the heartbeat tag `yuzu.output_dropped` and keeps the agent-local counter `yuzu_agent_plugin_output_dropped_total` (neither has a server rollup). Skipped policy targets raise `YuzuPolicyCollectSkipped`.
+
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 
 **In short.** Affected: a caller whose `Execution:Read` does not cover the fleet (a management-group-scoped grant, or none), or whose `Execution:Read` check cannot be resolved for that call, when it calls `execute_instruction` with a `_meta.progressToken` on a streaming session. To do: poll `get_execution_status` for the counts it may see. A caller with an unrestricted `Execution:Read` sees the same frames as before.

@@ -10,6 +10,8 @@
  */
 
 #include "result_set_matcher.hpp"
+#include "live_kinds.hpp"
+#include "result_parsing.hpp"
 #include "unverified_frame_registry.hpp"
 
 #include <catch2/catch_test_macros.hpp>
@@ -1372,4 +1374,21 @@ TEST_CASE("UnverifiedFrameRegistry: a full set of remembered commands sets the l
     CHECK(reg.contains("c0", "a0", 104));          // including the dropped command
     CHECK_FALSE(reg.note("c4", "a4", 105).latched); // already set: not reported again
     CHECK_FALSE(reg.contains("never-seen", "b", 103 + 60 + 2)); // the latch ages out
+}
+
+// Pins a DELIBERATE divergence (WP07 review): split_output_lines (SSE rows) deletes every CR, but
+// the matcher keeps CR in a cell because the cell text decides result-set MEMBERSHIP. A CRLF
+// answer's last cell therefore does not `eq`-match its CR-stripped value. Changing this changes
+// membership: an owner decision, not a drive-by.
+TEST_CASE("matcher: a CR is kept in the cell text (membership semantics pinned)",
+          "[result_set][matcher]") {
+    const std::string out = "__schema__|pid|sha256\n42|abc\r\n__total__|1\n";
+    CHECK_FALSE(response_matches(R"({"column":"sha256","op":"eq","value":"abc"})", kOk, out));
+    CHECK(response_matches(R"({"column":"sha256","op":"contains","value":"abc"})", kOk, out));
+}
+
+TEST_CASE("the three line splitters' CR handling is pinned (WP07 review)", "[result_set][matcher]") {
+    const std::string in = "a\rb\r\nc";
+    CHECK(yuzu::server::split_output_lines(in) == std::vector<std::string>{"ab", "c"});
+    CHECK(yuzu::server::live::split_lines(in) == std::vector<std::string>{"a\rb", "c"});
 }
