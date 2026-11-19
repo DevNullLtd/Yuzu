@@ -463,7 +463,9 @@ TEST_CASE("crypto widgets: widgets_json - availability per gate class, drill ava
         }
     }
     cw::AccessMemo none({});
-    for (const auto& w : cw::widgets_json(none)["widgets"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_466 = cw::widgets_json(none);
+    for (const auto& w : range_root_466["widgets"])
         CHECK(w["available"] == false);
 }
 

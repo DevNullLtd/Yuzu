@@ -9655,7 +9655,9 @@ namespace {
 nlohmann::json get_me_output_schema(McpTestServer& ts) {
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7000})");
     nlohmann::json schema;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_9658 = nlohmann::json::parse(res->body);
+    for (const auto& t : range_root_9658["result"]["tools"])
         if (t["name"] == "get_me")
             schema = t["outputSchema"];
     // A missing schema must fail here, never let schema_violation pass vacuously.
@@ -11634,7 +11636,9 @@ TEST_CASE("MCP DEX: list_dex_apps returns the stability list, no audit (aggregat
         auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7504})");
         REQUIRE(listed);
         nlohmann::json schema;
-        for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"])
+        // Bound to a local: ranging over a subobject of a temporary dangles.
+        auto range_root_11637 = nlohmann::json::parse(listed->body);
+        for (const auto& t : range_root_11637["result"]["tools"])
             if (t["name"] == "list_dex_apps")
                 schema = t["outputSchema"];
         REQUIRE(schema.is_object());
@@ -12516,7 +12520,9 @@ TEST_CASE("MCP list_pending_approvals: a bound ticket carries request/digest/roo
     // The declared output schema names the new fields as OPTIONAL (not in `required`).
     auto list = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":308})");
     REQUIRE(list);
-    for (const auto& tool : nlohmann::json::parse(list->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_12519 = nlohmann::json::parse(list->body);
+    for (const auto& tool : range_root_12519["result"]["tools"]) {
         if (tool["name"] != "list_pending_approvals")
             continue;
         const auto item = tool["outputSchema"]["properties"]["approvals"]["items"];
@@ -28282,7 +28288,9 @@ TEST_CASE("MCP export_crypto_cbom: success returns a CycloneDX 1.7 BOM, scoped b
 
     // The structured output matches its advertised outputSchema.
     auto listed = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":2})");
-    for (const auto& t : nlohmann::json::parse(listed->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_28285 = nlohmann::json::parse(listed->body);
+    for (const auto& t : range_root_28285["result"]["tools"]) {
         if (t["name"] != "export_crypto_cbom")
             continue;
         for (const auto& req : t["outputSchema"]["required"])
@@ -48203,7 +48211,9 @@ TEST_CASE("MCP runtime config: the set_runtime_config description names exactly 
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     std::string description;
-    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_48206 = nlohmann::json::parse(res->body);
+    for (const auto& tool : range_root_48206["result"]["tools"])
         if (tool["name"] == "set_runtime_config")
             description = tool["description"].get<std::string>();
     REQUIRE_FALSE(description.empty());
@@ -49224,7 +49234,9 @@ TEST_CASE("MCP cancel_execution / record_execution_rerun: registered with truthf
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     int found = 0;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_49227 = nlohmann::json::parse(res->body);
+    for (const auto& t : range_root_49227["result"]["tools"]) {
         const auto name = t["name"].get<std::string>();
         if (name != "cancel_execution" && name != "record_execution_rerun")
             continue;
@@ -50246,7 +50258,9 @@ TEST_CASE("MCP execute_instruction_definition: the description lists the machine
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     std::string desc;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_50249 = nlohmann::json::parse(res->body);
+    for (const auto& t : range_root_50249["result"]["tools"])
         if (t["name"] == "execute_instruction_definition")
             desc = t["description"].get<std::string>();
     REQUIRE_FALSE(desc.empty());
@@ -52476,7 +52490,9 @@ TEST_CASE("MCP execute_workflow: the served tool declares approval_id, is destru
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     bool found = false;
-    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_52479 = nlohmann::json::parse(res->body);
+    for (const auto& tool : range_root_52479["result"]["tools"]) {
         if (tool["name"] != "execute_workflow")
             continue;
         found = true;
@@ -54228,7 +54244,9 @@ TEST_CASE("MCP execute_workflow: a zero-reach status is always one of the closed
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     bool found = false;
-    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_54231 = nlohmann::json::parse(res->body);
+    for (const auto& tool : range_root_54231["result"]["tools"]) {
         if (tool["name"] != "execute_workflow")
             continue;
         found = true;
@@ -54536,7 +54554,9 @@ TEST_CASE("MCP execute_workflow: the served tool leads with the key, requires it
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
     bool found = false;
-    for (const auto& tool : nlohmann::json::parse(res->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_54539 = nlohmann::json::parse(res->body);
+    for (const auto& tool : range_root_54539["result"]["tools"]) {
         if (tool["name"] != "execute_workflow")
             continue;
         found = true;
@@ -55874,7 +55894,9 @@ std::string replace_all(std::string text, const std::string& from, const std::st
 
 std::vector<std::string> mcp_children_ids(const std::unique_ptr<httplib::Response>& res) {
     std::vector<std::string> ids;
-    for (const auto& c : mcp_structured(res)["children"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_55877 = mcp_structured(res);
+    for (const auto& c : range_root_55877["children"])
         ids.push_back(c["id"].get<std::string>());
     std::sort(ids.begin(), ids.end());
     return ids;
@@ -58441,7 +58463,9 @@ std::map<std::string, nlohmann::json> sam29_output_schemas(McpTestServer& ts) {
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7100})");
     REQUIRE(res != nullptr);
     std::map<std::string, nlohmann::json> schemas;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_58444 = nlohmann::json::parse(res->body);
+    for (const auto& t : range_root_58444["result"]["tools"]) {
         const auto name = t["name"].get<std::string>();
         if (sam29_is_write(name) ||
             std::ranges::find(kSam29Reads, name) != std::end(kSam29Reads)) {
@@ -59118,7 +59142,9 @@ yuzu::server::mcp::McpServer::FleetReadFn sam21_scoped_gate(std::unordered_set<s
 nlohmann::json sam21_output_schema(McpTestServer& ts, const std::string& tool) {
     auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":7100})");
     nlohmann::json schema;
-    for (const auto& t : nlohmann::json::parse(res->body)["result"]["tools"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_59121 = nlohmann::json::parse(res->body);
+    for (const auto& t : range_root_59121["result"]["tools"])
         if (t["name"] == tool)
             schema = t["outputSchema"];
     REQUIRE(schema.is_object()); // a missing schema must fail here, never pass schema_violation vacuously

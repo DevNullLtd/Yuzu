@@ -6780,7 +6780,9 @@ TEST_CASE("REST guaranteed-state: order_uncertain and projection_pending on the 
               false)["data"]["guards"][0]["projection_pending"]
               .get<bool>());
     int uncertain_guards = 0;
-    for (const auto& g : get("/api/v1/guaranteed-state/agents/WS-1/rules", false)["data"]["guards"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_6783 = get("/api/v1/guaranteed-state/agents/WS-1/rules", false);
+    for (const auto& g : range_root_6783["data"]["guards"])
         if (g["order_uncertain"].get<bool>())
             ++uncertain_guards;
     CHECK(uncertain_guards == 1);
