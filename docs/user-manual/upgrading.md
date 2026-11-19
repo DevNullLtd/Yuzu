@@ -731,8 +731,12 @@ start**.
   its id and fetch status). The server **refuses to start** when two URLs of one source become one
   URL in that form, logging `RevocationSourceStore: refusing to open: CRL URL ids <a> and <b> of
   revocation source <id> are one URL in the canonical form`; delete one of the two
-  `revocation_source_store.source_url` rows and restart. A scope key that cannot take the new
-  form also fails the start, rather than dropping an anti-rollback mark.
+  `revocation_source_store.source_url` rows and restart. A stored URL that cannot be put in the
+  canonical form refuses the start the same way (`CRL URL id <n> of revocation source <id> cannot
+  be put in the canonical form`); remove that `source_url` row and restart. A scope key that cannot
+  take the new form also fails the start, rather than dropping an anti-rollback mark. A
+  development build from before version 2 still writes registrations if you roll back to it, and
+  can store two spellings of one URL; rolling forward again then refuses to start as above.
 - **The high-water reset body changed.** `POST .../reset-high-water` and MCP
   `reset_revocation_source_high_water` now require `keep_key_sha256` and
   `expected_config_version`; an empty body or `{}` is refused `400`. See

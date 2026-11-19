@@ -291,7 +291,7 @@ public:
     /// lease): the number of stored URLs it rewrote, or nullopt when it refused (see the
     /// constructor) or found no connection. Public so a test can stage a v1 row and run the pass
     /// again; idempotent.
-    [[nodiscard]] std::optional<std::int64_t> canonicalise_stored_urls();
+    [[nodiscard]] std::optional<std::int64_t> canonicalise_stored_urls_for_test();
 
     /// Test seam (empty in production): called with the operation name at the start of every write
     /// (`create`, `replace`, `remove`, `reset_high_water`); a returned kind makes the call fail with

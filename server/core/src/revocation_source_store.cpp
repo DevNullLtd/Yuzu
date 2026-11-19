@@ -471,13 +471,21 @@ std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
     pg::PgResult lock = pg::exec_params(
         conn, "SELECT pg_advisory_xact_lock(hashtext('revocation_source.registration'))",
         std::vector<std::string>{});
-    if (lock.status() != PGRES_TUPLES_OK)
+    if (lock.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not take the registration "
+                      "lock (SQLSTATE {})",
+                      sqlstate(lock));
         return std::nullopt;
+    }
     pg::PgResult rows_lock = pg::exec_params(
         conn, "SELECT id FROM revocation_source_store.source ORDER BY id FOR UPDATE",
         std::vector<std::string>{});
-    if (rows_lock.status() != PGRES_TUPLES_OK)
+    if (rows_lock.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not lock the sources "
+                      "(SQLSTATE {})",
+                      sqlstate(rows_lock));
         return std::nullopt;
+    }
     pg::PgResult urls = pg::exec_params(
         conn,
         "SELECT source_id, id, url, host FROM revocation_source_store.source_url ORDER BY "
@@ -564,7 +572,7 @@ RevocationSourceStore::RevocationSourceStore(pg::PgPool& pool) : pool_(pool) {
     open_ = true;
 }
 
-std::optional<std::int64_t> RevocationSourceStore::canonicalise_stored_urls() {
+std::optional<std::int64_t> RevocationSourceStore::canonicalise_stored_urls_for_test() {
     auto lease = pool_.try_acquire_for(timeout_);
     if (!lease)
         return std::nullopt;

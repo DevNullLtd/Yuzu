@@ -23,6 +23,12 @@
 /// URL a register or `PUT` body carries (after its syntax check), and the store's open-time pass
 /// (migration v2) rewrites any stored URL into this form. The store also refuses to write a URL
 /// that is not already in it.
+///
+/// CHANGING THIS FUNCTION IS A SCHEMA CHANGE. The store re-applies it to every stored URL on every
+/// open, rewrites any row whose form changed and REFUSES TO OPEN (the server does not start) when
+/// a stored URL no longer canonicalises or two URLs of one source become one. A change to the form
+/// therefore migrates stored rows with no migration number: review it as a migration, state its
+/// effect on existing rows in the upgrade notes, and test it against stored v2 data.
 
 #include "oidc_egress_policy.hpp"
 
@@ -112,6 +118,10 @@ struct CanonicalCrlUrl {
                 c = static_cast<char>(c - 'A' + 'a');
         return s;
     };
+    // A fragment is never part of a CRL URL (the service refuses it first); refusing it here too
+    // keeps a `#` from being read as part of the host.
+    if (url.find('#') != std::string_view::npos)
+        return std::nullopt;
     const auto sep = url.find("://");
     if (sep == std::string_view::npos)
         return std::nullopt;

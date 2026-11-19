@@ -2473,15 +2473,29 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
     REQUIRE(now->keys.size() == 1);
     CHECK(now->keys[0].cert_sha256 == new_key);
     CHECK(now->config_version == 3);
-    // The attempted row is the evidence of what the reset kept.
-    bool attempted = false;
-    for (const auto& r : fx.rows("crypto.revocation_source.reset_high_water"))
-        if (r.result == "attempted") {
-            attempted = true;
-            CHECK_THAT(r.detail, ContainsSubstring("keep_key_sha256=" + new_key));
-            CHECK_THAT(r.detail, ContainsSubstring("expected_config_version=2"));
+    // The attempted row written just before the success row is the evidence of what the reset
+    // kept (the refused unknown-key and stale attempts above wrote their own attempted rows).
+    const auto rows = fx.rows("crypto.revocation_source.reset_high_water");
+    std::optional<std::size_t> success_at;
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].result == "success")
+            success_at = i;
+    REQUIRE(success_at.has_value());
+    REQUIRE(*success_at > 0);
+    const auto& attempted = rows[*success_at - 1];
+    CHECK(attempted.result == "attempted");
+    CHECK_THAT(attempted.detail, ContainsSubstring("keep_key_sha256=" + new_key));
+    CHECK_THAT(attempted.detail, ContainsSubstring("expected_config_version=2"));
+    CHECK_THAT(rows[*success_at].detail, ContainsSubstring("dropped_ca_certificates=1"));
+    // The refused stale attempt is on record as attempted with the version it sent, then denied.
+    bool stale_attempt = false;
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i)
+        if (rows[i].result == "attempted" &&
+            rows[i].detail.find("expected_config_version=1") != std::string::npos) {
+            stale_attempt = true;
+            CHECK(rows[i + 1].result == "denied");
         }
-    CHECK(attempted);
+    CHECK(stale_attempt);
     // The same body again (a retry after an unknown outcome) is a conflict, not a second reset.
     CHECK(fx.rest_reset_raw(id, R"({"keep_key_sha256":[")" + new_key + R"("],)" + v2 + "}")->status ==
           409);
@@ -2509,12 +2523,10 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
     CHECK(ok["dropped_ca_certificates"] == 0);
     CHECK(ok["config_version"] == 2);
     // A stale version is refused and changes nothing.
-    CHECK(json::parse(fx.h.mcp_call_tool_approved(
-                          kReset, {{"id", id},
-                                   {"keep_key_sha256", json::array({key})},
-                                   {"expected_config_version", 1}})
-                          ->body)
-              .contains("error"));
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+              kReset, {{"id", id},
+                       {"keep_key_sha256", json::array({key})},
+                       {"expected_config_version", 1}})) == invalid);
     CHECK(fx.store.get(id)->config_version == 2);
     // The schema states both members as required.
     const auto tools = tools_list(fx);
@@ -2526,4 +2538,12 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
     CHECK(keep["minItems"] == 1);
     CHECK(keep["maxItems"] == 8);
     CHECK(keep["items"]["pattern"] == "^[0-9a-f]{64}$");
+    CHECK(keep["uniqueItems"] == true);
+    CHECK((*reset)["inputSchema"]["properties"]["expected_config_version"]["minimum"] == 1);
+    const auto& out = (*reset)["outputSchema"];
+    for (const char* f : {"dropped_ca_certificates", "config_version"}) {
+        INFO(f);
+        CHECK(out["properties"].contains(f));
+        CHECK(std::ranges::find(out["required"], json(f)) != out["required"].end());
+    }
 }

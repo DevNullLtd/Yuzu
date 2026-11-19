@@ -42,6 +42,8 @@ TEST_CASE("CRL URL canonical form: scheme, host, port and empty path", "[revocat
         {"http://crl.example.com:80", "http://crl.example.com/"},
         {"http://crl.example.com?x=1", "http://crl.example.com/?x=1"},
         {"http://10.0.0.5:8080", "http://10.0.0.5:8080/"},
+        {"http://crl.example.com:00080/a.crl", "http://crl.example.com/a.crl"},
+        {"http://crl.example.com:65535/a.crl", "http://crl.example.com:65535/a.crl"},
     };
     for (const auto& [in, want] : cases) {
         INFO(in);
@@ -82,6 +84,11 @@ TEST_CASE("CRL URL canonical form: an IPv6 literal in RFC 5952 form", "[revocati
     CHECK(v6("::FFFF:C000:0201") == "::ffff:192.0.2.1");
     CHECK(v6("::ffff:192.0.2.1") == "::ffff:192.0.2.1");
     CHECK(v6("64:ff9b::c000:201") == "64:ff9b::c000:201");
+    CHECK(v6("0:0:1:0:0:1:1:1") == "::1:0:0:1:1:1");     // a tie whose first run is at the start
+    CHECK(v6("1:1:1:0:0:1:0:0") == "1:1:1::1:0:0");      // a tie: the first, not the trailing, run
+    CHECK(v6("::ffff:0:0") == "::ffff:0.0.0.0");          // the mapped block's edge
+    CHECK(v6("::1.2.3.4") == "::102:304");                // IPv4-compatible is not written mixed
+    CHECK(v6("::ffff:0:1.2.3.4") == "::ffff:0:102:304");  // only ::ffff:0:0/96 is written mixed
 }
 
 TEST_CASE("CRL URL canonical form: what it cannot put in the form", "[revocation_source][canonical]") {
@@ -89,7 +96,9 @@ TEST_CASE("CRL URL canonical form: what it cannot put in the form", "[revocation
                             "http://u@h/a", "http://h:/a", "http://h:0/a", "http://h:65536/a",
                             "http://h:123456/a", "http://h:8a/a", "http://[2001:db8::1/a",
                             "http://[2001:db8::1]x/a", "http://[fe80::1%25eth0]/a", "http://[zz::1]/a",
-                            "http://2001:db8::1/a", "http://[]/a"}) {
+                            "http://2001:db8::1/a", "http://[]/a", "http://[::1]:/a",
+                            "http://h:00000/a", "http://h:000080/a", // more than 5 port digits
+                            "http://h#f", "http://h/a#f"}) {
         INFO(bad);
         CHECK_FALSE(rs::canonical_crl_url(bad).has_value());
     }

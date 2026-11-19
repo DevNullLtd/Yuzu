@@ -9983,7 +9983,7 @@ Resets the CA's anti-rollback marks, removes every registered key you do not nam
 }
 ```
 
-- `keep_key_sha256` (**required**): 1 to 8 `ca_certificates[].cert_sha256` values the source already holds, the keys of the CA as it is after the rebuild. Every other key of the source is removed by the reset. An entry the source does not hold is `400` naming it (`keep_key_sha256[1]`), and nothing changes: **`PUT` the rebuilt CA's certificates first**, then name them here. A pre-rebuild key left registered would let an older CRL it signed verify again, which is why the list cannot be omitted.
+- `keep_key_sha256` (**required**): 1 to 8 `ca_certificates[].cert_sha256` values the source already holds, the keys of the CA as it is after the rebuild. Every other key of the source is removed by the reset. Entries must be distinct (`400` naming the repeat). An entry the source does not hold is `400` naming it (`keep_key_sha256[1]`), and nothing changes: **`PUT` the rebuilt CA's certificates first**, then name them here. A pre-rebuild key left registered would let an older CRL it signed verify again, which is why the list cannot be omitted.
 - `expected_config_version` (**required**, as `PUT` takes it): the source's `config_version` as you last read it. A mismatch is `409` naming the current version, and nothing changes, so a reset built from a stale read cannot remove a key another administrator has just added.
 - A body without either (including an empty body or `{}`) is `400`.
 
