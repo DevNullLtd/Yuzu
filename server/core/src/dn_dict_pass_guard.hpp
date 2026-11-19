@@ -23,9 +23,18 @@ public:
               using namespace std::chrono_literals;
               auto since_cancel = 500ms;
               while (!finished_.load(std::memory_order_acquire)) {
-                  if (!lead()) {
+                  bool leading = true;
+                  try {
+                      leading = lead();
+                  } catch (...) {
+                      leading = false; // cannot tell: cancel, the safe side
+                  }
+                  if (!leading) {
                       if (since_cancel >= 500ms) {
-                          cancel_();
+                          try {
+                              cancel_();
+                          } catch (...) { // a throw here would terminate the process
+                          }
                           since_cancel = 0ms;
                       }
                   }
@@ -37,8 +46,12 @@ public:
         finished_.store(true, std::memory_order_release);
         if (watcher_.joinable())
             watcher_.join();
-        if (done_)
-            done_();
+        if (done_) {
+            try {
+                done_();
+            } catch (...) { // a destructor must not throw
+            }
+        }
     }
     DnDictPassGuard(const DnDictPassGuard&) = delete;
     DnDictPassGuard& operator=(const DnDictPassGuard&) = delete;

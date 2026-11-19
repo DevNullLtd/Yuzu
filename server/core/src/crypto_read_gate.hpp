@@ -8,10 +8,12 @@
 /// note_read_shed` keeps the `yuzu_inventory_read_degrade_total` reason label in one place.
 
 #include <atomic>
+#include <cstddef>
 #include <mutex>
 #include <string>
 #include <string_view>
 #include <unordered_set>
+#include <utility>
 
 namespace yuzu::server {
 
@@ -88,6 +90,11 @@ private:
 /// principal (a caller whose identity could not be resolved) shares ONE slot with every other
 /// such caller, so an unresolved identity is capped more tightly, never exempted. Taken BEFORE the
 /// shared gate lease, so a refused read never occupies a gate slot.
+///
+/// Per server process, like the gate: with N replicas a principal can hold one such read on each.
+/// Not `PrincipalQuota` (principal_quota.hpp): that is the configurable engine-principal REQUEST
+/// quota with its own denial envelope and metrics; this is a fixed one-slot concurrency bound on
+/// one read class, released when the read returns, with nothing to configure or count.
 class CertPrincipalReadCap {
 public:
     CertPrincipalReadCap() = default;

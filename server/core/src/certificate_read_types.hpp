@@ -13,8 +13,10 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <map>
 #include <optional>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace yuzu::server {
@@ -217,12 +219,7 @@ struct CertSummary {
 
 // ── Fleet gauge rollup (cert_inventory.fleet_store_status) ───────────────────
 
-/// Stores per status for ONE device (the five closed statuses), folded in SQL so the rollup is one
-/// row per device, not one per (device, status). The server joins the device's OS from a single
-/// registry snapshot (cert_read::fold_fleet_status).
-struct CertDeviceStatusCount {
-    std::string agent_id;
-    std::int64_t ok{0}, absent{0}, unreadable{0}, constrained{0}, not_observed{0};
-};
+/// Stores per {OS bucket, status}, folded in SQL (CertificateInventoryStore::fleet_status_counts).
+using CertFleetStatusCounts = std::map<std::pair<std::string, std::string>, std::int64_t>;
 
 } // namespace yuzu::server

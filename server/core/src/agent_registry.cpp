@@ -951,6 +951,15 @@ nlohmann::json AgentRegistry::to_json_obj() const {
     return arr;
 }
 
+std::vector<std::pair<std::string, std::string>> AgentRegistry::id_os_snapshot() const {
+    std::lock_guard lock(mu_);
+    std::vector<std::pair<std::string, std::string>> out;
+    out.reserve(agents_.size());
+    for (const auto& s : agents_ | std::views::values)
+        out.emplace_back(s->agent_id, s->os);
+    return out;
+}
+
 std::string AgentRegistry::to_json() const {
     return to_json_obj().dump();
 }

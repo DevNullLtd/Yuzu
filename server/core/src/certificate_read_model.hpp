@@ -129,14 +129,10 @@ inline constexpr std::string_view kAuditTarget = "fleet_certificates";
 
 // ── Fleet gauge ──────────────────────────────────────────────────────────────
 
-/// Fold per-device status counts into `{os, status} -> stores`. `os_by_agent` is ONE registry
-/// snapshot (agent_id -> reported OS); a device absent from it is `unknown` (not connected to this
-/// replica), and a reported OS outside windows/linux/darwin is `other`. Only the five closed
-/// statuses are ever emitted, so the label set is bounded whatever the store holds. Zero counts are
-/// omitted.
-[[nodiscard]] std::map<std::pair<std::string, std::string>, std::int64_t>
-fold_fleet_status(const std::vector<CertDeviceStatusCount>& rows,
-                  const std::unordered_map<std::string, std::string>& os_by_agent);
+/// The fleet gauge's OS label for a device's reported OS: windows/linux/darwin pass through, any
+/// other value is `other` (a device absent from the registry snapshot is `unknown`, assigned in
+/// SQL). The label set is bounded whatever an agent reports.
+[[nodiscard]] std::string fleet_os_bucket(std::string_view reported_os);
 
 // ── JSON ─────────────────────────────────────────────────────────────────────
 

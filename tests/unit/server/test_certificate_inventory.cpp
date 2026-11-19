@@ -2172,51 +2172,46 @@ TEST_CASE("CertificateInventoryStore reads: a store that is not open degrades, n
     REQUIRE_FALSE(l.has_value());
     CHECK(l.error().kind == CertReadError::Kind::kNotOpen);
     CHECK_FALSE(store.summarize_certificates({}, std::nullopt).has_value());
-    CHECK_FALSE(store.device_status_counts().has_value());
+    CHECK_FALSE(store.fleet_status_counts({}, {}).has_value());
 }
 
-TEST_CASE("CertificateInventoryStore reads: device_status_counts is one row per device with the closed statuses",
+TEST_CASE("CertificateInventoryStore reads: fleet_status_counts folds stores per (OS, status) in SQL",
           "[certinv][pg][read]") {
     CERT_SHARED(store, pool);
     put_report(store, "agent-1", {rfact(1)}, "S1", "ok");
     put_report(store, "agent-2", {rfact(2)}, "S2", "constrained");
-    auto c = store.device_status_counts();
+    put_report(store, "agent-3", {rfact(3)}, "S3", "ok");
+    // agent-3 is not in the snapshot (not connected here): `unknown`.
+    auto c = store.fleet_status_counts({"agent-1", "agent-2"}, {"windows", "linux"});
     REQUIRE(c.has_value());
-    REQUIRE(c->size() == 2);
-    std::map<std::string, CertDeviceStatusCount> m;
-    for (const auto& x : *c)
-        m[x.agent_id] = x;
-    CHECK(m["agent-1"].ok == 1);
-    CHECK(m["agent-1"].constrained == 0);
-    CHECK(m["agent-2"].constrained == 1);
-    // A wall budget of nothing fails the read (a degrade), never a partial rollup.
-    auto none = store.device_status_counts(std::chrono::milliseconds{3000}, std::chrono::milliseconds{0});
-    CHECK_FALSE(none.has_value());
-}
-
-TEST_CASE("cert read model: the fleet gauge fold buckets by OS, bounds its labels and omits zeros",
-          "[certread][model][gauge]") {
-    using namespace yuzu::server;
-    const std::vector<CertDeviceStatusCount> rows = {
-        {"w1", 2, 0, 1, 0, 0}, {"l1", 1, 0, 0, 3, 0}, {"m1", 0, 1, 0, 0, 0},
-        {"x1", 1, 0, 0, 0, 0}, {"gone", 0, 0, 0, 0, 4}, {"w2", 1, 0, 0, 0, 0}};
-    const std::unordered_map<std::string, std::string> os = {
-        {"w1", "windows"}, {"w2", "windows"}, {"l1", "linux"}, {"m1", "darwin"}, {"x1", "freebsd"}};
-    const auto f = cert_read::fold_fleet_status(rows, os);
     using K = std::pair<std::string, std::string>;
-    CHECK(f.at(K{"windows", "ok"}) == 3);
-    CHECK(f.at(K{"windows", "unreadable"}) == 1);
-    CHECK(f.at(K{"linux", "constrained"}) == 3);
-    CHECK(f.at(K{"darwin", "absent"}) == 1);
-    CHECK(f.at(K{"other", "ok"}) == 1);               // an OS outside the three is "other"
-    CHECK(f.at(K{"unknown", "not_observed"}) == 4);   // not in the registry snapshot
-    CHECK_FALSE(f.contains(K{"windows", "absent"}));  // zero counts are omitted
-    for (const auto& [k, n] : f) {
+    CHECK(c->at(K{"windows", "ok"}) == 1);
+    CHECK(c->at(K{"linux", "constrained"}) == 1);
+    CHECK(c->at(K{"unknown", "ok"}) == 1);
+    CHECK_FALSE(c->contains(K{"windows", "constrained"})); // zero counts are omitted
+    for (const auto& [k, n] : *c) {
         (void)n;
         CHECK((k.second == "ok" || k.second == "absent" || k.second == "unreadable" ||
                k.second == "constrained" || k.second == "not_observed"));
     }
-    CHECK(cert_read::fold_fleet_status({}, {}).empty());
+    // Arrays of different lengths are refused, never misaligned.
+    auto bad = store.fleet_status_counts({"agent-1"}, {});
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CertReadError::Kind::kInvalid);
+    // A wall budget of nothing fails the read (a degrade), never a partial rollup.
+    auto none = store.fleet_status_counts({}, {}, std::chrono::milliseconds{3000}, std::chrono::milliseconds{0});
+    CHECK_FALSE(none.has_value());
+}
+
+TEST_CASE("cert read model: the fleet gauge OS bucket bounds its label set",
+          "[certread][model][gauge]") {
+    using namespace yuzu::server;
+    CHECK(cert_read::fleet_os_bucket("windows") == "windows");
+    CHECK(cert_read::fleet_os_bucket("linux") == "linux");
+    CHECK(cert_read::fleet_os_bucket("darwin") == "darwin");
+    CHECK(cert_read::fleet_os_bucket("freebsd") == "other");
+    CHECK(cert_read::fleet_os_bucket("") == "other");
+    CHECK(cert_read::fleet_os_bucket("Windows") == "other"); // exact, never folded
 }
 
 TEST_CASE("CertificateInventoryStore reads: EVERY summary figure is confined, foreign values never appear",
@@ -2326,7 +2321,7 @@ TEST_CASE("CertificateInventoryStore reads: a SQL fault is a degrade on every re
     const auto s = store.summarize_certificates({}, std::nullopt);
     REQUIRE_FALSE(s.has_value());
     CHECK(s.error().kind == CertReadError::Kind::kQueryError);
-    CHECK_FALSE(store.device_status_counts().has_value());
+    CHECK_FALSE(store.fleet_status_counts({}, {}).has_value());
     // deny-all still answers with no SQL
     CHECK(store.list_certificates({}, CertScopeIds{std::vector<std::string>{}}, std::nullopt, 10)
               .has_value());

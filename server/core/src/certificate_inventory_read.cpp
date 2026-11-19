@@ -806,27 +806,32 @@ CertificateInventoryStore::summarize_certificates(const CertSummaryQuery& query,
     return out;
 }
 
-std::expected<std::vector<CertDeviceStatusCount>, CertReadError>
-CertificateInventoryStore::device_status_counts(std::chrono::milliseconds acquire_timeout,
-                                                std::chrono::milliseconds budget) {
+std::expected<CertFleetStatusCounts, CertReadError>
+CertificateInventoryStore::fleet_status_counts(const std::vector<std::string>& agent_ids,
+                                               const std::vector<std::string>& os_buckets,
+                                               std::chrono::milliseconds acquire_timeout,
+                                               std::chrono::milliseconds budget) {
     if (!open_)
         return std::unexpected(fail(CertReadError::Kind::kNotOpen, "store not open"));
-    std::vector<CertDeviceStatusCount> out;
-    const auto err = bounded(pool_, "device_status_counts", [&](PGconn* c, std::string& e) -> bool {
+    if (agent_ids.size() != os_buckets.size())
+        return std::unexpected(fail(CertReadError::Kind::kInvalid, "agent_ids and os_buckets differ in length"));
+    CertFleetStatusCounts out;
+    const std::vector<std::string> params = {pg::to_text_array(agent_ids), pg::to_text_array(os_buckets)};
+    const auto err = bounded(pool_, "fleet_status_counts", [&](PGconn* c, std::string& e) -> bool {
+        // Folded entirely in SQL: at most (5 OS buckets x 5 statuses) rows come back, whatever the
+        // fleet size. A device missing from the snapshot joins no row and is `unknown`.
         pg::PgResult r = run(c,
-                             "SELECT agent_id, "
-                             "count(*) FILTER (WHERE status = 'ok'), "
-                             "count(*) FILTER (WHERE status = 'absent'), "
-                             "count(*) FILTER (WHERE status = 'unreadable'), "
-                             "count(*) FILTER (WHERE status = 'constrained'), "
-                             "count(*) FILTER (WHERE status = 'not_observed') "
-                             "FROM certificate_inventory_store.store_state GROUP BY agent_id",
-                             {}, e);
+                             "SELECT COALESCE(m.os, 'unknown'), s.status, count(*) "
+                             "FROM certificate_inventory_store.store_state s "
+                             "LEFT JOIN unnest($1::text[], $2::text[]) AS m(agent_id, os) "
+                             "ON m.agent_id = s.agent_id "
+                             "WHERE s.status IN ('ok', 'absent', 'unreadable', 'constrained', 'not_observed') "
+                             "GROUP BY 1, 2",
+                             params, e);
         if (r.status() != PGRES_TUPLES_OK)
             return false;
         for (int i = 0; i < PQntuples(r.get()); ++i)
-            out.push_back({cell_s(r, i, 0), cell_i64(r, i, 1), cell_i64(r, i, 2), cell_i64(r, i, 3),
-                           cell_i64(r, i, 4), cell_i64(r, i, 5)});
+            out[{cell_s(r, i, 0), cell_s(r, i, 1)}] += cell_i64(r, i, 2);
         return true;
     }, acquire_timeout, budget);
     if (err)

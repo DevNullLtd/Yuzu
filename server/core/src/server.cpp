@@ -10432,7 +10432,9 @@ public:
         // five minutes, and whenever a non-leader recorded a reconcile request newer than its last
         // pass; the prune is due hourly by the DATABASE clock. Boot, /readyz, /livez and gRPC never
         // wait on it; until it completes the two substring filters are refused (retryable while
-        // reconciling, non-retryable if it failed). One pooled connection is held during a run.
+        // reconciling, non-retryable if it failed). One pooled connection is held for the run's
+        // statements; reading the prune schedule and recording a failure each take a second,
+        // short lease (250 ms acquire), so a run can briefly hold two.
         if (certificate_inventory_store_ && certificate_inventory_store_->is_open()) {
             certificate_inventory_store_->set_dn_dict_observer([this](std::string_view step, std::string_view result) {
                 metrics_.counter("yuzu_server_cert_inventory_dn_dict_runs_total",
@@ -10673,16 +10675,24 @@ public:
                         .set(certificate_inventory_store_->substring_index_available() ? 1.0 : 0.0);
                     // Worst case this pass holds the sweep thread for TWO 250 ms acquires (the
                     // readiness re-check above and the rollup) plus the connect timeout (a pool that
-                    // must open a new connection) plus the 500 ms WALL budget of the one-row-per-
-                    // device read, plus the client fold: one registry snapshot, one pass over the
-                    // rows, no per-row lock.
-                    if (auto counts = certificate_inventory_store_->device_status_counts(
-                            std::chrono::milliseconds{250}, std::chrono::milliseconds{500})) {
-                        std::unordered_map<std::string, std::string> os_by_agent;
-                        for (const auto& a : registry_.to_json_obj())
-                            os_by_agent.emplace(a.value("agent_id", std::string{}),
-                                                a.value("os", std::string{}));
-                        const auto now_counts = cert_read::fold_fleet_status(*counts, os_by_agent);
+                    // must open a new connection) plus the 500 ms WALL budget of the rollup. The
+                    // registry snapshot is two string copies per agent (id_os_snapshot, never the
+                    // per-agent JSON build under the heartbeat mutex, gov perf-S2), and the fold is
+                    // in SQL, so at most 25 rows come back whatever the fleet size.
+                    std::vector<std::string> snap_ids, snap_os;
+                    {
+                        auto snap = registry_.id_os_snapshot();
+                        snap_ids.reserve(snap.size());
+                        snap_os.reserve(snap.size());
+                        for (auto& [id, os] : snap) {
+                            snap_os.push_back(cert_read::fleet_os_bucket(os));
+                            snap_ids.push_back(std::move(id));
+                        }
+                    }
+                    if (auto counts = certificate_inventory_store_->fleet_status_counts(
+                            snap_ids, snap_os, std::chrono::milliseconds{250},
+                            std::chrono::milliseconds{500})) {
+                        const auto& now_counts = *counts;
                         for (const auto& [key, n] : now_counts) {
                             metrics_.gauge("yuzu_fleet_cert_store_status",
                                            {{"os", key.first}, {"status", key.second}})

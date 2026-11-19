@@ -837,24 +837,10 @@ std::string_view degraded_message(CryptoReadCause cause) {
                                                     : "certificate inventory read degraded";
 }
 
-std::map<std::pair<std::string, std::string>, std::int64_t>
-fold_fleet_status(const std::vector<CertDeviceStatusCount>& rows,
-                  const std::unordered_map<std::string, std::string>& os_by_agent) {
-    std::map<std::pair<std::string, std::string>, std::int64_t> out;
-    for (const auto& r : rows) {
-        std::string os = "unknown";
-        if (const auto it = os_by_agent.find(r.agent_id); it != os_by_agent.end())
-            os = (it->second == "windows" || it->second == "linux" || it->second == "darwin")
-                     ? it->second
-                     : std::string("other");
-        const std::pair<const char*, std::int64_t> by_status[] = {
-            {"ok", r.ok}, {"absent", r.absent}, {"unreadable", r.unreadable},
-            {"constrained", r.constrained}, {"not_observed", r.not_observed}};
-        for (const auto& [status, n] : by_status)
-            if (n > 0)
-                out[{os, status}] += n;
-    }
-    return out;
+std::string fleet_os_bucket(std::string_view reported_os) {
+    if (reported_os == "windows" || reported_os == "linux" || reported_os == "darwin")
+        return std::string(reported_os);
+    return "other";
 }
 
 // ── D10 lint ─────────────────────────────────────────────────────────────────

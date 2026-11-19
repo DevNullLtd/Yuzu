@@ -671,9 +671,8 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
                                      ? read.error().message
                                      : std::string(crt::degraded_message(read.error().cause)),
                                  "retry the request",
-                                 /*retry_after_ms=*/read.error().retry_after_ms
-                                     ? static_cast<long>(*read.error().retry_after_ms)
-                                     : kMcpStoreFaultRetryMs,
+                                 /*retry_after_ms=*/static_cast<long>(
+                                     read.error().retry_after_ms.value_or(kMcpStoreFaultRetryMs)),
                                  {}, true));
         return;
     }
@@ -735,9 +734,8 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
                                      ? read.error().message
                                      : std::string(crt::degraded_message(read.error().cause)),
                                  "retry the request",
-                                 /*retry_after_ms=*/read.error().retry_after_ms
-                                     ? static_cast<long>(*read.error().retry_after_ms)
-                                     : kMcpStoreFaultRetryMs,
+                                 /*retry_after_ms=*/static_cast<long>(
+                                     read.error().retry_after_ms.value_or(kMcpStoreFaultRetryMs)),
                                  {}, true));
         return;
     }

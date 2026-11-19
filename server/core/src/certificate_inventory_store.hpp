@@ -347,15 +347,19 @@ public:
     summarize_certificates(const CertSummaryQuery& query, const CertScopeIds& scope);
 
     /// Stores per (device, status) over the whole fleet, for the `fleet_store_status` gauge job.
-    /// One row per (status, agent) pair would be too many at fleet scale, so the rollup is one row per
-    /// DEVICE (agent_id, then its stores' statuses folded in SQL as a small status->count array) and
-    /// the caller folds in the registry OS once per device. The job shares a serial sweep thread
-    /// with the revocation teardown backstop, so its bounds are the caller's (the sweep passes a
-    /// 250 ms acquire and a 500 ms WALL budget for the whole transaction): a timeout is a
-    /// CertReadError, never a partial rollup.
-    [[nodiscard]] std::expected<std::vector<CertDeviceStatusCount>, CertReadError>
-    device_status_counts(std::chrono::milliseconds acquire_timeout = std::chrono::milliseconds{3000},
-                         std::chrono::milliseconds budget = std::chrono::milliseconds{10000});
+    /// Stores per (OS bucket, status) for the fleet gauge, folded ENTIRELY in SQL: the caller
+    /// passes one registry snapshot as two parallel arrays (agent id, OS bucket from
+    /// cert_read::fleet_os_bucket), and at most 25 rows come back whatever the fleet size (a
+    /// device absent from the snapshot is `unknown`; only the five closed statuses are counted;
+    /// zero counts are omitted). The job shares a serial sweep thread with the revocation teardown
+    /// backstop, so its bounds are the caller's (the sweep passes a 250 ms acquire and a 500 ms
+    /// WALL budget for the whole transaction): a timeout is a CertReadError, never a partial
+    /// rollup. Arrays of different lengths are kInvalid.
+    [[nodiscard]] std::expected<CertFleetStatusCounts, CertReadError>
+    fleet_status_counts(const std::vector<std::string>& agent_ids,
+                        const std::vector<std::string>& os_buckets,
+                        std::chrono::milliseconds acquire_timeout = std::chrono::milliseconds{3000},
+                        std::chrono::milliseconds budget = std::chrono::milliseconds{10000});
 
     /// Row counts for one agent, for tests and diagnostics: {agent_state, store_state,
     /// cert_location, cert_fact, cert_san, cert_eku, cert_cdp}. nullopt on a failure.
