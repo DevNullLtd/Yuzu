@@ -737,6 +737,21 @@ TEST_CASE("authoring routes refuse a fragment, policy or enable that names a gat
     CHECK(bad->status == 400);
     CHECK(nlohmann::json::parse(bad->body).at("error").at("message").get<std::string>().find("(gated)") !=
           std::string::npos);
+    {
+        // The A4 envelope, like the dispatch 409: a correlation id (body and header), a null
+        // retry, and the reason in the remediation text, which is how a client tells this 400
+        // from the string-error 400s on the same routes.
+        const auto body = nlohmann::json::parse(bad->body);
+        const auto& err = body.at("error");
+        CHECK(err.at("code") == 400);
+        CHECK(err.contains("correlation_id"));
+        CHECK_FALSE(err.at("correlation_id").get<std::string>().empty());
+        CHECK_FALSE(bad->get_header_value("X-Correlation-Id").empty());
+        CHECK(err.contains("retry_after_ms"));
+        CHECK(err.at("retry_after_ms").is_null());
+        CHECK(err.at("remediation").get<std::string>().rfind("policy_dispatch_refused: gated", 0) == 0);
+        CHECK(body.at("meta").at("api_version") == "v1");
+    }
     REQUIRE_FALSE(r.audit_calls.empty());
     CHECK(r.audit_calls.back().action == "policy_fragment.create");
     CHECK(r.audit_calls.back().result == "denied");
@@ -787,6 +802,18 @@ TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instr
     auto res = r.sink.Post("/api/policy-fragments", fragment_yaml("any", allowed), "text/plain");
     REQUIRE(res);
     CHECK(res->status == 503);
+    {
+        // The A4 envelope with a concrete retry: the lookup may answer on the next try.
+        const auto body = nlohmann::json::parse(res->body);
+        const auto& err = body.at("error");
+        CHECK(err.at("code") == 503);
+        CHECK(err.at("message") == "instruction lookup unavailable, try again");
+        CHECK(err.contains("correlation_id"));
+        CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+        REQUIRE(err.contains("retry_after_ms"));
+        CHECK(err.at("retry_after_ms") == 5000);
+        CHECK(body.at("meta").at("api_version") == "v1");
+    }
     auto frags = r.ps.query_fragments();
     REQUIRE(frags.has_value());
     CHECK(frags->empty());

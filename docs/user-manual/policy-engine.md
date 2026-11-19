@@ -334,8 +334,8 @@ What this means in use:
   with it. Disabling it does not clear them: a disabled policy's `blocked` rows stay in the
   failing figure until the 24 hour rule above ages them out.
 - Creating a fragment or a policy, and enabling a policy, checks each instruction the
-  fragment names and answers `400` for a refused pair (and `503` when the lookup cannot be
-  answered). The check is advisory: the dispatch check above is the control, and an
+  fragment names and answers `400` for a refused pair (and `503`, with `retry_after_ms` 5000,
+  when the lookup cannot be answered). Both bodies are the A4 error envelope. The check is advisory: the dispatch check above is the control, and an
   instruction that does not exist yet is accepted, because product packs create their
   instructions and fragments in any order. **Pack install does not refuse** a policy
   whose instruction is refused: it installs, and shows `blocked` at its first dispatch.

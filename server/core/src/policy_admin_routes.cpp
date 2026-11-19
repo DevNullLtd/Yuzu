@@ -72,6 +72,31 @@ void PolicyAdminRoutes::register_routes(httplib::Server& svr,
                     std::move(emit_event_fn), policy_store, policy_evaluator, metrics);
 }
 
+namespace {
+
+/// The remediation text of a refused dispatch or a refused authoring request: the closed
+/// reason token first (it is how a client tells these bodies from the string-error 400s on the
+/// same routes), then what to do. `unwired` is not the instruction's fault: the server could
+/// not check the pair at all, so changing the instruction would not help.
+std::string refusal_remediation(PolicyDispatchDenialReason reason, bool authoring) {
+    std::string out = "policy_dispatch_refused: " + std::string(to_string(reason)) + ". ";
+    if (reason == PolicyDispatchDenialReason::Unwired)
+        return out + "Policy evaluation cannot check this action now, because the server's "
+                     "capability registry is not available. Try again later, and tell the "
+                     "administrator if it persists.";
+    if (authoring)
+        return out + "The instruction names an action that policy evaluation does not "
+                     "dispatch. Use a different instruction.";
+    return out + "The policy's check or fix names an action that policy evaluation does not "
+                 "dispatch. Change the instruction the policy uses.";
+}
+
+// The lookup could not be answered, so the request is neither accepted nor refused: a retry
+// may answer it.
+constexpr std::int64_t kInstructionLookupRetryMs = 5000;
+
+} // namespace
+
 void PolicyAdminRoutes::answer_dispatch_refused(httplib::Response& res,
                                                 PolicyDispatchDenialReason reason) {
     // A refusal is its own 409: the shared A4 builder gives it a correlation id and the
@@ -80,17 +105,7 @@ void PolicyAdminRoutes::answer_dispatch_refused(httplib::Response& res,
     // can tell them apart.
     res.status = 409;
     detail::A4ErrorOpts opts;
-    // `unwired` is not the instruction's fault: the server could not check the pair at all, so
-    // changing the instruction would not help.
-    const std::string_view advice =
-        reason == PolicyDispatchDenialReason::Unwired
-            ? "Policy evaluation cannot check this action now, because the server's capability "
-              "registry is not available. Try again later, and tell the administrator if it "
-              "persists."
-            : "The policy's check or fix names an action that policy evaluation does not "
-              "dispatch. Change the instruction the policy uses.";
-    const std::string remediation =
-        "policy_dispatch_refused: " + std::string(to_string(reason)) + ". " + std::string(advice);
+    const std::string remediation = refusal_remediation(reason, /*authoring=*/false);
     opts.remediation = remediation;
     res.set_content(detail::a4_error(res, "policy dispatch refused", opts), "application/json");
 }
@@ -108,24 +123,25 @@ bool PolicyAdminRoutes::refuse_unusable_instructions(
         if (check.kind == PolicyEvaluator::InstructionCheck::Kind::Degraded) {
             // Never an accept and never a refusal: the lookup could not be answered.
             res.status = 503;
-            res.set_content(
-                R"({"error":{"code":503,"message":"instruction lookup unavailable, try again"},"meta":{"api_version":"v1"}})",
-                "application/json");
+            detail::A4ErrorOpts opts;
+            opts.retry_after_ms = kInstructionLookupRetryMs;
+            res.set_content(detail::a4_error(res, "instruction lookup unavailable, try again", opts),
+                            "application/json");
             return true;
         }
         const std::string token(to_string(check.denial->reason));
         audit_fn_(req, audit_verb, "denied", target_type, target_id,
                   "reason=" + token + " instruction=" + audit_token(id));
         res.status = 400;
-        res.set_content(
-            nlohmann::json({{"error",
-                             {{"code", 400},
-                              {"message", "instruction " + id +
-                                              " names an action that policy evaluation does not "
-                                              "dispatch (" + token + ")"}}},
-                            {"meta", {{"api_version", "v1"}}}})
-                .dump(),
-            "application/json");
+        detail::A4ErrorOpts opts;
+        const std::string remediation = refusal_remediation(check.denial->reason, /*authoring=*/true);
+        opts.remediation = remediation;
+        res.set_content(detail::a4_error(res,
+                                         "instruction " + id +
+                                             " names an action that policy evaluation does not "
+                                             "dispatch (" + token + ")",
+                                         opts),
+                        "application/json");
         return true;
     }
     return false;
