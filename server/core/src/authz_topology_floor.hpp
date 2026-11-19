@@ -62,7 +62,7 @@
 /// existing admin-only posture across a gate migration, OR it returns the
 /// audit evidence itself. Two later classes follow; a new entry must fit at least one of the five.
 ///
-/// Slice-2 PR 2a-2b added a NEW-DATA-CLASS inclusion class: a new fleet-wide copy of endpoint data
+/// The fleet certificate read surface (ADR-0070 D12) added a NEW-DATA-CLASS inclusion class: a new fleet-wide copy of endpoint data
 /// that an ACCEPTED ADR requires to be admin-only in BOTH RBAC states (here ADR-0070 D12, "Read
 /// surface"). `CertificateInventory:Read` is neither authorization topology, a gate migration nor
 /// the audit trail - it is new data (subjects and SANs can carry personal data), and the output of
@@ -160,7 +160,7 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     // here - and the surface's own administrator predicate then refuses every non-administrator,
     // so no grant of this pair is ever enough on its own.
     {"RevocationSource", "Read"},
-    // Slice-2 PR 2a-2b (ADR-0070 D12) - the fleet certificate inventory. Fits only the file
+    // ADR-0070 D12 - the fleet certificate inventory. Fits only the file
     // header's new-data-class inclusion class, and does not pretend to fit another.
     {"CertificateInventory", "Read"},
 };

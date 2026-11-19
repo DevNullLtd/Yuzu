@@ -422,7 +422,7 @@ same one list.
 - **The disclosure floor protects one table only.** A cell or an application below the floor is merged or withheld, but two slices or windows can be differenced to isolate a small group, and at the default floor of 1 a cell can be one device's figures. Read access to the route is therefore the control for that residue, not the floor.
 
 
-## 5. Slice-2 PR 2a-2b: `CertificateInventory` (40th securable)
+## 5. The fleet certificate read surface: `CertificateInventory` (40th securable)
 
 The fleet certificate inventory (ADR-0070 D12) gets a dedicated securable appended to
 `rbac_store.cpp`'s `types[]` (39 to 40) and its `mcp_server.cpp` `kRbacSecurables[]` mirror (same

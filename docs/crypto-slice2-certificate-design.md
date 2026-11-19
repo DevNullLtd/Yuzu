@@ -1147,7 +1147,7 @@ follow it with the name filters to cover those.
   fragment of that name. This is a **disclosed residual**, recorded in guard 21's rationale; it is not
   an owner-accepted one. Restricting the filter (excluding self-signed non-CA certificates from the
   issuer match, as the summary's issuer rollup already does) changes the dictionary's ingest, reconcile,
-  prune and decommission paths, so it is left for an owner ruling rather than made here.
+  prune and decommission paths, so it is left for an owner ruling (#8343) rather than made here.
 - **Audit rows carry filter names and operators, never values** (see [Audit and degrade](#audit-and-degrade)).
   A substring filter is recorded as `issuer_dn_contains=contains` or `subject_dn_contains=contains`, so
   a person's name typed into either filter never lands in the audit details.
@@ -2343,7 +2343,7 @@ CRL, and keeping the per-row `config_version` changes nothing):
     still find that certificate. It returns nothing the exact `issuer_dn` filter or an unfiltered read
     does not already give the same admin-only, audited caller, and the audit row records the operator,
     never the value. This residual is disclosed, not owner-accepted; restricting the filter is an open
-    owner decision (see [Finding one CA's certificates](#finding-one-cas-certificates)).
+    owner decision, #8343 (see [Finding one CA's certificates](#finding-one-cas-certificates)).
 22. **A substring filter becomes a pattern.** An unescaped `%`, `_` or `\` in a substring filter
     matches far more (or other) than was typed, and the caller reads it as a match. Guard: the value
     is escaped (`\` first, then `%` and `_`) before it reaches `ILIKE ... ESCAPE '\'`, and a value

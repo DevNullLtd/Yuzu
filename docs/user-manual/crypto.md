@@ -656,6 +656,7 @@ to recompute a count exactly.
 | Class (`reason` on `yuzu_inventory_read_degrade_total{source="cert_inventory"}`) | Retryable? | Cause | What to do |
 |---|---|---|---|
 | `admission_full` | yes (`retry_after_ms` 5000) | The two `/crypto` read slots are busy | Retry shortly; find the poller |
+| `substring_principal_busy` | yes (`retry_after_ms` 5000) | A second concurrent `issuer_dn_contains` / `subject_dn_contains` read by the same user: one is in flight per user, and callers whose identity cannot be resolved share one slot | Wait for the first read to finish, or filter with `issuer_dn` / `agent_id` |
 | `pool_acquire_timeout`, `query_error` | yes | Postgres pool or query fault, or a page past its 15 s wall budget | Retry; check `yuzu_pg_pool_*` |
 | `store_not_open` | yes | The certificate store is unavailable | Check `/readyz` |
 | `pool_too_small` | **no** | `--postgres-pool-size` is below 4 | Restart with a larger pool |

@@ -5198,6 +5198,9 @@ of rows), then reaches the certificates through ordinary btree indexes on `issue
 - **Disk and write cost.** The two btrees are small (equal values are stored once); the dictionary holds distinct names only.
   A certificate that is new or changed costs one extra index entry.
 - **Backup and restore.** `pg_dump` restores the dictionary and its indexes; the pass re-reconciles it after the restart.
+- **One substring read per user.** At most one read carrying `issuer_dn_contains` or `subject_dn_contains` runs at a time per
+  user (callers whose identity cannot be resolved share one slot); a second answers a retryable `503` (`retry_after_ms` 5000,
+  reason `substring_principal_busy`) and takes none of the two shared `/crypto` read slots.
 - **Capacity limit.** A substring that matches more than 20,000 distinct names is refused with a `400` ("make it longer");
   with the dictionary holding names nothing references any more, they count toward that limit until the prune removes them.
 

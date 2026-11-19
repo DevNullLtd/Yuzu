@@ -193,9 +193,9 @@ constexpr FloorPair kExpectedFloorPairs[] = {
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the thirteen documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the twelve floored pairs (a change to kTopologyFloor's
+    // Positive: the thirteen floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
     // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics; #5771
@@ -235,10 +235,10 @@ TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floor
     CHECK_FALSE(topology_floor_applies("CertificateInventory", "Write")); // the Read pair only
     CHECK_FALSE(topology_floor_applies("Inventory", "Read")); // the certificate pair is its own securable
 
-    // Cardinality lock: a thirteenth pair silently added to kTopologyFloor
+    // Cardinality lock: a fourteenth pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 12);
+    CHECK(std::size(kTopologyFloor) == 13);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────

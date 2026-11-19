@@ -2382,7 +2382,7 @@ While a version 2 document is stored, new and old replicas return different Apps
 `get_crypto_certificate_summary`, and a "Fleet certificates" panel on `/crypto`. Nothing in the fleet reports
 certificates until the agent-side collector ships, so on upgrade the views are empty.
 
-**New permission.** `CertificateInventory:Read` is a new, 39th securable. It is seeded to **Administrator only** and is
+**New permission.** `CertificateInventory:Read` is a new, 40th securable. It is seeded to **Administrator only** and is
 **admin-floored even while RBAC enforcement is off** (the default), so on the first day non-admin sessions and
 service-scoped API tokens get `403` naming the permission. It cannot yet be delegated (custom roles are not creatable);
 read from an administrator session or an administrator-minted token. No existing role loses or gains any other permission.
