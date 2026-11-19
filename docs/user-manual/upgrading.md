@@ -2380,7 +2380,10 @@ While a version 2 document is stored, new and old replicas return different Apps
 **What changed.** The server now serves the certificate inventory it already stored:
 `GET /api/v1/crypto/certificates` and `/summary`, the MCP tools `list_crypto_certificates` and
 `get_crypto_certificate_summary`, and a "Fleet certificates" panel on `/crypto`. Nothing in the fleet reports
-certificates until the agent-side collector ships, so on upgrade the views are empty.
+certificates until the agent-side collector ships, so on upgrade the views are empty. Once certificates arrive, an
+unconfined fleet-wide summary on a large fleet (measured: 100,000 devices) can exceed its 15-second
+read budget and answer a non-retryable `503` (`scale_limit`); narrow it with `agent_id`, `store` or another
+filter.
 
 **New permission.** `CertificateInventory:Read` is a new, 40th securable. It is seeded to **Administrator only** and is
 **admin-floored even while RBAC enforcement is off** (the default), so on the first day non-admin sessions and

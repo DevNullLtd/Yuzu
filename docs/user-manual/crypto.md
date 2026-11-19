@@ -527,10 +527,11 @@ named rules and windows, each shown with its criterion (they arrive with the cou
 release). There is no verdict, colour, icon or risk ordering, and revocation is **not checked** by
 this version.
 
-Every fact is **agent-reported**: where the agent includes the certificate's DER the server
-re-derives the parsed fields from it, otherwise it stores the agent's parsed fields as sent, and
-in neither case does anything independently verify what a device claims about its own stores (a
-compromised device can report anything). Server-side revocation statements arrive in a later release; until then, treat a
+Every fact is **agent-reported**: the server stores the agent's parsed fields as sent and does not
+re-parse the certificate. Where the agent includes the DER, the server checks only that it hashes to
+the reported SHA-256 (a mismatched DER is dropped and the certificate marked `der_hash_mismatch`);
+nothing independently verifies what a device claims about its own stores (a compromised device can
+report anything). Server-side revocation statements arrive in a later release; until then, treat a
 fact as the device's claim.
 
 ### Who can read it
@@ -616,7 +617,7 @@ its names (one CA issues under several). Each question is a query on the same re
 fleet-wide substring search over those would be a search for a person. `issuer_dn_contains` has no
 such condition; a self-signed end-entity certificate repeats its subject as its issuer, so it can still
 reach a person's name, but it reaches nothing the exact `issuer_dn` filter does not already return to
-the same caller. Both substring filters resolve through a distinct-DN dictionary (a table of every distinct issuer DN and CA
+the same caller. This residual is disclosed, not owner-accepted: the owner ruling is pending (#8343). Both substring filters resolve through a distinct-DN dictionary (a table of every distinct issuer DN and CA
 subject DN), so they cost a scan of thousands of rows plus an index lookup, not a scan of every certificate. A
 substring matching more than 20,000 distinct names is refused with a `400` asking for a longer one. Until the
 background build has completed after a server start the two filters are refused with a retryable `503` (with a retry hint; non-retryable only if the dictionary failed deterministically)
