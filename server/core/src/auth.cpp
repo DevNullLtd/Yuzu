@@ -504,7 +504,7 @@ bool AuthManager::derive_session_deadlines(Session& s, std::int64_t created_ms,
 
     // Fail-closed sentinels FIRST, so an early return below leaves EVERY steady
     // field in the defined {} state — even when re-deriving a LIVE cached session
-    // (mark_mfa / elevate re-derive `it->second` in place), where a partially-set
+    // (`post_stamp_factor_recheck` re-derives `it->second` in place), where a partially-set
     // false path would otherwise leave a stale steady_elevated_until/mfa live
     // (adversarial-review K2). A false return means "do not honor / do not cache".
     s.steady_expires = {};
@@ -1512,8 +1512,9 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
         const std::string key = hash_token(token);
         // Durable write FIRST (bumps the generation → every replica's cache drops the
         // stale copy on its next refresh); the store writes the CARRIED instant and
-        // generation (never its own now()) and RETURNs every time field, so the cache
-        // re-derives exactly.
+        // generation (never its own now()) and RETURNs the row's time fields; the future-dated
+        // check below reads `mfa_verified_ms`, and the cached copy is then dropped rather than
+        // re-derived (see the drop after the recheck).
         auto r = session_store_->mark_mfa(key, proof);
         if (!r) {
             spdlog::error("mark_session_mfa_verified: durable write failed ({})",
@@ -1553,15 +1554,17 @@ AuthManager::stamp_session_mfa_proof(const std::string& token,
             if (verdict == StampRecheck::kUnverifiable)
                 return MfaStampOutcome::kStoreError;
         }
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("mfa_stamp");
+        // Drop the cached copy instead of re-deriving it from `a`. `a` was read inside the
+        // durable write, so by now it can predate a revocation that cleared the elevation and
+        // evicted this entry, after which a validator repopulated the cache from the cleared
+        // row; re-deriving the stale `a` into that fresh entry would resurrect the elevation
+        // with no later generation poll to undo it. The drop advances the cache epoch, so the
+        // next validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        // As in post_stamp_factor_recheck: the re-derive edits the cached MFA proof in
-        // place, so the cache epoch moves in this critical section, entry present or not
-        // (#8010).
-        ++session_cache_epoch_;
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            (void)derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                           a.last_activity_ms, a.mfa_verified_ms,
-                                           a.elevated_until_ms, a.elevation_issued_ms, a.db_now_ms);
+        drop_cached_session_locked(key);
         return MfaStampOutcome::kStamped;
     }
     // Legacy no-store path: this host's clock is the authority, the same rule as the
@@ -1608,18 +1611,18 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
         if (!r->has_value())
             return std::nullopt;
         const auto& a = r->value();
-        // Re-derive the cached session (best-effort — it may live only on another
-        // replica, which picks up the grant on its next generation refresh).
-        // The cache epoch deliberately does NOT move here: this edit GRANTS an elevation, so a
-        // stale pre-elevation copy held by a cold validation under-grants (the session reads
-        // as not elevated, which fails closed) and self-heals at the next generation poll,
-        // unlike the privilege-removing edits in revoke_elevation, revoke_user_elevations and
-        // drop_cached_mfa_proof.
+        // TEST-ONLY seam: no lock is held here (it may block to straddle a revocation).
+        if (post_durable_write_hook_for_test_)
+            post_durable_write_hook_for_test_("elevate");
+        // Drop the cached copy instead of re-deriving it from `a` (another replica picks the
+        // grant up on its next generation refresh). `a` was read inside the durable write, so
+        // by now it can predate a revocation that cleared the elevation and evicted this
+        // entry, after which a validator repopulated the cache from the cleared row;
+        // re-deriving the stale `a` into that fresh entry would resurrect the elevation with
+        // no later generation poll to undo it. The drop advances the cache epoch, so the next
+        // validate re-reads durable state under the epoch-guarded populate path.
         std::unique_lock lock(mu_);
-        if (auto it = sessions_.find(key); it != sessions_.end())
-            derive_session_deadlines(it->second, a.created_at_ms, a.expires_at_ms,
-                                     a.last_activity_ms, a.mfa_verified_ms, a.elevated_until_ms,
-                                     a.elevation_issued_ms, a.db_now_ms);
+        drop_cached_session_locked(key);
         return tp_from_ms(a.elevated_until_ms);
     }
     std::unique_lock lock(mu_);
@@ -1658,57 +1661,68 @@ AuthManager::elevate_session(const std::string& token, std::chrono::seconds dura
     return until;
 }
 
-std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token) {
+std::expected<bool, std::string> AuthManager::revoke_elevation(const std::string& token,
+                                                               bool* lookup_degraded) {
+    if (lookup_degraded)
+        *lookup_degraded = false;
     if (token.size() > auth::kMaxSessionTokenLength)
         return false;
     if (session_store_) {
         const std::string key = hash_token(token);
         // Determine "was elevated" from authoritative state (cache-first), then
         // clear durably. was_elevated distinguishes a real step-down from a
-        // no-op for the route's audit.
+        // no-op for the route's audit. The CLEAR is the fail-closed action and
+        // does not depend on the read: elevate_session drops the cached entry
+        // after its durable write, so this read is usually cache-cold, and a
+        // degraded find must not stop the clear (the /elevate audit-failure
+        // rollback would otherwise leave a live, unrecorded elevation).
         std::optional<Session> s;
         {
             std::shared_lock lock(mu_);
             if (auto it = sessions_.find(key); it != sessions_.end())
                 s = it->second;
         }
+        std::optional<std::string> find_error; // set when the authoritative read degraded
         if (!s) {
             auto found = session_store_->find(key);
             if (!found) {
-                // Degraded authoritative read — cannot tell if an elevation is
-                // live. Fail closed: do NOT report a successful no-op over a
-                // possibly-live durable elevation (adversarial C2).
                 note_session_store_degrade("validate");
-                return std::unexpected(std::string("session lookup degraded: ") +
-                                       found.error().message);
-            }
-            if (!found->has_value())
+                find_error = found.error().message;
+            } else if (!found->has_value()) {
                 return false; // definitively no such session → genuine no-op
-            s = session_from_row(found->value().row, found->value().db_now_ms);
+            } else {
+                s = session_from_row(found->value().row, found->value().db_now_ms);
+            }
         }
-        const bool was_elevated = is_elevated(*s);
+        const bool was_elevated = s && is_elevated(*s);
         auto r = session_store_->clear_elevation(key);
         if (!r) {
             spdlog::error("revoke_elevation: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // The durable elevation is STILL LIVE — surface the failure so the
-            // route fails closed instead of auditing a false revocation.
+            // The durable elevation is STILL LIVE (or, with a degraded read too, cannot be
+            // ruled out) - surface the failure so the route fails closed instead of auditing
+            // a false revocation.
+            if (find_error)
+                return std::unexpected("session lookup degraded: " + *find_error +
+                                       "; durable clear also failed: " + r.error().message);
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
-        std::unique_lock lock(mu_);
-        // The clear below edits a cached entry in place and REMOVES privilege, so the cache
-        // epoch moves in this same critical section, whether or not `key` is cached: a
-        // cold validation in flight holds a copy read before the durable clear, still
-        // elevated, and must not cache it (it would ride that copy until the next
-        // generation poll). The entry is edited, not erased, so the erase paths' bump
-        // does not cover it. Same reasoning as drop_cached_mfa_proof (#8010).
-        ++session_cache_epoch_;
-        if (auto it = sessions_.find(key); it != sessions_.end()) {
-            it->second.elevated_until = {};
-            it->second.elevation_issued_at = {};
-            it->second.steady_elevated_until = {}; // the field is_elevated reads
+        // Drop the cached entry (advancing the cache epoch) rather than zeroing it in place: a
+        // validator that read the still-elevated durable row before the clear and is parked
+        // before its cache insert re-inserts only while the epoch is unchanged
+        // (validate_session_durable), so an in-place zero would let it put an elevated copy
+        // back. The next validate re-reads the cleared durable row.
+        {
+            std::unique_lock lock(mu_);
+            drop_cached_session_locked(key);
         }
-        return was_elevated;
+        // With a degraded read was_elevated is UNKNOWN: the clear succeeded, so any elevation
+        // is definitively gone. The returned value is then only whether a session ROW existed
+        // (clear_elevation's RETURNING), NOT whether it was elevated, and `*lookup_degraded` is
+        // set so the caller can say "unknown" rather than claim an elevation was ended.
+        if (find_error && lookup_degraded)
+            *lookup_degraded = true;
+        return find_error ? *r : was_elevated;
     }
     std::unique_lock lock(mu_);
     auto it = sessions_.find(token);
@@ -1851,6 +1865,11 @@ void AuthManager::expire_session_generation_poll_for_test() {
     last_session_gen_refresh_ms_ = steady_now_ms() - kSessionGenRefreshMs - 1;
 }
 
+void AuthManager::suppress_session_generation_poll_for_test() {
+    std::lock_guard<std::mutex> g(session_gen_mtx_);
+    last_session_gen_refresh_ms_ = steady_now_ms() + 3'600'000;
+}
+
 void AuthManager::age_session_generation_refresh_for_test(std::chrono::milliseconds age) {
     std::lock_guard<std::mutex> g(session_gen_mtx_);
     last_successful_session_gen_refresh_ms_ -= age.count();
@@ -1858,6 +1877,11 @@ void AuthManager::age_session_generation_refresh_for_test(std::chrono::milliseco
 
 void AuthManager::set_validate_pre_cache_hook_for_test(std::function<void()> hook) {
     validate_pre_cache_hook_for_test_ = std::move(hook);
+}
+
+void AuthManager::set_post_durable_write_hook_for_test(
+    std::function<void(std::string_view op)> hook) {
+    post_durable_write_hook_for_test_ = std::move(hook);
 }
 
 void AuthManager::set_between_local_erase_and_wipe_hook_for_test(std::function<void()> hook) {
@@ -1901,28 +1925,21 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
     if (session_store_) {
         // Durable clear FIRST (bumps the generation → every replica drops the
         // stale elevations on refresh); the store's count is authoritative
-        // (sessions may live only on other replicas). Then clear local cache.
+        // (sessions may live only on other replicas). Then drop this replica's cached copies,
+        // advancing the cache epoch: a validator that read the still-elevated durable row
+        // before the clear (a cold miss, or a cache HIT whose copy is written back) and is
+        // parked before its insert must not re-cache an elevated copy, so an in-place zero
+        // would not do. The next validate re-reads the cleared durable row.
         auto r = session_store_->clear_user_elevations(username);
         if (!r) {
             spdlog::error("revoke_user_elevations: durable clear failed ({})", r.error().message);
             note_session_store_degrade("invalidate_user");
-            // Elevations may still be live durably — surface so the caller fails
+            // Elevations may still be live durably - surface so the caller fails
             // closed rather than reporting a successful "0 cleared" (C2).
             return std::unexpected(std::string("durable clear failed: ") + r.error().message);
         }
         std::unique_lock lock(mu_);
-        // As in revoke_elevation: the loop below clears cached elevations in place (privilege
-        // removed), so the cache epoch moves in this critical section whether or not any of
-        // the account's sessions is cached here, and a cold validation holding a
-        // pre-clear, still-elevated copy is not cached (#8010).
-        ++session_cache_epoch_;
-        for (auto& [key, s] : sessions_) {
-            if (s.username == username) {
-                s.elevated_until = {};
-                s.elevation_issued_at = {};
-                s.steady_elevated_until = {}; // the field is_elevated reads
-            }
-        }
+        drop_cached_user_sessions_locked(username);
         return *r;
     }
     std::unique_lock lock(mu_);
@@ -1936,6 +1953,29 @@ std::expected<int, std::string> AuthManager::revoke_user_elevations(const std::s
         }
     }
     return cleared;
+}
+
+void AuthManager::drop_local_sessions_of_user(const std::string& username) noexcept {
+    try {
+        std::unique_lock lock(mu_);
+        if (session_store_) {
+            // Durable mode: the clear already committed; evict this replica's cache and advance
+            // the epoch so a racing validator cannot re-insert the pre-clear copy.
+            drop_cached_user_sessions_locked(username);
+            return;
+        }
+        for (auto& [key, s] : sessions_) {
+            if (s.username == username) {
+                s.elevated_until = {};
+                s.elevation_issued_at = {};
+                s.steady_elevated_until = {}; // the field is_elevated reads
+            }
+        }
+    } catch (const std::exception& e) {
+        spdlog::error("drop_local_sessions_of_user failed ({})", e.what());
+    } catch (...) {
+        spdlog::error("drop_local_sessions_of_user failed (unknown exception)");
+    }
 }
 
 std::optional<Session> AuthManager::validate_session(const std::string& token) const {

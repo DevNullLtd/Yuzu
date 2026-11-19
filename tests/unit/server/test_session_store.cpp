@@ -12,6 +12,7 @@
  */
 
 #include "session_store.hpp"
+#include "session_store_sql_helpers.hpp"
 
 #include "pg/pg_exec.hpp"
 #include "pg/pg_pool.hpp"
@@ -29,6 +30,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <optional>
 #include <string>
 #include <thread>
 #include <utility>
@@ -1603,4 +1605,150 @@ TEST_CASE("SessionStore v3: upgrading a v2 schema keeps its rows, unbound",
     CHECK((*found)->row.mfa_verified_ms > 0);
     CHECK((*found)->row.mfa_factor_gen == 0); // the previous release's proof re-proves once
     CHECK((*found)->row.mfa_bind_seq == 0);
+}
+
+// ---- session_sql in-txn lock + elevation-clear helpers -------------------------------------
+namespace {
+
+struct InTxnClear {
+    bool lock_ok{false};
+    std::optional<int> cleared;
+    bool bump_ok{false};
+    bool committed{false};
+    std::string err;
+};
+
+// Runs the lock -> clear -> bump sequence the unassign owner uses, in ONE transaction.
+InTxnClear lock_clear_bump(PgPool& pool, const std::string& user, bool bump = true) {
+    InTxnClear out;
+    out.committed = pool.with_txn_for(std::chrono::milliseconds{2000}, [&](PGconn* c) -> bool {
+        out.lock_ok = session_sql::lock_user_session_rows_in_txn(c, user, out.err);
+        if (!out.lock_ok)
+            return false;
+        out.cleared = session_sql::clear_user_elevations_in_txn(c, user, out.err);
+        if (!out.cleared)
+            return false;
+        if (bump && *out.cleared > 0)
+            out.bump_ok = session_sql::bump_generation_in_txn(c);
+        else
+            out.bump_ok = true;
+        return out.bump_ok;
+    });
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("session_sql: lock + clear zeroes only the target user's elevations and counts them",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("yuzu_test_x1", "yuzu_test_x")).has_value());
+    REQUIRE(store.create(make_params("yuzu_test_x2", "yuzu_test_x")).has_value());
+    REQUIRE(store.create(make_params("yuzu_test_y1", "yuzu_test_y")).has_value());
+    for (const char* h : {"yuzu_test_x1", "yuzu_test_x2", "yuzu_test_y1"}) {
+        auto e = store.set_elevation(h, 600'000);
+        REQUIRE(e.has_value());
+        REQUIRE(e->has_value());
+    }
+
+    const auto out = lock_clear_bump(pool, "yuzu_test_x");
+    REQUIRE(out.committed);
+    REQUIRE(out.cleared.has_value());
+    CHECK(*out.cleared == 2);
+    for (const char* h : {"yuzu_test_x1", "yuzu_test_x2"}) {
+        auto row = store.find(h);
+        REQUIRE(row.has_value());
+        REQUIRE(row->has_value());
+        CHECK((*row)->row.elevated_until_ms == 0);
+        CHECK((*row)->row.elevation_issued_ms == 0);
+    }
+    auto y = store.find("yuzu_test_y1");
+    REQUIRE(y.has_value());
+    REQUIRE(y->has_value());
+    CHECK((*y)->row.elevated_until_ms != 0); // another user is untouched
+    CHECK((*y)->row.elevation_issued_ms != 0);
+}
+
+TEST_CASE("session_sql: clear for a user with no elevated row counts zero and leaves the "
+          "generation alone",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("yuzu_test_p1", "yuzu_test_plain")).has_value());
+    const std::int64_t gen_before = write_generation(pool);
+
+    const auto out = lock_clear_bump(pool, "yuzu_test_plain");
+    REQUIRE(out.committed);
+    REQUIRE(out.cleared.has_value());
+    CHECK(*out.cleared == 0);
+    CHECK(write_generation(pool) == gen_before); // a 0-row clear needs no bump
+}
+
+TEST_CASE("session_sql: an expired but still nonzero elevation window is matched and counted",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("yuzu_test_e1", "yuzu_test_exp")).has_value());
+    // A long-expired window the reaper has not zeroed yet: nonzero, far in the past.
+    REQUIRE(exec_ok(pool,
+                    "UPDATE session_store.sessions SET elevation_issued_ms=1000, "
+                    "elevated_until_ms=2000 WHERE token_hash=$1",
+                    {"yuzu_test_e1"}));
+
+    const auto out = lock_clear_bump(pool, "yuzu_test_exp");
+    REQUIRE(out.committed);
+    REQUIRE(out.cleared.has_value());
+    CHECK(*out.cleared == 1);
+    CHECK(scalar(pool,
+                 "SELECT elevated_until_ms || ',' || elevation_issued_ms "
+                 "FROM session_store.sessions WHERE token_hash=$1",
+                 {"yuzu_test_e1"}) == "0,0");
+}
+
+TEST_CASE("session_sql: the row lock on a user with no sessions succeeds", "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    std::string err;
+    bool ok = false;
+    const bool committed = pool.with_txn_for(std::chrono::milliseconds{2000}, [&](PGconn* c) {
+        ok = session_sql::lock_user_session_rows_in_txn(c, "yuzu_test_nobody", err);
+        return ok;
+    });
+    CHECK(committed);
+    CHECK(ok);
+    CHECK(err.empty());
+}
+
+TEST_CASE("session_sql: lock + clear + a final session_meta bump commit together and advance the "
+          "generation by one",
+          "[session_store][pg]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, session_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+
+    REQUIRE(store.create(make_params("yuzu_test_g1", "yuzu_test_gen")).has_value());
+    REQUIRE(store.set_elevation("yuzu_test_g1", 600'000).has_value());
+    const std::int64_t gen_before = write_generation(pool);
+
+    const auto out = lock_clear_bump(pool, "yuzu_test_gen");
+    REQUIRE(out.committed);
+    REQUIRE(out.lock_ok);
+    REQUIRE(out.cleared.has_value());
+    CHECK(*out.cleared == 1);
+    CHECK(out.bump_ok);
+    CHECK(write_generation(pool) == gen_before + 1);
 }

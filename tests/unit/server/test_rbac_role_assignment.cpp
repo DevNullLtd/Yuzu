@@ -61,6 +61,7 @@
 #include "rbac_assignable_roles.hpp"
 #include "web_utils.hpp" // audit_token — C5's expected-neutralization oracle
 
+#include "test_principal_lock_gate.hpp" // SessionWipeFault: a forced durable session-store failure
 #include "test_rbac_admin_surface_harness.hpp" // AuditRecord, RbacStoreOnAuthPool, RbacRoleHarness (A1 Step 6.1 extraction)
 
 #include <catch2/catch_test_macros.hpp>
@@ -68,8 +69,12 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
+#include <memory>
+#include <sstream>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -1109,6 +1114,47 @@ TEST_CASE("MCP unassign_rbac_role: a genuine store fault is kInternalError with 
     // The raw store error still reaches the audit row (which is what proves the client
     // message above is a substitution and not an absence of the error).
     CHECK(h.audit_log.back().detail.find("principal_roles") != std::string::npos);
+}
+
+TEST_CASE("MCP unassign_rbac_role: the store-fault log line neutralises a hostile role, so it "
+          "cannot forge a field",
+          "[pg][mcp][rbac][a2]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    {
+        yuzu::server::pg::PgConn conn{PQconnectdb(h.auth_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        yuzu::server::pg::PgResult d{
+            PQexec(conn.get(), "DROP TABLE rbac_store.principal_roles CASCADE")};
+        REQUIRE(d.ok());
+    }
+
+    // Captures the default logger for this scope (restored on every unwind path).
+    std::ostringstream oss;
+    const auto prev = spdlog::default_logger();
+    {
+        auto lg = std::make_shared<spdlog::logger>(
+            "unassign_store_fault_log_test", std::make_shared<spdlog::sinks::ostream_sink_mt>(oss));
+        lg->set_level(spdlog::level::trace);
+        spdlog::set_default_logger(lg);
+    }
+    struct Restore {
+        std::shared_ptr<spdlog::logger> prev;
+        ~Restore() { spdlog::set_default_logger(prev); }
+    } restore{prev};
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "jane"}, {"role", "Operator x error=y"}});
+    REQUIRE(res);
+    const std::string log = oss.str();
+    const auto at = log.find("rbac.role.unassigned store fault:");
+    REQUIRE(at != std::string::npos);
+    const auto line = log.substr(at, log.find('\n', at) - at);
+    // The hostile value is one token: no space or '=' survives inside the role field, so it
+    // cannot start a second `error=` field ahead of the real one.
+    CHECK(line.find("role=Operator_x_error_y ") != std::string::npos);
+    CHECK(line.find("role=Operator x") == std::string::npos);
+    CHECK(line.find("x error=y") == std::string::npos);
 }
 
 // ── REST: assign_role store-fault classification (Doomgoose external
@@ -2609,4 +2655,334 @@ TEST_CASE("MCP unassign_rbac_role: a principal_id with a control byte is refused
         CHECK(a.target_id.find('\x1b') == std::string::npos);
         CHECK(a.detail.find('\x1b') == std::string::npos);
     }
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// An Administrator unassign that ENDS live JIT elevations says so, on both
+// transports: ` elevations_cleared=N` on the rbac.role.unassigned success row and one dedicated
+// role.elevation.revoked row, both only when N > 0. The response is unchanged. The harness's
+// real-session mode (`use_real_sessions`) supplies the elevated durable sessions.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+constexpr const char* kElevRevoked = "role.elevation.revoked";
+
+int audit_count(const RbacRoleHarness& h, const std::string& action) {
+    int n = 0;
+    for (const auto& a : h.audit_log)
+        if (a.action == action)
+            ++n;
+    return n;
+}
+
+const AuditRecord* audit_find(const RbacRoleHarness& h, const std::string& action,
+                              const std::string& result, const std::string& target) {
+    for (const auto& a : h.audit_log)
+        if (a.action == action && a.result == result && a.target_id == target)
+            return &a;
+    return nullptr;
+}
+
+// `x` holds Administrator and has `n` elevated durable sessions; a second counted Administrator
+// exists so the last-Administrator guard passes. Returns the real-session fixture.
+void seed_admin_with_elevations(RbacRoleHarness& h, const std::string& x, int n) {
+    auto& s = h.use_real_sessions();
+    REQUIRE(h.auth_db->upsert_user("s10e_other", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "s10e_other", "Administrator"}).has_value());
+    REQUIRE(h.rbac->assign_role({"user", x, "Administrator"}).has_value());
+    REQUIRE(s.seed_elevated(x, n) == n);
+}
+
+} // namespace
+
+TEST_CASE("REST unassign Administrator with two elevated sessions: unchanged 200 body, the "
+          "success row carries elevations_cleared=2 and one role.elevation.revoked row follows",
+          "[pg][rest][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_x", 2);
+    // The response shape of a no-elevation unassign, taken on the same route, is the oracle.
+    REQUIRE(h.assign_rest("Operator", R"({"principal_type":"user","principal_id":"s10e_y"})")
+                ->status == 201);
+    auto plain = h.unassign_rest("Operator", "s10e_y");
+    REQUIRE(plain);
+    REQUIRE(plain->status == 200);
+
+    auto res = h.unassign_rest("Administrator", "s10e_x");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK(res->body == plain->body);
+    CHECK(res->body.find("elevation") == std::string::npos);
+    CHECK_FALSE(res->has_header("Sec-Audit-Failed"));
+    CHECK_FALSE(holds_role(h, "s10e_x", "Administrator"));
+    CHECK(h.sessions->elevated_rows("s10e_x") == 0);
+
+    const auto* ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_x");
+    REQUIRE(ok);
+    CHECK(ok->detail == "Administrator; removed=true elevations_cleared=2");
+    CHECK(audit_count(h, kElevRevoked) == 1);
+    const auto* rv = audit_find(h, kElevRevoked, "ok", "s10e_x");
+    REQUIRE(rv);
+    CHECK(rv->target_type == "User");
+    CHECK(rv->detail == "reason=administrator_unassign cleared=2 role=Administrator");
+    // The no-elevation unassign above (Operator) wrote neither the suffix nor the row.
+    const auto* plain_row = audit_find(h, "rbac.role.unassigned", "success", "s10e_y");
+    REQUIRE(plain_row);
+    CHECK(plain_row->detail == "Operator; removed=true");
+}
+
+TEST_CASE("MCP unassign_rbac_role Administrator with two elevated sessions: the same two rows "
+          "and the same count, unchanged payload",
+          "[pg][mcp][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_x", 2);
+
+    auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "s10e_x"}, {"role", "Administrator"}});
+    REQUIRE(res);
+    CHECK(res->body.find("\"error\"") == std::string::npos);
+    CHECK(res->body.find("\"unassigned\":true") != std::string::npos);
+    CHECK(res->body.find("elevation") == std::string::npos);
+    CHECK_FALSE(holds_role(h, "s10e_x", "Administrator"));
+    CHECK(h.sessions->elevated_rows("s10e_x") == 0);
+
+    const auto* ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_x");
+    REQUIRE(ok);
+    CHECK(ok->detail == "Administrator; removed=true elevations_cleared=2");
+    CHECK(audit_count(h, kElevRevoked) == 1);
+    const auto* rv = audit_find(h, kElevRevoked, "ok", "s10e_x");
+    REQUIRE(rv);
+    CHECK(rv->target_type == "User");
+    CHECK(rv->detail == "reason=administrator_unassign cleared=2 role=Administrator");
+}
+
+TEST_CASE("REST and MCP unassign agree: the same cleared count and an equivalent new row",
+          "[pg][rest][mcp][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_rest", 3);
+    REQUIRE(h.rbac->assign_role({"user", "s10e_mcp", "Administrator"}).has_value());
+    REQUIRE(h.sessions->seed_elevated("s10e_mcp", 3) == 3);
+
+    REQUIRE(h.unassign_rest("Administrator", "s10e_rest")->status == 200);
+    REQUIRE(h.mcp_call_tool_approved("unassign_rbac_role",
+                                     {{"principal_id", "s10e_mcp"}, {"role", "Administrator"}})
+                ->body.find("\"error\"") == std::string::npos);
+
+    const auto* rest_ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_rest");
+    const auto* mcp_ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_mcp");
+    const auto* rest_rv = audit_find(h, kElevRevoked, "ok", "s10e_rest");
+    const auto* mcp_rv = audit_find(h, kElevRevoked, "ok", "s10e_mcp");
+    REQUIRE((rest_ok && mcp_ok && rest_rv && mcp_rv));
+    CHECK(rest_ok->detail == mcp_ok->detail);
+    CHECK(rest_ok->detail == "Administrator; removed=true elevations_cleared=3");
+    CHECK(rest_rv->detail == mcp_rv->detail);
+    CHECK(rest_rv->target_type == mcp_rv->target_type);
+}
+
+TEST_CASE("unassign with nothing to end writes no role.elevation.revoked row and no suffix",
+          "[pg][rest][mcp][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    auto& s = h.use_real_sessions();
+    REQUIRE(h.auth_db->upsert_user("s10e_other", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "s10e_other", "Administrator"}).has_value());
+
+    SECTION("Administrator with a session that holds no elevation") {
+        REQUIRE(h.auth_db->upsert_user("s10e_n", "hash", "salt", auth::Role::user).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "s10e_n", "Administrator"}).has_value());
+        REQUIRE_FALSE(s.mgr.create_local_session_for_test("s10e_n", auth::Role::user, false).empty());
+        auto res = h.unassign_rest("Administrator", "s10e_n");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        const auto* ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_n");
+        REQUIRE(ok);
+        CHECK(ok->detail == "Administrator; removed=true");
+    }
+    SECTION("Administrator via MCP, no session at all") {
+        REQUIRE(h.rbac->assign_role({"user", "s10e_n", "Administrator"}).has_value());
+        auto res = h.mcp_call_tool_approved("unassign_rbac_role",
+                                            {{"principal_id", "s10e_n"}, {"role", "Administrator"}});
+        REQUIRE(res);
+        CHECK(res->body.find("\"error\"") == std::string::npos);
+        const auto* ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_n");
+        REQUIRE(ok);
+        CHECK(ok->detail == "Administrator; removed=true");
+    }
+    SECTION("a Viewer unassign leaves the user's elevations alone") {
+        REQUIRE(h.rbac->assign_role({"user", "s10e_v", "Viewer"}).has_value());
+        REQUIRE(h.rbac->assign_role({"user", "s10e_v", "Administrator"}).has_value());
+        REQUIRE(s.seed_elevated("s10e_v", 2) == 2);
+        auto res = h.unassign_rest("Viewer", "s10e_v");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK(s.elevated_rows("s10e_v") == 2);
+        const auto* ok = audit_find(h, "rbac.role.unassigned", "success", "s10e_v");
+        REQUIRE(ok);
+        CHECK(ok->detail == "Viewer; removed=true");
+    }
+    CHECK(audit_count(h, kElevRevoked) == 0);
+}
+
+TEST_CASE("unassign Administrator, forced session-store failure: the existing 503/internal "
+          "error, the denied row, the grant stays and no role.elevation.revoked row",
+          "[pg][rest][mcp][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_x", 2);
+    yuzu::test::SessionWipeFault fault{h.auth_db.pool()};
+    fault.arm();
+
+    SECTION("REST") {
+        auto res = h.unassign_rest("Administrator", "s10e_x");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("role unassignment store fault") != std::string::npos);
+        CHECK(res->body.find("session") == std::string::npos); // the raw store text stays in the audit row
+    }
+    SECTION("MCP") {
+        auto res = h.mcp_call_tool_approved(
+            "unassign_rbac_role", {{"principal_id", "s10e_x"}, {"role", "Administrator"}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(res->body.find("role unassignment store fault") != std::string::npos);
+    }
+    fault.repair();
+    const auto* denied = audit_find(h, "rbac.role.unassigned", "denied", "s10e_x");
+    REQUIRE(denied != nullptr);
+    // The libpq text ends in a newline (and can carry a CONTEXT line): the row is one line.
+    CHECK(denied->detail.find("session row lock failed") != std::string::npos);
+    CHECK(denied->detail.find_first_of("\r\n") == std::string::npos);
+    CHECK(audit_find(h, "rbac.role.unassigned", "success", "s10e_x") == nullptr);
+    CHECK(audit_count(h, kElevRevoked) == 0);
+    CHECK(holds_role(h, "s10e_x", "Administrator"));
+    CHECK(h.sessions->elevated_rows("s10e_x") == 2); // the rollback kept the elevations too
+}
+
+TEST_CASE("unassign of the last Administrator is refused as before: no new row, elevations kept",
+          "[pg][rest][mcp][rbac][a2][s10_audit]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    auto& s = h.use_real_sessions();
+    REQUIRE(h.auth_db->upsert_user("s10e_sole", "hash", "salt", auth::Role::user).has_value());
+    REQUIRE(h.rbac->assign_role({"user", "s10e_sole", "Administrator"}).has_value());
+    REQUIRE(s.seed_elevated("s10e_sole", 2) == 2);
+
+    auto rest = h.unassign_rest("Administrator", "s10e_sole");
+    REQUIRE(rest);
+    CHECK(rest->status == 409);
+    auto mcp = h.mcp_call_tool_approved("unassign_rbac_role",
+                                        {{"principal_id", "s10e_sole"}, {"role", "Administrator"}});
+    REQUIRE(mcp);
+    CHECK(mcp->body.find("\"error\"") != std::string::npos);
+    CHECK(audit_count(h, kElevRevoked) == 0);
+    CHECK(audit_find(h, "rbac.role.unassigned", "success", "s10e_sole") == nullptr);
+    CHECK(holds_role(h, "s10e_sole", "Administrator"));
+    CHECK(s.elevated_rows("s10e_sole") == 2);
+}
+
+TEST_CASE("unassign Administrator, post-commit audit failures: the unassign stays committed and the "
+          "existing audit-gap 503 is returned; both rows are attempted",
+          "[pg][rest][mcp][rbac][a2][s10_audit][audit_failclose]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_x", 2);
+
+    SECTION("REST, only the new row fails to persist") {
+        h.audit_fail_result = "ok";
+        auto res = h.unassign_rest("Administrator", "s10e_x");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->body.find("took effect but its audit record could not be persisted") !=
+              std::string::npos);
+        CHECK(res->has_header("Sec-Audit-Failed"));
+        CHECK(audit_count(h, kElevRevoked) == 1); // attempted
+        CHECK(audit_find(h, "rbac.role.unassigned", "success", "s10e_x") != nullptr);
+    }
+    SECTION("REST, only the success row fails: the new row is still attempted") {
+        h.audit_fail_result = "success";
+        auto res = h.unassign_rest("Administrator", "s10e_x");
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(audit_count(h, kElevRevoked) == 1);
+    }
+    SECTION("MCP, only the new row fails to persist") {
+        // The ticket mint/approve path audits too; flip the fault only for the recall.
+        const std::string approval_id = h.mcp_mint_and_approve(
+            "unassign_rbac_role", {{"principal_id", "s10e_x"}, {"role", "Administrator"}});
+        h.audit_fail_result = "ok";
+        auto res = h.mcp_call_tool("unassign_rbac_role", {{"principal_id", "s10e_x"},
+                                                           {"role", "Administrator"},
+                                                           {"approval_id", approval_id}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(res->body.find("the role was unassigned but its audit record could not be persisted") !=
+              std::string::npos);
+        CHECK(audit_count(h, kElevRevoked) == 1);
+    }
+    SECTION("MCP, only the success row fails: the new row is still attempted") {
+        const std::string approval_id = h.mcp_mint_and_approve(
+            "unassign_rbac_role", {{"principal_id", "s10e_x"}, {"role", "Administrator"}});
+        h.audit_fail_result = "success";
+        auto res = h.mcp_call_tool("unassign_rbac_role", {{"principal_id", "s10e_x"},
+                                                           {"role", "Administrator"},
+                                                           {"approval_id", approval_id}});
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body, nullptr, false);
+        REQUIRE_FALSE(body.is_discarded());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == 503);
+        CHECK(res->body.find("\"audit_persisted\":false") != std::string::npos);
+        CHECK(res->body.find("the role was unassigned but its audit record could not be persisted") !=
+              std::string::npos);
+        CHECK(audit_count(h, kElevRevoked) == 1);
+    }
+    // In every case the unassign and the clear are committed: the 503 is the audit gap.
+    CHECK_FALSE(holds_role(h, "s10e_x", "Administrator"));
+    CHECK(h.sessions->elevated_rows("s10e_x") == 0);
+}
+
+TEST_CASE("unassign_rbac_role: a control byte in the role is refused and no role.elevation.revoked "
+          "row carries caller text; the row's fields are audit_token-clean",
+          "[pg][mcp][rbac][a2][s10_audit][validation]") {
+    RbacRoleHarness h;
+    h.make_caller_admin(/*rbac_on=*/false);
+    seed_admin_with_elevations(h, "s10e_x", 2);
+
+    auto res = h.mcp_call_tool_approved(
+        "unassign_rbac_role", {{"principal_id", "s10e_x"}, {"role", "Administrator\nrole=Viewer"}});
+    REQUIRE(res);
+    auto body = nlohmann::json::parse(res->body, nullptr, false);
+    REQUIRE_FALSE(body.is_discarded());
+    REQUIRE(body.contains("error"));
+    CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    CHECK(audit_count(h, kElevRevoked) == 0);
+    CHECK(holds_role(h, "s10e_x", "Administrator"));
+
+    // A real clear, then every field of the new row is exactly what audit_token leaves alone.
+    REQUIRE(h.mcp_call_tool_approved("unassign_rbac_role",
+                                     {{"principal_id", "s10e_x"}, {"role", "Administrator"}})
+                ->body.find("\"error\"") == std::string::npos);
+    const auto* rv = audit_find(h, kElevRevoked, "ok", "s10e_x");
+    REQUIRE(rv);
+    CHECK(audit_token(rv->target_id) == rv->target_id);
+    CHECK(rv->detail.find('\n') == std::string::npos);
+    CHECK(rv->detail.find("role=Administrator") != std::string::npos);
+
+    // The shared builder: a hostile role that DID reach it through audit_token cannot forge a
+    // second key=value pair or a line break.
+    const auto hostile = unassign_elevation_revoked_detail(2, audit_token("Admin\nrole=Viewer"));
+    CHECK(hostile.find('\n') == std::string::npos);
+    CHECK(hostile.find("role=Viewer") == std::string::npos);
+    CHECK(unassign_elevations_cleared_suffix(0).empty());
+    CHECK(unassign_elevations_cleared_suffix(-1).empty());
+    CHECK(unassign_elevations_cleared_suffix(4) == " elevations_cleared=4");
 }

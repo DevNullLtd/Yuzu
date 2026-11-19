@@ -160,6 +160,18 @@ std::optional<yuzu::server::auth::Session> poll_and_validate(AuthManager& mgr,
     return mgr.validate_session(token);
 }
 
+// Arms `suppress_session_generation_poll_for_test` for real. The seam is voided while the
+// manager has never completed a poll (`session_gen_valid_` false): the first validate then polls
+// regardless and re-stamps the refresh clock, so a stall of a second or more would let a real
+// poll mask the defect a barrier test hunts. One throwaway validate (of a session no test
+// asserts on) completes that first poll; the suppression is applied after it.
+void warm_generation_view_then_suppress_poll(AuthManager& mgr) {
+    const auto warmup = mgr.create_local_session_for_test("poll_warmup", Role::user, false);
+    REQUIRE_FALSE(warmup.empty());
+    REQUIRE(mgr.validate_session(warmup).has_value());
+    mgr.suppress_session_generation_poll_for_test();
+}
+
 // Fixture SQL: delete a session's durable row WITHOUT the store's generation bump, so a
 // later validate can tell a cached entry (served) from an uncached one (cold read, absent).
 void delete_durable_row_silently(PgPool& pool, const std::string& token) {
@@ -1409,4 +1421,447 @@ TEST_CASE("update_role_checked answers UpdatedSessionWipeFailed when the durable
     const auto role = f.db->get_user("alice");
     REQUIRE(role.has_value());
     CHECK(role->role == Role::admin); // the role IS changed
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// Administrator unassign ends the target's live JIT elevation
+//
+// The RbacStore clears the durable elevations in the unassign transaction; the callback wired
+// below (exactly as server.cpp wires it) drops THIS replica's cached sessions. AcctFx shares one
+// RbacStore, so the callback reaches manager A only: manager B models the OTHER replica, which
+// converges on its next generation poll.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+struct UnassignWorld {
+    AcctFx f;
+    AuthManager& a;
+    AuthManager& b;
+    std::string token;
+
+    // `x` holds the Administrator grant AND a second counted Administrator exists, so the
+    // last-Administrator guard passes. `x` has an elevated session warm on BOTH replicas.
+    explicit UnassignWorld(bool wire_callback = true) : a(f.add()), b(f.add()) {
+        f.seed("s10c_other", Role::user);
+        f.seed("s10c_x", Role::user);
+        REQUIRE(f.rbac.assign_role({"user", "s10c_other", "Administrator"}).has_value());
+        REQUIRE(f.rbac.assign_role({"user", "s10c_x", "Administrator"}).has_value());
+        token = a.create_local_session_for_test("s10c_x", Role::user, false);
+        REQUIRE_FALSE(token.empty());
+        REQUIRE(a.elevate_session(token, std::chrono::seconds(300)).has_value());
+        REQUIRE(a.validate_session(token).has_value());
+        REQUIRE(b.validate_session(token).has_value()); // cold read: warms B with the elevation
+        if (wire_callback)
+            REQUIRE(f.rbac.set_local_session_drop(
+                [&mgr = a](const std::string& u) { mgr.drop_local_sessions_of_user(u); }));
+        REQUIRE(elevated(a));
+        REQUIRE(elevated(b));
+    }
+
+    bool elevated(AuthManager& m) const {
+        const auto s = m.validate_session(token);
+        REQUIRE(s.has_value());
+        return yuzu::server::auth::is_elevated(*s) &&
+               yuzu::server::auth::effective_role(*s) == Role::admin;
+    }
+};
+
+} // namespace
+
+TEST_CASE("unassign Administrator: the unassigning replica drops the elevation on its NEXT "
+          "request, the other replica after one poll (S10-C1)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+    // No real poll may run before the staleness assertions: A's drop must come from the callback
+    // alone and B's staleness must not depend on how fast this runner is.
+    w.a.suppress_session_generation_poll_for_test();
+    w.b.suppress_session_generation_poll_for_test();
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    REQUIRE(res.has_value());
+    CHECK(res->removed);
+    CHECK(res->elevations_cleared == 1);
+
+    // A: the callback evicted the cached copy, so the very next validate re-reads the cleared row.
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+        CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    }
+    // B: nothing told it, so its warm entry is still elevated until the generation poll runs.
+    CHECK(w.elevated(w.b));
+    {
+        const auto s = poll_and_validate(w.b, w.token);
+        REQUIRE(s.has_value());
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+        CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    }
+    // The clear emits no `role.elevation.expired` signal: the lapse reaper finds nothing to reap
+    // on either replica (a sentinel window is "already reaped or revoked").
+    CHECK_FALSE(w.a.reap_expired_elevation(w.token).has_value());
+    CHECK_FALSE(w.b.reap_expired_elevation(w.token).has_value());
+}
+
+TEST_CASE("unassign Administrator: without the callback only the generation poll converges "
+          "(the wiring is what makes the unassigning replica immediate) (S10-C2)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w(/*wire_callback=*/false);
+    w.a.suppress_session_generation_poll_for_test(); // staleness must not race a real poll
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+
+    CHECK(w.elevated(w.a)); // stale warm cache: the baseline the callback exists to remove
+    const auto s = poll_and_validate(w.a, w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+}
+
+TEST_CASE("unassign of a non-Administrator role leaves both replicas elevated (S10-C3)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+    REQUIRE(w.f.rbac.assign_role({"user", "s10c_x", "Viewer"}).has_value());
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Viewer");
+    REQUIRE(res.has_value());
+    CHECK(res->removed);
+    CHECK(res->elevations_cleared == 0);
+
+    CHECK(w.elevated(w.a));
+    CHECK(w.elevated(w.b));
+    const auto sb = poll_and_validate(w.b, w.token);
+    REQUIRE(sb.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*sb));
+}
+
+TEST_CASE("unassign Administrator: a last-Administrator refusal does not invoke the callback and "
+          "leaves the elevation alone (S10-C4)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w(/*wire_callback=*/false);
+    int calls = 0;
+    REQUIRE(w.f.rbac.set_local_session_drop([&](const std::string& u) {
+        ++calls;
+        w.a.drop_local_sessions_of_user(u);
+    }));
+    // Remove the second counted Administrator first, so s10c_x is the last one.
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_other", "Administrator").has_value());
+    // That removal was a successful user Administrator unassign of ANOTHER user: one callback.
+    REQUIRE(calls == 1);
+
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    CHECK_FALSE(res.has_value());
+    CHECK(calls == 1); // the refusal ran no callback
+    CHECK(w.elevated(w.a));
+    CHECK(w.elevated(w.b));
+    const auto sb = poll_and_validate(w.b, w.token);
+    REQUIRE(sb.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*sb)); // nothing was cleared durably either
+}
+
+TEST_CASE("unassign Administrator: a real AuthRoutes admin gate admits the elevated user before "
+          "and refuses on the next request after (S10-C5)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    UnassignWorld w;
+    yuzu::server::Config cfg{};
+    cfg.https_enabled = false;
+    std::shared_mutex oidc_mu;
+    std::unique_ptr<yuzu::server::oidc::OidcProvider> oidc_provider;
+    // The route runs on A, the replica the callback reaches. `routes` before `sink`.
+    yuzu::server::AuthRoutes routes(cfg, w.a, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    oidc_mu, oidc_provider);
+    yuzu::server::test::TestRouteSink sink;
+    routes.register_routes(sink);
+    const std::unordered_map<std::string, std::string> hdrs{
+        {"Cookie", "yuzu_session=" + w.token}};
+    // The inline admin gate (effective_role) runs before the step-up stage, so an elevated user
+    // gets PAST it (whatever the later stage answers) and a non-elevated one gets the 403 body.
+    const auto call = [&] {
+        return sink.dispatch("POST", "/api/v1/users/nobody_s10c/elevation-eligibility",
+                             R"({"eligible":true})", "application/json", hdrs);
+    };
+    {
+        const auto before = call();
+        REQUIRE(before);
+        CHECK(before->body.find("admin role required") == std::string::npos);
+        CHECK(before->status != 401);
+    }
+
+    w.a.suppress_session_generation_poll_for_test(); // only the callback may drop A
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+
+    const auto after = call();
+    REQUIRE(after);
+    CHECK(after->status == 403);
+    CHECK(after->body.find("admin role required") != std::string::npos);
+}
+
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+// A writer that stalls across an Administrator unassign cannot resurrect the elevation
+//
+// `elevate_session` and `stamp_session_mfa_proof` used to re-derive their durable RETURNING row
+// into an existing cache entry. A writer that committed and then stalled could therefore put its
+// pre-revocation elevation back into an entry a validator had just repopulated from the cleared
+// row. Both now drop the cached entry instead, so the next validate re-reads durable state.
+//
+// ORDERING, stated once for every case below: the writer's durable write commits FIRST (the
+// elevation is live in the row), then the unassign commits and clears that row's elevation, so
+// the FINAL durable state is unelevated and the cache must agree with it.
+// ═════════════════════════════════════════════════════════════════════════════════════════════
+
+namespace {
+
+// Parks the thread that calls a writer in `set_post_durable_write_hook_for_test` until released.
+// Only the thread that arms `parks_this_thread` parks; every other caller passes straight through.
+class ParkedWriter {
+public:
+    void install(AuthManager& mgr, std::string_view op) {
+        mgr_ = &mgr;
+        mgr.set_post_durable_write_hook_for_test([this, op = std::string(op)](std::string_view o) {
+            if (o != op || !parks_this_thread())
+                return;
+            std::unique_lock lk(mu_);
+            reached_ = true;
+            cv_.notify_all();
+            // Bounded: a test that never releases must not hang the suite.
+            cv_.wait_for(lk, std::chrono::seconds(30), [this] { return released_; });
+        });
+    }
+
+    // Runs `fn` on a thread that is the parked one; returns once it is parked in the hook.
+    void start(std::function<void()> fn) {
+        worker_ = std::thread([this, fn = std::move(fn)] {
+            parks_this_thread() = true;
+            fn();
+        });
+        std::unique_lock lk(mu_);
+        if (!cv_.wait_for(lk, std::chrono::seconds(10), [this] { return reached_; }))
+            FAIL("the writer never reached the post-durable-write hook within 10 s");
+    }
+
+    void release_and_join() {
+        {
+            std::lock_guard lk(mu_);
+            released_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable())
+            worker_.join();
+    }
+
+    ~ParkedWriter() {
+        release_and_join(); // a failed REQUIRE must not leave a joinable thread behind
+        if (mgr_)
+            mgr_->set_post_durable_write_hook_for_test(nullptr); // only after the join
+    }
+
+private:
+    static bool& parks_this_thread() {
+        thread_local bool v = false;
+        return v;
+    }
+
+    AuthManager* mgr_ = nullptr;
+    std::mutex mu_;
+    std::condition_variable cv_;
+    bool reached_ = false;
+    bool released_ = false;
+    std::thread worker_;
+};
+
+std::int64_t wall_ms_minus(std::chrono::milliseconds back) {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(
+               std::chrono::system_clock::now().time_since_epoch())
+               .count() -
+           back.count();
+}
+
+} // namespace
+
+TEST_CASE("an elevation write that stalls across an Administrator unassign does not resurrect the "
+          "elevation in the repopulated cache (S10-D1)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    UnassignWorld w;
+    // Declared BEFORE `parked`: the worker writes into it by reference and ~ParkedWriter joins
+    // the worker, so it must outlive `parked` on every unwind path (a failed REQUIRE included).
+    std::optional<std::chrono::system_clock::time_point> until;
+    ParkedWriter parked;
+    parked.install(w.a, "elevate");
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection
+    parked.start([&] { until = w.a.elevate_session(w.token, std::chrono::seconds(300)); });
+
+    // The writer's durable grant has committed and it is parked before touching the cache. Now the
+    // unassign clears the durable elevation and the callback drops A's entry (epoch advances).
+    const auto res = w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator");
+    REQUIRE(res.has_value());
+    CHECK(res->elevations_cleared == 1);
+    // A validator repopulates A's cache from the cleared row.
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    parked.release_and_join();
+    REQUIRE(until.has_value()); // the writer's own return value is untouched by the fix
+
+    // The stale writer data must not have been re-derived into the fresh entry.
+    const auto s = w.a.validate_session(w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    // A poll converges either way; the immediate checks above are the discriminating ones.
+    const auto polled = poll_and_validate(w.a, w.token);
+    REQUIRE(polled.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*polled));
+}
+
+TEST_CASE("an MFA stamp that stalls across an Administrator unassign does not resurrect the "
+          "elevation in the repopulated cache, and the proof is read from durable state (S10-D2)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    UnassignWorld w;
+    // Declared BEFORE `parked`: see S10-D1 (the worker's by-reference write target must outlive
+    // the join in ~ParkedWriter).
+    auto outcome = AuthManager::MfaStampOutcome::kStoreError;
+    ParkedWriter parked;
+    parked.install(w.a, "mfa_stamp");
+    w.a.suppress_session_generation_poll_for_test(); // a real poll would mask a resurrection
+    parked.start([&] {
+        outcome = w.a.stamp_session_mfa_proof(
+            w.token, yuzu::server::LocalMfaProof{0, wall_ms_minus(std::chrono::seconds(5))});
+    });
+
+    REQUIRE(w.f.rbac.unassign_role_detailed("user", "s10c_x", "Administrator").has_value());
+    {
+        const auto s = w.a.validate_session(w.token);
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    parked.release_and_join();
+    CHECK(outcome == AuthManager::MfaStampOutcome::kStamped);
+
+    const auto s = w.a.validate_session(w.token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) != Role::admin);
+    // The stamp's own effect is intact: the (durable) proof is on the served session.
+    CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{});
+}
+
+TEST_CASE("elevate_session and the MFA stamp still show on the next validate, which re-reads "
+          "durable state (S10-D3)",
+          "[auth][session_store][account_active][pg][unassign_elevation]") {
+    AcctFx f;
+    auto& a = f.add();
+    f.seed("s10d_y", Role::user);
+    const auto token = a.create_local_session_for_test("s10d_y", Role::user, false);
+    REQUIRE_FALSE(token.empty());
+    {
+        const auto s = a.validate_session(token); // warm the cache with the plain session
+        REQUIRE(s.has_value());
+        REQUIRE_FALSE(yuzu::server::auth::is_elevated(*s));
+        REQUIRE(s->mfa_verified_at == std::chrono::system_clock::time_point{});
+    }
+
+    REQUIRE(a.stamp_session_mfa_proof(token, yuzu::server::LocalMfaProof{
+                                                 0, wall_ms_minus(std::chrono::seconds(5))}) ==
+            AuthManager::MfaStampOutcome::kStamped);
+    {
+        const auto s = a.validate_session(token);
+        REQUIRE(s.has_value());
+        CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{});
+        CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    }
+
+    const auto until = a.elevate_session(token, std::chrono::seconds(300));
+    REQUIRE(until.has_value());
+    CHECK(*until > std::chrono::system_clock::now());
+    const auto s = a.validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::admin);
+    CHECK(s->mfa_verified_at != std::chrono::system_clock::time_point{}); // the stamp survived
+}
+
+TEST_CASE("revoke_elevation drops the cached session, so a validation that read the elevated row "
+          "before the clear cannot re-cache an elevated copy",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    // elevate_session leaves the cache cold, so revoke_elevation finds no entry to zero. A
+    // validator that read the still-elevated durable row and is parked before its cache insert
+    // inserts only while the cache epoch is unchanged; zeroing in place never advances it, so
+    // the elevated copy would be served from the cache until the next generation poll.
+    YUZU_REQUIRE_PG_DB_TPL(db, sessacct_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto a = make_mgr(store);
+
+    const auto token = a->create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(300)).has_value()); // cache is cold
+    warm_generation_view_then_suppress_poll(*a); // a real poll would mask the resurrection
+
+    HeldValidation held;
+    held.install(*a);
+    // The cold validation reads the elevated durable row, then parks before the cache insert.
+    held.start([&] { return a->validate_session(token); });
+
+    const auto rev = a->revoke_elevation(token); // durable clear, then returns
+    REQUIRE(rev.has_value());
+    CHECK(*rev);
+
+    // The held validation is concurrent with the revoke, so what it returns is not asserted.
+    (void)held.release_and_join();
+
+    const auto s = a->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::user);
+}
+
+TEST_CASE("revoke_user_elevations drops the user's cached sessions, so a validation in flight "
+          "cannot re-cache an elevated copy (cold read and cache hit)",
+          "[auth][session_store][account_active][cache_epoch][pg][unassign_elevation]") {
+    // The eligibility revoke clears every durable elevation of a user, then the local cache. A
+    // validator that copied an elevated session before the clear and is parked before its cache
+    // insert writes that copy back whenever the cache epoch is unchanged: a cold validator
+    // inserts what it read, and a cache HIT writes its copy back too. Zeroing the cached entries
+    // in place never advances the epoch, so the elevated copy would be served until the next
+    // generation poll. The poll is suppressed (after a warm-up, see the helper), so only the
+    // epoch can protect the cache.
+    YUZU_REQUIRE_PG_DB_TPL(db, sessacct_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 6}};
+    SessionStore store{pool};
+    REQUIRE(store.is_open());
+    auto a = make_mgr(store);
+
+    const auto token = a->create_local_session_for_test("alice", Role::user, true);
+    REQUIRE_FALSE(token.empty());
+    REQUIRE(a->elevate_session(token, std::chrono::seconds(300)).has_value()); // cache is cold
+    warm_generation_view_then_suppress_poll(*a);
+
+    SECTION("a cold validator that read the elevated row") {
+        // Nothing is cached for the token: the held validation reads the durable row itself.
+    }
+    SECTION("a validator that copied a cached HIT") {
+        const auto warm = a->validate_session(token); // cold read: caches the elevated copy
+        REQUIRE(warm.has_value());
+        REQUIRE(yuzu::server::auth::is_elevated(*warm));
+    }
+
+    HeldValidation held;
+    held.install(*a);
+    held.start([&] { return a->validate_session(token); });
+
+    const auto cleared = a->revoke_user_elevations("alice");
+    REQUIRE(cleared.has_value());
+    CHECK(*cleared == 1);
+
+    // The held validation is concurrent with the revoke, so what it returns is not asserted.
+    (void)held.release_and_join();
+
+    const auto s = a->validate_session(token);
+    REQUIRE(s.has_value());
+    CHECK_FALSE(yuzu::server::auth::is_elevated(*s));
+    CHECK(yuzu::server::auth::effective_role(*s) == Role::user);
 }

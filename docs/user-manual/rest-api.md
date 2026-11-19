@@ -2149,7 +2149,7 @@ Grant or revoke a user's **JIT-admin-elevation eligibility** — who may activat
 
 **Body:** `{"eligible": <bool>}`.
 
-**Side effect:** setting `eligible=false` immediately terminates any in-flight elevation for that user.
+**Side effect:** setting `eligible=false` terminates any in-flight elevation for that user: at once on the replica that handled the call, and on the other replicas on their next poll of the session generation (about 1 second, up to about 30 seconds while that read is failing or slow; neither bound holds after a database restore or a failover to a lagging standby, so restart every replica then). A `POST /api/v1/elevate` in flight at that moment is covered: that route re-reads eligibility after its elevation commits, and either sees the revoked flag and rolls the elevation back (`403`), or the revoke's clear runs after the elevation committed and ends it.
 
 Two route forms, same handler:
 
@@ -2185,7 +2185,7 @@ The query-parameter form of the route above. It uses the same handler, permissio
 (`oidc:<iss>#<sub>`; URL-encode the `#` as `%23`), because a path segment cannot carry that principal's
 `/` and `#`. A local username may use either form. A missing or empty `username` returns `400`. See the
 section above for the full permission rules (admin plus MFA step-up, self-grant blocked, granting needs
-the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation. If
+the caller's own administrator role). Revoking with `eligible:false` also ends any active elevation (at once on the replica that handled the call, and on the others within the bound given above). If
 that clean-up fails, the route returns `503` even though the flag change was saved; retry to finish the
 revocation.
 
@@ -3611,6 +3611,44 @@ identical SAML gap in the last-Administrator guard. Audited `rbac.role.assigned`
 Revoke a fleet-wide RBAC role grant from a human user. Idempotent —
 unassigning a role the principal did not hold still returns success.
 
+**Removing a user's `Administrator` grant also ends that user's JIT elevation
+window**, in the same database transaction as the removal: the removal and the
+clear commit together or not at all, so if the clear cannot be done the removal
+is rolled back and the route answers `503`. The clear runs only when a grant row
+was actually removed. Unassigning an `Administrator` grant the user does not
+hold (the usual case for a just-in-time user who elevates through eligibility
+alone) is an idempotent no-op: it answers success, the audit detail records
+`removed=false`, and no elevation is ended. This replica drops its cached
+sessions of the user after the commit (all of them, elevated or not, each re-read from the
+durable store on its next request); other replicas converge within about a
+second (up to about 30 seconds while their session-generation read is failing
+or slow; neither bound holds after a database restore or a failover to a lagging
+standby, which can bring the cleared elevation back and leave a restored
+generation equal to a replica's cached one unnoticed, so restart every replica).
+It does not change the user's elevation eligibility and does not
+block a later `POST /api/v1/elevate`: an eligible user can open a new window. To
+end elevated access for good, first call
+`POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}`
+(it refuses service-scoped and MCP-tier tokens, needs the caller's own
+administrator role or an active elevation rather than an `Administrator` grant, and also
+ends live elevations, at once on the replica that handled it and on the others within the
+same bound as above); for a user with no grant that call is the only step needed. A
+request already past its authorization check when the clear lands is not
+recalled, a `POST /api/v1/elevate` that had already passed its eligibility check
+can wait on the unassign's session-row lock and complete just after the unassign
+commits (so a new window can stand; revoking eligibility closes that race, see the
+eligibility route), and an open event stream is not re-checked
+for elevation. For this
+case the transaction bounds each lock wait at 2000 ms (other unassigns keep the
+pool default), so it can answer a retryable `503` when it cannot take its locks
+in time. A server log warning `rbac.role.unassigned store fault` (a failed unassign of an engine
+principal's role logs `engine_principal.role.unassigned store fault` on its own route, and, when
+the store has no error text, also the `RbacStore: unassign_role transaction did not complete`
+warning) and the
+counter `yuzu_server_rbac_lifecycle_store_failure_total{op="unassign"}` record
+such a fault; each logged value is capped at 256 bytes and a space, `=` or `,` in it is
+written as `_`. See "Fleet-Wide Role Assignment" in `rbac.md`.
+
 **Permission:** Same dedicated `is_rbac_administrator` check as the `POST`
 above (including the MCP-tier-token structural denial), plus MFA step-up.
 
@@ -3642,9 +3680,23 @@ surface) principal is never counted as a surviving administrator (the guard has
 known residual gaps, see "Fleet-Wide Role Assignment" in `rbac.md`); `503` — the
 RBAC store is unavailable (including when the admin gate itself cannot
 confirm durable authority — logged and audited as a `denied` row), a
-genuine store/query fault removing the grant, or (on an otherwise-successful
-unassignment) its audit row could not persist — treat the removal as
-unconfirmed and reconcile via a read. Audited `rbac.role.unassigned`.
+genuine store/query fault removing the grant (for a user `Administrator`
+grant this includes a lock wait over 2000 ms, a deadlock, or a failure to clear
+the elevation: the removal is rolled back and a retry is safe, but if the
+database's commit acknowledgement was lost the removal and the clear may have
+committed, so read the grant list before assuming nothing changed), or (on an
+otherwise-successful unassignment) its audit row could not persist — the
+removal is already committed, so treat it as unconfirmed and reconcile via a
+read; do not repeat the call to restore the missing row (a repeat reports
+`removed=false` and writes neither addition). Audited `rbac.role.unassigned`;
+when the clear changed N > 0 session rows that held an elevation window (an
+expired window not yet reaped is counted), its `detail` ends with
+` elevations_cleared=N` and one `role.elevation.revoked` row
+(`detail=reason=administrator_unassign cleared=N role=Administrator`, target the
+user) is written too, either failing to persist giving the same audit-gap `503`.
+A no-op unassign, and a retry after a lost commit acknowledgement, write
+neither addition. The response body is the same in every case. See
+`docs/user-manual/audit-log.md`.
 
 MCP twins: `assign_rbac_role` / `unassign_rbac_role` — see
 `docs/user-manual/mcp.md`.
@@ -15753,15 +15805,17 @@ curl -s -X POST -H "Cookie: yuzu_session=$COOKIE" \
   "https://yuzu.example.com/api/v1/elevate"
 ```
 
+**Post-commit recheck.** After the elevation has committed and before the `role.elevation.granted` row is written, the route reads eligibility once more, failing closed. This closes a race with `POST /api/v1/users/{username}/elevation-eligibility` with `eligible=false`, which flips the flag before it clears the user's elevations: either this re-read sees the revoked flag and the route rolls the elevation back, or the flip came after the re-read and the revoke's clear runs after the elevation committed and ends it. A revoked flag answers `403` (`not authorized to elevate`) and an unreadable one `503`; if the rollback itself fails the route logs at CRITICAL and answers `500` and the elevation may be active: the user can end it from the session that holds it with `POST /api/v1/elevate/revoke` (it needs only that session and is exempt from the step-up), or an administrator can send the eligibility revoke, `POST /api/v1/users/{name}/elevation-eligibility` with `{"eligible": false}` (REST-only; it ends every live elevation of that user and stops new ones); if the store is still failing, either call can fail too, so retry it. An `Administrator` unassign does not end an elevation that rests on eligibility alone. No `role.elevation.granted` row is written in any of these cases.
+
 **Response (200):** `{"status":"ok","expires_in":<seconds>,"expires_at":"<RFC3339 UTC>"}`. `expires_in` is the TRUE remaining time computed after the grant (not an echo of the requested `duration_secs`) — the window is clamped to `--jit-max-elevation-secs` **and** to the session's own absolute expiry (an elevation can never outlive the cookie session that carries it), so `expires_in` is always `<=` the requested duration. `expires_at` is the wall-clock projection of that same window.
 
-**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"), **or a fresh MFA step-up is required** (a stale or absent proof; the answer is the standard step-up `401` challenge envelope, see `meta.challenge_url` and `/login/mfa/stepup`; a failure to read the MFA status other than a store outage is also a `401`, with an `auth_db unavailable` remediation); `403` — not eligible, eligibility read failed (fail-closed), the account's identity source could not be read or does not match the session, **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), **OIDC-amr elevation is disabled** (`--no-jit-oidc-amr-elevation` set), or eligibility was revoked while the step-up was in progress. A SAML session cannot elevate in this release and is always refused: it has no account row to mark eligible, so it is turned away at the eligibility check (see `authentication.md`, "JIT Admin Elevation"); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted; `503` — the persistent auth store is not available, or the second-factor state cannot be verified. Retry while `error.retry_after_ms` is `5000`; `null` is no retry hint, not a promise that nothing will clear it (the two store-outage `503`s of this route before the step-up check carry no hint either). For a `503` that names the second-factor state, `null` means: do not loop and follow the MFA binding enforcement runbook. Run `yuzu-server --mfa-reset <user>` only for an account that reads `mfa_factor_gen <= 0`; an unenforced binding trigger or an inconclusive trigger validation is not repaired by it.
+**Errors:** `400` — blank/missing justification, wrong-typed field, or negative duration; `401` — not authenticated, no cookie (token caller), the session dissolved mid-request, **or the session is already at/past its own absolute expiry** (a dead-window guard: rather than granting a zero-or-negative-length window and misleading a scripted caller with a `200 ok`, this is rejected the same way as "session vanished between validate and elevate"), **or a fresh MFA step-up is required** (a stale or absent proof; the answer is the standard step-up `401` challenge envelope, see `meta.challenge_url` and `/login/mfa/stepup`; a failure to read the MFA status other than a store outage is also a `401`, with an `auth_db unavailable` remediation); `403` — not eligible, eligibility read failed (fail-closed), the account's identity source could not be read or does not match the session, **no MFA enrolled** (local session), **no MFA in the SSO login** (OIDC session with no `amr` proof), **OIDC-amr elevation is disabled** (`--no-jit-oidc-amr-elevation` set), or eligibility was revoked while the step-up was in progress, or after the elevation committed (the final eligibility re-read, see "Post-commit recheck" above: the elevation is rolled back and the answer is `403` `not authorized to elevate`). A SAML session cannot elevate in this release and is always refused: it has no account row to mark eligible, so it is turned away at the eligibility check (see `authentication.md`, "JIT Admin Elevation"); `500` with `Sec-Audit-Failed: true` — the mandatory grant audit could not persist, so the elevation was rolled back and **not** granted, or (without that header) the final eligibility re-read refused the elevation and its rollback failed, so the elevation may be active until it is ended (see "Post-commit recheck" above for the two ways); `503` — the persistent auth store is not available, eligibility could not be re-read after the elevation committed (the elevation is rolled back), or the second-factor state cannot be verified. Retry while `error.retry_after_ms` is `5000`; `null` is no retry hint, not a promise that nothing will clear it (the two store-outage `503`s of this route before the step-up check carry no hint either). For a `503` that names the second-factor state, `null` means: do not loop and follow the MFA binding enforcement runbook. Run `yuzu-server --mfa-reset <user>` only for an account that reads `mfa_factor_gen <= 0`; an unenforced binding trigger or an inconclusive trigger validation is not repaired by it.
 
-**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a `403`, with a distinct `detail` reason per cause (not eligible / eligibility read failed / identity-source lookup failed / identity-source mismatch / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / eligibility revoked during step-up); the `detail` `mfa_step_up_refused` is also written when the shared step-up gate refuses the call: a stale or absent proof is a `401`; an unwired auth store, an MFA store or decrypt outage, or an internal fault in the gate itself is a `503`; any other failure to read the MFA status is a `401` whose remediation says `auth_db unavailable`. None of them is a `403`. When the second-factor store cannot be read, the `503` also writes `role.elevation.denied`, with `result=error` rather than `denied` and a detail that says the secret or store was unavailable (fail-closed). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
+**Audit:** `role.elevation.granted` (`detail=duration_secs=<N> mfa=<oidc_amr|local_totp> expires_at=<RFC3339 UTC> justification=<sanitised>` — the machine-parsed `mfa=` and `expires_at=` tokens are placed before the free-text `justification=` field so a crafted justification can't forge either) on success; `role.elevation.denied` on a refusal (a `403` for most causes; the post-commit recheck also writes it for its `503` and `500`, and the cases named below for a `401` or `503`), with a distinct `detail` reason per cause (not eligible / eligibility read failed / identity-source lookup failed / identity-source mismatch / no MFA enrolled / no MFA in SSO login / OIDC-amr elevation disabled / eligibility revoked during step-up / eligibility revoked during elevation / eligibility read failed after elevation, the last with `result=error`; a failed rollback there is also `result=error`, with `rollback_failed=true` in the `detail`); the `detail` `mfa_step_up_refused` is also written when the shared step-up gate refuses the call: a stale or absent proof is a `401`; an unwired auth store, an MFA store or decrypt outage, or an internal fault in the gate itself is a `503`; any other failure to read the MFA status is a `401` whose remediation says `auth_db unavailable`. None of them is a `403`. When the second-factor store cannot be read, the `503` also writes `role.elevation.denied`, with `result=error` rather than `denied` and a detail that says the secret or store was unavailable (fail-closed). A window that later lapses PASSIVELY (no manual revoke) is audited lazily as `role.elevation.expired` on the operator's next authenticated request — see `docs/user-manual/audit-log.md`.
 
 #### `POST /api/v1/elevate/revoke`
 
-Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body. If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
+Step an active elevation down early (reduces privilege; no MFA step-up required). Body: none. Answers `200 {"status":"ok"}` once the elevation is cleared, whether or not a window was active; that is recorded as `was_elevated=<bool>` in the `role.elevation.revoked` audit detail, not the response body (`was_elevated=unknown` when the lookup of the session before the clear was degraded: the clear succeeded, so any elevation has ended). If the server cannot durably clear the elevation it answers `503` (retry) and writes the same action with `result=error`, because the elevation may still be live.
 
 #### `POST /logout`
 

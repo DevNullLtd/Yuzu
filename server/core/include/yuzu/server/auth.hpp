@@ -885,7 +885,13 @@ public:
     /// session's own absolute lifetime — an elevation can never outlive the
     /// cookie session that carries it (residual-risk follow-up B, security
     /// review 2026-06-30). The CALLER is responsible for the eligibility +
-    /// MFA-step-up gates; this only mutates the in-memory session. Returns the
+    /// MFA-step-up gates. With a `SessionStore` the grant is a durable write (authored in
+    /// the DB clock domain), after which THIS replica's cached copy of the session is
+    /// DROPPED, not re-derived from the row the write returned, so the next validate
+    /// re-reads durable state (a re-derive could resurrect an elevation that an
+    /// Administrator unassign cleared in between); other replicas pick the grant up on
+    /// their next generation refresh. Store-less (unit-test) mode mutates the in-memory
+    /// session instead. Returns the
     /// absolute (possibly-clamped) expiry `system_clock::time_point` on success
     /// (so the route can report it), nullopt if the session does not exist OR
     /// is already at/past its own `expires_at` (a dead-window guard, governance
@@ -906,24 +912,43 @@ public:
     /// no-op). Returns `unexpected` ONLY when a durable `SessionStore` clear
     /// FAILED — the route MUST fail closed there (the elevation is still live
     /// durably; reporting success would falsely tell an incident responder the
-    /// admin was revoked, governance-missed / adversarial C2). Store-less
-    /// (legacy) mode never errors. On the durable path the in-place clear of a cached
-    /// entry advances `session_cache_epoch_` in the same critical section, whether or not
-    /// the entry is cached (it removes privilege, so a cold validation holding a
-    /// pre-clear, still-elevated copy must not cache it, #8010).
-    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token);
+    /// admin was revoked, governance-missed / adversarial C2). The clear is
+    /// attempted even when the pre-clear session read is degraded; if that clear
+    /// succeeds the value is true when a session row existed (was_elevated is
+    /// then UNKNOWN: an elevation, if there was one, has been ended) and, when
+    /// `lookup_degraded` is non-null, `*lookup_degraded` is set true so the caller
+    /// can report "unknown" instead of asserting an elevation was ended (it is
+    /// false on every other path). On a success the cached session is dropped
+    /// (advancing the cache epoch), not zeroed in place. Store-less (legacy) mode
+    /// never errors.
+    [[nodiscard]] std::expected<bool, std::string> revoke_elevation(const std::string& token,
+                                                                    bool* lookup_degraded = nullptr);
 
     /// Clear any active JIT elevation on EVERY session of `username` (all
     /// devices). Called when an admin removes a user's elevation eligibility so
-    /// an in-flight elevation is terminated immediately — symmetric with the
-    /// session wipe on demote/delete (governance UP-1). On success the value is
+    /// an in-flight elevation is terminated (at once on this replica, and on the others at
+    /// their next session-generation poll: about 1 s, up to about 30 s while that read is
+    /// failing or slow; neither bound holds after a database restore or a failover to a
+    /// lagging standby, which can bring a cleared elevation back: restart every replica),
+    /// symmetric with the session wipe on demote/delete (governance UP-1). On success the value is
     /// the number of sessions whose elevation was cleared. Returns `unexpected`
     /// ONLY when the durable `SessionStore` clear FAILED — the route MUST fail
     /// closed (an in-flight elevation may still be live durably; the eligibility
-    /// flip alone does not drop it). Store-less (legacy) mode never errors. As in
-    /// `revoke_elevation`, the durable path advances `session_cache_epoch_` in the same
-    /// critical section as the in-place clears, whether or not any session is cached.
+    /// flip alone does not drop it). After a successful durable clear the user's cached
+    /// sessions are dropped (advancing the cache epoch), not zeroed in place, so a validator
+    /// that read an elevated row before the clear cannot re-cache it. Store-less (legacy) mode
+    /// never errors.
     [[nodiscard]] std::expected<int, std::string> revoke_user_elevations(const std::string& username);
+
+    /// Drop THIS replica's cached copies of `username`'s sessions, in memory only, so the next
+    /// `validate_session` re-reads the durable row. The `RbacStore` local-drop callback (wired in
+    /// server.cpp) calls this after an Administrator unassign has cleared the durable elevations
+    /// inside its own transaction; it repeats no durable work. With a `SessionStore` it goes
+    /// through `drop_cached_user_sessions_locked`, which also advances the cache epoch so a
+    /// validator that read the row before the clear cannot re-insert it. Store-less (unit-test)
+    /// mode zeroes the elevation fields of the user's cached sessions instead. Takes `mu_` only;
+    /// never throws.
+    void drop_local_sessions_of_user(const std::string& username) noexcept;
 
     /// Lazily reap a PASSIVELY-lapsed JIT elevation (residual-risk follow-up A,
     /// security review 2026-06-30): if `token`'s session holds an elevation
@@ -977,6 +1002,13 @@ public:
     /// anchor. Production code MUST NOT call this.
     void expire_session_generation_poll_for_test();
 
+    /// TEST-ONLY: the opposite of `expire_session_generation_poll_for_test`: suppress the
+    /// session generation poll (for an hour of steady time) so a test can assert that a cached
+    /// entry is still served without a slow runner's real ~1 s poll falsifying the assertion.
+    /// `expire_session_generation_poll_for_test` (or `poll_and_validate`) lifts it. Does not
+    /// touch the cached generation or the stale-serve anchor. Production code MUST NOT call this.
+    void suppress_session_generation_poll_for_test();
+
     /// TEST-ONLY: age the last SUCCESSFUL session-generation refresh by `age`, so the
     /// stale-serve bound (`kSessionGenStaleServeBoundMs`) can be crossed without waiting it
     /// out. Does not touch the cached generation or the poll gate. Production code MUST NOT
@@ -993,6 +1025,16 @@ public:
     /// call this - no caller in `server/core/src/**` references it. A no-op
     /// (nullptr) by default; install it before any concurrent validation starts.
     void set_validate_pre_cache_hook_for_test(std::function<void()> hook);
+
+    /// TEST-ONLY: installs a callback fired by `elevate_session` (op "elevate") and
+    /// `stamp_session_mfa_proof` (op "mfa_stamp") on the durable path, AFTER the durable write
+    /// succeeded and BEFORE the cache drop, with NO lock held. It lets a test hold a writer
+    /// open while another manager revokes the elevation and a validator repopulates the cache,
+    /// to prove the late writer cannot resurrect stale state. A hook shared by several threads
+    /// must select its own thread. Production code MUST NOT call this - no caller in
+    /// `server/core/src/**` references it. A no-op (empty) by default; install it before any
+    /// concurrent writer starts.
+    void set_post_durable_write_hook_for_test(std::function<void(std::string_view op)> hook);
 
     /// TEST-ONLY: installs a callback fired in `reactivate_user` and `update_role_checked`
     /// BETWEEN the local cache erase and the durable session wipe, with NO lock held. It lets a
@@ -1876,6 +1918,11 @@ private:
     /// lifetime/production-reachability as `role_recheck_race_hook_for_test_` above.
     std::function<void()> validate_pre_cache_hook_for_test_;
 
+    /// Backing field for `set_post_durable_write_hook_for_test` - see that method's doc.
+    /// Invoked (if set) from `elevate_session` and `stamp_session_mfa_proof` only, with no lock
+    /// held. Same shape/lifetime/production-reachability as `validate_pre_cache_hook_for_test_`.
+    std::function<void(std::string_view)> post_durable_write_hook_for_test_;
+
     /// Backing field for `set_between_local_erase_and_wipe_hook_for_test` - see that method's
     /// doc. Invoked (if set) from `reactivate_user` and `update_role_checked` only, with no lock
     /// held. Same shape/lifetime/production-reachability as the hooks above.
@@ -1987,7 +2034,8 @@ private:
     void evict_target_after_indeterminate_write(const std::string& username);
 
     /// #4966: `yuzu_server_rbac_lifecycle_store_failure_total{op}` (deactivate | set_role |
-    /// would_strand | grant_read). No-op without a MetricsRegistry.
+    /// would_strand | grant_read; the fifth op, `unassign`, is counted by `RbacStore`, not here).
+    /// No-op without a MetricsRegistry.
     void note_lifecycle_store_failure(const char* op) const;
 
     /// Poll the durable write-generation on an interval; when it has changed

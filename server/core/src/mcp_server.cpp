@@ -3777,6 +3777,29 @@ static const ToolDef kTools[] = {
      "principal is never counted as a surviving Administrator, so a refusal can happen even "
      "when other Administrator grants nominally exist. "
      "Idempotent: unassigning a role the principal did not hold still returns success. "
+     "Removing a user's Administrator grant also ends that user's JIT elevation window "
+     "in the same transaction: the removal and the clear commit together, and if the clear "
+     "fails the removal is rolled back (an internal error with a retry hint; after a lost "
+     "commit acknowledgement the removal may have committed, so read the grant list before "
+     "assuming nothing changed). The clear runs only when a grant was actually removed: "
+     "unassigning an Administrator grant the user does not hold still succeeds but ends no "
+     "elevation. After the commit the replica that handled the call drops its cached sessions "
+     "of the user, so the elevation ends at once there; other replicas converge on their next "
+     "session-generation poll (about 1 s, up to about 30 s while that read is failing or "
+     "slow; neither bound holds after a database restore or a failover to a lagging "
+     "standby). It does not change the user's elevation eligibility, so an eligible user "
+     "can elevate again, and an elevate request that had already passed its eligibility "
+     "check can complete just after the unassign commits. To end elevated access for good, "
+     "revoke the user's elevation eligibility first with the REST route "
+     "POST /api/v1/users/{name}/elevation-eligibility (it ends live elevations at once on the "
+     "replica that handled it and on other replicas on their next session-generation poll, "
+     "with the same bounds); "
+     "there is no MCP equivalent yet, so an MCP-only caller cannot take that step. If the "
+     "error says the audit record could not be persisted, the removal is already committed: "
+     "verify with a read and do not repeat the call. "
+     "At the supervised tier the approval ticket is consumed before this tool runs and is not "
+     "restored when the call then fails, so a retry after an internal error needs a new "
+     "approval ticket. "
      "Destructive — verify the target doesn't need this role before calling. Requires "
      "Security:Write (supervised MCP tier; approval-gated).",
      R"j({"type":"object","properties":{)j"
@@ -30452,6 +30475,11 @@ McpServer::HandlerFn McpServer::build_handler(
                 // failure, not a client error → kInternalError, not kInvalidParams.
                 auto result = rbac_store->unassign_role("engine", principal_id, role_name);
                 if (!result) {
+                    // audit_token, as on the user arm: the text can carry control bytes and spaces.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("engine_principal.role.unassigned store fault: principal={} "
+                                 "role={} error={}",
+                                 tok(principal_id), tok(role_name), tok(result.error()));
                     res.set_content(a4_error(kInternalError, result.error(), {},
                                              /*retry_after_ms=*/mcp::kMcpStoreFaultRetryMs),
                                     "application/json");
@@ -30948,10 +30976,12 @@ McpServer::HandlerFn McpServer::build_handler(
                 // zero administrators (a business-rule conflict, not a store
                 // fault) — is_rbac_last_admin_refusal distinguishes them so
                 // only the genuine fault carries a retry hint.
-                auto result = rbac_store->unassign_role("user", principal_id, role_id);
+                auto result = rbac_store->unassign_role_detailed("user", principal_id, role_id);
                 if (!result) {
+                    // flatten_audit_text: a libpq error carries a trailing newline and a
+                    // CONTEXT line, which would otherwise reach the audit row as extra lines.
                     (void)audit_fn(req, "rbac.role.unassigned", "denied", "User", audit_target_id,
-                                   result.error());
+                                   flatten_audit_text(result.error()));
                     if (is_rbac_last_admin_refusal(result.error())) {
                         // retry-hint-exempt: business-rule outcome (last
                         // remaining Administrator), not a store fault.
@@ -30964,8 +30994,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                         "application/json");
                         return;
                     }
+                    // audit_token, not log_key_token: it maps space, '=' and ',' as well as
+                    // control bytes to '_', so a value cannot forge a `role=x error=y` field
+                    // on this unquoted line. Each value is capped at 256 bytes.
+                    const auto tok = [](std::string_view v) { return audit_token(v.substr(0, 256)); };
+                    spdlog::warn("rbac.role.unassigned store fault: user={} role={} error={}",
+                                 tok(principal_id), tok(role_id), tok(result.error()));
                     // A store fault returns a constant client message; the raw text
-                    // goes only to the audit row above.
+                    // reaches only the audit row above and the server log line, never
+                    // the client.
                     res.set_content(
                         a4_error(kInternalError,
                                  "role unassignment store fault; retry, and if this persists "
@@ -30978,9 +31015,26 @@ McpServer::HandlerFn McpServer::build_handler(
                 // removed=<bool> (governance SHOULD #10) lets an auditor
                 // tell an actual revoke apart from an idempotent no-op from
                 // the log alone.
+                //
+                // An Administrator unassign that ended elevations says so on this
+                // row (suffix) and on one dedicated `role.elevation.revoked` row, both only when
+                // N > 0 and both attempted even if the first fails. Either failing takes the same
+                // 503 as the success row alone always did: the removal and the clear are already
+                // committed, so it reports the audit gap, never a failed removal. The response
+                // payload is unchanged. A no-op (`removed=false`: the user held no such grant)
+                // clears nothing, so it carries neither addition; nor does a retry after a lost
+                // COMMIT acknowledgement, which finds the grant already gone.
+                const int cleared = result->elevations_cleared;
                 bool audit_ok = yuzu::server::detail::try_persist_audit(
                     audit_fn, req, "rbac.role.unassigned", "success", "User", audit_target_id,
-                    audit_role + "; removed=" + (*result ? "true" : "false"));
+                    audit_role + "; removed=" + (result->removed ? "true" : "false") +
+                        unassign_elevations_cleared_suffix(cleared));
+                if (cleared > 0) {
+                    const bool revoked_ok = yuzu::server::detail::try_persist_audit(
+                        audit_fn, req, std::string(kElevationRevokedAuditAction), "ok", "User",
+                        audit_target_id, unassign_elevation_revoked_detail(cleared, audit_role));
+                    audit_ok = audit_ok && revoked_ok;
+                }
                 if (!audit_ok) {
                     mcp_audit("error", "audit_persist_failed");
                     res.set_content(

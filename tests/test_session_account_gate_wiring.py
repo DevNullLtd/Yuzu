@@ -35,6 +35,17 @@ comment-stripped text, not a proof.
         nowhere else in auth.cpp except the cache-hygiene drops in `validate_session` and
         `validate_session_durable` (expired or idle entries, not a revocation).
 
+  (ix)  `RbacAdminAuthorityOwner::unassign_role` ends the target's durable elevation in its own
+        transaction, in the one safe order: `set_txn_timeouts` BEFORE the first lock, then
+        `session_sql::lock_user_session_rows_in_txn`, then `session_sql::clear_user_elevations_in_txn`,
+        then the RBAC `bump_generation_in_txn(c)`, then exactly ONE `session_sql::bump_generation_in_txn`
+        (session_meta LAST, nothing after it). The owner body names no `session_store.` SQL literal:
+        every session statement goes through the `session_sql::` helpers.
+  (x)   production code never calls the test-only opt-out `use_no_session_store_for_test(`
+        (everything under server/ except the declaration in rbac_store.hpp): a production
+        RbacStore in `kNoSessionStore` mode would answer an Administrator unassign with success
+        while the elevation survives. Also: `server.cpp` never names `kNoSessionStore`.
+
 Comments and string-literal contents are excluded from every scan except (i), which reads
 literals on purpose. Wired into tests/meson.build (suite 'docs') and docs-lint.yml.
 """
@@ -112,6 +123,80 @@ def check_owner(owner_src: str):
     if soft == -1 or bump.start() < soft:
         return ["(ii) the session generation bump must come after the soft delete"]
     return []
+
+
+def check_unassign(owner_src: str):
+    """(ix): the user Administrator unassign's elevation clear, in order."""
+    # Comment-free text with each string literal replaced by a numbered placeholder, so braces
+    # inside SQL cannot unbalance the body scan and the literals can still be inspected.
+    lits, parts = [], []
+    for kind, t in _lexer.tokenize(owner_src):
+        if kind == "string":
+            parts.append(f'"S{len(lits)}"')
+            lits.append(t)
+        else:
+            parts.append(t)
+    flat = re.sub(r"\s+", " ", "".join(parts)).strip()
+    body = function_body(flat, "RbacAdminAuthorityOwner::unassign_role(")
+    if body is None:
+        return ["(ix) RbacAdminAuthorityOwner::unassign_role not found"]
+    fails = []
+    for k in {int(m) for m in re.findall(r'"S(\d+)"', body)}:
+        if re.search(r"\bsession_store\.", lits[k]):
+            fails.append("(ix) unassign_role names a `session_store.` SQL literal: every session "
+                         "statement belongs in session_store_sql_helpers.hpp (session_sql::)")
+            break
+    timeouts = body.find("set_txn_timeouts(")
+    first_lock = body.find("lock_authenticatable_admin_grants(")
+    lock = body.find("session_sql::lock_user_session_rows_in_txn(")
+    clear = body.find("session_sql::clear_user_elevations_in_txn(")
+    rbac_bumps = [m.start() for m in re.finditer(r"(?<!session_sql::)bump_generation_in_txn\(c\)", body)]
+    session_bumps = [m.start() for m in re.finditer(r"session_sql::bump_generation_in_txn\(c\)", body)]
+    if (body.count("set_txn_timeouts(") != 1 or first_lock == -1 or timeouts > first_lock):
+        fails.append("(ix) unassign_role must call set_txn_timeouts exactly once, before the "
+                     "first lock (lock_authenticatable_admin_grants)")
+    if (body.count("session_sql::lock_user_session_rows_in_txn(") != 1
+            or body.count("session_sql::clear_user_elevations_in_txn(") != 1
+            or not (first_lock < lock < clear)):
+        fails.append("(ix) unassign_role must call session_sql::lock_user_session_rows_in_txn "
+                     "then session_sql::clear_user_elevations_in_txn, once each, after the "
+                     "grant lock")
+    if len(rbac_bumps) != 1 or len(session_bumps) != 1 or body.count("bump_generation_in_txn(") != 2:
+        fails.append("(ix) unassign_role must call the RBAC bump_generation_in_txn(c) exactly "
+                     "once and session_sql::bump_generation_in_txn(c) exactly once")
+    elif not (clear < rbac_bumps[0] < session_bumps[0]):
+        fails.append("(ix) order must be: clear elevations, RBAC bump, then the session_meta "
+                     "bump LAST")
+    else:
+        tail = body[session_bumps[0] + len("session_sql::bump_generation_in_txn(c)"):]
+        end = tail.find("});")
+        tail = tail if end == -1 else tail[:end]
+        if end == -1 or re.search(r"exec_params\(|_in_txn\(|lock_\w*\(|with_txn", tail):
+            fails.append("(ix) nothing may follow the session_meta bump but its own failure "
+                         "branch and `return true;`: session_meta is the lock every session "
+                         "writer shares, so no statement may wait after it")
+    return fails
+
+
+FOR_TEST_OPT_OUT = re.compile(r"\buse_no_session_store_for_test\s*\(")
+
+
+def check_no_production_opt_out(files):
+    """(x): `files` maps path -> text. The opt-out is declared in rbac_store.hpp and called only
+    by tests (tests/ is not scanned: this runs over server/ only); `server.cpp` never names
+    kNoSessionStore."""
+    fails = []
+    for rel, text in files.items():
+        if rel == "server/core/src/rbac_store.hpp":
+            continue
+        if FOR_TEST_OPT_OUT.search(_lexer.code(text)):
+            fails.append(f"(x) {rel} calls use_no_session_store_for_test(): test-only, never "
+                         "production")
+    server = files.get("server/core/src/server.cpp")
+    if server is not None and "kNoSessionStore" in _lexer.code(server):
+        fails.append("(x) server.cpp must never name kNoSessionStore: production passes the "
+                     "durable mode (the RbacStore default)")
+    return fails
 
 
 def check_auth(auth_src: str):
@@ -215,6 +300,52 @@ def _selfcheck() -> None:
     if not check_owner(owner.replace("soft_delete_user_in_txn(c, u, e);",
                                      "x;").replace("return true; }", "auth_sql::soft_delete_user_in_txn(c,u,e); return true; }")):
         raise SystemExit("selfcheck: (ii) missed a bump before the soft delete")
+    unassign = (
+        'RbacAdminAuthorityOwner::UnassignOutcome\nRbacAdminAuthorityOwner::unassign_role(const std::string& t,'
+        ' const std::string& p, const std::string& r, SessionGenerationMode m) const {\n'
+        ' const bool ok = pool_.with_txn_for(w, [&](PGconn* c) -> bool {\n'
+        '  if (u && !set_txn_timeouts(c, lt, err)) return false;\n'
+        '  auto locked = lock_authenticatable_admin_grants(c, e);\n'
+        '  pg::exec_params(c, "DELETE FROM rbac_store.principal_roles WHERE a", v);\n'
+        '  if (x) { if (!session_sql::lock_user_session_rows_in_txn(c, p, err)) return false;\n'
+        '   auto k = session_sql::clear_user_elevations_in_txn(c, p, err); if (!k) return false; }\n'
+        '  new_gen = bump_generation_in_txn(c); if (!new_gen.has_value()) return false;\n'
+        '  if (x && n > 0 && !session_sql::bump_generation_in_txn(c)) { err = "e"; return false; }\n'
+        '  return true;\n });\n UnassignOutcome out{ok}; return out; }\n')
+    if check_unassign(unassign):
+        raise SystemExit(f"selfcheck: (ix) rejected the good shape: {check_unassign(unassign)}")
+    bad_unassign = {
+        "(ix) session_store literal": unassign.replace(
+            '"DELETE FROM rbac_store.principal_roles WHERE a"',
+            '"UPDATE session_store.sessions SET a"'),
+        "(ix) no timeouts": unassign.replace("set_txn_timeouts(c, lt, err)", "true"),
+        "(ix) timeouts after the lock": unassign.replace(
+            "  if (u && !set_txn_timeouts(c, lt, err)) return false;\n", "").replace(
+            "  pg::exec_params(", "  set_txn_timeouts(c, lt, err);\n  pg::exec_params(", 1),
+        "(ix) lock removed": unassign.replace("session_sql::lock_user_session_rows_in_txn(c, p, err)", "true"),
+        "(ix) clear before lock": unassign.replace(
+            "session_sql::lock_user_session_rows_in_txn", "session_sql::TMP").replace(
+            "session_sql::clear_user_elevations_in_txn", "session_sql::lock_user_session_rows_in_txn").replace(
+            "session_sql::TMP", "session_sql::clear_user_elevations_in_txn"),
+        "(ix) session bump before the RBAC bump": unassign.replace(
+            "  new_gen = bump_generation_in_txn(c);",
+            "  session_sql::bump_generation_in_txn(c); new_gen = bump_generation_in_txn(c);").replace(
+            "!session_sql::bump_generation_in_txn(c)", "!true"),
+        "(ix) second session bump": unassign.replace(
+            "return true;\n });", "session_sql::bump_generation_in_txn(c); return true;\n });"),
+        "(ix) statement after the session bump": unassign.replace(
+            "return false; }\n  return true;", "return false; }\n  pg::exec_params(c, \"SELECT 1\", v);\n  return true;"),
+    }
+    for name, text in bad_unassign.items():
+        if not check_unassign(text):
+            raise SystemExit(f"selfcheck: the scan missed: {name}")
+    if check_no_production_opt_out({"server/core/src/rbac_store.hpp": "void use_no_session_store_for_test() noexcept {}",
+                                    "server/core/src/server.cpp": "// kNoSessionStore in a comment\nint x;"}):
+        raise SystemExit("selfcheck: (x) rejected the good shape")
+    if not check_no_production_opt_out({"server/core/src/server.cpp": "rbac_store_->use_no_session_store_for_test();"}):
+        raise SystemExit("selfcheck: (x) missed a production call")
+    if not check_no_production_opt_out({"server/core/src/server.cpp": "auto m = SessionGenerationMode::kNoSessionStore;"}):
+        raise SystemExit("selfcheck: (x) missed kNoSessionStore in server.cpp")
     auth = ("auto r = rbac_store_->deactivate_account(u, session_store_ ? SessionGenerationMode::kBumpSessionGeneration"
             " : SessionGenerationMode::kNoSessionStore);\n"
             "void f() { sessions_.clear();\n ++session_cache_epoch_; }\n"
@@ -293,7 +424,8 @@ def main() -> int:
                for f in tracked if f.endswith((".cpp", ".hpp"))}
     failures = []
     failures += check_soft_delete_literals(sources)
-    for rel, check in ((OWNER, check_owner), (AUTH, check_auth)):
+    failures += check_no_production_opt_out(sources)
+    for rel, check in ((OWNER, check_owner), (OWNER, check_unassign), (AUTH, check_auth)):
         if rel not in sources:
             failures.append(f"{rel} is not tracked; nothing to check")
         else:

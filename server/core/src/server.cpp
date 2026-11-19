@@ -2418,24 +2418,29 @@ public:
         // #4966: a store fault inside the account-lifecycle guard (a lock wait that expired, a
         // lost connection, an unwired guard), by the guarded operation. NOT a refusal: the
         // request was neither allowed nor judged. Counted in AuthManager, so the dashboard, SCIM
-        // and every other caller through it share one series. No alert rule ships with it yet
-        // (a later change owns the alerts).
+        // and every other caller through it share one series, except op=unassign, which
+        // RbacStore counts for a failed role unassignment of any role or principal type. No
+        // alert rule ships with it yet (a later change owns the alerts).
         metrics_.describe("yuzu_server_rbac_lifecycle_store_failure_total",
-                          "Store faults inside the account-lifecycle last-Administrator guard, "
-                          "by operation (deactivate: account removal; set_role: role write; "
-                          "would_strand: the advisory pre-check, after which the request still "
-                          "proceeds to the guarded write; grant_read: the SCIM "
-                          "pre-provisioning Administrator-grant read). The unwired fail-closed "
+                          "Store faults in the account-lifecycle last-Administrator guard and in "
+                          "role unassignment, by operation (deactivate: account removal; "
+                          "set_role: role write; would_strand: the advisory pre-check, after "
+                          "which the request still proceeds to the guarded write; grant_read: "
+                          "the SCIM pre-provisioning Administrator-grant read; unassign: a "
+                          "role unassignment, of any role or principal type, whose transaction "
+                          "failed with a store fault; a last-Administrator refusal is not "
+                          "counted). The unwired fail-closed "
                           "arm also counts, for deactivate and set_role only. A sustained "
-                          "non-zero rate means deprovisioning or role changes are being "
-                          "answered with a store-unavailable error rather than judged, except "
-                          "for would_strand, which never stops the request (SCIM answers 503 "
-                          "with Retry-After; the dashboard role route gives no retry hint): "
-                          "look at yuzu_pg_pool_waiters and "
-                          "yuzu_pg_acquire_wait_seconds, and for a stuck rbac_enabled row lock "
-                          "holder.",
+                          "non-zero rate means deprovisioning, role changes or unassignments "
+                          "are being answered with a store-unavailable error rather than "
+                          "judged, except for would_strand, which never stops the request "
+                          "(SCIM answers 503 with Retry-After; the dashboard role route gives "
+                          "no retry hint): look at yuzu_pg_pool_waiters and "
+                          "yuzu_pg_acquire_wait_seconds, and for a stuck lock holder (the "
+                          "rbac_enabled row for deactivate and set_role; an unassign takes no "
+                          "rbac_enabled lock).",
                           "counter");
-        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read"})
+        for (const auto op : {"deactivate", "set_role", "would_strand", "grant_read", "unassign"})
             metrics_.counter("yuzu_server_rbac_lifecycle_store_failure_total", {{"op", op}});
         // #4966: a SCIM same-request compensation (the guarded undo of a just-created or
         // just-revived account) that did NOT complete. Written beside the
@@ -7720,6 +7725,33 @@ public:
                 // does not exist until this block. Nulled at teardown beside
                 // set_credential_change_owner(nullptr).
                 auth_mgr_.set_rbac_store(rbac_store_.get());
+                // An Administrator unassign clears the target's durable elevations in
+                // its own transaction (the RbacStore default mode; this file never opts out).
+                // That clear needs the session_store schema, which only an OPEN SessionStore
+                // guarantees. The SessionStore construction block earlier in this startup path
+                // already sets `startup_failed_` when the store fails to open, and this block
+                // runs only while `startup_failed_` is false, so the check below is a backstop
+                // against a future reordering, not a new boot refusal in a healthy configuration;
+                // it exists so a console where every user Administrator unassign would fail is
+                // never served. The callback then drops THIS
+                // replica's cached sessions of the user (other replicas converge on their next
+                // generation poll). `auth_mgr_` is a reference to main.cpp's AuthManager, which
+                // outlives ServerImpl; the callback is never cleared at teardown (it is
+                // read lock-free by serving threads) and only takes AuthManager's own lock.
+                if (!session_store_ || !session_store_->is_open()) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore Administrator unassign "
+                                  "ends the target's JIT elevation in its own transaction, which "
+                                  "needs an open SessionStore (session_store schema), and none is "
+                                  "available");
+                    startup_failed_ = true;
+                } else if (!rbac_store_->set_local_session_drop(
+                               [&auth_mgr = auth_mgr_](const std::string& username) {
+                                   auth_mgr.drop_local_sessions_of_user(username);
+                               })) {
+                    spdlog::error("[PG] Refusing to start: the RbacStore local session-drop "
+                                  "callback was already set; it must be wired exactly once");
+                    startup_failed_ = true;
+                }
             }
         }
         // #4966 boot self-check: an AuthDB without the guard would leave
