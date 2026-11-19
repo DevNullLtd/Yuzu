@@ -18,6 +18,8 @@ Use `yuzu::test::unique_temp_path(prefix)` / `yuzu::test::TempDbFile` / `yuzu::t
 
 **Standing invariant:** both self-hosted CI pools run 4 runner agents as ONE shared OS identity on ONE box — Windows "Wee Tam" (documented as LOCAL SYSTEM in `deploy/windows/README.md`; the real account is tracked in #7637), Linux "Big Tam" (`runner` user sharing `$HOME`, `docs/ci-architecture.md`). A fixed registry key/port/named-object/path is a cross-JOB shared resource — two concurrent CI jobs on one box collide (#1871's `RegistryGuard` family; same bug on Linux gateway eunit `health_port`). Salt every such identifier per-test/per-process like `unique_temp_path()` — see `test_guard_registry.cpp`'s `TempRegKey`/`TempEnforceKey`. The registry plugin's Windows fixtures take their scratch-key prefix from `yuzu::test::registry_scratch_prefix()` (`YuzuTest-<scope>-`, the scope read from `YUZU_TEST_REGISTRY_SCOPE`, which CI sets per job so its leftover-key check judges one job; unset elsewhere) and never spell `YuzuTest-` themselves (`tests/test_registry_definition.py` pins the quoted and backslash-prefixed spellings; CI's leftover check scans only the direct children named `YuzuTest-*`, so the local dispatcher's `Software\YuzuTest\RegistryPr17Ld_<salt>` keys are outside it); with `YUZU_REQUIRE_WINDOWS_REGISTRY_TESTS=1` (CI's Windows leg) a skipped registry case fails instead of skipping; the one exception is the Echo bam live case, which skips when the create of its scratch keys under `bam` is refused (ACCESS_DENIED; see `docs/ci-architecture.md` `Test (non-pg suites)`).
 
+**Echo registry-live cases skip only on a named ETW environment cause.** When the Kernel-Registry ETW session does not open, `require_etw_or_skip` (`tests/unit/test_echo_registry_source.cpp`) reads the Win32 code from `RegistryReader::etw_start_error` and SKIPs for exactly two: 1450 (`ERROR_NO_SYSTEM_RESOURCES`, "the system trace-session limit is reached", whatever the elevation) and 5 on a non-elevated token ("not elevated"). Any other start error, elevated or not, FAILs with the code in the message; the 15 s await-timeout failure is unchanged. The classification is the pure `etw_skip_reason`, tested on every host.
+
 ## Skip-versus-fail contract for the Linux Service spark case
 
 The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daemon` plus a child process, #5719 item 5) has its own skip-vs-fail contract: it SKIPs when `dbus-daemon` is not installed or the socket path is too long for `sockaddr_un`, and `YUZU_REQUIRE_SPARK_DBUS_TESTS` (non-empty and not `0`) turns that skip into a FAIL; no CI leg sets it yet (tracked in #7901).
@@ -25,6 +27,12 @@ The Linux Service spark case in `test_spark_mechanism.cpp` (a private `dbus-daem
 ## Echo fresh-database opens: `echo_test_db.hpp`
 
 `yuzu::test::open_echo_db(path)` (`tests/unit/echo_test_db.hpp`, `yuzu_echo_tests` only) opens an `EchoDatabase` that starts at the current schema version: it copies a per-process migrated template to `path` first and sets `PRAGMA synchronous=OFF` on the write connection. A fresh `EchoDatabase::open` walks the v2 to v10 ladder as separate commits (about 25 fsyncs), and the suite opens about 470 databases, which made the Windows debug leg fsync-bound and intermittently past its 180 s limit (#7135, #7872). Use it where a test wants "the state a fresh open leaves". **Keep a real `EchoDatabase::open` on a path the test prepared** for anything about the open itself or the ladder (a fresh open's own end state, an upgrade, a corrupt, busy or colliding file, the open's log lines) and for durability or crash behaviour. The helper prints to stderr and falls back to a plain open if the template cannot be built, and `echo_test_db: the migrated template is built...` fails the suite in that case.
+
+## Echo tests
+
+New and changed `tests/unit/**/test_echo*.cpp` follow [echo-test-standard.md](echo-test-standard.md): ten rules (cost and
+determinism, host dependence and honesty) and the lexical gate `tests/test_echo_test_standard_lexical.py` (meson suite `echo`),
+whose four patterns cover rules 3 to 5. A finding is waived only by a real `// echo-test-ok: <reason>` comment, justified in the PR.
 
 ## Route-handler tests — `TestRouteSink`
 
@@ -43,6 +51,13 @@ FIRST (reverse declaration order); its callback must not throw, since it can run
 mid-unwind, where a second throw would terminate. Used by `test_thread_pool.cpp`
 (releasing parked pool workers before `~ThreadPool` joins them). Promoted from
 `test_thread_pool.cpp` once a second file needed it.
+
+A call whose **return** is under test (`OpenRetryLoop::stop()`, a plugin's `shutdown()`) is the
+exception to "guard it with `ScopeExit`": a hung call cannot be unwound, because the owner's
+destructor blocks in it too. Run it through `yuzu::test::must_return_within`
+(`tests/unit/test_bounded_return.hpp`), which runs the call on the calling thread under a watchdog
+that ends the process with the call's name if the bound passes, and prints every call's elapsed
+seconds. Never `std::async` plus `wait_for` for this: the future's destructor blocks in the same call.
 
 A bounded drain is not a lifetime guarantee for a detached worker. In
 `test_guardian_outbox_send_executor.cpp`, each stalled callback owns its gate

@@ -1058,22 +1058,30 @@ public:
      * referenced. Backs the `echo.purge_source` action (retention-paused frame, Phase 15.A): it
      * drops a deliberately paused source's accumulated forensic data WITHOUT re-enabling
      * collection. The rows go in one transaction (all or none); the dictionary sweep follows
-     * it under `dictionary_deadline` (60 s: operator-initiated and rare) and, if it outruns the
-     * deadline or fails, the strings stay until the weekly GC: that is REPORTED
+     * it under `dictionary_deadline` (kPurgeDictionaryDeadline: operator-initiated and rare) and,
+     * if it outruns the deadline or fails, the strings stay until the weekly GC: that is REPORTED
      * (`dictionary_pending`, counted in `dict_gc_starved_total`), never a silent success, since
      * the purge is promised as forensic erasure and the strings of the purged rows are forensic
      * data too. The deadline is a parameter so a test can drive that path (gc_dictionary's
-     * deadline is the seam).
-     * @return the rows deleted and whether the dictionary sweep is pending, or an error string
-     *         (unknown source / SQL error).
+     * deadline is the seam). `cancelled`, when set, is the caller's stop request (agent
+     * shutdown): the sweep gives up at its next check, as at a deadline, and the TRUNCATE
+     * checkpoint is skipped, both reported as pending. A sweep ended by a stop request is not
+     * counted in `dict_gc_starved_total`: it was not starved. The final TRUNCATE checkpoint never
+     * waits (busy timeout 0): a reader that pins the WAL leaves the pre-delete page images in the
+     * -wal file, which is REPORTED too (`wal_pending`), as the forensic residue it is.
+     * @return the rows deleted and whether the dictionary sweep and the WAL checkpoint are
+     *         pending, or an error string (unknown source / SQL error).
      */
     struct PurgeResult {
         int rows_deleted{0};
         bool dictionary_pending{false}; ///< strings of the purged rows remain until the weekly GC
+        bool wal_pending{false};        ///< the WAL was not truncated: purged pages may linger in it
     };
+    static constexpr std::chrono::seconds kPurgeDictionaryDeadline{60};
     std::expected<PurgeResult, std::string> purge_source(
         const std::string& source,
-        std::chrono::steady_clock::duration dictionary_deadline = std::chrono::seconds(60));
+        std::chrono::steady_clock::duration dictionary_deadline = kPurgeDictionaryDeadline,
+        const std::function<bool()>& cancelled = {});
 
 private:
     explicit EchoDatabase(sqlite3* db);

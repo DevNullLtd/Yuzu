@@ -19,7 +19,8 @@ on:
     branches: [dev, main]
     # Only fuzz PRs that can change fuzzed behavior. The harnesses compile
     # first-party C++ directly (no meson/vcpkg), and their entire compile
-    # closure is the seven parser families below plus tests/fuzz/ itself -
+    # closure is the parser families below (under server/core/src/, agents/shared/ and the
+    # component_inventory ZIP reader) plus tests/fuzz/ itself -
     # nothing in sdk/, proto/, the rest of agents/ or the rest of server/
     # reaches them. Family globs (not exact files) so a sibling header/impl added
     # to a family stays covered. KEEP IN SYNC with BOTH
@@ -37,6 +38,10 @@ on:
     # docs/ci-architecture.md; adopting the detect-code-change pattern is
     # tracked on #3771).
     paths:
+      - 'agents/shared/file_search_*'
+      - 'agents/shared/base64*'
+      - 'agents/shared/wire_utf8*'
+      - 'agents/shared/sha256*'
       - 'server/core/src/preflight_parse*'
       - 'server/core/src/deployment_parse*'
       - 'server/core/src/yaml_scan*'
@@ -44,6 +49,7 @@ on:
       - 'server/core/src/guardian_resilience_schema*'
       - 'server/core/src/guardian_schema_registry*'
       - 'agents/plugins/component_inventory/src/zip_directory*'
+      - 'agents/shared/binary_header_*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-pr.yml'

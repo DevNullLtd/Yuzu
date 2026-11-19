@@ -492,9 +492,10 @@ std::unexpected<ServiceError> unavailable(std::string message) {
     return std::unexpected(ServiceError{Kind::kUnavailable, std::move(message), "", 0});
 }
 
-// IPv4 addresses an IPv6 address stands for: IPv4-mapped (::ffff:a.b.c.d), NAT64 (the well-known
-// 64:ff9b::/96 and every configured prefix) and 6to4 (2002::/16, the next 32 bits). Used to compare
-// a resolved address with this server's own IPv4 addresses.
+// IPv4 addresses an IPv6 address stands for: IPv4-mapped (::ffff:a.b.c.d), SIIT
+// (::ffff:0:a.b.c.d), IPv4-compatible (::a.b.c.d), NAT64 (the well-known 64:ff9b::/96 and every
+// configured prefix) and 6to4 (2002::/16, the next 32 bits). Used to compare a resolved address
+// with this server's own IPv4 addresses.
 std::vector<Addr> embedded_v4(const Addr& a, std::span<const eg::Nat64Prefix> prefixes) {
     std::vector<Addr> out;
     if (a.v4)
@@ -507,6 +508,14 @@ std::vector<Addr> embedded_v4(const Addr& a, std::span<const eg::Nat64Prefix> pr
     };
     if (a.b[0] == 0x20 && a.b[1] == 0x02) // 6to4
         push(eg::Ipv4{a.b[2], a.b[3], a.b[4], a.b[5]});
+    const auto zero = [&a](std::size_t from, std::size_t to) {
+        return std::all_of(a.b.begin() + static_cast<std::ptrdiff_t>(from),
+                           a.b.begin() + static_cast<std::ptrdiff_t>(to),
+                           [](std::uint8_t x) { return x == 0; });
+    };
+    const bool siit = zero(0, 8) && a.b[8] == 0xff && a.b[9] == 0xff && zero(10, 12);
+    if (siit || zero(0, 12)) // SIIT, IPv4-compatible
+        push(eg::Ipv4{a.b[12], a.b[13], a.b[14], a.b[15]});
     eg::Ipv6 raw{};
     std::copy(a.b.begin(), a.b.end(), raw.begin());
     const eg::Nat64Prefix wk{{0x00, 0x64, 0xff, 0x9b, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}, 96};
@@ -606,6 +615,17 @@ host_classes(const UrlParts& parts, Ctx& ctx, const std::string& param) {
         if (own)
             return invalid(param, "the host resolves to an address this server is bound to or "
                                   "listening on; that is always refused");
+        // A local-use NAT64 address (64:ff9b:1::/48) cannot be decoded without its prefix length,
+        // so it is refused unless a declared prefix covers it: the IPv4 address it stands for could
+        // be any class, this server included.
+        if (!a->v4 && eg::in_local_use_nat64(a->b) &&
+            std::ranges::none_of(declared, [&](const eg::Nat64Prefix& p) {
+                return eg::matches(a->b, p);
+            }))
+            return invalid(param, "the host resolves to an address in the local-use NAT64 prefix "
+                                  "64:ff9b:1::/48 that no --oidc-nat64-prefix declares; declare "
+                                  "the translator's exact prefix and length (a wrong length "
+                                  "decodes the wrong IPv4 address) so it can be checked");
         const auto c = a->v4 ? classify_addr(*a)
                              : eg::classify_ipv6(a->b, std::span<const eg::Nat64Prefix>(declared));
         if (c == eg::AddressClass::Loopback || eg::detail::never_allowed(c))
@@ -749,9 +769,10 @@ std::optional<std::vector<std::string>> interface_addresses() {
     if (::getifaddrs(&list) != 0)
         return std::nullopt;
     std::unique_ptr<struct ifaddrs, decltype(&::freeifaddrs)> guard(list, ::freeifaddrs);
-    // ifa_addr points at a sockaddr_in / sockaddr_in6 / sockaddr_dl chosen by sa_family; its
-    // length is sa_len on the BSDs and implied by the family on Linux, so `add` is handed the
-    // minimum the family requires after reading sa_family from the base type.
+    // ifa_addr points at a sockaddr_in / sockaddr_in6 / sockaddr_ll chosen by sa_family. The
+    // server builds on Linux only (ADR-0035), where the length is implied by the family (there is
+    // no sa_len), so `add` is handed the minimum the family requires after reading sa_family from
+    // the base type.
     for (const struct ifaddrs* i = list; i != nullptr; i = i->ifa_next) {
         if (i->ifa_addr == nullptr)
             continue;
@@ -1006,10 +1027,7 @@ RevocationSourceService::register_source(const nlohmann::json& body, const std::
 std::expected<RevocationSourceRecord, ServiceError>
 RevocationSourceService::register_validated(const NewRevocationSource& v,
                                             const std::string& created_by) {
-    auto id = store_.create(v, created_by);
-    if (!id)
-        return map_store_error(id.error());
-    auto r = store_.get(*id);
+    auto r = store_.create(v, created_by);
     if (!r)
         return map_store_error(r.error());
     return std::move(*r);
@@ -1221,8 +1239,9 @@ nlohmann::json reset_json(const HighWaterReset& r) {
     nlohmann::json j;
     j["reset_at"] = rfc3339_utc(r.reset_at);
     j["crls_deleted"] = r.crls_deleted;
-    // The window the reset opened: a CRL that verifies and is dated at or after this time is
-    // accepted again, whatever its number.
+    // The window the reset opened, reported as reset_at itself: the fetcher also allows the CA
+    // five minutes of clock skew before it, so a CRL that verifies and is dated no earlier than
+    // reset_at - 5 minutes is accepted again, whatever its number.
     j["replay_window_opens_at"] = rfc3339_utc(r.reset_at);
     j["pinned"] = r.pinned;
     return j;

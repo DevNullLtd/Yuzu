@@ -161,6 +161,21 @@ origin_text(Ctx) ->
 
 register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
     case yuzu_gw_upstream:proxy_register(RegisterReq, upstream_opts(Ctx)) of
+        {ok, #{accepted := false} = Response} ->
+            %% The server refused this Register (denied, pending approval,
+            %% invalid token) with gRPC OK and accepted=false, and minted no
+            %% session. Nothing is stored: a pending row here would let an empty
+            %% or guessed x-yuzu-session-id complete a registration the server
+            %% rejected (F29). The agent still gets the server's answer verbatim.
+            yuzu_gw_safe_call:warn_limited(
+              register_rejected, "Register not accepted by the server; nothing stored", []),
+            {ok, Response, Ctx};
+        {ok, #{session_id := Sid}} when not is_binary(Sid); Sid =:= <<>> ->
+            %% accepted but no server-minted session id: unusable as a key.
+            yuzu_gw_safe_call:warn_limited(
+              register_failed, "Upstream Register failed: answer carries no session id", []),
+            {grpc_error, {?GRPC_STATUS_INTERNAL,
+                          <<"Upstream registration failed: malformed response">>}};
         {ok, Response} when is_map(Response) ->
             %% Stash the session_id and agent_info; the agent process is
             %% created when Subscribe arrives (matched by session_id).
@@ -204,7 +219,13 @@ register_upstream(Ctx, RegisterReq, PeerAddr, Reservation) ->
                     {grpc_error, {?GRPC_STATUS_INTERNAL,
                                   <<"Registration failed: registry unavailable">>}};
                 {error, session_limit} ->
-                    session_limit_error()
+                    session_limit_error();
+                {error, invalid_session} ->
+                    yuzu_gw_safe_call:warn_limited(
+                      register_invalid_session,
+                      "Register failed: the registry refused the session id as a pending key", []),
+                    {grpc_error, {?GRPC_STATUS_INTERNAL,
+                                  <<"Upstream registration failed: malformed response">>}}
             end;
 
         {ok, _NotAMap} ->
@@ -244,7 +265,8 @@ subscribe(Ref, State) ->
     SessionId = maps:get(<<"x-yuzu-session-id">>, Headers, undefined),
 
     case SessionId of
-        undefined ->
+        Missing when Missing =:= undefined; Missing =:= <<>> ->
+            %% An empty value is as good as no header: it can name no session.
             logger:warning("Subscribe: missing x-yuzu-session-id header"),
             throw({grpc_error, {?GRPC_STATUS_INVALID_ARGUMENT,
                                 <<"Missing x-yuzu-session-id header">>}});

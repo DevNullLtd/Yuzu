@@ -32,6 +32,7 @@
 #pragma once
 
 #include <launchctl_list.hpp> // yuzu::shared::{LaunchctlRow,LaunchctlParseResult,parse_launchctl_list}
+#include <sudo_argv.hpp>      // yuzu::shared::sudo_wrap (the portable two-argument form)
 
 #include <yuzu/agent/runner_status.hpp>     // yuzu::agent::classify_runner_failure
 #include <yuzu/agent/subprocess_runner.hpp> // yuzu::agent::SubprocessResult
@@ -229,6 +230,50 @@ inline LaunchdListResult parse_launchctl_list(std::string_view output, bool runn
     }
 
     return result;
+}
+
+// ── set_start_mode privileged argv ───────────────────────────────────────
+
+/// The root-owned helper the sudoers file grants for services.set_start_mode, in place of any
+/// systemctl or launchctl line: `scripts/install-agent-user.sh` writes it (root-owned 0755) and
+/// names its path in sudoers with no argument and no wildcard. A non-root agent runs
+/// `yuzu-svc-helper systemctl <verb> <name>` (Linux) or `yuzu-svc-helper launchctl <verb> <name>`
+/// (macOS); the helper checks the name against the same character class as is_safe_service_name
+/// (1 to 256 of letters, digits and - _ . @) and builds the tool's argument list itself. The two
+/// strings are the installer's SVC_HELPER_PATH on each platform;
+/// tests/test_legacy_quarantine_plugin_removed_lexical.py checks them against it.
+inline constexpr std::string_view kSvcHelperPathLinux = "/usr/local/sbin/yuzu-svc-helper";
+inline constexpr std::string_view kSvcHelperPathMacos =
+    "/Library/PrivilegedHelperTools/yuzu-svc-helper";
+
+/// The argv that runs `systemctl <verb> -- <name>` for set_start_mode. `verb` is one of enable,
+/// disable, mask, unmask; `name` has passed is_safe_service_name (a leading '-' is allowed there,
+/// which is why `--` precedes it). A root agent (euid_is_root) has no sudoers grant to bound and
+/// runs systemctl itself, at `systemctl_path`; any other agent goes through the helper, under the
+/// canonical `sudo -n --` form. The decision is the euid alone, the one sudo_wrap makes: there is
+/// no probe for the helper and no fallback to the tool when it is missing (a host provisioned
+/// without this build's installer fails with sudo's own message).
+[[nodiscard]] inline std::vector<std::string>
+systemctl_set_start_mode_argv(std::string_view systemctl_path, std::string_view verb,
+                              std::string_view name, bool euid_is_root) {
+    if (euid_is_root)
+        return {std::string{systemctl_path}, std::string{verb}, "--", std::string{name}};
+    return yuzu::shared::sudo_wrap(
+        {std::string{kSvcHelperPathLinux}, "systemctl", std::string{verb}, std::string{name}},
+        /*euid_is_root=*/false);
+}
+
+/// The macOS twin: `launchctl <verb> system/<name>` for a root agent, at `launchctl_path`; the
+/// helper's `launchctl <verb> <name>` (which adds the `system/` itself) under `sudo -n --` for any
+/// other. `verb` is enable or disable.
+[[nodiscard]] inline std::vector<std::string>
+launchctl_set_start_mode_argv(std::string_view launchctl_path, std::string_view verb,
+                              std::string_view name, bool euid_is_root) {
+    if (euid_is_root)
+        return {std::string{launchctl_path}, std::string{verb}, std::format("system/{}", name)};
+    return yuzu::shared::sudo_wrap(
+        {std::string{kSvcHelperPathMacos}, "launchctl", std::string{verb}, std::string{name}},
+        /*euid_is_root=*/false);
 }
 
 // ── set_start_mode call-site decision ────────────────────────────────────
