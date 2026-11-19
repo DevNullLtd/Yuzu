@@ -104,12 +104,17 @@ public:
         }
         if (closed)
             d.closed_summary = enqueue_closed(*closed);
+        // A straggler after the forced (shutdown) flush: its dropped id can never be named.
+        if (!d.admitted && stopped_.load(std::memory_order_acquire))
+            note_unrecorded();
         return d;
     }
 
     /// Time-based flush: closes the window when due (or `force`) and returns the NEW chunk rows
     /// (already queued for `take_pending`). Empty if the window is still open or nothing was dropped.
     [[nodiscard]] std::vector<std::string> poll_closed(std::int64_t now_ms, bool force) {
+        if (force)
+            stopped_.store(true, std::memory_order_release); // sticky: the forced flush is shutdown
         std::optional<ClosedWindow> closed;
         {
             std::lock_guard lk(mu_);
@@ -165,11 +170,19 @@ public:
     void note_unrecorded() noexcept { ids_truncated_.fetch_add(1); }
     /// Give counts back after a failed publish (a metric registry that threw) so they are not lost.
     void restore_counts(std::uint64_t ids_truncated, std::uint64_t queue_full,
-                        std::uint64_t alloc_failed) noexcept {
+                        std::uint64_t alloc_failed, std::uint64_t write_failed = 0,
+                        std::uint64_t shutdown = 0) noexcept {
         ids_truncated_.fetch_add(ids_truncated);
         queue_full_dropped_.fetch_add(queue_full);
         alloc_failed_.fetch_add(alloc_failed);
+        write_failed_carry_.fetch_add(write_failed);
+        shutdown_carry_.fetch_add(shutdown);
     }
+    /// Chunk counts handed back by a failed publish, for the next flush round to report.
+    [[nodiscard]] std::uint64_t take_write_failed_carry() { return write_failed_carry_.exchange(0); }
+    [[nodiscard]] std::uint64_t take_shutdown_carry() { return shutdown_carry_.exchange(0); }
+    /// True once a forced (shutdown) flush has run.
+    [[nodiscard]] bool stopped() const noexcept { return stopped_.load(std::memory_order_acquire); }
     [[nodiscard]] std::size_t pending_size() const {
         std::lock_guard lk(pending_mu_);
         return pending_.size();
@@ -301,6 +314,12 @@ private:
             recent_order_.pop_front();
         }
     }
+    /// Compile-time pin: the loss-accounting helpers never throw (a throw out of them would lose the
+    /// very ids they exist to count). Never called.
+    void noexcept_pins_() noexcept {
+        static_assert(noexcept(enqueue_closed(std::declval<const ClosedWindow&>())),
+                      "enqueue_closed must stay noexcept");
+    }
     static inline const std::string kOther{"other"};
     /// A source already tracked keeps its own entry; a NEW one past `kMaxSources` shares `other`.
     const std::string& clamp_source(const std::string& s) const {
@@ -395,11 +414,15 @@ private:
     std::atomic<std::uint64_t> ids_truncated_{0};
     std::atomic<std::uint64_t> queue_full_dropped_{0};
     std::atomic<std::uint64_t> alloc_failed_{0};
+    std::atomic<std::uint64_t> write_failed_carry_{0};
+    std::atomic<std::uint64_t> shutdown_carry_{0};
+    std::atomic<bool> stopped_{false};
 };
 
 /// How often the server's dedicated flush thread flushes the queued chunks, and the time one round
-/// may spend writing (checked BETWEEN rows: one AuditStore::log can overrun it by its 4 s write
-/// timeout). Measured: at 2000 distinct dropped ids/s a 15 s cadence (1.5 audit windows) against the
+/// may spend writing (checked BETWEEN rows: one AuditStore::log can overrun it by about 34 s: a 4 s
+/// pool acquire plus the 30 s statement_timeout; worst-case stop is 2 x (2 s + 34 s) + 500 ms plus the
+/// shutdown drain of up to 60 s). Measured: at 2000 distinct dropped ids/s a 15 s cadence (1.5 audit windows) against the
 /// 128-row queue named only 78-82% of the ids; 5 s keeps one window's 100 chunks inside the queue.
 /// The thread is separate from the health thread so a slow audit store cannot delay the revocation
 /// sweep (server.cpp, reregistration_flush_thread_).
@@ -432,6 +455,8 @@ ReregistrationFlushResult flush_reregistration_budget(UnprovenAuditBudget& budge
     (void)budget.poll_closed(window_now_ms, force);
     r.queue_full = budget.take_queue_full_dropped();
     r.alloc_failed = budget.take_alloc_failed();
+    r.write_failed = budget.take_write_failed_carry();
+    r.shutdown = budget.take_shutdown_carry();
     const std::int64_t deadline = now_ms() + deadline_ms;
     while (auto row = budget.take_pending()) {
         if (now_ms() >= deadline) {
@@ -454,7 +479,7 @@ ReregistrationFlushResult flush_reregistration_budget(UnprovenAuditBudget& budge
         break; // a failing store: retry on the next round, not in a tight loop
     }
     if (force)
-        r.shutdown = budget.discard_pending();
+        r.shutdown += budget.discard_pending();
     r.ids_truncated = budget.take_ids_truncated();
     return r;
 }

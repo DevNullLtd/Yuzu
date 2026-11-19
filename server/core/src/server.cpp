@@ -10498,35 +10498,47 @@ public:
         // besides stop(); per-process state, so NOT leader-gated (ReplicaSafe). Every 5 s
         // (kReregistrationFlushIntervalMs), contained, time-bounded per round
         // (kReregistrationFlushDeadlineMs, checked between rows: one AuditStore::log can overrun it by
-        // its 4 s write timeout) and skipped for one round after a failed round. Joined next to
+        // about 34 s: a 4 s pool acquire plus the 30 s statement_timeout) and skipped for one round after a failed round. Joined next to
         // health_recompute_thread_ in stop(), BEFORE the forced flush and the store teardown.
-        reregistration_flush_thread_ = std::thread([this]() {
-            bool skip_next_round = false;
-            while (!stop_requested_.load(std::memory_order_acquire)) {
-                // Sleep in <= 500 ms increments so the join in stop() is prompt.
-                for (std::int64_t waited = 0; waited < detail::kReregistrationFlushIntervalMs &&
-                                              !stop_requested_.load(std::memory_order_acquire);
-                     waited += 500)
-                    std::this_thread::sleep_for(std::chrono::milliseconds{500});
-                if (stop_requested_.load(std::memory_order_acquire))
-                    break;
-                if (skip_next_round) {
-                    skip_next_round = false;
-                    continue;
+        // The spawn holds lifecycle_mu_ and re-checks teardown_complete_/stop_requested_, exactly like
+        // the typed-source purge and collation recheck starts: without it a SIGTERM during boot could
+        // run stop() (which holds lifecycle_mu_ for its whole teardown and joins this thread) between
+        // the stop_requested_ read and the assignment, leaving a joinable thread that borrows
+        // audit_store_ and metrics_. Under the lock either stop() has not begun (it will join the
+        // thread) or it has finished (skip). The thread never takes lifecycle_mu_.
+        {
+            std::lock_guard<std::mutex> life(lifecycle_mu_);
+            if (!teardown_complete_ && !stop_requested_.load(std::memory_order_acquire)) {
+            reregistration_flush_thread_ = std::thread([this]() {
+                bool skip_next_round = false;
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    // Sleep in <= 500 ms increments so the join in stop() is prompt.
+                    for (std::int64_t waited = 0; waited < detail::kReregistrationFlushIntervalMs &&
+                                                  !stop_requested_.load(std::memory_order_acquire);
+                         waited += 500)
+                        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+                    if (stop_requested_.load(std::memory_order_acquire))
+                        break;
+                    if (skip_next_round) {
+                        skip_next_round = false;
+                        continue;
+                    }
+                    try {
+                        YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
+                        skip_next_round = flush_reregistration_audit_summary(audit_store_.get(),
+                                                                             &metrics_, /*force=*/false);
+                    } catch (const std::exception& e) {
+                        skip_next_round = true;
+                        spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
+                    } catch (...) {
+                        skip_next_round = true;
+                        spdlog::warn("Re-registration audit summary flush failed: unknown exception");
+                    }
                 }
-                try {
-                    YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
-                    skip_next_round = flush_reregistration_audit_summary(audit_store_.get(),
-                                                                         &metrics_, /*force=*/false);
-                } catch (const std::exception& e) {
-                    skip_next_round = true;
-                    spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
-                } catch (...) {
-                    skip_next_round = true;
-                    spdlog::warn("Re-registration audit summary flush failed: unknown exception");
-                }
+            });
+
             }
-        });
+        }
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
@@ -11975,8 +11987,11 @@ public:
             health_recompute_thread_.join();
         }
         // WP01: the summary flush thread, BEFORE the forced flush below and before audit_store_ /
-        // the pool are reset. Worst case this join waits for one round (<= 2 s of rows plus one
-        // 4 s write overrun), far inside the shipped 210 s stop grace.
+        // the pool are reset. Worst case this join waits for one round (up to 2 s of rows, each
+        // write possibly about 34 s: a 4 s pool acquire plus the 30 s statement_timeout) and the
+        // forced flush then runs one more round the same way, so the audit part of stop() is at
+        // most 2 x (2 s + 34 s) + 500 ms, about 73 s, on top of the shutdown drain (up to 60 s,
+        // kMaxShutdownDrainSeconds): about 133 s against the shipped 210 s stop grace.
         if (reregistration_flush_thread_.joinable()) {
             reregistration_flush_thread_.join();
         }
@@ -26422,7 +26437,7 @@ private:
         kMaxConcurrentContainmentReads};
     std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
-    std::thread reregistration_flush_thread_; // WP01: audit summary flush; joined with the health thread
+    std::thread reregistration_flush_thread_; // WP01: audit summary flush; started under lifecycle_mu_, joined in stop() right after health_recompute_thread_
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()

@@ -327,3 +327,133 @@ TEST_CASE("budget: a scenario sweep at EVERY allocation point throws nothing and
     CHECK(total_points > 200);
     CHECK(saw_alloc_failed); // the alloc_failed count really moves (the window-closing arm)
 }
+
+static_assert(noexcept(std::declval<yuzu::server::detail::UnprovenAuditBudget&>().requeue_front(
+                  std::declval<yuzu::server::detail::UnprovenAuditBudget::PendingRow>())),
+              "requeue_front must stay noexcept");
+static_assert(noexcept(std::declval<yuzu::server::detail::UnprovenAuditBudget&>()
+                           .requeue_front_unconditional(
+                               std::declval<yuzu::server::detail::UnprovenAuditBudget::PendingRow>())),
+              "requeue_front_unconditional must stay noexcept");
+static_assert(noexcept(std::declval<yuzu::server::detail::UnprovenAuditBudget&>().note_unrecorded()),
+              "note_unrecorded must stay noexcept");
+
+// ---- the re-queue node-boundary fault ---------------------------------------------------------
+
+TEST_CASE("budget: a re-queue that must allocate a deque node (a node boundary) counts the chunk's ids",
+          "[reregistration_gate][wp01][audit_budget][alloc]") {
+    std::size_t fired_unconditional = 0, fired_conditional = 0;
+    for (int pre = 0; pre < 40; ++pre)
+        for (int which = 0; which < 2; ++which) {
+            B b;
+            for (long i = 0; i < 12000; ++i)
+                (void)b.admit("i" + std::to_string(i), "s", 0);
+            (void)b.poll_closed(20000, true);
+            (void)b.take_ids_truncated();
+            for (int k = 0; k < pre; ++k)
+                (void)b.take_pending();
+            auto r = b.take_pending();
+            if (!r)
+                continue;
+            const std::size_t ids = r->ids;
+            r->attempts = 0;
+            g_countdown = 0; // the very next allocation fails
+            if (which == 0)
+                b.requeue_front_unconditional(std::move(*r));
+            else
+                (void)b.requeue_front(std::move(*r));
+            const bool fired = g_countdown < 0;
+            g_countdown = -1;
+            if (!fired)
+                continue; // spare room in the front node: nothing allocated
+            (which == 0 ? fired_unconditional : fired_conditional) += 1;
+            CHECK(b.take_ids_truncated() == ids);
+            CHECK(b.take_alloc_failed() == 1);
+        }
+    CHECK(fired_unconditional > 0);
+    CHECK(fired_conditional > 0);
+}
+
+// ---- three windows, flush rounds under fault: ids are conserved ---------------------------------
+
+namespace {
+long ids_in(const std::string& row) {
+    const auto p = row.find(" ids=");
+    if (p == std::string::npos)
+        return 0;
+    const auto s = row.substr(p + 5);
+    if (s.empty())
+        return 0;
+    long n = 1;
+    for (const char c : s)
+        n += c == ',' ? 1 : 0;
+    return n;
+}
+/// 3 windows of `nd` drops, then 12 flush rounds with the writer in `mode` (0 ok, 1 every 2nd call
+/// fails, 2 always fails) and the allocation fault armed at the `failn`-th allocation of the rounds.
+/// Returns true when an id was lost (dropped > named + counted).
+bool conservation_run(int mode, long failn, long nd) {
+    B b;
+    long long dropped = 0, named = 0, trunc = 0;
+    std::int64_t t = 0;
+    long calls = 0;
+    const auto admit_n = [&](long n, long base) {
+        for (long i = 0; i < n; ++i)
+            if (!b.admit("id" + std::to_string(base + i), "s" + std::to_string(i % 7), t).admitted)
+                ++dropped;
+    };
+    admit_n(nd, 0);
+    t += 10000;
+    admit_n(nd, 100000);
+    t += 10000;
+    admit_n(nd, 200000);
+    t += 10000;
+    std::int64_t clk = t;
+    const auto now = [&] { return clk; };
+    const auto write = [&](const std::string& row) -> bool {
+        Pause p;
+        ++calls;
+        if (mode == 2 || (mode == 1 && calls % 2 == 0))
+            return false;
+        named += ids_in(row);
+        return true;
+    };
+    g_countdown = failn;
+    for (int rnd = 0; rnd < 12; ++rnd) {
+        clk += 5000;
+        try {
+            const auto r = yuzu::server::detail::flush_reregistration_budget(b, clk, false, 2000, write, now);
+            Pause p;
+            trunc += static_cast<long long>(r.ids_truncated);
+        } catch (...) {
+            g_countdown = -1;
+            return true; // an exception escaped the flush
+        }
+    }
+    g_countdown = -1;
+    const auto r = yuzu::server::detail::flush_reregistration_budget(b, clk + 100000, true, 2000, write, now);
+    trunc += static_cast<long long>(r.ids_truncated) + static_cast<long long>(b.take_ids_truncated());
+    return dropped > named + trunc;
+}
+} // namespace
+
+TEST_CASE("budget: across three windows and every allocation fault in the flush rounds, no dropped id is lost",
+          "[reregistration_gate][wp01][audit_budget][alloc]") {
+    std::size_t runs = 0, lost = 0;
+    for (int mode = 0; mode < 3; ++mode)
+        for (long n = 1; n <= 160; ++n) {
+            ++runs;
+            lost += conservation_run(mode, n, 1500) ? 1 : 0;
+        }
+    CHECK(runs == 480);
+    CHECK(lost == 0);
+}
+
+TEST_CASE("budget: with the queue FULL (three 20000-id windows against 128 rows) every dropped id is still "
+          "named or counted",
+          "[reregistration_gate][wp01][audit_budget][alloc]") {
+    // No fault here: this pins the queue-full accounting the fault sweep above cannot reach (its
+    // windows are too small to fill the queue).
+    CHECK_FALSE(conservation_run(0, -1, 25000));
+    CHECK_FALSE(conservation_run(2, -1, 25000));
+}

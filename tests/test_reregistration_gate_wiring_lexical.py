@@ -126,6 +126,20 @@ def run(texts):
              and p.name not in ("agent_service_impl.hpp", "agent_service_impl.cpp")
              and "override_cert_proof_for_test" in p.read_text(encoding="utf-8", errors="replace")]
     check(not stray, "override_cert_proof_for_test (a test seam) must not appear in " + ", ".join(stray))
+
+    # 7. the flush thread is spawned under lifecycle_mu_ with the teardown re-check (like the typed-source
+    #    purge start), and stop() joins it BEFORE the forced flush.
+    spawn = server.find("reregistration_flush_thread_ = std::thread(")
+    check(server.count("reregistration_flush_thread_ = std::thread(") == 1 and spawn > 0,
+          "server.cpp must spawn reregistration_flush_thread_ exactly once")
+    if spawn > 0:
+        head = server[max(0, spawn - 400):spawn]
+        check("lifecycle_mu_" in head and "!teardown_complete_" in head and "stop_requested_" in head,
+              "the reregistration_flush_thread_ spawn must hold lifecycle_mu_ and re-check "
+              "teardown_complete_/stop_requested_")
+    join = server.find("reregistration_flush_thread_.join()")
+    forced = server.find("flush_reregistration_audit_summary(audit_store_.get(), &metrics_, /*force=*/true)")
+    check(0 < join < forced, "stop() must join reregistration_flush_thread_ before the forced flush")
     return failures
 
 

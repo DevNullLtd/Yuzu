@@ -152,9 +152,9 @@ inline DenialAuditBudget& reregistration_log_budget() {
 }
 
 /// Time-based / shutdown flush of the closed windows' dropped-row summary chunks (see
-/// UnprovenAuditBudget). The ONLY writer of those rows: the server's health thread, every 5 s
-/// (deadline 2 s, skipped for one round after a failed round), and
-/// stop() (`force`, deadline 2 s). A chunk that fails to write is retried on the next tick up to
+/// UnprovenAuditBudget). The ONLY writer of those rows: the server's dedicated
+/// `reregistration_flush_thread_`, every 5 s (deadline 2 s, skipped for one round after a failed round), and
+/// stop() (`force`, deadline 2 s; a write can overrun the deadline by about 34 s). A chunk that fails to write is retried on the next tick up to
 /// `kMaxWriteAttempts`; chunks that cannot be written are counted
 /// (`yuzu_register_reregistration_audit_summary_dropped_total{reason}`), never silently lost.
 /// `store` may be null/closed (counted as a failed attempt). `deadline_ms` bounds the time spent
@@ -199,8 +199,8 @@ inline bool flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsR
         auto& budget = detail::reregistration_unproven_budget();
         count("queue_full", r.queue_full, [&](std::uint64_t n) { budget.restore_counts(0, n, 0); });
         count("alloc_failed", r.alloc_failed, [&](std::uint64_t n) { budget.restore_counts(0, 0, n); });
-        count("write_failed", r.write_failed, [](std::uint64_t) {});
-        count("shutdown", r.shutdown, [](std::uint64_t) {});
+        count("write_failed", r.write_failed, [&](std::uint64_t n) { budget.restore_counts(0, 0, 0, n, 0); });
+        count("shutdown", r.shutdown, [&](std::uint64_t n) { budget.restore_counts(0, 0, 0, 0, n); });
         if (r.ids_truncated) {
             try {
                 metrics->counter("yuzu_register_reregistration_audit_ids_truncated_total")
@@ -210,6 +210,12 @@ inline bool flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsR
             }
         }
     }
+    // The shutdown-discard count is otherwise visible only to metrics in an exiting process, so a
+    // forced flush that dropped chunks or left ids unnamed says so once in the log, with both numbers.
+    if (force && (r.shutdown || r.ids_truncated))
+        spdlog::warn("Re-registration audit summary: shutdown flush dropped {} chunk(s) and left {} "
+                     "dropped id(s) unnamed (an upper bound; see the audit log reference)",
+                     r.shutdown, r.ids_truncated);
     return r.any_failed;
 }
 
@@ -265,7 +271,7 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
     };
     // Refusal rows (denied/failure) are bounded per (outcome, agent id); the admitted audit-mode
     // row is bounded per agent id, and the ids of the rows it drops are named best effort in chunked
-    // aggregate rows written by the flush thread (see reregistration_unproven_budget). Neither bound changes the call's outcome, and the unsampled
+    // aggregate rows written by the dedicated flush thread (see reregistration_unproven_budget). Neither bound changes the call's outcome, and the unsampled
     // counter yuzu_register_reregistration_total counts every decision.
     const auto emit = [&](std::string_view action, std::string_view result,
                           std::string_view outcome_text, std::string_view extra) {

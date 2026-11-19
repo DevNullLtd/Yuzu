@@ -535,7 +535,7 @@ std::pair<std::uint64_t, std::uint64_t> simulate_flood(std::int64_t interval_ms,
             (void)b.admit("fl-" + std::to_string(k), "seed-" + std::to_string(k / 40), clock);
         clock += B::kWindowMs + 1;
     }
-    (void)b.poll_closed(clock, true);
+    (void)b.poll_closed(clock, false); // not forced: a forced flush is sticky shutdown
     (void)b.take_ids_truncated();
     while (b.take_pending()) {
     }
@@ -640,12 +640,13 @@ TEST_CASE("unproven audit budget: the flush counts chunks AND ids for every unwr
         CHECK(r.shutdown >= 1);
         CHECK(r.ids_truncated >= 1);
         CHECK(b.pending_size() == 0);
-        // a forced flush with time to write loses nothing
+        // a forced flush with time to write loses nothing (a fresh budget: the one above is stopped)
+        B b2;
         std::int64_t t2 = 91'000'000;
-        fill_window(b, t2, 500);
+        fill_window(b2, t2, 500);
         std::size_t seen = 0;
         const auto ok = detail::flush_reregistration_budget(
-            b, t2, true, 1'000'000, [&](const std::string&) { ++seen; return true; }, never);
+            b2, t2, true, 1'000'000, [&](const std::string&) { ++seen; return true; }, never);
         CHECK(ok.shutdown == 0);
         CHECK(ok.ids_truncated == 0);
         CHECK(seen == ok.written);
@@ -680,4 +681,42 @@ TEST_CASE("unproven audit budget: over-cap figures are UPPER BOUNDS (a repeat of
     CHECK(rows[0].find("distinct_dropped_ids=") == std::string::npos); // the exact-sounding name is gone
     // true distinct drops: 22000 - 299 = 21701 -> over the cap by 1701; the bound counts the repeats too
     CHECK(b.take_ids_truncated() >= 1701);
+}
+
+TEST_CASE("unproven audit budget: a failed publish hands every count back, and a straggler after the forced "
+          "flush is counted",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    // restore_counts: what a registry that threw gives back is reported by the NEXT round, all five.
+    b.restore_counts(/*ids_truncated=*/7, /*queue_full=*/2, /*alloc_failed=*/3, /*write_failed=*/4, /*shutdown=*/5);
+    const auto r = detail::flush_reregistration_budget(
+        b, 1, false, 1000, [](const std::string&) { return true; }, [] { return 0; });
+    CHECK(r.ids_truncated == 7);
+    CHECK(r.queue_full == 2);
+    CHECK(r.alloc_failed == 3);
+    CHECK(r.write_failed == 4);
+    CHECK(r.shutdown == 5);
+    // a second round reports nothing again (the carry is taken once)
+    const auto r2 = detail::flush_reregistration_budget(
+        b, 2, false, 1000, [](const std::string&) { return true; }, [] { return 0; });
+    CHECK(r2.write_failed == 0);
+    CHECK(r2.shutdown == 0);
+
+    // Straggler: before the forced flush a refused row is NOT counted unnamed (its id is in the open
+    // window); after it, the id can never be named, so it is.
+    std::int64_t t = 120'000'000;
+    (void)b.admit("opener", "x", t);
+    for (int i = 0; i < 4; ++i)
+        (void)b.admit("opener", "x", t); // 3 admitted, then dropped
+    CHECK_FALSE(b.stopped());
+    CHECK(b.take_ids_truncated() == 0);
+    (void)detail::flush_reregistration_budget(b, t + 1, true, 1000,
+                                              [](const std::string&) { return true; }, [] { return 0; });
+    CHECK(b.stopped());
+    (void)b.take_ids_truncated();
+    (void)b.admit("late-1", "x", t + 2);
+    for (int i = 0; i < 10; ++i)
+        (void)b.admit("opener", "x", t + 2); // refused rows after shutdown
+    CHECK(b.take_ids_truncated() >= 1);
 }
