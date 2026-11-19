@@ -4043,7 +4043,7 @@ groups:
           description: >-
             A re-enrolment consumed a single-use enrollment token for an agent id that holds a live
             leaf, but the server issued no new leaf (reason no_csr: the agent sent no CSR, which
-            happens while its certificate file is inside its first two thirds of life; no_signer;
+            happens while its certificate is valid by its own check (inside its first two thirds of life); no_signer;
             signer_failed; signer_threw). The token is spent and the old leaf is not superseded.
             Recovery: remove the agent's cert_dir, restart it and give it a fresh single-use token.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokennoleaf"
@@ -4054,11 +4054,13 @@ groups:
         labels:
           severity: warning
         annotations:
-          summary: "More than 20000 distinct dropped re-registration ids in one window were not named"
+          summary: "Dropped re-registration ids are in no audit summary row"
           description: >-
-            The dropped-row summary names at most 20000 distinct dropped agent ids per 10 s window;
-            this counter counts the ids beyond that. For those ids the only record is the
-            unbudgeted yuzu_register_reregistration_total.
+            The dropped-row summary names at most 20000 distinct dropped agent ids per 10 s window,
+            and a summary chunk can be dropped or never built. This counter counts the ids no row
+            names: the ids beyond the cap and every id of a chunk that was dropped or never built.
+            It is an upper bound (a repeat of an over-cap id counts again). For those ids the only
+            record is the unbudgeted yuzu_register_reregistration_total.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditidstruncated"
 
       - alert: YuzuAgentReregistrationAuditSummaryDropped
@@ -4069,8 +4071,11 @@ groups:
         annotations:
           summary: "A dropped-row summary chunk for re-registration audit rows was not written"
           description: >-
-            A summary chunk was discarded (reason queue_full, write_failed or shutdown). The ids it
-            named are still counted by yuzu_register_reregistration_audit_dropped_total.
+            A summary chunk was discarded (reason queue_full, write_failed, shutdown or
+            alloc_failed). The ids it would have named are now UNNAMED and counted by id in
+            yuzu_register_reregistration_audit_ids_truncated_total
+            (yuzu_register_reregistration_audit_dropped_total counts rows, not ids). The unbudgeted
+            yuzu_register_reregistration_total still counts every decision.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditsummarydropped"
 
       - alert: YuzuAgentLeafSupersedeFailed

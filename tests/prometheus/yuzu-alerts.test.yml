@@ -11059,3 +11059,19 @@ tests:
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
       - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+
+  # WP01 Gate 8 pass 6: the alloc_failed reason fires too, and the annotation names the right counter.
+  - interval: 1m
+    name: audit summary dropped - alloc_failed fires, and the description points at the ids counter
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="alloc_failed"}', values: "0x10 1 1x60"}
+    alert_rule_test:
+      - alertname: YuzuAgentReregistrationAuditSummaryDropped
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: warning}
+            exp_annotations:
+              summary: "A dropped-row summary chunk for re-registration audit rows was not written"
+              description: "A summary chunk was discarded (reason queue_full, write_failed, shutdown or alloc_failed). The ids it would have named are now UNNAMED and counted by id in yuzu_register_reregistration_audit_ids_truncated_total (yuzu_register_reregistration_audit_dropped_total counts rows, not ids). The unbudgeted yuzu_register_reregistration_total still counts every decision."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditsummarydropped"
+
