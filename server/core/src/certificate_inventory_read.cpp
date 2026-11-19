@@ -306,7 +306,12 @@ pg::PgResult run(PGconn* c, const std::string& sql, const std::vector<std::strin
         err = PQerrorMessage(c);
         if (const char* st = PQresultErrorField(r.get(), PG_DIAG_SQLSTATE)) {
             t_sqlstate = st;
-            t_timed_out = t_sqlstate == "57014"; // query_canceled: the statement_timeout we armed
+            // query_canceled counts as OUR budget running out only when the wall deadline has (nearly)
+            // passed; an earlier 57014 (pg_cancel_backend, an operator cancel) is an ordinary
+            // retryable degrade, never a scale limit.
+            t_timed_out = t_sqlstate == "57014" &&
+                          std::chrono::steady_clock::now() >=
+                              t_txn_deadline - std::chrono::milliseconds{250};
         }
     }
     return r;
