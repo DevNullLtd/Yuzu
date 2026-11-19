@@ -750,6 +750,17 @@ TEST_CASE("cert read model: a page is caller-priced unless unfiltered or key-add
           "[certread][model]") {
     using namespace yuzu::server;
     CertReadFilter f;
+    // Tripwire: a new CertReadFilter field fails this binding to compile, forcing a decision on
+    // whether caller_priced_page must count it (an unlisted field would be uncapped).
+    {
+        auto& [store, scope, key_alg_oid, sig_alg_oid, ec_curve_oid, not_after_before, not_after_after,
+               not_before_after, rsa_modulus_bits_lt, ec_order_bits_lt, is_ca, self_signed, agent_id,
+               issuer_dn, issuer_dn_contains, subject_dn_contains, sha256, spki_sha256, aki_key_id] = f;
+        (void)store, (void)scope, (void)key_alg_oid, (void)sig_alg_oid, (void)ec_curve_oid;
+        (void)not_after_before, (void)not_after_after, (void)not_before_after, (void)rsa_modulus_bits_lt;
+        (void)ec_order_bits_lt, (void)is_ca, (void)self_signed, (void)agent_id, (void)issuer_dn;
+        (void)issuer_dn_contains, (void)subject_dn_contains, (void)sha256, (void)spki_sha256, (void)aki_key_id;
+    }
     CHECK_FALSE(cert_read::caller_priced_page(f));
     f.agent_id = "a";
     f.sha256 = std::string(64, 'a');

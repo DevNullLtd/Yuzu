@@ -46,6 +46,8 @@ inline constexpr std::size_t kCertCursorMaxBytes = 2048;
 /// Every filter of the per-certificate read and the summary. Values are already validated and
 /// normalised by `cert_read::parse_*` (hex lower/upper-cased to the stored case, dates
 /// normalised to `YYYY-MM-DDTHH:MM:SSZ`, bounds checked); the store binds them, never splices.
+/// Adding a field? Decide whether cert_read::caller_priced_page must count it (the field-count
+/// tripwire in test_certificate_read_model.cpp fails to compile until you do).
 struct CertReadFilter {
     std::optional<std::string> store;      ///< a store_id: has a location in it
     std::optional<std::string> scope;      ///< closed: "machine"

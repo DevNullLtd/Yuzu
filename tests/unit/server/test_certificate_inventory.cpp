@@ -2084,16 +2084,22 @@ TEST_CASE("CertificateInventoryStore reads: a self-issued end-entity certificate
     ca.issuer_dn = "CN=Root CA";
     ca.self_signed.reset();
     ca.is_ca = true; // a self-issued CA still names a CA
-    put_report(store, "agent-1", {rfact(1), leaf, ca});
+    auto nosub = rfact(9);
+    nosub.subject_dn.reset(); // no subject: cannot be shown to differ from its issuer
+    nosub.issuer_dn = "CN=Carol Person";
+    nosub.self_signed.reset();
+    nosub.is_ca = false;
+    put_report(store, "agent-1", {rfact(1), leaf, ca, nosub});
     auto r = store.summarize_certificates(CertSummaryQuery{}, std::nullopt);
     REQUIRE(r.has_value());
     bool saw_root = false;
     for (const auto& g : r->issuers) {
         CHECK(g.issuer_dn.find("Bob") == std::string::npos);
+        CHECK(g.issuer_dn.find("Carol") == std::string::npos);
         saw_root = saw_root || g.issuer_dn == "CN=Root CA";
     }
     CHECK(saw_root);
-    CHECK(r->totals.certificate_count == 3); // excluded from the issuer groups only
+    CHECK(r->totals.certificate_count == 4); // excluded from the issuer groups only
 }
 
 TEST_CASE("CertificateInventoryStore reads: the summary groups raw values and buckets the caller's edges",
@@ -3072,6 +3078,41 @@ TEST_CASE("pg background build: a stop cancels a CIC blocked behind an old snaps
     REQUIRE(t.status() == PGRES_TUPLES_OK);
     CHECK(std::string(PQgetvalue(t.get(), 0, 0)) == "t");
     exec_ok(pool, "DROP INDEX IF EXISTS certificate_inventory_store.blocked_idx");
+}
+
+TEST_CASE("CertificateInventoryStore reads: a summary cancelled early is a retryable degrade, never a scale limit",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "agent-1", {rfact(1), rfact(2)});
+    PgPool side{{.conninfo = cert_shared().db.dsn(), .size = 2}};
+    REQUIRE(side.valid());
+    auto locker = side.acquire();
+    REQUIRE(locker);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE certificate_inventory_store.cert_fact IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    const int locker_pid = PQbackendPID(locker.get());
+    std::atomic<bool> done{false};
+    auto killer_lease = side.acquire();
+    REQUIRE(killer_lease);
+    std::thread killer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{400}); // far from the 15 s wall deadline
+        while (!done.load())
+            (void)pg::exec_params(killer_lease.get(),
+                                  "SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+                                  "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                                  "AND pid <> pg_backend_pid() AND pid <> $1::int",
+                                  std::vector<std::string>{std::to_string(locker_pid)});
+    });
+    auto r = store.summarize_certificates(CertSummaryQuery{}, std::nullopt);
+    done = true;
+    killer.join();
+    (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind != CertReadError::Kind::kScaleLimit); // an operator cancel, not fleet size
+    CHECK(r.error().kind == CertReadError::Kind::kQueryError);
 }
 
 TEST_CASE("pg background build: a cancel burst never returns a connection with the timeouts lifted",
