@@ -31,7 +31,7 @@
     "**IP matching includes local bind addresses, not just remote peers.** `check_ip_addresses()` matches an IOC IP against either `conn.local_addr` or `conn.remote_addr` (`ioc_plugin.cpp:575`) — the macOS capture shows `127.0.0.1` reported `matched=true` with detail `Active connection - LISTEN (pid 20945)` (`docs/samples/macos.txt:4`), i.e. a socket merely *bound* to the checked address counts as a match even with no outbound connection to it.",
     "**Linux sees TCP only.** `get_connections()` on Linux parses `/proc/net/tcp` and `/proc/net/tcp6` only — there is no `/proc/net/udp` read (`ioc_plugin.cpp:346-351`) — so `ip_addresses`/`ports` checks against a UDP-only listener silently report \"not found\" on Linux even though the same check would match on Windows or macOS.",
     "**Silent degradation on API failure, not a typed error.** If `GetExtendedTcpTable`/`GetExtendedUdpTable` returns a non-`NO_ERROR` status, `get_connections()` simply adds no rows for that table rather than surfacing a failure (`ioc_plugin.cpp:141-179,222-242`); combined with the plugin never setting a result status, a caller cannot distinguish \"checked, not present\" from \"the connection table couldn't be read.\"",
-    "**`/etc/hosts` domain matching is a raw substring search.** `check_domains()` on Linux/macOS strips comments then does `line.find(domain)` (`ioc_plugin.cpp:613-621`) — a short or partial domain can match unrelated lines; there is no word-boundary or exact-hostname check. At most 100 `domains` are accepted per command (counted after splitting on commas, trimming whitespace and dropping empty entries; duplicates count): a longer list is refused whole (one `error|domains|false|Too many domains (N, max 100)` row, rc 1, no check run), never truncated. On Windows the DNS resolver cache is read once per command and freed before matching (`win_dns_cache_table.hpp`).",
+    "**Domain checks see only the hosts file on Linux/macOS.** `check_domains()` reads `/etc/hosts` and nothing else — there is no DNS cache lookup, so a name resolvable only via DNS is reported not found. At most 100 `domains` are accepted per command (counted after splitting on commas, trimming whitespace and dropping empty entries; duplicates count): a longer list is refused whole (one `error|domains|false|Too many domains (N, max 100)` row, rc 1, no check run), never truncated. On Windows the DNS resolver cache is read once per command and freed before matching (`win_dns_cache_table.hpp`).",
     "**PID is never available from the Linux TCP parse.** `parse_proc_net()` hard-codes PID 0 for every connection (`ioc_plugin.cpp:341`), so Linux `ip`/`port` match details never name an owning process the way Windows and macOS do."
   ],
   "definitions": [
@@ -40,7 +40,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Check one or more Indicators of Compromise against the local endpoint state. Supports five IOC types: IP addresses (checked against active connections — TCP and UDP on Windows and macOS, TCP only on Linux), domains (checked against the DNS resolver cache on Windows, or a substring match against /etc/hosts on Linux/macOS), file hashes (SHA-256 compared against specified file paths), file paths (existence and size), and ports (checked against the same connection table as IP addresses). All parameters are optional but at least one must be provided, or the plugin returns rc 1 with no result rows. Values within each parameter are comma-separated.",
+      "description": "Check one or more Indicators of Compromise against the local endpoint state. Supports five IOC types: IP addresses (checked against active connections — TCP and UDP on Windows and macOS, TCP only on Linux), domains (checked against the DNS resolver cache on Windows, or an exact hostname or alias match against /etc/hosts on Linux/macOS), file hashes (SHA-256 compared against specified file paths), file paths (existence and size), and ports (checked against the same connection table as IP addresses). All parameters are optional but at least one must be provided, or the plugin returns rc 1 with no result rows. Values within each parameter are comma-separated.",
       "display_name": "Check Indicators of Compromise",
       "execute_roles": [
         "endpoint-admin",
@@ -59,7 +59,7 @@
     }
   ],
   "description": "Indicator of Compromise checking — match IOCs against local endpoint state",
-  "how_it_works": "`check` is the plugin's only action. It takes five optional, comma-separated parameters (`ip_addresses`, `domains`, `file_hashes`, `file_paths`, `ports`); if none are supplied it writes one `error|none|false|No IOC parameters provided` row and returns 1 without ever writing the column-header line (`ioc_plugin.cpp:802-809`). Otherwise it writes a literal `type|value|matched|detail` header line (`ioc_plugin.cpp:809`), then runs each supplied check in a fixed order — IP, domain, hash, path, port — reporting progress at 30/50/70/90/100% (`ioc_plugin.cpp:817-847`). Active connections are enumerated once and shared by the IP and port checks (`ioc_plugin.cpp:812-815`). Domain checking is two different mechanisms depending on OS: the Windows leg queries the live DNS resolver cache via the undocumented `DnsGetCacheDataTable` export; Linux and macOS instead do a substring search over `/etc/hosts` (`ioc_plugin.cpp:392-425,604-629`). Hash checking never touches an IOC feed or reputation service — it computes SHA-256 (a from-scratch implementation, no OpenSSL) over every path in `file_paths` and compares against each requested hash (`ioc_plugin.cpp:452-549,633-674`); without `file_paths` every requested hash reports unmatched. The plugin deliberately does no network calls, no threat-intel lookup, and no quarantine or remediation action — it only reports what is locally observable at call time.",
+  "how_it_works": "`check` is the plugin's only action. It takes five optional, comma-separated parameters (`ip_addresses`, `domains`, `file_hashes`, `file_paths`, `ports`); if none are supplied it writes one `error|none|false|No IOC parameters provided` row and returns 1 without ever writing the column-header line (`ioc_plugin.cpp:797-804`). Otherwise it writes a literal `type|value|matched|detail` header line (`ioc_plugin.cpp:804`), then runs each supplied check in a fixed order — IP, domain, hash, path, port — reporting progress at 30/50/70/90/100% (`ioc_plugin.cpp:818-842`). Active connections are enumerated once and shared by the IP and port checks (`ioc_plugin.cpp:807-810`). Domain checking is two different mechanisms depending on OS: the Windows leg queries the live DNS resolver cache via the undocumented `DnsGetCacheDataTable` export; Linux and macOS instead do an exact hostname or alias match against `/etc/hosts` (comments stripped, case-insensitive, one trailing dot ignored, address column never matched). Hash checking never touches an IOC feed or reputation service — it computes SHA-256 (a from-scratch implementation, no OpenSSL) over every path in `file_paths` and compares against each requested hash (`ioc_plugin.cpp:452-551,628-669`); without `file_paths` every requested hash reports unmatched. The plugin deliberately does no network calls, no threat-intel lookup, and no quarantine or remediation action — it only reports what is locally observable at call time.",
   "inputs": [
     {
       "constraints": null,
@@ -74,7 +74,7 @@
       "constraints": null,
       "default": null,
       "definition_id": "security.ioc.check",
-      "description": "Comma-separated list of domain names (e.g. `evil.example.com`) to check. On Windows this queries the DNS resolver cache; on Linux/macOS it is a substring search over /etc/hosts lines (comments stripped), so a short domain can match more than intended. At most 100 domains per command (counted after splitting on commas, trimming whitespace and dropping empty entries; duplicates count); more is refused with an error row and nothing is checked.\n",
+      "description": "Comma-separated list of domain names (e.g. `evil.example.com`) to check. On Windows this queries the DNS resolver cache; on Linux/macOS it is an exact hostname or alias match against /etc/hosts (comments stripped, case-insensitive, one trailing dot ignored; the address column is never matched). At most 100 domains per command (counted after splitting on commas, trimming whitespace and dropping empty entries; duplicates count); more is refused with an error row and nothing is checked.\n",
       "name": "domains",
       "required": false,
       "type": "string"
@@ -185,8 +185,8 @@
   },
   "privileges": [
     {
-      "grant": "None observed — `GetExtendedTcpTable`/`GetExtendedUdpTable`, `DnsGetCacheDataTable`, and `GetFileAttributesEx`-family calls read attributes only (`ioc_plugin.cpp:141-242,393-425,436-446`)",
-      "if_refused": "Silent degradation, not an error: a failed `GetExtendedTcpTable`/`UdpTable` call is skipped with no rows added (`ioc_plugin.cpp:141-179,222-242`), so an IP/port check that can't read the connection table reports \"not found\" rather than a typed failure — the plugin never calls a result-status API",
+      "grant": "None observed — `GetExtendedTcpTable`/`GetExtendedUdpTable`, `DnsGetCacheDataTable`, and `GetFileAttributesEx`-family calls read attributes only (`ioc_plugin.cpp:143-244,395-427,438-448`)",
+      "if_refused": "Silent degradation, not an error: a failed `GetExtendedTcpTable`/`UdpTable` call is skipped with no rows added (`ioc_plugin.cpp:143-181,224-244`), so an IP/port check that can't read the connection table reports \"not found\" rather than a typed failure — the plugin never calls a result-status API",
       "measured": "2026-09-07, bare-metal, Windows NT 10.0.26200.0 x64 (`docs/samples/windows.txt:1`)",
       "os": "Windows",
       "runs_as": "no `docs/agent-privilege-model.md` row; sample captured as `SYSTEM`"
@@ -200,7 +200,7 @@
     },
     {
       "grant": "None observed — `/proc/net/tcp[6]`, `/etc/hosts`, and `stat()` are world-readable",
-      "if_refused": "Same silent-degradation pattern; additionally, PID is never available from `/proc/net/tcp` parsing on Linux (`ioc_plugin.cpp:341`), so IP/port match details there never name a process",
+      "if_refused": "Same silent-degradation pattern; additionally, PID is never available from `/proc/net/tcp` parsing on Linux (`ioc_plugin.cpp:343`), so IP/port match details there never name a process",
       "measured": "2026-09-07, container, Debian GNU/Linux 13 aarch64 (`docs/samples/linux.txt:1`)",
       "os": "Linux",
       "runs_as": "no privilege-model row; sample captured at euid 0, container"
@@ -319,17 +319,20 @@
       "server/core/src/capability_decls/plugin_action_catalogue_d.hpp"
     ],
     "changelog": [
+      "changelog.d/7710-ioc-hosts-exact-match.fixed.md",
       "changelog.d/8164-ioc-domain-cap.fixed.md"
     ],
     "definitions": [
       "content/definitions/ioc.yaml"
     ],
     "plugin": [
+      "agents/plugins/ioc/src/ioc_parsers.hpp",
       "agents/plugins/ioc/src/ioc_plugin.cpp"
     ],
     "privilege_row": false,
     "tests": [
-      "tests/unit/test_ioc_domain_cap.cpp"
+      "tests/unit/test_ioc_domain_cap.cpp",
+      "tests/unit/test_ioc_parsers.cpp"
     ]
   },
   "version": "1.0.0",

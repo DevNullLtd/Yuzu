@@ -38,6 +38,10 @@ on:
     # docs/ci-architecture.md; adopting the detect-code-change pattern is
     # tracked on #3771).
     paths:
+      - 'agents/shared/file_search_*'
+      - 'agents/shared/base64*'
+      - 'agents/shared/wire_utf8*'
+      - 'agents/shared/sha256*'
       - 'server/core/src/preflight_parse*'
       - 'server/core/src/deployment_parse*'
       - 'server/core/src/yaml_scan*'

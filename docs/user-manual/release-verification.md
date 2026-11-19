@@ -12,6 +12,12 @@ All examples assume you have downloaded the release assets from
 <https://github.com/DevNullLtd/Yuzu/releases> into the current directory, and
 that the tag under verification is `v0.11.0`. Substitute as needed.
 
+**cosign version.** Every `cosign verify` of a Docker image on this page needs **cosign v3.0 or
+later**. Recent releases' images are signed with cosign v3's bundle format, and cosign v2.x reports
+`no signatures found` for a genuine image (some v2.x builds accept `--new-bundle-format` but
+ignore it, so do not rely on that flag). cosign v3 also verifies older releases' images. `cosign
+verify-blob` of a release's `SHA256SUMS` works with cosign v2.6.2 or later.
+
 > **Warning: older release pages show a wildcard command.** The GitHub release
 > pages for v0.7.0-rc1 to v0.15.0 (18 of the 22 pages published in that range,
 > all published before the fix in #7529) print a `cosign verify-blob` command
@@ -61,7 +67,228 @@ certificate at build time and cannot be restamped.
 | CycloneDX SBOMs | One per binary archive, package and installer (the Compose Wizard zip, first-party HTML and JavaScript, has none), named after the file without its extension (`yuzu-linux-x64.cdx.json`, `yuzu-agent_X.Y.Z_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z.cdx.json`, ...), and one per image: `yuzu-{server,gateway,postgres}-image.cdx.json` and `yuzu-{server,gateway,agent}-chisel-image.cdx.json` | `cyclonedx validate` |
 | SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
-| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` | `cosign verify` |
+| Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
+| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
+
+**Do not trust an image tag that has no GitHub Release.** The images are pushed, signed and tagged
+before the GitHub Release is created, and a failed publish job stops the release. A release workflow
+moves an image's tags only after the pushed digest was checked to be the scanned image and was
+signed and attested, but a `:X.Y.Z` tag can still exist in GHCR for a version that has no GitHub
+Release, or whose release lacks that image's SBOM in `SHA256SUMS`. Use an image only when its version has a published GitHub Release and the image
+passes `cosign verify` (step 3) with the exact release identity.
+
+**`:latest` moves before the Release exists.** For a stable release, the floating tags `:latest` and
+`:X.Y` of `yuzu-server`, `yuzu-gateway`, `yuzu-postgres` and the three `-chisel` images move when
+each image is tagged (after its digest is verified, signed and attested), which is during the release
+workflow and BEFORE the GitHub Release is created
+(the Release is created only after every one of those images is published). For the minutes in
+between, and for as long as the release stays unfinished when a later image or the release step
+fails, `:latest` names a version that has no GitHub Release, and can name the new version for some
+images and the previous one for others. (The agent-bundle image is tagged only as `:X.Y.Z`, after the
+Release.) So do not deploy `:latest` or `:X.Y` blind: resolve it to a digest, and check that digest
+belongs to a version with a published GitHub Release and passes `cosign verify` for that release's
+tag. Pinning a release's exact tag or digest avoids the question.
+
+Check that the Release exists, verify every image of it, and compare `:latest` with it:
+
+```bash
+TAG=vX.Y.Z    # the release you mean to deploy
+# 1. The GitHub Release exists (exit 1, "release not found", when it does not):
+gh release view "$TAG" --repo DevNullLtd/Yuzu --json tagName,isDraft,publishedAt
+# 2. Every image of that release is signed by that release's workflow and tag:
+for img in yuzu-server yuzu-gateway yuzu-postgres yuzu-server-chisel yuzu-gateway-chisel \
+           yuzu-agent-chisel yuzu-agent-bundle-chisel; do
+  cosign verify \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "ghcr.io/${OWNER}/${img}:${TAG#v}" > /dev/null && echo "${img}:${TAG#v} verified"
+done
+# 3. What :latest names now, against the release's own tag (repeat per image you pull):
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-server:latest" --format '{{.Manifest.Digest}}'
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-server:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+Accept the release only when step 1 prints `"isDraft":false` and a `publishedAt` date (a draft is
+not a release, and `gh release view` shows drafts to anyone with access to the repository), every
+`verified` line prints, and, before you deploy `:latest`, the two digests are equal. Releases before
+the chisel variants and the agent bundle have no such images, so those names fail to resolve there
+(the agent bundle is tagged only as `:X.Y.Z`, never `:latest`). If only `yuzu-agent-bundle-chisel`
+fails to verify, read the bundle's publish journals (below): they say how far each attempt got, and
+whether any attempt moved the tag.
+
+## Image vulnerability scan before publishing
+
+Before `release.yml` pushes an image, it scans the locally built image (by image ID) with a pinned
+Trivy and refuses to push it when the scanner finds a **CRITICAL vulnerability that has a fix
+available** in what it can see and the finding is not an accepted one. "What it can see" is narrower
+than the image: the list below says what it does not cover. Accepted findings are listed in
+`.trivyignore.yaml` in the repository at the release tag; the release scan honours an entry only when
+it is scoped to concrete file paths inside the image (each a path with a `/`, with no wildcard
+character and not a scanner result name such as `Python`) or to packages at exact versions, never to
+a bare vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
+approver's login, an approval date and a pull-request reference that are not `pending`. The release
+scan checks those three approval fields for **format only**: it does not confirm with GitHub that the
+pull request exists or that the named person approved it, and nothing stops the approver it names
+from being the change's own author. The control behind an acceptance is the project's review of the
+change that adds it, and that review is not required: the repository's code-owner entries for
+these files (pull request #8243) request a review from a release owner, but the branch rules do not require a code owner's review (an owner
+decision), so any one approving review merges the change. To audit an
+acceptance, follow its pull-request reference and check who approved it there.
+
+The release scan also refuses to push, rather than report a clean scan, when:
+
+- the scanner sees no operating-system package in an image that is not on the reviewed not-covered
+  list (the chiselled images are on it, below);
+- the scanner cannot show its database holds advisories for the image's operating-system release,
+  as the scanner identifies that release from the image's files: the scanner marks the release end
+  of life; the distribution is not Debian, Ubuntu or Alpine; the version is a pre-release (`_alpha`,
+  `_rc`, `~rc1`, `-rc`, Debian testing or sid, Alpine edge, and similar markers) or not a plain
+  release number; or a test scan of that release holding packages older than every fix matches
+  nothing. A clean scan of such an image would prove nothing about what it ships;
+- the vulnerability database is older than 72 hours, or was not downloaded by that run.
+
+After the release, the pre-release QA workflow scans the published tags again with a newer database;
+a finding there is reported, it cannot unpublish anything.
+
+What this does **not** gate:
+
+- HIGH and lower findings, and CRITICAL findings with no fix released: they are in the report, not
+  refused.
+- The operating-system packages of the chiselled images (`yuzu-*-chisel`, and the agent-bundle delivery
+  image): they are built from Ubuntu package slices with no package database the scanner can read, so
+  their OS packages are not scanned at all. Each report's `.gate.txt` says `coverage: not-covered` for
+  them. Choose the non-chisel image if you need its OS packages covered by this scan.
+- PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
+  which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
+- The gateway's bundled Erlang/OTP runtime, and anything statically linked into the server and agent
+  binaries.
+- The integrity of the vulnerability database itself: its publisher does not sign it. Each report
+  records the database's registry digest, so the database a scan used can be identified afterwards,
+  but a database altered before the download is not detected.
+
+Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
+`trivy-<image>.attempt-<N>.json` (the full report, including the image ID, the layer digests and
+every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
+`trivy-<image>.attempt-<N>.gate.txt` (the run attempt, the Trivy version, the database's digest and
+date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
+file's hash and the result). `<N>` is the release workflow's run attempt; every attempt's reports are
+kept, a refused or cancelled attempt's (`gate: FAIL: <reason>`, `gate: FAIL: cancelled ...`)
+included. Beside each attempt whose scan passed is its publish journal,
+`publish-<image>.attempt-<N>.txt`: one line per publishing step that attempt completed, in this
+order and with one digest throughout:
+
+```
+publish: none
+publish: push-started <repository>[:candidate-<run>-<N>]
+publish: verified <repository>@sha256:<digest>
+publish: signed-attested <repository>@sha256:<digest>
+publish: tagging <repository>:<tag>[,...] sha256:<digest>
+publish: tagged <repository>:<tag>[,...] sha256:<digest>
+```
+
+Each line is written before the next step starts, and the image's tags are moved only after the
+`signed-attested` line: the digest was first checked to have the scanned image's layers, then signed
+and attested. A journal that stops early records how far that attempt got (`tagging` means some of
+its tags may have moved). An attempt with no journal normally pushed nothing (its scan refused the
+image, or the job stopped first), but a missing journal is absence of a record, not proof: the
+upload of the record can fail.
+
+For each of the six images the published image is the HIGHEST attempt whose journal ends
+`publish: tagged`, and the release is not created unless there is one and no higher attempt ends
+`publish: tagging`. To check one of them (the release's assets, downloaded beside `SHA256SUMS` and
+verified as above):
+
+```bash
+OWNER=devnullltd; TAG=vX.Y.Z   # the release, as set above
+img=yuzu-server   # or yuzu-gateway, yuzu-postgres, yuzu-server-chisel, ...
+# Each attempt's last journal line, in attempt order (attempt 10 after 9):
+for f in $(ls publish-${img}.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
+docker buildx imagetools inspect "ghcr.io/${OWNER}/${img}:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+The highest attempt whose last line is `publish: tagged ...` must name the digest the last command
+prints. A refusal that was never followed by a release (the tag was cut again instead) is kept only
+in that workflow run's artifacts, for 90 days.
+
+**Candidate tags and untagged digests are not releases.** The packages also hold images no release
+names: a `:candidate-<run>-<N>` tag on `yuzu-agent-bundle-chisel` (how the bundle is pushed before
+it is checked), and untagged digests in every package (an attempt whose push was not verified,
+signed or tagged, or that a later attempt replaced). Do not deploy them, and do not take a
+signature on one as a release: a published image is the digest a release tag (`:X.Y.Z`) names, of a
+version with a published GitHub Release, that `cosign verify` accepts for that release's tag.
+Candidates are left in place; nothing deletes them as routine cleanup. If you use image
+automation that picks the newest tag, restrict it to release tags (`^[0-9]+\.[0-9]+\.[0-9]+$`, which
+excludes candidate and pre-release tags) or pin by digest, so it never selects a candidate.
+
+**Release images and release tags: what is enforced and what is practice.** Enforced by the
+release workflow: within it, a release tag is moved only by its "Tag the release" step, after the
+image is scanned, verified, signed and attested, and the workflow deletes no image. Practice, not
+enforced: a wrong or superseded release is fixed by a new patch release; deleting a published
+release or a GHCR package version, and moving a release tag outside the workflow, are
+owner-decided incidents, recorded in a tracking issue and announced. A patch release does not move
+the superseded release's own `:X.Y.Z` (a deployment pinned to that tag keeps pulling the image it
+names), and a patch on an older `X.Y` line moves `:latest` to that line until the next stable
+release on the newest line, so pin a version or a digest if that matters to you. Two older
+maintainer scripts (`scripts/docker-release.sh`, `scripts/build-agent-bundle.sh --push`) can push
+release tags outside the release workflow, bypassing its gate and journal; they are not used to
+publish a release, and an image they pushed is not one the release's signed records name. If a
+release image or tag ever had to stop being served, the project would announce it with the release.
+Either of the following is an incident, not a registry fault to wait out; report it through
+[private vulnerability reporting](https://github.com/DevNullLtd/Yuzu/security/advisories/new):
+
+- **A release's `:X.Y.Z`, or a digest its journal names, stops resolving or changes without such an
+  announcement.** Do not adopt the new digest. Keep deploying the digest you already have only if
+  `cosign verify` still accepts THAT DIGEST for that release's tag (verify the digest, not the tag,
+  which may now name something else); never replace it with an image no release names:
+
+  ```bash
+  cosign verify \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "ghcr.io/${OWNER}/<image>@sha256:<the digest you deployed>"
+  ```
+
+- **You suspect a release digest itself is compromised.** Stop deploying that digest to new hosts,
+  and handle the hosts already running it under your own incident process (isolating them if your
+  process calls for it). Do not switch to an image no release names; move only to a digest a later
+  release announces and that `cosign verify` accepts, by digest as above, for that release's tag.
+
+The agent-bundle image is built after the release exists, so its reports and journals are attached
+afterwards, every attempt's, with a signed checksum list per attempt (table above). Check them, and
+that the bundle's tag names the digest of the highest `tagged` attempt:
+
+```bash
+TAG=vX.Y.Z
+gh release download "$TAG" --repo DevNullLtd/Yuzu --dir bundle-scan \
+  --pattern 'yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*' \
+  --pattern 'trivy-yuzu-agent-bundle-chisel.attempt-*' \
+  --pattern 'publish-yuzu-agent-bundle-chisel.attempt-*'
+cd bundle-scan
+for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
+  cosign verify-blob --bundle "${sums}.sigstore" \
+    --certificate-identity "https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG}" \
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+    "$sums"
+  sha256sum -c "$sums"
+done
+grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt
+for f in $(ls publish-yuzu-agent-bundle-chisel.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
+docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
+```
+
+Every list must print `Verified OK` and every file `OK`. The highest attempt whose journal's last
+line is `publish: tagged ...` is the published bundle image: the digest on that line must equal
+what the last command prints, and that attempt's `gate:` line must be `gate: pass`. If an attempt
+above it ends `publish: tagging`, the tag may name either digest: do not deploy the bundle until a
+later attempt ends `tagged`. When no attempt ends `publish: tagged`, the record cannot say what the
+tag names: an attempt ending `tagging` may have moved it, and so may an attempt whose record was
+never uploaded. Deploy the bundle only if the digest the last command prints is on some attempt's
+`tagging` or `tagged` line (that digest was checked and signed before any tag moved) and passes
+`cosign verify` for the release's tag; otherwise do not deploy it, and ask the project. A re-run
+adds new report assets and never replaces a completed one (an upload that was interrupted, which
+GitHub never served, is replaced). The reports are a point-in-time record:
+a vulnerability disclosed after the release is not in them.
 
 ## Prerequisites
 
@@ -72,7 +299,8 @@ certificate at build time and cannot be restamped.
 #   macOS:   brew install gh
 #   Windows: winget install --id GitHub.cli
 
-# cosign v2.6.2 or later, for Sigstore signature verification
+# cosign v3.0 or later, for Sigstore signature verification (see "cosign version" at
+# the top of this page)
 #   Ubuntu/Debian: curl -sSLO https://github.com/sigstore/cosign/releases/latest/download/cosign-linux-amd64 && chmod +x cosign-*
 #   macOS:         brew install cosign
 #   Windows:       winget install --id Sigstore.Cosign
@@ -119,6 +347,15 @@ above); never take it from an error message.
 
 On success: `Verified OK`. Combined with step 1, this proves every
 listed asset is exactly what the workflow produced.
+
+Rely on the signed list, not on the release's asset list: release assets
+can change after publication (GitHub's immutable-releases setting is off
+for this repository, and the agent bundle's files are attached after the
+release). Download every asset and run `sha256sum -c SHA256SUMS` without
+`--ignore-missing`, so a listed file that is missing or changed fails. An
+asset that no signed list names proves nothing, and the agent bundle's
+per-attempt lists are not themselves listed anywhere signed, so a removed
+attempt (its list, signature and files together) cannot be detected.
 
 ## 3. Verify Docker image signatures (cosign)
 
@@ -430,6 +667,30 @@ jq '.relationships[] | select(.relationshipType == "CONTAINS" and .relatedSpdxEl
 
 ### CycloneDX
 
+From 0.16.0, the Windows agent archive and installer also carry Microsoft's
+Visual C++ runtime in the agent's `bin` directory, unmodified and signed by
+Microsoft: `vcruntime140.dll`, `vcruntime140_1.dll`, `msvcp140.dll`,
+`msvcp140_atomic_wait.dll` and any other `vcruntime140_*.dll` or
+`msvcp140_*.dll` the build machine's Visual Studio redistributable directory
+holds. Each Windows SBOM describes its own artifact: the archive's SBOM
+is made from the unpacked archive, which holds these DLLs in `bin`, and the
+installer's SBOM lists the files its installer packs, with the runtime DLLs at
+`msvc-runtime\...` (see "What a file's SBOM lists" above). The cataloguer that
+makes the archive's SBOM (syft, through the pinned `anchore/sbom-action`)
+lists each native DLL it finds as an application component, named and versioned from the DLL's version resource (for a
+Microsoft DLL, its file description), with a CPE and no package URL (purl), so
+a runtime DLL can appear more than once. A scanner or policy that matches
+components on purl does not see them. No release SBOM has yet been inspected
+for these entries. The authoritative version of the runtime a release shipped
+is the file version of the Microsoft-signed DLLs in its payload (the archive's
+`bin` directory, or `bin` under the installed agent's directory). The
+`Build Windows x64` job's step summary lists the staged DLLs and their file
+versions for that workflow run and is kept only as long as the run is. The
+version follows the Visual C++ toolset the release is pinned to
+(`deploy/packaging/windows/msvc-toolset.pin`). Their licence terms are in
+`NOTICE`. Windows Update does not service this copy; see "Windows agent:
+Visual C++ runtime" in the [user manual](README.md#windows-agent-visual-c-runtime).
+
 ```bash
 # List all components + versions (CycloneDX, pretty-printed)
 jq -r '.components[] | "\(.name)\t\(.version)\t\(.purl // "")"' yuzu-linux-x64.cdx.json | column -t
@@ -610,7 +871,8 @@ subject cosign prints. A network error reaching Sigstore's TUF root usually
 clears on a re-run (cosign needs network access to the TUF root, or a local
 `--trusted-root`; there is no offline mode in `scripts/build-agent-bundle.sh`); if
 it persists for about an hour, or cosign reports an expired or unverifiable
-trusted root, update cosign (v2.6.2 or later) instead of waiting.
+trusted root, update cosign (v2.6.2 or later for this check; v3.0 or later if you also verify
+images) instead of waiting.
 
 **`SHA256SUMS.sigstore: no such file`** — the v0.7.x releases ship the
 bundle only under the legacy filename `SHA256SUMS.bundle`; v0.8.0-rc0 to

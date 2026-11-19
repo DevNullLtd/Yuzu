@@ -5297,7 +5297,7 @@ void SettingsRoutes::register_routes(
         if (is_reserved_identity_prefix(username)) {
             spdlog::warn("POST /api/settings/users: username '{}' uses a reserved SSO-principal "
                         "prefix — rejected",
-                        username);
+                        ::yuzu::log_key_token(username));
             audit_fn_(req, "user.create", "denied", "User", username, "reserved_prefix");
             res.status = 400;
             res.set_header(

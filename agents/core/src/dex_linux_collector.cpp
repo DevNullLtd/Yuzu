@@ -30,6 +30,7 @@
 #include "dex_perf_breach.hpp"    // breach_update, kCpuBreach/kMemoryBreach, *_observation
 #include "dex_win_poll.hpp"       // DiskLevel, latch_should_emit
 
+#include <yuzu/log_token.hpp> // log_key_token: subject/reason come from journal fields (F59)
 #include <yuzu/agent/dex_rate_limiter.hpp> // DexRateLimiter — per-obs_type hourly emit cap
 
 #include <sys/statvfs.h>
@@ -511,7 +512,7 @@ private:
         if (decision != RateDecision::Emit)
             return; // over cap this hour — drop
         spdlog::info("dex_observer(linux): observed {} subject='{}' reason={}", obs.obs_type,
-                     obs.subject, obs.reason);
+                     ::yuzu::log_key_token(obs.subject), ::yuzu::log_key_token(obs.reason));
         try {
             sink_(obs);
         } catch (...) {
