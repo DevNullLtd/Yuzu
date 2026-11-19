@@ -33,9 +33,15 @@
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <atomic>
 #include <chrono>
 #include <ctime>
+#include <memory>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -2302,6 +2308,105 @@ TEST_CASE("PolicyStore: mark_blocked writes in chunks and counts distinct ids",
     REQUIRE(cs.has_value());
     CHECK(cs->blocked == 1201);
     CHECK(cs->total == 1201);
+}
+
+TEST_CASE("PolicyStore: mark_blocked takes its pool lease once per chunk and holds none between",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    std::atomic<int> acquires{0};
+    PgPool::Options opts;
+    opts.conninfo = db.dsn();
+    opts.size = 4;
+    opts.observer.on_acquire_wait_seconds = [&acquires](double) { ++acquires; };
+    PgPool pool{opts};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // 1201 ids is three chunks (500, 500, 201); an unfenced and a fenced write each take one
+    // lease per chunk, so a long run never pins one pooled connection for its whole length.
+    std::vector<std::string> ids;
+    for (int i = 0; i < 1201; ++i)
+        ids.push_back("agent-" + std::to_string(i));
+
+    const int before = acquires.load();
+    auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE(r.has_value());
+    CHECK(r->changed == 1201);
+    CHECK(acquires.load() - before == 3);
+    CHECK(pool.in_use() == 0);
+
+    // A single chunk takes one.
+    const int before_small = acquires.load();
+    auto small = store.mark_blocked(pol.value(), {"agent-1", "agent-2"}, "check", "echo",
+                                    "purge_source", "destructive");
+    REQUIRE(small.has_value());
+    CHECK(acquires.load() - before_small == 1);
+}
+
+namespace {
+// Captures what the default logger writes while it is alive, at info level or above.
+class StoreLogCapture {
+public:
+    StoreLogCapture()
+        : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(os_)),
+          saved_level_(spdlog::default_logger()->level()) {
+        spdlog::default_logger()->set_level(spdlog::level::info);
+        spdlog::default_logger()->sinks().push_back(sink_);
+    }
+    ~StoreLogCapture() {
+        auto& sinks = spdlog::default_logger()->sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
+        spdlog::default_logger()->set_level(saved_level_);
+    }
+    StoreLogCapture(const StoreLogCapture&) = delete;
+    StoreLogCapture& operator=(const StoreLogCapture&) = delete;
+    std::string text() {
+        spdlog::default_logger()->flush();
+        return os_.str();
+    }
+
+private:
+    std::ostringstream os_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+    spdlog::level::level_enum saved_level_;
+};
+} // namespace
+
+TEST_CASE("PolicyStore: mark_blocked logs at info when a run covers more than 5000 targets",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    std::vector<std::string> ids;
+    for (int i = 0; i < 5000; ++i)
+        ids.push_back("agent-" + std::to_string(i));
+
+    {
+        StoreLogCapture cap;
+        auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+        REQUIRE(r.has_value());
+        CHECK(cap.text().find("mark_blocked") == std::string::npos); // 5000 is not over the line
+    }
+    ids.push_back("agent-5000");
+    {
+        StoreLogCapture cap;
+        auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+        REQUIRE(r.has_value());
+        const auto text = cap.text();
+        CHECK(text.find("[info]") != std::string::npos);
+        CHECK(text.find("mark_blocked") != std::string::npos);
+        CHECK(text.find("policy=" + pol.value()) != std::string::npos);
+        CHECK(text.find("targets=5001") != std::string::npos);
+        CHECK(text.find("phase=check") != std::string::npos);
+    }
 }
 
 TEST_CASE("PolicyStore: mark_blocked never stores an identifier authoring would refuse",

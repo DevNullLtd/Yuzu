@@ -1240,10 +1240,12 @@ PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::s
     std::sort(ids.begin(), ids.end());
     ids.erase(std::unique(ids.begin(), ids.end()), ids.end());
 
-    auto lease = pool_.try_acquire_for(kAcquireTimeout);
-    if (!lease)
-        return std::unexpected(std::string(kPolicyDbErrorPrefix) +
-                               "database unavailable, try again");
+    // A large run is worth a line: it is one write per 500 targets on every refusal.
+    constexpr std::size_t kLargeRun = 5000;
+    if (ids.size() > kLargeRun)
+        spdlog::info("PolicyStore: mark_blocked policy={} phase={} targets={} (chunks of 500, one "
+                     "pool lease per chunk)",
+                     policy_id, phase, ids.size());
 
     // Unfenced (a refused CHECK): the UPSERT, because the first refusal for an agent may be
     // its first row. Every target row is written, so last_check_at is refreshed on each
@@ -1303,6 +1305,19 @@ PolicyStore::mark_blocked(const std::string& policy_id, const std::vector<std::s
         std::vector<std::string> params{policy_id, pg::to_text_array(as_views(chunk)), check_result};
         if (expected_gen)
             params.push_back(std::to_string(*expected_gen));
+
+        // One pool lease per chunk, released before the next: a refused /evaluate on a large
+        // scope repeats every chunk on each call, and holding one connection across all of them
+        // would let a handful of concurrent calls take the whole pool. Each chunk is its own
+        // statement, so nothing depends on one connection spanning them.
+        auto lease = pool_.try_acquire_for(kAcquireTimeout);
+        if (!lease) {
+            // Earlier chunks stay written; a retry is idempotent.
+            if (total.changed > 0)
+                invalidate_fleet_compliance_cache();
+            return std::unexpected(std::string(kPolicyDbErrorPrefix) +
+                                   "database unavailable, try again");
+        }
 
         pg::PgResult res =
             pg::exec_params(lease.get(), expected_gen ? fenced_sql.c_str() : unfenced_sql.c_str(),
