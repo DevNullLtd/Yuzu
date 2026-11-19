@@ -31,6 +31,23 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 **What changed.** REST accepted such a field. It is now refused with `400` and `RESULT_SET_BAD_REQUEST: a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)`, before the instruction is looked up and before anything is dispatched or stored. These are the bounds the MCP tool `create_result_set_from_instruction_result` already applied, with the same message without the `RESULT_SET_BAD_REQUEST: ` prefix; the tool is unchanged. They bound the size of a matcher field a caller supplies, and apply to the matcher's own `column`, `op` and `value` whatever its `kind`. The dashboard's form limits `column` to 128 and `value` to 512 characters, so it can exceed a bound only with non-ASCII text; the page then shows the refusal.
 
+## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: every Windows device that runs the agent. To do: deploy each Windows agent from the 0.16.0 installer or archive. Agent self-update (OTA) does not carry the runtime or any plugin.
+
+**What changed.**
+
+- **The Visual C++ runtime ships with the agent.** `yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe` carry `vcruntime140*.dll` and `msvcp140*.dll` in the agent's `bin` directory, so a Windows device needs no Visual C++ 2015-2022 Redistributable (Microsoft's package that installs the runtime into `System32`) installed first. The agent uses this copy even where the Redistributable is installed, and Windows Update does not service it. See [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime).
+- **The installer installs five more plugins.** System: `browser_inventory`, `printing`, `privacy_permissions`. Network: `netprobe`. Windows: `rdp_control`. `browser_inventory` and `privacy_permissions` stay behind their server-side kill switch (off until an operator turns it on; where it is already on, a device installed with this installer answers them at once). `rdp_control`'s `set_state` can turn Remote Desktop on and open its firewall rule group (Mutating, Irreversible, admin or approval).
+- **`license_scan` is not installed by the installer.** Installing it starts the agent's daily software-licensing collection on the device with no operator action, and under ADR-3006 (decision D10) no release adds a unit that runs by default until the fleet-level setting for additions exists (#8309 tracks it). The release archive still carries it.
+- **Uninstall removes three files the installer does not install.** `plugins\license_scan.dll` (copied in from the archive, if it was), and `bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified`, which agent self-update leaves. What uninstall removes and what it leaves, the agent's data directory included, is under [What uninstalling removes](README.md#what-uninstalling-removes).
+
+**Each release's installer and archive carry that release's runtime and plugins.** Deploy a Windows agent from the installer or archive of a single release. Agent self-update (OTA) replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin (#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported configuration (see "Deployment contract (hard cutover)" in the Forensics section of this page). Agents check for updates automatically. No installer option turns that off, and every run of the installer writes the agent's service command line without `--no-auto-update`; see "Over-the-Air Agent Updates" in [Device Management](device-management.md#over-the-air-agent-updates).
+
+**If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service manager restarts the service every 60 seconds and each start fails the same way. Deploy the agent from the installer or archive of one release (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
 ## Behaviour change: release SBOMs describe each shipped file, and every package and installer has its own
 
 **What changed.** The release used to publish one CycloneDX and one SPDX SBOM per platform, made by scanning the whole build workspace: they listed the vcpkg ports catalogue, docs and test tooling (40,853 components for v0.15.0's Linux SBOM) and not the C++ libraries the binaries link. Each release asset now has its own SBOM pair, made from that file alone:
