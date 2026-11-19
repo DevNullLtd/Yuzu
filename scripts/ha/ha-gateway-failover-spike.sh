@@ -48,6 +48,8 @@ export LC_ALL=C   # a comma-radix locale would change EPOCHREALTIME's format
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source=../lib/agent-session-fp.sh
+. "$REPO_ROOT/scripts/lib/agent-session-fp.sh"
 COMPOSE_FILE="$REPO_ROOT/deploy/docker/docker-compose.ha-gateway-failover.yml"
 STATE_ROOT="${SPIKE_STATE_ROOT:-$HOME/.local/share/yuzu/ws13-spike}"
 NETFAULT_IMAGE="yuzu-spike-netfault:1"
@@ -280,9 +282,23 @@ agent_map() {
     for c in $(compose ps -q agent); do
         local name sess
         name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
-        sess="$(docker logs "$c" 2>&1 | sed -n 's/.*Registered with server (session=\([^,]*\),.*/\1/p' | tail -1)"
+        # The agent log carries only session_fp= (#8159): the first 8 hex of SHA-256(session id).
+        # Join it to the id in the route table, the same key the rest of this script uses.
+        local fp alog
+        alog="$(docker logs "$c" 2>&1 | tr -d '\r')"
+        fp="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
+        sess=""
+        if [ -n "$fp" ]; then
+            # Exactly one route row or the whole map fails (shared with the tests, scripts/lib).
+            sess="$(route_session_for_fp "$fp")" || { echo "agent_map: cannot resolve the session for $name" >&2; rm -f "$run/agent_map.csv.tmp"; return 1; }
+        else
+            echo "agent_map: no session_fp on the Registered line of $name; cannot resolve its session" >&2
+            rm -f "$run/agent_map.csv.tmp"
+            return 1
+        fi
         echo "$name,$c,$sess"
-    done > "$run/agent_map.csv"
+    done > "$run/agent_map.csv.tmp" || { rm -f "$run/agent_map.csv.tmp"; return 1; }
+    mv "$run/agent_map.csv.tmp" "$run/agent_map.csv"
 }
 
 dispatch_probe() { # dispatch_probe RUN LABEL AGENT_ID : one os_info command to one agent
@@ -632,7 +648,7 @@ cmd_scenario() {
     local run="$STATE/run-$id-$mode-$(date +%H%M%S)"; mkdir -p "$run"
     local total; total="$(compose ps -q agent | wc -l)"
     say "scenario $id mode=$mode agents=$total window=${window}s -> $run"
-    agent_map "$run"
+    agent_map "$run" || die "agent_map failed; refusing to measure on a partial agent map"
     local victim; victim="$(node_counts | sort -t, -k2 -nr | head -1 | cut -d, -f1)"
     if [ -n "$force_victim" ]; then
         local fip; fip="$(docker inspect -f '{{(index .NetworkSettings.Networks "'"$SPIKE_PROJECT"'_spike").IPAddress}}' "$(cname "$force_victim")")"
@@ -722,7 +738,8 @@ cmd_scenario() {
         docker logs --since "$since" "$(cname $n)" > "$run/gwlog-$n.txt" 2>&1
     done
     docker logs --since "$since" "$(cname server)" > "$run/serverlog.txt" 2>&1
-    agent_map "$run.after" 2>/dev/null; mv "$run.after/agent_map.csv" "$run/agent_map_after.csv" 2>/dev/null; rmdir "$run.after" 2>/dev/null
+    mkdir -p "$run.after" && agent_map "$run.after" && mv "$run.after/agent_map.csv" "$run/agent_map_after.csv" || note "after-map unavailable"
+    rm -rf "$run.after"
     analyse "$run" "$id" "$mode"
     case "$id" in
     F2|F2p|F3|F3x)

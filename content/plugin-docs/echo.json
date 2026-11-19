@@ -2931,12 +2931,14 @@
       "agents/plugins/echo/src/echo_user_collector.cpp",
       "agents/plugins/echo/src/echo_version.hpp",
       "agents/plugins/echo/src/echo_win_process_name.hpp",
-      "agents/plugins/echo/src/echo_win_raii_guards.hpp"
+      "agents/plugins/echo/src/echo_win_raii_guards.hpp",
+      "agents/plugins/echo/src/echo_wire_scrub.hpp"
     ],
     "privilege_row": true,
     "tests": [
       "tests/test_echo_adoption_wiring_lexical.py",
       "tests/test_echo_mapdrive_pin_lexical.py",
+      "tests/test_echo_scrub_wiring_lexical.py",
       "tests/test_echo_security_wiring_lexical.py",
       "tests/test_echo_test_standard_lexical.py",
       "tests/test_echo_timeline_script_behaviour.py",

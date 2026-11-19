@@ -43,10 +43,13 @@ namespace detail {
 /// is a flat "k=v;k=v" string parsed by SIEM tooling and rendered on the
 /// dashboard audit log; an unsanitised value could inject `;`/`=` to forge
 /// additional fields, or `\r`/`\n`/other control bytes to inject fake log
-/// lines or corrupt terminal/log-viewer rendering. Replaces `;`, `=`, `\r`,
-/// `\n`, and any control byte (incl. DEL) with `_`, then truncates to 128
-/// bytes — backing up to a UTF-8 code-point boundary so a multi-byte value
-/// never ends mid-sequence. Dependency-free by design. Exposed in
+/// lines or corrupt terminal/log-viewer rendering. First folds the value
+/// through `yuzu::log_key_token` (C0 controls, DEL, well-formed C1 U+0080-U+009F,
+/// U+2028 and U+2029 become `_`; input over 256 bytes is shortened there), then
+/// replaces `;`, `=`, `\r`, `\n` and any remaining control byte with `_`, then
+/// truncates to 128 bytes — backing up to a UTF-8 code-point boundary so a
+/// multi-byte value never ends mid-sequence. Depends only on the header-only
+/// `log_token.hpp`. Exposed in
 /// `yuzu::server::detail` (mirrors the rest_a4_envelope.hpp pattern) so unit
 /// tests can call it directly.
 ///
@@ -58,6 +61,14 @@ namespace detail {
 /// is later rendered. Never rely on this function alone to make a value
 /// HTML-safe.
 std::string sanitize_detail_value(std::string_view v);
+
+/// Neutralise a SamlProvider::validate_response error for the log line AND the
+/// `auth.saml_login_failed` audit detail / event (F72, CWE-117). The text embeds values read
+/// from the posted XML (the unsigned samlp:StatusCode/@Value, the Assertion ID), and an XML
+/// character reference such as `&#10;` decodes to a real line feed. Folds CR/LF/C0/C1 and the
+/// Unicode line separators (yuzu::log_key_token, which also caps the length), then the
+/// audit-detail delimiters (sanitize_detail_value).
+std::string neutralise_saml_error(std::string_view err);
 
 } // namespace detail
 
