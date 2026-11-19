@@ -205,8 +205,9 @@ enum class ReadError {
 };
 
 /// The REST `retry_after_ms` (and, rounded to seconds, `Retry-After`) and the MCP hint of `kBusy`.
-/// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held up to the store
-/// call's own bounds, so 2 s is a typical-contention hint, not a guarantee.
+/// Derivation: the 500 ms slot wait plus one typical page read. A slot can be held for the store
+/// call plus the audit write(s) (about 62 s on REST in the worst case), so 2 s is a
+/// typical-contention hint, not a guarantee.
 inline constexpr std::int64_t kBusyRetryAfterMs = 2000;
 
 /// Wire message for a refused request: the cursor messages above, and for `kScopeTooWide` the

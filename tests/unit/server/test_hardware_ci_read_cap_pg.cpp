@@ -322,7 +322,8 @@ AuditLockRun run_with_locked_audit_table(const std::string& dsn, int cap, bool h
             locker.get(),
             "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events'",
+            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events' "
+            "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
             std::vector<std::string>{});
         if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
             waiting = std::atoi(PQgetvalue(r.get(), 0, 0));

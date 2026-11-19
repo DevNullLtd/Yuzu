@@ -9,7 +9,7 @@ round 1 fix), `cd9c5dea60` (round 2 fix; documentation, the triage and client gu
 `22e73a667e` and `3a69da28d6` (round 2 follow-ups), `021f8f626d` (round 3: the slot is held through the audit
 write of a served bulk page, #7951) and the round 4 commit (an MCP busy refusal writes no row, the bound wording
 and hold-time figures corrected).
-**Status:** implemented and governed, with four fix rounds; not merged. The residuals below are recorded, not
+**Status:** implemented and governed, with five fix rounds (the round 4 commit 2175f94e96, the round 5 wording commit b29fa5985e) and a scoped re-review of the last range; not merged. The residuals below are recorded, not
 accepted; residual 3 also records the owner's adjudication of it as pre-existing and out of scope.
 
 **Supersession.** The subjects of `915454b74b` ("authz and audit keep a connection") and `28e94b3b9a`
@@ -49,8 +49,9 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
    `test_hardware_ci_read_cap_pg.cpp`, with a control). The audit writes that hold no slot stay uncapped: point
    reads (`agent_id`), the failure row after a failed store read, the refusal rows (scope too wide, collation
    ordering unverified, MCP argument refusals) and every other audited route, so the same lock can still
-   saturate the pool through them (a mechanism that predates this change), and at pool 1 or 2 (cap 1) one
-   stalled audit write can leave authorization without a connection. A busy refusal writes no row on either
+   saturate the pool through them (a mechanism that predates this change), and at pool 1 (cap 1, the
+   whole pool) one stalled audit write can leave authorization without a connection (at pool 2 it takes two: the one capped
+   bulk writer plus one writer that holds no slot). A busy refusal writes no row on either
    transport. Owner adjudication: recorded as pre-existing and out of scope for this change (2026-11-18); the
    class-wide follow-up is the audit-write-path issue (to be filed; its number will be recorded here and in the ledger).
 4. A slot is held for the whole store call and then the access-audit write(s). The store call: a pool acquire of up to 3 s

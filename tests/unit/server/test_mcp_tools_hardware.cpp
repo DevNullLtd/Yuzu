@@ -44,6 +44,7 @@
 #include <chrono>
 #include <condition_variable>
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <latch>
 #include <map>
@@ -51,6 +52,7 @@
 #include <mutex>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -3104,13 +3106,14 @@ struct HandlerLockRun {
     int served{0};      // calls answered normally once the lock was released
     int rows_written{0};
     bool authz_ok{false};
+    std::string authz_error; // the rbac read's error text when it failed
     int in_use_during{-1};
 };
 
 enum class Transport { kRest, kMcp };
 
 HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap, Transport transport) {
-    pg::PgPool pool{{.conninfo = dsn, .size = pool_size}};
+    pg::PgPool pool{{.conninfo = dsn, .size = static_cast<std::size_t>(pool_size)}};
     REQUIRE(pool.valid());
     RbacStore rbac{pool};
     AuditStore audit{pool};
@@ -3120,6 +3123,11 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
     Twin t(capped(cap));
     seed(t, {"a", "b"});
     std::atomic<int> rows_written{0};
+    // The fake store is not thread-safe and two workers are admitted at cap 2: serialise its read.
+    t.ci_read_hook = [&](const DeviceCiKeysetQuery& q) {
+        std::lock_guard lk(t.mu);
+        return t.ci_store.read(q);
+    };
     // The handler's own audit sink writes a real row. Domain row only: the first write is the one
     // that parks on the lock, so it is the one that matters for the pool.
     t.on_domain_audit = [&] {
@@ -3148,7 +3156,7 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
              {"params", {{"name", "list_hardware_ci_records"}, {"arguments", json::object()}}}}
             .dump();
     const int burst = cap + 2; // always a surplus beyond the cap
-    std::atomic<int> busy{0}, served{0};
+    std::atomic<int> busy{0}, served{0}, failed{0};
     std::vector<std::thread> threads;
     // Declared after `threads`, the atomics and the Twin: on any exit path the lock is released first
     // (the stalled INSERTs then finish), then every thread is joined.
@@ -3166,16 +3174,21 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
     for (int i = 0; i < burst; ++i)
         threads.emplace_back([&] {
             bool is_busy = false;
+            bool is_ok = false;
             if (transport == Transport::kRest) {
                 const auto res = t.sink.Get("/api/v1/hardware-ci");
                 is_busy = res && res->status == 503 && res->get_header_value("Retry-After") == "2";
+                is_ok = res && res->status == 200;
             } else {
                 // post(), not call(): call() uses REQUIRE, which is not safe off the test thread.
                 const auto res = t.post(call_body);
                 const json r = res ? json::parse(res->body, nullptr, false) : json();
-                is_busy = r.is_object() && r.contains("error") && r["error"].value("message", "") == kBusyMessage;
+                is_busy = r.is_object() && r.contains("error") && r["error"].is_object() &&
+                          r["error"].value("message", "") == kBusyMessage;
+                is_ok = r.is_object() && r.contains("result");
             }
-            (is_busy ? busy : served).fetch_add(1);
+            // served = answered normally; anything else that is not busy is a failure, not a serve.
+            (is_busy ? busy : (is_ok ? served : failed)).fetch_add(1);
         });
 
     // Every surplus call is refused promptly; the `cap` admitted ones are parked in their audit write.
@@ -3190,7 +3203,8 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
             locker.get(),
             "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
             "JOIN pg_namespace n ON n.oid = c.relnamespace "
-            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events'",
+            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events' "
+            "AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())",
             std::vector<std::string>{});
         if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
             waiting = std::atoi(PQgetvalue(r.get(), 0, 0));
@@ -3201,12 +3215,18 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
     out.waiting = waiting;
     out.busy = busy.load();
     out.in_use_during = t.ci_slots->in_use();
-    out.authz_ok = rbac.user_rbac_group_names_checked("tester").has_value();
+    {
+        const auto authz = rbac.user_rbac_group_names_checked("tester");
+        out.authz_ok = authz.has_value();
+        if (!authz)
+            out.authz_error = authz.error();
+    }
 
     unlock();
     for (auto& th : threads)
         th.join();
     out.served = served.load();
+    CHECK(failed.load() == 0); // no admitted call may fail for another reason
     out.rows_written = rows_written.load();
     CHECK(t.ci_slots->in_use() == 0);
     return out;
@@ -3217,9 +3237,12 @@ HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap,
 TEST_CASE("audit lock, real handlers: pool 4 / cap 2 parks exactly the cap and authorization keeps a connection",
           "[pg][hardware][ci_page][bulk_read_slots][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, handler_lock_tpl);
+    const auto resolved = resolve_bulk_read_cap(2, 4); // the largest explicit cap the boot rule admits at pool 4
+    REQUIRE(resolved.has_value());
+    REQUIRE(resolved->cap == 2);
     for (const auto transport : {Transport::kRest, Transport::kMcp}) {
         INFO((transport == Transport::kRest ? "REST" : "MCP"));
-        const auto r = run_handler_burst(db_.dsn(), /*pool=*/4, /*cap=*/2, transport);
+        const auto r = run_handler_burst(db_.dsn(), /*pool=*/4, resolved->cap, transport);
         CHECK(r.waiting == 2); // the handlers' writers really are parked on the lock
         CHECK(r.busy == 2);    // the surplus was refused: no read, no audit write
         CHECK(r.in_use_during == 2);
@@ -3249,15 +3272,19 @@ TEST_CASE("audit lock, real handlers: pool 2 / cap 1 (the derived default) leave
 TEST_CASE("audit lock, real handlers: pool 1 / cap 1 is the documented residual, the cap is not a reserve",
           "[pg][hardware][ci_page][bulk_read_slots][slow]") {
     YUZU_REQUIRE_PG_DB_TPL(db_, handler_lock_tpl);
+    const auto resolved = resolve_bulk_read_cap(kBulkReadCapUnset, 1);
+    REQUIRE(resolved.has_value());
+    REQUIRE(resolved->cap == 1);
     for (const auto transport : {Transport::kRest, Transport::kMcp}) {
         INFO((transport == Transport::kRest ? "REST" : "MCP"));
-        const auto r = run_handler_burst(db_.dsn(), /*pool=*/1, /*cap=*/1, transport);
+        const auto r = run_handler_burst(db_.dsn(), /*pool=*/1, resolved->cap, transport);
         CHECK(r.waiting == 1);
         CHECK(r.busy == 2);
         // The cap equals the whole pool, so the one parked writer holds the only connection. This is
         // pinned as the documented behaviour (review record residual 3), not endorsed: a change that
         // reserves a connection should flip it.
         CHECK_FALSE(r.authz_ok);
+        CHECK(r.authz_error.starts_with(kRbacErrPoolAcquireTimeout)); // starved, not some other failure
         CHECK(r.served == 1);
         CHECK(r.rows_written == 1);
     }
