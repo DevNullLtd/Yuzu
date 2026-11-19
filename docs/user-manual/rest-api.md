@@ -5521,7 +5521,7 @@ Enable a previously disabled policy.
 
 **Response (400):** `policy not found`. **Response (400), refused instruction:** enabling is where a policy starts to run, so the same refused-instruction check runs here (a policy installed by a product pack was never checked at install); same body as `POST /api/policy-fragments`, audited `policy.enable / denied`, detail `reason=<reason> instruction=<id>`. **Response (503):** a genuine internal
 store failure on the write — safe to retry, internal error string never
-included in the body; also `503` with message `instruction lookup unavailable, try again` (the A4 error envelope; `retry_after_ms` 5000 only when the instruction store failed, `null` for an unwired evaluator) when the refused-instruction check cannot be answered.
+included in the body; also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator).
 
 ---
 
