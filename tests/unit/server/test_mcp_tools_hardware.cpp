@@ -13,6 +13,7 @@
 /// failure withholds the data, strict argument bounds, REST byte identity, output-schema
 /// conformance, and the audit-row contents.
 
+#include "audit_store.hpp"
 #include "bulk_read_slots.hpp"
 #include "device_ci_kinds.hpp"
 #include "device_ci_section_digest.hpp"
@@ -24,11 +25,17 @@
 #include "mcp_server_testonly.hpp"
 #include "mcp_tool_deps.hpp"
 #include "mcp_tool_registry.hpp"
+#include "pg/pg_exec.hpp"
+#include "pg/pg_pool.hpp"
+#include "pg/pg_raii.hpp"
+#include "rbac_store.hpp"
 #include "test_fake_ci_keyset_store.hpp"
 #include "test_json_schema_subset.hpp"
 #include "test_route_sink.hpp"
+#include "../test_helpers.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 #include <yuzu/metrics.hpp>
 
@@ -3053,4 +3060,205 @@ TEST_CASE("audit outage: a stalled audit write holds its slot, so the cap refuse
     CHECK(second->get_header_value("Retry-After") == "2");
     CHECK(t.ci_store.reads == reads_before); // refused before any read
     // (the second request's own audit hook never runs: a busy refusal writes no REST row)
+}
+
+// ───────────── the real handlers against a really locked audit table (#7951, residual 14) ─────────
+//
+// The Postgres cases in test_hardware_ci_read_cap_pg.cpp drive `read_page` and `AuditStore::log`
+// directly. These run the REAL REST and MCP handlers through the Twin, with the domain audit sink
+// writing a real row to a real AuditStore on a pool of 1, 2 or 4 connections while a session
+// outside the pool holds ACCESS EXCLUSIVE on the audit table. Pool 2 uses the derived default cap
+// (1); pool 4 uses the largest explicit cap the boot rule allows (2); pool 1 has cap 1.
+//
+// What the pool size changes, asserted by name: at pool 4 (cap 2) and pool 2 (cap 1) at least one
+// connection stays free for authorization; at pool 1 (cap 1, the whole pool) it does not, which is
+// the documented residual ("the cap is not a reserve"). Needs YUZU_TEST_POSTGRES_DSN (SKIPs without).
+
+namespace {
+
+yuzu::test::PgTestTemplate handler_lock_tpl{"hwci_handler_audit_lock", [](const std::string& dsn) {
+    pg::PgPool pool{{.conninfo = dsn, .size = 2}};
+    RbacStore rbac{pool};
+    AuditStore audit{pool};
+    if (!rbac.is_open() || !audit.is_open())
+        throw std::runtime_error("hwci handler audit lock template: a store failed to migrate");
+}};
+
+AuditEvent handler_audit_row() {
+    AuditEvent e;
+    e.timestamp = std::chrono::duration_cast<std::chrono::seconds>(
+                      std::chrono::system_clock::now().time_since_epoch())
+                      .count();
+    e.principal = "tester";
+    e.action = "inventory.devices.ci";
+    e.target_type = "Inventory";
+    e.target_id = "fleet";
+    e.detail = "hardware CI records: rows=2 scope=fleet";
+    e.result = "success";
+    return e;
+}
+
+struct HandlerLockRun {
+    int waiting{0};     // audit INSERTs the server reports ungranted on the locked table
+    int busy{0};        // calls refused as busy while the lock was held
+    int served{0};      // calls answered normally once the lock was released
+    int rows_written{0};
+    bool authz_ok{false};
+    int in_use_during{-1};
+};
+
+enum class Transport { kRest, kMcp };
+
+HandlerLockRun run_handler_burst(const std::string& dsn, int pool_size, int cap, Transport transport) {
+    pg::PgPool pool{{.conninfo = dsn, .size = pool_size}};
+    REQUIRE(pool.valid());
+    RbacStore rbac{pool};
+    AuditStore audit{pool};
+    REQUIRE(rbac.is_open());
+    REQUIRE(audit.is_open());
+
+    Twin t(capped(cap));
+    seed(t, {"a", "b"});
+    std::atomic<int> rows_written{0};
+    // The handler's own audit sink writes a real row. Domain row only: the first write is the one
+    // that parks on the lock, so it is the one that matters for the pool.
+    t.on_domain_audit = [&] {
+        if (audit.log(handler_audit_row()))
+            rows_written.fetch_add(1);
+    };
+
+    pg::PgConn locker{PQconnectdb(dsn.c_str())};
+    REQUIRE(PQstatus(locker.get()) == CONNECTION_OK);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(), "LOCK TABLE audit_store.audit_events IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    bool locked = true;
+    auto unlock = [&] {
+        if (locked) {
+            (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+            locked = false;
+        }
+    };
+
+    const std::string call_body =
+        json{{"jsonrpc", "2.0"},
+             {"method", "tools/call"},
+             {"id", 7},
+             {"params", {{"name", "list_hardware_ci_records"}, {"arguments", json::object()}}}}
+            .dump();
+    const int burst = cap + 2; // always a surplus beyond the cap
+    std::atomic<int> busy{0}, served{0};
+    std::vector<std::thread> threads;
+    // Declared after `threads`, the atomics and the Twin: on any exit path the lock is released first
+    // (the stalled INSERTs then finish), then every thread is joined.
+    struct Cleanup {
+        std::function<void()> unlock;
+        std::vector<std::thread>& threads;
+        ~Cleanup() {
+            unlock();
+            for (auto& th : threads)
+                if (th.joinable())
+                    th.join();
+        }
+    } cleanup{unlock, threads};
+
+    for (int i = 0; i < burst; ++i)
+        threads.emplace_back([&] {
+            bool is_busy = false;
+            if (transport == Transport::kRest) {
+                const auto res = t.sink.Get("/api/v1/hardware-ci");
+                is_busy = res && res->status == 503 && res->get_header_value("Retry-After") == "2";
+            } else {
+                // post(), not call(): call() uses REQUIRE, which is not safe off the test thread.
+                const auto res = t.post(call_body);
+                const json r = res ? json::parse(res->body, nullptr, false) : json();
+                is_busy = r.is_object() && r.contains("error") && r["error"].value("message", "") == kBusyMessage;
+            }
+            (is_busy ? busy : served).fetch_add(1);
+        });
+
+    // Every surplus call is refused promptly; the `cap` admitted ones are parked in their audit write.
+    const auto settle = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (busy.load() < burst - cap && std::chrono::steady_clock::now() < settle)
+        std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    HandlerLockRun out;
+    int waiting = 0;
+    const auto lock_deadline = std::chrono::steady_clock::now() + std::chrono::seconds{10};
+    while (std::chrono::steady_clock::now() < lock_deadline) {
+        auto r = pg::exec_params(
+            locker.get(),
+            "SELECT count(*) FROM pg_locks l JOIN pg_class c ON c.oid = l.relation "
+            "JOIN pg_namespace n ON n.oid = c.relnamespace "
+            "WHERE NOT l.granted AND n.nspname = 'audit_store' AND c.relname = 'audit_events'",
+            std::vector<std::string>{});
+        if (r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1)
+            waiting = std::atoi(PQgetvalue(r.get(), 0, 0));
+        if (waiting >= cap)
+            break;
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+    }
+    out.waiting = waiting;
+    out.busy = busy.load();
+    out.in_use_during = t.ci_slots->in_use();
+    out.authz_ok = rbac.user_rbac_group_names_checked("tester").has_value();
+
+    unlock();
+    for (auto& th : threads)
+        th.join();
+    out.served = served.load();
+    out.rows_written = rows_written.load();
+    CHECK(t.ci_slots->in_use() == 0);
+    return out;
+}
+
+} // namespace
+
+TEST_CASE("audit lock, real handlers: pool 4 / cap 2 parks exactly the cap and authorization keeps a connection",
+          "[pg][hardware][ci_page][bulk_read_slots][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, handler_lock_tpl);
+    for (const auto transport : {Transport::kRest, Transport::kMcp}) {
+        INFO((transport == Transport::kRest ? "REST" : "MCP"));
+        const auto r = run_handler_burst(db_.dsn(), /*pool=*/4, /*cap=*/2, transport);
+        CHECK(r.waiting == 2); // the handlers' writers really are parked on the lock
+        CHECK(r.busy == 2);    // the surplus was refused: no read, no audit write
+        CHECK(r.in_use_during == 2);
+        CHECK(r.authz_ok);
+        CHECK(r.served == 2);
+        CHECK(r.rows_written == 2); // the parked writes complete once the lock is released
+    }
+}
+
+TEST_CASE("audit lock, real handlers: pool 2 / cap 1 (the derived default) leaves the other connection free",
+          "[pg][hardware][ci_page][bulk_read_slots][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, handler_lock_tpl);
+    const auto resolved = resolve_bulk_read_cap(kBulkReadCapUnset, 2);
+    REQUIRE(resolved.has_value());
+    REQUIRE(resolved->cap == 1);
+    for (const auto transport : {Transport::kRest, Transport::kMcp}) {
+        INFO((transport == Transport::kRest ? "REST" : "MCP"));
+        const auto r = run_handler_burst(db_.dsn(), /*pool=*/2, resolved->cap, transport);
+        CHECK(r.waiting == 1);
+        CHECK(r.busy == 2);
+        CHECK(r.authz_ok); // one connection parked in the audit INSERT, one left
+        CHECK(r.served == 1);
+        CHECK(r.rows_written == 1);
+    }
+}
+
+TEST_CASE("audit lock, real handlers: pool 1 / cap 1 is the documented residual, the cap is not a reserve",
+          "[pg][hardware][ci_page][bulk_read_slots][slow]") {
+    YUZU_REQUIRE_PG_DB_TPL(db_, handler_lock_tpl);
+    for (const auto transport : {Transport::kRest, Transport::kMcp}) {
+        INFO((transport == Transport::kRest ? "REST" : "MCP"));
+        const auto r = run_handler_burst(db_.dsn(), /*pool=*/1, /*cap=*/1, transport);
+        CHECK(r.waiting == 1);
+        CHECK(r.busy == 2);
+        // The cap equals the whole pool, so the one parked writer holds the only connection. This is
+        // pinned as the documented behaviour (review record residual 3), not endorsed: a change that
+        // reserves a connection should flip it.
+        CHECK_FALSE(r.authz_ok);
+        CHECK(r.served == 1);
+        CHECK(r.rows_written == 1);
+    }
 }
