@@ -460,14 +460,84 @@ insert_url(PGconn* conn, std::int64_t id, const NewRevocationSource::Url& u) {
 // held CRLs. Refuses (nullopt, nothing changed) when a stored URL cannot be canonicalised or two
 // URLs of one source collapse into one: two rows would then claim one URL, and choosing which
 // keeps the fetch state is an administrator's call. The log names the source and URL ids, never
-// the URL text. Serialised with registrations (the same advisory lock as `create`) and with
-// `replace` / `reset_high_water` (every source row locked), so a replica opening while another
-// writes cannot interleave. Idempotent: a canonical row is left untouched, so the steady state is
-// one read. Returns the number of rows rewritten.
+// the URL text. Returns the number of rows rewritten.
+//
+// The steady state takes NO lock: a first unlocked read decides whether anything needs doing, so a
+// boot is never held up, or refused, by an unrelated transaction holding a source row (an open
+// psql session, a reset in flight on another replica). Only when that read finds work (a row to
+// rewrite, or an apparent refusal) does the pass lock - the same advisory lock as `create`, then
+// every source row, under its own lock_timeout - and decide again on what it then reads, so a
+// replica opening while another writes cannot interleave and a refusal is never decided on a
+// read another writer was changing. Idempotent: a canonical row is left untouched.
+struct UrlRewrite {
+    std::int64_t url_id;
+    std::string url;
+    std::string host;
+};
+
+// The rewrites the stored URLs need, or nullopt on a refusal (logged) or a read failure (logged).
+// `log_refusal` is false for the unlocked first look, whose refusal is only a reason to re-read.
+std::optional<std::vector<UrlRewrite>> plan_url_rewrites(PGconn* conn, bool log_refusal) {
+    pg::PgResult urls = pg::exec_params(
+        conn,
+        "SELECT source_id, id, url, host FROM revocation_source_store.source_url ORDER BY "
+        "source_id, id",
+        std::vector<std::string>{});
+    if (urls.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not read URLs (SQLSTATE {})",
+                      sqlstate(urls));
+        return std::nullopt;
+    }
+    std::vector<UrlRewrite> rewrites;
+    std::map<std::pair<std::int64_t, std::string>, std::int64_t> seen; // (source, canonical) -> url id
+    for (int i = 0; i < PQntuples(urls.get()); ++i) {
+        const std::int64_t source_id = to_i64(urls, i, 0);
+        const std::int64_t url_id = to_i64(urls, i, 1);
+        const std::string url = PQgetvalue(urls.get(), i, 2);
+        const std::string host = PQgetvalue(urls.get(), i, 3);
+        const auto c = revocation_source::canonical_crl_url(url);
+        if (!c) {
+            if (log_refusal)
+                spdlog::error("RevocationSourceStore: refusing to open: CRL URL id {} of revocation "
+                              "source {} cannot be put in the canonical form; remove that URL from "
+                              "the source in the database, then restart",
+                              url_id, source_id);
+            return std::nullopt;
+        }
+        const auto [it, fresh] = seen.emplace(std::make_pair(source_id, c->url), url_id);
+        if (!fresh) {
+            if (log_refusal)
+                spdlog::error("RevocationSourceStore: refusing to open: CRL URL ids {} and {} of "
+                              "revocation source {} are one URL in the canonical form; delete one "
+                              "of the two source_url rows in the database, then restart",
+                              it->second, url_id, source_id);
+            return std::nullopt;
+        }
+        if (c->url != url || c->host != host)
+            rewrites.push_back({url_id, c->url, c->host});
+    }
+    return rewrites;
+}
+
 std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
+    // First look, unlocked: the steady state ends here with no lock taken.
+    if (const auto first = plan_url_rewrites(conn, false); first && first->empty())
+        return 0;
+
     if (!begin(conn, "BEGIN"))
         return std::nullopt;
     pg::PgTxn txn(conn);
+    // Bounded whatever the pool's session settings are (a DSN `options` setting replaces them).
+    pg::PgResult timeouts = pg::exec_params(
+        conn, "SELECT set_config('lock_timeout', '10s', true), "
+              "set_config('statement_timeout', '30s', true)",
+        std::vector<std::string>{});
+    if (timeouts.status() != PGRES_TUPLES_OK) {
+        spdlog::error("RevocationSourceStore: canonical URL pass could not set its timeouts "
+                      "(SQLSTATE {})",
+                      sqlstate(timeouts));
+        return std::nullopt;
+    }
     pg::PgResult lock = pg::exec_params(
         conn, "SELECT pg_advisory_xact_lock(hashtext('revocation_source.registration'))",
         std::vector<std::string>{});
@@ -486,51 +556,14 @@ std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
                       sqlstate(rows_lock));
         return std::nullopt;
     }
-    pg::PgResult urls = pg::exec_params(
-        conn,
-        "SELECT source_id, id, url, host FROM revocation_source_store.source_url ORDER BY "
-        "source_id, id",
-        std::vector<std::string>{});
-    if (urls.status() != PGRES_TUPLES_OK) {
-        spdlog::error("RevocationSourceStore: canonical URL pass could not read URLs (SQLSTATE {})",
-                      sqlstate(urls));
+    // Decide again on what the locked read shows.
+    const auto rewrites = plan_url_rewrites(conn, true);
+    if (!rewrites)
         return std::nullopt;
-    }
-    struct Rewrite {
-        std::int64_t url_id;
-        std::string url;
-        std::string host;
-    };
-    std::vector<Rewrite> rewrites;
-    std::map<std::pair<std::int64_t, std::string>, std::int64_t> seen; // (source, canonical) -> url id
-    for (int i = 0; i < PQntuples(urls.get()); ++i) {
-        const std::int64_t source_id = to_i64(urls, i, 0);
-        const std::int64_t url_id = to_i64(urls, i, 1);
-        const std::string url = PQgetvalue(urls.get(), i, 2);
-        const std::string host = PQgetvalue(urls.get(), i, 3);
-        const auto c = revocation_source::canonical_crl_url(url);
-        if (!c) {
-            spdlog::error("RevocationSourceStore: refusing to open: CRL URL id {} of revocation "
-                          "source {} cannot be put in the canonical form; remove that URL from "
-                          "the source in the database, then restart",
-                          url_id, source_id);
-            return std::nullopt;
-        }
-        const auto [it, fresh] = seen.emplace(std::make_pair(source_id, c->url), url_id);
-        if (!fresh) {
-            spdlog::error("RevocationSourceStore: refusing to open: CRL URL ids {} and {} of "
-                          "revocation source {} are one URL in the canonical form; delete one of "
-                          "the two source_url rows in the database, then restart",
-                          it->second, url_id, source_id);
-            return std::nullopt;
-        }
-        if (c->url != url || c->host != host)
-            rewrites.push_back({url_id, c->url, c->host});
-    }
     // No two rows of a source share a canonical form, and a canonical row is its own canonical
     // form, so no UPDATE below can meet another row's current value: UNIQUE (source_id, url)
     // holds at every step.
-    for (const auto& r : rewrites) {
+    for (const auto& r : *rewrites) {
         pg::PgResult u = pg::exec_params(
             conn,
             "UPDATE revocation_source_store.source_url SET url = $2, host = $3 WHERE id = $1::bigint",
@@ -544,10 +577,10 @@ std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
     }
     if (!txn.commit())
         return std::nullopt;
-    if (!rewrites.empty())
+    if (!rewrites->empty())
         spdlog::info("RevocationSourceStore: rewrote {} stored CRL URL(s) to the canonical form",
-                     rewrites.size());
-    return static_cast<std::int64_t>(rewrites.size());
+                     rewrites->size());
+    return static_cast<std::int64_t>(rewrites->size());
 }
 
 } // namespace

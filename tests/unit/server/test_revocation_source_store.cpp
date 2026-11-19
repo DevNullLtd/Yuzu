@@ -919,6 +919,28 @@ TEST_CASE("RevocationSourceStore: a stored URL that cannot be canonicalised keep
     CHECK(std::string(PQgetvalue(left.get(), 0, 0)) == "ftp://crl.example.com/");
 }
 
+TEST_CASE("RevocationSourceStore: a steady-state open takes no lock, so a held source row does not "
+          "block it",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    // Another session holds the source row (an open psql transaction, a reset in flight).
+    PgConn holder{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    PgResult b{PQexec(holder.get(), "BEGIN")};
+    REQUIRE(b.status() == PGRES_COMMAND_OK);
+    PgResult held{PQexec(holder.get(), ("SELECT id FROM revocation_source_store.source WHERE id = " +
+                                        std::to_string(*id) + " FOR UPDATE").c_str())};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    // Every stored URL is already canonical: the open needs nothing, waits for nothing.
+    RevocationSourceStore again{rs_pool_fx_};
+    CHECK(again.is_open());
+    CHECK(again.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(0));
+    PgResult end{PQexec(holder.get(), "ROLLBACK")};
+    CHECK(end.status() == PGRES_COMMAND_OK);
+}
+
 TEST_CASE("RevocationSourceStore: a replace refuses a URL that is not canonical",
           "[revocation_source_store][pg]") {
     RS_STORE(store);

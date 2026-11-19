@@ -2232,6 +2232,7 @@ TEST_CASE("RevocationSource: the REST and MCP kind -> status table is locked",
         {SK::kLimitReached, 409, yuzu::server::mcp::kInvalidParams},
         {SK::kConflict, 409, yuzu::server::mcp::kInvalidParams},
         {SK::kInvalidInput, 400, yuzu::server::mcp::kInvalidParams},
+        {SK::kUnknownKey, 400, yuzu::server::mcp::kInvalidParams},
     };
     for (const auto& row : rows) {
         INFO("fault " << static_cast<int>(row.fault));
@@ -2285,7 +2286,7 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
         {"remove", [&] { last_rest = fx.rest_delete(id); return last_rest->status; },
          [&] { last = fx.h.mcp_call_tool_approved(kRemove, {{"id", id}}); return mcp_error_code(*last); }},
         {"reset", [&] { last_rest = fx.rest_reset(id); return last_rest->status; },
-         [&] { last = fx.h.mcp_call_tool_approved(kReset, {{"id", id}}); return mcp_error_code(*last); }},
+         [&] { last = fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}})); return mcp_error_code(*last); }},
     };
     struct Expect {
         SK fault;
@@ -2308,6 +2309,7 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
         {SK::kVersionConflict, 409, kInvalid, -1},
         {SK::kSubjectChanged, 400, kInvalid, -1},
         {SK::kBadResetTime, 400, kInvalid, -1},
+        {SK::kUnknownKey, 400, kInvalid, -1},
     };
     for (const auto& route : routes) {
         for (const auto& e : table) {

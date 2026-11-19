@@ -5087,9 +5087,9 @@ static const ToolDef kTools[] = {
      "replay window, because a CRL that verifies and is dated at or after the reset is accepted "
      "whatever its number. reset_at (RFC 3339 UTC, optional, no later than the server clock; "
      "default now) sets the floor: a value below the CA's current thisUpdate widens that window "
-     "to everything since it. The response echoes the window opened. NOT idempotent: each call "
-     "sets a new reset_at and deletes the held CRLs again, so a repeat after a CRL was accepted "
-     "discards it. After a reset whose outcome is unknown, read get_revocation_source: "
+     "to everything since it. The response echoes the window opened. NOT idempotent: each "
+     "accepted reset sets a new reset_at, deletes the held CRLs and moves config_version, so a "
+     "replay of the same arguments is refused as a version conflict and changes nothing. After a reset whose outcome is unknown, read get_revocation_source: "
      "high_water.reset_at shows the floor in force (a retry is then refused as a version "
      "conflict, because the reset moved config_version). REQUIRED keep_key_sha256: 1 to 8 "
      "ca_certificates[].cert_sha256 values already registered on the source (add a rebuilt CA's "
@@ -7229,8 +7229,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ADR-0070 R1 (slice 2b-1a). register: Additive, NOT idempotent (a second registration of the
     // same CA is a 409). update: a full replace - Destructive (dropping a URL or key deletes its
     // held CRLs) and idempotent (an equal body changes nothing). remove: Destructive, idempotent
-    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each call
-    // sets a new reset_at and discards the held CRLs again). openWorldHint is true ONLY for
+    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each
+    // accepted call sets a new reset_at, discards the held CRLs and moves config_version, so a
+    // replay is a version conflict). openWorldHint is true ONLY for
     // register and update: they resolve the administrator-registered host, the only outbound
     // reach any tool has (no tool fetches a CRL; the refresh job does).
     {"list_revocation_sources", {ToolEffect::ReadOnly, true, "List registered CRL sources"}},
@@ -7241,7 +7242,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, true, "Replace a CRL source's keys and URLs", /*open_world=*/true}},
     {"remove_revocation_source", {ToolEffect::Destructive, true, "Remove a CRL source"}},
     {"reset_revocation_source_high_water",
-     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks"}},
+     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks and keep only the named keys"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
