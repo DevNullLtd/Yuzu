@@ -283,7 +283,8 @@ read_macho(const Source& src, const MachoLimits& lim = {}, ReadBudget budget = {
     const std::uint32_t nfat = u32(head, 4, std::endian::big);
     if (nfat == 0 || nfat >= 45)
         return std::unexpected(ParseError::not_this_format);
-    if (nfat > lim.max_fat_archs) // a real universal binary over the caller's cap, as PE and ELF report theirs
+    // A real universal binary over the caller's cap: a limit, as the PE and ELF readers report theirs.
+    if (nfat > lim.max_fat_archs)
         return std::unexpected(ParseError::limit_exceeded);
     const std::size_t entry = is64 ? kFatArch64Bytes : kFatArchBytes;
     const auto table_len = checked_mul(nfat, entry);

@@ -307,6 +307,19 @@ TEST_CASE("macho: an LC_BUILD_VERSION whose tool count does not fit its command 
     const auto ok = parse(thin(fits));
     REQUIRE(ok.has_value());
     CHECK(ok->slices[0].build_version->platform == 1);
+    for (const std::endian order : {std::endian::little, std::endian::big}) {
+        INFO("big-endian: " << (order == std::endian::big));
+        ThinSpec two;
+        two.order = order;
+        two.cmds = {lc_build_version(order, 1, 5, 6, 2, 16)}; // two 8-byte entries, present
+        REQUIRE(parse(thin(two)).has_value());
+        ThinSpec half;
+        half.order = order;
+        half.cmds = {lc_build_version(order, 1, 5, 6, 2, 8)}; // room for one of the two
+        const auto short_by_one = parse(thin(half));
+        REQUIRE_FALSE(short_by_one.has_value());
+        CHECK(short_by_one.error() == ParseError::malformed);
+    }
     for (const std::uint32_t ntools : {1u, 100u, 0xFFFFFFFFu}) {
         ThinSpec s;
         s.cmds = {lc_build_version(s.order, 1, 5, 6, ntools, 0)}; // the entries are missing
