@@ -3,6 +3,7 @@
 #include <spdlog/spdlog.h>
 
 #include <yuzu/secure_zero.hpp> // sanctioned std::string zeroizer — used on BOTH platform branches
+#include <yuzu/log_token.hpp> // log_key_token: IdP-controlled NameID in the accepted-assertion log line
 
 // ──────────────────────────────────────────────────────────────────────────────
 // Windows: compile stubs only — SAML is unsupported on Windows (N4).
@@ -1219,7 +1220,8 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
         }
     }
 
-    spdlog::debug("SamlProvider: signature verified (assertion_id={})", assertion_id);
+    spdlog::debug("SamlProvider: signature verified (assertion_id={})",
+                  ::yuzu::log_key_token(assertion_id));
 
     // ── 11.5. Validate Assertion-level <saml:Issuer> ─────────────────────────
     // Read the Issuer from the VERIFIED assertion node.  The SAML 2.0 WebSSO
@@ -1446,7 +1448,8 @@ SamlProvider::validate_response(const std::string& saml_response_b64,
 
     spdlog::info("SamlProvider: assertion accepted (name_id={}, groups={}, has_display={}, "
                  "has_email={})",
-                 name_id, groups.size(), !display_name.empty(), !email.empty());
+                 ::yuzu::log_key_token(name_id), groups.size(), !display_name.empty(),
+                 !email.empty());
     return SamlAssertion{std::move(name_id),   std::move(name_id_format), std::move(groups),
                          group_cap_truncated,  std::move(display_name),   std::move(email)};
 }

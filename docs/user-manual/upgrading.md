@@ -37,6 +37,23 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What changed.** REST accepted such a field. It is now refused with `400` and `RESULT_SET_BAD_REQUEST: a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)`, before the instruction is looked up and before anything is dispatched or stored. These are the bounds the MCP tool `create_result_set_from_instruction_result` already applied, with the same message without the `RESULT_SET_BAD_REQUEST: ` prefix; the tool is unchanged. They bound the size of a matcher field a caller supplies, and apply to the matcher's own `column`, `op` and `value` whatever its `kind`. The dashboard's form limits `column` to 128 and `value` to 512 characters, so it can exceed a bound only with non-ASCII text; the page then shows the refusal.
 
+## ⚠️ Breaking: some log lines and audit details changed shape (log parsers and runbooks)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anything that parses the server or agent logs, a runbook that sends on-call to a log line for Postgres detail, and a SIEM rule keyed on a changed string. Alert expressions and metric names are unchanged (alert annotation text changed).
+
+**What changed.**
+
+- **The agent's registration line** is now `Registered with server (session_fp=<8 hex>, enrollment=...)`. It was `(session=<id>, enrollment=...)`. The fingerprint is the first 8 hex of the SHA-256 of the session id, which is a bearer credential; this build's agent logs only the fingerprint. A parser that took `session=` from this line must take the id from the server's `[gateway] ProxyRegister succeeded: agent=<id>, session=<id>` line (or the gateway route table) and match on the fingerprint; the bundled UAT and HA scripts do. <!-- tripwire-allow: upgrade note quotes the old line -->
+- **Postgres connect-phase failures** (only the connect step; errors after a connection exists, for example in a store query, still print libpq's text unfolded, as before; #5964 tracks neutralising it) (the pool's `PgPool: connection attempt failed:` line, the leader elector's `dedicated connection failed:` line, the `[readyz] Postgres not reachable` line, `yuzu_pg_canary`) now log one of a fixed set of causes (`authentication failed ...`, `server not reachable ...`, `connection timed out`, and so on) instead of libpq's text, and `PgPool::last_error()` returns the same cause. Host, port and database name are no longer printed. Diagnose with `psql` against the same DSN and the PostgreSQL server log. The `YuzuServerPostgresUnreachable` alert is unchanged; its annotation now says this.
+- **`auth.saml_login_failed` audit detail** (and the matching analytics event field) is the rejection reason with control and C1 characters folded, `;` and `=` replaced by `_`, and clipped to its first 128 bytes with no truncation marker; it used to be the raw text. The server log line for the same failure keeps up to 256 bytes. A SIEM rule that matches a rejection reason in this detail must match the first 128 bytes of the folded text (a long reason is cut and `;`/`=` inside it read as `_`), or key on `action=auth.saml_login_failed` instead and read the server log for the full text.
+- **Other audit detail values** that pass through the shared detail sanitiser (OIDC and SAML `display=`, `email=` and subject values, `idp error:`, and the MCP and REST denial details) now also fold C1 controls (U+0080-U+009F), U+2028 and U+2029 to `_`. Values without those characters are unchanged.
+- **Login and SSO log lines** that print a user name or NameID (`Auth failed: unknown user '...'`, `Login blocked ...`, `SAML session created ...`, `SamlProvider: assertion accepted (name_id=...)` and similar) now fold control characters, C1 controls and Unicode line separators to `_` in the printed copy; stored values are unchanged.
+- **`audit_token` and `log_key_token`** now fold every well-formed C1 code point (U+0080-U+009F), not just NEL.
+
+**What to do.** Update log parsers and runbooks as above. No data migration.
+
 ## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
@@ -732,6 +749,44 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **What changed:** the Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row.
 - **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
 - **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so bring up every server replica before the agents of the same build enroll.
+
+## Upgrade note: the `yuzu-postgres` image moves to PostgreSQL 18.6, and published images take current packages
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying an existing database forward.
+
+The `yuzu-postgres` image (and `yuzu-postgres-ha`, which is built on it) moves from PostgreSQL
+18.4 to 18.6, which carries the server security fixes released after 18.4. There was no 18.5:
+PostgreSQL withdrew it before release.
+
+- **Fresh database only.** Deploy this build's `yuzu-postgres` image on a freshly provisioned data
+  volume, as the deployment contract requires. A volume written by the v0.15.0 image or by any
+  earlier build is a database written by an earlier build: this page describes no in-place
+  upgrade of it. The same holds for a `yuzu-postgres-ha` cluster, which is provisioned fresh, so
+  there is no replica-by-replica procedure to follow.
+- **When the new image is used.** The composes pin `yuzu-postgres:${YUZU_VERSION:-X.Y.Z}`, so the
+  18.6 image arrives with the rest of this release when `YUZU_VERSION` (or the compose default)
+  names it. A deployment pinned to an earlier tag keeps that tag's image.
+- **Collation.** The image stays on Debian bookworm with glibc 2.36 and ICU 72, so a database it
+  initialises records the collation version `2.36` and the collation check
+  ([server-admin.md](server-admin.md#postgresql-collation-version)) reports `ok`. The image build
+  fails if a package update would move libc6 off glibc 2.36 or ICU off 72; a change of sort data
+  within glibc 2.36 is not visible to that check or to the build (item (11) of that section's
+  "What this does not cover").
+- **Returning to an earlier image** is not supported (see "Deployment contract (hard cutover)").
+
+Every image the release publishes now takes its distribution's security updates when it is built
+(`apt-get upgrade` / `apk upgrade`; the chisel images cut their slices from the current archive),
+except the PostgreSQL packages in `yuzu-postgres`, which stay at the pinned minor until the
+image's base is moved to a newer one. The release refuses to push an image that has a CRITICAL
+vulnerability with a fix available, as far as its scanner can see it, or whose operating-system
+release it cannot show the scanner has advisory data for (end of life, a pre-release or rolling
+release, or a distribution other than Debian, Ubuntu and Alpine): the OS packages of the four
+chiselled images,
+PostgreSQL itself, the gateway's Erlang/OTP runtime and the statically linked server and agent
+binaries are not covered (see
+[release-verification.md](release-verification.md#image-vulnerability-scan-before-publishing)).
+Nothing needs configuring.
+
 ## Upgrade note: the server now requires a `revocation_source_store` schema (CRL sources, ADR-0070 R1)
 
 This release adds the registered-CRL-source store (`/api/v1/crypto/revocation-sources`). It is

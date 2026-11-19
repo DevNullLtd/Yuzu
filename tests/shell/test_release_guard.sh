@@ -25,8 +25,11 @@
 #   (i.e. every image-publishing job, including any added later) and the
 #   `release` job list `release-guard` in `needs`, as do the three build jobs.
 #   Each of those publishing jobs and `release` runs
-#   scripts/ci/check-release-tag-sha.sh exactly once, before its first push /
-#   `gh release create` line (the script itself: test_release_tag_sha.sh).
+#   scripts/ci/check-release-tag-sha.sh exactly once, before its first
+#   publishing line: the release tags moving (`scripts/ci/image-publish.sh tag`,
+#   WP15/S9: the push itself is by digest or to a candidate tag and publishes
+#   nothing), a `push: true` / `--push`, or `gh release create` (the script
+#   itself: test_release_tag_sha.sh).
 #
 # Run:  bash tests/shell/test_release_guard.sh
 set -uo pipefail
@@ -190,7 +193,8 @@ check "empty GITHUB_REF_NAME -> gh never called" "" "$(cat "$TMP/args")"
 # ── Wiring ───────────────────────────────────────────────────────────────────
 # One line per job:
 #   "<job>|<needs-line>|<has-packages-write>|<#tag-recheck lines>|<first recheck line>|<first act line>"
-# An "act" line is a `push: true`, `--push` or `gh release create` outside a comment.
+# An "act" line is `image-publish.sh tag` (the release tags move), a `push: true`,
+# `--push` or `gh release create`, outside a comment.
 echo "release-guard wiring:"
 awk '
   function flush() {
@@ -208,7 +212,7 @@ awk '
   j {
     line = $0; sub(/[[:space:]]+#.*/, "", line)   # drop a trailing YAML comment
     if (line ~ /check-release-tag-sha\.sh/) { nchk++; if (!firstchk) firstchk = NR }
-    if (line ~ /push:[[:space:]]*true/ || line ~ /--push/ || line ~ /gh release create/) { if (!firstact) firstact = NR }
+    if (line ~ /image-publish\.sh tag / || line ~ /push:[[:space:]]*true/ || line ~ /--push/ || line ~ /gh release create/) { if (!firstact) firstact = NR }
   }
   END { flush() }
 ' "$WF" > "$TMP/jobs"
@@ -255,7 +259,8 @@ for job, spec in (wf.get("jobs") or {}).items():
     # The push itself must not run after a failed recheck (if: always() etc.).
     for st in spec.get("steps") or []:
         txt = (st.get("run") or "") + str(st.get("with") or "")
-        acts = "gh release create" in txt or "--push" in txt or "'push': True" in txt
+        acts = ("gh release create" in txt or "--push" in txt or "'push': True" in txt
+                or "image-publish.sh tag " in txt)
         cond = str(st.get("if", ""))
         if acts and any(k in cond for k in ("always()", "failure()", "cancelled()")):
             print(f"{job} push step|runs-after-failure")

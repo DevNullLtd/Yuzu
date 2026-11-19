@@ -39,7 +39,9 @@ jobs:
   prune-linux:
     name: "Prune Linux runner cache"
     runs-on: [self-hosted, Linux, X64, yuzu-bigtam-linux]
-    timeout-minutes: 15  # headroom for the #1367 sweep's worst-case per-instance psql timeouts
+    # Headroom for the #1367 sweep's worst-case per-instance psql timeouts,
+    # plus the buildx prune over four runners' caches (about 120 GB measured).
+    timeout-minutes: 30
     steps:
       - name: Prune vcpkg binary cache zips older than 30 days
         run: |
@@ -63,16 +65,30 @@ jobs:
           set -eu
           # docker-publish-chisel writes a type=local,mode=max buildx cache per
           # image under $RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>-chisel —
-          # several GB per arch with no built-in eviction. buildx rewrites the dir
-          # each run, so an untouched *-chisel dir is genuinely stale. Linux-only
+          # several GB per arch with no built-in eviction. Every release run
+          # writes into the dir, so a *-chisel dir untouched for 30 days is
+          # genuinely stale (no release used it). Within a dir that IS used,
+          # superseded blobs pile up: the next step removes those. Linux-only
           # (the chisel C++ builds run on the self-hosted Big Tam Linux runner).
+          # Each removal takes the directory's lock exclusively without waiting
+          # (the same <dir>.lock the publish jobs hold shared,
+          # scripts/ci/buildcache-lock.sh), so a directory a publish job is
+          # using is skipped, never removed under it.
           bc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}/yuzu-docker-buildcache"
           if [[ ! -d "$bc" ]]; then
             echo "::notice::buildx cache dir $bc not present — skipping"
             exit 0
           fi
           before=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
-          find "$bc" -maxdepth 1 -type d -name '*-chisel' -mtime +30 -exec rm -rf {} + 2>/dev/null || true
+          while IFS= read -r -d '' d; do
+            rc=0
+            flock --exclusive --nonblock --conflict-exit-code 75 "$d.lock" rm -rf -- "$d" || rc=$?
+            case "$rc" in
+              0) echo "removed stale $d" ;;
+              75) echo "::notice::$d skipped: in use (a publish job holds $d.lock)" ;;
+              *) echo "::warning::$d: could not lock or remove it (exit $rc)" ;;
+            esac
+          done < <(find "$bc" -maxdepth 1 -type d -name '*-chisel' -mtime +30 -print0)
           after=$(du -sh "$bc" 2>/dev/null | awk '{print $1}' || echo '?')
           echo "buildx chisel cache: before=${before} after=${after}"
 
@@ -108,7 +124,58 @@ jobs:
           # touch.
           clean: false
 
+      - name: Prune unreferenced buildx cache blobs (WP15/S9)
+        run: |
+          set -eu
+          # Every release publish job exports a type=local,mode=max cache to
+          # $RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>. An export writes
+          # new blobs and replaces index.json but never deletes the blobs only
+          # the old index named, and YUZU_PACKAGE_REFRESH makes the package
+          # layer new on every run attempt, so the dirs grow without bound
+          # (one server dir measured 20 GB, 6.3 GB referenced).
+          #
+          # All four Big Tam runners' caches, every week: each runner has its
+          # own tool cache (/srv/ci/work-N/_tool), all four run as one OS
+          # identity, and this job lands on one runner, so it walks its
+          # siblings' too. A publish job holds a shared lock on <dir>.lock
+          # for its whole run (scripts/ci/buildcache-lock.sh); the script
+          # takes it exclusively without waiting and skips a dir in use. It
+          # removes only blobs no index can reach and older than 24 h, skips a
+          # dir written in the last 3 h, removes a BROKEN dir whole (the next
+          # build runs cold instead of failing), and reports an ERROR, exit 1
+          # after the last dir, for a dir it cannot read. Recovery for a
+          # broken cache: docs/ci-architecture.md "Cache pruning + weekly
+          # maintenance".
+          tc="${RUNNER_TOOL_CACHE:-/opt/actions-runner/_work/_tool}"
+          roots=("$tc/yuzu-docker-buildcache")
+          if [[ "$tc" == */work-*/_tool ]]; then
+            for r in "${tc%/work-*/_tool}"/work-*/_tool/yuzu-docker-buildcache; do
+              [[ "$r" == "$tc/yuzu-docker-buildcache" ]] || roots+=("$r")
+            done
+          fi
+          shopt -s nullglob
+          dirs=()
+          for r in "${roots[@]}"; do
+            if [[ ! -d "$r" || -L "$r" ]]; then
+              echo "buildx cache root $r: not present (or a symlink), skipped"
+              continue
+            fi
+            echo "buildx cache root $r: before=$(du -sh "$r" 2>/dev/null | awk '{print $1}' || echo '?')"
+            for d in "$r"/*/; do dirs+=("${d%/}"); done
+          done
+          rc=0
+          if [[ ${#dirs[@]} -gt 0 ]]; then
+            python3 -I scripts/ci/prune-buildcache.py "${dirs[@]}" || rc=$?
+          fi
+          for r in "${roots[@]}"; do
+            [[ -d "$r" ]] && echo "buildx cache root $r: after=$(du -sh "$r" 2>/dev/null | awk '{print $1}' || echo '?')"
+          done
+          exit "$rc"
+
       - name: Sweep leaked yuzu_test_* databases (#1367)
+        # Runs even when a prune step above failed: a prune error must not
+        # leave the leaked databases unswept until it is fixed.
+        if: success() || failure()
         run: bash scripts/ci/sweep-test-databases.sh
 
   prune-macos:
