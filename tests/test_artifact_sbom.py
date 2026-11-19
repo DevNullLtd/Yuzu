@@ -1089,6 +1089,103 @@ class Units(unittest.TestCase):
                         ok = full if server else untouched
                         self.assertEqual(errs == [], ok, errs)
 
+    def test_release_check_compares_the_vendored_ids_with_the_manifest(self):
+        # The gate holds a server pair to EXACTLY the manifest's component ids,
+        # in each half, each once: the note plus any one entry is not enough
+        # (a pair that lost nine of ten components must fail). The expected
+        # set is the manifest's, never the pair's own.
+        m = self.mod
+        ids = m.vendored_manifest_ids(VENDORED)
+        self.assertEqual(len(ids), 10)
+
+        def keep_cdx(comps, keep):
+            out = []
+            for c in comps:
+                ref = str(c.get("bom-ref", ""))
+                if ref.startswith("vendored-") and not keep(ref[len("vendored-"):]):
+                    continue
+                if c.get("components"):
+                    c = dict(c, components=keep_cdx(c["components"], keep))
+                out.append(c)
+            return out
+
+        def keep_spdx(spdx, keep):
+            spdx["packages"] = [p for p in spdx["packages"]
+                                if not p["SPDXID"].startswith("SPDXRef-Package-vendored-")
+                                or keep(p["SPDXID"][len("SPDXRef-Package-vendored-"):])]
+
+        def gate(cdx, spdx, name, manifest=None):
+            d = self.tmp / f"ids-{name}"
+            d.mkdir()
+            (d / "yuzu-test-server-image.cdx.json").write_text(json.dumps(cdx))
+            (d / "yuzu-test-server-image.spdx.json").write_text(json.dumps(spdx))
+            return m.image_pair_errors(d, manifest)
+
+        cdx, spdx = release_image_pair("yuzu-test-server", SERVER_IMAGE_FILES)
+        self.assertEqual(m.image_vendored_state(cdx, spdx, ids), (True, True))
+        self.assertEqual(gate(cdx, spdx, "intact"), [])
+
+        only = ids[0]
+        variants = {
+            "nine of ten lost, both halves": (lambda c, s: (c.update(components=keep_cdx(c["components"],
+                                                                                     lambda i: i == only)),
+                                                            keep_spdx(s, lambda i: i == only)),
+                                              "missing "),
+            "a nested one lost (CycloneDX)": (lambda c, s: c.update(components=keep_cdx(c["components"],
+                                                                                    lambda i: i != "tslib")),
+                                              "CycloneDX: missing tslib"),
+            "one lost (SPDX)": (lambda c, s: keep_spdx(s, lambda i: i != "qrcodegen"), "SPDX: missing qrcodegen"),
+            "an id the manifest lacks": (lambda c, s: (c["components"].append({"bom-ref": "vendored-leftpad",
+                                                                               "type": "library",
+                                                                               "name": "leftpad"}),
+                                                       s["packages"].append(dict(s["packages"][-1],
+                                                                                 SPDXID="SPDXRef-Package-vendored-"
+                                                                                        "leftpad"))),
+                                         "not in the manifest: leftpad"),
+            "one listed twice (SPDX)": (lambda c, s: s["packages"].append(
+                next(p for p in s["packages"] if p["SPDXID"] == "SPDXRef-Package-vendored-htmx")),
+                                        "SPDX: listed twice: htmx"),
+        }
+        for label, (edit, needle) in variants.items():
+            with self.subTest(variant=label):
+                c, sp = json.loads(json.dumps(cdx)), json.loads(json.dumps(spdx))
+                edit(c, sp)
+                self.assertNotEqual(m.image_vendored_state(c, sp, ids), (True, True))
+                errs = gate(c, sp, label.replace(" ", "-").replace(",", "").replace("(", "").replace(")", ""))
+                self.assertEqual(len(errs), 1, errs)
+                self.assertIn("does not list the components compiled into it", errs[0])
+                self.assertIn(needle, errs[0])
+
+        # The expected set is the manifest's: the intact pair fails against a
+        # manifest with one more component, and a manifest the gate cannot
+        # read fails the pair rather than passing it.
+        man = json.loads(VENDORED.read_text(encoding="utf-8"))
+        man["components"].append(dict(man["components"][0], id="leftpad"))
+        more = self.tmp / "more.json"
+        more.write_text(json.dumps(man))
+        errs = gate(cdx, spdx, "more", more)
+        self.assertTrue(any("CycloneDX: missing leftpad" in e for e in errs), errs)
+        bad = self.tmp / "bad.json"
+        bad.write_text("{")
+        errs = gate(cdx, spdx, "bad", bad)
+        self.assertEqual(len(errs), 1, errs)
+        self.assertIn("bad.json", errs[0])
+        # Through the CLI: `check --vendored-components` (one artifact SBOM
+        # beside the pair, as the release directory holds).
+        d = self.tmp / "ids-more"
+        art = d / "yuzu-plugins_1.2.3_amd64.deb"
+        art.write_bytes(b"plugins")
+        (d / "yuzu-plugins_1.2.3_amd64.cdx.json").write_text(json.dumps({
+            "bomFormat": "CycloneDX", "components": [], "metadata": {
+                "component": {"name": art.name, "hashes": [{"alg": "SHA-256",
+                                                            "content": hashlib.sha256(b"plugins").hexdigest()}]},
+                "properties": [{"name": "yuzu:sbom:unpacked-files", "value": "2"}]}}))
+        r = run_script("check", "--artifacts-dir", d)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = run_script("check", "--artifacts-dir", d, "--vendored-components", more)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("CycloneDX: missing leftpad", r.stderr)
+
     def test_a_failed_pair_write_leaves_both_files_or_refuses_the_torn_pair(self):
         # _write_image_pair: a failed temporary write changes neither file and
         # leaves no *.tmp; a failed SECOND rename leaves a torn pair (new

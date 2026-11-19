@@ -756,7 +756,10 @@ The release's SBOM scope check does not hold image SBOMs to the file rules
 carry the marker and does not, one carrying only part of it, one named as a
 release image that lacks that image's title label, and a pair that does not
 list yuzu-server's vendored components in both formats when the image holds
-`yuzu-server` (or lists them when it does not).
+`yuzu-server` (or lists them when it does not). Listing them means the
+`yuzu:sbom:vendored` note and exactly the components of the release's
+`server/core/vendored-components.json`, each once: a pair missing one of them,
+or listing one the manifest does not, is refused.
 
 The agent-bundle image (`yuzu-agent-bundle-chisel`) is not a release image: it
 is built from the published release afterwards, by a separate job. Its syft

@@ -526,10 +526,12 @@ release when:
   merge; making it required is a decision on the branch ruleset, not taken
   here;
 - an image SBOM pair of an image in which syft lists `yuzu-server` does not
-  list yuzu-server's vendored components (the entries and the
-  `yuzu:sbom:vendored` note) in both formats, or the pair of an image in which
-  syft lists no `yuzu-server` carries any part of them (the `augment` step
-  above adds them);
+  list yuzu-server's vendored components (the `yuzu:sbom:vendored` note, and
+  exactly the component ids of the tag's `vendored-components.json`, each
+  once) in both formats, or the pair of an image in which syft lists no
+  `yuzu-server` carries any part of them (the `augment` step above adds them;
+  like the marker tokens, the expected ids are recomputed from the manifest,
+  never read from the pair);
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that

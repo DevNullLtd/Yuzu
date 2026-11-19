@@ -210,6 +210,7 @@ NVD_CPE = {
 REPO_ROOT = Path(__file__).resolve().parents[2]
 VENDORED_MANIFEST = "server/core/vendored-components.json"
 VENDORED_TYPES = {"library": "library", "font": "file"}  # manifest type -> CycloneDX type
+VENDORED_ID = re.compile(r"[A-Za-z0-9.-]+")
 # A SHA-256 recorded in an attribution file (a NOTICE): any case, as bytes.
 NOTICE_SHA256 = re.compile(rb"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
 SPDX_LINE = re.compile(r"SPDX-License-Identifier:\s*(\S+)")
@@ -826,6 +827,11 @@ def _manifest_shape(m: dict) -> list[str]:
     with_files = {c.get("id") for c in comps if c.get("files")}
     for c in comps:
         cid = c.get("id") or "?"
+        # The id is the CycloneDX bom-ref suffix and the SPDXID suffix as it
+        # is: SPDX allows only [A-Za-z0-9.-] there, so any other character
+        # would make the two halves spell the component differently.
+        if isinstance(c.get("id"), str) and not VENDORED_ID.fullmatch(c["id"]):
+            errs.append(f"{cid}: `id` may hold only letters, digits, `.` and `-`")
         for key in ("id", "name", "title", "license", "upstream", "version_source"):
             if not isinstance(c.get(key), str) or not c[key].strip():
                 errs.append(f"{cid}: `{key}` is missing or empty")
@@ -1502,22 +1508,74 @@ def mark_image(cdx: dict, spdx: dict) -> tuple[list[str], bool]:
     return want, True
 
 
-def image_vendored_state(cdx: dict, spdx: dict) -> tuple:
-    """(cdx_state, spdx_state) of yuzu-server's vendored components on an image
-    pair. Each is True when the document carries both the `yuzu:sbom:vendored`
-    note and the vendored entries `augment` adds, None when it carries neither,
-    and PARTIAL otherwise."""
-    _croot, sroot = _image_roots(cdx, spdx)
-    cnote = cdx_note(cdx.get("metadata"), "vendored")
-    ccomps = any(str(c.get("bom-ref", "")).startswith("vendored-") for c in _cdx_components(cdx.get("components")))
-    snote = spdx_note(sroot.get("comment"), "vendored")
-    spkgs = any(str(p.get("SPDXID", "")).startswith("SPDXRef-Package-vendored-") for p in spdx.get("packages") or [])
+VENDORED_CDX_PREFIX = "vendored-"
+VENDORED_SPDX_PREFIX = "SPDXRef-Package-vendored-"
 
-    def state(note, entries):
-        if note is None and not entries:
+
+def image_vendored_ids(cdx: dict, spdx: dict) -> tuple[list[str], list[str]]:
+    """The vendored component ids each half of an image pair lists, as
+    written (duplicates kept): CycloneDX `bom-ref`s `vendored-<id>` at any
+    nesting depth (a bundled component sits inside its parent), SPDX
+    packages `SPDXRef-Package-vendored-<id>`. A manifest id is
+    [A-Za-z0-9.-] only (_manifest_shape), so both spell it the same."""
+    cids = [str(c.get("bom-ref", ""))[len(VENDORED_CDX_PREFIX):] for c in _cdx_components(cdx.get("components"))
+            if str(c.get("bom-ref", "")).startswith(VENDORED_CDX_PREFIX)]
+    sids = [str(p.get("SPDXID", ""))[len(VENDORED_SPDX_PREFIX):] for p in spdx.get("packages") or []
+            if str(p.get("SPDXID", "")).startswith(VENDORED_SPDX_PREFIX)]
+    return cids, sids
+
+
+def image_vendored_state(cdx: dict, spdx: dict, expected_ids=None) -> tuple:
+    """(cdx_state, spdx_state) of yuzu-server's vendored components on an image
+    pair. Each is None when the document carries neither the
+    `yuzu:sbom:vendored` note nor any vendored entry. With `expected_ids` (the
+    manifest's component ids), it is True only when the document carries the
+    note and lists exactly those ids, each once; without it (augment, which
+    refuses any part), True when it carries the note and any entry. PARTIAL
+    otherwise."""
+    _croot, sroot = _image_roots(cdx, spdx)
+    cids, sids = image_vendored_ids(cdx, spdx)
+    cnote = cdx_note(cdx.get("metadata"), "vendored")
+    snote = spdx_note(sroot.get("comment"), "vendored")
+
+    def state(note, ids):
+        if note is None and not ids:
             return None
-        return True if note is not None and entries else PARTIAL
-    return state(cnote, ccomps), state(snote, spkgs)
+        if note is None or not ids:
+            return PARTIAL
+        if expected_ids is not None and (len(ids) != len(set(ids)) or set(ids) != set(expected_ids)):
+            return PARTIAL
+        return True
+    return state(cnote, cids), state(snote, sids)
+
+
+def vendored_manifest_ids(manifest_path: Path) -> list[str]:
+    """The component ids the vendored-components manifest lists, after its
+    shape check (not the source-tree check: the release gate compares an
+    image pair's entries with the manifest of the tag it runs on)."""
+    try:
+        m = json.loads(manifest_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as e:
+        raise SbomError(f"{manifest_path}: {e}") from e
+    errs = _manifest_shape(m) if isinstance(m, dict) else ["not a JSON object"]
+    if errs:
+        raise SbomError(f"{manifest_path.name}: {'; '.join(errs[:5])}")
+    return [c["id"] for c in m["components"]]
+
+
+def _vendored_id_gaps(ids: list[str], expected_ids) -> str:
+    """What differs between one half's vendored ids and the manifest's."""
+    parts = []
+    missing = sorted(set(expected_ids) - set(ids))
+    extra = sorted(set(ids) - set(expected_ids))
+    twice = sorted({i for i in ids if ids.count(i) > 1})
+    if missing:
+        parts.append("missing " + ", ".join(missing))
+    if extra:
+        parts.append("not in the manifest: " + ", ".join(extra))
+    if twice:
+        parts.append("listed twice: " + ", ".join(twice))
+    return "; ".join(parts)
 
 
 def augment_image(cdx: dict, spdx: dict, load_vendored) -> list[str]:
@@ -1564,13 +1622,22 @@ def augment_image(cdx: dict, spdx: dict, load_vendored) -> list[str]:
     return found
 
 
-def image_pair_errors(adir: Path) -> list[str]:
+def image_pair_errors(adir: Path, vendored_manifest: Path | None = None) -> list[str]:
     """The release gate for image SBOMs in `adir`: each `<stem>-image.cdx.json`
     has its SPDX partner, a pair named as one of the release's images
     (`<title>-image`, YUZU_IMAGE_TITLE) carries that image's title label, the
     pair carries exactly the marker mark-image adds, and it lists yuzu-server's
-    vendored components (in both formats) exactly when syft lists yuzu-server
-    in the image."""
+    vendored components (in both formats, exactly the component ids of
+    `vendored_manifest`, default this checkout's) exactly when syft lists
+    yuzu-server in the image. Like the marker tokens, the expected set is
+    recomputed here, never read from the pair."""
+    manifest = vendored_manifest or REPO_ROOT / VENDORED_MANIFEST
+    loaded: dict = {}
+
+    def expected():
+        if "ids" not in loaded:
+            loaded["ids"] = vendored_manifest_ids(manifest)
+        return loaded["ids"]
     stems: dict = {}
     for p in sorted(adir.iterdir()):
         if is_image_sbom(p.name):
@@ -1587,6 +1654,11 @@ def image_pair_errors(adir: Path) -> list[str]:
             have = image_marker(cdx, spdx)
             server = image_server_paths(cdx, spdx)
             vendored = image_vendored_state(cdx, spdx)
+            if server and vendored != (None, None):
+                ids = expected()
+                vendored = image_vendored_state(cdx, spdx, ids)
+                # Only a half that lists entries has an id set to compare.
+                gaps = [_vendored_id_gaps(h, ids) if h else "" for h in image_vendored_ids(cdx, spdx)]
         except (OSError, ValueError, SbomError) as e:
             errs.append(f"{stem}-image: {e}")
             continue
@@ -1608,9 +1680,14 @@ def image_pair_errors(adir: Path) -> list[str]:
             errs.append(f"{stem}-image: marked incomplete ({_marker_label(have[0])} / {_marker_label(have[1])}) "
                         f"for nothing the image is seen to hold")
         if server and vendored != (True, True):
+            detail = ""
+            if vendored != (None, None):
+                detail = "; ".join(f"{fmt}: {g}" for fmt, g in zip(("CycloneDX", "SPDX"), gaps) if g)
+                detail = f"; against {VENDORED_MANIFEST}, {detail}" if detail else ""
             errs.append(f"{stem}-image: the image holds yuzu-server ({', '.join(server)}), but the pair does not list "
                         f"the components compiled into it ({_vendored_label(vendored[0])} (CycloneDX) / "
-                        f"{_vendored_label(vendored[1])} (SPDX)): run `artifact-sbom.py augment` on a fresh scan")
+                        f"{_vendored_label(vendored[1])} (SPDX){detail}): run `artifact-sbom.py augment` on a "
+                        f"fresh scan")
         elif not server and vendored != (None, None):
             errs.append(f"{stem}-image: lists yuzu-server's vendored components ({_vendored_label(vendored[0])} / "
                         f"{_vendored_label(vendored[1])}), but syft lists no yuzu-server in the image")
@@ -1810,7 +1887,7 @@ def cmd_check(a) -> int:
     errs = [e for f in files for e in check_file(f, adir, a.max_components)]
     images = ""
     if adir is not None and not a.sboms:
-        image_errs = image_pair_errors(adir)
+        image_errs = image_pair_errors(adir, Path(a.vendored_components) if a.vendored_components else None)
         errs += image_errs
         n = len({p.name.rpartition("-image.")[0] for p in adir.iterdir() if is_image_sbom(p.name)})
         images = f"; {n} image SBOM pair(s), {'FAILED' if image_errs else 'OK'}"
@@ -1912,6 +1989,8 @@ def main(argv=None) -> int:
     c = sub.add_parser("check", help="the release gate over artifact SBOMs")
     c.add_argument("--artifacts-dir")
     c.add_argument("--max-components", type=int, default=MAX_COMPONENTS)
+    c.add_argument("--vendored-components", help=f"the manifest an image pair holding yuzu-server must match "
+                                                 f"(default: this checkout's {VENDORED_MANIFEST})")
     c.add_argument("sboms", nargs="*")
     mi = sub.add_parser("mark-image", help="mark a syft image SBOM pair incomplete where the image holds what the "
                                            "scan cannot list, in place")

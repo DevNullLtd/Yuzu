@@ -304,6 +304,18 @@ class ScratchCopy(unittest.TestCase):
                                                            "SPDX-License-Identifier: Apache-2.0"), encoding="utf-8")
         self.assertFails("three: server/core/vendor/three-NOTICE.txt says SPDX-License-Identifier: Apache-2.0")
 
+    def test_id_outside_the_spdx_id_characters_fails(self):
+        # The id is used as it is in the CycloneDX bom-ref and the SPDXID, and
+        # SPDX allows only [A-Za-z0-9.-]: anything else would make the two
+        # halves name the component differently, so the manifest refuses it.
+        for bad in ("qr_codegen", "qr codegen", "qrcodegen/2", "qrcödegen"):
+            with self.subTest(id=bad):
+                def rename(m, bad=bad):
+                    next(c for c in m["components"] if c["id"] == "qrcodegen")["id"] = bad
+                shutil.copy2(ROOT / MANIFEST, self.tmp / MANIFEST)
+                self.edit_manifest(rename)
+                self.assertFails("`id` may hold only letters, digits, `.` and `-`")
+
     def test_guessed_version_fails(self):
         def guess(m):
             next(c for c in m["components"] if c["id"] == "htmx-ext-sse")["version"] = "2.2.3"
