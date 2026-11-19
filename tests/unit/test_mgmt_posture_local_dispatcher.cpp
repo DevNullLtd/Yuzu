@@ -254,7 +254,7 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
 
     // ... and invalid UTF-8 bytes are replaced first (a protobuf string field must be UTF-8),
     // exactly as posture_row does for its values: an invalid byte becomes '?', a valid sequence
-    // survives. sanitize_utf8 does not yet reject overlong or surrogate forms (#4864).
+    // survives. sanitize_utf8 also replaces overlong and surrogate forms (#4864).
     const auto binary = dispatcher.run(&throwing, "bad\xff!");
     CHECK(binary.rc == 1);
     const auto brows = captured_rows(binary.captured);
@@ -275,4 +275,89 @@ TEST_CASE("mgmt_posture execute seam: unknown action is escaped; a throwing leg 
     CHECK(d.result_status == YUZU_RESULT_STATUS_PERMISSION_DENIED);
     CHECK(d.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
     CHECK(d.result_provenance == "linux:mgmt_posture:sssd_conf:permission_denied");
+}
+
+// F70: the host enforces the UTF-8 wire contract once, in CommandContextImpl::append_output, for
+// every plugin: a raw plugin write of invalid / overlong / surrogate bytes reaches the (capture)
+// buffer as '?', well-formed text survives, and the row/field boundaries are unchanged.
+namespace {
+int raw_bytes_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_write_output(ctx, "bad\xff|x");
+    yuzu_ctx_write_output(ctx, "over\xc0\x80|ok");
+    yuzu_ctx_write_output(ctx, "sur\xed\xa0\x80|ok");
+    yuzu_ctx_write_output(ctx, "caf\xc3\xa9|fine");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("host scrubs plugin output to well-formed UTF-8 before buffering (F70)",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor raw{};
+    raw.execute = &raw_bytes_execute;
+    const auto r = dispatcher.run(&raw, "x");
+    CHECK(r.captured == "bad?|x\nover??|ok\nsur???|ok\ncaf\xc3\xa9|fine");
+}
+
+// Dropped plugin output must be VISIBLE (WP07 gate-8 I2/I3): capture consumers trust
+// `rc == 0 && !truncated`, so a write lost to an allocation failure must set `truncated`, must not
+// leave a stray separator, and must report CONSTRAINED/PARTIAL -- never a short blob that looks
+// complete (the server would replace stored rows with it).
+namespace yuzu::agent {
+void arm_output_alloc_failure_for_test(int nth); // agent.cpp test seam
+bool stream_flush_alloc_failure_marks_dropped_for_test(int nth); // agent.cpp test seam
+}
+
+namespace {
+int three_writes_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_write_output(ctx, "a");
+    yuzu_ctx_write_output(ctx, "b"); // armed to fail
+    yuzu_ctx_write_output(ctx, "c");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("a plugin write lost to bad_alloc marks the capture truncated and CONSTRAINED (gate-8)",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &three_writes_execute;
+    yuzu::agent::arm_output_alloc_failure_for_test(2); // the second capture append fails
+    const auto r = dispatcher.run(&d, "x");
+    yuzu::agent::arm_output_alloc_failure_for_test(0);
+    CHECK(r.rc == 0);
+    CHECK(r.truncated);
+    // No stray '\n' for the chunk that never landed; once truncated, later writes are skipped (the
+    // capture is incomplete, and consumers refuse it).
+    CHECK(r.captured == "a");
+    CHECK(r.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(r.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+}
+
+// Stream mode: the final flush after execute() allocates the concatenated payload. A failure there
+// must be contained inside the context and counted as a dropped write, not unwind to the dispatch
+// firewall with yuzu_agent_plugin_output_dropped_total and yuzu.output_dropped unmoved.
+TEST_CASE("a stream-mode final flush lost to bad_alloc is contained and marked dropped",
+          "[agent][utf8][seam]") {
+    // nth = 1: the failure hits while the payload is being built (buffer still intact).
+    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test(1));
+    // nth = 2: the failure hits AFTER output_buffer was cleared; the output is gone for good, so
+    // it must be counted just the same.
+    CHECK(yuzu::agent::stream_flush_alloc_failure_marks_dropped_for_test(2));
+}
+
+namespace {
+int bad_provenance_execute(YuzuCommandContext* ctx, const char*, const YuzuParam*, size_t) {
+    yuzu_ctx_set_result_status(ctx, YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL,
+                               "src\xff:leg");
+    return 0;
+}
+} // namespace
+
+TEST_CASE("a plugin-set result provenance is scrubbed to well-formed UTF-8",
+          "[agent][utf8][seam]") {
+    yuzu::agent::LocalDispatcher dispatcher;
+    YuzuPluginDescriptor d{};
+    d.execute = &bad_provenance_execute;
+    CHECK(dispatcher.run(&d, "x").result_provenance == "src?:leg");
 }
