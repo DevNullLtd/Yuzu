@@ -607,6 +607,24 @@ TEST_CASE("binary_header_pe: every cap is exact", "[binary_header][pe]") {
 
 // ---- hostile offsets and sizes ---------------------------------------------------------------------
 
+TEST_CASE("binary_header_pe: an optional header past the end of the file is truncated even with no "
+          "resource directory slot",
+          "[binary_header][pe]") {
+    for (const bool plus : {false, true}) {
+        ImageSpec spec;
+        spec.plus = plus;
+        spec.rsrc = false;
+        auto img = build_image(spec);
+        set32(img.bytes, img.L.opt + (plus ? 108 : 92), 2); // NumberOfRvaAndSizes: no slot for index 2
+        INFO("PE32+: " << plus);
+        REQUIRE(parse(img.bytes).has_value()); // control: the declared size fits, so "no version"
+        set16(img.bytes, img.L.coff + 16, 0xFFFF);
+        const auto r = parse(img.bytes);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ParseError::truncated);
+    }
+}
+
 TEST_CASE("binary_header_pe: offsets and sizes near UINT32_MAX never read out of range",
           "[binary_header][pe]") {
     const auto good = canonical_image(false);
