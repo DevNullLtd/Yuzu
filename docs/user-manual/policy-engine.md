@@ -330,6 +330,9 @@ What this means in use:
   The first refusal after a row went stale refreshes it at once, but the fleet figure is
   cached for 60 seconds, so that device can still show as `unknown` for up to 60 seconds,
   once.
+- **To clear a policy's `blocked` rows at once, delete the policy**: its results are removed
+  with it. Disabling it does not clear them: a disabled policy's `blocked` rows stay in the
+  failing figure until the 24 hour rule above ages them out.
 - Creating a fragment or a policy, and enabling a policy, checks each instruction the
   fragment names and answers `400` for a refused pair (and `503` when the lookup cannot be
   answered). The check is advisory: the dispatch check above is the control, and an
