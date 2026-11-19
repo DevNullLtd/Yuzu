@@ -11,6 +11,21 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: policy evaluation does not dispatch gated, destructive, reserved or unclassifiable actions, and the devices show `blocked` (G01)
+
+**In short.** Affected: a policy whose check, fix or post-fix check names an instruction whose action needs approval (an execute gate), is Destructive, is reserved for the server, or is one the server cannot classify. To do: nothing for any other policy. For an affected policy, change what it runs or delete it (below); until then its devices show the new `blocked` status.
+
+**What changed.** Earlier builds dispatched such a pair without applying the approval requirement. Policy evaluation now applies it before anything is sent, with the same capability catalogue the interactive dispatch path uses. A refused pair is not sent. The policy engine manual, "Action approval and the `blocked` status", has the full rule and the reasons.
+
+**What operators will see.**
+
+- The devices of an affected policy show `blocked`, which counts as failing in the compliance pill, the Failing checks readout and the home tile. Each device's `check_result` names the phase (`check`, `fix` or `verify`), the reason (`gated`, `destructive`, `reserved`, `unclassified`, `ambiguous`, `unwired` or `dispatch_identifier_invalid`), and the plugin and action.
+- `POST /api/policies/{id}/evaluate` and `POST /api/policies/{id}/remediate` answer `409` for a refused pair. The body is the standard error envelope and its `remediation` text starts `policy_dispatch_refused: ` followed by the reason. The dashboard toast shows the reason.
+- Creating a fragment, creating a policy and enabling a policy answer `400` when an instruction they name is refused (and `503` when the check cannot be answered). An instruction that does not exist yet is accepted, and installing a product pack does not refuse its policies: a pack policy that names a refused action installs, and shows `blocked` at its first dispatch.
+- New: the counter `yuzu_server_policy_dispatch_denied_total{reason}` and the audit event `policy.dispatch`.
+
+**How it clears.** Deleting the policy removes its `blocked` rows at once. Changing what the policy runs, so that its instruction names an action policy evaluation dispatches, replaces `blocked` with the device's own result at the next check. Disabling the policy does not clear the rows: they leave the failing figure only when the 24 hour freshness rule ages them out. `POST /api/policies/{id}/invalidate` resets them to `unknown`, and the next check records the refusal again if it still applies.
+
 ## ⚠️ Breaking: agent plugin result rows neutralise `|`, CR and LF, and the `network_config` proxy row redacts credentials (WP11)
 
 **In short.** Affected: anything that parses stored results of the `filesystem` (`list_dir`, `search_dir`, Windows `get_version_info`), `installed_apps` (`list`, `query`, `list_per_user`), `processes` (`list`, `query`, `list_hashed`, `list_tree`), `procfetch`, `wmi` (`query`, `get_instance`) and `network_config` (`proxy`, including its `bypass` rows) plugins, or that matched on a raw proxy value.
