@@ -15,8 +15,7 @@ what is listed.
   all**. The walk does not enter an excluded directory (macOS `/usr/local/Cellar`,
   `/opt/homebrew/Cellar`); each is counted, not silently skipped.
 - **Per library:** one open, then only header reads through that descriptor, never the whole file,
-  made by the shared binary header readers (`agents/shared/binary_header_*.hpp`; this change depends on
-  the pull request that adds them and cannot merge before it). Their ceilings apply: at most 128 ELF
+  made by the shared binary header readers (`agents/shared/binary_header_*.hpp`, added by PR #8284). Their ceilings apply: at most 128 ELF
   program headers of exactly the format's own entry size, 4,096 dynamic entries (64 KiB), and for
   Mach-O at most 16 fat slices, 1,024 load commands in at most 512 KiB, plus a per-reader budget of
   4 MiB and 4,096 reads. The plugin keeps a 255-byte name cap on top. A count or size past a bound is

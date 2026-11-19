@@ -1585,8 +1585,7 @@ question of whether package-owned trees are excluded: yes.
 
 **Readers.** The ELF SONAME and the Mach-O `LC_ID_DYLIB` are read by the shared, bounded, fuzz-tested
 readers `read_elf` and `read_macho` (`agents/shared/binary_header_elf.hpp`, `binary_header_macho.hpp`,
-over `binary_header_reader.hpp`), not by parsers of the plugin's own. SAM-22 depends on the change that
-adds them and cannot merge before it. The plugin keeps a thin adapter
+over `binary_header_reader.hpp`), not by parsers of the plugin's own (they landed in PR #8284). The plugin keeps a thin adapter
 (`component_native_parsers.hpp`) that turns a file's read function into the shared source and maps the
 result to three outcomes: `not_this_format` is not a library (no row); `io`, `truncated`, `malformed`
 and `limit_exceeded` are unreadable (a row from the file name, `version_source` `unreadable`, an

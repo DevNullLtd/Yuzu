@@ -666,7 +666,7 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
-    'unit/test_component_native_parsers.cpp',    # component_inventory: bounded ELF SONAME / Mach-O LC_ID_DYLIB readers, fat-slice confinement, deterministic sweep (SAM-22)
+    'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
