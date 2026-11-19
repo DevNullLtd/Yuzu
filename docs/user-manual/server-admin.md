@@ -5207,7 +5207,7 @@ of rows), then reaches the certificates through ordinary btree indexes on `issue
 - **Capacity limit.** A substring that matches more than 20,000 distinct names is refused with a `400` ("make it longer");
   with the dictionary holding names nothing references any more, they count toward that limit until the prune removes them.
 
-**Measured** on 100,000 devices and 26.8 million certificates (PostgreSQL 18, a laptop, default settings): 
+**Measured** on 100,000 devices and 26.8 million certificates (PostgreSQL 18, a laptop, default settings):
 the upgrade (store open, migration v2) took **11-15 ms** (it creates an empty table); the background build (two
 `CREATE INDEX CONCURRENTLY` indexes of about 200 MB each, then the reconcile) took **121 seconds** from a cold start, **with
 certificate ingest running throughout**: 854 concurrent full reports (300 certificates each, a third carrying new names) were
