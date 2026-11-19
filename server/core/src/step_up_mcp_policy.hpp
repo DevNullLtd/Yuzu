@@ -62,12 +62,13 @@ inline constexpr std::string_view kReadOnlyOperation =
 
 /// The closed list of reasons a kExempt MCP row may carry. A new reason is a new constant in
 /// `step_up_policy.hpp` (or above) AND an entry here: the class name is the review record.
-inline constexpr std::array<std::string_view, 9> kMcpExemptReasons = {
+inline constexpr std::array<std::string_view, 11> kMcpExemptReasons = {
     step_up_detail::kExecutionDispatch, step_up_detail::kOperationalData,
     step_up_detail::kSyncTrigger,       step_up_detail::kEvidenceCapture,
     step_up_detail::kCancelsRecord,     step_up_detail::kCreatesRerunRecord,
     kReadOnlyOperation,                 step_up_detail::kContentAuthoring,
-    step_up_detail::kCollectionSettings,
+    step_up_detail::kCollectionSettings, step_up_detail::kLifecycleRules,
+    step_up_detail::kReferenceDataReplace,
 };
 
 [[nodiscard]] constexpr McpStepUpPolicyEntry exempt(std::string_view tool, std::string_view reason,
@@ -144,6 +145,13 @@ inline constexpr McpStepUpPolicyEntry kMcpStepUpPolicy[] = {
     step_up_mcp_detail::exempt ("delete_instruction_set",               step_up_detail::kContentAuthoring,  "DELETE", R"(/api/v1/instruction-sets/([^/]+))"),
     // Inventory:Write
     step_up_mcp_detail::exempt ("create_result_set_from_inventory_query", step_up_detail::kOperationalData, "POST",   R"(/api/v1/result-sets/from-inventory-query)"),
+    // Inventory:Write (SAM-29): the REST twins' classes and exact patterns. Each REST reason itself says
+    // the MFA step-up question awaits an owner ruling; when it comes, REST and MCP rows move together.
+    step_up_mcp_detail::exempt ("import_software_lifecycle_rules",      step_up_detail::kLifecycleRules,    "POST",   R"(/api/v1/inventory/software/lifecycle/rules)"),
+    step_up_mcp_detail::exempt ("delete_software_lifecycle_rules",      step_up_detail::kLifecycleRules,    "DELETE", R"(/api/v1/inventory/software/lifecycle/rules)"),
+    step_up_mcp_detail::exempt ("curate_software_alias",                step_up_detail::kReferenceDataReplace, "POST", R"(/api/v1/inventory/software/normalization/aliases)"),
+    step_up_mcp_detail::exempt ("reject_software_curation",             step_up_detail::kOperationalData,   "POST",   R"(/api/v1/inventory/software/normalization/queue/([A-Za-z0-9_-]+)/reject)"),
+    step_up_mcp_detail::exempt ("replace_software_normalization_pack",  step_up_detail::kReferenceDataReplace, "POST", R"(/api/v1/inventory/software/normalization/pack)"),
     // License:Write
     step_up_mcp_detail::pending("activate_platform_license",            "POST",   R"(/api/v1/license)"),
     // ManagementGroup:Write
@@ -234,7 +242,7 @@ inline constexpr std::size_t kMcpStepUpPolicyCount = std::size(kMcpStepUpPolicy)
 
 namespace step_up_mcp_detail {
 /// Slots of the tool-name index a check builds locally; kept at least 3x the row count.
-inline constexpr std::size_t kMcpKeySlots = 256;
+inline constexpr std::size_t kMcpKeySlots = 512;
 } // namespace step_up_mcp_detail
 static_assert(kMcpStepUpPolicyCount * 3 <= step_up_mcp_detail::kMcpKeySlots,
               "step_up_mcp_policy.hpp: the table outgrew its tool-name index; raise kMcpKeySlots "

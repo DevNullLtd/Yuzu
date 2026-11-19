@@ -32,6 +32,18 @@ fuzz_targets = {
     'sources': files('fuzz_component_zip.cpp'),
     'deps': [],
   },
+  'fuzz_binary_header_pe': {
+    'sources': files('fuzz_binary_header_pe.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_elf': {
+    'sources': files('fuzz_binary_header_elf.cpp'),
+    'deps': [],
+  },
+  'fuzz_binary_header_macho': {
+    'sources': files('fuzz_binary_header_macho.cpp'),
+    'deps': [],
+  },
   'fuzz_deployment_parse': {
     'sources': files('fuzz_deployment_parse.cpp'),
     'deps': [],
@@ -48,6 +60,18 @@ fuzz_targets = {
       '../../server/core/src/guardian_schema_registry.cpp',
     ),
     'deps': [nlohmann_dep],
+  },
+  'fuzz_file_search_cursor': {
+    'sources': files('fuzz_file_search_cursor.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_names': {
+    'sources': files('fuzz_file_search_names.cpp'),
+    'deps': [],
+  },
+  'fuzz_file_search_glob': {
+    'sources': files('fuzz_file_search_glob.cpp'),
+    'deps': [],
   },
 }
 

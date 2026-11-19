@@ -92,6 +92,9 @@ constexpr std::size_t kYuzuChartsMinBytes = 6'000; // ≥6 KB adapter floor
 // any change here must coincide with a deliberate vendor refresh.
 constexpr std::size_t kExpectedThreeJsBytes = 685'408;
 constexpr std::size_t kExpectedThreeOrbitJsBytes = 32'134;
+// Cytoscape.js 3.33.3 ESM minified (static/cytoscape.min.js), pinned to the npm
+// tarball's dist/cytoscape.esm.min.mjs; the SHA-256 is in static/cytoscape-NOTICE.txt.
+constexpr std::size_t kExpectedCytoscapeJsBytes = 432'844;
 } // namespace
 
 // ── HTMX core ───────────────────────────────────────────────────────────────
@@ -1550,6 +1553,12 @@ namespace yuzu::server {
 extern const std::string kYuzuVizHostJs;
 extern const std::string kCytoscapeJs;
 } // namespace yuzu::server
+
+TEST_CASE("static_js_bundle: kCytoscapeJs has expected pinned size", "[static-js][viz-host]") {
+    // A vendor refresh updates this constant and the hash in static/cytoscape-NOTICE.txt
+    // together.
+    CHECK(yuzu::server::kCytoscapeJs.size() == kExpectedCytoscapeJsBytes);
+}
 
 TEST_CASE("static_js_bundle: kYuzuVizHostJs imports cytoscape", "[static-js][viz-host]") {
     CHECK_THAT(yuzu::server::kYuzuVizHostJs, ContainsSubstring("cytoscape"));

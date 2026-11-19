@@ -1076,9 +1076,13 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (83 rows: 33 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (88 rows: 38 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
-  behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
+  behaviour. The exempt rows draw on a closed list of 11 reasons; the two newest
+  (`kLifecycleRules`, `kReferenceDataReplace`) are the REST twins' own reasons,
+  carried by the five software lifecycle-rule and curation writes (SAM-29), whose
+  REST rows are exempt pending an owner ruling on MFA step-up: when it comes, the
+  REST and MCP rows move together. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP

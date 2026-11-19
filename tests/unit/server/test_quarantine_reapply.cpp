@@ -9,13 +9,27 @@
 
 #include "quarantine_reapply.hpp"
 
+// The agent's own grammar, included by relative path so the server's mapper is tested against the
+// code the device runs (#7585a). Header-only, standard library only.
+#include "../../../agents/plugins/firewall/src/firewall_quarantine_parsers.hpp"
+
+#include <yuzu/protective_actions.hpp>
+
 #include <catch2/catch_test_macros.hpp>
 
 #include <cstdint>
 #include <string>
+#include <string_view>
+#include <utility>
 #include <vector>
 
 using yuzu::server::build_quarantine_reapply_params;
+using yuzu::server::kContainmentApplyAction;
+using yuzu::server::kContainmentPlugin;
+using yuzu::server::kContainmentReleaseAction;
+using yuzu::server::kContainmentStatusAction;
+using yuzu::server::kWhitelistInvalidMessage;
+using yuzu::server::kWhitelistTooLongMessage;
 using yuzu::server::ContainmentReply;
 using yuzu::server::endpoint_state_name;
 using yuzu::server::kContainmentExceptionsParam;
@@ -244,4 +258,84 @@ TEST_CASE("endpoint_state_name: the enumerator's name, never device text", "[ser
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::inactive)) == "inactive");
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::busy)) == "busy");
     CHECK(std::string(endpoint_state_name(QuarantineEndpointState::unconfirmed)) == "unconfirmed");
+}
+
+// ── The mapper against the agent's grammar (#7585a) ───────────────────────────
+
+// Each address is sent twice (/out and /in), and the agent refuses more than kMaxExceptions
+// entries, so the server's address cap is exactly half of it. The two caps must move together:
+// changing either number alone fails the build here instead of failing on a device (or leaving a
+// cap the other side never reaches).
+static_assert(2 * yuzu::server::kContainmentMaxAddresses ==
+                  yuzu::firewall::quarantine::kMaxExceptions,
+              "the server's address cap and the agent's exception cap must be changed together: "
+              "each address is sent as two entries");
+
+TEST_CASE("map_whitelist_to_exceptions: what the mapper emits is accepted by the agent's own parser, "
+          "with twice as many endpoints as addresses",
+          "[server][quarantine][reapply][differential]") {
+    const std::vector<std::pair<std::string, std::size_t>> accepted{
+        {"10.0.0.5", 1},
+        {"2001:db8::1", 1},
+        {"10.0.0.1,2001:db8::1, fe80::1", 3},
+        {" 10.0.0.1 , 10.0.0.2 ", 2},
+        {n_addresses(32), 32},
+    };
+    for (const auto& [whitelist, addresses] : accepted) {
+        CAPTURE(whitelist.size());
+        const auto mapped = map_whitelist_to_exceptions(whitelist);
+        REQUIRE(mapped.has_value());
+        const auto agent = yuzu::firewall::quarantine::parse_exceptions_csv(*mapped);
+        REQUIRE(agent.has_value());
+        CHECK(agent->size() == 2 * addresses); // one /out and one /in per address
+    }
+    // The empty list maps to nothing, and the agent reads nothing as an empty set.
+    const auto empty = map_whitelist_to_exceptions("");
+    REQUIRE(empty.has_value());
+    const auto agent_empty = yuzu::firewall::quarantine::parse_exceptions_csv(*empty);
+    REQUIRE(agent_empty.has_value());
+    CHECK(agent_empty->empty());
+}
+
+TEST_CASE("map_whitelist_to_exceptions: forms the agent would misread are refused before they reach it",
+          "[server][quarantine][reapply][differential]") {
+    for (const char* refused : {"010.0.0.1",                                  // a leading-zero octet
+                                "::ffff:10.0.0.1",                            // IPv4-mapped
+                                "10.0.0.1:443",                               // a port
+                                "10.0.0.0/8",                                 // a prefix length
+                                "10.0.0.1;rm"}) {                             // outside the charset
+        CAPTURE(refused);
+        CHECK_FALSE(map_whitelist_to_exceptions(refused).has_value());
+    }
+    // 46 characters of address charset: one past the token limit.
+    CHECK_FALSE(map_whitelist_to_exceptions(std::string(46, 'a')).has_value());
+    CHECK_FALSE(map_whitelist_to_exceptions(n_addresses(33)).has_value());
+}
+
+// ── The containment constants and the protective set (#7644) ─────────────────
+
+TEST_CASE("the containment action constants are exactly the closed protective set, and nothing else "
+          "on the firewall plugin is",
+          "[server][quarantine][reapply]") {
+    using yuzu::protective::is_protective_action;
+    using yuzu::protective::is_firewall_control_plugin;
+    for (const auto action : {kContainmentApplyAction, kContainmentStatusAction,
+                              kContainmentReleaseAction, std::string_view{"quarantine_allow"}}) {
+        CAPTURE(action);
+        CHECK(is_firewall_control_plugin(kContainmentPlugin, action));
+        CHECK(is_protective_action(kContainmentPlugin, action));
+    }
+    // A renamed constant would be refused here instead of in production, and an action added to the
+    // firewall plugin later does not inherit the exemption.
+    CHECK_FALSE(is_firewall_control_plugin(kContainmentPlugin, "state"));
+    CHECK_FALSE(is_firewall_control_plugin(kContainmentPlugin, "rules"));
+    CHECK_FALSE(is_firewall_control_plugin("os_info", kContainmentApplyAction));
+}
+
+TEST_CASE("the whitelist refusal texts name the limits the constants set", "[server][quarantine][reapply]") {
+    CHECK(std::string(kWhitelistTooLongMessage).find(std::to_string(kQuarantineWhitelistMaxLen)) !=
+          std::string::npos);
+    const std::string invalid{kWhitelistInvalidMessage};
+    CHECK(invalid.find(std::to_string(kContainmentMaxAddresses)) != std::string::npos);
+    CHECK(invalid.find(std::to_string(kQuarantineWhitelistMaxLen)) != std::string::npos);
 }
