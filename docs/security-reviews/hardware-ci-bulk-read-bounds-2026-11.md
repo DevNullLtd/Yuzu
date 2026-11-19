@@ -73,9 +73,12 @@ Recorded 2026-11-18. Each is a fact about the code as committed.
 13. A restart (SIGTERM) while a bulk read is parked in its audit write on a locked audit table can outlast the
     server's 15 s listener grace and end in a forced exit; any audited handler has the same exposure, so it
     predates this change and the slot hold does not lengthen the handler.
-14. The real REST and MCP handlers were not run against a really locked audit table (the Postgres tests drive
-    `read_page` plus `AuditStore::log`, and the handlers' release point is pinned with stub audit sinks); the
-    Postgres cases run at pool 4 only, pool 1 and 2 by arithmetic.
+14. The real REST and MCP handlers are now run against a really locked audit table, at pool 4 (cap 2), pool 2
+    (derived cap 1) and pool 1 (cap 1), in `test_mcp_tools_hardware.cpp` (tag `[pg][hardware][ci_page]`).
+    Pool 4 and pool 2 keep a connection for authorization; pool 1 does not, and the test pins that as the
+    documented behaviour of residual 3 (a change that reserves a connection should flip it). Still untested:
+    a DSN carrying `options=` or `PGOPTIONS` (which drops the injected statement and lock timeouts), the
+    default pool of 16, and a database that is frozen but still acknowledging packets.
 
 ## Frozen by this change
 
