@@ -11,6 +11,7 @@
 #include <catch2/matchers/catch_matchers_string.hpp>
 #include <nlohmann/json.hpp>
 
+#include <functional>
 #include <set>
 #include <string>
 #include <vector>
@@ -743,4 +744,27 @@ TEST_CASE("cert read model: a substring needle with a NUL is refused; a backslas
     const auto ok = crt::parse_list_params(P({{"issuer_dn_contains", "a\\b"}}));
     REQUIRE(ok.has_value());
     CHECK(*ok->filter.issuer_dn_contains == "a\\b");
+}
+
+TEST_CASE("cert read model: a page is caller-priced unless unfiltered or key-addressed (#6333)",
+          "[certread][model]") {
+    using namespace yuzu::server;
+    CertReadFilter f;
+    CHECK_FALSE(cert_read::caller_priced_page(f));
+    f.agent_id = "a";
+    f.sha256 = std::string(64, 'a');
+    f.scope = "machine";
+    CHECK_FALSE(cert_read::caller_priced_page(f)); // key-addressed and closed filters only
+    for (auto set : std::vector<std::function<void(CertReadFilter&)>>{
+             [](CertReadFilter& x) { x.ec_curve_oid = "1.2.3"; },
+             [](CertReadFilter& x) { x.rsa_modulus_bits_lt = 2048; },
+             [](CertReadFilter& x) { x.store = "My"; },
+             [](CertReadFilter& x) { x.issuer_dn = "CN=X"; },
+             [](CertReadFilter& x) { x.issuer_dn_contains = "abc"; },
+             [](CertReadFilter& x) { x.is_ca = true; },
+             [](CertReadFilter& x) { x.aki_key_id = "AB"; }}) {
+        CertReadFilter g;
+        set(g);
+        CHECK(cert_read::caller_priced_page(g));
+    }
 }
