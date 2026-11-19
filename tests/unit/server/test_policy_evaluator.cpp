@@ -1708,7 +1708,9 @@ TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatch
     CHECK(h.dispatch_calls == 0);
     check_blocked(h, pid, "check", "gated", "content_dist", "execute_staged");
 
-    // The same refusal on the next due tick rewrites nothing (write on change).
+    // The same refusal on the next due tick changes no verdict or detail. last_check_at is
+    // not compared: a refusal refreshes it from the database clock, so it can differ at a
+    // second boundary.
     auto before = h.ps.get_agent_status(pid, "agentA");
     REQUIRE(before.has_value());
     REQUIRE(before->has_value());
@@ -1718,7 +1720,6 @@ TEST_CASE("policy dispatch approval: a pair with an execute gate is not dispatch
     auto after = h.ps.get_agent_status(pid, "agentA");
     REQUIRE(after.has_value());
     REQUIRE(after->has_value());
-    CHECK((*after)->last_check_at == (*before)->last_check_at);
     CHECK((*after)->check_result == (*before)->check_result);
 }
 
