@@ -402,6 +402,7 @@ TEST_CASE("list_row_json carries the lookup keys and leaves device_row_json unto
     r.entry.install_scope = "machine";
     r.entry.install_location = "/usr/bin";
     r.entry.instance_key = "abc";
+    r.entry.package_id = "{PID-1}";
     r.facet_status = "full";
     r.last_confirmed_at = 0;
     DeviceFacts facts;
@@ -413,9 +414,10 @@ TEST_CASE("list_row_json carries the lookup keys and leaves device_row_json unto
     for (const auto& [k, v] : base.items()) {
         CAPTURE(k);
         REQUIRE(j.contains(k));
-        CHECK(j[k] == v); // the 14 original keys are byte-for-byte what device_row_json emits
+        CHECK(j[k] == v); // every device_row_json key (incl. package_id) is carried byte for byte
     }
     CHECK(j.size() == base.size() + 9);
+    CHECK(j["package_id"] == "{PID-1}");
     CHECK(j["hostname"] == "host-1");
     CHECK(j["last_seen"] == 1700000000);
     CHECK(j["status"] == "current");
@@ -798,19 +800,23 @@ TEST_CASE("read_components_page: push-down, wide path counts distinct dropped de
     }
 }
 
-TEST_CASE("CSV: 23-column installs header; quoting; the components header", "[server][software_list_model]") {
-    // The first 14 columns are the existing installs header, byte for byte.
-    CHECK(kListCsvHeader.substr(0, swc::kInstallsCsvHeader.size()) == swc::kInstallsCsvHeader);
-    CHECK(kListCsvColumns == 23);
-    CHECK(kListCsvHeader.ends_with(",instance_key,purl"));
+TEST_CASE("CSV: 24-column list header; quoting; the components header", "[server][software_list_model]") {
+    // The first 14 columns are the installs header minus its trailing package_id, byte for byte.
+    const auto installs = swc::kInstallsCsvHeader;
+    const auto installs_head = installs.substr(0, installs.rfind(','));
+    CHECK(kListCsvHeader.starts_with(std::string(installs_head) + ","));
+    CHECK(installs.ends_with(",package_id"));
+    CHECK(kListCsvColumns == 24);
+    CHECK(kListCsvHeader.ends_with(",instance_key,purl,package_id"));
 
     auto r = fleet_row("a,b\nc", "a1", 1); // comma and newline in a cell
     r.entry.purl = "pkg:deb/debian/git@2.39";
+    r.entry.package_id = "{PID}";
     DeviceFacts facts;
     const auto csv = list_csv({r}, facts);
     CHECK(csv.starts_with(std::string(kListCsvHeader) + "\n"));
     CHECK(csv.find("\"a,b\nc\"") != std::string::npos);
-    // Data row: the quoted newline stays inside one record; 23 cells are written, purl last.
+    // Data row: the quoted newline stays inside one record; 24 cells are written, package_id last.
     const auto body = csv.substr(kListCsvHeader.size() + 1);
     std::size_t commas = 0;
     bool quoted = false;
@@ -821,10 +827,11 @@ TEST_CASE("CSV: 23-column installs header; quoting; the components header", "[se
             ++commas;
     }
     CHECK(commas == kListCsvColumns - 1);
-    CHECK(body.ends_with(",pkg:deb/debian/git@2.39\n"));
-    // A row with no purl ends in an empty cell, not a missing one.
+    CHECK(body.ends_with(",pkg:deb/debian/git@2.39,{PID}\n"));
+    // A row with neither ends in two empty cells, not missing ones.
     r.entry.purl.clear();
-    CHECK(list_csv({r}, facts).ends_with(",\n"));
+    r.entry.package_id.clear();
+    CHECK(list_csv({r}, facts).ends_with(",,\n"));
 
     const auto ccsv = components_csv({comp_row("libfoo", "a1", "01")}, facts);
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
@@ -849,6 +856,7 @@ TEST_CASE("list_row_cells: the one column projection, equal to the CSV row after
     r.entry.install_location = "C:\\Program Files\\App";
     r.entry.instance_key = "inst-1";
     r.entry.purl = "pkg:deb/debian/app@2.5";
+    r.entry.package_id = "{PID-2}";
     r.last_confirmed_at = 1'700'000'000;
     DeviceFacts facts;
     facts.hostname["a1"] = "host-one";
@@ -865,6 +873,7 @@ TEST_CASE("list_row_cells: the one column projection, equal to the CSV row after
     CHECK(cells[15] == "1699000000");
     CHECK(cells[17] == "1700000000");
     CHECK(cells[22] == "pkg:deb/debian/app@2.5");
+    CHECK(cells[23] == "{PID-2}");
     CHECK(list_row_cells(fleet_row("n", "unknown-agent", 1), DeviceFacts{})[14].empty());
 
     // Read the CSV row back (RFC 4180) and compare cell for cell.
@@ -911,10 +920,11 @@ TEST_CASE("CSV: every agent- or device-influenced cell of both exports is formul
     auto r = fleet_row("=cmd|' /C calc'!A0", "a1", 1);
     r.entry.install_location = "+1+1";
     r.entry.publisher = "-2";
+    r.entry.package_id = "@pid";
     DeviceFacts facts;
     facts.hostname["a1"] = "@SUM(1)";
     const auto csv = list_csv({r}, facts);
-    for (const char* hostile : {"'=cmd|' /C calc'!A0", "'+1+1", "'-2", "'@SUM(1)"}) {
+    for (const char* hostile : {"'=cmd|' /C calc'!A0", "'+1+1", "'-2", "'@SUM(1)", "'@pid"}) {
         CAPTURE(hostile);
         CHECK(csv.find(hostile) != std::string::npos);
     }

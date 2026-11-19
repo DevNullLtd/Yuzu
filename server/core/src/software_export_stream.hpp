@@ -13,7 +13,7 @@
 ///    in-memory formats, not to a stream.
 ///  * ROWS: one row is exactly the list route's row (`list_row_json`, or the list CSV writer, which
 ///    neutralises formula cells through data_export.hpp). The formats carry the same columns as
-///    the list route's JSON and CSV, so a consumer can move between them. XLSX carries the CSV's 23
+///    the list route's JSON and CSV, so a consumer can move between them. XLSX carries the CSV's 24
 ///    columns from the same projection (`list_row_cells`), every cell as text.
 ///  * XLSX is not a stream: a workbook cannot be sent before it is finished, so the route builds it
 ///    whole into a temporary file first and sends it with a Content-Length (software_export_xlsx.hpp,

@@ -63,8 +63,8 @@ inline constexpr std::size_t kNameMaxBytes = 1024;
 
 inline constexpr std::string_view kInstallsCsvHeader =
     "agent_id,name,version,publisher,install_date,kind,ecosystem,epoch,release,arch,"
-    "signature_status,distro_id,distro_version,source";
-inline constexpr std::size_t kInstallsCsvColumns = 14; ///< the cells of kInstallsCsvHeader
+    "signature_status,distro_id,distro_version,source,package_id";
+inline constexpr std::size_t kInstallsCsvColumns = 15; ///< the cells of kInstallsCsvHeader
 inline constexpr std::string_view kTitlesCsvHeader =
     "name,publisher,installs,versions,ecosystems,kinds,newest_version";
 
@@ -233,6 +233,9 @@ catalogue_response_json(const std::vector<SoftwareCatalogRow>& rows,
                                                     bool truncated, bool omit_newest,
                                                     std::int64_t devices_omitted);
 
+/// One installed-software row: 15 keys, every key always present. `package_id` is the source's
+/// own package identifier (the Windows Installer product code on msi rows), "" when the source
+/// sets none.
 [[nodiscard]] nlohmann::json device_row_json(const SoftwareFleetRow& r);
 /// `next_cursor` non-empty -> string, else null. `truncated_by_cap` adds `result_truncated_by_cap`
 /// (true whenever rows == the effective limit, page or export).

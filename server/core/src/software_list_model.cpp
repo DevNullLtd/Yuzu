@@ -572,7 +572,7 @@ std::array<std::string, kListCsvColumns> list_row_cells(const SoftwareFleetRow& 
             epoch_text(last_seen_of(facts, r.agent_id)),
             std::string(derive_status(r.facet_status, r.facet_enabled)),
             epoch_text(r.last_confirmed_at), e.install_type, e.install_scope,
-            e.install_location, e.instance_key, e.purl};
+            e.install_location, e.instance_key, e.purl, e.package_id};
 }
 
 std::string list_csv(const std::vector<SoftwareFleetRow>& rows, const DeviceFacts& facts) {

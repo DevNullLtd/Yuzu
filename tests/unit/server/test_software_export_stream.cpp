@@ -139,7 +139,8 @@ TEST_CASE("export chunk: JSONL is one list_row_json object per line", "[software
     swl::DeviceFacts facts;
     facts.hostname = {{"a-1", "host-one"}};
     facts.last_seen = {{"a-1", 1'700'000'000}};
-    const std::vector<SoftwareFleetRow> rows{row("a-1", 1, "pkg"), row("a-2", 2, "pkg")};
+    std::vector<SoftwareFleetRow> rows{row("a-1", 1, "pkg"), row("a-2", 2, "pkg")};
+    rows[0].entry.package_id = "{PID-JSONL}";
 
     const auto text = swe::format_chunk(rows, facts, swe::ExportFormat::jsonl, true);
     REQUIRE_FALSE(text.empty());
@@ -151,6 +152,7 @@ TEST_CASE("export chunk: JSONL is one list_row_json object per line", "[software
         REQUIRE(i < rows.size());
         const auto parsed = json::parse(line);
         CHECK(parsed == swl::list_row_json(rows[i], facts));
+        CHECK(parsed["package_id"] == (i == 0 ? "{PID-JSONL}" : ""));
         ++i;
     }
     CHECK(i == rows.size());
@@ -204,12 +206,14 @@ TEST_CASE("export chunk: CSV neutralises formula cells and escapes quotes and ne
     const swl::DeviceFacts facts;
     auto r = row("a-1", 1, "=HYPERLINK(\"http://x\")", "Acme, \"Inc\"\nLine2");
     r.entry.install_location = "+cmd";
+    r.entry.package_id = "=pid";
     const auto recs = parse_csv(swe::format_chunk({r}, facts, swe::ExportFormat::csv, false));
     REQUIRE(recs.size() == 1);
     REQUIRE(recs[0].size() == swl::kListCsvColumns);
     CHECK(recs[0][1] == "'=HYPERLINK(\"http://x\")"); // name: a leading '=' is defused
     CHECK(recs[0][3] == "Acme, \"Inc\"\nLine2");       // publisher: comma, quote, newline round-trip
     CHECK(recs[0][20] == "'+cmd");                     // install_location
+    CHECK(recs[0][23] == "'=pid");                     // package_id: the trailing cell
 }
 
 TEST_CASE("export cap: the flag is clamped to the accepted range, never to 0 (which the budget "

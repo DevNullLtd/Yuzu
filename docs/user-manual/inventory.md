@@ -213,7 +213,7 @@ cadences.
   rather than a product silently disappearing. The same product normally also has an `app`/`windows`
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
-  `package_id`; the REST and MCP software routes do not return that column yet)
+  `package_id`, which the REST and MCP software routes return on each row)
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
@@ -996,15 +996,17 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   [rest-api.md](rest-api.md); `format`, `purl` and `vers` are REST-only (the MCP tool takes
   every other parameter).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 24 fields: the 15
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  release, arch, signature_status, distro_id, distro_version, source, package_id}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
-  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  `<plugin>.<action>` that produced the row; `package_id` is the source's own package
+  identifier (the Windows Installer product code on `msi_packages.list_inventory` rows, an
+  empty string when the source sets none) — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
-  tool's rows carry the same 23 fields.
+  tool's rows carry the same 24 fields.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
   purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
@@ -1077,7 +1079,7 @@ a statement timeout there degrades the page to a 503 (tracked in #5698). A conti
 
 `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` writes every installed-software row
 that matches your filters as one download, with no paging: JSONL is one JSON object per line,
-CSV is the 23 columns of the list under a single header row, and XLSX is the same 23 columns as a
+CSV is the 24 columns of the list under a single header row, and XLSX is the same 24 columns as a
 one-sheet workbook you can open directly (a bold, frozen header row, every cell text). It takes the filters of the
 route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
 confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
