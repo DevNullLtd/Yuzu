@@ -95,6 +95,16 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "get_software_collection_settings",
                                            "set_software_collection_settings",
                                            "get_software_host_collection_settings",
+                                           // SAM-29: the lifecycle-rule and normalisation
+                                           // curation twins (three reads, five writes).
+                                           "list_software_lifecycle_rules",
+                                           "import_software_lifecycle_rules",
+                                           "delete_software_lifecycle_rules",
+                                           "get_software_normalization_status",
+                                           "list_software_curation_queue",
+                                           "curate_software_alias",
+                                           "reject_software_curation",
+                                           "replace_software_normalization_pack",
                                            // SAM-21: the components lookup twin.
                                            "query_software_components"};
 constexpr std::string_view kCompliance[] = {

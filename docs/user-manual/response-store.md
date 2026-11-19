@@ -417,7 +417,10 @@ operator-visible notes:
 Responses are retained for 90 days by default. The server reaps responses
 whose TTL has expired on a periodic guarded sweep (clock-guarded and capped,
 so a skewed clock or a large backlog cannot mass-delete or stall — the same
-retention-guard shape the audit log uses). Deletion is permanent.
+retention-guard shape the audit log uses). Deletion is permanent. The one shorter lifetime is the
+quarantine reconciler's recurring status replies, which are kept 24 hours unless they changed what the
+server holds about the device; with retention set to 0 (keep forever) they are kept like every other
+response.
 
 To preserve data beyond the retention window, set up periodic exports using
 cron or a scheduled task:

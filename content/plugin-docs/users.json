@@ -196,7 +196,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Lists members of a specified local group. On Windows queries NetLocalGroupGetMembers and reports member type (user, group, well_known_group, alias). On Linux reads /etc/group and checks primary GID assignments in /etc/passwd. On macOS reads the group via dscl. The group name is a required parameter.",
+      "description": "Lists members of a specified local group. On Windows queries NetLocalGroupGetMembers and reports member type (user, group, well_known_group, alias). On Linux reads /etc/group and checks primary GID assignments in /etc/passwd; a failed group lookup answers \"Group lookup failed\" and a constrained (partial) result, distinct from \"Group not found\". On macOS reads the group via dscl. The group name is a required parameter.",
       "display_name": "List Group Members",
       "execute_roles": [
         "endpoint-admin",
@@ -217,7 +217,7 @@
       "author_roles": [
         "content-author"
       ],
-      "description": "Lists members of the local Administrators group. On Windows this queries the Administrators group via NetLocalGroupGetMembers and reports member type (user, group, well_known_group, alias) and domain. On Linux checks sudo/wheel groups plus root. On macOS reads the admin group via dscl.",
+      "description": "Lists members of the local Administrators group. On Windows this queries the Administrators group via NetLocalGroupGetMembers and reports member type (user, group, well_known_group, alias) and domain. On Linux checks sudo/wheel groups plus root. On macOS reads the admin group via dscl. On Linux, if a group or account lookup fails (as opposed to the group not existing) the result is marked constrained (partial) rather than silently listing fewer members.",
       "display_name": "List Local Administrators",
       "execute_roles": [
         "endpoint-admin",
@@ -814,6 +814,12 @@
     },
     {
       "completeness": "PARTIAL",
+      "provenance": "`linux:users:local_admins:lookup_failed` / `linux:users:group_members:lookup_failed`",
+      "status": "`CONSTRAINED`",
+      "when": "a Linux `getgrnam_r` / `getpwuid_r` lookup failed (an NSS fault, or a record too large for the 1 MiB buffer cap). A group that simply does not exist is not a failure: `local_admins` skips it and `group_members` answers `Group not found`. On failure `local_admins` lists what it could read and `group_members` answers `Group lookup failed` with rc 1"
+    },
+    {
+      "completeness": "PARTIAL",
       "provenance": "`users_win_events:access_denied`",
       "status": "`PERMISSION_DENIED`",
       "when": "Windows Security channel query denied; for `primary_user` only when the ProfileList fallback also failed"
@@ -1295,6 +1301,7 @@
       "content/definitions/users.yaml"
     ],
     "plugin": [
+      "agents/plugins/users/src/users_group_lookup.hpp",
       "agents/plugins/users/src/users_macos_last.hpp",
       "agents/plugins/users/src/users_plugin.cpp",
       "agents/plugins/users/src/users_win_events.hpp"

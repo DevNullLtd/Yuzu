@@ -132,6 +132,7 @@
 #include "offline_endpoint_store.hpp"
 #include "plugin_absence_confirmation.hpp"
 #include "pg/pg_collation_check.hpp"
+#include "pg/pg_server_encoding.hpp" // boot-time UTF8 database-encoding check (warn-only)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -717,9 +718,12 @@ public:
         // Streamed installed-software export (SAM-36): every format x result and every rejection
         // reason exist from boot, so a first rejection reads as an increase from 0.
         metrics_.describe("yuzu_server_software_export_total",
-                          "Streamed installed-software exports that ended, by format (jsonl/csv) "
+                          "Streamed installed-software exports that ended, by format (jsonl/csv/xlsx) "
                           "and result (completed/degraded/deadline/aborted/limit); anything but "
-                          "completed is a transfer the client saw truncated; aborted covers a "
+                          "completed is a transfer the client saw truncated (xlsx is built before "
+                          "anything is sent, so there a limit is a 413 and a degraded read, the "
+                          "deadline or a closing server before the first byte is a 503; only a "
+                          "deadline or abort during delivery truncates); aborted covers a "
                           "client that went away and a server that began shutting down; limit is "
                           "a stream cut at --inventory-export-max-rows or "
                           "--inventory-export-max-bytes",
@@ -1965,36 +1969,10 @@ public:
             metrics_.counter("yuzu_server_quarantine_gate_total",
                              {{"outcome", std::string(outcome)}});
 
-        // #3425: QuarantineContainmentReconciler's outcome series, seeded
-        // across its whole closed label set for the same "absent must not
-        // be confused with never ran" reason as the gate outcomes above.
-        for (const auto result : yuzu::server::kQuarantineReapplyResults)
-            metrics_.counter("yuzu_server_quarantine_reapply_total",
-                             {{"result", std::string(result)}});
-        // Per-replica gauge (never sum() across instances — each replica
-        // only sees the sessions its own gRPC listener holds). Seeded at 0
-        // for both label values so a healthy fleet with nothing unconfirmed
-        // renders as an explicit 0, not an absent series.
-        for (const char* reachability : {"connected", "offline"}) {
-            metrics_.gauge("yuzu_server_quarantine_endpoint_unconfirmed",
-                           {{"reachability", reachability}})
-                .set(0);
-            // Releasing records (a release asked for, the device not yet confirmed) and records
-            // an operator ended by force whose device still owes a release.
-            metrics_.gauge("yuzu_server_quarantine_release_pending",
-                           {{"reachability", reachability}})
-                .set(0);
-            metrics_.gauge("yuzu_server_quarantine_forced_release_owed",
-                           {{"reachability", reachability}})
-                .set(0);
-        }
-        // Freshness signal for the gauge above (#3425 review, Doomgoose
-        // #3567): pre-seeded optimistic (1) since the reconciler's tick
-        // thread starts within a boot-time window measured in seconds, not
-        // minutes — a brief false-healthy read before the first real tick
-        // is a negligible tradeoff against the alternative of a 0 (falsely
-        // degraded) or absent (loses absent()-alertability) default.
-        metrics_.gauge("yuzu_server_quarantine_reconciler_tick_healthy").set(1);
+        // #3425: QuarantineContainmentReconciler's outcome counters and gauges, seeded across
+        // their whole closed label sets so `absent()` is never confused with "never ran"
+        // (#7584e: one function, so a test can run it too).
+        QuarantineContainmentReconciler::seed_metrics(metrics_);
 
         // The quarantine read-degrade family was never pre-seeded, unlike its
         // mgmt-group and discovery siblings above, so every reason read as
@@ -5727,6 +5705,19 @@ public:
                     spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
                                  pg_pool_->size());
                     pg_probe_ok = true;
+                    // WARN-ONLY (owner decision pending on refusing to boot): the strict JSON
+                    // dumps and PG's own invalid-UTF-8 rejection assume a UTF8 database.
+                    {
+                        std::string enc;
+                        const bool utf8 = pg::report_server_encoding(probe.get(), metrics_, &enc);
+                        if (!utf8)
+                            spdlog::error("[PG] database encoding is '{}', not UTF8: PostgreSQL "
+                                          "will not reject invalid UTF-8 from agents and strict "
+                                          "JSON serialisation of stored text can throw. Recreate "
+                                          "the database with ENCODING 'UTF8'. (Warning only; the "
+                                          "server keeps starting.)",
+                                          ::yuzu::log_key_token(enc));
+                    }
                 }
                 // The probe lease is released here. At start, before any store serves: compare the
                 // database's recorded collation version with the operating system's. Never stops
@@ -12365,14 +12356,16 @@ public:
         // SLE ProductRegistryStore: the /api/v1/sle/* route closures capture `this`
         // and dereference this store only at request time; the gRPC + HTTP drains
         // above have quiesced every handler, so drop it BEFORE the pool (ADR-0012
-        // destruct-before-pool). Nothing borrows it long-lived (its writer is the UCE
-        // module's evaluator, out-of-server), so no unwire step precedes the reset.
+        // destruct-before-pool). Its only long-lived borrower is McpServer's raw pointer for the
+        // SAM-29 curation tools, which the same drains quiesce before this reset (the writer of
+        // the registry rows is the UCE module's evaluator, out-of-server).
         product_registry_store_.reset();
         // SAM-34 collection settings store: its routes capture it and are served only until
         // web_server_->stop(); drop it ahead of the pool with the other born-on-PG stores.
         software_collection_settings_store_.reset();
-        // SAM-23 lifecycle store: only /readyz borrows it (HealthRoutes deps), and that server is
-        // stopped above; drop it ahead of the pool.
+        // SAM-23 lifecycle store: /readyz borrows it (HealthRoutes deps) and McpServer holds a raw
+        // pointer for the SAM-29 lifecycle tools; both servers are stopped above; drop it ahead of
+        // the pool.
         software_lifecycle_store_.reset();
         // B2: roll-up (query owner) then the fleet store; both before the pool.
         app_perf_rollup_.reset();
@@ -19453,11 +19446,15 @@ private:
         // Heartbeat-triggered fast path (the ONLY event-driven trigger that
         // is dispatch-safe — Register returns before Subscribe establishes
         // the stream, so a hook fired from there would have `send_to`
-        // silently drop it). The tick below is the periodic backstop:
-        // AgentRegistry::send_to drops offline agents silently, so a tick
-        // against a still-offline device costs one cheap skip and catches a
-        // device that reconnected between heartbeats (same shape as
-        // PreflightRunner's re-dispatch-on-reconnect loop).
+        // silently drop it). It only MARKS the device due (#7619): no store
+        // read and no dispatch on the heartbeat ingest path. The reconciler
+        // thread below drains the marks every second and runs the periodic
+        // tick once 20 s have passed since the last one (elapsed time, not a
+        // pass count: a slow drain must not stretch the tick).
+        // AgentRegistry::send_to drops offline agents
+        // silently, so a tick against a still-offline device costs one cheap
+        // skip and catches a device that reconnected between heartbeats (same
+        // shape as PreflightRunner's re-dispatch-on-reconnect loop).
         if (heartbeat_ingestion_) {
             heartbeat_ingestion_->set_quarantine_reconcile_fn(
                 [this](std::string_view agent_id) {
@@ -19466,12 +19463,24 @@ private:
                 });
         }
         quarantine_reconcile_thread_ = std::thread([this]() {
-            spdlog::info("Quarantine containment reconciler thread started (cadence=20s)");
+            spdlog::info("Quarantine containment reconciler thread started (heartbeat drain "
+                         "every 1s, tick every 20s)");
+            // ponytail: one reconciler thread does all reconcile I/O, so a mass quarantine is
+            // worked through here at kMaxDispatchesPerTick per pass; shard by agent if that
+            // ceiling is ever reached.
+            constexpr auto kTickEvery = std::chrono::seconds{20};
+            auto last_tick = std::chrono::steady_clock::now();
             while (!stop_requested_.load(std::memory_order_acquire)) {
-                for (int i = 0; i < 4 && !stop_requested_.load(std::memory_order_acquire); ++i)
-                    std::this_thread::sleep_for(std::chrono::seconds{5});
+                std::this_thread::sleep_for(std::chrono::seconds{1});
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
+                // Tick once 20 s have passed since the last tick, otherwise drain: a pass is 1 s
+                // of sleep plus the drain, so counting passes would stretch the tick under a
+                // slow drain.
+                const auto now = std::chrono::steady_clock::now();
+                const bool tick_pass = now - last_tick >= kTickEvery;
+                if (tick_pass)
+                    last_tick = now;
                 if (quarantine_reconciler_) {
                     // tick() touches PG and gRPC dispatch — either can throw;
                     // an escaping exception would std::terminate the whole
@@ -19491,11 +19500,15 @@ private:
                         // reclassify this pass to a ReplicaSafe stream-partitioned
                         // form. Correct + inert today (single replica == leader).
                         if (leader_gate_permits<background_job_class("quarantine_reconciler.tick")>(
-                                leader_elector_.get()))
-                            quarantine_reconciler_->tick();
+                                leader_elector_.get())) {
+                            if (tick_pass)
+                                quarantine_reconciler_->tick();
+                            else
+                                (void)quarantine_reconciler_->drain_heartbeat_due();
+                        }
                     } catch (const std::exception& e) {
-                        spdlog::error("quarantine_reconciler: tick threw ({}) — thread continuing",
-                                      e.what());
+                        spdlog::error("quarantine_reconciler: {} threw ({}) — thread continuing",
+                                      tick_pass ? "tick" : "heartbeat drain", e.what());
                         // #3425 governance correction round (cpp-safety
                         // SHOULD + unhappy-path UP-1): an exception here
                         // means this tick did not reach ITS OWN successful
@@ -19505,8 +19518,8 @@ private:
                         // of exposing the outage.
                         quarantine_reconciler_->on_tick_exception();
                     } catch (...) {
-                        spdlog::error(
-                            "quarantine_reconciler: tick threw unknown exception — continuing");
+                        spdlog::error("quarantine_reconciler: {} threw unknown exception — continuing",
+                                      tick_pass ? "tick" : "heartbeat drain");
                         quarantine_reconciler_->on_tick_exception();
                     }
                 }
@@ -21701,7 +21714,8 @@ private:
 
         // Software normalisation curation REST (queue, curated aliases, pack replace). The
         // routes borrow product_registry_store_ and are served only until web_server_->stop(),
-        // which precedes the store reset in stop(); the class holds no state of its own.
+        // which precedes the store reset in stop(); the class holds no state of its own. The
+        // MCP curation tools borrow the same store through McpServer's raw pointer.
         {
             HttplibRouteSink curation_sink{*web_server_};
             SoftwareCurationRoutes{}.register_routes(
@@ -21745,7 +21759,8 @@ private:
         // Imported software lifecycle rules REST (SAM-24): import, list and clear. Registered
         // here, ahead of rest_api_v1_->register_routes, for the same reason as the routes above
         // (the generic GET /api/v1/inventory/{a}/{b} would take the bare path's neighbours). The
-        // routes borrow software_lifecycle_store_ only; stop() joins the web thread ahead of
+        // routes borrow software_lifecycle_store_ only (the MCP lifecycle tools borrow it through
+        // McpServer's raw pointer); stop() joins the web thread ahead of
         // resetting it, and the class holds no state of its own. A null or closed store answers
         // 503 on every route.
         {
@@ -21823,6 +21838,7 @@ private:
                     .concurrency = cfg_.inventory_export_concurrency,
                     .limits = {.max_rows = cfg_.inventory_export_max_rows,
                                .max_bytes = cfg_.inventory_export_max_bytes},
+                    .xlsx_tmp_dir = cfg_.db_dir() / "export-tmp",
                 });
         }
 
@@ -24543,6 +24559,16 @@ private:
             tool_deps.ci_collation_gate = &collation_gate_;
             tool_deps.dex_score_fn = hw_dex_score_fn;
             tool_deps.quarantine_list_fn = hw_quarantine_list_fn;
+            // #7624: records an operator ended by force whose device still owes a release, for
+            // `list_quarantined_devices` with include=release_owed. The same scope-in-query read
+            // the REST route makes.
+            tool_deps.quarantine_owed_list_fn =
+                [this](const std::vector<std::string>* ids,
+                       std::size_t limit) -> std::optional<std::vector<QuarantineRecord>> {
+                if (!quarantine_store_ || !quarantine_store_->is_open())
+                    return std::nullopt;
+                return quarantine_store_->list_release_owed_in(ids, limit);
+            };
             // /crypto widgets: list_crypto_widgets' availability, get_crypto_ca_stats' R2
             // withhold and list_issued_certs' filtered form use the SAME callback as the REST
             // routes and the dashboard. One instance feeds both consumers below: the seven
@@ -24652,6 +24678,9 @@ private:
                                                          mgmt_group_store_.get(),
                                                          plugin_config_store_.get()},
                 collection_settings_probe_fn);
+            // SAM-29 twins: the SAME stores SoftwareLifecycleRoutes and SoftwareCurationRoutes borrow.
+            mcp_server_->set_software_lifecycle_store(software_lifecycle_store_.get());
+            mcp_server_->set_product_registry_store(product_registry_store_.get());
             // #2146 Batch B1 — the SAME BaselineStore GET
             // /guaranteed-state/device-compliance already reads, backing MCP
             // get_guardian_device_compliance's identical baseline lookup.

@@ -670,9 +670,22 @@ yuzu_key_provider_dep = declare_dependency(
 # linker folds silently (see yuzu_server_core_dep below).
 yuzu_server_core_cpp_args = https_cpp_args + ['-DCPPHTTPLIB_LISTEN_BACKLOG=128'] + (cxx.get_id() == 'msvc' ? ['/bigobj'] : []) + switch_werror_args
 yuzu_server_core_incs = include_directories('include', '../../common/include')
+# libxlsxwriter (SAM-36b, `format=xlsx` of the installed-software export), used by ONE translation
+# unit (software_export_xlsx.cpp). pkg-config only: the vcpkg port installs `xlsxwriter.pc` and NO
+# CMake package, so a cmake lookup could never succeed. minizip is a direct dependency of that same
+# translation unit: after workbook_close it reads the finished workbook back through minizip's
+# unzip API (`xlsx_verify_workbook`), because the library does not report a failed write of its
+# temporary files. The .pc also lists `zlib minizip` as public requirements, so the static link
+# would carry minizip through it anyway; it is declared on its own because this code calls it, and
+# the server tests read workbooks back through it too. Both are server-feature ports (vcpkg.json),
+# absent from the agent-only Windows and macOS installs, and this file is only processed when the
+# server is built (Linux, ADR-0035).
+xlsxwriter_dep = dependency('xlsxwriter', method: 'pkg-config', required: true, include_type: 'system')
+minizip_dep = dependency('minizip', method: 'pkg-config', required: true, include_type: 'system')
+
 yuzu_server_core_deps = [yuzu_sdk_dep, yuzu_proto_dep, spdlog_dep, httplib_dep,
                          sqlite3_dep, nlohmann_json_dep, re2_dep, qrcodegen_dep,
-                         libpq_dep, yuzu_key_provider_dep]
+                         libpq_dep, yuzu_key_provider_dep, xlsxwriter_dep, minizip_dep]
 yuzu_server_core_deps += auth_crypto_deps
 yuzu_server_core_deps += https_deps
 yuzu_server_core_deps += saml_deps
@@ -880,6 +893,7 @@ yuzu_server_core_lib = static_library(
     'src/software_plugin_health_model.cpp',
     'src/software_read_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
     'src/software_collection_settings_api.cpp', # SAM-35: transport-neutral body shared by the REST routes and the MCP twins
+    'src/software_lifecycle_api.cpp', # SAM-29: transport-neutral body shared by the REST routes and the MCP twins
     'src/crypto_cbom.cpp',    # /crypto CBOM export: pure CycloneDX 1.7 shaper
     'src/crypto_library_model.cpp', # /crypto slice 1: pure curated table + shared REST/MCP model
     'src/crypto_api.cpp',     # /crypto slice 1: store-backed CryptoApi seam impl
@@ -1063,10 +1077,12 @@ yuzu_server_routes_lib = static_library(
     'src/device_ui.cpp',
     'src/inventory_routes.cpp',
     'src/software_curation_routes.cpp',
+    'src/software_curation_api.cpp', # SAM-29: shared body of the curation routes and the MCP twins; routes lib because it calls the curation_keys codecs defined in software_curation_routes.cpp
     'src/software_collection_settings_routes.cpp',
     'src/software_lifecycle_routes.cpp',
     'src/software_read_routes.cpp',
     'src/software_export_routes.cpp',
+    'src/software_export_xlsx.cpp', # SAM-36b: the only TU that includes libxlsxwriter
     'src/inventory_ui.cpp',
     'src/device_containment_routes.cpp',
     'src/device_estate_routes.cpp',

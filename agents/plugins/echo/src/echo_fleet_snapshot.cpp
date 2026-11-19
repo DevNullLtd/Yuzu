@@ -91,7 +91,7 @@ std::string build_fleet_snapshot_json(const std::vector<yuzu::agent::ProcessInfo
     if (!tcp_source_enabled)
         doc["tcp_source_paused"] = true;
 
-    return doc.dump();
+    return doc.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 namespace {

@@ -147,7 +147,11 @@ std::optional<LiveKind> resolve_rest_kind(const std::string& kind);
 // ── Line / field helpers ─────────────────────────────────────────────────────────
 
 /// Split newline-joined write_output() lines: tolerate a trailing '\r' and drop empty
-/// lines (matches both legacy renderers).
+/// lines (matches both legacy renderers). An INTERIOR '\r' is kept verbatim: this is NOT the
+/// same splitter as `split_output_lines` (result_parsing.hpp, which deletes every '\r' because
+/// its rows feed the SSE stream) nor `rs_matcher`'s (which keeps even a trailing '\r'; its
+/// cells decide result-set MEMBERSHIP, so it must not change silently). The three divergences
+/// are pinned by tests in test_result_set_matcher.cpp.
 std::vector<std::string> split_lines(const std::string& output);
 
 /// Split one pipe-delimited line into fields (empty trailing field preserved).

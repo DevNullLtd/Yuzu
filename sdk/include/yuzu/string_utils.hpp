@@ -29,6 +29,8 @@ inline bool icontains(std::string_view haystack, std::string_view needle) {
 
 /// Replace invalid UTF-8 bytes with '?' to avoid protobuf serialization errors.
 /// Windows registry strings may contain Latin-1 or other non-UTF-8 data.
+/// Accepts exactly RFC 3629 well-formed UTF-8: overlong forms, UTF-16 surrogates
+/// and scalars above U+10FFFF are replaced too (protobuf rejects them).
 inline std::string sanitize_utf8(const std::string& s) {
     std::string out;
     out.reserve(s.size());
@@ -39,7 +41,7 @@ inline std::string sanitize_utf8(const std::string& s) {
             // ASCII
             out += s[i];
             ++i;
-        } else if ((c >> 5) == 0x06 && i + 1 < s.size() &&
+        } else if (c >= 0xC2 && (c >> 5) == 0x06 && i + 1 < s.size() &&
                    (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02) {
             // Valid 2-byte sequence
             out += s[i];
@@ -47,7 +49,9 @@ inline std::string sanitize_utf8(const std::string& s) {
             i += 2;
         } else if ((c >> 4) == 0x0E && i + 2 < s.size() &&
                    (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02) {
+                   (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02 &&
+                   !(c == 0xE0 && static_cast<unsigned char>(s[i + 1]) < 0xA0) &&   // overlong
+                   !(c == 0xED && static_cast<unsigned char>(s[i + 1]) >= 0xA0)) {  // surrogate
             // Valid 3-byte sequence
             out += s[i];
             out += s[i + 1];
@@ -56,7 +60,9 @@ inline std::string sanitize_utf8(const std::string& s) {
         } else if ((c >> 3) == 0x1E && i + 3 < s.size() &&
                    (static_cast<unsigned char>(s[i + 1]) >> 6) == 0x02 &&
                    (static_cast<unsigned char>(s[i + 2]) >> 6) == 0x02 &&
-                   (static_cast<unsigned char>(s[i + 3]) >> 6) == 0x02) {
+                   (static_cast<unsigned char>(s[i + 3]) >> 6) == 0x02 && c <= 0xF4 &&
+                   !(c == 0xF0 && static_cast<unsigned char>(s[i + 1]) < 0x90) &&   // overlong
+                   !(c == 0xF4 && static_cast<unsigned char>(s[i + 1]) >= 0x90)) {  // > U+10FFFF
             // Valid 4-byte sequence
             out += s[i];
             out += s[i + 1];

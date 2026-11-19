@@ -411,10 +411,9 @@ each publishing job runs it once, before its first push.
 
 **There is no override.** A published release's assets and signatures describe
 the images it shipped, so any re-push over it breaks verification. To ship
-different images, cut a new version. To redo a release whose published content
-is itself wrong, delete the GitHub release first (destructive; the release
-skill requires operator confirmation), then start a fresh run, which recreates
-the release with a `SHA256SUMS` that matches its images.
+different images, cut a new version. Deleting a published release, or redoing
+one under its tag, is not a release procedure: see "Release tag policy" below
+(an owner-decided incident; Limit 2).
 
 Limits: the guard's read-only token cannot see a **draft** release — one made
 by hand, or one `gh release create` leaves behind when interrupted while
@@ -438,8 +437,9 @@ flattened, and before `SHA256SUMS`, signing, the `.intoto.jsonl` bundles and
 `gh release create`. When it fails, no GitHub release, `SHA256SUMS` or
 signature exists yet, but **the container images are already published**:
 the `release` job needs `docker-publish`, `docker-publish-postgres` and
-`docker-publish-chisel`, which push `:X.Y.Z` (and, on a stable tag, `:X.Y` and
-`:latest`) first (the agent-bundle image needs `release`, so it is not
+`docker-publish-chisel`, which have moved `:X.Y.Z` (and, on a stable tag, `:X.Y` and
+`:latest`) to their verified, signed digests first (each of their publish journals
+ends `tagged`; the agent-bundle image needs `release`, so it is not
 published), and the build jobs' provenance attestations are already recorded.
 An image is never published ahead of a failed build: every image-publish job (`docker-publish`,
 `docker-publish-chisel`, `docker-publish-postgres`) also needs all four builds
@@ -455,6 +455,44 @@ at a release that does not exist until the release is fixed. It fails the
 release when:
 
 - an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` has no SBOM pair of its own
+  (`<name without the extension>.{cdx,spdx}.json`), or an SBOM belongs to no
+  archive, package or image of the release (supply-chain S8);
+- an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
+  in the release or whose SHA-256 differs, has more entries than the bound in
+  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 58 for the
+  Linux files and 212 for v0.15.0's Windows archive, the largest), has no entries and no record
+  that its file was unpacked and held files, or lists a path under `vcpkg/`,
+  `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
+  `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
+  ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
+  caught only by the bound);
+- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, lacks
+  the incomplete marker its image calls for or carries only part of it, or is
+  named as a release image (`yuzu-server-image`, ...) without that image's
+  title label, on which the marker it needs is decided: each image-publish job runs
+  `artifact-sbom.py mark-image` on its pair after signing and before its
+  release tags move ("Tag the release"), which marks an image
+  holding `yuzu-server`, `yuzu-agent`, the Erlang emulator or the source-built
+  pgvector (what syft cannot list there), and the same step refuses a pair
+  that describes two different images. These SBOM steps run after the images
+  are pushed: a failure about the SBOM itself needs a fix and a new tag, while
+  a transfer fault (a SHA-256 mismatch, a missing file) needs only a re-run
+  (the release skill's failure table). The build jobs make these SBOMs with
+  that script: each artifact is unpacked and scanned on its own with syft
+  pinned to v1.57.2 (the image SBOM steps pin the same version), and the vcpkg
+  ports its binaries are built from are added from the installed tree for the
+  release triplet; the Windows installer's SBOM lists the files the Inno
+  Setup compiler's own manifest says it packed, each checked against the
+  build directory by SHA-256 (the installer manifest contract below). Each
+  `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  (Docs Lint, every PR) pins that contract against a fixture in the
+  compiler's format; the `CBOM schema` job runs the same suite with
+  `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
+  vendored CycloneDX 1.7 and SPDX 2.3 schemas. **Owner item:** `CBOM schema`
+  is not a required check, so a schema-validation failure does not block a
+  merge; making it required is a decision on the branch ruleset, not taken
+  here;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
@@ -479,10 +517,161 @@ For a builder naming defect, a fresh run builds the tag's original commit
 again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
 
-If the release cannot be fixed promptly on a stable tag, move `:latest` back
-to the previous release's images. The gate has no override; the naming forms
+If the release cannot be fixed promptly on a stable tag, `:latest` and `:X.Y`
+keep naming its unreleased images until it is fixed and re-tagged or a later
+release moves them; moving a release tag by hand is not a release procedure ("Release tag policy",
+below). The gate has no override; the naming forms
 it checks are a second copy of the builders' naming, and its header lists
 where each lives.
+
+#### The installer manifest contract (`OutputManifestFile`)
+
+**Decision record (2026-11-18).** After five governance passes found the `.iss` parser kept accepting forms it then mapped differently from the Inno Setup compiler, the enterprise-architect review recommended replacing it with the compiler's own manifest, verified by SHA-256 against the build directory; the project owner (fjarvis) accepted that ruling on 2026-11-18. The manifest format below was checked against issrc tag is-6_7_3. Review this decision if Inno Setup changes the manifest format, or if the installer starts taking files at install time (`external`, `download`).
+
+The Windows installer's SBOM is made from the file list the Inno Setup
+compiler (ISCC) writes when it builds the installer. The installer script is
+never parsed. `deploy/packaging/windows/yuzu-agent.iss` sets
+`OutputManifestFile=YuzuAgentSetup.manifest.txt`. In `release.yml`, the
+"Build Windows installers (InnoSetup)" step deletes any old manifest, runs
+ISCC, fails if that run wrote none, and copies it beside the installer as
+`YuzuAgentSetup-<version>.manifest.txt`. "Generate per-artifact SBOMs" then
+runs `artifact-sbom.py generate --inno-manifest <that copy> --build-dir
+build-windows --inno-build-dir <the /DBuildDir that ISCC run was given>`. The
+script reads each listed file from `build-windows`, checks its SHA-256, copies
+the checked bytes into a scratch tree at the file's path below the build
+directory, and runs syft and the vcpkg closure over that tree, as for any
+other artifact. The manifest is not a release asset (it records the runner's
+paths); the Windows job keeps it for 90 days, the repository maximum, as the
+`windows-installer-manifest` workflow artifact, so it is available as evidence of how the
+installer SBOM was produced (owner decision, 2026-11-18).
+
+**The format,** read from Inno Setup's source at tag `is-6_7_3`, the version
+v0.15.0 was built with:
+
+- UTF-8 with a byte order mark, and every line, the last included, ends in
+  CR LF: `TTextFileWriter` (`Projects/Src/Shared.FileClass.pas`, 508-573)
+  encodes with `Utf8Encode`, writes the mark at the start of a new file, and
+  `WriteLine` appends CR LF.
+- A tab-separated header, exactly `Index`, `SourceFilename`, `TimeStamp`,
+  `Version`, `SHA256Sum`, `OriginalSize`, `FirstSlice`, `LastSlice`,
+  `StartOffset`, `ChunkSuboffset`, `ChunkCompressedSize`, `Encrypted`,
+  `ISSigKeyID`, then one row per file location, `Index` counting from 0
+  (`Projects/Src/Compiler.SetupCompiler.pas`, `CreateManifestFile`,
+  7942-8005).
+- `SourceFilename` is the source path as ISCC built it at compile time: the
+  `[Files]` `Source` with `{#BuildDir}` expanded, joined to the file name it
+  found, not normalised. ISCC merges two entries naming the same path
+  (compared case-insensitively) into one location, so it lists a file once.
+- `SHA256Sum` is 64 lowercase hex digits (`SHA256DigestToString`,
+  `Components/SHA256.pas`) over the file's own bytes, taken before any
+  compression transform (`Compiler.CompressionHandler.pas`, 243-260).
+
+**Path mapping.** A `SourceFilename` and `--inno-build-dir` are both read as
+drive-absolute Windows paths (Python's `ntpath`) and normalised with
+`normpath`, so a `..` that stays inside the build directory is resolved and
+`/` reads as `\`. The drive and every component are compared
+case-insensitively, as Windows compares them. The components after the build
+directory's are the file's build-relative path, looked up under
+`--build-dir`; the file's real location, with symlinks and junctions
+resolved, must be inside `--build-dir`.
+
+**Refused.** `generate` fails, naming the manifest line and the problem, on:
+
+- an encoding other than ISCC's: no UTF-8 byte order mark, or bytes after it
+  that are not UTF-8;
+- a line not ended by CR LF, or a bare CR or LF;
+- a header that is not exactly the one above;
+- no rows;
+- a row with a column count other than 13, an `Index` out of sequence, or a
+  `SHA256Sum` that is not 64 lowercase hex digits;
+- a `SourceFilename` not strictly inside the build directory after
+  normalisation: a `..` out of it, another drive, a UNC or `\\?\` path, a
+  relative path, or the build directory itself; or a component Windows reads
+  differently (a reserved character such as an NTFS stream colon, a trailing
+  dot or space);
+- the same path listed twice with two hashes;
+- a file missing from `--build-dir`, not a regular file, or resolving outside
+  it (a symlink or junction);
+- a SHA-256 that differs from the one ISCC recorded.
+
+**Residuals** (stated, not fixed):
+
+- The installer's InnoSetup runtime (setup loader and uninstaller) and what
+  the compiler embeds beside the packed files (the licence text, the icon and
+  the compiled `[Code]` script) are not listed. The SBOM is marked incomplete
+  for them (`installer-runtime`).
+- A `[Files]` entry that takes its file at install time (`external`, or Inno
+  Setup 6.5's `download`) has no file location, so ISCC does not list it. The
+  script has none today.
+- Install paths and components are not recorded: the paths are
+  build-relative.
+- The manifest is trusted as ISCC's statement of what it packed. The hash
+  proves that each listed file is the file in the build directory, not that
+  the list is complete.
+- The compiler version is not pinned: `release.yml` uses whichever Inno Setup
+  6 the runner has, and installs the current one with winget only when it
+  finds none. A version that writes another header fails the release's
+  Windows SBOM step until the contract and its fixture are updated, after
+  reading the new format in that version's source.
+- **No real manifest has been checked yet.** The contract and its fixture
+  come from issrc's source; the first real verification is the Windows job
+  of the first tag that carries this, which should be a pre-release
+  (`-rcN`, the release skill's first-run advice).
+
+**Future findings.** A defect in this contract is an accepted row whose listed
+file differs from the bytes the installer packs, or a residual not stated
+above. A manifest shape the contract refuses is an expected refusal, not a
+finding, and so is any `.iss` edit, including one that makes ISCC write a
+manifest the contract refuses (the script is not parsed). Extend the contract
+deliberately: a change of format is a change to `artifact-sbom.py`, its
+fixture in `tests/test_artifact_sbom.py` and this section together.
+
+### Windows agent runtime gates (`build-windows` job, release only)
+
+Three checks in `release.yml`'s `build-windows` job keep the Windows agent
+payloads (`yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe`)
+self-contained. They run only on a release tag; none has run on a real tag
+yet, and the PR-time coverage is the `docs`-suite tests named below
+(`docs-lint.yml` runs the pwsh ones with `YUZU_REQUIRE_PWSH_TEST=1`).
+
+- **App-local Visual C++ runtime.** "Package archive" runs
+  `deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies
+  `vcruntime140*.dll` and `msvcp140*.dll` from the runner's Visual Studio
+  redistributable directory (`VCToolsRedistDir`) into the zip's `bin` and into
+  `build-windows\msvc-runtime`, which `yuzu-agent.iss` installs into
+  `{app}\bin`. It refuses a missing required DLL, a redistributable older than
+  the toolset and, on Windows, a DLL not validly signed by Microsoft. It
+  writes the staged DLLs and file versions to the step summary, which covers
+  that workflow run and is kept only as long as the run is; the authoritative
+  version is the file version of the Microsoft-signed DLLs in the shipped
+  payload (the zip's `bin`, or `{app}\bin` after an install). A failed
+  summary write is a warning, not a failure.
+- **MSVC toolset pin.** The same script refuses the release when
+  `VCToolsVersion`'s major.minor differs from
+  `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
+  replaces only `yuzu-agent.exe`, never the app-local runtime (#8219,
+  decision #8218), and an executable built by a newer toolset can need
+  runtime exports an older copy lacks and then does not start. Moving the
+  pin is a reviewed change whose release notes must state that agent
+  self-update does not carry the new runtime. Wee Tam's MSVC is otherwise observed,
+  not pinned, by `deploy/windows/toolchain-contract.json`.
+- **Import closure.** "Check the DLL import closure of both payloads", after
+  "Verify the agent runs from the packaged archive" and before the installer
+  is compiled, runs `scripts/ci/check-windows-payload-imports.py` over the
+  zip and over the files `yuzu-agent.iss` packs from `build-windows`: every
+  DLL a shipped `.exe` or `.dll` imports (normal and delay-load) must be in
+  that payload's `bin`, be an API set, or be an OS DLL in `System32`, except
+  the Visual C++ runtime, which counts as missing unless shipped, because the
+  runner has it installed.
+
+Pinned by `tests/test_windows_payload_imports.py` (the checker over
+synthetic PE32 and PE32+ images, the wiring and step order, and the staging
+script under pwsh) and `tests/test_agent_installer_plugin_coverage_lint.py`
+(every built plugin has an installer line or a recorded
+`; plugin-not-installed:` reason; `[UninstallDelete]` deletes every excluded
+plugin's DLL and the two files agent self-update leaves in `bin`,
+`[InstallDelete]` deletes those two, and neither section uses a wildcard).
+Reference: `docs/windows-build.md`.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 
@@ -636,8 +825,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -660,8 +850,17 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
@@ -730,9 +929,9 @@ fixed by reviewing the edit, not by re-running the job.
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — seven parser families
-(six under `server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -932,6 +1131,632 @@ with no `cache-to`), so it never evicts release layers and adds no cache directo
 likewise has no `cache-to`: it shares one buildkitd instance with the push build,
 so the push hits BuildKit's own solver cache and rebuilds nothing.
 
+### Release image vulnerability gate (`scripts/ci/image-vuln-gate.sh`, WP15/S9)
+
+**What it checks.** Every image `release.yml` publishes (server, gateway, postgres, the three
+chisel variants and the agent bundle) is scanned with a pinned Trivy **before it is pushed**.
+The gate fails when an image has a CRITICAL vulnerability that has a fix available and is not
+accepted in `.trivyignore.yaml`. HIGH findings and unfixed CRITICALs are printed for the record
+and do not fail it. It also fails, rather than pass a scan that could not mean anything:
+
+- a scan that cannot complete (Trivy error, DB download failure, wrong Trivy version, missing
+  ignore file);
+- the **DB**: downloaded once per run into a fresh, empty cache directory the script creates in
+  its per-run work directory; an inherited `TRIVY_CACHE_DIR` is ignored (with a note), so a
+  preseeded cache can never be scanned with. Each source's tag (`mirror.gcr.io/aquasec/trivy-db:2`,
+  then `ghcr.io/aquasecurity/trivy-db:2`) is first resolved to its manifest digest and the download
+  pinned to `repository@digest` (Trivy checks the manifest and layers against it); that
+  `repository@digest` is recorded in every `.gate.txt` and the step summary. The gate fails when
+  no source can be resolved and downloaded, or when the DB's `UpdatedAt` is older than 72 hours,
+  more than an hour in the future, or unreadable, or its `DownloadedAt` is earlier than the run.
+  Every scan then runs on that one DB (`--skip-db-update`). **The DB is not signed upstream:**
+  `aquasecurity/trivy-db` is pushed with `oras` and carries no cosign signature, no OCI referrer
+  and no GitHub attestation (checked 2026-11-18 with `cosign tree`, the referrers API and the
+  attestations API), so the gate cannot verify it. A DB substituted at, or on the way from, the
+  registry is detectable only by TLS to the registry and, after the fact, by the recorded digest;
+  a tampered DB with a fresh `UpdatedAt` (one CVE's version range edited) passes the gate. Every
+  long call has its own deadline and the gate has an overall budget ("Time budget" below), so a
+  registry that trickles bytes ends the attempt instead of holding the job until its timeout;
+- **no advisory data for the OS release**: Trivy marks the OS end of service life
+  (`Metadata.OS.EOSL`), or its family is not one the gate has a canary for (Debian, Ubuntu, Alpine:
+  every image the release publishes), or its version is a pre-release (`verdict=pre-release`, "no
+  advisory data for a pre-release": `_alpha`, `_beta`, `_pre`, `_rc`, `_git`, `~`, `-rc`, `.rc`,
+  `sid`, `testing`, `edge`, ...) or not a released version number (`N`, `N.N`, `N.N.N`), or the
+  canary matches nothing. A pre-release is refused before the canary because Trivy reads it against
+  the released version's advisories (Alpine `3.24.0_alpha...` as 3.24, Debian `13.0~rc1` as 13), so
+  the canary would match and the image would read as covered. The canary is a tiny root
+  filesystem of the image's exact OS release holding `openssl` and `zlib` at versions older than
+  every fix, scanned against the run's DB once per OS release per run; it proves the DB holds
+  advisories for that release. Trivy matches nothing for an OS release with no advisory bucket, so without this an
+  image on Debian testing/sid (Trivy reports `forky/sid`), Alpine edge or an Ubuntu devel series
+  (read as Debian sid) reads as scanned and clean (checked 2026-11-18: `debian:sid-slim` had 77
+  packages, 0 findings and was `covered`). Trivy's "not on the EOL list" warning is not used: it
+  also fires for Ubuntu 26.04, which has data;
+- **no OS packages seen**: an image whose OS package scan found no package (no OS detected, or a
+  0-package OS target) was not scanned for OS vulnerabilities, so the gate fails unless the image
+  is listed, in force, in `scripts/ci/image-vuln-gate-not-covered.txt` (exact name match). Each
+  listing carries the reason, `approved_by`, `approved_on`, `approval_ref` (the approving pull
+  request) and an expiry at most 92 days out; an expired listing is not in force, and one whose
+  `approval_ref` is `pending` is not in force in a release (`--release`). A listed image is
+  printed as `NOT COVERED` (and a step warning) on every run. Today four images are listed: the
+  three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices,
+  which leave no dpkg database (and no chisel manifest, because they do not cut
+  `base-files_chisel`), so Trivy 0.70.0 reports "No OS package is detected". **Their libc6,
+  libssl3t64, zlib1g and other slices ship unscanned.** The gate learns an image's name from
+  `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
+- an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
+
+The environment cannot steer the scan: the script clears every inherited `TRIVY_*` variable
+(`TRIVY_CACHE_DIR` included), names the DB repositories explicitly, and gives Trivy an empty
+config file so a `trivy.yaml` in the working directory is not read. `TRIVY_BIN` (use another trivy
+binary) is for local runs and tests and is refused on GitHub Actions. `YUZU_TRIVYIGNORE` (another
+ignore file) goes through the same parser, and Trivy never reads the named file at all: it reads
+the checker's canonical YAML copy of the entries in force, so a plain-format file or an entry the
+parser did not see cannot reach it. Trivy's temporary files go under the script's own work
+directory.
+
+**Time budget.** Every long call runs under `timeout`, bounded by its own deadline and by what is
+left of the gate's overall budget: the DB digest lookup 60 s per source, the whole Trivy download
+(all of curl's retries) 180 s, each DB download 420 s per source, each scan 600 s (with Trivy's own
+`--timeout` 10 s inside it; Trivy's default is 5 minutes). The network calls alone are at most
+2 x 60 + 180 + 2 x 420 = 1140 s (19 minutes) with both DB sources failing slowly. The budget is 1500 s
+(25 minutes) by default (`GATE_BUDGET`; `--budget SECONDS` overrides it, 1 to 3600): when it runs
+out the gate stops, writes `gate: FAIL: gate stopped before this image was judged: the gate ran out
+of its <N>s budget` for every image not yet judged, and exits 1. So the gate ends by itself, with its
+reports, within its budget plus a few seconds (the 2 s `--kill-after`, the cleanup).
+`pre-release.yml`'s `security-scan` (timeout 30 minutes) passes `--budget 1200`, leaving 10 minutes
+for checkout and the seven pulls before it; the `release.yml` jobs that run it have 60 to 120 minute
+timeouts, but each builds its image first, so a slow build can still bring the job timeout before the
+gate's budget, which is then a cancel (next paragraph). `tests/test_image_vuln_gate.py` checks that
+every call names a deadline and that each call's budget (or the default), plus 10 minutes for the
+job's other work before it, fits its job's `timeout-minutes`; mutants of the pre-release call (raised,
+dropped, moved to a continuation line) must fail that check.
+
+**Where.** `docker-publish` and `docker-publish-chisel` scan the image their healthcheck
+verification build already loaded (step "Scan image for fixable CRITICAL vulnerabilities
+(pre-push gate)", between the healthcheck probe and the tag re-check). `docker-publish-postgres`
+gains its own no-push build for the scan. `docker-publish-agent-bundle` runs
+`scripts/build-agent-bundle.sh` without `--push`, scans the local image, then pushes it.
+`pre-release.yml` `security-scan` runs the same script on all seven published tags afterwards
+with a fresher DB (detective: see "Pre-release QA"); it pulls each tag first.
+
+**Evidence.** Each publish job runs the gate with `--release --attempt <run attempt> --report-dir`,
+which writes, per image, `trivy-<image>.attempt-<N>.json` (the full Trivy report: image ID, layer
+diff IDs, OS, every package, the HIGH/CRITICAL findings and the accepted ones),
+`trivy-<image>.attempt-<N>.txt` (the table) and `trivy-<image>.attempt-<N>.gate.txt` (mode, run
+attempt, Trivy version, the DB's `repository@digest`, `UpdatedAt` and `DownloadedAt`, image ID, OS,
+OS package count, coverage, the advisory canary's result, the ignore-file hash with how many entries
+were in force and pending, and the result). A `.gate.txt` is written for every image on every exit
+the script reaches after reading its arguments: a refused image's says `gate: FAIL: <reason>`, when
+the gate stops before judging an image (a refused ignore file, a stale DB) each image's says why, and
+a SIGINT or SIGTERM (a cancelled run or a job timeout) writes `gate: FAIL: cancelled (SIGINT) before
+this image was judged` (or `(SIGTERM)`). The step `exec`s the script so the runner's signal reaches
+it, and the script runs each long child (Trivy, curl, the digest lookup) in the background and
+`wait`s, so the trap runs at once rather than after the scan. The runner cancels with SIGINT, then
+SIGTERM about 7.5 s later, then SIGKILL: on the first signal the trap ignores any further SIGINT or
+SIGTERM, writes the reports at once, then stops the child (SIGTERM, SIGKILL after 3 s at most) and
+exits 130 or 143, well inside the 7.5 s. A SIGKILL, or a usage error before the image list is read,
+leaves no report. The `.gate.txt` is the gate script's alone: no other step writes to it. The
+upload, as the `<image>-image-vuln-gate-attempt-<N>` artifact (for example
+`yuzu-server-image-vuln-gate-attempt-1`) with
+`retention-days: 90` (the repository's maximum) and no `overwrite`, runs whenever the gate step ran,
+passed, failed or was cancelled (`if: always() && (steps.gate.outcome == 'success' ||
+steps.gate.outcome == 'failure' || steps.gate.outcome == 'cancelled')`), so a refusal, the control
+operating, is retained too, and **a re-run adds its attempt's reports beside the refused attempt's
+instead of replacing them**. The same artifact carries the attempt's publish journal (next
+paragraph) when its gate passed; the upload is the job's last publishing-related step, after the tags
+move. The `release` job downloads every attempt's gate artifact of the run (`pattern:
+'*-image-vuln-gate-attempt-*'` with `merge-multiple`; an artifact an earlier run attempt uploaded is
+listed in a re-run, which "Re-run failed jobs" already relies on for the build artifacts) and
+attaches every file to the GitHub Release, inside the signed `SHA256SUMS`, the same way it ships the
+image SBOMs. `scripts/check-release-artifacts.sh` refuses a release in which a gate report or a
+journal is not named per attempt, any journal is not a legal prefix (below) or sits beside a gate
+report that does not record exactly `gate: pass`, or, for one of the six images, no attempt's journal
+ends `tagged`, an attempt above the published one ends `tagging`, or the published attempt lacks
+Trivy's three non-empty reports. Earlier and later attempts' reports may record a failure; they are
+kept as the evidence. The agent bundle's job runs after the release exists, so its reports cannot be
+inside `SHA256SUMS`; `attach-bundle-gate-report` attaches them to the GitHub Release afterwards. It
+runs whenever the bundle job ran at all (`needs.docker-publish-agent-bundle.result != 'skipped'`),
+downloads every attempt's bundle gate artifact the same way, fails when there is none, and attaches,
+per attempt, its reports, its journal and a checksum list
+`yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the same
+`release.yml` identity and verified in-job. Each run of it converges: after the last one, every
+attempt's files are on the release.
+
+**The publish journal** (`scripts/ci/image-publish.sh`). A release tag (`:X.Y.Z`, and on a stable
+tag `:X.Y` and `:latest`) is public the moment it moves, so it moves LAST, and every push of the
+image and every tag move is announced before it runs. (The SBOMs, the provenance attestation and the
+cosign signature are pushed as referrers of the digest before `signed-attested` records them: the
+digest was announced at `push-started`, and no tag names it yet.) The contract:
+
+- The journal is `publish-<image>.attempt-<N>.txt`, beside the gate's reports. Only
+  `image-publish.sh` writes it, appending one line per completed step; it is never rewritten, and
+  its LAST line is the state. The only legal contents are a prefix of exactly this sequence, with
+  one digest throughout:
+  1. `publish: none`, written when the gate passed (the script refuses unless every
+     `<scanner>-<image>.attempt-<N>.gate.txt`, Trivy's and any future scanner's, records exactly
+     `gate: pass`);
+  2. `publish: push-started <candidate>`, appended BEFORE the push (`<candidate>` is the
+     repository for a push by digest, or `<repository>:candidate-<run id>-<N>` for the agent
+     bundle's `docker push`);
+  3. `publish: verified <repository>@<digest>`, after `image-identity.sh verify-pushed` proves the
+     digest has the scanned image's layers;
+  4. `publish: signed-attested <repository>@<digest>`, after the SBOMs, the provenance attestation
+     and the cosign signature are made BY DIGEST and the signature verifies for the workflow's
+     identity;
+  5. `publish: tagging <tags> <digest>`, appended BEFORE the first tag moves;
+  6. `publish: tagged <tags> <digest>`, once every tag, applied with `docker buildx imagetools
+     create --prefer-index=false -t <tag> <repository>@<digest>`, resolves to the digest.
+- No journal for an attempt means one of three things: its gate refused the image (its `.gate.txt`
+  is not `pass`), the job stopped before the journal was opened, or the journal never reached the
+  artifact (the evidence upload and its one retry both failed, or the runner was lost: residuals
+  below). The first two pushed nothing; the third is absence of evidence, not proof that nothing
+  was pushed.
+- A failure or a cancellation simply stops the journal. There is no failure label, and nothing is
+  written on a cancel. So a journal's last label claims at least what the registry holds:
+  `push-started` may have pushed an untagged digest (or the bundle's candidate tag), `tagging` may
+  have moved some of the tags. A cancel reaches the script itself: every step runs it as `exec
+  scripts/ci/image-publish.sh ...`, because the Actions runner signals only the step's PID (SIGINT,
+  SIGTERM 7.5 s later, SIGKILL 2.5 s after that; `actions/runner` `ProcessInvoker`), never its
+  process group. On SIGINT or SIGTERM the script stops at the next step boundary: it stops the
+  registry call it is waiting on (each runs in the background, so the trap acts at once), appends
+  nothing further and exits 130 or 143. No process of it outlives the step to append or move a tag
+  after the evidence upload has read the journal (G8P6-chaos-injector-1), in this run or in a later
+  run of the same tag (G8P6-chaos-injector-2: the chisel and bundle jobs' `cancel-in-progress`
+  groups cancel an older run's leg the same way).
+- The pushes carry no release tag: the buildx jobs push with `outputs:
+  type=image,name=<repository>,push-by-digest=true,name-canonical=true,push=true` and no `tags:`,
+  and the agent bundle pushes `:candidate-<run id>-<attempt>` and resolves its digest. The tags are
+  applied only by `image-publish.sh tag`, which moves every one of them from the digest; a failed
+  check that a tag resolves to the digest leaves the journal at `tagging`.
+- The journal is uploaded with the gate reports under the same `if: always()` status function, and
+  a retry step (`if: always() && steps.upload_gate.outcome == 'failure'`, no `overwrite`) uploads
+  it again when that upload failed. Job outputs carry no publish state; consumers read the journal
+  through `image-publish.sh state` (one attempt) or `published` (all attempts), and accept only a
+  legal prefix.
+- Across attempts, the published image is the HIGHEST attempt whose journal ends `tagged`. The
+  release check and the attach job fail when any attempt above it ends `tagging`: a tag may then
+  name either digest. A re-run that completes `tagged` heals it.
+
+**Decision record (2026-11-18).** This contract and the "Future findings on this path" rule
+below are the enterprise-architect contract, accepted by the project owner (fjarvis) on 2026-11-18.
+After repeated Gate 8 governance passes kept finding orderings in which the publish state reported
+by job outputs and the attach job disagreed with what the registry held, the enterprise-architect
+review recommended replacing further point fixes with this write-ahead journal and a closed
+definition of a defect on this path; the project owner accepted that ruling, and later passes
+judge findings on this path by it. Evidence, in the repository: the journal and this contract
+landed on branch `fix/wp15-images` in commits `6240c1f945` (the code) and `1763a7bdac` (this
+section), and the record in `1679c0f50d`; the Gate 8 findings that led to it (pass 5) and the
+later passes' verdicts judged by it (passes 6 and 7) are rows of the governance ledger
+`governance.d/0000-wp15-images.UVdbCU.jsonl`. The enterprise-architect review itself is not a
+committed artifact, and the author and the owner are the same account, so the pull request's
+approving review is the independent confirmation. Review this decision if a publish job gains a registry
+write the journal does not announce; if a release tag starts moving, within `release.yml`,
+anywhere other than `image-publish.sh tag` in a "Tag the release" step; or if a new tool or
+documented procedure gains a way to delete a GHCR image or to move a release tag by hand (the
+pre-existing hand push paths are Limit 1 of the "Release tag policy" below). Amended three times on 2026-11-18: commit
+`03bdfb9290` (Gate 8 round 7) added a hand tag-repair carve-out to the second condition, and the
+Gate 8 round 8 commit that adds "Release tag policy" below withdrew it, after round 8 found new
+defects in the hand procedure; the Gate 8 pass 9 commit that freezes the "Release tag policy"
+scoped the second condition to `release.yml` and the third to new paths. All three amendments were
+made by the author account, so, as for the record itself, the pull request's approving review is
+their independent confirmation.
+
+Verified before this contract was frozen (2026-11-18): `docker buildx imagetools create
+--prefer-index=false -t <tag> <repository>@<digest>` keeps a single-platform manifest's digest byte
+for byte (a local `registry:2`, both a `docker push`ed Docker v2 manifest and a buildx push-by-digest
+OCI manifest; without `--prefer-index=false` it wraps the manifest in a new index with another
+digest), and a cosign signature made by digest before the tag existed verifies against the new tag;
+`actions/download-artifact` v8 lists the run's artifacts through the runtime token's run scope, and
+a release run whose attempt 3 re-ran only the Windows build created its release from attempt 1's
+`yuzu-*` artifacts (v0.11.0-rc1).
+
+**What the journal does not cover** (residuals, disclosed once here):
+
+- **No evidence reaches the artifact** for an attempt when the runner is killed or lost before the
+  upload, or when the evidence upload and its retry both fail (an artifact-service outage, or a
+  first upload that failed part-way and left the artifact's name taken, which the retry, with no
+  `overwrite`, then cannot reuse). That
+  is absence, not disagreement: no journal claims less than the registry holds. Its cost: for one
+  of the six images the release job does not run (it needs that job green, and a re-run tags a new
+  digest the release then names). For the agent bundle, if that attempt had moved `:X.Y.Z`, the
+  attach job reads only the other attempts, so it may name an older attempt as published (or none)
+  while `:X.Y.Z` names the missing attempt's verified, signed digest (G8P6-architect-4); the bundle
+  job is red. The release skill's terminal check (resolve `:X.Y.Z`, compare it with every journal)
+  is how that is caught before the release is announced.
+- **A SIGKILL of the script, or a lost runner process, mid-call.** The script stops its own
+  registry call within about 3 s of the first signal, well before the runner's SIGKILL (10 s), so
+  only a runner that kills or loses the script earlier can leave a registry call running. The
+  journal already announced that call; the runner's orphan cleanup (at the end of the job) stops
+  what remains unless the runner itself died, and such a call could then still move a tag after a
+  later run's `tagged`.
+- **A re-run moves the tag to a new digest.** Each attempt pushes and tags its own build; the
+  release check requires the release's assets to name the published (highest `tagged`) attempt.
+  That holds only until the release exists. When a job is re-run, GitHub also re-runs every job
+  that depends on it, but not the jobs it depends on ("Re-running workflows and jobs" in GitHub's
+  Actions docs), so `release-guard` is not repeated and each re-run publish job passes its tag
+  re-check. Once the GitHub Release exists, do not re-run a build or publish job (a forbidden
+  re-run, "Release tag policy" below):
+
+  | Re-run, after the GitHub Release exists | What runs | |
+  |---|---|---|
+  | "Re-run all jobs", or `release-guard` alone | `release-guard`, which refuses the existing release; every other job is skipped | safe, does nothing |
+  | `build-linux`, `build-gateway`, `build-windows` or `build-macos` | that build, then every publish job (all of them need all four builds): all six images move `:X.Y.Z` (and `:X.Y`, `:latest`) to new digests the release does not name; `release` fails `already PUBLISHED` | **forbidden** |
+  | `docker-publish`, `docker-publish-postgres` or `docker-publish-chisel` | that job's images move the same way; `release` fails `already PUBLISHED` | **forbidden** |
+  | `release` | it refuses at `already PUBLISHED` before uploading; the bundle and attach jobs are skipped (#5479) | safe, does nothing |
+  | `docker-publish-agent-bundle` that FAILED ("Re-run failed jobs") | it and the attach job; it builds from the release's own assets and its attempt joins the attached record | safe: the recovery |
+  | `docker-publish-agent-bundle` that SUCCEEDED | moves the announced `yuzu-agent-bundle-chisel:X.Y.Z` to a new digest | **forbidden** |
+  | `attach-bundle-gate-report` | adds missing assets, replaces only an incomplete upload | safe |
+
+  "Re-run failed jobs" is safe only when every failed job is `release`,
+  `docker-publish-agent-bundle` or `attach-bundle-gate-report`. Undoing a forbidden re-run by
+  hand is not a release procedure ("Release tag policy" below): it is an owner-decided incident,
+  recorded in a tracking issue opened for it and announced, and the next stable patch release
+  moves `:X.Y` and `:latest` on. The re-run release's own `:X.Y.Z` keeps naming the re-run's
+  digest, because no later release moves it, and no signed record shows which digest was first
+  announced (Limit 3).
+- **Several tags do not move atomically.** That is what `tagging` records; the next attempt to end
+  `tagged` moves all of them again.
+- **Release assets can change after publication (G8P8-compliance-officer-3).** GitHub's immutable
+  releases setting is off for the repository (read from the API on 2026-11-18), so anyone holding
+  `contents: write` can delete, replace or add an asset. The release process itself changes assets
+  after publication in two ways: the attach job adds the agent bundle's files and replaces only an
+  incomplete upload of its own (not `uploaded`, or bytes not matching GitHub's size or digest),
+  and the release skill's Phase 4 re-uploads an asset missing from the release by hand. What a
+  verifier can rely on is the signed `SHA256SUMS` (keyless; the identity is `release.yml` at the
+  release's tag, which binds the workflow file and the tag, not one run): a listed file that is
+  present and matches was produced by that workflow, and `sha256sum -c SHA256SUMS`, run without
+  `--ignore-missing`, fails on a listed file that is missing or changed. An asset no signed list
+  names proves nothing. The agent bundle's files are covered per attempt by their own signed
+  lists, but nothing signed lists the attempts, so removing one attempt's whole set (list,
+  signature and files) is not detectable from the release.
+- **Untagged candidate digests and the bundle's candidate tags stay in GHCR (decided 2026-11-18,
+  Gate 8 round 7).** A digest that was pushed but never tagged (a verify failure, a cancel) and the
+  `:candidate-<run id>-<attempt>` tags are left in place: they are not release tags, nothing pulls
+  them by name, and each was gate-scanned before its push, so they hold no unscanned content.
+  "Left in place" is a practice, not an enforced control: nothing technical stops a package admin
+  from deleting one. The release workflow deletes no image, and no deletion procedure is documented: an earlier
+  deletion script was withdrawn after it was shown, against a real registry with a simulated
+  lagging packages API, deleting a live release tag that the API had not listed
+  (G8P7-security-guardian-1), and the hand check that replaced it was withdrawn after it was shown
+  to judge deletable a published digest whose release tag a re-run had moved
+  (G8P8-consistency-auditor-1): a check keyed on today's tags cannot protect a digest whose tag
+  has moved. Deleting a GHCR package version deletes that digest under EVERY tag that names it;
+  what the release process does instead is "Release tag policy", below. GitHub lets a package admin restore a deleted version within 30 days ("Deleting and restoring a
+  package" in GitHub's Packages docs); it does not say whether the version's tags come back with it.
+
+**Release tag policy (frozen 2026-11-18).**
+
+**Controls (enforced by `release.yml`).** Within the release workflow, a release tag (`:X.Y.Z`,
+`:X.Y`, `:latest` of the six release images; the agent bundle's `:X.Y.Z`) is written only by the
+"Tag the release" step (`scripts/ci/image-publish.sh tag`), after the gate, verify, sign and attest
+steps and behind the publish journal. `release-guard` refuses a run for a tag that has a published
+release. The workflow deletes no image.
+
+**Practices (not enforced).** A wrong or superseded published release is fixed by a new patch
+release. Deleting a published GitHub release, redoing a release under its tag, moving a release tag
+outside the workflow, and deleting a GHCR package version are not release procedures: each is an
+owner-decided incident, recorded in a tracking issue opened for it and announced. First step for a
+suspected-compromised digest: open that issue and announce the digest; delete or move nothing until
+the owner decides.
+
+**Limits (disclosed).** (1) `scripts/docker-release.sh` and `scripts/build-agent-bundle.sh --push`
+predate the gate and can push release tags with maintainer credentials; they bypass the gate and the
+journal and are not used to publish a release. (2) Once a published release is deleted,
+`release-guard` passes a fresh run of its tag; that run destroys the release's signed `SHA256SUMS`,
+moves every tag including `:latest`, and leaves the earlier digests untagged with no signed record.
+(3) No signed record of "digests ever announced" exists. A journal records what each attempt
+published; it does not show which digest was first announced, nor whether a re-run was sanctioned,
+and releases up to v0.15.0 have no journals. (4) Nothing technical stops a package admin deleting a
+version or moving a tag.
+
+Frozen by the enterprise-architect ruling of 2026-11-18 (Gate 8 pass 9 non-convergence); adopted by
+the project owner via this pull request's review.
+
+**Future findings against this policy.** A finding against the Release tag policy is a defect only
+if (a) a statement under **Controls** is false against the code at HEAD; (b) a doc site states as
+enforced, or with "never / nobody / no tool / only", something not under Controls; (c) a site
+documents a procedure for an action listed under Practices as an incident; (d) this change creates a
+new path that moves a release tag or deletes an image, or worsens a listed Limit; or (e) a site
+contradicts the frozen text. Not defects: pre-existing behaviour listed under Limits and not
+worsened; a practice being unenforced; a missing runbook step for an owner incident; the absence of
+a signed announced-digest record. Those are follow-up issues, never blockers on this branch.
+
+Hand procedures were withdrawn because each round's version opened a new defect class: a deletion
+script trusted a lagging packages API (round 7); the hand deletion check that replaced it judged
+deletable a published digest whose tag had moved, and a hand tag-repair block accepted a release
+whose journal was missing, had no check for an in-flight run and could not download one release
+twice (round 8). Limits of the patch-release remedy: no later release moves the superseded
+release's own `:X.Y.Z`, and no signed record shows which of its digests was announced (Limit 3);
+and `release.yml` moves `:latest` on every stable tag, so a patch to an older `X.Y` line moves
+`:latest` to that line until the next stable release on the newest line.
+`release-guard` passes the new version: it refuses only a ref that is not a release tag or a tag
+that already has a published release, and checks no ordering between versions. The release skill
+carries the same policy, and its post-release check compares every image's `:X.Y.Z`, `:X.Y` and
+`:latest` with the release's journals.
+
+**Future findings on this path.** A defect is a reachable row (a gate outcome, a point where the
+job stops, a publish shape, and for attach an attempt order) in which the journal's last label
+claims LESS than the registry holds, or in which the attach job or `check-release-artifacts.sh`
+accepts an illegal sequence. Anything else on this path is non-blocking.
+`tests/test_image_publish.py` is the table: gate pass, fail, SIGINT, SIGTERM and budget, times
+stop points before the push, mid-push, a verify failure or cancel, an attest or sign failure,
+before the tags, mid-tag with and without a tag applied, a cancel while `tag` is still loading the
+journal, a tag move in flight that would complete later, another writer moving a tag, after the
+tags before `tagged`, a failed evidence upload, and complete, for both the buildx and the bundle
+shapes, run in `release.yml`'s own step order against a stub registry, with every cancel delivered
+to the step's PID only (as the runner delivers it) and the evidence read as uploaded; cross-attempt
+rows with the attach job interrupted at each attempt; a cross-run row (an older run cancelled
+mid-tag while a newer run publishes); journal-reader rows; and mutants (adjacent step swaps, named
+reorders, a dropped intent line, `tagged` recorded early, a writing step without `exec`, a script
+that ignores the signal or waits on its registry call in the foreground, unchecked late journal
+lines) that must be killed.
+
+It never replaces a completed asset. For each name already on the release (the attach job re-run
+for the same attempt) it reads GitHub's asset `state`, `size` and `digest`: an asset whose state is
+not `uploaded` (`starter`, `open`: an upload that was interrupted, which GitHub never served), or
+whose downloaded bytes do not match GitHub's own size or digest for it, is an incomplete upload, not
+evidence, and is deleted and uploaded again; a completed asset is kept when identical to this run's
+file (a `.sigstore` when it verifies this run's list) and fails the job when it differs. Every
+refusal is decided before anything is deleted, and a failed download stops the job rather than
+counting as incomplete. If the attach job fails, the Release run is red, so Pre-release QA does not
+start (it runs only on a successful Release run), and the report exists only as the 90-day artifact,
+which is shorter than a SOC 2 Type II observation window (except when the only failure is a higher
+attempt stopped while tagging: the files are attached first, then the job fails):
+
+- **A transient failure, or an interrupted upload** (a network error, a cosign or GitHub outage, a
+  cancel during `gh release upload`): "Re-run failed jobs" re-runs the attach job (and any other job
+  that failed); it replaces the incomplete assets and adds the rest. Dispatch `pre-release.yml` with
+  the tag if QA still has not started once the run is green.
+- **A refusal** (`already on the release with different content`, `does not verify`, or a publish
+  journal that is not a legal prefix): a re-run fails the same way. A completed asset under
+  this attempt's name with other content means something other than this job wrote it; do not
+  delete it to make the job pass. Investigate it as a release-integrity incident with the owner.
+- **A higher attempt stopped while tagging** (`stopped while moving the bundle's tag`): the record is
+  attached, then the job fails, because `:X.Y.Z` may name either attempt's digest. "Re-run failed
+  jobs" re-runs the bundle job; once an attempt ends `tagged`, this job passes. When the bundle
+  job's re-run cannot pass (its gate refuses for a reason that needs a commit), this state is
+  terminal for the release: do not keep re-running. Resolve `:X.Y.Z` (`docker buildx imagetools
+  inspect ghcr.io/<owner>/yuzu-agent-bundle-chisel:X.Y.Z --format '{{.Manifest.Digest}}'`) and
+  compare it with every attempt's journal: a digest on a `tagging` or `tagged` line was verified
+  and signed before any tag moved (`cosign verify` it), so that is the bundle image this version
+  ships, and the announcement says so. A digest on no uploaded journal's line is looked for in the
+  bundle job's logs (the script prints every line it records; an attempt whose report never
+  uploaded shows its tag move only there); found nowhere, or no tag at all, it is an incident to
+  investigate with the owner. The same check applies whenever the run is red around the bundle,
+  because an attempt whose evidence never uploaded can have moved the tag (residuals above).
+
+Do not attach the report by hand: a hand upload has no signed checksum list. If the bundle job never
+uploaded a report there is nothing to attach; its job log is the record. The report globs
+in the release job, `SHA256SUMS`, the release upload, the pre-release upload and the bundle
+attachment take every scanner's files (`trivy-*` and `grype-*`), while the coverage check reads
+Trivy's JSON report only (it refuses any other). The script also writes a step summary table,
+including the rows of a run that stopped early.
+
+**Scanning the right image.** Four Big Tam runners share one Docker daemon, so a tag is not a
+safe handle. Each verification build gets a tag salted with the commit, run id and run attempt
+(under `yuzu-hc-verify/`, so `cache-prune.yml`'s sweep still reclaims a leaked one), and
+`scripts/ci/image-identity.sh pin` resolves it to its image ID once, right after the build;
+the healthcheck probe and the gate then use the ID. Every Trivy call passes
+`--image-src docker`, so a missing local image fails the gate instead of a same-named image
+being fetched from a registry and scanned. The push build is a second build that normally
+reuses the scanned build's layers, but nothing forces it to: right after the push, before any
+SBOM, attestation or signature, `image-identity.sh verify-pushed` reads the pushed digest's
+layer diff IDs from the registry and fails the job unless they equal the scanned image's (the
+image config, with its labels and timestamps, legitimately differs); `image-publish.sh verified`
+runs it and records the result. The agent bundle is pushed from the scanned local image itself,
+under its candidate tag, after checking its local tag still names the scanned ID. A mismatch leaves
+an untagged digest (or the bundle's candidate tag) in GHCR, unsigned; no release tag names it, the
+journal stays at `push-started`, and the release job does not run.
+
+**Current packages.** The Debian and Alpine images upgrade their packages in the final stage
+(`apt-get upgrade`, `apk upgrade`; `yuzu-postgres` holds the PGDG server packages so the
+PostgreSQL minor stays the pinned one), and the chisel images cut their slices from the live
+Ubuntu archive. A package index that cannot be fetched fails the build: the Debian runtime
+stages run `apt-get update --error-on=any` (plain `apt-get update` exits 0 when, say, the
+security pocket is unreachable, and the upgrade then ships without it; checked 2026-11-18 on
+bookworm's apt 2.6 and trixie's apt 3.0, both exit 100 with the option), and Alpine's
+`apk upgrade` already refuses an unavailable repository (exit 99). After the upgrade each Debian
+build logs what apt still keeps back (`apt-get -s upgrade`). The Big Tam publish jobs build with
+a persistent local cache, so each of those steps reads the `YUZU_PACKAGE_REFRESH` build argument,
+which the workflow sets to `<run_id>-<run_attempt>`: every run attempt takes current packages,
+and the scan build and the push build of one attempt share the layer. That writes new blobs into
+the cache on every attempt; `cache-prune.yml` removes the ones no cache index references (see
+"Cache pruning + weekly maintenance"). `tests/test_image_vuln_gate.py` (`docs` suite) is a
+lexical tripwire over every workflow job: it flags a job whose steps match a push marker (the
+`push:` input, `docker`/`podman`/`buildah`/`nerdctl` push or manifest push, one through a
+variable named for the tool, `--push` or `--push=true`, an `--output`/`-o`/`outputs:` of
+`type=registry` or `push=true`, a registry copy or retag with `imagetools create`, crane, skopeo,
+oras, regctl or `cosign copy`), following local composite actions, local reusable workflows and
+the repository scripts a job names, and counting a remote reusable workflow as a push; it fails
+unless the job is a gated release job or listed as not a release image. It reads text, so it
+cannot see a push assembled at run time (an `eval`, a command read from a file) or inside a remote
+action. It also pins the gate-before-push order, `--release`, the evidence upload and its status
+function, `--error-on=any` and the refresh argument.
+
+**Trivy.** The script downloads Trivy `0.70.0` and checks it against a sha256 pinned in the
+script (the release's checksums file and tarball were verified with `cosign verify-blob` when
+pinned; re-verify on a bump). It installs into `RUNNER_TEMP` and keeps its DB there, never under
+`$HOME`: the four Big Tam runners share one OS identity (#1871). No marketplace action is used.
+Trivy (Apache-2.0) is a CI-time tool only; it ships in no image.
+
+**Accepting a finding.** Add an entry to `.trivyignore.yaml` with a scope, a `statement` (why it
+does not apply, with the evidence), an unquoted `expired_at` at most 92 days out, `approved_by`
+(the GitHub login of the person who accepted it), and `approval_ref` (the pull request in which
+they approved it, `"#N"` or its URL) with `approved_on` (the date). The scope is never a bare CVE
+id: a `paths` item is one concrete relative path to a file in the image (it contains a `/`; no glob
+character, no empty string, no leading `/`, no `.`/`..` component, and not a Trivy result target,
+class or type name such as `Python`, `Node.js`, `Java`, `gobinary` or `os-pkgs`), because Trivy
+matches `paths` as globs against a package's path AND its result's target, and an OS package's path
+is empty: `**`, `*` or `""` would suppress the CVE in every package, and `Python` in every Python
+package (verified with Trivy 0.70.0: an entry scoped `Python` hid CVE-2020-14343, a fixable CRITICAL
+in PyYAML 5.3.1, from a `--release` run). A `purls` item is a full package URL with its version,
+because Trivy matches a purl without one against every version. Until the approval is recorded,
+`approval_ref: pending` (and no `approved_on`) records a proposed acceptance: the release gate
+(`--release`) does not honour it, local runs and the post-release scan do and report it as pending.
+`image-vuln-gate-checks.py` parses the file (a strict block-style subset of YAML: flow style,
+anchors, a comment after a value, an unknown key or a second top-level section are refused, so a
+decoy line cannot satisfy it), the gate refuses a file that breaks any rule, and Trivy reads only
+the checker's canonical copy of the entries in force. It warns 21 days before an entry expires. An
+expired entry is not in force, so the next release fails on that finding again. Today there is one
+entry: the Go standard library CVE-2025-68121 in the upstream postgres image's `gosu` (gosu does not
+link `crypto/tls`), with `approval_ref: pending`, as are the four not-covered listings: until an
+approval is recorded in them, a release fails at the postgres and chisel legs. The entry is a
+commit, so it is in the tag a release builds: it can only help a release cut after it.
+
+**What the approval fields are, and what the control is.** `approved_by`, `approved_on` and
+`approval_ref` are a RECORDED REFERENCE: the gate checks that they are present and well formed (a
+GitHub login, a past date, `#N` or a pull-request URL) and nothing else. It does not ask GitHub
+whether that pull request exists, was merged, or was approved by `approved_by`, so a typed `"#9999"`
+with a date passes it exactly like a real approval. They are not a verified approval and no
+document may present them as one. The control is human review of every change to
+`.trivyignore.yaml`, `scripts/ci/image-vuln-gate-not-covered.txt`, the gate scripts
+(`scripts/ci/image-vuln-gate.sh`, `scripts/ci/image-vuln-gate-checks.py`,
+`scripts/ci/image-identity.sh`, `scripts/ci/image-publish.sh`, `scripts/check-release-artifacts.sh`) and the workflows that run them
+(`release.yml`, `pre-release.yml`): the approval is the review of the pull request that adds or
+changes the entry, and the fields record where to find it. That review is as strong as the branch
+protection that requires it.
+
+**The approver can be the change's author.** Nothing in the gate, the checker or the format stops
+`approved_by` from naming the person who wrote the entry. GitHub does not let a pull request's
+author approve it, but nothing ties `approved_by` to whoever did review it, and without branch
+protection that requires a review the pull request can merge with none. Separation of duties
+therefore rests entirely on that branch protection, and it is not enforced: the `.github/CODEOWNERS`
+entries for these paths (PR #8243) request a review from either owner (`@fjarvis`, `@Tr3kkR`),
+and they only REQUEST it: "Require review from
+Code Owners" is off on the Protect Dev and Protect Main rulesets by owner decision (2026-11-18), and both owners can bypass the rulesets as organisation admins. So any one
+approval merges a change to an acceptance, a not-covered listing or the gate, and an approver
+recorded in `approved_by` may be the change's own author. By practice, when one of the two owners
+writes an entry, the other approves it; a reviewer of these paths checks that the named approver
+actually approved.
+
+**Recording an approval.** For an acceptance or a not-covered listing:
+
+1. Open a pull request that adds (or changes) the entry with `approved_by: <the approver's login>`
+   and `approval_ref: pending` (no `approved_on`; in the not-covered list, `approved_on=-
+   approval_ref=pending`), and the evidence in `statement` (or `reason=`). A pending entry is not
+   honoured by a release, so merging it changes no release yet.
+2. The approver reviews that pull request and approves it in GitHub's review UI. The approval is
+   that review; it is not given anywhere else.
+3. In the same pull request, after the approving review, set `approval_ref` to that pull request
+   (`"#N"`, or its URL) and `approved_on` to the date of the review (in the not-covered list,
+   `approved_on=<YYYY-MM-DD> approval_ref=#N`). A push after an approval may dismiss it under the
+   branch rules; then the approver re-approves the final diff, and `approved_on` is that date.
+4. Merge. Before tagging, the release skills run `python3 -I scripts/ci/image-vuln-gate-checks.py
+   pending .trivyignore.yaml scripts/ci/image-vuln-gate-not-covered.txt`, which fails while any
+   entry in force is still pending, and while any entry or listing has expired or expires today or
+   tomorrow (each publish leg re-reads the date, so one that lapses during the release fails the legs
+   that run after it); it warns for one expiring within 21 days.
+
+Steps 1 and 3 are alternatives for when the reference is filled in: in the same pull request after
+the approving review (step 3), or in a follow-up pull request after merging the pending entry (step
+1). Either way, a tagged tree that still holds a pending entry fails the pre-tag check.
+
+Whoever audits an acceptance later follows `approval_ref` to the pull request and checks the
+approving review there; the gate does not.
+
+**When it fails.** The leg whose gate failed pushed nothing (a failure in "Verify the pushed image
+is the scanned one" pushed an untagged digest: see that paragraph and the release skill). Its sibling matrix
+legs are `fail-fast: false`, so they may already have moved `:X.Y.Z` (and, on a stable tag,
+`:X.Y` and `:latest`, leaving those tags on a mix of this release and the previous one), and the
+release job does not run (same state as any other publish failure; the release skill's Recovery
+covers it; `:latest` and `:X.Y` keep naming the unreleased digests until the release is finished,
+re-tagged or superseded, and moving them by hand is not a release procedure: Release tag policy). Read the step log first. For every publish job
+except the agent bundle:
+
+- **A distro package with a fix**: the fix usually landed after the run started. "Re-run failed
+  jobs" on the newest run takes current packages (the refresh argument changes per attempt).
+- **A stale DB** (`more than 72` in the log): the published DB is rebuilt every few hours and
+  the mirror normally lags by under a day, so wait and "Re-run failed jobs"; if it stays stale,
+  check whether the mirror or Trivy's DB publishing is broken before anything else.
+- **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
+  package database from an image that used to have one. Fix the image; listing it in
+  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned.
+  Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
+  it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
+- **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as
+  "Recording an approval" describes; a commit, so re-tag.
+- **No advisory data** (`end of service life`, `no advisory data`, `no advisory data for a
+  pre-release`): the image's base moved to an unreleased, pre-release, rolling or end-of-life OS
+  release. Move it back to a released, supported one; a
+  commit, so re-tag. An unknown OS family needs a canary added to `image-vuln-gate-checks.py`
+  first.
+- **An acceptance that expires mid-release, or a CRITICAL disclosed between legs**: the legs that
+  ran before it have pushed and the rest fail, and "Re-run failed jobs" fails the same way. Renew
+  the entry (a commit) and re-tag. The pre-tag `pending` check fails on an entry or listing that has
+  expired or expires within two days, and warns 21 days ahead, as does every gate run's log; nothing
+  warns between releases (a tracked gap).
+- **The gate ran out of its budget** (`ran out of its <N>s budget`): a registry or the DB mirror
+  was slow, or a scan hung. "Re-run failed jobs"; if it recurs, look at which call used the time
+  in the step log before raising the budget.
+- **A fix that is not in the distro yet, or in a binary the base image ships** (a Go tool, an
+  upstream-built binary): refresh the base image digest if upstream has rebuilt it; otherwise
+  accept it in `.trivyignore.yaml` with the evidence. Either is a commit, so re-tag.
+
+**When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
+the `release` job has published the GitHub Release, so the tag is already a published release:
+re-tagging it is forbidden (#5282), and `release-guard` refuses a fresh run of it. The gate runs
+from the tag's own checkout, so a fix that needs a commit (a new `.trivyignore.yaml` entry, a new
+base digest, a list entry) cannot reach this release's bundle at all. So:
+
+- **A distro package with a fix, a stale DB, the gate's budget running out, or a cancel**: "Re-run
+  failed jobs" on that run (the only recovery the release skill allows for this job); the chisel
+  cut takes the current archive.
+- **Anything that needs a commit**: this version ships without the agent-bundle image. The
+  release itself is complete and its other images are signed; say so in the release notes or
+  announcement, land the fix, and cut the next version (a patch release) to deliver the bundle.
+  Publishing a bundle outside `release.yml` bypasses the gate and journal (Release tag policy,
+  Limit 1); it is an owner-decided incident, recorded in a tracking issue opened for it and announced.
+
+A failed bundle job also leaves the Release run red, and Pre-release QA starts only on a
+successful Release run, so that version gets no post-release scan or QA at all; a manual dispatch
+of `pre-release.yml` stops at `docker pull` of the missing bundle tag before scanning the six
+published images (a tracked gap).
+
+**What it does not see.**
+
+- **The chisel images' and the agent bundle's OS packages** (above): listed as not covered, so
+  their CVEs in libc6, libssl3t64, zlib1g and the other slices never reach this gate.
+- **PostgreSQL itself.** In `yuzu-postgres` Trivy lists `postgresql-18`, `libpq5` and
+  `postgresql-common` as packages but matches no vulnerability to them: they come from the PGDG
+  repository, and Trivy's Debian advisories cover Debian's own packages only. And the image holds
+  the PGDG packages at the pinned minor on purpose, so no release build ever takes a PostgreSQL
+  fix: only a deliberate `PG_BASE` bump in `Dockerfile.postgres` does. The build log names every
+  held package with a newer version available (`kept back (held PGDG package)`), so a kept-back
+  fix is visible in the publish job; reading it, and the PostgreSQL security announcements, is a
+  release-time task for the release engineer.
+- **The gateway's Erlang/OTP runtime.** Trivy does not identify the OTP runtime in the gateway's
+  bundled ERTS, so OTP CVEs pass this gate (grype does report them).
+- **Statically linked code.** Nothing in a statically linked C++ binary (the server and agent) is
+  visible to either scanner.
+- **A tampered DB.** The DB is unsigned upstream (above). The canary catches a DB with no
+  advisories for the image's OS release, not one whose individual advisories were edited.
+
+**Routed-concern invariants** (the `.claude/routed-concerns.md` row points here). Every publish
+job gates its pinned image ID with `--release` BEFORE any push, and checks the pushed layers
+BEFORE any SBOM, attestation or signature. The release tag moves only after verify, sign and
+attest, and the publish journal is write-ahead ("The publish journal" above): only
+`image-publish.sh` writes it, within `release.yml` only `image-publish.sh tag` moves a release tag, every writing step
+runs it with `exec` and it appends nothing after a SIGINT or SIGTERM, consumers read it only through
+`image-publish.sh state` or `published` (one reader), and accept only a legal prefix; the published
+image is the HIGHEST attempt ending `tagged`, and any higher attempt ending `tagging` fails both the
+release check and the attach job. Within `release.yml` no step deletes an image or moves a release
+tag outside "Tag the release"; the pre-existing hand push paths bypass the gate, so never extend
+them or add another ("Release tag policy" above, Limit 1). The gate fails closed:
+a scan, DB, coverage or advisory-data failure is never a pass, and every exit it reaches after reading its arguments,
+SIGTERM/SIGINT included, writes a report that the upload keeps, named per run attempt so a re-run
+never replaces a refusal's. An acceptance is in force only when its scope is concrete (a path inside
+the image, containing a `/` and naming no Trivy target, or a full purl with its version), it has not
+expired, and, in a release, its approval fields are filled in and well formed (not `pending`); the
+same holds for a not-covered listing. Those fields are a recorded reference, checked for format only;
+the review of the change is the control. Trivy reads only the checker's canonical copy of the ignore
+file, and the DB only from this run's fresh cache, pinned by digest. Widening any of these (a glob
+or one-word scope, a bare id, an honoured pending approval, an inherited cache, a second coverage
+reader that is not Trivy's report, an overwritten or clobbered report, a push that carries a
+release tag, a second journal writer or reader, a consumer that accepts an illegal sequence, a
+tool or documented procedure that deletes an image or moves a release tag by hand) is a security
+decision, not a fix.
+
 ### Pre-release QA (`pre-release.yml`)
 
 **Trigger.** `workflow_run` on a completed `Release` run whose head is a `v*` tag
@@ -976,9 +1801,13 @@ than the tag under test (#5150). The other jobs check the following:
   `.deb` control `Version` equals the tag's Debian spelling (`0.14.0~rc3`); a
   mismatch fails. The RPM metadata step only prints. The ARM64 archive is checked only when the
   release ships one (#5135).
-- **security-scan**: Trivy scans the server and gateway images. Its findings
-  are informational and do not fail the run, but an image that cannot be
-  pulled fails the job.
+- **security-scan**: runs the release image vulnerability gate
+  (`scripts/ci/image-vuln-gate.sh`) on all seven published images (server,
+  gateway, postgres, the three chisel variants, the agent bundle). A CRITICAL
+  with a fix that `.trivyignore.yaml` does not accept fails the job, as does an
+  image that cannot be pulled or scanned; HIGH findings are informational.
+  `release.yml` already ran the same gate before each push, so a failure here
+  usually means a CVE disclosed after the release.
 - **soak-test**: ten minutes on the stack. Every 30s it checks that all four
   services are running with 0 restarts, at least one agent is connected, and
   the gateway is ready. About once a minute it also round-trips a command. At
@@ -1168,6 +1997,138 @@ The coverage fixtures stub disk space as well as `ps`, `find` and `ln`, so host 
 slow scenarios (`CH-19`, the process-tree kill, about 2.5 minutes; `CH-23`, signal bursts,
 about 35 s) and the rest of the harness are not in CI yet; wiring them into a nightly job,
 and hardening them for the shared-identity runner pools, is #6116.
+
+## Release build environment and provenance
+
+This states how a release is built today, as checked against `release.yml` on
+2026-11-17. It describes the pipeline; it is not a certification.
+
+**Owner role:** the release manager (the maintainer who cuts releases with the
+`/release` skill). Re-check this section against `release.yml` before each
+minor release, and in the same change as any edit to a release job's runner,
+cache or signing wiring.
+
+**Trigger.** `release.yml` runs on a `v*` tag push or a `workflow_dispatch` on
+a tag ref. Anyone with write access can push such a tag: the repository has
+branch rulesets for `dev` and `main` but no tag ruleset, and nothing checks
+that the tagged commit is on `main`. The `release-guard` job refuses a non-tag
+ref, a malformed tag and a tag that already has a published release
+(see [Release re-publish guard](#release-re-publish-guard-release-guard-5282)).
+
+**Where each job runs.**
+
+| Job | Runner |
+|---|---|
+| `release-guard`, `release` (assembles, checksums and signs the release), `docker-publish-agent-bundle` | GitHub-hosted `ubuntu-24.04` (fresh VM per job) |
+| `build-linux`, `build-gateway`, `docker-publish`, `docker-publish-postgres`, `docker-publish-chisel` | self-hosted `yuzu-bigtam-linux` (Big Tam) |
+| `build-windows` | self-hosted `yuzu-weetam-windows` (Wee Tam) |
+| `build-macos` | self-hosted `yuzu-bigmags-macos` (BigMags) |
+
+The self-hosted runners are persistent (not ephemeral or just-in-time; #1595
+tracks that for Windows) and are the same runner agents that run `ci.yml`,
+`nightly.yml`, `sanitizer-tests.yml` and `codeql.yml` (table below). `ci.yml`
+runs on every pull request to `dev` or `main` from a branch in this
+repository, so code from any write-access branch executes on the hosts that
+later build a release. On Big Tam and Wee Tam the four runner agents of a pool
+share one OS account. Fork pull requests do not run there unless a maintainer
+approves a revision through `trusted-fork-ci.yml`, which isolates its caches
+([Trusted fork pull-request CI](#trusted-fork-pull-request-ci)). The automated
+vcpkg baseline PR (branch `deps/vcpkg-baseline*`, opened by
+`vcpkg-baseline-update.yml`) does not run there either until a maintainer who
+is not its author, did not push its head and is on none of its commits has
+reviewed its upstream range and approved the PR at the head the CI run
+builds: until then `preflight-gate` fails, its self-hosted
+legs are skipped and `Preflight (runner health)` is red
+([Dependency updates](dependency-updates.md), "Self-hosted CI is held until a
+maintainer approves the head"). That limits when unreviewed upstream code reaches these
+hosts; it does not separate the caches below from release builds.
+
+**State that persists into a release build.** Release builds reuse local state
+left by earlier jobs on the same host; none of it comes from the GitHub
+Actions cache service.
+
+- ccache, on all three build platforms, in the same directory the CI jobs on
+  that runner use: per runner agent on Big Tam (each agent has its own
+  `HOME`, [`deploy/linux/`](../deploy/linux/README.md)), one machine-wide
+  `CCACHE_DIR` shared by all four agents on Wee Tam
+  ([`deploy/windows/`](../deploy/windows/README.md)), and the runner's
+  ccache on BigMags.
+- `build-linux` checks out with `clean: false` and deletes only `build-linux/`,
+  so `vcpkg_installed/` survives in the workspace between jobs (validated by
+  the [vcpkg sentinel](#universal-vcpkg-cache-key-contract)). `build-windows`
+  and `build-macos` check out clean and reinstall `vcpkg_installed/`, from
+  vcpkg's default binary cache for the runner account (Windows) or from
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos`, which the `ci.yml` macOS
+  leg also fills (macOS).
+- The image jobs read and write a BuildKit layer cache under
+  `runner.tool_cache/yuzu-docker-buildcache/`. Base images are pinned by
+  digest.
+
+**Provenance and signing.**
+
+- Every build job runs `actions/attest-build-provenance` on its own artifacts,
+  inside the same job as the build steps, with `id-token: write` granted to
+  the whole job. The attested assets are the platform archives, the native
+  installers and the images; each attested archive and installer also ships
+  its provenance bundle as `<asset>.intoto.jsonl`. The SBOMs, `SHA256SUMS`
+  and the Compose Wizard zip are not attested; the signed `SHA256SUMS`
+  covers the SBOMs and the zip.
+- Every published image is cosign-signed keyless by digest and attested
+  (`push-to-registry: true`). BuildKit's own provenance is turned off
+  (`provenance: false`) in favour of those.
+- `SHA256SUMS` lists every asset, is cosign-signed keyless in the hosted
+  `release` job and is verified there against the exact tag-bound
+  `release.yml` identity before the release is created.
+- Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+  The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
+  app-local. Each Windows SBOM describes its own
+  artifact: the archive's SBOM is made from the unpacked archive, which holds
+  them in `bin`, and the installer's SBOM lists the files its ISCC manifest
+  names, at their build-directory paths (`msvc-runtime\...`). Syft's
+  cataloguer lists each DLL in the archive's SBOM as an application component named and versioned from
+  its version resource, with a CPE and no package URL (purl), possibly more
+  than once, so a purl-matching scanner does not see them (not yet inspected in
+  a release SBOM). Their authoritative version is the file version of the
+  Microsoft-signed DLLs in the shipped payload; the `build-windows` job's step
+  summary lists them for that run only
+  ([Windows agent runtime gates](#windows-agent-runtime-gates-build-windows-job-release-only)).
+- Authenticode and Apple signing and notarization run only when their
+  secrets are set, and skip silently otherwise. On 2026-11-17 none of
+  `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets
+  exist in the repository, so the Windows and macOS installers ship unsigned
+  (#239). Making a stable release refuse, rather than skip, unsigned
+  installers is planned but held until the secrets exist; update this bullet
+  when it lands.
+
+**SLSA Build level.** Provenance is generated and signed through GitHub's
+attestation service from the workflow's OIDC identity, and the build runs on
+CI infrastructure rather than a developer machine. That is roughly SLSA Build
+L2, and L2 is the most that should be claimed. The pipeline does not meet L3:
+the runners are persistent and shared with CI that runs code from any
+write-access branch; release builds consume caches (ccache, vcpkg, BuildKit,
+the Linux workspace) that those jobs can write; and the build steps run in
+the job that holds the OIDC token used to sign the provenance, so they could
+mint an attestation themselves. Reaching L3 means isolated ephemeral runners
+for release builds with no shared caches, and provenance generated outside
+the build job (for example a reusable workflow on GitHub-hosted runners).
+
+**Open gaps.** Disclosed here, not yet fixed, and each needs a tracking
+issue:
+
+- **No tag ruleset.** Anyone with write access can push a `v*` tag, which
+  starts `release.yml`, and nothing checks that the tagged commit is on
+  `main`.
+- **Release builds read caches that CI can write.** CI jobs from any
+  write-access branch fill ccache, the Linux workspace's `vcpkg_installed/`
+  and the vcpkg binary caches that release jobs on the same host then read
+  (the macOS binary cache is the same
+  `runner.tool_cache/yuzu-vcpkg-binary-cache-macos` directory in `ci.yml` and
+  `release.yml`). Only release jobs write the BuildKit layer cache through
+  BuildKit, but a CI job running as the same OS account (any job on the same
+  Big Tam or Wee Tam pool, or on the same runner agent) can write its
+  directory directly. The vcpkg baseline PR's approval gate narrows
+  one unattended route into these caches; it does not close the gap, which
+  needs release builds that start from no cache a CI job can write.
 
 ## Self-hosted runner topology
 
@@ -3904,11 +4865,44 @@ itself re-warm the new key.
 Deletes `${RUNNER_TOOL_CACHE}/yuzu-vcpkg-binary-cache-*/<file>` >30 days
 old. Does not touch ccache (own LRU at `CCACHE_MAXSIZE=30G`).
 Also sweeps the buildx local cache the chisel images write
-(`/mnt/d/docker-buildcache/*-chisel`, `mode=max` — several GB/arch, no
-built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux only.
+(`$RUNNER_TOOL_CACHE/yuzu-docker-buildcache/*-chisel`, `mode=max` — several
+GB/arch, no built-in eviction); whole-`*-chisel`-dir mtime sweep >30 days, Linux
+only, each removal under an exclusive non-blocking `flock` on `<dir>.lock`, so a
+directory a publish job holds is skipped with a notice, never removed under it.
 Since #1367 the same run also executes `scripts/ci/sweep-test-databases.sh`
 on both boxes — the weekly out-of-band janitor for leaked `yuzu_test_*`
-databases (thresholds and semantics: "Test-database lifecycle" above).
+databases (thresholds and semantics: "Test-database lifecycle" above). It runs
+even when a prune step before it failed (`if: success() || failure()`).
+
+**Release buildx caches (WP15/S9).** The Big Tam publish jobs export
+`type=local,mode=max` caches to `$RUNNER_TOOL_CACHE/yuzu-docker-buildcache/<image>`
+(`server`, `gateway`, `postgres`, `<image>-chisel`); an export never deletes
+superseded blobs, so `scripts/ci/prune-buildcache.py` removes the blobs no cache
+index references. Each Big Tam runner has its own tool cache
+(`/srv/ci/work-N/_tool`) and all four run as one OS identity, so the weekly job,
+which lands on one runner, prunes all four runners' caches every week. In use is
+decided by a lock, not the clock: each publish job holds a shared `flock` on
+`<dir>.lock` from before its first build until the job ends
+(`scripts/ci/buildcache-lock.sh`), and the prune takes it exclusively without
+waiting and skips a directory in use; a publish job waits up to 30 minutes for a
+prune holding it. As defence in depth the prune also skips a directory written
+in the last 3 hours, removes only unreferenced regular files older than 24
+hours, removes a BROKEN directory (unparseable index, or an index naming a
+missing blob, which would fail its next import) whole so the next build runs
+cold, and refuses a symlinked directory or lock. A directory it cannot read is
+an error: reported, left untouched, and the step exits 1 after the last
+directory. So is a directory holding a file dated more than an hour in the
+future (a clock or file time that would otherwise keep the 3-hour window open
+for ever), and one holding a blob that starts like JSON but is over the 64 MiB
+read cap (read as a layer, its references would be lost and blobs a manifest
+needs removed). Its clock-guard disposition is in `docs/clock-guarded-retention.md`.
+
+**A corrupted release cache** (a publish build failing to import its cache with
+`NotFound content`, or a prune error naming a directory): on the runner that ran
+the leg, delete `/srv/ci/work-N/_tool/yuzu-docker-buildcache/<image>` (leave
+`<image>.lock`; check no publish job is running on that runner), then "Re-run
+failed jobs": that build runs cold (the C++ images take the longest). The weekly
+prune removes a broken directory itself the next Sunday.
 
 ## Chiselled demo images + agent bundle (release-time)
 
@@ -3924,9 +4918,10 @@ failed or cancelled chisel leg skips the release.
 
 `docker-publish-agent-bundle` runs **after** `release` (it repackages the
 release's own agent archives, after verifying the release `SHA256SUMS` cosign signature) on a GitHub-hosted runner — no
-compilation, so no self-hosted dependency — and cosign-signs + SBOMs +
-attests the pushed `yuzu-agent-bundle-chisel` image like the other publish
-jobs.
+compilation, so no self-hosted dependency — builds the image without pushing,
+runs the release image vulnerability gate on it, pushes it, and cosign-signs +
+SBOMs + attests the pushed `yuzu-agent-bundle-chisel` image like the other
+publish jobs.
 
 ## vcpkg state corruption — recovery path
 

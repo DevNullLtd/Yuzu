@@ -1239,8 +1239,9 @@ nlohmann::json reset_json(const HighWaterReset& r) {
     nlohmann::json j;
     j["reset_at"] = rfc3339_utc(r.reset_at);
     j["crls_deleted"] = r.crls_deleted;
-    // The window the reset opened: a CRL that verifies and is dated at or after this time is
-    // accepted again, whatever its number.
+    // The window the reset opened, reported as reset_at itself: the fetcher also allows the CA
+    // five minutes of clock skew before it, so a CRL that verifies and is dated no earlier than
+    // reset_at - 5 minutes is accepted again, whatever its number.
     j["replay_window_opens_at"] = rfc3339_utc(r.reset_at);
     j["pinned"] = r.pinned;
     return j;
