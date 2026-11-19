@@ -37,6 +37,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <ctime>
 #include <stdexcept>
 #include <string>
@@ -2759,4 +2760,89 @@ TEST_CASE("PolicyStore: a live refusal stays in the fleet figure and an unrefres
     auto cs = store.get_compliance_summary(gone.value());
     REQUIRE(cs.has_value());
     CHECK(cs->blocked == 1);
+}
+
+// ----------------------------------------------------------------------------
+// G01: mark_blocked is one statement (one implicit transaction) per 500-target chunk, never one
+// transaction for the run, before and after the per-chunk lease. A chunk that fails therefore
+// leaves the earlier chunks written, writes nothing of its own (the statement rolls back as a
+// whole) and never attempts the later ones; the call reports an error; and the next call repairs
+// the rest while B6 (every refusal refreshes last_check_at, only a changed row counts) still holds.
+// ----------------------------------------------------------------------------
+
+TEST_CASE("PolicyStore: a failed chunk leaves earlier chunks written and later ones untouched, "
+          "and the next call repairs them with B6 intact",
+          "[policy_store][pg][blocked]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    PolicyStore store{pool};
+    auto frag = store.create_fragment(kFullFragment);
+    REQUIRE(frag.has_value());
+    auto pol = store.create_policy(make_policy_yaml(frag.value()));
+    REQUIRE(pol.has_value());
+
+    // 1201 zero-padded ids sort numerically: chunk 1 is 0000..0499, chunk 2 is 0500..0999 and
+    // chunk 3 is 1000..1200. Submitted in reverse so the sort, not the input order, decides.
+    std::vector<std::string> ids;
+    for (int i = 1200; i >= 0; --i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "agent-%04d", i);
+        ids.emplace_back(buf);
+    }
+
+    const auto exec = [&](const char* sql) {
+        auto lease = pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto r = yuzu::server::pg::exec_params(lease.get(), sql, std::vector<std::string>{});
+        INFO(PQerrorMessage(lease.get()));
+        REQUIRE(r.status() == PGRES_COMMAND_OK);
+    };
+    // The write of one row in chunk 2 fails, after its neighbours in the same statement.
+    exec("CREATE FUNCTION policy_store.g01_chunk_fail() RETURNS trigger LANGUAGE plpgsql AS "
+         "$$ BEGIN IF NEW.agent_id = 'agent-0700' THEN RAISE EXCEPTION 'chunk refused'; END IF; "
+         "RETURN NEW; END $$");
+    exec("CREATE TRIGGER g01_chunk_fail BEFORE INSERT OR UPDATE ON policy_store.policy_status "
+         "FOR EACH ROW EXECUTE FUNCTION policy_store.g01_chunk_fail()");
+
+    auto failed = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE_FALSE(failed.has_value());
+    CHECK(failed.error().find("failed to record blocked status") != std::string::npos);
+
+    // Chunk 1 is written and committed; chunk 2 wrote nothing, not even the rows before the
+    // failing one; chunk 3 was never attempted.
+    auto cs = store.get_compliance_summary(pol.value());
+    REQUIRE(cs.has_value());
+    CHECK(cs->blocked == 500);
+    CHECK(cs->total == 500);
+    const auto absent = [&](const char* agent) {
+        auto st = store.get_agent_status(pol.value(), agent);
+        REQUIRE(st.has_value());
+        CHECK_FALSE(st->has_value());
+    };
+    CHECK(check_stamp_age(store, pol.value(), "agent-0000") < 60);
+    CHECK(check_stamp_age(store, pol.value(), "agent-0499") < 60);
+    absent("agent-0500");
+    absent("agent-0699"); // before the failing id, same statement
+    absent("agent-1000");
+    absent("agent-1200");
+
+    // The next call, with the cause gone, writes the rest. Only the 701 rows that were not
+    // blocked count as changed, so a repeated refusal writes one audit row, not two.
+    exec("DROP TRIGGER g01_chunk_fail ON policy_store.policy_status");
+    age_check_stamp(pool, pol.value(), "agent-0000", 23 * kHour);
+    auto repaired = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE(repaired.has_value());
+    CHECK(repaired->changed == 701);
+    cs = store.get_compliance_summary(pol.value());
+    REQUIRE(cs.has_value());
+    CHECK(cs->blocked == 1201);
+    // B6: a row that was already blocked is refreshed by the repair even though it is unchanged.
+    CHECK(check_stamp_age(store, pol.value(), "agent-0000") < 60);
+
+    // And a further identical refusal changes nothing but still refreshes.
+    age_check_stamp(pool, pol.value(), "agent-0000", 23 * kHour);
+    auto again = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
+    REQUIRE(again.has_value());
+    CHECK(again->changed == 0);
+    CHECK(check_stamp_age(store, pol.value(), "agent-0000") < 60);
 }

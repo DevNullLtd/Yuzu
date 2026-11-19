@@ -45,6 +45,8 @@
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
 
+#include <cstdio>
+#include <ctime>
 #include <map>
 #include <set>
 #include <stdexcept>
@@ -2555,4 +2557,86 @@ TEST_CASE("policy dispatch approval: a refused fix writes its audit row after th
     auto rows = audit_rows(audit, "policy.dispatch");
     REQUIRE(rows.size() == 1);
     CHECK(rows[0].detail.find("phase=fix") != std::string::npos);
+}
+
+// G01: a chunk that fails part-way through a large refused run. The refusal still stands and
+// nothing is sent; the first tick audits it as status_write=error; the next tick repairs the
+// rest and writes one row for what changed; a third, identical refusal writes none (B6).
+TEST_CASE("policy dispatch approval: a chunk failure part-way through a large refused run is "
+          "audited as status_write=error, and the next refusal repairs it once",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+    // 1201 more targets: ids sort as agent-0000..agent-1200, then agentA and agentB. Chunks of
+    // 500 are 0000..0499, 0500..0999 and the remaining 203.
+    for (int i = 0; i <= 1200; ++i) {
+        char buf[16];
+        std::snprintf(buf, sizeof buf, "agent-%04d", i);
+        REQUIRE(h.mg.add_member(h.group_id, buf).has_value());
+    }
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+
+    exec_sql(db.dsn(),
+             "CREATE FUNCTION policy_store.g01_chunk_fail() RETURNS trigger LANGUAGE plpgsql AS "
+             "$$ BEGIN IF NEW.agent_id = 'agent-0700' THEN RAISE EXCEPTION 'chunk refused'; END IF; "
+             "RETURN NEW; END $$");
+    exec_sql(db.dsn(),
+             "CREATE TRIGGER g01_chunk_fail BEFORE INSERT OR UPDATE ON policy_store.policy_status "
+             "FOR EACH ROW EXECUTE FUNCTION policy_store.g01_chunk_fail()");
+
+    ev.tick(true); // the first refusal; chunk 2 of 3 fails
+    CHECK(h.dispatch_calls == 0);
+    CHECK(denied(metrics, "gated") == 1);
+    auto summary = h.ps.get_compliance_summary(pid);
+    REQUIRE(summary.has_value());
+    CHECK(summary->blocked == 500); // chunk 1 only
+    // The partial count is not reported: the blocked verdict counter does not move.
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 0);
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("status_write=error") != std::string::npos);
+    CHECK(rows[0].detail.find("origin=tick") != std::string::npos);
+
+    exec_sql(db.dsn(), "DROP TRIGGER g01_chunk_fail ON policy_store.policy_status");
+    h.fake_now += 4000;
+    ev.tick(true); // the repair: 703 targets were not blocked yet
+    summary = h.ps.get_compliance_summary(pid);
+    REQUIRE(summary.has_value());
+    CHECK(summary->blocked == 1203);
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 703);
+    rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 2);
+    // Newest first or oldest first, exactly one of the two rows carries the error marker.
+    int errors = 0;
+    for (const auto& r : rows)
+        errors += r.detail.find("status_write=error") != std::string::npos ? 1 : 0;
+    CHECK(errors == 1);
+
+    // B6: the same refusal again changes nothing, writes no new row, and still refreshes.
+    exec_sql(db.dsn(),
+             "UPDATE policy_store.policy_status SET last_check_at = "
+             "EXTRACT(EPOCH FROM NOW())::bigint - 82800 WHERE policy_id = $1 AND agent_id = "
+             "'agent-0000'",
+             {pid});
+    h.fake_now += 4000;
+    ev.tick(true);
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 2);
+    CHECK(metrics.counter("yuzu_server_policy_verdicts_total", {{"status", "blocked"}}).value() == 703);
+    auto st = h.ps.get_agent_status(pid, "agent-0000");
+    REQUIRE(st.has_value());
+    REQUIRE(st->has_value());
+    CHECK(static_cast<int64_t>(std::time(nullptr)) - (*st)->last_check_at < 60);
+    CHECK(h.dispatch_calls == 0);
 }
