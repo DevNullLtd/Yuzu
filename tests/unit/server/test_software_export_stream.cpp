@@ -213,7 +213,7 @@ TEST_CASE("export chunk: CSV neutralises formula cells and escapes quotes and ne
     CHECK(recs[0][1] == "'=HYPERLINK(\"http://x\")"); // name: a leading '=' is defused
     CHECK(recs[0][3] == "Acme, \"Inc\"\nLine2");       // publisher: comma, quote, newline round-trip
     CHECK(recs[0][20] == "'+cmd");                     // install_location
-    CHECK(recs[0][23] == "'=pid");                     // package_id: the trailing cell
+    CHECK(recs[0].back() == "'=pid");                  // package_id: the trailing cell
 }
 
 TEST_CASE("export cap: the flag is clamped to the accepted range, never to 0 (which the budget "

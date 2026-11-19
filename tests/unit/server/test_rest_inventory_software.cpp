@@ -350,6 +350,9 @@ TEST_CASE("REST inventory/software: the 200 body is typed in the OpenAPI spec an
         required.insert(k.get<std::string>());
     CHECK(properties == served);
     CHECK(required == served);
+    CHECK(properties.contains("package_id"));
+    CHECK(required.contains("package_id"));
+    CHECK(schemas["InstalledSoftwareRow"]["properties"]["package_id"]["type"] == "string");
 
     // The row's ecosystem description points at the generated filter enum rather than carrying a
     // hand-typed list that drifts behind the vocabulary table (it once named nine of seventeen).

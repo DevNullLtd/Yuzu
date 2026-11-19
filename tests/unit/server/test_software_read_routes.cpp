@@ -512,6 +512,7 @@ TEST_CASE("host detail: an in-scope host returns its facets and one pinned insta
     h.hosts = {host_row("a1"), host_row("a2")};
     h.roster = {{"a1", "alpha"}};
     h.installs = {install_row("a1", 1), install_row("a1", 2), install_row("a2", 3)};
+    h.installs[0].entry.package_id = "{PID-1}"; // one row with a product code, one without
     h.scope = scope_of({"a1"});
 
     auto res = h.sink.Get("/api/v1/inventory/software/hosts/a1?limit=1&name=ignored");
@@ -523,6 +524,7 @@ TEST_CASE("host detail: an in-scope host returns its facets and one pinned insta
     CHECK(data.at("host").at("facets")[0].at("row_status") == "current");
     CHECK(ids_of(data.at("software")) == std::vector<std::string>{"a1"});
     CHECK(data.at("count") == 1);
+    CHECK(data.at("software")[0].at("package_id") == "{PID-1}");
     CHECK(h.last_install_agent == "a1"); // pinned to the device
     REQUIRE(data.at("next_cursor").is_string());
 
@@ -532,6 +534,7 @@ TEST_CASE("host detail: an in-scope host returns its facets and one pinned insta
     REQUIRE(res->status == 200);
     data = body_of(*res).at("data");
     CHECK(data.at("software")[0].at("version") == "1.2");
+    CHECK(data.at("software")[0].at("package_id") == "");
     CHECK(data.at("next_cursor").is_null());
 
     // An in-scope device with no report is the unknown-host 404.

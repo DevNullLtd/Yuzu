@@ -57285,6 +57285,8 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         INFO(std::string(confined ? "confined caller" : "unfiltered caller"));
         Sam35ReadRig rig(confined ? VisibleSet{std::unordered_set<std::string>{"a1"}}
                                   : VisibleSet{});
+        // One row with a product code, one without.
+        rig.fakes.installs[0].entry.package_id = "{PID-1}";
         CHECK(rig.mcp_data("list_software_hosts") ==
               rig.rest_data("/api/v1/inventory/software/hosts"));
         CHECK(rig.mcp_data("list_software_hosts", R"({"q":"web"})") ==
@@ -57301,6 +57303,10 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         }
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1"})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1"));
+        const auto host = rig.mcp_data("get_software_host", R"({"agent_id":"a1"})");
+        REQUIRE(host["software"].size() == 2);
+        CHECK(host["software"][0]["package_id"] == "{PID-1}");
+        CHECK(host["software"][1]["package_id"] == "");
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1","limit":1})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1?limit=1"));
         CHECK(rig.mcp_data("list_software_changes") ==
@@ -59619,8 +59625,12 @@ TEST_CASE("MCP lookup tools: tools/list serves both new tools read-only with typ
                 CHECK(out.contains(key));
             for (const char* key : {"hostname", "last_seen", "status", "last_confirmed_at",
                                     "install_type", "install_scope", "install_location",
-                                    "instance_key", "purl"})
+                                    "instance_key", "purl", "package_id"})
                 CHECK(out["software"]["items"]["properties"].contains(key));
+            const auto& item = out["software"]["items"];
+            CHECK(item["properties"]["package_id"]["type"] == "string");
+            CHECK(std::find(item["required"].begin(), item["required"].end(), "package_id") !=
+                  item["required"].end());
         }
         if (name == "sync_hardware_software") {
             CHECK(t["inputSchema"]["properties"]["confirm"]["type"] == "boolean");
