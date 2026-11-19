@@ -1794,7 +1794,7 @@ TEST_CASE("REST inventory/software: lookup rows carry hostname, last_seen, statu
     CHECK(r.contains("install_location"));
     CHECK(r["instance_key"].get<std::string>().size() == 64);
     CHECK(r["package_id"] == "{PID-REST}");
-    // The original 14 fields are unchanged.
+    // The 15 package fields are unchanged by the lookup.
     CHECK(r["name"] == "git");
     CHECK(r["version"] == "2.1");
     CHECK(r["source"] == kLookupFacet);

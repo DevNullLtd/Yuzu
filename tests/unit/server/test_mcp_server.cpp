@@ -59144,6 +59144,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
           "confined caller; both representations are kept",
           "[mcp][inventory][software][sam21]") {
     Sam21Reads fakes;
+    fakes.installs[0].entry.package_id = "{PID-MCP}";
     const auto rq = swl::parse_list_params(swl::Params{{"name", "git"}});
     REQUIRE(rq);
     for (const bool confined : {false, true}) {
@@ -59184,6 +59185,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
         CHECK(row["status"] == "current");
         CHECK(row["last_confirmed_at"] == 1'700'000'100);
         CHECK(row["purl"] == "pkg:brew/git@1.0");
+        CHECK(row["package_id"] == "{PID-MCP}");
         if (confined) {
             CHECK(structured["count"] == 1);
             CHECK(structured["totals"].is_null());
@@ -59195,8 +59197,10 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
             CHECK_FALSE(structured.contains("totals_omitted"));
         }
         // The other row (a2) has no roster entry: null, never "".
-        if (!confined)
+        if (!confined) {
             CHECK(structured["software"][1]["hostname"].is_null());
+            CHECK(structured["software"][1]["package_id"] == "");
+        }
     }
 }
 

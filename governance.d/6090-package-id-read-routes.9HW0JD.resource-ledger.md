@@ -1,6 +1,6 @@
 # Resource Ledger - #6090 (package_id on the installed-software read routes)
 
-Run: `6090-package-id-read-routes.pkgid1`. Gate 1 Resource Ledger for the C++ diff.
+Run: `6090-package-id-read-routes.9HW0JD`. Gate 1 Resource Ledger for the C++ diff.
 
 ## Production code (`software_catalogue_model.{cpp,hpp}`, `software_list_model.{cpp,hpp}`, `rest_api_v1.cpp`, `mcp_server.cpp`, comment-only edits in `software_export_routes.cpp` and `software_export_stream.hpp`)
 
