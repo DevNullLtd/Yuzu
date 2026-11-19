@@ -13,8 +13,8 @@
 #include "web_utils.hpp" // audit_token
 
 #include <nlohmann/json.hpp>
-#include <cstdint>
 
+#include <cstdint>
 #include <string>
 #include <vector>
 
@@ -92,8 +92,9 @@ std::string refusal_remediation(PolicyDispatchDenialReason reason, bool authorin
                  "dispatch. Change the instruction the policy uses.";
 }
 
-// The lookup could not be answered, so the request is neither accepted nor refused: a retry
-// may answer it.
+// The lookup could not be answered, so the request is neither accepted nor refused. When the
+// instruction store failed, a retry may answer it after this long; the constant is used only
+// then (an unwired evaluator is not retried).
 constexpr std::int64_t kInstructionLookupRetryMs = 5000;
 
 } // namespace
@@ -126,10 +127,14 @@ bool PolicyAdminRoutes::refuse_unusable_instructions(
             res.status = 503;
             detail::A4ErrorOpts opts;
             // A hint only when a retry can help: a store failure may clear, an unwired
-            // evaluator will not.
+            // evaluator will not. The message agrees with the hint.
             if (check.transient)
                 opts.retry_after_ms = kInstructionLookupRetryMs;
-            res.set_content(detail::a4_error(res, "instruction lookup unavailable, try again", opts),
+            res.set_content(detail::a4_error(res,
+                                             check.transient
+                                                 ? "instruction lookup unavailable, try again"
+                                                 : "instruction lookup unavailable",
+                                             opts),
                             "application/json");
             return true;
         }

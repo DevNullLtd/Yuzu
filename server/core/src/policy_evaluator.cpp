@@ -790,8 +790,13 @@ PolicyEvaluator::authorize_instruction(const std::string& instruction_id) const 
     // No registry or no instruction store is an unavailable answer, not a verdict: an
     // unwired evaluator reads as degraded (503) here, the same fail-closed posture the
     // dispatch seam takes (`unwired`), never as an accept.
-    if (!d_.instruction_store || !d_.capability_registry)
+    if (!d_.instruction_store || !d_.capability_registry) {
+        // A wiring defect a retry will not clear; logged so an operator can see it without
+        // reading source (the 503 carries no store text).
+        spdlog::error("policy_evaluator: authorize_instruction: evaluator is not wired (no "
+                      "instruction store or no capability registry)");
         return {InstructionCheck::Kind::Degraded, std::nullopt, /*transient=*/false};
+    }
     auto def = d_.instruction_store->get_definition(instruction_id);
     if (!def) {
         spdlog::warn("policy_evaluator: authorize_instruction: instruction store unavailable");

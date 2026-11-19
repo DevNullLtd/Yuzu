@@ -809,7 +809,8 @@ TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instr
         const auto body = nlohmann::json::parse(res->body);
         const auto& err = body.at("error");
         CHECK(err.at("code") == 503);
-        CHECK(err.at("message") == "instruction lookup unavailable, try again");
+        // No "try again": the null hint and the message agree that a retry will not help.
+        CHECK(err.at("message") == "instruction lookup unavailable");
         CHECK(err.contains("correlation_id"));
         CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
         REQUIRE(err.contains("retry_after_ms"));
