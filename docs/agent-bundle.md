@@ -61,12 +61,17 @@ Each triplet ships **both** forms:
 # Build locally for your host arch (downloads + verifies + assembles + smoke-tests):
 bash scripts/build-agent-bundle.sh                      # default version
 
-# Pin a specific release and push a single-arch image:
-bash scripts/build-agent-bundle.sh --version 0.11.0 --push
+# Build a specific release's bundle locally:
+bash scripts/build-agent-bundle.sh --version 0.11.0
 
-# Multi-arch (so arm64 and amd64 hosts both pull natively) — pushes to the registry:
-bash scripts/build-agent-bundle.sh --multiarch --push
+# Push a test image to YOUR OWN registry (single-arch, or --multiarch for arm64 + amd64):
+bash scripts/build-agent-bundle.sh --version 0.11.0 --registry ghcr.io/<your-account> --push
 ```
+
+The project's bundle image is published by `release.yml`, not by this script. `--push` against
+the project's registry moves a release tag outside the release workflow, bypassing its image gate
+and publish journal (`docs/ci-architecture.md` "Release tag policy", Limit 1): that is not a
+release procedure but an owner-decided incident, recorded in a tracking issue and announced.
 
 The script first runs `cosign verify-blob` on the release's `SHA256SUMS`
 against `SHA256SUMS.sigstore` with the exact identity
@@ -136,7 +141,8 @@ DIGEST=$(docker buildx imagetools inspect ghcr.io/<owner>/yuzu-agent-bundle-chis
   --format '{{.Manifest.Digest}}')
 
 # 2. verify that digest against the exact, tag-bound identity; only a successful
-#    verify sets VERIFIED
+#    verify sets VERIFIED (needs cosign v3.0 or later: an older cosign reports
+#    "no signatures found" for the genuine image)
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>' \
@@ -340,6 +346,7 @@ the digest form from "Use it (partner)"; `DIGEST` is resolved with the same
 `docker buildx imagetools inspect` call:
 
 ```bash
+# needs cosign v3.0 or later (an older cosign reports "no signatures found" for the genuine image)
 cosign verify "ghcr.io/<owner>/yuzu-agent-bundle-chisel@${DIGEST}" \
   --certificate-oidc-issuer=https://token.actions.githubusercontent.com \
   --certificate-identity='https://github.com/<signer>/.github/workflows/release.yml@refs/tags/v<version>'

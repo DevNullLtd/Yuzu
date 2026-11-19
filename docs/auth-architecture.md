@@ -2292,8 +2292,11 @@ user-editable IdP profile field, controls it. `detail` is a flat
 inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
 bytes to inject fake log lines. `detail::sanitize_detail_value`
 (`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
-this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
-with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+this: it first folds the value through `log_key_token` (C0, DEL, well-formed C1
+(U+0080-U+009F), U+2028 and U+2029 become `_`; input over 256 bytes is shortened
+before the 128-byte head clip), then replaces `;`, `=`, `\r`, `\n` and any
+remaining control byte with `_`, then truncates to 128 bytes on a UTF-8
+code-point boundary.
 Every `display=`/`email=`/`oidc_sub`/`name` value attached in
 `/auth/callback` is run through it before concatenation. **It is
 audit-detail-field-injection defense only — it does NOT strip HTML
@@ -2665,7 +2668,7 @@ applies to these two flags).
 | Action | Result | When |
 |---|---|---|
 | `auth.saml_login` | `ok` | ACS validation passed; session minted |
-| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.) |
+| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.). Detail = `detail::neutralise_saml_error`: `log_key_token` (folds C0/C1/Unicode line separators, caps 256) then `sanitize_detail_value` (`;`/`=` to `_`, head-only clip to 128 bytes, no marker); the log line uses `log_key_token` alone (256) |
 
 ### Security posture
 
