@@ -19,7 +19,7 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 **What operators will see.**
 
-- The devices of an affected policy show `blocked`, which counts as failing in the compliance pill, the Failing checks readout and the home tile. Each device's `check_result` names the phase (`check`, `fix` or `verify`), the reason (`gated`, `destructive`, `reserved`, `unclassified`, `ambiguous`, `unwired` or `dispatch_identifier_invalid`), and the plugin and action.
+- The devices of an affected policy show `blocked`, which counts as failing in the compliance pill, the Failing checks readout and the home tile. Each device's `check_result` names the phase (`check`, `fix` or `verify`), the reason (`gated`, `destructive`, `reserved`, `unclassified`, `ambiguous`, `unwired` or `dispatch_identifier_invalid`), and the plugin and action (for `dispatch_identifier_invalid` only their lengths, never their text).
 - `POST /api/policies/{id}/evaluate` and `POST /api/policies/{id}/remediate` answer `409` for a refused pair. The body is the standard error envelope and its `remediation` text starts `policy_dispatch_refused: ` followed by the reason. The dashboard toast shows the reason.
 - Creating a fragment, creating a policy and enabling a policy answer `400` when an instruction they name is refused (and `503` when the check cannot be answered). An instruction that does not exist yet is accepted, and installing a product pack does not refuse its policies: a pack policy that names a refused action installs, and shows `blocked` at its first dispatch.
 - New: the counter `yuzu_server_policy_dispatch_denied_total{reason}` and the audit event `policy.dispatch`.
