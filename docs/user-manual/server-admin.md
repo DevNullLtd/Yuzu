@@ -5183,7 +5183,7 @@ of rows), then reaches the certificates through ordinary btree indexes on `issue
 
   The next background cycle completes the marker (it is a no-op reconcile), so the dictionary reads ready within five minutes
   and no restart is needed.
-- **Optional trigram index.** If `pg_trgm` is available (the bundled Postgres image enables it on first boot; on managed
+- **Optional trigram index.** If `pg_trgm` is available (the bundled Postgres image enables it when it creates a new data directory, not on an existing volume, where you run `CREATE EXTENSION pg_trgm` yourself if you want it; on managed
   PostgreSQL run `CREATE EXTENSION pg_trgm`, and on Azure add it to `azure.extensions` first), the pass adds a trigram index on the
   dictionary only. It is a convenience for a dictionary of millions of names; the filters work without it.
 - **Retention.** The dictionary does not outlive the certificates: the decommission cascade deletes the names a device referenced that
@@ -5198,6 +5198,8 @@ of rows), then reaches the certificates through ordinary btree indexes on `issue
 - **Disk and write cost.** The two btrees are small (equal values are stored once); the dictionary holds distinct names only.
   A certificate that is new or changed costs one extra index entry.
 - **Backup and restore.** `pg_dump` restores the dictionary and its indexes; the pass re-reconciles it after the restart.
+- **Pool floor.** The certificate reads need `--postgres-pool-size` of at least 4; below that every certificate read is
+  refused (`503`, reason `pool_too_small`, no retry hint) until the server is restarted with a larger pool.
 - **One caller-priced read per user.** At most one certificate summary, or page carrying any filter other than `agent_id`,
   `sha256` or `scope`, runs at a time per user (callers whose identity cannot be resolved share one slot); a second answers a
   retryable `503` (`retry_after_ms` 15000, reason `principal_busy`) and takes none of the two shared `/crypto` read slots. An

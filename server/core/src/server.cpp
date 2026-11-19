@@ -2698,8 +2698,8 @@ public:
         metrics_.gauge("yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds").set(0.0);
         metrics_.describe("yuzu_fleet_cert_store_status",
                           "Certificate stores by device OS and read status (ok, absent, unreadable, "
-                          "constrained, not_observed) from the fleet certificate inventory (slice-2 "
-                          "PR 2a-2b); os unknown = the device is not connected to this replica. "
+                          "constrained, not_observed) from the fleet certificate inventory; "
+                          "os unknown = the device is not connected to this replica. "
                           "Absent until the first successful read, and held at its prior value "
                           "when a read degrades",
                           "gauge");
@@ -2709,6 +2709,8 @@ public:
                           "was held at its prior value - a non-zero rate means that gauge may be "
                           "frozen, not genuinely low",
                           "counter");
+        // Seeded at 0 so increase() sees the first failure (a series born at 1 hides its 0->1 step).
+        metrics_.counter("yuzu_fleet_cert_store_status_unavailable_total");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
                           "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
