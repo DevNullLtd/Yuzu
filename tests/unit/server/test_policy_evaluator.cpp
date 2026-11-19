@@ -43,9 +43,14 @@
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
+#include <spdlog/sinks/ostream_sink.h>
+#include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <map>
+#include <memory>
 #include <set>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2436,4 +2441,142 @@ TEST_CASE("policy dispatch approval: authorize_instruction is degraded, never an
         PolicyEvaluator ev(deps);
         CHECK(ev.authorize_instruction(gated_id).kind == Kind::Degraded);
     }
+}
+
+// ---------------------------------------------------------------------------
+// G01 fold-in (Q1 option b, -14): record_denial observes AuditStore::log and warns once when the
+// row is not written, and a refused fix writes its audit row after the claim is released.
+// ---------------------------------------------------------------------------
+
+namespace {
+
+// Captures what the default logger writes while it is alive.
+class LogCapture {
+public:
+    LogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(os_)) {
+        spdlog::default_logger()->sinks().push_back(sink_);
+    }
+    ~LogCapture() {
+        auto& sinks = spdlog::default_logger()->sinks();
+        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
+    }
+    LogCapture(const LogCapture&) = delete;
+    LogCapture& operator=(const LogCapture&) = delete;
+    std::string text() {
+        spdlog::default_logger()->flush();
+        return os_.str();
+    }
+
+private:
+    std::ostringstream os_;
+    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
+};
+
+size_t count_of(const std::string& hay, const std::string& needle) {
+    size_t n = 0;
+    for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
+        ++n;
+    return n;
+}
+
+// A BEFORE INSERT trigger on the audit table for the policy.dispatch row. `body` is the plpgsql
+// that runs first; it may RAISE to make the INSERT fail, which makes AuditStore::log return false.
+void install_audit_insert_trigger(const std::string& dsn, const char* body) {
+    const std::string fn =
+        std::string("CREATE FUNCTION audit_store.g01_audit_probe() RETURNS trigger LANGUAGE "
+                    "plpgsql AS $$ BEGIN IF NEW.action = 'policy.dispatch' THEN ") +
+        body + " END IF; RETURN NEW; END $$";
+    exec_sql(dsn, fn.c_str());
+    exec_sql(dsn, "CREATE TRIGGER g01_audit_probe BEFORE INSERT ON audit_store.audit_events "
+                  "FOR EACH ROW EXECUTE FUNCTION audit_store.g01_audit_probe()");
+}
+
+} // namespace
+
+TEST_CASE("policy dispatch approval: a refusal whose audit row is not written logs one warning "
+          "naming the policy, phase and reason",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "content_dist");
+    const auto check = define_real_pair(h, "content_dist", "execute_staged");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+    const std::string phrase = "policy.dispatch audit row not written";
+
+    // A row that is written logs nothing of the kind.
+    {
+        LogCapture cap;
+        REQUIRE(ev.evaluate_now(pid).has_value());
+        CHECK(count_of(cap.text(), phrase) == 0);
+        CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
+        CHECK(audit.emit_failed_count() == 0);
+    }
+
+    // The audit INSERT now fails. The refusal still stands; one warning says the row is missing.
+    install_audit_insert_trigger(db.dsn(), "RAISE EXCEPTION 'audit insert refused';");
+    {
+        LogCapture cap;
+        auto r = ev.evaluate_now(pid);
+        REQUIRE(r.has_value());
+        const auto text = cap.text();
+        CHECK(count_of(text, phrase) == 1);
+        CHECK(text.find("policy=" + pid) != std::string::npos);
+        CHECK(text.find("phase=check") != std::string::npos);
+        CHECK(text.find("reason=gated") != std::string::npos);
+        // The store's own error text is not copied into the evaluator's line (the store logs
+        // its own error separately).
+        const auto at = text.find(phrase);
+        REQUIRE(at != std::string::npos);
+        const auto line = text.substr(at, text.find('\n', at) - at);
+        CHECK(line.find("audit insert refused") == std::string::npos);
+    }
+    CHECK(audit.emit_failed_count() == 1);
+    CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
+    CHECK(h.dispatch_calls == 0);
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+}
+
+TEST_CASE("policy dispatch approval: a refused fix writes its audit row after the claim is "
+          "released",
+          "[pg][policy][evaluator][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    AuditStore audit{pool};
+    REQUIRE(audit.is_open());
+    can_non_compliant(h, "echo");
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "echo", "purge_source"); // Destructive: refused
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.audit_store = &audit;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    // The audit INSERT fails while any claim is still held, so a row exists only if it is
+    // written after the release.
+    install_audit_insert_trigger(
+        db.dsn(), "IF EXISTS (SELECT 1 FROM policy_store.policy_status WHERE "
+                  "remediation_claim_at <> 0) THEN RAISE EXCEPTION 'claim still held'; END IF;");
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    REQUIRE(rr.denial.has_value());
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    CHECK(audit.emit_failed_count() == 0);
+    auto rows = audit_rows(audit, "policy.dispatch");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].detail.find("phase=fix") != std::string::npos);
 }

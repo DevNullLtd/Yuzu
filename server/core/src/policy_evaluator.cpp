@@ -455,12 +455,14 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
                                      .denied_action = {}};
 }
 
-void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_view phase,
-                                    const std::vector<std::string>& targets,
-                                    const DispatchInstructionResult& r, DispatchOrigin origin,
-                                    std::optional<int64_t> expected_gen) {
+PolicyEvaluator::DenialAudit
+PolicyEvaluator::record_denial_status(const std::string& policy_id, std::string_view phase,
+                                      const std::vector<std::string>& targets,
+                                      const DispatchInstructionResult& r, DispatchOrigin origin,
+                                      std::optional<int64_t> expected_gen) {
+    DenialAudit audit;
     if (!r.denial)
-        return;
+        return audit;
     const std::string token(to_string(r.denial->reason));
     // The pair is only ever shown when it is a well formed identifier (letters, digits, '_',
     // '.', '-'), so it carries nothing a log or audit reader could be misled by; otherwise
@@ -508,8 +510,7 @@ void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_vi
     // Audit (rulings F and 4a): an operator-triggered refusal is always evidence of the
     // attempt; on the tick and verify paths a row is written only when something changed or
     // the status write failed, so a refusal that repeats every interval stays silent.
-    if (d_.audit_store &&
-        (origin == DispatchOrigin::Operator || changed > 0 || write_error)) {
+    if (d_.audit_store && (origin == DispatchOrigin::Operator || changed > 0 || write_error)) {
         std::string detail = "phase=" + std::string(phase);
         if (well_formed)
             detail += " plugin=" + r.denied_plugin + " action=" + r.denied_action;
@@ -520,22 +521,44 @@ void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_vi
         detail += origin == DispatchOrigin::Operator ? " origin=operator" : " origin=tick";
         if (write_error)
             detail += " status_write=error";
-        AuditEvent ev;
-        ev.timestamp = now();
-        ev.principal = "system";
-        ev.action = "policy.dispatch";
-        ev.target_type = "policy";
-        ev.target_id = policy_id;
-        ev.result = "denied";
-        ev.detail = std::move(detail);
-        // Synchronous and fail-hard: AuditStore::log returns false on a pool timeout or an
-        // INSERT error, and the row is then lost (counted by the store's emit_failed_ metric).
-        // It is not reliably retried: a repeated tick refusal changes nothing, so it writes no
-        // row, and a post-fix-check refusal is not dispatched a second time.
-        // The result is discarded on purpose: the refusal already happened and nothing was sent.
-        // The operator's own row is the route's.
-        (void)d_.audit_store->log(ev);
+        audit.due = true;
+        audit.policy_id = policy_id;
+        audit.phase = std::string(phase);
+        audit.reason = token;
+        audit.detail = std::move(detail);
     }
+    return audit;
+}
+
+void PolicyEvaluator::emit_denial_audit(const DenialAudit& a) {
+    if (!a.due || !d_.audit_store)
+        return;
+    AuditEvent ev;
+    ev.timestamp = now();
+    ev.principal = "system";
+    ev.action = "policy.dispatch";
+    ev.target_type = "policy";
+    ev.target_id = a.policy_id;
+    ev.result = "denied";
+    ev.detail = a.detail;
+    // Synchronous and fail-hard: AuditStore::log returns false on a closed store, a pool
+    // timeout or an INSERT error, and the row is then lost (the store counts it in its
+    // emit_failed_ metric and logs its own error). Observed here, never reversed: the refusal
+    // already happened and nothing was sent. One warning names the policy, phase and reason,
+    // and carries no store text. The row is not retried: a repeated tick refusal changes
+    // nothing, so it writes no row, and a post-fix-check refusal is not dispatched a second
+    // time. The operator's own row is the route's.
+    if (!d_.audit_store->log(ev))
+        spdlog::warn("policy_evaluator: policy.dispatch audit row not written: policy={} "
+                     "phase={} reason={}",
+                     a.policy_id, a.phase, a.reason);
+}
+
+void PolicyEvaluator::record_denial(const std::string& policy_id, std::string_view phase,
+                                    const std::vector<std::string>& targets,
+                                    const DispatchInstructionResult& r, DispatchOrigin origin,
+                                    std::optional<int64_t> expected_gen) {
+    emit_denial_audit(record_denial_status(policy_id, phase, targets, r, origin, expected_gen));
 }
 
 std::expected<PolicyEvaluator::KickoffOutcome, std::string>
@@ -953,13 +976,16 @@ PolicyEvaluator::remediate(const std::string& policy_id,
         // claim is still held, then release: releasing first would leave a window in which a
         // sibling replica or an operator reclaims the row and an unfenced write overwrites
         // their `fixing`. Fenced, the write matches no row after a reclaim.
-        record_denial(policy_id, "fix", claimed, *dispatch_result, DispatchOrigin::Operator,
-                      claim_gen);
+        // The audit row is written after the release: AuditStore::log is synchronous and can
+        // wait on the pool, and the claim must not be held across it.
+        const auto pending = record_denial_status(policy_id, "fix", claimed, *dispatch_result,
+                                                  DispatchOrigin::Operator, claim_gen);
         auto rel = d_.policy_store->release_remediation_claim(policy_id, claimed, claim_gen);
         if (!rel)
             spdlog::warn("policy_evaluator: remediate: failed to release claim for policy {} "
                         "after a refused dispatch: {}",
                         policy_id, rel.error());
+        emit_denial_audit(pending);
         // Not a store failure: `degraded` stays false. The message is neutral; the route
         // answers on `denial`.
         out.denial = dispatch_result->denial;

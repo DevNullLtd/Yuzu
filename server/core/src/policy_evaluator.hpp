@@ -298,11 +298,34 @@ private:
         std::string denied_action;
     };
 
+    /// What `record_denial_status` leaves for `emit_denial_audit`: the audit row of a refusal,
+    /// when one is due. Split from the status write so a refused fix can write `blocked` while
+    /// its claim is held and write the audit row only after the claim is released.
+    struct DenialAudit {
+        bool due = false;
+        std::string policy_id;
+        std::string phase;
+        std::string reason;
+        std::string detail;
+    };
+
     /// Record a refused dispatch for `targets`: write the `blocked` status (write on change,
-    /// fenced on `expected_gen` for a fix or verify refusal), count it, log it, and write the
-    /// `policy.dispatch` / `denied` audit row (an operator-triggered refusal always; a tick or
-    /// verify refusal only when a row changed or the status write failed). Never reverses the
-    /// refusal: nothing was sent either way.
+    /// fenced on `expected_gen` for a fix or verify refusal), count it and log it. Returns the
+    /// `policy.dispatch` / `denied` audit row to write (an operator-triggered refusal always; a
+    /// tick or verify refusal only when a row changed or the status write failed). Never
+    /// reverses the refusal: nothing was sent either way.
+    [[nodiscard]] DenialAudit record_denial_status(const std::string& policy_id,
+                                                   std::string_view phase,
+                                                   const std::vector<std::string>& targets,
+                                                   const DispatchInstructionResult& r,
+                                                   DispatchOrigin origin,
+                                                   std::optional<int64_t> expected_gen);
+
+    /// Write the audit row `record_denial_status` returned, if one is due. Warns once, naming
+    /// the policy, phase and reason, when the store does not write it.
+    void emit_denial_audit(const DenialAudit& a);
+
+    /// `record_denial_status` then `emit_denial_audit`, for a refusal that holds no claim.
     void record_denial(const std::string& policy_id, std::string_view phase,
                        const std::vector<std::string>& targets, const DispatchInstructionResult& r,
                        DispatchOrigin origin, std::optional<int64_t> expected_gen);
