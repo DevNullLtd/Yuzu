@@ -791,11 +791,11 @@ PolicyEvaluator::authorize_instruction(const std::string& instruction_id) const 
     // unwired evaluator reads as degraded (503) here, the same fail-closed posture the
     // dispatch seam takes (`unwired`), never as an accept.
     if (!d_.instruction_store || !d_.capability_registry)
-        return {InstructionCheck::Kind::Degraded, std::nullopt};
+        return {InstructionCheck::Kind::Degraded, std::nullopt, /*transient=*/false};
     auto def = d_.instruction_store->get_definition(instruction_id);
     if (!def) {
         spdlog::warn("policy_evaluator: authorize_instruction: instruction store unavailable");
-        return {InstructionCheck::Kind::Degraded, std::nullopt};
+        return {InstructionCheck::Kind::Degraded, std::nullopt, /*transient=*/true};
     }
     if (!*def)
         return {InstructionCheck::Kind::Allowed, std::nullopt};

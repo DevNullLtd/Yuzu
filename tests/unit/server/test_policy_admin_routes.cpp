@@ -803,7 +803,9 @@ TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instr
     REQUIRE(res);
     CHECK(res->status == 503);
     {
-        // The A4 envelope with a concrete retry: the lookup may answer on the next try.
+        // The A4 envelope. An evaluator with no registry is a wiring condition no retry
+        // clears, so the body carries a null retry hint (a transient store failure carries
+        // 5000: the next test).
         const auto body = nlohmann::json::parse(res->body);
         const auto& err = body.at("error");
         CHECK(err.at("code") == 503);
@@ -811,13 +813,45 @@ TEST_CASE("authoring routes answer 503, never an accept or a 400, when the instr
         CHECK(err.contains("correlation_id"));
         CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
         REQUIRE(err.contains("retry_after_ms"));
-        CHECK(err.at("retry_after_ms") == 5000);
+        CHECK(err.at("retry_after_ms").is_null());
         CHECK(body.at("meta").at("api_version") == "v1");
     }
     auto frags = r.ps.query_fragments();
     REQUIRE(frags.has_value());
     CHECK(frags->empty());
     // A degraded lookup is not an operator denial: no denied row.
+    for (const auto& c : r.audit_calls)
+        CHECK(c.result != "denied");
+}
+
+TEST_CASE("authoring routes carry retry_after_ms on a 503 only when the instruction lookup failed "
+          "transiently",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry()); // wired: the lookup can only fail transiently
+    const auto allowed = r.define("i.status", "echo", "status");
+
+    // The instruction table becomes unreadable: a store failure, not a wiring condition.
+    {
+        auto lease = r.pool.try_acquire_for(std::chrono::milliseconds{2000});
+        REQUIRE(lease);
+        auto q = yuzu::server::pg::exec_params(
+            lease.get(),
+            "ALTER TABLE instruction_store.instruction_definitions RENAME TO "
+            "instruction_definitions_gone",
+            std::vector<std::string>{});
+        REQUIRE(q.status() == PGRES_COMMAND_OK);
+    }
+
+    auto res = r.sink.Post("/api/policy-fragments", fragment_yaml("any", allowed), "text/plain");
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("message") == "instruction lookup unavailable, try again");
+    CHECK_FALSE(res->get_header_value("X-Correlation-Id").empty());
+    REQUIRE(err.contains("retry_after_ms"));
+    CHECK(err.at("retry_after_ms") == 5000);
     for (const auto& c : r.audit_calls)
         CHECK(c.result != "denied");
 }

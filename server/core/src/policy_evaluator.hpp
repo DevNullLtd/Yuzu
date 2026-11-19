@@ -207,6 +207,11 @@ public:
         enum class Kind : uint8_t { Allowed, Refused, Degraded };
         Kind kind{Kind::Allowed};
         std::optional<PolicyDispatchDenial> denial; // set when Refused
+        /// Degraded only: true when the lookup failed in the instruction store, which a retry
+        /// may clear; false when the evaluator has no registry or no instruction store (a
+        /// wiring condition no retry clears). The authoring routes send a retry hint only for
+        /// the first.
+        bool transient{false};
     };
 
     [[nodiscard]] InstructionCheck authorize_instruction(const std::string& instruction_id) const;

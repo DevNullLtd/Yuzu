@@ -125,7 +125,10 @@ bool PolicyAdminRoutes::refuse_unusable_instructions(
             // Never an accept and never a refusal: the lookup could not be answered.
             res.status = 503;
             detail::A4ErrorOpts opts;
-            opts.retry_after_ms = kInstructionLookupRetryMs;
+            // A hint only when a retry can help: a store failure may clear, an unwired
+            // evaluator will not.
+            if (check.transient)
+                opts.retry_after_ms = kInstructionLookupRetryMs;
             res.set_content(detail::a4_error(res, "instruction lookup unavailable, try again", opts),
                             "application/json");
             return true;
