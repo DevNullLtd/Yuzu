@@ -176,7 +176,7 @@ TEST_CASE("unproven audit budget: exact numbers - per-source sub-cap, reserved b
     t += B::kWindowMs + 1;
     const std::string summary = join_rows(b.poll_closed(t, /*force=*/false));
     CHECK(summary.find("dropped_rows=") != std::string::npos);
-    CHECK(summary.find("distinct_dropped_ids=") != std::string::npos);
+    CHECK(summary.find("distinct_dropped_ids_max=") != std::string::npos);
     CHECK(summary.find("sources=") != std::string::npos);
     CHECK(summary.find("bot-") != std::string::npos); // per-source counts, not a caller identity
     CHECK(b.poll_closed(t, false).empty());           // delivered once
@@ -196,7 +196,7 @@ TEST_CASE("unproven audit budget: a legitimate restart storm, the shutdown flush
     // Shutdown flush closes the OPEN window and reports it (otherwise lost on exit).
     const std::string summary = join_rows(b.poll_closed(t + 1, /*force=*/true));
     CHECK(summary.find("dropped_rows=750") != std::string::npos);
-    CHECK(summary.find("distinct_dropped_ids=750") != std::string::npos);
+    CHECK(summary.find("distinct_dropped_ids_max=750") != std::string::npos);
     CHECK(b.poll_closed(t + 2, true).empty());
 }
 
@@ -289,7 +289,7 @@ TEST_CASE("unproven audit budget: ONE source naming 300 distinct live-leaf ids -
     const auto rows = b.poll_closed(t, false);
     REQUIRE(rows.size() == 2); // 250 dropped ids: 200 + 50
     for (const auto& r : rows)
-        CHECK(r.find("ids_truncated=0") != std::string::npos);
+        CHECK(r.find("ids_beyond_cap_max=0") != std::string::npos);
     CHECK(ids_in_row(rows[0]) == B::kSummaryIds);
     CHECK(ids_in_row(rows[1]) == 250 - B::kSummaryIds);
     const auto all = join_rows(rows);
@@ -314,7 +314,7 @@ TEST_CASE("unproven audit budget: a restart storm behind one origin-less gateway
     REQUIRE(rows.size() == 2);
     CHECK(rows[0].find("dropped_rows=250") != std::string::npos);
     CHECK(rows[0].find("sources=10.1.2.3:250") != std::string::npos);
-    CHECK(rows[0].find("distinct_dropped_ids=250") != std::string::npos);
+    CHECK(rows[0].find("distinct_dropped_ids_max=250") != std::string::npos);
     // Nothing the old 200-id cut dropped is missing: the last dropped id is named.
     CHECK(join_rows(rows).find("live-299") != std::string::npos);
 }
@@ -360,10 +360,10 @@ TEST_CASE("unproven audit budget: beyond 20000 distinct dropped ids the excess i
     REQUIRE(rows.size() == B::kMaxDroppedIds / B::kSummaryIds);
     const auto trunc = std::to_string(dropped - B::kMaxDroppedIds);
     for (const auto& r : rows) {
-        CHECK(r.find(" ids_truncated=" + trunc + " ") != std::string::npos);
+        CHECK(r.find(" ids_beyond_cap_max=" + trunc + " ") != std::string::npos);
         CHECK(ids_in_row(r) <= B::kSummaryIds);
     }
-    CHECK(rows[0].find("distinct_dropped_ids=" + std::to_string(dropped)) != std::string::npos);
+    CHECK(rows[0].find("distinct_dropped_ids_max=" + std::to_string(dropped)) != std::string::npos);
     CHECK(b.take_ids_truncated() == dropped - B::kMaxDroppedIds);
     CHECK(b.take_ids_truncated() == 0);
 }
@@ -446,7 +446,7 @@ TEST_CASE("unproven audit budget: the summary names the TOP 10 sources by count 
     CHECK(r.find("src-02:3") != std::string::npos);
     CHECK(r.find("src-01") == std::string::npos); // the 11th and 12th source are cut
     CHECK(r.find("src-00") == std::string::npos);
-    CHECK(r.find(" ids_truncated=0 part=1/1 ids=") != std::string::npos);
+    CHECK(r.find(" ids_beyond_cap_max=0 part=1/1 ids=") != std::string::npos);
     CHECK(count_of(r, "rep-11") == 1); // a dropped id is named ONCE however often it was dropped
     CHECK(r.find("a?b?c-and-a-very-long-id") != std::string::npos); // 24 chars, '?' for the rest
     CHECK(r.find("a?b?c-and-a-very-long-ide") == std::string::npos);    // cut at 24
@@ -660,4 +660,24 @@ TEST_CASE("unproven audit budget: the flush counts chunks AND ids for every unwr
         CHECK(r.any_failed);
         CHECK(b.pending_size() >= 1);
     }
+}
+
+TEST_CASE("unproven audit budget: over-cap figures are UPPER BOUNDS (a repeat of an over-cap id counts again)",
+          "[reregistration_gate][wp01][audit_budget][audit]") {
+    using B = detail::UnprovenAuditBudget;
+    B b;
+    std::int64_t t = 110'000'000;
+    (void)b.admit("opener", "x", t);
+    for (int i = 0; i < 22'000; ++i) // 22000 distinct ids, all dropped past the first 300 admitted
+        (void)b.admit("d-" + std::to_string(i), "atk", t);
+    for (int i = 0; i < 1000; ++i) // 1000 REPEATS of one over-cap id
+        (void)b.admit("d-21999", "atk", t);
+    t += B::kWindowMs + 1;
+    const auto rows = b.poll_closed(t, false);
+    REQUIRE(!rows.empty());
+    CHECK(rows[0].find("distinct_dropped_ids_max=") != std::string::npos);
+    CHECK(rows[0].find(" ids_beyond_cap_max=") != std::string::npos);
+    CHECK(rows[0].find("distinct_dropped_ids=") == std::string::npos); // the exact-sounding name is gone
+    // true distinct drops: 22000 - 299 = 21701 -> over the cap by 1701; the bound counts the repeats too
+    CHECK(b.take_ids_truncated() >= 1701);
 }

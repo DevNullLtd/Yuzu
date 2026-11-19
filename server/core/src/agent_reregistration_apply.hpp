@@ -180,21 +180,35 @@ inline bool flush_reregistration_audit_summary(AuditStore* store, yuzu::MetricsR
                        std::chrono::steady_clock::now().time_since_epoch())
                 .count();
         });
+    // Publish each counter on its own: a registry that throws (allocation failure) must neither
+    // escape nor lose the counts that were already taken from the budget, so the three
+    // budget-backed counts are handed back for the next round.
     if (metrics) {
-        const auto count = [&](std::string_view reason, std::uint64_t n) {
-            if (n)
+        const auto count = [&](std::string_view reason, std::uint64_t n, auto&& restore) {
+            if (!n)
+                return;
+            try {
                 metrics
                     ->counter("yuzu_register_reregistration_audit_summary_dropped_total",
                               {{"reason", std::string(reason)}})
                     .increment(static_cast<double>(n));
+            } catch (...) {
+                restore(n);
+            }
         };
-        count("queue_full", r.queue_full);
-        count("alloc_failed", r.alloc_failed);
-        count("write_failed", r.write_failed);
-        count("shutdown", r.shutdown);
-        if (r.ids_truncated)
-            metrics->counter("yuzu_register_reregistration_audit_ids_truncated_total")
-                .increment(static_cast<double>(r.ids_truncated));
+        auto& budget = detail::reregistration_unproven_budget();
+        count("queue_full", r.queue_full, [&](std::uint64_t n) { budget.restore_counts(0, n, 0); });
+        count("alloc_failed", r.alloc_failed, [&](std::uint64_t n) { budget.restore_counts(0, 0, n); });
+        count("write_failed", r.write_failed, [](std::uint64_t) {});
+        count("shutdown", r.shutdown, [](std::uint64_t) {});
+        if (r.ids_truncated) {
+            try {
+                metrics->counter("yuzu_register_reregistration_audit_ids_truncated_total")
+                    .increment(static_cast<double>(r.ids_truncated));
+            } catch (...) {
+                budget.restore_counts(r.ids_truncated, 0, 0);
+            }
+        }
     }
     return r.any_failed;
 }
@@ -250,8 +264,8 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
                               .admitted;
     };
     // Refusal rows (denied/failure) are bounded per (outcome, agent id); the admitted audit-mode
-    // row is bounded per agent id with an aggregate row per closed window (see
-    // reregistration_unproven_budget). Neither bound changes the call's outcome, and the unsampled
+    // row is bounded per agent id, and the ids of the rows it drops are named best effort in chunked
+    // aggregate rows written by the flush thread (see reregistration_unproven_budget). Neither bound changes the call's outcome, and the unsampled
     // counter yuzu_register_reregistration_total counts every decision.
     const auto emit = [&](std::string_view action, std::string_view result,
                           std::string_view outcome_text, std::string_view extra) {
@@ -275,6 +289,9 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
                                       detail::reregistration_audit_now_ms())
                                .admitted;
             } catch (...) {
+                // Not even recorded by the budget (e.g. an allocation failure building the argument):
+                // count the one id that may now be in no summary.
+                detail::reregistration_unproven_budget().note_unrecorded();
             }
             if (!admitted) {
                 if (metrics)

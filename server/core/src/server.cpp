@@ -3717,11 +3717,12 @@ public:
             (void)metrics_.counter("yuzu_register_reenrol_token_no_leaf_total",
                                    {{"reason", reason}});
         metrics_.describe("yuzu_register_reregistration_audit_ids_truncated_total",
-                          "Dropped agent ids that NO summary row names: the excess over 20000 "
-                          "distinct ids in one 10 s window, and every id of a summary chunk that was "
-                          "dropped (queue full, three failed writes, still queued at shutdown) or "
-                          "never built (allocation failure). For those ids the only record is the "
-                          "unbudgeted decision counter.",
+                          "Dropped agent ids that NO summary row names, as an UPPER BOUND (a "
+                          "repeat of an over-cap id counts again): the excess over 20000 distinct ids "
+                          "in one 10 s window, and every id of a summary chunk that was dropped (queue "
+                          "full, three failed writes, still queued at shutdown) or never built "
+                          "(allocation failure). For those ids the only record is the unbudgeted "
+                          "decision counter. Lost with the process on a crash.",
                           "counter");
         metrics_.describe("yuzu_register_reregistration_audit_summary_dropped_total",
                           "Dropped-row summary chunks that were NOT written (reason: queue_full = "
@@ -3738,10 +3739,10 @@ public:
                           "agent's cert_dir.",
                           "counter");
         metrics_.describe("yuzu_register_reregistration_audit_dropped_total",
-                          "Re-registration audit rows NOT written because the per-id audit budget "
-                          "was spent (per-source, global or per-id caps). The decision counter still "
-                          "counts every attempt; one aggregate summary row is written per closed "
-                          "window.",
+                          "Re-registration audit ROWS (not ids) NOT written because the audit "
+                          "budget was spent (per-source, global or per-id caps). The decision "
+                          "counter still counts every attempt; the ids of dropped rows are named best "
+                          "effort in summary rows (see ids_truncated_total for the ones that are not).",
                           "counter");
         metrics_.describe("yuzu_register_reregistration_audit_write_failures_total",
                           "Re-registration audit rows whose write FAILED (audit store error).",
@@ -10490,39 +10491,50 @@ public:
         }
 
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
+        // WP01: the audit-mode "unproven re-registration" summary flush has its OWN thread. It
+        // used to ride the health thread, whose serial budget is shared with the SECURITY-relevant
+        // revocation sweep: a slow or failing audit store stretched the sweep-to-sweep gap (21 s at
+        // 500 ms/write, 75 s with a store failing for 30 s). The only writer of the summary chunks
+        // besides stop(); per-process state, so NOT leader-gated (ReplicaSafe). Every 5 s
+        // (kReregistrationFlushIntervalMs), contained, time-bounded per round
+        // (kReregistrationFlushDeadlineMs, checked between rows: one AuditStore::log can overrun it by
+        // its 4 s write timeout) and skipped for one round after a failed round. Joined next to
+        // health_recompute_thread_ in stop(), BEFORE the forced flush and the store teardown.
+        reregistration_flush_thread_ = std::thread([this]() {
+            bool skip_next_round = false;
+            while (!stop_requested_.load(std::memory_order_acquire)) {
+                // Sleep in <= 500 ms increments so the join in stop() is prompt.
+                for (std::int64_t waited = 0; waited < detail::kReregistrationFlushIntervalMs &&
+                                              !stop_requested_.load(std::memory_order_acquire);
+                     waited += 500)
+                    std::this_thread::sleep_for(std::chrono::milliseconds{500});
+                if (stop_requested_.load(std::memory_order_acquire))
+                    break;
+                if (skip_next_round) {
+                    skip_next_round = false;
+                    continue;
+                }
+                try {
+                    YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
+                    skip_next_round = flush_reregistration_audit_summary(audit_store_.get(),
+                                                                         &metrics_, /*force=*/false);
+                } catch (const std::exception& e) {
+                    skip_next_round = true;
+                    spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
+                } catch (...) {
+                    skip_next_round = true;
+                    spdlog::warn("Re-registration audit summary flush failed: unknown exception");
+                }
+            }
+        });
+
+        // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
-            bool reregistration_flush_skip_ = false;
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 // Sleep in small increments for responsive shutdown
-                for (int i = 0; i < 15000 / detail::kReregistrationFlushIntervalMs &&
-                                !stop_requested_.load(std::memory_order_acquire);
-                     ++i) {
-                    std::this_thread::sleep_for(
-                        std::chrono::milliseconds{detail::kReregistrationFlushIntervalMs});
-                    // WP01: flush the closed windows' dropped-audit-row summary chunks every 5 s
-                    // (the 15 s sweep cadence spans 1.5 audit windows against a 128-row queue, which
-                    // loses ids above about 1300 distinct ids/s). With stop() the ONLY writer of
-                    // those rows; per-process state, so NOT leader-gated (ReplicaSafe). Contained,
-                    // time-bounded (2 s) and skipped for one round after a failed round so a
-                    // dead audit store cannot stall this thread's real work.
-                    if (stop_requested_.load(std::memory_order_acquire))
-                        break;
-                    if (reregistration_flush_skip_) {
-                        reregistration_flush_skip_ = false;
-                    } else {
-                        try {
-                            YUZU_ASSERT_BACKGROUND_JOB("reregistration_audit.flush_summary"); // WS-10 ReplicaSafe
-                            reregistration_flush_skip_ = flush_reregistration_audit_summary(
-                                audit_store_.get(), &metrics_, /*force=*/false);
-                        } catch (const std::exception& e) {
-                            reregistration_flush_skip_ = true;
-                            spdlog::warn("Re-registration audit summary flush failed: {}", e.what());
-                        } catch (...) {
-                            reregistration_flush_skip_ = true;
-                            spdlog::warn("Re-registration audit summary flush failed: unknown exception");
-                        }
-                    }
+                for (int i = 0; i < 3 && !stop_requested_.load(std::memory_order_acquire); ++i) {
+                    std::this_thread::sleep_for(std::chrono::seconds{5});
                 }
                 if (stop_requested_.load(std::memory_order_acquire))
                     break;
@@ -11961,6 +11973,12 @@ public:
         // Join the fleet health recomputation thread
         if (health_recompute_thread_.joinable()) {
             health_recompute_thread_.join();
+        }
+        // WP01: the summary flush thread, BEFORE the forced flush below and before audit_store_ /
+        // the pool are reset. Worst case this join waits for one round (<= 2 s of rows plus one
+        // 4 s write overrun), far inside the shipped 210 s stop grace.
+        if (reregistration_flush_thread_.joinable()) {
+            reregistration_flush_thread_.join();
         }
 
         // Join the app-perf roll-up thread (borrows app_perf_rollup_ +
@@ -26404,6 +26422,7 @@ private:
         kMaxConcurrentContainmentReads};
     std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
+    std::thread reregistration_flush_thread_; // WP01: audit summary flush; joined with the health thread
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()

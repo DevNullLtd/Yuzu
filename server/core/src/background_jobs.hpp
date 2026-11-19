@@ -276,7 +276,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "per-replica in-memory (#5513): bounded erase of stale per-agent heartbeat-reconcile claims "
      "in THIS replica's gate; steady_clock cutoff over no store, no shared state, never "
      "leader-gated"},
-    {"reregistration_audit.flush_summary", "health_recompute_thread_",
+
+    // ---- reregistration_flush_thread_ (5s tick, its own thread so a slow audit store cannot delay
+    // the revocation sweep on health_recompute_thread_) ----
+    {"reregistration_audit.flush_summary", "reregistration_flush_thread_",
      BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory (WP01): writes THIS replica's closed-window dropped-audit-row summary "
      "chunks from its own budget to the audit log; no shared state, so never leader-gated (a "

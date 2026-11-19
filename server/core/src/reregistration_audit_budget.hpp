@@ -41,15 +41,17 @@ namespace yuzu::server::detail {
 /// A row that loses the budget is not written, but its id is remembered, in DROP order, up to
 /// `kMaxDroppedIds` distinct ids per window, and the closed window is written as CHUNKED aggregate
 /// rows (at most `kSummaryIds` ids per row, every chunk repeating the per-source counts and
-/// `ids_truncated=N`). Chunks are built OUTSIDE `mu_`, queued in a bounded pending deque
+/// `ids_beyond_cap_max=N`). Chunks are built OUTSIDE `mu_`, queued in a bounded pending deque
 /// (`kMaxPendingRows`), and written ONLY by the server's flush (`flush_reregistration_audit_summary`,
-/// every 5 s from the health thread, and at stop()), never on a Register thread. A dropped id is
+/// every 5 s from its own thread, and at stop()), never on a Register thread. A dropped id is
 /// NAMED in a row only when that flush succeeds.
 /// WHAT IS NOT GUARANTEED (MEDIUM residual, conditional on this wording and on the alerts
 /// `YuzuAgentReregistrationAuditIdsTruncated` / `...AuditSummaryDropped`): the open window and the
 /// queue are memory only, so a process kill loses the ids of up to one open window plus the unflushed
 /// chunks (measured 47-65% of recent ids in a kill test); ids are cut to 24 characters in a row; more
-/// than `kMaxDroppedIds` distinct drops in one window, a chunk dropped because the queue was full,
+/// than `kMaxDroppedIds` distinct drops in one window (the figure `distinct_dropped_ids_max` and the
+/// count beyond the cap are UPPER BOUNDS: an over-cap id is not remembered, so each repeat of it is
+/// counted again), a chunk dropped because the queue was full,
 /// the write failed three times, or it was still queued at shutdown, and a window whose summary
 /// could not be built (allocation failure) leave their ids UNNAMED; every one of those is counted BY
 /// ID in `yuzu_register_reregistration_audit_ids_truncated_total` (chunks, by cause, in
@@ -98,6 +100,7 @@ public:
             admit_locked(d, agent_id, source);
         } catch (...) {
             d.admitted = false;
+            note_unrecorded(); // this row's id may be in no summary: counted (an upper bound of 1)
         }
         if (closed)
             d.closed_summary = enqueue_closed(*closed);
@@ -127,20 +130,45 @@ public:
         pending_.pop_front();
         return r;
     }
-    /// Returns false (chunk dropped) once the row has failed `kMaxWriteAttempts` times.
-    [[nodiscard]] bool requeue_front(PendingRow r) {
+    /// Returns false (chunk dropped, its ids counted) once the row has failed `kMaxWriteAttempts`
+    /// times, or if handing it back cannot allocate (counted as `alloc_failed`). Never throws.
+    [[nodiscard]] bool requeue_front(PendingRow r) noexcept {
+        const std::size_t ids = r.ids;
         if (++r.attempts >= kMaxWriteAttempts) {
-            ids_truncated_.fetch_add(r.ids); // the chunk is dropped: its ids are now unnamed
+            ids_truncated_.fetch_add(ids); // the chunk is dropped: its ids are now unnamed
             return false;
         }
-        std::lock_guard lk(pending_mu_);
-        pending_.push_front(std::move(r));
-        return true;
+        try {
+            std::lock_guard lk(pending_mu_);
+            pending_.push_front(std::move(r));
+            return true;
+        } catch (...) {
+            alloc_failed_.fetch_add(1);
+            ids_truncated_.fetch_add(ids);
+            return false;
+        }
     }
     /// Hands a chunk back unchanged (the deadline ran out before it was tried: not a failed attempt).
-    void requeue_front_unconditional(PendingRow r) {
-        std::lock_guard lk(pending_mu_);
-        pending_.push_front(std::move(r));
+    /// Never throws; if it cannot be re-queued the chunk is dropped and its ids are counted.
+    void requeue_front_unconditional(PendingRow r) noexcept {
+        const std::size_t ids = r.ids;
+        try {
+            std::lock_guard lk(pending_mu_);
+            pending_.push_front(std::move(r));
+        } catch (...) {
+            alloc_failed_.fetch_add(1);
+            ids_truncated_.fetch_add(ids);
+        }
+    }
+    /// A row (or id) whose evidence may be in NO summary because an allocation failed before it
+    /// could be recorded (the budget itself, or the code around it): counted as one unnamed id.
+    void note_unrecorded() noexcept { ids_truncated_.fetch_add(1); }
+    /// Give counts back after a failed publish (a metric registry that threw) so they are not lost.
+    void restore_counts(std::uint64_t ids_truncated, std::uint64_t queue_full,
+                        std::uint64_t alloc_failed) noexcept {
+        ids_truncated_.fetch_add(ids_truncated);
+        queue_full_dropped_.fetch_add(queue_full);
+        alloc_failed_.fetch_add(alloc_failed);
     }
     [[nodiscard]] std::size_t pending_size() const {
         std::lock_guard lk(pending_mu_);
@@ -173,7 +201,7 @@ private:
         std::uint64_t dropped_rows{0};
         std::map<std::string, std::size_t> by_source;
         std::vector<std::string> ids; ///< distinct dropped ids in DROP order
-        std::uint64_t ids_overflow{0};
+        std::uint64_t id_events_beyond_cap{0}; ///< UPPER BOUND of distinct ids over the cap
     };
 
     void admit_locked(Decision& d, const std::string& agent_id, const std::string& raw_source) {
@@ -214,7 +242,7 @@ private:
                 w.dropped_rows = dropped_rows_;
                 w.by_source = std::move(dropped_by_source_);
                 w.ids = std::move(dropped_order_);
-                w.ids_overflow = dropped_ids_overflow_;
+                w.id_events_beyond_cap = dropped_id_events_beyond_cap_;
                 out = std::move(w);
             }
             open_ = false;
@@ -234,27 +262,43 @@ private:
         dropped_by_source_.clear();
         dropped_ids_.clear();
         dropped_order_.clear();
-        dropped_ids_overflow_ = 0;
+        dropped_id_events_beyond_cap_ = 0;
     }
+    /// Every allocation happens BEFORE a counter moves, and a partial insert is undone, so a throw
+    /// (std::bad_alloc) leaves the window consistent: admit() then counts the one id.
     void drop_locked(const std::string& id, const std::string& source) {
-        ++dropped_rows_;
-        ++dropped_by_source_[source.substr(0, 45)];
+        auto& by_source = dropped_by_source_[source.substr(0, 45)]; // may throw: nothing changed yet
         if (dropped_ids_.find(id) == dropped_ids_.end()) {
             if (dropped_ids_.size() < kMaxDroppedIds) {
-                dropped_ids_.insert(id);
-                dropped_order_.push_back(id);
+                dropped_order_.push_back(id); // may throw
+                try {
+                    dropped_ids_.insert(id);
+                } catch (...) {
+                    dropped_order_.pop_back();
+                    throw;
+                }
             } else {
-                ++dropped_ids_overflow_;
+                // An UPPER BOUND, not a distinct count: an over-cap id is not remembered, so every
+                // later repeat of it is counted again.
+                ++dropped_id_events_beyond_cap_;
             }
         }
+        ++by_source;
+        ++dropped_rows_;
     }
     void remember_locked(const std::string& id) {
-        if (recent_.insert(id).second) {
-            recent_order_.push_back(id);
-            if (recent_order_.size() > kRecentIds) {
-                recent_.erase(recent_order_.front());
-                recent_order_.pop_front();
-            }
+        if (recent_.find(id) != recent_.end())
+            return;
+        recent_order_.push_back(id); // may throw: nothing changed yet
+        try {
+            recent_.insert(id);
+        } catch (...) {
+            recent_order_.pop_back();
+            throw;
+        }
+        if (recent_order_.size() > kRecentIds) {
+            recent_.erase(recent_order_.front());
+            recent_order_.pop_front();
         }
     }
     static inline const std::string kOther{"other"};
@@ -277,7 +321,7 @@ private:
     /// One row per element, each at most `kSummaryIds` ids; every row repeats the head.
     static std::vector<std::string> build_rows(const ClosedWindow& w) {
         std::string head = "dropped_rows=" + std::to_string(w.dropped_rows) +
-                           " distinct_dropped_ids=" + std::to_string(w.ids.size() + w.ids_overflow) +
+                           " distinct_dropped_ids_max=" + std::to_string(w.ids.size() + w.id_events_beyond_cap) +
                            " sources=";
         std::vector<std::pair<std::size_t, std::string>> by;
         for (const auto& [src, n] : w.by_source)
@@ -289,7 +333,7 @@ private:
         std::vector<std::string> rows;
         rows.reserve(parts);
         for (std::size_t p = 0; p < parts; ++p) {
-            std::string r = head + " ids_truncated=" + std::to_string(w.ids_overflow) +
+            std::string r = head + " ids_beyond_cap_max=" + std::to_string(w.id_events_beyond_cap) +
                             " part=" + std::to_string(p + 1) + "/" + std::to_string(parts) +
                             " ids=";
             for (std::size_t k = p * kSummaryIds; k < w.ids.size() && k < (p + 1) * kSummaryIds; ++k)
@@ -301,10 +345,10 @@ private:
     /// Builds the chunks (no lock held) and queues them; a full queue drops the new chunk, counted.
     std::vector<std::string> enqueue_closed(const ClosedWindow& w) noexcept {
         std::size_t accounted = 0;      // ids already queued in a chunk or counted unnamed
-        bool overflow_counted = false;  // w.ids_overflow already added to ids_truncated_
+        bool overflow_counted = false;  // w.id_events_beyond_cap already added to ids_truncated_
         try {
             auto rows = build_rows(w);
-            ids_truncated_.fetch_add(w.ids_overflow);
+            ids_truncated_.fetch_add(w.id_events_beyond_cap);
             overflow_counted = true;
             std::lock_guard lk(pending_mu_);
             std::size_t k = 0;
@@ -326,7 +370,7 @@ private:
             // (one window, those ids unnamed) instead of losing it silently. Atomics do not allocate.
             alloc_failed_.fetch_add(1);
             ids_truncated_.fetch_add((w.ids.size() - std::min(accounted, w.ids.size())) +
-                                     (overflow_counted ? 0 : w.ids_overflow));
+                                     (overflow_counted ? 0 : w.id_events_beyond_cap));
             return {};
         }
     }
@@ -342,7 +386,7 @@ private:
     std::map<std::string, std::size_t> dropped_by_source_;
     std::set<std::string> dropped_ids_;
     std::vector<std::string> dropped_order_;
-    std::uint64_t dropped_ids_overflow_{0};
+    std::uint64_t dropped_id_events_beyond_cap_{0};
     std::set<std::string> recent_;
     std::deque<std::string> recent_order_;
 
@@ -353,13 +397,14 @@ private:
     std::atomic<std::uint64_t> alloc_failed_{0};
 };
 
-/// How often the server's health thread flushes the queued chunks, and the time one round may spend
-/// writing. Measured: at 2000 distinct dropped ids/s a 15 s cadence (1.5 audit windows) against the
-/// 128-row queue named only 40-76% of the ids; 5 s keeps one window's 100 chunks inside the queue.
-/// The health thread's 15 s sweep loop is built from this interval (server.cpp).
+/// How often the server's dedicated flush thread flushes the queued chunks, and the time one round
+/// may spend writing (checked BETWEEN rows: one AuditStore::log can overrun it by its 4 s write
+/// timeout). Measured: at 2000 distinct dropped ids/s a 15 s cadence (1.5 audit windows) against the
+/// 128-row queue named only 78-82% of the ids; 5 s keeps one window's 100 chunks inside the queue.
+/// The thread is separate from the health thread so a slow audit store cannot delay the revocation
+/// sweep (server.cpp, reregistration_flush_thread_).
 inline constexpr std::int64_t kReregistrationFlushIntervalMs = 5000;
 inline constexpr std::int64_t kReregistrationFlushDeadlineMs = 2000;
-static_assert(15000 % kReregistrationFlushIntervalMs == 0, "the 15 s sweep is a whole number of rounds");
 
 /// What one flush round did (counters for the caller to publish).
 struct ReregistrationFlushResult {

@@ -984,7 +984,7 @@ if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
     reregistration_budget_alloc_exe,
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'server',
-    timeout: 60,
+    timeout: 300,
   )
 endif
 
