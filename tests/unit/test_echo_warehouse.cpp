@@ -179,7 +179,8 @@ TEST_CASE("Echo warehouse roll-up: process hourly -> daily -> monthly",
     // bucketed to the coarser grain, merged by the fold's own rules
     CHECK(daily.find("86400") != std::string::npos);
     CHECK(monthly.find("start of month") != std::string::npos);
-    CHECK(daily.find("start_count=start_count+excluded.start_count") != std::string::npos);
+    CHECK(daily.find("start_count=CASE WHEN excluded.start_count>0") != std::string::npos);
+    CHECK(daily.find("ELSE start_count+excluded.start_count END") != std::string::npos);
     // only rows at or above the mark the caller binds
     CHECK(daily.find("r.hour_ts >= ?1") != std::string::npos);
 }
@@ -214,8 +215,8 @@ TEST_CASE("Echo warehouse roll-up: the daily bucket is the UTC day (midnight rol
     CHECK(bucket_start(day0 + 3600 * 23 + 59 * 60, "hourly").value() == day0 + 3600 * 23);
     const auto sql = fold_tier_from_tier_sql("user", "hourly", "daily");
     REQUIRE_FALSE(sql.empty());
-    CHECK(sql.find("login_count=login_count+excluded.login_count") != std::string::npos);
-    CHECK(sql.find("logout_count=logout_count+excluded.logout_count") != std::string::npos);
+    CHECK(sql.find("login_count=CASE WHEN excluded.login_count>0") != std::string::npos);
+    CHECK(sql.find("logout_count=CASE WHEN excluded.logout_count>0") != std::string::npos);
 }
 
 TEST_CASE("Echo warehouse roll-up: unknown source or unsupported step is empty",

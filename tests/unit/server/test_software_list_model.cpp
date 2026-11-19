@@ -11,8 +11,10 @@
 #include "software_list_model.hpp"
 
 #include <algorithm>
+#include <array>
 #include <set>
 #include <tuple>
+#include <type_traits>
 #include <unordered_map>
 #include <unordered_set>
 #include <string>
@@ -828,6 +830,79 @@ TEST_CASE("CSV: 23-column installs header; quoting; the components header", "[se
     CHECK(ccsv.starts_with(std::string(kComponentsCsvHeader) + "\n"));
 }
 
+TEST_CASE("list_row_cells: the one column projection, equal to the CSV row after unescaping",
+          "[server][software_list_model]") {
+    auto r = fleet_row("My \"App\", Pro\nEdition", "a1", 7);
+    r.entry.version = "2.5";
+    r.entry.publisher = "Acme, Inc";
+    r.entry.install_date = "20260101";
+    r.entry.kind = "app";
+    r.entry.ecosystem = "deb";
+    r.entry.epoch = "1";
+    r.entry.release = "3";
+    r.entry.arch = "x86_64";
+    r.entry.signature_status = "signed";
+    r.entry.distro_id = "debian";
+    r.entry.distro_version = "12";
+    r.entry.install_type = "msi";
+    r.entry.install_scope = "machine";
+    r.entry.install_location = "C:\\Program Files\\App";
+    r.entry.instance_key = "inst-1";
+    r.entry.purl = "pkg:deb/debian/app@2.5";
+    r.last_confirmed_at = 1'700'000'000;
+    DeviceFacts facts;
+    facts.hostname["a1"] = "host-one";
+    facts.last_seen["a1"] = 1'699'000'000;
+
+    const auto cells = list_row_cells(r, facts);
+    STATIC_REQUIRE(std::tuple_size_v<std::remove_cvref_t<decltype(cells)>> == kListCsvColumns);
+    // Positions follow kListCsvHeader.
+    CHECK(cells[0] == "a1");
+    CHECK(cells[1] == "My \"App\", Pro\nEdition");
+    CHECK(cells[2] == "2.5");
+    CHECK(cells[3] == "Acme, Inc");
+    CHECK(cells[14] == "host-one");
+    CHECK(cells[15] == "1699000000");
+    CHECK(cells[17] == "1700000000");
+    CHECK(cells[22] == "pkg:deb/debian/app@2.5");
+    CHECK(list_row_cells(fleet_row("n", "unknown-agent", 1), DeviceFacts{})[14].empty());
+
+    // Read the CSV row back (RFC 4180) and compare cell for cell.
+    const auto csv = list_csv({r}, facts);
+    const auto body = csv.substr(kListCsvHeader.size() + 1);
+    std::vector<std::string> back;
+    std::string cell;
+    bool quoted = false;
+    for (std::size_t i = 0; i < body.size(); ++i) {
+        const char c = body[i];
+        if (quoted) {
+            if (c == '"' && i + 1 < body.size() && body[i + 1] == '"') {
+                cell += '"';
+                ++i;
+            } else if (c == '"') {
+                quoted = false;
+            } else {
+                cell += c;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == ',') {
+            back.push_back(cell);
+            cell.clear();
+        } else if (c == '\n') {
+            back.push_back(cell);
+            cell.clear();
+        } else {
+            cell += c;
+        }
+    }
+    REQUIRE(back.size() == kListCsvColumns);
+    for (std::size_t i = 0; i < kListCsvColumns; ++i) {
+        CAPTURE(i);
+        CHECK(back[i] == cells[i]);
+    }
+}
+
 TEST_CASE("CSV: every agent- or device-influenced cell of both exports is formula-neutralised (CWE-1236)",
           "[server][software_list_model][security]") {
     // A cell starting with = + - @ TAB or CR is a spreadsheet formula trigger; both serialisers
@@ -994,4 +1069,313 @@ TEST_CASE("parse_components_params: rules, limits and the export cap", "[server]
     CHECK_FALSE(parse_components_params(params({{"format", "xml"}})));
     CHECK_FALSE(parse_components_params(params({{"limit", "abc"}})));
     CHECK_FALSE(parse_components_params(params({{"status", "stale"}})));
+}
+
+// ── SAM-21: the lookup core both surfaces call ───────────────────────────────
+
+namespace {
+// Every read of one lookup, faked. Not copyable once reads() has been taken (the closures hold
+// `this`).
+struct FakeLookup {
+    std::vector<SoftwareFleetRow> installs;
+    std::vector<SoftwareComponentRow> comps;
+    std::vector<std::string> distinct;
+    bool rows_ok{true};
+    bool versions_ok{true};
+    bool facts_ok{true};
+    int page_reads{0};
+    SoftwareFleetQuery seen_installs;
+    SoftwareComponentQuery seen_comps;
+    std::optional<std::vector<std::string>> seen_scope;
+    FakeTotals totals;
+
+    FakeLookup() {
+        installs = {fleet_row("git", "a1", 1)};
+        comps = {comp_row("libfoo", "a1", "01")};
+    }
+
+    LookupReads reads() {
+        LookupReads io;
+        io.installs = [this](const SoftwareFleetQuery& q) -> std::optional<std::vector<SoftwareFleetRow>> {
+            ++page_reads;
+            if (!rows_ok)
+                return std::nullopt;
+            seen_installs = q;
+            return installs;
+        };
+        io.components =
+            [this](const SoftwareComponentQuery& q) -> std::optional<std::vector<SoftwareComponentRow>> {
+            ++page_reads;
+            if (!rows_ok)
+                return std::nullopt;
+            seen_comps = q;
+            return comps;
+        };
+        io.install_versions = [this](std::string_view, const std::optional<std::vector<std::string>>& ids)
+            -> std::optional<std::vector<std::string>> {
+            seen_scope = ids;
+            if (!versions_ok)
+                return std::nullopt;
+            return distinct;
+        };
+        io.component_versions = [this](std::string_view, std::string_view,
+                                       const std::optional<std::vector<std::string>>& ids)
+            -> std::optional<std::vector<std::string>> {
+            seen_scope = ids;
+            if (!versions_ok)
+                return std::nullopt;
+            return distinct;
+        };
+        io.facts.last_seen = [this](const std::vector<std::string>& ids)
+            -> std::optional<std::unordered_map<std::string, std::int64_t>> {
+            if (!facts_ok)
+                return std::nullopt;
+            std::unordered_map<std::string, std::int64_t> out;
+            for (const auto& id : ids)
+                out[id] = 1700000500;
+            return out;
+        };
+        io.facts.hostnames = [] {
+            return std::unordered_map<std::string, std::string>{{"a1", "host-a"}};
+        };
+        io.totals = totals.reads();
+        return io;
+    }
+};
+
+const VisibleSet kGlobalScope = std::nullopt;
+VisibleSet one_device_scope() { return std::unordered_set<std::string>{"a1"}; }
+} // namespace
+
+TEST_CASE("lookup_installs: totals are served to a global caller for an exact name only",
+          "[server][software_list_model][security]") {
+    FakeLookup f;
+    const auto io = f.reads();
+    const auto exact = parse_list_params(params({{"name", "git"}}));
+    REQUIRE(exact);
+
+    SECTION("a global scope and an exact name serve totals and the facts") {
+        const auto d = lookup_installs(io, *exact, kGlobalScope, true);
+        REQUIRE(d);
+        CHECK(d->decision.serve);
+        CHECK(d->totals.status == TotalsStatus::kServed);
+        const auto body = lookup_body(*d);
+        CHECK(body["totals"]["installs"] == 10);
+        CHECK(body["totals"]["devices"] == 4);
+        CHECK_FALSE(body.contains("totals_omitted"));
+        REQUIRE(body["software"].size() == 1);
+        CHECK(body["software"][0]["hostname"] == "host-a");
+        CHECK(body["software"][0]["last_seen"] == 1700000500);
+    }
+    SECTION("an engaged scope omits totals with totals_omitted=scope and reads no rollup") {
+        const auto d = lookup_installs(io, *exact, one_device_scope(), true);
+        REQUIRE(d);
+        const auto body = lookup_body(*d);
+        CHECK(body["totals"].is_null());
+        CHECK(body["totals_omitted"] == "scope");
+        CHECK(f.totals.title_reads == 0);
+        CHECK(f.totals.set_reads == 0);
+    }
+    SECTION("a non-exact match omits with filters") {
+        const auto prefix = parse_list_params(params({{"name", "gi"}, {"match", "prefix"}}));
+        REQUIRE(prefix);
+        const auto d = lookup_installs(io, *prefix, kGlobalScope, true);
+        REQUIRE(d);
+        CHECK(lookup_body(*d)["totals_omitted"] == "filters");
+        CHECK(f.totals.title_reads == 0);
+    }
+    SECTION("a never-built rollup omits with building") {
+        f.totals.refreshed_at = 0;
+        const auto d = lookup_installs(io, *exact, kGlobalScope, true);
+        REQUIRE(d);
+        CHECK(d->totals.status == TotalsStatus::kBuilding);
+        const auto body = lookup_body(*d);
+        CHECK(body["totals"].is_null());
+        CHECK(body["totals_omitted"] == "building");
+    }
+    SECTION("want_totals=false reads no totals at all (the CSV export)") {
+        const auto d = lookup_installs(io, *exact, kGlobalScope, false);
+        REQUIRE(d);
+        CHECK(f.totals.title_reads == 0);
+        CHECK(d->page.rows.size() == 1);
+    }
+}
+
+TEST_CASE("lookup_installs / lookup_components: each degraded read is kUnavailable with its own "
+          "audit detail, never an empty Ok",
+          "[server][software_list_model]") {
+    const std::string prefix = "software inventory store degraded — ";
+    const auto installs = parse_list_params(params({{"name", "git"}}));
+    const auto ranged = parse_list_params(params({{"name", "git"}, {"version_min", "1.0"}}));
+    const auto comps = parse_components_params(params({{"name", "libfoo"}, {"kind", "library"}}));
+    REQUIRE(installs);
+    REQUIRE(ranged);
+    REQUIRE(comps);
+    const auto comp_ranged = parse_components_params(
+        params({{"name", "libfoo"}, {"kind", "library"}, {"version_min", "1.0"}}));
+    REQUIRE(comp_ranged);
+
+    SECTION("the page read") {
+        FakeLookup f;
+        f.rows_ok = false;
+        const auto io = f.reads();
+        const auto a = lookup_installs(io, *installs, kGlobalScope, true);
+        REQUIRE_FALSE(a);
+        CHECK(a.error().fault == LookupFault::kUnavailable);
+        CHECK(a.error().audit_detail == "store degraded");
+        CHECK(a.error().message == prefix + "query failed");
+        const auto c = lookup_components(io, *comps, kGlobalScope, true);
+        REQUIRE_FALSE(c);
+        CHECK(c.error().audit_detail == "store degraded");
+    }
+    SECTION("the device facts read") {
+        FakeLookup f;
+        f.facts_ok = false;
+        const auto io = f.reads();
+        const auto a = lookup_installs(io, *installs, kGlobalScope, true);
+        REQUIRE_FALSE(a);
+        CHECK(a.error().fault == LookupFault::kUnavailable);
+        CHECK(a.error().audit_detail == "device facts degraded");
+        CHECK(a.error().message == prefix + "last-poll read failed");
+        const auto c = lookup_components(io, *comps, kGlobalScope, true);
+        REQUIRE_FALSE(c);
+        CHECK(c.error().audit_detail == "device facts degraded");
+    }
+    SECTION("the totals read") {
+        FakeLookup f;
+        f.totals.ok = false;
+        const auto io = f.reads();
+        const auto a = lookup_installs(io, *installs, kGlobalScope, true);
+        REQUIRE_FALSE(a);
+        CHECK(a.error().audit_detail == "totals degraded");
+        CHECK(a.error().message == prefix + "totals read failed");
+        const auto c = lookup_components(io, *comps, kGlobalScope, true);
+        REQUIRE_FALSE(c);
+        CHECK(c.error().audit_detail == "totals degraded");
+        // The same degraded rollup under want_totals=false is not read, so the page is served.
+        CHECK(lookup_installs(io, *installs, kGlobalScope, false));
+    }
+    SECTION("the version range read") {
+        FakeLookup f;
+        f.versions_ok = false;
+        const auto io = f.reads();
+        const auto a = lookup_installs(io, *ranged, kGlobalScope, true);
+        REQUIRE_FALSE(a);
+        CHECK(a.error().fault == LookupFault::kUnavailable);
+        CHECK(a.error().audit_detail == "version read degraded");
+        CHECK(a.error().message == prefix + "version range read failed");
+        CHECK(f.page_reads == 0); // the page is never read against an unresolved range
+        const auto c = lookup_components(io, *comp_ranged, kGlobalScope, true);
+        REQUIRE_FALSE(c);
+        CHECK(c.error().fault == LookupFault::kUnavailable);
+        CHECK(c.error().audit_detail == "version read degraded");
+        CHECK(c.error().message == prefix + "version range read failed");
+        CHECK(f.page_reads == 0);
+    }
+}
+
+TEST_CASE("lookup_installs / lookup_components: a version range is resolved over the caller's scope; "
+          "a read cut at the cap is a bad request",
+          "[server][software_list_model][security]") {
+    FakeLookup f;
+    f.distinct = {"1.0", "1.5", "2.0"};
+    const auto io = f.reads();
+    const auto ranged =
+        parse_list_params(params({{"name", "git"}, {"version_min", "1.0"}, {"version_max", "1.5"}}));
+    const auto comp_ranged = parse_components_params(
+        params({{"name", "libfoo"}, {"version_min", "1.5"}, {"version_max", "2.0"}}));
+    REQUIRE(ranged);
+    REQUIRE(comp_ranged);
+
+    const auto a = lookup_installs(io, *ranged, one_device_scope(), true);
+    REQUIRE(a);
+    // The caller's scope is what the distinct-version read was given, and the resolved set is the
+    // SQL predicate of the page read (it never appears in the body).
+    REQUIRE(f.seen_scope.has_value());
+    CHECK(*f.seen_scope == std::vector<std::string>{"a1"});
+    REQUIRE(f.seen_installs.versions.has_value());
+    CHECK(*f.seen_installs.versions == std::vector<std::string>{"1.0", "1.5"});
+    CHECK_FALSE(lookup_body(*a).contains("versions"));
+
+    const auto c = lookup_components(io, *comp_ranged, kGlobalScope, true);
+    REQUIRE(c);
+    CHECK_FALSE(f.seen_scope.has_value()); // a global caller reads the fleet
+    REQUIRE(f.seen_comps.versions.has_value());
+    CHECK(*f.seen_comps.versions == std::vector<std::string>{"1.5", "2.0"});
+
+    SECTION("a read cut at the cap cannot be resolved") {
+        FakeLookup cut;
+        for (int i = 0; i < kCatalogRowCap; ++i)
+            cut.distinct.push_back(std::to_string(i));
+        const auto cut_io = cut.reads();
+        const auto r = lookup_installs(cut_io, *ranged, kGlobalScope, true);
+        REQUIRE_FALSE(r);
+        CHECK(r.error().fault == LookupFault::kBadRequest);
+        CHECK(r.error().message == kRangeNotResolvable);
+        CHECK(r.error().audit_detail.empty());
+        CHECK(cut.page_reads == 0);
+    }
+}
+
+TEST_CASE("lookup_components mirrors the installs cases, kind plus name serves totals",
+          "[server][software_list_model]") {
+    FakeLookup f;
+    const auto io = f.reads();
+    const auto rq = parse_components_params(params({{"name", "libfoo"}, {"kind", "library"}}));
+    REQUIRE(rq);
+
+    const auto d = lookup_components(io, *rq, kGlobalScope, true);
+    REQUIRE(d);
+    CHECK(d->totals.status == TotalsStatus::kServed);
+    const auto body = lookup_body(*d);
+    CHECK(body["totals"]["instances"] == 9);
+    CHECK(body["totals"]["devices_unconfirmed"] == 2);
+    REQUIRE(body["components"].size() == 1);
+    CHECK(body["components"][0]["hostname"] == "host-a");
+
+    const auto scoped = lookup_components(io, *rq, one_device_scope(), true);
+    REQUIRE(scoped);
+    CHECK(lookup_body(*scoped)["totals_omitted"] == "scope");
+
+    const auto filtered = parse_components_params(params({{"name", "lib"}, {"match", "prefix"}}));
+    REQUIRE(filtered);
+    const auto fd = lookup_components(io, *filtered, kGlobalScope, true);
+    REQUIRE(fd);
+    CHECK(lookup_body(*fd)["totals_omitted"] == "filters");
+
+    f.totals.refreshed_at = 0;
+    const auto building = lookup_components(io, *rq, kGlobalScope, true);
+    REQUIRE(building);
+    CHECK(lookup_body(*building)["totals_omitted"] == "building");
+}
+
+TEST_CASE("lookup_body equals the response builder plus set_totals for the same data",
+          "[server][software_list_model]") {
+    FakeLookup f;
+    const auto io = f.reads();
+    const auto rq = parse_list_params(params({{"name", "git"}}));
+    const auto crq = parse_components_params(params({{"name", "libfoo"}, {"kind", "library"}}));
+    REQUIRE(rq);
+    REQUIRE(crq);
+
+    const auto d = lookup_installs(io, *rq, kGlobalScope, true);
+    REQUIRE(d);
+    auto expected = list_response_json(d->page.rows, d->facts, d->page.next_cursor,
+                                       d->page.devices_omitted, d->page.hit_cap);
+    set_totals(expected, d->totals, false);
+    CHECK(lookup_body(*d) == expected);
+
+    const auto c = lookup_components(io, *crq, kGlobalScope, true);
+    REQUIRE(c);
+    auto cexpected = components_response_json(c->page.rows, c->facts, c->page.next_cursor,
+                                              c->page.devices_omitted, c->page.hit_cap);
+    set_totals(cexpected, c->totals, true);
+    CHECK(lookup_body(*c) == cexpected);
+
+    const auto scoped = lookup_installs(io, *rq, one_device_scope(), true);
+    REQUIRE(scoped);
+    auto omitted = list_response_json(scoped->page.rows, scoped->facts, scoped->page.next_cursor,
+                                      scoped->page.devices_omitted, scoped->page.hit_cap);
+    set_totals_omitted(omitted, kOmittedScope);
+    CHECK(lookup_body(*scoped) == omitted);
 }

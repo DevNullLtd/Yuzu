@@ -129,9 +129,11 @@ struct EgressEnv {
         local_addresses;
     /// NAT64 prefixes (RFC 6052) the operator declared (`--oidc-nat64-prefix`): an IPv6 address
     /// inside one is classified, and compared with this server's own addresses, by the IPv4 address
-    /// embedded in it. The well-known 64:ff9b::/96 and 6to4 2002::/16 are always decoded. These
-    /// are the ONLY NAT64 prefixes registration knows: it does no RFC 7050 discovery (the 2b-1b
-    /// fetcher does, and re-classifies every address at fetch time).
+    /// embedded in it. The well-known 64:ff9b::/96, 6to4 2002::/16, SIIT ::ffff:0:0:0/96 and
+    /// IPv4-compatible ::/96 are always decoded; an address in the local-use prefix
+    /// 64:ff9b:1::/48 that no declared prefix covers is refused. These are the ONLY NAT64 prefixes
+    /// registration knows: it does no RFC 7050 discovery (the 2b-1b fetcher does, and
+    /// re-classifies every address at fetch time).
     std::vector<::yuzu::server::oidc::egress::Nat64Prefix> nat64_prefixes;
     /// Counted once per degrade, with a closed `reason` (own_addresses_unavailable, dns_unavailable, dns_timeout, dns_busy,
     /// dns_budget_exhausted, validation_busy). Empty = not counted (tests).

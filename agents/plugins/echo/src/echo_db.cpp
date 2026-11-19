@@ -68,6 +68,12 @@ constexpr int kBusyTimeoutMs = 5000;
 
 using yuzu::shared::sqlite_quarantine::now_epoch_seconds;
 
+// Quarantined echo.db copies kept (owner ruling Q6, #2155): the newest three; older ones are
+// deleted at quarantine time. Deliberately separate from the command-dedup store's constant
+// (#3665, command_dedup_quarantine.hpp): two owner rulings on stores with different contents, and
+// the two may diverge.
+constexpr std::size_t kKeepQuarantined = 3;
+
 struct StmtDeleter {
     void operator()(sqlite3_stmt* s) const { sqlite3_finalize(s); }
 };
@@ -154,7 +160,8 @@ int echo_query_authorizer(void* /*ctx*/, int action, const char* arg1, const cha
             if (is_queryable_table(arg1) || is_fold_view(arg1))
                 return SQLITE_OK;
             // The roll-up views read echo_dict and their `_r` tables; operator SQL may
-            // reach those ONLY through a roll-up view, never by name. The inner-most
+            // reach those only through a roll-up view, or a column-less read of a row
+            // table (below), never by name. The inner-most
             // view argument names a SQL context, not a persisted view: a CTE of that
             // name is reported the same way. This rule is sound ONLY because
             // validate_and_translate_sql rejects WITH, so no CTE can shadow a view
@@ -1031,6 +1038,19 @@ std::expected<EchoDatabase, std::string> EchoDatabase::open(const std::filesyste
         spdlog::error("ECHO: echo.db failed PRAGMA integrity_check (echo.db.corruption_detected) — "
                       "quarantined to {} and re-initialising a fresh database",
                       quarantined->string());
+        // Bound the evidence kept: a disk that corrupts echo.db on every start must not fill the
+        // volume with copies. Best effort (a copy that cannot be removed is left for the next
+        // recovery); the group just made is never a candidate.
+        {
+            const auto pruned = yuzu::shared::sqlite_quarantine::prune_old_quarantines(
+                path, *quarantined, kKeepQuarantined);
+            for (const auto& f : pruned.removed)
+                spdlog::info("EchoDatabase: removed old quarantined database {} (keeping the "
+                             "newest {})",
+                             f.string(), kKeepQuarantined);
+            for (const auto& note : pruned.notes)
+                spdlog::warn("EchoDatabase: {}", note);
+        }
 #ifdef _WIN32
         // A sidecar that had to be copied (not renamed) took the directory's ACL: protect it again.
         secure_quarantined_sidecars(*quarantined, dacl);
@@ -2029,7 +2049,8 @@ bool EchoDatabase::create_warehouse_tables() {
 
 std::expected<EchoDatabase::PurgeResult, std::string>
 EchoDatabase::purge_source(const std::string& source,
-                           std::chrono::steady_clock::duration dictionary_deadline) {
+                           std::chrono::steady_clock::duration dictionary_deadline,
+                           const std::function<bool()>& cancelled) {
     // Resolve the source's tables from the schema registry -- never hardcode. A roll-up tier
     // name (`process_hourly`) is a VIEW; the rows live in its `_r` table. The tables the roll-up
     // does not own (netqual_boot, usage_live, usage_daily) are named as they are.
@@ -2113,9 +2134,13 @@ EchoDatabase::purge_source(const std::string& source,
     // the result SAYS so and the starved counter moves (cmp-3): the action's audit row must not
     // record a complete erasure while the purged strings are still on disk. The weekly sweep
     // finishes the job.
-    PurgeResult out{static_cast<int>(total), false};
+    PurgeResult out{static_cast<int>(total), false, false};
+    bool stopped = false;
     if (fold_) {
-        const auto swept = fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline);
+        const auto swept =
+            fold_->gc_dictionary(*this, EchoFold::Clock::now() + dictionary_deadline, cancelled);
+        // A stop request is sticky, so this one read holds for the rest of the call.
+        stopped = cancelled && cancelled();
         if (!swept) {
             out.dictionary_pending = true;
             spdlog::warn("purge_source({}): the dictionary sweep failed ({}); the purged strings "
@@ -2123,11 +2148,12 @@ EchoDatabase::purge_source(const std::string& source,
                          source, swept.error());
         } else if (swept->deadline_hit) {
             out.dictionary_pending = true;
-            spdlog::warn("purge_source({}): the dictionary sweep ran out of time; the purged strings "
-                         "stay until the weekly sweep",
-                         source);
+            spdlog::warn("purge_source({}): the dictionary sweep {}; the purged strings stay until "
+                         "the weekly sweep",
+                         source, stopped ? "was stopped" : "ran out of time");
         }
-        if (out.dictionary_pending) {
+        // A sweep the agent stop ended was not starved: it is reported pending, not counted.
+        if (out.dictionary_pending && !stopped) {
             int64_t starved = 0;
             const auto text = get_config("dict_gc_starved_total", "0");
             const auto [p, ec] = std::from_chars(text.data(), text.data() + text.size(), starved);
@@ -2144,10 +2170,17 @@ EchoDatabase::purge_source(const std::string& source,
     // reclaim disk, which a passive checkpoint won't do promptly. Force a TRUNCATE checkpoint
     // here so the erasure is complete and the WAL is reclaimed at return. Best-effort: the DELETE
     // already committed, so a checkpoint that can't fully complete (e.g. a lingering reader) is
-    // logged, not fatal -- the residue clears at the next one.
-    if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
+    // logged, not fatal -- but REPORTED (`wal_pending`), as the dictionary is. The pages stay
+    // until a later checkpoint truncates the log: a rerun of this purge does, and reports it; the
+    // maintenance pass only when it evicts rows or the log outgrows its allowance. A stop request
+    // skips the checkpoint: the agent is going down and the close checkpoints.
+    if (stopped) {
+        out.wal_pending = true;
+    } else if (checkpoint(CheckpointMode::kTruncate) != CheckpointResult::kOk) {
+        out.wal_pending = true;
         spdlog::warn("purge_source({}): WAL checkpoint(TRUNCATE) did not complete -- purged data may "
-                     "persist in the WAL until the next checkpoint",
+                     "persist in the WAL until a later checkpoint truncates it (a rerun of the "
+                     "purge does)",
                      source);
     }
     return out;

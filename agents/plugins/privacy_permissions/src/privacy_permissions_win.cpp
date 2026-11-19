@@ -243,8 +243,18 @@ int collect_windows_permissions(yuzu::CommandContext& ctx) {
         const auto f = win::profile_record_failure(rf.key_open, rf.rc);
         discovery_rows.push_back(failure_row("windows", "-", "-", f.denied, f.cause, acc));
     }
-    const auto hku_subkeys = yuzu::win::enumerate_hku_subkeys();
-    const auto profiles = yuzu::profiles::build_profile_list(discovery.records, hku_subkeys);
+    // A failed or unstable HKEY_USERS listing is a discovery failure row, never "no hive is loaded"
+    // (every profile would then read as logged-off and be mounted offline). With no usable list
+    // nothing is walked per profile; the HKLM source and the failure row still stand.
+    const auto hku = yuzu::win::enumerate_hku_subkeys_checked();
+    std::vector<yuzu::profiles::ProfileInfo> profiles;
+    if (hku.error.empty()) {
+        profiles = yuzu::profiles::build_profile_list(discovery.records, hku.names);
+    } else {
+        spdlog::warn("privacy_permissions: HKEY_USERS listing incomplete ({})", hku.error);
+        discovery_rows.push_back(
+            failure_row("windows", "-", "-", false, "profiles:hku_list_incomplete", acc));
+    }
 
     // The one per-profile read. assemble_windows_rows has already validated the SID (a malformed or
     // empty one never reaches here), so it is safe to append to HKEY_USERS.
