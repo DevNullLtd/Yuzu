@@ -795,8 +795,8 @@ std::string filter_names(const CertReadFilter& f) {
     add(f.self_signed.has_value(), "self_signed", "eq");
     add(f.agent_id.has_value(), "agent_id", "eq");
     add(f.issuer_dn.has_value(), "issuer_dn", "eq");
-    add(f.issuer_dn_contains.has_value(), "issuer_dn_contains", "ilike");
-    add(f.subject_dn_contains.has_value(), "subject_dn_contains", "ilike");
+    add(f.issuer_dn_contains.has_value(), "issuer_dn_contains", "contains");
+    add(f.subject_dn_contains.has_value(), "subject_dn_contains", "contains");
     add(f.sha256.has_value(), "sha256", "eq");
     add(f.spki_sha256.has_value(), "spki_sha256", "eq");
     add(f.aki_key_id.has_value(), "aki_key_id", "eq");

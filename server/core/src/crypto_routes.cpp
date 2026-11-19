@@ -165,6 +165,23 @@ void api_unwired(httplib::Response& res) {
 /// The Yuzu-issued counts' gate (ADR-0070 R2): fleet_read_fn Inventory:Read, then a CONFINED
 /// caller is withheld - 403 naming no permission (none would admit them), audited `denied`.
 /// Returns true when the request may proceed (unconfined); otherwise the answer is written.
+/// The REST certificate reads' principal for the per-principal substring cap (#6333): resolved
+/// only when a substring filter is present (every other read leaves it empty and never consults the
+/// cap). The fleet-read gate already authenticated the request, so a failed re-resolution is a
+/// session that ended between the two calls; auth_fn then wrote the 401 and this returns false.
+bool cert_principal(const CryptoRoutes::Deps& d, const httplib::Request& req,
+                    httplib::Response& res, const CertReadFilter& f, std::string& out) {
+    if (!f.issuer_dn_contains && !f.subject_dn_contains)
+        return true;
+    if (!d.auth_fn)
+        return true; // unwired (tests): "" shares the unresolved callers' single slot
+    auto session = d.auth_fn(req, res);
+    if (!session)
+        return false;
+    out = session->username;
+    return true;
+}
+
 bool ca_counts_gate(const CryptoRoutes::Deps& d, const httplib::Request& req,
                     httplib::Response& res, const std::string& cid) {
     if (gate_unwired(d.fleet_read_fn, res, false))
@@ -290,9 +307,10 @@ std::string layout_failure_detail(const CryptoReadError& e) {
 
 namespace crt = cert_read;
 
-/// Every certificate surface gates on the dedicated securable and the denial names it.
+/// Every certificate surface gates on the dedicated securable and the denial names it. The gate
+/// calls spell the pair as literals ("CertificateInventory", "Read"): the API-parity gate
+/// (scripts/ci/check-api-parity.py) compares REST and MCP gates lexically.
 constexpr const char* kCertSecurable = "CertificateInventory";
-constexpr const char* kCertOperation = "Read";
 
 /// A fragment never answers the gate's 4xx/5xx (htmx would not swap it): a gate that DEGRADED
 /// (503) renders the access-check banner with Retry, a genuine refusal the 200 note naming
@@ -902,7 +920,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         auto session = deps_.auth_fn(req, res);
         if (!session)
             return;
-        const auto parsed = crt::parse_summary_params(req.params);
+        const auto parsed = crt::parse_summary_params(model_detail::to_params(req.params));
         const std::string retry = parsed ? crypto_html::certificate_summary_url(*parsed) : std::string{};
         if (!deps_.fleet_read_fn) {
             spdlog::error("crypto routes: fleet_read_fn unwired - misconfigured call site; "
@@ -912,7 +930,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                retry, CryptoReadCause::kStoreDegraded));
             return;
         }
-        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        auto gate = deps_.fleet_read_fn(req, res, "CertificateInventory", "Read");
         if (!gate.admitted) {
             soften_cert_denial(res, 0, retry);
             return;
@@ -927,7 +945,9 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto cid = detail::ensure_correlation_id(res);
-        auto read = deps_.api->certificate_summary(*parsed, gate.scope);
+        auto query = *parsed;
+        query.principal = session->username; // keys the per-principal substring cap (#6333)
+        auto read = deps_.api->certificate_summary(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
                 send_html(res, crypto_html::render_certificate_summary_caveat(read.error().message));
@@ -964,7 +984,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!session)
             return;
         const bool row = is_continuation(req);
-        const auto parsed = crt::parse_list_params(req.params);
+        const auto parsed = crt::parse_list_params(model_detail::to_params(req.params));
         const std::string retry = parsed ? crypto_html::certificates_page_url(*parsed) : std::string{};
         const auto note = [&](std::string_view m) {
             send_html(res, crypto_html::render_ca_caveat(m, row));
@@ -977,7 +997,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                                retry, CryptoReadCause::kStoreDegraded, row));
             return;
         }
-        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        auto gate = deps_.fleet_read_fn(req, res, "CertificateInventory", "Read");
         if (!gate.admitted) {
             soften_cert_denial(res, row ? 2 : 1, retry);
             return;
@@ -992,7 +1012,9 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         const auto cid = detail::ensure_correlation_id(res);
-        auto read = deps_.api->certificates(*parsed, gate.scope);
+        auto query = *parsed;
+        query.principal = session->username; // keys the per-principal substring cap (#6333)
+        auto read = deps_.api->certificates(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
                 note(read.error().message);
@@ -1033,19 +1055,22 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         set_private_no_store(res);
         if (gate_unwired(deps_.fleet_read_fn, res, false))
             return;
-        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        auto gate = deps_.fleet_read_fn(req, res, "CertificateInventory", "Read");
         if (!gate.admitted)
             return; // the gate wrote the 401/403/503 and its own denial row
         if (!deps_.api) {
             api_unwired(res);
             return;
         }
-        const auto parsed = crt::parse_list_params(req.params);
+        const auto parsed = crt::parse_list_params(model_detail::to_params(req.params));
         if (!parsed) {
             rest_error(res, 400, parsed.error());
             return;
         }
-        auto read = deps_.api->certificates(*parsed, gate.scope);
+        auto query = *parsed;
+        if (!cert_principal(deps_, req, res, query.filter, query.principal))
+            return; // the session could not be re-resolved: auth_fn wrote the 401
+        auto read = deps_.api->certificates(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
                 rest_error(res, 400, read.error().message);
@@ -1080,19 +1105,22 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         set_private_no_store(res);
         if (gate_unwired(deps_.fleet_read_fn, res, false))
             return;
-        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        auto gate = deps_.fleet_read_fn(req, res, "CertificateInventory", "Read");
         if (!gate.admitted)
             return;
         if (!deps_.api) {
             api_unwired(res);
             return;
         }
-        const auto parsed = crt::parse_summary_params(req.params);
+        const auto parsed = crt::parse_summary_params(model_detail::to_params(req.params));
         if (!parsed) {
             rest_error(res, 400, parsed.error());
             return;
         }
-        auto read = deps_.api->certificate_summary(*parsed, gate.scope);
+        auto query = *parsed;
+        if (!cert_principal(deps_, req, res, query.filter, query.principal))
+            return; // the session could not be re-resolved: auth_fn wrote the 401
+        auto read = deps_.api->certificate_summary(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
                 rest_error(res, 400, read.error().message);

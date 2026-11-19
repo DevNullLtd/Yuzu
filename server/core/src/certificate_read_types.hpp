@@ -64,12 +64,18 @@ struct CertQuery {
     CertReadFilter filter;
     std::string cursor; ///< opaque; "" = first page
     int limit{kCertPageDefault};
+    /// The calling principal (the session username), set by the transport AFTER parsing, never
+    /// from a request parameter. Keys the one-in-flight substring cap (CertSubstringPrincipalCap,
+    /// crypto_read_gate.hpp); "" shares one slot with every other unresolved caller.
+    std::string principal;
 };
 
 struct CertSummaryQuery {
     CertReadFilter filter;
     /// The caller's `not_after` histogram edges, ascending RFC 3339 UTC; empty = no histogram.
     std::vector<std::string> not_after_edges;
+    /// As CertQuery::principal.
+    std::string principal;
 };
 
 /// The keyset position of the last row served (ordered by (agent_id, sha256)).

@@ -2065,7 +2065,7 @@ TEST_CASE("crypto routes: REST certificates - gated on CertificateInventory:Read
     CHECK(h.audits[0].target_type == "CertificateInventory");
     CHECK_THAT(h.audits[0].detail, ContainsSubstring("scope=confined"));
     CHECK_THAT(h.audits[0].detail, ContainsSubstring("rows=2"));
-    CHECK_THAT(h.audits[0].detail, ContainsSubstring("issuer_dn_contains=ilike"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("issuer_dn_contains=contains"));
     CHECK_THAT(h.audits[0].detail, !ContainsSubstring("Test"));
 }
 

@@ -450,7 +450,7 @@ TEST_CASE("cert read model: the audit detail names filters and never carries a v
     CHECK_THAT(d, ContainsSubstring("rows=3"));
     CHECK_THAT(d, ContainsSubstring("truncated=true"));
     CHECK_THAT(d, ContainsSubstring("issuer_dn=eq"));
-    CHECK_THAT(d, ContainsSubstring("issuer_dn_contains=ilike"));
+    CHECK_THAT(d, ContainsSubstring("issuer_dn_contains=contains"));
     CHECK_THAT(d, ContainsSubstring("not_after_before=lt"));
     CHECK_THAT(d, ContainsSubstring("rsa_modulus_bits_lt=lt"));
     CHECK_THAT(d, ContainsSubstring("page=continuation"));
@@ -729,4 +729,18 @@ TEST_CASE("cert read model: decode_cursor refuses random bytes and never throws"
         const auto r = crt::decode_cursor(tok, fp);
         CHECK_FALSE(r.has_value());
     }
+}
+
+TEST_CASE("cert read model: a substring needle with a NUL is refused; a backslash is accepted as text",
+          "[certread][model]") {
+    for (const char* key : {"issuer_dn_contains", "subject_dn_contains"}) {
+        auto params = P({{key, std::string("emS\0ign", 7)}, {"is_ca", "true"}});
+        const auto r = crt::parse_list_params(params);
+        REQUIRE_FALSE(r.has_value());
+        CHECK_THAT(r.error(), ContainsSubstring(key));
+        CHECK_FALSE(crt::parse_summary_params(params).has_value());
+    }
+    const auto ok = crt::parse_list_params(P({{"issuer_dn_contains", "a\\b"}}));
+    REQUIRE(ok.has_value());
+    CHECK(*ok->filter.issuer_dn_contains == "a\\b");
 }

@@ -62,6 +62,9 @@ struct LocalCryptoApiDeps {
     /// reads (kDegraded), never an empty answer; `devices` supplies hostnames for its rows.
     CertificateInventoryStore* certificates = nullptr;
     int max_concurrent_reads = kMaxConcurrentCryptoReads;
+    /// The per-principal substring cap (#6333). Null (production) = the api's own instance;
+    /// a test injects one to hold a principal's slot and observe the refusal.
+    CertSubstringPrincipalCap* substring_cap = nullptr;
     int pool_size = 0;
     std::chrono::seconds shared_read_ttl{0};
     std::function<void(std::string_view source, std::string_view reason)> note_degrade;

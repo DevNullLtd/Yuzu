@@ -4060,7 +4060,7 @@ MCP twins).
    "Settings read-twins" below), as of #4031, `{Enrollment:Read,
    OidcConfig:Read}`, as of Wave 7 PR7.2, `{Forensics:Read}`, as of
    #5771, `{AuditLog:Read}` (see "The audit trail" below), and as of slice-2
-   PR 2a-2b, `{CertificateInventory:Read}` (the fourth inclusion class, below) — require the
+   PR 2a-2b, `{CertificateInventory:Read}` (the new-data inclusion class, below) — require the
    `admin` session role regardless of the RBAC on/off toggle, via
    `authz_topology_floor.hpp`'s `topology_floor_applies()`. The groups are
    different categories that happen to share this one mechanism: the
@@ -4682,9 +4682,10 @@ owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a sche
 where the database came from.
 
 
-**Fourth inclusion class: a new fleet-wide data class the design requires admin-only (slice-2 PR
+**The new-data inclusion class: a new fleet-wide data class the design requires admin-only (slice-2 PR
 2a-2b, ADR-0070 D12).** `{CertificateInventory:Read}` is in the floor, and it fits none of the
-three classes above, so `authz_topology_floor.hpp`'s inclusion test gains a fourth: *a new
+other inclusion classes (topology, existing admin-only posture, evidence-grade data, operator-registered
+egress targets), so `authz_topology_floor.hpp`'s inclusion test gains one more: *a new
 fleet-wide copy of data that an accepted ADR requires to be admin-only in both RBAC states* (here ADR-0070 D12). The
 certificate inventory is not authorization topology and not the audit trail, and it is not an
 existing admin-only posture either: the output of today's `certificates.list` runs is readable

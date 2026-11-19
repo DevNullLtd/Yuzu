@@ -9724,11 +9724,11 @@ Query parameters:
 | `is_ca`, `self_signed` | `true` or `false` | The certificate's own basic-constraints claim, and whether the collector reported it self-signed. |
 | `agent_id` | free text, 1 to 256 bytes | Exact device id, still confined to the devices you may see. |
 | `issuer_dn` | free text, at most 1,024 bytes | Exact RFC 4514 string. A present empty value selects certificates whose issuer is the empty string. |
-| `issuer_dn_contains` | free text, 3 to 256 bytes | Case-insensitive **literal** substring of `issuer_dn`: `%`, `_` and `\` are escaped, never a pattern. |
-| `subject_dn_contains` | free text, 3 to 256 bytes | The same match on `subject_dn`, accepted **only together with `is_ca=true`**; without it the request is a `400` naming `is_ca`. |
+| `issuer_dn_contains` | free text, 3 to 256 bytes, no NUL | Case-insensitive **literal** substring of `issuer_dn` (PostgreSQL `ILIKE`, so case folds by the database's locale: under a UTF-8 locale `é` matches `É`, under `C` only ASCII letters fold). `%`, `_` and `\` are escaped, never a pattern. The match is against the stored RFC 4514 string, escapes included (a comma in a value is `\,`). At most **one** substring read per user is in flight; a second is a retryable `503` (`retry_after_ms` 5000). |
+| `subject_dn_contains` | free text, 3 to 256 bytes, no NUL | The same match on `subject_dn`, accepted **only together with `is_ca=true`**; without it, or with `is_ca=false`, the request is a `400` naming `is_ca`. |
 | `sha256` | 64 hex characters | Exact certificate SHA-256 (either case). |
-| `spki_sha256` | 64 hex characters | Exact: every certificate over one public key, cross-signed and re-issued copies included. |
-| `aki_key_id` | 2 to 128 hex characters (whole bytes) | Exact authority key identifier: every certificate one CA key signed, whatever name the issuer used. |
+| `spki_sha256` | 64 hex characters | Exact (either case): every certificate over one public key, cross-signed and re-issued copies included. |
+| `aki_key_id` | 2 to 128 hex characters (whole bytes, either case) | Exact authority key identifier: every certificate one CA key signed, whatever name the issuer used. Matches only certificates whose authority key identifier carries a `keyIdentifier`; one with no AKI, or an issuer-and-serial-only AKI, is never matched. For a compromised key prefer `spki_sha256`, then this, then the name filters. |
 | `cursor`, `limit` | opaque / integer 1 to 500 (default 100) | Per-certificate read only. A `limit` outside 1 to 500 is refused, never clamped. |
 | `not_after_edges` | 1 to 32 comma-separated, strictly ascending RFC 3339 UTC instants | Summary only: **your** bucket edges for the `not_after` histogram. |
 

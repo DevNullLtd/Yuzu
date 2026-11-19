@@ -111,6 +111,8 @@ constexpr std::string_view kSourceLayout = "crypto_layout";
 constexpr std::string_view kSourceCert = "cert_inventory";
 constexpr std::string_view kCertUnavailable = "certificate inventory read degraded";
 constexpr std::string_view kReasonAdmission = "admission_full";
+/// A second concurrent substring certificate read by one principal (CertSubstringPrincipalCap).
+constexpr std::string_view kReasonSubstringPrincipalBusy = "substring_principal_busy";
 constexpr std::string_view kReasonPoolTooSmall = "pool_too_small";
 
 std::string_view degrade_reason(CaReadError::Kind k) {
@@ -205,6 +207,7 @@ public:
     explicit LocalCryptoApi(const LocalCryptoApiDeps& d)
         : store_(d.software), devices_(d.devices), ca_(d.ca), layouts_(d.layouts),
           certs_(d.certificates),
+          substring_cap_ext_(d.substring_cap),
           ca_refused_(d.pool_size > 0 && d.pool_size < kCryptoCaMinPoolSize),
           cert_refused_(d.pool_size > 0 && d.pool_size < kCryptoCertMinPoolSize),
           library_refused_(d.pool_size > 0 && d.pool_size < kCryptoLibraryMinPoolSize),
@@ -414,6 +417,9 @@ public:
         }
         std::optional<std::expected<CertPage, CertReadError>> read;
         {
+            const auto sub = substring_lease(q.filter, q.principal);
+            if (!sub)
+                return std::unexpected(substring_principal_busy());
             const auto lease = cert_lease(); // released when this block ends, throw included
             if (!lease)
                 return std::unexpected(cert_refusal());
@@ -453,6 +459,9 @@ public:
         }
         std::optional<std::expected<CertSummary, CertReadError>> read;
         {
+            const auto sub = substring_lease(q.filter, q.principal);
+            if (!sub)
+                return std::unexpected(substring_principal_busy());
             const auto lease = cert_lease();
             if (!lease)
                 return std::unexpected(cert_refusal());
@@ -684,6 +693,33 @@ private:
         return lease;
     }
 
+    /// The per-principal substring lease (CertSubstringPrincipalCap): a read with no substring
+    /// filter gets a truthy, empty lease without touching the cap. Taken before cert_lease, so a
+    /// refused substring read never holds a shared gate slot.
+    struct SubstringLease {
+        CertSubstringPrincipalCap::Lease lease;
+        bool needed{false};
+        explicit operator bool() const noexcept { return !needed || static_cast<bool>(lease); }
+    };
+    SubstringLease substring_lease(const CertReadFilter& f, const std::string& principal) const {
+        SubstringLease out;
+        out.needed = f.issuer_dn_contains.has_value() || f.subject_dn_contains.has_value();
+        if (out.needed) {
+            out.lease = (substring_cap_ext_ ? *substring_cap_ext_ : substring_cap_).try_acquire(principal);
+            if (!out.lease)
+                note(kSourceCert, kReasonSubstringPrincipalBusy);
+        }
+        return out;
+    }
+
+    static CryptoReadError substring_principal_busy() {
+        CryptoReadError e = capacity_in_use();
+        e.message = "another certificate read of yours with a substring filter (issuer_dn_contains or "
+                    "subject_dn_contains) is still running; retry when it completes";
+        e.retry_after_ms = 5000;
+        return e;
+    }
+
     CryptoReadError cert_refusal() const {
         return cert_refused_ ? pool_too_small("fleet certificate reads", kCryptoCertMinPoolSize)
                              : capacity_in_use();
@@ -832,6 +868,7 @@ private:
     CaStore* ca_;
     CryptoDashboardLayoutStore* layouts_;
     CertificateInventoryStore* certs_;
+    CertSubstringPrincipalCap* substring_cap_ext_; ///< injected (tests); null = substring_cap_
     const bool ca_refused_;
     const bool cert_refused_;
     const bool library_refused_;
@@ -842,6 +879,8 @@ private:
     // Per-process bound on in-flight store calls, shared by every method. The lease is a scoped
     // RAII block around the store call, so every path - and any throw - releases it.
     mutable CryptoReadGate gate_;
+    /// At most one in-flight substring certificate read per principal (#6333).
+    mutable CertSubstringPrincipalCap substring_cap_;
 };
 
 } // namespace

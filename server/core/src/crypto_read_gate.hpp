@@ -8,6 +8,10 @@
 /// note_read_shed` keeps the `yuzu_inventory_read_degrade_total` reason label in one place.
 
 #include <atomic>
+#include <mutex>
+#include <string>
+#include <string_view>
+#include <unordered_set>
 
 namespace yuzu::server {
 
@@ -70,6 +74,76 @@ public:
 private:
     const int max_;
     std::atomic<int> in_flight_{0};
+};
+
+/// The per-principal bound on in-flight certificate reads that carry a SUBSTRING filter
+/// (`issuer_dn_contains`, `subject_dn_contains`; slice-2 PR 2a-2b, #6333). A substring read is the
+/// one certificate read whose cost the caller chooses by its needle, and `CryptoReadGate` has only
+/// two process-wide slots: without this bound one principal could hold both with two concurrent
+/// substring reads and shed every other `/crypto` read for up to two wall budgets. At most ONE such
+/// read per principal is in flight; a second is refused (the caller answers a retryable 503,
+/// cause capacity). A read with no substring filter never touches this bound. An empty principal
+/// (a caller whose identity could not be resolved) shares ONE slot with every other such caller,
+/// so an unresolved identity is capped more tightly, never exempted. Taken BEFORE the shared gate
+/// lease, so a refused substring read never occupies a gate slot.
+class CertSubstringPrincipalCap {
+public:
+    CertSubstringPrincipalCap() = default;
+    CertSubstringPrincipalCap(const CertSubstringPrincipalCap&) = delete;
+    CertSubstringPrincipalCap& operator=(const CertSubstringPrincipalCap&) = delete;
+
+    class Lease {
+    public:
+        Lease() noexcept = default;
+        Lease(Lease&& o) noexcept : cap_(o.cap_), key_(std::move(o.key_)) { o.cap_ = nullptr; }
+        Lease& operator=(Lease&& o) noexcept {
+            if (this != &o) {
+                release();
+                cap_ = o.cap_;
+                key_ = std::move(o.key_);
+                o.cap_ = nullptr;
+            }
+            return *this;
+        }
+        Lease(const Lease&) = delete;
+        Lease& operator=(const Lease&) = delete;
+        ~Lease() { release(); }
+
+        explicit operator bool() const noexcept { return cap_ != nullptr; }
+
+    private:
+        friend class CertSubstringPrincipalCap;
+        Lease(CertSubstringPrincipalCap* c, std::string key) noexcept
+            : cap_(c), key_(std::move(key)) {}
+        void release() noexcept {
+            if (cap_) {
+                const std::lock_guard lock(cap_->mu_);
+                cap_->held_.erase(key_);
+                cap_ = nullptr;
+            }
+        }
+        CertSubstringPrincipalCap* cap_{nullptr};
+        std::string key_;
+    };
+
+    /// A lease for `principal`, falsy when that principal already holds one. Allocation failure
+    /// (inserting the key) propagates as std::bad_alloc; nothing is held then.
+    [[nodiscard]] Lease try_acquire(std::string_view principal) {
+        std::string key(principal);
+        const std::lock_guard lock(mu_);
+        if (!held_.insert(key).second)
+            return Lease{};
+        return Lease{this, std::move(key)};
+    }
+
+    [[nodiscard]] std::size_t held() const {
+        const std::lock_guard lock(mu_);
+        return held_.size();
+    }
+
+private:
+    mutable std::mutex mu_;
+    std::unordered_set<std::string> held_;
 };
 
 } // namespace yuzu::server

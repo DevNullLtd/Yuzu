@@ -1093,11 +1093,11 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
 | `is_ca`, `self_signed` | bool | Refused if not a bool. |
 | `agent_id` | free text | Exact; confined by the gate. |
 | `issuer_dn` | free text | Exact match on the RFC 4514 string. |
-| `issuer_dn_contains` | free text, 3..256 bytes | Case-insensitive substring of `issuer_dn` (ASCII case folding). The value is matched literally: `%`, `_` and `\` are escaped, never a pattern. Refused if shorter, longer or invalid UTF-8. |
-| `subject_dn_contains` | free text, 3..256 bytes | The same match on `subject_dn`, accepted **only together with `is_ca=true`**. Without it, 400 / `kInvalidParams` naming `is_ca`. |
-| `sha256` | 64 hex | Refused if malformed. |
-| `spki_sha256` | 64 hex | Exact. Every certificate over one key. Refused if malformed. |
-| `aki_key_id` | hex, 2..128 | Exact. Every certificate whose authority key identifier names one CA key. Refused if malformed. |
+| `issuer_dn_contains` | free text, 3..256 bytes | Case-insensitive substring of `issuer_dn`. The exact SQL form is `dn ILIKE '%' \|\| $1 \|\| '%' ESCAPE '\'` over the distinct-DN dictionary, with `\`, `%` and `_` in the value each prefixed by `\` first, so the value is matched literally and never as a pattern. `ILIKE` folds case by the database's `LC_CTYPE`, not by ASCII rules: under a UTF-8 locale `é` matches `É`, under the `C` locale only ASCII letters fold. The needle is matched against the stored RFC 4514 string, escapes included: a comma inside a value is stored as `\,`, so `Acme\, Inc` is the needle for that name. Refused if shorter, longer, invalid UTF-8 or containing a NUL byte. |
+| `subject_dn_contains` | free text, 3..256 bytes | The same match on `subject_dn`, accepted **only together with `is_ca=true`**. Without it, or with `is_ca=false`, 400 / `kInvalidParams` naming `is_ca`. |
+| `sha256` | 64 hex | Either case, lowercased before the match. Refused if malformed. |
+| `spki_sha256` | 64 hex | Exact. Every certificate over one key. Either case is accepted and lowercased before the match (the stored case), so a value pasted from an advisory in uppercase does not return a silent zero. Refused if malformed. |
+| `aki_key_id` | hex, 2..128, even length | Exact. Every certificate whose authority key identifier names one CA key. Either case is accepted and uppercased before the match (the stored case). Refused if malformed or of odd length (a key identifier is whole bytes). |
 | `not_after_edges` (summary histogram) | list of RFC 3339, 1..32, ascending | The caller's bucket edges (ADR-0070's derived-field table, under "The test applied"). Refused if unsorted or too many. |
 | `cursor`, `limit` | opaque / int 1..500 (default 100) | REST and MCP both refuse a value out of range. |
 
@@ -1105,12 +1105,15 @@ in OpenAPI beside "not refused" on the server is the #6122 item 2 defect.
 
 **Proposed.** An operator who learns that a CA is distrusted or compromised needs every device
 holding that CA's own certificates, and every certificate it issued. The exact `issuer_dn` filter
-alone cannot answer that: one CA issues under several names. The October 2026 eMudhra incident is
-the reference case. Eight eMudhra intermediate CAs had P-384 private keys that were small integers
-(4, 56, 115 and others), recoverable from the public certificates in under a second. Browsers
-distrusted them, but a server, appliance or application with its own trust store does not follow a
-browser update. eMudhra's names also vary: its CNs say `emSign` and its `O` says
-`eMudhra Technologies Limited`.
+alone cannot answer that: one CA issues under several names. The October 2026 eMudhra incident
+([Mozilla bug 2083449](https://bugzilla.mozilla.org/show_bug.cgi?id=2083449)) is the reference case.
+Eight eMudhra intermediate CAs had P-384 private keys that were integers below 256, recoverable
+"trivially" from the public certificates. Browsers distrusted them, but a server, appliance or
+application with its own trust store does not follow a browser update. The names vary. The eight
+intermediates are `EM EV TLS CA - G3B`/`G3C`, `EM OV TLS CA - G3B`/`G3C`, `EM DV TLS CA - G3B`/`G3C`
+and `EM OV CS CA - G3B`/`G3C`, with `O` either `eMudhra BV` or `eMudhra Inc`. They were issued by the
+`emSign Root ... CA - G3` roots. So `subject_dn_contains=emSign` finds the roots, not the eight, and
+`eMudhra` finds the eight through their `O`.
 
 The four filters added above answer it, each from fields the per-certificate read already
 stores. Each query goes through the same gate, confinement, audit and pagination as any other
@@ -1118,10 +1121,17 @@ per-certificate read. The snapshot accepts them too, because it takes the same f
 
 | Question | Query |
 |---|---|
-| Which devices hold one of this CA's own certificates, under any of its names? | `is_ca=true&subject_dn_contains=eMudhra`, then `subject_dn_contains=emSign` |
-| Which certificates did any of its names issue? | `issuer_dn_contains=eMudhra`, then `issuer_dn_contains=emSign` |
 | Where is one compromised key, including cross-signed and re-issued copies of its certificate? | `spki_sha256=<the key's hash>`; copies have their own `sha256` but share the key |
 | What did one compromised CA key sign, whatever name the issuer used? | `aki_key_id=<that CA certificate's ski>` |
+| Which devices hold one of the eight intermediates, or the roots above them? | `is_ca=true&subject_dn_contains=eMudhra` (the eight, through `O`), then `is_ca=true&subject_dn_contains=emSign` (the roots) |
+| Which certificates did any of those names issue? | `issuer_dn_contains=eMudhra`, then `issuer_dn_contains=EM OV` and the other `EM ...` prefixes |
+
+For a compromised key, prefer the two key filters, in the order above, to the name filters: a key
+filter cannot miss a certificate because of how its issuer was named, and cannot match an unrelated
+CA whose name shares a substring. **`aki_key_id` is complete only for certificates whose authority key
+identifier carries a `keyIdentifier`.** A certificate with no AKI extension, or with an AKI that gives
+only `authorityCertIssuer` and `authorityCertSerialNumber`, has no `aki_key_id` and is never matched;
+follow it with the name filters to cover those.
 
 - **`subject_dn_contains` needs `is_ca=true`.** An end-entity subject can carry a person's name or
   e-mail address (see [Personal data](#personal-data)). A fleet-wide substring search over those
@@ -1132,16 +1142,43 @@ per-certificate read. The snapshot accepts them too, because it takes the same f
 - **`issuer_dn_contains` has no such condition.** An issuer DN names a CA. A self-signed end-entity
   certificate repeats its subject as its issuer, so this filter can still reach a person's name.
   It reaches nothing that the existing exact `issuer_dn` filter, or an unfiltered read, does not
-  already return to the same caller. Filter values are audited (only counts and filters are), so a
-  person's name typed into either filter lands in the audit details. The audit-log entry for the
-  verb says so.
+  already return to the same caller, and the surface is admin-only (`CertificateInventory:Read`, in
+  the authorization-topology floor) and audited per read. What it adds is *searchability* by a
+  fragment of that name. This is a **disclosed residual**, recorded in guard 21's rationale; it is not
+  an owner-accepted one. Restricting the filter (excluding self-signed non-CA certificates from the
+  issuer match, as the summary's issuer rollup already does) changes the dictionary's ingest, reconcile,
+  prune and decommission paths, so it is left for an owner ruling rather than made here.
+- **Audit rows carry filter names and operators, never values** (see [Audit and degrade](#audit-and-degrade)).
+  A substring filter is recorded as `issuer_dn_contains=contains` or `subject_dn_contains=contains`, so
+  a person's name typed into either filter never lands in the audit details.
 - **`spki_sha256` and `aki_key_id` are filters, not identity.** The rule that `spki_sha256` is never
   certificate identity or a join key (see [Fields collected](#fields-collected)) still holds:
   filtering by a key returns every certificate over it, and that is the point.
 - **Indexes.** `cert_fact (spki_sha256)` and `(aki_key_id)` are added to the
-  [store's index list](#store-and-schema). The two substring filters scan the caller's visible
-  `cert_fact` rows under the read's statement timeout. That cost is unmeasured. 2a-2b measures it at
-  the target scale and adds a `pg_trgm` index only if the measured p95 needs one.
+  [store's index list](#store-and-schema). The two substring filters never scan `cert_fact`: they
+  match a distinct-DN dictionary (every distinct issuer DN and CA subject DN, once), then reach the
+  certificates through btree indexes on `issuer_dn` and `subject_dn`. A match of more than 20,000
+  distinct names is refused 400 ("make it longer").
+- **The read's timeout.** Every per-certificate read and summary runs in one transaction under a
+  **15-second wall budget**: before each statement the store re-sets `SET LOCAL statement_timeout` to
+  the budget that remains, so the whole transaction, not one statement, is bounded. A page that runs
+  out answers an ordinary retryable 503 (`reason="query_error"`); a summary that runs out answers a
+  non-retryable 503 (`reason="scale_limit"`, "narrow it"), because its cost grows with the visible
+  fleet and a retry repeats it.
+- **A per-principal cap on substring reads.** A substring read is the one certificate read whose
+  cost the caller picks by its needle, and the shared `/crypto` read gate has two slots. So at most
+  **one** read carrying `issuer_dn_contains` or `subject_dn_contains` is in flight per principal (the
+  session username); a second answers a retryable 503 (cause capacity, `retry_after_ms` 5000) and
+  takes no gate slot. Callers whose identity cannot be resolved share one slot. A read without a
+  substring filter is never counted.
+- **The `pg_trgm` decision rests on the worst-case needle, not p95.** A needle that matches nothing,
+  or a short one that matches a little of everything, must read the whole dictionary; that is the
+  worst case, because the dictionary has no index a substring can use without `pg_trgm`. At 100,000
+  devices and 26.8 million certificates the dictionary held about 3,000 names and the scan took about
+  1 ms; a needle matching nothing answered the page in 1-4 ms (see the server-admin manual's measured
+  figures). A trigram index is therefore optional: the background pass adds one on the dictionary
+  when the extension is available, for a dictionary of millions of names, and the filters work
+  without it.
 - **Out of scope here.** Detecting a weak key from the key itself (a tiny EC private key, shared or
   close RSA primes) needs more than these filters. It is a separate proposal.
 
@@ -2292,13 +2329,26 @@ CRL, and keeping the per-row `config_version` changes nothing):
 20. **Personal data in a lower-privileged projection.** A SAN or subject used as a summary group, a
     metric label or an audit detail. Guard: the personal-data rules above and CH-2's checks.
 21. **The subject substring search becomes a person search.** `subject_dn_contains` is admitted
-    without `is_ca=true`, or the condition is checked on REST but not on MCP. Guard: one shared
-    parameter validator for both twins. A test refuses the bare filter on each twin. Another test
-    sends `is_ca=true` with an end-entity row in the store and asserts that row is not returned.
-22. **A substring filter becomes a pattern.** An unescaped `%` or `_` in `issuer_dn_contains`
-    matches far more than was typed, and the caller reads it as a match. Guard: the value is
-    escaped before it reaches `ILIKE`. A test filters on a literal `%` and `_` and checks that only
-    the literal rows return.
+    without `is_ca=true` (or with `is_ca=false`), or the condition is checked on one surface but not
+    another. Guard: ONE parameter validator (`cert_read::parse_list_params` /
+    `parse_summary_params`) serves every surface that accepts the filters: the REST pair
+    (`GET /api/v1/crypto/certificates`, `/summary`), the MCP pair (`list_crypto_certificates`,
+    `get_crypto_certificate_summary`), the dashboard fragment twins
+    (`/fragments/crypto/certificates`, `/fragments/crypto/certificates/devices`), and the snapshot
+    pair when slice 2a-3 ships it (it calls the same functions; a second validator there is this
+    defect). Tests refuse the bare filter and `is_ca=false` on each pair. Another test sends
+    `is_ca=true` with an end-entity row in the store and asserts that row is not returned.
+    *Rationale, disclosed residual:* `issuer_dn_contains` carries no such condition, and a self-signed
+    end-entity certificate repeats its subject as its issuer, so a fragment of a person's name can
+    still find that certificate. It returns nothing the exact `issuer_dn` filter or an unfiltered read
+    does not already give the same admin-only, audited caller, and the audit row records the operator,
+    never the value. This residual is disclosed, not owner-accepted; restricting the filter is an open
+    owner decision (see [Finding one CA's certificates](#finding-one-cas-certificates)).
+22. **A substring filter becomes a pattern.** An unescaped `%`, `_` or `\` in a substring filter
+    matches far more (or other) than was typed, and the caller reads it as a match. Guard: the value
+    is escaped (`\` first, then `%` and `_`) before it reaches `ILIKE ... ESCAPE '\'`, and a value
+    with a NUL byte is refused 400. Tests filter on a literal `%`, a literal `_` and a literal
+    backslash and check that only the literal rows return, and refuse a NUL on both filters.
 
 ## ADR-0070 clause map
 

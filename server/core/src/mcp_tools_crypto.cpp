@@ -650,7 +650,11 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
     // The seam's caller-input refusal (a bad cursor) is answered through this helper so the
     // `if (!read)` block below holds only the store-fault answers.
     auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
-    auto read = ctx.deps->crypto_certificates_fn(*parsed, gate.scope);
+    auto query = *parsed;
+    // The per-principal substring cap's key (#6333); "" (unresolved) shares one slot.
+    if (ctx.deps->username_fn)
+        query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
+    auto read = ctx.deps->crypto_certificates_fn(query, gate.scope);
     if (!read) {
         if (read.error().kind == CryptoReadError::Kind::kInvalid) {
             refuse_input(read.error().message);
@@ -710,7 +714,11 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
     }
     const bool confined = gate.scope.has_value();
     auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
-    auto read = ctx.deps->crypto_certificate_summary_fn(*parsed, gate.scope);
+    auto query = *parsed;
+    // The per-principal substring cap's key (#6333); "" (unresolved) shares one slot.
+    if (ctx.deps->username_fn)
+        query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
+    auto read = ctx.deps->crypto_certificate_summary_fn(query, gate.scope);
     if (!read) {
         if (read.error().kind == CryptoReadError::Kind::kInvalid) {
             refuse_input(read.error().message);

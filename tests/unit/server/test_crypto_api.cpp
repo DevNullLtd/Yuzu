@@ -2173,3 +2173,58 @@ TEST_CASE("CryptoApi certificates: a refused substring filter and a summary scal
         CHECK(count("query_error") == 1.0);
     }
 }
+
+TEST_CASE("CryptoApi certificates: one in-flight substring read per principal (#6333)",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    CertSubstringPrincipalCap cap;
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store, .substring_cap = &cap});
+    auto held = cap.try_acquire("alice"); // alice's substring read is still running
+    REQUIRE(held);
+    CHECK_FALSE(cap.try_acquire("alice"));
+
+    CertQuery q;
+    q.filter.issuer_dn_contains = "test";
+    q.principal = "alice";
+    SECTION("a second substring read by the same principal is a retryable capacity refusal") {
+        auto r = api->certificates(q, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().cause == CryptoReadCause::kCapacity);
+        CHECK_FALSE(r.error().unavailable_until_restart);
+        REQUIRE(r.error().retry_after_ms.has_value());
+        CHECK(*r.error().retry_after_ms == 5000);
+        CertSummaryQuery s;
+        s.filter.subject_dn_contains = "test";
+        s.filter.is_ca = true;
+        s.principal = "alice";
+        auto rs = api->certificate_summary(s, std::nullopt);
+        REQUIRE_FALSE(rs.has_value());
+        CHECK(rs.error().cause == CryptoReadCause::kCapacity);
+        CHECK(cap.held() == 1); // the refusal took nothing
+    }
+    SECTION("the same principal's read without a substring filter never touches the cap") {
+        CertQuery plain;
+        plain.principal = "alice";
+        auto r = api->certificates(plain, std::nullopt);
+        REQUIRE(r.has_value());
+        CHECK(r->rows.size() == 5);
+    }
+    SECTION("another principal is not refused by alice's slot, and releases its own") {
+        q.principal = "bob";
+        auto r = api->certificates(q, std::nullopt);
+        if (!r.has_value())
+            CHECK(r.error().cause != CryptoReadCause::kCapacity); // the dictionary may still be reconciling
+        CHECK(cap.held() == 1);
+    }
+    SECTION("unresolved callers share one slot") {
+        auto anon = cap.try_acquire("");
+        REQUIRE(anon);
+        q.principal = "";
+        auto r = api->certificates(q, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().cause == CryptoReadCause::kCapacity);
+    }
+    held = CertSubstringPrincipalCap::Lease{};
+    CHECK(cap.held() == 0);
+}

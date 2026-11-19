@@ -60078,7 +60078,7 @@ TEST_CASE("MCP certificate twins: success carries the model's JSON, the gate's s
     CHECK(mcp_audits(ts, "mcp.list_crypto_certificates|success") == 1);
     CHECK(mcp_audit_details(ts, "mcp.list_crypto_certificates|success") ==
           std::vector<std::string>{
-              "scope=confined rows=2 truncated=false filters=is_ca=eq,issuer_dn_contains=ilike"});
+              "scope=confined rows=2 truncated=false filters=is_ca=eq,issuer_dn_contains=contains"});
     CHECK(mcp_audits(ts, "mcp.get_crypto_certificate_summary|success") == 1);
     for (const auto& d : mcp_audit_details(ts, "mcp.list_crypto_certificates|success")) {
         CHECK_THAT(d, !Catch::Matchers::ContainsSubstring("Test CA"));

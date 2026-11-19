@@ -2375,7 +2375,7 @@ While a version 2 document is stored, new and old replicas return different Apps
 
 **No action on upgrade.** There is no schema change. A stored version 1 document stays valid and is read as before.
 
-## Behaviour change: fleet certificate read surface and a store schema upgrade (slice-2 PR 2a-2b)
+## Behaviour change: fleet certificate read surface and a store schema upgrade
 
 **What changed.** The server now serves the certificate inventory it already stored:
 `GET /api/v1/crypto/certificates` and `/summary`, the MCP tools `list_crypto_certificates` and

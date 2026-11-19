@@ -256,11 +256,11 @@ TEST_CASE("build_access_review: grants of the CertificateInventory securable are
     const auto* group_row = h.find(*result, "group", "pki");
     REQUIRE(group_row != nullptr);
     CHECK(group_row->effective_permission_count == 1);
-    // The Administrator holder's count includes the securable's five CRUD operations: 39 types x 5
-    // + Push + Attest + Rotate = 198.
+    // The Administrator holder's count includes the securable's five CRUD operations: 40 types x 5
+    // + Push + Attest + Rotate = 203.
     const auto* admin_row = h.find(*result, "user", "root-admin");
     REQUIRE(admin_row != nullptr);
-    CHECK(admin_row->effective_permission_count == 198);
+    CHECK(admin_row->effective_permission_count == 203);
     // The role-permission read the export expands shows the grant itself.
     bool found = false;
     for (const auto& p : h.rbac->get_role_permissions("CertReader"))

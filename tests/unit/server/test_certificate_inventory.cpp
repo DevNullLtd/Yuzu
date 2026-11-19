@@ -2364,6 +2364,15 @@ TEST_CASE("CertificateInventoryStore: ingest maintains the DN dictionary and the
     f.subject_dn_contains = "jane"; // an end-entity subject is not searchable
     CHECK(must_list(store, f).rows.empty());
     f = {};
+    // A literal backslash in the needle matches a literal backslash (like_literal escapes `\`
+    // itself, the ILIKE's ESCAPE character), never an escape of the next byte.
+    put_report(store, "a3", {dn_fact(5, "CN=Back\\slash CA", "CN=h5", false),
+                             dn_fact(6, "CN=Backslash CA", "CN=h6", false)});
+    f.issuer_dn_contains = "k\\s";
+    CHECK(shas(must_list(store, f)) == ids_of({5}));
+    f.issuer_dn_contains = "_CA"; // `_` is literal, not one-character wildcard
+    CHECK(must_list(store, f).rows.empty());
+    f = {};
     f.issuer_dn_contains = "no-such-ca";
     CHECK(must_list(store, f).rows.empty());
     // The summary resolves the same way.

@@ -2669,7 +2669,7 @@ public:
         // (a series created on first use makes its first increment invisible to rate()).
         for (const char* reason : {"admission_full", "pool_too_small", "substring_index_missing",
                                    "scale_limit", "reconciling", "reconcile_failed_transient", "store_not_open", "pool_acquire_timeout",
-                                   "query_error"})
+                                   "query_error", "substring_principal_busy"})
             metrics_.counter("yuzu_inventory_read_degrade_total",
                              {{"reason", reason}, {"source", "cert_inventory"}});
         metrics_.describe("yuzu_server_cert_inventory_substring_index_available",
