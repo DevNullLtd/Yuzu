@@ -9,14 +9,17 @@
  *     production row has (reserved and gated, an unspecified gate, ambiguity).
  */
 
+#include "agent_registry.hpp"
 #include "capability_fragments.hpp"
 #include "command_capability.hpp"
+#include "dispatch_caller.hpp"
 #include "instruction_definition_model.hpp"
 #include "policy_dispatch.hpp"
 #include "test_policy_capability_fixture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <array>
 #include <initializer_list>
 #include <optional>
 #include <set>
@@ -242,4 +245,73 @@ TEST_CASE("policy dispatch seam: sweep over every production capability row",
     CHECK(refused > 0);
     CHECK(allowed > 0);
     CHECK(rows == refused + allowed);
+}
+
+TEST_CASE("policy dispatch seam: the interactive chokepoint's refusals are a subset of the seam's",
+          "[policy][dispatch_seam][sweep]") {
+    // The seam is the only approval check on the evaluator's surface (it dispatches as the
+    // system caller, which the interactive chokepoint admits before any gate). So for EVERY
+    // production row, whatever `classify_and_authorize_dispatch` refuses an operator who holds
+    // every permission, has no admin standing and no approval provenance, the seam refuses
+    // too; and the only rows the seam refuses beyond that are Destructive rows with no gate,
+    // which the interactive path leaves to the targeting rule. A row or a DispatchClass value
+    // added later is covered without editing this test.
+    const auto& reg = full_registry();
+    const auto allow_all = [](std::string_view, std::string_view, authz::Operation) { return true; };
+
+    DispatchCaller operator_caller;
+    operator_caller.principal = "alice";
+    operator_caller.principal_role = "operator";
+    operator_caller.principal_is_admin = false;
+    DispatchCaller system_caller;
+    system_caller.system = true;
+
+    std::size_t rows = 0;
+    std::size_t seam_only = 0;
+    reg.for_each_row([&](const CommandCapability& cap) {
+        ++rows;
+        INFO("row " << cap.plugin << "." << cap.action);
+        const bool seam_allows = authorize_policy_dispatch(reg, cap.plugin, cap.action).has_value();
+        const bool operator_allowed =
+            detail::classify_and_authorize_dispatch(reg, operator_caller, cap.plugin, cap.action, allow_all)
+                .has_value();
+        const bool system_allowed =
+            detail::classify_and_authorize_dispatch(reg, system_caller, cap.plugin, cap.action, allow_all)
+                .has_value();
+
+        // Never looser than the interactive path.
+        if (seam_allows)
+            CHECK(operator_allowed);
+        // The system caller is admitted whenever the row is classifiable: nothing but the seam
+        // stands between the evaluator and a gated or reserved pair.
+        if (cap.execute_gate != ExecuteGate::Unspecified)
+            CHECK((system_allowed || !reg.classify(cap.plugin, cap.action).has_value()));
+        // Stricter only for an ungated Destructive row.
+        if (operator_allowed && !seam_allows) {
+            ++seam_only;
+            CHECK(cap.dispatch_class == DispatchClass::Destructive);
+            CHECK(cap.execute_gate == ExecuteGate::None);
+            CHECK_FALSE(cap.system_reserved);
+        }
+    });
+    CHECK(rows > 0);
+    CHECK(seam_only > 0);
+}
+
+TEST_CASE("policy dispatch seam: a DispatchClass value no branch names is refused",
+          "[policy][dispatch_seam]") {
+    // A future enumerator added without a decision here must not be admitted by default.
+    static constexpr std::array<CommandCapability, 1> kRows{{CommandCapability{
+        .plugin = "futurep",
+        .action = "run",
+        .dispatch_class = static_cast<DispatchClass>(99),
+        .mutability = Mutability::None,
+        .securable = "Infrastructure",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .system_reserved = false,
+        .execute_gate = ExecuteGate::None,
+    }}};
+    const CommandCapabilityRegistry reg{std::span<const CommandCapability>(kRows)};
+    CHECK(refusal(reg, "futurep", "run") == Reason::Unclassified);
 }

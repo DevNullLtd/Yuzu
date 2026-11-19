@@ -131,9 +131,17 @@ authorize_policy_dispatch(const CommandCapabilityRegistry& registry, std::string
         return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Reserved});
     if (cap.execute_gate != ExecuteGate::None)
         return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Gated});
-    if (cap.dispatch_class == DispatchClass::Destructive)
-        return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Destructive});
-    return cap;
+    // A switch with no `default:`, like the gate switch at the interactive chokepoint: a new
+    // `DispatchClass` enumerator is a `-Werror=switch` build failure here, never a silent
+    // admit. A value no branch names (an out-of-range cast) is refused as unclassified.
+    switch (cap.dispatch_class) {
+        case DispatchClass::ReadOnly:
+        case DispatchClass::Mutating:
+            return cap;
+        case DispatchClass::Destructive:
+            return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Destructive});
+    }
+    return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Unclassified});
 }
 
 } // namespace yuzu::server
