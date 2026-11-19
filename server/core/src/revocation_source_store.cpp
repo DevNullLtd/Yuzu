@@ -519,31 +519,49 @@ std::optional<std::vector<UrlRewrite>> plan_url_rewrites(PGconn* conn, bool log_
     return rewrites;
 }
 
-std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
-    // First look, unlocked: the steady state ends here with no lock taken.
-    if (const auto first = plan_url_rewrites(conn, false); first && first->empty())
-        return 0;
-
-    if (!begin(conn, "BEGIN"))
-        return std::nullopt;
-    pg::PgTxn txn(conn);
-    // Bounded whatever the pool's session settings are (a DSN `options` setting replaces them).
+// Bounds the transaction's waits whatever the pool's session settings are (a DSN `options`
+// setting replaces them).
+bool bound_pass_txn(PGconn* conn) {
     pg::PgResult timeouts = pg::exec_params(
         conn, "SELECT set_config('lock_timeout', '10s', true), "
               "set_config('statement_timeout', '30s', true)",
         std::vector<std::string>{});
-    if (timeouts.status() != PGRES_TUPLES_OK) {
-        spdlog::error("RevocationSourceStore: canonical URL pass could not set its timeouts "
-                      "(SQLSTATE {})",
-                      sqlstate(timeouts));
+    if (timeouts.status() == PGRES_TUPLES_OK)
+        return true;
+    spdlog::error("RevocationSourceStore: canonical URL pass could not set its timeouts (SQLSTATE {})",
+                  sqlstate(timeouts));
+    return false;
+}
+
+std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
+    // First look, taking no row or advisory lock (a read-only transaction, bounded like the
+    // locked one): the steady state ends here.
+    {
+        if (!begin(conn, "BEGIN READ ONLY"))
+            return std::nullopt;
+        pg::PgTxn look(conn);
+        if (!bound_pass_txn(conn))
+            return std::nullopt;
+        const auto first = plan_url_rewrites(conn, false);
+        if (first && first->empty()) {
+            if (!look.commit())
+                return std::nullopt;
+            return 0;
+        }
+    } // anything else: rolled back, and decided again under the locks
+
+    if (!begin(conn, "BEGIN"))
         return std::nullopt;
-    }
+    pg::PgTxn txn(conn);
+    if (!bound_pass_txn(conn))
+        return std::nullopt;
     pg::PgResult lock = pg::exec_params(
         conn, "SELECT pg_advisory_xact_lock(hashtext('revocation_source.registration'))",
         std::vector<std::string>{});
     if (lock.status() != PGRES_TUPLES_OK) {
         spdlog::error("RevocationSourceStore: canonical URL pass could not take the registration "
-                      "lock (SQLSTATE {})",
+                      "lock (SQLSTATE {}; 55P03 means another transaction held it past 10s - "
+                      "find and end it, then restart)",
                       sqlstate(lock));
         return std::nullopt;
     }
@@ -552,7 +570,8 @@ std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
         std::vector<std::string>{});
     if (rows_lock.status() != PGRES_TUPLES_OK) {
         spdlog::error("RevocationSourceStore: canonical URL pass could not lock the sources "
-                      "(SQLSTATE {})",
+                      "(SQLSTATE {}; 55P03 means another transaction held a source row past 10s - "
+                      "find and end it, then restart)",
                       sqlstate(rows_lock));
         return std::nullopt;
     }
@@ -1032,11 +1051,14 @@ RevocationSourceStore::reset_high_water(std::int64_t id, const HighWaterResetReq
     pg::PgResult drop = pg::exec_params(
         conn,
         "DELETE FROM revocation_source_store.source_ca_key WHERE source_id = $1::bigint AND "
-        "cert_sha256 <> ALL($2::text[]) RETURNING 1",
+        "cert_sha256 <> ALL($2::text[]) RETURNING cert_sha256",
         std::vector<std::string>{std::to_string(id), hex_array_literal(req.keep_key_sha256)});
     if (drop.status() != PGRES_TUPLES_OK)
         return statement_error("reset drop keys", conn, drop, true);
     out.dropped_keys = PQntuples(drop.get());
+    for (int i = 0; i < PQntuples(drop.get()); ++i)
+        out.dropped_key_sha256.emplace_back(PQgetvalue(drop.get(), i, 0));
+    std::ranges::sort(out.dropped_key_sha256);
 
     // The CA-level row (created if none) takes the floor and the optional pin; every scope row
     // loses its number and thisUpdate (a rebuilt CA restarts both) and takes the same floor. The

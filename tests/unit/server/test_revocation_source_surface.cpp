@@ -2489,6 +2489,7 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
     CHECK_THAT(attempted.detail, ContainsSubstring("keep_key_sha256=" + new_key));
     CHECK_THAT(attempted.detail, ContainsSubstring("expected_config_version=2"));
     CHECK_THAT(rows[*success_at].detail, ContainsSubstring("dropped_ca_certificates=1"));
+    CHECK_THAT(rows[*success_at].detail, ContainsSubstring("dropped_key_sha256=" + old_key));
     // The refused stale attempt is on record as attempted with the version it sent, then denied.
     bool stale_attempt = false;
     for (std::size_t i = 0; i + 1 < rows.size(); ++i)

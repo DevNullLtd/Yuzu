@@ -8747,7 +8747,8 @@ public:
             if (!revocation_source_store_->is_open()) {
                 spdlog::error("[PG] Refusing to start: revocation-source store migration/open "
                               "failed (database reachable but the revocation_source_store schema could "
-                              "not be created/opened)");
+                              "not be created/opened, or its open-time canonical URL pass refused; "
+                              "the preceding RevocationSourceStore line names the cause)");
                 startup_failed_ = true;
             } else {
                 // The service owns the registration-time address check: the listener addresses

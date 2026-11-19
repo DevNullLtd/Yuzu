@@ -84,8 +84,10 @@ std::unexpected<ServiceError> map_store_error(const RevocationSourceStoreError& 
         return std::unexpected(ServiceError{
             Kind::kVersionConflict,
             "the source's config_version is " + std::to_string(e.existing_id) +
-                ", not the expected one; another change was applied since you read it. Read the "
-                "source and resend against its current config_version",
+                ", not the expected one; another change was applied since you read it (possibly your own "
+                "earlier call, if its outcome was unknown). Read the source first: if it already "
+                "shows the change you meant (for a reset, high_water.reset_at and the kept "
+                "ca_certificates), do not resend; otherwise resend against its current config_version",
             "expected_config_version", e.existing_id});
     case SK::kBadResetTime:
         return invalid("reset_at", "reset_at must be no later than the server clock");
@@ -1340,10 +1342,27 @@ std::string audit_detail_reset(std::string_view cid, const nlohmann::json& body)
     return out;
 }
 
+namespace {
+// The removed keys by cert_sha256 (at most 8, each 64 hex), so the audit row names which keys
+// stopped being trusted, not only how many.
+std::string dropped_keys_part(const std::vector<std::string>& keys) {
+    if (keys.empty())
+        return {};
+    std::string out = " dropped_key_sha256=";
+    for (std::size_t i = 0; i < keys.size(); ++i) {
+        if (i)
+            out += '|';
+        out += ::yuzu::log_token(keys[i]);
+    }
+    return out;
+}
+} // namespace
+
 std::string audit_detail_reset_result(std::string_view cid, const HighWaterReset& r) {
     return cid_part(cid) + " reset_at=" + rfc3339_utc(r.reset_at) +
            " crls_deleted=" + std::to_string(r.crls_deleted) +
            " dropped_ca_certificates=" + std::to_string(r.dropped_keys) +
+           dropped_keys_part(r.dropped_key_sha256) +
            " config_version=" + std::to_string(r.config_version);
 }
 

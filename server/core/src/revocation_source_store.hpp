@@ -210,6 +210,8 @@ struct HighWaterReset {
     std::int64_t reset_at{0};       ///< epoch seconds: the floor now in force for the CA
     std::int64_t crls_deleted{0};   ///< held CRLs the reset discarded
     std::int64_t dropped_keys{0};   ///< registered keys the reset removed (not in keep_key_sha256)
+    /// Their cert_sha256 values, sorted: the audit evidence of WHICH keys stopped being trusted.
+    std::vector<std::string> dropped_key_sha256;
     std::int64_t config_version{0}; ///< the source's config_version after the reset
     bool pinned{false};             ///< a first-CRL pin was recorded
 };

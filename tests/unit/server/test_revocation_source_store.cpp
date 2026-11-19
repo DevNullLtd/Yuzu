@@ -29,6 +29,7 @@
 
 #include <atomic>
 #include <expected>
+#include <chrono>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -941,6 +942,34 @@ TEST_CASE("RevocationSourceStore: a steady-state open takes no lock, so a held s
     CHECK(end.status() == PGRES_COMMAND_OK);
 }
 
+TEST_CASE("RevocationSourceStore: a pass with work waits a bounded time for a held source row",
+          "[revocation_source_store][pg]") {
+    RS_STORE(store);
+    const auto id = create_id(store, make_source("Corp CA", '1'), "alice");
+    REQUIRE(id.has_value());
+    const auto uid = store.get(*id)->urls[0].id;
+    RS_EXEC(rs_db_fx_, ("UPDATE revocation_source_store.source_url SET url = "
+                        "'HTTP://CRL.EXAMPLE.COM/a.crl' WHERE id = " + std::to_string(uid)).c_str());
+    PgConn holder{PQconnectdb(rs_db_fx_.dsn().c_str())};
+    REQUIRE(PQstatus(holder.get()) == CONNECTION_OK);
+    PgResult b{PQexec(holder.get(), "BEGIN")};
+    REQUIRE(b.status() == PGRES_COMMAND_OK);
+    PgResult held{PQexec(holder.get(), ("SELECT id FROM revocation_source_store.source WHERE id = " +
+                                        std::to_string(*id) + " FOR UPDATE").c_str())};
+    REQUIRE(held.status() == PGRES_TUPLES_OK);
+    // The pass needs the row: it gives up after its own lock_timeout, changing nothing, rather
+    // than hanging the boot.
+    const auto t0 = std::chrono::steady_clock::now();
+    CHECK_FALSE(store.canonicalise_stored_urls_for_test().has_value());
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(25));
+    PgResult end{PQexec(holder.get(), "ROLLBACK")};
+    REQUIRE(end.status() == PGRES_COMMAND_OK);
+    CHECK(store.get(*id)->urls[0].url == "HTTP://CRL.EXAMPLE.COM/a.crl");
+    // With the row free, the same pass completes.
+    CHECK(store.canonicalise_stored_urls_for_test() == std::optional<std::int64_t>(1));
+    CHECK(store.get(*id)->urls[0].url == "http://crl.example.com/a.crl");
+}
+
 TEST_CASE("RevocationSourceStore: a replace refuses a URL that is not canonical",
           "[revocation_source_store][pg]") {
     RS_STORE(store);
@@ -1046,6 +1075,7 @@ TEST_CASE("RevocationSourceStore: a reset keeps only the named keys, at the vers
     const auto ok = store.reset_high_water(*id, r);
     REQUIRE(ok.has_value());
     CHECK(ok->dropped_keys == 2);
+    CHECK(ok->dropped_key_sha256 == std::vector<std::string>{hex64('a'), hex64('c')});
     CHECK(ok->crls_deleted == 1);
     CHECK(ok->config_version == 2);
     now = store.get(*id);
