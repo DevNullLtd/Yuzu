@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <charconv>
 #include <cstdint>
+#include <limits>
 #include <regex>
 #include <string>
 #include <string_view>
@@ -206,11 +207,28 @@ InstructionResult parse_result(const std::string& output, const std::string& res
 
         // ---- Structured result ----
 
+        // Hostile-input policy (F6): `doc` is agent-supplied. Every typed read
+        // is guarded by an explicit kind check; a wrong-typed member keeps its
+        // default rather than throwing type_error out of the caller's pass.
+        const auto str_or = [](const nlohmann::json& o, const char* k,
+                               std::string dflt) -> std::string {
+            if (!o.is_object())
+                return dflt;
+            auto it = o.find(k);
+            return (it != o.end() && it->is_string()) ? it->get<std::string>() : dflt;
+        };
+        const auto int_or = [](const nlohmann::json& o, const char* k, int64_t dflt) -> int64_t {
+            if (!o.is_object())
+                return dflt;
+            auto it = o.find(k);
+            return (it != o.end() && it->is_number_integer()) ? it->get<int64_t>() : dflt;
+        };
+
         // Parse columns.
         for (const auto& col_json : doc["columns"]) {
             ResultColumn col;
-            col.name = col_json.value("name", "");
-            std::string type_str = col_json.value("type", "string");
+            col.name = str_or(col_json, "name", "");
+            std::string type_str = str_or(col_json, "type", "string");
 
             // Schema takes precedence if it defines a type for this column.
             if (auto it = schema_types.find(col.name); it != schema_types.end()) {
@@ -228,34 +246,33 @@ InstructionResult parse_result(const std::string& output, const std::string& res
                     if (val.is_string())
                         row.values[key] = val.get<std::string>();
                     else
-                        row.values[key] = val.dump();
+                        row.values[key] = val.dump(-1, ' ', false,
+                                                   nlohmann::json::error_handler_t::replace);
                 }
             }
             result.rows.push_back(std::move(row));
         }
 
         // Pull optional metadata from the JSON if present.
-        if (doc.contains("execution_id"))
-            result.execution_id = doc.value("execution_id", "");
-        if (doc.contains("definition_id"))
-            result.definition_id = doc.value("definition_id", "");
-        if (doc.contains("agent_id"))
-            result.agent_id = doc.value("agent_id", "");
-        if (doc.contains("timestamp"))
-            result.timestamp = doc.value("timestamp", int64_t{0});
-        if (doc.contains("status"))
-            result.status = doc.value("status", "");
-        if (doc.contains("error_code"))
-            result.error_code = doc.value("error_code", 0);
-        if (doc.contains("duration_ms"))
-            result.duration_ms = doc.value("duration_ms", int64_t{0});
-        if (doc.contains("stdout"))
-            result.stdout_text = doc.value("stdout", "");
-        if (doc.contains("stderr"))
-            result.stderr_text = doc.value("stderr", "");
+        result.execution_id = str_or(doc, "execution_id", "");
+        result.definition_id = str_or(doc, "definition_id", "");
+        result.agent_id = str_or(doc, "agent_id", "");
+        result.timestamp = int_or(doc, "timestamp", 0);
+        result.status = str_or(doc, "status", "");
+        {
+            const int64_t ec = int_or(doc, "error_code", 0);
+            result.error_code = (ec >= std::numeric_limits<int>::min() &&
+                                 ec <= std::numeric_limits<int>::max())
+                                    ? static_cast<int>(ec)
+                                    : 0;
+        }
+        result.duration_ms = int_or(doc, "duration_ms", 0);
+        result.stdout_text = str_or(doc, "stdout", "");
+        result.stderr_text = str_or(doc, "stderr", "");
         if (doc.contains("warnings") && doc["warnings"].is_array()) {
             for (const auto& w : doc["warnings"])
-                result.warnings.push_back(w.get<std::string>());
+                if (w.is_string())
+                    result.warnings.push_back(w.get<std::string>());
         }
 
     } else {

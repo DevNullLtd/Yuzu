@@ -26,7 +26,10 @@ constexpr const char* kPluginKey = "plugin";
 constexpr const char* kRowDiscriminatorKey = "row_discriminator";
 
 // Split `text` on '\n' into non-owning views, dropping a trailing empty
-// fragment. Bounded by the caller's output size (responses are retention-
+// fragment. Deliberately keeps EVERY '\r' (even a trailing one): the cells decide result-set
+// MEMBERSHIP (eq/in/contains over cell text), so changing this would silently change which
+// devices are members. It is therefore NOT the same splitter as `split_output_lines`
+// (deletes all '\r') or `live::split_lines` (drops a trailing '\r'); pinned by a test. Bounded by the caller's output size (responses are retention-
 // capped) so no DoS surface here.
 std::vector<std::string_view> split_lines(std::string_view text) {
     std::vector<std::string_view> out;

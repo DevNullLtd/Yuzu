@@ -106,3 +106,13 @@ TEST_CASE("heartbeat bridge: plugins_failed tag joins names, omitted when none",
     emit_plugins_failed_tag(tags, {"echo", "wmi"});
     CHECK(tags["yuzu.plugins_failed"] == "echo,wmi");
 }
+
+// WP07: a non-UTF-8 byte in a plugin heartbeat tag value would make the server reject the whole
+// direct Heartbeat RPC (proto3 string map value); the value is scrubbed to '?' at emission.
+TEST_CASE("plugin heartbeat tag values are scrubbed to well-formed UTF-8", "[heartbeat_tags]") {
+    const Kv kv{{"p", {{"heartbeat.state", "ok\xff\xc3!"}, {"heartbeat.fine", "caf\xc3\xa9"}}}};
+    const auto tags = run(kv, {"p"});
+    REQUIRE(tags.count("yuzu.plugin.p.state") == 1);
+    CHECK(tags.at("yuzu.plugin.p.state") == "ok??!");
+    CHECK(tags.at("yuzu.plugin.p.fine") == "caf\xc3\xa9");
+}
