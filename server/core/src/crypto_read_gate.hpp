@@ -76,21 +76,23 @@ private:
     std::atomic<int> in_flight_{0};
 };
 
-/// The per-principal bound on in-flight certificate reads that carry a SUBSTRING filter
-/// (`issuer_dn_contains`, `subject_dn_contains`; slice-2 PR 2a-2b, #6333). A substring read is the
-/// one certificate read whose cost the caller chooses by its needle, and `CryptoReadGate` has only
-/// two process-wide slots: without this bound one principal could hold both with two concurrent
-/// substring reads and shed every other `/crypto` read for up to two wall budgets. At most ONE such
-/// read per principal is in flight; a second is refused (the caller answers a retryable 503,
-/// cause capacity). A read with no substring filter never touches this bound. An empty principal
-/// (a caller whose identity could not be resolved) shares ONE slot with every other such caller,
-/// so an unresolved identity is capped more tightly, never exempted. Taken BEFORE the shared gate
-/// lease, so a refused substring read never occupies a gate slot.
-class CertSubstringPrincipalCap {
+/// The per-principal bound on in-flight CALLER-PRICED certificate reads (#6333): every summary
+/// (`certificate_summary`, whose cost grows with the visible fleet, up to its 15 s wall budget)
+/// and every page that carries a substring filter (`issuer_dn_contains`, `subject_dn_contains`,
+/// whose cost the caller chooses by its needle). `CryptoReadGate` has only two process-wide
+/// slots: without this bound one principal could hold both with two such reads and shed every
+/// other `/crypto` read for up to two wall budgets. At most ONE such read per principal is in
+/// flight; a second is refused (the caller answers a retryable 503, cause capacity, reason
+/// `principal_busy`). An ordinary page (keyset, index-backed, no substring) never touches this
+/// bound, so one principal can still hold one caller-priced read plus one ordinary page. An empty
+/// principal (a caller whose identity could not be resolved) shares ONE slot with every other
+/// such caller, so an unresolved identity is capped more tightly, never exempted. Taken BEFORE the
+/// shared gate lease, so a refused read never occupies a gate slot.
+class CertPrincipalReadCap {
 public:
-    CertSubstringPrincipalCap() = default;
-    CertSubstringPrincipalCap(const CertSubstringPrincipalCap&) = delete;
-    CertSubstringPrincipalCap& operator=(const CertSubstringPrincipalCap&) = delete;
+    CertPrincipalReadCap() = default;
+    CertPrincipalReadCap(const CertPrincipalReadCap&) = delete;
+    CertPrincipalReadCap& operator=(const CertPrincipalReadCap&) = delete;
 
     class Lease {
     public:
@@ -112,8 +114,8 @@ public:
         explicit operator bool() const noexcept { return cap_ != nullptr; }
 
     private:
-        friend class CertSubstringPrincipalCap;
-        Lease(CertSubstringPrincipalCap* c, std::string key) noexcept
+        friend class CertPrincipalReadCap;
+        Lease(CertPrincipalReadCap* c, std::string key) noexcept
             : cap_(c), key_(std::move(key)) {}
         void release() noexcept {
             if (cap_) {
@@ -122,7 +124,7 @@ public:
                 cap_ = nullptr;
             }
         }
-        CertSubstringPrincipalCap* cap_{nullptr};
+        CertPrincipalReadCap* cap_{nullptr};
         std::string key_;
     };
 

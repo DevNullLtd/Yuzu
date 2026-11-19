@@ -1165,12 +1165,13 @@ follow it with the name filters to cover those.
   out answers an ordinary retryable 503 (`reason="query_error"`); a summary that runs out answers a
   non-retryable 503 (`reason="scale_limit"`, "narrow it"), because its cost grows with the visible
   fleet and a retry repeats it.
-- **A per-principal cap on substring reads.** A substring read is the one certificate read whose
-  cost the caller picks by its needle, and the shared `/crypto` read gate has two slots. So at most
-  **one** read carrying `issuer_dn_contains` or `subject_dn_contains` is in flight per principal (the
-  session username); a second answers a retryable 503 (cause capacity, `retry_after_ms` 5000) and
-  takes no gate slot. Callers whose identity cannot be resolved share one slot. A read without a
-  substring filter is never counted.
+- **A per-principal cap on caller-priced reads.** A substring read is a certificate read whose cost
+  the caller picks by its needle, and a summary's cost grows with the visible fleet up to its wall
+  budget; the shared `/crypto` read gate has two slots. So at most **one** summary, or page carrying
+  `issuer_dn_contains` or `subject_dn_contains`, is in flight per principal (the session username); a
+  second answers a retryable 503 (cause capacity, reason `principal_busy`, `retry_after_ms` 5000) and
+  takes no gate slot. Callers whose identity cannot be resolved share one slot. An ordinary page
+  (keyset, index-backed) is never counted.
 - **The `pg_trgm` decision rests on the worst-case needle, not p95.** A needle that matches nothing,
   or a short one that matches a little of everything, must read the whole dictionary; that is the
   worst case, because the dictionary has no index a substring can use without `pg_trgm`. At 100,000
@@ -2342,7 +2343,7 @@ CRL, and keeping the per-row `config_version` changes nothing):
     end-entity certificate repeats its subject as its issuer, so a fragment of a person's name can
     still find that certificate. It returns nothing the exact `issuer_dn` filter or an unfiltered read
     does not already give the same admin-only, audited caller, and the audit row records the operator,
-    never the value. This residual is disclosed, not owner-accepted; restricting the filter is an open
+    never the value, so the audit log shows that a substring search happened but not whom it targeted. This residual is disclosed, not owner-accepted; restricting the filter is an open
     owner decision, #8343 (see [Finding one CA's certificates](#finding-one-cas-certificates)).
 22. **A substring filter becomes a pattern.** An unescaped `%`, `_` or `\` in a substring filter
     matches far more (or other) than was typed, and the caller reads it as a match. Guard: the value

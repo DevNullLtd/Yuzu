@@ -2174,12 +2174,12 @@ TEST_CASE("CryptoApi certificates: a refused substring filter and a summary scal
     }
 }
 
-TEST_CASE("CryptoApi certificates: one in-flight substring read per principal (#6333)",
+TEST_CASE("CryptoApi certificates: one in-flight caller-priced read (summary or substring page) per principal (#6333)",
           "[pg][crypto][certs]") {
     YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
     CertFx fx{db.dsn()};
-    CertSubstringPrincipalCap cap;
-    auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store, .substring_cap = &cap});
+    CertPrincipalReadCap cap;
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store, .principal_cap = &cap});
     auto held = cap.try_acquire("alice"); // alice's substring read is still running
     REQUIRE(held);
     CHECK_FALSE(cap.try_acquire("alice"));
@@ -2202,8 +2202,14 @@ TEST_CASE("CryptoApi certificates: one in-flight substring read per principal (#
         REQUIRE_FALSE(rs.has_value());
         CHECK(rs.error().cause == CryptoReadCause::kCapacity);
         CHECK(cap.held() == 1); // the refusal took nothing
+        // Any summary is caller-priced (its cost grows with the visible fleet), filter or not.
+        CertSummaryQuery plain_sum;
+        plain_sum.principal = "alice";
+        auto rp = api->certificate_summary(plain_sum, std::nullopt);
+        REQUIRE_FALSE(rp.has_value());
+        CHECK(rp.error().cause == CryptoReadCause::kCapacity);
     }
-    SECTION("the same principal's read without a substring filter never touches the cap") {
+    SECTION("the same principal's PAGE without a substring filter never touches the cap") {
         CertQuery plain;
         plain.principal = "alice";
         auto r = api->certificates(plain, std::nullopt);
@@ -2225,6 +2231,6 @@ TEST_CASE("CryptoApi certificates: one in-flight substring read per principal (#
         REQUIRE_FALSE(r.has_value());
         CHECK(r.error().cause == CryptoReadCause::kCapacity);
     }
-    held = CertSubstringPrincipalCap::Lease{};
+    held = CertPrincipalReadCap::Lease{};
     CHECK(cap.held() == 0);
 }

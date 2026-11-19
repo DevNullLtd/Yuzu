@@ -701,8 +701,10 @@ CertificateInventoryStore::summarize_certificates(const CertSummaryQuery& query,
             pg::PgResult r = group("f.issuer_dn", "f.issuer_dn", kCertSummaryIssuerMax, "",
                                    // A self-signed END-ENTITY certificate repeats its subject (which can
                                    // be a person's name) as its issuer: it is never an issuer GROUP.
-                                   "f.issuer_dn IS NOT NULL AND NOT (f.self_signed IS TRUE AND "
-                                   "f.is_ca IS NOT TRUE)");
+                                   // Self-issued (issuer == subject) counts too, so a certificate
+                                   // whose self_signed the collector left unknown (NULL) is excluded.
+                                   "f.issuer_dn IS NOT NULL AND NOT ((f.self_signed IS TRUE OR "
+                                   "(f.issuer_dn = f.subject_dn) IS TRUE) AND f.is_ca IS NOT TRUE)");
             if (r.status() != PGRES_TUPLES_OK)
                 return false;
             const auto n = cap_flag(PQntuples(r.get()), kCertSummaryIssuerMax);

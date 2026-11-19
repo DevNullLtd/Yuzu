@@ -651,7 +651,7 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
     // `if (!read)` block below holds only the store-fault answers.
     auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
     auto query = *parsed;
-    // The per-principal substring cap's key (#6333); "" (unresolved) shares one slot.
+    // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
     if (ctx.deps->username_fn)
         query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
     auto read = ctx.deps->crypto_certificates_fn(query, gate.scope);
@@ -715,7 +715,7 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
     const bool confined = gate.scope.has_value();
     auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
     auto query = *parsed;
-    // The per-principal substring cap's key (#6333); "" (unresolved) shares one slot.
+    // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
     if (ctx.deps->username_fn)
         query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
     auto read = ctx.deps->crypto_certificate_summary_fn(query, gate.scope);
@@ -991,10 +991,11 @@ constexpr ToolRecord kToolRecords[] = {
      "Inventory", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
      "Get Yuzu-issued certificate counts", &handle_get_crypto_ca_stats},
 
-    // Fleet certificates (slice-2 PR 2a-2b): gated on fleet_read_fn CertificateInventory:Read
-    // (the floor-applying gate). The inventory has no per-service slice to narrow to and the pair
-    // is not in the seeded-empty kServiceScopeGlobalSafe, so a service-scoped token stays
-    // `denied` - 403 in both RBAC states, as the REST twins answer.
+    // Fleet certificates: gated on fleet_read_fn CertificateInventory:Read (the floor-applying
+    // gate). The inventory has no per-service slice to narrow to and the pair is not in the
+    // seeded-empty kServiceScopeGlobalSafe, so a service-scoped token stays `denied` - 403 in both
+    // RBAC states. The REST twins answer the same while ITServiceOwner lacks the pair (no seed
+    // grants it); an administrator who grants it lets REST admit such a token, confined.
     {"list_crypto_certificates",
      "List the certificates held in the fleet's machine certificate stores, one row per (device, "
      "certificate), with raw X.509 facts: subject and issuer DN, validity, public-key algorithm "
@@ -1067,7 +1068,7 @@ constexpr ToolRecord kToolRecords[] = {
      "distinct-certificate counts grouped by public-key algorithm and size, signature algorithm "
      "(with PSS hash), elliptic curve, issuer (top 50 by devices) and store, the stores-per-status "
      "coverage, and a not_after histogram over bucket edges YOU supply in not_after_edges (no edge "
-     "is chosen for you). Subject DNs and SANs are never a grouping key, and a self-signed certificate that is not a CA is never an issuer group (its issuer repeats its subject). The same filters as "
+     "is chosen for you). Subject DNs and SANs are never a grouping key, and a self-signed or self-issued certificate that is not a CA is never an issuer group (its issuer repeats its subject). The same filters as "
      "list_crypto_certificates narrow the set. Nothing is graded: facts only; the only built-in checks are D13's "
      "named rules and windows, each shown with its criterion. Counts are distinct devices and "
      "distinct certificate SHA-256 values, computed in one snapshot at read time and not stored; "

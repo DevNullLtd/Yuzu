@@ -48,7 +48,9 @@ class CryptoDashboardLayoutStore;
 /// `note_degrade(source, reason)` is told of every shed and degraded read on the Yuzu-issued,
 /// certificate and layout paths, with closed label values only: source `ca_issued` |
 /// `cert_inventory` | `crypto_layout`, reason
-/// `admission_full` | `store_not_open` | `pool_acquire_timeout` | `query_error`. The library
+/// `admission_full` | `store_not_open` | `pool_acquire_timeout` | `query_error`, and on the
+/// certificate path also `pool_too_small` | `reconciling` | `reconcile_failed_transient` |
+/// `substring_index_missing` | `scale_limit` | `principal_busy` (all seeded in server.cpp). The library
 /// path keeps `SoftwareInventoryStore::note_read_shed`. Never a username or widget id.
 ///
 /// LIFETIME CONTRACT: every pointer is BORROWED, NOT owned, and must outlive every call to the
@@ -58,13 +60,13 @@ struct LocalCryptoApiDeps {
     const DeviceApi* devices = nullptr;
     CaStore* ca = nullptr;
     CryptoDashboardLayoutStore* layouts = nullptr;
-    /// The fleet certificate inventory (slice-2 PR 2a-2b). Null degrades the two certificate
+    /// The fleet certificate inventory. Null degrades the two certificate
     /// reads (kDegraded), never an empty answer; `devices` supplies hostnames for its rows.
     CertificateInventoryStore* certificates = nullptr;
     int max_concurrent_reads = kMaxConcurrentCryptoReads;
-    /// The per-principal substring cap (#6333). Null (production) = the api's own instance;
+    /// The per-principal read cap (#6333, crypto_read_gate.hpp). Null (production) = the api's own instance;
     /// a test injects one to hold a principal's slot and observe the refusal.
-    CertSubstringPrincipalCap* substring_cap = nullptr;
+    CertPrincipalReadCap* principal_cap = nullptr;
     int pool_size = 0;
     std::chrono::seconds shared_read_ttl{0};
     std::function<void(std::string_view source, std::string_view reason)> note_degrade;

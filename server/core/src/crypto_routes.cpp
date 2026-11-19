@@ -165,13 +165,14 @@ void api_unwired(httplib::Response& res) {
 /// The Yuzu-issued counts' gate (ADR-0070 R2): fleet_read_fn Inventory:Read, then a CONFINED
 /// caller is withheld - 403 naming no permission (none would admit them), audited `denied`.
 /// Returns true when the request may proceed (unconfined); otherwise the answer is written.
-/// The REST certificate reads' principal for the per-principal substring cap (#6333): resolved
-/// only when a substring filter is present (every other read leaves it empty and never consults the
-/// cap). The fleet-read gate already authenticated the request, so a failed re-resolution is a
+/// The REST certificate reads' principal for the per-principal read cap (#6333): resolved for
+/// a summary, and for a page only when a substring filter is present (an ordinary page leaves it
+/// empty and never consults the cap). The fleet-read gate already authenticated the request, so a failed re-resolution is a
 /// session that ended between the two calls; auth_fn then wrote the 401 and this returns false.
 bool cert_principal(const CryptoRoutes::Deps& d, const httplib::Request& req,
-                    httplib::Response& res, const CertReadFilter& f, std::string& out) {
-    if (!f.issuer_dn_contains && !f.subject_dn_contains)
+                    httplib::Response& res, const CertReadFilter& f, bool summary,
+                    std::string& out) {
+    if (!summary && !f.issuer_dn_contains && !f.subject_dn_contains)
         return true;
     if (!d.auth_fn)
         return true; // unwired (tests): "" shares the unresolved callers' single slot
@@ -946,7 +947,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const auto cid = detail::ensure_correlation_id(res);
         auto query = *parsed;
-        query.principal = session->username; // keys the per-principal substring cap (#6333)
+        query.principal = session->username; // keys the per-principal read cap (#6333)
         auto read = deps_.api->certificate_summary(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
@@ -1013,7 +1014,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         }
         const auto cid = detail::ensure_correlation_id(res);
         auto query = *parsed;
-        query.principal = session->username; // keys the per-principal substring cap (#6333)
+        query.principal = session->username; // keys the per-principal read cap (#6333)
         auto read = deps_.api->certificates(query, gate.scope);
         if (!read) {
             if (read.error().kind == CryptoReadError::Kind::kInvalid) {
@@ -1068,7 +1069,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto query = *parsed;
-        if (!cert_principal(deps_, req, res, query.filter, query.principal))
+        if (!cert_principal(deps_, req, res, query.filter, /*summary=*/false, query.principal))
             return; // the session could not be re-resolved: auth_fn wrote the 401
         auto read = deps_.api->certificates(query, gate.scope);
         if (!read) {
@@ -1118,7 +1119,7 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
             return;
         }
         auto query = *parsed;
-        if (!cert_principal(deps_, req, res, query.filter, query.principal))
+        if (!cert_principal(deps_, req, res, query.filter, /*summary=*/true, query.principal))
             return; // the session could not be re-resolved: auth_fn wrote the 401
         auto read = deps_.api->certificate_summary(query, gate.scope);
         if (!read) {

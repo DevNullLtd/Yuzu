@@ -2070,6 +2070,32 @@ TEST_CASE("CertificateInventoryStore reads: keyset paging walks every row once",
     CHECK_FALSE(store.list_certificates({}, std::nullopt, std::nullopt, kCertPageMax + 1).has_value());
 }
 
+TEST_CASE("CertificateInventoryStore reads: a self-issued end-entity certificate is never an issuer group, "
+          "even when self_signed is unknown",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    auto leaf = rfact(7);
+    leaf.subject_dn = "CN=Bob Person";
+    leaf.issuer_dn = "CN=Bob Person"; // self-issued
+    leaf.self_signed.reset();         // the collector could not tell (NULL)
+    leaf.is_ca = false;
+    auto ca = rfact(8);
+    ca.subject_dn = "CN=Root CA";
+    ca.issuer_dn = "CN=Root CA";
+    ca.self_signed.reset();
+    ca.is_ca = true; // a self-issued CA still names a CA
+    put_report(store, "agent-1", {rfact(1), leaf, ca});
+    auto r = store.summarize_certificates(CertSummaryQuery{}, std::nullopt);
+    REQUIRE(r.has_value());
+    bool saw_root = false;
+    for (const auto& g : r->issuers) {
+        CHECK(g.issuer_dn.find("Bob") == std::string::npos);
+        saw_root = saw_root || g.issuer_dn == "CN=Root CA";
+    }
+    CHECK(saw_root);
+    CHECK(r->totals.certificate_count == 3); // excluded from the issuer groups only
+}
+
 TEST_CASE("CertificateInventoryStore reads: the summary groups raw values and buckets the caller's edges",
           "[certinv][pg][read]") {
     CERT_SHARED(store, pool);

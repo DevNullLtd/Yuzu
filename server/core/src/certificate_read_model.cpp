@@ -698,7 +698,7 @@ Json summary_json(const CertSummary& s) {
             {"result_truncated", s.result_truncated},
             {"truncated_parts", s.truncated_parts},
             {"issuers_note",
-             "A self-signed certificate that is not a CA is never an issuer group: its issuer "
+             "A self-signed or self-issued certificate that is not a CA is never an issuer group: its issuer "
              "repeats its subject, which can be a person's name."},
             {"blob_versions", blob_versions_json(s.blob_versions)}};
 }

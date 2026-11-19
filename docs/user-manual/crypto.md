@@ -541,7 +541,7 @@ reachable through neither `Security:Read` nor `Inventory:Read`.
 
 - **RBAC enforcement off (the default):** admin-only. The pair is in the authorization-topology floor,
   so a signed-in non-admin gets `403` even though most other reads are open.
-- **A service-scoped API token:** `403` in both RBAC states. The inventory has no per-service slice.
+- **A service-scoped API token:** `403` in both RBAC states. The inventory has no per-service slice. (On REST this holds while the `ITServiceOwner` role does not hold `CertificateInventory:Read`, which no seed grants; if an administrator grants it, REST admits such a token, confined to its tagged devices, while MCP still refuses it.)
 - **A management-group-confined holder** sees only its visible devices, and the counts and `coverage`
   are computed over that scope.
 - **It cannot be delegated yet.** Only the built-in Administrator role holds `CertificateInventory:Read`, and custom
@@ -587,7 +587,7 @@ and SANs are never a grouping key.**
 | `is_ca`, `self_signed` | `true` or `false` | The certificate's own basic-constraints claim, and whether the collector reported it self-signed. |
 | `agent_id` | free text, 1 to 256 bytes | Exact device id, still confined to the devices you may see. |
 | `issuer_dn` | free text, at most 1,024 bytes | Exact RFC 4514 string. A present empty value selects certificates whose issuer is the empty string. |
-| `issuer_dn_contains` | free text, 3 to 256 bytes, no NUL | Case-insensitive **literal** substring of `issuer_dn` (PostgreSQL `ILIKE`, so case folds by the database's locale: under a UTF-8 locale `é` matches `É`, under `C` only ASCII letters fold). `%`, `_` and `\` are escaped, never a pattern. The match is against the stored RFC 4514 string, escapes included (a comma in a value is `\,`). At most **one** substring read per user is in flight; a second is a retryable `503` (`retry_after_ms` 5000). |
+| `issuer_dn_contains` | free text, 3 to 256 bytes, no NUL | Case-insensitive **literal** substring of `issuer_dn` (PostgreSQL `ILIKE`, so case folds by the database's locale: under a UTF-8 locale `é` matches `É`, under `C` only ASCII letters fold). `%`, `_` and `\` are escaped, never a pattern. The match is against the stored RFC 4514 string, escapes included (a comma in a value is `\,`). At most **one** certificate summary or substring-filtered page per user is in flight; a second is a retryable `503` (`retry_after_ms` 5000). |
 | `subject_dn_contains` | free text, 3 to 256 bytes, no NUL | The same match on `subject_dn`, accepted **only together with `is_ca=true`**; without it, or with `is_ca=false`, the request is a `400` naming `is_ca`. |
 | `sha256` | 64 hex characters | Exact certificate SHA-256 (either case). |
 | `spki_sha256` | 64 hex characters | Exact (either case): every certificate over one public key, cross-signed and re-issued copies included. |
@@ -626,8 +626,8 @@ background build has completed after a server start the two filters are refused 
 
 Each summary group (key algorithm, signature algorithm, curve, store) is capped at 500 groups and
 the issuer groups at 50; a capped summary sets `result_truncated` and `truncated_parts:
-["row_ceiling"]`. A self-signed certificate that is not a CA is never an issuer group, because its
-issuer repeats its subject, which can be a person's name; the response says so in `issuers_note`.
+["row_ceiling"]`. A self-signed or self-issued (issuer equal to subject) certificate that is not a CA
+is never an issuer group, because its issuer repeats its subject, which can be a person's name; the response says so in `issuers_note`.
 A whole read, however many statements it needs, has a 15-second wall budget; past it the read is
 a `503` with a retry hint. String filter lengths are counted in **bytes**. `blob_versions` lists
 the blob versions of the devices in the result (integers when numeric).
@@ -656,7 +656,7 @@ to recompute a count exactly.
 | Class (`reason` on `yuzu_inventory_read_degrade_total{source="cert_inventory"}`) | Retryable? | Cause | What to do |
 |---|---|---|---|
 | `admission_full` | yes (`retry_after_ms` 5000) | The two `/crypto` read slots are busy | Retry shortly; find the poller |
-| `substring_principal_busy` | yes (`retry_after_ms` 5000) | A second concurrent `issuer_dn_contains` / `subject_dn_contains` read by the same user: one is in flight per user, and callers whose identity cannot be resolved share one slot | Wait for the first read to finish, or filter with `issuer_dn` / `agent_id` |
+| `principal_busy` | yes (`retry_after_ms` 5000) | A second concurrent certificate summary, or page with `issuer_dn_contains` / `subject_dn_contains`, by the same user: one such read is in flight per user, and callers whose identity cannot be resolved share one slot | Wait for the first read to finish, or filter with `issuer_dn` / `agent_id` |
 | `pool_acquire_timeout`, `query_error` | yes | Postgres pool or query fault, or a page past its 15 s wall budget | Retry; check `yuzu_pg_pool_*` |
 | `store_not_open` | yes | The certificate store is unavailable | Check `/readyz` |
 | `pool_too_small` | **no** | `--postgres-pool-size` is below 4 | Restart with a larger pool |

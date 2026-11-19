@@ -65,7 +65,7 @@ struct CertQuery {
     std::string cursor; ///< opaque; "" = first page
     int limit{kCertPageDefault};
     /// The calling principal (the session username), set by the transport AFTER parsing, never
-    /// from a request parameter. Keys the one-in-flight substring cap (CertSubstringPrincipalCap,
+    /// from a request parameter. Keys the one-in-flight caller-priced read cap (CertPrincipalReadCap,
     /// crypto_read_gate.hpp); "" shares one slot with every other unresolved caller.
     std::string principal;
 };
