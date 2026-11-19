@@ -343,10 +343,14 @@ static_assert(noexcept(std::declval<yuzu::server::detail::UnprovenAuditBudget&>(
 TEST_CASE("budget: a re-queue that must allocate a deque node (a node boundary) counts the chunk's ids",
           "[reregistration_gate][wp01][audit_budget][alloc]") {
     std::size_t fired_unconditional = 0, fired_conditional = 0;
-    for (int pre = 0; pre < 40; ++pre)
+    // A node boundary recurs every (node bytes / sizeof(PendingRow)) rows: about 10 on libstdc++
+    // (512-byte nodes) and about 85 to 100 on libc++ (4096-byte nodes). The queue must hold more
+    // rows than that to pop up to a boundary, and 20000 distinct ids (the tracked-id cap) make about
+    // 100 rows of 200 ids; 200 offsets cover every boundary the queue can reach.
+    for (int pre = 0; pre < 200; ++pre)
         for (int which = 0; which < 2; ++which) {
             B b;
-            for (long i = 0; i < 12000; ++i)
+            for (long i = 0; i < 20000; ++i)
                 (void)b.admit("i" + std::to_string(i), "s", 0);
             (void)b.poll_closed(20000, true);
             (void)b.take_ids_truncated();
