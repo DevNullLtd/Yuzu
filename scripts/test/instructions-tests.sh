@@ -16,7 +16,9 @@
 # has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
 # cannot pass),
-# interactive, and network-disrupt (the firewall containment actions).
+# interactive, and network-disrupt (the firewall containment actions: --risks network-disrupt
+# runs scripts/test/instructions_firewall_containment.py against --target-agent-id, the disposable
+# agent on this host, instead of dispatching them; see that script for its guards).
 # scripts/test/instructions-risk-classification.json is the authority.
 #
 # A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks
@@ -46,6 +48,8 @@
 #        --dashboard with userinfo or a backslash, or (targeted run) an --output or
 #        manifest that already exists)
 #   130  interrupted (Ctrl-C, Ctrl-Break or SIGTERM)
+#   --risks network-disrupt returns the ceremony's own codes (0 passed, 1 a check failed,
+#   2 nothing changed, 3 the release could not be confirmed: clear the firewall by hand)
 
 set -uo pipefail
 
@@ -91,7 +95,9 @@ Optional:
                            network-disrupt, interactive; destructive and
                            forensic need --target-agent-id, --confirm-target,
                            --run-id and --params-override, and
-                           server-internal cannot pass)
+                           server-internal cannot pass; network-disrupt
+                           runs alone, as the firewall containment
+                           ceremony against --target-agent-id)
   --target-agent-id ID     the id of the one connected agent sent as the target
                            of destructive and forensic dispatches
   --confirm-target HOST    that agent's hostname (must match the server's agent
@@ -165,6 +171,19 @@ if ! python3 -c "import yaml" 2>/dev/null; then
 "self-hosted CI runner, do not install it here: fix the runner's provisioning." >&2
     exit 2
 fi
+
+# network-disrupt is never a dispatch of its definitions: it runs the firewall containment ceremony
+# (scripts/test/instructions_firewall_containment.py) against the one --target-agent-id, which must be
+# the disposable agent on this host. It runs alone, never beside another class, and never in /test.
+for r in "${RISKS[@]}"; do
+    [[ "$r" == "network-disrupt" ]] || continue
+    if [[ "${#RISKS[@]}" -ne 1 || -z "$TARGET_AGENT_ID" ]]; then
+        echo "error: --risks network-disrupt runs alone and needs --target-agent-id (the disposable agent on this host)" >&2
+        exit 2
+    fi
+    YUZU_PASSWORD="$PASSWORD" exec python3 "$HERE/instructions_firewall_containment.py" \
+        --dashboard "$DASHBOARD_URL" --user "$USERNAME" --agent-id "$TARGET_AGENT_ID" --apply-containment
+done
 
 ARGS=(
     --dashboard "$DASHBOARD_URL"

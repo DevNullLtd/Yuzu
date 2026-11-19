@@ -261,9 +261,10 @@ YUZU_GW_HEALTH_PORT=${c.gwHealthPort}
 YUZU_GW_METRICS_PORT=${c.gwMetricsPort}
 # This stack's server sets YUZU_INSECURE_GATEWAY_PEER=1 (plaintext gateway; gateway
 # peer authorization is disabled). Not for production. See docker-compose.yml.
-# Erlang distribution cookie — the gateway fail-closes on the insecure default.
+# Erlang distribution cookie — the gateway refuses to start without a strong one
+# (>= 32 chars of [A-Za-z0-9._~+=-]; the same value on every replica).
 # Generated unique per stack; keep it out of git. Rotate with: openssl rand -hex 32
-# (Single ephemeral node? You may instead set YUZU_GW_ALLOW_DEFAULT_COOKIE=1.)
+# (Single ephemeral node? YUZU_GW_ALLOW_DEFAULT_COOKIE=1 uses a random per-boot cookie.)
 YUZU_GW_COOKIE=${c.gwCookie}` : ''}`;
 }
 

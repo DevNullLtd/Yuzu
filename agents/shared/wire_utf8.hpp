@@ -8,10 +8,10 @@
 //
 // The accepted set is exactly RFC 3629 (Unicode Table 3-7): no overlong forms, no UTF-16
 // surrogates, nothing above U+10FFFF, no truncated sequence. Each offending byte is replaced in
-// place with '?', so a row keeps its length and its field boundaries. This is stricter than
-// yuzu::util::sanitize_utf8, which passes overlong, surrogate and out-of-range sequences that
-// protobuf then rejects (#4864); it is a separate header rather than a change to that public SDK
-// function so it cannot alter any other plugin's output.
+// place with '?', so a row keeps its length and its field boundaries. yuzu::util::sanitize_utf8
+// accepts the same RFC 3629 set (#4864) but does not replace NUL; this header is the shared
+// scrubber (it also replaces NUL), and the agent host applies it to all plugin output in
+// CommandContextImpl::append_output.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
 // this directory.
@@ -52,6 +52,16 @@ namespace yuzu::shared {
         return 4;
     }
     return 0;
+}
+
+/// Length of the longest prefix of `s` that is at most `max_bytes` and does not end inside a UTF-8
+/// scalar (never splits a multi-byte sequence: it backs up to the lead byte). For truncating text
+/// that goes into a proto3 `string` (a mid-scalar cut makes the whole frame unparseable).
+[[nodiscard]] inline std::size_t utf8_prefix_len(std::string_view s, std::size_t max_bytes) noexcept {
+    std::size_t n = s.size() < max_bytes ? s.size() : max_bytes;
+    while (n > 0 && n < s.size() && (static_cast<unsigned char>(s[n]) & 0xC0u) == 0x80u)
+        --n;
+    return n;
 }
 
 /// How many bytes scrub_wire_bytes would replace in `s`, without changing it.

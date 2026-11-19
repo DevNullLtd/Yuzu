@@ -18,16 +18,22 @@
 #include <cstddef>
 #include <format>
 #include <string>
+#include <string_view>
+#include <vector>
 
 using yuzu::agent::SubprocessResult;
 using yuzu::agent::TerminationReason;
 using yuzu::services::decide_set_start_mode_outcome;
 using yuzu::services::is_safe_service_name;
 using yuzu::services::kMaxServiceRows;
+using yuzu::services::kSvcHelperPathLinux;
+using yuzu::services::kSvcHelperPathMacos;
 using yuzu::services::LaunchdListResult;
+using yuzu::services::launchctl_set_start_mode_argv;
 using yuzu::services::parse_launchctl_list;
 using yuzu::services::parse_systemctl_list_units;
 using yuzu::services::SystemdUnitEntry;
+using yuzu::services::systemctl_set_start_mode_argv;
 
 // ── parse_systemctl_list_units ───────────────────────────────────────────────
 
@@ -320,4 +326,80 @@ TEST_CASE("decide_set_start_mode_outcome: a nonzero exit's captured output (e.g.
     CHECK_FALSE(outcome.runner_failed);
     CHECK(outcome.message ==
          "error|systemctl command failed for 'sshd' (exit=1): sudo: a password is required");
+}
+
+// ── set_start_mode privileged argv ──────────────────────────────────────────
+//
+// The argv a non-root agent runs is `sudo -n -- <helper> <tool> <verb> <name>`: the sudoers file
+// names the root-owned helper with no argument and no wildcard, and the helper (whose text
+// tests/test_legacy_quarantine_plugin_removed_lexical.py runs against the same cases) builds the
+// tool's argument list itself. A root agent has no grant to bound and runs the tool directly. The
+// decision is the euid alone: no probe for the helper, no fallback to the tool.
+
+using Argv = std::vector<std::string>;
+
+TEST_CASE("systemctl_set_start_mode_argv: a non-root agent runs the helper under sudo, for each verb",
+          "[services][sudoers]") {
+    CHECK(kSvcHelperPathLinux == "/usr/local/sbin/yuzu-svc-helper");
+    for (const char* verb : {"enable", "disable", "mask", "unmask"}) {
+        INFO(verb);
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", verb, "cron.service", false) ==
+              Argv{"/usr/bin/sudo", "-n", "--", "/usr/local/sbin/yuzu-svc-helper", "systemctl", verb,
+                   "cron.service"});
+    }
+    // the tool path the plugin probed is not used by a non-root agent: the helper picks its own
+    CHECK(systemctl_set_start_mode_argv("/bin/systemctl", "mask", "sshd", false) ==
+          systemctl_set_start_mode_argv("/usr/bin/systemctl", "mask", "sshd", false));
+}
+
+TEST_CASE("systemctl_set_start_mode_argv: a root agent runs systemctl itself, with -- before the name",
+          "[services][sudoers]") {
+    for (const char* verb : {"enable", "disable", "mask", "unmask"}) {
+        INFO(verb);
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", verb, "cron.service", true) ==
+              Argv{"/usr/bin/systemctl", verb, "--", "cron.service"});
+    }
+    CHECK(systemctl_set_start_mode_argv("/bin/systemctl", "enable", "getty@tty1.service", true) ==
+          Argv{"/bin/systemctl", "enable", "--", "getty@tty1.service"});
+}
+
+TEST_CASE("systemctl_set_start_mode_argv: a name with a leading hyphen is one argv element in both modes",
+          "[services][sudoers]") {
+    // The helper takes the name as its third argument and puts -- before it; the root form puts -- itself.
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", "-foo", false).back() == "-foo");
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", "-foo", true) ==
+          Argv{"/usr/bin/systemctl", "enable", "--", "-foo"});
+    const std::string longest(256, 'a');
+    CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "disable", longest, false).back() == longest);
+}
+
+TEST_CASE("launchctl_set_start_mode_argv: a non-root agent runs the helper under sudo, for each verb",
+          "[services][sudoers]") {
+    CHECK(kSvcHelperPathMacos == "/Library/PrivilegedHelperTools/yuzu-svc-helper");
+    for (const char* verb : {"enable", "disable"}) {
+        INFO(verb);
+        // the helper adds system/ itself: it is given the bare label
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", verb, "com.example.agent", false) ==
+              Argv{"/usr/bin/sudo", "-n", "--", "/Library/PrivilegedHelperTools/yuzu-svc-helper",
+                   "launchctl", verb, "com.example.agent"});
+    }
+}
+
+TEST_CASE("launchctl_set_start_mode_argv: a root agent runs launchctl itself on system/<label>",
+          "[services][sudoers]") {
+    for (const char* verb : {"enable", "disable"}) {
+        INFO(verb);
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", verb, "com.example.agent", true) ==
+              Argv{"/bin/launchctl", verb, "system/com.example.agent"});
+    }
+}
+
+TEST_CASE("set_start_mode argv: every name is_safe_service_name admits reaches the helper whole",
+          "[services][sudoers]") {
+    for (const std::string_view name : {"a", "cron.service", "getty@tty1.service", "Some_Service-2", "-x",
+                                         "com.apple.something"}) {
+        REQUIRE(is_safe_service_name(name));
+        CHECK(systemctl_set_start_mode_argv("/usr/bin/systemctl", "enable", name, false).back() == name);
+        CHECK(launchctl_set_start_mode_argv("/bin/launchctl", "enable", name, false).back() == name);
+    }
 }

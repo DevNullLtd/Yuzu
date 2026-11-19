@@ -965,7 +965,7 @@ std::expected<void, AuthDBError> AuthDB::upsert_user(const std::string& username
                                                      const std::string& password_hash,
                                                      const std::string& salt_hex, auth::Role role) {
     if (!is_valid_username(username)) {
-        spdlog::warn("upsert_user rejected invalid username: '{}'", username);
+        spdlog::warn("upsert_user rejected invalid username: '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     std::string role_str = (role == auth::Role::admin) ? "admin" : "user";
@@ -1281,7 +1281,7 @@ std::expected<bool, AuthDBError> AuthDB::user_exists(const std::string& username
 std::expected<void, AuthDBError> AuthDB::update_role(const std::string& username,
                                                      auth::Role new_role) {
     if (!is_valid_username(username)) {
-        spdlog::warn("update_role rejected invalid username: '{}'", username);
+        spdlog::warn("update_role rejected invalid username: '{}'", ::yuzu::log_key_token(username));
         return std::unexpected(AuthDBError::InvalidUsername);
     }
     std::string role_str = (new_role == auth::Role::admin) ? "admin" : "user";

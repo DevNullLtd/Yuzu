@@ -220,6 +220,20 @@ new connections wait in the kernel backlog (agents already connected are unaffec
 they reconnect). Limit connections per source address at the L4 balancer or firewall; see
 [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
+**Gateway Erlang distribution is outside the PKI and unencrypted.** Between
+gateway nodes of a cluster, commands and results (including plugin parameters)
+travel over plain TCP guarded only by the shared cookie handshake; there is no
+encryption and no per-message integrity. Keep the cluster network trusted and
+firewalled to the gateway nodes only (EPMD 4369 and the distribution range
+9100-9105), and give every node a strong cookie. TLS distribution is tracked as
+#8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). If a node
+will not start and you cannot reach the vendor docs, read the
+refusal text: the container logs it on stderr (`[gateway-entrypoint] FATAL: ...`)
+and the systemd unit in the journal (`yuzu-gateway: ...`); it names the fix and
+never prints the cookie. A conforming cookie is 32 to 255 characters from
+`[A-Za-z0-9._~+=-]` (`openssl rand -hex 32`), identical on every node. See
+[Distribution Cookie](gateway.md#distribution-cookie-required-in-production).
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.
@@ -586,8 +600,10 @@ curl -s -X POST http://localhost:8080/api/v1/quarantine \
 
 ### The whitelist (read this before quarantining a dual-stack host)
 
-The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32**. Each address
-is sent to the plugin as an outbound and an inbound exception. A port, a prefix length, an
+The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32 and at most 512
+characters in total**. Each address is sent to the plugin as an outbound and an inbound exception. A
+list over 512 characters is refused with `400` (`whitelist exceeds 512 characters`; about 13 full-length
+IPv6 addresses reach it, well under 32 entries). A port, a prefix length, an
 IPv4-mapped form (`::ffff:1.2.3.4`), an IPv4 octet with a leading zero or a host name is refused
 with `400`; nothing is silently dropped. Containment covers **both address families**: a v4-only
 whitelist leaves IPv6 fully contained.
@@ -658,7 +674,8 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
   server then does **not** confirm it and does not read status: the device is contained, but not under
   this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
-  (`allow_set_not_applied record_id=<id> command_id=<id>`) is written, and
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
+  restart) is written, and
   `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
   the device.** To get it there, release the device and quarantine it again (the release ends the record
   once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
@@ -674,7 +691,18 @@ reads `releasing`, stays listed, and keeps the dispatch refusal, so a device tha
 containment is never treated as free. The reconciler reads the device's status first (`inactive` ends
 the record), otherwise sends `firewall.release` and reads status again, and no answer to the release
 itself ends anything. A record that cannot finish stays listed with commands refused until it is forced,
-and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device.
+and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device. That gauge carries no
+device label: find the devices with `GET /api/v1/quarantine` and read the records whose `status` is
+`releasing`.
+
+**How a `202` finishes.** There is no callback. The record leaves `GET /api/v1/quarantine` when the
+device confirms, and a `DELETE` repeated after that answers `400` (`device is not quarantined`), the
+same as for a device that was never quarantined: poll the list. A `202` is also the answer when the
+device did say `inactive` but an apply reached it, or was being sent to it, after that observation: the
+record could not end on a word the apply may have overtaken, so it stays `releasing` and the next
+status read settles it (the audit row's `detail` says `apply_in_flight=1`). The same holds for an apply
+sent before the release whose reply the reconciler has not read yet: about a minute after a reconciler
+apply, and up to 120 seconds after an MCP `quarantine_device` call, which reads no reply.
 
 **The two ways a record ends, and no other:**
 
@@ -690,9 +718,14 @@ not end the record either; the quarantine routes set no time limit.
 finish a release (such as the Linux packaged unit, which refuses mutation). Authority is the release's
 own: scoped `Security:Execute`, the same-principal check and the dispatch check for `firewall.release`.
 It **does not release the device**: the device may still be contained, the server stops refusing
-commands to it, the reconciler sends the release it owes once per reconnect and then parks the device
-after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert fires
-on it), and an operator can send `firewall.release` through the generic routes at any time. A device
+commands to it, the reconciler sends the release it owes once per reconnect and once per server start
+(the bookkeeping is in memory, and a restart drops every device's stream anyway) and then parks the
+device after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert
+fires on it), and an operator can send `firewall.release` through the generic routes at any time.
+A forced end answers `released: false`, because the device's word is what `released` reports.
+`GET /api/v1/quarantine?include=release_owed` (MCP `list_quarantined_devices` with
+`include=release_owed`) lists the records that were ended by force and whose device has not yet
+confirmed a release, so the forced-end runbook can find them: each has `status: "release_owed"`. A device
 whose firewall plugin does not load cannot be released from the server at all (#7444).
 
 Until the device confirms that owed release, **the release lifts whatever containment the device holds,
@@ -794,8 +827,10 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
 `QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:
 
 - **Trigger.** A heartbeat from the device (the fast path) or a periodic ~20-second tick (the
-  backstop). Deliberately **not** agent registration itself: the command stream does not exist yet
-  there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
+  backstop). A heartbeat only **marks** the device due; it reads no store and dispatches nothing, so
+  heartbeat ingest never waits on the database. The reconciler thread, which does all of this work,
+  acts on the marks every second. Deliberately **not** agent registration itself: the command stream
+  does not exist yet there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
   short grace window, confirm), so it spans a few heartbeat intervals from reconnect to a confirmed
   record.
 - **What it dispatches.** The **stored** whitelist, mapped to the plugin's `exceptions` (`<ip>/out,<ip>/in`
@@ -806,9 +841,13 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   `validation_failed`.
 - **Re-verify and drift.** A confirmed record is re-read every 5 minutes while its device is connected,
   and stays confirmed meanwhile (the unconfirmed gauge and its alert do not blink); the CONFIRMED audit
-  row is written once per transition. A re-verify that no longer confirms is **drift**: one
-  `quarantine.reapply` failure row (`drift status=<name>`), then the next cycle re-applies through the
-  same chokepoint. A device whose live session changes (a reboot) re-verifies via status first, and a
+  row is written once per transition. A re-verify that no longer confirms is read against the store
+  again before it is called **drift** (the record may have ended or begun releasing while the status
+  command was in flight): a failed read writes no row and re-verifies, a release requested in the
+  meantime makes it a release, and only a record that still reads active gets one `quarantine.reapply`
+  failure row (`drift status=<name>`, counted as `result="drift"`), then the next cycle re-applies
+  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires at three drift rows in an hour across
+  the server's devices (the counter has no device label; the audit rows name each device). A device whose live session changes (a reboot) re-verifies via status first, and a
   record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
@@ -825,7 +864,10 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   release only on a new session. A `busy` answer (the device's mutation gate was held, so the release
   did not run) does not spend the session's release: the reconciler waits an escalating backoff, reads
   status and sends the release again, so a gate that stays busy costs at most one release and one
-  `forced_release_sent` row per 15 minutes.
+  `forced_release_sent` row per 15 minutes. The bookkeeping that remembers a session's release is in
+  memory: a server restart sends the release once more (and writes the `forced_release_*` rows again),
+  which is harmless because a release is idempotent on the device.
+- **What the server keeps as evidence.** The reconciler's re-verify replies are working data, kept 24 hours (or forever on a server set to keep responses forever). What lasts is the record's `last_confirmed_at` stamp, which every confirming re-verify moves, the audit rows written on each change (`CONFIRMED`, `drift`, the release rows, `forced_release_unconfirmed`) and the counters; no reply is kept as proof that re-verify kept running. The lasting evidence for a parked owed release is its `forced_release_unconfirmed status=<name>` row, not the reply.
 - **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
   trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
   rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
@@ -836,30 +878,54 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   instances; `offline` is expected and not alerted on, a sustained `connected` count is the signal
   (`YuzuQuarantineEndpointUnconfirmed`, `YuzuQuarantineReleasePending` in [Metrics](metrics.md)).
   `yuzu_server_quarantine_reapply_total{result}` breaks down every outcome (`reapplied`, `confirmed`,
-  `unconfirmed`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
+  `unconfirmed`, `drift`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
   `validation_failed`, `dispatch_error`, `release_sent`, `released`).
   `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes an empty queue from a tick that
   could not read at all: check it first when a gauge looks suspiciously static.
+  `yuzu_server_quarantine_reconciler_last_tick_unixtime` is when a tick last finished, and
+  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for about ten minutes
+  (five minutes stale, held for five): while it fires, the gauges above are frozen at their last values.
 
-**Known limitation.** A release request landing at the exact moment the reconciler is mid-apply for the
-same device can end with the apply arriving after the release, in one of two ways:
+**The apply fence, and what it does not close.** A record ends on the device's `inactive` answer, and an
+apply that reaches the device after the observation that produced that answer would leave the device
+contained with no record naming it. Two parts close that:
 
-- The apply lands while the record still reads releasing: the release_pending guard and the
-  status-first rule make the next cycle correct it, but for up to one cycle the device can be contained
-  under a record that reads releasing.
-- The release completes first and the apply lands after it: the device is firewalled and **no record
-  names it**. Nothing re-reads it, so nothing corrects it. The only trace is a `quarantine.reapply`
-  failure row in the audit log, `dispatch accepted record_id=<id> command_id=<id> but the durable stamp
-  failed: device is not quarantined`, and the way back is `firewall.release` sent through the generic
-  command routes.
+- Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
+  record, which moves a durable apply generation. A dispatch that returned is not a delivery (a gateway
+  only queues the command), and a delivered command is not a run (the agent executes commands on a
+  thread pool, and the firewall plugin takes its own gate in the order its workers reach it). So an apply
+  that reached a device **keeps its claim** until the reconciler has read the apply's reply, and
+  otherwise until the claim stops counting; while it is held no generation is issued and no end is
+  accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
+  reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
+  120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The
+  server also keeps the claims it stamped on its own monotonic clock for the same 120 seconds, so a
+  step of the database's clock cannot make one of them read expired early; after a restart (or for a
+  claim another replica stamped) the database clock alone judges the window. MCP
+  `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
+  release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
+  seconds; the second call answers a retryable fault.
+- Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
+  answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
+  write that ends the record presents it. The store refuses the end when an apply was claimed since
+  (`apply_in_flight`). The record then stays `releasing` and the next status read takes a fresh
+  generation and settles it. A forced end rests on no observation and is not refused.
+
+This relies on commands to one device arriving in the order one server dispatched them (one stream, a
+first-in first-out gateway queue). **Still open:** a transport that reorders commands to one device;
+an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (an
+apply that stays unexecuted that long is ignored); and the two check-then-dispatch windows below. In each the
+trace is the same, a `quarantine.reapply` failure row and a device that is contained under no record or
+a releasing one, and the way back is `firewall.release` sent through the generic command routes.
 
 The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
 same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
 within 5 minutes). The same outcome follows when a release sent earlier is run by the device after a later
 record's apply, because commands are not ordered on the device: the new record can be confirmed and the
-device then released, uncontained until the re-verify re-applies it. If you release and immediately re-quarantine the same device with a different
-whitelist, a follow-up `firewall.quarantine_status` check is a reasonable sanity step. Tracked for a
-proper fix (a claim or generation token on the active record).
+device then released, uncontained until the re-verify re-applies it. If you release and immediately
+re-quarantine the same device with a different whitelist, a follow-up `firewall.quarantine_status` check
+is a reasonable sanity step.
 
 ## IOC Checking
 
@@ -892,6 +958,8 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
   }'
 ```
 
+**Domain checks and the Windows DNS cache.** On Windows a `domains` check reads the resolver cache once per command. If the cache cannot be read (the DNS API is unavailable, or returns failure, which some Windows 11 builds do on every call), the result is marked **constrained / partial** with provenance `windows:ioc:dns_cache_unreadable`, and each domain row says `DNS resolver cache could not be read`. Treat that as **unknown, not clean**: a constrained domain answer says nothing about whether the endpoint resolved the domain. Earlier builds reported `Not in DNS cache` in this case. At most 100 domains are accepted per command; more is refused whole with `error|domains|false|Too many domains (N, max 100)`.
+
 IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
 
 ## Certificate Inventory
@@ -920,7 +988,7 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 - Restrict the app registration to your tenant (single-tenant)
 - Rotate the client secret regularly
 - **Use an `https` issuer only, and never `--oidc-skip-tls-verify` outside a lab.** The server fetches the issuer's JWKS and trusts it as the signature key for every ID token, and sends the client secret to the token endpoint, both over the issuer's own scheme. With an `http://` issuer, or with TLS verification off, anyone who can sit on the network path (or poison the issuer's DNS name) can substitute the keys and mint a sign-in for any user, up to the administrator group, and can read the client secret. The server logs a warning for an `http://` issuer on a non-loopback host. Plain `http://` to a PUBLIC address is refused outright (no switch; the error is `plain http is not permitted to a public address`), which closes the internet man-in-the-middle case; `http://` to a loopback or private address is allowed only with `--oidc-allow-private-networks` and stays exposed to anyone on that network path (keys, token response and client secret in the clear), so it is a lab setup.
-- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. On Linux and macOS the OIDC name lookups run in a pool of 16 slots (gauge `yuzu_server_oidc_resolver_in_flight`), a lookup the resolver does not finish keeps its slot until the resolver returns, and further lookups fail closed at once while the pool is full, while the name already has 8 lookups outstanding, while lookups for 64 names are outstanding, when the admission check does not complete, and for 3 s after a lookup of the same name was refused or timed out (a refusal is never an allow; the pool, the name limit and the memory are per server process, so under high availability each replica has its own; the `ipv4only.arpa` prefix lookup is exempt from the name limit and the 3 s memory, and the pool's cap is its only bound); a known residual is that a failed or timed-out `ipv4only.arpa` prefix lookup is remembered as failed for 1 minute, during which IPv6 destinations are classified with the prefixes already learned (none on a fresh start; on a DNS64 network set `--oidc-nat64-prefix`); a translated private address inside a prefix the server has not learned is classified as public while the prefix lookup is unanswered, and while the probe is refused (the pool is full or no worker could be started), IPv6 destinations are classified with the prefixes already learned (none on a fresh start) and without a fresh probe, which is tried again on the next fetch. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
+- **Egress control.** The server's OIDC requests (discovery, JWKS, Test Connection, token POST) go to hosts the IdP's discovery document names, and Test Connection goes to whatever issuer an administrator types. Each request is resolved by the server, every resolved address is classified, and the connection is pinned to a permitted address (Windows token POST: pre-checked only, strictly: one refused address in its answer refuses the request; see below). Link-local addresses (the cloud metadata address `169.254.169.254` included), the other listed cloud metadata addresses, multicast and unspecified addresses are always refused (Oracle Cloud's `192.0.0.192` is not listed: it lies in the `192.0.0.0/24` special-purpose block that `--oidc-allow-private-networks` admits). Loopback, RFC 1918, carrier-grade NAT and IPv6 unique-local addresses are refused unless the server operator starts the process with `--oidc-allow-private-networks`, which no dashboard or REST caller can set. Leave it off unless your IdP is on an internal network. Residual: on Windows the token POST resolves its name again inside WinHTTP, so DNS rebinding between the check and the connect is not covered for that one request (that request does not follow redirects and accepts only HTTP status 200, so a 3xx cannot move it to an unchecked host or be taken for a token response; host names must be ASCII, with an internationalized name given as punycode); there is no per-host allow-list and no HTTP proxy on the discovery and JWKS path (the Windows token POST uses the system default proxy). NAT64: an IPv6 address inside a NAT64 prefix is classified by the IPv4 address embedded in it (every RFC 6052 section 2.2 layout), so `Pref64 + 169.254.169.254` is refused as link-local. SIIT (`::ffff:0:0:0/96`) and IPv4-compatible (`::/96`) addresses are classified by the IPv4 address they embed too, never as more open than non-global, and plain http to such a form of a public address is refused by the cleartext rule; a local-use NAT64 address (`64:ff9b:1::/48`) that no configured or learned prefix covers is refused whatever the switch says. The server learns prefixes from RFC 7050 (it resolves `ipv4only.arpa`, only when a request is about to be pinned to an otherwise permitted IPv6 address, and repeats the lookup after 10 minutes, or 1 minute when it learned none; a learned prefix is only ever added to the set and kept until restart, never forgotten by a later answer, and an answer that would take the set past 64 prefixes refuses the fetch instead of being installed partially) and from `--oidc-nat64-prefix`; a failed lookup means "none discovered" and does not fail the request. On Linux and macOS the OIDC name lookups run in a pool of 16 slots (gauge `yuzu_server_oidc_resolver_in_flight`), a lookup the resolver does not finish keeps its slot until the resolver returns, and further lookups fail closed at once while the pool is full, while the name already has 8 lookups outstanding, while lookups for 64 names are outstanding, when the admission check does not complete, and for 3 s after a lookup of the same name was refused or timed out (a refusal is never an allow; the pool, the name limit and the memory are per server process, so under high availability each replica has its own; the `ipv4only.arpa` prefix lookup is exempt from the name limit and the 3 s memory, and the pool's cap is its only bound); a known residual is that a failed or timed-out `ipv4only.arpa` prefix lookup is remembered as failed for 1 minute, during which IPv6 destinations are classified with the prefixes already learned (none on a fresh start; on a DNS64 network set `--oidc-nat64-prefix`); a translated private address inside a prefix the server has not learned is classified as public while the prefix lookup is unanswered, and while the probe is refused (the pool is full or no worker could be started), IPv6 destinations are classified with the prefixes already learned (none on a fresh start) and without a fresh probe, which is tried again on the next fetch. A configured prefix is trusted to describe a translator and may therefore permit a destination its own address class would otherwise gate; only the always-refused tier is never relaxed. Teredo, IPv6 benchmarking and the other non-global parts of `2001::/23` are refused unless the private-network switch is set, except the sub-ranges the IANA registry marks globally reachable. Residual: translators the server cannot see, that is a translator whose prefix is neither discoverable nor configured, a proxy, a VPN, or CLAT/464XLAT outside the host, can still map an address that classifies as public to a private destination; because TLS verification still uses the host name, such a path is limited to a blind TCP connect for `https`, and plain `http` to a public-looking (translated) address is refused by the cleartext rule above. See [Authentication -> Network and trust](authentication.md#network-and-trust). **Operator warning:** a configured prefix asserts that a NAT64 translator lives there and can permit HTTPS connections to ULA addresses even when `--oidc-allow-private-networks` is off; declare only actual translation prefixes (native IPv6 services inside a declared prefix get the same embedded-IPv4 classification; always-refused addresses remain blocked).
 
 > **Upgrading: if `oidc_client_secret` was ever set on this install, rotate it.**
 > Releases up to and including v0.13.0 emitted the value in the clear to three places - the

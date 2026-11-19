@@ -6,8 +6,8 @@
 /// (a 30-day basis), and the exposure rate per hour of use. Header-only and
 /// store-type-free by construction: no store header, no httplib, no JSON, no
 /// clock. Every time value comes from the request (`DexUsageRequest::now_epoch`).
-/// Nothing here is published by any surface yet (REST, MCP and the Apps page
-/// are separate changes); the figures are aggregates and never carry an agent id.
+/// GET /api/v1/dex/apps/usage serves this model; the Apps page and MCP are
+/// separate surfaces. The figures are aggregates and never carry an agent id.
 ///
 /// Honesty rules (each is pinned by a test):
 ///  - Matching. An Apps subject matches a usage name by the ASCII-lowercased
@@ -25,7 +25,8 @@
 ///    lowercased; the plan does not take the basename or trim, so a subject that
 ///    carries a path or surrounding whitespace reads `no_usage`.
 ///  - One population. A device counts as reporting usage only while the server
-///    received its usage state within `kDexUsageFreshSecs` (server receipt time).
+///    received its usage state within `kDexUsageFreshSecs` (server receipt time,
+///    measured on the database clock that authored it, not the request instant).
 ///    The usage totals, the exposed events and the reporting count come from
 ///    the same fresh devices, so the rate's numerator and denominator share a
 ///    population. Stale devices are counted separately and contribute nothing.
@@ -160,7 +161,11 @@ struct DexUsageQuery {
     std::vector<DexUsageKey> keys;
     std::string since_iso; ///< "" = no lower bound (window all)
     std::string until_iso; ///< exclusive upper bound
-    std::int64_t fresh_since_epoch{0};
+    /// The freshness WIDTH in seconds, never an instant: the owner cuts it against the database
+    /// clock (`usage_state.last_seen` is authored by the database), so a replica clock that is
+    /// skewed against the database cannot move the fresh/stale split. The observation window
+    /// (`since_iso`, `until_iso`) stays on the request instant.
+    std::int64_t fresh_secs{kDexUsageFreshSecs};
 };
 
 /// Aggregates only: no agent id anywhere in this type.
@@ -238,6 +243,9 @@ struct DexAppsUsageModel {
     std::int64_t reporting_devices{0};
     std::int64_t stale_devices{0};
     std::int64_t floor{kDexCohortFloor};
+    /// The request instant the model was built at (epoch seconds), so a cached
+    /// model's age is visible to the consumer.
+    std::int64_t as_of_epoch{0};
     std::vector<DexAppUsage> apps; ///< index-aligned with DexAppsModel::apps
 };
 
@@ -640,11 +648,10 @@ build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, cons
         q.subjects.push_back(a.subject);
     q.keys = dex_usage_match_plan(q.subjects);
     const int days = dex_window_to_days(apps.window);
-    // The same arithmetic as dex_iso_since, from the one request instant.
-    q.since_iso = days > 0 ? dex_iso_at(req.now_epoch - static_cast<std::int64_t>(days) * 86400)
-                           : std::string{};
+    // The one window-cut arithmetic, from the one request instant.
+    q.since_iso = dex_iso_since_at(req.now_epoch, days);
     q.until_iso = dex_iso_at(req.now_epoch);
-    q.fresh_since_epoch = req.now_epoch - kDexUsageFreshSecs;
+    q.fresh_secs = kDexUsageFreshSecs;
 
     // An Apps model with no rows is not an early return: the read still runs with an
     // empty key list so the coverage counts are real.
@@ -657,6 +664,7 @@ build_dex_apps_usage_model(const DexAppsModel& apps, const DexFleet& fleet, cons
         return unexpected(std::string("usage_unavailable"));
     model->slice = slice;
     model->population = static_cast<std::int64_t>(population.size());
+    model->as_of_epoch = req.now_epoch;
     return std::move(*model);
 }
 

@@ -18,7 +18,12 @@
 #   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
 
 # ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
-ARG ERLANG_IMAGE=erlang:28@sha256:dc7e60b050b1c8f5ac25cef3f15cac0a7bec200b51158634c259e8a371118aae
+# erlang:28 = OTP 28.5.0.8 (built 2026-11-05). `include_erts` puts this
+# image's ERTS and OTP libraries into the shipped release, so this digest decides
+# the OTP the chisel gateway runs. It is held in an ARG default, which Dependabot
+# does not see: refresh it by hand (last: 2026-11-17). It is a separate pin from
+# Dockerfile.gateway's erlang:28-alpine, which #6711/#6740 hold on 28.5.0.2.
+ARG ERLANG_IMAGE=erlang:28@sha256:fe3425a5d92e03aa3696b951b128f6c55c6f76d4ddf341c8e511ae9c515ac8d2
 FROM ${ERLANG_IMAGE} AS deps
 
 RUN apt-get update && apt-get install -y --no-install-recommends git \
@@ -71,7 +76,13 @@ RUN set -eux; \
 # package indices (main + universe) from the Ubuntu archive over the network,
 # and the large universe index occasionally EOFs mid-download. Retrying makes
 # release rebuilds reliable.
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the cut below fetches the current archive (security and updates
+# pockets) instead of being served from the runner's persistent build cache.
+# Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
 RUN set -eux; mkdir -p /rootfs; \
+    : "package refresh: ${YUZU_PACKAGE_REFRESH}"; \
     SLICES="base-files_base base-files_etc base-files_var base-files_tmp \
       base-files_release-info base-passwd_data netbase_config \
       ca-certificates_data openssl_config libc6_libs libgcc-s1_libs \
@@ -138,5 +149,10 @@ WORKDIR /opt/yuzu_gw
 
 EXPOSE 50051 50063 8081 9568
 
+# NO gateway-entrypoint.sh here, so NO pre-VM cookie check (F24): an unset
+# YUZU_GW_COOKIE boots with OTP's per-host random ~/.erlang.cookie and the in-VM
+# guard then refuses it as too short (after distribution is listening). If $HOME
+# is unwritable the VM cannot create that file and crash-loops. Always set a
+# strong YUZU_GW_COOKIE (or YUZU_GW_ALLOW_DEFAULT_COOKIE=1 for a throwaway demo).
 ENTRYPOINT ["/opt/yuzu_gw/bin/yuzu_gw"]
 CMD ["foreground"]

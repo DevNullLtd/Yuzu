@@ -392,9 +392,10 @@ groups:
             no server identity: read yuzu_server_identity_uri_present on the
             server; 0 means the in-place re-issue was skipped or failed (see
             YuzuServerIdentityUriAbsent: fix the cause and restart the server,
-            which needs no gateway restart); absent means the server runs a
-            release that does not mint the identity or is not being scraped
-            (upgrade the server first). (2) The server uses its own
+            which needs no gateway restart); absent means the server is not
+            being scraped (restore its scrape target and re-read it) or runs
+            a build that does not mint the identity (every server and gateway
+            runs the same build; run the server from the gateway's build). (2) The server uses its own
             certificates (bring-your-own, --no-default-certs, or its own
             --cert/--key), which carry no identity: set {yuzu_gw,
             mgmt_peer_auth_mode} to pin with that certificate's pin. That
@@ -3110,6 +3111,50 @@ groups:
             reach 'fixing' after an operator remediate, and review any recent
             change to claim_remediation or the collect_ready gen threading.
 
+      # WP07: the compliance collect pass skipped a target (collect_target) or a whole ready
+      # item (collect_item) because evaluating it threw -- the response-store read, the verdict
+      # write or an allocation failure. A skipped target keeps its PREVIOUS status (no verdict is
+      # recorded this cycle), so a skip that stays above zero for 15 minutes means compliance data is going stale for
+      # someone. The per-device "unevaluable response" case is NOT this alert: it scores that
+      # device `error` and is counted by yuzu_server_policy_unevaluable_responses_total{reason}.
+      - alert: YuzuPolicyCollectSkipped
+        expr: |
+          sum(increase(yuzu_server_policy_eval_errors_total{phase=~"collect_item|collect_target"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy collect pass is skipping targets ({{ $value }} in 1h)"
+          description: >-
+            yuzu_server_policy_eval_errors_total{phase="collect_target"|"collect_item"}
+            incremented: evaluating a policy check response (or the response-store read behind it)
+            threw, so that target's or item's verdict was not recorded this cycle and its previous
+            status stands. Look in the server log for "policy_evaluator: ... skipped" lines (they
+            carry the policy id and, for a std::exception, its sanitised text; a non-std
+            exception line carries the policy id only), check Postgres health and memory
+            pressure, and remember the status shown for the affected devices may be stale.
+
+      # WP07: the server's boot-time check found the PostgreSQL database encoding is not UTF8.
+      # The gauge is per replica but the fact is per database (every replica shares one), so the
+      # alert groups by job only: one alert for the deployment, not one per replica. The check is
+      # WARN-ONLY (refusing to start is an undecided owner call), so this alert is
+      # the only thing that keeps the condition visible after the one-off log line scrolls away.
+      - alert: YuzuPgServerEncodingNotUtf8
+        expr: |
+          max by (job) (yuzu_pg_server_encoding_not_utf8) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The PostgreSQL database encoding is not UTF8 (reported by at least one {{ $labels.job }} server)"
+          description: >-
+            yuzu_pg_server_encoding_not_utf8 is 1: at start the server found the database
+            encoding is not UTF8. Postgres then does not reject invalid UTF-8 from agents, and
+            surfaces that re-serialise stored text with a strict JSON writer can throw. Create a
+            new database with ENCODING 'UTF8' and move the data (an existing database's encoding
+            cannot be changed); see server-admin.md "PostgreSQL database encoding". The gauge is
+            set once at start, so restart the server after the move.
+
       - alert: YuzuQuarantineGateServingStaleState
         expr: |
           sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
@@ -3192,6 +3237,16 @@ groups:
             fresh deployment of this build. On a Linux host running the
             packaged systemd unit every containment action is refused
             (privilege_unavailable), so a record there stays unconfirmed.
+            It also fires when a NEW record lands on a device that is already
+            contained under other operator exceptions: the device keeps the
+            exceptions it has, so it is contained but not under the new
+            record's whitelist, and the record stays unconfirmed on purpose.
+            The cause is one quarantine.reapply failure row per record,
+            "allow_set_not_applied record_id=... command_id=...", and
+            yuzu_server_quarantine_reapply_total{result="unconfirmed"}. The
+            remedy is to release the device (DELETE /api/v1/quarantine/{agent_id})
+            and then quarantine it again, so the new whitelist is applied to a
+            device that holds no containment.
 
       - alert: YuzuQuarantineReleasePending
         expr: |
@@ -3216,16 +3271,78 @@ groups:
             correlate with yuzu_server_quarantine_reapply_total{result}
             (release_sent says the release went out; unconfirmed says the device
             did not answer inactive) and the quarantine.disable audit rows
-            (pending release_sent). A common cause is a device that refuses every
+            (pending release_sent). The gauge carries no device label: find the
+            devices with GET /api/v1/quarantine (MCP list_quarantined_devices) and
+            read the records whose status is releasing. A common cause is a device
+            that refuses every
             mutating firewall action (a Linux host on the packaged systemd unit:
             privilege_unavailable). The way out is
             DELETE /api/v1/quarantine/{agent_id}?force=true, which ends the record
             without the device's confirmation. A forced end does NOT release the
             device: it may still be contained, the server stops refusing commands
             to it, and the reconciler sends the release it owes once per
-            reconnect (yuzu_server_quarantine_forced_release_owed counts those; no
+            reconnect and once per server start
+            (yuzu_server_quarantine_forced_release_owed counts those; no
             alert fires on it, an offline device that owes a release is an expected
-            state).
+            state). A forced-ended record leaves GET /api/v1/quarantine; list the
+            ones whose device still owes a release with
+            GET /api/v1/quarantine?include=release_owed (status release_owed).
+
+      - alert: YuzuQuarantineDriftRepeated
+        expr: |
+          increase(yuzu_server_quarantine_reapply_total{result="drift"}[1h]) >= 3
+        labels:
+          severity: warning
+        annotations:
+          summary: "Contained devices keep losing their firewall containment"
+          description: >-
+            QuarantineContainmentReconciler saw three or more drift observations
+            in the last hour across this server's contained devices
+            (yuzu_server_quarantine_reapply_total{result="drift"}): a confirmed
+            record whose device no longer reports its rules in force, with a
+            re-apply scheduled each time. The counter cannot tell one device
+            drifting three times from three devices drifting once, nor whether
+            the re-apply succeeded; the audit rows below show both. Something on
+            the host removes the rules,
+            for example a host firewall manager or a management-tool reload. Each
+            cycle can leave the device uncontained for up to 5 minutes (the
+            re-verify interval) before the next re-apply, so a device that
+            drifts every few minutes is mostly not contained, and
+            YuzuQuarantineEndpointUnconfirmed never fires on it because the
+            re-apply confirms again within a few ticks. The evidence is the
+            quarantine.reapply failure rows "drift status=... record_id=..."
+            (system principal), which name the device. The counter carries no
+            device label. Find what changes the host's firewall; the server
+            cannot stop it.
+
+      - alert: YuzuQuarantineReconcilerStalled
+        expr: |
+          time() - max by (job) (yuzu_server_quarantine_reconciler_last_tick_unixtime) > 300
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The quarantine reconciler has not finished a tick for about ten minutes"
+          description: >-
+            yuzu_server_quarantine_reconciler_last_tick_unixtime has been more
+            than five minutes old on every server of this job for five minutes,
+            so no tick has finished for about ten minutes. The reconciler ticks
+            every 20 seconds, so its thread is stuck or no longer running. While
+            this fires, yuzu_server_quarantine_release_pending and
+            yuzu_server_quarantine_endpoint_unconfirmed are FROZEN at their last
+            values (possibly 0), so YuzuQuarantineReleasePending and
+            YuzuQuarantineEndpointUnconfirmed cannot be trusted: a release may be
+            waiting for a reconcile that is not happening, and an owed release
+            is not being sent. The max over the job is correct while the tick is
+            leader-only (#4119): a non-leader replica does not tick and its
+            gauge stays at its boot value, so judging each instance would page
+            on every follower; the rule fires only when no replica of the job
+            has ticked. A tick that threw does not move the gauge. First check
+            that the clocks of the server and of Prometheus agree: the rule
+            compares the two, so a skew of more than five minutes fires it with
+            a healthy reconciler. Then look at the server log for
+            "quarantine_reconciler: tick threw" and for a thread blocked on a
+            Postgres pool acquire or a gateway dispatch.
 
       - alert: YuzuDispatchTargetRejected
         expr: |
@@ -4854,14 +4971,23 @@ groups:
             The dedicated Postgres reachability probe on {{ $labels.instance }}
             has failed for over 2 minutes; /readyz reports not ready with a
             `pg` reason (unreachable, stale, or read_only). Check the server log
-            for the "[readyz] Postgres not reachable" line (it carries the libpq
-            detail), the database, and the network or proxy path to it.
+            for the "[readyz] Postgres not reachable" line. For a connect failure it
+            carries a FIXED cause ("server not reachable", "authentication failed",
+            "no free connection slots" (slot exhaustion, the #4943 shape) or "no
+            writable host" (read-only or standby only)), never libpq's connect text,
+            which can quote part of a DSN password; for a failed probe query it
+            carries the failing step plus the first line of libpq's message (the libpq
+            portion is folded and capped at 120 bytes, the step name is added to it),
+            and a connect failure matching no fixed cause logs the step followed by
+            "(libpq details withheld)". Probe
+            from the server host with psql against the same DSN for more detail, check the
+            database, and the network or proxy path to it.
             read_only means the probe reached a server that refuses writes: a
             standby (check that the proxy routes to the current primary) or a
             primary with default_transaction_read_only on (often a full disk on
             managed Postgres). With a multi-host DSN (target_session_attrs=read-write)
             libpq refuses read-only hosts itself, so a cluster with no writable
-            host shows as unreachable, with the reason in the log line.
+            host shows as unreachable, with the fixed cause in the log line.
 
       - alert: YuzuPgConnectFailing
         # The pool's connect-failure breaker has armed — NEW pool connections
@@ -5482,20 +5608,22 @@ groups:
       # with no alert referencing it, so a sustained read degrade silently
       # turned device compliance scores "healthy" (the DEX-score fail-open
       # this counter's guardian_state source also covers) and paged nobody.
-      # Four sources on the SAME counter (guardian_census, #5690, covers the
+      # Five sources on the SAME counter (guardian_census, #5690, covers the
       # two census gauge reads, the pending-evidence count and the
       # unordered-agents count: they serve no empty result, each gauge
       # keeps its last value; guardian_census_device, #7217, covers the
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
-      # does not touch either gauge), each
+      # does not touch either gauge; dex_usage covers the fleet application usage
+      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
+      # figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
       # statement_timeout on guardian_census_device for a read that ran past its
       # 5 s budget, most likely because of a large retained pending backlog, and
       # on guardian_state for an Apps read cancelled at the 30 s statement
-      # timeout): "guardian_state"
+      # timeout, and on dex_usage for a usage read cancelled at its 10 s bound): "guardian_state"
       # is the DEX/observation family (dex_read<>/dex_observation) - these
       # fail SOFT, serving an empty/degraded result rather than an error, so
       # this is the ONLY external signal that anything went wrong; "guardian_rules"
@@ -5571,6 +5699,22 @@ groups:
             list read (GET /api/v1/dex/apps, list_dex_apps) was refused with a
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
+            source="dex_usage" means the fleet application usage read behind
+            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
+            request is a 503 naming the reason, never a 200 with zero figures.
+            reason="concurrency_budget" is the same in-flight budget refusal
+            (four at once, retryable). reason="statement_timeout" is the read
+            running past its 10 s bound; three in a row spanning two minutes with
+            no success make the route answer fleet_too_large (503 with no retry
+            hint), which a retry does not clear. Measured on one test host over a
+            synthetic dataset of about 205 usage rows per device, the read cost
+            4.1 s at 60,000 online devices and reaches the 10 s bound near
+            150,000 by extrapolation (not a guaranteed ceiling); an index on the
+            executable key did not change the plan. Only platform= narrows the
+            read, there is no operator-side fix today, the state clears on the
+            first successful read, and the other DEX routes are unaffected. Runbook:
+            docs/dex/app-usage.md#runbook-fleet_too_large (check
+            yuzu_pg_pool_in_use and yuzu_pg_acquire_wait_seconds as well).
             See #2659 for the deferred-widening posture behind this metric.
           runbook_url: "https://docs.yuzu.io/runbooks/guardian-read-degraded"
 
@@ -6618,8 +6762,8 @@ groups:
         # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
         # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
         # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
-        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
-        # upgrade ahead of the server) is stuck.
+        # freezes and nothing else shows it. Sustained = a device (or a fleet of agents on a
+        # different build from the server, outside the deployment contract) is stuck.
         # increase over a day with NO hold: a single device refused once a day is enough, and a
         # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
         expr: |
@@ -6633,8 +6777,10 @@ groups:
           description: >-
             yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
             error/budget_exceeded) increased in the last day. The affected devices'
-            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
-            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent on a
+            different build from the server, outside the deployment contract
+            (every agent and server runs the same build; reprovision the agent
+            from the server's build); bad_header / over_cap / blob_too_large = a
             malformed or oversize report - find the agent in the warn log line
             "certificate_inventory: blob from agent=... refused".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
@@ -8810,12 +8956,52 @@ groups:
             the rename (including a sidecar present under both names) and a corrupt echo.db that
             could not be moved aside; the upgrade notes cover adoption under 'Two cases the
             agent refuses, and what to do', and the corrupt-database case is under
-            Corrupt-database quarantine in the Echo manual. An Echo that loads offline for lack
-            of free space is not counted here (#7290). The value and the plugin label are
+            Corrupt-database quarantine in the Echo manual. An Echo that loads offline (for lack
+            of free space, or after a failed v10 migration) is not counted here; see
+            YuzuEchoStorageOffline (#7290). The value and the plugin label are
             agent-self-reported: the server bounds the label to its catalogue, so an agent
             cannot displace a real plugin, but it can still report a real plugin's name as
             failed, or not report a failure, so the signal is not authoritative.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/upgrading.md#behaviour-change-the-activity-record-feature-is-renamed-echo-tardb-adopted-as-echodb-stored-references-migrated"
+
+      # Echo loaded OFFLINE because its database could not be opened (a failed v10 roll-up
+      # migration, or too little free disk for it) and is retrying in the background (#7290). Such
+      # an agent no longer fails the plugin's init, so it is NOT in yuzu_fleet_plugin_init_failed:
+      # this rule is what replaces that signal. The family has a fixed label set (free_space,
+      # migration_failed, open_failed, unknown) published every sweep, 0 included, so `> 0`
+      # selects only the reasons with agents. Same expression shape as YuzuPluginInitFailed
+      # (max_over_time[5m] rides over a replica restart's one absent sample, `sum by` drops
+      # `instance` so an agent moving replicas does not reset the clock).
+      #
+      # `for: 30m` is a DESIGN value derived from the agent's retry schedule (1, 5 and 15 minutes,
+      # then hourly; the three quick retries finish about 21 minutes after the start), so a
+      # transient condition such as a briefly full disk or a held lock has had its quick retries
+      # before anyone is told. It is not fitted to fleet data. Warning, not critical: the agent
+      # keeps retrying on its own (bar a collection-start failure, which needs an agent restart)
+      # and the value is agent-self-reported.
+      - alert: YuzuEchoStorageOffline
+        expr: |
+          sum by (job, reason) (max_over_time(yuzu_fleet_echo_storage_offline[5m])) > 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "About {{ $value }} agent(s) have Echo storage offline ({{ $labels.reason }})"
+          description: >-
+            For more than 25 minutes, about {{ $value }} agent(s) (summed across core replicas,
+            so a failover can count one twice for a few minutes) have reported that their Echo
+            database could not be opened and Echo is offline (heartbeat tag
+            yuzu.plugin.echo.storage_offline), reason {{ $labels.reason }}: free_space is too
+            little free disk for the v10 roll-up migration, migration_failed is a migration that
+            failed or ran past its deadline and was rolled back with the old data intact,
+            open_failed is any other failure on a retry. reason="unknown" sums values the server
+            does not recognise. Nothing is collected on an affected endpoint, but the agent keeps
+            retrying (1, 5 and 15 minutes, then hourly) and recovers by itself once the cause is
+            gone, except an open_failed where the database opened but collection failed to start:
+            that is not retried and needs an agent restart. The agent log and `echo status` on
+            the device name the cause. The value and the reason are agent-self-reported, so the
+            signal is not authoritative.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/ops-runbooks/echo-storage-offline.md"
 
   - name: yuzu-web-writes
     # Cookie-session requests refused by the pre-routing same-site gate

@@ -760,6 +760,70 @@ http2_frame_rate_default_test_() ->
                          mgmt_entry(#{http2 => #{max_concurrent_streams => 32}})))
       end}].
 
+%% CVE-2026-113431 (cowlib <= 2.21.0): an unauthenticated peer could send an
+%% HPACK header block that decodes to an unbounded header list, because
+%% cow_http2_machine never enforced max_header_list_size. cowlib 2.22.0 enforces
+%% it and DEFAULTS it to 32768 (the protocol default is infinity), so the
+%% listeners get the bound without setting the key: http2_opts/1 must therefore
+%% NOT override it with a larger value or `infinity', and the machine Cowboy
+%% builds from these opts must advertise it and refuse an over-limit request.
+%% The block is 9 x (user-agent, 4000 bytes) = 36 000 + 9 x 32 + the pseudo
+%% headers, past 32768, and indexed (the value is sent once and referenced), so a
+%% small block expands: the case an encoded-size limit alone does not catch.
+http2_header_list_bound_test_() ->
+    Headers = [{<<":method">>, <<"GET">>}, {<<":scheme">>, <<"http">>},
+               {<<":path">>, <<"/">>}],
+    Block = fun(N) ->
+                {B, _} = cow_hpack:encode(
+                           Headers ++ lists:duplicate(N, {<<"user-agent">>,
+                                                          binary:copy(<<$a>>, 4000)}),
+                           cow_hpack:init(), #{huffman => false}),
+                iolist_to_binary(B)
+            end,
+    Machine = fun(Entry) ->
+                  {ok, Preface, M0} = cow_http2_machine:init(
+                                        server, yuzu_grpc_listener:http2_opts(Entry)),
+                  {ok, M} = cow_http2_machine:frame({settings, #{}}, M0),
+                  {iolist_to_binary(Preface), M}
+              end,
+    [{"neither listener role overrides the library bound",
+      fun() ->
+          ?assertNot(maps:is_key(max_header_list_size, yuzu_grpc_listener:http2_opts(entry()))),
+          ?assertNot(maps:is_key(max_header_list_size,
+                                 yuzu_grpc_listener:http2_opts(mgmt_entry())))
+      end},
+     {"the allow-list refuses max_header_list_size (not tunable: fails safe)",
+      ?_assertMatch({error, {unknown_keys, http2, [max_header_list_size], {allowed, _}}},
+                    refused(#{http2 => #{max_header_list_size => 16#ffffffff}}))},
+     {"max_headers and max_fragmented_header_block_size are left unset (Cowboy's defaults) on both roles",
+      fun() ->
+          [?assertNot(maps:is_key(K, yuzu_grpc_listener:http2_opts(E)))
+           || K <- [max_headers, max_fragmented_header_block_size],
+              E <- [entry(), mgmt_entry()]]
+      end},
+     {"the server preface advertises SETTINGS_MAX_HEADER_LIST_SIZE = 32768, on both roles",
+      fun() ->
+          [begin
+               {Preface, _} = Machine(E),
+               {ok, {settings, Settings}, _} = cow_http2:parse(Preface),
+               ?assertEqual(32768, maps:get(max_header_list_size, Settings))
+           end || E <- [entry(), mgmt_entry()]]
+      end},
+     {"a request whose header list is within the bound is accepted",
+      fun() ->
+          {_, M} = Machine(entry()),
+          ?assertMatch({ok, {headers, 1, fin, _, _, _}, _},
+                       cow_http2_machine:frame({headers, 1, fin, head_fin, Block(8)}, M))
+      end},
+     {"a request whose header list is over the bound is refused (stream error, not growth), on both roles",
+      fun() ->
+          [begin
+               {_, M} = Machine(E),
+               ?assertMatch({error, {stream_error, 1, enhance_your_calm, _}, _},
+                            cow_http2_machine:frame({headers, 1, fin, head_fin, Block(9)}, M))
+           end || E <- [entry(), mgmt_entry()]]
+      end}].
+
 %% The server holds ONE connection to the management listener and sends every
 %% command of a fan-out over it. 6000 unary RPCs in 12 waves of 500 concurrent
 %% calls are about 12000 received frames (HEADERS and DATA per call); inside one

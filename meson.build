@@ -546,8 +546,13 @@ subdir('sdk')
 # ── Agent ─────────────────────────────────────────────────────────────────────
 if build_agent
   subdir('agents/core')
-  # build_examples gates ONLY the four genuinely decorative demo plugins
-  # below -- every other plugin is a real, shipped capability (several are
+  # build_examples gates ONLY the four plugins below: the three demo plugins
+  # (example, chargen, procfetch) and netprobe, which is NOT a demo -- it is
+  # active network measurement (ICMP/TCP round-trip, DNS timing) and the
+  # Windows installer installs it with the Network component. build_examples
+  # defaults to true and the release does not turn it off, so all four ship
+  # (tests/test_agent_installer_plugin_coverage_lint.py pins that). Every
+  # other plugin is a real, shipped capability (several are
   # unconditional link_depends of tests/meson.build's yuzu_agent_tests
   # target) and must build regardless of this flag (#4262). Verified via
   # a grep sweep of every subdir name against the rest of the tree before
@@ -622,6 +627,7 @@ if build_agent
   subdir('agents/plugins/mgmt_posture')  # management-plane posture (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/shares')  # configured SMB/NFS shares (Linux, macOS and Windows legs)
   subdir('agents/plugins/remote_access_audit')  # SSH inbound-access audit (Linux + macOS legs; Windows planned)
+  subdir('agents/plugins/process_introspect')  # per-process introspection of one pid (Linux leg; macOS and Windows planned)
   subdir('agents/plugins/runtimes')  # Wave 10 PR10.1-b
   subdir('agents/plugins/component_inventory')  # SAM-16: Java components found in application trees (Linux + macOS legs; Windows planned)
   subdir('agents/plugins/virtualization')  # PR12.1-a: VM / hypervisor / container facts (Linux, macOS and Windows legs)
@@ -906,8 +912,17 @@ if host_machine.system() == 'windows'
     _deploy_args += ['--debug']
   endif
 
-  # Run at configure time so a fresh setup has all DLLs immediately
-  run_command(_python3, _deploy_script, _deploy_args, check: false)
+  # Run at configure time so a fresh setup has all DLLs immediately. Not
+  # fatal here (plugins are not built yet, and the build-time target below
+  # runs again), but a copy that failed is reported instead of dropped.
+  _deploy_run = run_command(_python3, _deploy_script, _deploy_args, check: false)
+  if _deploy_run.returncode() != 0
+    warning('deploy_build_dlls.py failed at configure time; the build-time '
+            + 'deploy_dlls target will retry and fail the build if it still '
+            + 'cannot copy:\n' + _deploy_run.stderr())
+  elif _deploy_run.stderr().strip() != ''
+    message(_deploy_run.stderr().strip())
+  endif
 
   # Run at build time so rebuilt plugins are always copied to plugins/
   custom_target('deploy_dlls',

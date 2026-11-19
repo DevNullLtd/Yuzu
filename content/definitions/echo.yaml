@@ -18,14 +18,20 @@ metadata:
     mechanism actually collecting — always polling today), so status never
     misrepresents the active capture mechanism. On the healthy path the FIRST
     line is storage_state|ok. Offline means collection and retention are both
-    stopped until the agent restarts and every other field is withheld -- the
+    stopped and every other field is withheld -- the
     reply is then just an error| line followed by storage_state|offline (a
-    wedged rollback closed the Echo database) or
-    storage_state|offline|free_space (the roll-up migration was refused at
-    start because the volume held less than twice the database file plus its write-ahead log free, or
-    its free space could not be read; the file is untouched and Echo loads
-    without its database until a restart with the space freed), and the
-    action exits non-zero. The order is REVERSED on that path: error| comes
+    wedged rollback closed the Echo database; recovery needs an agent restart)
+    or storage_state|offline|<reason>, where free_space means the roll-up
+    migration was refused because the volume held less than twice the database
+    file plus its write-ahead log free (or its free space could not be read),
+    migration_failed means the v10 roll-up step failed, ran out of its deadline
+    or waited on an earlier step that had not finished, and open_failed means
+    any other failure seen on a later retry; in each case the file is untouched,
+    Echo loads without its database, and the agent retries the open by itself
+    (1, 5 and 15 minutes after the first failure, then hourly), so no restart is
+    needed once the cause is gone; the one exception is a collection start that
+    fails after a late open, which is not retried, and the error| line then asks
+    for an agent restart. The action exits non-zero. The order is REVERSED on that path: error| comes
     FIRST, because
     server and dashboard consumers key off the output starting with error|, so
     do not assume storage_state is always the first line. Historical data
@@ -383,7 +389,11 @@ metadata:
     collection intervals, and command-line
     redaction patterns for sensitive data protection. Lowering
     db_budget_bytes deletes history on the next maintenance pass (within 15
-    minutes) and cannot be undone.
+    minutes) and cannot be undone. A setting that cannot be saved stops the
+    call with exit code 1 and an error| line; settings saved earlier in the
+    same call stay saved and are listed first as partial|applied|<keys>. An
+    interval listed there takes effect at the next agent restart or when sent
+    again in a call that succeeds.
   tags: [echo, timeline, configuration, security]
 
 spec:
@@ -409,10 +419,11 @@ spec:
           is over budget the maintenance pass removes hourly rows older than
           48 hours (5 days for procperf), oldest first. Daily and
           monthly rows are never removed, nor are the usage tables,
-          or paused or errored sources (an unreadable <source>_enabled counts
-          as errored). Requires an agent newer than v0.15.0; an older agent
-          ignores this key beside other keys and refuses it alone
-          (error|no valid configuration parameters provided). Lowering it
+          or paused sources, or sources errored while paused (an unreadable
+          <source>_enabled is preserved). Requires an agent newer than
+          v0.15.0; an older agent ignores this key beside other keys and
+          refuses it alone (error|no valid configuration parameters
+          provided). Lowering it
           permanently deletes the oldest eligible history within 15 minutes,
           before its tier's retention limit; raising it again does not
           restore it.
@@ -923,7 +934,7 @@ spec:
       - name: events_recorded
         type: int32
         description: >-
-          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable. Values: non-negative integer.
+          Count of change events this tick appended to the warehouse. Carried as the third field of the actual response line `echo|collect_fast|<events_recorded>|<token>`, where <token> is one of source_disabled / unsupported_platform / baseline / sample_recorded / cursor_advanced / cursor_lost / capture_incomplete / counters_unavailable / state_unreadable / retry_backoff (retry_backoff only on a cursor source's own collect_<source> line). Values: non-negative integer.
         example: "-"
         platforms: [windows, linux, darwin]
 

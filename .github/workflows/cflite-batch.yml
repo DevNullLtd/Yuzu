@@ -65,6 +65,10 @@ on:
     branches: [dev]
     # KEEP IN SYNC with cflite-pr.yml's paths (and .clusterfuzzlite/build.sh).
     paths:
+      - 'agents/shared/file_search_*'
+      - 'agents/shared/base64*'
+      - 'agents/shared/wire_utf8*'
+      - 'agents/shared/sha256*'
       - 'server/core/src/preflight_parse*'
       - 'server/core/src/deployment_parse*'
       - 'server/core/src/yaml_scan*'
@@ -72,6 +76,7 @@ on:
       - 'server/core/src/guardian_resilience_schema*'
       - 'server/core/src/guardian_schema_registry*'
       - 'agents/plugins/component_inventory/src/zip_directory*'
+      - 'agents/shared/binary_header_*'
       - 'tests/fuzz/**'
       - '.clusterfuzzlite/**'
       - '.github/workflows/cflite-batch.yml'

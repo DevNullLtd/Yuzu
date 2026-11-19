@@ -97,6 +97,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <win_dns_cache_table.hpp> // DnsCacheTableOwner (F64: frees the DnsGetCacheDataTable list)
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 #include <iphlpapi.h>
 #include <netioapi.h> // GetIpNetTable2 / MIB_IPNET_ROW2 / ConvertInterfaceLuidToAlias (arp)
@@ -1184,17 +1185,18 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (proxy_cfg.lpszAutoConfigUrl) {
             ctx.write_output(std::format("proxy_type|pac"));
             ctx.write_output(
-                std::format("proxy_address|{}", from_wide(proxy_cfg.lpszAutoConfigUrl)));
+                yuzu::network_config::format_proxy_address_row(from_wide(proxy_cfg.lpszAutoConfigUrl)));
             GlobalFree(proxy_cfg.lpszAutoConfigUrl);
         }
         if (proxy_cfg.lpszProxy) {
             auto proxy = from_wide(proxy_cfg.lpszProxy);
             ctx.write_output(std::format("proxy_type|http"));
-            ctx.write_output(std::format("proxy_address|{}", proxy));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(
+                                     proxy, yuzu::network_config::ProxyShape::list));
             GlobalFree(proxy_cfg.lpszProxy);
         }
         if (proxy_cfg.lpszProxyBypass) {
-            ctx.write_output(std::format("bypass|{}", from_wide(proxy_cfg.lpszProxyBypass)));
+            ctx.write_output(yuzu::network_config::format_bypass_row(from_wide(proxy_cfg.lpszProxyBypass)));
             GlobalFree(proxy_cfg.lpszProxyBypass);
         }
         if (!proxy_cfg.lpszAutoConfigUrl && !proxy_cfg.lpszProxy) {
@@ -1216,10 +1218,10 @@ int do_proxy(yuzu::CommandContext& ctx) {
         if (val && *val) {
             if (std::string_view(var).find("no_proxy") != std::string_view::npos ||
                 std::string_view(var).find("NO_PROXY") != std::string_view::npos) {
-                ctx.write_output(std::format("bypass|{}", val));
+                ctx.write_output(yuzu::network_config::format_bypass_row(val));
             } else {
                 ctx.write_output(std::format("proxy_type|{}", var));
-                ctx.write_output(std::format("proxy_address|{}", val));
+                ctx.write_output(yuzu::network_config::format_proxy_address_row(val));
             }
             found = true;
         }
@@ -1329,7 +1331,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
         const auto choice = yuzu::network_config::select_proxy(candidates);
         if (choice.found) {
             ctx.write_output(std::format("proxy_type|{}", choice.type));
-            ctx.write_output(std::format("proxy_address|{}", choice.address));
+            ctx.write_output(yuzu::network_config::format_proxy_address_row(choice.address));
             emitted = true;
         }
 
@@ -1352,7 +1354,7 @@ int do_proxy(yuzu::CommandContext& ctx) {
             // is the acquisition half.
             const std::string joined = yuzu::network_config::join_bypass_list(entries);
             if (!joined.empty())
-                ctx.write_output(std::format("bypass|{}", joined));
+                ctx.write_output(yuzu::network_config::format_bypass_row(joined));
         }
     } else {
         // SCDynamicStoreCopyProxies failed. Falling through to the
@@ -1764,66 +1766,67 @@ private:
     static int do_dns_cache(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
         // Dynamically load DnsGetCacheDataTable from dnsapi.dll
-        using DNS_CACHE_ENTRY = struct _DNS_CACHE_ENTRY {
-            struct _DNS_CACHE_ENTRY* pNext;
-            PWSTR pszName;
-            WORD wType;
-            WORD wDataLength;
-            DWORD dwFlags;
-        };
-        using DnsGetCacheDataTableFn = BOOL(WINAPI*)(DNS_CACHE_ENTRY*);
+        using DnsGetCacheDataTableFn = BOOL(WINAPI*)(yuzu::shared::DnsCacheNode**);
 
-        auto hDnsApi = LoadLibraryA("dnsapi.dll");
+        auto hDnsApi = LoadLibraryExW(L"dnsapi.dll", nullptr, LOAD_LIBRARY_SEARCH_SYSTEM32);
         if (!hDnsApi) {
             ctx.write_output("dns_cache|not_available|dnsapi.dll not found");
             return 0;
         }
 
         auto pFunc = reinterpret_cast<DnsGetCacheDataTableFn>(
-            GetProcAddress(hDnsApi, "DnsGetCacheDataTable"));
+            reinterpret_cast<void*>(GetProcAddress(hDnsApi, "DnsGetCacheDataTable")));
         if (!pFunc) {
             FreeLibrary(hDnsApi);
             ctx.write_output("dns_cache|not_available|DnsGetCacheDataTable not found");
             return 0;
         }
 
-        DNS_CACHE_ENTRY root{};
-        if (pFunc(&root)) {
-            int count = 0;
-            for (auto* entry = root.pNext; entry; entry = entry->pNext) {
-                if (entry->pszName) {
-                    auto name = from_wide(entry->pszName);
-                    // wType: 1=A, 28=AAAA, 5=CNAME, etc.
-                    const char* type = "unknown";
-                    switch (entry->wType) {
-                    case 1:
-                        type = "A";
-                        break;
-                    case 28:
-                        type = "AAAA";
-                        break;
-                    case 5:
-                        type = "CNAME";
-                        break;
-                    case 12:
-                        type = "PTR";
-                        break;
-                    case 15:
-                        type = "MX";
-                        break;
-                    case 33:
-                        type = "SRV";
-                        break;
+        {
+            // The list is caller-owned (F64): the owner frees every node + name on scope exit,
+            // including when write_output/from_wide throws. It must be destroyed BEFORE
+            // FreeLibrary below, which it is (inner scope).
+            yuzu::shared::DnsCacheTableOwner table(hDnsApi);
+            if (pFunc(table.out())) {
+                int count = 0;
+                std::size_t nodes = 0;
+                for (auto* entry = table.head(); entry; entry = entry->pNext) {
+                    if (++nodes > yuzu::shared::kDnsCacheNodeWalkCap)
+                        break; // corrupted/cyclic list: bound the walk
+                    if (entry->pszName) {
+                        auto name = from_wide(entry->pszName);
+                        // wType: 1=A, 28=AAAA, 5=CNAME, etc.
+                        const char* type = "unknown";
+                        switch (entry->wType) {
+                        case 1:
+                            type = "A";
+                            break;
+                        case 28:
+                            type = "AAAA";
+                            break;
+                        case 5:
+                            type = "CNAME";
+                            break;
+                        case 12:
+                            type = "PTR";
+                            break;
+                        case 15:
+                            type = "MX";
+                            break;
+                        case 33:
+                            type = "SRV";
+                            break;
+                        }
+                        ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
+                        ++count;
                     }
-                    ctx.write_output(std::format("cache_entry|{}|{}|0|", name, type));
-                    ++count;
                 }
+                if (count == 0) {
+                    ctx.write_output("dns_cache|empty");
+                }
+            } else {
+                ctx.write_output("dns_cache|not_available|query failed");
             }
-            if (count == 0) {
-                ctx.write_output("dns_cache|empty");
-            }
-        } else {
-            ctx.write_output("dns_cache|not_available|query failed");
         }
         FreeLibrary(hDnsApi);
 
