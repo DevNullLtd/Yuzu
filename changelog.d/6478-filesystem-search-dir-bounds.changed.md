@@ -30,8 +30,8 @@
   UTF-8 now shows as `?` in `search_dir`, `find_by_hash` and `get_acl` rows instead of making the whole
   response unreadable, and on Windows an unpaired UTF-16 surrogate in a name shows as U+FFFD, the
   replacement character. Definition `device.filesystem.search_dir` is now 0.5.0 (columns `row_kind`,
-  `path`, `entry_type`); an existing server keeps 0.4.0 until the definition is replaced (see the
-  upgrade note).
+  `path`, `entry_type`); a server started on a database created by this build holds
+  0.5.0.
 - **Breaking - a result-set `matcher` over 64 KiB is refused (#6478).** Affected: a caller of
   `POST /api/v1/result-sets/from-instruction-result` or the MCP tool
   `create_result_set_from_instruction_result` that sends a `matcher` over 65,536 bytes of compact
