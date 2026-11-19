@@ -651,6 +651,30 @@ TEST_CASE("POST /api/policies/:id/evaluate: a refused dispatch is a 409 of its o
     CHECK(found);
 }
 
+TEST_CASE("POST /api/policies/:id/evaluate: an unwired refusal does not tell the caller to change "
+          "the instruction",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), nullptr); // no capability registry: every pair reads unwired
+    const auto check = r.define("i.check", "echo", "status");
+    const auto fid = r.fragment("unwired", check);
+    const auto pid = r.policy("unwired policy", fid, r.group_id);
+
+    auto res = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(res);
+    CHECK(res->status == 409);
+    CHECK(r.dispatch_calls == 0);
+
+    const auto body = nlohmann::json::parse(res->body);
+    const auto& err = body.at("error");
+    CHECK(err.at("message") == "policy dispatch refused");
+    const auto remediation = err.at("remediation").get<std::string>();
+    CHECK(remediation.rfind("policy_dispatch_refused: unwired", 0) == 0);
+    // The instruction is not at fault: the server could not check it.
+    CHECK(remediation.find("Change the instruction") == std::string::npos);
+    CHECK(remediation.find("Try again later") != std::string::npos);
+}
+
 TEST_CASE("POST /api/policies/:id/evaluate: the refusal 409 is distinguishable from the "
           "nothing-to-dispatch 409",
           "[pg][policy][admin][dispatch_approval]") {

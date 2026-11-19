@@ -294,6 +294,10 @@ const char* const kCompliancePageTemplate =
     }
     function errText(r, fallback) {
       var d = r.data;
+      /* A refused dispatch (409) names its reason in the A4 remediation text. */
+      var rem = d && d.error && typeof d.error.remediation === 'string' ? d.error.remediation : '';
+      var refused = /^policy_dispatch_refused: ([a-z_]+)\. (.*)$/.exec(rem);
+      if (refused) return 'Policy dispatch refused (' + refused[1] + '). ' + refused[2];
       if (d && typeof d.error === 'string') return d.error;
       if (d && d.error && typeof d.error.message === 'string') return d.error.message;
       if (r.status === 403) return 'You do not have permission for this action.';
@@ -389,7 +393,7 @@ const char* const kCompliancePageTemplate =
         var n = el.getAttribute('data-n');
         var lines = [(n !== null ? 'Currently ' + n + ' non-compliant devices; the fix runs on whichever are non-compliant when you confirm.'
                                 : 'The fix runs on whichever devices are non-compliant when you confirm.'),
-          'It dispatches the policy fragment\u2019s fix instruction directly, with no approval step. Review the fragment before you proceed.'];
+          'It dispatches the policy fragment\u2019s fix instruction. A fix that needs approval, is destructive or is reserved for the server is refused, not dispatched. Review the fragment before you proceed.'];
         return confirmAct('Remediate ' + name + '?', lines, 'Remediate', true).then(function(ok) {
           if (!ok) return;
           return api('POST', '/api/policies/' + encodeURIComponent(id) + '/remediate', {}).then(function(r) {

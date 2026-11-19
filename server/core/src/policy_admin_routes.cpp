@@ -80,10 +80,17 @@ void PolicyAdminRoutes::answer_dispatch_refused(httplib::Response& res,
     // can tell them apart.
     res.status = 409;
     detail::A4ErrorOpts opts;
+    // `unwired` is not the instruction's fault: the server could not check the pair at all, so
+    // changing the instruction would not help.
+    const std::string_view advice =
+        reason == PolicyDispatchDenialReason::Unwired
+            ? "Policy evaluation cannot check this action now, because the server's capability "
+              "registry is not available. Try again later, and tell the administrator if it "
+              "persists."
+            : "The policy's check or fix names an action that policy evaluation does not "
+              "dispatch. Change the instruction the policy uses.";
     const std::string remediation =
-        "policy_dispatch_refused: " + std::string(to_string(reason)) +
-        ". The policy's check or fix names an action that policy evaluation does not "
-        "dispatch. Change the instruction the policy uses.";
+        "policy_dispatch_refused: " + std::string(to_string(reason)) + ". " + std::string(advice);
     opts.remediation = remediation;
     res.set_content(detail::a4_error(res, "policy dispatch refused", opts), "application/json");
 }

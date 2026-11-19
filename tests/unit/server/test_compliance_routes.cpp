@@ -1040,6 +1040,20 @@ TEST_CASE("compliance page: actions use one delegated [data-act] listener, no in
     CHECK(page.find("r.data.deleted === true") != std::string::npos);
 }
 
+TEST_CASE("compliance page: the remediate copy says what policy evaluation refuses, and a refused "
+          "dispatch toast carries its reason",
+          "[compliance][fragments]") {
+    const std::string page = kComplianceHtml;
+    // The confirm copy no longer says the fix has no approval step: a fix that needs approval,
+    // is destructive or is reserved for the server is refused, not dispatched.
+    CHECK(page.find("with no approval step") == std::string::npos);
+    CHECK(page.find("is refused, not dispatched") != std::string::npos);
+    // The toast text is composed from the A4 body's remediation when the 409 is a refused
+    // dispatch, so the reason reaches the operator and not only "policy dispatch refused".
+    CHECK(page.find("policy_dispatch_refused: ") != std::string::npos);
+    CHECK(page.find("d.error.remediation") != std::string::npos);
+}
+
 TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once and echoes them",
           "[compliance][fragments]") {
     {

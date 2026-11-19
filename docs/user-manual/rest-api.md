@@ -5615,7 +5615,8 @@ built like every other A4 error (`error.code` 409, `message` "policy dispatch
 refused", a `correlation_id`, and a `remediation` text that starts
 `policy_dispatch_refused: ` followed by the reason: `gated`, `destructive`,
 `reserved`, `unclassified`, `ambiguous`, `unwired` or
-`dispatch_identifier_invalid`). Nothing was sent; the policy's devices are
+`dispatch_identifier_invalid`; the text tells the caller to change the instruction, except for
+`unwired`, where it says to try again later). Nothing was sent; the policy's devices are
 `blocked` and the attempt is audited as `policy.evaluate` `denied`. **Response (503):** either the policy evaluator
 isn't wired, a genuine internal store failure occurred while reading the policy
 or fragment, recording the dispatch claim, or (ADR-0058) resolving the check

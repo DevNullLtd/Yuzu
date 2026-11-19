@@ -439,7 +439,9 @@ interval. It returns `202` with an `execution_id`; verdicts land within roughly
 15–30 seconds (next collection cycle). If the check names an action that policy
 evaluation does not run, nothing is dispatched and the route answers `409` with a
 remediation text that starts `policy_dispatch_refused` and names the reason; the
-devices become `blocked` (see above).
+devices become `blocked` (see above). For every reason except `unwired` the text says to
+change the instruction the policy uses. For `unwired` (the server's capability registry is
+not available) the instruction is not at fault, and the text says to try again later.
 
 ---
 
@@ -473,7 +475,7 @@ when the signed-in role holds the permission (the server re-checks every call).
 | **Evaluate** | `Policy:Execute` | Dispatches a read-only check now. The toast shows the execution id, not a device count. |
 | **Invalidate all** | `Policy:Execute` | Resets every result to unknown; fleet compliance reads 0% until devices check in. Confirmation required. |
 | **New policy** / **New fragment** | `Policy:Write` | Paste YAML (up to 1 MiB); a refused document shows the server's message. Not available in this build: the controls appear only once the shared dialog script (`/static/yuzu-dialog.js`) is shipped, so create policies and fragments with `POST /api/policies` and `POST /api/policy-fragments` until then. |
-| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm; there is no approval step. |
+| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm. A fix that needs approval, is destructive or is reserved for the server is refused, not dispatched, and the devices show `blocked`; the toast names the reason. |
 | **Invalidate cache** | `Policy:Execute` | Resets one policy's results and its fix attempt counts. Confirmation required. |
 | **Delete** (policy, fragment) | `Policy:Delete` | Confirmation required. A fragment still used by a policy cannot be deleted. |
 
