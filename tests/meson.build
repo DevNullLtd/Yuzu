@@ -309,6 +309,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
+    'unit/test_session_log_fingerprint.cpp', # #8159: session id never logged raw
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
@@ -4877,6 +4878,36 @@ test('access audit production wiring lexical gate',
 test('same-site gate production wiring lexical gate',
   _python3_test,
   args: [files('test_same_site_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
+test('agent session id log wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_session_log_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# #8159: the session_fp -> session id join in scripts/lib/agent-session-fp.sh, on LF and CRLF fixtures.
+test('agent session fp shell join',
+  _python3_test,
+  args: [files('test_agent_session_fp_shell.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# F56: yuzu_pg_canary prints a fixed cause on a connect failure, never libpq's text. Server-only.
+if is_variable('pg_canary_exe')
+  test('pg canary connect failure line',
+    _python3_test,
+    args: [files('test_pg_canary_connect_failure.py'), pg_canary_exe],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
+# WP04-X: the readiness probe's query-phase sites never use the connect classifier.
+test('pg probe query-phase classifier lexical gate',
+  _python3_test,
+  args: [files('test_pg_probe_query_phase_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

@@ -47,8 +47,9 @@ What CAN appear at runtime is `pg_reachable`, with a `pg` reason
 Postgres primary (HA WS-8; `docs/user-manual/server-admin.md`, "What
 `/readyz` checks"). Engine-principal requests then degrade like every other
 Postgres-backed path (§3). Treat it as a Postgres-reachability question:
-read the `[readyz] Postgres not reachable` server-log line for the libpq
-detail, and `yuzu_server_pg_reachable` / the pool metrics, before assuming
+read the `[readyz] Postgres not reachable` server-log line for the fixed cause
+(libpq's own text is withheld; use `psql` against the same DSN and the PostgreSQL
+server log for the detail), and `yuzu_server_pg_reachable` / the pool metrics, before assuming
 the `engine_principal_store` schema itself is the problem.
 
 ### 3. Engine-authenticated requests failing — the 503-vs-401 split

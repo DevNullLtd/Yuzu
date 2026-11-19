@@ -21,6 +21,23 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 - The list CSV and the XLSX export grow from 23 to 24 columns; `package_id` is the last column, so positions of the existing columns do not move. The dashboard's Software page "Export installs" download is the same CSV. The truncation trailer record is 24 fields wide.
 - The OpenAPI `InstalledSoftwareRow` schema and the MCP `query_installed_software` output schema declare the field. Nothing is stored, ingested or migrated differently: the column was already persisted.
 
+## ⚠️ Breaking: some log lines and audit details changed shape (log parsers and runbooks)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anything that parses the server or agent logs, a runbook that sends on-call to a log line for Postgres detail, and a SIEM rule keyed on a changed string. Alert expressions and metric names are unchanged (alert annotation text changed).
+
+**What changed.**
+
+- **The agent's registration line** is now `Registered with server (session_fp=<8 hex>, enrollment=...)`. It was `(session=<id>, enrollment=...)`. The fingerprint is the first 8 hex of the SHA-256 of the session id, which is a bearer credential; this build's agent logs only the fingerprint. A parser that took `session=` from this line must take the id from the server's `[gateway] ProxyRegister succeeded: agent=<id>, session=<id>` line (or the gateway route table) and match on the fingerprint; the bundled UAT and HA scripts do. <!-- tripwire-allow: upgrade note quotes the old line -->
+- **Postgres connect-phase failures** (only the connect step; errors after a connection exists, for example in a store query, still print libpq's text unfolded, as before; #5964 tracks neutralising it) (the pool's `PgPool: connection attempt failed:` line, the leader elector's `dedicated connection failed:` line, the `[readyz] Postgres not reachable` line, `yuzu_pg_canary`) now log one of a fixed set of causes (`authentication failed ...`, `server not reachable ...`, `connection timed out`, and so on) instead of libpq's text, and `PgPool::last_error()` returns the same cause. Host, port and database name are no longer printed. Diagnose with `psql` against the same DSN and the PostgreSQL server log. The `YuzuServerPostgresUnreachable` alert is unchanged; its annotation now says this.
+- **`auth.saml_login_failed` audit detail** (and the matching analytics event field) is the rejection reason with control and C1 characters folded, `;` and `=` replaced by `_`, and clipped to its first 128 bytes with no truncation marker; it used to be the raw text. The server log line for the same failure keeps up to 256 bytes. A SIEM rule that matches a rejection reason in this detail must match the first 128 bytes of the folded text (a long reason is cut and `;`/`=` inside it read as `_`), or key on `action=auth.saml_login_failed` instead and read the server log for the full text.
+- **Other audit detail values** that pass through the shared detail sanitiser (OIDC and SAML `display=`, `email=` and subject values, `idp error:`, and the MCP and REST denial details) now also fold C1 controls (U+0080-U+009F), U+2028 and U+2029 to `_`. Values without those characters are unchanged.
+- **Login and SSO log lines** that print a user name or NameID (`Auth failed: unknown user '...'`, `Login blocked ...`, `SAML session created ...`, `SamlProvider: assertion accepted (name_id=...)` and similar) now fold control characters, C1 controls and Unicode line separators to `_` in the printed copy; stored values are unchanged.
+- **`audit_token` and `log_key_token`** now fold every well-formed C1 code point (U+0080-U+009F), not just NEL.
+
+**What to do.** Update log parsers and runbooks as above. No data migration.
+
 ## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
