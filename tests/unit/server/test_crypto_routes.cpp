@@ -2069,6 +2069,53 @@ TEST_CASE("crypto routes: REST certificates - gated on CertificateInventory:Read
     CHECK_THAT(h.audits[0].detail, !ContainsSubstring("Test"));
 }
 
+TEST_CASE("crypto routes: every certificate surface keys the per-principal read cap on the session user",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertList) + "?issuer_dn_contains=k%5Cs")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertSum))->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates?issuer_dn_contains=Test")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?issuer_dn_contains=Test")->status == 200);
+    REQUIRE(h.api->cert_queries.size() + h.api->cert_summary_queries.size() >= 3);
+    for (const auto& q : h.api->cert_queries)
+        CHECK(q.principal == h.username);
+    for (const auto& q : h.api->cert_summary_queries)
+        CHECK(q.principal == h.username);
+    CHECK(*h.api->cert_queries[0].filter.issuer_dn_contains == "k\\s"); // a literal backslash, unchanged
+    // An ordinary REST page carries no substring filter and never resolves the principal.
+    h.api->cert_queries.clear();
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertList))->status == 200);
+    REQUIRE(h.api->cert_queries.size() == 1);
+    CHECK(h.api->cert_queries[0].principal.empty());
+}
+
+TEST_CASE("crypto routes: every certificate surface refuses a bare subject substring, is_ca=false and a NUL "
+          "needle (guards 21/22)",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    for (const std::string path : {std::string(kCertList), std::string(kCertSum),
+                                   std::string("/fragments/crypto/certificates"),
+                                   std::string("/fragments/crypto/certificates/devices")}) {
+        for (const char* q : {"?subject_dn_contains=emSign", "?subject_dn_contains=emSign&is_ca=false",
+                              "?issuer_dn_contains=eMu%00dhra", "?subject_dn_contains=emS%00ign&is_ca=true"}) {
+            INFO(path << q);
+            auto res = h.sink.dispatch("GET", path + q);
+            REQUIRE(res);
+            // REST answers 400; a fragment renders its caveat in place (never a 5xx, never a read).
+            if (path.rfind("/api/", 0) == 0)
+                CHECK(res->status == 400);
+            else
+                CHECK(res->status < 500);
+        }
+    }
+    CHECK(h.api->cert_calls_total == 0);
+    CHECK(h.audits.empty());
+}
+
 TEST_CASE("crypto routes: certificate audit rows never carry a subject, SAN or filter value",
           "[crypto][routes][rest][certs][privacy]") {
     Harness h;

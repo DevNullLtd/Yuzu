@@ -1107,7 +1107,7 @@ TEST_CASE("mcp crypto tools: list_crypto_certificates and get_crypto_certificate
     }
 }
 
-TEST_CASE("mcp crypto tools: the certificate reads key the substring cap on username_fn and answer "
+TEST_CASE("mcp crypto tools: the certificate reads key the per-principal read cap on username_fn and answer "
           "its refusal with the seam's retry hint",
           "[mcp][crypto][certs]") {
     Twin t;
@@ -1121,7 +1121,7 @@ TEST_CASE("mcp crypto tools: the certificate reads key the substring cap on user
     CHECK(t.api->cert_summary_queries[0].principal == "alice");
 
     CryptoReadError busy = degraded(CryptoReadCause::kCapacity);
-    busy.message = "another certificate read of yours with a substring filter is still running";
+    busy.message = "another certificate summary or substring-filtered certificate read of yours is still running";
     busy.retry_after_ms = 5000;
     t.api->cert_page = std::unexpected(busy);
     t.clear_audit();
@@ -1130,4 +1130,31 @@ TEST_CASE("mcp crypto tools: the certificate reads key the substring cap on user
     REQUIRE(r.contains("error"));
     CHECK(r["error"]["data"]["retry_after_ms"] == 5000);
     CHECK(audit_count(t.generic_rows, "mcp.list_crypto_certificates|failure") == 1);
+}
+
+TEST_CASE("mcp crypto tools: the certificate reads refuse a bare subject substring, is_ca=false and a NUL "
+          "needle before any read (guards 21/22)",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    for (const char* tool : {"list_crypto_certificates", "get_crypto_certificate_summary"}) {
+        for (const json& args :
+             {json{{"subject_dn_contains", "emSign"}},
+              json{{"subject_dn_contains", "emSign"}, {"is_ca", false}},
+              json{{"issuer_dn_contains", std::string("eMu\0dhra", 8)}},
+              json{{"subject_dn_contains", std::string("emS\0ign", 7)}, {"is_ca", true}}}) {
+            INFO(tool << " " << args.dump());
+            t.clear_audit();
+            const json r = t.call(tool, args);
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == -32602);
+        }
+    }
+    CHECK(t.api->cert_queries.empty());
+    CHECK(t.api->cert_summary_queries.empty());
+    // The principal is the session username, never a parameter.
+    Twin u;
+    REQUIRE_FALSE(u.call("list_crypto_certificates", json{{"issuer_dn_contains", "k\\s"}}).contains("error"));
+    REQUIRE(u.api->cert_queries.size() == 1);
+    CHECK(u.api->cert_queries[0].principal == u.username);
+    CHECK(*u.api->cert_queries[0].filter.issuer_dn_contains == "k\\s"); // a literal backslash reaches the seam unchanged
 }
