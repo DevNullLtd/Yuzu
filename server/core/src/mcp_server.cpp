@@ -5474,7 +5474,7 @@ static const ToolDef kTools[] = {
     // software_curation_api.cpp behind /api/v1/inventory/software/normalization/*): the same
     // global gate, limits, refusals and audit rows. Every one takes the global Inventory grant and
     // keeps the default-denied service-scope class. The package_id and catalogue identity half of
-    // the lifecycle surface is held (#6090) and is not here. Appended at the VERY END of kTools[]
+    // the lifecycle surface is held (#8357) and is not here. Appended at the VERY END of kTools[]
     // per the standing governance note above.
     {"list_software_lifecycle_rules",
      "The imported software lifecycle rules (end-of-life, end-of-support and similar dated events "
