@@ -417,7 +417,8 @@ void RevocationSourceRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
                       unknown_id(req, res, verb, cid);
                       return;
                   }
-                  // An empty body is the same as `{}` (reset to now).
+                  // An empty body is read as `{}`, which validate_reset refuses: keep_key_sha256
+                  // and expected_config_version are required (#6590).
                   nlohmann::json body = nlohmann::json::object();
                   if (!req.body.empty() && !parse_body(req, res, verb, raw, body))
                       return;

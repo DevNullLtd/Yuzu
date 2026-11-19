@@ -10,12 +10,34 @@
 /// CHECKS a CRL against; it is never a trust anchor, an issuer, or a TLS root for any Yuzu
 /// decision path.
 ///
-/// This PR (2b-1a) WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables
-/// the fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. The
-/// #6590 rulings (2026-11-18: reset key list, `scope_key` encoding, canonical URLs) land as
-/// migration v2 before 2b-1b. `fetch_status`, `crl`, `crl_entry` and `rollback_high_water` exist,
-/// are READ here (a source's fetch status, its held-CRL count) and are deleted with their source /
-/// URL / key, but nothing in this PR inserts into `crl` or `crl_entry`. The one exception is
+/// 2b-1a WRITES only `source`, `source_ca_key` and `source_url`. v1 creates the tables the
+/// fetcher (2b-1b) reads and writes; `cert_signature_check` (2b-2) is not created here. v2 lands
+/// the three #6590 rulings (owner, 2026-11-18) before 2b-1b accepts any CRL:
+///   - ONE encoded `scope_key`, used identically in `crl` and `rollback_high_water`: `full` or
+///     `idp:<64 lowercase hex of the IDP DER SHA-256>`, then `:base` or `:delta`, pinned by a
+///     CHECK on both tables. The CA is the table's own column (`crl.source_id`,
+///     `rollback_high_water.ca_subject_name_sha256`), never part of the key. Only
+///     `rollback_high_water`'s CHECK also admits `'*'`, the CA-level row whose permanent
+///     `reset_at` scopes first seen later inherit. `crl.is_delta` is GENERATED from the suffix,
+///     so the two cannot disagree, and `UNIQUE (source_id, scope_key, is_delta)` stays: the
+///     fetcher replaces a scope's held CRL by delete-then-insert inside its acceptance
+///     transaction, so a reader sees the old CRL or the new one, never both and never none;
+///   - every stored URL is in the canonical form of `revocation_url_canonical.hpp`, which
+///     `UNIQUE (source_id, url)` and `replace` compare. The store refuses to write any other
+///     form, and on every open it rewrites a stored URL that is not canonical (a v1 row), refusing
+///     to open, with the source named in the error log, when two URLs of one source collapse
+///     into one;
+///   - the high-water reset names the keys that survive (`keep_key_sha256`, values of
+///     `source_ca_key.cert_sha256`, each already registered) and the `config_version` it was
+///     read from: every other key and every held CRL of the CA are removed in its transaction.
+/// `config_version` stays a PER-ROW counter (kept by the same ruling): 1 at register, raised by
+/// one in the transaction of a `replace` that changes the source and of every reset. Source ids
+/// come from an identity column that is never reset, so a remove and re-register can never
+/// reproduce an earlier (source id, config_version) pair; there is no global sequence.
+///
+/// `fetch_status`, `crl`, `crl_entry` and `rollback_high_water` are READ here (a source's fetch
+/// status, its held-CRL count) and are deleted with their source / URL / key, but nothing in
+/// this store inserts into `crl` or `crl_entry` yet. The one exception is
 /// `rollback_high_water`, which `reset_high_water` upserts: that mark is keyed by the CA, never by
 /// the source, so it survives `remove` (a remove and re-register cannot accept an older CRL).
 ///
@@ -50,7 +72,8 @@
 
 namespace yuzu::server::pg {
 class PgPool;
-}
+struct PgMigration;
+} // namespace yuzu::server::pg
 
 namespace yuzu::server {
 
@@ -65,9 +88,12 @@ namespace yuzu::server {
 ///   kLimitReached       `create`: kMaxSources sources are already registered;
 ///   kSubjectChanged     `replace`: the new CA certificates name a different subject than the
 ///                       source holds (a source is one CA);
-///   kVersionConflict    `replace`: the caller's expected_config_version is not the stored one;
+///   kVersionConflict    `replace` / `reset_high_water`: the caller's expected_config_version is
+///                       not the stored one;
 ///                       `existing_id` carries the stored config_version;
 ///   kBadResetTime       `reset_high_water`: the supplied `reset_at` is later than Postgres now();
+///   kUnknownKey         `reset_high_water`: a `keep_key_sha256` entry names no key registered on
+///                       the source; `existing_id` carries the entry's index;
 ///   kOutcomeUnknown     the connection was lost after a write was sent: it may or may not have
 ///                       committed - re-read to check, never assume either way.
 /// `message` is for logs and never carries a URL, a name or a username.
@@ -82,12 +108,15 @@ struct RevocationSourceStoreError {
         kLimitReached,
         kSubjectChanged,
         kBadResetTime,
-    kVersionConflict,
+        kVersionConflict,
+        kUnknownKey,
         kOutcomeUnknown,
     };
     Kind kind{Kind::kQueryError};
     std::string message;
-    std::int64_t existing_id{0}; ///< kConflict: the existing source id; kVersionConflict: the stored config_version
+    /// kConflict: the existing source id; kVersionConflict: the stored config_version;
+    /// kUnknownKey: the index of the first `keep_key_sha256` entry that is not registered.
+    std::int64_t existing_id{0};
 };
 
 /// One CA certificate (key) of a source. `cert_der` is the raw DER on write and EMPTY on read
@@ -113,8 +142,8 @@ struct RevocationFetchStatus {
 /// confirmed at registration (sorted); the fetcher refuses an address outside them.
 struct RevocationSourceUrl {
     std::int64_t id{0};
-    std::string url;
-    std::string host;
+    std::string url;  ///< canonical form (`revocation_url_canonical.hpp`)
+    std::string host; ///< the canonical URL's host, without brackets
     std::vector<std::string> confirmed_address_classes;
     RevocationFetchStatus fetch;
 };
@@ -143,8 +172,8 @@ struct NewRevocationSource {
     std::string ca_subject_name_sha256;
     std::vector<RevocationSourceKey> keys;
     struct Url {
-        std::string url;
-        std::string host;
+        std::string url;  ///< MUST be canonical (`canonical_crl_url`); the store refuses any other form
+        std::string host; ///< MUST be the canonical URL's host
         std::vector<std::string> confirmed_address_classes;
     };
     std::vector<Url> urls;
@@ -161,11 +190,34 @@ struct RevocationSourceUpdate {
     std::int64_t crls_deleted{0};
 };
 
-struct HighWaterReset {
-    std::int64_t reset_at{0};     ///< epoch seconds: the floor now in force for the CA
-    std::int64_t crls_deleted{0}; ///< held CRLs the reset discarded
-    bool pinned{false};           ///< a first-CRL pin was recorded
+/// What `reset_high_water` is asked to do (already validated by the service; the store re-checks
+/// only its own invariants).
+struct HighWaterResetRequest {
+    /// The keys that survive the reset: `source_ca_key.cert_sha256` values (64 lowercase hex), each
+    /// already registered on the source, 1..kMaxCaKeys of them, no duplicates. Every other key of
+    /// the source is removed in the reset's transaction.
+    std::vector<std::string> keep_key_sha256;
+    /// The source's config_version as the caller read it; a reset against any other version is
+    /// kVersionConflict and changes nothing.
+    std::int64_t expected_config_version{0};
+    /// RFC 3339 UTC (already shape-checked), no later than Postgres now(); empty = now().
+    std::string reset_at_rfc3339;
+    /// Optional, 64 lowercase hex: the only first CRL to accept afterwards.
+    std::string pin_crl_sha256;
 };
+
+struct HighWaterReset {
+    std::int64_t reset_at{0};       ///< epoch seconds: the floor now in force for the CA
+    std::int64_t crls_deleted{0};   ///< held CRLs the reset discarded
+    std::int64_t dropped_keys{0};   ///< registered keys the reset removed (not in keep_key_sha256)
+    std::int64_t config_version{0}; ///< the source's config_version after the reset
+    bool pinned{false};             ///< a first-CRL pin was recorded
+};
+
+/// The store's numbered migrations (v1, v2), exactly as the constructor runs them. Exposed so a
+/// test can stage a database at an earlier version (run a prefix through `PgMigrationRunner`)
+/// and prove the upgrade; not for production use.
+[[nodiscard]] const std::vector<pg::PgMigration>& revocation_source_store_migrations();
 
 class RevocationSourceStore {
 public:
@@ -178,8 +230,11 @@ public:
     static constexpr std::size_t kMaxUsernameBytes = 1024;
     static constexpr std::size_t kMaxCertDerBytes = 64 * 1024;
 
-    /// Borrows the shared pool and runs the schema migration on a pinned lease. `is_open()` is
-    /// false if the lease was empty or the migration failed.
+    /// Borrows the shared pool, runs the schema migration on a pinned lease, then the canonical-URL
+    /// pass (every stored URL rewritten to the canonical form). `is_open()` is false if the lease
+    /// was empty, the migration failed, or the pass refused: a stored URL that cannot be
+    /// canonicalised, or two URLs of one source that collapse into one (the error log names the
+    /// source id and the URL ids, never the URL text).
     explicit RevocationSourceStore(pg::PgPool& pool);
 
     RevocationSourceStore(const RevocationSourceStore&) = delete;
@@ -219,16 +274,24 @@ public:
     /// marks SURVIVE. Errors: kNotFound plus the write errors.
     [[nodiscard]] std::expected<void, RevocationSourceStoreError> remove(std::int64_t id);
 
-    /// Reset the CA's anti-rollback marks: sets `reset_at` on every scope of the source's CA
-    /// (creating the CA-level row if none) and deletes the source's held CRLs, in one
-    /// transaction. `reset_at_rfc3339` (UTC, already shape-checked) must not be later than
-    /// Postgres now(); empty = now(). NOT idempotent: each call sets a new `reset_at`.
-    /// `pin_crl_sha256` (optional, 64 lowercase hex): the only first CRL to accept afterwards. Also
-    /// clears each scope's CRL number and thisUpdate, keeps `reset_at` permanently on every row and
-    /// bumps config_version. Errors: kNotFound, kBadResetTime plus the write errors.
+    /// Reset the CA's anti-rollback marks, in ONE transaction under the source row lock: refuses a
+    /// stale `expected_config_version` (kVersionConflict) and a `keep_key_sha256` entry that is not
+    /// a registered key (kUnknownKey), then removes every key NOT named in `keep_key_sha256`, sets
+    /// `reset_at` on every scope of the source's CA (creating the CA-level `'*'` row if none),
+    /// clears each scope's CRL number and thisUpdate, records the optional pin on the CA-level row,
+    /// deletes every held CRL of the CA and bumps config_version. `reset_at` must not be later
+    /// than Postgres now() (kBadResetTime) and is kept permanently on every row. NOT idempotent:
+    /// each call sets a new `reset_at` (and a retry after an unknown outcome is kVersionConflict,
+    /// because the first call moved config_version). Errors: kNotFound, kVersionConflict,
+    /// kUnknownKey, kBadResetTime, kInvalidInput plus the write errors.
     [[nodiscard]] std::expected<HighWaterReset, RevocationSourceStoreError>
-    reset_high_water(std::int64_t id, const std::string& reset_at_rfc3339,
-                     const std::string& pin_crl_sha256 = {});
+    reset_high_water(std::int64_t id, const HighWaterResetRequest& req);
+
+    /// The open-time canonical-URL pass on its own (the constructor runs it once, on its pinned
+    /// lease): the number of stored URLs it rewrote, or nullopt when it refused (see the
+    /// constructor) or found no connection. Public so a test can stage a v1 row and run the pass
+    /// again; idempotent.
+    [[nodiscard]] std::optional<std::int64_t> canonicalise_stored_urls();
 
     /// Test seam (empty in production): called with the operation name at the start of every write
     /// (`create`, `replace`, `remove`, `reset_high_water`); a returned kind makes the call fail with

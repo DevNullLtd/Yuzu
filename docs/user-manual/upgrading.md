@@ -725,6 +725,18 @@ start**.
 - **Rolling back** to an older server leaves the `revocation_source_store` schema in place; the older
   binary ignores it. Nothing is dropped, and upgrading again reuses it (registrations, and the CAs'
   anti-rollback marks, survive a rollback).
+- **Schema version 2 (#6590), development databases only.** A database written by an earlier
+  development build of this store is upgraded at start: each held CRL's scope key gains its
+  `:base` or `:delta` suffix, and each stored CRL URL is rewritten to the canonical form (it keeps
+  its id and fetch status). The server **refuses to start** when two URLs of one source become one
+  URL in that form, logging `RevocationSourceStore: refusing to open: CRL URL ids <a> and <b> of
+  revocation source <id> are one URL in the canonical form`; delete one of the two
+  `revocation_source_store.source_url` rows and restart. A scope key that cannot take the new
+  form also fails the start, rather than dropping an anti-rollback mark.
+- **The high-water reset body changed.** `POST .../reset-high-water` and MCP
+  `reset_revocation_source_high_water` now require `keep_key_sha256` and
+  `expected_config_version`; an empty body or `{}` is refused `400`. See
+  [Registering a CRL source](server-admin.md#registering-a-crl-source).
 - **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (41 gated
   routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
   [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.

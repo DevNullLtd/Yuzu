@@ -1696,6 +1696,7 @@ if build_server
       'unit/server/test_rbac_enforcement_read_mcp.cpp', # #6033: MCP get_rbac_enforcement
       'unit/server/test_guardian_generation_raise.cpp', # POST .../guaranteed-state/policy-generation/raise + MCP twin raise_guardian_policy_generation
       'unit/server/test_revocation_source_surface.cpp', # ADR-0070 R1: /api/v1/crypto/revocation-sources + MCP twins + service validation
+      'unit/server/test_revocation_url_canonical.cpp', # #6590: the one canonical form of a registered CRL URL (pure)
       'unit/server/test_rbac_account_lifecycle_guard.cpp', # #4966: last-Administrator guard for account lifecycle (deactivate_account / set_local_role / would_strand)
       'unit/server/test_list_read_confinement.cpp',
       'unit/server/test_response_execution_scope_authz.cpp', # #1634: response/execution fleet-read confinement

@@ -22,8 +22,9 @@ branches: 2a-2b `feat/cert-inventory-read`, 2a-2c `feat/cert-inventory-tombstone
 `feat/cert-inventory-agent-windows`, 2a-2g `feat/cert-inventory-agent-macos`, 2a-3
 `feat/cert-inventory-counts`, 2a-4 `feat/cert-inventory-cbom` and 2b-1b `feat/revocation-fetcher`.
 The owner ruled the three CRL store contract questions of #6590 on 2026-11-18 (see
-[Decisions](#decisions)); the changes they make land as the CRL store's migration v2 before 2b-1b
-(keeping the per-row `config_version` changes nothing).
+[Decisions](#decisions)); the changes they make land as the CRL store's migration v2
+(`feat/revocation-store-v2`) before 2b-1b, with the "Proposed, for the migration v2 PR" points as
+proposed (keeping the per-row `config_version` changes nothing).
 
 It supersedes the "Slice 2: certificate inventory" section of `docs/crypto-asset-design.md` where
 the two differ. One difference matters: that section proposes computing days-to-expiry on the
@@ -1366,7 +1367,9 @@ every later 2b PR.
 5. **Audit first.** Every mutation writes its `attempted` audit row before the store call and
    changes nothing when that row cannot be stored.
 
-Owed before the fetcher: the CRL store's migration v2 for the three #6590 rulings ([Decisions](#decisions), 2026-11-18).
+The CRL store's migration v2 carries the three #6590 rulings ([Decisions](#decisions),
+2026-11-18) and lands before the fetcher: the reset names its surviving keys, one encoded scope
+key, and canonical URLs.
 
 ### Registration
 
@@ -1405,7 +1408,9 @@ Owed before the fetcher: the CRL store's migration v2 for the three #6590 ruling
   a source is one CA, and its several keys let a CA renewal keep verifying (D5 condition 1). The
   store keeps each key's DER, the CA's subject Name DER hash, each key's SKI and its SPKI hash.
 - **Each URL** must be `http` or `https`, with a host, and with no userinfo, no fragment and at
-  most 2,048 bytes. The host must be ASCII (IDNs are given as punycode). `file:`, LDAP, UNC and
+  most 2,048 bytes. It is stored, compared and returned in one canonical form (#6590; the
+  canonicaliser is `revocation_url_canonical.hpp`, see [Decisions](#decisions)), so a `PUT` that
+  only respells a URL keeps that URL and its fetch state. The host must be ASCII (IDNs are given as punycode). `file:`, LDAP, UNC and
   everything else are refused (ADR-0070 §D12, "The fetcher's own security review"). At registration the host is resolved and its
   address class shown to the administrator, who confirms it. Refused outright, at registration and
   on every fetch, with no override: the always-refused tier that `oidc_egress_policy.hpp:12-22`
@@ -1532,7 +1537,11 @@ review, as a new egress surface.
   key that verifies is recorded as `verified_key_sha256`, for display only. If none verifies, the
   cause is `verification_failed`.
 - **Scope key** is (registered CA, IDP DER hash or "full", base or delta), where the registered CA
-  is the source, identified by the CA's subject Name DER hash. It is **not** keyed by the signing
+  is the source, identified by the CA's subject Name DER hash. Stored (migration v2, #6590) as the
+  CA in the table's own column (`crl.source_id`, `rollback_high_water.ca_subject_name_sha256`) and
+  ONE encoded `scope_key`: `full` or `idp:<64 lowercase hex of the IDP DER SHA-256>`, then `:base`
+  or `:delta`, identical in both tables and pinned by a `CHECK` on each; only
+  `rollback_high_water`'s also admits `'*'`, the CA-level row. It is **not** keyed by the signing
   key, so after a CA re-key a CRL signed by the new key supersedes one signed by the old key in the
   same scope, rather than living beside it as a second, staler answer. The IDP is read for
   `distributionPoint`, `onlySomeReasons`, `onlyContainsUserCerts` and `onlyContainsCACerts`. An
@@ -1576,11 +1585,13 @@ review, as a new egress surface.
 - **A reset cannot be replayed into.** Plain `http` is allowed, so after a reset an on-path
   attacker or a stale mirror could serve an older CRL that still verifies, possibly one from before
   the rebuild with a higher number. So:
-  - the reset body lists the source's keys after the rebuild, and every key not listed is removed,
-    in the same transaction as the reset. **Deferred (#6590, ruled 2026-11-18), not in 2b-1a:**
-    the shipped reset accepts only `reset_at` and `pin_crl_sha256` and removes no keys, so this
-    must land before 2b-1b accepts any CRL. Shipped in 2b-1a: every held CRL of the CA is deleted
-    in the reset's transaction;
+  - the reset body lists the source's keys after the rebuild (`keep_key_sha256`, required and
+    non-empty, each a `source_ca_key.cert_sha256` already registered on the source, so an
+    administrator `PUT`s the rebuilt CA's certificates first), with the required
+    `expected_config_version` that `PUT` takes; every key not listed and every held CRL of the CA
+    is removed in the same transaction as the reset. An unlisted entry, a stale version or a body
+    without either is refused and changes nothing. Landed in the store's migration v2 (#6590),
+    before 2b-1b accepts any CRL;
   - the reset clears each scope's number and `this_update` but writes `reset_at` (Postgres `now()`
     at the reset) on every high-water row of the CA, and on a CA-level row that scopes first seen
     later inherit. **`reset_at` is kept permanently**: every CRL accepted afterwards, not only the
@@ -1640,16 +1651,19 @@ separate from `ca_store`, in the readiness conjunction.
 |---|---|---|
 | `source` | `id` | `name`, `ca_subject_name_sha256` (UNIQUE: one source per CA), `config_version`, `created_by`, `created_at`, `updated_at` |
 | `source_ca_key` | (`source_id`, `cert_sha256`) | `cert_der`, `ski`, `spki_sha256` |
-| `source_url` | `id` | `source_id`, `url`, `host`, `confirmed_address_classes` |
+| `source_url` | `id` (`UNIQUE (source_id, url)`, `url` canonical) | `source_id`, `url`, `host`, `confirmed_address_classes` |
 | `fetch_status` | `url_id` | `last_attempt_at`, `last_success_at`, `last_failure_cause`, `consecutive_failures`, `next_attempt_at`, `etag`, `last_modified` |
-| `crl` | `id` | `source_id`, `scope_key`, `url_id`, `crl_number`, `this_update`, `next_update`, `is_delta`, `base_crl_number`, `idp_reasons`, `expired_certs_on_crl`, `verified_key_sha256`, `der_sha256`, `entry_count`, `fetched_at` |
+| `crl` | `id` | `source_id`, `scope_key`, `url_id`, `crl_number`, `this_update`, `next_update`, `is_delta`, `base_crl_number`, `idp_reasons`, `expired_certs_on_crl`, `verified_key_sha256`, `der_sha256`, `entry_count`, `fetched_at` (`is_delta` generated from `scope_key`'s suffix; `UNIQUE (source_id, scope_key, is_delta)`) |
 | `crl_entry` | (`crl_id`, `serial`) | `revocation_date`, `reason`, `invalidity_date` |
 | `rollback_high_water` | (`ca_subject_name_sha256`, `scope_key`; `scope_key = '*'` is the CA-level row) | `crl_number`, `this_update`, `reset_at` (permanent once set), `pinned_crl_sha256` |
 | `cert_signature_check` (2b-2) | (`cert_sha256`, `ca_key_sha256`) | `source_id`, `verified` |
 
 - `this_update`, `next_update` and `revocation_date` are the CA's own times, from the CRL.
 - `fetched_at`, `last_*_at`, `created_at` and `updated_at` are Postgres `now()`.
-- Only the newest accepted CRL per scope is kept.
+- Only the newest accepted CRL per scope is kept: a newer one replaces it by delete-then-insert in
+  the acceptance transaction (migration v2, #6590).
+- `config_version` is a per-row counter (1 at register, raised by one by a changing `PUT` and by
+  every reset); the store header (`revocation_source_store.hpp`) states the same contract.
 - `cert_signature_check` is keyed by the server-recomputed whole-DER SHA-256, so it is a pure
   function of the bytes and the registered key. It is not a stored verdict under D13 condition 3:
   it reads no clock and applies no Yuzu threshold. Its rows are deleted with their source (above),

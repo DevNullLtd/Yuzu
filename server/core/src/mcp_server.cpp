@@ -5090,7 +5090,13 @@ static const ToolDef kTools[] = {
      "to everything since it. The response echoes the window opened. NOT idempotent: each call "
      "sets a new reset_at and deletes the held CRLs again, so a repeat after a CRL was accepted "
      "discards it. After a reset whose outcome is unknown, read get_revocation_source: "
-     "high_water.reset_at shows the floor in force. Optional pin_crl_sha256 (64 hex) names the "
+     "high_water.reset_at shows the floor in force (a retry is then refused as a version "
+     "conflict, because the reset moved config_version). REQUIRED keep_key_sha256: 1 to 8 "
+     "ca_certificates[].cert_sha256 values already registered on the source (add a rebuilt CA's "
+     "certificates with update_revocation_source first); every other key of the source is "
+     "removed with the held CRLs in the reset's transaction, and an entry the source does not "
+     "hold is refused. REQUIRED expected_config_version, as update_revocation_source takes: a "
+     "mismatch is a conflict and changes nothing. Optional pin_crl_sha256 (64 hex) names the "
      "only first CRL to accept afterwards; the reset also clears each scope's CRL number and "
      "thisUpdate and bumps config_version. Requires RevocationSource:Write AND a durable Administrator role, the "
      "supervised MCP tier (approval-gated) and is denied outright to a service-scoped token and "
@@ -5098,11 +5104,14 @@ static const ToolDef kTools[] = {
      "attempted row first, carrying the reset_at you supplied). Scope: facts only; the only built-in "
      "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
      "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
-     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},"reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"uniqueItems":true,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source; every other key is removed"},)j"
+     R"j("expected_config_version":{"type":"integer","minimum":1,"description":"Required: the source's config_version as you last read it; a mismatch is a conflict and changes nothing"},)j"
+     R"j("reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
      R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"
      R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
-     R"j(},"required":["id"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
+     R"j(},"required":["id","keep_key_sha256","expected_config_version"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"dropped_ca_certificates":{"type":"integer","minimum":0,"description":"Registered keys the reset removed (those not in keep_key_sha256)"},"config_version":{"type":"integer","minimum":1,"description":"The source's config_version after the reset"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned","dropped_ca_certificates","config_version"]})j"},
     // ── #2146 batch C: the instruction-definition / instruction-set authoring twins ─────────────
     // MCP twins of the nine v1 REST routes in instruction_authoring_routes.cpp (and the legacy
     // /api/instructions and /api/instruction-sets writes). Legacy kTools[] path, helper TU
