@@ -625,6 +625,8 @@ yuzu_key_provider_lib = static_library(
   'yuzu_key_provider',
   files('src/key_provider.cpp'),
   dependencies: [spdlog_dep, openssl_dep],
+  # log_token.hpp (F54): header-only, no link edge.
+  include_directories: include_directories('../../common/include'),
 )
 yuzu_key_provider_dep = declare_dependency(
   link_with: yuzu_key_provider_lib,
@@ -1182,10 +1184,11 @@ yuzu_server_exe = executable(
 # TARGET stays: the CI link-provenance assertions on all four Tier-1 legs
 # (ldd/otool/dumpbin in ci.yml) inspect this binary path. Do not remove or
 # rename without updating those workflow steps.
-executable(
+pg_canary_exe = executable(
   'yuzu_pg_canary',
   files('src/pg/canary_main.cpp'),
   dependencies: [libpq_dep],
+  include_directories: include_directories('../../common/include'), # pg_raii.hpp -> log_token.hpp
   install: false,
 )
 
