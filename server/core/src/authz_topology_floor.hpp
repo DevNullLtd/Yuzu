@@ -62,7 +62,7 @@
 /// existing admin-only posture across a gate migration, OR it returns the
 /// audit evidence itself. Two later classes follow; a new entry must fit at least one of the five.
 ///
-/// The fleet certificate read surface (ADR-0070 D12) added a NEW-DATA-CLASS inclusion class: a new fleet-wide copy of endpoint data
+/// The fleet certificate read surface (ADR-0070 D12, as corrected by its 2026-11-19 Update) added a NEW-DATA-CLASS inclusion class: a new fleet-wide copy of endpoint data
 /// that an ACCEPTED ADR requires to be admin-only in BOTH RBAC states (here ADR-0070 D12, "Read
 /// surface"). `CertificateInventory:Read` is neither authorization topology, a gate migration nor
 /// the audit trail - it is new data (subjects and SANs can carry personal data), and the output of

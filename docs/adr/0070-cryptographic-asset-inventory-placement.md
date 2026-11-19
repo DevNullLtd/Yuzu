@@ -1685,3 +1685,20 @@ subject which is the agent id, SAN, status, dates, issuer) and the no-grant wide
 `docs/user-manual/upgrading.md`.
 
 **Approval.** The maintainer, Dave Rae, approved applying this Update on 2026-10-24. The ADR author's confirmation is not recorded in the repository.
+
+## Update (2026-11-19): why `CertificateInventory:Read` is on the topology floor
+
+D12 "Read surface" says the floor entry fits the inclusion class for preserving an existing
+admin-only posture, because "the live certificate list is admin-only under RBAC off today". That
+premise does not hold. The stored output of `certificates.list` runs is read through
+`Response:Read`, which any signed-in user holds while RBAC is off, so no admin-only posture existed
+to preserve.
+
+The decision itself is unchanged: the dedicated securable is floored, admin-only in both RBAC
+states. Only the reason changes. The entry fits a new-data-class inclusion class: a new fleet-wide
+copy of endpoint data (subjects and SANs can carry personal data) that this ADR requires to be
+admin-only in both RBAC states. `server/core/src/authz_topology_floor.hpp` states that class, and
+`docs/crypto-slice2-certificate-design.md` records the same reasoning. Where D12's wording and this
+Update disagree, this Update wins.
+
+**Approval.** Pending: recorded for the ADR owner's confirmation on the pull request that adds it.
