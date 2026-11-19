@@ -48,9 +48,15 @@ TEST_CASE("background-job table classifies every audited pass correctly",
     // Count tripwire — forces a conscious table update when a pass is added or
     // removed (a silent count change is exactly what WS-10 exists to prevent).
     // Update this number ONLY alongside a real classification change.
-    CHECK(kBackgroundJobs.size() == 54);
+    CHECK(kBackgroundJobs.size() == 56); // +cert_inventory.fleet_store_status, +dn_dict_maintenance (2a-2b)
 
     // The load-bearing per-pass calls — a regression here is the WS-10 hazard.
+    SECTION("the fleet certificate store-status gauge is a ReplicaSafe read-only sweep") {
+        auto* j = find("cert_inventory.fleet_store_status");
+        REQUIRE(j != nullptr);
+        CHECK(j->cls == BackgroundJobClass::ReplicaSafe);
+        CHECK(j->owning_thread == "health_recompute_thread_");
+    }
     SECTION("MUST-run-per-replica passes are ReplicaSafe, never leader-gated") {
         // ADR-2002 §5: leader-gating the event-outbox poll starves non-leader SSE.
         auto* poll = find("execution_tracker.poll_event_outbox_once");

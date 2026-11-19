@@ -79,7 +79,7 @@ struct CryptoSummary {
 /// read); it is
 /// rendered by the dashboard fragments only (review #6109) and no seam ever returns it - on REST
 /// and MCP the gate writes its own envelope.
-enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity, kAccessCheck };
+enum class CryptoReadCause { kNone, kStoreDegraded, kCapacity, kAccessCheck, kReconciling, kReconcileFailedTransient };
 
 struct CryptoDeviceRow {
     std::string agent_id;

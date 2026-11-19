@@ -6,7 +6,7 @@
 /// `certificate_inventory` daily-sync source. Design:
 /// `docs/crypto-slice2-certificate-design.md`, "Server: store, ingest and lifecycle".
 ///
-/// SHAPE. Seven tables, every one leading its key with `agent_id` (decommission and
+/// SHAPE. Nine tables: seven lead their key with `agent_id` (decommission and
 /// confinement): `agent_state` (hash-skip state), `store_state` (one row per store per
 /// device: status, reason, `observed_at`, `status_at`), `cert_location` (where a
 /// certificate was seen), `cert_fact` (one row per (device,
@@ -17,7 +17,10 @@
 /// later CBOM agreement sample is ordered by a key an agent cannot choose; it is never sent to
 /// an agent and no read column list includes it.
 /// A `cert_fact` row exists while at least one `cert_location` row references it; the
-/// ingest transaction deletes the orphans.
+/// ingest transaction deletes the orphans. The other two are the FLEET-SHARED `dn_dict` (key
+/// `dn`, below) and `dn_dict_state` (key `k`: the DB-clock maintenance schedule and the
+/// non-leader's reconcile request); the decommission cascade reaches them only through
+/// `prune_dn_names`.
 ///
 /// CLOCK. Every `*_at` / `*_seen` column is a TIMESTAMPTZ authored by the DATABASE clock
 /// (never the replica's, never the agent's: #1685, ADR-0016 clock-skew rule). One value is
@@ -43,14 +46,43 @@
 /// FAILURE POSTURE (ADR-0012 §1). Ingest is fail-soft (a transient outage returns `kError`; the
 /// seam answers the agent (a full report is asked to resend; a hash-only report is acknowledged and retries next interval)). `delete_agent` returns true only when the
 /// transaction committed, so the decommission cascade records a rolled-back erasure as Failed.
-/// This PR ships no read surface; a store that failed to open is visible on `/readyz`.
+/// A store that failed to open is visible on `/readyz`. READS (slice-2 PR 2a-2b, below) answer
+/// `CertReadError` on any pool or query fault, never an empty result.
+///
+/// THE DN DICTIONARY (`dn_dict`, slice-2 PR 2a-2b) - invariants a future author must keep:
+///   - It is a FLEET-WIDE, cross-agent table, deliberately NOT keyed by `agent_id` (the one exception to
+///     the "every key leads with agent_id" rule above). It holds distinct issuer DNs and CA-subject DNs
+///     ONLY, never an end-entity subject, and the read surface applies the caller's scope to
+///     `cert_fact`, never to the dictionary (a name resolves for everyone; reaching a device does not).
+///   - Ingest only ADDS names (`INSERT .. ON CONFLICT DO NOTHING`, sorted, one statement per report) and
+///     raises role flags by a separate sorted UPDATE. NEVER use `ON CONFLICT .. DO UPDATE .. WHERE`
+///     here: concurrent multi-chunk reports deadlock (60-90% measured).
+///   - It must NOT outlive the facts it names (erasure): the decommission cascade and the periodic
+///     background prune delete names no certificate references, ONLY via `prune_dn_names` (lock
+///     candidates FOR UPDATE SKIP LOCKED, then a NEW-snapshot DELETE with NOT EXISTS). Ingest
+///     takes FOR KEY SHARE on its names (sorted) after the DO NOTHING insert and RE-INSERTS any it
+///     finds missing, in the same transaction, so a committed report never leaves a referenced name
+///     absent (chaos-verified). The reconcile (every 5 minutes, at every process start before the
+///     dictionary reads as ready) is the backstop for names a pre-existing/rolled-back writer
+///     skipped: a window of at most one pass, never a permanent miss.
+///   - Empty DNs are never entered (`<> ''` at ingest; the reconcile's keyset starts above '').
+///   - READINESS is a marker on the table comment (`ready:<ms>`), valid only if a reconcile completed
+///     AFTER this process started, with both btree indexes valid. Until then the two substring filters
+///     are refused, never answered from a partial dictionary: RETRYABLE (`kReconciling`, with a
+///     retry hint) while a reconcile is pending, non-retryable only for a `failed:` dictionary.
+///   - The build/reconcile/prune run in `run_dn_dictionary_maintenance` (a leader-gated background
+///     pass); boot, the migration and readiness never scan or index `cert_fact`.
 ///
 /// Registered in the agent-decommission cascade (`AgentDecommissionStores::certificate_inventory`,
 /// the eighth store).
 
+#include "certificate_read_types.hpp"
+#include "pg/pg_background_build.hpp"
+
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <expected>
 #include <functional>
 #include <optional>
 #include <string>
@@ -60,6 +92,9 @@
 namespace yuzu {
 class MetricsRegistry;
 }
+
+struct pg_conn;
+typedef struct pg_conn PGconn;
 
 namespace yuzu::server::pg {
 class PgPool;
@@ -74,6 +109,8 @@ namespace yuzu::server {
 /// hash-skip), `delete_agent` and the future retention prune ALL use this one constant.
 inline constexpr std::string_view kCertInventoryAgentLockPrefix = "cert_inventory:";
 
+
+
 /// The store's migration array (schema `certificate_inventory_store`), for the D13 schema lint.
 [[nodiscard]] const std::vector<pg::PgMigration>& certificate_inventory_migrations();
 
@@ -85,6 +122,33 @@ inline constexpr std::string_view kUnreadable = "unreadable";
 inline constexpr std::string_view kConstrained = "constrained";
 inline constexpr std::string_view kNotObserved = "not_observed";
 } // namespace cert_status
+
+/// Why a read failed. kInvalid is a request the store refuses outright (defence in depth behind
+/// the model's validation); every other kind is a degrade (503 + retry, never an empty result).
+struct CertReadError {
+    enum class Kind {
+        kNotOpen,
+        kPoolAcquireTimeout,
+        kQueryError,
+        kInvalid,
+        /// A substring filter on a FAILED dictionary: NOT retryable until an operator repairs it.
+        /// (A merely not-yet-reconciled one is a retryable kQueryError with `reconciling` set.)
+        kSubstringIndexMissing,
+        /// A SUMMARY that ran out of its wall budget: its cost grows with the visible fleet, so a
+        /// retry re-runs the same scan and fails the same way. NOT retryable; narrow the scope.
+        kScaleLimit
+    };
+    Kind kind{Kind::kQueryError};
+    std::string message;
+    std::string sqlstate;   ///< the PG SQLSTATE of the failing statement, "" when none
+    bool timed_out{false};  ///< SQLSTATE 57014 or the armed wall deadline elapsed
+    bool transient_failure{false}; ///< the retryable refusal is a transient pass FAILURE, not the start-up wait
+    std::int64_t retry_hint_ms{0}; ///< when reconciling: the hint to send (0 = kReconcileRetryHintMs)
+    bool reconciling{false}; ///< a kQueryError that is the EXPECTED post-restart wait (retryable + hint)
+};
+
+/// The caller's visible devices: nullopt = unfiltered, present-empty = deny-all.
+using CertScopeIds = std::optional<std::vector<std::string>>;
 
 /// One SAN entry. `type` is one of dns, ip, rfc822, uri, upn, dirname, other.
 struct CertSan {
@@ -163,6 +227,23 @@ struct CertIngestResult {
     CertNeedFullCause need_full_cause{CertNeedFullCause::kNone};
 };
 
+/// Delete the dictionary names in `names` that NO certificate references, inside the caller's
+/// transaction: statement 1 locks the candidate rows `FOR UPDATE SKIP LOCKED` (conflicts with the
+/// `FOR KEY SHARE` an ingest holds on every name it relies on, so a name an in-flight ingest uses is
+/// skipped), statement 2 - a NEW snapshot, taken after the locks are held - deletes only the locked
+/// names that no `cert_fact` row references as an issuer or a CA subject. Shared by `delete_agent`
+/// and the background prune.
+[[nodiscard]] bool prune_dn_names(PGconn* conn, const std::vector<std::string_view>& names);
+
+/// Why the substring filters can or cannot be answered right now.
+enum class SubstringState {
+    kReady,       ///< a reconcile that started after this process did completed; indexes valid
+    kReconciling, ///< not yet: a pass is due or running (a restart, a leader change). RETRYABLE.
+    kFailedTransient, ///< the last pass failed on a TRANSIENT cause (57014, 55P03, class 40/08/53):
+                      ///< RETRYABLE with a pass-interval hint; never nudges the leader.
+    kFailed,      ///< the last pass failed deterministically, or the dictionary is absent. NOT retryable.
+};
+
 class CertificateInventoryStore {
 public:
     /// Borrows the shared pool and runs the `certificate_inventory_store` migration on a pinned lease.
@@ -174,6 +255,61 @@ public:
     CertificateInventoryStore& operator=(const CertificateInventoryStore&) = delete;
 
     [[nodiscard]] bool is_open() const noexcept { return open_; }
+
+    /// True when the DISTINCT-DN dictionary behind the two substring filters is built and its btree
+    /// indexes are valid (migration v2 builds it; see certificate_inventory_store.cpp). While false the
+    /// read surface REFUSES those filters with CertReadError::Kind::kSubstringIndexMissing
+    /// (retryable while reconciling, non-retryable once failed) rather than answer from a half-built dictionary. Boot never fails on it.
+    [[nodiscard]] bool substring_index_available() const noexcept {
+        return substring_state() == SubstringState::kReady;
+    }
+    [[nodiscard]] SubstringState substring_state() const noexcept {
+        return static_cast<SubstringState>(substring_state_.load(std::memory_order_acquire));
+    }
+    /// Retry hint (ms) for a kReconciling answer: a poll interval, not an estimate.
+    static constexpr std::int64_t kReconcileRetryHintMs = 10000;
+    /// Re-check the catalog (NO DDL): picks up an operator's manual repair without a restart. Called
+    /// from the fleet gauge pass. Returns the new state; unchanged when the catalog cannot be read.
+    bool refresh_substring_index_state();
+
+    /// The BACKGROUND, leader-gated build of the substring-filter dictionary (contract:
+    /// pg/pg_background_build.hpp). In order: (1) the two cert_fact btree indexes, CREATE INDEX
+    /// CONCURRENTLY, an INVALID leftover dropped first; (2) a batched RECONCILE of `dn_dict` from
+    /// cert_fact (loose index scans, bounded batches, each its own short statement; runs at every
+    /// process start before ready); (3) the optional trigram index on the small dictionary;
+    /// (4) when the database clock says an hour has passed since the last one, the batched removal of names no certificate references; then (5) the marker
+    /// `ready:<ms>`. Returns true when the whole run completed. A failure (SQLSTATE 57014 included)
+    /// is logged with the real error, recorded as `failed: ...` unless the dictionary is already
+    /// ready, and retried at the next cycle - it never throws. `should_stop` is polled between
+    /// batches. Holds ONE pooled connection for its whole duration; never called on boot.
+    bool run_dn_dictionary_maintenance(const std::function<bool()>& should_stop = {});
+
+    /// The durable DB-clock scheduling state of the background pass.
+    struct DictSchedule {
+        std::int64_t db_now_ms{0};
+        std::int64_t last_pass_start_ms{0};    ///< 0 = never
+        std::int64_t last_prune_ms{0};         ///< 0 = never
+        std::int64_t reconcile_requested_ms{0}; ///< 0 = never
+    };
+    [[nodiscard]] std::optional<DictSchedule> read_dn_dictionary_schedule();
+    /// A non-leader that finds the dictionary not ready records "reconcile requested at <DB now>"; the
+    /// leader's loop polls it and runs a pass when the request postdates its last pass start.
+    void request_dn_reconcile();
+    /// Prune now (own lease): the names no certificate references. Used by the pass and by tests.
+    [[nodiscard]] bool prune_dn_dictionary(const std::function<bool()>& should_stop = {});
+    /// Interrupt a running concurrent index build (stop()): safe from any thread, bounded.
+    void cancel_running_build() { build_cancel_.cancel(); }
+    /// Clear a per-run stop (lost leadership) after the run returned; never for shutdown.
+    void clear_build_stop() { build_cancel_.reset_stop(); }
+    /// Observe each pass step (`step`, `result`) - the server counts them.
+    void set_dn_dict_observer(pg::StepObserver o) { dn_observer_ = std::move(o); }
+    /// Unix seconds of the last successful prune recorded in the DB (0 = never); refreshed by
+    /// read_dn_dictionary_schedule.
+    [[nodiscard]] std::int64_t dn_dict_last_prune_unix_s() const noexcept {
+        return last_prune_unix_s_.load(std::memory_order_acquire);
+    }
+    static constexpr std::int64_t kPruneIntervalMs = 3600000;   ///< hourly, DB clock
+    static constexpr std::int64_t kPassIntervalMs = 300000;     ///< reconcile cadence
 
     /// Apply one full report for `agent_id` in ONE transaction under the per-agent lock.
     /// `content_hash` is the SHA-256 of the raw received bytes, recomputed by the seam. Per-store
@@ -193,6 +329,34 @@ public:
     /// Erase every table's rows for the agent in ONE transaction under the per-agent lock. Empty id -> false without touching PG. True iff committed.
     [[nodiscard]] bool delete_agent(std::string_view agent_id);
 
+    // ── Reads (slice-2 PR 2a-2b) ─────────────────────────────────────────────────
+    // Every read pushes the caller's visible-device set into SQL (`agent_id = ANY($n)`): nullopt =
+    // unfiltered, present-EMPTY = deny-all, answered with no SQL (ADR-0017 / ADR-0033). Each runs
+    // in ONE REPEATABLE READ transaction under a bounded `statement_timeout`, so a page and its
+    // children are one snapshot. Defined in certificate_inventory_read.cpp.
+
+    /// One page of (device, certificate) rows ordered by (agent_id, sha256), keyset-continued
+    /// after `after`; `limit` is 1..kCertPageMax. `has_more` says rows exist past the page; the
+    /// cursor, the truncation flags and the byte budget are the model's to apply.
+    [[nodiscard]] std::expected<CertPage, CertReadError>
+    list_certificates(const CertReadFilter& filter, const CertScopeIds& scope,
+                      const std::optional<CertReadAfter>& after, int limit);
+
+    /// The raw-value rollups over the filtered, scoped set.
+    [[nodiscard]] std::expected<CertSummary, CertReadError>
+    summarize_certificates(const CertSummaryQuery& query, const CertScopeIds& scope);
+
+    /// Stores per (device, status) over the whole fleet, for the `fleet_store_status` gauge job.
+    /// One row per (status, agent) pair would be too many at fleet scale, so the rollup is one row per
+    /// DEVICE (agent_id, then its stores' statuses folded in SQL as a small status->count array) and
+    /// the caller folds in the registry OS once per device. The job shares a serial sweep thread
+    /// with the revocation teardown backstop, so its bounds are the caller's (the sweep passes a
+    /// 250 ms acquire and a 500 ms WALL budget for the whole transaction): a timeout is a
+    /// CertReadError, never a partial rollup.
+    [[nodiscard]] std::expected<std::vector<CertDeviceStatusCount>, CertReadError>
+    device_status_counts(std::chrono::milliseconds acquire_timeout = std::chrono::milliseconds{3000},
+                         std::chrono::milliseconds budget = std::chrono::milliseconds{10000});
+
     /// Row counts for one agent, for tests and diagnostics: {agent_state, store_state,
     /// cert_location, cert_fact, cert_san, cert_eku, cert_cdp}. nullopt on a failure.
     struct RowCounts {
@@ -201,11 +365,21 @@ public:
     };
     [[nodiscard]] std::optional<RowCounts> row_counts(std::string_view agent_id);
 
+    /// TEST SEAM: shrink the read wall budget to exercise the deadline path.
+    void set_read_budget_for_test(std::chrono::milliseconds b) { read_budget_ = b; }
+
     /// TEST SEAMS. Run inside the transaction (null in production): `after_lock` right after an
     /// ingest has taken the per-agent lock, `after_erase` in `delete_agent` after the deletes and
     /// before the commit. They let a test start a racing call at exactly that point.
     void set_test_hook_after_lock(std::function<void()> hook) {
         test_hook_after_lock_ = std::move(hook);
+    }
+    /// Fires inside ingest_full's transaction at "after_dict_insert" (names inserted, not yet
+    /// pinned), "after_flag_update" (flags raised, not yet pinned) and "after_pin" (every name
+    /// FOR KEY SHARE-locked). Tests drive exact interleavings with a prune / decommission / second
+    /// ingest from another connection; production never sets it.
+    void set_test_hook_dict(std::function<void(std::string_view)> hook) {
+        test_hook_dict_ = std::move(hook);
     }
     void set_test_hook_after_erase(std::function<void()> hook) {
         test_hook_after_erase_ = std::move(hook);
@@ -236,8 +410,17 @@ private:
     yuzu::MetricsRegistry* metrics_{nullptr};
     std::function<std::chrono::steady_clock::duration(std::size_t)> ingest_budget_;
     bool open_{false};
+    bool refresh_substring_index_state(PGconn* conn);
+    std::chrono::milliseconds read_budget_{15000}; ///< the wall budget of one read transaction
+    std::atomic<std::int64_t> started_ms_{0}; ///< DB clock (ms) when this process opened the store
+    std::atomic<int> substring_state_{static_cast<int>(SubstringState::kReconciling)};
+    std::atomic<bool> state_logged_{false};
+    std::atomic<std::int64_t> last_prune_unix_s_{0};
+    pg::BuildCancel build_cancel_;
+    pg::StepObserver dn_observer_;
     std::function<void()> test_hook_after_lock_;
     std::function<void()> test_hook_after_erase_;
+    std::function<void(std::string_view)> test_hook_dict_;
 };
 
 } // namespace yuzu::server

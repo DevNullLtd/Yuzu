@@ -1,6 +1,8 @@
 #include "crypto_api_local.hpp"
 
 #include "ca_store.hpp"
+#include "certificate_inventory_store.hpp"
+#include "certificate_read_model.hpp"
 #include "crypto_dashboard_layout_store.hpp"
 #include "crypto_library_model.hpp"
 #include "crypto_read_gate.hpp"
@@ -8,6 +10,8 @@
 #include "crypto_widget_catalogue.hpp"
 #include "device_api.hpp"
 #include "software_inventory_store.hpp"
+
+#include <spdlog/spdlog.h>
 
 #include <algorithm>
 #include <chrono>
@@ -104,7 +108,10 @@ constexpr std::string_view kCorruptMessage =
 // The closed metric label values (LocalCryptoApiDeps::note_degrade).
 constexpr std::string_view kSourceCa = "ca_issued";
 constexpr std::string_view kSourceLayout = "crypto_layout";
+constexpr std::string_view kSourceCert = "cert_inventory";
+constexpr std::string_view kCertUnavailable = "certificate inventory read degraded";
 constexpr std::string_view kReasonAdmission = "admission_full";
+constexpr std::string_view kReasonPoolTooSmall = "pool_too_small";
 
 std::string_view degrade_reason(CaReadError::Kind k) {
     switch (k) {
@@ -114,6 +121,21 @@ std::string_view degrade_reason(CaReadError::Kind k) {
         return "pool_acquire_timeout";
     case CaReadError::Kind::kInvalidRequest:
     case CaReadError::Kind::kQueryError:
+        break;
+    }
+    return "query_error";
+}
+
+std::string_view degrade_reason(CertReadError::Kind k) {
+    switch (k) {
+    case CertReadError::Kind::kNotOpen:
+        return "store_not_open";
+    case CertReadError::Kind::kPoolAcquireTimeout:
+        return "pool_acquire_timeout";
+    case CertReadError::Kind::kInvalid:
+    case CertReadError::Kind::kQueryError:
+    case CertReadError::Kind::kSubstringIndexMissing:
+    case CertReadError::Kind::kScaleLimit:
         break;
     }
     return "query_error";
@@ -182,11 +204,21 @@ class LocalCryptoApi final : public CryptoApi {
 public:
     explicit LocalCryptoApi(const LocalCryptoApiDeps& d)
         : store_(d.software), devices_(d.devices), ca_(d.ca), layouts_(d.layouts),
+          certs_(d.certificates),
           ca_refused_(d.pool_size > 0 && d.pool_size < kCryptoCaMinPoolSize),
+          cert_refused_(d.pool_size > 0 && d.pool_size < kCryptoCertMinPoolSize),
           library_refused_(d.pool_size > 0 && d.pool_size < kCryptoLibraryMinPoolSize),
           ttl_(d.shared_read_ttl), note_degrade_(d.note_degrade),
           bound_as_of_(d.bound_pinned_as_of),
-          gate_(crypto_admission_bound(d.max_concurrent_reads, d.pool_size)) {}
+          gate_(crypto_admission_bound(d.max_concurrent_reads, d.pool_size)) {
+        // A pool below the floor refuses EVERY certificate read until a restart: say so once, at
+        // boot, instead of leaving it to be discovered as a stream of 503s.
+        if (cert_refused_ && certs_)
+            spdlog::warn("crypto: the Postgres pool ({} connections) is below the {} a fleet "
+                         "certificate read needs; every certificate read answers 503 until the "
+                         "server restarts with --postgres-pool-size {} or more",
+                         d.pool_size, kCryptoCertMinPoolSize, kCryptoCertMinPoolSize);
+    }
 
     std::expected<CryptoSummary, CryptoReadError>
     library_summary(const CryptoSummaryQuery& q, const authz::VisibleSet& scope) const override {
@@ -354,6 +386,82 @@ public:
                  .install_id = last.install_id, .names_as_of = page->names_as_of},
                 fp);
         }
+        return out;
+    }
+
+    std::expected<CertPage, CryptoReadError>
+    certificates(const CertQuery& q, const authz::VisibleSet& scope) const override {
+        if (q.limit < 1 || q.limit > kCertPageMax)
+            return std::unexpected(invalid("limit must be an integer from 1 to " +
+                                           std::to_string(kCertPageMax)));
+        // Defence in depth behind the model's parameter check (design "Finding one CA's
+        // certificates"): a subject substring is only ever searched among CA certificates.
+        if (q.filter.subject_dn_contains && !(q.filter.is_ca && *q.filter.is_ca))
+            return std::unexpected(invalid("parameter subject_dn_contains is accepted only "
+                                           "together with is_ca=true"));
+        const std::string fp = cert_read::filter_fingerprint(q.filter);
+        std::optional<CertReadAfter> after;
+        if (!q.cursor.empty()) {
+            auto pos = cert_read::decode_cursor(q.cursor, fp);
+            if (!pos)
+                return std::unexpected(
+                    invalid(std::string(cert_read::cursor_error_message(pos.error()))));
+            after = std::move(*pos);
+        }
+        if (!certs_) {
+            note(kSourceCert, "store_not_open");
+            return std::unexpected(unavailable(kCertUnavailable));
+        }
+        std::optional<std::expected<CertPage, CertReadError>> read;
+        {
+            const auto lease = cert_lease(); // released when this block ends, throw included
+            if (!lease)
+                return std::unexpected(cert_refusal());
+            read = certs_->list_certificates(q.filter, to_agent_ids(scope), after, q.limit);
+        }
+        if (!*read)
+            return std::unexpected(cert_failure(read->error()));
+        CertPage page = std::move(**read);
+        if (devices_ && !page.rows.empty()) {
+            // Only the PAGE's devices are looked up (never a copy of the whole fleet).
+            std::vector<std::string> ids;
+            for (const auto& r : page.rows)
+                if (ids.empty() || ids.back() != r.agent_id)
+                    ids.push_back(r.agent_id); // rows are ordered by agent: consecutive runs
+            std::unordered_map<std::string, std::string> hostnames;
+            for (auto& d : devices_->list_devices_by_id(ids))
+                hostnames.emplace(std::move(d.agent_id), std::move(d.hostname));
+            for (auto& r : page.rows)
+                if (const auto h = hostnames.find(r.agent_id); h != hostnames.end())
+                    r.hostname = h->second;
+        }
+        cert_read::finish_page(page, fp);
+        return page;
+    }
+
+    std::expected<CertSummary, CryptoReadError>
+    certificate_summary(const CertSummaryQuery& q, const authz::VisibleSet& scope) const override {
+        if (q.filter.subject_dn_contains && !(q.filter.is_ca && *q.filter.is_ca))
+            return std::unexpected(invalid("parameter subject_dn_contains is accepted only "
+                                           "together with is_ca=true"));
+        if (q.not_after_edges.size() > kCertEdgesMax)
+            return std::unexpected(invalid("parameter not_after_edges takes at most " +
+                                           std::to_string(kCertEdgesMax) + " instants"));
+        if (!certs_) {
+            note(kSourceCert, "store_not_open");
+            return std::unexpected(unavailable(kCertUnavailable));
+        }
+        std::optional<std::expected<CertSummary, CertReadError>> read;
+        {
+            const auto lease = cert_lease();
+            if (!lease)
+                return std::unexpected(cert_refusal());
+            read = certs_->summarize_certificates(q, to_agent_ids(scope));
+        }
+        if (!*read)
+            return std::unexpected(cert_failure(read->error()));
+        CertSummary out = std::move(**read);
+        cert_read::finish_summary(out);
         return out;
     }
 
@@ -563,6 +671,53 @@ private:
         return lease;
     }
 
+    /// The certificate admission lease (the SAME gate_ as every other /crypto read): refused
+    /// outright on a pool too small to spare a multi-statement snapshot read.
+    CryptoReadGate::Lease cert_lease() const {
+        CryptoReadGate::Lease lease;
+        if (!cert_refused_)
+            lease = gate_.try_acquire();
+        if (!lease)
+            // A refusal for a too-small pool is a permanent misconfiguration, not a shed: its own
+            // reason, so the alert does not tell an operator to look for a poll storm.
+            note(kSourceCert, cert_refused_ ? kReasonPoolTooSmall : kReasonAdmission);
+        return lease;
+    }
+
+    CryptoReadError cert_refusal() const {
+        return cert_refused_ ? pool_too_small("fleet certificate reads", kCryptoCertMinPoolSize)
+                             : capacity_in_use();
+    }
+
+    CryptoReadError cert_failure(const CertReadError& e) const {
+        if (e.kind == CertReadError::Kind::kInvalid)
+            return invalid(e.message);
+        if (e.kind == CertReadError::Kind::kSubstringIndexMissing ||
+            e.kind == CertReadError::Kind::kScaleLimit) {
+            // NOT retryable: the same call fails the same way (until an operator builds the
+            // dictionary, or the caller narrows the request). No retry hint on any transport.
+            const bool dict = e.kind == CertReadError::Kind::kSubstringIndexMissing;
+            note(kSourceCert, dict ? "substring_index_missing" : "scale_limit");
+            CryptoReadError r = unavailable(e.message);
+            r.unavailable_until_restart = true;
+            r.remediation = dict ? "build the DN dictionary (server-admin.md, \"The substring-filter "
+                                   "dictionary\"), or filter with issuer_dn / agent_id instead"
+                                 : "narrow the summary with agent_id, store or another filter; the "
+                                   "fleet-wide counts arrive in a later release";
+            return r;
+        }
+        if (e.reconciling) {
+            note(kSourceCert, e.transient_failure ? "reconcile_failed_transient" : "reconciling");
+            CryptoReadError r = unavailable(e.message);
+            r.cause = e.transient_failure ? CryptoReadCause::kReconcileFailedTransient
+                                          : CryptoReadCause::kReconciling;
+            r.retry_after_ms = e.retry_hint_ms > 0 ? e.retry_hint_ms : CertificateInventoryStore::kReconcileRetryHintMs;
+            return r;
+        }
+        note(kSourceCert, degrade_reason(e.kind));
+        return unavailable(kCertUnavailable);
+    }
+
     CryptoReadError ca_failure(const CaReadError& e) const {
         if (e.kind == CaReadError::Kind::kInvalidRequest)
             return invalid(e.message);
@@ -676,7 +831,9 @@ private:
     const DeviceApi* devices_;
     CaStore* ca_;
     CryptoDashboardLayoutStore* layouts_;
+    CertificateInventoryStore* certs_;
     const bool ca_refused_;
+    const bool cert_refused_;
     const bool library_refused_;
     const std::chrono::seconds ttl_;
     std::function<void(std::string_view, std::string_view)> note_degrade_;

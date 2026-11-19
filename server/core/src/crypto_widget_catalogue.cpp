@@ -916,6 +916,8 @@ std::string audit_detail_ca_degraded(std::string_view cid, std::optional<std::in
     case CryptoReadCause::kAccessCheck:
         what = "access check unavailable";
         break;
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling: // certificate-only cause; read as degraded here
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         what = "store degraded";

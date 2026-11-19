@@ -41,6 +41,18 @@ public:
         return registry_.agent_count();
     }
 
+    /// O(ids) point lookups; never walks the fleet (a page of results names a bounded set).
+    [[nodiscard]] std::vector<DeviceListRow>
+    list_devices_by_id(const std::vector<std::string>& agent_ids) const override {
+        std::vector<DeviceListRow> out;
+        out.reserve(agent_ids.size());
+        for (const auto& id : agent_ids) {
+            if (const auto s = registry_.get_session(id))
+                out.push_back({s->agent_id, s->hostname, s->os, s->arch, s->agent_version});
+        }
+        return out;
+    }
+
     [[nodiscard]] std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& agent_id) const override {
         // O(1) point lookup — NEVER a linear scan (#3564: a scan whose length

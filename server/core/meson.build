@@ -953,6 +953,10 @@ yuzu_server_core_lib = static_library(
     'src/software_licensing_ingestion.cpp',
     'src/app_usage_store.cpp',           # Wave 7b PR7b.2
     'src/certificate_inventory_store.cpp',      # slice-2 PR 2a-2a
+    'src/certificate_inventory_read.cpp',       # slice-2 PR 2a-2b: the store's read half
+    'src/certificate_inventory_dn_dict.cpp',    # slice-2 PR 2a-2b: DN dictionary background maintenance
+    'src/pg/pg_background_build.cpp',           # reusable concurrent-index + batched-reconcile steps
+    'src/certificate_read_model.cpp',           # slice-2 PR 2a-2b: pure parse/cursor/shape model
     'src/certificate_inventory_ingestion.cpp',  # slice-2 PR 2a-2a
     'src/app_usage_ingestion.cpp',       # Wave 7b PR7b.2
     'src/app_usage_read_model.cpp',      # Wave 7b PR7b.2 (Rule 1 shared builder)

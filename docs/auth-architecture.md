@@ -3972,7 +3972,7 @@ counter registrations). Tests: `tests/unit/server/test_saml_scim_link.cpp`,
 
 ## Granular RBAC (Phase 3)
 
-- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 39 securable types, per-operation permissions, deny-override logic.
+- 8 roles (adds `ForensicsAnalyst`, the read-only delegable Forensics tier, #4990), 40 securable types, per-operation permissions, deny-override logic.
 - **OIDC SSO**: Full PKCE flow, OIDC Discovery, JWT validation, group-to-role mapping. Endpoints and `jwks_uri` are never derived from the issuer: `OidcProvider::ensure_discovered` reads them lazily from the issuer's discovery document (an explicit `OidcConfig` field is authoritative for that one field), fails closed with no fallback, and applies one validation, shared with the Settings "Test Connection" button: `issuer` byte-equal to the configured issuer (OIDC Discovery 4.3, the mix-up defense) and every endpoint an absolute URL on the issuer's scheme, at most 2048 bytes, with a well-formed `host[:port]` authority. Test Connection shares only the fetch and validation functions: it never reads or clears the provider's discovery state, so it is a connectivity check and not a guarantee of what a sign-in will hit.
   - All IdP GETs go through one bounded primitive (`http_get_bounded`): 5 s per-operation timeouts and a total bound of 2 x that timeout, 10 s by default, from the start of the request, covering name resolution on Windows and on POSIX (Linux and macOS): there `resolve_host_addresses_status` runs the lookup on a detached worker through `bounded_resolve` (`bounded_resolver.hpp`) with an OIDC-owned pool (cap 16, gauge `yuzu_server_oidc_resolver_in_flight`) and the caller stops waiting at the per-lookup bound, so the IdP GETs, the check before the token-exchange POST connects (`exchange_code` -> `vet_egress_target`) and the one-time NAT64 probe lookup, and with them sign-in and Test Connection, are held to the 10 s figure (on a glibc build the OIDC name lookups could wait about 30 s past the intended 10 s bound; they now stop waiting at the bound). A lookup still running keeps its slot until the resolver returns, and a full pool fails closed at once as "the host name lookup was not started" instead of waiting, as does a name whose lookup was refused or timed out in the last 3 s (`HostLookupAdmission`, `resolver_host_admission.hpp`: at most 8 lookups outstanding per name and 64 names tracked, the count held by the lookup until the resolver returns; a refused name remembered for 3 s, at most 32 names, the refusal never extended, no success cached, the NAT64 probe exempt from both the limit and that memory, so only the pool's cap bounds it; the pool, the limit and the memory are per process, so per replica under high availability; discovery does not remember that refusal: the next attempt looks the name up again, where any other failed discovery arms the 30 s no-retry window). On Windows `resolve_host_addresses` runs its own overlapped `GetAddrInfoExW` lookup, canceled at that timeout rounded up to whole seconds, with up to 5 s more for the canceled lookup to complete; a lookup still not complete then is not freed (the OS may still write into it) but handed to a process-wide ledger that destroys it once its event is signaled, holds at most 16 such requests plus lookups in flight, and makes a new lookup fail closed with "the host name did not resolve" while 16 are stuck: `oidc_abandoned_ledger.hpp`), connect and the response; 256 KiB body cap, redirects not followed.
   - A watchdog thread shuts the socket down at that deadline, and again every 50 ms because a pre-connect shutdown does not persist on macOS (measured), so the bound also covers the TLS handshake, which httplib's own `set_max_timeout` does not. On POSIX the watchdog holds a descriptor it reserved before the client existed (an alias of the socket, made by dup2 from httplib's socket-options callback, so exhaustion fails the request closed with `request failed: no file descriptor available` rather than leaving it unwatched). On Windows it takes a private duplicate of the socket (`WSADuplicateSocketW`, so it never touches a socket number httplib may close and Windows may reuse), and a duplicate that cannot be taken fails the request closed with the same text; from the deadline it calls `CancelIoEx` on the duplicate and shuts the connection down every 50 ms, and after 10 such cuts (500 ms) closes the duplicate with `SO_LINGER` zero, an abortive close that resets the connection (the count restarts for each socket httplib hands it). httplib (0.37.1 and 0.59.0) waits with `WSAPoll` on Windows; the evidence for the cut is the end-to-end Windows drip test. Per-OS test provenance is in `docs/test-coverage.md`.
@@ -4058,8 +4058,9 @@ MCP twins).
    EnginePrincipal:Read}` — plus, as of #4028, `{TlsConfig:Read,
    PluginSigning:Read, ServerConfig:Read, AnalyticsConfig:Read}` (see
    "Settings read-twins" below), as of #4031, `{Enrollment:Read,
-   OidcConfig:Read}`, as of Wave 7 PR7.2, `{Forensics:Read}`, and as of
-   #5771, `{AuditLog:Read}` (see "The audit trail" below) — require the
+   OidcConfig:Read}`, as of Wave 7 PR7.2, `{Forensics:Read}`, as of
+   #5771, `{AuditLog:Read}` (see "The audit trail" below), and as of slice-2
+   PR 2a-2b, `{CertificateInventory:Read}` (the fourth inclusion class, below) — require the
    `admin` session role regardless of the RBAC on/off toggle, via
    `authz_topology_floor.hpp`'s `topology_floor_applies()`. The groups are
    different categories that happen to share this one mechanism: the
@@ -4679,6 +4680,28 @@ is detected: decisions on engine or group grants made by earlier builds are not 
 not recorded". This is the project's "Deployment contract (hard cutover)" posture, a decision of the project
 owner recorded in `docs/user-manual/upgrading.md`; the executable refuses a schema state, it does not verify
 where the database came from.
+
+
+**Fourth inclusion class: a new fleet-wide data class the design requires admin-only (slice-2 PR
+2a-2b, ADR-0070 D12).** `{CertificateInventory:Read}` is in the floor, and it fits none of the
+three classes above, so `authz_topology_floor.hpp`'s inclusion test gains a fourth: *a new
+fleet-wide copy of data that an accepted ADR requires to be admin-only in both RBAC states* (here ADR-0070 D12). The
+certificate inventory is not authorization topology and not the audit trail, and it is not an
+existing admin-only posture either: the output of today's `certificates.list` runs is readable
+under `Response:Read`, by any signed-in user under RBAC off. Subjects and SANs can be personal
+data, so the new store is floored on design grounds (the `Forensics` entry is the nearest
+precedent). The securable is dedicated: it is seeded to Administrator only, is absent from the
+Viewer read-list, and is reachable through neither `Security:Read` nor `Inventory:Read`. Every
+certificate read goes through `require_fleet_read`, which applies the floor
+(`authz_gates.cpp`), **never** `require_list_read`, which does not (its own comment says a floored
+securable routed through it "must re-apply the floor explicitly"). A service-scoped API token is
+refused 403 in both RBAC states: under RBAC off `require_fleet_read` refuses every service-scoped
+session, and under RBAC on the ITServiceOwner ceiling refuses a pair that role does not hold. The
+pair is not in the seeded-empty `kServiceScopeGlobalSafe`, and adding it would be a security
+decision. Coverage: `tests/unit/server/test_authz_topology_floor.cpp` (membership and cardinality)
+and `tests/unit/server/test_fleet_read_ceiling_routes_authz.cpp` ("crypto certificate routes real
+gate": RBAC off non-admin 403, admin admitted, RBAC on exact visible set, service-scoped 403 in
+both states).
 
 ## Render-time permission probes (capability hints)
 

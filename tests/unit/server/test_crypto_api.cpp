@@ -12,6 +12,8 @@
 #include "pg/pg_raii.hpp"
 #include "software_inventory_store.hpp"
 #include "ca_store.hpp"
+#include "certificate_inventory_store.hpp"
+#include "certificate_read_model.hpp"
 #include "crypto_dashboard_layout_store.hpp"
 #include "crypto_shared_read.hpp"
 #include "crypto_widget_catalogue.hpp"
@@ -1779,4 +1781,395 @@ TEST_CASE("SharedRead: a compute that throws degrades its waiters and the next c
     REQUIRE(next.has_value());
     CHECK(*next == 42);
     CHECK(calls == 1);
+}
+
+// ── Fleet certificates (slice-2 PR 2a-2b): the seam over the REAL CertificateInventoryStore ──
+
+namespace {
+
+yuzu::test::PgTestTemplate certapi_tpl{"cryptoapicert", [](const std::string& dsn) {
+                                           PgPool pool{{.conninfo = dsn, .size = 1}};
+                                           CertificateInventoryStore store{pool};
+                                           if (!store.is_open())
+                                               throw std::runtime_error(
+                                                   "cryptoapicert template: store failed to migrate");
+                                       }};
+
+std::string cert_sha(int n) {
+    const std::string h = std::to_string(n);
+    return std::string(64 - h.size(), '0') + h;
+}
+
+void put_certs(CertificateInventoryStore& st, const std::string& agent, std::initializer_list<int> ids,
+               const std::string& status = "ok") {
+    CertReportData d;
+    d.blob_version = "1";
+    d.stores.push_back({"LocalMachine\\Root", "machine", status, ""});
+    for (const int n : ids) {
+        CertFactRow f;
+        f.sha256 = cert_sha(n);
+        f.subject_dn = "CN=host" + std::to_string(n);
+        f.issuer_dn = "CN=Test CA";
+        f.not_after = "2030-01-01T00:00:00Z";
+        f.key_alg_oid = "1.2.840.113549.1.1.1";
+        f.rsa_modulus_bits = 2048;
+        d.facts.push_back(f);
+        d.locations.push_back({"LocalMachine\\Root", "", f.sha256});
+    }
+    REQUIRE(st.ingest_full(agent, d, "h-" + agent).outcome == CertIngestOutcome::kStored);
+}
+
+struct CertFx {
+    PgPool pool;
+    CertificateInventoryStore store;
+    explicit CertFx(const std::string& dsn)
+        : pool(PgPool::Options{.conninfo = dsn, .size = 4}), store(pool) {
+        REQUIRE(store.is_open());
+        put_certs(store, "a1", {1, 2, 3});
+        put_certs(store, "a2", {4});
+        put_certs(store, "a3", {5}, "constrained");
+    }
+};
+
+} // namespace
+
+TEST_CASE("CryptoApi certificates: scope push-down TOP vs set vs empty; hostnames; truncation flags",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    FakeDevices devices;
+    auto api = make_local_crypto_api(
+        LocalCryptoApiDeps{.devices = &devices, .certificates = &fx.store});
+
+    auto top = api->certificates({}, std::nullopt);
+    REQUIRE(top.has_value());
+    CHECK(top->rows.size() == 5);
+    CHECK(top->rows[0].hostname == "alpha"); // joined from the device registry
+    CHECK(top->coverage.devices_reporting == 3);
+    CHECK_FALSE(top->coverage.confined);
+    // a3's store is `constrained`, so the response says it is not the whole story.
+    CHECK(top->result_truncated);
+    CHECK(top->truncated_parts == std::vector<std::string>{"constrained_store"});
+
+    auto some = api->certificates({}, set_of({"a2"}));
+    REQUIRE(some.has_value());
+    CHECK(some->rows.size() == 1);
+    CHECK(some->rows[0].agent_id == "a2");
+    CHECK(some->coverage.devices_reporting == 1);
+    CHECK(some->coverage.confined);
+    CHECK_FALSE(some->result_truncated);
+
+    auto none = api->certificates({}, authz::VisibleSet{std::unordered_set<std::string>{}});
+    REQUIRE(none.has_value());
+    CHECK(none->rows.empty());
+    CHECK(none->coverage.confined);
+
+    auto sum = api->certificate_summary({}, set_of({"a1"}));
+    REQUIRE(sum.has_value());
+    CHECK(sum->totals.certificate_count == 3);
+    CHECK(sum->totals.device_count == 1);
+}
+
+TEST_CASE("CryptoApi certificates: a page's cursor is bound to its filter and walks every row once",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store});
+    CertQuery q;
+    q.limit = 2;
+    std::vector<std::string> seen;
+    int pages = 0;
+    for (;;) {
+        auto p = api->certificates(q, std::nullopt);
+        REQUIRE(p.has_value());
+        ++pages;
+        for (const auto& r : p->rows)
+            seen.push_back(r.sha256);
+        if (p->next_cursor.empty()) {
+            CHECK(pages == 3);
+            // The last page is complete: the only remaining cut is a3's constrained store.
+            break;
+        }
+        CHECK(p->result_truncated); // a page with a successor is never presented as complete
+        CHECK(std::ranges::find(p->truncated_parts, "page_limit") != p->truncated_parts.end());
+        q.cursor = p->next_cursor;
+        REQUIRE(pages < 10);
+    }
+    CHECK(seen == std::vector<std::string>{cert_sha(1), cert_sha(2), cert_sha(3), cert_sha(4), cert_sha(5)});
+
+    // A cursor reused under another filter set is refused (400), not silently re-bound.
+    CertQuery other;
+    other.filter.agent_id = "a1";
+    other.cursor = q.cursor.empty() ? cert_read::encode_cursor({"a1", cert_sha(1)}, "0123456789abcdef")
+                                    : q.cursor;
+    auto bad = api->certificates(other, std::nullopt);
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CryptoReadError::Kind::kInvalid);
+    CertQuery junk;
+    junk.cursor = "not-a-cursor";
+    auto j = api->certificates(junk, std::nullopt);
+    REQUIRE_FALSE(j.has_value());
+    CHECK(j.error().kind == CryptoReadError::Kind::kInvalid);
+    // Defence in depth: the seam itself refuses a subject substring without is_ca=true.
+    CertQuery subj;
+    subj.filter.subject_dn_contains = "host";
+    CHECK(api->certificates(subj, std::nullopt).error().kind == CryptoReadError::Kind::kInvalid);
+    CertSummaryQuery ssubj;
+    ssubj.filter.subject_dn_contains = "host";
+    CHECK(api->certificate_summary(ssubj, std::nullopt).error().kind == CryptoReadError::Kind::kInvalid);
+}
+
+TEST_CASE("CryptoApi certificates: no store, a shed and a small pool are 503s, never an empty answer",
+          "[pg][crypto][certs]") {
+    SECTION("no certificate store wired") {
+        yuzu::MetricsRegistry metrics;
+        auto api = make_local_crypto_api(LocalCryptoApiDeps{
+            .note_degrade = [&](std::string_view src, std::string_view why) {
+                metrics.counter("yuzu_inventory_read_degrade_total",
+                                {{"reason", std::string(why)}, {"source", std::string(src)}})
+                    .increment();
+            }});
+        auto r = api->certificates({}, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == CryptoReadError::Kind::kDegraded);
+        CHECK_FALSE(api->certificate_summary({}, std::nullopt).has_value());
+        CHECK(metrics
+                  .counter("yuzu_inventory_read_degrade_total",
+                           {{"reason", "store_not_open"}, {"source", "cert_inventory"}})
+                  .value() == 2.0);
+    }
+    SECTION("over the admission bound") {
+        YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+        CertFx fx{db.dsn()};
+        yuzu::MetricsRegistry metrics;
+        auto api = make_local_crypto_api(LocalCryptoApiDeps{
+            .certificates = &fx.store,
+            .max_concurrent_reads = 0,
+            .note_degrade = [&](std::string_view src, std::string_view why) {
+                metrics.counter("yuzu_inventory_read_degrade_total",
+                                {{"reason", std::string(why)}, {"source", std::string(src)}})
+                    .increment();
+            }});
+        auto r = api->certificates({}, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == CryptoReadError::Kind::kDegraded);
+        CHECK(r.error().cause == CryptoReadCause::kCapacity);
+        CHECK_FALSE(r.error().unavailable_until_restart);
+        CHECK_FALSE(api->certificate_summary({}, std::nullopt).has_value());
+        CHECK(metrics
+                  .counter("yuzu_inventory_read_degrade_total",
+                           {{"reason", "admission_full"}, {"source", "cert_inventory"}})
+                  .value() == 2.0);
+    }
+    SECTION("a pool too small to spare the read lasts until a restart") {
+        YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+        CertFx fx{db.dsn()};
+        auto api = make_local_crypto_api(
+            LocalCryptoApiDeps{.certificates = &fx.store, .pool_size = 2});
+        auto r = api->certificates({}, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().unavailable_until_restart);
+    }
+    SECTION("a pool below the floor is counted as pool_too_small, never as a shed") {
+        YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+        CertFx fx{db.dsn()};
+        yuzu::MetricsRegistry metrics;
+        auto api = make_local_crypto_api(LocalCryptoApiDeps{
+            .certificates = &fx.store,
+            .pool_size = 2,
+            .note_degrade = [&](std::string_view src, std::string_view why) {
+                metrics.counter("yuzu_inventory_read_degrade_total",
+                                {{"reason", std::string(why)}, {"source", std::string(src)}})
+                    .increment();
+            }});
+        CHECK_FALSE(api->certificates({}, std::nullopt).has_value());
+        CHECK(metrics
+                  .counter("yuzu_inventory_read_degrade_total",
+                           {{"reason", "pool_too_small"}, {"source", "cert_inventory"}})
+                  .value() == 1.0);
+        CHECK(metrics
+                  .counter("yuzu_inventory_read_degrade_total",
+                           {{"reason", "admission_full"}, {"source", "cert_inventory"}})
+                  .value() == 0.0);
+    }
+    SECTION("a broken backend degrades; a deny-all scope still answers with no SQL") {
+        YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+        CertFx fx{db.dsn()};
+        {
+            auto lease = fx.pool.try_acquire_for(std::chrono::seconds{5});
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA certificate_inventory_store CASCADE",
+                                    std::vector<std::string>{})
+                        .status() == PGRES_COMMAND_OK);
+        }
+        auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store});
+        auto top = api->certificates({}, std::nullopt);
+        REQUIRE_FALSE(top.has_value()); // proves the empty answer below was not read from the database
+        CHECK(top.error().kind == CryptoReadError::Kind::kDegraded);
+        auto none = api->certificates({}, authz::VisibleSet{std::unordered_set<std::string>{}});
+        REQUIRE(none.has_value());
+        CHECK(none->rows.empty());
+        // The summary's deny-all also answers with no SQL (the schema is gone), while TOP degrades.
+        auto sum_none = api->certificate_summary({}, authz::VisibleSet{std::unordered_set<std::string>{}});
+        REQUIRE(sum_none.has_value());
+        CHECK(sum_none->totals.certificate_count == 0);
+        CHECK_FALSE(api->certificate_summary({}, std::nullopt).has_value());
+    }
+}
+
+TEST_CASE("CryptoReadGate: a certificate read holds one of the same two slots as every other /crypto read",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    // One slot, taken by hand: the certificate read is refused at once, not queued.
+    auto api = make_local_crypto_api(
+        LocalCryptoApiDeps{.certificates = &fx.store, .max_concurrent_reads = 1});
+    auto first = api->certificates({}, std::nullopt);
+    REQUIRE(first.has_value()); // the lease is released on return: a second read succeeds too
+    CHECK(api->certificates({}, std::nullopt).has_value());
+}
+
+TEST_CASE("CryptoApi certificates: hostnames come from point lookups of the page's devices, never a fleet copy",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    struct PointOnly final : DeviceApi {
+        mutable std::vector<std::string> asked;
+        std::vector<DeviceListRow> list_devices() const override {
+            throw std::runtime_error("the fleet must not be walked for one page of certificates");
+        }
+        std::expected<std::optional<DeviceDetail>, DeviceReadError>
+        lookup_device(const std::string&) const override {
+            return std::nullopt;
+        }
+        std::vector<DeviceListRow>
+        list_devices_by_id(const std::vector<std::string>& ids) const override {
+            asked = ids;
+            std::vector<DeviceListRow> out;
+            for (const auto& id : ids)
+                out.push_back({id, "host-of-" + id, "linux", "x86_64", "1"});
+            return out;
+        }
+    } devices;
+    auto api = make_local_crypto_api(
+        LocalCryptoApiDeps{.devices = &devices, .certificates = &fx.store});
+    auto p = api->certificates({}, std::nullopt);
+    REQUIRE(p.has_value());
+    CHECK(devices.asked == std::vector<std::string>{"a1", "a2", "a3"}); // one entry per device on the page
+    for (const auto& r : p->rows)
+        CHECK(r.hostname == "host-of-" + r.agent_id);
+}
+
+TEST_CASE("CryptoApi certificates: a not-yet-reconciled or transiently failed dictionary is RETRYABLE; "
+          "a deterministic failure is not",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{.certificates = &fx.store});
+    const auto set_marker = [&](const std::string& m) {
+        auto lease = fx.pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                ("COMMENT ON TABLE certificate_inventory_store.dn_dict IS '" + m + "'").c_str(),
+                                std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+        (void)fx.store.refresh_substring_index_state();
+    };
+    CertQuery q;
+    q.filter.issuer_dn_contains = "test";
+    const auto read = [&] { return api->certificates(q, std::nullopt); };
+    SECTION("reconciling: retryable, short hint, flagged") {
+        set_marker("building");
+        auto r = read();
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().unavailable_until_restart);
+        CHECK(r.error().cause == CryptoReadCause::kReconciling);
+        REQUIRE(r.error().retry_after_ms.has_value());
+        CHECK(*r.error().retry_after_ms == CertificateInventoryStore::kReconcileRetryHintMs);
+    }
+    for (const char* sqlstate : {"57014", "55P03", "40P01", "08006", "53300", "57P01", "57P02", "57P03"}) {
+        SECTION(std::string("a transient failure (") + sqlstate + ") is retryable at the pass interval, "
+                "and never echoes the database error") {
+            set_marker(std::string("failed: reconcile: ") + sqlstate + " secret-table-detail");
+            CHECK(fx.store.substring_state() == SubstringState::kFailedTransient);
+            auto r = read();
+            REQUIRE_FALSE(r.has_value());
+            CHECK_FALSE(r.error().unavailable_until_restart);
+            REQUIRE(r.error().retry_after_ms.has_value());
+            CHECK(*r.error().retry_after_ms == CertificateInventoryStore::kPassIntervalMs);
+            CHECK(r.error().cause == CryptoReadCause::kReconcileFailedTransient);
+            CHECK_THAT(r.error().message, !Catch::Matchers::ContainsSubstring("secret-table-detail"));
+            CHECK_THAT(r.error().message, !Catch::Matchers::ContainsSubstring(sqlstate));
+        }
+    }
+    for (const char* marker : {"failed: issuer_dn: 54000 index row too large", "failed: x",
+                               "ready:1;last_failure:reconcile: 42P01 relation missing"}) {
+        SECTION(std::string("a deterministic failure (") + marker + ") stays non-retryable") {
+            set_marker(marker);
+            CHECK(fx.store.substring_state() == SubstringState::kFailed);
+            auto r = read();
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error().unavailable_until_restart);
+            CHECK_FALSE(r.error().retry_after_ms.has_value());
+        }
+    }
+}
+
+TEST_CASE("CryptoApi certificates: a refused substring filter and a summary scale limit are non-retryable, "
+          "with remediation and their own degrade reason",
+          "[pg][crypto][certs]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, certapi_tpl);
+    CertFx fx{db.dsn()};
+    yuzu::MetricsRegistry metrics;
+    auto api = make_local_crypto_api(LocalCryptoApiDeps{
+        .certificates = &fx.store,
+        .note_degrade = [&](std::string_view src, std::string_view why) {
+            metrics.counter("yuzu_inventory_read_degrade_total",
+                            {{"reason", std::string(why)}, {"source", std::string(src)}})
+                .increment();
+        }});
+    const auto count = [&](const char* reason) {
+        return metrics.counter("yuzu_inventory_read_degrade_total",
+                               {{"reason", reason}, {"source", "cert_inventory"}}).value();
+    };
+    SECTION("the dictionary is not built") {
+        {
+            auto lease = fx.pool.acquire();
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "COMMENT ON TABLE certificate_inventory_store.dn_dict IS 'failed: x'",
+                                    std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(fx.store.refresh_substring_index_state());
+        CertQuery q;
+        q.filter.issuer_dn_contains = "test";
+        auto r = api->certificates(q, std::nullopt);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == CryptoReadError::Kind::kDegraded);
+        CHECK(r.error().unavailable_until_restart); // => no retry hint on any transport
+        CHECK_FALSE(r.error().remediation.empty());
+        CHECK_THAT(r.error().message, Catch::Matchers::ContainsSubstring("dictionary"));
+        CHECK(count("substring_index_missing") == 1.0);
+        // The summary refuses it too; a filter that is not a substring still answers.
+        CertSummaryQuery sq;
+        sq.filter.issuer_dn_contains = "test";
+        auto sr = api->certificate_summary(sq, std::nullopt);
+        REQUIRE_FALSE(sr.has_value());
+        CHECK(sr.error().unavailable_until_restart);
+        CertQuery exact;
+        exact.filter.agent_id = "a1";
+        CHECK(api->certificates(exact, std::nullopt).has_value());
+        CHECK(count("query_error") == 0.0);
+    }
+    SECTION("a summary past its wall budget is a scale limit; a page's timeout stays retryable") {
+        fx.store.set_read_budget_for_test(std::chrono::milliseconds{0});
+        auto s = api->certificate_summary({}, std::nullopt);
+        REQUIRE_FALSE(s.has_value());
+        CHECK(s.error().unavailable_until_restart);
+        CHECK_FALSE(s.error().remediation.empty());
+        CHECK(count("scale_limit") == 1.0);
+        auto p = api->certificates({}, std::nullopt);
+        REQUIRE_FALSE(p.has_value());
+        CHECK_FALSE(p.error().unavailable_until_restart);
+        CHECK(count("query_error") == 1.0);
+    }
 }

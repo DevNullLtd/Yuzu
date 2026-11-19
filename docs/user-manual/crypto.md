@@ -445,6 +445,8 @@ permissions, through REST and MCP.
 | `GET /api/v1/crypto/dashboard/layout` | Your own layout (`widgets`, `is_default`, `version`, `preserved_unknown`). Authentication only; refused to service-scoped tokens. The dashboard page answers such a token, or an MCP token whose tier does not allow the read, with the default layout, read-only, and never reads or shows the minting operator's saved layout. |
 | `PUT /api/v1/crypto/dashboard/layout` | Replace your own layout: body `{"widgets":[ids], "expected_version": n}`, at most 64 catalogue ids, no repeats; `expected_version` names the version you read (omit it only for a first save). A stale version, or none while a layout is stored, is `409`. Same-site browser writes only; audited `crypto.dashboard.layout.update`. |
 | `GET /api/v1/crypto/ca/stats` | Every Yuzu-issued count against one `as_of`. `Inventory:Read`, withheld from a confined caller (`403`). |
+| `GET /api/v1/crypto/certificates` | **Fleet certificates**, one row per device and certificate, paged. `CertificateInventory:Read`. Every filter below, plus `cursor` and `limit` (1 to 500, default 100). See "Fleet certificates". |
+| `GET /api/v1/crypto/certificates/summary` | **Raw-value rollups** of the same inventory (key and signature algorithm, curve, issuer, store, your `not_after` histogram). `CertificateInventory:Read`. See "Fleet certificates". |
 | `GET /api/v1/ca/issued?kind=...` | The Yuzu-issued certificates behind one count: `kind` (required in this form), `days`, `week`, `bucket`, `as_of`, `limit` (1 to 500, default 100), `cursor` (the previous page's `next_cursor`; no `offset`). `Security:Read`, withheld from a confined caller and from one holding no `Inventory:Read` grant. Without any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` the route lists the inventory with `offset` paging (see [PKI](server-admin.md)). That unfiltered list is held to the same rules: it is withheld from a confined caller (`403`, no permission named), it is audited `crypto.ca.certificates.view`, and it answers `503` when the confinement check cannot be made. |
 
 `version` and `ecosystem` are matched **exactly**, and a parameter that is present but empty is
@@ -471,6 +473,8 @@ Full parameters, response shapes and error tables are in [rest-api.md](rest-api.
 | `list_crypto_widgets` | `GET /api/v1/crypto/widgets` | No args. |
 | `get_crypto_dashboard_layout` / `set_crypto_dashboard_layout` | `GET` / `PUT /api/v1/crypto/dashboard/layout` | The calling principal's own layout; `set` takes `widgets` and optional `expected_version`. |
 | `get_crypto_ca_stats` | `GET /api/v1/crypto/ca/stats` | No args. |
+| `list_crypto_certificates` | `GET /api/v1/crypto/certificates` | Every filter, `cursor` and `limit`. Strict input. |
+| `get_crypto_certificate_summary` | `GET /api/v1/crypto/certificates/summary` | Every filter and `not_after_edges` (an array). Strict input. |
 | `list_issued_certs` | `GET /api/v1/ca/issued` | With any of `kind`, `days`, `week`, `bucket`, `as_of` or `cursor` it lists the certificates behind one count, paged by `next_cursor`; without them it lists the inventory with `offset` paging, under the same confinement refusal and the same audit. |
 
 The published ecosystems are the closed list the software catalogue tools use: `""`, `rpm`,
@@ -509,6 +513,194 @@ data, permission or other operator is touched).
   nothing: every data read keeps its own gate.
 
 See [mcp.md](mcp.md) for the tool table.
+
+## Fleet certificates
+
+The certificates held in every device's **machine** certificate stores, as raw X.509 facts. They
+arrive through the daily `certificate_inventory` sync (ADR-0016), so a row is as fresh as the
+device's last report: `last_seen` on a certificate, and `observed_at` / `status_at` on a store, are
+server receipt times. This page covers the **read** surface; a device reports once a collector ships
+on the agent, so an empty result today means "no device has reported", not "no certificates".
+
+Nothing here grades a certificate. The surface is facts only: the only built-in checks are D13's
+named rules and windows, each shown with its criterion (they arrive with the counts, in a later
+release). There is no verdict, colour, icon or risk ordering, and revocation is **not checked** by
+this version.
+
+Every fact is **agent-reported**: where the agent includes the certificate's DER the server
+re-derives the parsed fields from it, otherwise it stores the agent's parsed fields as sent, and
+in neither case does anything independently verify what a device claims about its own stores (a
+compromised device can report anything). Server-side revocation statements arrive later (slice-2 PR 2b-2); until then, treat a
+fact as the device's claim.
+
+### Who can read it
+
+`CertificateInventory:Read`, a dedicated securable that no other surface uses. Subjects and SANs
+(e-mail addresses, UPNs, names) can be personal data, so it is seeded to **Administrator only** and is
+reachable through neither `Security:Read` nor `Inventory:Read`.
+
+- **RBAC enforcement off (the default):** admin-only. The pair is in the authorization-topology floor,
+  so a signed-in non-admin gets `403` even though most other reads are open.
+- **A service-scoped API token:** `403` in both RBAC states. The inventory has no per-service slice.
+- **A management-group-confined holder** sees only its visible devices, and the counts and `coverage`
+  are computed over that scope.
+- **It cannot be delegated yet.** Only the built-in Administrator role holds `CertificateInventory:Read`, and custom
+  roles are not yet creatable through REST, MCP or the dashboard (see "Custom Roles (Planned)" in
+  [rbac.md](rbac.md)). Until they are, an analyst reads certificates from an administrator's session or an
+  administrator-minted API token; whether to seed a read-only certificate role is a product decision, not yet made.
+- **A denied certificate half says so.** The `403` names `CertificateInventory:Read`; a dashboard
+  fragment answers a note that names it. It never reads as "no certificates".
+
+### REST, MCP and the page
+
+| Surface | Reads |
+|---|---|
+| `GET /api/v1/crypto/certificates`, MCP `list_crypto_certificates`, `/fragments/crypto/certificates/devices` | One row per (device, certificate), paged |
+| `GET /api/v1/crypto/certificates/summary`, MCP `get_crypto_certificate_summary`, `/fragments/crypto/certificates` | Distinct-device and distinct-certificate counts grouped by raw value |
+
+A row carries the SHA-256 (the identity), SHA-1 and TBS digest, serial, subject and issuer DN, `not_before`
+and `not_after` to the second, key algorithm OID with RSA modulus bits or EC curve and order bits,
+signature algorithm and PSS hash, `spki_sha256`, `ski` and `aki_key_id`, `is_ca`, `path_len`,
+`self_signed`, key usage, EKU OIDs, SANs, every `locations[]` entry (store, path, the **status of that
+store**, `observed_at`, `last_seen`), and `constrained_fields`. A field the device did not report is
+`null`, distinct from a real empty value. `stores[]` lists the status of every store on every device
+in the page (`ok`, `absent`, `unreadable`, `constrained`, `not_observed`), so a kept row is never shown
+without the status that explains it. `not_read` names what the collector does not read (Java
+`cacerts`, PKCS#12 files, `.p11-kit`, NSS databases, application stores, per-user stores), and
+`coverage` gives the denominator: `devices_reporting` (in-scope devices with a report) and
+`devices_included` (devices on this page).
+
+The summary groups by key algorithm (OID with modulus or order bits), signature algorithm (with PSS
+hash), elliptic curve, issuer (the top 50 by devices), and store, lists stores per status, and buckets
+`not_after` over the edges **you** pass in `not_after_edges` (plus an `unknown` bucket). **Subject DNs
+and SANs are never a grouping key.**
+
+### Filters
+
+| Parameter | Shape | Meaning |
+|---|---|---|
+| `store` | free text, 1 to 1,024 bytes | Exact `store_id`: certificates with a location in that store. No enum: a store id that exists nowhere matches nothing. |
+| `scope` | `machine` | Closed. Only machine stores are read in this release. Anything else is a `400`. |
+| `key_alg_oid`, `sig_alg_oid`, `ec_curve_oid` | dotted-decimal OID (`^[0-2](\.[0-9]+){1,32}$`) | Exact. Any well-formed OID is accepted. |
+| `not_after_before`, `not_after_after`, `not_before_after` | RFC 3339 UTC to the second, `YYYY-MM-DDTHH:MM:SSZ` | The instant is **yours**: the certificates whose `not_after` is strictly before / after it, or whose `not_before` is strictly after it. Nothing is chosen for you. |
+| `rsa_modulus_bits_lt`, `ec_order_bits_lt` | integer 1 to 65536 | RSA certificates whose modulus is smaller than, or EC certificates whose curve order is smaller than, your threshold. |
+| `is_ca`, `self_signed` | `true` or `false` | The certificate's own basic-constraints claim, and whether the collector reported it self-signed. |
+| `agent_id` | free text, 1 to 256 bytes | Exact device id, still confined to the devices you may see. |
+| `issuer_dn` | free text, at most 1,024 bytes | Exact RFC 4514 string. A present empty value selects certificates whose issuer is the empty string. |
+| `issuer_dn_contains` | free text, 3 to 256 bytes | Case-insensitive **literal** substring of `issuer_dn`: `%`, `_` and `\` are escaped, never a pattern. |
+| `subject_dn_contains` | free text, 3 to 256 bytes | The same match on `subject_dn`, accepted **only together with `is_ca=true`**; without it the request is a `400` naming `is_ca`. |
+| `sha256` | 64 hex characters | Exact certificate SHA-256 (either case). |
+| `spki_sha256` | 64 hex characters | Exact: every certificate over one public key, cross-signed and re-issued copies included. |
+| `aki_key_id` | 2 to 128 hex characters (whole bytes) | Exact authority key identifier: every certificate one CA key signed, whatever name the issuer used. |
+| `cursor`, `limit` | opaque / integer 1 to 500 (default 100) | Per-certificate read only. A `limit` outside 1 to 500 is refused, never clamped. |
+| `not_after_edges` | 1 to 32 comma-separated, strictly ascending RFC 3339 UTC instants | Summary only: **your** bucket edges for the `not_after` histogram. |
+
+Hex values compare case-insensitively against the stored case. An unknown parameter, a repeated
+parameter with differing values, invalid UTF-8 and an over-long value are all refused with a `400`
+that names the parameter: a typo'd filter is never silently ignored, because an ignored filter
+would return the whole fleet. The same value is refused identically on REST and MCP.
+
+### Finding one CA's certificates
+
+When a CA is distrusted or compromised you need every device holding its certificates, under any of
+its names (one CA issues under several). Each question is a query on the same read:
+
+| Question | Query |
+|---|---|
+| Which devices hold one of this CA's own certificates? | `is_ca=true&subject_dn_contains=eMudhra`, then `subject_dn_contains=emSign` |
+| Which certificates did any of its names issue? | `issuer_dn_contains=eMudhra`, then `issuer_dn_contains=emSign` |
+| Where is one key, cross-signed and re-issued copies included? | `spki_sha256=<the key's hash>` |
+| What did one CA key sign, whatever name the issuer used? | `aki_key_id=<that CA certificate's ski>` |
+
+`subject_dn_contains` needs `is_ca=true` because an end-entity subject can carry a person's name: a
+fleet-wide substring search over those would be a search for a person. `issuer_dn_contains` has no
+such condition; a self-signed end-entity certificate repeats its subject as its issuer, so it can still
+reach a person's name, but it reaches nothing the exact `issuer_dn` filter does not already return to
+the same caller. Both substring filters resolve through a distinct-DN dictionary (a table of every distinct issuer DN and CA
+subject DN), so they cost a scan of thousands of rows plus an index lookup, not a scan of every certificate. A
+substring matching more than 20,000 distinct names is refused with a `400` asking for a longer one. Until the
+background build has completed after a server start the two filters are refused with a retryable `503` (with a retry hint; non-retryable only if the dictionary failed deterministically)
+(see [server-admin.md](server-admin.md#the-substring-filter-dictionary-fleet-certificate-substring-filters)).
+
+### Limits
+
+Each summary group (key algorithm, signature algorithm, curve, store) is capped at 500 groups and
+the issuer groups at 50; a capped summary sets `result_truncated` and `truncated_parts:
+["row_ceiling"]`. A self-signed certificate that is not a CA is never an issuer group, because its
+issuer repeats its subject, which can be a person's name; the response says so in `issuers_note`.
+A whole read, however many statements it needs, has a 15-second wall budget; past it the read is
+a `503` with a retry hint. String filter lengths are counted in **bytes**. `blob_versions` lists
+the blob versions of the devices in the result (integers when numeric).
+
+### Truncation never looks complete
+
+`result_truncated` is the **OR of every cut** in the response, and `truncated_parts` names each:
+
+| Part | Meaning |
+|---|---|
+| `page_limit` | More rows exist past this page (`next_cursor` is set). |
+| `byte_budget` | The page stopped at a whole certificate at the 4 MiB budget (`next_cursor` is set). |
+| `locations_cap` | A certificate has more places than the 32 listed. |
+| `sans_cap` | A certificate has more SANs than the 64 listed. |
+| `constrained_store` | A store in `stores[]` is `constrained` (a cap or parse error): its rows may be incomplete. |
+| `constrained_certificate` | A certificate has `constrained_fields`. |
+| `row_ceiling` | Summary only: a group hit its row ceiling (issuers keep the top 50). |
+
+The last page of a walk carries `next_cursor: null` and `result_truncated: false` unless a cut
+other than paging happened. **Paged reads make no cross-page consistency promise**: an ingest or a
+decommission between two pages can add, drop or change a row, so use paging to browse and drill, not
+to recompute a count exactly.
+
+### When a read is refused (`503` classes)
+
+| Class (`reason` on `yuzu_inventory_read_degrade_total{source="cert_inventory"}`) | Retryable? | Cause | What to do |
+|---|---|---|---|
+| `admission_full` | yes (`retry_after_ms` 5000) | The two `/crypto` read slots are busy | Retry shortly; find the poller |
+| `pool_acquire_timeout`, `query_error` | yes | Postgres pool or query fault, or a page past its 15 s wall budget | Retry; check `yuzu_pg_pool_*` |
+| `store_not_open` | yes | The certificate store is unavailable | Check `/readyz` |
+| `pool_too_small` | **no** | `--postgres-pool-size` is below 4 | Restart with a larger pool |
+| `reconciling` | yes (`retry_after_ms` 10000) | `issuer_dn_contains` / `subject_dn_contains` before the leader's background pass has completed after a start (seconds on a steady store, a couple of minutes while the indexes are first built) | Retry |
+| `reconcile_failed_transient` | yes (`retry_after_ms` 300000) | The same filters after the leader's last background pass failed on a transient cause (cancelled or lock-timed-out statement, deadlock, connection or resource error); retried automatically | Retry in about five minutes |
+| `substring_index_missing` | **no** | `issuer_dn_contains` / `subject_dn_contains` while the DN dictionary FAILED (see the table comment) | Build it ([server-admin.md](server-admin.md#the-substring-filter-dictionary-fleet-certificate-substring-filters)), or filter with `issuer_dn` / `agent_id` |
+| `scale_limit` | **no** | A summary exceeded its 15 s budget for the visible fleet | Narrow it with `agent_id`, `store` or another filter |
+| (audit row lost) | yes | REST read fails closed (`Sec-Audit-Failed: true`, no data) | Retry once the audit store is healthy |
+
+The summary reliably finishes for roughly 1,000 to 2,000 confined devices. An unconfined summary at 100,000 devices, or a
+confined one over about 10,000, is a `scale_limit`. For the one-CA question use the per-certificate read with an exact key
+(`spki_sha256`, `aki_key_id`, `issuer_dn`, or a substring filter); the fleet-wide counts and snapshot export of a later
+release are the path for fleet-wide figures. Everything marked "no" carries no `retry_after_ms` (MCP: `retry_after_ms: null`) and says what to do.
+
+### Audit and degrade
+
+Every read is audited (`crypto.certificates.view`, `crypto.certificates.summary`; MCP
+`mcp.list_crypto_certificates`, `mcp.get_crypto_certificate_summary`). The detail records
+`scope=fleet|confined`, the row count, whether the result was truncated and the **names and operators**
+of the filters applied (for example `filters=issuer_dn=eq,not_after_before=lt`), **never a value, a
+subject or a SAN**. A DN typed into a filter can carry a person's name, so it never enters an audit row.
+
+- **REST fails closed.** If the audit row cannot be written the response is `503` with
+  `Sec-Audit-Failed: true`, a retry hint and **no data**.
+- **The dashboard fragments and MCP proceed**, with the "Audit not recorded." notice and
+  `audit_persisted: false`.
+- **A degraded read is a `503` with `retry_after_ms`, never an empty `200`.** So is a read refused
+  because two `/crypto` reads are already running (the same two slots every `/crypto` read shares). A
+  Postgres pool too small to spare the read is a `503` without a retry hint: it lasts until a restart
+  with a larger `--postgres-pool-size`.
+
+### Personal data
+
+Subjects and SANs are served on the per-certificate read only. They are not redacted (an e-mail SAN
+is the certificate's identity), so the narrow securable is the control. They are never a summary
+grouping key, a metric label or an audit detail. A departed person's certificate leaves the inventory
+when it is removed from the device (at the next successful read of that store) or when the device is
+decommissioned.
+
+**The distinct-DN dictionary also holds names, and does not outlive the certificates.** To make the substring filters fast the server
+keeps each distinct issuer DN and CA-subject DN once (never an end-entity subject). Those names can identify a person (a self-signed
+certificate's issuer is its subject). Decommissioning a device deletes the names only that device referenced (a name another device
+still holds stays); an **hourly** background prune deletes any name no certificate references, and a name an ingest began
+referencing at the instant it was pruned is re-inserted by that ingest in the same transaction (the prune skips locked rows and re-checks references in a fresh snapshot). A data-subject erasure is therefore met by
+removing the certificate from the device (or decommissioning it): the dictionary follows at the next hourly prune.
 
 ## Exporting a CBOM
 
@@ -591,6 +783,8 @@ Every read that serves data is written to the audit log (see [audit-log.md](audi
 | `crypto.cbom.export` | A CBOM is exported (REST route). The MCP tool writes `mcp.export_crypto_cbom`. Same detail key set as the summary (`rows` is the number of families), plus ` serial=<urn:uuid:...> [ecosystem=<filter>] components=<n>` (the `ecosystem` key only when that filter was given) on the success row, tying the audit row to the exact document handed out. |
 | `crypto.ca.stats.view` | The Yuzu-issued counts are served (`GET /api/v1/crypto/ca/stats`, the dashboard, a single Yuzu-issued card, and the MCP tool `get_crypto_ca_stats` under the same verb). Target `Inventory` / `yuzu_ca`; detail `cid=.. ws=crypto_widget_windows_v1 as_of=<epoch>`, plus `widgets=<n>` on the dashboard row. A confined caller's refusal is a `denied` row with `withheld=confined`. |
 | `crypto.ca.certificates.view` | A page of Yuzu-issued certificates behind one count is served: `GET /api/v1/ca/issued` (filtered or not), the drill with every Load more page, and `list_issued_certs` (filtered or not), under the same verb. Target `Security` / `kind=<k>[ days=<n>][ week=<YYYY-Www>][ bucket=<b>]`; detail adds `as_of` (with `pinned` when the caller supplied it or the page continues a cursor), `rows`, `page=first` or `page=continuation`, and `total`. On the route and the tool a confined caller's or no-grant caller's refusal is a `denied` row with `withheld=confined` or `withheld=refused` (target `filtered` or `inventory`), and an access check that could not be completed is a `failure` row; the drill and the Settings panel write **no** `denied` row for a refused caller and the drill writes none when its access check is unavailable. That is tracked by #6384. The unfiltered `GET /api/v1/ca/issued` and `list_issued_certs` write the same verb with target `Security` / `inventory` and detail `inventory rows=<n> limit=<n> offset=<n> has_more=<true|false>`. On the route and the tool every success row, filtered or not, ends `standing=available` (the only standing that is served; a caller with no `Inventory:Read` grant is refused and a failed access check is a `503`, see [Access](#access)). The Settings certificate panel is not audited. `issued_by` names who caused the issuance: `agent:<id>` for an enrolment, `operator:<username>` for a certificate an operator issued, or `system:default-certs` for the server's own bootstrap certificates, so the list can carry operator usernames (personal data) to every `Security:Read` holder whose `Inventory:Read` is unconfined (a global grant, or RBAC enforcement off); a confined caller and a caller with no `Inventory:Read` grant are refused. |
+| `crypto.certificates.view` | A page of fleet certificates is served (`GET /api/v1/crypto/certificates`, the `/fragments/crypto/certificates/devices` drill). MCP writes `mcp.list_crypto_certificates`. **REST fails closed** if the row cannot be written. See "Fleet certificates". |
+| `crypto.certificates.summary` | The certificate rollups are served (`GET /api/v1/crypto/certificates/summary`, the `/fragments/crypto/certificates` fragment). MCP writes `mcp.get_crypto_certificate_summary`. **REST fails closed.** |
 | `crypto.dashboard.layout.update` | You save a layout (`PUT /api/v1/crypto/dashboard/layout`, the dashboard buttons, or `set_crypto_dashboard_layout`). An `attempted` row is written first and the layout is not changed if it cannot be; then `success` (with the new `version=`) or `failure` (with `outcome=conflict`, `corrupt`, `degraded`, `unknown` or `invalid`). Target `CryptoDashboard` / your user name; detail `widgets=<n>`, plus `expected_version=<n>` when sent. A service-scoped token's attempt is a `denied` row. |
 | `crypto.dashboard.layout.access_denied` | A service-scoped API token tried to read a layout (`GET /api/v1/crypto/dashboard/layout`); written as `denied`. |
 
@@ -722,12 +916,12 @@ an empty list, because an empty list would read as "no library installed".
   `yuzu_inventory_read_degrade_total{source="crypto_layout",reason="store_not_open"}`. Layout reads and saves do not use the two-read bound below.
 
 **Capacity.** Each server process lets at most two `/crypto` store reads run at once (the library
-summary and drill and the Yuzu-issued counts and list share the bound; with several replicas the
+summary and drill, the Yuzu-issued counts and list, and the fleet certificate reads share the bound; with several replicas the
 fleet-wide ceiling is two times the replica count), because a summary read can hold a database
 connection for as long as the statement timeout and the connection pool is shared with
 authorization, audit and ingest. On a small connection pool the bound is a quarter of the pool,
 at least one: one read at once on a pool of 4 to 7 connections. On a pool of 3 connections or
-fewer (`--postgres-pool-size`) the Yuzu-issued reads are refused every time, leaving those few
+fewer (`--postgres-pool-size`) the Yuzu-issued reads are refused every time, and on a pool of fewer than 4 the fleet certificate reads are too (counted as `reason="pool_too_small"`, not as a shed, with a warning in the server log at boot), leaving those few
 connections to the rest of the server (the agent certificate revocation check among them), and
 on a pool of a single connection the library reads, the device drill and the CBOM export
 (`GET /api/v1/crypto/cbom`, MCP `export_crypto_cbom`) are refused too, so the revocation check
@@ -946,9 +1140,11 @@ shapes are in [REST API: Revocation sources](rest-api.md#revocation-sources-regi
 
 The following are planned and not yet available, unless marked available. No dates are committed.
 
-- A fleet certificate inventory with full X.509 fields. Certificate data is not available on
-  this page until that slice ships (the endpoint `certificates` plugin already lists system store
-  certificates per device).
+- The fleet certificate inventory's collector and counts. The server stores and serves the
+  inventory (see "Fleet certificates"), but a device only reports once the agent-side collector
+  ships, and the named counts, windows and CBOM certificate components arrive in later releases.
+  Until a device reports, the certificate views are empty (the endpoint `certificates` plugin
+  already lists system store certificates per device).
 - SSH key inventory (host keys and keys at rest). SSH login evidence is subject to a separate
   privacy decision before it is built.
 - Protocol and configuration settings (for example TLS and SSH daemon settings).

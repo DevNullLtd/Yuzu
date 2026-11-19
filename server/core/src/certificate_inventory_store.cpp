@@ -19,6 +19,8 @@
 #include <cstdint>
 #include <functional>
 #include <array>
+#include <limits>
+#include <map>
 #include <charconv>
 #include <optional>
 #include <set>
@@ -112,6 +114,30 @@ const std::string& fact_upsert_sql() {
     }();
     return sql;
 }
+
+// The substring filters (`issuer_dn_contains`, `subject_dn_contains` with is_ca) resolve through a
+// DISTINCT-DN DICTIONARY: `dn_dict` holds each distinct issuer DN (and each distinct CA subject DN)
+// once, so the ILIKE scans a table of thousands of rows, not 27 million cert_fact rows; the matching
+// DNs then hit cert_fact through ordinary btree indexes on issuer_dn / subject_dn (btree
+// deduplication keeps them small). No cert_fact index is trigram: that design could not be built
+// within the pool's 30 s statement_timeout on a populated store and made changed-fact ingest ~36x
+// costlier.
+//
+// MIGRATION v2 ONLY CREATES THE EMPTY TABLE (cheap on a table of any size; nothing scans or indexes
+// cert_fact at boot, so readiness, /livez and gRPC are never held up). The indexes, the backfill and
+// the ready marker are built by a BACKGROUND, leader-gated pass (certificate_inventory_dn_dict.cpp,
+// `run_dn_dictionary_maintenance`, contract in pg/pg_background_build.hpp). Ingest maintains the
+// dictionary from the moment the table exists. The table comment is the marker:
+// `building` | `failed: <SQLSTATE> <message>` | `ready:<db-clock ms the successful run STARTED>`.
+constexpr std::string_view kDnDictionaryMigrationSql =
+    "CREATE TABLE dn_dict ("
+    "  dn             TEXT PRIMARY KEY,"
+    "  is_issuer      BOOLEAN NOT NULL DEFAULT false,"
+    "  is_ca_subject  BOOLEAN NOT NULL DEFAULT false);"
+    "COMMENT ON TABLE dn_dict IS 'building';"
+    // Durable, DB-clock scheduling state of the background pass (all values are DB-clock ms):
+    // last_pass_start_ms, last_prune_ms, reconcile_requested_ms.
+    "CREATE TABLE dn_dict_state (k TEXT PRIMARY KEY, v BIGINT NOT NULL);";
 
 const std::vector<pg::PgMigration>& build_migrations() {
     // Unqualified DDL: the runner sets search_path to the store schema for the migration
@@ -244,6 +270,7 @@ const std::vector<pg::PgMigration>& build_migrations() {
          "  PRIMARY KEY (agent_id, sha256, ord),"
          "  FOREIGN KEY (agent_id, sha256) REFERENCES cert_fact (agent_id, sha256)"
          "    ON DELETE CASCADE);"},
+        {2, std::string(kDnDictionaryMigrationSql)},
     };
     return kMigrations;
 }
@@ -423,6 +450,117 @@ CertificateInventoryStore::CertificateInventoryStore(pg::PgPool& pool) : pool_(p
         return;
     }
     open_ = true;
+    // The DATABASE clock at process start: the dictionary counts as ready only if a reconcile
+    // completed AFTER this instant. If it cannot be read the process stays not-ready (fail closed).
+    {
+        pg::PgResult t = pg::exec_params(
+            lease.get(), "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            std::vector<std::string>{});
+        started_ms_.store(tup_ok(t) && PQntuples(t.get()) == 1 ? result_i64(t, 0, 0)
+                                                               : std::numeric_limits<std::int64_t>::max(),
+                          std::memory_order_release);
+    }
+    refresh_substring_index_state(lease.get());
+}
+
+bool CertificateInventoryStore::refresh_substring_index_state() {
+    if (!open_)
+        return false;
+    // 250 ms: this runs on the gauge sweep thread that also carries the revocation-teardown backstop.
+    auto lease = pool_.try_acquire_for(std::chrono::milliseconds{250});
+    if (!lease)
+        return substring_index_available(); // unchanged: no answer, no flip
+    return refresh_substring_index_state(lease.get());
+}
+
+// CATALOG CHECK ONLY - no DDL at boot or on the gauge pass (the build is the background pass /
+// the manual procedure). Ready means: the dictionary marker is `ready:<ms>` with <ms> NOT BEFORE
+// this process started (a reconcile that STARTED after we did completed: a rollback to a binary that
+// did not maintain the dictionary, then a re-upgrade, can never read as ready with missing names)
+// AND both btree indexes it feeds exist and are VALID (a failed CONCURRENTLY build leaves an invalid
+// one). `failed:` / absent is kFailed (non-retryable); everything else - `building`, a `ready:` left
+// by an earlier process, a missing index while no failure is recorded - is kReconciling (a pass is
+// due or running; retryable).
+namespace {
+// The marker records `<step>: <SQLSTATE> <message>` after `failed: ` / `;last_failure:`. A TRANSIENT
+// cause (cancelled/lock timeout, serialization/deadlock, connection, resources) clears on a retry
+// with no operator; anything else (or no SQLSTATE at all) is deterministic and stays non-retryable.
+bool transient_failure(const std::string& marker) {
+    std::size_t at = marker.find(";last_failure:");
+    at = at != std::string::npos ? at + 14 : (marker.rfind("failed:", 0) == 0 ? 7 : std::string::npos);
+    if (at == std::string::npos)
+        return false;
+    const std::size_t colon = marker.find(": ", at);
+    if (colon == std::string::npos || colon + 8 > marker.size())
+        return false;
+    const std::string st = marker.substr(colon + 2, 5);
+    if (marker.size() > colon + 7 && marker[colon + 7] != ' ')
+        return false;
+    for (char ch : st)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'A' && ch <= 'Z')))
+            return false;
+    return st == "57014" || st == "55P03" || st.rfind("40", 0) == 0 || st.rfind("08", 0) == 0 ||
+           st.rfind("53", 0) == 0 ||
+           st == "57P01" || st == "57P02" || st == "57P03";
+}
+} // namespace
+
+bool CertificateInventoryStore::refresh_substring_index_state(PGconn* conn) {
+    if (started_ms_.load(std::memory_order_acquire) == std::numeric_limits<std::int64_t>::max()) {
+        // The boot-time clock read failed (fail closed). Recover as soon as a read succeeds, so a
+        // replica is not stuck not-ready - and requesting reconciles - for ever (UP10-5). Any
+        // marker older than now is correctly not ready: only a pass starting from here counts.
+        pg::PgResult t = pg::exec_params(
+            conn, "SELECT floor(extract(epoch FROM clock_timestamp()) * 1000)::bigint",
+            std::vector<std::string>{});
+        if (tup_ok(t) && PQntuples(t.get()) == 1)
+            started_ms_.store(result_i64(t, 0, 0), std::memory_order_release);
+    }
+    pg::PgResult r = pg::exec_params(
+        conn,
+        "SELECT coalesce((SELECT obj_description(c.oid, 'pg_class') FROM pg_class c JOIN "
+        "pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname = 'dn_dict'), "
+        "'missing'), "
+        "(SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid JOIN pg_namespace "
+        "n ON n.oid = c.relnamespace WHERE n.nspname = $1 AND c.relname IN "
+        "('cert_fact_issuer_dn_idx', 'cert_fact_subject_ca_dn_idx') AND i.indisvalid AND "
+        "i.indisready)",
+        std::vector<std::string>{kStoreName});
+    if (!tup_ok(r) || PQntuples(r.get()) != 1)
+        return substring_index_available(); // catalog unreadable: keep state
+    const std::string state = PQgetvalue(r.get(), 0, 0);
+    const std::int64_t valid_indexes = result_i64(r, 0, 1);
+    bool marker_ok = false;
+    bool stale_failure = false; // `ready:<earlier>;last_failure:` - a failure after the last good pass
+    if (state.rfind("ready:", 0) == 0) {
+        std::int64_t ms = 0;
+        const auto* b = state.data() + 6;
+        const auto fc = std::from_chars(b, state.data() + state.size(), ms);
+        marker_ok = fc.ec == std::errc{} && ms >= started_ms_.load(std::memory_order_acquire);
+        // A replica that started AFTER the leader's last good pass cannot count that marker, and a
+        // recorded failure means the leader's passes since then are failing: that is FAILED (not a
+        // wait that clears by itself), and it must not nudge the leader into back-to-back passes.
+        stale_failure = !marker_ok && state.find(";last_failure:") != std::string::npos;
+    }
+    const bool have = marker_ok && valid_indexes == 2;
+    SubstringState now = have ? SubstringState::kReady : SubstringState::kReconciling;
+    if (!have && (state.rfind("failed:", 0) == 0 || state == "missing" || stale_failure))
+        now = transient_failure(state) ? SubstringState::kFailedTransient : SubstringState::kFailed;
+    const auto was = static_cast<SubstringState>(
+        substring_state_.exchange(static_cast<int>(now), std::memory_order_acq_rel));
+    if (now != SubstringState::kReady && (was == SubstringState::kReady || !state_logged_.exchange(true)))
+        spdlog::warn("CertificateInventoryStore: the DN dictionary behind the substring filters is NOT "
+                     "ready (marker '{}', {} of 2 valid indexes; {}). issuer_dn_contains and "
+                     "subject_dn_contains are refused until the leader's background pass completes "
+                     "after this process started{}",
+                     state, valid_indexes,
+                     now == SubstringState::kFailed ? "FAILED: non-retryable" : now == SubstringState::kFailedTransient ? "last pass failed on a transient cause: retryable" : "reconciling: retryable",
+                     now == SubstringState::kFailed
+                         ? "; see server-admin.md (\"The substring-filter dictionary\")"
+                         : "");
+    if (now == SubstringState::kReady && was != SubstringState::kReady)
+        spdlog::info("CertificateInventoryStore: the DN dictionary behind the substring filters is ready");
+    return now == SubstringState::kReady;
 }
 
 CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_id,
@@ -580,6 +718,87 @@ CertIngestResult CertificateInventoryStore::ingest_full(std::string_view agent_i
         }
         if (test_hook_after_facts_)
             test_hook_after_facts_();
+        // Keep the substring-filter dictionary current, in ONE statement for the whole report (so
+        // every concurrent ingest takes its dictionary row locks in the same global sorted order:
+        // chunk-by-chunk locking between two reports with different chunk membership deadlocks).
+        // Only facts that were inserted or changed contribute. New names go in with DO NOTHING (a
+        // known name writes nothing, takes no lock a reader or another ingest waits on); a role flag
+        // is only ever raised by a SEPARATE sorted UPDATE of the rows whose flag is still false.
+        {
+            std::map<std::string, std::pair<bool, bool>> dns;
+            for (const auto* f : facts) {
+                if (!changed.contains(f->sha256))
+                    continue;
+                if (f->issuer_dn && !f->issuer_dn->empty())
+                    dns[*f->issuer_dn].first = true;
+                if (f->is_ca && *f->is_ca && f->subject_dn && !f->subject_dn->empty())
+                    dns[*f->subject_dn].second = true;
+            }
+            if (!dns.empty()) {
+                Json darr = Json::array();
+                for (const auto& [dn, roles] : dns)
+                    darr.push_back({{"dn", dn}, {"iss", roles.first}, {"ca", roles.second}});
+                const std::string payload = darr.dump();
+                if (!cmd_ok(pg::exec_params(
+                        c,
+                        "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer, "
+                        "is_ca_subject) SELECT t.dn, t.iss, t.ca FROM jsonb_to_recordset($1::jsonb) "
+                        "AS t(dn text, iss boolean, ca boolean) ORDER BY t.dn ON CONFLICT (dn) DO "
+                        "NOTHING",
+                        std::vector<std::string>{payload})))
+                    return false;
+                if (test_hook_dict_)
+                    test_hook_dict_("after_dict_insert");
+                if (!cmd_ok(pg::exec_params(
+                        c,
+                        "UPDATE certificate_inventory_store.dn_dict d SET is_issuer = d.is_issuer OR "
+                        "s.iss, is_ca_subject = d.is_ca_subject OR s.ca FROM (SELECT x.dn, t.iss, "
+                        "t.ca FROM certificate_inventory_store.dn_dict x JOIN "
+                        "jsonb_to_recordset($1::jsonb) AS t(dn text, iss boolean, ca boolean) ON "
+                        "x.dn = t.dn WHERE (t.iss AND NOT x.is_issuer) OR (t.ca AND NOT "
+                        "x.is_ca_subject) ORDER BY x.dn FOR NO KEY UPDATE OF x) s WHERE d.dn = s.dn",
+                        std::vector<std::string>{payload})))
+                    return false;
+                if (test_hook_dict_)
+                    test_hook_dict_("after_flag_update");
+                // The flag UPDATE above locks FOR NO KEY UPDATE, NOT FOR UPDATE: that mode does not
+                // conflict with the FOR KEY SHARE pin below (or another ingest's), so the two
+                // statements cannot form a lock cycle between reports raising different flags on
+                // shared names (measured: FOR UPDATE deadlocked 42% of reports during a pass). It
+                // still conflicts with the prune's FOR UPDATE SKIP LOCKED, which is all it needs.
+                // Pin every name this report relies on: FOR KEY SHARE, in sorted order, conflicts with
+                // the FOR UPDATE a prune / decommission takes before deleting, so a name cannot be
+                // deleted from under this transaction from here on. A name found MISSING was deleted
+                // between the insert above and this lock (the statements run in separate snapshots): put
+                // it back and lock it again. Bounded: a name is only removed by a prune that found no
+                // reference, and our facts are not committed yet, so this converges in one extra pass.
+                for (int attempt = 0; attempt < 3; ++attempt) {
+                    pg::PgResult lk = pg::exec_params(
+                        c,
+                        "SELECT x.dn FROM certificate_inventory_store.dn_dict x JOIN "
+                        "jsonb_to_recordset($1::jsonb) AS t(dn text) ON x.dn = t.dn ORDER BY x.dn FOR "
+                        "KEY SHARE OF x",
+                        std::vector<std::string>{payload});
+                    if (!tup_ok(lk))
+                        return false;
+                    if (static_cast<std::size_t>(PQntuples(lk.get())) == dns.size()) {
+                        if (test_hook_dict_)
+                            test_hook_dict_("after_pin");
+                        break;
+                    }
+                    if (attempt == 2)
+                        return false; // cannot happen unless a prune keeps winning: nack, agent resends
+                    if (!cmd_ok(pg::exec_params(
+                            c,
+                            "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer, "
+                            "is_ca_subject) SELECT t.dn, t.iss, t.ca FROM jsonb_to_recordset($1::jsonb) "
+                            "AS t(dn text, iss boolean, ca boolean) ORDER BY t.dn ON CONFLICT (dn) DO "
+                            "NOTHING",
+                            std::vector<std::string>{payload})))
+                        return false;
+                }
+            }
+        }
         std::vector<const CertFactRow*> child_facts;
         for (const auto* f : facts)
             if (changed.contains(f->sha256))
@@ -863,12 +1082,47 @@ bool CertificateInventoryStore::delete_agent(std::string_view agent_id) {
         bool got = false;
         if (!take_lock(c, id, /*blocking=*/true, got))
             return false;
+        // Names this device's certificates reference (before they are erased).
+        std::set<std::string> dn_cands;
+        {
+            pg::PgResult r = pg::exec_params(
+                c,
+                "SELECT issuer_dn FROM certificate_inventory_store.cert_fact WHERE agent_id = $1 AND "
+                "issuer_dn IS NOT NULL UNION SELECT subject_dn FROM "
+                "certificate_inventory_store.cert_fact WHERE agent_id = $1 AND is_ca AND subject_dn "
+                "IS NOT NULL",
+                std::vector<std::string>{id});
+            if (!tup_ok(r))
+                return false;
+            for (int i = 0; i < PQntuples(r.get()); ++i)
+                dn_cands.insert(PQgetvalue(r.get(), i, 0));
+        }
         for (const char* t : {"cert_san", "cert_eku", "cert_cdp", "cert_location", "cert_fact",
                               "store_state", "agent_state"}) {
             const std::string sql =
                 std::string("DELETE FROM certificate_inventory_store.") + t + " WHERE agent_id = $1";
             if (!cmd_ok(pg::exec_params(c, sql.c_str(), std::vector<std::string>{id})))
                 return false;
+        }
+        // The dictionary must not outlive the facts it names (erasure promise): drop every name
+        // this device referenced that NO remaining certificate references (a name another device
+        // still holds stays). Sorted, SKIP LOCKED: never waits on a concurrent ingest's row; a name
+        // an in-flight ingest is about to reference is re-added by the next reconcile (<= 5 min).
+        // The prune's anti-join needs the two cert_fact indexes: without them it is a full scan that
+        // exceeds the statement timeout at scale and would roll the whole decommission back (measured
+        // at 27M rows). So an unbuilt/invalid index SKIPS the erasure here (the facts are still
+        // deleted); the background prune removes the names once the indexes exist.
+        if (!dn_cands.empty()) {
+            if (pg::index_is_valid(c, kStoreName, "cert_fact_issuer_dn_idx") &&
+                pg::index_is_valid(c, kStoreName, "cert_fact_subject_ca_dn_idx")) {
+                std::vector<std::string_view> v(dn_cands.begin(), dn_cands.end());
+                if (!prune_dn_names(c, v))
+                    return false;
+            } else {
+                spdlog::warn("CertificateInventoryStore: decommission of agent={} left {} DN dictionary "
+                             "name(s) for the background prune: the dictionary indexes are not built",
+                             agent_id, dn_cands.size());
+            }
         }
         if (test_hook_after_erase_)
             test_hook_after_erase_();

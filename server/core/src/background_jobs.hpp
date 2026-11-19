@@ -94,7 +94,7 @@ struct BackgroundJobDecl {
     std::string_view mechanism;     ///< why the class holds (the recorded rationale)
 };
 
-/// The exhaustive inventory (54 passes). Verified against the source sweep
+/// The exhaustive inventory (56 passes). Verified against the source sweep
 /// 2026-09-07 per the SWEEP METHODOLOGY above (plus the WS-4 4.2a addition of
 /// `gateway_route_store.reap_stale_routes`, 2026-09-11, the HA WS-8 addition
 /// of `pg_reachability_probe.tick`, 2026-09-24, and the #4982 Part B addition
@@ -106,8 +106,9 @@ struct BackgroundJobDecl {
 /// `workflow_engine.refresh_table_size_metrics`, and the SAM-14 addition of
 /// `software_inventory_store.run_retention_prune_changes`, the SAM-17 addition of
 /// `software_catalog_rollup.refresh_component_rollup`, the SAM-33 addition of
-/// `software_catalog_rollup.refresh_fleet_snapshot`, and the collation-version recheck
-/// `pg_collation_recheck.tick`); keep the count
+/// `software_catalog_rollup.refresh_fleet_snapshot`, the collation-version recheck
+/// `pg_collation_recheck.tick`, and the slice-2 PR 2a-2b additions of
+/// `cert_inventory.fleet_store_status` and `cert_inventory.dn_dict_maintenance`); keep the count
 /// tripwire in `test_background_jobs.cpp` in step with any add/remove here.
 inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
     // ---- result_set_maint_thread_ (2s tick) ----
@@ -258,6 +259,10 @@ inline constexpr std::array kBackgroundJobs = std::to_array<BackgroundJobDecl>({
      "read-only run-table size gauges: one catalog row, per-replica, 250 ms acquire and "
      "statement bounds (plus connect_timeout_s when the pool must open a connection); a failed "
      "sample only counts and logs"},
+    {"cert_inventory.fleet_store_status", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
+     "fleet gauge sweep (slice-2 PR 2a-2b), every ~5 minutes: one bounded SELECT over certificate_inventory_store.store_state published as yuzu_fleet_cert_store_status{os,status}, plus a catalog-only re-check that refreshes this replica's substring-filter readiness flag (no DDL, 250 ms acquire); idempotent, no DB write, no shared state; a degrade holds the prior value"},
+    {"cert_inventory.dn_dict_maintenance", "cert_dn_dict_thread_", BackgroundJobClass::FencedLeaderOnly,
+     "BACKGROUND build of the certificate DN dictionary (slice-2 PR 2a-2b): CREATE INDEX CONCURRENTLY, a batched reconcile from cert_fact (at every process start before ready), the optional trigram index and a periodic prune, each batch its own short statement; safe if two ran for the data (DO NOTHING inserts, sorted flag updates, SKIP LOCKED deletes), but a second concurrent CREATE/DROP INDEX on the same name can invalidate a valid index, which the leader gate prevents; a replica that never leads WRITES a reconcile request (rate-limited) and waits for the leader's completion marker"},
     {"registry.reap_stale_sessions", "health_recompute_thread_", BackgroundJobClass::ReplicaSafe,
      "per-replica in-memory Subscribe-stream reap (local presence)"},
     {"ca.publish_crl", "health_recompute_thread_", BackgroundJobClass::FencedLeaderOnly,

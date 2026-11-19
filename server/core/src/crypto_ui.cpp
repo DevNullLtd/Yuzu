@@ -7,6 +7,7 @@
 
 #include "crypto_ui.hpp"
 
+#include "certificate_read_model.hpp"
 #include "crypto_library_model.hpp"
 #include "secure_random.hpp"
 #include "web_utils.hpp"
@@ -295,6 +296,10 @@ std::string unavailable_reason(CryptoReadCause cause) {
         reason = std::string(kAccessCheckReason) +
                  " This is <b>not</b> \"no library installed\" and not a refusal.";
         break;
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling: // certificate-only cause; unreachable on a library surface
+        reason = "Temporarily unavailable; retry shortly.";
+        break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         reason = "The inventory store could not be read (Postgres pool/query degraded). This is "
@@ -367,6 +372,8 @@ std::string render_unavailable_row(std::string_view what, std::string_view retry
     case CryptoReadCause::kAccessCheck:
         reason = std::string(kAccessCheckReason) + " This is <b>not</b> \"no more devices\".";
         break;
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling: // certificate-only cause; read as degraded here
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         reason = "The inventory store could not be read. This is <b>not</b> \"no more devices\".";
@@ -551,6 +558,8 @@ std::string ca_certs_note_reason(CryptoReadCause cause) {
     case CryptoReadCause::kAccessCheck:
         return "The access check could not be completed: the permission store could not be read. "
                "This is <b>not</b> a refusal and not a count of zero.";
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling: // certificate-only cause; read as degraded here
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         break;
@@ -879,6 +888,17 @@ std::string render_dashboard(const CryptoDashboardLayout& layout, cw::AccessMemo
         h += "<span class=\"cry-grey\">" + std::to_string(layout.preserved_unknown) +
              (layout.preserved_unknown == 1 ? " widget" : " widgets") +
              " from another server version kept but not shown.</span>";
+    // The fleet certificate drill's entry point (slice-2 PR 2a-2b). Offered only to a caller the
+    // non-auditing probe says holds CertificateInventory:Read (confined included); the fragment
+    // behind it gates again. It loads into the ONE drill panel, so no widget is added here.
+    if (const auto ca = access(cw::WidgetGate::kFleetRead, "CertificateInventory", "Read");
+        ca == cw::Access::kAvailable || ca == cw::Access::kConfined)
+        h += "<button type=\"button\" class=\"cry-btn\" "
+             "hx-get=\"/fragments/crypto/certificates\" hx-target=\"#" +
+             std::string(kDrillPanelId) +
+             "\" hx-swap=\"innerHTML\" "
+             "title=\"Raw certificate facts from every device's machine certificate stores\">"
+             "Fleet certificates</button>";
     h += "</div><div id=\"cry-dash-err\" class=\"cry-err\" role=\"alert\" hidden></div>";
     if (data.library_audit_lost || data.ca_audit_lost)
         h += render_audit_notice();
@@ -1134,6 +1154,342 @@ std::string render_ca_caveat(std::string_view message, bool row) {
 
 std::string render_ca_audit_notice_row() {
     return "<tr class=\"cry-more\"><td colspan=\"8\">" + render_audit_notice() + "</td></tr>";
+}
+
+// ── Fleet certificates (slice-2 PR 2a-2b) ─────────────────────────────────────
+
+namespace {
+
+constexpr std::size_t kCertCols = 8;
+
+std::string cert_filter_query(const CertReadFilter& f) {
+    std::string q;
+    const auto add = [&](const char* k, const std::optional<std::string>& v) {
+        if (v)
+            q += std::string(q.empty() ? "" : "&") + k + "=" + url_encode(*v);
+    };
+    const auto addi = [&](const char* k, const std::optional<int>& v) {
+        if (v)
+            q += std::string(q.empty() ? "" : "&") + k + "=" + std::to_string(*v);
+    };
+    const auto addb = [&](const char* k, const std::optional<bool>& v) {
+        if (v)
+            q += std::string(q.empty() ? "" : "&") + k + "=" + (*v ? "true" : "false");
+    };
+    add("store", f.store);
+    add("scope", f.scope);
+    add("key_alg_oid", f.key_alg_oid);
+    add("sig_alg_oid", f.sig_alg_oid);
+    add("ec_curve_oid", f.ec_curve_oid);
+    add("not_after_before", f.not_after_before);
+    add("not_after_after", f.not_after_after);
+    add("not_before_after", f.not_before_after);
+    addi("rsa_modulus_bits_lt", f.rsa_modulus_bits_lt);
+    addi("ec_order_bits_lt", f.ec_order_bits_lt);
+    addb("is_ca", f.is_ca);
+    addb("self_signed", f.self_signed);
+    add("agent_id", f.agent_id);
+    add("issuer_dn", f.issuer_dn);
+    add("issuer_dn_contains", f.issuer_dn_contains);
+    add("subject_dn_contains", f.subject_dn_contains);
+    add("sha256", f.sha256);
+    add("spki_sha256", f.spki_sha256);
+    add("aki_key_id", f.aki_key_id);
+    return q;
+}
+
+std::string opt_text(const std::optional<std::string>& v) {
+    return v ? esc(*v) : dash();
+}
+
+std::string key_cell(const CertReadRow& r) {
+    if (!r.key_alg_oid)
+        return dash();
+    std::string k = "<span class=\"cry-mono\">" + esc(*r.key_alg_oid) + "</span>";
+    if (r.rsa_modulus_bits)
+        k += " <span class=\"cry-grey\">" + std::to_string(*r.rsa_modulus_bits) + " bits</span>";
+    if (r.ec_curve_oid)
+        k += " <span class=\"cry-grey\">curve " + esc(*r.ec_curve_oid) + "</span>";
+    if (r.ec_order_bits)
+        k += " <span class=\"cry-grey\">order " + std::to_string(*r.ec_order_bits) + " bits</span>";
+    return k;
+}
+
+std::string where_cell(const CertReadRow& r) {
+    std::string w;
+    for (const auto& l : r.locations) {
+        w += "<span class=\"cry-pill\">" + esc(l.store_id) + (l.path.empty() ? "" : " " + esc(l.path)) +
+             " &middot; " + esc(l.store_status) + "</span> ";
+    }
+    if (r.locations_truncated)
+        w += "<span class=\"cry-grey\">(more places not listed)</span>";
+    return w.empty() ? dash() : w;
+}
+
+std::string cert_rows(const CertPage& p) {
+    std::string h;
+    for (const auto& r : p.rows) {
+        h += "<tr><td><span class=\"cry-name\">" +
+             (r.hostname.empty() ? std::string("<span class=\"cry-mono\">") + esc(r.agent_id) + "</span>"
+                                 : esc(r.hostname)) +
+             "</span></td><td>" + opt_text(r.subject_dn) + "</td><td>" + opt_text(r.issuer_dn) +
+             "</td><td>" + opt_text(r.not_before) + "</td><td>" + opt_text(r.not_after) +
+             "</td><td>" + key_cell(r) + "</td><td>" +
+             (r.sig_alg_oid ? "<span class=\"cry-mono\">" + esc(*r.sig_alg_oid) + "</span>" : dash()) +
+             "</td><td>" + where_cell(r) + "</td></tr>";
+    }
+    return h;
+}
+
+std::string cert_more_row(const CertQuery& q, const CertPage& p) {
+    if (p.next_cursor.empty() || p.rows.empty())
+        return {};
+    CertQuery next = q;
+    next.cursor = p.next_cursor;
+    return "<tr class=\"cry-more\"><td colspan=\"" + std::to_string(kCertCols) +
+           "\"><button type=\"button\" class=\"cry-btn pri\" hx-get=\"" +
+           esc(certificates_page_url(next)) +
+           "\" hx-target=\"closest tr\" hx-swap=\"outerHTML\" hx-disabled-elt=\"this\">Load more "
+           "certificates</button></td></tr>";
+}
+
+std::string cert_blind_spots() {
+    std::string h = "<div class=\"cry-caveat\">Facts only: " +
+                    esc(std::string(cert_read::kFactsOnlySentence)) +
+                    ". An empty result is not proof of absence. Not read: ";
+    bool first = true;
+    for (const auto& s : cert_read::not_read()) {
+        h += (first ? "" : "; ") + esc(std::string(s));
+        first = false;
+    }
+    return h + ".</div>";
+}
+
+std::string counts_cells(const CertCounts& c) {
+    return "<td class=\"cry-num\">" + fmt_int(c.device_count) + "</td><td class=\"cry-num\">" +
+           fmt_int(c.certificate_count) + "</td>";
+}
+
+template <class Groups, class Label>
+std::string group_table(std::string_view title, const Groups& groups, Label&& label) {
+    if (groups.empty())
+        return {};
+    std::string h = "<div class=\"cry-panel cry-tblwrap\"><table class=\"cry-tbl\"><thead><tr><th>" +
+                    esc(std::string(title)) +
+                    "</th><th class=\"cry-num\">Devices</th><th class=\"cry-num\">Certificates</th>"
+                    "</tr></thead><tbody>";
+    for (const auto& g : groups)
+        h += "<tr><td>" + label(g) + "</td>" + counts_cells(g.counts) + "</tr>";
+    return h + "</tbody></table></div>";
+}
+
+} // namespace
+
+std::string certificates_page_url(const CertQuery& q) {
+    std::string u = "/fragments/crypto/certificates/devices";
+    std::string query = cert_filter_query(q.filter);
+    if (!q.cursor.empty())
+        query += std::string(query.empty() ? "" : "&") + "cursor=" + url_encode(q.cursor);
+    if (q.limit != kCertPageDefault)
+        query += std::string(query.empty() ? "" : "&") + "limit=" + std::to_string(q.limit);
+    return query.empty() ? u : u + "?" + query;
+}
+
+std::string certificate_summary_url(const CertSummaryQuery& q) {
+    std::string query = cert_filter_query(q.filter);
+    if (!q.not_after_edges.empty()) {
+        std::string joined;
+        for (const auto& e : q.not_after_edges)
+            joined += (joined.empty() ? "" : ",") + e;
+        query += std::string(query.empty() ? "" : "&") + "not_after_edges=" + url_encode(joined);
+    }
+    return query.empty() ? "/fragments/crypto/certificates"
+                         : "/fragments/crypto/certificates?" + query;
+}
+
+std::string render_certificate_summary(const CertSummaryQuery& q, const CertSummary& s) {
+    std::string h = style();
+    h += "<div class=\"cry-wrap\"><h1 class=\"cry-h1\">Fleet certificates</h1><div "
+         "class=\"cry-sub\">Raw certificate facts reported by the fleet's machine certificate "
+         "stores, grouped by value. Counts are distinct devices and distinct certificates; "
+         "nothing here grades a certificate.</div>";
+    h += "<div class=\"cry-kpis\">" +
+         tile("Devices reporting", fmt_int(s.coverage.devices_reporting),
+              s.coverage.confined ? "in your visible scope" : "fleet-wide") +
+         tile("Devices in this view", fmt_int(s.totals.device_count),
+              "holding a matching certificate") +
+         tile("Distinct certificates", fmt_int(s.totals.certificate_count), "by SHA-256") +
+         "</div>";
+    // The per-certificate drill, loaded below the rollups (HTMX; no inline script).
+    h += "<div><button type=\"button\" class=\"cry-btn pri\" "
+         "hx-get=\"" + esc(certificates_page_url(CertQuery{.filter = q.filter})) +
+         "\" hx-target=\"next .cry-cert-rows\" "
+         "hx-swap=\"innerHTML\">Show certificates</button><div class=\"cry-cert-rows\"></div></div>";
+    if (s.result_truncated)
+        h += "<div class=\"cry-caveat\">Some groups were capped (row ceiling); counts of the "
+             "groups shown are unaffected.</div>";
+    h += group_table("Key algorithm", s.key_algorithms, [](const CertKeyAlgGroup& g) {
+        std::string l = "<span class=\"cry-mono\">" + esc(g.key_alg_oid) + "</span>";
+        if (g.rsa_modulus_bits)
+            l += " <span class=\"cry-grey\">" + std::to_string(*g.rsa_modulus_bits) + " bits</span>";
+        if (g.ec_order_bits)
+            l += " <span class=\"cry-grey\">order " + std::to_string(*g.ec_order_bits) + " bits</span>";
+        return l;
+    });
+    h += group_table("Signature algorithm", s.signature_algorithms, [](const CertSigAlgGroup& g) {
+        std::string l = "<span class=\"cry-mono\">" + esc(g.sig_alg_oid) + "</span>";
+        if (g.pss_hash_oid)
+            l += " <span class=\"cry-grey\">PSS hash " + esc(*g.pss_hash_oid) + "</span>";
+        return l;
+    });
+    h += group_table("Elliptic curve", s.ec_curves, [](const CertCurveGroup& g) {
+        return "<span class=\"cry-mono\">" + esc(g.ec_curve_oid) + "</span>";
+    });
+    h += group_table("Issuer (top 50 by devices)", s.issuers,
+                     [](const CertIssuerGroup& g) { return esc(g.issuer_dn); });
+    h += group_table("Store", s.stores,
+                     [](const CertStoreGroup& g) { return esc(g.store_id); });
+    if (!s.not_after_histogram.empty()) {
+        h += "<div class=\"cry-panel cry-tblwrap\"><table class=\"cry-tbl\"><thead><tr><th>Valid "
+             "until (your edges)</th><th class=\"cry-num\">Devices</th><th "
+             "class=\"cry-num\">Certificates</th></tr></thead><tbody>";
+        for (const auto& b : s.not_after_histogram) {
+            std::string label;
+            if (b.unknown)
+                label = "unknown";
+            else if (b.from && b.to)
+                label = esc(*b.from) + " to before " + esc(*b.to);
+            else if (b.to)
+                label = "before " + esc(*b.to);
+            else
+                label = "on or after " + esc(b.from.value_or(""));
+            h += "<tr><td>" + label + "</td>" + counts_cells(b.counts) + "</tr>";
+        }
+        h += "</tbody></table></div>";
+    }
+    if (!s.store_statuses.empty()) {
+        h += "<div class=\"cry-panel cry-tblwrap\"><table class=\"cry-tbl\"><thead><tr><th>Store "
+             "status</th><th class=\"cry-num\">Stores</th><th class=\"cry-num\">Devices</th></tr>"
+             "</thead><tbody>";
+        for (const auto& g : s.store_statuses)
+            h += "<tr><td>" + esc(g.status) + "</td><td class=\"cry-num\">" + fmt_int(g.store_count) +
+                 "</td><td class=\"cry-num\">" + fmt_int(g.device_count) + "</td></tr>";
+        h += "</tbody></table></div>";
+    }
+    if (s.totals.certificate_count == 0)
+        h += "<div class=\"cry-panel cry-empty\">No matching certificates in your visible "
+             "inventory. This is not proof that none exist.</div>";
+    h += cert_blind_spots() + "</div>";
+    return h;
+}
+
+std::string render_certificate_rows(const CertQuery& q, const CertPage& p, bool continuation) {
+    if (continuation)
+        return cert_rows(p) + cert_more_row(q, p);
+    std::string h = "<div class=\"cry-drill\"><span class=\"cry-close\" role=\"button\" "
+                    "tabindex=\"0\" onclick=\"this.parentNode.parentNode.innerHTML=''\">close "
+                    "&times;</span><div class=\"cry-devhead\"><b>Fleet certificates</b><span>&middot; " +
+                    fmt_int(static_cast<std::int64_t>(p.rows.size())) +
+                    " rows on this page</span><span>&middot; " +
+                    fmt_int(p.coverage.devices_reporting) + " devices reporting</span></div>";
+    if (p.result_truncated) {
+        h += "<div class=\"cry-caveat\">This page is not the whole result (";
+        bool first = true;
+        for (const auto& part : p.truncated_parts) {
+            h += (first ? "" : ", ") + esc(part);
+            first = false;
+        }
+        h += ").</div>";
+    }
+    if (!p.stores.empty()) {
+        h += "<div class=\"cry-tblwrap\"><table class=\"cry-tbl cry-sub\"><thead><tr><th>Device"
+             "</th><th>Store</th><th>Status</th><th>Reason</th><th>Last read</th></tr></thead>"
+             "<tbody>";
+        for (const auto& s : p.stores)
+            h += "<tr><td class=\"cry-mono\">" + esc(s.agent_id) + "</td><td>" + esc(s.store_id) +
+                 "</td><td>" + esc(s.status) + "</td><td>" +
+                 (s.reason.empty() ? dash() : esc(s.reason)) + "</td><td>" +
+                 opt_text(s.observed_at) + "</td></tr>";
+        h += "</tbody></table></div>";
+    }
+    if (p.rows.empty()) {
+        h += "<div class=\"cry-empty\">No matching certificates in your visible inventory. This is "
+             "not proof that none exist.</div>";
+    } else {
+        h += "<div class=\"cry-tblwrap\"><table class=\"cry-tbl cry-sub\"><thead><tr>"
+             "<th>Device</th><th>Subject</th><th>Issuer</th><th>Valid from</th><th>Valid until</th>"
+             "<th>Key</th><th>Signature</th><th>Where</th></tr></thead><tbody>" +
+             cert_rows(p) + cert_more_row(q, p) + "</tbody></table></div>";
+    }
+    return h + cert_blind_spots() + "</div>";
+}
+
+namespace {
+std::string cert_unavailable_reason(CryptoReadCause cause, std::string_view permanent = {}) {
+    // An answer a retry cannot change (a small pool, an unbuilt substring dictionary, a summary past
+    // its scale limit) says what the operator must do instead, and offers no Retry button.
+    if (!permanent.empty())
+        return esc(std::string(permanent)) + " This is <b>not</b> \"no certificates\".";
+    switch (cause) {
+    case CryptoReadCause::kCapacity:
+        return "Temporarily busy: two reads are already running on this server; retry shortly. "
+               "This is <b>not</b> \"no certificates\".";
+    case CryptoReadCause::kAccessCheck:
+        return std::string(kAccessCheckReason) +
+               " This is <b>not</b> \"no certificates\" and not a refusal.";
+    case CryptoReadCause::kReconcileFailedTransient:
+        return "The substring filters are temporarily unavailable: the last background pass failed on "
+               "a transient cause and is retried automatically; retry in about five minutes. This is "
+               "<b>not</b> \"no certificates\".";
+    case CryptoReadCause::kReconciling:
+        return "The substring filters are still being prepared after a server start (the leader's "
+               "background pass has not completed yet); this clears by itself, retry in a few "
+               "seconds. This is <b>not</b> \"no certificates\".";
+    case CryptoReadCause::kNone:
+    case CryptoReadCause::kStoreDegraded:
+        break;
+    }
+    return "The certificate inventory could not be read (Postgres pool/query degraded). This is "
+           "<b>not</b> \"no certificates\": reads here are authoritative, so this banner is shown "
+           "instead of an empty table.";
+}
+} // namespace
+
+std::string render_certificate_summary_unavailable(std::string_view retry_url,
+                                                   CryptoReadCause cause, bool audit_lost,
+                                                   std::string_view permanent) {
+    // The Retry swaps just the banner (the summary is loaded into the drill panel, so targeting the
+    // dashboard mount would replace the whole page).
+    return style() + (audit_lost ? render_audit_notice() : std::string{}) +
+           "<div class=\"cry-degrade\"><b>Fleet certificates unavailable.</b> " +
+           cert_unavailable_reason(cause, permanent) +
+           (retry_url.empty() || !permanent.empty()
+                ? std::string{}
+                : " <button type=\"button\" class=\"cry-btn\" hx-get=\"" +
+                      esc(std::string(retry_url)) +
+                      "\" hx-target=\"closest .cry-degrade\" hx-swap=\"outerHTML\">Retry</button>") +
+           "</div>";
+}
+
+std::string render_certificate_summary_caveat(std::string_view message) {
+    return style() + render_caveat(message);
+}
+
+std::string render_certificate_unavailable(std::string_view retry_url, CryptoReadCause cause,
+                                           bool row, std::string_view permanent) {
+    // First page: the banner replaces ITSELF (the rows live in the drill panel, not a widget slot).
+    const std::string body =
+        "<div class=\"cry-degrade\"><b>Fleet certificates unavailable.</b> " +
+        cert_unavailable_reason(cause, permanent) +
+        (retry_url.empty() || !permanent.empty()
+             ? std::string{}
+             : " <button type=\"button\" class=\"cry-btn\" hx-get=\"" + esc(std::string(retry_url)) +
+                   "\" hx-target=\"" + (row ? "closest tr" : "closest .cry-degrade") +
+                   "\" hx-swap=\"outerHTML\">Retry</button>") +
+        "</div>";
+    return row ? "<tr class=\"cry-more\"><td colspan=\"" + std::to_string(kCertCols) + "\">" + body +
+                     "</td></tr>"
+               : body;
 }
 
 } // namespace yuzu::server::crypto_html

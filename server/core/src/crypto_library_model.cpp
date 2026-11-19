@@ -395,6 +395,10 @@ std::string audit_detail_degraded(std::string_view cid, CryptoReadCause cause, b
     case CryptoReadCause::kAccessCheck: // fragment-only; the gate writes its own audit row
         what = "access check unavailable";
         break;
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling:
+        what = "reconciling";
+        break;
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         what = "store degraded";
@@ -411,6 +415,8 @@ std::string_view degraded_message(CryptoReadCause cause) {
         return "crypto read capacity in use; retry";
     case CryptoReadCause::kAccessCheck: // fragment-only; REST/MCP carry the gate's own envelope
         return "crypto access check unavailable";
+    case CryptoReadCause::kReconcileFailedTransient:
+    case CryptoReadCause::kReconciling: // certificate-only cause; read as degraded here
     case CryptoReadCause::kNone:
     case CryptoReadCause::kStoreDegraded:
         return "crypto library read degraded";

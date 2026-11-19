@@ -894,6 +894,7 @@ TEST_CASE("MCP AuditStore: query with mcp_tool field", "[pg][mcp][audit]") {
 
 #include "pg/pg_exec.hpp"               // exec_params — degrade the store in the [pg] degrade test
 #include "pg/pg_pool.hpp"               // PgPool for the query_installed_software [pg] test
+#include "certificate_read_model.hpp" // slice-2 PR 2a-2b certificate twins: D10 lint, kArgumentsNotObject
 #include "crypto_library_model.hpp" // /crypto slice 1 twins: families() pins the schema enum
 #include "crypto_widget_catalogue.hpp" // /crypto widget twins: the closed window set pins the days enum
 #include "crypto_api_local.hpp"     // make_local_crypto_api: the present-empty-scope no-SQL pin
@@ -1840,6 +1841,17 @@ private:
                                                            const yuzu::server::authz::VisibleSet& s) {
                         return api->library_devices(q, s);
                     };
+                if (!deps.crypto_certificates_fn)
+                    deps.crypto_certificates_fn = [api](const yuzu::server::CertQuery& q,
+                                                        const yuzu::server::authz::VisibleSet& s) {
+                        return api->certificates(q, s);
+                    };
+                if (!deps.crypto_certificate_summary_fn)
+                    deps.crypto_certificate_summary_fn =
+                        [api](const yuzu::server::CertSummaryQuery& q,
+                              const yuzu::server::authz::VisibleSet& s) {
+                            return api->certificate_summary(q, s);
+                        };
                 if (!deps.crypto_ca_stats_fn)
                     deps.crypto_ca_stats_fn = [api](std::optional<std::int64_t> as_of) {
                         return api->ca_stats(as_of);
@@ -3438,8 +3450,9 @@ TEST_CASE("MCP 2383: RBAC catalogue mirrors have the expected cardinality", "[mc
     // AnalyticsConfig — Settings read-twins) = 33,
     // + 3 #4031 additions (Directory, Enrollment, OidcConfig) = 36,
     // + 2 Wave 7 (Forensics, Decommission — PR7.2) = 38,
-    // + 1 ADR-0070 R1 (RevocationSource, slice 2b-1a) = 39.
-    CHECK(rbac_securables_for_test().size() == 39);
+    // + 1 ADR-0070 R1 (RevocationSource, slice 2b-1a) = 39,
+    // + 1 slice-2 PR 2a-2b (CertificateInventory) = 40.
+    CHECK(rbac_securables_for_test().size() == 40);
 }
 
 TEST_CASE("MCP 2383: three-way dispatch classifier — knownness decides first", "[mcp][2g]") {
@@ -27692,6 +27705,26 @@ public:
         scopes.push_back(scope);
         devices_queries.push_back(q);
         return devices;
+    }
+
+    // ── Fleet certificates (slice-2 PR 2a-2b) ──
+    std::expected<yuzu::server::CertPage, CryptoReadError> cert_page{yuzu::server::CertPage{}};
+    std::expected<yuzu::server::CertSummary, CryptoReadError> cert_sum{yuzu::server::CertSummary{}};
+    mutable std::vector<yuzu::server::CertQuery> cert_list_queries;
+    mutable std::vector<yuzu::server::CertSummaryQuery> cert_sum_queries;
+    std::expected<yuzu::server::CertPage, CryptoReadError>
+    certificates(const yuzu::server::CertQuery& q,
+                 const yuzu::server::authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        cert_list_queries.push_back(q);
+        return cert_page;
+    }
+    std::expected<yuzu::server::CertSummary, CryptoReadError>
+    certificate_summary(const yuzu::server::CertSummaryQuery& q,
+                        const yuzu::server::authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        cert_sum_queries.push_back(q);
+        return cert_sum;
     }
 
     // ── Dashboard widget methods (recorded so a test can pin user isolation and as_of) ──
@@ -59900,5 +59933,371 @@ TEST_CASE("MCP sync_hardware_software: a whole-fleet run writes its pre-dispatch
         CHECK(r["error"]["code"] == yuzu::server::mcp::kInternalError);
         CHECK(r["error"]["data"]["retry_after_ms"].get<int>() > 0);
         CHECK(rig.dispatches == 0); // nothing sent when the row could not be stored
+    }
+}
+
+// ── Fleet certificates (slice-2 PR 2a-2b): list_crypto_certificates / get_crypto_certificate_summary ──
+
+namespace {
+
+yuzu::server::CertReadRow mcp_cert_row(int n) {
+    yuzu::server::CertReadRow r;
+    r.agent_id = "agent-1";
+    r.hostname = "host-" + std::to_string(n);
+    r.sha256 = std::string(63, '0') + std::to_string(n);
+    r.subject_dn = "CN=Jane Doe " + std::to_string(n);
+    r.issuer_dn = "CN=Test CA";
+    r.sans = {{"rfc822", "jane@example.org"}};
+    r.last_seen = "2026-10-23T00:00:00Z";
+    return r;
+}
+
+std::shared_ptr<FakeMcpCryptoApi> cert_fake() {
+    auto f = std::make_shared<FakeMcpCryptoApi>();
+    yuzu::server::CertPage p;
+    p.rows = {mcp_cert_row(1), mcp_cert_row(2)};
+    p.coverage = {4, 1, true};
+    p.blob_versions = {"1"};
+    f->cert_page = p;
+    yuzu::server::CertSummary s;
+    s.totals = {2, 3};
+    s.issuers = {{"CN=Test CA", {2, 3}}};
+    f->cert_sum = s;
+    return f;
+}
+
+const char* const kCertTools[] = {"list_crypto_certificates", "get_crypto_certificate_summary"};
+
+void collect_keys(const nlohmann::json& j, std::vector<std::string>& out) {
+    if (j.is_object())
+        for (const auto& [k, v] : j.items()) {
+            out.push_back(k);
+            collect_keys(v, out);
+        }
+    else if (j.is_array())
+        for (const auto& e : j)
+            collect_keys(e, out);
+}
+
+} // namespace
+
+TEST_CASE("MCP certificate twins: advertised read-only with all annotations, bounded input and a typed "
+          "output, D10 clean",
+          "[mcp][crypto][certs]") {
+    McpTestServer ts;
+    ts.start();
+    auto res = ts.call(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
+    const auto tools = nlohmann::json::parse(res->body)["result"]["tools"];
+    int found = 0;
+    for (const auto& t : tools) {
+        const auto name = t["name"].get<std::string>();
+        if (name != kCertTools[0] && name != kCertTools[1])
+            continue;
+        ++found;
+        INFO(name);
+        CHECK(t["annotations"]["readOnlyHint"] == true);
+        CHECK(t["annotations"]["destructiveHint"] == false);
+        CHECK(t["annotations"]["idempotentHint"] == true);
+        CHECK(t["annotations"]["openWorldHint"] == false);
+        CHECK_FALSE(t["annotations"]["title"].get<std::string>().empty());
+        CHECK_FALSE(t["outputSchema"]["properties"].empty());
+        const auto& in = t["inputSchema"];
+        CHECK(in["additionalProperties"] == false); // bounded: no free-form key
+        CHECK(in["properties"]["issuer_dn_contains"]["minLength"] == 3);
+        CHECK(in["properties"]["issuer_dn_contains"]["maxLength"] == 256);
+        CHECK(in["properties"]["subject_dn_contains"]["minLength"] == 3);
+        CHECK(in["properties"]["scope"]["enum"] == nlohmann::json::array({"machine"}));
+        CHECK(in["properties"]["rsa_modulus_bits_lt"]["maximum"] == 65536);
+        CHECK(in["properties"]["aki_key_id"].contains("pattern"));
+        CHECK(in["properties"]["spki_sha256"].contains("pattern"));
+        // `store` is free text: no enum in the schema (a closed enum beside "not refused" is the
+        // #6122 item 2 defect).
+        CHECK_FALSE(in["properties"]["store"].contains("enum"));
+        if (name == kCertTools[0]) {
+            CHECK(in["properties"]["limit"]["maximum"] == 500);
+            CHECK(in["properties"]["cursor"]["maxLength"] == 2048);
+        } else {
+            CHECK(in["properties"]["not_after_edges"]["maxItems"] == 32);
+            CHECK_FALSE(in["properties"].contains("limit"));
+        }
+        const auto desc = t["description"].get<std::string>();
+        CHECK_THAT(desc, Catch::Matchers::ContainsSubstring(
+                             "facts only; the only built-in checks are D13's named rules and windows, "
+                             "each shown with its criterion"));
+        CHECK_THAT(desc, Catch::Matchers::ContainsSubstring("NOT proof"));
+        CHECK_THAT(desc, Catch::Matchers::ContainsSubstring("CertificateInventory:Read"));
+        // D10 lint: no verdict-shaped key anywhere in the input or output schema.
+        nlohmann::json both = {{"in", t["inputSchema"]}, {"out", t["outputSchema"]}};
+        CHECK(yuzu::server::cert_read::verdict_shaped_keys(both).empty());
+    }
+    CHECK(found == 2);
+}
+
+TEST_CASE("MCP certificate twins: success carries the model's JSON, the gate's scope and a values-free audit",
+          "[mcp][crypto][certs]") {
+    auto fake = cert_fake();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    std::vector<std::string> securables;
+    ts.fleet_read_fn_for_test = [&securables](const httplib::Request&, httplib::Response&,
+                                              const std::string& securable, const std::string& op)
+        -> yuzu::server::authz::FleetReadGate {
+        securables.push_back(securable + ":" + op);
+        return {true, std::unordered_set<std::string>{"agent-1"}};
+    };
+    ts.start();
+    auto l = mcp_tool_call(ts, "list_crypto_certificates",
+                           R"({"issuer_dn_contains":"Test CA","is_ca":false,"limit":5})");
+    INFO(l.dump());
+    REQUIRE_FALSE(l.contains("error"));
+    const auto& sc = l["result"]["structuredContent"];
+    CHECK(sc["certificates"].size() == 2);
+    CHECK(sc["certificates"][0]["sans"][0]["value"] == "jane@example.org");
+    CHECK(sc["count"] == 2);
+    CHECK(sc["not_read"].is_array());
+    CHECK(sc["coverage"]["confined"] == true);
+    CHECK_FALSE(sc.contains("audit_persisted"));
+    REQUIRE(fake->cert_list_queries.size() == 1);
+    CHECK(*fake->cert_list_queries[0].filter.issuer_dn_contains == "Test CA");
+    CHECK(*fake->cert_list_queries[0].filter.is_ca == false);
+    CHECK(fake->cert_list_queries[0].limit == 5);
+    REQUIRE(fake->scopes.size() == 1);
+    CHECK(*fake->scopes[0] == std::unordered_set<std::string>{"agent-1"}); // the gate's scope, verbatim
+
+    auto s = mcp_tool_call(ts, "get_crypto_certificate_summary",
+                           R"({"not_after_edges":["2026-01-01T00:00:00Z","2027-01-01T00:00:00Z"]})");
+    INFO(s.dump());
+    REQUIRE_FALSE(s.contains("error"));
+    CHECK(s["result"]["structuredContent"]["totals"]["certificate_count"] == 3);
+    REQUIRE(fake->cert_sum_queries.size() == 1);
+    CHECK(fake->cert_sum_queries[0].not_after_edges.size() == 2);
+    // The securable is the dedicated one, on both tools.
+    CHECK(securables == std::vector<std::string>{"CertificateInventory:Read", "CertificateInventory:Read"});
+
+    // Audited with the filter NAMES and OPERATORS - never a value, a subject or a SAN.
+    CHECK(mcp_audits(ts, "mcp.list_crypto_certificates|success") == 1);
+    CHECK(mcp_audit_details(ts, "mcp.list_crypto_certificates|success") ==
+          std::vector<std::string>{
+              "scope=confined rows=2 truncated=false filters=is_ca=eq,issuer_dn_contains=ilike"});
+    CHECK(mcp_audits(ts, "mcp.get_crypto_certificate_summary|success") == 1);
+    for (const auto& d : mcp_audit_details(ts, "mcp.list_crypto_certificates|success")) {
+        CHECK_THAT(d, !Catch::Matchers::ContainsSubstring("Test CA"));
+        CHECK_THAT(d, !Catch::Matchers::ContainsSubstring("Jane"));
+        CHECK_THAT(d, !Catch::Matchers::ContainsSubstring("example.org"));
+    }
+}
+
+TEST_CASE("MCP certificate twins: a dropped audit row serves the data and says so (set-and-proceed)",
+          "[mcp][crypto][certs][security]") {
+    auto fake = cert_fake();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.audit_succeeds_ = false;
+    ts.start();
+    for (const char* tool : kCertTools) {
+        INFO(tool);
+        auto r = mcp_tool_call(ts, tool, "{}");
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(r["result"]["structuredContent"]["audit_persisted"] == false);
+    }
+    auto l = mcp_tool_call(ts, kCertTools[0], "{}");
+    CHECK(l["result"]["structuredContent"]["certificates"].size() == 2); // the data is still there
+}
+
+TEST_CASE("MCP certificate twins: strict input is refused with an A4 error.data, identically to REST",
+          "[mcp][crypto][certs]") {
+    auto fake = cert_fake();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    const std::vector<std::pair<const char*, std::string>> bad = {
+        {kCertTools[0], R"({"limit":0})"},
+        {kCertTools[0], R"({"limit":501})"},
+        {kCertTools[0], R"({"limit":"5"})"},
+        {kCertTools[0], R"({"is_ca":"true"})"},
+        {kCertTools[0], R"({"rsa_modulus_bits_lt":70000})"},
+        {kCertTools[0], R"({"key_alg_oid":"1"})"},
+        {kCertTools[0], R"({"not_after_before":"tomorrow"})"},
+        {kCertTools[0], R"({"sha256":"abc"})"},
+        {kCertTools[0], R"({"aki_key_id":"abc"})"},
+        {kCertTools[0], R"({"issuer_dn_contains":"ab"})"},
+        {kCertTools[0], R"({"subject_dn_contains":"emSign"})"},
+        {kCertTools[0], R"({"scope":"user"})"},
+        {kCertTools[0], R"({"nonsense":1})"},
+        {kCertTools[1], R"({"limit":5})"},
+        {kCertTools[1], R"({"not_after_edges":"2026-01-01T00:00:00Z"})"},
+        {kCertTools[1], R"({"not_after_edges":["2027-01-01T00:00:00Z","2026-01-01T00:00:00Z"]})"},
+        {kCertTools[1], R"({"subject_dn_contains":"emSign","is_ca":false})"},
+    };
+    for (const auto& [tool, args] : bad) {
+        INFO(tool << " " << args);
+        auto body = mcp_tool_call(ts, tool, args);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        CHECK(body["error"]["data"].contains("correlation_id")); // A4 error.data on a local error
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null());
+        CHECK_FALSE(body["error"]["data"]["remediation"].is_null());
+    }
+    // The subject substring refusal names is_ca.
+    auto subj = mcp_tool_call(ts, kCertTools[0], R"({"subject_dn_contains":"emSign"})");
+    CHECK_THAT(subj["error"]["message"].get<std::string>(), Catch::Matchers::ContainsSubstring("is_ca"));
+    CHECK(fake->cert_list_queries.empty()); // refused before the seam
+    CHECK(fake->cert_sum_queries.empty());
+    // With is_ca=true it is accepted.
+    CHECK_FALSE(mcp_tool_call(ts, kCertTools[0], R"({"subject_dn_contains":"emSign","is_ca":true})")
+                    .contains("error"));
+    // A non-object arguments root is refused through the real handler, with the A4 data.
+    for (const char* tool : kCertTools) {
+        for (const char* args : {"null", R"([{"limit":1}])", R"("x")", "7"}) {
+            INFO(tool << " arguments=" << args);
+            auto r = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":9,)") +
+                             R"("params":{"name":")" + tool + R"(","arguments":)" + args + "}}");
+            REQUIRE(r);
+            const auto body = nlohmann::json::parse(r->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  std::string(yuzu::server::cert_read::kArgumentsNotObject));
+            CHECK(body["error"]["data"].contains("correlation_id"));
+        }
+    }
+}
+
+TEST_CASE("MCP certificate twins: a degraded read is a retryable error, never an empty result",
+          "[mcp][crypto][certs]") {
+    using yuzu::server::CryptoReadCause;
+    SECTION("store degraded") {
+        auto fake = cert_fake();
+        fake->cert_page = std::unexpected(
+            CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+        fake->cert_sum = std::unexpected(
+            CryptoReadError{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        for (const char* tool : kCertTools) {
+            auto body = mcp_tool_call(ts, tool, "{}");
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+            CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+            CHECK_FALSE(body.contains("result"));
+        }
+        CHECK(mcp_audits(ts, "mcp.list_crypto_certificates|failure") == 1);
+        CHECK(mcp_audit_details(ts, "mcp.list_crypto_certificates|failure") ==
+              std::vector<std::string>{"scope=fleet filters=none store degraded"});
+    }
+    SECTION("admission shed") {
+        auto fake = cert_fake();
+        fake->cert_page = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry",
+            CryptoReadCause::kCapacity});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, kCertTools[0], "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == yuzu::server::mcp::kMcpStoreFaultRetryMs);
+        CHECK(body["error"]["message"] == "crypto read capacity in use; retry");
+    }
+    SECTION("a seam-refused cursor is invalid params") {
+        auto fake = cert_fake();
+        fake->cert_page = std::unexpected(CryptoReadError{CryptoReadError::Kind::kInvalid, "invalid cursor"});
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.start();
+        auto body = mcp_tool_call(ts, kCertTools[0], R"({"cursor":"zzz"})");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    SECTION("an unwired seam is an internal error") {
+        McpTestServer ts;
+        ts.start();
+        for (const char* tool : kCertTools) {
+            auto body = mcp_tool_call(ts, tool, "{}");
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        }
+    }
+}
+
+TEST_CASE("MCP certificate twins: a refused gate stops before the seam; a service-scoped token is denied",
+          "[mcp][crypto][certs][security][service_scope]") {
+    {
+        auto fake = cert_fake();
+        McpTestServer ts;
+        ts.crypto_api_for_test = fake;
+        ts.fleet_read_fn_for_test = [](const httplib::Request&, httplib::Response& res,
+                                       const std::string&,
+                                       const std::string&) -> yuzu::server::authz::FleetReadGate {
+            res.status = 403;
+            return {};
+        };
+        ts.start();
+        for (const char* tool : kCertTools) {
+            auto r = ts.call(std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":7,)") +
+                             R"("params":{"name":")" + tool + R"(","arguments":{}}})");
+            REQUIRE(r);
+            CHECK(r->status == 403); // the gate's own response, not a JSON-RPC success
+        }
+        CHECK(fake->scopes.empty());
+    }
+    // The inventory has no per-service slice to narrow to: a service-scoped token is `denied` by
+    // the C8 class check before the handler, in both RBAC states.
+    auto fake = cert_fake();
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.mock_token_scope_service = "printers";
+    ts.start("readonly");
+    for (const char* tool : kCertTools) {
+        auto body = mcp_tool_call(ts, tool, "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kPermissionDenied);
+    }
+    CHECK(fake->scopes.empty());
+}
+
+TEST_CASE("MCP certificate twins: the securable is mirrored in the RBAC catalogue",
+          "[mcp][crypto][certs]") {
+    const auto sec = rbac_securables_for_test();
+    CHECK(std::ranges::find(sec, std::string("CertificateInventory")) != sec.end());
+}
+
+TEST_CASE("MCP certificate twins: the post-start reconciling wait IS retryable and carries retry_after_ms",
+          "[mcp][crypto][certs]") {
+    auto fake = cert_fake();
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "substring filters reconciling",
+                      yuzu::server::CryptoReadCause::kReconciling};
+    e.retry_after_ms = 300000;
+    fake->cert_page = std::unexpected(e);
+    fake->cert_sum = std::unexpected(e);
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const char* tool : kCertTools) {
+        auto body = mcp_tool_call(ts, tool, "{}");
+        INFO(tool << " " << body.dump());
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["data"]["retry_after_ms"] == 300000);
+    }
+}
+
+TEST_CASE("MCP certificate twins: a refused substring filter / scale limit is NOT retryable and says what to do",
+          "[mcp][crypto][certs]") {
+    auto fake = cert_fake();
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "the substring filters are unavailable",
+                      yuzu::server::CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    e.remediation = "build the DN dictionary (server-admin.md)";
+    fake->cert_page = std::unexpected(e);
+    fake->cert_sum = std::unexpected(e);
+    McpTestServer ts;
+    ts.crypto_api_for_test = fake;
+    ts.start();
+    for (const char* tool : kCertTools) {
+        auto body = mcp_tool_call(ts, tool, "{}");
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInternalError);
+        CHECK(body["error"]["data"]["retry_after_ms"].is_null()); // honest: a retry fails identically
+        CHECK(body["error"]["data"]["remediation"] == "build the DN dictionary (server-admin.md)");
     }
 }

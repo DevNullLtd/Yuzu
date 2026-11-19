@@ -84,7 +84,8 @@ constexpr std::string_view kInventory[] = {"query_inventory", "list_inventory_ta
                                            "query_software_licenses", "get_agent_app_usage",
                                            "query_software_catalogue", "get_software_versions",
                                            "get_crypto_libraries", "list_crypto_library_devices",
-                                           "export_crypto_cbom", "list_hardware_ci",
+                                           "export_crypto_cbom", "list_crypto_certificates",
+                                           "get_crypto_certificate_summary", "list_hardware_ci",
                                            "get_hardware_ci", "list_hardware_ci_records",
                                            // SAM-35: the installed-software v3 reads and the
                                            // collection settings (read, set, per-device effective).

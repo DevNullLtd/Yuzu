@@ -7,6 +7,7 @@
 #include "model_param_helpers.hpp"
 
 #include "app_shell.hpp"
+#include "certificate_read_model.hpp"
 #include "body_cap_policy.hpp" // the pre-routing twin of kLayoutBodyMaxBytes (static_assert below)
 #include "crypto_cbom.hpp"
 #include "crypto_library_model.hpp"
@@ -283,6 +284,60 @@ std::string layout_failure_detail(const CryptoReadError& e) {
         break;
     }
     return e.cause == CryptoReadCause::kCapacity ? " outcome=busy" : " outcome=degraded";
+}
+
+// ── Fleet certificates (slice-2 PR 2a-2b) ────────────────────────────────────
+
+namespace crt = cert_read;
+
+/// Every certificate surface gates on the dedicated securable and the denial names it.
+constexpr const char* kCertSecurable = "CertificateInventory";
+constexpr const char* kCertOperation = "Read";
+
+/// A fragment never answers the gate's 4xx/5xx (htmx would not swap it): a gate that DEGRADED
+/// (503) renders the access-check banner with Retry, a genuine refusal the 200 note naming
+/// CertificateInventory:Read. `kind`: 0 summary (whole body), 1 devices first page, 2 devices
+/// continuation row.
+void soften_cert_denial(httplib::Response& res, int kind, std::string_view retry_url) {
+    const bool degraded = res.status == 503;
+    res.status = 200;
+    if (degraded) {
+        if (kind == 0)
+            send_html(res, crypto_html::render_certificate_summary_unavailable(
+                               retry_url, CryptoReadCause::kAccessCheck));
+        else
+            send_html(res, crypto_html::render_certificate_unavailable(
+                               retry_url, CryptoReadCause::kAccessCheck, kind == 2));
+        return;
+    }
+    if (kind == 0)
+        send_html(res, crypto_html::render_certificate_summary_caveat(crt::kDeniedMessage));
+    else
+        send_html(res, crypto_html::render_ca_caveat(crt::kDeniedMessage, kind == 2));
+}
+
+/// The REST 503 for a degraded certificate read. A pool too small to spare the read lasts until a
+/// restart (no retry hint); anything else is transient.
+void cert_degraded(httplib::Response& res, const CryptoReadError& e) {
+    if (e.unavailable_until_restart) {
+        rest_error(res, 503, e.message, false);
+        return;
+    }
+    if (e.retry_after_ms) { // an honest estimate (the post-restart reconcile wait), not the default
+        res.status = 503;
+        res.set_content(detail::a4_error(res, e.message, detail::A4ErrorOpts{.retry_after_ms = *e.retry_after_ms}),
+                        "application/json");
+        return;
+    }
+    rest_error(res, 503, std::string(crt::degraded_message(e.cause)), true);
+}
+
+/// Fail CLOSED (OD-2): the certificate read's audit row did not persist, so the response carries
+/// no data - 503 with `Sec-Audit-Failed` (set by emit_behavioral_audit) and a retry hint.
+void cert_audit_failed(httplib::Response& res) {
+    rest_error(res, 503,
+               "the access-audit row could not be recorded, so this read was not served; retry",
+               true);
 }
 
 } // namespace
@@ -835,6 +890,232 @@ void CryptoRoutes::register_routes(HttpRouteSink& sink, Deps deps) {
         if (!persisted)
             data["audit_persisted"] = false;
         res.set_content(ok_json(std::move(data)), "application/json");
+    });
+
+    // -- Fragment: fleet certificate summary (the whole page body) - the dashboard twin of
+    // GET /api/v1/crypto/certificates/summary. CertificateInventory:Read through fleet_read_fn
+    // (admit-then-filter, ADR-0017); audited crypto.certificates.summary, set-and-proceed with a
+    // VISIBLE notice when the row is lost. Always 200.
+    sink.Get("/fragments/crypto/certificates", [this](const httplib::Request& req,
+                                                       httplib::Response& res) {
+        set_private_no_store(res);
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        const auto parsed = crt::parse_summary_params(req.params);
+        const std::string retry = parsed ? crypto_html::certificate_summary_url(*parsed) : std::string{};
+        if (!deps_.fleet_read_fn) {
+            spdlog::error("crypto routes: fleet_read_fn unwired - misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            send_html(res, crypto_html::render_certificate_summary_unavailable(
+                               retry, CryptoReadCause::kStoreDegraded));
+            return;
+        }
+        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        if (!gate.admitted) {
+            soften_cert_denial(res, 0, retry);
+            return;
+        }
+        if (!deps_.api) {
+            send_html(res, crypto_html::render_certificate_summary_unavailable(
+                               retry, CryptoReadCause::kStoreDegraded));
+            return;
+        }
+        if (!parsed) {
+            send_html(res, crypto_html::render_certificate_summary_caveat(parsed.error()));
+            return;
+        }
+        const auto cid = detail::ensure_correlation_id(res);
+        auto read = deps_.api->certificate_summary(*parsed, gate.scope);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                send_html(res, crypto_html::render_certificate_summary_caveat(read.error().message));
+                return;
+            }
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.certificates.summary", "failure", kCertSecurable,
+                std::string(crt::kAuditTarget),
+                crt::audit_detail_degraded(cid, parsed->filter, read.error().cause, is_confined(gate)));
+            // A failure that lasts until a restart offers no Retry button (it would loop).
+            send_html(res, crypto_html::render_certificate_summary_unavailable(
+                               retry, read.error().cause, !persisted,
+                               read.error().unavailable_until_restart ? std::string_view(read.error().message)
+                                                                      : std::string_view{}));
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.certificates.summary", "success", kCertSecurable,
+            std::string(crt::kAuditTarget),
+            crt::audit_detail(cid, parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
+                              read->result_truncated,
+                              false, is_confined(gate)));
+        send_html(res, (persisted ? std::string{} : crypto_html::render_audit_notice()) +
+                           crypto_html::render_certificate_summary(*parsed, *read));
+    });
+
+    // -- Fragment: the per-certificate rows (a continuation page when `cursor` is present) - the
+    // dashboard twin of GET /api/v1/crypto/certificates. Same gate and audit posture as above
+    // (crypto.certificates.view). A continuation answer is ONE table row.
+    sink.Get("/fragments/crypto/certificates/devices", [this](const httplib::Request& req,
+                                                               httplib::Response& res) {
+        set_private_no_store(res);
+        auto session = deps_.auth_fn(req, res);
+        if (!session)
+            return;
+        const bool row = is_continuation(req);
+        const auto parsed = crt::parse_list_params(req.params);
+        const std::string retry = parsed ? crypto_html::certificates_page_url(*parsed) : std::string{};
+        const auto note = [&](std::string_view m) {
+            send_html(res, crypto_html::render_ca_caveat(m, row));
+        };
+        if (!deps_.fleet_read_fn) {
+            spdlog::error("crypto routes: fleet_read_fn unwired - misconfigured call site; "
+                          "failing closed");
+            res.status = 503;
+            send_html(res, crypto_html::render_certificate_unavailable(
+                               retry, CryptoReadCause::kStoreDegraded, row));
+            return;
+        }
+        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        if (!gate.admitted) {
+            soften_cert_denial(res, row ? 2 : 1, retry);
+            return;
+        }
+        if (!deps_.api) {
+            send_html(res, crypto_html::render_certificate_unavailable(
+                               retry, CryptoReadCause::kStoreDegraded, row));
+            return;
+        }
+        if (!parsed) {
+            note(parsed.error());
+            return;
+        }
+        const auto cid = detail::ensure_correlation_id(res);
+        auto read = deps_.api->certificates(*parsed, gate.scope);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                note(read.error().message);
+                return;
+            }
+            const bool persisted = detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.certificates.view", "failure", kCertSecurable,
+                std::string(crt::kAuditTarget),
+                crt::audit_detail_degraded(cid, parsed->filter, read.error().cause, is_confined(gate)));
+            send_html(res, (persisted ? std::string{}
+                                      : (row ? crypto_html::render_ca_audit_notice_row()
+                                             : crypto_html::render_audit_notice())) +
+                               crypto_html::render_certificate_unavailable(
+                                   retry, read.error().cause, row,
+                                   read.error().unavailable_until_restart ? std::string_view(read.error().message)
+                                                                          : std::string_view{}));
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.certificates.view", "success", kCertSecurable,
+            std::string(crt::kAuditTarget),
+            crt::audit_detail(cid, parsed->filter, read->rows.size(), read->result_truncated, row,
+                              is_confined(gate)));
+        std::string notice;
+        if (!persisted)
+            notice = row ? crypto_html::render_ca_audit_notice_row() : crypto_html::render_audit_notice();
+        send_html(res, std::move(notice) + crypto_html::render_certificate_rows(*parsed, *read, row));
+    });
+
+    // -- REST: GET /api/v1/crypto/certificates[?<filters>&cursor=&limit=] - one row per (device,
+    // certificate). CertificateInventory:Read through fleet_read_fn (the gate that applies the
+    // topology floor, NOT require_list_read); the gate's VisibleSet is pushed into the SQL. A
+    // lost audit row FAILS CLOSED (OD-2): 503 + Sec-Audit-Failed, no data. A degraded read is a
+    // 503 with a retry hint, never an empty 200.
+    sink.Get("/api/v1/crypto/certificates", [this](const httplib::Request& req,
+                                                    httplib::Response& res) {
+        const auto cid = detail::ensure_correlation_id(res);
+        set_private_no_store(res);
+        if (gate_unwired(deps_.fleet_read_fn, res, false))
+            return;
+        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        if (!gate.admitted)
+            return; // the gate wrote the 401/403/503 and its own denial row
+        if (!deps_.api) {
+            api_unwired(res);
+            return;
+        }
+        const auto parsed = crt::parse_list_params(req.params);
+        if (!parsed) {
+            rest_error(res, 400, parsed.error());
+            return;
+        }
+        auto read = deps_.api->certificates(*parsed, gate.scope);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                rest_error(res, 400, read.error().message);
+                return;
+            }
+            (void)detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.certificates.view", "failure", kCertSecurable,
+                std::string(crt::kAuditTarget),
+                crt::audit_detail_degraded(cid, parsed->filter, read.error().cause, is_confined(gate)));
+            cert_degraded(res, read.error());
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.certificates.view", "success", kCertSecurable,
+            std::string(crt::kAuditTarget),
+            crt::audit_detail(cid, parsed->filter, read->rows.size(), read->result_truncated,
+                              !parsed->cursor.empty(), is_confined(gate)));
+        if (!persisted) {
+            cert_audit_failed(res);
+            return;
+        }
+        res.set_content(ok_json(crt::list_json(*read)), "application/json");
+    });
+
+    // -- REST: GET /api/v1/crypto/certificates/summary[?<filters>&not_after_edges=] - the
+    // raw-value rollups (key and signature algorithm, curve, issuer top 50, store, the caller's
+    // not_after histogram, store-status coverage). Same gate, scope, admission and fail-closed
+    // audit (crypto.certificates.summary). Subjects and SANs are never a grouping key.
+    sink.Get("/api/v1/crypto/certificates/summary", [this](const httplib::Request& req,
+                                                            httplib::Response& res) {
+        const auto cid = detail::ensure_correlation_id(res);
+        set_private_no_store(res);
+        if (gate_unwired(deps_.fleet_read_fn, res, false))
+            return;
+        auto gate = deps_.fleet_read_fn(req, res, kCertSecurable, kCertOperation);
+        if (!gate.admitted)
+            return;
+        if (!deps_.api) {
+            api_unwired(res);
+            return;
+        }
+        const auto parsed = crt::parse_summary_params(req.params);
+        if (!parsed) {
+            rest_error(res, 400, parsed.error());
+            return;
+        }
+        auto read = deps_.api->certificate_summary(*parsed, gate.scope);
+        if (!read) {
+            if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+                rest_error(res, 400, read.error().message);
+                return;
+            }
+            (void)detail::emit_behavioral_audit(
+                deps_.audit_fn, req, res, "crypto.certificates.summary", "failure", kCertSecurable,
+                std::string(crt::kAuditTarget),
+                crt::audit_detail_degraded(cid, parsed->filter, read.error().cause, is_confined(gate)));
+            cert_degraded(res, read.error());
+            return;
+        }
+        const bool persisted = detail::emit_behavioral_audit(
+            deps_.audit_fn, req, res, "crypto.certificates.summary", "success", kCertSecurable,
+            std::string(crt::kAuditTarget),
+            crt::audit_detail(cid, parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
+                              read->result_truncated,
+                              false, is_confined(gate)));
+        if (!persisted) {
+            cert_audit_failed(res);
+            return;
+        }
+        res.set_content(ok_json(crt::summary_json(*read)), "application/json");
     });
 
     // -- REST: GET /api/v1/crypto/widgets - the widget catalogue with the caller's availability.

@@ -53,5 +53,27 @@
     },
     "mcp_twin": "list_issued_certs",
     "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/certificates",
+    "capability_id": "get.fragments-crypto-certificates",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/certificates/summary"
+    },
+    "mcp_twin": "get_crypto_certificate_summary",
+    "status": "twinned"
+  },
+  {
+    "method": "GET",
+    "path": "/fragments/crypto/certificates/devices",
+    "capability_id": "get.fragments-crypto-certificates-devices",
+    "rest_v1_twin": {
+      "method": "GET",
+      "path": "/api/v1/crypto/certificates"
+    },
+    "mcp_twin": "list_crypto_certificates",
+    "status": "twinned"
   }
 ]

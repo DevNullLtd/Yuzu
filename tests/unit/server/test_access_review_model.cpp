@@ -232,6 +232,42 @@ TEST_CASE("build_access_review: union of GRANTED user/group/active-engine/revoke
     CHECK(rows.size() == 4);
 }
 
+TEST_CASE("build_access_review: grants of the CertificateInventory securable are in the export "
+          "(SOC 2 CC6.2, slice-2 PR 2a-2b)",
+          "[access_review][model][pg][certinv]") {
+    ModelHarness h;
+    // A custom role that grants ONLY the certificate read, a user and a group holding it, and the
+    // seeded Administrator (which holds the securable via the CRUD loop).
+    REQUIRE(h.rbac->create_role({.name = "CertReader", .description = "d"}).has_value());
+    REQUIRE(h.rbac->set_permission({"CertReader", "CertificateInventory", "Read", "allow"}).has_value());
+    h.add_user("dana");
+    REQUIRE(h.rbac->assign_role({"user", "dana", "CertReader"}).has_value());
+    REQUIRE(h.rbac->create_group({.name = "pki", .description = "d", .source = "local"}).has_value());
+    REQUIRE(h.rbac->assign_role({"group", "pki", "CertReader"}).has_value());
+    h.add_user("root-admin");
+    REQUIRE(h.rbac->assign_role({"user", "root-admin", "Administrator"}).has_value());
+
+    auto result = build_access_review(h.auth_db.get(), h.rbac.get(), h.engines.get(), nullptr, nullptr);
+    REQUIRE(result.has_value());
+    const auto* user_row = h.find(*result, "user", "dana");
+    REQUIRE(user_row != nullptr);
+    CHECK(user_row->roles == std::vector<std::string>{"CertReader"});
+    CHECK(user_row->effective_permission_count == 1); // exactly CertificateInventory:Read
+    const auto* group_row = h.find(*result, "group", "pki");
+    REQUIRE(group_row != nullptr);
+    CHECK(group_row->effective_permission_count == 1);
+    // The Administrator holder's count includes the securable's five CRUD operations: 39 types x 5
+    // + Push + Attest + Rotate = 198.
+    const auto* admin_row = h.find(*result, "user", "root-admin");
+    REQUIRE(admin_row != nullptr);
+    CHECK(admin_row->effective_permission_count == 198);
+    // The role-permission read the export expands shows the grant itself.
+    bool found = false;
+    for (const auto& p : h.rbac->get_role_permissions("CertReader"))
+        found = found || (p.securable_type == "CertificateInventory" && p.operation == "Read");
+    CHECK(found);
+}
+
 // ── R2: per-type permission computation ─────────────────────────────────────
 
 TEST_CASE("build_access_review: R2 — a group's permission count comes from the group-direct "

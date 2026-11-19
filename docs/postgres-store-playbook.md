@@ -563,7 +563,7 @@ from the registry changes what a FRESH database gets and nothing about a deploye
 `PgMigrationRunner` runs every migration in a transaction (`SET LOCAL search_path` requires it),
 so statements that cannot run in a transaction block — `CREATE INDEX CONCURRENTLY`, `VACUUM`,
 `ALTER TYPE ... ADD VALUE` — **cannot** be a `PgMigration` today. The non-transactional migration
-kind is **deliberately not built yet** (no store needs it). The rule:
+kind is **deliberately not built yet** (no store needs it): a large-table index is built by a leader-gated background pass instead, through the reusable helper `server/core/src/pg/pg_background_build.hpp` (spec-stamped `CREATE INDEX CONCURRENTLY`, cancellable, typed stop; first user: the certificate DN dictionary). The rule:
 
 - Initial DDL on a **new/empty** table uses normal transactional migrations — a plain
   `CREATE INDEX` on an empty table takes a trivial lock and is fine.

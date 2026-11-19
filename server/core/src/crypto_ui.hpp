@@ -11,6 +11,7 @@
 /// `url_encode`; no JS string is ever built from data. Colour comes from the design tokens
 /// only, and the htmx `hx-on` attributes are never used (the dashboard CSP blocks them).
 
+#include "certificate_read_types.hpp"
 #include "crypto_api.hpp" // CryptoReadError (pure seam types; no store)
 #include "crypto_types.hpp"
 #include "crypto_widget_catalogue.hpp"
@@ -203,6 +204,42 @@ render_dashboard_unavailable(CryptoReadCause cause = CryptoReadCause::kStoreDegr
 inline constexpr std::string_view kCaDrillNeedsSecurityRead =
     "The certificate list needs Security:Read. The counts above stay visible with Inventory:Read; "
     "ask an administrator for Security:Read to see the certificates behind them.";
+
+// ── Fleet certificates (slice-2 PR 2a-2b, ADR-0070 D10/D12) ────────────────────
+//
+// The dashboard twins of the REST reads `GET /api/v1/crypto/certificates[/summary]`:
+// `/fragments/crypto/certificates` (the raw-value summary, the whole page body) and
+// `/fragments/crypto/certificates/devices` (the per-certificate rows, a drill; a continuation
+// page returns only table rows). Facts only: no grading colour, icon or risk ordering - groups are
+// ordered by device count. Every page states what is NOT read, and a degrade or a refusal is a
+// banner or a note, never an empty table.
+
+/// The summary body: CSS, title, KPI strip, the raw-value groups, the `not_after` histogram over
+/// the caller's edges, the store-status coverage and the blind-spot caveat.
+/// `q` is the query the summary answered: "Show certificates" carries its FILTERS to the list, so
+/// the drill is the same set the totals describe (never an unfiltered list under filtered totals).
+[[nodiscard]] std::string render_certificate_summary(const CertSummaryQuery& q, const CertSummary& s);
+/// The per-certificate drill. `continuation` returns only table rows (+ the Load-more row).
+[[nodiscard]] std::string render_certificate_rows(const CertQuery& q, const CertPage& p,
+                                                  bool continuation);
+/// The fragment URL of one per-certificate page (every filter and the cursor), for Load-more and
+/// a continuation row's Retry.
+[[nodiscard]] std::string certificates_page_url(const CertQuery& q);
+/// The summary fragment URL for a query (the Retry target).
+[[nodiscard]] std::string certificate_summary_url(const CertSummaryQuery& q);
+/// A degrade or shed on the summary: the CSS, an audit-loss notice when `audit_lost`, then a
+/// banner whose Retry re-requests `retry_url`.
+[[nodiscard]] std::string render_certificate_summary_unavailable(std::string_view retry_url,
+                                                                 CryptoReadCause cause,
+                                                                 bool audit_lost = false,
+                                                                 std::string_view permanent = {});
+/// A refusal or bad-parameter note as the summary fragment's whole answer (CSS + note).
+[[nodiscard]] std::string render_certificate_summary_caveat(std::string_view message);
+/// The per-certificate drill's failure answer: a block (first page) or ONE table row spanning the
+/// columns (a continuation page). `retry_url` empty = nothing to retry.
+[[nodiscard]] std::string render_certificate_unavailable(std::string_view retry_url,
+                                                         CryptoReadCause cause, bool row,
+                                                         std::string_view permanent = {});
 
 /// JSON for an inline `<script>`: dumped ASCII-only (U+2028/U+2029 and every non-ASCII code
 /// point become \u escapes) with `<`, `>` and `&` escaped as < / > / &, so no

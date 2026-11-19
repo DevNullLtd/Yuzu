@@ -60,7 +60,16 @@
 /// session, which defeats the control it evidences. The inclusion test is
 /// therefore: the read discloses authorization topology, OR it preserves an
 /// existing admin-only posture across a gate migration, OR it returns the
-/// audit evidence itself. A new entry must fit one of the three.
+/// audit evidence itself. Two later classes follow; a new entry must fit at least one of the five.
+///
+/// Slice-2 PR 2a-2b added a NEW-DATA-CLASS inclusion class: a new fleet-wide copy of endpoint data
+/// that an ACCEPTED ADR requires to be admin-only in BOTH RBAC states (here ADR-0070 D12, "Read
+/// surface"). `CertificateInventory:Read` is neither authorization topology, a gate migration nor
+/// the audit trail - it is new data (subjects and SANs can carry personal data), and the output of
+/// today's `certificates.list` runs, though stored under `Response:Read`, is readable by any
+/// signed-in user under RBAC off. The accepted ADR requires the new store to be admin-only in both
+/// states, so it is floored here, not because a previous gate was admin-only. The `Forensics`
+/// entry is the nearest precedent (it too floors a new data class on a design requirement).
 ///
 /// ADR-0070 R1 (revocation sources, slice 2b-1a) added a further inclusion class: an
 /// OPERATOR-REGISTERED EGRESS TARGET. `RevocationSource:Read` returns the CRL URLs an
@@ -69,9 +78,9 @@
 /// host name, an RFC 1918 address). The read is not authorization topology, not a gate migration
 /// and not audit evidence, so the test is now: the read discloses authorization topology, OR it
 /// preserves an existing admin-only posture across a gate migration, OR it returns the audit
-/// evidence itself, OR it discloses operator-registered egress targets. (A certificate-inventory
-/// PR that lands alongside adds its own class for new fleet-wide copies of endpoint data; the
-/// classes are independent, and a new entry must fit at least one.) The pair is ALSO behind the
+/// evidence itself, OR it discloses operator-registered egress targets, OR it serves a new
+/// fleet-wide data class an accepted ADR requires admin-only (the certificate-inventory class
+/// above). The classes are independent, and a new entry must fit at least one. The pair is ALSO behind the
 /// durable-administrator predicate (`revocation_source_admin_gate.hpp`) in BOTH RBAC states, so
 /// this floor is the RBAC-off half of a two-part control and the predicate is the RBAC-on half.
 ///
@@ -151,6 +160,9 @@ inline constexpr TopologyFloorEntry kTopologyFloor[] = {
     // here - and the surface's own administrator predicate then refuses every non-administrator,
     // so no grant of this pair is ever enough on its own.
     {"RevocationSource", "Read"},
+    // Slice-2 PR 2a-2b (ADR-0070 D12) - the fleet certificate inventory. Fits only the file
+    // header's new-data-class inclusion class, and does not pretend to fit another.
+    {"CertificateInventory", "Read"},
 };
 
 /// True when `(securable, operation)` is in the topology floor, i.e. the

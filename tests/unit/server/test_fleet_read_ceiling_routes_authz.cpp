@@ -477,7 +477,17 @@ public:
         p.family = q.family;
         return p;
     }
-    // The widget methods are not under test here.
+    // The certificate and widget methods are not under test here.
+    std::expected<CertPage, CryptoReadError> certificates(const CertQuery&,
+                                                          const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        return CertPage{};
+    }
+    std::expected<CertSummary, CryptoReadError>
+    certificate_summary(const CertSummaryQuery&, const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        return CertSummary{};
+    }
     std::expected<CaCertStats, CryptoReadError> ca_stats(std::optional<std::int64_t>) const override {
         return std::unexpected(CryptoReadError{});
     }
@@ -603,6 +613,147 @@ TEST_CASE("crypto routes real gate: confined; global; ungranted and service-scop
             auto [code, body] = call(svc, path);
             CHECK(code == 403);
             CHECK(has(body, "service-scoped tokens require RBAC to be enabled"));
+        }
+        CHECK(api->scopes.empty());
+    }
+}
+
+// ── /crypto fleet certificates (slice-2 PR 2a-2b): the REAL gate, the floor and the dedicated
+// securable. Routed through require_fleet_read (NOT require_list_read, which does not apply the
+// topology floor): a certificate read under RBAC off is admin-only, a service-scoped token is 403
+// in both RBAC states, and a confined caller reaches the seam with exactly its group.
+TEST_CASE("crypto certificate routes real gate: floor, dedicated securable, confinement and "
+          "service-scoped tokens",
+          "[pg][crypto][certs][confinement][authz][service_scope][floor]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, yuzu::test::response_execution_authz_tpl);
+    CeilingRouteRig r{db.dsn()};
+    // bob: CertificateInventory:Read through his management group only -> confined to bob-agent.
+    REQUIRE(r.rig.rbac.create_role({"CertReader6127", "", false, 0}).has_value());
+    REQUIRE(r.rig.rbac.set_permission({"CertReader6127", "CertificateInventory", "Read", "allow"})
+                .has_value());
+    REQUIRE(r.rig.mgmt.assign_role({r.rig.bob_group, "user", "bob", "CertReader6127"}).has_value());
+    // ivan: a GLOBAL CertificateInventory:Read -> TOP; the minter of a service token below.
+    REQUIRE(r.rig.rbac.assign_role({"user", "ivan", "CertReader6127"}).has_value());
+    REQUIRE(r.rig.auth_mgr.upsert_user("ivan", "correct-horse-battery-staple", auth::Role::user));
+    // carol: Inventory:Read and Security:Read - NOT the certificate securable.
+    REQUIRE(r.rig.rbac.create_role({"InvSecReader6127", "", false, 0}).has_value());
+    for (const char* securable : {"Inventory", "Security"})
+        REQUIRE(r.rig.rbac.set_permission({"InvSecReader6127", securable, "Read", "allow"})
+                    .has_value());
+    REQUIRE(r.rig.rbac.assign_role({"user", "carol", "InvSecReader6127"}).has_value());
+    REQUIRE(r.rig.auth_mgr.upsert_user("carol", "correct-horse-battery-staple", auth::Role::user));
+    REQUIRE(r.rig.auth_mgr.upsert_user("adminy", "correct-horse-battery-staple", auth::Role::admin));
+    const auto mint = [&](const std::string& user) {
+        const auto expires = std::chrono::duration_cast<std::chrono::seconds>(
+                                 std::chrono::system_clock::now().time_since_epoch())
+                                 .count() +
+                             3600;
+        auto t = r.rig.api_tokens->create_token("crypto-6127", user, expires);
+        REQUIRE(t.has_value());
+        return *t;
+    };
+
+    GateFns g = make_gate_fns(*r.svc_auth);
+    auto api = std::make_shared<ScopeRecordingCryptoApi>();
+    CryptoRoutes routes;
+    yuzu::server::test::TestRouteSink sink;
+    CryptoRoutes::Deps d;
+    d.auth_fn = g.auth_fn;
+    d.fleet_read_fn = g.fleet_fn;
+    d.audit_fn = g.audit_fn;
+    d.api = api;
+    routes.register_routes(sink, std::move(d));
+
+    const std::vector<std::string> rest = {"/api/v1/crypto/certificates",
+                                           "/api/v1/crypto/certificates/summary"};
+    const std::vector<std::string> frags = {"/fragments/crypto/certificates",
+                                            "/fragments/crypto/certificates/devices"};
+    auto call = [&](const std::string& token, const std::string& path) {
+        auto res = sink.dispatch("GET", path, {}, "application/json",
+                                 {{"Authorization", "Bearer " + token}});
+        REQUIRE(res);
+        return std::pair{res->status, res->body};
+    };
+
+    SECTION("RBAC on: a management-group-confined caller reaches the seam with exactly its group") {
+        r.rig.rbac.set_rbac_enabled(true);
+        const auto tok = r.rig.mint_bob();
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 200);
+        for (const auto& path : frags)
+            CHECK(call(tok, path).first == 200);
+        REQUIRE(api->scopes.size() == 4);
+        for (const auto& s : api->scopes) {
+            REQUIRE(s.has_value());
+            CHECK(*s == std::unordered_set<std::string>{"bob-agent"});
+        }
+    }
+    SECTION("RBAC on: a global CertificateInventory:Read holder is TOP (unfiltered)") {
+        r.rig.rbac.set_rbac_enabled(true);
+        const auto tok = mint("ivan");
+        for (const auto& path : rest)
+            CHECK(call(tok, path).first == 200);
+        REQUIRE(api->scopes.size() == 2);
+        for (const auto& s : api->scopes)
+            CHECK_FALSE(s.has_value());
+    }
+    SECTION("RBAC on: Inventory:Read and Security:Read do NOT admit a certificate read") {
+        r.rig.rbac.set_rbac_enabled(true);
+        const auto tok = mint("carol");
+        for (const auto& path : rest) {
+            auto [code, body] = call(tok, path);
+            CHECK(code == 403);
+            CHECK(has(body, "CertificateInventory"));   // the denial names the permission required
+            CHECK_FALSE(has(body, "\"permission\":\"Inventory"));
+        }
+        for (const auto& path : frags) {
+            auto [code, body] = call(tok, path);
+            CHECK(code == 200); // htmx swaps only a 2xx: a refusal note
+            CHECK(has(body, "CertificateInventory:Read is required"));
+            CHECK_FALSE(has(body, "No matching certificates"));
+        }
+        CHECK(api->scopes.empty());
+    }
+    SECTION("RBAC OFF (the shipped default): the floor makes it admin-only; a non-admin is 403") {
+        r.rig.rbac.set_rbac_enabled(false);
+        const auto user_tok = mint("carol"); // a signed-in non-admin: every other Read is open to it
+        for (const auto& path : rest) {
+            auto [code, body] = call(user_tok, path);
+            CHECK(code == 403);
+            CHECK(has(body, "CertificateInventory"));
+        }
+        for (const auto& path : frags) {
+            auto [code, body] = call(user_tok, path);
+            CHECK(code == 200);
+            CHECK(has(body, "CertificateInventory:Read is required"));
+        }
+        CHECK(api->scopes.empty());
+        // The same caller's slice-1 read is still open (the floor is narrow, not "every Read").
+        CHECK(call(user_tok, "/api/v1/crypto/libraries").first == 200);
+        // An admin is admitted, unfiltered, on every certificate route.
+        const auto admin_tok = mint("adminy");
+        api->scopes.clear();
+        for (const auto& path : rest)
+            CHECK(call(admin_tok, path).first == 200);
+        for (const auto& path : frags)
+            CHECK(call(admin_tok, path).first == 200);
+        REQUIRE(api->scopes.size() == 4);
+        for (const auto& s : api->scopes)
+            CHECK_FALSE(s.has_value());
+    }
+    SECTION("a service-scoped token is 403 in BOTH RBAC states") {
+        const auto svc = r.mint_service("ivan", "printers");
+        for (const bool rbac_on : {true, false}) {
+            INFO("rbac on: " << rbac_on);
+            r.rig.rbac.set_rbac_enabled(rbac_on);
+            for (const auto& path : rest) {
+                auto [code, body] = call(svc, path);
+                CHECK(code == 403);
+                // RBAC on: the ITServiceOwner ceiling names the pair it does not hold. RBAC off:
+                // service-scoped tokens need RBAC at all (no permission would admit them).
+                CHECK(has(body, rbac_on ? "CertificateInventory:Read"
+                                        : "service-scoped tokens require RBAC to be enabled"));
+            }
         }
         CHECK(api->scopes.empty());
     }
