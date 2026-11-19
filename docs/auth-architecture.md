@@ -431,7 +431,7 @@ the `session_sql::` helpers. `deactivate_account` takes the
 `session_store.sessions` rows FOR UPDATE (ordered by `token_hash`) after the
 `auth.users` row and before the `rbac_meta` write-generation row, to end the
 target's elevation in the same transaction, and takes `session_meta` last only
-when it cleared at least one elevation (the 2026-11-16 Update in ADR-0012 and
+when it cleared at least one elevation (the ADR-0012 Update titled "the user `Administrator` unassign takes the target's `session_store.sessions` rows" and
 the A2/A1 RBAC administration clause 1 below carry the full order). That edge is
 acyclic because no single-row session writer takes an RBAC or account lock; two
 multi-row writers on one user's sessions can still deadlock on row order, in

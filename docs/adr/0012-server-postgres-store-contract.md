@@ -307,7 +307,7 @@ row, then `session_store.sessions` rows, then the `audit_store.audit_events` INS
 `auth.users`), no audit writer touches `session_store`, the locking post-mint re-read
 (`AuthDB::recheck_role_locked`) takes `auth.users` only after its own session INSERT has committed,
 and `RbacAdminAuthorityOwner` takes `principal_roles` before `auth.users` and never a session or
-audit lock (superseded for `deactivate_account` by Update 2026-11-13 and for the user `Administrator` unassign by Update 2026-11-16, both below). Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
+audit lock (superseded for `deactivate_account` by Update 2026-11-13 and for the user `Administrator` unassign by the Update 2026-11-16 titled "the user `Administrator` unassign takes the target's `session_store.sessions` rows", both below). Like the RBAC owner, it is correct only because `AuthDB`, `SessionStore` and
 `AuditStore` share ONE pool/database (ADR-0006); a split onto separate databases fails every
 statement closed, never a silent partial write.
 
