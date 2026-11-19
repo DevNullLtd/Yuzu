@@ -450,7 +450,7 @@ The output never names a skipped path: when a counter is above zero, narrow it d
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash 802f5467fb09
+**Windows** — captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash cc317a696b1d
 
 ```
 == action=exists path=C:\Windows\System32\drivers\etc\hosts
@@ -515,8 +515,11 @@ match|C:\Windows\System32\drivers\etc\hosts|1224
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN
 
-== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts*
-total_matches|0
+== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts* match_type=both
+result|C:\Windows\System32\drivers\etc\hosts|file
+result|C:\Windows\System32\drivers\etc\hosts.ics|file
+result|C:\Windows\System32\drivers\etc\lmhosts.sam|file
+total_matches|3
 [result_status] UNDECLARED / UNKNOWN
 
 == action=get_version_info path=C:\Windows\System32\notepad.exe
@@ -637,9 +640,13 @@ truncated|none|visited=261|hashed=2997701|skipped_unreadable=17|skipped_symlink=
 matches_found|1
 [result_status] CONSTRAINED / PARTIAL / filesystem:skipped_unreadable
 
-== action=search_dir root=/etc pattern=*hosts*
-truncated|none|visited=273|hashed=0|skipped_unreadable=1|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0
-total_matches|0
+== action=search_dir root=/etc pattern=*hosts* match_type=both
+result|/private/etc/hosts.equiv|file
+result|/private/etc/apache2/original/extra/httpd-vhosts.conf|file
+result|/private/etc/apache2/extra/httpd-vhosts.conf|file
+result|/private/etc/hosts|file
+truncated|none|visited=274|hashed=0|skipped_unreadable=1|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0
+total_matches|4
 [result_status] CONSTRAINED / PARTIAL / filesystem:skipped_unreadable
 
 == action=get_version_info path=/bin/ls
@@ -678,7 +685,7 @@ total_lines_after|1
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash 802f5467fb09
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-10-04 · euid 0 · leg-hash cc317a696b1d
 
 ```
 == action=exists path=/etc/hosts
@@ -756,8 +763,12 @@ truncated|none|visited=1676|hashed=1922709|skipped_unreadable=0|skipped_symlink=
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN
 
-== action=search_dir root=/etc pattern=*hosts*
-total_matches|0
+== action=search_dir root=/etc pattern=*hosts* match_type=both
+result|/etc/hosts|file
+result|/etc/apparmor.d/abstractions/hosts_access|file
+result|/etc/cloud/templates/hosts.debian.tmpl|file
+truncated|none|visited=1806|hashed=0|skipped_unreadable=0|skipped_symlink=807|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0
+total_matches|3
 [result_status] UNDECLARED / UNKNOWN
 
 == action=get_version_info path=/bin/ls

@@ -2792,16 +2792,20 @@
         {
           "action": "search_dir",
           "not_captured": null,
-          "params": "root=/etc pattern=*hosts*",
+          "params": "root=/etc pattern=*hosts* match_type=both",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 5,
           "rows": [
-            "total_matches|0"
+            "result|/etc/hosts|file",
+            "result|/etc/apparmor.d/abstractions/hosts_access|file",
+            "result|/etc/cloud/templates/hosts.debian.tmpl|file",
+            "truncated|none|visited=1806|hashed=0|skipped_unreadable=0|skipped_symlink=807|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
+            "total_matches|3"
           ],
           "truncated": false
         },
@@ -2915,7 +2919,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "container",
-        "leg_hash": "802f5467fb09",
+        "leg_hash": "cc317a696b1d",
         "os": "linux",
         "os_version": "Debian GNU/Linux 13 (trixie) aarch64",
         "privilege": "euid 0"
@@ -3090,17 +3094,20 @@
         {
           "action": "search_dir",
           "not_captured": null,
-          "params": "root=/etc pattern=*hosts*",
+          "params": "root=/etc pattern=*hosts* match_type=both",
           "rc": 0,
           "result_status": {
             "completeness": "PARTIAL",
             "provenance": "filesystem:skipped_unreadable",
             "status": "CONSTRAINED"
           },
-          "row_count": 2,
+          "row_count": 6,
           "rows": [
-            "truncated|none|visited=273|hashed=0|skipped_unreadable=1|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0",
-            "total_matches|0"
+            "result|/private/etc/hosts.equiv|file",
+            "result|/private/etc/apache2/original/extra/httpd-vhosts.conf|file",
+            "result|/private/etc/apache2/extra/httpd-vhosts.conf|file",
+            "result|/private/etc/hosts|file",
+            "truncated|none|visited=274|hashed=0|skipped_unreadable=1|skipped_symlink=4|skipped_not_regular=0|skipped_oversize=0|skipped_network_mount=0"
           ],
           "truncated": false
         },
@@ -3387,16 +3394,19 @@
         {
           "action": "search_dir",
           "not_captured": null,
-          "params": "root=C:\\Windows\\System32\\drivers\\etc pattern=*hosts*",
+          "params": "root=C:\\Windows\\System32\\drivers\\etc pattern=*hosts* match_type=both",
           "rc": 0,
           "result_status": {
             "completeness": "UNKNOWN",
             "provenance": "",
             "status": "UNDECLARED"
           },
-          "row_count": 1,
+          "row_count": 4,
           "rows": [
-            "total_matches|0"
+            "result|C:\\Windows\\System32\\drivers\\etc\\hosts|file",
+            "result|C:\\Windows\\System32\\drivers\\etc\\hosts.ics|file",
+            "result|C:\\Windows\\System32\\drivers\\etc\\lmhosts.sam|file",
+            "total_matches|3"
           ],
           "truncated": false
         },
@@ -3515,7 +3525,7 @@
       "stamp": {
         "date": "2026-10-04",
         "host_class": "bare-metal",
-        "leg_hash": "802f5467fb09",
+        "leg_hash": "cc317a696b1d",
         "os": "windows",
         "os_version": "Windows 10.0.26200 x86_64",
         "privilege": "LocalSystem (elevated)"

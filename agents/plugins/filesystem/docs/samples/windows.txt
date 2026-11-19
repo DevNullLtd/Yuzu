@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash 802f5467fb09
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-10-04 · LocalSystem (elevated) · leg-hash cc317a696b1d
 == action=exists path=C:\Windows\System32\drivers\etc\hosts
 exists|true
 type|file
@@ -87,8 +87,11 @@ match|C:\Windows\System32\drivers\etc\hosts|1224
 matches_found|1
 [result_status] UNDECLARED / UNKNOWN / 
 
-== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts*
-total_matches|0
+== action=search_dir root=C:\Windows\System32\drivers\etc pattern=*hosts* match_type=both
+result|C:\Windows\System32\drivers\etc\hosts|file
+result|C:\Windows\System32\drivers\etc\hosts.ics|file
+result|C:\Windows\System32\drivers\etc\lmhosts.sam|file
+total_matches|3
 [result_status] UNDECLARED / UNKNOWN / 
 
 == action=get_version_info path=C:\Windows\System32\notepad.exe
