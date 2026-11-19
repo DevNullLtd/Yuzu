@@ -37,20 +37,16 @@
 #include "response_store.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <yuzu/metrics.hpp>
 
 #include <catch2/catch_test_macros.hpp>
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <map>
-#include <memory>
 #include <set>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -2450,28 +2446,6 @@ TEST_CASE("policy dispatch approval: authorize_instruction is degraded, never an
 
 namespace {
 
-// Captures what the default logger writes while it is alive.
-class LogCapture {
-public:
-    LogCapture() : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(os_)) {
-        spdlog::default_logger()->sinks().push_back(sink_);
-    }
-    ~LogCapture() {
-        auto& sinks = spdlog::default_logger()->sinks();
-        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
-    }
-    LogCapture(const LogCapture&) = delete;
-    LogCapture& operator=(const LogCapture&) = delete;
-    std::string text() {
-        spdlog::default_logger()->flush();
-        return os_.str();
-    }
-
-private:
-    std::ostringstream os_;
-    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
-};
-
 size_t count_of(const std::string& hay, const std::string& needle) {
     size_t n = 0;
     for (size_t at = hay.find(needle); at != std::string::npos; at = hay.find(needle, at + 1))
@@ -2513,8 +2487,9 @@ TEST_CASE("policy dispatch approval: a refusal whose audit row is not written lo
 
     // A row that is written logs nothing of the kind.
     {
-        LogCapture cap;
+        yuzu::test::LogCapture cap(spdlog::level::warn);
         REQUIRE(ev.evaluate_now(pid).has_value());
+        cap.stop();
         CHECK(count_of(cap.text(), phrase) == 0);
         CHECK(audit_rows(audit, "policy.dispatch").size() == 1);
         CHECK(audit.emit_failed_count() == 0);
@@ -2523,20 +2498,21 @@ TEST_CASE("policy dispatch approval: a refusal whose audit row is not written lo
     // The audit INSERT now fails. The refusal still stands; one warning says the row is missing.
     install_audit_insert_trigger(db.dsn(), "RAISE EXCEPTION 'audit insert refused';");
     {
-        LogCapture cap;
+        yuzu::test::LogCapture cap(spdlog::level::warn);
         auto r = ev.evaluate_now(pid);
         REQUIRE(r.has_value());
+        cap.stop();
         const auto text = cap.text();
         CHECK(count_of(text, phrase) == 1);
-        CHECK(text.find("policy=" + pid) != std::string::npos);
-        CHECK(text.find("phase=check") != std::string::npos);
-        CHECK(text.find("reason=gated") != std::string::npos);
+        const auto first = text.find(phrase);
+        REQUIRE(first != std::string::npos);
+        const auto warn_line = text.substr(first, text.find('\n', first) - first);
+        CHECK(warn_line.find("policy=" + pid) != std::string::npos);
+        CHECK(warn_line.find("phase=check") != std::string::npos);
+        CHECK(warn_line.find("reason=gated") != std::string::npos);
         // The store's own error text is not copied into the evaluator's line (the store logs
         // its own error separately).
-        const auto at = text.find(phrase);
-        REQUIRE(at != std::string::npos);
-        const auto line = text.substr(at, text.find('\n', at) - at);
-        CHECK(line.find("audit insert refused") == std::string::npos);
+        CHECK(warn_line.find("audit insert refused") == std::string::npos);
     }
     CHECK(audit.emit_failed_count() == 1);
     CHECK(audit_rows(audit, "policy.dispatch").size() == 1);

@@ -542,8 +542,9 @@ void PolicyEvaluator::emit_denial_audit(const DenialAudit& a) {
     ev.result = "denied";
     ev.detail = a.detail;
     // Synchronous and fail-hard: AuditStore::log returns false on a closed store, a pool
-    // timeout or an INSERT error, and the row is then lost (the store counts it in its
-    // emit_failed_ metric and logs its own error). Observed here, never reversed: the refusal
+    // timeout or an INSERT error, and the row is then lost (the store counts every such
+    // failure in its emit_failed_ metric, and logs its own error on a pool timeout or an
+    // INSERT error, not on a closed store). Observed here, never reversed: the refusal
     // already happened and nothing was sent. One warning names the policy, phase and reason,
     // and carries no store text. The row is not retried: a repeated tick refusal changes
     // nothing, so it writes no row, and a post-fix-check refusal is not dispatched a second

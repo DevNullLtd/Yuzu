@@ -1052,6 +1052,8 @@ TEST_CASE("compliance page: the remediate copy says what policy evaluation refus
     // dispatch, so the reason reaches the operator and not only "policy dispatch refused".
     CHECK(page.find("policy_dispatch_refused: ") != std::string::npos);
     CHECK(page.find("d.error.remediation") != std::string::npos);
+    // An authoring 400 keeps the instruction id its message names.
+    CHECK(page.find("m.indexOf('instruction ') === 0") != std::string::npos);
 }
 
 TEST_CASE("/fragments/compliance/summary: probes Write, Execute and Delete once and echoes them",

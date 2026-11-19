@@ -13,6 +13,7 @@
 #include "web_utils.hpp" // audit_token
 
 #include <nlohmann/json.hpp>
+#include <cstdint>
 
 #include <string>
 #include <vector>

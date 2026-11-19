@@ -27,21 +27,17 @@
 #include "store_errors.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp"
 
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <libpq-fe.h>
 #include <nlohmann/json.hpp>
-#include <spdlog/sinks/ostream_sink.h>
-#include <spdlog/spdlog.h>
 
-#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <ctime>
-#include <memory>
-#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <utility>
@@ -2310,7 +2306,7 @@ TEST_CASE("PolicyStore: mark_blocked writes in chunks and counts distinct ids",
     CHECK(cs->total == 1201);
 }
 
-TEST_CASE("PolicyStore: mark_blocked takes its pool lease once per chunk and holds none between",
+TEST_CASE("PolicyStore: mark_blocked takes its pool lease once per chunk and holds none after",
           "[policy_store][pg][blocked]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
     std::atomic<int> acquires{0};
@@ -2346,35 +2342,6 @@ TEST_CASE("PolicyStore: mark_blocked takes its pool lease once per chunk and hol
     CHECK(acquires.load() - before_small == 1);
 }
 
-namespace {
-// Captures what the default logger writes while it is alive, at info level or above.
-class StoreLogCapture {
-public:
-    StoreLogCapture()
-        : sink_(std::make_shared<spdlog::sinks::ostream_sink_mt>(os_)),
-          saved_level_(spdlog::default_logger()->level()) {
-        spdlog::default_logger()->set_level(spdlog::level::info);
-        spdlog::default_logger()->sinks().push_back(sink_);
-    }
-    ~StoreLogCapture() {
-        auto& sinks = spdlog::default_logger()->sinks();
-        sinks.erase(std::remove(sinks.begin(), sinks.end(), sink_), sinks.end());
-        spdlog::default_logger()->set_level(saved_level_);
-    }
-    StoreLogCapture(const StoreLogCapture&) = delete;
-    StoreLogCapture& operator=(const StoreLogCapture&) = delete;
-    std::string text() {
-        spdlog::default_logger()->flush();
-        return os_.str();
-    }
-
-private:
-    std::ostringstream os_;
-    std::shared_ptr<spdlog::sinks::ostream_sink_mt> sink_;
-    spdlog::level::level_enum saved_level_;
-};
-} // namespace
-
 TEST_CASE("PolicyStore: mark_blocked logs at info when a run covers more than 5000 targets",
           "[policy_store][pg][blocked]") {
     YUZU_REQUIRE_PG_DB_TPL(db, policy_store_tpl);
@@ -2390,16 +2357,18 @@ TEST_CASE("PolicyStore: mark_blocked logs at info when a run covers more than 50
         ids.push_back("agent-" + std::to_string(i));
 
     {
-        StoreLogCapture cap;
+        yuzu::test::LogCapture cap(spdlog::level::info);
         auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
         REQUIRE(r.has_value());
+        cap.stop();
         CHECK(cap.text().find("mark_blocked") == std::string::npos); // 5000 is not over the line
     }
     ids.push_back("agent-5000");
     {
-        StoreLogCapture cap;
+        yuzu::test::LogCapture cap(spdlog::level::info);
         auto r = store.mark_blocked(pol.value(), ids, "check", "echo", "purge_source", "destructive");
         REQUIRE(r.has_value());
+        cap.stop();
         const auto text = cap.text();
         CHECK(text.find("[info]") != std::string::npos);
         CHECK(text.find("mark_blocked") != std::string::npos);

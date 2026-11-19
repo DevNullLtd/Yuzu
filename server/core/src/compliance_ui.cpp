@@ -297,7 +297,12 @@ const char* const kCompliancePageTemplate =
       /* A refused dispatch (409) names its reason in the A4 remediation text. */
       var rem = d && d.error && typeof d.error.remediation === 'string' ? d.error.remediation : '';
       var refused = /^policy_dispatch_refused: ([a-z_]+)\. (.*)$/.exec(rem);
-      if (refused) return 'Policy dispatch refused (' + refused[1] + '). ' + refused[2];
+      if (refused) {
+        /* An authoring 400 names the instruction in its message: keep it. */
+        var m = d.error.message;
+        if (typeof m === 'string' && m.indexOf('instruction ') === 0) return m + '. ' + refused[2];
+        return 'Policy dispatch refused (' + refused[1] + '). ' + refused[2];
+      }
       if (d && typeof d.error === 'string') return d.error;
       if (d && d.error && typeof d.error.message === 'string') return d.error.message;
       if (r.status === 403) return 'You do not have permission for this action.';
