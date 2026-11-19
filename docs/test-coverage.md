@@ -350,6 +350,8 @@ All plugins are loaded as dynamic libraries; their OS-dependent runtime code (su
 
 ## Adding New Tests
 
+Echo tests (`tests/unit/**/test_echo*.cpp`) follow [testing/echo-test-standard.md](testing/echo-test-standard.md).
+
 ### Agent tests
 1. Add test file to `tests/unit/`
 2. Add to `agent_test_exe` sources in `tests/meson.build`

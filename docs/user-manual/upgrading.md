@@ -28,6 +28,45 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **What to do.** Update log parsers and runbooks as above. No data migration.
 
+## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: every Windows device that runs the agent. To do: deploy each Windows agent from the 0.16.0 installer or archive. Agent self-update (OTA) does not carry the runtime or any plugin.
+
+**What changed.**
+
+- **The Visual C++ runtime ships with the agent.** `yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe` carry `vcruntime140*.dll` and `msvcp140*.dll` in the agent's `bin` directory, so a Windows device needs no Visual C++ 2015-2022 Redistributable (Microsoft's package that installs the runtime into `System32`) installed first. The agent uses this copy even where the Redistributable is installed, and Windows Update does not service it. See [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime).
+- **The installer installs five more plugins.** System: `browser_inventory`, `printing`, `privacy_permissions`. Network: `netprobe`. Windows: `rdp_control`. `browser_inventory` and `privacy_permissions` stay behind their server-side kill switch (off until an operator turns it on; where it is already on, a device installed with this installer answers them at once). `rdp_control`'s `set_state` can turn Remote Desktop on and open its firewall rule group (Mutating, Irreversible, admin or approval).
+- **`license_scan` is not installed by the installer.** Installing it starts the agent's daily software-licensing collection on the device with no operator action, and under ADR-3006 (decision D10) no release adds a unit that runs by default until the fleet-level setting for additions exists (#8309 tracks it). The release archive still carries it.
+- **Uninstall removes three files the installer does not install.** `plugins\license_scan.dll` (copied in from the archive, if it was), and `bin\yuzu-agent.old.exe` and `bin\.yuzu-update-verified`, which agent self-update leaves. What uninstall removes and what it leaves, the agent's data directory included, is under [What uninstalling removes](README.md#what-uninstalling-removes).
+
+**Each release's installer and archive carry that release's runtime and plugins.** Deploy a Windows agent from the installer or archive of a single release. Agent self-update (OTA) replaces `yuzu-agent.exe` only; it does not install or refresh the runtime or any plugin (#8219, #8218). A device whose agent was updated that way mixes builds and is not a supported configuration (see "Deployment contract (hard cutover)" in the Forensics section of this page). Agents check for updates automatically. No installer option turns that off, and every run of the installer writes the agent's service command line without `--no-auto-update`; see "Over-the-Air Agent Updates" in [Device Management](device-management.md#over-the-air-agent-updates).
+
+**If an agent stops reporting because `yuzu-agent.exe` cannot start.** The Windows service manager restarts the service every 60 seconds and each start fails the same way. Deploy the agent from the installer or archive of one release (see "Deployment contract (hard cutover)" in the Forensics section of this page).
+
+## Behaviour change: release SBOMs describe each shipped file, and every package and installer has its own
+
+**What changed.** The release used to publish one CycloneDX and one SPDX SBOM per platform, made by scanning the whole build workspace: they listed the vcpkg ports catalogue, docs and test tooling (40,853 components for v0.15.0's Linux SBOM) and not the C++ libraries the binaries link. Each release asset now has its own SBOM pair, made from that file alone:
+
+| Asset | SBOM |
+|---|---|
+| `yuzu-linux-x64.tar.gz`, `yuzu-gateway-linux-x64.tar.gz`, `yuzu-agent-windows-x64.zip`, `yuzu-agent-macos-arm64.tar.gz` | same names as before: `<archive without .tar.gz/.zip>.{cdx,spdx}.json` |
+| each `.deb` and `.rpm` | new: the package name without `.deb`/`.rpm`, e.g. `yuzu-agent_X.Y.Z_amd64.cdx.json`, `yuzu-server-X.Y.Z-1.x86_64.spdx.json` |
+| `YuzuAgentSetup-X.Y.Z.exe` | new: `YuzuAgentSetup-X.Y.Z.{cdx,spdx}.json`, listing the files the installer packs, as the Inno Setup compiler's own manifest names them, at their paths in the build directory (not where they are installed) |
+| `YuzuAgent-X.Y.Z-macos-arm64.pkg` | new: `YuzuAgent-X.Y.Z-macos-arm64.{cdx,spdx}.json` |
+| container images | unchanged names; now made with the same syft version (v1.57.2), and marked incomplete where the image holds what the scan cannot list |
+
+Each SBOM names its file and records its SHA-256, and lists the vcpkg libraries its C++ binaries are built with (version, licence, upstream purl, CPE where NVD has one), the gateway's Erlang/OTP release, and what syft recognises in the file. A pre-release uses the pre-release package names (`yuzu-agent_X.Y.Z-rcN_amd64.cdx.json`, `YuzuAgentSetup-X.Y.Z_rcN.cdx.json`).
+
+**Who is affected.** Anyone who imports the release SBOMs into a dependency scanner or an asset inventory (Dependency-Track, grype, a procurement portal), and anyone who downloads them by name.
+
+**What to do.**
+- Re-baseline scanner findings on the first release with the new SBOMs: the component set changes completely (thousands of workspace entries disappear; the shipped OpenSSL, libpq and other vcpkg libraries appear at their real versions), so findings appear and close that did not change in the product.
+- To describe a package or the installer, use its own SBOM rather than the archive's.
+- Check any script that reads the release's SBOMs. One that downloads every `*.cdx.json` or `*.spdx.json` now gets one pair per asset plus the image SBOMs, not one pair per platform; one that picks a platform's SBOM by name keeps working for the four archives only. Select an asset's SBOM by its stem (the asset's file name without `.tar.gz`, `.zip`, `.deb`, `.rpm`, `.exe` or `.pkg`; image SBOMs end in `-image`), and confirm the pair is that asset's by comparing the SHA-256 on its root (CycloneDX `metadata.component.hashes`, the SPDX described package's `checksums`) with the file's. A script that counted components, or looked for a workspace path, will see far fewer: the SBOM lists the file's contents now. A script that needs to know whether an SBOM is complete reads its `yuzu:sbom:incomplete-reasons` note (or the marker itself: the CycloneDX `compositions` entry, the SPDX `CONTAINS NOASSERTION` relationship), not the component count. Every `yuzu:sbom:` note has the same key in both formats: in CycloneDX it is the `metadata.properties` entry of that name, and in SPDX it is the line of the described package's `comment` that starts with the key, a colon and a space (`yuzu:sbom:incomplete-reasons: erts-static`), so a script that reads only CycloneDX properties finds nothing in an SPDX file. "Reading the `yuzu:sbom:` notes" in [Release verification](release-verification.md) section 5 gives a command for each format. No note means no marker; SBOMs of earlier releases carry neither notes nor marker.
+- Read "What a file's SBOM lists" and "What to expect from a dependency scanner" in [Release verification](release-verification.md) section 5 for what is not listed yet (vendored code in `yuzu-server`, the installer's InnoSetup runtime, what the gateway's Erlang emulator vendors, operating-system libraries) and how an SBOM marks itself incomplete, with the closed list of reason tokens.
+
 ## Behaviour change: verifying a release's provenance needs GitHub CLI 2.102.0 or later
 
 **What changed.** The `gh attestation verify` commands on [Release Verification](release-verification.md) now pin the attestation to `release.yml` at the release's tag (`--signer-workflow`, `--source-ref`). GitHub CLI versions before 2.102.0 do not enforce those flags as written, so the page now requires `gh` 2.102.0 or later, and its end-to-end verification script exits 1, before checking anything, when `gh` is older or reports a version it cannot read.
@@ -191,6 +230,25 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 
 **Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
 
+## Behaviour change: malformed agent data is contained per device (WP07)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: everyone who runs policies or reads result rows. To do: nothing; read "Known limits" for the limits.
+
+**What the server does.** A policy check response nested past the depth guard, whose evaluation throws, or whose compliance expression fails to evaluate scores that device `error` (the check result carries `{"reason":"unevaluable_response"}` when evaluation threw) and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception|expression"}`; the collect pass carries on with every other device, and each target is its own failure domain. A numeric JSON value in a row is compared as text (`{"hostname":1}` reads as `"1"`). The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR, CRLF and LF as one line break, and result rows lose every embedded carriage return.
+
+**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings of its snapshot-diff sources, its fleet snapshot and its module-load rows at collection (its cursor-based sources keep their own codecs, replacing or allowlisted values only; removable-media events, the macOS nstat connection stream, the start-up and history backfills and the network-quality rows are stored as collected and are not scrubbed, so they can hold raw path or process-name bytes in `echo.db`).
+
+**Known limits.**
+- Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.
+- An exception in one Echo collect leg can skip the later legs of that fast tick (per-leg isolation is not done).
+- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (tracked in #8179).
+- The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row occupies a slot at full size.
+- The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
+- **A non-UTF8 PostgreSQL database.** The server only WARNS at start (log line, gauge `yuzu_pg_server_encoding_not_utf8` = 1, alert `YuzuPgServerEncodingNotUtf8`); it does not refuse to start. On such a database Postgres does not reject invalid UTF-8 agent text; see [server-admin.md](server-admin.md#postgresql-database-encoding).
+- **Where to see the signals.** A command whose plugin output was lost to an allocation failure reports `constrained`/`partial` (provenance `host:output_dropped`); the agent also reports the heartbeat tag `yuzu.output_dropped` and keeps the agent-local counter `yuzu_agent_plugin_output_dropped_total` (neither has a server rollup). Skipped policy targets raise `YuzuPolicyCollectSkipped`.
+
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 
 **In short.** Affected: a caller whose `Execution:Read` does not cover the fleet (a management-group-scoped grant, or none), or whose `Execution:Read` check cannot be resolved for that call, when it calls `execute_instruction` with a `_meta.progressToken` on a streaming session. To do: poll `get_execution_status` for the counts it may see. A caller with an unrestricted `Execution:Read` sees the same frames as before.
@@ -295,7 +353,7 @@ The top-level directory inside each archive is renamed the same way (`yuzu-agent
 - If you run the server on Windows or macOS, follow "Moving a Windows or macOS server to Linux" in [Server Administration](server-admin.md): the old server's data cannot be carried over, so you deploy a new Linux server (the container image or the Linux packages), enroll agents with it as new installations, and delete the old server's leftover files, which hold secrets.
 - Do not unpack the new agent archive over a directory a server still runs from.
 
-**Known limitations.** The Windows and macOS SBOMs are generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of an SBOM can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.)
+**Known limitations (releases before the per-file SBOMs).** In the releases this entry first applied to, the Windows and macOS SBOMs were generated from the whole build workspace, so they can list components the archive does not ship or load; a dependency scan of one of those SBOMs can therefore report components the agent does not use. (From the release that carries ADR-0035 step 3 the Windows archive no longer contains the server's DLLs such as `libpq.dll`.) From the release that describes each shipped file (the "release SBOMs describe each shipped file" entry above), each SBOM lists only its own file's contents, and one whose file holds something it does not list is marked incomplete and names why in its `yuzu:sbom:incomplete-reasons` note (see that entry). The workspace SBOMs of the earlier releases carry no such marker, so a missing marker there says nothing about completeness.
 
 ## ⚠️ Breaking: role removal, engine-role assignment, management-group member and role routes and the OTA package delete refuse a control byte
 

@@ -150,6 +150,7 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 ## vcpkg
 
 - Manifest `vcpkg.json`; pinned baseline `9eec002df1cd109f8f104cd966a763daf9751489` (matches `vcpkgGitCommitId` in CI). `builtin-baseline` is required by the abseil `version>=` constraint — without it vcpkg resolves against HEAD.
+- **`overrides` (security pins above the baseline).** `vcpkg.json` pins `brotli` 1.2.1 and `sqlite3` 3.54.1 without moving the baseline. Which CVEs each pin fixes, the decisions behind them, how to confirm the linked versions and when to delete each entry: [Security dependency pins](#security-dependency-pins) below.
 - OpenSSL is **required on every platform including Windows** — gRPC's TLS/JWT/PEM paths compile against OpenSSL headers regardless of linkage, so `grpc.lib` needs `libssl`+`libcrypto`; it is an unconditional top-level dep (the old `!windows`/schannel filter was disproven, #375).
 - `catch2` is platform-filtered to `x64 | arm64` (not 32-bit ARM).
 - **libpq (ADR-0006/0008):** on Windows it is a **DLL** (the static override covers only the grpc stack), a server-only concern since ADR-0035 step 3 (the release zip's vcpkg-DLL sweep no longer sees it, and `release.yml`'s `build-windows` "Verify the agent runs from the packaged archive" step refuses any of the nine server DLLs, i.e. the `libpq*`, `libecpg*`, `libpgtypes*`, `drogon*`, `trantor*`, `jsoncpp*` and `*xmlsec*` families, in the agent archive); `libpq_dep` is gated on the server being built (the `build_server` variable; agent stays SQLite); manifest pins `default-features: false, features: [openssl]`; the buildtype-conditional `_vcpkg_lib_win` pick is load-bearing (pure-C libpq has no `detect_mismatch`, so a wrong-CRT lib links silently). No cmake target carries static libpq's full closure (`libpgcommon`/`libpgport` live in `libpq.pc`'s `Libs.private`) — `meson.build`'s `libpq_dep` block wires it explicitly. libpq 18 no longer installs `libpgcommon.lib`/`libpgport.lib` on Windows, so only `libpq.lib` is required there; the other two are linked when present.
@@ -157,6 +158,81 @@ Every `dependency()` is marked `include_type: 'system'` so vcpkg/gRPC/abseil/pro
 - **Windows grpc/protobuf/abseil is load-bearing — both halves.** The `triplets/x64-windows.cmake` static-linkage override AND meson's hand-wired `protobuf_dep`/`grpcpp_dep` (`cxx.find_library()`) are the only config that avoids both LNK2038 and LNK2005 — don't simplify either half without reading `.claude/agents/build-ci.md` (full #375 timeline; the configuration is permanent — the #376 QUIC escape was withdrawn, ADR-0066). Linux/macOS unaffected.
 - **Linux sanitizer triplets (`x64-linux-asan`/`x64-linux-tsan`) are STATIC (#4019), matching the stock `x64-linux` triplet.** Dynamic linkage (the setting from each triplet's introduction through #4019) split grpc/protobuf/re2 into separate `.so` images in the sanitizer test binaries, each independently embedding abseil's `MixingHashState::kSeed` (self-referential, so copies legitimately diverge) — a `protobuf::Map` populated via one image's hash and queried via another's silently missed an existing key, corrupting Guardian spark-validation lookups nondeterministically under both ASan and TSan. Don't revert to dynamic linkage without reading the triplet files' own header comments — the `-fsanitize=...` flag propagation both triplets exist for works identically under static linkage. This is CI/test-tooling only; no shipped artifact is built from these triplets.
 - **TSan on vendored libpq**: `pqSaveParameterStatus` (`fe-exec.c`) races two connections' initial `ParameterStatus` writes into two process-wide statics; suppressed via a compiled-in `__tsan_default_suppressions` hook in `tests/unit/test_runner_main.cpp`, kept honest by the `tests/test_no_connless_pq_escape.py` tripwire (#1611).
+
+### Security dependency pins
+
+`vcpkg.json`'s `overrides` hold a port at a fixed version above the `builtin-baseline`, so a
+security fix lands without moving the baseline. Moving the baseline would also take protobuf 6 → 7,
+gRPC 1.81 → 1.84 and zlib 1.3 → 1.4 across the #375 Windows stack. Every `overrides` entry has a
+row in the table below; `tests/test_vcpkg_overrides_documented.py` fails when one does not.
+
+| Port | Pinned | Fixes | Delete the override when |
+|---|---|---|---|
+| `brotli` | 1.2.1 | CVE-2026-111497 (decoder buffer overflow) | the baseline's `brotli` is 1.2.1 or later |
+| `sqlite3` | 3.54.1 | CVE-2026-119371 to CVE-2026-119379, CVE-2026-119586 and CVE-2026-119591 (fixed in 3.54.0) | the baseline's `sqlite3` is 3.54.1 or later |
+
+An override is an **exact** pin, port-version included. It also holds the port back once the
+baseline passes it, so the baseline bump that reaches the pinned version (normally the monthly
+`vcpkg-baseline-update.yml` PR) deletes the entry and its table row in the same change. See the
+checklist in [`docs/dependency-updates.md`](dependency-updates.md#vcpkg-baseline). vcpkg resolves an
+override from the registry's versions database. The first resolve after the manifest changes needs
+network access to fetch the registry; after that, the install root's `vcpkg-lock.json` refreshes on
+its own.
+
+**Brotli reach (CVE-2026-111497).** cpp-httplib decodes a `Content-Encoding: br` response in any
+client compiled with `CPPHTTPLIB_BROTLI_SUPPORT` unless that client calls `set_decompress(false)`.
+This applies whatever the request's `Accept-Encoding` header said, because the peer chooses the
+encoding.
+
+- **Server.** Every `server/core` source is compiled with `CPPHTTPLIB_BROTLI_SUPPORT`, and no server
+  client disables decompression. The decoder therefore runs on responses from:
+  - the OIDC provider: discovery, JWKS and token endpoint (`oidc_provider.cpp`);
+  - the NVD feed (`nvd_client.cpp`);
+  - webhook targets (`webhook_store.cpp`) and offload targets (`offload_target_store.cpp`);
+  - the directory-sync provider (`directory_sync.cpp`);
+  - analytics sinks (`analytics_sinks.cpp`);
+  - health-check targets (`healthcheck_probe.cpp`).
+
+  Inbound requests do not reach the decoder. The pre-routing body-cap gate refuses any
+  non-identity `Content-Encoding` with 415 before the body is read (`evaluate_body_cap` in
+  `body_cap_policy.hpp`).
+- **Agent.** The agent core is not compiled with Brotli support. Three plugins decode `br`:
+  - `http_client` and `content_dist`, which fetch operator-supplied URLs;
+  - `printing`, which talks to the local CUPS daemon.
+
+  The `virtualization` plugin links Brotli but calls `set_decompress(false)`, so it never decodes.
+
+**SQLite.** The agent's SQLite is in `libyuzu_agent_core` (`.so`, `.dll` or `.dylib`). The server
+also links it.
+
+**Decisions** (Fraser, project owner, 2026-11-18):
+
+| Decision | Reason | Revisit when |
+|---|---|---|
+| The one-month minimum release age is waived for `brotli` 1.2.1 and `sqlite3` 3.54.1. The project normally takes only releases at least a month old (Dependabot `cooldown`, the rebar3 checklist). | Both are security fixes. | The baseline passes the pin: delete the override (tracked in #8221). |
+| `libpq` stays at 18.4. | vcpkg has no libpq 18.6 port, so there is nothing to override to. The owner's assessment is that the PostgreSQL CVEs fixed in 18.6 are server-side issues, not defects in the libpq client library Yuzu links. The `yuzu-postgres` image moves to PostgreSQL 18.6 in a separate change. | vcpkg ships libpq 18.6: bump it (tracked in #8222). |
+
+**Version evidence.** To confirm what a tree links:
+
+- the SQLite header: `grep -E 'SQLITE_(VERSION|SOURCE_ID)' vcpkg_installed/<triplet>/include/sqlite3.h`;
+- the Brotli package: `grep Version vcpkg_installed/<triplet>/lib/pkgconfig/libbrotlidec.pc`;
+- the SQLite source id in a built binary: `strings <build-dir>/agents/core/libyuzu_agent_core.so | grep '^2026-10-16 14:45:20'`.
+
+Observed on `x64-linux` on 2026-11-18:
+
+- SQLite 3.54.1, source id `2026-10-16 14:45:20 555e07ef…`, in `libyuzu_agent_core.so` and
+  `yuzu-server`;
+- Brotli 1.2.1.
+
+The `[deps][security]` unit cases check the same floors at compile time and at run time:
+
+- `yuzu_server_tests`: `test_sqlite_raii.cpp` and `test_http_response_policy.cpp`;
+- `yuzu_agent_tests`: `test_kv_store.cpp`.
+
+A tree that links an older SQLite or Brotli fails them. Container scanners such as grype and syft
+find no packages under `vcpkg_installed`, because static vcpkg libraries carry no package
+metadata. Scanner evidence therefore comes from the per-artifact SBOMs added on branch
+`fix/wp15-sbom`. The CVE list and the reach analysis come from the 2026-11-17 supply-chain review.
 
 ## Instruction Engine build-time dependency
 

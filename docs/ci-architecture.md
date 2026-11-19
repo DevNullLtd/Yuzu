@@ -455,6 +455,43 @@ at a release that does not exist until the release is fixed. It fails the
 release when:
 
 - an expected archive, installer glob or SBOM is missing or empty (#362/#408);
+- a `.deb`/`.rpm`/`.exe`/`.pkg` has no SBOM pair of its own
+  (`<name without the extension>.{cdx,spdx}.json`), or an SBOM belongs to no
+  archive, package or image of the release (supply-chain S8);
+- an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
+  in the release or whose SHA-256 differs, has more entries than the bound in
+  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 58 for the
+  Linux files and 212 for v0.15.0's Windows archive, the largest), has no entries and no record
+  that its file was unpacked and held files, or lists a path under `vcpkg/`,
+  `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
+  `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
+  ("Check artifact SBOM scope", S8; a scan of some other wrong directory is
+  caught only by the bound);
+- an image SBOM pair (`<image>-image.{cdx,spdx}.json`) lacks a half, lacks
+  the incomplete marker its image calls for or carries only part of it, or is
+  named as a release image (`yuzu-server-image`, ...) without that image's
+  title label, on which the marker it needs is decided: each image-publish job runs
+  `artifact-sbom.py mark-image` on its pair after signing, which marks an image
+  holding `yuzu-server`, `yuzu-agent`, the Erlang emulator or the source-built
+  pgvector (what syft cannot list there), and the same step refuses a pair
+  that describes two different images. These SBOM steps run after the images
+  are pushed: a failure about the SBOM itself needs a fix and a new tag, while
+  a transfer fault (a SHA-256 mismatch, a missing file) needs only a re-run
+  (the release skill's failure table). The build jobs make these SBOMs with
+  that script: each artifact is unpacked and scanned on its own with syft
+  pinned to v1.57.2 (the image SBOM steps pin the same version), and the vcpkg
+  ports its binaries are built from are added from the installed tree for the
+  release triplet; the Windows installer's SBOM lists the files the Inno
+  Setup compiler's own manifest says it packed, each checked against the
+  build directory by SHA-256 (the installer manifest contract below). Each
+  `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  (Docs Lint, every PR) pins that contract against a fixture in the
+  compiler's format; the `CBOM schema` job runs the same suite with
+  `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
+  vendored CycloneDX 1.7 and SPDX 2.3 schemas. **Owner item:** `CBOM schema`
+  is not a required check, so a schema-validation failure does not block a
+  merge; making it required is a decision on the branch ruleset, not taken
+  here;
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that
@@ -480,9 +517,159 @@ again, so fix the builder, then delete and re-push the tag at the fixed commit.
 Either way the images are rebuilt and re-pushed under the same tags.
 
 If the release cannot be fixed promptly on a stable tag, move `:latest` back
-to the previous release's images. The gate has no override; the naming forms
-it checks are a second copy of the builders' naming, and its header lists
-where each lives.
+to the previous release's images (the release skill's Recovery gives the
+commands, and the `X.Y.0` case where no earlier `:X.Y` exists). The gate has
+no override; the naming forms it checks are a second copy of the builders'
+naming, and its header lists where each lives.
+
+#### The installer manifest contract (`OutputManifestFile`)
+
+**Decision record (2026-11-18).** After five governance passes found the `.iss` parser kept accepting forms it then mapped differently from the Inno Setup compiler, the enterprise-architect review recommended replacing it with the compiler's own manifest, verified by SHA-256 against the build directory; the project owner (fjarvis) accepted that ruling on 2026-11-18. The manifest format below was checked against issrc tag is-6_7_3. Review this decision if Inno Setup changes the manifest format, or if the installer starts taking files at install time (`external`, `download`).
+
+The Windows installer's SBOM is made from the file list the Inno Setup
+compiler (ISCC) writes when it builds the installer. The installer script is
+never parsed. `deploy/packaging/windows/yuzu-agent.iss` sets
+`OutputManifestFile=YuzuAgentSetup.manifest.txt`. In `release.yml`, the
+"Build Windows installers (InnoSetup)" step deletes any old manifest, runs
+ISCC, fails if that run wrote none, and copies it beside the installer as
+`YuzuAgentSetup-<version>.manifest.txt`. "Generate per-artifact SBOMs" then
+runs `artifact-sbom.py generate --inno-manifest <that copy> --build-dir
+build-windows --inno-build-dir <the /DBuildDir that ISCC run was given>`. The
+script reads each listed file from `build-windows`, checks its SHA-256, copies
+the checked bytes into a scratch tree at the file's path below the build
+directory, and runs syft and the vcpkg closure over that tree, as for any
+other artifact. The manifest is not a release asset (it records the runner's
+paths); the Windows job keeps it for 90 days, the repository maximum, as the
+`windows-installer-manifest` workflow artifact, so it is available as evidence of how the
+installer SBOM was produced (owner decision, 2026-11-18).
+
+**The format,** read from Inno Setup's source at tag `is-6_7_3`, the version
+v0.15.0 was built with:
+
+- UTF-8 with a byte order mark, and every line, the last included, ends in
+  CR LF: `TTextFileWriter` (`Projects/Src/Shared.FileClass.pas`, 508-573)
+  encodes with `Utf8Encode`, writes the mark at the start of a new file, and
+  `WriteLine` appends CR LF.
+- A tab-separated header, exactly `Index`, `SourceFilename`, `TimeStamp`,
+  `Version`, `SHA256Sum`, `OriginalSize`, `FirstSlice`, `LastSlice`,
+  `StartOffset`, `ChunkSuboffset`, `ChunkCompressedSize`, `Encrypted`,
+  `ISSigKeyID`, then one row per file location, `Index` counting from 0
+  (`Projects/Src/Compiler.SetupCompiler.pas`, `CreateManifestFile`,
+  7942-8005).
+- `SourceFilename` is the source path as ISCC built it at compile time: the
+  `[Files]` `Source` with `{#BuildDir}` expanded, joined to the file name it
+  found, not normalised. ISCC merges two entries naming the same path
+  (compared case-insensitively) into one location, so it lists a file once.
+- `SHA256Sum` is 64 lowercase hex digits (`SHA256DigestToString`,
+  `Components/SHA256.pas`) over the file's own bytes, taken before any
+  compression transform (`Compiler.CompressionHandler.pas`, 243-260).
+
+**Path mapping.** A `SourceFilename` and `--inno-build-dir` are both read as
+drive-absolute Windows paths (Python's `ntpath`) and normalised with
+`normpath`, so a `..` that stays inside the build directory is resolved and
+`/` reads as `\`. The drive and every component are compared
+case-insensitively, as Windows compares them. The components after the build
+directory's are the file's build-relative path, looked up under
+`--build-dir`; the file's real location, with symlinks and junctions
+resolved, must be inside `--build-dir`.
+
+**Refused.** `generate` fails, naming the manifest line and the problem, on:
+
+- an encoding other than ISCC's: no UTF-8 byte order mark, or bytes after it
+  that are not UTF-8;
+- a line not ended by CR LF, or a bare CR or LF;
+- a header that is not exactly the one above;
+- no rows;
+- a row with a column count other than 13, an `Index` out of sequence, or a
+  `SHA256Sum` that is not 64 lowercase hex digits;
+- a `SourceFilename` not strictly inside the build directory after
+  normalisation: a `..` out of it, another drive, a UNC or `\\?\` path, a
+  relative path, or the build directory itself; or a component Windows reads
+  differently (a reserved character such as an NTFS stream colon, a trailing
+  dot or space);
+- the same path listed twice with two hashes;
+- a file missing from `--build-dir`, not a regular file, or resolving outside
+  it (a symlink or junction);
+- a SHA-256 that differs from the one ISCC recorded.
+
+**Residuals** (stated, not fixed):
+
+- The installer's InnoSetup runtime (setup loader and uninstaller) and what
+  the compiler embeds beside the packed files (the licence text, the icon and
+  the compiled `[Code]` script) are not listed. The SBOM is marked incomplete
+  for them (`installer-runtime`).
+- A `[Files]` entry that takes its file at install time (`external`, or Inno
+  Setup 6.5's `download`) has no file location, so ISCC does not list it. The
+  script has none today.
+- Install paths and components are not recorded: the paths are
+  build-relative.
+- The manifest is trusted as ISCC's statement of what it packed. The hash
+  proves that each listed file is the file in the build directory, not that
+  the list is complete.
+- The compiler version is not pinned: `release.yml` uses whichever Inno Setup
+  6 the runner has, and installs the current one with winget only when it
+  finds none. A version that writes another header fails the release's
+  Windows SBOM step until the contract and its fixture are updated, after
+  reading the new format in that version's source.
+- **No real manifest has been checked yet.** The contract and its fixture
+  come from issrc's source; the first real verification is the Windows job
+  of the first tag that carries this, which should be a pre-release
+  (`-rcN`, the release skill's first-run advice).
+
+**Future findings.** A defect in this contract is an accepted row whose listed
+file differs from the bytes the installer packs, or a residual not stated
+above. A manifest shape the contract refuses is an expected refusal, not a
+finding, and so is any `.iss` edit, including one that makes ISCC write a
+manifest the contract refuses (the script is not parsed). Extend the contract
+deliberately: a change of format is a change to `artifact-sbom.py`, its
+fixture in `tests/test_artifact_sbom.py` and this section together.
+
+### Windows agent runtime gates (`build-windows` job, release only)
+
+Three checks in `release.yml`'s `build-windows` job keep the Windows agent
+payloads (`yuzu-agent-windows-x64.zip` and `YuzuAgentSetup-<version>.exe`)
+self-contained. They run only on a release tag; none has run on a real tag
+yet, and the PR-time coverage is the `docs`-suite tests named below
+(`docs-lint.yml` runs the pwsh ones with `YUZU_REQUIRE_PWSH_TEST=1`).
+
+- **App-local Visual C++ runtime.** "Package archive" runs
+  `deploy/packaging/windows/stage-msvc-runtime.ps1`, which copies
+  `vcruntime140*.dll` and `msvcp140*.dll` from the runner's Visual Studio
+  redistributable directory (`VCToolsRedistDir`) into the zip's `bin` and into
+  `build-windows\msvc-runtime`, which `yuzu-agent.iss` installs into
+  `{app}\bin`. It refuses a missing required DLL, a redistributable older than
+  the toolset and, on Windows, a DLL not validly signed by Microsoft. It
+  writes the staged DLLs and file versions to the step summary, which covers
+  that workflow run and is kept only as long as the run is; the authoritative
+  version is the file version of the Microsoft-signed DLLs in the shipped
+  payload (the zip's `bin`, or `{app}\bin` after an install). A failed
+  summary write is a warning, not a failure.
+- **MSVC toolset pin.** The same script refuses the release when
+  `VCToolsVersion`'s major.minor differs from
+  `deploy/packaging/windows/msvc-toolset.pin` (14.44). Agent self-update
+  replaces only `yuzu-agent.exe`, never the app-local runtime (#8219,
+  decision #8218), and an executable built by a newer toolset can need
+  runtime exports an older copy lacks and then does not start. Moving the
+  pin is a reviewed change whose release notes must state that agent
+  self-update does not carry the new runtime. Wee Tam's MSVC is otherwise observed,
+  not pinned, by `deploy/windows/toolchain-contract.json`.
+- **Import closure.** "Check the DLL import closure of both payloads", after
+  "Verify the agent runs from the packaged archive" and before the installer
+  is compiled, runs `scripts/ci/check-windows-payload-imports.py` over the
+  zip and over the files `yuzu-agent.iss` packs from `build-windows`: every
+  DLL a shipped `.exe` or `.dll` imports (normal and delay-load) must be in
+  that payload's `bin`, be an API set, or be an OS DLL in `System32`, except
+  the Visual C++ runtime, which counts as missing unless shipped, because the
+  runner has it installed.
+
+Pinned by `tests/test_windows_payload_imports.py` (the checker over
+synthetic PE32 and PE32+ images, the wiring and step order, and the staging
+script under pwsh) and `tests/test_agent_installer_plugin_coverage_lint.py`
+(every built plugin has an installer line or a recorded
+`; plugin-not-installed:` reason; `[UninstallDelete]` deletes every excluded
+plugin's DLL and the two files agent self-update leaves in `bin`,
+`[InstallDelete]` deletes those two, and neither section uses a wildcard).
+Reference: `docs/windows-build.md`.
 
 ### Linux ELF floor gate (`scripts/ci/check-elf-floor.sh`, ADR-2003 S0)
 
@@ -636,8 +823,9 @@ It runs as its **own workflow**, not folded into `ci.yml`: a source
 grep needs no build, so it doesn't share `ci.yml`'s build-dependent
 PR fast-path or `changes`-job path filtering — there is nothing
 expensive to skip, so the workflow simply always runs on every PR and
-push to `main`/`dev`. A failing lexical scan is a **merge-blocking**
-required check; remediation is either moving the call into the
+push to `main`/`dev`. A failing lexical scan fails the PR's checks,
+but it is **not a required status check** in the `dev` or `main`
+rulesets today, so it does not by itself block a merge; remediation is either moving the call into the
 registered allowlist (if it is a legitimate, reviewed acquisition
 path) or removing the raw spawn in favour of the sanctioned subprocess
 runner.
@@ -660,8 +848,17 @@ requests only, not a required check today) runs
 `scripts/ci/check-plugin-readme-touch.sh`: a change under
 `agents/plugins/<name>/src/**` must also touch that README, or the PR body
 must carry a visible `docs-unchanged: <section> — <reason>` line, which
-the job prints. Both scripts carry a fixture self-test that the `docs`
-suite also runs (the touch-rule one off Windows only, #5428).
+the job prints. It diffs the `refs/pull/<N>/merge` commit against that
+commit's first parent, so the change it judges is exactly the PR's own,
+however far the target branch has moved since `base.sha` was recorded;
+the spawn scan's grandfathering base is taken the same way. The two
+bases come from `scripts/ci/pr-merge-parent.sh`, which fails the job
+closed when the checked-out merge commit does not merge the PR's head
+(push again for a fresh run: a re-run reuses the same event); its
+`--selftest`, run by the touch-rule job and the `docs` suite, also pins
+both workflows to it. All three scripts carry a fixture self-test that
+the `docs` suite also runs (the touch-rule and merge-parent ones off
+Windows only, #5428).
 
 A third `docs-lint.yml` gate, the personal-data guard
 (`scripts/ci/check-personal-data.py`, run `--strict-baseline --ratchet`), keeps
@@ -730,9 +927,9 @@ fixed by reviewing the edit, not by re-running the job.
 
 PR-scoped libFuzzer fuzzing of the untrusted-input parsers (target
 inventory: `.clusterfuzzlite/README.md`). Not a required status check, and
-deliberately path-gated to the fuzzed compile closure — seven parser families
-(six under `server/core/src/`, the component_inventory ZIP reader under
-`agents/plugins/component_inventory/src/`) plus `tests/fuzz/` and `.clusterfuzzlite/` — so
+deliberately path-gated to the fuzzed compile closure — the parser families under
+`server/core/src/` and `agents/shared/`, and the component_inventory ZIP reader under
+`agents/plugins/component_inventory/src/`, plus `tests/fuzz/` and `.clusterfuzzlite/` — so
 "why did the fuzz check not run on my PR" is almost always "the PR touches
 nothing a harness compiles". The two workflows share one paths list;
 KEEP-IN-SYNC banners in both plus `.clusterfuzzlite/build.sh` bind them.
@@ -1251,6 +1448,18 @@ Actions cache service.
   `release` job and is verified there against the exact tag-bound
   `release.yml` identity before the release is created.
 - Per-platform and per-image CycloneDX and SPDX SBOMs are generated with syft.
+  The Windows agent payloads also carry Microsoft's Visual C++ runtime DLLs
+  app-local. Each Windows SBOM describes its own
+  artifact: the archive's SBOM is made from the unpacked archive, which holds
+  them in `bin`, and the installer's SBOM lists the files its ISCC manifest
+  names, at their build-directory paths (`msvc-runtime\...`). Syft's
+  cataloguer lists each DLL in the archive's SBOM as an application component named and versioned from
+  its version resource, with a CPE and no package URL (purl), possibly more
+  than once, so a purl-matching scanner does not see them (not yet inspected in
+  a release SBOM). Their authoritative version is the file version of the
+  Microsoft-signed DLLs in the shipped payload; the `build-windows` job's step
+  summary lists them for that run only
+  ([Windows agent runtime gates](#windows-agent-runtime-gates-build-windows-job-release-only)).
 - Authenticode and Apple signing and notarization run only when their
   secrets are set, and skip silently otherwise. On 2026-11-17 none of
   `WINDOWS_SIGNING_CERT`, `MACOS_SIGNING_CERT` or the notarization secrets

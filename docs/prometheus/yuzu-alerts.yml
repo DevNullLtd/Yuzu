@@ -392,9 +392,10 @@ groups:
             no server identity: read yuzu_server_identity_uri_present on the
             server; 0 means the in-place re-issue was skipped or failed (see
             YuzuServerIdentityUriAbsent: fix the cause and restart the server,
-            which needs no gateway restart); absent means the server runs a
-            release that does not mint the identity or is not being scraped
-            (upgrade the server first). (2) The server uses its own
+            which needs no gateway restart); absent means the server is not
+            being scraped (restore its scrape target and re-read it) or runs
+            a build that does not mint the identity (every server and gateway
+            runs the same build; run the server from the gateway's build). (2) The server uses its own
             certificates (bring-your-own, --no-default-certs, or its own
             --cert/--key), which carry no identity: set {yuzu_gw,
             mgmt_peer_auth_mode} to pin with that certificate's pin. That
@@ -3109,6 +3110,50 @@ groups:
             silently do nothing. Cross-check that policy_status rows actually
             reach 'fixing' after an operator remediate, and review any recent
             change to claim_remediation or the collect_ready gen threading.
+
+      # WP07: the compliance collect pass skipped a target (collect_target) or a whole ready
+      # item (collect_item) because evaluating it threw -- the response-store read, the verdict
+      # write or an allocation failure. A skipped target keeps its PREVIOUS status (no verdict is
+      # recorded this cycle), so a skip that stays above zero for 15 minutes means compliance data is going stale for
+      # someone. The per-device "unevaluable response" case is NOT this alert: it scores that
+      # device `error` and is counted by yuzu_server_policy_unevaluable_responses_total{reason}.
+      - alert: YuzuPolicyCollectSkipped
+        expr: |
+          sum(increase(yuzu_server_policy_eval_errors_total{phase=~"collect_item|collect_target"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy collect pass is skipping targets ({{ $value }} in 1h)"
+          description: >-
+            yuzu_server_policy_eval_errors_total{phase="collect_target"|"collect_item"}
+            incremented: evaluating a policy check response (or the response-store read behind it)
+            threw, so that target's or item's verdict was not recorded this cycle and its previous
+            status stands. Look in the server log for "policy_evaluator: ... skipped" lines (they
+            carry the policy id and, for a std::exception, its sanitised text; a non-std
+            exception line carries the policy id only), check Postgres health and memory
+            pressure, and remember the status shown for the affected devices may be stale.
+
+      # WP07: the server's boot-time check found the PostgreSQL database encoding is not UTF8.
+      # The gauge is per replica but the fact is per database (every replica shares one), so the
+      # alert groups by job only: one alert for the deployment, not one per replica. The check is
+      # WARN-ONLY (refusing to start is an undecided owner call), so this alert is
+      # the only thing that keeps the condition visible after the one-off log line scrolls away.
+      - alert: YuzuPgServerEncodingNotUtf8
+        expr: |
+          max by (job) (yuzu_pg_server_encoding_not_utf8) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The PostgreSQL database encoding is not UTF8 (reported by at least one {{ $labels.job }} server)"
+          description: >-
+            yuzu_pg_server_encoding_not_utf8 is 1: at start the server found the database
+            encoding is not UTF8. Postgres then does not reject invalid UTF-8 from agents, and
+            surfaces that re-serialise stored text with a strict JSON writer can throw. Create a
+            new database with ENCODING 'UTF8' and move the data (an existing database's encoding
+            cannot be changed); see server-admin.md "PostgreSQL database encoding". The gauge is
+            set once at start, so restart the server after the move.
 
       - alert: YuzuQuarantineGateServingStaleState
         expr: |
@@ -6539,8 +6584,8 @@ groups:
         # certificate_inventory: result="rejected" is a whole report refused (over 3 MiB, unknown
         # major version, bad header, over 64 stores / 10,000 certificates, >64 sources). It is
         # acknowledged WITHOUT a resend and writes nothing, so the device's stored inventory
-        # freezes and nothing else shows it. Sustained = a device (or a fleet after an agent
-        # upgrade ahead of the server) is stuck.
+        # freezes and nothing else shows it. Sustained = a device (or a fleet of agents on a
+        # different build from the server, outside the deployment contract) is stuck.
         # increase over a day with NO hold: a single device refused once a day is enough, and a
         # rate()-with-for would never fire for it. budget_exceeded freezes a device the same way.
         expr: |
@@ -6554,8 +6599,10 @@ groups:
           description: >-
             yuzu_server_cert_inventory_ingest_total{result="rejected"} (or
             error/budget_exceeded) increased in the last day. The affected devices'
-            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent newer than the
-            server (upgrade the server first); bad_header / over_cap / blob_too_large = a
+            certificate inventory is frozen (acknowledged, not stored, not resent). By reason label: unknown_version = an agent on a
+            different build from the server, outside the deployment contract
+            (every agent and server runs the same build; reprovision the agent
+            from the server's build); bad_header / over_cap / blob_too_large = a
             malformed or oversize report - find the agent in the warn log line
             "certificate_inventory: blob from agent=... refused".
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
