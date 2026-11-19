@@ -614,7 +614,7 @@ which `Register` and the gateway `ProxyRegister` call before re-admitting an alr
 with the index, 113.7 ms without). Like v5 the build uses a plain, transactional `CREATE INDEX` that
 blocks `ca_issued` writers while it runs, the same accepted exception, with the same `lock_timeout` and
 `statement_timeout = 0`; the non-transactional kind this ADR names for later indexes is not available
-until #4432 delivers it (still open at this date).
+until #4432 delivers it (still open at this date). In a fresh deployment the table is empty when v6 runs, so nothing blocks; an existing database is outside the Deployment contract (hard cutover).
 
 Two behaviours of the store are part of the contract: a leaf the server revokes as `reenrolled` (the
 older leaf of an agent that re-enrolled with a single-use token) is lifecycle bookkeeping, written only

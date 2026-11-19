@@ -4033,6 +4033,27 @@ groups:
             nothing happened: the authoritative count is yuzu_register_reregistration_total.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditwritefailed"
 
+      # First-weeks-after-flip alert (owner ruling 2026-11-19): the soak cannot exercise the token
+      # path (audit mode neither checks nor consumes a token for an approved live-leaf id), so for the
+      # first weeks after --agent-reregistration-proof=enforce is switched on, ANY refused token
+      # re-enrolment is worth a look. It is a standing rule: an operator who finds it noisy once the
+      # fleet has settled may silence or remove it (see the alert runbook).
+      - alert: YuzuAgentReenrolTokenRefusedFirstWeeks
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reenrol_token_refused_total[1h])) > 0
+        labels:
+          severity: info
+        annotations:
+          summary: "A token re-enrolment was refused (first weeks after enforce)"
+          description: >-
+            An enrollment token was refused for an agent id that holds a live leaf (reason
+            multi_use_token, not_found, expired, revoked, already_consumed or invalid_input_length).
+            The audit-mode soak cannot exercise the token path, so for the first weeks after
+            --agent-reregistration-proof=enforce was switched on every refusal is a lost-key agent
+            that still has no way back in, or a wrong token. Mint a fresh single-use token
+            (max_uses 1); if the agent still holds a certificate file, remove its cert_dir first.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokenrefusedfirstweeks"
+
       - alert: YuzuAgentReenrolTokenNoLeaf
         expr: |
           sum by (job, instance) (increase(yuzu_register_reenrol_token_no_leaf_total[15m])) > 0

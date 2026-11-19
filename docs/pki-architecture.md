@@ -145,7 +145,7 @@ holds key material, only metadata; see "Key custody + threat model" below. Table
   `(subject, not_after) WHERE purpose = 'agent'`, behind `CaStore::agent_leaf_state`, the
   per-agent identity read every re-registration of an already-enrolled id makes (measured on
   200,000 rows: 0.057 ms with the index, 113.7 ms without). Additive; its plain `CREATE INDEX`
-  blocks `ca_issued` writers while it builds, the same accepted exception as v5.
+  blocks `ca_issued` writers while it builds, the same accepted exception as v5. In a fresh deployment the table is empty when v6 runs, so nothing blocks; an existing database is outside the Deployment contract (hard cutover).
 - Three read-only indexes on `ca_issued` (Postgres migration v5, ADR-0070 D13), additive only:
   `(sort key, serial_hex)` range indexes on `not_after` (active rows), `revoked_at` (revoked rows)
   and `issued_at`, each including the columns its counts read. They back the Yuzu-issued

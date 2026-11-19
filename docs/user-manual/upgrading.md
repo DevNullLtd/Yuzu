@@ -33,21 +33,28 @@ The marker is derived from the listener's real capability, so a plaintext listen
 
 **A new fleet.** If no agent is enrolled yet, set `--agent-reregistration-proof=enforce` (`YUZU_AGENT_REREGISTRATION_PROOF=enforce`) on every replica BEFORE the first enrolment: there is nothing to soak, because no live leaf exists to be re-registered without proof. The soak below is for a fleet whose agents are ALREADY enrolled. A fleet behind a plaintext, wizard, demo or UAT gateway cannot be enforced (see above) and stays in `audit`.
 
-**How to know it is safe to switch (soak).** Run `audit` for at least a week (one agent restart cycle), with `witness_client_cert` set on every gateway's agent listener and each gateway restarted (the config is read at boot). Switch to `enforce` only when this query returns **no row** for the whole window (it is filtered to values above 0), AND the liveness query below returns a non-zero value for each path you use and the replica count query matches your replica count. An empty result alone proves nothing: it is the same output as a Prometheus that scrapes nothing.
+**How to know it is safe to switch (soak).** Run `audit` for at least a week (one agent restart cycle), with `witness_client_cert` set on every gateway's agent listener and each gateway restarted (the config is read at boot). Switch to `enforce` only when ALL FOUR of these hold for the whole window:
 
-```promql
-sum by (path, outcome) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[7d])) > 0
-```
+1. **No would-refuse admissions.** This query returns **no row** (it is filtered to values above 0):
 
-Liveness and coverage (all three must hold, or the soak is not valid):
+   ```promql
+   sum by (path, outcome) (increase(yuzu_register_reregistration_total{mode="audit",outcome=~"no_proof|unattested_gateway|revoked_identity|lookup_failed"}[7d])) > 0
+   ```
 
-```promql
-sum by (path) (increase(yuzu_register_reregistration_total{mode="audit"}[7d])) > 0
-count(yuzu_server_agent_reregistration_proof_mode{mode="audit"} == 1)
-sum(up{job="yuzu-server"} == 1)
-```
+2. **The soak is live and covers every replica.** An empty result in 1 is the same output as a Prometheus that scrapes nothing, so all of these must hold (use your own server job name in place of `yuzu-server`): the first query is non-zero for each path you use, and the second equals the third (every replica is scraped and in `audit`):
 
-(use your own server job name in place of `yuzu-server`; the first is non-zero for each path you use, the second equals the third: every replica is scraped and in `audit`), and `outcome="proven_by_leaf"` is non-zero on each path you use. **A clean soak says nothing about the token path (fourth condition):** in `audit` mode an APPROVED live-leaf id presenting a token is neither checked nor consumed, so a clean soak does not show that a lost-key agent can be recovered under `enforce`; test that on a separate fresh stack as described below and keep a fresh single-use token for every agent that may have lost its key. **`outcome="via_token"` is its own line:** in `audit` mode a token presented for an APPROVED live-leaf id takes the fast path and is neither checked nor consumed, so the single-use, supersede and issuance steps of the token path are not exercised during the soak. (For an id whose enrollment row is absent or still pending, the ordinary token block still runs and consumes the token as a first enrolment does, whatever the mode.) Review every `via_token` (and the `agent.reregistration_unproven` rows) for re-enrolments that were intended. The token path itself cannot be exercised during an `audit` soak. Exercise it on a SEPARATE, FRESH stack: its own server process, its own empty PostgreSQL database and its own test agent, started with `--agent-reregistration-proof=enforce`; enrol the test agent, remove its `cert_dir`, and re-enrol it with a single-use token. Do NOT attach an `enforce` replica to the database of the fleet being soaked: it would differ in mode from the other replicas (raising `YuzuAgentReregistrationModeMixed` after 10 minutes), join leader election and run the leader's background passes against production data. Also require `sum(increase(yuzu_register_reregistration_audit_dropped_total[7d]))` to be 0 (rows dropped under load are counted: a non-zero value means some admissions have no row, only the counter), and treat NO DATA for the whole window as a FAILED soak, not a clean one. Full query list and alerts: `docs/user-manual/metrics.md`. In `audit` mode every admitted unproven re-registration also leaves an `agent.reregistration_unproven` audit row with the source address (bounded per id: see `audit-log.md`).
+   ```promql
+   sum by (path) (increase(yuzu_register_reregistration_total{mode="audit"}[7d])) > 0
+   count(yuzu_server_agent_reregistration_proof_mode{mode="audit"} == 1)
+   sum(up{job="yuzu-server"} == 1)
+   ```
+
+3. **The witnessed leaf path works.** `outcome="proven_by_leaf"` is non-zero on each path you use. Review every `via_token` and every `agent.reregistration_unproven` row for re-enrolments that were intended.
+4. **No audit rows were dropped.** `sum(increase(yuzu_register_reregistration_audit_dropped_total[7d]))` is 0 (rows dropped under load are counted: a non-zero value means some admissions have no row, only the counter). NO DATA for the whole window is a FAILED soak, not a clean one.
+
+Full query list and alerts: `docs/user-manual/metrics.md`. In `audit` mode every admitted unproven re-registration also leaves an `agent.reregistration_unproven` audit row with the source address (bounded per id: see `audit-log.md`).
+
+**Not covered by the soak: the token path.** In `audit` mode an APPROVED live-leaf id presenting a token takes the fast path and is neither checked nor consumed (for an id whose enrollment row is absent or still pending, the ordinary token block still runs and consumes the token as a first enrolment does, whatever the mode). So a clean soak says nothing about whether a lost-key agent can be recovered under `enforce`: the single-use, supersede and issuance steps are not exercised. Exercise them on a SEPARATE, FRESH stack: its own server process, its own empty PostgreSQL database and its own test agent, started with `--agent-reregistration-proof=enforce`; enrol the test agent, remove its `cert_dir`, and re-enrol it with a single-use token. Do NOT attach an `enforce` replica to the database of the fleet being soaked: it would differ in mode from the other replicas (raising `YuzuAgentReregistrationModeMixed` after 10 minutes), join leader election and run the leader's background passes against production data. Keep a fresh single-use token ready for every agent that may have lost its key. After you switch to `enforce`, `YuzuAgentReenrolTokenRefusedFirstWeeks` fires on any refused token re-enrolment for the first weeks, so a wrong or spent token is noticed at once (see the alert runbook).
 
 **Recovery and token rules.**
 

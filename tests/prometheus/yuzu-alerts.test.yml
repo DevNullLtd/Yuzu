@@ -11075,3 +11075,23 @@ tests:
               description: "A summary chunk was discarded (reason queue_full, write_failed, shutdown or alloc_failed). The ids it would have named are now UNNAMED and counted by id in yuzu_register_reregistration_audit_ids_truncated_total (yuzu_register_reregistration_audit_dropped_total counts rows, not ids). The unbudgeted yuzu_register_reregistration_total still counts every decision."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditsummarydropped"
 
+  # WP01 pass 7: the first-weeks-after-flip alert fires on any refused token re-enrolment, within 1h.
+  - interval: 1m
+    name: token refused first weeks - one refusal fires (info), quiet after 1h, other reasons and counters count
+    input_series:
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="not_found"}', values: "0x10 1 1x200"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="multi_use_token"}', values: "0x210"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="c",reason="no_csr"}', values: "0x10 1 1x200"}
+    alert_rule_test:
+      - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
+        eval_time: 30m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: info}
+            exp_annotations:
+              summary: "A token re-enrolment was refused (first weeks after enforce)"
+              description: "An enrollment token was refused for an agent id that holds a live leaf (reason multi_use_token, not_found, expired, revoked, already_consumed or invalid_input_length). The audit-mode soak cannot exercise the token path, so for the first weeks after --agent-reregistration-proof=enforce was switched on every refusal is a lost-key agent that still has no way back in, or a wrong token. Mint a fresh single-use token (max_uses 1); if the agent still holds a certificate file, remove its cert_dir first."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokenrefusedfirstweeks"
+      - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
+        eval_time: 150m
+        exp_alerts: []
+
