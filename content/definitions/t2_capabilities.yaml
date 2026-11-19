@@ -57,8 +57,10 @@ metadata:
     a lookahead ((?= or (?!: any (? group other than the non-capturing (?:)
     with error|regex lookahead is not supported (use (?: to group), because no
     engine bounds one and a match over one name cannot be interrupted. With no
-    lookahead, on Linux a match takes time linear in the name's length and a
-    back-reference is refused; on macOS and Windows a pattern too costly for a
+    lookahead, on Linux the time for one match grows with the name's length and
+    with the size of the compiled pattern, which can be far larger than the
+    pattern's text; a compiled pattern over the engine's own limit, and a
+    back-reference, are refused; on macOS and Windows a pattern too costly for a
     name ends the run with an error row: the rows already written stay, no
     total_matches row follows and the run fails with return code 1, so the
     device counts as failed. An unexpected failure ends a run the same way on

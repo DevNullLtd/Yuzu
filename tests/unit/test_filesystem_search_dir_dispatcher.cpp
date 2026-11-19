@@ -8,7 +8,7 @@
  *
  * MUTATION NOTES (what each case catches):
  *   clean run / error rows -- a shell that reorders its checks or changes an existing error row.
- *   regex bound            -- a regex compile without the linear-time flag on the GNU library, or a
+ *   regex bound            -- a regex compile without the GNU library's __polynomial flag, or a
  *                             regex_error escaping the name predicate (the suite timeout is the
  *                             oracle: no sleep, no timer).
  *   lookahead refusal      -- a regex lookahead reaching the engine (the has_lookahead check
@@ -274,7 +274,7 @@ TEST_CASE("filesystem search_dir: an ambiguous-alternation regex over a long nam
     t.write(std::string(64, 'a'));
     const auto r = search(*plugin, t, "(a|aa)+b", {{"regex", "true"}, {"match_type", "files"}});
 #if defined(__GLIBCXX__)
-    // the GNU library's linear-time executor: a clean, empty answer
+    // the GNU library's breadth-first executor: a clean, empty answer
     CHECK(r.rc == 0);
     CHECK(captured_rows(r.captured) == Rows{"total_matches|0"});
 #else

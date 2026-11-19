@@ -25,7 +25,8 @@
   counted in the set's `agents_failed`, so the set reads `partial` (the server reads the new result key
   `partialWhenConstrained`, set by definition 0.5.0; `find_by_hash` sets are unchanged). In regex
   mode a pattern too costly for a file name ends the run with an error row and no count (with no
-  lookahead, a match on Linux takes time linear in the name's length). A name byte that is not valid
+  lookahead, a match on Linux takes time that grows with the name's length and with the size of the
+  compiled pattern; the deadline cannot interrupt it inside one name). A name byte that is not valid
   UTF-8 now shows as `?` in `search_dir`, `find_by_hash` and `get_acl` rows instead of making the whole
   response unreadable, and on Windows an unpaired UTF-16 surrogate in a name shows as U+FFFD, the
   replacement character. Definition `device.filesystem.search_dir` is now 0.5.0 (columns `row_kind`,

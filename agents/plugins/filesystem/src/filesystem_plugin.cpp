@@ -1681,11 +1681,11 @@ private:
             }
             auto flags = std::regex::ECMAScript | std::regex::optimize;
 #if defined(__GLIBCXX__)
-            // The GNU library's breadth-first executor: time linear in the name for a pattern
-            // with no lookahead (refused above: that executor re-runs one from every position).
-            // Without the flag the library backtracks with no complexity limit, so one name could
-            // outlive the walk deadline. It refuses a back-reference at compile, which lands in
-            // the invalid-regex row below.
+            // The GNU library's breadth-first executor does not backtrack: with no lookahead
+            // (refused above) one match costs about the name's length times the compiled pattern's
+            // size, which can far exceed its text (has_nested_quantifiers is a heuristic, not a
+            // bound). Without the flag one name could outlive the walk deadline. A back-reference,
+            // or a compiled pattern over the library's limit, fails the compile below.
             flags |= std::regex_constants::__polynomial;
 #endif
             try {
