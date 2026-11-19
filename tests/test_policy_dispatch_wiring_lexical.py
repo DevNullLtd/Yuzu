@@ -24,6 +24,7 @@ Required statements (each is one requirement id below):
                         that dispatch, and the refusal returns before it;
   * unwired-closed      an evaluator with no registry is refused (`Unwired`), never allowed;
   * denial-recorded     the check, fix and verify callers each record a refused dispatch.
+  * denial-audit-emitted the fix caller writes its audit row (emit_denial_audit) after the release.
 
 Robustness: comments are stripped with a literal-aware scanner, and all whitespace is removed before
 matching, so line wrapping, re-indentation and comment text that mentions a token cannot satisfy or
@@ -158,10 +159,15 @@ def problems(sources: dict[str, str]) -> list[str]:
         out.append("unwired-closed: an evaluator with no capability_registry is not refused as Unwired")
 
     for phase in ("check", "fix", "verify"):
-        if not re.search(r'record_denial\([A-Za-z_.>-]*policy_id,"%s"|record_denial\(p\.id,"%s"'
-                         % (phase, phase), evaluator):
+        # The fix caller holds the claim, so it records the status with record_denial_status and
+        # writes the audit row after the release; the other two call record_denial.
+        if not re.search(r'record_denial(?:_status)?\([A-Za-z_.>-]*policy_id,"%s"'
+                         r'|record_denial(?:_status)?\(p\.id,"%s"' % (phase, phase), evaluator):
             out.append(f"denial-recorded: no record_denial(..., \"{phase}\", ...) call in "
                        "policy_evaluator.cpp")
+    if "emit_denial_audit(pending);" not in evaluator:
+        out.append("denial-audit-emitted: remediate does not write the audit row of a refused fix "
+                   "(emit_denial_audit(pending);) after releasing its claim")
     return out
 
 

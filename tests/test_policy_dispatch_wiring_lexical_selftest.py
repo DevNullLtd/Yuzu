@@ -85,8 +85,12 @@ expect("the verify caller no longer records",
        mutate(real, E, 'record_denial(f.policy_id, "verify",', 'forget_denial(f.policy_id, "verify",'),
        "denial-recorded")
 expect("the fix caller no longer records",
-       mutate(real, E, 'record_denial(policy_id, "fix",', 'forget_denial(policy_id, "fix",'),
+       mutate(real, E, 'record_denial_status(policy_id, "fix",',
+              'forget_denial(policy_id, "fix",'),
        "denial-recorded")
+expect("the fix caller no longer writes its audit row",
+       mutate(real, E, "emit_denial_audit(pending);", "(void)pending;"),
+       "denial-audit-emitted")
 expect("the check caller no longer records",
        mutate(real, E, 'record_denial(p.id, "check",', 'forget_denial(p.id, "check",'),
        "denial-recorded")
