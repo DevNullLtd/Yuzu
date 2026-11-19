@@ -3556,6 +3556,42 @@ test('qa-stack gateway crash signatures',
   suite: 'docs',
   timeout: 30,
 )
+# WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
+# fails closed, run against a stub trivy; plus lexical tripwires that every
+# release.yml publish job runs it before its push and pre-release.yml scans
+# every published image. Hermetic, no Docker; the bash cases skip on Windows.
+test('image vulnerability gate',
+  _python3_test,
+  args: [files('test_image_vuln_gate.py')],
+  suite: 'docs',
+  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
+  # limit of 60): many cases each run the gate script and a stub trivy.
+  timeout: 240,
+)
+
+# WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
+# outcomes x stop points x publish shapes runs release.yml's publish steps in
+# the workflow's order against a stub registry and checks the journal never
+# claims less than the registry holds; cross-attempt rows run the attach job;
+# step-reorder and script mutants must be killed. Cancels are delivered to the
+# step's PID only, as the Actions runner delivers them, and some rows wait out
+# a stall or a cancelled run, hence the timeout. Bash + PyYAML, no Docker.
+test('image publish journal',
+  _python3_test,
+  args: [files('test_image_publish.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
+# release publish jobs' buildx type=local caches, removes only unreferenced
+# blobs and never leaves an index naming a removed blob. Synthetic layout.
+test('buildx cache prune',
+  _python3_test,
+  args: [files('test_prune_buildcache.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
 # against a synthetic complete artifacts directory, then with each expected
@@ -3564,7 +3600,7 @@ test('release artifact gate',
   _python3_test,
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
-  timeout: 60,
+  timeout: 120,
 )
 
 # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft

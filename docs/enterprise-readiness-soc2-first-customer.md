@@ -1127,14 +1127,75 @@ macOS leg now installs Erlang/OTP 28, and every CI leg that runs `meson test` (c
 configure, that the gateway tests were registered (`scripts/ci/assert-gateway-tests.py`),
 so a runner missing the gateway toolchain fails instead of passing without the gateway.
 
+**Evidence line — release SBOMs and the image vulnerability gate (CC7.1; CC8.1 for the
+acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's sample:
+- *SBOMs:* the four platform archives and the six images published before the release each
+  have a CycloneDX and an SPDX SBOM inside the release's cosign-signed `SHA256SUMS`
+  (`scripts/check-release-artifacts.sh` refuses a release without them; the agent-bundle image's
+  SBOM stays a workflow artifact). Verification: `docs/user-manual/release-verification.md`.
+- *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
+  and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
+  image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
+  packages the scanner cannot see. The push carries no release tag (the agent bundle's carries a
+  `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
+  pushed digest is verified to be the scanned image, signed and attested, and a write-ahead publish
+  journal (`publish-<image>.attempt-<N>.txt`) records each step before it runs. What is kept: every
+  report the gate wrote for a run attempt whose job reached the upload step (a pass, a refusal, a
+  budget stop, or a cancel the gate caught as SIGINT or SIGTERM), with that attempt's journal when
+  its gate passed, uploaded as a 90-day workflow artifact; for a release that was created, every
+  attempt's files of the six release images as release assets inside `SHA256SUMS`, and the agent
+  bundle's, every attempt's, with a signed checksum list per attempt once the attach job attaches
+  them (it does so before failing on a higher attempt stopped while tagging).
+  Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
+  upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
+  as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
+- *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+  carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
+  the control is the pull-request review of changes to those files, the gate scripts and the
+  workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").
+  An approver may be the change's author: the `CODEOWNERS` entries for those paths (PR #8243)
+  request a review from a release owner, they only request it, and "Require review from Code Owners" is off on the protected branches by owner
+  decision, so any one approving review merges such a change and
+  separation of duties is a practice, not an enforced control. Disclose it with the control.
+- *What the release's evidence can prove:* release assets are not immutable (GitHub's immutable
+  releases setting is off for the repository), so a holder of `contents: write` can delete,
+  replace or add one after publication, and the release process itself adds the agent bundle's
+  files afterwards (the attach job, which replaces only an incomplete upload of its own) and may
+  re-upload a missing asset by hand (release skill, Phase 4). A verifier can rely on the signed
+  `SHA256SUMS` (identity: `release.yml` at the release's tag): a listed file present and matching
+  is what that workflow produced, and `sha256sum -c SHA256SUMS` fails on a listed file that is
+  missing or changed. An asset no signed list names proves nothing, and nothing signed lists the
+  agent bundle's attempts, so removing one attempt's whole set is not detectable
+  (`docs/ci-architecture.md` "What the journal does not cover").
+- *Image deletion and release tags:* **Control (enforced by `release.yml`):** within the release
+  workflow a release tag is written only by the "Tag the release" step, after the gate, verify,
+  sign and attest steps and behind the publish journal; `release-guard` refuses a run for a tag
+  that has a published release; the workflow deletes no image. **Practice (not enforced):** a
+  wrong or superseded published release is fixed by a new patch release; deleting a published
+  release, redoing a release under its tag, moving a release tag outside the workflow, and
+  deleting a GHCR package version are owner-decided incidents, recorded in a tracking issue opened
+  for it and announced (`docs/ci-architecture.md` "Release tag policy"); untagged candidate
+  digests and the bundle's candidate tags are left in place (each was scanned before its push). A
+  package admin can delete a version, and a `packages: write` holder can move a tag; the
+  tracking-issue record is the evidence. A patch release does not move the superseded release's
+  own `:X.Y.Z`, and a patch on an older `X.Y` line moves `:latest` to that line until the next
+  stable release on the newest line. `scripts/docker-release.sh` and
+  `scripts/build-agent-bundle.sh --push` predate the gate and can push release tags with
+  maintainer credentials, bypassing the gate and the journal; they are not used to publish a
+  release (Limit 1 of the policy).
+- *Not covered (disclose with the control):* the OS packages of the chiselled images, PostgreSQL
+  in `yuzu-postgres`, the gateway's Erlang/OTP runtime, statically linked code, HIGH and unfixed
+  findings (reported, not gated), and the integrity of the vulnerability DB (unsigned upstream).
+  `pre-release.yml` rescans the published images afterwards; it is detective only.
+
 **Accepted risks — the merge rulesets' review rule (CC8.1), 2026-11-18.**
 The only accepted route around the review rule is the OrganizationAdmin bypass on Protect
 Dev and Protect Main, a deliberate break-glass route whose use is visible in the audit log.
 It was accepted by fjarvis (project owner) on 2026-11-18 and is to be reviewed by
 2027-05-18, tracked in #8228. On the same date fjarvis (project owner) left "Require review
 from Code Owners" off in both rulesets (`require_code_owner_review: false`): the
-supply-chain CODEOWNERS entries proposed in #8243 (owners `@fjarvis` and `@Tr3kkR`) will
-request review once that pull request is merged, but will not require it, and both owners
+supply-chain CODEOWNERS entries added by #8243 (owners `@fjarvis` and `@Tr3kkR`) request
+review but do not require it, and both owners
 can bypass the rulesets as organisation admins. This is to be reviewed by 2027-05-18,
 tracked in #8228.
 
