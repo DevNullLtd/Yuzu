@@ -332,7 +332,7 @@ Recommended order for a fresh install:
 
 ## The authorization topology floor (#2376)
 
-Twelve reads are treated as **authorization topology or audit evidence**
+13 reads are treated as **authorization topology or audit evidence**
 rather than ordinary operational data. Wherever the legacy RBAC-off fallback is the branch in
 effect, they require the `admin` session role — the generic “any Read is
 allowed” rule does not reach them. (With RBAC **enabled** they are ordinary
@@ -357,14 +357,14 @@ admitted; the floor never overrides a live RBAC grant.)
 
 **Why this exists.** With RBAC **disabled**, the legacy fallback described
 above allows any authenticated non-engine session to perform every `Read` —
-that includes these twelve. On a default install (RBAC ships disabled) that
+that includes these 13. On a default install (RBAC ships disabled) that
 handed a plain `user` session read access to the authorization topology
 itself: who holds what role, and the complete access-review grant
 population that is supposed to *be* SOC 2 CC6.2 evidence of controlled
 access — and, until #5771, the full audit trail (who did what, to which
 target, with what outcome, plus the free-text detail and, on the legacy
 `GET /api/audit` route, each actor's role and source IP). The floor closes
-that gap by denying these twelve reads to a
+that gap by denying these 13 reads to a
 non-admin whenever the legacy fallback is the branch in effect — never by
 changing behavior under a live RBAC grant.
 
@@ -375,7 +375,7 @@ particular, a non-admin holding the seeded `Reviewer` role (`AccessReview:Read`
 + `AccessReview:Attest`) continues to reach the access-review export exactly
 as before — the floor never overrides that grant.
 
-**If you are relying on a non-admin reaching one of these twelve reads on an
+**If you are relying on a non-admin reaching one of these 13 reads on an
 RBAC-disabled install,** that access is now denied. The supported remedy is
 to enable RBAC and grant the appropriate role rather than to expect a
 non-admin session to reach authorization topology while RBAC is off:
