@@ -460,9 +460,10 @@ release when:
   archive, package or image of the release (supply-chain S8);
 - an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
   in the release or whose SHA-256 differs, has more entries than the bound in
-  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 63 for the
-  Linux files, the server's with the 10 vendored entries below, and 212 for
-  v0.15.0's Windows archive, the largest), has no entries and no record
+  `scripts/ci/artifact-sbom.py` (400; measured locally: 16 to 63 for the
+  Linux files, where the counts for the files holding the server include its
+  10 vendored entries described below, and 212 for v0.15.0's Windows archive,
+  the largest), has no entries and no record
   that its file was unpacked and held files, or lists a path under `vcpkg/`,
   `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
   `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan

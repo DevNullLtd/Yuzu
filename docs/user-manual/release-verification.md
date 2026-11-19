@@ -640,8 +640,8 @@ A note that is absent means the SBOM does not carry it (no
 `yuzu:sbom:incomplete-reasons` note: no marker). The release writes each note
 once: treat a file that carries two copies of one as altered. The release
 check refuses a second copy of the notes it reads (`yuzu:sbom:unpacked-files`
-on a file SBOM, `yuzu:sbom:incomplete-reasons` on an image SBOM pair); it does
-not read the others. To read one note from either
+on a file SBOM, `yuzu:sbom:incomplete-reasons` and `yuzu:sbom:vendored` on an
+image SBOM pair); it does not read the others. To read one note from either
 format (set `KEY` to the note you want, and the file names to your SBOMs):
 
 ```bash
@@ -701,9 +701,9 @@ cyclonedx validate --input-file yuzu-linux-x64.cdx.json
 # Count components
 jq '.components | length' yuzu-linux-x64.cdx.json
 
-# The third-party files compiled into yuzu-server (ZRender and tslib are
-# nested under ECharts, in its .components)
-jq -r '.components[] | select(."bom-ref" // "" | startswith("vendored-"))
+# The third-party files compiled into yuzu-server: 10 lines (ZRender and
+# tslib are nested under ECharts, in its .components; recurse lists them too)
+jq -r '.components[] | recurse(.components[]?) | select(."bom-ref" // "" | startswith("vendored-"))
        | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-linux-x64.cdx.json
 
 # Find all dependencies declaring a specific license
@@ -771,8 +771,9 @@ package SBOMs inside the release list that binary's libraries.
 jq '.components | length' yuzu-server-image.cdx.json
 jq -r '.components[] | "\(.name)@\(.version)"' yuzu-server-image.cdx.json | sort -u
 
-# The third-party files compiled into yuzu-server
-jq -r '.components[] | select(."bom-ref" // "" | startswith("vendored-"))
+# The third-party files compiled into yuzu-server (10 lines, the nested
+# ZRender and tslib included)
+jq -r '.components[] | recurse(.components[]?) | select(."bom-ref" // "" | startswith("vendored-"))
        | "\(.name)\t\(.version // "unresolved")\t\(.purl)"' yuzu-server-chisel-image.cdx.json
 ```
 

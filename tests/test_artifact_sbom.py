@@ -1186,6 +1186,29 @@ class Units(unittest.TestCase):
         self.assertNotEqual(r.returncode, 0)
         self.assertIn("CycloneDX: missing leftpad", r.stderr)
 
+    def test_the_docs_vendored_query_lists_every_component(self):
+        # release-verification.md's two "compiled into yuzu-server" jq
+        # queries, as written, over an augmented image SBOM: every manifest
+        # component, the ones nested under ECharts included (a flat
+        # `.components[]` would list 8 of 10).
+        doc = (ROOT / "docs" / "user-manual" / "release-verification.md").read_text(encoding="utf-8")
+        queries = re.findall(r"^(jq -r '\.components\[\] \| recurse.*?startswith\(\"vendored-\"\)\)\n.*?)"
+                             r" (yuzu-[a-z0-9-]+?)\.cdx\.json$", doc, re.M | re.S)
+        self.assertEqual(len(queries), 2, queries)
+        if not (shutil.which("jq") and shutil.which("bash")):
+            self.skipTest("jq or bash not installed: the docs' vendored query was not run")
+        cdx, spdx = release_image_pair("yuzu-test-server", SERVER_IMAGE_FILES)
+        (self.tmp / "q.cdx.json").write_text(json.dumps(cdx))
+        want = len(self.mod.vendored_manifest_ids(VENDORED))
+        for query, _name in queries:
+            with self.subTest(query=query[:60]):
+                r = subprocess.run(["bash", "-c", "set -euo pipefail\n" + query + " q.cdx.json"], cwd=self.tmp,
+                                   capture_output=True, text=True)
+                self.assertEqual(r.returncode, 0, r.stderr)
+                self.assertEqual(len(r.stdout.splitlines()), want, r.stdout)
+                self.assertIn("zrender\t", r.stdout)
+                self.assertIn("tslib\t", r.stdout)
+
     def test_a_failed_pair_write_leaves_both_files_or_refuses_the_torn_pair(self):
         # _write_image_pair: a failed temporary write changes neither file and
         # leaves no *.tmp; a failed SECOND rename leaves a torn pair (new

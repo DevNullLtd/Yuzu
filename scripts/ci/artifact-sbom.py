@@ -213,6 +213,9 @@ VENDORED_TYPES = {"library": "library", "font": "file"}  # manifest type -> Cycl
 VENDORED_ID = re.compile(r"[A-Za-z0-9.-]+")
 # A SHA-256 recorded in an attribution file (a NOTICE): any case, as bytes.
 NOTICE_SHA256 = re.compile(rb"(?<![0-9A-Fa-f])[0-9A-Fa-f]{64}(?![0-9A-Fa-f])")
+# A longer run of hex digits: it may hold a SHA-256 the pattern above never
+# extracts (one glued to another hex digit), so a NOTICE carrying one fails.
+NOTICE_LONG_HEX = re.compile(rb"[0-9A-Fa-f]{65,}")
 SPDX_LINE = re.compile(r"SPDX-License-Identifier:\s*(\S+)")
 
 GITHUB_GIT = re.compile(r"^git\+https://github\.com/([^/]+)/([^/@]+?)(?:\.git)?@(.+)$")
@@ -906,15 +909,17 @@ def _first_party(rel: str, patterns) -> bool:
 
 
 def _notice_text(data: bytes):
-    """A NOTICE's text: strict UTF-8 (a leading byte-order mark is allowed), or
-    None when the bytes are not valid UTF-8, which the caller fails. That
-    catches a NOTICE re-encoded with a byte-order mark (UTF-16 with a BOM is
-    not valid UTF-8), not every other encoding: a BOM-less UTF-16 file of
-    ASCII text decodes as valid UTF-8 (with NULs), and then its SHA-256 and
-    SPDX lines are simply not found, which the checks below treat like a
-    NOTICE that records none."""
+    """A NOTICE's text: strict UTF-8 (a leading byte-order mark is allowed)
+    holding no NUL, or None, which the caller fails. Invalid UTF-8 catches a
+    NOTICE re-encoded with a byte-order mark (UTF-16 with a BOM is not valid
+    UTF-8); the NUL rule catches a BOM-less UTF-16 file, which for ASCII text
+    decodes as valid UTF-8 with a NUL beside every character, so its SHA-256
+    and SPDX lines would otherwise simply not be found. A text NOTICE holds
+    no NUL."""
     if data.startswith(b"\xef\xbb\xbf"):
         data = data[3:]
+    if b"\x00" in data:
+        return None
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
@@ -1005,8 +1010,13 @@ def vendored_problems(manifest_path: Path, root: Path) -> list[str]:
             errs.append(f"{n}: cannot be read ({e.strerror or e})")
             continue
         if text is None:
-            errs.append(f"{n} is not UTF-8 (the NOTICE of {ids}): its SHA-256 and SPDX lines cannot be checked")
+            errs.append(f"{n} is not UTF-8 text (the NOTICE of {ids}; invalid UTF-8, or a NUL byte as UTF-16 "
+                        f"holds): its SHA-256 and SPDX lines cannot be checked")
             continue
+        for run in NOTICE_LONG_HEX.findall(text.encode("utf-8")):
+            errs.append(f"{n} holds a run of {len(run)} hex digits, starting {run[:16].decode()} (the NOTICE of "
+                        f"{ids}): a SHA-256 inside it cannot be checked. Write each SHA-256 as 64 hex digits "
+                        f"on its own")
         for c in owners:
             for lic in SPDX_LINE.findall(text):
                 if lic != c["license"]:
@@ -1375,6 +1385,14 @@ def _image_roots(cdx: dict, spdx: dict) -> tuple[dict, dict]:
     sroot = _spdx_root(spdx)
     if croot.get("type") != "container" or sroot.get("primaryPackagePurpose") != "CONTAINER":
         raise SbomError("not an image SBOM: the described root is not a container image")
+    # The pair is bound by name and version only, not by image digest: the
+    # CycloneDX root syft 1.57.2 writes for an image carries no digest (the
+    # real scans in tests/fixtures/image-sbom: bom-ref, type, name, version),
+    # while the SPDX root does (a SHA256 checksum and the pkg:oci purl), so
+    # there is no digest on both sides to compare. Two scans of different
+    # digests under one name and version would pair here; what keeps a
+    # release pair one image's is that each publish leg scans its one pushed
+    # digest into one pair of files in the same job.
     if (croot.get("name"), croot.get("version")) != (sroot.get("name"), sroot.get("versionInfo")):
         raise SbomError(f"the two SBOMs describe different images: {croot.get('name')}@{croot.get('version')} "
                         f"(CycloneDX), {sroot.get('name')}@{sroot.get('versionInfo')} (SPDX)")

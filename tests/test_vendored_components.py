@@ -205,7 +205,36 @@ class ScratchCopy(unittest.TestCase):
         # patterns: it must fail, not pass unchecked.
         p = self.tmp / "server/core/vendor/echarts-NOTICE.txt"
         p.write_bytes(p.read_text(encoding="utf-8").encode("utf-16"))
-        self.assertFails("server/core/vendor/echarts-NOTICE.txt is not UTF-8 (the NOTICE of echarts)")
+        self.assertFails("server/core/vendor/echarts-NOTICE.txt is not UTF-8 text (the NOTICE of echarts")
+
+    def test_utf16_notice_without_a_bom_fails(self):
+        # BOM-less UTF-16 of ASCII text is valid UTF-8 with a NUL beside each
+        # character, so its SPDX and SHA-256 lines would go unread; the NUL
+        # fails it (a licence change hidden this way must not pass). The
+        # ECharts NOTICE is ASCII-only, so its UTF-16 IS valid UTF-8: only the
+        # NUL rule can fail it.
+        p = self.tmp / "server/core/vendor/echarts-NOTICE.txt"
+        raw = p.read_bytes()
+        self.assertTrue(raw.isascii())
+        text = raw.decode("ascii").replace("SPDX-License-Identifier: Apache-2.0", "SPDX-License-Identifier: MIT")
+        self.assertNotEqual(text, raw.decode("ascii"))
+        for enc in ("utf-16-le", "utf-16-be"):
+            with self.subTest(encoding=enc):
+                p.write_bytes(text.encode(enc))
+                p.read_bytes().decode("utf-8")   # valid UTF-8, NULs and all
+                self.assertFails("server/core/vendor/echarts-NOTICE.txt is not UTF-8 text (the NOTICE of echarts")
+
+    def test_sha256_inside_a_longer_hex_run_fails(self):
+        # A recorded SHA-256 glued to another hex digit is never extracted by
+        # the 64-digit pattern, so a stale hash could hide there: the run fails.
+        p = self.tmp / "server/core/vendor/echarts-NOTICE.txt"
+        s = p.read_text(encoding="utf-8")
+        echarts = "bf4a223524e40b77c304bec67e1222cf551f14880cf42c69dc046558e11c07b1"
+        self.assertIn(echarts, s)
+        for glued in (self.CYTOSCAPE_SHA + "0", "f" + self.CYTOSCAPE_SHA, echarts + self.CYTOSCAPE_SHA):
+            with self.subTest(glued=glued[:8]):
+                p.write_text(s.replace(echarts, glued, 1), encoding="utf-8")
+                self.assertFails(f"server/core/vendor/echarts-NOTICE.txt holds a run of {len(glued)} hex digits")
 
     def test_notice_with_a_bom_passes(self):
         p = self.tmp / "server/core/vendor/echarts-NOTICE.txt"
