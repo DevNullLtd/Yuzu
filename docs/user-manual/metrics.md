@@ -859,7 +859,7 @@ and pre-seeded at boot, so `absent()` alerting stays meaningful.
 | Metric | Type | Description |
 |---|---|---|
 | `yuzu_server_policy_dispatch_denied_total{reason}` | counter | Policy dispatches refused before anything was sent, by reason: `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired`, `dispatch_identifier_invalid`. One increment per refused dispatch call (per policy and phase per attempt, not per device), whether or not an audit row is written. All seven series exist at 0 from startup. See [Action approval and the `blocked` status](policy-engine.md#action-approval-and-the-blocked-status). |
-| `yuzu_server_policy_verdicts_total{status}` | counter | Device verdicts policy evaluation recorded, by status (`compliant`, `non_compliant`, `unknown`, `error` and `blocked`). `blocked` is incremented by the number of devices whose stored status changed when a refusal is recorded, so a refusal that repeats unchanged adds nothing. |
+| `yuzu_server_policy_verdicts_total{status}` | counter | Device verdicts policy evaluation recorded, by status (`compliant`, `non_compliant`, `unknown`, `error` and `blocked`). `blocked` is incremented by the number of devices whose stored status changed when a refusal is recorded, so a refusal that repeats unchanged adds nothing. When a large run fails part-way, the rows of the chunks that were written are not counted by that run (the call reports an error); the next refusal counts the rows it then changes. |
 | `yuzu_server_policy_eval_errors_total{phase}` | counter | Evaluation failures by phase. A refused dispatch is not an evaluation failure and is not counted here (not in `dispatch` and not in `verify`). |
 
 ## Audit-store metrics
