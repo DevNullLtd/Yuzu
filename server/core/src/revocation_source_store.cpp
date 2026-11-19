@@ -600,9 +600,15 @@ std::optional<std::int64_t> canonicalise_urls(PGconn* conn) {
     }
     if (!txn.commit())
         return std::nullopt;
-    if (!rewrites->empty())
+    if (!rewrites->empty()) {
+        // The rewrite has no audit row (it runs before any caller exists); the per-row ids are
+        // its evidence, naming each source_url row whose text changed. The URLs are not logged.
+        for (const auto& r : *rewrites)
+            spdlog::info("RevocationSourceStore: rewrote stored CRL URL id {} to the canonical form",
+                         r.url_id);
         spdlog::info("RevocationSourceStore: rewrote {} stored CRL URL(s) to the canonical form",
                      rewrites->size());
+    }
     return static_cast<std::int64_t>(rewrites->size());
 }
 

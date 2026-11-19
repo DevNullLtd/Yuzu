@@ -5105,7 +5105,7 @@ static const ToolDef kTools[] = {
      "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
      "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
      R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
-     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source; every other key is removed"},)j"
+     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the distinct ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source (a repeated entry is invalid_params naming its index); every other key is removed"},)j"
      R"j("expected_config_version":{"type":"integer","minimum":1,"description":"Required: the source's config_version as you last read it; a mismatch is a conflict and changes nothing"},)j"
      R"j("reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
      R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"
@@ -13946,7 +13946,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // assign_rbac_role family gates on the predicate INSTEAD OF perm_fn; this surface
             // does not.) The shared helpers are declared once here; every tool branch below keeps its
             // own block (the retry-hint gate scans each tool's block).
-            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e) {
+            // `reset` selects the reset tool's version-conflict remediation: a stale reset must
+            // be retried as a reset (after checking it has not already landed), never as an update.
+            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e,
+                               bool reset = false) {
                 using RsKind = yuzu::server::revocation_source::ServiceError::Kind;
                 switch (e.kind) {
                 case RsKind::kInvalidParams:
@@ -13962,9 +13965,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 case RsKind::kVersionConflict:
                     res.set_content(a4_error(kInvalidParams, e.message,
-                                             "read the source with get_revocation_source and resend "
-                                             "update_revocation_source with expected_config_version=" +
-                                                 std::to_string(e.existing_id)),
+                                             reset
+                                                 ? "read the source with get_revocation_source; if "
+                                                   "it already shows the reset you meant "
+                                                   "(high_water.reset_at and the kept "
+                                                   "ca_certificates) do not resend, otherwise "
+                                                   "resend reset_revocation_source_high_water with "
+                                                   "expected_config_version=" +
+                                                       std::to_string(e.existing_id)
+                                                 : "read the source with get_revocation_source "
+                                                   "and resend update_revocation_source with "
+                                                   "expected_config_version=" +
+                                                       std::to_string(e.existing_id)),
                                     "application/json"); // retry-hint-exempt: stale version, resending it fails identically
                     return;
                 case RsKind::kConflict:
@@ -14316,7 +14328,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
                                    rs::audit_detail_error("", done.error()));
                     mcp_audit(rs::audit_result_for(done.error()), done.error().message);
-                    rs_fail(done.error());
+                    rs_fail(done.error(), /*reset=*/true);
                     return;
                 }
                 const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,

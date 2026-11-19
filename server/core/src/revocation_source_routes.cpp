@@ -72,7 +72,9 @@ void service_error(httplib::Response& res, const rs::ServiceError& e) {
         return;
     case K::kVersionConflict:
         rest_error(res, 409, e.message, false,
-                   "read the source (GET /api/v1/crypto/revocation-sources/{id}) and resend with "
+                   "read the source (GET /api/v1/crypto/revocation-sources/{id}); if it already "
+                   "shows the change you meant (for a reset, high_water.reset_at and the kept "
+                   "ca_certificates) do not resend, otherwise resend the same request with "
                    "expected_config_version=" + std::to_string(e.existing_id));
         return;
     case K::kConflict:

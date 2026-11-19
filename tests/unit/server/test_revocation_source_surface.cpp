@@ -2433,7 +2433,6 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
     for (const auto& k : stored->keys)
         if (k.cert_sha256 != old_key)
             new_key = k.cert_sha256;
-    INFO(data_of(*put).dump());
     REQUIRE(new_key.size() == 64);
 
     const auto refused = [&](const std::string& body, int status, const std::string& param) {
@@ -2462,6 +2461,15 @@ TEST_CASE("revocation source REST: a reset names the surviving keys and the vers
             400, "keep_key_sha256[1]");
     // A stale read: 409, nothing changed.
     refused(R"({"keep_key_sha256":[")" + new_key + R"("],"expected_config_version":1})", 409, "");
+    {
+        // Its remediation says to check whether the reset already landed before resending.
+        auto stale = fx.rest_reset_raw(id, R"({"keep_key_sha256":[")" + new_key +
+                                               R"("],"expected_config_version":1})");
+        REQUIRE(stale->status == 409);
+        const auto fix = data_of(*stale)["error"]["remediation"].get<std::string>();
+        CHECK_THAT(fix, ContainsSubstring("do not resend"));
+        CHECK_THAT(fix, ContainsSubstring("expected_config_version=2"));
+    }
     // No refusal changed anything, and none was a mutation attempt.
     auto now = fx.store.get(id);
     REQUIRE(now.has_value());
@@ -2529,16 +2537,28 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
               kReset, {{"id", id},
                        {"keep_key_sha256", json::array({std::string(64, 'e')})},
                        {"expected_config_version", 1}})) == invalid);
+    // A repeated entry passes the schema (it cannot state distinctness) and is refused by the
+    // service as invalid_params, changing nothing.
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+              kReset, {{"id", id},
+                       {"keep_key_sha256", json::array({key, key})},
+                       {"expected_config_version", 1}})) == invalid);
     CHECK(fx.store.get(id)->config_version == 1);
     const auto ok = mcp_payload(*fx.h.mcp_call_tool_approved(
         kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}, {"expected_config_version", 1}}));
     CHECK(ok["dropped_ca_certificates"] == 0);
     CHECK(ok["config_version"] == 2);
-    // A stale version is refused and changes nothing.
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
-              kReset, {{"id", id},
-                       {"keep_key_sha256", json::array({key})},
-                       {"expected_config_version", 1}})) == invalid);
+    // A stale version is refused and changes nothing; the remediation says to check whether the
+    // reset already landed and to retry as a RESET, never as an update.
+    const auto stale = fx.h.mcp_call_tool_approved(
+        kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}, {"expected_config_version", 1}});
+    CHECK(mcp_error_code(*stale) == invalid);
+    const auto stale_fix =
+        json::parse(stale->body)["error"]["data"]["remediation"].get<std::string>();
+    CHECK_THAT(stale_fix, ContainsSubstring("resend reset_revocation_source_high_water"));
+    CHECK_THAT(stale_fix, ContainsSubstring("expected_config_version=2"));
+    CHECK_THAT(stale_fix, ContainsSubstring("do not resend"));
+    CHECK(stale_fix.find("update_revocation_source") == std::string::npos);
     CHECK(fx.store.get(id)->config_version == 2);
     // The schema states both members as required.
     const auto tools = tools_list(fx);
@@ -2558,5 +2578,43 @@ TEST_CASE("revocation source MCP: the reset requires the surviving keys and the 
         INFO(f);
         CHECK(out["properties"].contains(f));
         CHECK(std::ranges::find(out["required"], json(f)) != out["required"].end());
+    }
+}
+
+TEST_CASE("revocation source: an update that drops a key names its hash in the success audit row",
+          "[revocation_source][pg]") {
+    // REST and MCP share one audit helper; each transport is asserted so a handler that stops
+    // using it fails here.
+    const auto dropped_in_success = [](const std::vector<AuditRecord>& rows, const std::string& key) {
+        for (const auto& r : rows)
+            if (r.result == "success" &&
+                r.detail.find("dropped_key_sha256=" + key) != std::string::npos)
+                return true;
+        return false;
+    };
+    SECTION("REST PUT") {
+        Fx fx;
+        fx.admin(false);
+        auto created = fx.rest_post(rstest::valid_body());
+        REQUIRE(created->status == 201);
+        const auto id = data_of(*created)["data"]["id"].get<std::int64_t>();
+        const auto old_key =
+            data_of(*created)["data"]["ca_certificates"][0]["cert_sha256"].get<std::string>();
+        auto put = fx.rest_put(id, rstest::valid_body()); // a renewal key replaces the old one
+        REQUIRE(put->status == 200);
+        CHECK(dropped_in_success(fx.rows("crypto.revocation_source.update"), old_key));
+    }
+    SECTION("MCP update_revocation_source") {
+        Fx fx;
+        fx.admin(false);
+        const auto src = mcp_payload(*fx.h.mcp_call_tool_approved(kRegister, rstest::valid_body()));
+        const auto id = src["id"].get<std::int64_t>();
+        const auto old_key = src["ca_certificates"][0]["cert_sha256"].get<std::string>();
+        json upd = rstest::valid_body();
+        upd["id"] = id;
+        upd["expected_config_version"] = 1;
+        const auto changed = mcp_payload(*fx.h.mcp_call_tool_approved(kUpdate, upd));
+        REQUIRE(changed["changed"] == true);
+        CHECK(dropped_in_success(fx.rows("crypto.revocation_source.update"), old_key));
     }
 }
