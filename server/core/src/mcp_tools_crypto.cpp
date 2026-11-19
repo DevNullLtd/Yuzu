@@ -147,6 +147,13 @@ void refuse_params(const ToolCallContext& ctx, const std::string& message) {
     answer_invalid_params(ctx, message);
 }
 
+/// The certificate tools' caller-input refusal: the same -32602, but as an A4 error.data (correlation
+/// id plus a remediation), identically to the REST twins' 400 body.
+void refuse_cert_params(const ToolCallContext& ctx, const std::string& message) {
+    (void)ctx.audit("denied", "invalid arguments: " + message);
+    answer(ctx, ctx.a4_error(kInvalidParams, message, "correct the named argument (see the tool's input schema) and call again", -1, {}, true)); // retry-hint-exempt: caller-input rejection
+}
+
 /// The generic mcp.<tool> row, written the way the legacy branches' `mcp_audit` lambda wrote it.
 bool mcp_row(const ToolCallContext& ctx, const std::string& result_status,
              const std::string& detail = {}) {
@@ -634,7 +641,7 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
         return; // gate already wrote the A4 error body + status
     // Strict input (the one validator REST also uses), judged before any read.
     if (const auto bad = crt::strict_list_args_error(ctx.args)) {
-        refuse_params(ctx, *bad);
+        refuse_cert_params(ctx, *bad);
         return;
     }
     if (!ctx.deps->crypto_certificates_fn) {
@@ -643,13 +650,13 @@ void handle_list_crypto_certificates(const ToolCallContext& ctx) {
     }
     const auto parsed = crt::parse_list_params(crt::params_from_args(ctx.args));
     if (!parsed) {
-        refuse_params(ctx, parsed.error());
+        refuse_cert_params(ctx, parsed.error());
         return;
     }
     const bool confined = gate.scope.has_value();
     // The seam's caller-input refusal (a bad cursor) is answered through this helper so the
     // `if (!read)` block below holds only the store-fault answers.
-    auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
+    auto refuse_input = [&](const std::string& message) { refuse_cert_params(ctx, message); };
     auto query = *parsed;
     // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
     if (ctx.deps->username_fn)
@@ -699,7 +706,7 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
     if (!gate.admitted)
         return; // gate already wrote the A4 error body + status
     if (const auto bad = crt::strict_summary_args_error(ctx.args)) {
-        refuse_params(ctx, *bad);
+        refuse_cert_params(ctx, *bad);
         return;
     }
     if (!ctx.deps->crypto_certificate_summary_fn) {
@@ -708,11 +715,11 @@ void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
     }
     const auto parsed = crt::parse_summary_params(crt::params_from_args(ctx.args));
     if (!parsed) {
-        refuse_params(ctx, parsed.error());
+        refuse_cert_params(ctx, parsed.error());
         return;
     }
     const bool confined = gate.scope.has_value();
-    auto refuse_input = [&](const std::string& message) { refuse_params(ctx, message); };
+    auto refuse_input = [&](const std::string& message) { refuse_cert_params(ctx, message); };
     auto query = *parsed;
     // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
     if (ctx.deps->username_fn)

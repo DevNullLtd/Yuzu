@@ -1877,7 +1877,9 @@ TEST_CASE("crypto routes: REST cbom - a scoped caller's exact scope reaches the 
     auto confined = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
     REQUIRE(confined);
     bool marked = false;
-    for (const auto& p : body_of(*confined)["metadata"]["properties"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json confined_json = body_of(*confined);
+    for (const auto& p : confined_json["metadata"]["properties"])
         if (p["name"] == "yuzu:crypto:scope")
             marked = p["value"] == "confined";
     CHECK(marked);
@@ -1967,7 +1969,9 @@ TEST_CASE("crypto routes: REST cbom - a lost audit row is flagged in the header 
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     bool flagged = false;
-    for (const auto& p : body_of(*res)["metadata"]["properties"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json bom_json = body_of(*res);
+    for (const auto& p : bom_json["metadata"]["properties"])
         if (p["name"] == "yuzu:crypto:audit_persisted")
             flagged = p["value"] == "false";
     CHECK(flagged);
