@@ -24,9 +24,13 @@ release gates), `docs/user-manual/release-verification.md` (verifying a publishe
 The two rulesets share the same core: changes arrive only by pull request; one approving
 review is required; an approval is dismissed by any later push, and the last push must itself be
 approved by someone other than its pusher; a change GitHub cannot attribute to a user needs an
-extra approval; non-fast-forward pushes and branch deletion are refused; and six status
-checks must pass on a branch that is up to date with its base — *Linux gcc-15 debug*, *Windows MSVC debug*, *macOS debug*, *Proto
-backward-compat*, *Preflight (runner health)*, *CHANGELOG order*. *Protect Main* additionally
+extra approval; non-fast-forward pushes and branch deletion are refused; and the ruleset's
+required status checks must pass on a branch that is up to date with its base. On 2026-11-19
+both rulesets required the same seven: *Linux gcc-15 debug*, *Windows MSVC debug*, *macOS
+debug*, *Proto backward-compat*, *Preflight (runner health)*, *CHANGELOG order* and *CBOM
+schema*. The rulesets live outside git and change without a commit, so the authority is the
+ruleset itself (`gh api repos/DevNullLtd/Yuzu/rulesets/13631572` and `/15845250`), not this
+list. *Protect Main* additionally
 carries an `update` rule (ref updates restricted to bypass actors) that *Protect Dev* does not;
 read together with the merge history below, its practical effect appears to be that merging
 to `main` itself needs an administrator.
@@ -78,8 +82,13 @@ is actually used.
    `release/vX.Y.Z-prep` is cut from the reconciled `dev` it promotes (#5113); a sub-PR of a
    long-lived `feat/*` branch is cut from that branch (below). Name it with a prefix from the
    table above and keep it to a single change.
-2. **Open the PR against `dev`.** CI runs the Tier 1 fast path on `pull_request`; the full matrix
-   runs on the push that lands on `dev` or `main` (`ci.yml`, `on:` block).
+2. **Open the PR against `dev`.** CI runs the Tier 1 fast path on `pull_request`. After the
+   merge, what runs depends on the branch (`docs/ci-architecture.md`, Tiers 2 and 2b):
+   - a push to `dev` runs the **debug legs only** (`ci.yml` drops the release legs on a
+     `refs/heads/dev` push), so a green `dev` push run says nothing about release builds;
+   - the release and LTO legs run on `dev` **once a day**, dispatched by
+     `release-legs-daily.yml` against `dev`'s tip; a red run opens a `release-legs-broken` issue;
+   - only a push to `main` runs the **full matrix**, debug and release legs together.
 3. **Run `/governance <base>..HEAD` locally before asking for review** (`CLAUDE.md` → *Agent team
    & governance*). It reviews a commit range, so commit first. It writes one JSONL fragment per
    run under `governance.d/`, committed with the work it reviewed (`.claude/skills/governance/SKILL.md`,
@@ -89,8 +98,9 @@ is actually used.
 4. **Add a `changelog.d/<PR#>-<slug>.<section>.md` fragment** for any operator-visible change;
    never edit `CHANGELOG.md` directly (`changelog.d/README.md`). Pure refactors, CI plumbing and
    test-only changes may skip it.
-5. **Documentation gates run in CI** on every PR. The ones that can stop a merge are the steps
-   inside the *CHANGELOG order* job, one of the six required checks: besides the changelog order
+5. **Documentation gates run in CI** on every PR. The ones that can stop a merge are the two
+   required `docs-lint.yml` jobs: *CBOM schema* (the CBOM goldens and per-artifact SBOMs
+   validated against their schemas) and the steps inside *CHANGELOG order*: besides the changelog order
    itself, these include the docs-drift fact-parity check, the issue-lifecycle docs hygiene check
    (including the `CLAUDE.md` size cap), RBAC doc/seed parity and the governance-ledger linter
    self-test (`docs-lint.yml`, job `changelog-order`). The
@@ -99,9 +109,12 @@ is actually used.
    adds them to the rulesets (`docs/docs-drift-gate.md`, `docs/plugin-readme-standard.md`).
    `CLAUDE.md`'s claim that the `Changelog fragments` job "enforce[s]" this holds only in that
    advisory sense.
-6. **One non-author approval, then merge.** All three merge methods are enabled on the
-   repository; the practice is a merge commit, so a PR's own commits survive on `dev` beside the
-   merge commit that lands them. The source branch is deleted automatically on merge.
+6. **One non-author approval, then merge — with a merge commit.** This is a rule, by owner
+   ruling of 2026-09-11, and it covers every branch, not only long-lived ones: bring a branch
+   up to date by merging `origin/dev` into it, land the PR with a merge commit, and never
+   rebase, squash or force-push. A PR's own commits then survive on `dev` beside the merge
+   commit that lands them. GitHub has all three merge methods enabled on the repository; what
+   it enables is not what the owner allows. The source branch is deleted automatically on merge.
 
 ### Long-lived feature branches
 
@@ -148,7 +161,11 @@ accepts changes only by pull request, this is the only route. Three shapes have 
   `dev` commit, write that commit into the PR body, merge with
   `gh pr merge --merge --match-head-commit <candidate>` (GitHub refuses the merge if the head
   has moved — nothing protects `release/*` branches, so the branch alone is no guard), and
-  check before tagging that the merge commit's second parent is the candidate. If the head
+  check before tagging that the merge commit's second parent is the candidate. Candidate
+  pinning is serialised between operators: one release authority pins at a time and says so
+  on the release issue first, because the check that the branch does not exist and the push
+  that creates it are separate steps; `--match-head-commit` bounds a collision to a disrupted,
+  re-reviewed promotion. If the head
   moves — a push, or "Update branch" when a hotfix lands on `main` — close the PR, back-merge
   `main` into `dev` first if `main` gained a commit `dev` lacks (else every new candidate is
   refused the same way), pin the new candidate on a fresh branch and re-review. #6264 (`dev → main sync`, 21 October) was the same `--head dev` shape with no release
@@ -194,6 +211,11 @@ step (today it has no cache step at all, so this passes vacuously); (8)
 `docker-compose.full-uat.yml` has `--data-dir`; (9) `origin/dev` and `origin/main` have identical
 tips; (10, `--full` only) a local compile.
 
+Preflight does not look at the release legs. Before tagging, the release skill also requires
+the release/LTO legs green on `main`'s tip and no open `release-legs-broken` issue
+(`.claude/skills/release/SKILL.md`, *Pre-conditions*): those legs are the only place the tests
+run in release mode, and on `dev` they run once a day, not per push (§2 step 2).
+
 **Preflight is the only enforcement of 4b and 9, and it runs only on the operator's machine.**
 The tag push below triggers no preflight; `release.yml` checks neither fragments nor divergence.
 
@@ -218,9 +240,12 @@ reviewable afterwards:
   release-prep commits (promote, version stamp, compose defaults) and hotfixes you can name.
   `git cherry -v origin/dev origin/main` shows each as `-` (already patch-equivalent on `dev`)
   or `+`; every `+` must be a release-prep commit or a hotfix the back-merge (§3.5) will carry.
-  A `+` you cannot name stops the release. Both commands skip merge commits, so also run
-  `git log --merges -p --cc origin/dev..origin/main`: a merge that shows a non-empty `--cc` diff
-  was hand-resolved and may have dropped or altered a hunk — read it before accepting.
+  A `+` you cannot name stops the release. Both commands skip merge commits, so also list them
+  (`git log --merges --oneline origin/dev..origin/main`) and review each one's conflict
+  resolution with `git show --remerge-diff <merge>` (Git 2.36 or later). An empty
+  `git log -p --cc` result proves nothing: `--cc` hides every hunk whose result matches one
+  parent, so a conflict resolved wholly to `dev`'s old side — dropping a hotfix — shows no
+  patch at all. Then confirm the named hotfixes' changes are present in the merged tree.
 - **`dev` side:** `git log --no-merges --oneline origin/main..origin/dev` is expected to be
   long; what matters is that every commit you meant to ship is in the promotion. Run this on
   the merged tip, after the promotion PR has landed: `git diff --stat origin/main^1 origin/main`
@@ -361,8 +386,8 @@ The sequence, as practised:
    "branch from `dev`" (§2 step 1). A branch cut from `dev` and pointed at `main` would carry
    every unreleased commit with it; a real hotfix PR has had between 2 and 11 commits (#5311,
    #6245, #5447, #5255), with one deliberate 29-commit stability bundle (#5493).
-2. **Fix, with a `changelog.d/` fragment**, and open the PR against `main`. The same six checks
-   and review rule apply as on `dev` (and the same bypass caveat, §1).
+2. **Fix, with a `changelog.d/` fragment**, and open the PR against `main`. The same required
+   checks and review rule apply as on `dev` (and the same bypass caveat, §1).
 3. **Merge** — not while a `nightly-broken` issue is open (§3.1; check with an authenticated
    `gh issue list --label nightly-broken --state open`, and treat an API error as a stop) —
    then **fold the fragment** before the next tag (§3.4): `promote X.Y.Z --append`
@@ -406,7 +431,12 @@ do not promote it:
 
 ## 5. Who decides
 
-Three questions are settled by current practice rather than by a written policy. This is the
+**Decided by owner ruling (2026-09-11): merge, never rewrite.** Every branch is brought up to
+date by merging `origin/dev` into it, every PR lands with a merge commit, and nothing is
+rebased, squashed or force-pushed (§2 step 6). This is a rule, not observed practice; the
+repository settings that still enable squash and rebase merges do not change it.
+
+Three further questions are settled by current practice rather than by a written policy. This is the
 practice as confirmed on 2026-10-24 and recorded on the originating issue
 ([#119, comment by @mdornbrook, 2026-10-24](https://github.com/DevNullLtd/Yuzu/issues/119#issuecomment-6385608102));
 the three bullets below restate that comment, so they stand if the link does not, and add

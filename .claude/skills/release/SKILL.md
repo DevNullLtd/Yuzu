@@ -32,17 +32,17 @@ Before invoking the skill, the operator should already have:
 - CHANGELOG promoted: `python3 scripts/assemble-changelog.py promote X.Y.Z` run and committed — it assembles all `changelog.d/` fragments (plus any legacy `[Unreleased]` content) into `## [X.Y.Z] - YYYY-MM-DD` and deletes the fragment files. Never hand-move `[Unreleased]` content. Preflight check 4b fails while unpromoted fragments remain. **Later RCs and the final release:** the version was promoted at its first RC, so hotfix fragments added since then are folded in with `python3 scripts/assemble-changelog.py promote X.Y.Z --append` before each later RC tag, and with `--append --date <final-date>` before the final tag; run that even if no fragment landed since the last RC: with no fragments it only re-dates the header (#5221). Convention: `changelog.d/README.md`.
 - `meson.build` `version: 'X.Y.Z'` updated.
 - `README.md`'s Docker quickstart updated to the new release (the `/vX.Y.Z/` URL and `YUZU_VERSION=X.Y.Z`); `python3 -I tests/test_readme_quickstart.py` passes. CI runs it too (the `docs` suite of the required *Linux gcc-15 debug* check), but not on a docs-only change (PR or push), which gets that check's stub — run it locally before the release commit's PR rather than finding out from CI (#5540 is the precedent for the bump).
-- The six required checks green on the commit being tagged (`main`'s tip). **Skipped counts as passing; absent, failed or cancelled do not.** A docs/changelog-only push to `main` (the final `promote --append --date` commit is one only when it touches `CHANGELOG.md` alone; folding fragments also deletes `changelog.d/*.md`, which are nested markdown and so build) skips the build legs via preflight's `code_changed=false` (#5320): `Proto backward-compat` shows `skipped`, and the `Linux gcc-15 debug` / `Windows MSVC debug` / `macOS debug` names come from the `docs-required-checks` stub as `success`. That skip only happens when the previous commit's push run succeeded, so a green docs-only commit never hides a red or unbuilt code commit. `success` on those three names for a docs-only commit means *inherited from the predecessor's build*, not *built*; the run's summary says so. A context that is missing entirely is a stop: wait for the run, or find out why it did not start. Check it with:
+- The ruleset's required checks green on the commit being tagged (`main`'s tip). **Skipped counts as passing; absent, failed or cancelled do not.** A docs/changelog-only push to `main` (the final `promote --append --date` commit is one only when it touches `CHANGELOG.md` alone; folding fragments also deletes `changelog.d/*.md`, which are nested markdown and so build) skips the build legs via preflight's `code_changed=false` (#5320): `Proto backward-compat` shows `skipped`, and the `Linux gcc-15 debug` / `Windows MSVC debug` / `macOS debug` names come from the `docs-required-checks` stub as `success`. That skip only happens when the previous commit's push run succeeded, so a green docs-only commit never hides a red or unbuilt code commit. `success` on those three names for a docs-only commit means *inherited from the predecessor's build*, not *built*; the run's summary says so. A context that is missing entirely is a stop: wait for the run, or find out why it did not start. Check it with:
 
   ```bash
   SHA=$(git rev-parse origin/main)
   gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
     if .total_count > 100 then "WARN: \(.total_count) check runs; only the first 100 were read" else empty end,
-    ([.check_runs[] | select(.name | IN("Preflight (runner health)","Proto backward-compat","Linux gcc-15 debug","Windows MSVC debug","macOS debug","CHANGELOG order"))]
+    ([.check_runs[] | select(.name | IN("Preflight (runner health)","Proto backward-compat","Linux gcc-15 debug","Windows MSVC debug","macOS debug","CHANGELOG order","CBOM schema"))]
      | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)")'
   ```
 
-  It must print all six names, each `completed` with `success` or `skipped`. The ruleset that lists them is the repo's "Protect Main" setting, not this file.
+  It must print all seven names, each `completed` with `success` or `skipped` (`CBOM schema` is a `docs-lint.yml` job and runs on every push, docs-only included). The ruleset that lists them is the repo's "Protect Main" setting, not this file, and it changes outside git: if `gh api repos/DevNullLtd/Yuzu/rulesets/13631572 --jq '[.rules[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'` names a check missing from the list above, add it here and check it too.
 - The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
 
   ```bash
@@ -306,6 +306,8 @@ Candidate: $CANDIDATE
 <then the step-2 record lines, Release: through Validated SHA: NOT YET RUN>"
 ```
 
+**Candidate pinning is serialised between operators:** only one release authority pins a candidate for a given version at a time, and says so on the release issue before running the block above. Its absence check and its push are separate steps, so a second operator creating the same branch in between would be fast-forwarded by this push; `--match-head-commit` below still binds the merge to the recorded candidate, so the worst case is a disrupted, re-reviewed promotion, never an unreviewed tag.
+
 Merge it only this way, after the nightly-broken gate. `PROMO_PR` is this promotion PR, and
 Phase 1 uses the same number. `--match-head-commit` makes GitHub refuse the merge if the head
 has moved since it was pinned — nothing protects `release/*` branches, so this, not the branch
@@ -360,7 +362,10 @@ bash scripts/release-preflight.sh vX.Y.Z; PF_RC=$?   # READ IT: every check exce
 # The evidence reads $VALIDATED, not origin/main: preflight re-fetches, and origin/main may have moved.
 git log --no-merges --oneline "origin/dev..$VALIDATED"   # must be ONLY release prep + hotfixes you can name
 git cherry -v origin/dev "$VALIDATED"                     # every `+` must be in the expected list; an unexpected `+` STOPS the release
-git log --merges -p --cc "origin/dev..$VALIDATED"         # cherry and --no-merges both skip merges; a non-empty --cc diff = a hand-resolved merge, READ it
+git log --merges --oneline "origin/dev..$VALIDATED"       # cherry and --no-merges both skip merges; list them, then for EACH one:
+#   git show --remerge-diff <merge>                         # Git >= 2.36; READ it. Empty --cc output proves nothing: a conflict
+#                                                           # resolved wholly to one side (e.g. dev's old line over a hotfix) shows no --cc patch
+#   then grep the named hotfixes' changed lines in "$VALIDATED" to confirm each survived
 git diff --stat "$VALIDATED^1" "$VALIDATED"               # the promotion merge vs its first parent = what the release added; must be the intended delta
 echo "Validated SHA: $VALIDATED"
 ```
@@ -463,6 +468,7 @@ Capture the workflow run ID immediately:
 ```bash
 sleep 10  # give GitHub a moment to start the workflow
 RUN_ID=$(gh run list --workflow=release.yml --branch="vX.Y.Z" --limit=1 --json databaseId --jq '.[0].databaseId')
+[ -n "$RUN_ID" ] || { echo "STOP: no release run found for vX.Y.Z yet - wait and re-run this block"; return 1 2>/dev/null || exit 1; }
 echo "Release workflow: https://github.com/DevNullLtd/Yuzu/actions/runs/$RUN_ID"
 ```
 
