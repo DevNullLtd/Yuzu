@@ -22,7 +22,7 @@
 #   docker build -t yuzu-server -f deploy/docker/Dockerfile.server .
 
 # ── Stage 1: deps — toolchain + vcpkg packages (cached when vcpkg.json unchanged) ─
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258 AS deps
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2 AS deps
 
 # TRIPLET selects the vcpkg target. Pass --build-arg TRIPLET=arm64-linux for
 # arm64; the default keeps the historical x64 build behaviour.
@@ -105,7 +105,7 @@ RUN --mount=type=cache,target=/root/.cache/ccache \
 # for a WORKING bash + /dev/tcp (not merely a bash binary — a bash built without
 # net redirections is caught too) before release.yml pushes it, and on every PR
 # that touches this file.
-FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3bb48c7f8e94f258
+FROM debian:trixie-slim@sha256:a72b4433de1cf7d6bae0c4cee74d0547f58601a643b3375f070c51600d63b6b2
 
 # /var/log/yuzu uses 0750 (not the default 0755) to align with the deb postinst
 # (deploy/packaging/debian/postinst) and prevent log disclosure to other UIDs
@@ -125,7 +125,27 @@ FROM debian:trixie-slim@sha256:3a39a0592364683e6bab97937b72cad5a8fa6dcbbee90edb3
 # wiring — ADR-0008 plans static vcpkg libpq, in which case this too is
 # belt-and-braces, but it keeps the image correct if the Windows static-link
 # canary forces a dynamic-libpq fallback.
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# `apt-get upgrade` first (WP15/S9): the base digest is only as fresh as the day
+# Debian built it, so every release build takes the trixie security and point
+# updates for the packages the base already carries (perl-base, libc, util-linux,
+# ...); the named installs below come from the same refreshed index. The release
+# scans this image for fixable CRITICAL vulnerabilities before pushing it
+# (release.yml, scripts/ci/image-vuln-gate.sh). `--error-on=any`: plain
+# `apt-get update` exits 0 when an index (the security pocket) cannot be
+# fetched, and the upgrade would then ship without its fixes from a green
+# build; with it the build fails (exit 100). The `apt-get -s upgrade` line logs
+# anything apt still keeps back (a fix that needs a new dependency).
+# YUZU_PACKAGE_REFRESH: release.yml passes a value that changes on every run
+# attempt, so the package step below re-runs instead of being served from the
+# runner's persistent build cache (cache-from type=local; cache-prune.yml only
+# removes blobs no cache index references, so a referenced package layer stays
+# cached indefinitely), which would otherwise keep shipping the packages of
+# whichever build first populated it. Local builds leave it empty and cache as usual.
+ARG YUZU_PACKAGE_REFRESH=
+RUN : "package refresh: ${YUZU_PACKAGE_REFRESH}" \
+    && apt-get update --error-on=any && apt-get upgrade -y --no-install-recommends \
+    && apt-get -s upgrade | sed -n '/kept back:/,/^[^ ]/p' \
+    && apt-get install -y --no-install-recommends \
     libssl3 libpq5 ca-certificates bash \
     && rm -rf /var/lib/apt/lists/* \
     && useradd -r -s /usr/sbin/nologin yuzu \
