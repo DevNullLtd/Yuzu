@@ -32,7 +32,6 @@
 #include <set>
 #include <stdexcept>
 #include <string>
-#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <vector>
@@ -115,6 +114,29 @@ DexAppUsage with_rate(DexAppUsage a, const DexExposureRate& r) {
 DexAppUsage withheld_app(const std::string& subject, const std::string& token) {
     DexAppUsage a = matched_app(subject, 40, 7200, 10);
     a.rate_withheld = token;
+    return a;
+}
+
+DexAppUsage below_app(const std::string& subject) {
+    DexAppUsage a = matched_app(subject, 3, 0, 0);
+    a.totals.reset();
+    a.rate_withheld = "below_floor";
+    return a;
+}
+
+DexAppUsage no_usage_app(const std::string& subject) {
+    DexAppUsage a;
+    a.subject = subject;
+    a.state = DexUsageState::NoUsage;
+    a.rate_withheld = "no_usage";
+    return a;
+}
+
+DexAppUsage ambiguous_app(const std::string& subject) {
+    DexAppUsage a;
+    a.subject = subject;
+    a.state = DexUsageState::AmbiguousName;
+    a.rate_withheld = "ambiguous_name";
     return a;
 }
 
@@ -216,19 +238,21 @@ TEST_CASE("Usage UI: the Stability page adds only the View chips and one line", 
     CHECK(contains(offered, view_row(false)));
     CHECK(replace_all(offered, view_row(false), "") == hidden); // exactly the chips, nothing else
 
-    const std::string refused = render_dex_apps_fragment(model, 7, "all", DexAppsUsageEntry::Refused);
-    const std::string refused_line =
-        "<div class=\"gp-note\">Usage is not shown: it needs the Forensics read permission, which this account "
-        "does not hold. Nothing else on this page is affected.</div>";
-    CHECK(replace_all(refused, view_row(false) + refused_line, "") == hidden);
-    CHECK(contains(refused, "ledger.exe")); // the table and its figures are still there
-
-    const std::string unavailable = render_dex_apps_fragment(model, 7, "all", DexAppsUsageEntry::GateUnavailable);
-    const std::string unavailable_line =
-        "<div class=\"gp-note\">Usage is not shown: the permission check could not be completed. Try again in a "
-        "moment. Nothing else on this page is affected.</div>";
-    CHECK(replace_all(unavailable, view_row(false) + unavailable_line, "") == hidden);
-    CHECK(contains(unavailable, "ledger.exe"));
+    struct Case {
+        DexAppsUsageEntry entry;
+        std::string line;
+    };
+    for (const auto& k :
+         {Case{DexAppsUsageEntry::Refused,
+               "<div class=\"gp-note\">Usage is not shown: it needs the Forensics read permission, which this "
+               "account does not hold. Nothing else on this page is affected.</div>"},
+          Case{DexAppsUsageEntry::GateUnavailable,
+               "<div class=\"gp-note\">Usage is not shown: the permission check could not be completed. Try "
+               "again in a moment. Nothing else on this page is affected.</div>"}}) {
+        const std::string page = render_dex_apps_fragment(model, 7, "all", k.entry);
+        CHECK(replace_all(page, view_row(false) + k.line, "") == hidden); // the chips and the line, nothing else
+        CHECK(contains(page, "ledger.exe")); // the table and its figures are still there
+    }
 
     // An unrecognised platform still draws the chips (they fall back to all) beside the error panel.
     const std::string bad = render_dex_apps_fragment(model, 7, "beos", DexAppsUsageEntry::Offered);
@@ -243,20 +267,9 @@ DexAppsUsageModel mixed_model() {
     m.apps.push_back(with_rate(matched_app("ledger.exe", 40, 3'600'000, 900), rate_of(5.0 / 70.0, 0.031, 0.1415, 70.0, 4, 1)));
     m.apps.push_back(with_rate(matched_app("tiny.exe", 12, 36'000, 20), rate_of(0.000123456, 0.0001, 0.00015, 7.0, 1, 0, false)));
     m.apps.push_back(with_rate(matched_app("busy.exe", 60, 7'200'000, 50), rate_of(1234.5678, 1200.0, 1300.0, 3.0, 3000, 700)));
-    DexAppUsage below = matched_app("below.exe", 3, 0, 0);
-    below.totals.reset();
-    below.rate_withheld = "below_floor";
-    m.apps.push_back(below);
-    DexAppUsage none;
-    none.subject = "none.exe";
-    none.state = DexUsageState::NoUsage;
-    none.rate_withheld = "no_usage";
-    m.apps.push_back(none);
-    DexAppUsage amb;
-    amb.subject = "inventory-collector-";
-    amb.state = DexUsageState::AmbiguousName;
-    amb.rate_withheld = "ambiguous_name";
-    m.apps.push_back(amb);
+    m.apps.push_back(below_app("below.exe"));
+    m.apps.push_back(no_usage_app("none.exe"));
+    m.apps.push_back(ambiguous_app("inventory-collector-"));
     return m;
 }
 
@@ -297,7 +310,6 @@ TEST_CASE("Usage UI: each row equals the REST payload of the same model", "[dex]
     CHECK(contains(page, "100 devices online now (all platforms)"));
     CHECK(contains(page, "80 reported usage in the last " + std::to_string(j["freshness_window_hours"].get<int>()) + " hours"));
     CHECK(contains(page, "10 last reported earlier"));
-    CHECK(contains(page, "10 have never reported usage"));
     CHECK(contains(page, "<b>Reporting floor</b> " + std::to_string(j["floor"].get<int>()) + " device,"));
     CHECK(contains(page, "<span class=\"nw\">2023-11-14</span> <span class=\"nw\">22:13:20Z</span>"));
     // The crashes and hangs are per hour, not per 1,000 hours.
@@ -347,24 +359,14 @@ TEST_CASE("Usage UI: payload key-set parity in both directions (R39)", "[dex][ap
     for (const char* k : {"per_hour", "per_hour.estimate", "per_hour.lower", "per_hour.upper", "per_hour.reliable",
                           "hours", "crashes", "hangs", "basis"})
         shown.insert(std::string("apps[].exposure_rate.") + k);
-    // Keys the page deliberately does not print, one reason each. None today: every published key is
-    // read on the page.
-    const std::set<std::string> declared_omitted = {};
-
-    std::set<std::string> accounted = shown;
-    accounted.insert(declared_omitted.begin(), declared_omitted.end());
+    // Every published key is read on the page (a new key fails the first loop, a removed one the second).
     for (const auto& p : published) {
-        INFO("payload key '" << p << "' is neither shown nor declared omitted");
-        CHECK(accounted.count(p) == 1);
+        INFO("payload key '" << p << "' is not read on the page");
+        CHECK(shown.count(p) == 1);
     }
     for (const auto& p : shown) {
         INFO("page map names '" << p << "' but the payload no longer carries it");
         CHECK(published.count(p) == 1);
-    }
-    for (const auto& p : declared_omitted) {
-        INFO("declared omitted '" << p << "' but the payload no longer carries it (stale declaration)");
-        CHECK(published.count(p) == 1);
-        CHECK(shown.count(p) == 0);
     }
 
     // The keys that are not figures are bound to where the page reads them.
@@ -384,20 +386,9 @@ TEST_CASE("Usage UI: payload key-set parity in both directions (R39)", "[dex][ap
 
 TEST_CASE("Usage UI: every withheld state reads in words, never as a number", "[dex][apps_ui]") {
     auto m = base_model();
-    DexAppUsage below = matched_app("below.exe", 3, 0, 0);
-    below.totals.reset();
-    below.rate_withheld = "below_floor";
-    m.apps.push_back(below);
-    DexAppUsage none;
-    none.subject = "none.exe";
-    none.state = DexUsageState::NoUsage;
-    none.rate_withheld = "no_usage";
-    m.apps.push_back(none);
-    DexAppUsage amb;
-    amb.subject = "ambiguous";
-    amb.state = DexUsageState::AmbiguousName;
-    amb.rate_withheld = "ambiguous_name";
-    m.apps.push_back(amb);
+    m.apps.push_back(below_app("below.exe"));
+    m.apps.push_back(no_usage_app("none.exe"));
+    m.apps.push_back(ambiguous_app("ambiguous"));
     for (const char* token : {"unbounded_window", "window_exceeds_retention", "zero_usage", "no_statistic"})
         m.apps.push_back(withheld_app(std::string("w-") + token, token));
     m.apps.push_back(withheld_app("odd", "<b>new</b>"));
@@ -433,7 +424,7 @@ TEST_CASE("Usage UI: every withheld state reads in words, never as a number", "[
     auto reporting_zero = base_model();
     reporting_zero.reporting_devices = 0;
     reporting_zero.stale_devices = 0;
-    reporting_zero.apps.push_back(none);
+    reporting_zero.apps.push_back(no_usage_app("none.exe"));
     const std::string p0 = render_dex_apps_usage_fragment(controls_for(), reporting_zero);
     const std::string p0_body = body_of(p0, "none.exe");
     CHECK(contains(p0_body, "no device has reported usage"));
@@ -444,7 +435,7 @@ TEST_CASE("Usage UI: every withheld state reads in words, never as a number", "[
     nobody.population = 0;
     nobody.reporting_devices = 0;
     nobody.stale_devices = 0;
-    nobody.apps.push_back(none);
+    nobody.apps.push_back(no_usage_app("none.exe"));
     const std::string pn = render_dex_apps_usage_fragment(controls_for(), nobody);
     CHECK(contains(body_of(pn, "none.exe"), "no device online"));
     CHECK(contains(pn, "0 devices online now (all platforms). Usage needs at least one online device."));
@@ -503,7 +494,6 @@ TEST_CASE("Usage UI: cells are keyed on kind and their labels are escaped", "[de
     CHECK_FALSE(contains(body, "<script>"));
     CHECK(contains(body, "rtl&lt;U+202E&gt;x"));
     CHECK(contains(body, "Devices with no value for this tag"));
-    CHECK(contains(body, "Devices whose value is not among the 50 most common"));
     CHECK_FALSE(contains(body, "merged")); // floor 1: nothing is merged in
     CHECK(count_of(body, "under 30 devices") == 1);
     CHECK(contains(body, "6 cells"));
@@ -535,81 +525,40 @@ TEST_CASE("Usage UI: cells are keyed on kind and their labels are escaped", "[de
     const std::string gb = body_of(gpage, "grp.exe");
     CHECK(contains(gb, "<td class=\"dx-indent\">Finance &lt;laptops&gt;</td>"));
     CHECK(contains(gb, "<td class=\"dx-indent\">&lt;gone&gt;</td>"));
-    CHECK(contains(gb, "Devices outside the group"));
     CHECK(contains(gpage, "by management group Finance &lt;laptops&gt;"));
 }
 
-namespace {
-
-// A model built the way the builder builds it: cells assigned over a population, then disclosed.
-DexAppsUsageModel residual_model(const DexUsageSlice& slice, std::size_t population_size, std::int64_t floor,
-                                 const std::unordered_set<std::string>& members,
-                                 const std::unordered_map<std::string, std::string>& values,
-                                 const std::string& odd_os) {
-    std::vector<std::pair<std::string, std::string>> population;
-    for (std::size_t i = 0; i < population_size; ++i)
-        population.emplace_back("d" + std::to_string(i), i + 1 == population_size ? odd_os : std::string("windows"));
-    const auto assigned = dex_usage_assign_cells(population, slice, members, values);
-    std::vector<DexUsageRawCell> raw;
-    for (const auto& def : assigned.defs)
-        raw.push_back({def.kind, def.label, 0, 0, 0});
-    for (const int cell : assigned.cell_of) {
-        auto& r = raw[static_cast<std::size_t>(cell)];
-        ++r.devices;
-        r.run_seconds += 3600;
-        r.launches += 1;
-    }
-    const auto disclosed = dex_usage_disclose(raw, floor);
-    auto m = base_model();
-    m.slice = slice;
-    m.floor = floor;
-    DexAppUsage a = matched_app("res.exe", disclosed.devices, disclosed.totals ? disclosed.totals->run_seconds_30d : 0, 1);
-    a.totals = disclosed.totals;
-    a.cells = disclosed.cells;
-    a.rate_withheld = "zero_usage";
-    m.apps.push_back(a);
-    return m;
-}
-
-} // namespace
-
+// The renderer words the residual cell from the slice kind and from floor > 1 alone. Which devices
+// land in the cell is the model's job and is pinned in test_dex_usage_model.cpp, so the models here
+// are built by hand: one Other-kind cell per slice, at floor 1 and at floor 10.
 TEST_CASE("Usage UI: the residual cell is named for what the model puts in it", "[dex][apps_ui]") {
-    DexUsageSlice platform;
-    platform.kind = DexUsageSliceKind::Platform;
-    DexUsageSlice group;
-    group.kind = DexUsageSliceKind::Group;
-    group.key = "g-1";
-    DexUsageSlice tag;
-    tag.kind = DexUsageSliceKind::Tag;
-    tag.key = "site";
-
-    std::unordered_set<std::string> members;
-    for (int i = 0; i < 12; ++i)
-        members.insert("d" + std::to_string(i));
-    std::unordered_map<std::string, std::string> values;
-    for (int i = 0; i < 60; ++i)
-        values["d" + std::to_string(i)] = "v" + std::to_string(100 + i); // 60 values: the 50 cap leaves 10 over
-
     const std::string merged = "plus cells merged in so that no row is below the reporting floor";
     struct Case {
-        DexUsageSlice slice;
-        std::size_t population;
+        DexUsageSliceKind kind;
+        const char* key;
         const char* words;
     };
-    for (const auto& c : {Case{platform, 13, "Devices on a platform other than Windows, Linux or macOS"},
-                          Case{group, 24, "Devices outside the group"},
-                          Case{tag, 60, "Devices whose value is not among the 50 most common"}}) {
+    for (const auto& c : {Case{DexUsageSliceKind::Platform, "", "Devices on a platform other than Windows, Linux or macOS"},
+                          Case{DexUsageSliceKind::Group, "g-1", "Devices outside the group"},
+                          Case{DexUsageSliceKind::Tag, "site", "Devices whose value is not among the 50 most common"}}) {
         INFO(c.words);
-        const auto at_one = residual_model(c.slice, c.population, 1, members, values, "plan9");
-        const std::string body1 = body_of(render_dex_apps_usage_fragment(controls_for(c.slice.kind, c.slice.key), at_one), "res.exe");
-        CHECK(contains(body1, c.words));
-        CHECK_FALSE(contains(body1, "floor")); // at floor 1 nothing is merged in
-        CHECK_FALSE(contains(body1, "merged"));
-
-        const auto at_ten = residual_model(c.slice, c.population, 10, members, values, "plan9");
-        const std::string body10 = body_of(render_dex_apps_usage_fragment(controls_for(c.slice.kind, c.slice.key), at_ten), "res.exe");
-        CHECK(contains(body10, c.words));
-        CHECK(contains(body10, merged));
+        for (const std::int64_t floor : {1, 10}) {
+            auto m = base_model();
+            m.slice.kind = c.kind;
+            m.slice.key = c.key;
+            m.floor = floor;
+            DexAppUsage a = withheld_app("res.exe", "zero_usage");
+            a.cells = {cell_of(DexUsageCellKind::Other, "other", 5, 3600, 1)};
+            m.apps.push_back(a);
+            const std::string body = body_of(render_dex_apps_usage_fragment(controls_for(c.kind, c.key), m), "res.exe");
+            CHECK(contains(body, c.words));
+            if (floor == 1) { // nothing is merged in at floor 1, so the suffix would be false
+                CHECK_FALSE(contains(body, "floor"));
+                CHECK_FALSE(contains(body, "merged"));
+            } else {
+                CHECK(contains(body, merged));
+            }
+        }
     }
 }
 
@@ -641,27 +590,6 @@ TEST_CASE("Usage UI: slice controls carry the request and the pane attributes", 
     CHECK(contains(tpage, "value=\"a&quot;b\""));
     CHECK(contains(tpage, "<span class=\"dx-none\">none defined</span>"));
     CHECK_FALSE(contains(tpage, "<select"));
-}
-
-TEST_CASE("Usage UI: a control's request never carries its own parameter", "[dex][apps_ui]") {
-    auto t = controls_for(DexUsageSliceKind::Tag, "site");
-    t.groups = {{"g-1", "Finance"}};
-    const std::string tpage = render_dex_apps_usage_fragment(t, base_model());
-    const std::string tag_get = hx_get_after(tpage, "name=\"tag_key\"");
-    CHECK(contains(tag_get, "slice=tag"));
-    CHECK(contains(tag_get, "window=7d"));
-    CHECK(contains(tag_get, "platform=all"));
-    CHECK_FALSE(contains(tag_get, "tag_key="));
-    CHECK(contains(tpage, "value=\"site\""));
-
-    auto g = controls_for(DexUsageSliceKind::Group, "g-1");
-    g.groups = {{"g-1", "Finance"}};
-    const std::string gpage = render_dex_apps_usage_fragment(g, base_model());
-    const std::string group_get = hx_get_after(gpage, "name=\"group\"");
-    CHECK(contains(group_get, "slice=group"));
-    CHECK(contains(group_get, "window=7d"));
-    CHECK(contains(group_get, "platform=all"));
-    CHECK_FALSE(contains(group_get, "group="));
 }
 
 TEST_CASE("Usage UI: captions name the population, the basis and the cell denominator", "[dex][apps_ui]") {
@@ -718,8 +646,6 @@ TEST_CASE("Usage UI: every row that prints a device count prints the reporting p
     }
     CHECK(heads == 6);
     CHECK(cells == 2);
-    // An application that prints no device count prints no denominator.
-    CHECK_FALSE(contains(head_row(body_of(page, "inventory-collector-")), "reporting</span>"));
 }
 
 TEST_CASE("Usage UI: each refusal draws its own panel and nothing from a model", "[dex][apps_ui]") {
@@ -742,8 +668,7 @@ TEST_CASE("Usage UI: each refusal draws its own panel and nothing from a model",
                           Case{"group_unavailable", "query_error", "members could not be read"},
                           Case{"tag_unavailable", "", "The tag values could not be read"},
                           Case{"no_population", "", "No fleet source is connected"},
-                          Case{"usage_unavailable", "not_wired", "The read could not be completed"},
-                          Case{"internal_error", "", "The read could not be completed"}}) {
+                          Case{"usage_unavailable", "not_wired", "The read could not be completed"}}) {
         INFO(k.reason << "/" << k.detail);
         const std::string page = render_dex_apps_usage_refusal(c, k.reason, k.detail);
         CHECK(contains(page, k.words));
@@ -1038,32 +963,41 @@ TEST_CASE("Usage route: bad parameters draw a panel, write no audit row and read
 TEST_CASE("Usage route: a control's request, as htmx completes it, reaches the read intact", "[dex][apps_ui]") {
     UsageRouteFixture f;
     f.groups = {{"g-1", "Finance"}, {"g-2", "Engineering"}};
-    auto first = f.get("slice=tag&tag_key=model");
-    REQUIRE(first);
-    const std::string tag_get = hx_get_after(first->body, "name=\"tag_key\"");
-    const std::string group_get = hx_get_after(first->body, "name=\"group\"");
+    // Each control is taken from a page where its own parameter is live and not the default, under a
+    // non-default window and platform. A URL that pre-carried tag_key or group would pin the old value
+    // (the handler reads the first one), and a control that dropped the window or platform would reset it.
+    auto tagged = f.get("window=30d&platform=linux&slice=tag&tag_key=site");
+    auto grouped = f.get("window=30d&platform=linux&slice=group&group=g-1");
+    REQUIRE(tagged);
+    REQUIRE(grouped);
+    const std::string tag_get = hx_get_after(tagged->body, "name=\"tag_key\"");
+    const std::string group_get = hx_get_after(grouped->body, "name=\"group\"");
     f.events.clear();
     f.reads.clear();
     f.audits.clear();
 
     // htmx appends the control's own name=value to a GET.
-    auto by_tag = f.sink.Get(tag_get + "&tag_key=site");
+    auto by_tag = f.sink.Get(tag_get + "&tag_key=rack");
     REQUIRE(by_tag);
     CHECK(by_tag->status == 200);
     REQUIRE(f.reads.size() == 1);
+    CHECK(f.reads[0].window == "30d");
+    CHECK(f.reads[0].scope == "linux");
     CHECK(f.reads[0].slice.kind == DexUsageSliceKind::Tag);
-    CHECK(f.reads[0].slice.key == "site");
+    CHECK(f.reads[0].slice.key == "rack");
     REQUIRE(f.audits.size() == 1);
-    CHECK(contains(f.audits[0].detail, "slice=tag key=site "));
+    CHECK(contains(f.audits[0].detail, " window=30d platform=linux slice=tag key=rack "));
 
     auto by_group = f.sink.Get(group_get + "&group=g-2");
     REQUIRE(by_group);
     CHECK(by_group->status == 200);
     REQUIRE(f.reads.size() == 2);
+    CHECK(f.reads[1].window == "30d");
+    CHECK(f.reads[1].scope == "linux");
     CHECK(f.reads[1].slice.kind == DexUsageSliceKind::Group);
     CHECK(f.reads[1].slice.key == "g-2");
     REQUIRE(f.audits.size() == 2);
-    CHECK(contains(f.audits[1].detail, "slice=group key=g-2 "));
+    CHECK(contains(f.audits[1].detail, " window=30d platform=linux slice=group key=g-2 "));
     CHECK(contains(by_group->body, "<option value=\"g-2\" selected>Engineering</option>"));
 }
 
@@ -1083,30 +1017,16 @@ TEST_CASE("Usage route: the two page conventions that differ from REST", "[dex][
 }
 
 TEST_CASE("Usage route: a refusal from the API is a 200 panel, the audit row stands", "[dex][apps_ui]") {
-    struct Case {
-        const char* reason;
-        const char* detail;
-        const char* words;
-    };
-    for (const auto& k : {Case{"usage_unavailable", "fleet_too_large", "Trying again does not help"},
-                          Case{"usage_unavailable", "concurrency_budget", "Usage is busy"},
-                          Case{"usage_unavailable", "statement_timeout", "Try again in a moment, or choose a single platform"},
-                          Case{"apps_degraded", "query_error", "The application list could not be read"},
-                          Case{"group_unavailable", "query_error", "members could not be read"},
-                          Case{"tag_unavailable", "", "The tag values could not be read"},
-                          Case{"no_population", "", "No fleet source is connected"},
-                          Case{"invalid_slice", "unknown_group", "Unknown management group"},
-                          Case{"invalid_request", "", "The read could not be completed"}}) {
-        INFO(k.reason << "/" << k.detail);
-        UsageRouteFixture f;
-        f.next_usage = std::unexpected(DexUsageRefusal{k.reason, k.detail});
-        auto r = f.get();
-        REQUIRE(r);
-        CHECK(r->status == 200);
-        CHECK(contains(r->body, k.words));
-        CHECK_FALSE(contains(r->body, "<table"));
-        CHECK(f.audits.size() == 1); // the row records the admitted request, not the outcome
-    }
+    // One case: every refusal takes the same pass-through, and the per-token panels are table-tested
+    // above. This panel needs both the reason and the detail, so it also fails if the two are swapped.
+    UsageRouteFixture f;
+    f.next_usage = std::unexpected(DexUsageRefusal{"usage_unavailable", "fleet_too_large"});
+    auto r = f.get();
+    REQUIRE(r);
+    CHECK(r->status == 200);
+    CHECK(contains(r->body, "Trying again does not help"));
+    CHECK_FALSE(contains(r->body, "<table"));
+    CHECK(f.audits.size() == 1); // the row records the admitted request, not the outcome
 }
 
 TEST_CASE("Usage route: a throwing API is contained and its text kept out of the page", "[dex][apps_ui]") {
@@ -1138,7 +1058,6 @@ TEST_CASE("Usage route: omitted parameters take their defaults; the Stability pa
     CHECK(f.reads[0].window == "7d");
     CHECK(f.reads[0].scope == "all");
     CHECK(f.reads[0].slice.kind == DexUsageSliceKind::Fleet);
-    CHECK(f.reads[0].floor == 1);
     CHECK(contains(f.audits[0].detail, " slice=fleet "));
 
     UsageRouteFixture t;

@@ -195,19 +195,12 @@ decomposition (the share and rate count only affected devices that are online no
 "Fleet-wide application performance" under Drill-downs.
 
 **Usage view.** A **View** row above the platform chips switches between **Stability** and **Usage**. **Usage**
-shows, per application, the devices that ran it, its run time (process-hours) and launches over the last 30 days,
-and its crashes and hangs **per hour of use**, printed as `GET /api/v1/dex/apps/usage` returns them and marked
-*estimated from 30-day usage*. Every device count reads "of R reporting", where R is the devices that reported
-usage in the last 48 hours. Slice chips (**Whole fleet**, **By platform**, **By tag**), a tag key box (default
-`model`) and a management group list split each application into cells that open under its row. Withheld figures
-read in words: below the reporting floor (the count only), no usage, an ambiguous name (Linux keeps only the first
-15 bytes of a process name), and one sentence for each reason a rate is not calculated. The page always reads at
-the default floor of 1; an unknown window reads as 7d. It needs `Forensics:Read` as well as `GuaranteedState:Read`
-(administrators only while RBAC is off). Without `Forensics:Read` the **Usage** chip shows the Stability page and
-the line "Usage is not shown: it needs the Forensics read permission, which this account does not hold", and the
-permission gate records the refusal. Each Usage view is audited as `dex.apps.usage.view` before it is read, and if
-that row cannot be stored the page says so and reads nothing. Details:
-[app usage](../dex/app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view).
+shows each application's devices, run time and launches over the last 30 days and its crashes and hangs per hour
+of use, marked *estimated from 30-day usage*, and can be split by platform, tag or management group. It needs
+`Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off); without
+`Forensics:Read` the **Usage** chip shows the Stability page and one line saying so. Each Usage view is audited as
+`dex.apps.usage.view` before it is read, and a view whose audit row cannot be stored reads nothing. Slice controls,
+withheld states and page conventions: [app usage](../dex/app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view).
 
 ### Scoring
 

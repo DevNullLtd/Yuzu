@@ -2630,47 +2630,40 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 refuse("invalid_scope", "");
                 return;
             }
-            const std::string slice_name =
+            const std::string slice_text =
                 req.has_param("slice") ? req.get_param_value("slice") : std::string("fleet");
-            DexUsageSlice slice;
-            if (slice_name == "fleet")
-                slice.kind = DexUsageSliceKind::Fleet;
-            else if (slice_name == "platform")
-                slice.kind = DexUsageSliceKind::Platform;
-            else if (slice_name == "group")
-                slice.kind = DexUsageSliceKind::Group;
-            else if (slice_name == "tag")
-                slice.kind = DexUsageSliceKind::Tag;
-            else {
+            const auto parsed_kind = dex_usage_slice_kind_from_token(slice_text);
+            if (!parsed_kind) {
                 refuse("invalid_slice", ""); // the controls fall back to the whole fleet
                 return;
             }
-            controls.slice.kind = slice.kind;
-            if (req.has_param("group") && slice.kind != DexUsageSliceKind::Group) {
+            // The controls hold the slice from here on: the kind now (so a refusal below draws the
+            // right chip), the key only once it validates (a rejected value is never placed in them).
+            controls.slice.kind = *parsed_kind;
+            if (req.has_param("group") && controls.slice.kind != DexUsageSliceKind::Group) {
                 refuse("invalid_slice", "group_outside_slice");
                 return;
             }
-            if (req.has_param("tag_key") && slice.kind != DexUsageSliceKind::Tag) {
+            if (req.has_param("tag_key") && controls.slice.kind != DexUsageSliceKind::Tag) {
                 refuse("invalid_slice", "tag_key_outside_slice");
                 return;
             }
-            if (slice.kind == DexUsageSliceKind::Group) {
+            if (controls.slice.kind == DexUsageSliceKind::Group) {
                 const std::string id = req.has_param("group") ? req.get_param_value("group") : std::string();
                 if (id.empty() || !mgmt_group_id_ok(id)) {
                     refuse("invalid_slice", "no_group");
                     return;
                 }
-                slice.key = id;
-            } else if (slice.kind == DexUsageSliceKind::Tag) {
+                controls.slice.key = id;
+            } else if (controls.slice.kind == DexUsageSliceKind::Tag) {
                 const std::string key =
                     req.has_param("tag_key") ? req.get_param_value("tag_key") : std::string(kDexDefaultCohortKey);
                 if (!valid_tag_key(key)) {
                     refuse("invalid_slice", "invalid_tag_key"); // the controls keep the default key
                     return;
                 }
-                slice.key = key;
+                controls.slice.key = key;
             }
-            controls.slice = slice;
 
             if (!dex_api_) {
                 if (apps_error_log_.should_warn("usage_not_wired"))
@@ -2684,14 +2677,15 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                                                "",
                                                "dashboard DEX fleet application usage read cid=" + cid +
                                                    " window=" + window + " platform=" + scope +
-                                                   " slice=" + slice_name + " key=" + audit_token(slice.key) +
+                                                   " slice=" + dex_usage_slice_token(controls.slice.kind) +
+                                                   " key=" + audit_token(controls.slice.key) +
                                                    " floor=" + std::to_string(kDexCohortFloor))) {
                 spdlog::warn("dex.apps.usage.view audit fail-closed (usage not read) cid={}", cid);
                 refuse("audit_unavailable", "");
                 return;
             }
 
-            const auto r = dex_api_->apps_usage(window, scope, slice, kDexCohortFloor, gate.scope);
+            const auto r = dex_api_->apps_usage(window, scope, controls.slice, kDexCohortFloor, gate.scope);
             if (r)
                 answer(render_dex_apps_usage_fragment(controls, *r));
             else

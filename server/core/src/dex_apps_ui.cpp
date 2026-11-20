@@ -574,31 +574,6 @@ const char* const kAppsUsageCss = R"CSS(<style>
 .gp-filters .dx-none{align-self:center;color:var(--mut);font-size:12.5px}
 </style>)CSS";
 
-const char* const kUsageSub =
-    "Usage per application across the fleet &mdash; devices, run time and launches over the last 30 "
-    "days, and crashes &amp; hangs per hour of use.";
-
-DexUsageSlice make_slice(DexUsageSliceKind kind, const std::string& key) {
-    DexUsageSlice s;
-    s.kind = kind;
-    s.key = key;
-    return s;
-}
-
-const char* slice_token(DexUsageSliceKind k) {
-    switch (k) {
-    case DexUsageSliceKind::Platform:
-        return "platform";
-    case DexUsageSliceKind::Group:
-        return "group";
-    case DexUsageSliceKind::Tag:
-        return "tag";
-    case DexUsageSliceKind::Fleet:
-        break;
-    }
-    return "fleet";
-}
-
 // "View: Stability | Usage". `platform` is a canonical scope token (never request text) and
 // `usage_on` says which chip is lit.
 std::string view_chips(const std::string& window, const std::string& platform, bool usage_on) {
@@ -620,7 +595,7 @@ std::string usage_base_url(const std::string& window, const std::string& platfor
 // The full request for a chip: the base plus the slice's own key.
 std::string usage_url(const std::string& window, const std::string& platform,
                       const DexUsageSlice& slice) {
-    std::string u = usage_base_url(window, platform, slice_token(slice.kind));
+    std::string u = usage_base_url(window, platform, dex_usage_slice_token(slice.kind));
     if (slice.kind == DexUsageSliceKind::Group && !slice.key.empty())
         u += "&amp;group=" + url_query_value(slice.key);
     if (slice.kind == DexUsageSliceKind::Tag)
@@ -661,11 +636,11 @@ std::string slice_controls(const DexAppsUsageControls& c, const std::string& win
                                     ? cur.key
                                     : std::string(kDexDefaultCohortKey);
     std::string h = "<div class=\"gp-filters\"><span class=\"dx-lbl\">Slice</span>";
-    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Fleet, "")), "Whole fleet",
+    h += dex_pane_chip(usage_url(window, keep, DexUsageSlice{DexUsageSliceKind::Fleet, ""}), "Whole fleet",
                        cur.kind == DexUsageSliceKind::Fleet);
-    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Platform, "")),
+    h += dex_pane_chip(usage_url(window, keep, DexUsageSlice{DexUsageSliceKind::Platform, ""}),
                        "By platform", cur.kind == DexUsageSliceKind::Platform);
-    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Tag, tag_key)), "By tag",
+    h += dex_pane_chip(usage_url(window, keep, DexUsageSlice{DexUsageSliceKind::Tag, tag_key}), "By tag",
                        cur.kind == DexUsageSliceKind::Tag);
     // The tag-key box: its URL names the slice but never tag_key, which htmx appends.
     h += "<input class=\"dx-ctl dx-key\" name=\"tag_key\" aria-label=\"Tag key\" value=\"" + esc(tag_key) +
@@ -698,9 +673,9 @@ std::string usage_head(const DexAppsUsageControls& c, const std::string& window,
     h += kAppsCss;
     h += kAppsUsageCss;
     h += "<div id=\"dex-apps\"><div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
-         "<div class=\"gp-sub\">";
-    h += kUsageSub;
-    h += "</div>" + captions + "</div></div>";
+         "<div class=\"gp-sub\">Usage per application across the fleet &mdash; devices, run time and "
+         "launches over the last 30 days, and crashes &amp; hangs per hour of use.</div>" +
+         captions + "</div></div>";
     h += view_chips(window, keep, true);
     h += usage_filters(c, window, keep);
     h += slice_controls(c, window, keep);
@@ -1072,11 +1047,11 @@ std::string render_dex_apps_usage_fragment(const DexAppsUsageControls& controls,
     std::string h = usage_head(controls, window, keep, usage_captions(controls, model, window));
 
     if (model.apps.empty()) {
-        const bool all = controls.platform.empty() || controls.platform == kDexAppsScopeAll;
+        const bool all = keep == kDexAppsScopeAll;
         h += placeholder("No applications to show usage for",
                          std::string("Usage is listed for the applications on the Stability view, and no application "
                                      "crashed or hung") +
-                             (all ? std::string() : " on " + std::string(scope_label(controls.platform)) + " devices") +
+                             (all ? std::string() : " on " + std::string(scope_label(keep)) + " devices") +
                              " in this window. An application that only ran is not listed.");
         return h + "</div>";
     }
