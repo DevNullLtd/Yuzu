@@ -120,7 +120,7 @@ TERMINAL rows only, nothing sweeps an in-flight row at boot, and `release` runs 
 process, so the row answers `RUNNING` for that command id until the agent's dedup database is removed
 (a reinstall); it is never evicted. The quarantine reconciler re-dispatches containment under a fresh
 command id, and an operator re-issues any other command under a new id. A boot sweep is not part of
-this build and is tracked as a follow-up issue (#TBD-SIGKILL-DEDUP).
+this build and is tracked as a follow-up issue (#3664).
 
 ## Two further contracts
 
