@@ -1072,8 +1072,10 @@ static const ToolDef kTools[] = {
      "from exactly the agents returned. Confined by management group / service scope: a "
      "confined caller's summary counts only its own visible agents, never the fleet-wide "
      "total. Policy evaluation does not dispatch a check that runs a Forensics-tier plugin (an "
-     "action on the Forensics securable carries an execute gate): every agent shows blocked "
-     "with an empty check_result, and the evaluator never reads Forensics-tier output. "
+     "action on the Forensics securable carries an execute gate): once the policy has been "
+     "evaluated every agent shows blocked, its check_result records the refusal (phase, "
+     "reason, plugin, action) and holds no check output, and the evaluator never reads "
+     "Forensics-tier output. "
      "REST v1 twin: GET /api/v1/compliance/{id} (same shape).",
      R"({"type":"object","properties":{"policy_id":{"type":"string","minLength":1,"description":"Policy ID"}},"required":["policy_id"]})",
      R"j({"type":"object","properties":{"policy_id":{"type":"string"},"summary":{"type":"object","properties":{"compliant":{"type":"integer"},"non_compliant":{"type":"integer"},"unknown":{"type":"integer"},"fixing":{"type":"integer"},"error":{"type":"integer"},"blocked":{"type":"integer"},"total":{"type":"integer"}}},"agents":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"status":{"type":"string"},"last_check_at":{"type":"integer"},"last_fix_at":{"type":"integer"},"check_result":{"type":"string"}},"required":["agent_id","status"]}},"audit_persisted":{"type":"boolean","description":"Present (false) only when the audit write for this read itself failed"}},"required":["policy_id","summary","agents"]})j"},

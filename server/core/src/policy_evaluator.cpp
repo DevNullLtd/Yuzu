@@ -346,7 +346,7 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
     // continuously rather than only at boot.
 
     // G01: describe and pre-seed the refusal counter at 0, one series per reason, so a rate()
-    // over it exists before the first refusal. The seven labels are the lowercase tokens the
+    // over it exists before the first refusal. The eight labels are the lowercase tokens the
     // `blocked` row, the audit detail and the log use too (`to_string`).
     if (d_.metrics) {
         d_.metrics->describe(
