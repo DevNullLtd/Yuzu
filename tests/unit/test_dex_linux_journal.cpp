@@ -64,8 +64,8 @@ private:
 TEST_CASE("journal: CR/LF/C0/C1 in journal-supplied subject and reason are folded (F59)",
           "[guardian][dex][linux][journal][log_injection]") {
     const std::string coredump =
-        R"({"__CURSOR":"c","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1",)"
-        R"("COREDUMP_COMM":"a\nforged\u001b[2J\u009b31m"})";
+        R"({"__CURSOR":"c","MESSAGE_ID":"fc2e22bc6ee647b6b90729ab34a250b1","_UID":"0",)"
+        R"("_COMM":"systemd-coredum","COREDUMP_COMM":"a\nforged\u001b[2J\u009b31m"})";
     const JournalLine jl = parse_journal_line(coredump);
     REQUIRE(jl.obs.has_value());
     CHECK(jl.obs->subject.find('\n') == std::string::npos);
@@ -74,7 +74,7 @@ TEST_CASE("journal: CR/LF/C0/C1 in journal-supplied subject and reason are folde
 
     const std::string unit =
         std::string(R"({"__CURSOR":"c","MESSAGE_ID":")") + std::string(kMsgIdUnitResult) +
-        R"(","UNIT":"x\r\ny.service","UNIT_RESULT":"exit\ncode"})";
+        R"(","_PID":"1","_UID":"0","UNIT":"x\r\ny.service","UNIT_RESULT":"exit\ncode"})";
     const JournalLine ju = parse_journal_line(unit);
     REQUIRE(ju.obs.has_value());
     CHECK(ju.obs->subject.find_first_of("\r\n") == std::string::npos);
