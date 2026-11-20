@@ -8,6 +8,7 @@
 
 #include <set>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace fs = yuzu::shared::file_search;
@@ -185,4 +186,88 @@ TEST_CASE("coverage: tokens are distinct and the shared gap tokens are exact",
                             fs::to_token(fs::Extents::collected),
                             fs::to_token(fs::Extents::unsupported)};
     CHECK(v.size() == 6);
+}
+
+TEST_CASE("coverage: a volume that is complete while naming a reason reads partial", "[file_search][coverage]") {
+    fs::CoverageEnvelope e;
+    e.volumes.push_back(vol("/", fs::VolumeState::complete, fs::Reason::budget_time)); // contradicts itself
+    REQUIRE_FALSE(e.valid());
+    CHECK_FALSE(e.complete());
+    CHECK(fs::format_coverage_rows(e).back().rfind("coverage|partial|", 0) == 0);
+    // the opposite contradiction: a partial volume that names no reason
+    e.volumes = {vol("/", fs::VolumeState::partial, fs::Reason::none)};
+    CHECK_FALSE(e.complete());
+}
+
+TEST_CASE("coverage: volumes the plan dropped make the verdict partial and are counted in a row",
+          "[file_search][coverage]") {
+    auto e = clean();
+    REQUIRE(e.complete());
+    e.volumes_dropped = 3;
+    CHECK_FALSE(e.complete());
+    const auto rows = fs::format_coverage_rows(e);
+    REQUIRE(rows.size() == 3);
+    CHECK(rows[1] == "volumes_dropped|3");
+    CHECK(rows.back().rfind("coverage|partial|", 0) == 0);
+    e.volumes_dropped = 0;
+    CHECK(fs::format_coverage_rows(e).size() == 2); // no row for none
+}
+
+TEST_CASE("coverage: every reason and gap cause is spelled, and the shared tokens are equal",
+          "[file_search][coverage]") {
+    using fs::GapCause;
+    using fs::Reason;
+    const std::vector<std::pair<Reason, const char*>> reasons = {
+        {Reason::none, "none"},
+        {Reason::budget_entries, "budget_entries"},
+        {Reason::budget_time, "budget_time"},
+        {Reason::budget_rows, "budget_rows"},
+        {Reason::cancelled, "cancelled"},
+        {Reason::fstype_not_allowed, "fstype_not_allowed"},
+        {Reason::network_mount, "network_mount"},
+        {Reason::mount_table_unreadable, "mount_table_unreadable"},
+        {Reason::permission_denied, "permission_denied"},
+        {Reason::private_namespace, "private_namespace"},
+        {Reason::other_device, "other_device"},
+        {Reason::stalled, "stalled"},
+        {Reason::unstable, "unstable"},
+        {Reason::unsupported, "unsupported"},
+        {Reason::duplicate_mount, "duplicate_mount"},
+        {Reason::behind_network_mount, "behind_network_mount"},
+        {Reason::max_slices, "max_slices"},
+        {Reason::mount_table_changed, "mount_table_changed"},
+        {Reason::firmlinks_only, "firmlinks_only"},
+    };
+    std::set<std::string> seen;
+    for (const auto& [r, token] : reasons) {
+        CHECK(std::string(fs::to_token(r)) == token);
+        seen.insert(token);
+    }
+    CHECK(seen.size() == reasons.size());
+
+    const std::vector<std::pair<GapCause, const char*>> causes = {
+        {GapCause::depth, "depth"},
+        {GapCause::dir_unreadable, "dir_unreadable"},
+        {GapCause::dir_truncated, "dir_truncated"},
+        {GapCause::other_device, "other_device"},
+        {GapCause::network_mount, "network_mount"},
+        {GapCause::memory_cap, "memory_cap"},
+        {GapCause::permission_denied, "permission_denied"},
+        {GapCause::dataless, "dataless"},
+        {GapCause::private_namespace, "private_namespace"},
+        {GapCause::name_too_long, "name_too_long"},
+        {GapCause::match_cap, "match_cap"},
+    };
+    std::set<std::string> gaps;
+    for (const auto& [c, token] : causes) {
+        CHECK(std::string(fs::to_token(c)) == token);
+        gaps.insert(token);
+    }
+    CHECK(gaps.size() == causes.size());
+
+    // the one vocabulary: where a reason and a gap cause mean the same, they are spelled the same
+    CHECK(std::string(fs::to_token(Reason::network_mount)) == fs::to_token(GapCause::network_mount));
+    CHECK(std::string(fs::to_token(Reason::permission_denied)) == fs::to_token(GapCause::permission_denied));
+    CHECK(std::string(fs::to_token(Reason::private_namespace)) == fs::to_token(GapCause::private_namespace));
+    CHECK(std::string(fs::to_token(Reason::other_device)) == fs::to_token(GapCause::other_device));
 }

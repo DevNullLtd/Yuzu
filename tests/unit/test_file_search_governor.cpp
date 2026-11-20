@@ -55,6 +55,31 @@ TEST_CASE("governor: limits validation", "[file_search][governor]") {
     CHECK_FALSE(fs::valid(l));
 }
 
+TEST_CASE("governor: a zero max_stalls or max_restarts is refused, not read as one",
+          "[file_search][governor]") {
+    fs::GovernorLimits l;
+    l.max_stalls = 0;
+    CHECK_FALSE(fs::valid(l));
+    l.max_stalls = 1;
+    CHECK(fs::valid(l));
+    l = {};
+    l.max_restarts = 0;
+    CHECK_FALSE(fs::valid(l));
+    l.max_restarts = 1;
+    CHECK(fs::valid(l));
+}
+
+TEST_CASE("governor: the default limits are the ruled slice, entry and row budgets",
+          "[file_search][governor]") {
+    const fs::GovernorLimits l;
+    CHECK(l.slice == milliseconds{10'000});
+    CHECK(l.max_entries == 400'000);
+    CHECK(l.max_rows == 1'000);
+    CHECK(l.max_stalls == 3);
+    CHECK(l.max_restarts == 3);
+    CHECK(fs::valid(l));
+}
+
 TEST_CASE("governor: deadline is construction time plus slice", "[file_search][governor]") {
     FakeClock c;
     const auto start = c.t;

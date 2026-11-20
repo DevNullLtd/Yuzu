@@ -44,7 +44,9 @@ enum class GapCause {
     private_namespace,
     // an entry whose name a Position cannot hold (valid_component false: over kMaxNameBytes, or
     // holding '/' or NUL): not searched
-    name_too_long
+    name_too_long,
+    // matches in one directory beyond the per-directory cap of one slice were not reported
+    match_cap
 };
 
 [[nodiscard]] constexpr const char* to_token(GapCause c) noexcept {
@@ -69,6 +71,8 @@ enum class GapCause {
         return "private_namespace";
     case GapCause::name_too_long:
         return "name_too_long";
+    case GapCause::match_cap:
+        return "match_cap";
     }
     return "unknown";
 }

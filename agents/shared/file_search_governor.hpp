@@ -42,9 +42,12 @@ struct GovernorLimits {
 // its deadline sum cannot overflow unless the injected clock reads within an hour of its maximum.
 inline constexpr std::chrono::milliseconds kMaxSlice{3'600'000};
 
+// A zero max_stalls or max_restarts is refused, not read as 1: record_slice would otherwise turn the
+// very first slice into a stall or a restart verdict.
 [[nodiscard]] inline bool valid(const GovernorLimits& l) noexcept {
     return l.slice.count() > 0 && l.slice <= kMaxSlice && l.work_quantum.count() > 0 &&
-           l.work_quantum <= l.slice && l.duty_percent >= 1 && l.duty_percent <= 100;
+           l.work_quantum <= l.slice && l.duty_percent >= 1 && l.duty_percent <= 100 &&
+           l.max_stalls >= 1 && l.max_restarts >= 1;
 }
 
 struct GovernorEnv {

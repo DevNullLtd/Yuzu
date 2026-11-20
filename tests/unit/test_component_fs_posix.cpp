@@ -40,6 +40,8 @@
 #include "component_legs.hpp"
 #include "component_walk.hpp"
 
+#include <network_fstype.hpp>
+
 #include <algorithm>
 #include <cerrno>
 #include <chrono>
@@ -52,7 +54,9 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <type_traits>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <dirent.h>
@@ -688,6 +692,447 @@ TEST_CASE("component_fs_posix: the walk over the real leg skips links and mounts
     CHECK(r.candidates[0].path == (t.root / "app" / "lib" / "x.jar").string());
     CHECK(r.stats.links_skipped == 1);
     CHECK(r.stats.mounts_skipped == 1);
+}
+
+
+// ---- the on-demand file search leg ----
+
+namespace {
+
+using shared_mount = yuzu::shared::MountEntry;
+
+[[nodiscard]] std::uint64_t device_of(const struct stat& st) {
+    return static_cast<std::uint64_t>(static_cast<std::make_unsigned_t<decltype(st.st_dev)>>(st.st_dev));
+}
+
+[[nodiscard]] SearchLeg search_leg(const std::string& root, std::vector<std::string> prune = {}, AccessLog log = {},
+                                   SearchHooks hooks = {}, ReadDirFn read_dir = {}) {
+    return make_search_leg(SearchTargets{root, std::move(prune)}, std::move(log), std::move(hooks), std::move(read_dir));
+}
+
+// Restores a directory's permissions so the temporary tree can be removed.
+struct ModeGuard {
+    fs::path p;
+    ~ModeGuard() { ::chmod(p.c_str(), 0700); }
+};
+
+[[nodiscard]] bool equal_entry(const shared_mount& a, const shared_mount& b) {
+    return a.mount_point == b.mount_point && a.root == b.root && a.fstype == b.fstype && a.source == b.source &&
+           a.dev_major == b.dev_major && a.dev_minor == b.dev_minor;
+}
+
+} // namespace
+
+TEST_CASE("component_fs_posix: list fills the device and inode of the directory and the inode of every entry",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "d" / "sub"));
+    write_file(t.root / "d" / "a.jar", "a");
+    fs::create_symlink(t.root / "d" / "a.jar", t.root / "d" / "lnk");
+
+    const std::string dir = (t.root / "d").string();
+    const auto r = plain_ops().list(dir, 100);
+    REQUIRE_FALSE(r.error);
+    struct stat st {};
+    REQUIRE(::stat(dir.c_str(), &st) == 0);
+    CHECK(r.dev != 0);
+    CHECK(r.dev == device_of(st));
+    CHECK(r.file_id == static_cast<std::uint64_t>(st.st_ino));
+    REQUIRE(r.entries.size() == 3);
+    for (const auto& e : r.entries) {
+        struct stat es {};
+        REQUIRE(::lstat((t.root / "d" / e.name).c_str(), &es) == 0);
+        CHECK(e.file_id != 0);
+        CHECK(e.file_id == static_cast<std::uint64_t>(es.st_ino));
+    }
+    // a directory that cannot be reached has no identity and no pretence of one
+    const auto missing = plain_ops().list((t.root / "nope").string(), 100);
+    CHECK(missing.error);
+    CHECK(missing.dev == 0);
+    CHECK(missing.file_id == 0);
+}
+
+TEST_CASE("component_fs_posix: a directory the account may not open is a permission_denied listing",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    if (::geteuid() == 0) {
+        WARN("running as root: a mode 000 directory is still readable, the refusal cannot be staged here");
+        return;
+    }
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "locked"));
+    REQUIRE(fs::create_directories(t.root / "open"));
+    const ModeGuard guard{t.root / "locked"};
+    REQUIRE(::chmod((t.root / "locked").c_str(), 0000) == 0);
+
+    const auto denied = plain_ops().list((t.root / "locked").string(), 100);
+    CHECK(denied.error);
+    CHECK(denied.cause == ListError::permission_denied);
+    const auto gone = plain_ops().list((t.root / "nope").string(), 100);
+    CHECK(gone.error);
+    CHECK(gone.cause == ListError::unreadable); // missing is not a refusal
+    CHECK_FALSE(plain_ops().list((t.root / "open").string(), 100).error);
+    CHECK(plain_ops().list((t.root / "open").string(), 100).cause == ListError::none);
+}
+
+TEST_CASE("component_fs_posix: with the descriptor stack on, sibling and child listings open only the missing components",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "a" / "b" / "c"));
+    REQUIRE(fs::create_directories(t.root / "a" / "b" / "d"));
+    REQUIRE(fs::create_directories(t.root / "a" / "e"));
+    write_file(t.root / "a" / "b" / "x.jar", "x");
+    write_file(t.root / "a" / "b" / "c" / "y.jar", "y");
+    const auto p = [&](const char* rel) { return (t.root / rel).string(); };
+
+    std::vector<std::string> log;
+    const auto leg = search_leg(t.root.string(), {}, [&log](const std::string& s) { log.push_back(s); });
+    const auto plain = plain_ops();
+
+    const auto same_as_plain = [&](const std::string& dir) {
+        const auto a = leg.ops.list(dir, 100);
+        const auto b = plain.list(dir, 100);
+        CHECK_FALSE(a.error);
+        CHECK(by_name(a) == by_name(b));
+        CHECK(a.dev == b.dev);
+        CHECK(a.file_id == b.file_id);
+        return a;
+    };
+
+    same_as_plain(p("a/b"));
+    CHECK(std::ranges::find(log, "/") != log.end()); // the first listing opened every hop
+    CHECK(std::ranges::find(log, p("a/b")) != log.end());
+    log.clear();
+
+    same_as_plain(p("a/b/c")); // a child: one hop
+    CHECK(log == std::vector<std::string>{p("a/b/c")});
+    log.clear();
+    same_as_plain(p("a/b/d")); // a sibling: the old leaf is dropped, one hop opened
+    CHECK(log == std::vector<std::string>{p("a/b/d")});
+    log.clear();
+    const auto again = same_as_plain(p("a/b")); // an ancestor: nothing is opened, the stream is read from its start
+    CHECK(log.empty());
+    CHECK(by_name(again).count("x.jar") == 1);
+    same_as_plain(p("a/b")); // and again
+    CHECK(log.empty());
+    same_as_plain(p("a/e")); // an uncle: one hop
+    CHECK(log == std::vector<std::string>{p("a/e")});
+    log.clear();
+    same_as_plain(p("a/b/c")); // back down: a/b is gone from the stack, so a/b and a/b/c are opened again
+    CHECK(log == (std::vector<std::string>{p("a/b"), p("a/b/c")}));
+}
+
+TEST_CASE("component_fs_posix: with the stack on, a directory swapped for a link after its parent was cached is refused",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "app" / "sub"));
+    REQUIRE(fs::create_directories(t.root / "app" / "inner"));
+    REQUIRE(fs::create_directories(t.root / "elsewhere"));
+    write_file(t.root / "elsewhere" / "secret.jar", "S");
+    write_file(t.root / "app" / "inner" / "kept.jar", "K");
+    const auto leg = search_leg(t.root.string());
+    const auto app = (t.root / "app").string();
+
+    CHECK(by_name(leg.ops.list(app, 100)).at("sub") == Type::dir); // `app` is now held
+
+    fs::remove_all(t.root / "app" / "sub");
+    fs::create_directory_symlink(t.root / "elsewhere", t.root / "app" / "sub");
+    const auto swapped = leg.ops.list((t.root / "app" / "sub").string(), 100);
+    CHECK(swapped.error);
+    CHECK(swapped.entries.empty()); // nothing under the link's target
+    CHECK(leg.root_state((t.root / "app" / "sub").string()) == RootState::is_link);
+
+    // the failure left the stack sound: the real sibling still lists, a link above is refused
+    CHECK(by_name(leg.ops.list((t.root / "app" / "inner").string(), 100)).at("kept.jar") == Type::file);
+    fs::create_directory_symlink(t.root / "app", t.root / "app_link");
+    CHECK(leg.ops.list((t.root / "app_link" / "inner").string(), 100).error);
+}
+
+TEST_CASE("component_fs_posix: a pruned mount point is never passed to stat or open, never listed, and costs no gap",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "mnt"));
+    REQUIRE(fs::create_directories(t.root / "plain"));
+    write_file(t.root / "mnt" / "z.jar", "Z");
+    write_file(t.root / "x.jar", "X");
+    write_file(t.root / "plain" / "p.jar", "P");
+    const std::string mnt = (t.root / "mnt").string();
+
+    std::vector<std::string> log;
+    const auto leg = search_leg(t.root.string(), {mnt}, [&log](const std::string& s) { log.push_back(s); });
+    const auto touched = [&] {
+        return std::ranges::any_of(log, [&](const std::string& p) { return p == mnt || p.starts_with(mnt + "/"); });
+    };
+
+    // the listing does not name it
+    CHECK(by_name(leg.ops.list(t.root.string(), 100)) ==
+          std::map<std::string, Type>{{"plain", Type::dir}, {"x.jar", Type::file}});
+    CHECK_FALSE(touched());
+
+    // and a walk over the leg sees neither the mount point nor anything below it, counts it nowhere
+    std::vector<std::string> visits;
+    const auto res = walk_ordered(t.root.string(), {}, WalkLimits{}, leg.ops, std::chrono::steady_clock::now() + 1h,
+                                  [&visits](const std::string& d, const DirEntry& e, std::uint64_t) {
+                                      visits.push_back(walk_detail::join(d, e.name));
+                                      return true;
+                                  });
+    CHECK(res.stop == Stop::complete);
+    CHECK(res.stats.mounts_skipped == 0);
+    CHECK(res.gaps.empty());
+    CHECK(visits == (std::vector<std::string>{(t.root / "plain").string(), (t.root / "plain" / "p.jar").string(),
+                                              (t.root / "x.jar").string()}));
+    CHECK_FALSE(touched());
+
+    // asking for it directly is refused without a syscall for any path through it
+    CHECK(leg.ops.list(mnt, 100).error);
+    CHECK_FALSE(leg.facts(mnt, "z.jar").opened);
+    CHECK_FALSE(leg.facts(t.root.string(), "mnt").opened);
+    CHECK(leg.root_state(mnt + "/anything") != RootState::ok);
+    CHECK_FALSE(touched());
+
+    // the leg never opens a file through FsOps
+    CHECK_FALSE(leg.ops.open_file((t.root / "x.jar").string()).has_value());
+}
+
+TEST_CASE("component_fs_posix: a root whose ancestor is a mount point is acquired when the prune set holds only descendants",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "mnt" / "inner" / "deep"));
+    write_file(t.root / "mnt" / "inner" / "f.jar", "F");
+    const std::string mnt = (t.root / "mnt").string();
+    const std::string inner = (t.root / "mnt" / "inner").string();
+    const std::string deep = (t.root / "mnt" / "inner" / "deep").string();
+
+    // the mount point `mnt` is an ancestor of the root: not in the prune set, so the walk reaches the root
+    const auto ok = search_leg(inner, {deep});
+    const auto r = ok.ops.list(inner, 100);
+    CHECK_FALSE(r.error);
+    CHECK(by_name(r) == std::map<std::string, Type>{{"f.jar", Type::file}}); // `deep` is erased
+    CHECK(ok.root_state(inner) == RootState::ok);
+
+    // the rule is real: put the ancestor in the prune set and the root cannot be reached at all
+    const auto refused = search_leg(inner, {mnt});
+    CHECK(refused.ops.list(inner, 100).error);
+    CHECK(refused.root_state(inner) != RootState::ok);
+}
+
+TEST_CASE("component_fs_posix: every lookup runs inside around_lookup and nothing else does",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "d" / "sub"));
+    write_file(t.root / "d" / "f.bin", "abc");
+    fs::create_directory_symlink(t.root / "d", t.root / "lnk");
+    const std::string d = (t.root / "d").string();
+
+    int depth = 0;
+    int enters = 0;
+    bool extents_inside = false;
+    int extents_calls = 0;
+    std::vector<std::string> outside; // every access-logged lookup made while the hook was not held
+    std::vector<std::string> logged;
+    SearchHooks hooks;
+    hooks.around_lookup = [&](const std::function<void()>& lookup) {
+        ++depth;
+        ++enters;
+        lookup();
+        --depth;
+    };
+    hooks.read_extents = [&](int, const struct stat&) {
+        extents_inside = extents_inside || depth != 0;
+        ++extents_calls;
+    };
+    // every entry is reported untyped, so classify_dirent stats it: that stat must be inside the hook too
+    const ReadDirFn untyped = [](DIR* dir) {
+        struct dirent* e = ::readdir(dir);
+        if (e != nullptr)
+            e->d_type = DT_UNKNOWN;
+        return e;
+    };
+    const auto leg = search_leg(
+        t.root.string(), {},
+        [&](const std::string& p) {
+            logged.push_back(p);
+            if (depth == 0)
+                outside.push_back(p);
+        },
+        hooks, untyped);
+
+    int before = enters;
+    const auto listing = leg.ops.list(d, 100);
+    CHECK(enters - before == 2); // the acquisition and the enumeration
+    CHECK(by_name(listing) == std::map<std::string, Type>{{"f.bin", Type::file}, {"sub", Type::dir}});
+    CHECK(std::ranges::find(logged, (t.root / "d" / "f.bin").string()) != logged.end()); // the untyped stat ran
+
+    before = enters;
+    const auto facts = leg.facts(d, "f.bin");
+    CHECK(enters - before == 2); // the acquisition (cached) and the leaf open
+    CHECK(facts.opened);
+    CHECK(extents_calls == 1);
+    CHECK_FALSE(extents_inside); // the extent read is not a lookup
+
+    before = enters;
+    CHECK(leg.root_state(d) == RootState::ok);
+    CHECK(enters - before == 1);
+    CHECK(leg.root_state((t.root / "lnk").string()) == RootState::is_link); // the link probe is a lookup too
+
+    CHECK(outside.empty());
+    CHECK(depth == 0);
+
+    // the same leg without a hook behaves the same
+    const auto bare = search_leg(t.root.string());
+    CHECK(by_name(bare.ops.list(d, 100)).size() == 2);
+}
+
+TEST_CASE("component_fs_posix: root_state tells a link at any component, a missing path and a non-directory apart",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "d" / "sub"));
+    write_file(t.root / "d" / "f.txt", "f");
+    fs::create_directory_symlink(t.root / "d", t.root / "lnk");
+    fs::create_symlink(t.root / "d" / "f.txt", t.root / "flnk");
+    const auto leg = search_leg(t.root.string());
+    const auto st = [&](const std::string& p) { return leg.root_state(p); };
+
+    CHECK(st((t.root / "d").string()) == RootState::ok);
+    CHECK(st((t.root / "d" / "sub").string()) == RootState::ok);
+    CHECK(st("/") == RootState::ok);
+    CHECK(st((t.root / "lnk").string()) == RootState::is_link);                // at the leaf
+    CHECK(st((t.root / "lnk" / "sub").string()) == RootState::is_link);        // at an intermediate component
+    CHECK(st((t.root / "flnk").string()) == RootState::is_link);               // a link to a file
+    CHECK(st((t.root / "d" / "missing").string()) == RootState::not_found);
+    CHECK(st((t.root / "nope" / "deeper").string()) == RootState::not_found);
+    CHECK(st((t.root / "d" / "f.txt").string()) == RootState::not_a_directory);
+    CHECK(st((t.root / "d" / "f.txt" / "x").string()) == RootState::not_a_directory);
+    CHECK(st("relative") == RootState::other);
+}
+
+TEST_CASE("component_fs_posix: facts opens the leaf under the cached parent, follows no link, waits on no FIFO",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    Tree t;
+    REQUIRE(fs::create_directories(t.root / "d" / "sub"));
+    write_file(t.root / "d" / "f.bin", "abc");
+    fs::create_symlink(t.root / "d" / "f.bin", t.root / "d" / "lnk");
+    REQUIRE(::mkfifo((t.root / "d" / "pipe").c_str(), 0600) == 0);
+    const std::string d = (t.root / "d").string();
+
+    std::vector<std::pair<std::uint64_t, bool>> seen; // size from the descriptor's own stat, descriptor valid
+    SearchHooks hooks;
+    hooks.read_extents = [&](int fd, const struct stat& st) {
+        seen.emplace_back(static_cast<std::uint64_t>(st.st_size), ::fcntl(fd, F_GETFD) != -1);
+    };
+    std::vector<std::string> log;
+    const auto leg = search_leg(t.root.string(), {}, [&log](const std::string& s) { log.push_back(s); }, hooks);
+
+    const auto f = leg.facts(d, "f.bin");
+    CHECK(f.opened);
+    CHECK(f.error == FactsError::none);
+    CHECK(f.size == 3);
+    struct stat st {};
+    REQUIRE(::stat((t.root / "d" / "f.bin").c_str(), &st) == 0);
+    CHECK(f.mtime == static_cast<std::int64_t>(st.st_mtime));
+    REQUIRE(seen.size() == 1);
+    CHECK(seen[0].first == 3);
+    CHECK(seen[0].second);
+    CHECK(std::ranges::find(log, (t.root / "d" / "f.bin").string()) != log.end());
+
+    const auto link = leg.facts(d, "lnk");
+    CHECK_FALSE(link.opened);
+    CHECK(link.error == FactsError::link);
+    const auto pipe = leg.facts(d, "pipe"); // opened without blocking, then refused as not regular
+    CHECK_FALSE(pipe.opened);
+    CHECK(pipe.error == FactsError::not_regular);
+    const auto dir = leg.facts(d, "sub");
+    CHECK_FALSE(dir.opened);
+    CHECK(dir.error == FactsError::not_regular);
+    const auto gone = leg.facts(d, "missing");
+    CHECK_FALSE(gone.opened);
+    CHECK(gone.error == FactsError::vanished);
+    CHECK(leg.facts(d, "a/b").error == FactsError::other); // not a single component
+    CHECK(leg.facts(d, "").error == FactsError::other);
+    CHECK(leg.facts((t.root / "nope").string(), "x").error == FactsError::vanished);
+    CHECK(seen.size() == 1); // the extent reader saw the one regular file and nothing else
+}
+
+TEST_CASE("component_legs: read_mount_entries_stream equals mount_entries on the whole text however it is read",
+          "[runtime][component_inventory][legs][component_fs_posix]") {
+    const std::string text = "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n"
+                             "30 22 8:2 /@home /home rw,relatime shared:2 - btrfs /dev/sda2 rw\n"
+                             "40 22 0:40 / /mnt/nfs rw shared:5 - nfs4 srv:/x rw\n"
+                             "41 22 0:41 / /tmp rw - tmpfs  rw\n";
+    const auto whole = yuzu::shared::mount_entries(text);
+    REQUIRE(whole.malformed == 0);
+    for (const std::size_t slice : {std::size_t{1}, std::size_t{7}, std::size_t{4096}}) {
+        INFO("slice " << slice);
+        const auto got = read_mount_entries_stream(serve(text, slice), {});
+        REQUIRE(got.has_value());
+        REQUIRE(got->entries.size() == whole.entries.size());
+        for (std::size_t i = 0; i < whole.entries.size(); ++i)
+            CHECK(equal_entry(got->entries[i], whole.entries[i]));
+        CHECK(got->malformed == 0);
+    }
+    // no trailing newline on the last line
+    const auto cut = read_mount_entries_stream(serve(text.substr(0, text.size() - 1), 5), {});
+    REQUIRE(cut.has_value());
+    CHECK(cut->entries.size() == whole.entries.size());
+}
+
+TEST_CASE("component_legs: read_mount_entries_stream keeps what the filter keeps, a later entry covers an earlier, malformed lines add up",
+          "[runtime][component_inventory][legs][component_fs_posix]") {
+    const std::string text = "1 0 8:1 / / rw - ext4 /dev/a rw\n"
+                             "2 1 8:2 / /data rw - ext4 /dev/b rw\n"
+                             "not a mount line\n"
+                             "3 1 8:3 / /skip rw - ext4 /dev/c rw\n"
+                             "4 2 0:7 / /data rw - tmpfs tmpfs rw\n"
+                             "also not a mount line\n";
+    const MountKeep keep = [](const shared_mount& e) { return e.mount_point != "/skip"; };
+    for (const std::size_t slice : {std::size_t{1}, std::size_t{4096}}) {
+        INFO("slice " << slice);
+        const auto got = read_mount_entries_stream(serve(text, slice), keep);
+        REQUIRE(got.has_value());
+        REQUIRE(got->entries.size() == 2);
+        CHECK(got->entries[0].mount_point == "/");
+        CHECK(got->entries[1].mount_point == "/data");
+        CHECK(got->entries[1].fstype == "tmpfs"); // the later mount of the point covers the earlier
+        CHECK(got->malformed == 2);
+    }
+}
+
+TEST_CASE("component_legs: read_mount_entries_stream fails closed, never returning the part it had read",
+          "[runtime][component_inventory][legs][component_fs_posix]") {
+    const std::string line = "1 0 8:1 / / rw - ext4 /dev/a rw\n";
+    const std::string table = line + "2 1 8:2 / /data rw - ext4 /dev/b rw\n" + "3 1 8:3 / /more rw - ext4 /dev/c rw\n";
+
+    // a read that fails after some of the table was parsed
+    CHECK_FALSE(read_mount_entries_stream(serve(table, line.size(), EIO), {}).has_value());
+    // an interrupted read is retried, not a failure
+    auto inner = serve(table, 4096);
+    bool interrupted = false;
+    const auto eintr_once = [&](char* buf, std::size_t len) -> ssize_t {
+        if (!interrupted) {
+            interrupted = true;
+            errno = EINTR;
+            return -1;
+        }
+        return inner(buf, len);
+    };
+    REQUIRE(read_mount_entries_stream(eintr_once, {}).has_value());
+
+    // a table over the total ceiling: exactly the ceiling passes, one byte more does not
+    CHECK(read_mount_entries_stream(serve(table, 16), {}, table.size()).has_value());
+    CHECK_FALSE(read_mount_entries_stream(serve(table, 16), {}, table.size() - 1).has_value());
+
+    // a line over 1 MiB, however it arrives
+    const std::string huge = "1 0 8:1 / / rw - ext4 /dev/a " + std::string(kMiB + 16, 'x') + "\n";
+    CHECK_FALSE(read_mount_entries_stream(serve(huge + line, 64 * 1024), {}).has_value());
+    CHECK_FALSE(read_mount_entries_stream(serve(huge, 7 * 1024 + 1), {}).has_value());
+
+    // more than max_kept distinct mount points; re-mounting a point does not count again
+    CHECK(read_mount_entries_stream(serve(table, 4096), {}, kMaxMountTable, 3).has_value());
+    CHECK_FALSE(read_mount_entries_stream(serve(table, 4096), {}, kMaxMountTable, 2).has_value());
+    const std::string remount = line + "2 1 8:2 / / rw - tmpfs tmpfs rw\n" + "3 1 8:3 / / rw - xfs /dev/c rw\n";
+    CHECK(read_mount_entries_stream(serve(remount, 4096), {}, kMaxMountTable, 1).has_value());
+    // entries the filter drops do not count either
+    const MountKeep only_root = [](const shared_mount& e) { return e.mount_point == "/"; };
+    CHECK(read_mount_entries_stream(serve(table, 4096), only_root, kMaxMountTable, 1).has_value());
 }
 
 #endif // !_WIN32

@@ -680,6 +680,9 @@ agent_test_exe = executable(
     'unit/test_file_search_coverage.cpp',        # file search core: coverage envelope rows (agents/shared/file_search_coverage.hpp), portable
     'unit/test_file_search_governor.cpp',        # file search core: slice governor with injected clock and sleep (agents/shared/file_search_governor.hpp), portable
     'unit/test_file_search_resume_contract.cpp', # file search core: walk_ordered + cursor transitions + governor + coverage composed over MemTree (the resume contract), portable
+    'unit/test_file_search_volumes.cpp',         # file search plugin: volume plan, units and refused rows, fsv1 cursor and its transition rule (agents/plugins/file_search/src), portable
+    'unit/test_file_search_driver.cpp',          # file search plugin: request parsing, in-memory state and the one-slice driver over fakes (MemTree, fake clock, fake runner), portable
+    'unit/test_file_search_rows.cpp',            # file search plugin: row arity, budgets, extents model and the user-directory tag (agents/plugins/file_search/src), portable
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
@@ -714,6 +717,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/browser_policy/src'),  # browser_policy_*.hpp (Wave 10 PR10.2-b)
     include_directories('../agents/plugins/runtimes/src'),  # runtimes_*parsers.hpp / runtimes_legs.hpp (Wave 10 PR10.1-b pure helpers)
     include_directories('../agents/plugins/component_inventory/src'),  # component_walk.hpp / component_*.hpp (pure helpers)
+    include_directories('../agents/plugins/file_search/src'),  # file_search_*.hpp (pure helpers)
     include_directories('../agents/plugins/browser_inventory/src'),  # browser_inventory_*_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/local_security_policy/src'),  # Wave 8 PR8.3
     include_directories('../agents/plugins/power_health/src'),  # power_health_parsers.hpp (pure helpers)
