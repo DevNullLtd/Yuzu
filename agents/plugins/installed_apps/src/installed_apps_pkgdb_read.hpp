@@ -211,20 +211,25 @@ struct DpkgRead {
     std::string failure;
 };
 
-/// Names in status.d that are not packages: hidden files, dpkg's own leftovers and editor backups.
+/// Names in status.d that are not packages: hidden files, the `<package>.md5sums` file image
+/// builders write beside each package's control file, dpkg's own leftovers and editor backups.
 [[nodiscard]] inline bool status_d_skips(std::string_view name) noexcept {
     const auto ends = [name](std::string_view suffix) {
         return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
     };
-    return name.empty() || name.front() == '.' || ends(".dpkg-new") || ends(".dpkg-old") ||
-           ends("~") || ends(".bak");
+    return name.empty() || name.front() == '.' || ends(".md5sums") || ends(".dpkg-new") ||
+           ends(".dpkg-old") || ends("~") || ends(".bak");
 }
 
-/// status.d: a directory of single-stanza control files (the layout minimal and distroless images use
-/// in place of one status file; dpkg-query itself does not read it). One component per call through
-/// the dir-fd forms; regular files only. A symlink entry fails the read (never followed), a
-/// directory, FIFO or device entry is skipped, an oversized file fails it, and the number of files
-/// is bounded by max_packages (row_cap). A missing directory is normal and benign.
+/// status.d: a directory of single-stanza control files (the layout minimal images with no shell
+/// and no package manager use in place of one status file; dpkg-query itself does not read it).
+/// Each package is one control file named for it, plus a `<package>.md5sums` sibling that is
+/// skipped. A real file has no Status field, so a stanza without one is read as
+/// `install ok installed` (MissingStatus::installed); a stanza that does have one is held to the
+/// three-word rule. One component per call through the dir-fd forms; regular files only. A symlink
+/// entry fails the read (never followed), a directory, FIFO or device entry is skipped, an
+/// oversized file fails it, and the number of files is bounded by max_packages (row_cap). A
+/// missing directory is normal and benign.
 [[nodiscard]] inline DpkgRead read_dpkg_status_d(const std::string& root, const Limits& lim,
                                                  PkgDbBudget& budget) {
     constexpr std::string_view kSource = "dpkg_status_d";
@@ -273,7 +278,8 @@ struct DpkgRead {
             out.failure = failure_token(kSource, r.error());
             return out;
         }
-        auto parsed = yuzu::shared::parse_dpkg_status(file.data, budget);
+        auto parsed = yuzu::shared::parse_dpkg_status(file.data, budget,
+                                                      yuzu::shared::MissingStatus::installed);
         if (!parsed) {
             out.failure = failure_token(kSource, parsed.error());
             return out;
@@ -295,7 +301,8 @@ struct DpkgRead {
             out.failure = failure_token(kSource, r.error());
             return out;
         }
-        auto parsed = yuzu::shared::parse_dpkg_status(file.data, budget);
+        auto parsed = yuzu::shared::parse_dpkg_status(file.data, budget,
+                                                      yuzu::shared::MissingStatus::corrupt);
         if (!parsed) {
             out.failure = failure_token(kSource, parsed.error());
             return out;

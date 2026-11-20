@@ -423,9 +423,13 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
  *
  * Items come in (key, data) pairs; a key is a 4-byte inline record number and the all-zero key is
  * rpm's own counter record, which is skipped. Pages 1..last_pgno are scanned in order and only
- * hash pages are read, so bucket and overflow-bucket pages need no chain walk of their own. An
- * overflow chain is followed with a step counter bounded by last_pgno, so a self-loop or a
- * two-page loop ends as `corrupt`, never as a hang.
+ * hash pages are read, so bucket and overflow-bucket pages need no chain walk of their own. A page
+ * of type 2 (P_HASH_UNSORTED, the pre-sort layout an in-place upgrade of an older file can leave
+ * inside a version 9 file) holds real key/data pairs this reader does not decode, so it answers
+ * `unsupported_format` rather than being skipped: a shorter roster must never pass as complete.
+ * Every other non-hash page type holds no package record and is skipped. An overflow chain is
+ * followed with a step counter bounded by last_pgno, so a self-loop or a two-page loop ends as
+ * `corrupt`, never as a hang.
  */
 [[nodiscard]] inline PkgDbVoid read_rpm_bdb(const ByteSource& src, PkgDbBudget& budget,
                                             const RpmBlobFn& on_blob) {
@@ -435,6 +439,7 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
     constexpr std::size_t kMetaRead = 512; // the smallest legal page, so always inside a legal file
     constexpr std::size_t kPageOverhead = 26;
     constexpr std::uint8_t kPageHash = 13;
+    constexpr std::uint8_t kPageHashUnsorted = 2;
     constexpr std::uint8_t kPageOverflow = 7;
     constexpr std::uint8_t kPageHashMeta = 8;
     constexpr std::uint8_t kItemKeyData = 1;
@@ -485,6 +490,8 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
                 return t;
         if (!src.read_at(std::uint64_t{pg} * pagesize, page))
             return std::unexpected(PkgDbCause::unreadable);
+        if (page[25] == kPageHashUnsorted)
+            return std::unexpected(PkgDbCause::unsupported_format); // records we cannot decode
         if (page[25] != kPageHash)
             continue;
 

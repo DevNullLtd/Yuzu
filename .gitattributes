@@ -14,6 +14,7 @@
 tests/unit/fixtures/software-estate/pkgdb/**/Packages binary
 tests/unit/fixtures/software-estate/pkgdb/**/Packages.db binary
 tests/unit/fixtures/software-estate/pkgdb/**/rpmdb.sqlite binary
+tests/unit/fixtures/software-estate/pkgdb/**/status.d/* binary
 
 # Windows-specific files that need CRLF
 *.bat text eol=crlf

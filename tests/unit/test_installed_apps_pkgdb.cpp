@@ -12,10 +12,10 @@
  *     refusals, the limits, the status.d directory, and the degraded contract.
  *
  * Fixture provenance: tests/unit/fixtures/software-estate/pkgdb/provenance.txt. "Real" means taken
- * from the S-7 captures; every hostile or edited input is built in memory or in a yuzu_test_
- * temporary directory from real fixture bytes and says so. No test spawns a process, sleeps or
- * touches the network; the sqlite cases copy the fixture into a TempDir first so no sidecar is ever
- * created in the source tree.
+ * from the S-7 captures, or from the debian12-statusd capture of a real status.d; every hostile or
+ * edited input is built in memory or in a yuzu_test_ temporary directory from real fixture bytes and
+ * says so. No test spawns a process, sleeps or touches the network; the sqlite cases copy the
+ * fixture into a TempDir first so no sidecar is ever created in the source tree.
  *
  * YUZU_TEST_PKGDB_FIXTURE_ROOT replaces the fixture root so the SAME parity case runs over the
  * full, untrimmed S-7 captures: a tree of <capture>/{status|rpmdb.sqlite|Packages.db|Packages} +
@@ -253,7 +253,8 @@ TEST_CASE("pkgdb: row-set parity with the old path on every fixture directory", 
                          got_inv.size(), got_list.size());
         ++checked;
     }
-    // The committed fixtures: debian12, ubuntu2404, fedora41, alma9, leap156, tumbleweed, alma8, alma8-s390x.
+    // The committed parity fixtures: debian12, ubuntu2404, fedora41, alma9, leap156, tumbleweed, alma8,
+    // alma8-s390x. debian12-statusd holds a status.d, not a database file, so it is skipped here.
     if (!overridden)
         CHECK(checked == 8);
     else
@@ -647,13 +648,94 @@ TEST_CASE("pkgdb status.d: a stanza moved into status.d (EDITED real debian12 ca
 
 TEST_CASE("pkgdb status.d: a host whose packages live only in status.d is dpkg", "[installed_apps][pkgdb]") {
     const auto [rest, stanza] = split_stanza("libacl1");
-    Root root; // no status file at all: the distroless layout
+    Root root; // no status file at all: the layout of a minimal image with no package manager
     root.put_text("var/lib/dpkg/status.d/libacl1", stanza);
     const auto h = read_root(root);
     REQUIRE(h.failure.empty());
     CHECK(h.ecosystem == Eco::dpkg);
     REQUIRE(h.dpkg.size() == 1);
     CHECK(h.dpkg[0].name == "libacl1");
+}
+
+namespace {
+
+// The real status.d capture (a minimal Debian 12 image with no shell): three packages, each a
+// Status-less control file with a `<package>.md5sums` sibling. Copies every file into `root`.
+const fs::path kStatusDCapture = default_fixture_root() / "debian12-statusd" / "status.d";
+void put_status_d_capture(const Root& root) {
+    for (const auto& e : fs::directory_iterator(kStatusDCapture))
+        root.put("var/lib/dpkg/status.d/" + e.path().filename().string(), e.path());
+}
+
+} // namespace
+
+TEST_CASE("pkgdb status.d: a real minimal-image capture reads as dpkg with its real package names",
+          "[installed_apps][pkgdb]") {
+    // REAL capture (provenance.txt): no status file, no Status field in any control file, and a
+    // .md5sums sibling beside each. Six files, three packages.
+    Root root;
+    put_status_d_capture(root);
+    const auto h = read_root(root);
+    REQUIRE(h.failure.empty());
+    CHECK(h.ecosystem == Eco::dpkg);
+    REQUIRE(h.dpkg.size() == 3); // files are read in name order: base-files, media-types, netbase
+    CHECK(h.dpkg[0].name == "base-files");
+    CHECK(h.dpkg[0].version == "12.4+deb12u15");
+    CHECK(h.dpkg[0].architecture == "arm64");
+    CHECK(h.dpkg[0].maintainer == "Santiago Vila <sanvila@debian.org>");
+    CHECK(h.dpkg[1].name == "media-types");
+    CHECK(h.dpkg[1].version == "10.0.0");
+    CHECK(h.dpkg[2].name == "netbase");
+    CHECK(h.dpkg[2].version == "6.4");
+    CHECK(h.dpkg[2].architecture == "all");
+    for (const auto& p : h.dpkg) { // a present control file is an installed package
+        INFO(p.name);
+        CHECK(p.want == "install");
+        CHECK(p.flag == "ok");
+        CHECK(p.status == "installed");
+    }
+    // And both row sets carry all three: the mapping accepts what the reader hands over.
+    CHECK(new_inv_rows(h).size() == 3);
+    CHECK(new_list_rows(h).size() == 3);
+}
+
+TEST_CASE("pkgdb status.d: a .md5sums entry is skipped, a Status-less stanza is installed here and corrupt in "
+          "the status file",
+          "[installed_apps][pkgdb]") {
+    CHECK(pkgdb::detail::status_d_skips("netbase.md5sums"));
+    CHECK_FALSE(pkgdb::detail::status_d_skips("netbase"));
+
+    const std::string netbase = read_text(kStatusDCapture / "netbase");
+    REQUIRE(netbase.find("\nStatus:") == std::string::npos); // the real file has none
+    SECTION("in status.d: installed") {
+        Root root;
+        root.put_text("var/lib/dpkg/status.d/netbase", netbase);
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        REQUIRE(h.dpkg.size() == 1);
+        CHECK(h.dpkg[0].status == "installed");
+    }
+    SECTION("in the status file: corrupt, as before") {
+        Root root;
+        root.put_text("var/lib/dpkg/status", netbase);
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_status:corrupt");
+        CHECK(h.dpkg.empty());
+        CHECK(h.ecosystem == Eco::none);
+    }
+    SECTION("a status.d stanza that has a Status is still held to it") {
+        Root root;
+        root.put_text("var/lib/dpkg/status.d/netbase", netbase + "Status: nonsense\n");
+        CHECK(read_root(root).failure == "dpkg_status_d:corrupt");
+    }
+    SECTION("an md5sums file is not parsed: its content would be corrupt if it were") {
+        Root root;
+        root.put_text("var/lib/dpkg/status.d/netbase", netbase);
+        root.put("var/lib/dpkg/status.d/netbase.md5sums", kStatusDCapture / "netbase.md5sums");
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.dpkg.size() == 1);
+    }
 }
 
 TEST_CASE("pkgdb status.d: a package in both keeps the status entry; leftovers and dotfiles are ignored",
@@ -668,7 +750,7 @@ TEST_CASE("pkgdb status.d: a package in both keeps the status entry; leftovers a
     other.replace(v, other.find('\n', v) - v, "Version: 9.9.9");
     root.put_text("var/lib/dpkg/status.d/libacl1", other);
     // Names that are not packages, with content that would be corrupt if it were parsed.
-    for (const char* junk : {".hidden", "x.dpkg-new", "x.dpkg-old", "backup~", "old.bak"})
+    for (const char* junk : {".hidden", "x.dpkg-new", "x.dpkg-old", "backup~", "old.bak", "x.md5sums"})
         root.put_text(std::string{"var/lib/dpkg/status.d/"} + junk, "garbage with no colon\n");
     const auto h = read_root(root);
     REQUIRE(h.failure.empty());

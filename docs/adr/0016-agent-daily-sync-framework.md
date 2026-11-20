@@ -1946,8 +1946,10 @@ output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label)
   falls through to rpm.
 - A tab, pipe or newline inside a Maintainer, VENDOR or PACKAGER value no longer truncates the value or splits
   the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time).
-- A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout distroless images use, which
-  `dpkg-query` never read) now reports them: new install rows and install events for that host.
+- A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout minimal images with no shell use,
+  which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
+  package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
+  file is read as installed, and a file that does carry a `Status` is held to the same three-word rule.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
   image: `rpm -qa` fails there).
 - A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the

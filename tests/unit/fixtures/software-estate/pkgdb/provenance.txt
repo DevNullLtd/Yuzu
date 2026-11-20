@@ -38,7 +38,33 @@ dpkg fixtures (debian12, ubuntu2404): REAL stanzas, trimmed by selection
   list.txt:       the capture's own `dpkg-query -W -f='${Package}|${Version}|${Maintainer}|${Status}\n'`
                   lines for the same ten packages, bytes unchanged.
   No capture holds a half-installed, unpacked, config-files, held or reinstreq package (a fresh
-  container has none) and none has a status.d directory (status.d.txt in the S-7 captures is empty).
+  container has none) and none of the S-7 captures has a status.d directory (status.d.txt in them is
+  empty). The real status.d layout is the separate capture below.
+
+dpkg status.d fixture (debian12-statusd): a REAL status.d from a minimal Debian 12 image
+  Captured 2026-11-20 on braga (Docker 29.7.2) from a minimal Debian 12 image that has no shell and no
+  package manager. It is not one of the S-7 captures. Platform manifest digest (linux/arm64):
+  sha256:b6d8cd9eeccef7a63b91771ba943056f484c0dc92396ec3140a5fe2c6279d581
+  The image is deliberately not named here; the digest is its identity.
+  Commands (<image> is that image; the container is never started, `/nonexistent` only satisfies
+  `docker create` for an image with no default command):
+    docker pull --platform linux/arm64 <image>
+    docker create --platform linux/arm64 <image> /nonexistent       -> prints the container id
+    docker cp <container id>:/var/lib/dpkg/status.d <scratch>/status.d
+    docker rm <container id>
+  The image has no /var/lib/dpkg/status and no dpkg-query, so there is no old-path output: this
+  directory has no inventory.tsv or list.txt and is not a parity capture (the parity case skips a
+  directory with no database file beside it).
+  What the layout is, as captured: status.d holds one control file per package, named for it, plus a
+  `<package>.md5sums` sibling (the list of file checksums). The control file is the package's
+  control stanza as an image builder writes it, and it has NO Status field. Five packages were
+  present (base-files, ca-certificates, media-types, netbase, tzdata). Three are committed, each with
+  its .md5sums sibling, all six files byte for byte: base-files (arm64, 720 B), media-types (all,
+  883 B) and netbase (all, 484 B). ca-certificates and tzdata were left out only because their
+  .md5sums siblings are 16 KB and 63 KB. Nothing was edited.
+  Loaded by test_installed_apps_pkgdb.cpp (the shell reads the directory as a host's status.d, with
+  and without a status file) and by test_dpkg_status_parsers.cpp (the parser's missing-Status
+  policy).
 
 rpm fixtures: REAL databases, trimmed by real rpm
   Recipe (the same for every rpm capture; run inside the same image with --network none):
@@ -92,10 +118,13 @@ Which test cases edit a real input (each says "edited" in its case name or comme
   test_installed_apps_pkgdb.cpp  a copy of a real rpmdb.sqlite is switched to the rollback journal, or
                                  has one row deleted through a second open connection; the debian12
                                  libacl1 stanza is cut out of status and written to status.d/libacl1
-                                 (the layout of a minimal image; no real capture has a status.d) and
-                                 a second copy of it carries another Version; other hostile inputs
+                                 (a stanza that HAS a Status, unlike the real status.d capture) and
+                                 a second copy of it carries another Version; one real status.d
+                                 control file gets an invalid Status line appended; other hostile inputs
                                  (not sqlite, no Packages table, a TEXT blob, a symlink, a directory,
                                  an oversized file, too many files) are built from scratch.
-  The one SYNTHETIC input in the tree is a tm with a single-digit day of month in the date-formatter
-  case (test_rpmdb_parsers.cpp), for the space-padded %e; every real install time is compared with
-  rpm's own text.
+  SYNTHETIC inputs (hand-built, not taken from any capture): the tm with a single-digit day of month
+  in the date-formatter case (test_rpmdb_parsers.cpp), for the space-padded %e; the hostile dpkg
+  strings in test_dpkg_status_parsers.cpp (NUL byte, missing colon, duplicate field, wrong Status
+  word count and the like); and the hostile inputs listed above as built from scratch. Every real
+  install time is compared with rpm's own text.

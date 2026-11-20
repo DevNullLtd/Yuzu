@@ -356,7 +356,7 @@ cadences.
   limits. The rows, and therefore the section hash, are byte-for-byte what the
   tools produced on every host measured, so a fleet upgrade resends nothing. The
   one visible difference is a host whose packages live only in `status.d`
-  (distroless-style images): its packages now appear, as new install rows. When
+  (minimal images with no shell): its packages now appear, as new install rows. When
   the read fails, the collection is degraded exactly as above, with no rows and
   a named reason in the agent log, the `list`/`query` error row and the result's
   provenance (`installed_apps:<source>:<cause>`): `locked` (the package manager

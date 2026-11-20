@@ -10,6 +10,9 @@
  *     Ubuntu 24.04, dpkg 1.22.6, run in arm64 containers on 2026-11-19), each with the capture's
  *     own `dpkg-query -W` output (inventory.tsv, list.txt) beside it, bytes unchanged.
  *     tests/unit/fixtures/software-estate/pkgdb/provenance.txt has the commands.
+ *   - "real status.d capture": tests/unit/fixtures/software-estate/pkgdb/debian12-statusd/status.d/
+ *     holds three control files from a minimal Debian 12 image with no shell, byte for byte (no
+ *     Status field in any of them). provenance.txt has the image digest and the commands.
  *   - "edited real stanza": a real stanza with ONE line changed in memory. A fresh container has
  *     no half-installed, unpacked, config-files or held package, so those states are built by
  *     editing the Status line of a real stanza and every such case says "edited" in its name.
@@ -254,6 +257,76 @@ TEST_CASE("dpkg status: edited real stanza with not-installed is skipped", "[dpk
     REQUIRE(parsed.has_value());
     REQUIRE(parsed->size() == 1);
     CHECK(parsed->front().name == "libattr1");
+}
+
+TEST_CASE("dpkg status: a stanza with no Status is the caller's policy (real status.d control files)",
+          "[dpkg][pkgdb]") {
+    for (const char* name : {"base-files", "netbase", "media-types"}) {
+        INFO(name);
+        const std::string text = read_text(pkgdb_fixture("debian12-statusd/status.d", name));
+        REQUIRE(text.find("\nStatus:") == std::string::npos);
+        {
+            auto b = generous(); // the default is the status file's: a missing Status is corrupt
+            const auto r = parse_dpkg_status(text, b);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == PkgDbCause::corrupt);
+            auto b2 = generous();
+            const auto strict = parse_dpkg_status(text, b2, MissingStatus::corrupt);
+            REQUIRE_FALSE(strict.has_value());
+            CHECK(strict.error() == PkgDbCause::corrupt);
+        }
+        auto b = generous();
+        const auto r = parse_dpkg_status(text, b, MissingStatus::installed);
+        REQUIRE(r.has_value());
+        REQUIRE(r->size() == 1);
+        CHECK(r->front().name == name);
+        CHECK(r->front().want == "install");
+        CHECK(r->front().flag == "ok");
+        CHECK(r->front().status == "installed");
+    }
+    auto b = generous();
+    const auto base_files = parse_dpkg_status(read_text(pkgdb_fixture("debian12-statusd/status.d", "base-files")),
+                                              b, MissingStatus::installed);
+    REQUIRE(base_files.has_value());
+    CHECK(base_files->front().version == "12.4+deb12u15");
+    CHECK(base_files->front().architecture == "arm64");
+    CHECK(base_files->front().maintainer == "Santiago Vila <sanvila@debian.org>");
+}
+
+TEST_CASE("dpkg status: MissingStatus::installed changes nothing for a stanza that has a Status",
+          "[dpkg][pkgdb]") {
+    const auto lenient = [](std::string_view text) {
+        auto b = generous();
+        return parse_dpkg_status(text, b, MissingStatus::installed);
+    };
+    // A Status that is present keeps the three-word rule ...
+    for (const char* bad : {"Status:\n", "Status: nonsense\n", "Status: install ok\n",
+                            "Status: install ok installed extra\n"}) {
+        INFO(bad);
+        const auto r = lenient(std::string{"Package: a\n"} + bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PkgDbCause::corrupt);
+    }
+    // ... keeps its own words (a held package is not rewritten to install) ...
+    const auto held = lenient("Package: a\nStatus: hold ok installed\n");
+    REQUIRE(held.has_value());
+    REQUIRE(held->size() == 1);
+    CHECK(held->front().want == "hold");
+    // ... and `not-installed` is still skipped.
+    const auto gone = lenient("Package: a\nStatus: purge ok not-installed\n\nPackage: b\n");
+    REQUIRE(gone.has_value());
+    REQUIRE(gone->size() == 1);
+    CHECK(gone->front().name == "b");
+    // Every other refusal is unchanged: no Package, a duplicate field, a NUL byte, a colon-less line.
+    for (const char* bad : {"Version: 1\n", "Package: a\nPackage: b\n", "Package: a\nno colon here\n"}) {
+        INFO(bad);
+        const auto r = lenient(bad);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == PkgDbCause::corrupt);
+    }
+    const auto nul = lenient(std::string("Package: a\0b\n", 13));
+    REQUIRE_FALSE(nul.has_value());
+    CHECK(nul.error() == PkgDbCause::corrupt);
 }
 
 TEST_CASE("dpkg status: hostile text is corrupt, never partial", "[dpkg][pkgdb]") {

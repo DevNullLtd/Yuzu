@@ -783,6 +783,13 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
             f[page_base + v.item_off] = 7; // an unknown type
             CHECK(cause(f) == PkgDbCause::corrupt);
         }
+        SECTION("edited hash page type 2 (unsorted, an upgraded file's layout) is not decoded, never skipped") {
+            // A page this reader skipped silently would return a shorter roster as complete.
+            Bytes f = good;
+            REQUIRE(f[page_base + 25] == 13);
+            f[page_base + 25] = 2;
+            CHECK(cause(f) == PkgDbCause::unsupported_format);
+        }
         SECTION("edited off-page first pgno outside [1, last_pgno]") {
             Bytes f = good;
             put32(f, page_base + v.item_off + 4, 0, be);

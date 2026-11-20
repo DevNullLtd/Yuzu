@@ -2,7 +2,7 @@
 
 /**
  * dpkg_status_parsers.hpp -- pure parser for the dpkg status text database
- * (/var/lib/dpkg/status and the single-stanza files of /var/lib/dpkg/status.d/).
+ * (/var/lib/dpkg/status and the single-stanza control files of /var/lib/dpkg/status.d/).
  *
  * Header-only, no I/O: the caller hands over the file's text, so every case is
  * fixture-fed on any host (docs/testing/unit-test-conventions.md "pure core,
@@ -25,6 +25,15 @@
  * three space-separated words (`<want> <flag> <state>`). dpkg itself rejects
  * the same inputs, so a database dpkg can read is never refused here.
  *
+ * A stanza with no Status field at all is the caller's policy (MissingStatus).
+ * The status file is dpkg's own record and always carries one, so there the
+ * answer is `corrupt` (the default). The files of status.d are plain control
+ * stanzas, written by an image builder from each package's control file, and a
+ * real minimal image's carry NO Status field: that caller asks for
+ * MissingStatus::installed, because a package whose file is present in status.d
+ * is installed by construction. A Status that IS present is checked by the same
+ * three-word rule in both places, and `not-installed` is skipped in both.
+ *
  * A stanza whose state word is `not-installed` is skipped (dpkg-query -W prints
  * none). Every other stanza is returned WITH its three words: which states count
  * as installed is the caller's rule (inv uses state == installed, `list` also
@@ -33,6 +42,7 @@
  */
 
 #include <cstddef>
+#include <cstdint>
 #include <expected>
 #include <string>
 #include <string_view>
@@ -53,6 +63,10 @@ struct DpkgPackage {
     std::string flag;   ///< ok | reinstreq | hold | hold-reinstreq
     std::string status; ///< installed | not-installed | config-files | half-installed | ...
 };
+
+/// What a stanza with no Status field means. The status file requires one (`corrupt`); a status.d
+/// control stanza has none and is installed (see the file comment).
+enum class MissingStatus : std::uint8_t { corrupt, installed };
 
 namespace dpkg_detail {
 
@@ -117,7 +131,8 @@ inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architect
 /// stanza seen (a skipped one too: a hostile file of a million not-installed
 /// stanzas is bounded by the row budget, not only by the byte cap).
 [[nodiscard]] inline PkgDbVoid finish(Stanza& st, PkgDbBudget& budget,
-                                      std::vector<DpkgPackage>& out, std::size_t& stanzas) {
+                                      std::vector<DpkgPackage>& out, std::size_t& stanzas,
+                                      MissingStatus missing) {
     if (!st.started)
         return {};
     if (auto r = budget.charge_row(); !r)
@@ -127,8 +142,16 @@ inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architect
             return t;
     if (!st.seen[0] || st.pkg.name.empty())
         return std::unexpected(PkgDbCause::corrupt); // a stanza without a Package
-    if (!st.seen[4] || !split_status(st.status_raw, st.pkg))
-        return std::unexpected(PkgDbCause::corrupt); // no Status, or not three words
+    if (st.seen[4]) {
+        if (!split_status(st.status_raw, st.pkg))
+            return std::unexpected(PkgDbCause::corrupt); // a Status that is not three words
+    } else if (missing == MissingStatus::installed) {
+        st.pkg.want = "install"; // a status.d control stanza: present means installed
+        st.pkg.flag = "ok";
+        st.pkg.status = "installed";
+    } else {
+        return std::unexpected(PkgDbCause::corrupt); // the status file always has one
+    }
     if (st.pkg.status != "not-installed")
         out.push_back(std::move(st.pkg));
     st = Stanza{};
@@ -137,10 +160,11 @@ inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architect
 
 } // namespace dpkg_detail
 
-/// Parses one status text. See the file comment for what is refused. The budget's
-/// rows are charged per stanza and its clock is read every 256 stanzas.
+/// Parses one status text. See the file comment for what is refused and for `missing`. The
+/// budget's rows are charged per stanza and its clock is read every 256 stanzas.
 [[nodiscard]] inline std::expected<std::vector<DpkgPackage>, PkgDbCause>
-parse_dpkg_status(std::string_view text, PkgDbBudget& budget) {
+parse_dpkg_status(std::string_view text, PkgDbBudget& budget,
+                  MissingStatus missing = MissingStatus::corrupt) {
     using namespace dpkg_detail;
     if (text.find('\0') != std::string_view::npos)
         return std::unexpected(PkgDbCause::corrupt);
@@ -159,7 +183,7 @@ parse_dpkg_status(std::string_view text, PkgDbBudget& budget) {
             line.remove_suffix(1);
 
         if (line.empty()) { // end of stanza
-            if (auto r = finish(st, budget, out, stanzas); !r)
+            if (auto r = finish(st, budget, out, stanzas, missing); !r)
                 return std::unexpected(r.error());
             continue;
         }
@@ -193,7 +217,7 @@ parse_dpkg_status(std::string_view text, PkgDbBudget& budget) {
             break;
         }
     }
-    if (auto r = finish(st, budget, out, stanzas); !r) // the last stanza needs no trailing blank line
+    if (auto r = finish(st, budget, out, stanzas, missing); !r) // the last stanza needs no trailing blank line
         return std::unexpected(r.error());
     return out;
 }
