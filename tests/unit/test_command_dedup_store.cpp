@@ -1099,6 +1099,39 @@ TEST_CASE("sqlite_quarantine: a failed copy onto a quarantine name that already 
     CHECK(r.notes[0].find("partial copy") == std::string::npos);
 }
 
+TEST_CASE("sqlite_quarantine: a copy that reports file_exists leaves what it found at the name alone",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: the name was free when this call checked it, and something took it before the copy
+    // landed (the copy seam stands in for that racer and answers file_exists). Whatever is there
+    // is not ours: it is not removed and the note does not claim a partial copy.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "racer bytes");
+        ec = std::make_error_code(std::errc::file_exists);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    const fs::path racer{r.dest->string() + "-wal"};
+    REQUIRE(fs::is_regular_file(racer));
+    CHECK(read_bytes(racer) == "racer bytes");
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found); // source sidecar gone
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") == std::string::npos);
+}
+
 #ifndef _WIN32
 TEST_CASE("sqlite_quarantine: a dangling link at the sidecar quarantine name is neither followed nor removed",
           "[command_dedup][corruption][quarantine_fs]") {
@@ -1135,6 +1168,52 @@ TEST_CASE("sqlite_quarantine: a dangling link at the sidecar quarantine name is 
     CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
     REQUIRE(r.notes.size() == 1);
     CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: a partial sidecar copy that cannot be removed is reported and left in place",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: the removal is the one destructive step, so its failure is reported, never hidden.
+    // The copy seam leaves a partial file and then makes the directory read-only, which fails the
+    // removal of that partial and of the source sidecar alike (the second note).
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; the removal cannot be made to fail");
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    struct RestorePerms {
+        fs::path d;
+        ~RestorePerms() {
+            std::error_code e;
+            fs::permissions(d, fs::perms::owner_all, fs::perm_options::replace, e);
+        }
+    } restore{dir.path};
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "wal");
+        std::error_code pec;
+        fs::permissions(dir.path, fs::perms::owner_read | fs::perms::owner_exec,
+                        fs::perm_options::replace, pec);
+        REQUIRE_FALSE(pec);
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    const fs::path partial{r.dest->string() + "-wal"};
+    CHECK(fs::is_regular_file(partial)); // the removal failed, so the partial is still there
+    REQUIRE(r.notes.size() == 2);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("could not be removed") != std::string::npos);
+    CHECK(r.notes[0].find("was removed") == std::string::npos);
+    CHECK(r.notes[1].find("a stale sidecar may remain") != std::string::npos); // the source too
 }
 #endif
 

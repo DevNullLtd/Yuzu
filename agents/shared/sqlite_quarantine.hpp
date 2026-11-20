@@ -439,21 +439,21 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
             }
         }
         if (cec) {
-            std::string removed;
+            std::string partial_note;
             // A copy that failed part-way (disk full) can leave a truncated file at the name that
             // was free when this call checked it; a truncated sidecar is not evidence and would
             // pass for the real one. file_exists means the entry is not ours: never removed.
             if (copy_ran && cec != std::errc::file_exists && is_regular_file_no_follow(side_dest)) {
                 std::error_code pec;
                 fs::remove(side_dest, pec);
-                removed = pec ? std::format("; the partial copy at {} could not be removed ({})",
-                                            side_dest.string(), pec.message())
-                              : std::format("; the partial copy at {} was removed",
-                                            side_dest.string());
+                partial_note =
+                    pec ? std::format("; the partial copy at {} could not be removed ({})",
+                                      side_dest.string(), pec.message())
+                        : std::format("; the partial copy at {} was removed", side_dest.string());
             }
             result.notes.push_back(std::format(
                 "could not preserve {} as {} ({}); its content is not kept{}", side.string(),
-                side_dest.string(), cec.message(), removed));
+                side_dest.string(), cec.message(), partial_note));
         } else {
             secure(side_dest);
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "

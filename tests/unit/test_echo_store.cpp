@@ -13,6 +13,7 @@
 #include "echo_netqual_boot.hpp"
 #include "echo_sql_executor.hpp"
 #include "echo_sqlite_progress.hpp"
+#include "test_bounded_return.hpp"
 #include "test_helpers.hpp"
 #include "test_log_capture.hpp"
 
@@ -37,6 +38,7 @@
 #include <iterator>
 #include <map>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -4827,9 +4829,15 @@ TEST_CASE("EchoDatabase: a corrupt open whose sidecar move and copy both fail le
         ec = std::make_error_code(std::errc::no_space_on_device);
     };
 
+    // The primitive's notes reach the operator through spdlog; echo_db.cpp is compiled into this
+    // binary, so the capture reaches it (see the caveat in test_log_capture.hpp).
+    yuzu::test::LogCapture logs;
     auto opened = EchoDatabase::open(db, seams);
+    logs.stop();
     REQUIRE(std::find(copied.begin(), copied.end(), "echo.db-wal") != copied.end()); // not vacuous
     REQUIRE(opened.has_value());
+    CHECK(logs.text().find("its content is not kept") != std::string::npos);
+    CHECK(logs.text().find("partial copy") != std::string::npos);
     REQUIRE(opened->quarantined_this_open().has_value());
     const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
     REQUIRE(kept.size() == 1); // the main file alone: no `-wal` or `-shm` partial in the set
@@ -4837,6 +4845,7 @@ TEST_CASE("EchoDatabase: a corrupt open whose sidecar move and copy both fail le
     CHECK(kept[0].find("-shm") == std::string::npos);
     CHECK((!fs::exists(wal) || slurp_file(wal) != wal_bytes)); // nothing stale beside the fresh file
     CHECK(opened->get_config("process_enabled", "true") == "true"); // a fresh database
+    CHECK(opened->get_config("wal_row", "absent") == "absent");     // the old WAL's row did not replay
 }
 
 // #7473. A directory whose filesystem cannot hard-link answers the claim with ENOTSUP: the open
@@ -4938,10 +4947,26 @@ TEST_CASE("EchoDatabase: a corrupt echo.db already hard-linked to a quarantine n
     CHECK(opened->get_config("process_enabled", "true") == "true");
 }
 
+namespace {
+// An open whose REFUSAL is under test (#7470): the call runs under the standard's hang backstop
+// (docs/testing/echo-test-standard.md, rule 4), which also prints its real elapsed seconds to the
+// test log on every run. A refusal slower than the bound ends the test process naming the call;
+// a slower one under it shows in the log and does not fail.
+std::expected<EchoDatabase, std::string> open_bounded(const char* what, const fs::path& db) {
+    std::optional<std::expected<EchoDatabase, std::string>> result;
+    yuzu::test::must_return_within(yuzu::test::kReturnBound, what,
+                                   [&] { result.emplace(EchoDatabase::open(db)); });
+    return std::move(*result);
+}
+} // namespace
+
 // #7470. A corrupt file another connection holds EXCLUSIVE is not quarantined: the open waits out
 // its busy timeout once and refuses as busy. The corruption is in every page after the first, so
 // the holder can still read the schema and take the lock while the integrity check would fail.
-// Once the holder is gone the next open quarantines the same bytes and recovers.
+// Once the holder is gone the next open quarantines the same bytes and recovers. The one wait is
+// SQLite's 5 s busy timeout (kBusyTimeoutMs, echo_db.cpp:67), acceptable for a boot-time call as in
+// the #7286 case above and the only wait in this case; measured 5.213 s on macOS (uid 501, HEAD
+// 4712650928), and the bounded call prints the elapsed time on every run.
 TEST_CASE("EchoDatabase: a corrupt echo.db held exclusively is refused as busy, then quarantined once released (#7470)",
           "[echo][store][lifecycle][corruption]") {
     yuzu::test::TempDir dir{"yuzu_test_echo_corruptbusy_"};
@@ -4971,7 +4996,7 @@ TEST_CASE("EchoDatabase: a corrupt echo.db held exclusively is refused as busy, 
     exec_sql(holder->db, "PRAGMA locking_mode=EXCLUSIVE");
     exec_sql(holder->db, "BEGIN EXCLUSIVE");
 
-    auto refused = EchoDatabase::open(db);
+    auto refused = open_bounded("EchoDatabase::open of a corrupt echo.db held exclusively", db);
     REQUIRE_FALSE(refused.has_value());
     CHECK(refused.error().find("echo.db is busy") != std::string::npos);
     CHECK(refused.error().find("not quarantined") != std::string::npos);
@@ -5011,7 +5036,7 @@ TEST_CASE("EchoDatabase: an echo.db with mode 000 is refused and opens once the 
     fs::permissions(db, fs::perms::none, fs::perm_options::replace, ec);
     REQUIRE_FALSE(ec);
 
-    auto refused = EchoDatabase::open(db);
+    auto refused = open_bounded("EchoDatabase::open of an echo.db with mode 000", db);
     REQUIRE_FALSE(refused.has_value());
     // Observed: the failure is at SQLite's open, so the text is `failed to open echo.db: unable to
     // open database file` (no path, no "could not be checked").
@@ -5049,14 +5074,15 @@ TEST_CASE("EchoDatabase: a read-only data directory is refused and opens once re
                     fs::perm_options::remove, ec);
     REQUIRE_FALSE(ec);
 
-    auto refused = EchoDatabase::open(db);
+    auto refused = open_bounded("EchoDatabase::open in a read-only data directory", db);
     REQUIRE_FALSE(refused.has_value());
     INFO("open error: " << refused.error());
     // Observed (macOS, uid 501): the file opens, the integrity check cannot create the WAL, so the
     // text is `echo.db could not be checked (sqlite rc 8): not quarantined and not opened; ...`,
-    // the class docs/user-manual/echo.md describes. Only the prefix is pinned, not the result
-    // code (8 on macOS), which another platform's SQLite may report differently.
+    // the class docs/user-manual/echo.md describes. The prefix and the path are pinned, not the
+    // result code (8 on macOS), which another platform's SQLite may report differently.
     CHECK(refused.error().find("echo.db could not be checked (sqlite rc ") != std::string::npos);
+    CHECK(refused.error().find(db.string()) != std::string::npos); // the refusal names the path
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 
     fs::permissions(dir.path, fs::perms::owner_all, fs::perm_options::add, ec);
