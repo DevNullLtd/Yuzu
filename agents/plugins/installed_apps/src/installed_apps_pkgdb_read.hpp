@@ -672,9 +672,10 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
     auto dir = yuzu::shared::open_dir_no_follow(dir_path);
     if (!dir.opened()) {
         // Absent, or a symlink / non-directory (a symlinked var/lib/rpm is skipped on purpose, never
-        // followed): the next location. A symlink with a database behind it is remembered, so that when
-        // no other location yields one the answer is a refusal, not an empty list. Anything else (a
-        // permission refusal) is a database we cannot show absent.
+        // followed): the next location. A symlink with a database behind it is remembered by the
+        // directory it resolves to, so that read_host_packages can refuse, rather than answer an empty
+        // list, unless that directory's database was read. Anything else (a permission refusal) is a
+        // database we cannot show absent.
         if (dir.err == ENOENT || dir.err == ENOTDIR || dir.err == ELOOP) {
             out.symlinked_db = symlink_hides_database(dir_path);
             return out;

@@ -379,7 +379,9 @@ cadences.
     rows, the server keeps its stored ones) until dpkg next rewrites it.
   - **Symlinks.** A symlinked status file, `status.d` directory or rpm database
     file is refused (`symlink_refused`) where the tools followed the link. A
-    symlinked rpm directory is skipped, never followed (the current Fedora, RHEL
+    symlinked rpm directory is skipped, never followed; when a database file sits
+    behind such a link in a directory this reader did not read, the read is
+    `rpmdb:symlink_refused` rather than an empty list (the current Fedora, RHEL
     and SUSE layout, where `/var/lib/rpm` links to the directory that is read, is
     unaffected).
   - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm

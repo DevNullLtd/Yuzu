@@ -1115,6 +1115,21 @@ TEST_CASE("pkgdb detection: an rpm database that was read and holds no package d
         CHECK(h.ecosystem == Eco::none);
         CHECK(h.rpm.empty());
     }
+    SECTION("one link to the directory read and another to an unread one is symlink_refused") {
+        // Every hiding link must resolve to a directory that was read: the first one doing so (or any
+        // one doing so) is not enough while another still hides a database this reader never saw.
+        Root root;
+        put_emptied_sqlite(root, "usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        root.put("elsewhere/rpmdb.sqlite", alma9);
+        fs::create_directories(root.at("var/lib"));
+        fs::create_directories(root.at("usr/share"));
+        fs::create_directory_symlink("../../usr/lib/sysimage/rpm", root.at("var/lib/rpm"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("usr/share/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpmdb:symlink_refused");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
     SECTION("older layout, emptied database: the link is seen first and still resolves to the directory read") {
         // usr/lib/sysimage/rpm links to var/lib/rpm, which is read AFTER the link is skipped: the
         // identities are compared once the loop is done, so this is none, not a refusal.
