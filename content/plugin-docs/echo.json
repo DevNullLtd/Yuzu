@@ -2850,6 +2850,7 @@
       "changelog.d/7420-echo-followups-mixed.changed.md",
       "changelog.d/7420-echo-followups-mixed.fixed.md",
       "changelog.d/7466-echo-mcp-hourly-rows.changed.md",
+      "changelog.d/7482-echo-agent-small-correctness.fixed.md",
       "changelog.d/7507-echo-drop-live-shims.removed.md"
     ],
     "definitions": [

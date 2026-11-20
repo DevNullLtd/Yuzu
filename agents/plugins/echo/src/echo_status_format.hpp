@@ -179,6 +179,20 @@ format_storage_refused_lines(OfflineReason reason, std::string_view detail,
            std::to_string(last_epoch);
 }
 
+/// The two always-present `config|` lines that say what shape the store is in (#2626):
+/// `config|schema_version|<N>` and `config|warehouse_tables_ok|<true|false>`, in that order.
+/// `warehouse_tables_ok` is false when open() succeeded but could not create every
+/// registry-declared warehouse table, which otherwise shows only as a stream of per-pass write
+/// failures. Server readers of `config|` lines skip keys they do not know, so adding these is not
+/// a wire break.
+[[nodiscard]] inline std::vector<std::string> format_schema_status_lines(int schema_version,
+                                                                         bool warehouse_ok) {
+    return {
+        std::format("config|schema_version|{}", schema_version),
+        std::format("config|warehouse_tables_ok|{}", warehouse_ok ? "true" : "false"),
+    };
+}
+
 /// `partial|applied|<k1,k2,...>` (#2155): the line `echo.configure` writes, ahead of its error
 /// line, when a write failed AFTER some earlier ones persisted. Keys are the config keys that did
 /// persist, in the order they were written. Empty (no line at all) when nothing persisted: that

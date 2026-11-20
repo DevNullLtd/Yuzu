@@ -28,6 +28,14 @@ std::string software_state_to_json(const std::vector<SoftwareInfo>& apps);
 /// blob.
 std::vector<SoftwareInfo> software_state_from_json(const std::string& s);
 
+/// One-entry-per-name: sort, then keep the highest-versioned of any same-name
+/// duplicates (e.g. the 64-bit and 32-bit views of a product sharing a
+/// DisplayName), so the diff key (name) is unambiguous. Versions compare with
+/// compare_versions, a strict weak order, so the kept entry does not depend on
+/// the input order (#1620, #7482). Pure; the Windows collector calls it, and it
+/// lives here so it is testable on every platform.
+void dedup(std::vector<SoftwareInfo>& apps);
+
 /// Outcome of one collect_software tick's PURE logic.
 struct SoftwareCollectResult {
     enum class Kind : std::uint8_t {

@@ -14,7 +14,10 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include <algorithm>
+#include <array>
 #include <string>
+#include <string_view>
 #include <vector>
 
 using namespace yuzu::echo;
@@ -54,6 +57,90 @@ TEST_CASE("compare_versions: non-numeric segment falls back to lexicographic",
     CHECK(compare_versions("1.9.5p2", "1.9.5p3") < 0);
     CHECK(compare_versions("", "") == 0);
     CHECK(compare_versions("1", "") > 0);
+}
+
+// #7482: the old rule fell back to a lexicographic compare whenever EITHER side
+// was non-numeric, so 9 < 10 (numeric), 10 < 1a (lexicographic), 1a < 9
+// (lexicographic) was a cycle, and std::sort over a cycle is undefined.
+TEST_CASE("compare_versions: the cycling triple 9, 10, 1a is transitive",
+          "[echo][software][version]") {
+    CHECK(compare_versions("9", "10") < 0);
+    CHECK(compare_versions("10", "1a") < 0);
+    CHECK(compare_versions("9", "1a") < 0); // the edge that closed the cycle
+    CHECK(compare_versions("1a", "9") > 0);
+}
+
+TEST_CASE("compare_versions: a strict weak order over an adversarial corpus",
+          "[echo][software][version]") {
+    constexpr std::array<std::string_view, 24> kCorpus = {
+        "",      "0",     "00",    "7",     "007",    "9",      "10",       "1a",
+        "1.a",   "a",     "A",     "1.0",   "1.0.0",  "1-0",    "1.9.5p2",  "1.9.5p3",
+        "1.2.3", "1.2.10", ".",    "-",     "1..2",   "a.b-c",  "9999999999999999999999999999999999",
+        "10000000000000000000000000000001",
+    };
+    auto sign = [](int v) { return (v > 0) - (v < 0); };
+    for (auto a : kCorpus) {
+        CHECK(compare_versions(a, a) == 0);
+        for (auto b : kCorpus) {
+            INFO("a='" << a << "' b='" << b << "'");
+            CHECK(sign(compare_versions(a, b)) == -sign(compare_versions(b, a)));
+            for (auto c : kCorpus) {
+                if (compare_versions(a, b) <= 0 && compare_versions(b, c) <= 0) {
+                    INFO("c='" << c << "'");
+                    CHECK(compare_versions(a, c) <= 0);
+                }
+                // Equivalence is transitive too (the other half of a weak order).
+                if (compare_versions(a, b) == 0 && compare_versions(b, c) == 0) {
+                    INFO("c='" << c << "'");
+                    CHECK(compare_versions(a, c) == 0);
+                }
+            }
+        }
+    }
+}
+
+TEST_CASE("compare_versions: long numeric segments compare by value, not by integer conversion",
+          "[echo][software][version]") {
+    // 30 digits would overflow a long long; the comparison is on the digit string.
+    const std::string big(30, '9');
+    const std::string bigger = "1" + std::string(30, '0');
+    CHECK(compare_versions(big, bigger) < 0);
+    CHECK(compare_versions(bigger, big) > 0);
+    CHECK(compare_versions(big, big) == 0);
+    CHECK(compare_versions("007", "7") == 0);
+    CHECK(compare_versions("1.007", "1.7.0") == 0);
+}
+
+TEST_CASE("dedup: the kept entry does not depend on input order", "[echo][software][version]") {
+    // The 9 / 10 / 1a triple was a comparator cycle: std::sort on it was undefined
+    // and the survivor depended on the registry enumeration order (#7482).
+    std::vector<SoftwareInfo> triple = {sw("App", "9"), sw("App", "10"), sw("App", "1a")};
+    std::sort(triple.begin(), triple.end(),
+              [](const SoftwareInfo& a, const SoftwareInfo& b) { return a.version < b.version; });
+    int orderings = 0;
+    do {
+        auto apps = triple;
+        dedup(apps);
+        REQUIRE(apps.size() == 1);
+        CHECK(apps[0].name == "App");
+        CHECK(apps[0].version == "1a");
+        ++orderings;
+    } while (std::next_permutation(
+        triple.begin(), triple.end(),
+        [](const SoftwareInfo& a, const SoftwareInfo& b) { return a.version < b.version; }));
+    CHECK(orderings == 6);
+}
+
+TEST_CASE("dedup: distinct names are untouched and come back sorted by name",
+          "[echo][software][version]") {
+    std::vector<SoftwareInfo> apps = {sw("Zed", "1"), sw("Alpha", "2"), sw("Alpha", "10"),
+                                      sw("Mid", "3")};
+    dedup(apps);
+    REQUIRE(apps.size() == 3);
+    CHECK(apps[0].name == "Alpha");
+    CHECK(apps[0].version == "10"); // numeric, not lexicographic
+    CHECK(apps[1].name == "Mid");
+    CHECK(apps[2].name == "Zed");
 }
 
 // =============================================================================

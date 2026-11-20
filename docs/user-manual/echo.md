@@ -135,7 +135,7 @@ There is no retention setting: each tier is pruned against its own window (see [
 - `process_stabilization_exclusions` matching is **case-insensitive substring**, not real glob. Leading and trailing `*` are stripped; `?` and `[abc]` are treated as literals. The **effective substring** (after stripping `*`) must be at least **3 characters** — a shorter one (e.g. `"a"`, or `"*a*"`, which strips to `"a"`) would match almost every process and is **rejected**. Use a longer substring (`"-helper"`, `"chrome-helper"`). Matching is on the **process name only**, so a binary renamed to contain an approved substring evades capture — exclusions are a noise-reduction convenience, **not a threat-hunting control**.
 - `network_capture_method` is validated against the **running host's OS** accept-list, not the union across all platforms — e.g. a Linux agent rejects the Windows-only `iphlpapi`. `polling` is always accepted (the platform default). Run the `compatibility` action to see the live accepted list for a given agent.
 - Disabling a collector (`<source>_enabled=false`) **atomically** stops new captures — the disable runs under the collection lock, so an in-flight cycle either completes before the stop takes effect or observes the disabled flag and skips (no extra snapshot slips through). Existing rows remain queryable. On re-enable the source starts from a **clean baseline**: the snapshot-diff state is cleared on disable, so the first collection cycle after re-enable emits a `started` event for every entity currently running/open (an expected one-time rebaseline, not a real-time burst) and **never** ghost `stopped` events for entities that exited during the pause. If the agent database is momentarily busy and the baseline cannot be cleared, the disable is **refused** — the source stays enabled and `configure` returns an error — so a disabled source can never be left with a stale baseline; retry the disable.
-  - The interval samplers (`perf` and `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory): no usage row ever spans the period it was disabled.
+  - The interval samplers (`perf` and `procperf`) report the **delta** between consecutive readings rather than started/stopped events, and keep that previous reading in memory. Disabling them resets that in-memory baseline under the same collection lock, and the sampler re-checks the disabled flag after taking the lock — so disabling them is equally atomic, and the **first** sample after a re-enable establishes a fresh baseline rather than reporting one row whose averaged rate covers the entire paused window. This matters most for `procperf` (per-application CPU/memory): no usage row ever spans the period it was disabled. Recovering a source from `errored` (a corrupt `<source>_enabled` flag) by sending `true` also starts from a fresh baseline: the snapshot-diff state is cleared in the same step as the flag, and the interval samplers drop their in-memory reading, so the errored interval is never diffed into events or into one averaged row.
 
 **Partial results.** Every setting is checked as it is saved. If a save fails (for example the database is busy), `configure` stops and exits `1` with an `error|` line. When earlier settings in the same call had already been saved, the reply first carries `partial|applied|<key1,key2,...>` listing the keys that did persist, and the result status is `constrained` (`echo:configure_partial_commit`). So a non-zero exit means at least one requested change did not persist, and `constrained` means some did; read `status` and re-send the rest. An interval (`fast_interval`, `slow_interval`, `software_interval`) listed under `partial|applied` is saved, but collection keeps its previous schedule until the agent restarts or that interval is sent again in a call that succeeds, so include it when re-sending. If nothing was saved, only the `error|` line is returned.
 
@@ -255,6 +255,8 @@ The `status` action returns database health information:
 ```
 storage_state|ok
 db_health|ok|0
+config|schema_version|10
+config|warehouse_tables_ok|true
 record_count|15234
 oldest_timestamp|1710950000
 newest_timestamp|1711050423
@@ -332,6 +334,8 @@ could not be moved aside, or was kept under its `.corrupt-<epoch>` name because
 the open fails before that write and nothing is persisted: the fact is then in
 the agent log and the kept file only, and the next start judges the file at
 `echo.db` afresh.
+
+**Store shape (`config|schema_version`, `config|warehouse_tables_ok`).** Both lines are always present after `db_health`. `config|schema_version|<N>` is the store's schema version. `config|warehouse_tables_ok|false` means the database opened but the agent could not create every warehouse table (a table or index of the expected name that has the wrong shape, for instance), so collectors and roll-ups that need the missing ones fail on every pass; the agent log carries the SQLite error at `error` level. The store is otherwise usable, so this is the line to alert on rather than a failed `status`.
 
 **Per-source health.** `<source>_last_status` is the terminal outcome token of
 the source's most recent collection (`never_ran` until it has run in this agent
@@ -444,7 +448,7 @@ retention_guard_failures_total|2
 Only tables with a non-zero count appear, so a healthy agent emits just the two
 totals. `__clock_state__` is not a table: it reports that the agent could not
 persist its own clock reading, which leaves the guard without a comparison point
-after the next restart. `__budget__` is not a table either: the byte-budget pass was skipped because the retention clock guard refused this pass's clock (it is counted in neither total, because the decline or failure that caused it is already counted). `__implausible_now__` is also not a table: it reports
+after the next restart. `__budget__` is not a table either: the byte-budget pass was skipped because the retention clock guard refused this pass's clock (it is counted in neither total, because the decline or failure that caused it is already counted). `__implausible_stored__` is not a table either: the stored comparison point was unreadable, negative or ahead of the clock, so the pass re-anchored it to the current reading; it is counted once per pass in which that was found, whether or not any table had rows to remove. `__implausible_now__` is also not a table: it reports
 that the clock reading **handed to a pass** (not the stored comparison point)
 was too far ahead to trust, so the whole pass declined before touching any
 table -- see "The retention clock guard" below. The per-table counters are in-memory and reset when the agent restarts

@@ -544,6 +544,94 @@ TEST_CASE("Echo #538: a failed baseline clear leaves the source ENABLED (UP-1)",
     CHECK(db.get_config("process_paused_at", "0") == "0");     // never paused
 }
 
+TEST_CASE("Echo #1624: recovering an errored source clears its mapped baseline",
+          "[echo][paused_at][issue1624]") {
+    // The baseline was last written before the flag went bad and nothing has
+    // maintained it since (collection is gated closed on a non-canonical flag).
+    // Resuming against it diffs the whole errored interval into ghost events.
+    const struct {
+        const char* source;
+        const char* state_key;
+    } cases[] = {{"process", "process"}, {"tcp", "network"}, {"service", "service"},
+                 {"user", "user"},       {"software", "software"},
+                 {"arp", "arp"},         {"dns", "dns"}};
+
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_errored_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    for (const auto& c : cases) {
+        INFO("source: " << c.source);
+        REQUIRE(db.set_state(c.state_key, R"([{"x":1}])"));
+        REQUIRE_FALSE(db.get_state(c.state_key).empty());
+        // The flag clobbered to a value the plugin never writes; a stale pause stamp too.
+        REQUIRE(db.set_config(std::string{c.source} + "_enabled", "maybe"));
+        REQUIRE(db.set_config(std::string{c.source} + "_paused_at", "1735689600"));
+        REQUIRE(canonical_source_enabled(db.get_config(std::string{c.source} + "_enabled", "true")) ==
+                "errored");
+
+        REQUIRE(apply_source_enabled_transition(db, c.source, "true", 1'735'700'000));
+
+        CHECK(db.get_state(c.state_key).empty());
+        CHECK(db.get_config(std::string{c.source} + "_enabled", "") == "true");
+        CHECK(db.get_config(std::string{c.source} + "_paused_at", "") == "0");
+    }
+}
+
+TEST_CASE("Echo #1624: true to true and false to true do not clear a baseline",
+          "[echo][paused_at][issue1624]") {
+    // Negative control: only the errored recovery is new. A re-assert of an
+    // enabled source and a plain un-pause must keep whatever baseline exists.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_control_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_state("process", R"([{"pid":1}])"));
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'600)); // true -> true
+    CHECK_FALSE(db.get_state("process").empty());
+
+    REQUIRE(apply_source_enabled_transition(db, "process", "false", 1'735'689'700)); // clears
+    REQUIRE(db.get_state("process").empty());
+    REQUIRE(db.set_state("process", R"([{"pid":2}])")); // something re-seeds it
+    REQUIRE(apply_source_enabled_transition(db, "process", "true", 1'735'689'800)); // false -> true
+    CHECK_FALSE(db.get_state("process").empty());
+}
+
+TEST_CASE("Echo #1624: a failed baseline clear on errored recovery leaves the flag unmoved",
+          "[echo][paused_at][issue1624]") {
+    // Mirror of the UP-1 case above for the new edge: the clear and the flag
+    // commit together or not at all, so a failed clear never reports a recovery.
+    yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_clearfail_"}};
+    auto opened = yuzu::test::open_echo_db(tmp.path);
+    REQUIRE(opened.has_value());
+    EchoDatabase db = std::move(*opened);
+    REQUIRE(db.create_warehouse_tables());
+
+    REQUIRE(db.set_config("process_enabled", "maybe"));
+    REQUIRE(db.set_config("process_paused_at", "1735689600"));
+    REQUIRE(db.execute_sql("DROP TABLE echo_state"));
+
+    CHECK_FALSE(apply_source_enabled_transition(db, "process", "true", 1'735'700'000));
+    CHECK(db.get_config("process_enabled", "true") == "maybe");        // still errored
+    CHECK(db.get_config("process_paused_at", "0") == "1735689600");    // stamp untouched
+}
+
+TEST_CASE("Echo #1624: interval_baseline_reset_due decides the in-memory reset",
+          "[echo][paused_at][issue1624]") {
+    // A disable always resets; an enable resets only when it leaves "errored".
+    for (const char* prev : {"true", "false", "errored"}) {
+        INFO("prev: " << prev);
+        CHECK(interval_baseline_reset_due(prev, "false"));
+    }
+    CHECK(interval_baseline_reset_due("errored", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("true", "true"));
+    CHECK_FALSE(interval_baseline_reset_due("false", "true"));
+}
+
 TEST_CASE("Echo #538: only the enable→disable TRANSITION clears (idempotent)",
           "[echo][paused_at][issue538]") {
     // The clear must fire on the transition, not on every false-write — a
@@ -1453,6 +1541,22 @@ TEST_CASE("Echo #2361: a table whose count cannot be read is skipped, not declin
     CHECK(row_count(*f.db, "tcp_hourly") == 20);
 }
 
+TEST_CASE("Echo #6197: a clock that steps backward between passes declines both, single-threaded",
+          "[echo][retention][clock-guard]") {
+    // Deterministic twin of the concurrent case below: the second pass sees a
+    // stored reading ahead of its own `now`, which is a different fact set from
+    // the first pass's, so it declines again instead of reading as already
+    // reported. No expired row goes in either pass.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 10 * kHourlyCutoffSec, 200); // all expired, no survivor
+
+    run_retention(*f.db, kT0 + 10, f.guard);
+    run_retention(*f.db, kT0 + 5, f.guard);
+
+    CHECK(declines_of(f.guard, "process_hourly") == 2);
+    CHECK(row_count(*f.db, "process_hourly") == 200);
+}
+
 TEST_CASE("Echo #2361: concurrent rollup passes are race-free when the caller serialises",
           "[echo][retention][clock-guard]") {
     // do_rollup is reachable from two places at once: the 900s `echo.rollup`
@@ -1888,6 +1992,37 @@ TEST_CASE("Echo #2361: an implausible stored reading is an anomaly, not a quiet 
     CHECK(declines_after("-1") == 1);              // negative
     CHECK(declines_after("not-a-number") == 1);    // unparseable
     CHECK(declines_after("99999999999999") == 1);  // far ahead of now
+}
+
+TEST_CASE("Echo #3104: an implausible stored reading is counted once per pass, with no expired rows",
+          "[echo][retention][clock-guard]") {
+    // The per-table decline for a corrupt stored reading fires only when a table
+    // has expired rows to decline, so on an idle device (every row inside its
+    // window) a tampered anchor produced no signal at all. The guard now counts
+    // the corruption itself, once, under a sentinel no table can collide with.
+    auto failures_after = [](const char* stored) {
+        EchoGuardFixture f;
+        seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+        REQUIRE(f.db->set_config("retention_guard_last_pass", stored));
+
+        run_retention(*f.db, kT0, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == 1);
+        CHECK(declines_of(f.guard, "process_hourly") == 0); // per-table behaviour unchanged
+        CHECK(row_count(*f.db, "process_hourly") == 3);
+        // Re-anchored to now, so the corruption is not counted again.
+        CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
+        run_retention(*f.db, kT0 + 1, f.guard);
+        return failures_of(f.guard, "__implausible_stored__");
+    };
+    CHECK(failures_after("not-a-number") == 1);   // unparseable
+    CHECK(failures_after("-1") == 1);             // negative
+    CHECK(failures_after("99999999999999") == 1); // far ahead of now
+
+    // A healthy anchor counts nothing.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3);
+    run_retention(*f.db, kT0, f.guard);
+    CHECK(failures_of(f.guard, "__implausible_stored__") == 0);
 }
 
 TEST_CASE("Echo #2361: a failed persist of the clock reading is reported",

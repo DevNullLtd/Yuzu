@@ -5,10 +5,12 @@
  */
 
 #include "echo_software_core.hpp"
+#include "echo_version.hpp"
 #include "echo_wire_scrub.hpp"
 
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <utility>
 
 namespace yuzu::echo {
@@ -47,6 +49,19 @@ std::vector<SoftwareInfo> software_state_from_json(const std::string& s) {
         result.push_back(std::move(a));
     }
     return result;
+}
+
+void dedup(std::vector<SoftwareInfo>& apps) {
+    std::sort(apps.begin(), apps.end(), [](const SoftwareInfo& a, const SoftwareInfo& b) {
+        if (a.name != b.name)
+            return a.name < b.name;
+        return compare_versions(a.version, b.version) > 0; // descending → unique keeps the highest
+    });
+    apps.erase(std::unique(apps.begin(), apps.end(),
+                           [](const SoftwareInfo& a, const SoftwareInfo& b) {
+                               return a.name == b.name;
+                           }),
+               apps.end());
 }
 
 SoftwareCollectResult software_collect_core(const std::string& prev_json,

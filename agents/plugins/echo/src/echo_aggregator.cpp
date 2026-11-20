@@ -142,7 +142,15 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
 
     const bool disable_edge = new_value == "false" && prev_canon != "false";
     const bool enable_edge = new_value == "true" && prev_canon != "true";
-    const std::string_view clear_key = disable_edge ? diff_state_key(source) : std::string_view{};
+    // Recovering from "errored" (#1624): the baseline was last written before the
+    // flag went bad, and nothing since has maintained it -- collection is gated
+    // closed on a non-canonical flag, exactly as it is while paused. Resuming
+    // against it would diff the whole errored interval into ghost events, the
+    // same storm the disable edge clears for (#538). So an errored->true edge
+    // clears it in the same transaction. true->true and false->true do not.
+    const bool errored_recovery = enable_edge && prev_canon == "errored";
+    const std::string_view clear_key =
+        (disable_edge || errored_recovery) ? diff_state_key(source) : std::string_view{};
 
     const std::string now_str = std::to_string(now_epoch);
     auto result = db.checked_transaction(
@@ -172,6 +180,10 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
             }
             return {};
         });
+    if (result.has_value() && errored_recovery)
+        spdlog::warn("Echo: source '{}' recovered from an errored enable flag; its snapshot "
+                     "baseline was cleared and collection restarts from a fresh baseline",
+                     source);
     return result.has_value();
 }
 
@@ -429,6 +441,14 @@ constexpr std::string_view kClockStateFailureKey = "__clock_state__";
 // "the value handed to this pass was never trustworthy enough to write".
 constexpr std::string_view kImplausibleNowKey = "__implausible_now__";
 
+// Reported when the STORED comparison point is unparseable, negative or ahead of
+// now (#3104). The per-table decline for a corrupt stored reading fires only when
+// a table has expired rows, so a tampered row on an idle device produced no
+// signal at all; this one is counted once per pass whatever any table holds.
+// Distinct from `kClockStateFailureKey` (the write failed) and from
+// `kImplausibleNowKey` (the value handed to this pass was bad).
+constexpr std::string_view kImplausibleStoredKey = "__implausible_stored__";
+
 // Does any row match? Runs through the TRUSTED connection. `execute_user_query`
 // is the authorizer-sandboxed path for untrusted operator SQL (echo.sql, #760)
 // and is deliberately NOT used here: this SQL is built from registry constants
@@ -633,6 +653,16 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
             prev_implausible = true;
             prev_pass_now.reset();
         }
+    }
+    // #3104: say so once per pass, whether or not any table has expired rows to
+    // decline. The re-anchor below overwrites the bad reading, so the next pass
+    // counts nothing more unless the row is corrupted again.
+    if (prev_implausible) {
+        spdlog::warn("Echo retention: the stored comparison point ({}) is not plausible (unparseable, "
+                     "negative or ahead of this pass); re-anchoring it to the current reading",
+                     kRetentionLastPassKey);
+        std::lock_guard lock(guard.mu);
+        ++guard.failures[std::string{kImplausibleStoredKey}];
     }
     // Record the reading for the NEXT pass before any early exit: it is an honest
     // observation of the clock whatever this pass goes on to do, and re-anchoring
