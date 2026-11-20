@@ -554,7 +554,8 @@ TEST_CASE("Echo #1624: recovering an errored source clears its mapped baseline",
         const char* state_key;
     } cases[] = {{"process", "process"}, {"tcp", "network"}, {"service", "service"},
                  {"user", "user"},       {"software", "software"},
-                 {"arp", "arp"},         {"dns", "dns"}};
+                 {"arp", "arp"},         {"dns", "dns"},
+                 {"mapdrive", "mapdrive"}};
 
     yuzu::test::TempDbFile tmp{std::string_view{"yuzu_test_echo_1624_errored_"}};
     auto opened = yuzu::test::open_echo_db(tmp.path);
