@@ -16,6 +16,12 @@
     "                      these only to the single --target-agent-id, and only when opted in",
     "                      with --risks. Source of truth: the Forensics rows in",
     "                      server/core/src/capability_decls/*.hpp.",
+    "  default-off       - the server boot-seeds the (plugin, action) pair kill-switched",
+    "                      (seed_action_kill_switch_default_off in server/core/src/server.cpp), so",
+    "                      it refuses the dispatch until an operator enables the pair with",
+    "                      PUT /api/v1/plugin-config/<plugin>/kill-switch. Opt-in only, via",
+    "                      --risks default-off, on a stack where that has been done; it is then",
+    "                      broadcast like a safe row.",
     "  server-internal   - catalog-only definitions with no agent plugin (plugin _server,",
     "                      server, server_internal). The dispatch chokepoint denies them",
     "                      (reason=unclassified or forbidden), so they cannot pass by dispatch.",
@@ -118,6 +124,8 @@
     "windows.execution_artifacts.prefetch":      "forensic",
 
     "device.asset_tags.sync":                    "server-internal",
-    "crossplatform.echo.fleet_snapshot":          "server-internal"
+    "crossplatform.echo.fleet_snapshot":          "server-internal",
+
+    "crossplatform.components.native":           "default-off"
   }
 }
