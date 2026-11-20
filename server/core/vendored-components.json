@@ -1,0 +1,247 @@
+{
+  "schema": 1,
+  "description": "Every third-party component compiled into yuzu-server that no package manager records (the vcpkg ports it links are not listed here: artifact-sbom.py lists them separately, from each port's vcpkg.spdx.json): the web assets it serves (htmx, ECharts, three.js, Cytoscape.js, IBM Plex) and the C++ QR-code library. scripts/ci/artifact-sbom.py adds these to the SBOM of every release artifact that holds yuzu-server, and its `check-vendored` command (tests/test_vendored_components.py) fails when a file under the tracked roots is added or changed without a matching entry here. Refreshing a vendored file: update its entry (version, version_source, sha256, bytes) in the same change as the file, its NOTICE and the byte-count pin in tests/unit/server/test_static_js_bundle.cpp. A version is recorded only when the file itself or its NOTICE states it; otherwise version is null, version_status is \"unresolved\" and the reason says what is known.",
+  "tracked_roots": ["server/core/static", "server/core/vendor"],
+  "first_party_patterns": ["server/core/static/yuzu-*.js", "server/core/static/yuzu.css"],
+  "attribution_patterns": ["*-NOTICE.txt", "LICENSE.txt"],
+  "components": [
+    {
+      "id": "htmx",
+      "name": "htmx.org",
+      "title": "htmx",
+      "type": "library",
+      "version": "2.0.4",
+      "version_status": "resolved",
+      "version_source": "The embedded bytes carry version:\"2.0.4\" in htmx's config object, and the header comment of static_js_bundle.cpp names HTMX 2.0.4. The bytes are npm htmx.org@2.0.4 dist/htmx.min.js (50,917 bytes) followed by one newline (checked 2026-11-18).",
+      "license": "0BSD",
+      "upstream": "https://github.com/bigskysoftware/htmx",
+      "download": "https://registry.npmjs.org/htmx.org/-/htmx.org-2.0.4.tgz",
+      "purl": "pkg:npm/htmx.org@2.0.4",
+      "files": [
+        {
+          "path": "server/core/src/static_js_bundle.cpp",
+          "cpp_raw_strings": ["kHtmxJsPart1", "kHtmxJsPart2", "kHtmxJsPart3", "kHtmxJsPart4"],
+          "sha256": "69caefd0da92269066e725d7fe175e26b9d50c962e3056459c0c477154cdb9d3",
+          "bytes": 50918,
+          "upstream_file": "dist/htmx.min.js"
+        }
+      ]
+    },
+    {
+      "id": "htmx-ext-sse",
+      "name": "htmx-ext-sse",
+      "title": "htmx Server Sent Events extension",
+      "type": "library",
+      "version": null,
+      "version_status": "unresolved",
+      "version_source": "The embedded file carries no version, and no NOTICE or comment in the tree names one. Its bytes are sse.js from npm htmx-ext-sse 2.2.2 and 2.2.3 (the file is identical in both releases) followed by one newline; they differ from 2.0.0, 2.1.0, 2.2.0, 2.2.1 and 2.2.4 (every release published as of 2026-11-18). The file cannot tell 2.2.2 from 2.2.3.",
+      "version_candidates": ["2.2.2", "2.2.3"],
+      "license": "0BSD",
+      "upstream": "https://github.com/bigskysoftware/htmx-extensions",
+      "download": null,
+      "purl": "pkg:npm/htmx-ext-sse",
+      "files": [
+        {
+          "path": "server/core/src/static_js_bundle.cpp",
+          "cpp_raw_strings": ["kSseJs"],
+          "sha256": "dbd53daa50c362f44ee2ceb55265065923f770e1c3778277ac6465a173532f22",
+          "bytes": 8897,
+          "upstream_file": "sse.js"
+        }
+      ]
+    },
+    {
+      "id": "echarts",
+      "name": "echarts",
+      "title": "Apache ECharts",
+      "type": "library",
+      "version": "5.6.0",
+      "version_status": "resolved",
+      "version_source": "The file sets t.version=\"5.6.0\" and server/core/vendor/echarts-NOTICE.txt names release 5.6.0. Byte-identical to npm echarts@5.6.0 dist/echarts.min.js (checked 2026-11-18).",
+      "license": "Apache-2.0",
+      "upstream": "https://github.com/apache/echarts",
+      "download": "https://registry.npmjs.org/echarts/-/echarts-5.6.0.tgz",
+      "purl": "pkg:npm/echarts@5.6.0",
+      "notice": ["server/core/vendor/echarts-NOTICE.txt"],
+      "files": [
+        {
+          "path": "server/core/vendor/echarts.min.js",
+          "sha256": "bf4a223524e40b77c304bec67e1222cf551f14880cf42c69dc046558e11c07b1",
+          "bytes": 1034102,
+          "upstream_file": "dist/echarts.min.js"
+        }
+      ]
+    },
+    {
+      "id": "zrender",
+      "name": "zrender",
+      "title": "ZRender (bundled inside echarts.min.js)",
+      "type": "library",
+      "part_of": "echarts",
+      "version": "5.6.1",
+      "version_status": "resolved",
+      "version_source": "echarts.min.js carries ZRender's own export object with version:\"5.6.1\" (beside registerSSRDataGetter), under ZRender's banner. Agrees with echarts 5.6.0's package.json, which pins zrender 5.6.1 exactly.",
+      "license": "BSD-3-Clause",
+      "upstream": "https://github.com/ecomfe/zrender",
+      "download": "https://registry.npmjs.org/zrender/-/zrender-5.6.1.tgz",
+      "purl": "pkg:npm/zrender@5.6.1"
+    },
+    {
+      "id": "tslib",
+      "name": "tslib",
+      "title": "tslib (helpers bundled inside echarts.min.js)",
+      "type": "library",
+      "part_of": "echarts",
+      "version": null,
+      "version_status": "unresolved",
+      "version_source": "echarts.min.js carries tslib's licence banner (Copyright (c) Microsoft Corporation, 0BSD text) but no tslib version. echarts 5.6.0's package.json pins tslib 2.3.0 exactly; that is upstream build metadata, not something the vendored file states.",
+      "version_candidates": ["2.3.0"],
+      "license": "0BSD",
+      "upstream": "https://github.com/microsoft/tslib",
+      "download": null,
+      "purl": "pkg:npm/tslib"
+    },
+    {
+      "id": "three",
+      "name": "three",
+      "title": "three.js r168 and its OrbitControls",
+      "type": "library",
+      "version": "0.168.0",
+      "version_status": "resolved",
+      "version_source": "three.module.min.js begins with const t=\"168\" (three.js REVISION) and three-NOTICE.txt names release r168 (npm 0.168.0). three-orbit-controls.js carries no version; three-orbit-NOTICE.txt names r168. Both files are byte-identical to npm three@0.168.0 (build/three.module.min.js and examples/jsm/controls/OrbitControls.js, checked 2026-11-18).",
+      "license": "MIT",
+      "upstream": "https://github.com/mrdoob/three.js",
+      "download": "https://registry.npmjs.org/three/-/three-0.168.0.tgz",
+      "purl": "pkg:npm/three@0.168.0",
+      "notice": ["server/core/vendor/three-NOTICE.txt", "server/core/vendor/three-orbit-NOTICE.txt"],
+      "files": [
+        {
+          "path": "server/core/vendor/three.module.min.js",
+          "sha256": "ee08b04912b21d9bf71f13658a65da65c113827601377076663e710c0b1772d0",
+          "bytes": 685408,
+          "upstream_file": "build/three.module.min.js"
+        },
+        {
+          "path": "server/core/vendor/three-orbit-controls.js",
+          "sha256": "80efaadea4f8a636a65fb0bd08bfef62f3d93a0bb94e2e7500f23176c5c07f4e",
+          "bytes": 32134,
+          "upstream_file": "examples/jsm/controls/OrbitControls.js"
+        }
+      ]
+    },
+    {
+      "id": "cytoscape",
+      "name": "cytoscape",
+      "title": "Cytoscape.js",
+      "type": "library",
+      "version": "3.33.3",
+      "version_status": "resolved",
+      "version_source": "The file ends with Wh.version=\"3.33.3\" (it has no banner) and server/core/static/cytoscape-NOTICE.txt names release 3.33.3. Byte-identical to npm cytoscape@3.33.3 dist/cytoscape.esm.min.mjs (checked 2026-11-18). It inlines three small MIT-licensed fragments with their own banners (a Promises/A+ thenable by Ralf S. Engelschall, a Bezier easing generator by Gaetan Renaudeau, a spring generator adapted from Framer.js by Koen Bok); they have no package of their own and are not listed separately.",
+      "license": "MIT",
+      "upstream": "https://github.com/cytoscape/cytoscape.js",
+      "download": "https://registry.npmjs.org/cytoscape/-/cytoscape-3.33.3.tgz",
+      "purl": "pkg:npm/cytoscape@3.33.3",
+      "notice": ["server/core/static/cytoscape-NOTICE.txt"],
+      "files": [
+        {
+          "path": "server/core/static/cytoscape.min.js",
+          "sha256": "5bca02e1e46211b7a34e661f033b899306edc3595ed02a01f280a860a509b9de",
+          "bytes": 432844,
+          "upstream_file": "dist/cytoscape.esm.min.mjs"
+        }
+      ]
+    },
+    {
+      "id": "ibm-plex-sans",
+      "name": "plex-sans",
+      "group": "@ibm",
+      "title": "IBM Plex Sans (Latin1 woff2, weights 400/500/600)",
+      "type": "font",
+      "version": "1.1.0",
+      "version_status": "resolved",
+      "version_source": "server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt names @ibm/plex-sans 1.1.0 (font Version 3.005). The woff2 files are byte-identical to that package's fonts/split/woff2 files (checked 2026-11-18); the version inside the fonts' compressed name table was not read.",
+      "license": "OFL-1.1",
+      "upstream": "https://github.com/IBM/plex",
+      "download": "https://registry.npmjs.org/@ibm/plex-sans/-/plex-sans-1.1.0.tgz",
+      "purl": "pkg:npm/%40ibm/plex-sans@1.1.0",
+      "notice": ["server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt", "server/core/vendor/ibm-plex/LICENSE.txt"],
+      "files": [
+        {
+          "path": "server/core/vendor/ibm-plex/ibm-plex-sans-latin-400-normal.woff2",
+          "sha256": "b5ad7bd39f996144915f0ad9849a90183b27d8c28ad97ed98af5b1bebc51f6b1",
+          "bytes": 20984,
+          "upstream_file": "fonts/split/woff2/IBMPlexSans-Regular-Latin1.woff2"
+        },
+        {
+          "path": "server/core/vendor/ibm-plex/ibm-plex-sans-latin-500-normal.woff2",
+          "sha256": "b5610af04d0d4b5a14a621d96d974b993e945a065db1a8861918f69ef9321934",
+          "bytes": 21960,
+          "upstream_file": "fonts/split/woff2/IBMPlexSans-Medium-Latin1.woff2"
+        },
+        {
+          "path": "server/core/vendor/ibm-plex/ibm-plex-sans-latin-600-normal.woff2",
+          "sha256": "fff0ab3a88b0b4aa0b693e4f0201359a15183b08e3fa5696d1918d8f0ade8ad5",
+          "bytes": 22260,
+          "upstream_file": "fonts/split/woff2/IBMPlexSans-SemiBold-Latin1.woff2"
+        }
+      ]
+    },
+    {
+      "id": "ibm-plex-mono",
+      "name": "plex-mono",
+      "group": "@ibm",
+      "title": "IBM Plex Mono (Latin1 woff2, weights 400/500)",
+      "type": "font",
+      "version": "2.5.0",
+      "version_status": "resolved",
+      "version_source": "server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt names @ibm/plex-mono 2.5.0 (font Version 2.005). The woff2 files are byte-identical to that package's fonts/split/woff2 files (checked 2026-11-18); the version inside the fonts' compressed name table was not read.",
+      "license": "OFL-1.1",
+      "upstream": "https://github.com/IBM/plex",
+      "download": "https://registry.npmjs.org/@ibm/plex-mono/-/plex-mono-2.5.0.tgz",
+      "purl": "pkg:npm/%40ibm/plex-mono@2.5.0",
+      "notice": ["server/core/vendor/ibm-plex/ibm-plex-NOTICE.txt", "server/core/vendor/ibm-plex/LICENSE.txt"],
+      "files": [
+        {
+          "path": "server/core/vendor/ibm-plex/ibm-plex-mono-latin-400-normal.woff2",
+          "sha256": "e8993d946649b9d01abb1ed06d574b19d8ea3e66b5c3948602db335c44c18e56",
+          "bytes": 17544,
+          "upstream_file": "fonts/split/woff2/IBMPlexMono-Regular-Latin1.woff2"
+        },
+        {
+          "path": "server/core/vendor/ibm-plex/ibm-plex-mono-latin-500-normal.woff2",
+          "sha256": "41201b658a328b9d00368215c2f1102770f80b15952ab82631e4006255e6365d",
+          "bytes": 17868,
+          "upstream_file": "fonts/split/woff2/IBMPlexMono-Medium-Latin1.woff2"
+        }
+      ]
+    },
+    {
+      "id": "qrcodegen",
+      "name": "qr-code-generator",
+      "title": "Project Nayuki QR Code generator (C++), compiled into yuzu-server",
+      "type": "library",
+      "version": "1.8.0",
+      "version_status": "resolved",
+      "version_source": "server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt says it is pinned to tag v1.8.0; the source files carry no version. Both files are byte-identical to cpp/qrcodegen.{cpp,hpp} at that tag (checked 2026-11-18).",
+      "license": "MIT",
+      "upstream": "https://github.com/nayuki/QR-Code-generator",
+      "download": "https://github.com/nayuki/QR-Code-generator/archive/refs/tags/v1.8.0.tar.gz",
+      "purl": "pkg:github/nayuki/qr-code-generator@v1.8.0",
+      "notice": ["server/core/vendor/qrcodegen/qrcodegen-NOTICE.txt"],
+      "files": [
+        {
+          "path": "server/core/vendor/qrcodegen/qrcodegen.cpp",
+          "sha256": "1f3b3fcdac6954c32cf583ccd02ec9b5901f756a38c461acedc70be4a77d3757",
+          "bytes": 27322,
+          "upstream_file": "cpp/qrcodegen.cpp"
+        },
+        {
+          "path": "server/core/vendor/qrcodegen/qrcodegen.hpp",
+          "sha256": "b779c3b156cf7a57ce789d6fee4fc991ccc2913774d26c909d22bb8f26b2a793",
+          "bytes": 20431,
+          "upstream_file": "cpp/qrcodegen.hpp"
+        }
+      ]
+    }
+  ]
+}

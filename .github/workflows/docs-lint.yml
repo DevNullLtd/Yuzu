@@ -377,10 +377,22 @@ jobs:
       # describes one shipped file with its vcpkg closure (agent or server),
       # never test or helper ports, and its `check` refuses a checkout-scale
       # SBOM, one listing a checkout/build/test-tree path and one whose artifact
-      # hash differs. syft, pkgutil and rpm2cpio are stubbed. Stdlib only (the
-      # `cbom-schema` job runs it again with jsonschema, validating the SBOMs).
+      # hash differs; its `augment` adds yuzu-server's vendored components to a
+      # server image's syft scan (trimmed real scans in
+      # tests/fixtures/image-sbom/) and leaves an agent image's scan
+      # unchanged. syft, pkgutil and rpm2cpio are stubbed. Stdlib only (the `cbom-schema` job
+      # runs it again with jsonschema, validating the SBOMs).
       - name: Per-artifact SBOM generator
         run: python3 -I tests/test_artifact_sbom.py
+
+      # The third-party components compiled into yuzu-server (web assets and
+      # the QR-code library) that the server SBOMs list come from
+      # server/core/vendored-components.json. Fails when a file under
+      # server/core/vendor/ or server/core/static/ (or the htmx literals in
+      # static_js_bundle.cpp) is added or changed without a matching entry, or
+      # a NOTICE records a hash or licence the manifest does not. Stdlib only.
+      - name: Vendored components manifest
+        run: python3 -I tests/test_vendored_components.py
 
       # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
       # server build or server installer in release.yml's Windows/macOS jobs,

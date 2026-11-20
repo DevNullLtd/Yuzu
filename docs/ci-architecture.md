@@ -460,8 +460,10 @@ release when:
   archive, package or image of the release (supply-chain S8);
 - an artifact SBOM (every SBOM but the `*-image` ones) names a file that is not
   in the release or whose SHA-256 differs, has more entries than the bound in
-  `scripts/ci/artifact-sbom.py` (400; measured locally at 16 to 58 for the
-  Linux files and 212 for v0.15.0's Windows archive, the largest), has no entries and no record
+  `scripts/ci/artifact-sbom.py` (400; measured locally: 16 to 63 for the
+  Linux files, where the counts for the files holding the server include its
+  10 vendored entries described below, and 212 for v0.15.0's Windows archive,
+  the largest), has no entries and no record
   that its file was unpacked and held files, or lists a path under `vcpkg/`,
   `vcpkg_installed/`, `build-*/`, `_build/`, `_build_*/`, `site/`, `tests/`,
   `.git/` or `.github/`, the marks of a checkout, build-tree or test-tree scan
@@ -484,8 +486,40 @@ release when:
   ports its binaries are built from are added from the installed tree for the
   release triplet; the Windows installer's SBOM lists the files the Inno
   Setup compiler's own manifest says it packed, each checked against the
-  build directory by SHA-256 (the installer manifest contract below). Each
-  `generate` command runs with a timeout. `tests/test_artifact_sbom.py`
+  build directory by SHA-256 (the installer manifest contract below). An
+  artifact holding `yuzu-server` also gets the third-party files compiled
+  into it (web assets, the QR-code library) from
+  `server/core/vendored-components.json`, and generation fails if that
+  manifest does not match the source tree. The docs-lint step "Vendored
+  components manifest" (`tests/test_vendored_components.py`) fails a PR that
+  adds or changes a file under `server/core/vendor/` or `server/core/static/`
+  without its entry. Two kinds of file there are not held to an entry's
+  SHA-256: a NOTICE a component names is checked only for its SPDX and
+  SHA-256 lines (its other text can change freely, provided it stays UTF-8
+  with no NUL byte and holds no run of more than 64 hex digits), and the first-party
+  `server/core/static/yuzu-*.js` and `yuzu.css` files (`first_party_patterns`,
+  the directory itself only, never a subdirectory) are exempt. The image SBOMs stay a syft scan of the pushed image, but
+  `docker-publish` and `docker-publish-chisel` then run `artifact-sbom.py
+  augment` on each leg's pair, after "Record signed and attested" and before
+  `mark-image`, the SBOM upload and "Tag the release", which adds the same
+  components to the `yuzu-server` and `yuzu-server-chisel` image SBOMs (syft
+  lists the binary only as an SPDX file) and leaves the other legs' untouched.
+  The entries carry fixed identifiers in every SBOM that lists them: CycloneDX
+  components whose `bom-ref` starts `vendored-`, SPDX packages whose SPDXID
+  starts `SPDXRef-Package-vendored-`, `yuzu:vendored:*` properties on each
+  CycloneDX component, and the `yuzu:sbom:vendored` note on the root; they are
+  not an incompleteness reason (the `server-vendored` token is retired, never
+  released, and never to be reused). `augment` fails the leg, before the SBOM
+  is uploaded and before any tag of that image moves (its publish journal ends
+  `signed-attested`), on a manifest that disagrees with the checkout or on an
+  image labelled as the release's server image in which syft lists no
+  `yuzu-server`.
+  On an image leg, while `build-linux` passed the same check on the same tag,
+  a manifest that disagrees with the checkout means the runner's reused
+  (`clean: false`) workspace holds a file the tag does not: reset that
+  workspace ("Persistence and recovery") and re-run the failed jobs, with no
+  new tag (the release skill's failure table). Each `generate` command runs
+  with a timeout. `tests/test_artifact_sbom.py`
   (Docs Lint, every PR) pins that contract against a fixture in the
   compiler's format; the `CBOM schema` job runs the same suite with
   `YUZU_REQUIRE_JSONSCHEMA=1`, validating each SBOM it generates against the
@@ -493,6 +527,13 @@ release when:
   is not a required check, so a schema-validation failure does not block a
   merge; making it required is a decision on the branch ruleset, not taken
   here;
+- an image SBOM pair of an image in which syft lists `yuzu-server` does not
+  list yuzu-server's vendored components (the `yuzu:sbom:vendored` note, and
+  exactly the component ids of the tag's `vendored-components.json`, each
+  once) in both formats, or the pair of an image in which syft lists no
+  `yuzu-server` carries any part of them (the `augment` step above adds them;
+  like the marker tokens, the expected ids are recomputed from the manifest,
+  never read from the pair);
 - an asset name contains a character GitHub rewrites on upload (anything but
   letters, digits, `.`, `_`, `-`, or a name not starting with a letter or
   digit), which would make `SHA256SUMS` and the provenance name an asset that

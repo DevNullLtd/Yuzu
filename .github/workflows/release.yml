@@ -386,6 +386,9 @@ jobs:
       # the binaries are static). It never scans the checkout: the old
       # `path: .` scan listed the vcpkg ports catalogue and test tooling
       # (40,853 components on v0.15.0) and none of the shipped libraries.
+      # An artifact holding yuzu-server also lists the web assets and QR-code
+      # library compiled into it, from server/core/vendored-components.json in
+      # this checkout (the run fails if the manifest and the files disagree).
       # Each SBOM is named after its artifact (yuzu-linux-x64.cdx.json for the
       # archive, <package without .deb/.rpm>.cdx.json for a package) and
       # records its SHA-256; the release job checks both.
@@ -1875,8 +1878,23 @@ jobs:
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}@${{ steps.build.outputs.digest }}
         run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
+      # syft cannot see the web assets and QR-code library compiled into
+      # yuzu-server: add them from server/core/vendored-components.json (checked
+      # against this checkout; a mismatch fails). No-op without yuzu-server.
+      # After `signed-attested` and before mark-image, the upload and the tags
+      # (#5242): like mark-image it edits only the local SBOM files the upload
+      # sends, which still describe the verified digest. A failure here leaves
+      # the journal at `signed-attested`: the digest is signed and attested but
+      # no release tag names it. The release job's SBOM check refuses a server
+      # image pair without them.
+      - name: Add yuzu-server's vendored components to the image SBOM
+        env:
+          SBOM: yuzu-${{ matrix.image }}-image
+        run: python3 scripts/ci/artifact-sbom.py augment --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
+
       # syft's image scan cannot see the vcpkg libraries linked into yuzu-server
-      # or yuzu-agent, nor what the Erlang emulator vendors: mark the pair
+      # or yuzu-agent, nor what the Erlang emulator vendors (the vendored
+      # components compiled into yuzu-server are listed above): mark the pair
       # incomplete, with the reason (no-op for an image holding neither).
       # After attest + sign, like the upload (#5242), and before the tags move:
       # it edits only the local SBOM files the next step uploads, which still
@@ -2660,6 +2678,13 @@ jobs:
           REF: ghcr.io/${{ steps.owner.outputs.value }}/yuzu-${{ matrix.image }}-chisel@${{ steps.build.outputs.digest }}
         run: exec scripts/ci/image-publish.sh signed-attested "$RUNNER_TEMP/image-vuln-gate" "$NAME" "$GITHUB_RUN_ATTEMPT" "$REF"
 
+      # As in docker-publish: yuzu-server's vendored components, server leg
+      # only, after `signed-attested` and before mark-image.
+      - name: Add yuzu-server's vendored components to the image SBOM
+        env:
+          SBOM: yuzu-${{ matrix.image }}-chisel-image
+        run: python3 scripts/ci/artifact-sbom.py augment --cdx "$SBOM.cdx.json" --spdx "$SBOM.spdx.json"
+
       # As in docker-publish.
       - name: Mark the image SBOM incomplete where the scan cannot see
         env:
@@ -3435,7 +3460,9 @@ jobs:
           # tests/, .git/ or .github/ (the marks of a checkout, build-tree or
           # test-tree scan, which is what the pre-S8 SBOMs were). Each image
           # SBOM pair must carry the marker mark-image adds where the image
-          # holds what syft cannot list. A failure here comes after the images
+          # holds what syft cannot list, and list yuzu-server's vendored
+          # components (augment) exactly when the image holds yuzu-server.
+          # A failure here comes after the images
           # are pushed: see the release skill's failure table (most causes need
           # a fix and re-tag; a transfer fault needs only a re-run).
           python3 scripts/ci/artifact-sbom.py check --artifacts-dir artifacts
@@ -3645,17 +3672,18 @@ jobs:
           Each binary archive, package and installer has its own CycloneDX and SPDX SBOM,
           named after the file (\`<name without .tar.gz/.zip/.deb/.rpm/.exe/.pkg>.{cdx,spdx}.json\`).
           It lists what is inside that file: the vcpkg libraries its C++ binaries
-          are built with (from the installed vcpkg tree), for the gateway the
-          Erlang/OTP release, and anything else syft recognises in it. The
+          are built with (from the installed vcpkg tree), for a file holding
+          \`yuzu-server\` the third-party code compiled into it (qrcodegen, and
+          the web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
+          fonts; the \`yuzu-server\` image SBOMs list these too), for the gateway
+          the Erlang/OTP release, and anything else syft recognises in it. The
           Windows installer's SBOM lists the files of
           \`yuzu-agent-windows-x64.zip\` that the installer installs.
-          Not listed yet, though the file holds it: code vendored into the
-          source tree and compiled into \`yuzu-server\` (qrcodegen, and the
-          web assets it embeds: htmx, ECharts, three.js, Cytoscape, IBM Plex
-          fonts), the Windows installer's own InnoSetup runtime, and what the
-          gateway's Erlang emulator (\`beam.smp\`) vendors (PCRE2, asmjit,
-          zstd, Ryu, OpenSSL's MD5). An SBOM whose file or image holds
-          something it does not list says so: a CycloneDX composition with
+          Not listed yet, though the file holds it: the Windows installer's
+          own InnoSetup runtime, and what the gateway's Erlang emulator
+          (\`beam.smp\`) vendors (PCRE2, asmjit, zstd, Ryu, OpenSSL's MD5).
+          An SBOM whose file or image holds something it does not list says
+          so: a CycloneDX composition with
           \`aggregate: incomplete\`, in SPDX a \`CONTAINS NOASSERTION\`
           relationship on its root, and the reason tokens in the
           \`yuzu:sbom:incomplete-reasons\` note (a CycloneDX property; in SPDX
@@ -3721,13 +3749,14 @@ jobs:
           v1.57.2 scan of the image by the digest this release signs). An image
           scan does not see the C++ libraries linked statically into
           \`yuzu-server\` and \`yuzu-agent\` (the \`yuzu-linux-x64\`, server
-          and agent package SBOMs list them), what the gateway's Erlang emulator vendors,
-          or the \`yuzu-postgres\` image's source-built pgvector, so each of
-          the six image SBOMs is marked incomplete with its reasons
-          (server: \`server-vendored, image-static-cpp\`; agent:
-          \`image-static-cpp\`; gateway: \`erts-static\`; postgres:
-          \`pgvector-source\`). The agent-bundle image published after the
-          release has no SBOM among the release assets. GitHub-native
+          and agent package SBOMs list them), what the gateway's Erlang
+          emulator vendors, or the \`yuzu-postgres\` image's source-built
+          pgvector, so each of the six image SBOMs is marked incomplete with
+          its reasons (server and agent: \`image-static-cpp\`; gateway:
+          \`erts-static\`; postgres: \`pgvector-source\`). The two server
+          image SBOMs also list the third-party files compiled into
+          \`yuzu-server\`, as its file SBOMs do. The agent-bundle image
+          published after the release has no SBOM among the release assets. GitHub-native
           SLSA build provenance attestations for every binary archive
           and Docker image, and cosign keyless signatures on both the
           Docker images and the \`SHA256SUMS\` manifest. See
