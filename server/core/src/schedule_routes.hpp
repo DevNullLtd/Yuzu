@@ -115,13 +115,12 @@
 /// pinned by this module's PG-backed test coverage, now produced by
 /// `perm_fn`/`require_permission` alone.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
 
 #include <functional>
-
-#include <yuzu/metrics.hpp>
 #include <optional>
 #include <string>
 

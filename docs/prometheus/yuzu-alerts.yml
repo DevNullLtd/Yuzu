@@ -3277,7 +3277,7 @@ groups:
             whose switch is off, is the control working, audited as
             command.dispatch_withheld. reason="param_key_invalid" (a params key with a control
             byte, NUL or invalid UTF-8, or a NUL value, refused at the ingress) is excluded
-            for the same reason: it is a refused malformed request, never a request that
+            for a different reason: it is a refused malformed request, never a request that
             named no device, and one client looping on it must not page as a targeting
             near-miss (the audit row `reason=param_key_invalid` and the counter are the
             evidence). reason values

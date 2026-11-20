@@ -3685,11 +3685,12 @@ public:
                     // branch resolves via its own write + continue, so claiming it
                     // would leak an unresolved in-flight record AND wrongly answer a
                     // re-sent control command RUNNING. It is the ONLY dispatch that
-                    // skips claiming for a reason of its own (a command refused above, for a NUL
-                    // parameter, claims nothing and dispatches nothing): gating on the literal (not the whole
-                    // reserved-name set) keeps durable idempotency the SAFE DEFAULT
-                    // for any future reserved-name command — a future __update__ OTA
-                    // path is deduplicated unless it, too, opts out in should_claim().
+                    // skips claiming for a reason of its own. (A command refused above, for
+                    // a NUL parameter, claims nothing and dispatches nothing, so no claim
+                    // exists to skip.) Gating on the literal, not the whole reserved-name
+                    // set, keeps durable idempotency the SAFE DEFAULT for any future
+                    // reserved-name command: a future __update__ OTA path is deduplicated
+                    // unless it, too, opts out in should_claim().
                     // The decision itself (which commands are claimed; replay / RUNNING /
                     // proceed after the claim) lives in command_dedup_decision.hpp — pure
                     // and unit-tested (tests/unit/test_command_dedup_decision.cpp, #3668).

@@ -17,8 +17,8 @@ namespace yuzu::server {
 /// destination: a stored row aimed at a refused address would otherwise write a log line and an
 /// audit row for EVERY fleet event. The counter and the delivery-log row are not throttled.
 /// Bounded: when the table reaches `kMaxTracked` targets, expired entries are evicted first and, if none
-/// is expired, the oldest one (never a wholesale clear: that would let every throttled target log and
-/// audit again at once).
+/// is expired, the oldest one. The table is never cleared wholesale: that would let every throttled
+/// target log and audit in the same instant.
 class RefusalThrottle {
 public:
     explicit RefusalThrottle(std::chrono::seconds window = std::chrono::seconds(300)) : window_(window) {}
@@ -47,9 +47,9 @@ public:
         return true;
     }
 
-private:
-public:
+    /// The most targets the table tracks.
     static constexpr std::size_t kMaxTracked = 4096;
+
 private:
     std::chrono::seconds window_;
     std::mutex mu_;

@@ -48,11 +48,19 @@ def check(src):
     return defects
 
 
+def drop_release_in_reject(src):
+    m = re.search(r"void reject_unstarted_command\(.*?\n    \}\n", src, re.S)
+    if not m:
+        return src
+    return src[:m.start()] + m.group(0).replace("release(cmd.command_id())", "erase(cmd.command_id())", 1) + src[m.end():]
+
+
 def selftest(src):
     mutants = {
         "bare sleep": src.replace("if (!sleep_interruptible(std::chrono::seconds(total_delay),", "std::this_thread::sleep_for(std::chrono::seconds(total_delay)); if (!sleep_interruptible(std::chrono::seconds(0),", 1),
         "no closing flag set": src.replace("command_pool_closing_.store(true, std::memory_order_release);", "", 1),
         "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
+        "reject drops the claim release": drop_release_in_reject(src),
         "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),
         "protective sleeps a stagger": src.replace(" && command_may_stagger(cmd.plugin(), cmd.action())", "", 1),
     }

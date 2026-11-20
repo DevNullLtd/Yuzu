@@ -2686,14 +2686,15 @@ tests:
         exp_samples: []
 
   # CASE 61d -- a client looping on a params key the agent would truncate (refused at the ingress,
-  # `param_key_invalid`) is a refused malformed request, not a targeting near-miss: silent.
+  # `param_key_invalid`) is a refused malformed request, not a targeting near-miss: silent. The series keep rising through
+  # both probes, so the 15m increase is non-zero at each; only the exclusion keeps the alert quiet.
   - interval: 1m
     name: dispatch target rejected - param_key_invalid refusals never fire the targeting alert
     input_series:
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="command",reason="param_key_invalid"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
       - series: 'yuzu_server_dispatch_target_rejected_total{job="yuzu",instance="s1",route="schedule",reason="param_key_invalid"}'
-        values: "0 0 0 40x30"
+        values: "0+40x30"
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuDispatchTargetRejected"}'
         eval_time: 10m

@@ -1774,6 +1774,26 @@ TEST_CASE("ScheduleRunner: D7 a false arming_check blocks the approval-gated fir
     CHECK(h.get(id).next_execution_at > 1);
 }
 
+TEST_CASE("ScheduleRunner: stored parameters that do not decode are a denial and never reach the "
+          "arming check or the enqueue",
+          "[schedule][runner][d7][sg10][pg]") {
+    int arming_calls = 0;
+    Harness h([&](const std::string&, const std::string&, const std::string&,
+                  const std::unordered_map<std::string, std::string>&) {
+        ++arming_calls;
+        return true; // would admit: only the undecodable text can be what denies
+    });
+    auto bad_json = h.make_due("test.def", "interval", /*requires_approval=*/false, "not json {");
+    auto not_object = h.make_due("test.def", "interval", /*requires_approval=*/false, "[1,2]");
+
+    h.runner.tick();
+
+    CHECK(arming_calls == 0);   // authority is never decided on a guess
+    CHECK(h.enqueues.empty());  // nothing dispatched
+    CHECK(h.get(bad_json).next_execution_at > 1);   // advanced: a denied schedule must not spin
+    CHECK(h.get(not_object).next_execution_at > 1);
+}
+
 TEST_CASE("ScheduleRunner: D7 an UNSET arming_check denies both the auto and approval-gated "
           "paths",
           "[schedule][runner][d7][pg]") {

@@ -7,6 +7,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <memory>
 #include <thread>
 #include <vector>
 
@@ -50,25 +51,33 @@ TEST_CASE("sleep_interruptible: a stop observed between slices ends it after at 
 
 TEST_CASE("sleep_interruptible: a 600 s stagger on a real thread is unblocked promptly by a stop",
           "[interruptible_wait][stop]") {
-    std::atomic<bool> stop{false};
-    std::atomic<bool> result{true};
-    std::atomic<bool> finished{false};
-    std::thread worker([&] {
-        result = sleep_interruptible(600s, [&] { return stop.load(); });
-        finished = true;
+    // The state is shared with the thread, never borrowed from this stack frame, so a thread that
+    // outlives a failed run (detached below) touches only memory it co-owns.
+    struct Shared {
+        std::atomic<bool> stop{false};
+        std::atomic<bool> started{false};
+        std::atomic<bool> finished{false};
+        std::atomic<bool> result{true};
+    };
+    const auto st = std::make_shared<Shared>();
+    std::thread worker([st] {
+        st->started = true;
+        st->result = sleep_interruptible(600s, [st] { return st->stop.load(); });
+        st->finished = true;
     });
-    std::this_thread::sleep_for(150ms);
-    CHECK_FALSE(finished.load());
+    while (!st->started.load())
+        std::this_thread::yield();
+    CHECK_FALSE(st->finished.load()); // a 600 s sleep cannot have ended
     const auto t0 = std::chrono::steady_clock::now();
-    stop = true;
+    st->stop = true;
     // The stop is seen within one slice (1 s) plus scheduling slack.
-    while (!finished.load() && std::chrono::steady_clock::now() - t0 < 5s)
-        std::this_thread::sleep_for(20ms);
-    const bool ok = finished.load();
+    while (!st->finished.load() && std::chrono::steady_clock::now() - t0 < 5s)
+        std::this_thread::yield();
+    const bool ok = st->finished.load();
     if (ok)
         worker.join();
     else
-        worker.detach(); // a hang is the failure being reported
+        worker.detach(); // a hang is the failure being reported; the thread owns its state
     CHECK(ok);
-    CHECK_FALSE(result.load());
+    CHECK_FALSE(st->result.load());
 }
