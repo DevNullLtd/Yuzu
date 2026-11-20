@@ -7,7 +7,8 @@
  * fixture tree through a real CommandContext. It runs the walk behind a
  * single-flight slot per action, so a walk stalled on a hung mount inside the
  * tree pins at most one agent worker per action. Pure filesystem reads: no
- * process is spawned and no `brew` binary is invoked.
+ * process is spawned and no `brew` binary is invoked. `packages` also walks the user-owned
+ * Homebrew prefixes under /Users, guarded by a run-start network-mount snapshot.
  */
 #include "pkg_inventory_legs.hpp"
 #include "pkg_inventory_macos_parsers.hpp"
@@ -17,7 +18,10 @@
 namespace yuzu::pkg_inventory {
 
 int run_macos(yuzu::CommandContext& ctx, Action a) {
-    return mac::run_macos_guarded(ctx, a, "/");
+    // The mount snapshot is read for `packages` only: it is the one action that walks /Users.
+    return mac::run_macos_guarded(ctx, a, "/",
+                                  a == Action::packages ? mac::production_user_prefix_config()
+                                                        : mac::UserPrefixConfig{});
 }
 
 } // namespace yuzu::pkg_inventory

@@ -323,18 +323,26 @@ std::vector<SwEntry> parse_installed_apps_output(const std::string& out) {
 }
 
 AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
-    // package|homebrew|<id>|<version>|<formula|cask>
+    // package|homebrew|<id>|<version>|<formula|cask>|<install_time or ->|<tap or ->|<on_request or ->|<machine|user>|<owner or ->|<prefix>
+    // package|homebrew|<id>|<version>|<formula|cask>            (the earlier five-token shape)
     // package|chocolatey|<id>|<version or ->|pkg
-    // A row whose id carries an escaped `\|` splits wider than five tokens, fails the width
+    // A row whose id carries an escaped `\|` splits wider than its grammar, fails the width
     // check below and is dropped (a gap, never a shifted row); this adapter does not unescape.
+    // Only the EXISTING columns take the extended fields: install_time -> install_date and the
+    // prefix -> install_location (still gated by machine_install_location in the v3 writer).
+    // tap, installed_on_request and the owner have no column and are not mapped. A `user`-scope
+    // row (or any scope other than `machine`) is seen and not mapped: a user's own prefix is
+    // never machine software.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
-        if (tok[0] != "package" || tok.size() != 5)
+        if (tok[0] != "package" || (tok.size() != 5 && tok.size() != 11))
             return false;
         const ManagerEcosystem* m = find_manager(tok[1]);
         if (!m || m->package_action != kActionPackages)
             return false;
+        if (tok.size() == 11 && tok[8] != "machine")
+            return true;
         SwEntry e;
         e.name = clamp_field(tok[2], kV3MaxFieldLen);
         if (e.name.empty())
@@ -351,9 +359,19 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
         // Chocolatey package whose nuspec was unreadable.
         e.version = tok[3] == "-" ? std::string{} : clamp_field(tok[3], kV3MaxFieldLen);
         e.ecosystem = std::string(m->ecosystem);
+        if (tok.size() == 11) {
+            const auto digits = [](std::string_view v) {
+                return !v.empty() && std::all_of(v.begin(), v.end(),
+                                                 [](char c) { return c >= '0' && c <= '9'; });
+            };
+            if (digits(tok[5]))
+                e.install_date = clamp_field(tok[5], kV3MaxFieldLen);
+            if (tok[10] != "-")
+                e.install_location = clamp_field(tok[10], kV3MaxFieldLen);
+        }
         entries.push_back(std::move(e));
         return true;
-    });
+    }, false, 12);
 }
 
 AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out) {

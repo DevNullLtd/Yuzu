@@ -166,3 +166,26 @@ TEST_CASE("mount_entries: hostile input neither overflows, throws nor loops", "[
     const auto minor = mount_entries("1 0 0:4294967296 / /x rw - ext4 /d rw\n");
     CHECK(minor.malformed == 1);
 }
+
+TEST_CASE("under_network_mount: segment-boundary match, a root mount covers everything",
+          "[network_fstype]") {
+    const std::vector<std::string> mounts{"/Users/js", "/mnt/nfs"};
+    CHECK(under_network_mount("/Users/js", mounts));            // exact
+    CHECK(under_network_mount("/Users/js/homebrew", mounts));   // a child
+    CHECK_FALSE(under_network_mount("/Users/jsmith", mounts));  // shared name prefix, other segment
+    CHECK_FALSE(under_network_mount("/Users", mounts));         // an ancestor is not under
+    CHECK_FALSE(under_network_mount("/Users/js", {}));          // empty mount list
+    const std::vector<std::string> root{"/"};
+    CHECK(under_network_mount("/Users/anyone", root));
+}
+
+TEST_CASE("touches_network_mount: under a mount or containing one", "[network_fstype]") {
+    const std::vector<std::string> mounts{"/Users/js/homebrew"};
+    CHECK(touches_network_mount("/Users/js/homebrew/Cellar", mounts)); // under
+    CHECK(touches_network_mount("/Users/js", mounts));                 // contains
+    CHECK(touches_network_mount("/Users", mounts));                    // contains
+    CHECK(touches_network_mount("/", mounts));                         // contains
+    CHECK_FALSE(touches_network_mount("/Users/jsmith", mounts));       // unrelated sibling
+    CHECK_FALSE(touches_network_mount("/Users/js/homebrew2", mounts)); // segment boundary
+    CHECK_FALSE(touches_network_mount("/Users/js", {}));
+}

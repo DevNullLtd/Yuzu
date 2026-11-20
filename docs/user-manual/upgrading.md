@@ -41,7 +41,7 @@ These signals are classified from journald-stamped sender fields, which a local 
 
 ### 4. macOS `installed_apps.list_per_user` no longer lists Homebrew
 
-The action does not run `brew`: the macOS agent is root and the Homebrew prefix is user-owned, so running it would execute a user-controlled script as root. The action returns system apps only; Homebrew formulae and casks are listed by `pkg_inventory.packages` (machine scope); there is no per-user Homebrew view. The `vuln_scan` plugin's macOS `cve_scan` still runs `brew list --versions` as root in this build (#8256).
+The action does not run `brew`: the macOS agent is root and the Homebrew prefix is user-owned, so running it would execute a user-controlled script as root. The action returns system apps only. Homebrew formulae and casks are listed by `pkg_inventory.packages`, which also lists a Homebrew a user installed in their own home (`~/homebrew`, `~/.homebrew`) as `user`-scope rows; those rows are never collected into the installed-software inventory. Each Homebrew row there is now eleven fields (the first five unchanged: install time, tap, requested flag, scope, owner and prefix are appended), so on first sync after the upgrade every Mac with Homebrew sends one full installed-software delta (the formula and cask rows gain an install date and an install location, and a formula present under both machine prefixes is two rows, not one). The `vuln_scan` plugin's macOS `cve_scan` does not run `brew` either; it does not scan Homebrew (#8256).
 
 ### 5. Windows Echo `$Module` signing verdicts are keyed on file id, size and USN
 

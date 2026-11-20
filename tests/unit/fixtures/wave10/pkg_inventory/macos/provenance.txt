@@ -11,12 +11,24 @@ tree.manifest
   date:     2026-09-21
   Reduced:  this Mac's /opt/homebrew/Cellar holds 66 formulae; ten were kept (ccache cmake fmt lz4 meson
             ninja openssl@3 sqlite xz zstd), each with the exact version directory name reported by ls.
-            Every kept directory holds real files (INSTALL_RECEIPT.json, bin/, ...) that the leg never
-            reads, so the manifest records the directory only (payload D:).
+            Every kept directory holds real files (INSTALL_RECEIPT.json, bin/, ...). The leg reads only
+            INSTALL_RECEIPT.json, so the manifest records the directory (payload D:) and, for three of
+            the ten, that one file (payload T:, see Receipts below).
   Caskroom: /opt/homebrew/Caskroom exists and is EMPTY on this host (recorded as an empty directory, so
             casks=0 is a real "exists, zero casks" reading).
   Taps:     /opt/homebrew/Library/Taps does NOT exist on this host (ls: No such file or directory), so no
             Taps entry is recorded and taps=0 is a real "absent" reading.
+
+Receipts: the INSTALL_RECEIPT.json of xz/5.8.3 (installed_on_request false), cmake/4.4.2 and
+  ccache/4.13.6_1 (both true), read from this Mac's /opt/homebrew on 2026-11-20 (same host class and
+  identity as above; each file dated 2026-08-20 by ls). Three reductions, each recorded here and not
+  a reading: (1) source.path is replaced by a fixed non-personal string (the real value is a path
+  under the capturing user's home); (2) ccache's runtime_dependencies array is emptied (the leg never
+  reads it; the real one is ~2.5 KB); (3) each file is re-serialised on one line with the same key
+  order, so the manifest's T: payload needs no newline escapes. Every key, time, tap and
+  installed_on_request value is the real one. The other seven formulae carry NO receipt line in the
+  manifest: they are the missing-receipt case (a reduction of this capture, not a reading of those
+  seven Cellar directories, which do hold receipts on the capture host).
 
 Not exercised against real data: Homebrew cask rows and tap counts above zero. This capture host has no
 installed cask and no tap directory, and populated Caskroom/Taps trees would be invented. They need a

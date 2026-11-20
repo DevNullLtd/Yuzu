@@ -4938,6 +4938,13 @@ test('installed_apps no-brew lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# The pkg_inventory plugin (which reads Homebrew prefixes, user-owned ones included, as root) never runs brew or any subprocess (source-text only).
+test('pkg_inventory no-brew lexical gate',
+  _python3_test,
+  args: [files('test_pkg_inventory_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
 test('agent session id log wiring lexical gate',
   _python3_test,

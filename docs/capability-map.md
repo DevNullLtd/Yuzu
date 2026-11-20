@@ -435,7 +435,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.5 Per-User Application Inventory :white_check_mark: `T2`
 
-`installed_apps` plugin extended with per-user hive enumeration (`list_per_user`): each local profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall` is read from the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `NTUSER.DAT` mount otherwise — via the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read (which under the agent's system-context identity resolves to the service account's own profile, not an end user's — see §12.7). Distinguishes system-wide from user-specific installs in output; on Linux/macOS `list_per_user` reports system-scope packages/apps plus (macOS) the calling account's own Homebrew formulae, not a per-profile walk.
+`installed_apps` plugin extended with per-user hive enumeration (`list_per_user`): each local profile's `Software\Microsoft\Windows\CurrentVersion\Uninstall` is read from the live `HKEY_USERS\<SID>` hive when the user is logged in, falling back to an offline `NTUSER.DAT` mount otherwise — via the shared ladder in `agents/shared/win_profiles.hpp` (#2771), not a literal `HKCU` read (which under the agent's system-context identity resolves to the service account's own profile, not an end user's — see §12.7). Distinguishes system-wide from user-specific installs in output; on Linux/macOS `list_per_user` reports system-scope packages/apps only (it no longer reads Homebrew; a user's own Homebrew is in `pkg_inventory.packages`), not a per-profile walk.
 
 ### 7.6 Software Deployment (Install/Upgrade) :large_orange_diamond: `T2` *(verified 2026-09-07)*
 
@@ -443,7 +443,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.7 Package-Manager Inventory :white_check_mark: `T2` *(new row, v4.1)*
 
-`pkg_inventory` plugin: `managers`, `packages` and `store_packages` — machine-scope package-manager inventory on Windows, macOS and Linux (`Inventory:Read`). Per-user package stores are out of scope. *(Evidence: `agents/plugins/pkg_inventory/README.md`.)*
+`pkg_inventory` plugin: `managers`, `packages` and `store_packages` — machine-scope package-manager inventory on Windows, macOS and Linux (`Inventory:Read`). On macOS `packages` also reads install receipts (tap, install time, requested flag) and user-owned Homebrew prefixes (`~/homebrew`, `~/.homebrew`); other per-user package stores are out of scope. *(Evidence: `agents/plugins/pkg_inventory/README.md`.)*
 
 ### 7.8 Language-Runtime Inventory :white_check_mark: `T2` *(new row, v4.1)*
 

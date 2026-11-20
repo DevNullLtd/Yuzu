@@ -23,6 +23,7 @@
 #include <cerrno>
 #include <chrono>
 #include <cstddef>
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -252,23 +253,34 @@ enum class EntryKind { directory, regular, symlink, other, error };
 /// (fifo, socket, device, or a vanished entry -- ENOENT race) as `other`, and a
 /// failed fstatat as `error` (with `detail` set). The Homebrew walks accept
 /// only `directory`; the other kinds are still named (not folded into `other`)
-/// so a caller can tell a file from a link.
+/// so a caller can tell a file from a link. `uid` is the entry's owner from the same
+/// fstatat (0 when none was read).
 struct EntryClass {
     EntryKind kind = EntryKind::other;
     std::string_view detail{};
+    std::uint32_t uid = 0;
 };
 
 [[nodiscard]] inline EntryClass classify_entry(const Dir& parent, const char* name) {
     struct stat st{};
     if (::fstatat(parent.fd(), name, &st, AT_SYMLINK_NOFOLLOW) != 0) {
         const int err = errno;
-        if (is_benign_absent_errno(err)) return {EntryKind::other, {}};
-        return {EntryKind::error, open_failure_token(err)};
+        if (is_benign_absent_errno(err)) return {EntryKind::other, {}, 0};
+        return {EntryKind::error, open_failure_token(err), 0};
     }
-    if (S_ISDIR(st.st_mode)) return {EntryKind::directory, {}};
-    if (S_ISREG(st.st_mode)) return {EntryKind::regular, {}};
-    if (S_ISLNK(st.st_mode)) return {EntryKind::symlink, {}};
-    return {EntryKind::other, {}};
+    const std::uint32_t uid = st.st_uid;
+    if (S_ISDIR(st.st_mode)) return {EntryKind::directory, {}, uid};
+    if (S_ISREG(st.st_mode)) return {EntryKind::regular, {}, uid};
+    if (S_ISLNK(st.st_mode)) return {EntryKind::symlink, {}, uid};
+    return {EntryKind::other, {}, uid};
+}
+
+/// The owner uid of an OPEN directory (fstat on the held descriptor, so it describes the object
+/// that will be read, not the name it was reached by); nullopt when the fstat fails.
+[[nodiscard]] inline std::optional<std::uint32_t> dir_owner(const Dir& dir) {
+    struct stat st{};
+    if (!dir.valid() || ::fstat(dir.fd(), &st) != 0) return std::nullopt;
+    return static_cast<std::uint32_t>(st.st_uid);
 }
 
 /// Outcome of a readlinkat. Exactly one of: `text` (the validated link text, a

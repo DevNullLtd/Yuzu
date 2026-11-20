@@ -1625,7 +1625,7 @@ TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][a
     const auto r = parse_pkg_inventory_packages_output(
         capture_section("pkg_inventory", "macos.txt", "packages"));
     REQUIRE(r.status == Status::ok);
-    REQUIRE(r.entries.size() == 70);
+    REQUIRE(r.entries.size() == 69);
     CHECK(r.entries[0].name == "actionlint");
     CHECK(r.entries[0].version == "1.7.12");
     CHECK(r.entries[0].kind == "pkg");
@@ -1634,6 +1634,9 @@ TEST_CASE("pkg_inventory packages adapter: real macOS capture", "[sync][parse][a
         CHECK((e.kind == "pkg" || e.kind == "app"));
         CHECK(e.ecosystem == "brew");
         CHECK(e.source.empty()); // the collector stamps source
+        // the capture is of the machine prefix, so every row fills install_location from it
+        CHECK(e.install_location == "/opt/homebrew");
+        CHECK(e.install_date.size() == 10); // the receipt's install time, epoch seconds
     }
 }
 
@@ -1646,6 +1649,93 @@ TEST_CASE("pkg_inventory packages adapter maps casks to kind app", "[sync][parse
     REQUIRE(r.entries.size() == 2);
     CHECK(r.entries[0].kind == "pkg");
     CHECK(r.entries[1].kind == "app");
+}
+
+TEST_CASE("pkg_inventory packages adapter: an eleven-field machine row fills install_date and "
+          "install_location only",
+          "[sync][parse][adapter]") {
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/opt/homebrew"),
+         pkg::format_homebrew_package_row("firefox", "130.0", pkg::PackageKind::cask, {},
+                                          pkg::BrewScope::machine, "", "/usr/local")}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2);
+    CHECK(r.entries[0].name == "wget");
+    CHECK(r.entries[0].kind == "pkg");
+    CHECK(r.entries[0].ecosystem == "brew");
+    CHECK(r.entries[0].install_date == "1767225600");
+    CHECK(r.entries[0].install_location == "/opt/homebrew");
+    // tap and installed_on_request have no column: nothing else carries them
+    CHECK(r.entries[0].publisher.empty());
+    CHECK(r.entries[0].source.empty());
+    CHECK(r.entries[1].kind == "app");
+    CHECK(r.entries[1].install_date.empty()); // `-` in the row: no receipt for a cask
+    CHECK(r.entries[1].install_location == "/usr/local");
+}
+
+TEST_CASE("pkg_inventory packages adapter: a user-scope row is seen and never mapped",
+          "[sync][parse][adapter]") {
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("mine", "1.0", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::user, "jsmith", "~/homebrew"),
+         "package|homebrew|odd|1.0|formula|-|-|-|team|-|/opt/homebrew", // an unknown scope token
+         pkg::format_homebrew_package_row("shared", "2.0", pkg::PackageKind::formula, {},
+                                          pkg::BrewScope::machine, "", "/opt/homebrew")}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 1);
+    CHECK(r.entries[0].name == "shared");
+}
+
+TEST_CASE("pkg_inventory packages adapter: the writer blanks a user-looking prefix on a machine row",
+          "[sync][parse][adapter]") {
+    for (const char* prefix : {"~/homebrew", "/Users/x/homebrew"}) {
+        INFO("prefix: " << prefix);
+        const auto r = parse_pkg_inventory_packages_output(nl(
+            {supported_status("packages"),
+             pkg::format_homebrew_package_row("a", "1", pkg::PackageKind::formula, {},
+                                              pkg::BrewScope::machine, "", prefix)}));
+        REQUIRE(r.entries.size() == 1);
+        CHECK(yuzu::agent::v3_normal_form(r.entries[0]).install_location.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: a non-digit install time and a `-` prefix stay empty",
+          "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"),
+         "package|homebrew|a|1|formula|17x7225600|-|-|machine|-|-",
+         "package|homebrew|b|1|formula|-|-|-|machine|-|-"}));
+    REQUIRE(r.entries.size() == 2);
+    for (const auto& e : r.entries) {
+        CHECK(e.install_date.empty());
+        CHECK(e.install_location.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory packages adapter: the old five-field shape maps as before and any other "
+          "width is dropped, never truncated",
+          "[sync][parse][adapter]") {
+    const auto r = parse_pkg_inventory_packages_output(nl(
+        {supported_status("packages"), "package|homebrew|old|1|formula",
+         "package|chocolatey|choc|2|pkg",
+         "package|homebrew|w6|1|formula|-",
+         "package|homebrew|w7|1|formula|-|-|-",
+         "package|homebrew|w8|1|formula|-|-|-|machine",
+         "package|homebrew|w9|1|formula|-|-|-|machine|-",
+         "package|homebrew|w12|1|formula|-|-|-|machine|-|/opt/homebrew|extra",
+         "package|homebrew|w13|1|formula|-|-|-|machine|-|/opt/homebrew|extra|more"}));
+    REQUIRE(r.status == Status::ok);
+    REQUIRE(r.entries.size() == 2);
+    CHECK(r.entries[0].name == "old");
+    CHECK(r.entries[0].install_date.empty());
+    CHECK(r.entries[0].install_location.empty());
+    CHECK(r.entries[1].name == "choc");
+    CHECK(r.entries[1].ecosystem == "chocolatey");
 }
 
 TEST_CASE("pkg_inventory managers adapter: one Homebrew presence row", "[sync][parse][adapter]") {
@@ -1912,7 +2002,7 @@ TEST_CASE("collector: Linux store_packages rows are collected, and a degraded ro
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
     const auto recs = plus_records(got->first);
-    CHECK(recs.size() == 393 + 70 + 1 + 3);
+    CHECK(recs.size() == 393 + 69 + 1 + 3);
     std::map<std::string, std::string> eco_by_name;
     std::size_t store = 0;
     for (const auto& rec : recs) {
@@ -2299,7 +2389,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
     const auto got = collect_with(all_plugins());
     REQUIRE(got.has_value());
     const auto recs = plus_records(got->first);
-    CHECK(recs.size() == 393 + 70 + 1);
+    CHECK(recs.size() == 393 + 69 + 1);
     const std::set<std::string> sources = {"installed_apps.list_inventory",
                                            "pkg_inventory.packages", "pkg_inventory.managers"};
     std::map<std::string, std::size_t> per_source;
@@ -2311,7 +2401,7 @@ TEST_CASE("collector: Mac-shaped run merges apps, brew packages and the presence
         ++per_source[f[15]];
     }
     CHECK(per_source["installed_apps.list_inventory"] == 393);
-    CHECK(per_source["pkg_inventory.packages"] == 70);
+    CHECK(per_source["pkg_inventory.packages"] == 69);
     CHECK(per_source["pkg_inventory.managers"] == 1);
     // The claimed report hash is the v3 hash over the facets the call holds: one full section each
     // (the unsupported ones are status-only and not held).
@@ -2603,7 +2693,7 @@ TEST_CASE("collector: a constrained managers answer is status-only, even beside 
     CHECK(m->status == "constrained");
     CHECK(m->token == "macos:homebrew_taps:permission_denied");
     CHECK(m->adds.empty());
-    CHECK(plus_records(got->first).size() == 393 + 70); // no managers row
+    CHECK(plus_records(got->first).size() == 393 + 69); // no managers row
     // The facet is not held: it is absent from the claimed report hash.
     std::vector<std::pair<std::string, std::string>> held;
     for (const auto& sec : secs) {
@@ -3100,10 +3190,10 @@ TEST_CASE("characterisation: collector section digests are byte-pinned",
         const auto [hashes, report] = digests("mac");
         REQUIRE(hashes.size() == 6);
         CHECK(hashes.at("installed_apps.list_inventory") == "0fd2f99dae065cffe3253f3e555bb97a2e826bfc530e8421854bd08bd32ca4a5");
-        CHECK(hashes.at("pkg_inventory.packages") == "7c8fbeeb6502b712034ab6ae188287e60a3d33d919d41265ca698b0277fbb685");
+        CHECK(hashes.at("pkg_inventory.packages") == "b53f22af3e3f5021587000b03bcb68d79ce64676f8d943fb398c0fb33d8b6ec3");
         CHECK(hashes.at("pkg_inventory.managers") == "e3131d004316be18633e1e86d3d625fe525ccbe1b8a78b221f0aae3f700adcae");
         check_empty_runtimes(hashes);
-        CHECK(report == "v3:4a0432236dee712f773bd400c1334d8bbe6fb4407276d084709da4e7c24c6484");
+        CHECK(report == "v3:a508a38f2c9263f72443d55556194a7130a7a47de7f6dd11d4e9c2231e04c1cb");
     }
 #if defined(_WIN32)
     SECTION("Windows-shaped run") {
@@ -3265,7 +3355,7 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1 + 1);
     }
     SECTION("escaped pipes in the free-text fields do not cost the sourced row") {
         // Built by the real producer: vendor and install_path go through safe_output_field, so a
@@ -3282,14 +3372,14 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 1);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1 + 1);
     }
     SECTION("a clean empty read contributes nothing and does not skip the cycle") {
         fake_mac();
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1);
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1);
     }
     SECTION("a constrained status reports the python facet status-only, even one that carries a row") {
         fake_mac();
@@ -3302,7 +3392,7 @@ TEST_CASE("collector: runtimes.python contributes sourced rows; a constrained or
         const auto got = collect_with(all_plugins());
         REQUIRE(got.has_value());
         CHECK(python_records(got->first) == 0);
-        CHECK(plus_records(got->first).size() == 393 + 70 + 1); // every other source's rows survive
+        CHECK(plus_records(got->first).size() == 393 + 69 + 1); // every other source's rows survive
         const auto secs = sections_of(got->first);
         const V3Sec* py = find_sec(secs, "runtimes.python");
         REQUIRE(py != nullptr);

@@ -242,6 +242,169 @@ TEST_CASE("pkg_inventory: package row shape", "[pkg_inventory][parsers][rows]") 
           "package|homebrew|firefox|130.0,1|cask");
 }
 
+// ── Homebrew receipts and the eleven-field row ───────────────────────────
+
+namespace {
+/// The SHAPE of a real INSTALL_RECEIPT.json (key order and nesting of a current Homebrew), with
+/// synthetic values: `time` and `installed_on_request` at the top level, `tap` inside `source`.
+constexpr std::string_view kReceiptShape =
+    R"({"homebrew_version":"4.5.0","used_options":[],"unused_options":[],"built_as_bottle":true,)"
+    R"("poured_from_bottle":true,"loaded_from_api":true,"installed_as_dependency":false,)"
+    R"("installed_on_request":true,"changed_files":["bin/x"],"time":1767225600,)"
+    R"("source_modified_time":1700000000,"tap_git_head":"abc","compiler":"clang","aliases":[],)"
+    R"("runtime_dependencies":[{"full_name":"dep","version":"1.0"}],)"
+    R"("source":{"path":"/synthetic/x.rb","tap":"homebrew/core","spec":"stable",)"
+    R"("versions":{"stable":"1.0"}},"arch":"arm64"})";
+
+std::string tap_doc(std::string_view value) {
+    return "{\"source\":{\"tap\":" + std::string{value} + "}}";
+}
+} // namespace
+
+TEST_CASE("pkg_inventory receipt: a real-shape receipt yields time, tap and on_request",
+          "[pkg_inventory][parsers][receipt]") {
+    const auto r = pi::parse_brew_receipt(kReceiptShape);
+    CHECK(r.install_time == "1767225600");
+    CHECK(r.tap == "homebrew/core");
+    CHECK(r.on_request == "true");
+}
+
+TEST_CASE("pkg_inventory receipt: missing keys, empty and non-JSON text give three empty fields",
+          "[pkg_inventory][parsers][receipt]") {
+    for (const std::string_view text :
+         {std::string_view{}, std::string_view{"{}"}, std::string_view{"not json at all"},
+          std::string_view{"{\"unrelated\":1}"}}) {
+        const auto r = pi::parse_brew_receipt(text);
+        CHECK(r.install_time.empty());
+        CHECK(r.tap.empty());
+        CHECK(r.on_request.empty());
+    }
+}
+
+TEST_CASE("pkg_inventory receipt: install time must be exactly ten digits in range, terminated",
+          "[pkg_inventory][parsers][receipt]") {
+    const auto time_of = [](std::string_view value) {
+        return pi::parse_brew_receipt("{\"time\":" + std::string{value}).install_time;
+    };
+    CHECK(time_of("1767225600}") == "1767225600");
+    CHECK(time_of("1767225600,\"x\":1}") == "1767225600");
+    CHECK(time_of("1767225600 }") == "1767225600");
+    CHECK(time_of("1230768000}") == "1230768000");  // the lower bound
+    CHECK(time_of("4102444799}") == "4102444799");  // the largest accepted
+    CHECK(time_of("-1767225600}").empty());         // negative
+    CHECK(time_of("1767225600.5}").empty());        // float
+    CHECK(time_of("176722560}").empty());           // 9 digits
+    CHECK(time_of("17672256000}").empty());         // 11 digits
+    CHECK(time_of("1230767999}").empty());          // below 2009
+    CHECK(time_of("4102444800}").empty());          // 2100 and later
+    CHECK(time_of("1767225600").empty());           // digits end at the end of the text
+    CHECK(time_of("\"1767225600\"}").empty());      // a string, not a number
+    CHECK(time_of("null}").empty());
+    CHECK(pi::parse_brew_receipt("{\"time\" : 1767225600 ,}").install_time == "1767225600");
+}
+
+TEST_CASE("pkg_inventory receipt: similarly named keys are never mistaken for time or tap",
+          "[pkg_inventory][parsers][receipt]") {
+    const auto r = pi::parse_brew_receipt(
+        R"({"source_modified_time":1700000000,"tap_git_head":"homebrew/core","tap_x":"a/b"})");
+    CHECK(r.install_time.empty());
+    CHECK(r.tap.empty());
+}
+
+TEST_CASE("pkg_inventory receipt: tap is <org>/<repo> of a closed alphabet and bounded length",
+          "[pkg_inventory][parsers][receipt]") {
+    CHECK(pi::parse_brew_receipt(tap_doc("\"homebrew/core\"")).tap == "homebrew/core");
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a.b_c-d/e.f\"")).tap == "a.b_c-d/e.f");
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a|b/c\"")).tap.empty());       // pipe
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a\x01/b\"")).tap.empty());     // control byte
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a\\\\b/c\"")).tap.empty());    // backslash
+    CHECK(pi::parse_brew_receipt(tap_doc("\"../..\"")).tap.empty());       // dot segments
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a/b/c\"")).tap.empty());       // two slashes
+    CHECK(pi::parse_brew_receipt(tap_doc("\"core\"")).tap.empty());        // no slash
+    CHECK(pi::parse_brew_receipt(tap_doc("\"/core\"")).tap.empty());       // empty org
+    CHECK(pi::parse_brew_receipt(tap_doc("\"org/\"")).tap.empty());        // empty repo
+    CHECK(pi::parse_brew_receipt(tap_doc("null")).tap.empty());
+    CHECK(pi::parse_brew_receipt(tap_doc("\"unterminated")).tap.empty());
+    const std::string nul_tap = std::string{"{\"tap\":\"a"} + '\0' + "b/c\"}";
+    CHECK(pi::parse_brew_receipt(nul_tap).tap.empty());                    // embedded NUL
+    const std::string t140 = "a/" + std::string(138, 'b');
+    const std::string t141 = "a/" + std::string(139, 'b');
+    REQUIRE(t140.size() == pi::kMaxBrewTapLen);
+    CHECK(pi::parse_brew_receipt(tap_doc("\"" + t140 + "\"")).tap == t140);
+    CHECK(pi::parse_brew_receipt(tap_doc("\"" + t141 + "\"")).tap.empty());
+}
+
+TEST_CASE("pkg_inventory receipt: installed_on_request is a bare true or false",
+          "[pkg_inventory][parsers][receipt]") {
+    const auto req = [](std::string_view value) {
+        return pi::parse_brew_receipt("{\"installed_on_request\":" + std::string{value}).on_request;
+    };
+    CHECK(req("true,") == "true");
+    CHECK(req("false}") == "false");
+    CHECK(req("true }") == "true");
+    CHECK(req("truex,").empty());
+    CHECK(req("\"true\",").empty()); // quoted
+    CHECK(req("null,").empty());
+    CHECK(req("1,").empty());
+    CHECK(req("true").empty());      // ends at the end of the text
+}
+
+TEST_CASE("pkg_inventory receipt: the first hit of a key wins, and key-shaped text inside a "
+          "string value is no hit",
+          "[pkg_inventory][parsers][receipt]") {
+    CHECK(pi::parse_brew_receipt(R"({"time":1767225600,"time":1700000000})").install_time ==
+          "1767225600");
+    // an invalid first hit is not replaced by a later valid one
+    CHECK(pi::parse_brew_receipt(R"({"time":"x","time":1767225600})").install_time.empty());
+    // the escaped quotes keep the whole text one string value
+    CHECK(pi::parse_brew_receipt(R"({"note":"say \"time\": 1767225600, ok"})").install_time.empty());
+    CHECK(pi::parse_brew_receipt(R"({"note":"a \"time\": 1767225600 b","time":1700000000})")
+              .install_time == "1700000000");
+}
+
+TEST_CASE("pkg_inventory receipt: hostile text neither throws nor loops",
+          "[pkg_inventory][parsers][receipt]") {
+    const std::string big(pi::kMaxBrewReceiptBytes, '"');
+    CHECK_NOTHROW(pi::parse_brew_receipt(big));
+    CHECK_NOTHROW(pi::parse_brew_receipt(std::string(pi::kMaxBrewReceiptBytes, '\\')));
+    CHECK(pi::parse_brew_receipt(std::string(1000, '{')).install_time.empty());
+}
+
+TEST_CASE("pkg_inventory: homebrew package rows carry eleven fields",
+          "[pkg_inventory][parsers][rows][receipt]") {
+    const pi::BrewReceipt full{"1767225600", "homebrew/core", "true"};
+    const auto machine = pi::format_homebrew_package_row(
+        "wget", "1.24.5", pi::PackageKind::formula, full, pi::BrewScope::machine, "", "/opt/homebrew");
+    CHECK(machine == "package|homebrew|wget|1.24.5|formula|1767225600|homebrew/core|true|machine|-|"
+                     "/opt/homebrew");
+    CHECK(pi::format_homebrew_package_row("wget", "1.24.5", pi::PackageKind::formula, full,
+                                          pi::BrewScope::user, "jsmith", "~/homebrew") ==
+          "package|homebrew|wget|1.24.5|formula|1767225600|homebrew/core|true|user|jsmith|~/homebrew");
+    CHECK(pi::format_homebrew_package_row("firefox", "130.0,1", pi::PackageKind::cask, {},
+                                          pi::BrewScope::machine, "", "/usr/local") ==
+          "package|homebrew|firefox|130.0,1|cask|-|-|-|machine|-|/usr/local");
+    CHECK(split_wire(machine).size() == 11);
+    // the first five fields are format_package_row's, unchanged
+    CHECK(machine.rfind(pi::format_package_row("wget", "1.24.5", pi::PackageKind::formula), 0) == 0);
+}
+
+TEST_CASE("pkg_inventory: a pipe or backslash in the owner or prefix cannot shift a column",
+          "[pkg_inventory][parsers][rows][receipt]") {
+    const auto row = pi::format_homebrew_package_row("a", "1", pi::PackageKind::formula, {},
+                                                     pi::BrewScope::user, "ev|il\\", "~/ho|me\\");
+    CHECK(split_wire(row).size() == 11);
+    CHECK(row.find("ev\\|il") != std::string::npos);
+}
+
+TEST_CASE("pkg_inventory: the user-walk tokens are wellformed", "[pkg_inventory][parsers]") {
+    for (const char* source : {"user_homes", "homebrew_user_prefix", "homebrew_user_cellar",
+                               "homebrew_user_caskroom"})
+        for (const char* detail : {"network_mount", "mounts_unreadable", "owner_mismatch",
+                                   "owner_name_unsupported", "walk_budget", "not_a_directory",
+                                   "permission_denied", "io_error", "row_cap", "byte_cap"})
+            CHECK(is_wellformed_token(pi::make_token("macos", source, detail)));
+}
+
 TEST_CASE("pkg_inventory: production resource-bound defaults are pinned",
           "[pkg_inventory][parsers][limits]") {
     // Every cap case injects a small Limits; this is the only assertion on the
@@ -476,15 +639,15 @@ TEST_CASE("pkg_inventory walk: macOS Homebrew over both prefixes",
     const auto packages = pi::mac::macos_package_rows_at(r, token);
     CHECK_FALSE(token.has_value());
     const std::vector<std::string> expected{
-        "package|homebrew|openssl@3|3.3.1|formula",
-        "package|homebrew|openssl@3|3.3.2|formula",
-        "package|homebrew|wget|1.24.5|formula",
-        "package|homebrew|some-cask|1.2.3,456|cask",
-        "package|homebrew|jq|1.7.1|formula",
+        "package|homebrew|openssl@3|3.3.1|formula|-|-|-|machine|-|/opt/homebrew",
+        "package|homebrew|openssl@3|3.3.2|formula|-|-|-|machine|-|/opt/homebrew",
+        "package|homebrew|wget|1.24.5|formula|-|-|-|machine|-|/opt/homebrew",
+        "package|homebrew|some-cask|1.2.3,456|cask|-|-|-|machine|-|/opt/homebrew",
+        "package|homebrew|jq|1.7.1|formula|-|-|-|machine|-|/usr/local",
     };
     CHECK(packages == expected);
     for (const auto& row : packages)
-        CHECK(split_wire(row).size() == 5);
+        CHECK(split_wire(row).size() == 11);
 }
 
 TEST_CASE("pkg_inventory walk: /usr/local without Homebrew markers is not Homebrew",
@@ -912,8 +1075,8 @@ TEST_CASE("pkg_inventory walk: symlinked and oddly named entries inside Cellar, 
     // Skips are silent by design (Homebrew creates real, well-named directories).
     CHECK_FALSE(token.has_value());
     const std::vector<std::string> expected{
-        "package|homebrew|good|1.0|formula",
-        "package|homebrew|goodcask|2.0|cask",
+        "package|homebrew|good|1.0|formula|-|-|-|machine|-|/opt/homebrew",
+        "package|homebrew|goodcask|2.0|cask|-|-|-|machine|-|/opt/homebrew",
     };
     CHECK(packages == expected);
     for (const auto& row : packages) {
@@ -964,8 +1127,12 @@ TEST_CASE("pkg_inventory walk: the output byte cap stops the rows and says so, c
     for (const char* id : {"pkg-a", "pkg-b", "pkg-c"})
         make_dir(dir.path, std::string{"opt/homebrew/Cellar/"} + id + "/1.0");
 
-    const std::size_t row_bytes =
-        pi::format_package_row("pkg-a", "1.0", pi::PackageKind::formula).size() + 1;
+    const auto row_of = [](const char* id, const char* ver, pi::PackageKind k) {
+        return pi::format_homebrew_package_row(id, ver, k, {}, pi::BrewScope::machine, "",
+                                               "/opt/homebrew");
+    };
+    const std::size_t row_bytes = row_of("pkg-a", "1.0", pi::PackageKind::formula).size() + 1;
+    const std::size_t cask_bytes = row_of("z", "1", pi::PackageKind::cask).size() + 1;
     pi::Limits lim;
     lim.max_output_bytes = 2 * row_bytes; // exactly two rows fit
     std::optional<std::string> token;
@@ -973,8 +1140,8 @@ TEST_CASE("pkg_inventory walk: the output byte cap stops the rows and says so, c
     REQUIRE(token.has_value());
     CHECK(*token == "macos:homebrew_cellar:byte_cap");
     REQUIRE(capped.size() == 2);
-    CHECK(capped[0] == "package|homebrew|pkg-a|1.0|formula");
-    CHECK(capped[1] == "package|homebrew|pkg-b|1.0|formula");
+    CHECK(capped[0] == "package|homebrew|pkg-a|1.0|formula|-|-|-|machine|-|/opt/homebrew");
+    CHECK(capped[1] == "package|homebrew|pkg-b|1.0|formula|-|-|-|machine|-|/opt/homebrew");
 
     lim.max_output_bytes = 3 * row_bytes; // exactly all three fit: complete, no token
     const auto full = pi::mac::macos_package_rows_at(dir.path, token, lim);
@@ -982,9 +1149,9 @@ TEST_CASE("pkg_inventory walk: the output byte cap stops the rows and says so, c
     CHECK(full.size() == 3);
 
     // Once the cap trips it stays tripped (like row_cap): a SHORTER row in a later
-    // container must not slip in. 30 spare bytes fit the 26-byte cask row.
+    // container must not slip in. The spare bytes fit the cask row but not a third formula row.
     make_dir(dir.path, "opt/homebrew/Caskroom/z/1");
-    lim.max_output_bytes = 2 * row_bytes + 30;
+    lim.max_output_bytes = 2 * row_bytes + cask_bytes + 4;
     const auto sticky = pi::mac::macos_package_rows_at(dir.path, token, lim);
     REQUIRE(token.has_value());
     CHECK(*token == "macos:homebrew_cellar:byte_cap,macos:homebrew_caskroom:byte_cap");

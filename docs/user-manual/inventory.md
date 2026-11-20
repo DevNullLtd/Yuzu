@@ -106,7 +106,7 @@ cadences.
   | `release` | ✓ | ✓ (empty for native pkgs) | ✓ (pkgrel) | ✓ | — | — | — | — | — | — | revision | commit | — | — | — | — | — | — | — | — | — |
   | `arch` | ✓ | ✓ | — | — | — | — | — | — | — | — | — | ✓ | — | — | — | — | — | — | — | ✓ | — |
   | `publisher` | VENDOR, else PACKAGER, else `via:rpm` | Maintainer, else `via:deb` | `via:apk` | `via:pacman` | Publisher, else `via:windows` | signing leaf CN, else `via:macos` | `via:macos_pkgutil` | `via:brew` | `via:brew` | `Microsoft` | `via:snap` | `via:flatpak` | `Publisher`, else `via:msi` | the `PythonCore` registry tag (Windows), else `via:python` (always on Linux and macOS) | `IBM` | `Microsoft` | the build's self-reported `IMPLEMENTOR`, else `via:jvm` | `via:chocolatey` | `via:winget` | `via:appx` | provider, else signer, else `via:windows`; Linux `via:kernel_module` |
-  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | — | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
+  | `install_date` | ✓ | — | — | — | ✓ | Last Modified | epoch seconds | epoch seconds (the receipt's install time; formulae only) | — | — | — | — | — | — | — | — | — | — | — | — | ✓ (Windows driver date) |
   | `signature_status` | `signed`/`unsigned` (stored header tags) | — | — | — | — | `signed`/`unsigned`; empty = not read | — | — | — | — | — | — | — | — | — | — | — | — | — | — | `signed`/`unsigned`; empty = unknown |
   | `distro_id` / `distro_version` | ✓ | ✓ | ✓ | ✓ | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — | — |
 
@@ -134,13 +134,17 @@ cadences.
   the rpmdb (is a signature recorded), never a live `rpm -K` cryptographic
   verification. `distro_id`/`distro_version` are host-level (`/etc/os-release`
   `ID`/`VERSION_ID`), stamped on every Linux row. deb rows include **held**
-  packages (they are installed). Machine-scope Homebrew
+  packages (they are installed). Machine-prefix Homebrew
   is collected through `pkg_inventory` with `ecosystem` `brew`: each formula is
   `kind` `pkg`, each cask `kind` `app` (`source` `pkg_inventory.packages`), plus
   one `kind` `app` row named `homebrew` (`publisher` `Homebrew`) with `source`
   `pkg_inventory.managers` that records Homebrew itself is present — one row however many prefixes
-  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). Per-user
-  Homebrew stores are out of scope; the sync is machine-scope. Only Homebrew,
+  exist (`/opt/homebrew` and `/usr/local` on one Mac collapse to one). The formula and cask rows
+  are one per prefix, so a formula under both prefixes is two rows, each with its own
+  `install_location`; a formula row's `install_date` is its receipt's install time (a claim the
+  installing account wrote). A Homebrew a user installed in their own home (`~/homebrew`,
+  `~/.homebrew`) is listed by `pkg_inventory.packages` as a `user`-scope row that the sync never
+  collects: the sync is machine-scope. Only Homebrew,
   Chocolatey and winget are mapped from `managers`: the Linux manager rows (dpkg,
   apt, rpm, dnf, pacman, apk, snap, flatpak) are read but not collected as
   software, and a
@@ -510,7 +514,8 @@ database.
 - **`install_location`** is the folder the software was installed into, when the collector reports
   one. It is stored only from the v3 blob (the v2 blob's slot is ignored), so a device that has not
   yet sent a v3 report has none. The agent fills it for Windows applications (the registry's
-  `InstallLocation`) and macOS applications (the `.app` path); Linux packages, MSI products, store
+  `InstallLocation`), macOS applications (the `.app` path) and Homebrew formulae and casks (the
+  machine prefix, `/opt/homebrew` or `/usr/local`); Linux packages, MSI products, store
   packages and the other sources have no single install folder, so it is empty for them. Only a
   folder under a known machine root is sent (the allowlist above); a location outside those roots
   is blanked, and the row is still reported with its name, version and publisher.

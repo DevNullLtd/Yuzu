@@ -154,18 +154,23 @@ metadata:
     Reports the packages installed under a package manager, read from
     directory names with no subprocess. macOS reports Homebrew formulae
     (Cellar/<formula>/<version>) and casks (Caskroom/<cask>/<version>) over
-    both /opt/homebrew and /usr/local. A formula or cask present under both
-    prefixes yields one row per prefix. Linux is UNSUPPORTED by design:
-    installed_apps owns the Linux package roster, so this action reports
-    `status|packages|unsupported|linux:owned_by_installed_apps` and no
-    package row. Windows reports the Chocolatey packages that have a loose
-    nuspec (lib\<id>\<id>.nuspec), with the nuspec version. Machine scope only:
-    per-user package stores are out of scope, deferred to the user-session
-    helper (ADR-3003). Homebrew casks install .app bundles that installed_apps' macOS
-    `list` also reports via system_profiler, and installed_apps'
-    `list_per_user` lists Homebrew formulae per user, so this action does not
-    claim to be disjoint from either; it adds the manager identity and the
-    cask version.
+    both machine prefixes (/opt/homebrew and /usr/local) and over a Homebrew a
+    user installed in their own home (~/homebrew or ~/.homebrew under each
+    /Users home, accepted only when the prefix is owned by the home's owner).
+    A formula or cask present under several prefixes yields one row per
+    prefix; each row names its prefix. A formula row also carries the install
+    time, the tap and whether the user asked for it, read from the formula's
+    INSTALL_RECEIPT.json without running Homebrew; those three values are the
+    installing account's own claim and are `-` when unknown. Linux is
+    UNSUPPORTED by design: installed_apps owns the Linux package roster, so
+    this action reports `status|packages|unsupported|linux:owned_by_installed_apps`
+    and no package row. Windows reports the Chocolatey packages that have a
+    loose nuspec (lib\<id>\<id>.nuspec), with the nuspec version. Other
+    per-user package stores (npm, pip, cargo) are out of scope, deferred to
+    the user-session helper (ADR-3003). Homebrew casks install .app bundles
+    that installed_apps' macOS `list` also reports via system_profiler, so
+    this action does not claim to be disjoint from it; it adds the manager
+    identity and the cask version.
   tags: [software, package-managers, inventory]
 
 spec:
@@ -183,9 +188,11 @@ spec:
 
   result:
     # status|packages|<supported|constrained|unsupported>|<failure tokens or ->
-    # package|<homebrew|chocolatey>|<id>|<version>|<formula|cask|pkg>
+    # package|homebrew|<id>|<version>|<formula|cask>|<install_time or ->|<tap or ->|<true|false|->|<machine|user>|<owner or ->|<prefix>
+    # package|chocolatey|<id>|<version or ->|pkg
     # Two row shapes on one stream, discriminated by field 0; a status row
-    # populates only row_kind..version and leaves the kind column unset.
+    # populates only row_kind..version and leaves the other columns unset.
+    # A Homebrew row is eleven fields (the first five unchanged); a Chocolatey row is five.
     columns:
       - name: row_kind
         type: string
@@ -213,6 +220,38 @@ spec:
         description: 'Package rows only: whether the directory came from the Cellar or the Caskroom. Values: formula, cask.'
         values: [formula, cask]
         example: formula
+        platforms: [darwin]
+      - name: install_time
+        type: string
+        description: 'Homebrew formula rows: the install time, epoch seconds, from the formula''s INSTALL_RECEIPT.json. "-" when there is no receipt, it is not owned by the version directory''s owner, or the value is out of shape. A claim the installing account wrote: user-writable, never verified. Casks have no receipt, so "-".'
+        example: "1767225600"
+        platforms: [darwin]
+      - name: tap
+        type: string
+        description: 'Homebrew formula rows: the tap the formula came from, <org>/<repo> (e.g. homebrew/core), from the receipt. "-" when unknown or out of shape. User-writable, never verified.'
+        example: homebrew/core
+        platforms: [darwin]
+      - name: on_request
+        type: string
+        description: 'Homebrew formula rows: whether the user asked for the formula (true) or it was pulled in as a dependency (false), from the receipt. "-" when unknown. User-writable, never verified.'
+        values: ['true', 'false', '-']
+        example: "true"
+        platforms: [darwin]
+      - name: scope
+        type: string
+        description: 'Homebrew rows: whose prefix the row came from. machine = /opt/homebrew or /usr/local; user = a Homebrew inside a user home.'
+        values: [machine, user]
+        example: machine
+        platforms: [darwin]
+      - name: owner
+        type: string
+        description: 'Homebrew user rows: the name of the home directory the prefix sits in (a directory name, not a directory-service lookup). "-" on a machine row.'
+        example: "-"
+        platforms: [darwin]
+      - name: prefix
+        type: string
+        description: 'Homebrew rows: the logical prefix: /opt/homebrew or /usr/local for a machine row, the literal ~/homebrew or ~/.homebrew for a user row (never an absolute home path).'
+        example: /opt/homebrew
         platforms: [darwin]
     aggregation:
       groupBy:

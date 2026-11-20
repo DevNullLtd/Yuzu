@@ -48,6 +48,7 @@
 #include <charconv>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -83,6 +84,30 @@ namespace yuzu::shared {
 [[nodiscard]] inline bool is_network_mount_fstype(std::string_view fstype) noexcept {
     return is_network_fstype(fstype) || fstype == "webdav" || fstype == "afpfs" ||
            fstype == "macfuse" || fstype == "osxfuse";
+}
+
+/// True iff `path` (absolute, normalised) is on or under a listed mount point: a segment-boundary
+/// match (`/Users/js` is not under `/Users/jsmith`), and a `/` mount covers every path.
+[[nodiscard]] inline bool under_network_mount(std::string_view path,
+                                              std::span<const std::string> mounts) noexcept {
+    for (const std::string_view m : mounts) {
+        if (m == "/" || path == m ||
+            (path.size() > m.size() && path.starts_with(m) && path[m.size()] == '/'))
+            return true;
+    }
+    return false;
+}
+
+/// True iff `path` is under a listed mount point OR contains one: a walk of `path` then touches
+/// that mount. The root mount "/" contains everything.
+[[nodiscard]] inline bool touches_network_mount(std::string_view path,
+                                                std::span<const std::string> mounts) noexcept {
+    if (under_network_mount(path, mounts)) return true;
+    if (path == "/") return !mounts.empty();
+    for (const std::string_view m : mounts) {
+        if (path.size() < m.size() && m.starts_with(path) && m[path.size()] == '/') return true;
+    }
+    return false;
 }
 
 /// Decodes the octal escapes /proc/self/mountinfo uses inside a field (\040 space, \011 tab,
