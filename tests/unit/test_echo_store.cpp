@@ -5052,7 +5052,11 @@ TEST_CASE("EchoDatabase: a read-only data directory is refused and opens once re
     auto refused = EchoDatabase::open(db);
     REQUIRE_FALSE(refused.has_value());
     INFO("open error: " << refused.error());
-    CHECK_FALSE(refused.error().empty());
+    // Observed (macOS, uid 501): the file opens, the integrity check cannot create the WAL, so the
+    // text is `echo.db could not be checked (sqlite rc 8): not quarantined and not opened; ...`,
+    // the class docs/user-manual/echo.md describes. Only the prefix is pinned, not the result
+    // code (8 on macOS), which another platform's SQLite may report differently.
+    CHECK(refused.error().find("echo.db could not be checked (sqlite rc ") != std::string::npos);
     CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
 
     fs::permissions(dir.path, fs::perms::owner_all, fs::perm_options::add, ec);
@@ -5089,6 +5093,12 @@ TEST_CASE("EchoDatabase: a non-empty -wal held open by a read connection is quar
     REQUIRE(fs::file_size(wal) > 0);
     const std::string wal_bytes = slurp_file(wal);
     spit_file(db, "this is not a SQLite database -- corrupt main file beside a read-held WAL");
+    // Seed the live -wal group/other-readable so the quarantined copy's 0600 proves the sidecar
+    // was re-secured, not inherited (SQLite creates the -wal with the database's own mode).
+    std::error_code pec;
+    fs::permissions(wal, fs::perms::owner_all | fs::perms::group_read | fs::perms::others_read,
+                    fs::perm_options::replace, pec);
+    REQUIRE_FALSE(pec);
 
     auto reopened = EchoDatabase::open(db);
     REQUIRE(reopened.has_value());

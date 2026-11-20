@@ -17,6 +17,10 @@
 /// rather than risk destroying evidence. Only the main file's name is claimed this way; a
 /// sidecar's quarantine name is derived from that exclusively claimed name (`<claimed>-wal`), so
 /// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
+/// A sidecar that cannot be renamed is copied only when no directory entry of any kind (a
+/// dangling link included, examined without following it) is at its quarantine name; and the one
+/// removal this header makes at a quarantine name is a partial copy it just wrote there, at a name
+/// that was free when checked.
 /// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
 /// under both names: a POSIX open quarantines it again under the next free name, while the
 /// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
@@ -43,11 +47,17 @@
 /// the claim: a replaced regular file is a recorded residual on that platform (SQLite holds its
 /// files without FILE_SHARE_DELETE, so a live database another process has open cannot lose its
 /// name there; unproven until the MSVC leg runs).
-/// Three residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// Four residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
 /// unsupported). The release of a claim that is not the judged file is also by name, so a file a
 /// third party put at the claimed name between the re-check and the release loses that name.
+/// The sidecar copy is by name as well: its quarantine name is checked free, the copy then creates
+/// the file, and a copy that fails part-way has its partial file removed, with no identity check
+/// between those steps. A file a third party puts at that name inside the gap may be overwritten
+/// by the copy on a standard library that does not create its destination exclusively, and one put
+/// there after a failed copy and before the removal is removed with it; both need write access to
+/// the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
