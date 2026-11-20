@@ -10,8 +10,9 @@
 // The HTMX 2.0.4 minified bundle is ~51 KB, which exceeds MSVC's 16380-byte
 // raw string literal limit (error C2026). It is split into 4 chunks of
 // <=14000 bytes each and concatenated at static-init time into a single
-// std::string. The reassembled bundle is byte-identical to the upstream
-// minified file.
+// std::string. The reassembled bundle is the upstream npm
+// `dist/htmx.min.js` with one trailing newline added (50,918 bytes against
+// 50,917); `server/core/vendored-components.json` records its hash.
 //
 // Consumers in server.cpp expect:
 //   extern const std::string kHtmxJs;
