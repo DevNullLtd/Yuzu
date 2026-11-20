@@ -7,6 +7,7 @@
 #include "dex_read_builders.hpp" // dex_device_score -- dex_routes.hpp no longer re-exports it (WS-A4 PR-1 F1 fix)
 #include "guaranteed_state_store.hpp"
 #include "http_route_sink.hpp"
+#include "mgmt_group_limits.hpp" // mgmt_group_id_ok -- the usage fragment's group-id rule (as REST)
 #include "rest_a4_envelope_http.hpp" // detail::a4_denial (deny_service_scoped_) — mints/reuses
                                      // X-Correlation-Id so header and body always agree
 #include "rest_audit.hpp" // detail::emit_behavioral_audit (Sec-Audit-Failed, #1647)
@@ -2503,26 +2504,21 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     });
 
     // -- Applications: the app-centric DEX lens (stability by app) --
-    sink.Get("/fragments/dex/apps", [this](const httplib::Request& req, httplib::Response& res) {
-        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
-            return;
-        // Canonical window and platform only: the raw params never reach the API or the markup.
-        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
-        // permission keeps perm_fn_'s status.
-        const int window_days =
-            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
-        const std::string scope = dex_normalize_apps_scope(
-            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
-        // Nothing escapes this handler: a throwing DexApi or renderer still answers 200 with a
-        // visible panel (htmx drops a 5xx body, which would leave the pane blank), and the cause is
-        // logged once per interval, never once per request.
+    //
+    // The Apps page body, shared by the Stability route and by the usage route for a caller who may
+    // not read usage (that caller gets this page plus one line of words). Nothing escapes it: a
+    // throwing DexApi or renderer still answers a visible panel (htmx drops a 5xx body, which would
+    // leave the pane blank), and the cause is logged once per interval, never once per request.
+    // `entry` is what the page offers for the Usage view.
+    const auto apps_page = [this](int window_days, const std::string& scope,
+                                  DexAppsUsageEntry entry) -> std::string {
         const auto fail = [&](const char* reason, const std::string& what) {
             if (apps_error_log_.should_warn(reason))
                 spdlog::error("GET /fragments/dex/apps: {} ({})", ::yuzu::log_key_token(what), reason);
             DexAppsModel m;
             m.degraded = true;
             m.degraded_reason = reason;
-            return render_dex_apps_fragment(m, window_days, scope);
+            return render_dex_apps_fragment(m, window_days, scope, entry);
         };
         std::string html;
         try {
@@ -2536,14 +2532,179 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
                 } else {
                     model = dex_api_->apps(dex_window_token(window_days), scope);
                 }
-                html = render_dex_apps_fragment(model, window_days, scope);
+                html = render_dex_apps_fragment(model, window_days, scope, entry);
             }
         } catch (const std::exception& e) {
             html = fail("internal_error", e.what());
         } catch (...) {
             html = fail("internal_error", "unknown exception");
         }
-        res.set_content(html, "text/html; charset=utf-8");
+        return html;
+    };
+
+    sink.Get("/fragments/dex/apps", [this, apps_page](const httplib::Request& req, httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        // Canonical window and platform only: the raw params never reach the API or the markup.
+        // A model-level failure is a 200 with an error panel (htmx drops a non-2xx body); a denied
+        // permission keeps perm_fn_'s status.
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+        res.set_content(apps_page(window_days, scope, DexAppsUsageEntry::Offered),
+                        "text/html; charset=utf-8");
+    });
+
+    // -- Applications, Usage view: fleet application usage and the exposure rate --
+    //
+    // The second view of the Apps tab, over the SAME DexAppsUsageModel that GET
+    // /api/v1/dex/apps/usage serializes, read in-process through DexApi::apps_usage (no HTTP call),
+    // so the page and the payload cannot disagree. The seam supplies the 30-second answer cache and
+    // the read budget; the read is stateless and idempotent, and a refusal is never cached.
+    //
+    // Gates, in the REST route's order:
+    //  1. GuaranteedState:Read through perm_fn_ with the real response, as the Apps tab does.
+    //  2. Forensics:Read through fleet_read_fn_ against a THROWAWAY response: htmx drops a 4xx/5xx
+    //     body, so the gate's own answer is never forwarded and this route stays at 200. A refused
+    //     caller (403) gets the Stability page plus one line of words, any other failure or an
+    //     unwired gate the same page plus "the permission check could not be completed". The gate
+    //     still writes its own denial row, as it does for REST. gate.scope is the caller's visible
+    //     devices and is passed to apps_usage, which reads only those.
+    //
+    // Audit: one dex.apps.usage.view row (the verb REST writes; target type Forensics, detail
+    // starting "dashboard") per view that passes its parameter checks, written BEFORE the read and
+    // FAIL CLOSED: when the row is known not to have persisted nothing is read and a words panel is
+    // drawn, still at status 200 so htmx swaps it (an HTML fragment otherwise proceeds on an audit
+    // failure; this one is Forensics-tier data, as the device-data routes treat theirs). The row
+    // records the admitted request, not the outcome: a refusal by the API still leaves it, as for
+    // REST. A bad parameter writes no row and reads nothing.
+    //
+    // Parameters follow REST (rest_api_v1.cpp, /api/v1/dex/apps/usage): platform, slice, group and
+    // tag_key are checked as REST checks them, including that `group` is refused outside slice=group
+    // and `tag_key` outside slice=tag. Two page conventions differ on purpose: an unknown `window`
+    // reads as 7d, as on every DEX tab (the lit chip and the audit row show the window in force;
+    // REST answers 400), and `floor` is not read (the page always reads at the default floor and
+    // prints it; REST accepts it). A stray value is never copied into the controls, the audit row
+    // or the markup.
+    sink.Get("/fragments/dex/apps/usage", [this, apps_page](const httplib::Request& req,
+                                                            httplib::Response& res) {
+        if (!perm_fn_(req, res, "GuaranteedState", "Read"))
+            return;
+        const int window_days =
+            window_to_days(req.has_param("window") ? req.get_param_value("window") : "7d");
+        const std::string window = dex_window_token(window_days);
+        const std::string scope = dex_normalize_apps_scope(
+            req.has_param("platform") ? req.get_param_value("platform") : kDexAppsScopeAll);
+
+        if (!fleet_read_fn_) {
+            res.set_content(apps_page(window_days, scope, DexAppsUsageEntry::GateUnavailable),
+                            "text/html; charset=utf-8");
+            return;
+        }
+        httplib::Response probe; // throwaway: never forwarded (htmx drops a 4xx/5xx body)
+        const authz::FleetReadGate gate = fleet_read_fn_(req, probe, "Forensics", "Read");
+        if (!gate.admitted) {
+            res.set_content(apps_page(window_days, scope,
+                                      probe.status == 403 ? DexAppsUsageEntry::Refused
+                                                          : DexAppsUsageEntry::GateUnavailable),
+                            "text/html; charset=utf-8");
+            return;
+        }
+
+        DexAppsUsageControls controls;
+        controls.window_days = window_days;
+        controls.platform = scope;
+        const auto answer = [&res](const std::string& html) {
+            res.set_content(html, "text/html; charset=utf-8");
+        };
+        const auto refuse = [&](std::string_view reason, std::string_view detail) {
+            answer(render_dex_apps_usage_refusal(controls, reason, detail));
+        };
+        try {
+            if (group_list_fn_)
+                controls.groups = group_list_fn_();
+
+            // Parameter checks, in REST's order. Each is a words panel with no audit row and no read.
+            if (scope.empty()) {
+                refuse("invalid_scope", "");
+                return;
+            }
+            const std::string slice_name =
+                req.has_param("slice") ? req.get_param_value("slice") : std::string("fleet");
+            DexUsageSlice slice;
+            if (slice_name == "fleet")
+                slice.kind = DexUsageSliceKind::Fleet;
+            else if (slice_name == "platform")
+                slice.kind = DexUsageSliceKind::Platform;
+            else if (slice_name == "group")
+                slice.kind = DexUsageSliceKind::Group;
+            else if (slice_name == "tag")
+                slice.kind = DexUsageSliceKind::Tag;
+            else {
+                refuse("invalid_slice", ""); // the controls fall back to the whole fleet
+                return;
+            }
+            controls.slice.kind = slice.kind;
+            if (req.has_param("group") && slice.kind != DexUsageSliceKind::Group) {
+                refuse("invalid_slice", "group_outside_slice");
+                return;
+            }
+            if (req.has_param("tag_key") && slice.kind != DexUsageSliceKind::Tag) {
+                refuse("invalid_slice", "tag_key_outside_slice");
+                return;
+            }
+            if (slice.kind == DexUsageSliceKind::Group) {
+                const std::string id = req.has_param("group") ? req.get_param_value("group") : std::string();
+                if (id.empty() || !mgmt_group_id_ok(id)) {
+                    refuse("invalid_slice", "no_group");
+                    return;
+                }
+                slice.key = id;
+            } else if (slice.kind == DexUsageSliceKind::Tag) {
+                const std::string key =
+                    req.has_param("tag_key") ? req.get_param_value("tag_key") : std::string(kDexDefaultCohortKey);
+                if (!valid_tag_key(key)) {
+                    refuse("invalid_slice", "invalid_tag_key"); // the controls keep the default key
+                    return;
+                }
+                slice.key = key;
+            }
+            controls.slice = slice;
+
+            if (!dex_api_) {
+                if (apps_error_log_.should_warn("usage_not_wired"))
+                    spdlog::error("GET /fragments/dex/apps/usage: no DexApi is wired for the Usage view");
+                refuse("usage_unavailable", "not_wired");
+                return;
+            }
+
+            const auto cid = detail::make_correlation_id();
+            if (!detail::emit_behavioral_audit(audit_fn_, req, res, "dex.apps.usage.view", "success", "Forensics",
+                                               "",
+                                               "dashboard DEX fleet application usage read cid=" + cid +
+                                                   " window=" + window + " platform=" + scope +
+                                                   " slice=" + slice_name + " key=" + audit_token(slice.key) +
+                                                   " floor=" + std::to_string(kDexCohortFloor))) {
+                spdlog::warn("dex.apps.usage.view audit fail-closed (usage not read) cid={}", cid);
+                refuse("audit_unavailable", "");
+                return;
+            }
+
+            const auto r = dex_api_->apps_usage(window, scope, slice, kDexCohortFloor, gate.scope);
+            if (r)
+                answer(render_dex_apps_usage_fragment(controls, *r));
+            else
+                refuse(r.error().reason, r.error().detail);
+        } catch (const std::exception& e) {
+            if (apps_error_log_.should_warn("usage_internal_error"))
+                spdlog::error("GET /fragments/dex/apps/usage: {} (internal_error)", ::yuzu::log_key_token(e.what()));
+            refuse("internal_error", "");
+        } catch (...) {
+            if (apps_error_log_.should_warn("usage_internal_error"))
+                spdlog::error("GET /fragments/dex/apps/usage: unknown exception (internal_error)");
+            refuse("internal_error", "");
+        }
     });
 
     // -- Catalogue: family-card grid (View 1) + a family's signals (View 2) --

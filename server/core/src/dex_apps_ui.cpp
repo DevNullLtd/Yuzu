@@ -14,6 +14,16 @@
 /// lever that helps is named. Every agent-reported or customer-authored string passes html_escape
 /// before markup (printed names also mark bidirectional-control and zero-width characters as
 /// visible text), and subjects pass url_query_value before an hx-get.
+///
+/// The Usage view (`render_dex_apps_usage_fragment`, `render_dex_apps_usage_refusal`) is the
+/// second view of the tab, PURE over `DexAppsUsageModel` (the model GET /api/v1/dex/apps/usage
+/// serializes). It keeps the same honesty rules and adds its own: every device count is printed
+/// beside the reporting population it is read against (an application row and a cell row alike);
+/// a withheld, estimated or ambiguous figure reads in words and never as a number; the rate is
+/// printed per hour of use, exactly as the payload carries it, to about four significant digits so
+/// a small value never collapses to "<0.1"; and a refusal prints the chrome and the controls and
+/// nothing derived from a model. The Stability page gains only the View chips and, for a caller
+/// who may not read usage, one line of words; with `DexAppsUsageEntry::Hidden` it is unchanged.
 
 #include "dex_apps_ui.hpp"
 
@@ -21,6 +31,7 @@
 #include "plural.hpp"
 #include "web_utils.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -363,8 +374,8 @@ std::string devices_cell(const DexStabilityFigures& f) {
 
 // The small-count tags and the "Small counts" note below say "under 20"; dex.md repeats it.
 static_assert(kDexStatsReliableMinEvents == 20,
-              "the Apps page prose (share tag, rate tag, Small counts note) and dex.md say 'under 20'; "
-              "update them with this constant");
+              "the Apps page prose (share tag, rate tag, Small counts note, and the Usage view's "
+              "'under 20 events' rate tag) and dex.md say 'under 20'; update them with this constant");
 
 std::string share_cell(const DexStabilityFigures& f, const RowCtx& c) {
     if (!f.share_affected || !c.population)
@@ -549,10 +560,460 @@ std::string empty_panel(const std::string& scope) {
     return placeholder("Nothing recorded" + where, body);
 }
 
+// ── The Usage view ───────────────────────────────────────────────────────────
+//
+// Pure over `DexAppsUsageModel`. The chips and controls come from `DexAppsUsageControls` (the
+// request), never from the model, so a refusal draws the same chrome. Emitted by the usage
+// renderers only: nothing below is reached from `render_dex_apps_fragment` except `view_chips`.
+
+// Tokens only. The five column widths, the narrow tag-key box (kDexCss gives .dx-ctl a 220px
+// minimum) and the "none defined" word beside the group list.
+const char* const kAppsUsageCss = R"CSS(<style>
+.dx-usage .u1{width:24%}.dx-usage .u2{width:15%}.dx-usage .u3{width:15%}.dx-usage .u4{width:13%}.dx-usage .u5{width:33%}
+.gp-filters .dx-ctl.dx-key{width:14ch;min-width:0}
+.gp-filters .dx-none{align-self:center;color:var(--mut);font-size:12.5px}
+</style>)CSS";
+
+const char* const kUsageSub =
+    "Usage per application across the fleet &mdash; devices, run time and launches over the last 30 "
+    "days, and crashes &amp; hangs per hour of use.";
+
+DexUsageSlice make_slice(DexUsageSliceKind kind, const std::string& key) {
+    DexUsageSlice s;
+    s.kind = kind;
+    s.key = key;
+    return s;
+}
+
+const char* slice_token(DexUsageSliceKind k) {
+    switch (k) {
+    case DexUsageSliceKind::Platform:
+        return "platform";
+    case DexUsageSliceKind::Group:
+        return "group";
+    case DexUsageSliceKind::Tag:
+        return "tag";
+    case DexUsageSliceKind::Fleet:
+        break;
+    }
+    return "fleet";
+}
+
+// "View: Stability | Usage". `platform` is a canonical scope token (never request text) and
+// `usage_on` says which chip is lit.
+std::string view_chips(const std::string& window, const std::string& platform, bool usage_on) {
+    const std::string qs = "window=" + window + "&amp;platform=" + platform;
+    return "<div class=\"gp-filters\"><span class=\"dx-lbl\">View</span>" +
+           dex_pane_chip("/fragments/dex/apps?" + qs, "Stability", !usage_on) +
+           dex_pane_chip("/fragments/dex/apps/usage?" + qs, "Usage", usage_on) + "</div>";
+}
+
+// A control's request carries every OTHER current parameter and never its own: htmx appends the
+// control's own name=value to a GET and the handler reads the first value of a repeated
+// parameter, so a URL that already carried the key would pin the old one.
+std::string usage_base_url(const std::string& window, const std::string& platform,
+                           const std::string& slice_name) {
+    return "/fragments/dex/apps/usage?window=" + window + "&amp;platform=" + platform +
+           "&amp;slice=" + slice_name;
+}
+
+// The full request for a chip: the base plus the slice's own key.
+std::string usage_url(const std::string& window, const std::string& platform,
+                      const DexUsageSlice& slice) {
+    std::string u = usage_base_url(window, platform, slice_token(slice.kind));
+    if (slice.kind == DexUsageSliceKind::Group && !slice.key.empty())
+        u += "&amp;group=" + url_query_value(slice.key);
+    if (slice.kind == DexUsageSliceKind::Tag)
+        u += "&amp;tag_key=" +
+             url_query_value(slice.key.empty() ? std::string(kDexDefaultCohortKey) : slice.key);
+    return u;
+}
+
+// A management group's name for printing (escaped), or its id when the list does not hold it.
+std::string group_name_text(const DexAppsUsageControls& c, const std::string& id) {
+    for (const auto& g : c.groups)
+        if (g.id == id)
+            return esc_text(g.name);
+    return esc_text(id);
+}
+
+std::string usage_filters(const DexAppsUsageControls& c, const std::string& window,
+                          const std::string& keep) {
+    std::string h = "<div class=\"gp-filters\"><span class=\"dx-lbl\">Platform</span>";
+    static const std::pair<const char*, const char*> kPlatforms[] = {{"all", "All platforms"},
+                                                                     {"windows", "Windows"},
+                                                                     {"macos", "macOS"},
+                                                                     {"linux", "Linux"}};
+    for (const auto& [tok, label] : kPlatforms)
+        h += dex_pane_chip(usage_url(window, tok, c.slice), label, c.platform == tok);
+    h += "<span class=\"dx-lbl sp\">Window</span>";
+    static const std::pair<const char*, const char*> kWindows[] = {
+        {"24h", "24h"}, {"7d", "7d"}, {"30d", "30d"}, {"all", "All"}};
+    for (const auto& [tok, label] : kWindows)
+        h += dex_pane_chip(usage_url(tok, keep, c.slice), label, window == tok);
+    return h + "</div>";
+}
+
+std::string slice_controls(const DexAppsUsageControls& c, const std::string& window,
+                           const std::string& keep) {
+    const DexUsageSlice& cur = c.slice;
+    const std::string tag_key = (cur.kind == DexUsageSliceKind::Tag && !cur.key.empty())
+                                    ? cur.key
+                                    : std::string(kDexDefaultCohortKey);
+    std::string h = "<div class=\"gp-filters\"><span class=\"dx-lbl\">Slice</span>";
+    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Fleet, "")), "Whole fleet",
+                       cur.kind == DexUsageSliceKind::Fleet);
+    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Platform, "")),
+                       "By platform", cur.kind == DexUsageSliceKind::Platform);
+    h += dex_pane_chip(usage_url(window, keep, make_slice(DexUsageSliceKind::Tag, tag_key)), "By tag",
+                       cur.kind == DexUsageSliceKind::Tag);
+    // The tag-key box: its URL names the slice but never tag_key, which htmx appends.
+    h += "<input class=\"dx-ctl dx-key\" name=\"tag_key\" aria-label=\"Tag key\" value=\"" + esc(tag_key) +
+         "\" hx-get=\"" + usage_base_url(window, keep, "tag") + "\" hx-trigger=\"change\"";
+    h += kDexPaneSwapAttrs;
+    h += ">";
+    h += "<span class=\"dx-lbl sp\">Management group</span>";
+    if (c.groups.empty())
+        return h + "<span class=\"dx-none\">none defined</span></div>";
+    // The group select: its URL names the slice but never group, which htmx appends.
+    h += "<select class=\"dx-ctl\" name=\"group\" aria-label=\"Management group\" hx-get=\"" +
+         usage_base_url(window, keep, "group") + "\" hx-trigger=\"change\"";
+    h += kDexPaneSwapAttrs;
+    h += ">";
+    h += std::string("<option value=\"\" disabled") +
+         (cur.kind == DexUsageSliceKind::Group ? "" : " selected") + ">Choose a group</option>";
+    for (const auto& g : c.groups)
+        h += "<option value=\"" + esc(g.id) + "\"" +
+             ((cur.kind == DexUsageSliceKind::Group && cur.key == g.id) ? " selected" : "") + ">" +
+             esc_text(g.name) + "</option>";
+    return h + "</select></div>";
+}
+
+// Page head: back link, sub-navigation, the two stylesheets, the title, the captions (model only;
+// empty for a refusal), then the View chips, the platform and window chips and the Slice row.
+std::string usage_head(const DexAppsUsageControls& c, const std::string& window, const std::string& keep,
+                       const std::string& captions) {
+    std::string h = "<a class=\"gp-back\" href=\"/\">&larr; Console</a>";
+    h += dex_subnav("apps", c.window_days);
+    h += kAppsCss;
+    h += kAppsUsageCss;
+    h += "<div id=\"dex-apps\"><div class=\"gp-head\"><div><div class=\"gp-titleline\"><h1>Applications</h1></div>"
+         "<div class=\"gp-sub\">";
+    h += kUsageSub;
+    h += "</div>" + captions + "</div></div>";
+    h += view_chips(window, keep, true);
+    h += usage_filters(c, window, keep);
+    h += slice_controls(c, window, keep);
+    return h;
+}
+
+// ── captions (model only) ──
+
+constexpr std::int64_t kUsageFreshHours = kDexUsageFreshSecs / 3600;
+
+// "date" and "time" in separate no-wrap spans, split at the 'T' of the ISO instant.
+std::string instant_text(const std::string& iso) {
+    const auto t = iso.find('T');
+    if (t == std::string::npos)
+        return "<span class=\"nw\">" + esc(iso) + "</span>";
+    return "<span class=\"nw\">" + esc(iso.substr(0, t)) + "</span> <span class=\"nw\">" +
+           esc(iso.substr(t + 1)) + "</span>";
+}
+
+std::string usage_captions(const DexAppsUsageControls& c, const DexAppsUsageModel& m,
+                           const std::string& window) {
+    const std::string basis = scope_label(m.platform_scope);
+    std::string h = "<div class=\"gp-sub dx-cl\"><b>Population</b> ";
+    if (m.population == 0) {
+        h += "0 devices online now (" + basis + "). Usage needs at least one online device.";
+    } else {
+        h += plural_count(m.population, "device", "devices") + " online now (" + basis + "). " +
+             n(m.reporting_devices) + " reported usage in the last " + n(kUsageFreshHours) +
+             " hours and " + plural_word(m.reporting_devices, "is", "are") + " counted; " +
+             n(m.stale_devices) + " last reported earlier and " + plural_word(m.stale_devices, "is", "are") +
+             " not counted";
+        const std::int64_t never = m.population - m.reporting_devices - m.stale_devices;
+        if (never >= 0)
+            h += "; " + n(never) + plural_word(never, " has", " have") + " never reported usage";
+        h += ".";
+    }
+    h += "</div>";
+
+    h += "<div class=\"gp-sub dx-cl\"><b>Basis</b> Estimated from 30-day usage: run time and launches are "
+         "each device&#39;s trailing 30-day totals from its last daily report";
+    if (window == "all")
+        h += ". The All window has no length, so no rate is calculated; choose 24h, 7d or 30d for a rate";
+    else
+        h += ", and the rate scales run time to the " + window + " window";
+    h += ". Read at " + instant_text(dex_iso_at(m.as_of_epoch)) +
+         "; an answer is reused for up to 30 seconds.</div>";
+
+    h += "<div class=\"gp-sub dx-cl\"><b>Reporting floor</b> " + plural_count(m.floor, "device", "devices") +
+         ", per table. A figure from fewer devices is withheld. The floor guards one table only: "
+         "comparing two slices or two windows can still single out a small group.</div>";
+
+    if (m.slice.kind != DexUsageSliceKind::Fleet) {
+        std::string what;
+        if (m.slice.kind == DexUsageSliceKind::Platform)
+            what = "by platform";
+        else if (m.slice.kind == DexUsageSliceKind::Group)
+            what = "by management group " + group_name_text(c, m.slice.key);
+        else
+            what = "by tag <code class=\"dx-code\">" + esc(m.slice.key) + "</code>";
+        h += "<div class=\"gp-sub dx-cl\"><b>Slice</b> " + what +
+             ". Each application&#39;s devices, run time and launches are also split into cells; open its "
+             "cells to read them. A cell&#39;s device count is read against all " + n(m.reporting_devices) +
+             " reporting devices, not against the cell&#39;s own size, which this read does not return.</div>";
+    }
+    return h;
+}
+
+// ── figures ──
+
+// The rate as the payload carries it: per hour of use, about four significant digits, so a small
+// value never collapses to "<0.1". Zero prints "0"; the caller handles a non-finite value.
+std::string fmt_rate(double x) {
+    if (!(x > 0.0))
+        return "0";
+    if (x < 1e-9)
+        return "&lt;0.000000001";
+    const int magnitude = static_cast<int>(std::floor(std::log10(x)));
+    const int decimals = std::max(0, 3 - magnitude);
+    return std::format("{:.{}f}", x, decimals);
+}
+
+std::string rate_bound(double x, const char* when_missing) {
+    return std::isfinite(x) ? fmt_rate(x) : std::string(when_missing);
+}
+
+std::string rate_withheld_words(const DexAppUsage& a, const DexAppsUsageModel& m) {
+    const std::string& w = a.rate_withheld;
+    if (w == "ambiguous_name")
+        return "withheld: the name is shared";
+    if (w == "no_usage")
+        return m.reporting_devices == 0 ? "not calculated: no device has reported usage"
+                                        : "not calculated: no usage reported";
+    if (w == "below_floor")
+        return "not calculated: below the reporting floor";
+    if (w == "unbounded_window")
+        return "not calculated: the All window has no length";
+    if (w == "window_exceeds_retention")
+        return "not calculated: the window is longer than the crash and hang history kept";
+    if (w == "zero_usage")
+        return "not calculated: no run time recorded";
+    if (w == "no_statistic")
+        return "not calculated: no statistic for these counts";
+    if (w.empty())
+        return "not calculated";
+    return "not calculated (reason: <code class=\"dx-code\">" + esc(w) + "</code>)";
+}
+
+std::string usage_rate_cell(const DexAppUsage& a, const DexAppsUsageModel& m, const std::string& window) {
+    if (!a.rate)
+        return word_cell(rate_withheld_words(a, m));
+    const DexExposureRate& r = *a.rate;
+    const DexInterval& i = r.per_hour;
+    const std::string est = rate_bound(i.estimate, "no estimate");
+    const std::string band = "(" + rate_bound(i.lower, "no lower bound") + "&ndash;" +
+                             rate_bound(i.upper, "no upper bound") + ")";
+    // The estimated tag is keyed on the basis token the payload carries; any other basis prints
+    // the token itself, escaped.
+    const std::string basis_tag =
+        std::string_view(r.basis) == std::string_view(kDexUsageBasis)
+            ? std::string("estimated from 30-day usage")
+            : esc(std::string(r.basis));
+    return "<td class=\"gp-num dx-fig\"><span class=\"v\">" + est + " <span class=\"gp-mute nw\">" + band +
+           "</span></span><span class=\"s\">" + plural_count(r.crashes, "crash", "crashes") + " + " +
+           plural_count(r.hangs, "hang", "hangs") + " over " + fmt1(r.hours) + " h in " + window +
+           "</span><span class=\"gp-derived\">" + basis_tag + "</span>" +
+           (i.reliable ? std::string() : std::string(" <span class=\"gp-derived\">under 20 events</span>")) +
+           "</td>";
+}
+
+// "of R reporting": the population every device count is read against.
+std::string of_reporting(const DexAppsUsageModel& m, const char* prefix) {
+    return std::string("<span class=\"s nw\">") + prefix + n(m.reporting_devices) + " reporting</span>";
+}
+
+std::string hours_cell(std::int64_t run_seconds) {
+    return "<td class=\"gp-num dx-fig\"><span class=\"v\">" + fmt1(static_cast<double>(run_seconds) / 3600.0) +
+           " h</span><span class=\"s nw\">process-hours</span></td>";
+}
+
+std::string cell_label(const DexAppsUsageControls& c, const DexAppsUsageModel& m, const DexUsageCell& cell) {
+    if (cell.kind == DexUsageCellKind::Untagged)
+        return "Devices with no value for this tag";
+    if (cell.kind == DexUsageCellKind::Other) {
+        // The residual is named for what the model puts in it for this slice
+        // (dex_usage_model.hpp, dex_usage_assign_cells). Cells are merged into it only above floor 1.
+        std::string t;
+        if (m.slice.kind == DexUsageSliceKind::Group)
+            t = "Devices outside the group";
+        else if (m.slice.kind == DexUsageSliceKind::Platform)
+            t = "Devices on a platform other than Windows, Linux or macOS";
+        else if (m.slice.kind == DexUsageSliceKind::Tag)
+            t = "Devices whose value is not among the " + n(kDexUsageCellCap) + " most common";
+        else
+            t = "Other devices";
+        if (m.floor > 1)
+            t += ", plus cells merged in so that no row is below the reporting floor";
+        return t;
+    }
+    // Only a Named cell prints its label, so a tag value of "other" or "(untagged)" prints as that
+    // literal value.
+    if (m.slice.kind == DexUsageSliceKind::Platform) {
+        const std::string known = scope_label(cell.label);
+        return known.empty() ? esc_text(cell.label) : known;
+    }
+    if (m.slice.kind == DexUsageSliceKind::Group)
+        return group_name_text(c, cell.label);
+    if (m.slice.kind == DexUsageSliceKind::Fleet)
+        return "Whole fleet";
+    return esc_text(cell.label);
+}
+
+std::string usage_app_body(const DexAppsUsageControls& c, const DexAppUsage& a, const DexAppsUsageModel& m,
+                           const std::string& window) {
+    std::string first =
+        a.subject.empty()
+            ? std::string("&lt;unknown&gt;")
+            : dex_pane_link("/fragments/dex/app?name=" + url_query_value(a.subject) + "&amp;window=" + window,
+                            esc_text(a.subject));
+    const bool show_cells = m.slice.kind != DexUsageSliceKind::Fleet && !a.cells.empty();
+    if (show_cells)
+        first += "<details class=\"dx-vx\"><summary>" + plural_count(static_cast<std::int64_t>(a.cells.size()), "cell", "cells") +
+                 "</summary><span class=\"vh\">The cell rows follow this row in the table.</span></details>";
+
+    std::string cells;
+    if (a.state == DexUsageState::AmbiguousName) {
+        // The cut is in bytes (dex_usage_model.hpp), and no device count is printed for a name that
+        // is attributed to none of its applications.
+        const std::string cut = n(static_cast<std::int64_t>(kDexUsageTruncBytes));
+        first += " <span class=\"gp-mute\">Linux keeps only the first " + cut + " bytes of a process name (" + cut +
+                 " characters for plain ASCII names), and this cut name matches more than one application here, "
+                 "so its usage is attributed to none of them.</span>";
+        cells = word_cell("withheld: the name is shared") + word_cell("withheld") + word_cell("withheld");
+    } else if (a.state == DexUsageState::NoUsage) {
+        const std::string w = m.population == 0          ? "no device online"
+                              : m.reporting_devices == 0 ? "no device has reported usage"
+                                                         : "no reporting device ran it";
+        cells = "<td class=\"gp-num dx-fig\"><span class=\"w\">" + w + "</span>" +
+                (m.reporting_devices > 0 ? of_reporting(m, "of ") : std::string()) + "</td>" +
+                word_cell("no usage reported") + word_cell("no usage reported");
+    } else if (!a.totals) {
+        cells = "<td class=\"gp-num dx-fig\"><span class=\"v\">" + n(a.devices) + "</span>" + of_reporting(m, "of ") +
+                "<span class=\"s nw\">count only</span></td>" + word_cell("below the reporting floor") +
+                word_cell("below the reporting floor");
+    } else {
+        cells = "<td class=\"gp-num dx-fig\"><span class=\"v\">" + n(a.devices) + "</span>" + of_reporting(m, "of ") +
+                "</td>" + hours_cell(a.totals->run_seconds_30d) + "<td class=\"gp-num\">" +
+                n(a.totals->launches_30d) + "</td>";
+    }
+
+    std::string out = "<tbody class=\"dx-app\"><tr class=\"dx-apphead\"><td>" + first + "</td>" + cells +
+                      usage_rate_cell(a, m, window) + "</tr>";
+    if (show_cells)
+        for (const auto& x : a.cells)
+            out += "<tr class=\"dx-ver\"><td class=\"dx-indent\">" + cell_label(c, m, x) +
+                   "</td><td class=\"gp-num dx-fig\"><span class=\"v\">" + n(x.devices) + "</span>" +
+                   of_reporting(m, "of all ") +
+                   (x.small_cohort ? std::string("<span class=\"gp-derived\">under 30 devices</span>") : std::string()) +
+                   "</td>" + hours_cell(x.totals.run_seconds_30d) + "<td class=\"gp-num\">" +
+                   n(x.totals.launches_30d) + "</td><td class=\"gp-num gp-mute\">not split by cell</td></tr>";
+    return out + "</tbody>";
+}
+
+// The small-cohort tag and its constant stay together.
+static_assert(kDexUsageSmallCohortDevices == 30,
+              "the Usage view's cell tag says 'under 30 devices'; update it with this constant");
+
+const char* const kUsageThead =
+    "<thead><tr><th class=\"u1\">Application</th><th class=\"gp-num u2\">Devices that ran it</th>"
+    "<th class=\"gp-num u3\">Run time, 30 days</th><th class=\"gp-num u4\">Launches, 30 days</th>"
+    "<th class=\"gp-num u5\">Crashes and hangs per hour of use</th></tr></thead>";
+
+std::string usage_notes() {
+    return "<div class=\"gp-note\"><b>Which applications:</b> the applications on the Stability view, in the same "
+           "order: those with a crash or hang in this window, at most 100. An application that only ran is not "
+           "listed.</div>"
+           "<div class=\"gp-note\"><b>Run time is process-hours:</b> it is summed per process run, so several "
+           "instances running at once add up. It is not interactive or foreground time.</div>"
+           "<div class=\"gp-note\"><b>Rate:</b> crashes plus hangs in the window, divided by the hours of use scaled "
+           "from the 30-day total to the window. The counts are not capped per device, so events clustered on one "
+           "device make the interval look narrower than it is. A rate on fewer than 20 events carries a tag.</div>"
+           "<div class=\"gp-note\"><b>Counted devices:</b> only devices that reported usage in the last " +
+           n(kUsageFreshHours) +
+           " hours. A device that last reported earlier adds to no figure here.</div>";
+}
+
+// A refusal panel: one per cause, each naming the lever that helps. The token is printed as a
+// code element through reason_note; a stray value is only ever escaped.
+std::string usage_refusal_panel(const std::string& reason, const std::string& detail) {
+    const std::string d = detail == reason ? std::string() : detail;
+    if (reason == "invalid_scope")
+        return placeholder("Unknown platform",
+                           "The platform filter must be one of all, windows, macos or linux, so no figures are "
+                           "shown. Choose a platform above.");
+    if (reason == "invalid_slice" && d == "unknown_group")
+        return placeholder("Unknown management group",
+                           "That management group does not exist (it may have been removed), so no figures are "
+                           "shown. Choose another group or slice above.");
+    if (reason == "invalid_slice")
+        return placeholder("Choose a slice",
+                           "The slice request does not fit together, so no figures are shown. The group slice "
+                           "needs a management group, the tag slice needs a valid tag key (letters, digits and "
+                           "<code class=\"dx-code\">_ . : -</code>, at most 64), and a group or a tag key is only "
+                           "read with its own slice. Choose a slice above." +
+                               (d.empty() ? std::string() : reason_note(d)));
+    if (reason == "audit_unavailable")
+        return placeholder("Usage is not shown",
+                           "The audit record for this read could not be stored, so the read was not run. Try again "
+                           "in a moment.");
+    if (reason == "usage_unavailable" && d == "fleet_too_large")
+        return placeholder("Usage does not fit its time limit for this fleet",
+                           "The read has timed out repeatedly, so no figures are shown. Trying again does not "
+                           "help; only a single platform (above) makes the read smaller. It clears on the first "
+                           "read that completes." + reason_note(d));
+    if (reason == "usage_unavailable" && (d == "concurrency_budget" || d == "pool_acquire_timeout"))
+        return placeholder("Usage is busy",
+                           "The server is running as many of these reads as it allows, so no figures are shown. "
+                           "Try again in a moment." + reason_note(d));
+    if (reason == "usage_unavailable" && d == "statement_timeout")
+        return placeholder("Usage is unavailable",
+                           "The read took too long, so no figures are shown. Try again in a moment, or choose a "
+                           "single platform to make the read smaller." + reason_note(d));
+    const std::string named = d.empty() ? reason : d;
+    if (reason == "apps_degraded")
+        return placeholder("Usage is unavailable",
+                           "The application list could not be read, so no figures are shown. The Stability view "
+                           "says why." + reason_note(named));
+    if (reason == "group_unavailable")
+        return placeholder("Usage is unavailable",
+                           "The management group&#39;s members could not be read, so no figures are shown. Try "
+                           "again in a moment." + reason_note(named));
+    if (reason == "tag_unavailable")
+        return placeholder("Usage is unavailable",
+                           "The tag values could not be read, so no figures are shown. Try again in a moment." +
+                               reason_note(reason));
+    if (reason == "no_population")
+        return placeholder("Usage is unavailable",
+                           "No fleet source is connected, so the population is unknown and no figures are shown." +
+                               reason_note(reason));
+    return placeholder("Usage is unavailable",
+                       "The read could not be completed, so no figures are shown. Try again in a moment. If it "
+                       "keeps failing, check PostgreSQL health." + reason_note(named));
+}
+
+// The platform the chips keep when the request's was unrecognised: all.
+std::string keep_platform(const DexAppsUsageControls& c) {
+    return c.platform.empty() ? std::string(kDexAppsScopeAll) : c.platform;
+}
+
+
 } // namespace
 
 std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
-                                     const std::string& platform) {
+                                     const std::string& platform, DexAppsUsageEntry usage) {
     const std::string window = dex_window_token(window_days);
     const std::string scope = dex_normalize_apps_scope(platform);
     // An unrecognised platform is an error even when the caller handed in a healthy model.
@@ -569,6 +1030,17 @@ std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
     if (!failed)
         h += captions(model, scope, window);
     h += "</div></div>";
+    // The View chips (and, for a caller who may not read usage, one line of words) ride with the
+    // filters, so they also appear on the degraded and error path. Hidden emits nothing.
+    if (usage != DexAppsUsageEntry::Hidden) {
+        h += view_chips(window, scope.empty() ? std::string(kDexAppsScopeAll) : scope, false);
+        if (usage == DexAppsUsageEntry::Refused)
+            h += "<div class=\"gp-note\">Usage is not shown: it needs the Forensics read permission, which this "
+                 "account does not hold. Nothing else on this page is affected.</div>";
+        else if (usage == DexAppsUsageEntry::GateUnavailable)
+            h += "<div class=\"gp-note\">Usage is not shown: the permission check could not be completed. Try "
+                 "again in a moment. Nothing else on this page is affected.</div>";
+    }
     h += filters(window, scope);
 
     if (failed)
@@ -590,6 +1062,42 @@ std::string render_dex_apps_fragment(const DexAppsModel& model, int window_days,
         h += app_body(a, model, window);
     h += "</table></div>";
     h += notes(model, scope);
+    return h + "</div>";
+}
+
+std::string render_dex_apps_usage_fragment(const DexAppsUsageControls& controls,
+                                           const DexAppsUsageModel& model) {
+    const std::string window = dex_window_token(controls.window_days);
+    const std::string keep = keep_platform(controls);
+    std::string h = usage_head(controls, window, keep, usage_captions(controls, model, window));
+
+    if (model.apps.empty()) {
+        const bool all = controls.platform.empty() || controls.platform == kDexAppsScopeAll;
+        h += placeholder("No applications to show usage for",
+                         std::string("Usage is listed for the applications on the Stability view, and no application "
+                                     "crashed or hung") +
+                             (all ? std::string() : " on " + std::string(scope_label(controls.platform)) + " devices") +
+                             " in this window. An application that only ran is not listed.");
+        return h + "</div>";
+    }
+
+    h += "<div class=\"dx-tw\"><table class=\"gp-table dx-apps dx-usage\">";
+    h += kUsageThead;
+    // ponytail: every cell row is pre-rendered (up to 100 applications x 52 cells) so one page view
+    // is one read; the upgrade path is a lazy per-application cells resource, API first.
+    for (const auto& a : model.apps)
+        h += usage_app_body(controls, a, model, window);
+    h += "</table></div>";
+    h += usage_notes();
+    return h + "</div>";
+}
+
+std::string render_dex_apps_usage_refusal(const DexAppsUsageControls& controls, std::string_view reason,
+                                          std::string_view detail) {
+    const std::string window = dex_window_token(controls.window_days);
+    // The chrome and the controls only: nothing on a refusal is derived from a model.
+    std::string h = usage_head(controls, window, keep_platform(controls), std::string());
+    h += usage_refusal_panel(std::string(reason), std::string(detail));
     return h + "</div>";
 }
 

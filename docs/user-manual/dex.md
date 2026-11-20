@@ -194,6 +194,21 @@ decomposition (the share and rate count only affected devices that are online no
 (`GET /api/v1/dex/perf/app`) is separate from the per-version figures this tab shows: see
 "Fleet-wide application performance" under Drill-downs.
 
+**Usage view.** A **View** row above the platform chips switches between **Stability** and **Usage**. **Usage**
+shows, per application, the devices that ran it, its run time (process-hours) and launches over the last 30 days,
+and its crashes and hangs **per hour of use**, printed as `GET /api/v1/dex/apps/usage` returns them and marked
+*estimated from 30-day usage*. Every device count reads "of R reporting", where R is the devices that reported
+usage in the last 48 hours. Slice chips (**Whole fleet**, **By platform**, **By tag**), a tag key box (default
+`model`) and a management group list split each application into cells that open under its row. Withheld figures
+read in words: below the reporting floor (the count only), no usage, an ambiguous name (Linux keeps only the first
+15 bytes of a process name), and one sentence for each reason a rate is not calculated. The page always reads at
+the default floor of 1; an unknown window reads as 7d. It needs `Forensics:Read` as well as `GuaranteedState:Read`
+(administrators only while RBAC is off). Without `Forensics:Read` the **Usage** chip shows the Stability page and
+the line "Usage is not shown: it needs the Forensics read permission, which this account does not hold", and the
+permission gate records the refusal. Each Usage view is audited as `dex.apps.usage.view` before it is read, and if
+that row cannot be stored the page says so and reads nothing. Details:
+[app usage](../dex/app-usage.md#using-it-in-the-dashboard-the-apps-tab-usage-view).
+
 ### Scoring
 
 The **Scoring** tab (`/fragments/dex/scoring`) shows the score policy in force and lets an
@@ -657,7 +672,7 @@ does (agentic-first parity):
   launches over a 30-day basis and its crashes and hangs per hour of use, marked as estimated. It
   needs `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off) and
   is audited fail-closed as `dex.apps.usage.view` once its parameters validate. The device floor applies per table only. No
-  agent ids appear. It is REST only for now: there is no MCP tool and no dashboard view yet. See
+  agent ids appear. The Apps tab shows it as the [Usage view](#apps); there is no MCP tool yet. See
   [app usage](../dex/app-usage.md#fleet-usage-per-application).
 - **`GET /api/v1/dex/catalogue?os=&window=`**, the Catalogue family cards, fleet
   coverage and the uncatalogued list, and **`GET /api/v1/dex/catalogue/group?name=&os=&window=`**,
