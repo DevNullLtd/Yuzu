@@ -45,6 +45,20 @@ using Bytes = std::vector<std::uint8_t>;
 
 namespace {
 
+/// A ByteSource over caller-owned memory. The span must outlive the source.
+ByteSource memory_source(std::span<const std::uint8_t> bytes) {
+    ByteSource s;
+    s.size = bytes.size();
+    s.read_at = [bytes](std::uint64_t off, std::span<std::uint8_t> out) {
+        if (off > bytes.size() || out.size() > bytes.size() - off)
+            return false;
+        if (!out.empty())
+            std::memcpy(out.data(), bytes.data() + off, out.size());
+        return true;
+    };
+    return s;
+}
+
 fs::path pkgdb_fixture(std::string_view capture, std::string_view file) {
     return fs::path{YUZU_TEST_FIXTURE_DIR} / "software-estate" / "pkgdb" / capture / file;
 }

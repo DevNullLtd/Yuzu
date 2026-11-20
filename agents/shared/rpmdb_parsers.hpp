@@ -65,21 +65,6 @@ struct ByteSource {
     std::function<bool(std::uint64_t off, std::span<std::uint8_t> out)> read_at;
 };
 
-/// A ByteSource over caller-owned memory (tests, and a blob already read). The
-/// span must outlive the source.
-[[nodiscard]] inline ByteSource memory_source(std::span<const std::uint8_t> bytes) {
-    ByteSource s;
-    s.size = bytes.size();
-    s.read_at = [bytes](std::uint64_t off, std::span<std::uint8_t> out) {
-        if (off > bytes.size() || out.size() > bytes.size() - off)
-            return false;
-        if (!out.empty())
-            std::memcpy(out.data(), bytes.data() + off, out.size());
-        return true;
-    };
-    return s;
-}
-
 namespace rpmdb_detail {
 
 /// The single integer-load helper of this header (byte order explicit). Callers
@@ -140,7 +125,6 @@ inline constexpr std::uint32_t kBin = 7;
 class RpmHeader {
 public:
     static constexpr std::uint32_t kMaxIndexEntries = 65535;
-    static constexpr std::uint32_t kMaxDataBytes = 256u * 1024u * 1024u;
 
     /// Borrows `blob`; it must outlive the header.
     [[nodiscard]] static std::expected<RpmHeader, PkgDbCause>
@@ -151,7 +135,7 @@ public:
         const std::uint32_t dl = rpmdb_detail::load_u32(blob, 4, true);
         if (il < 1 || il > kMaxIndexEntries)
             return std::unexpected(PkgDbCause::corrupt);
-        if (dl > kMaxDataBytes)
+        if (dl > kPkgDbMaxItemBytes)
             return std::unexpected(PkgDbCause::oversized);
         // 64-bit: 8 + 16 * 65535 + 256 MiB cannot overflow it, and a 32-bit sum could wrap.
         const std::uint64_t expect = 8ull + 16ull * il + dl;

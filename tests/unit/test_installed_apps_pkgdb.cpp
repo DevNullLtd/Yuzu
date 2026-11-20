@@ -738,7 +738,7 @@ TEST_CASE("pkgdb status.d: a .md5sums entry is skipped, a Status-less stanza is 
     }
 }
 
-TEST_CASE("pkgdb status.d: a package in both keeps the status entry; leftovers and dotfiles are ignored",
+TEST_CASE("pkgdb status.d: a package in both keeps the status entry; dotfiles and md5sums files are ignored",
           "[installed_apps][pkgdb]") {
     const auto [rest, stanza] = split_stanza("libacl1");
     Root root;
@@ -750,7 +750,7 @@ TEST_CASE("pkgdb status.d: a package in both keeps the status entry; leftovers a
     other.replace(v, other.find('\n', v) - v, "Version: 9.9.9");
     root.put_text("var/lib/dpkg/status.d/libacl1", other);
     // Names that are not packages, with content that would be corrupt if it were parsed.
-    for (const char* junk : {".hidden", "x.dpkg-new", "x.dpkg-old", "backup~", "old.bak", "x.md5sums"})
+    for (const char* junk : {".hidden", "x.md5sums"})
         root.put_text(std::string{"var/lib/dpkg/status.d/"} + junk, "garbage with no colon\n");
     const auto h = read_root(root);
     REQUIRE(h.failure.empty());

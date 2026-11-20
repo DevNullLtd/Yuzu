@@ -193,17 +193,6 @@ struct Stamp {
     return s;
 }
 
-[[nodiscard]] inline PkgDbBudget make_budget(std::size_t rows, std::uint64_t bytes,
-                                             std::uint64_t item_cap,
-                                             const std::function<bool()>& expired) {
-    PkgDbBudget b;
-    b.rows_left = rows;
-    b.bytes_left = bytes;
-    b.max_item_bytes = item_cap;
-    b.expired = expired;
-    return b;
-}
-
 // ── dpkg ────────────────────────────────────────────────────────────────────
 
 struct DpkgRead {
@@ -211,14 +200,10 @@ struct DpkgRead {
     std::string failure;
 };
 
-/// Names in status.d that are not packages: hidden files, the `<package>.md5sums` file image
-/// builders write beside each package's control file, dpkg's own leftovers and editor backups.
+/// Names in status.d that are not packages: hidden files and the `<package>.md5sums` file image
+/// builders write beside each package's control file.
 [[nodiscard]] inline bool status_d_skips(std::string_view name) noexcept {
-    const auto ends = [name](std::string_view suffix) {
-        return name.size() >= suffix.size() && name.substr(name.size() - suffix.size()) == suffix;
-    };
-    return name.empty() || name.front() == '.' || ends(".md5sums") || ends(".dpkg-new") ||
-           ends(".dpkg-old") || ends("~") || ends(".bak");
+    return name.empty() || name.front() == '.' || name.ends_with(".md5sums");
 }
 
 /// status.d: a directory of single-stanza control files (the layout minimal images with no shell
@@ -293,7 +278,10 @@ struct DpkgRead {
                                         const std::function<bool()>& expired) {
     constexpr std::string_view kSource = "dpkg_status";
     DpkgRead out;
-    PkgDbBudget budget = make_budget(lim.max_packages, lim.dpkg_max_bytes, lim.dpkg_max_bytes, expired);
+    PkgDbBudget budget{.rows_left = lim.max_packages,
+                       .bytes_left = lim.dpkg_max_bytes,
+                       .max_item_bytes = lim.dpkg_max_bytes,
+                       .expired = expired};
 
     auto file = yuzu::shared::read_file_no_follow(join(root, "var/lib/dpkg/status"), lim.dpkg_max_bytes);
     if (file.ok()) {
@@ -481,12 +469,17 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         return out;
     }
 
+    using BlobReader = yuzu::shared::PkgDbVoid (*)(const yuzu::shared::ByteSource&, PkgDbBudget&,
+                                                   const yuzu::shared::RpmBlobFn&);
     struct Candidate {
         const char* file;
         const char* source;
+        BlobReader read_blobs; ///< null for sqlite, which needs a connection rather than a byte source
     };
     static constexpr Candidate kCandidates[] = {
-        {"rpmdb.sqlite", "rpm_sqlite"}, {"Packages.db", "rpm_ndb"}, {"Packages", "rpm_bdb"}};
+        {"rpmdb.sqlite", "rpm_sqlite", nullptr},
+        {"Packages.db", "rpm_ndb", &yuzu::shared::read_rpm_ndb},
+        {"Packages", "rpm_bdb", &yuzu::shared::read_rpm_bdb}};
 
     for (const auto& c : kCandidates) {
         auto file = yuzu::shared::open_file_no_follow_at(dir.dir.fd(), c.file);
@@ -499,20 +492,19 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         }
         const int fd = file.file.fd();
         const auto before = stamp_of(fd);
-        PkgDbBudget budget = make_budget(lim.max_packages, lim.rpm_max_total_bytes,
-                                         lim.rpm_max_header_bytes, expired);
+        PkgDbBudget budget{.rows_left = lim.max_packages,
+                           .bytes_left = lim.rpm_max_total_bytes,
+                           .max_item_bytes = lim.rpm_max_header_bytes,
+                           .expired = expired};
         std::expected<std::vector<RpmPackage>, PkgDbCause> result;
-        if (std::string_view{c.source} == "rpm_sqlite") {
+        if (!c.read_blobs) {
             result = read_rpm_sqlite(join(dir_path, c.file), dir.dir.fd(), c.file, fd, lim, budget);
         } else {
             std::vector<RpmPackage> packages;
-            const auto src = fd_source(fd, file.size);
-            const auto on_blob = [&packages](std::span<const std::uint8_t> blob) {
-                return collect_header(blob, packages);
-            };
-            const auto r = std::string_view{c.source} == "rpm_ndb"
-                               ? yuzu::shared::read_rpm_ndb(src, budget, on_blob)
-                               : yuzu::shared::read_rpm_bdb(src, budget, on_blob);
+            const auto r = c.read_blobs(fd_source(fd, file.size), budget,
+                                        [&packages](std::span<const std::uint8_t> blob) {
+                                            return collect_header(blob, packages);
+                                        });
             if (r)
                 result = std::move(packages);
             else

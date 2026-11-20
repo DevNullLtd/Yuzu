@@ -4,7 +4,7 @@
 ##
 ## Sources by platform:
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
-##   Linux:   dpkg-query, rpm, or pacman (auto-detected)
+##   Linux:   dpkg status and rpm database (read in-process), pacman or apk (their tools)
 ##   macOS:   system_profiler SPApplicationsDataType
 ##
 ## The `list` action carries six columns: name, version, publisher,
