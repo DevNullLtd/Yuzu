@@ -342,40 +342,38 @@ static_assert(noexcept(std::declval<yuzu::server::detail::UnprovenAuditBudget&>(
 
 TEST_CASE("budget: a re-queue that must allocate a deque node (a node boundary) counts the chunk's ids",
           "[reregistration_gate][wp01][audit_budget][alloc]") {
-    std::size_t fired_unconditional = 0, fired_conditional = 0;
-    // A node boundary recurs every (node bytes / sizeof(PendingRow)) rows: about 10 on libstdc++
-    // (512-byte nodes) and about 85 to 100 on libc++ (4096-byte nodes). The queue must hold more
-    // rows than that to pop up to a boundary, and 20000 distinct ids (the tracked-id cap) make about
-    // 100 rows of 200 ids; 200 offsets cover every boundary the queue can reach.
-    for (int pre = 0; pre < 200; ++pre)
-        for (int which = 0; which < 2; ++which) {
-            B b;
-            for (long i = 0; i < 20000; ++i)
-                (void)b.admit("i" + std::to_string(i), "s", 0);
-            (void)b.poll_closed(20000, true);
-            (void)b.take_ids_truncated();
-            for (int k = 0; k < pre; ++k)
-                (void)b.take_pending();
-            auto r = b.take_pending();
-            if (!r)
-                continue;
-            const std::size_t ids = r->ids;
-            r->attempts = 0;
+    // Container-independent: whether a push_front allocates depends on the standard library's node
+    // size and start offset (libstdc++ and libc++ differ), so this does not hunt for a boundary by
+    // popping. It hands one chunk back again and again, each time with the NEXT allocation armed to
+    // fail, until a push needs a new node (at most one node's worth of rows, on any library). The
+    // copies are made BEFORE arming so a string copy never consumes the injected failure.
+    for (int which = 0; which < 2; ++which) {
+        B b;
+        for (long i = 0; i < 400; ++i)
+            (void)b.admit("i" + std::to_string(i), "s", 0);
+        (void)b.poll_closed(20000, true);
+        (void)b.take_ids_truncated();
+        auto base = b.take_pending();
+        REQUIRE(base.has_value());
+        const std::size_t ids = base->ids;
+        REQUIRE(ids > 0);
+        bool fired = false;
+        for (int push = 0; push < 20000 && !fired; ++push) {
+            auto c = *base;
+            c.attempts = 0;
             g_countdown = 0; // the very next allocation fails
             if (which == 0)
-                b.requeue_front_unconditional(std::move(*r));
+                b.requeue_front_unconditional(std::move(c));
             else
-                (void)b.requeue_front(std::move(*r));
-            const bool fired = g_countdown < 0;
+                (void)b.requeue_front(std::move(c));
+            fired = g_countdown < 0;
             g_countdown = -1;
-            if (!fired)
-                continue; // spare room in the front node: nothing allocated
-            (which == 0 ? fired_unconditional : fired_conditional) += 1;
-            CHECK(b.take_ids_truncated() == ids);
-            CHECK(b.take_alloc_failed() == 1);
         }
-    CHECK(fired_unconditional > 0);
-    CHECK(fired_conditional > 0);
+        INFO("variant " << which);
+        REQUIRE(fired); // a node allocation was reached and failed
+        CHECK(b.take_ids_truncated() == ids);
+        CHECK(b.take_alloc_failed() == 1);
+    }
 }
 
 // ---- three windows, flush rounds under fault: ids are conserved ---------------------------------
