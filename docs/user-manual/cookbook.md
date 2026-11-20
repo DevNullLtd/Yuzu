@@ -948,7 +948,7 @@ Every plugin and action at a glance. Use Part 1 walkthroughs for detailed exampl
 | `crossplatform.process.query` | query | Q | WLM | name:string (req) | found:bool, pid:int64, name:string |
 | `crossplatform.service.list` | list | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
 | `crossplatform.service.running` | running | Q | WLM | *(none)* | name:string, display_name:string, status:string, startup_type:string |
-| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string |
+| `crossplatform.service.set_start_mode` | set_start_mode | A | WLM | name:string (req), mode:enum (req) | status:string, service:string, mode:string (Linux also writes state:string, and note:string for static, indirect, alias or generated units) |
 
 ### User & Session
 
