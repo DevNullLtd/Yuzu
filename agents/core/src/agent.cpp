@@ -818,8 +818,9 @@ public:
                           "counter");
         metrics_.counter("yuzu_agent_commands_refused_nul_params_total");
         metrics_.describe("yuzu_agent_commands_rejected_closing_total",
-                          "Commands answered REJECTED without running because the command pool was "
-                          "closing for a reconnect or the agent was stopping (claim released)",
+                          "Ordinary commands answered REJECTED without running because the command pool "
+                          "was closing for a reconnect or the agent was stopping (claim released); "
+                          "a protective action is never counted",
                           "counter");
         metrics_.counter("yuzu_agent_commands_rejected_closing_total");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
