@@ -5095,7 +5095,7 @@ TEST_CASE("WP01 CH-2b: agent id variants are distinct identities and never inher
     wp01::enroll(h, "Victim-Agent");
     const std::vector<std::string> variants = {
         "victim-agent", "VICTIM-AGENT", "Victim-Agent ", " Victim-Agent", "Victim-Agent\t",
-        "Victim\xE2\x80\x90Agent", // U+2010 hyphen lookalike
+        "Victim\xE2\x80\x90" "Agent", // U+2010 hyphen lookalike
         "Victim-Agent\xE2\x80\x8B", // trailing zero-width space
         "Vict\xC3\xAFm-Agent"};       // i with diaeresis
     for (const auto& id : variants) {
