@@ -66,6 +66,14 @@ bool bind_upsert(TransactionHandle& h, const char* sql, std::span<const std::str
     return ok;
 }
 
+// One line per errored->true recovery, whichever arm of apply_source_enabled_transition
+// committed it (#1624). Worded for every source: only some of them keep a stored baseline.
+void log_errored_recovery(std::string_view source) {
+    spdlog::warn("Echo: source '{}' recovered from an errored enable flag; collection restarts "
+                 "from a fresh baseline",
+                 source);
+}
+
 } // namespace
 
 bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
@@ -111,6 +119,8 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
             return true; // idempotent re-assert -- nothing to invalidate
         if (!yuzu::echo::usage::usage_set_enabled(db, new_value == "true", now_epoch))
             return false;
+        if (new_value == "true" && prev_canon == "errored")
+            log_errored_recovery(source);
         if (new_value == "true") {
             // Boot, configure (here), and every fast tick all call this SAME
             // function -- see echo_usage.hpp. Best-effort: run_usage_fold()
@@ -181,9 +191,7 @@ bool apply_source_enabled_transition(EchoDatabase& db, std::string_view source,
             return {};
         });
     if (result.has_value() && errored_recovery)
-        spdlog::warn("Echo: source '{}' recovered from an errored enable flag; its snapshot "
-                     "baseline was cleared and collection restarts from a fresh baseline",
-                     source);
+        log_errored_recovery(source);
     return result.has_value();
 }
 
