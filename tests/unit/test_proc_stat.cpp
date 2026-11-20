@@ -11,8 +11,12 @@
 #include <unistd.h>
 #endif
 
+using yuzu::shared::classify_pid;
+using yuzu::shared::is_sha256_digest;
 using yuzu::shared::parse_stat_start_ticks;
+using yuzu::shared::PidState;
 using yuzu::shared::same_process;
+using yuzu::shared::settle_row_for;
 
 TEST_CASE("parse_stat_start_ticks: field 22, command names with spaces and parentheses",
           "[proc_stat][processes]") {
@@ -33,6 +37,48 @@ TEST_CASE("same_process: only an equal, known start time keeps a row", "[proc_st
     CHECK_FALSE(same_process(std::nullopt, 100u));
     CHECK_FALSE(same_process(100u, std::nullopt));
     CHECK_FALSE(same_process(std::nullopt, std::nullopt)); // unknown fails closed
+}
+
+TEST_CASE("parse_stat_start_ticks: a start time above 2^64 - 1 is refused, never wrapped",
+          "[proc_stat][processes]") {
+    auto line = [](const std::string& ticks) {
+        return "1 (x) S 0 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 " + ticks + " 1 1";
+    };
+    CHECK(parse_stat_start_ticks(line("18446744073709551615")) == 18446744073709551615ull); // 2^64 - 1
+    CHECK_FALSE(parse_stat_start_ticks(line("18446744073709551616")).has_value());          // 2^64 would wrap to 0
+    CHECK_FALSE(parse_stat_start_ticks(line("36893488147419103232")).has_value());          // 2^65
+    CHECK_FALSE(parse_stat_start_ticks(line("000000000000000000001")).has_value());          // 21 digits
+}
+
+TEST_CASE("classify_pid: same, recycled, or exited", "[proc_stat][processes]") {
+    CHECK(classify_pid(5u, 5u) == PidState::Same);
+    CHECK(classify_pid(5u, 6u) == PidState::Reused);
+    CHECK(classify_pid(std::nullopt, 6u) == PidState::Reused); // the first reading is unknown: unverifiable
+    CHECK(classify_pid(5u, std::nullopt) == PidState::Exited);
+    CHECK(classify_pid(std::nullopt, std::nullopt) == PidState::Exited);
+}
+
+TEST_CASE("settle_row_for: only a real digest is converted, a marker keeps its own reading",
+          "[proc_stat][processes]") {
+    const std::string digest(64, 'a');
+    CHECK_FALSE(settle_row_for(PidState::Same, digest).drop_path);
+    CHECK(settle_row_for(PidState::Same, digest).hash_cause.empty());
+
+    const auto reused = settle_row_for(PidState::Reused, digest);
+    CHECK(reused.drop_path);
+    CHECK(reused.hash_cause == "pid_reused");
+    const auto exited = settle_row_for(PidState::Exited, digest);
+    CHECK(exited.drop_path);
+    CHECK(exited.hash_cause == "pid_exited"); // a process that legitimately exited is its own token
+
+    for (const char* marker : {"hash_unavailable:timeout", "hash_unavailable:skipped", ""}) {
+        const auto r = settle_row_for(PidState::Reused, marker);
+        CHECK(r.drop_path);              // the path may be another process's: always dropped
+        CHECK(r.hash_cause.empty());     // but the existing marker is never overwritten
+    }
+    CHECK_FALSE(is_sha256_digest(std::string(63, 'a')));
+    CHECK_FALSE(is_sha256_digest(std::string(64, 'A'))); // lowercase hex only
+    CHECK_FALSE(is_sha256_digest(std::string(64, 'g')));
 }
 
 #if defined(__linux__)

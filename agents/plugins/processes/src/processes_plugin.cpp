@@ -55,7 +55,6 @@
 #ifdef __linux__
 #include <dirent.h>
 #include <fcntl.h>    // open (O_NONBLOCK on the exe link)
-#include <yuzu/agent/scoped_fd.hpp> // yuzu::agent::ScopedFd
 #include <fstream>
 #include <sys/stat.h> // fstat (identity key)
 #include <unistd.h>   // readlink, close
@@ -152,6 +151,9 @@ std::vector<ProcessInfo> enumerate_processes() {
 
         ProcessInfo pi;
         pi.pid = std::stoul(entry->d_name);
+        // The start time is read BEFORE and AFTER the name read: a pid recycled in between would
+        // otherwise pair one process's name with another's start time.
+        const auto ticks_before = read_start_ticks(pi.pid);
         std::string line;
         bool have_name = false, have_ppid = false;
         while (std::getline(ifs, line)) {
@@ -170,7 +172,10 @@ std::vector<ProcessInfo> enumerate_processes() {
             if (have_name && have_ppid)
                 break; // PPid follows Name in /proc/<pid>/status — both captured
         }
-        pi.start_ticks = read_start_ticks(pi.pid);
+        const auto ticks_after = read_start_ticks(pi.pid);
+        if (ticks_before && ticks_after && *ticks_before != *ticks_after)
+            continue; // recycled while its name was read: the row would be a mixed identity
+        pi.start_ticks = ticks_before;
         procs.push_back(std::move(pi));
     }
     closedir(proc_dir);
@@ -514,20 +519,24 @@ private:
     // on-disk image + its resolved path on each node (so the tree is the single
     // process view — no separate flat hashed list). ppid is 0 for a root / unresolved
     // parent; sha256/path are empty when the path can't be resolved or the image is
-    // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
+    // gone/too large. Hashing mirrors do_list_hashed (per-action cache, bounded read).
     // The name, the path and the hash of one row are three separate reads of a pid that can be
-    // recycled in between. A row is kept only when the process start time at enumeration equals the one
-    // seen after the hash; otherwise the path is dropped and the hash reads `hash_unavailable:pid_reused`
-    // (never another process's image hash under this process's name). Linux only: elsewhere unchanged.
+    // recycled in between. A row is kept only when the process start time read before the name and
+    // the one read after the hash agree. On a mismatch the path is dropped and a real digest reads
+    // `hash_unavailable:pid_reused` (the pid now belongs to another process) or
+    // `hash_unavailable:pid_exited` (its stat is no longer readable); an existing `timeout`/`skipped`
+    // marker or empty hash is left as it was. Linux only: Windows and macOS have no such guard.
     static void settle_row([[maybe_unused]] const ProcessInfo& p, [[maybe_unused]] std::string& path,
                            [[maybe_unused]] std::string& hash) {
 #if defined(__linux__)
         if (path.empty())
             return;
-        if (!yuzu::shared::same_process(p.start_ticks, read_start_ticks(p.pid))) {
+        const auto settle = yuzu::shared::settle_row_for(
+            yuzu::shared::classify_pid(p.start_ticks, read_start_ticks(p.pid)), hash);
+        if (settle.drop_path)
             path.clear();
-            hash = yuzu::shared::hash_unavailable("pid_reused");
-        }
+        if (!settle.hash_cause.empty())
+            hash = yuzu::shared::hash_unavailable(settle.hash_cause);
 #endif
     }
 
