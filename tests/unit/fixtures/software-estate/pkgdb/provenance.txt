@@ -45,11 +45,13 @@ dpkg status.d fixture (debian12-statusd): a REAL status.d from a minimal Debian 
   Captured 2026-11-20 on braga (Docker 29.7.2) from a minimal Debian 12 image that has no shell and no
   package manager. It is not one of the S-7 captures. Platform manifest digest (linux/arm64):
   sha256:b6d8cd9eeccef7a63b91771ba943056f484c0dc92396ec3140a5fe2c6279d581
-  The image is deliberately not named here; the digest is its identity.
-  Commands (<image> is that image; the container is never started, `/nonexistent` only satisfies
-  `docker create` for an image with no default command):
-    docker pull --platform linux/arm64 <image>
-    docker create --platform linux/arm64 <image> /nonexistent       -> prints the container id
+  Image as pulled: gcr.io/distroless/static-debian12:latest (index digest
+  sha256:d75cdd72874d4790092fcb1b058493ecf6bb5bf2b2b897045b00ff01d91843f2; the platform manifest
+  above is its linux/arm64 entry).
+  Commands (the container is never started, `/nonexistent` only satisfies `docker create` for an
+  image with no default command):
+    docker pull --platform linux/arm64 gcr.io/distroless/static-debian12:latest
+    docker create --platform linux/arm64 gcr.io/distroless/static-debian12:latest /nonexistent   -> prints the container id
     docker cp <container id>:/var/lib/dpkg/status.d <scratch>/status.d
     docker rm <container id>
   The image has no /var/lib/dpkg/status and no dpkg-query, so there is no old-path output: this
