@@ -353,10 +353,14 @@ cadences.
   `/var/lib/dpkg/status.d/` directory minimal images use) and the rpm database
   (sqlite, ndb or Berkeley DB, whichever the host uses) itself, read-only and
   without following symlinks, within 20 seconds, 50,000 packages and fixed byte
-  limits. The rows, and therefore the section hash, are byte-for-byte what the
+  limits (32 MiB of dpkg text in total, 32 MiB per rpm header, 1 GiB of rpm headers). The rows, and therefore the section hash, are byte-for-byte what the
   tools produced on every host measured, so a fleet upgrade resends nothing. The
-  one visible difference is a host whose packages live only in `status.d`
-  (minimal images with no shell): its packages now appear, as new install rows. When
+  visible differences are two, both about `status.d`: a host whose packages live
+  only there (minimal images with no shell) now reports them, as new install rows;
+  and a host with a healthy status file and one unparseable regular file in
+  `status.d` is degraded (`dpkg_status_d:corrupt`, no rows, the server keeps its
+  stored ones) where `dpkg-query` ignored the directory. Remove that file or give
+  it a leading dot, which is skipped. When
   the read fails, the collection is degraded exactly as above, with no rows and
   a named reason in the agent log, the `list`/`query` error row and the result's
   provenance (`installed_apps:<source>:<cause>`): `locked` (the package manager

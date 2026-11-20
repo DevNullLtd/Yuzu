@@ -10,7 +10,12 @@
  * popen()/command_exists()) for pacman/system_profiler, and, on Linux, the
  * in-process dpkg status / rpm database read (SAM-45; no dpkg-query or rpm
  * process runs any more -- the readers themselves are pinned over real
- * captures in test_installed_apps_pkgdb.cpp).
+ * captures in test_installed_apps_pkgdb.cpp). The rows on the Linux leg are
+ * the same under the old and the new acquisition (parity is the design), so
+ * no assertion here can tell them apart; that the Linux actions stopped
+ * running dpkg-query and rpm, and the lifecycle of the bounded read, are pinned
+ * by tests/test_installed_apps_pkgdb_wiring_lexical.py (a lexical gate: the
+ * Linux block is `#ifdef __linux__` and a unit test never spawns the tool).
  *
  * `list` is the fast, local, always-available action (no params; on macOS one
  * bounded in-process CFBundle pass for all listed apps for bundle_id, inside the noise

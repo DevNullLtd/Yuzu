@@ -122,9 +122,18 @@ Which test cases edit a real input (each says "edited" in its case name or comme
                                  libacl1 stanza is cut out of status and written to status.d/libacl1
                                  (a stanza that HAS a Status, unlike the real status.d capture) and
                                  a second copy of it carries another Version; one real status.d
-                                 control file gets an invalid Status line appended; other hostile inputs
-                                 (not sqlite, no Packages table, a TEXT blob, a symlink, a directory,
-                                 an oversized file, too many files) are built from scratch.
+                                 control file gets an invalid Status line appended; the Maintainer of
+                                 the real debian12 libacl1 stanza is replaced by a value holding a pipe
+                                 and a tab; the real fedora41 libssh-config header blob is edited in
+                                 memory (the first three bytes of VENDOR or PACKAGER become a pipe, a
+                                 tab and a newline; the VENDOR, PACKAGER or RELEASE index entry is
+                                 renumbered to an unused tag) and written into a one-package sqlite
+                                 database; copies of the real ndb, bdb and sqlite files get one byte
+                                 appended or their mtime moved, from inside the read, and a copy of the
+                                 real rpmdb.sqlite (WAL, or switched to the rollback journal) is
+                                 written to by a second connection while it is being read; other
+                                 hostile inputs (not sqlite, no Packages table, a TEXT blob, a symlink,
+                                 a directory, an oversized file, too many files) are built from scratch.
   SYNTHETIC inputs (hand-built, not taken from any capture): the tm with a single-digit day of month
   in the date-formatter case (test_rpmdb_parsers.cpp), for the space-padded %e; the hostile dpkg
   strings in test_dpkg_status_parsers.cpp (NUL byte, missing colon, duplicate field, wrong Status

@@ -18,10 +18,13 @@
  *              status is "not dpkg"; an empty one (no installed package) falls through,
  *              so an rpm host that carries a stale dpkg tree is still read as rpm.
  *   2. rpm     the first of usr/lib/sysimage/rpm, var/lib/rpm, usr/share/rpm that is a
- *              real directory (a symlinked one is skipped: on current Fedora, RHEL and SUSE
+ *              real directory (a symlinked one is never followed: on current Fedora, RHEL and SUSE
  *              /var/lib/rpm links to the sysimage copy, which is tried first), and in it the
  *              first of rpmdb.sqlite, Packages.db, Packages that exists. A lone data.mdb
- *              (an LMDB rpmdb) is unsupported_format, not "no rpm".
+ *              (an LMDB rpmdb) is unsupported_format, not "no rpm". A skipped symlink that has a
+ *              database file behind it (a stat, nothing opened) is rpmdb:symlink_refused when no
+ *              other candidate directory yields a database: a database that exists but may not be
+ *              read is never an empty list.
  *   3. nothing the plugin's pacman and apk legs run as before (ecosystem none).
  *
  * Every failure is a "<source>:<cause>" token (HostPackages::failure) and returns NO packages:
@@ -70,6 +73,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
+#include <bounded_wait.hpp>
 #include <dpkg_status_parsers.hpp>
 #include <pkgdb_budget.hpp>
 #include <posix_secure_read.hpp>
@@ -82,14 +86,16 @@ using yuzu::shared::PkgDbBudget;
 using yuzu::shared::PkgDbCause;
 using yuzu::shared::RpmPackage;
 
-/// What one read may spend. The wall clock is applied by the caller (the plugin wraps the call in
-/// bounded_call_ex with this duration and passes the same deadline as `expired`).
+/// What one read may spend. The wall clock is applied by read_host_packages_bounded (one
+/// bounded_call_ex with this duration; the same deadline is the readers' `expired`).
 struct Limits {
     std::size_t max_packages = 50000;
-    std::uint64_t dpkg_max_bytes = 32ull * 1024 * 1024;       ///< one dpkg text file
+    /// 32 MiB of dpkg text IN TOTAL: the status file and every status.d file share one budget. A
+    /// single file over it is `oversized`; files that each fit but sum over it are `byte_cap`.
+    std::uint64_t dpkg_max_bytes = 32ull * 1024 * 1024;
     std::uint64_t rpm_max_header_bytes = 32ull * 1024 * 1024; ///< one rpm header blob
     std::uint64_t rpm_max_total_bytes = 1ull << 30;           ///< all rpm headers of one read
-    std::chrono::seconds wall{20};
+    std::chrono::milliseconds wall{20000};                    ///< milliseconds so a test can use a short wall
     int sqlite_busy_ms = 2000;
 };
 
@@ -100,7 +106,7 @@ struct HostPackages {
     Ecosystem ecosystem = Ecosystem::none;
     std::vector<DpkgPackage> dpkg;
     std::vector<RpmPackage> rpm;
-    std::string failure; ///< "<source>:<cause>", source in dpkg_status, dpkg_status_d, rpm_sqlite, rpm_ndb, rpm_bdb, rpmdb
+    std::string failure; ///< "<source>:<cause>", source in dpkg_status, dpkg_status_d, rpm_sqlite, rpm_ndb, rpm_bdb, rpmdb, pkgdb
 };
 
 namespace detail {
@@ -133,14 +139,6 @@ namespace detail {
     return base;
 }
 
-[[nodiscard]] inline struct timespec ctime_of(const struct stat& st) noexcept {
-#if defined(__APPLE__)
-    return st.st_ctimespec;
-#else
-    return st.st_ctim;
-#endif
-}
-
 /// What identifies the opened file's state: taken from the descriptor before the first read and
 /// again after the last. ctime moves on every write(2) and an unprivileged writer cannot restore
 /// it, so a same-size, mtime-restoring in-place write still changes the stamp.
@@ -160,7 +158,7 @@ struct Stamp {
     if (::fstat(fd, &st) != 0)
         return std::nullopt;
     const struct timespec m = yuzu::shared::mtime_of(st);
-    const struct timespec c = ctime_of(st);
+    const struct timespec c = yuzu::shared::ctime_of(st);
     return Stamp{static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino),
                  static_cast<std::int64_t>(st.st_size), static_cast<std::int64_t>(m.tv_sec),
                  static_cast<std::int64_t>(m.tv_nsec), static_cast<std::int64_t>(c.tv_sec),
@@ -303,6 +301,9 @@ struct DpkgRead {
 
     auto status_d = read_dpkg_status_d(root, lim, budget);
     if (!status_d.failure.empty()) {
+        // Deliberate: the status packages parsed above are discarded. Answering with them alone would
+        // publish a roster without the status.d-only packages as the host's complete one (the server
+        // would record those as removed); no partial result is the readers' contract (pkgdb_budget.hpp).
         out.packages.clear();
         out.failure = std::move(status_d.failure);
         return out;
@@ -315,21 +316,18 @@ struct DpkgRead {
 
 struct RpmRead {
     bool found = false; ///< a database file (or an unsupported marker) exists in this directory
+    bool symlinked_db = false; ///< this candidate is a symlink with a database file behind it (never followed)
     std::vector<RpmPackage> packages;
     std::string failure;
 };
 
 /// One header blob -> one package, or the cause the whole read fails with.
-[[nodiscard]] inline yuzu::shared::PkgDbVoid collect_header(std::span<const std::uint8_t> blob,
-                                                            std::vector<RpmPackage>& out) {
+[[nodiscard]] inline std::expected<RpmPackage, PkgDbCause>
+collect_header(std::span<const std::uint8_t> blob) {
     auto header = yuzu::shared::RpmHeader::parse(blob);
     if (!header)
         return std::unexpected(header.error());
-    auto pkg = yuzu::shared::rpm_package_from_header(*header);
-    if (!pkg)
-        return std::unexpected(pkg.error());
-    out.push_back(std::move(*pkg));
-    return {};
+    return yuzu::shared::rpm_package_from_header(*header);
 }
 
 /// sqlite's URI for `path`: `%`, `?` and `#` are the only characters a URI path reads specially.
@@ -443,13 +441,25 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
             return std::unexpected(r.error());
         if (auto r = budget.charge_bytes(static_cast<std::uint64_t>(len)); !r)
             return std::unexpected(r.error());
-        if (auto r = collect_header(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data),
-                                                                   static_cast<std::size_t>(len)),
-                                    out);
-            !r)
-            return std::unexpected(r.error());
+        auto pkg = collect_header(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data),
+                                                                static_cast<std::size_t>(len)));
+        if (!pkg)
+            return std::unexpected(pkg.error());
+        out.push_back(std::move(*pkg));
     }
     return out;
+}
+
+/// True when `dir_path` is a symlink and a database file exists behind it. stat only: nothing is
+/// opened or read through the link.
+[[nodiscard]] inline bool symlink_hides_database(const std::string& dir_path) {
+    struct stat st {};
+    if (::lstat(dir_path.c_str(), &st) != 0 || !S_ISLNK(st.st_mode))
+        return false;
+    for (const char* name : {"rpmdb.sqlite", "Packages.db", "Packages", "data.mdb"})
+        if (::stat((dir_path + '/' + name).c_str(), &st) == 0)
+            return true;
+    return false;
 }
 
 /// Reads the rpm database in `rel_dir`, if there is one. `found == false` with no failure means this
@@ -460,10 +470,14 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
     const std::string dir_path = join(root, rel_dir);
     auto dir = yuzu::shared::open_dir_no_follow(dir_path);
     if (!dir.opened()) {
-        // Absent, or a symlink / non-directory (a symlinked var/lib/rpm is skipped on purpose): the next
-        // location. Anything else (a permission refusal) is a database we cannot show absent.
-        if (dir.err == ENOENT || dir.err == ENOTDIR || dir.err == ELOOP)
+        // Absent, or a symlink / non-directory (a symlinked var/lib/rpm is skipped on purpose, never
+        // followed): the next location. A symlink with a database behind it is remembered, so that when
+        // no other location yields one the answer is a refusal, not an empty list. Anything else (a
+        // permission refusal) is a database we cannot show absent.
+        if (dir.err == ENOENT || dir.err == ENOTDIR || dir.err == ELOOP) {
+            out.symlinked_db = symlink_hides_database(dir_path);
             return out;
+        }
         out.found = true;
         out.failure = failure_token("rpmdb", PkgDbCause::unreadable);
         return out;
@@ -501,10 +515,15 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
             result = read_rpm_sqlite(join(dir_path, c.file), dir.dir.fd(), c.file, fd, lim, budget);
         } else {
             std::vector<RpmPackage> packages;
-            const auto r = c.read_blobs(fd_source(fd, file.size), budget,
-                                        [&packages](std::span<const std::uint8_t> blob) {
-                                            return collect_header(blob, packages);
-                                        });
+            const auto r = c.read_blobs(
+                fd_source(fd, file.size), budget,
+                [&packages](std::span<const std::uint8_t> blob) -> yuzu::shared::PkgDbVoid {
+                    auto pkg = collect_header(blob);
+                    if (!pkg)
+                        return std::unexpected(pkg.error());
+                    packages.push_back(std::move(*pkg));
+                    return {};
+                });
             if (r)
                 result = std::move(packages);
             else
@@ -554,6 +573,7 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
 
     static constexpr std::string_view kRpmDirs[] = {"usr/lib/sysimage/rpm", "var/lib/rpm",
                                                     "usr/share/rpm"};
+    bool symlinked_db = false;
     for (const auto dir : kRpmDirs) {
         auto rpm = detail::read_rpm_dir(root, dir, lim, expired);
         if (!rpm.failure.empty()) {
@@ -565,8 +585,51 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
             out.rpm = std::move(rpm.packages);
             return out;
         }
+        symlinked_db = symlinked_db || rpm.symlinked_db;
     }
-    return out; // neither: the plugin's pacman and apk legs run
+    if (symlinked_db) // a database exists only behind a link this reader never follows
+        out.failure = detail::failure_token("rpmdb", PkgDbCause::symlink_refused);
+    return out; // otherwise neither: the plugin's pacman and apk legs run
+}
+
+/// The reader the bounded form runs; a test injects its own (the boundary, so no real wedged volume).
+using HostReader = std::function<HostPackages(const std::string&, const Limits&,
+                                              const std::function<bool()>&)>;
+
+/// read_host_packages under the wall clock: ONE bounded_call_ex of `lim.wall`, so a pread on a wedged
+/// volume cannot park the caller. The reader's `expired` is `stop` OR the same deadline, so an
+/// abandoned worker ends itself at its next poll. Every capture of the worker is by value (it may
+/// outlive this call). Failures: pkgdb:timeout (the wall passed, no rows), pkgdb:busy (the process-wide
+/// ceiling on abandoned workers refused the call; the reader never ran), pkgdb:unreadable (the reader
+/// threw: bounded_call_ex would otherwise leave the caller waiting out the whole wall and report it as
+/// a timeout, which points an operator at a slow disk).
+[[nodiscard]] inline HostPackages read_host_packages_bounded(const std::string& root, const Limits& lim,
+                                                             std::function<bool()> stop = {},
+                                                             HostReader reader = read_host_packages) {
+    const auto deadline = std::chrono::steady_clock::now() + lim.wall;
+    auto call = yuzu::shared::bounded_call_ex(
+        lim.wall, [root, lim, stop = std::move(stop), reader = std::move(reader), deadline]() -> HostPackages {
+            try {
+                return reader(root, lim, [&stop, deadline] {
+                    return (stop && stop()) || std::chrono::steady_clock::now() >= deadline;
+                });
+            } catch (...) {
+                HostPackages failed;
+                failed.failure = detail::failure_token("pkgdb", PkgDbCause::unreadable);
+                return failed;
+            }
+        });
+    HostPackages out;
+    switch (call.status) {
+    case yuzu::shared::BoundedCallStatus::Completed: return std::move(*call.value);
+    case yuzu::shared::BoundedCallStatus::TimedOut:
+        out.failure = detail::failure_token("pkgdb", PkgDbCause::timeout);
+        break;
+    case yuzu::shared::BoundedCallStatus::Rejected:
+        out.failure = detail::failure_token("pkgdb", PkgDbCause::busy);
+        break;
+    }
+    return out;
 }
 
 } // namespace yuzu::installed_apps::pkgdb

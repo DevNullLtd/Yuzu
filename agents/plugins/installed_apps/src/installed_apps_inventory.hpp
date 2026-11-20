@@ -206,7 +206,7 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
 // `installed`, whatever the want (install, hold, deinstall, purge) and the error flag
 // (ok, reinstreq ...): the OLD rule, kept, so a held package is present and scannable while "rc"
 // (removed, config-files) and "un" are not. Matches vuln_identity.hpp::parse_dpkg_line (PR #1804).
-inline std::optional<InvRecord> inv_record_from_dpkg(const yuzu::shared::DpkgPackage& p) {
+[[nodiscard]] inline std::optional<InvRecord> inv_record_from_dpkg(const yuzu::shared::DpkgPackage& p) {
     if (p.status != "installed")
         return std::nullopt;
     InvRecord r;
@@ -231,7 +231,7 @@ inline std::optional<InvRecord> inv_record_from_dpkg(const yuzu::shared::DpkgPac
 //   signature "signed" when SIGPGP (payload) or RSAHEADER (header) holds bytes, else "unsigned" --
 //             the STORED tags only, never a live verification (modern RHEL/Fedora/SUSE packages are
 //             frequently header-signed only, so SIGPGP alone would mislabel them; PR #1804 parity)
-inline InvRecord inv_record_from_rpm(const yuzu::shared::RpmPackage& p,
+[[nodiscard]] inline InvRecord inv_record_from_rpm(const yuzu::shared::RpmPackage& p,
                                      const std::function<std::tm(std::int64_t)>& to_local_tm) {
     InvRecord r;
     r.name = p.name;

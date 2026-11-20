@@ -80,9 +80,8 @@
 #include <fstream>
 #include <thread>
 
-#include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex -- the wall-clock bound on the database read
-
-// The Linux dpkg/rpm database readers (SAM-45); a header so the unit test drives the same code.
+// The Linux dpkg/rpm database readers and their wall-clock-bounded form (SAM-45); a header so the
+// unit test drives the same code.
 #include "installed_apps_pkgdb_read.hpp"
 #endif
 
@@ -355,17 +354,18 @@ namespace pkgdb = yuzu::installed_apps::pkgdb;
 // ── bounded in-process package-database read ──────────────────────────────
 //
 // The dpkg/rpm database read has no cancellation of its own (a pread on a wedged volume cannot be
-// interrupted), so it runs under yuzu::shared::bounded_call_ex: the caller waits at most
-// Limits::wall and gives up; the worker polls the same deadline (and the shutdown flag) through
-// the readers' budget and ends itself, so an abandoned worker is bounded too. The lambda owns
-// every descriptor the worker opens (RAII inside read_host_packages) and every capture is by value.
+// interrupted), so pkgdb::read_host_packages_bounded (installed_apps_pkgdb_read.hpp, compiled and
+// tested on every POSIX host) runs it under yuzu::shared::bounded_call_ex: the caller waits at most
+// Limits::wall and gives up, and the worker polls the same deadline (and the stop flag below)
+// through the readers' budget and ends itself, so an abandoned worker is bounded too.
 //
 // Tracked-call + bounded shutdown quiesce: the same shape as printing_plugin.cpp and
 // power_health_plugin.cpp (see printing_plugin.cpp's long comment on why the guard counts the
 // WAIT, on the calling thread, never from inside the detached worker). shutdown() raises the stop
 // flag, so any worker still running ends at its next poll, then waits a bounded time for callers
 // still inside a read. What it cannot close is bounded_wait.hpp's own accepted residual: a worker
-// the kernel never returns from may outlive the unload.
+// the kernel never returns from may outlive the unload. The guard, the flag and the quiesce are the
+// only part that lives here; tests/test_installed_apps_pkgdb_wiring_lexical.py pins their wiring.
 std::atomic<int> g_outstanding_pkgdb_calls{0};
 std::atomic<bool> g_pkgdb_stop{false};
 constexpr std::chrono::seconds kPkgDbShutdownQuiesce{5};
@@ -390,6 +390,13 @@ void quiesce_pkgdb_calls() noexcept {
                      residue);
 }
 
+// Re-reads the process time zone, once per collection and before any local_tm call. glibc caches the
+// zone for the life of the process, while every old-path collection ran a fresh `rpm` process in the
+// CURRENT zone; the install_date text is a hashed field, so without this a zone change would leave
+// rows rendered in the zone the agent started with until it restarts. One collection never straddles
+// a zone change (tzset is not called per package). Serialised with localtime_r by glibc.
+void refresh_local_zone() noexcept { ::tzset(); }
+
 // std::tm for an rpm INSTALLTIME in the agent's local zone -- what `rpm -qa` formatted with. A
 // failed conversion leaves tm_wday at -1, which rpm_date_c_locale renders as empty.
 std::tm local_tm(std::int64_t t) {
@@ -406,28 +413,9 @@ std::tm local_tm(std::int64_t t) {
 // One bounded read of the host's dpkg or rpm database. A failure (timeout, ceiling, or any
 // reader failure) comes back as `failure` with no packages: the caller reports a degraded answer.
 pkgdb::HostPackages read_host_packages_bounded() {
-    const pkgdb::Limits limits{};
-    const auto deadline = std::chrono::steady_clock::now() + limits.wall;
-    PkgDbCallGuard guard;
-    auto call = yuzu::shared::bounded_call_ex(
-        limits.wall, [limits, deadline]() -> pkgdb::HostPackages {
-            return pkgdb::read_host_packages("/", limits, [deadline] {
-                return g_pkgdb_stop.load(std::memory_order_relaxed) ||
-                       std::chrono::steady_clock::now() >= deadline;
-            });
-        });
-    pkgdb::HostPackages out;
-    switch (call.status) {
-    case yuzu::shared::BoundedCallStatus::Completed:
-        return std::move(*call.value);
-    case yuzu::shared::BoundedCallStatus::TimedOut:
-        out.failure = "pkgdb:timeout";
-        break;
-    case yuzu::shared::BoundedCallStatus::Rejected:
-        out.failure = "pkgdb:busy";
-        break;
-    }
-    return out;
+    PkgDbCallGuard guard; // counts the wait on THIS thread, never from inside the detached worker
+    return pkgdb::read_host_packages_bounded(
+        "/", pkgdb::Limits{}, [] { return g_pkgdb_stop.load(std::memory_order_relaxed); });
 }
 
 AppCollection get_installed_apps_linux() {
@@ -451,6 +439,7 @@ AppCollection get_installed_apps_linux() {
                                 std::move(rec->publisher), "-", {}, {}});
         }
     } else if (host.ecosystem == pkgdb::HostPackages::Ecosystem::rpm) {
+        refresh_local_zone();
         for (const auto& pkg : host.rpm) {
             auto rec = parsers::app_record_from_rpm(pkg, local_tm);
             apps.push_back({std::move(rec.name), std::move(rec.version), std::move(rec.publisher),
@@ -566,6 +555,7 @@ InvCollection get_inventory_linux() {
         // signature tags, never a live `rpm -K` verification, exactly as vuln_scan's
         // vuln_identity.hpp (PR #1804) does, so the two collectors agree on this field. The
         // publisher is the declared VENDOR, falling back to PACKAGER (a person) when VENDOR is unset.
+        refresh_local_zone();
         for (const auto& pkg : host.rpm)
             recs.push_back(inv::inv_record_from_rpm(pkg, local_tm));
     } else if (auto path = yuzu::agent::probe_tool_path({"/usr/bin/pacman", "/bin/pacman", "/usr/local/bin/pacman"});

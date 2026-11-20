@@ -1932,7 +1932,9 @@ subprocess legs. The readers live in `agents/shared` (`dpkg_status_parsers.hpp`,
 **What did not change.** The rows, the wire and the section hash. Every `inv|` and `app|` row the readers
 produce equals, as a set, the row the subprocess path produced for the same database on every capture taken
 for this change (eleven captures: Debian 12, Ubuntu 24.04, Fedora 41, AlmaLinux 8 on arm64 and on s390x,
-AlmaLinux 9, openSUSE Leap 15.6 and Tumbleweed, plus a dense variant of Debian, Fedora and Leap). There is no server
+AlmaLinux 9, openSUSE Leap 15.6 and Tumbleweed, plus a dense variant of Debian, Fedora and Leap). Eight of them are
+committed, trimmed, as test fixtures (the dense variants are not); the eleven full captures were measured once through
+`YUZU_TEST_PKGDB_FIXTURE_ROOT` and are not in the tree. There is no server
 change, no resend and no change-ledger event on upgrade. The earlier text of this ADR that names the line
 parsers (`parse_dpkg_inv_line`, `parse_rpm_inv_line`, `kRpmInvQueryFormat`, `parse_dpkg_list`,
 `parse_rpm_list`) describes the OLD path: those functions are now test-only, kept verbatim in
@@ -1949,7 +1951,15 @@ output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label)
 - A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout minimal images with no shell use,
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
-  file is read as installed, and a file that does carry a `Status` is held to the same three-word rule.
+  file is read as installed, and a file that does carry a `Status` is held to the same three-word rule. The
+  converse is also new: a host with a healthy status file and one unparseable regular file in `status.d` is
+  degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
+  packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
+  host's complete one. The remedy is to remove the file or give it a leading dot (hidden names are skipped).
+- An rpm directory that is a symlink is never followed, and when a database file exists behind such a link and no
+  other candidate directory yields one, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through
+  the link) instead of an empty list. The current Fedora, RHEL and SUSE layout (`/var/lib/rpm` linking to the
+  sysimage copy, which is read first) is unaffected.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
   image: `rpm -qa` fails there).
 - A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the
@@ -1959,7 +1969,8 @@ output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label)
 
 **Failure semantics are unchanged in kind.** A degraded answer is rc 1 with no rows and CONSTRAINED/PARTIAL,
 so the writer's status-only section keeps the server's stored rows (the `v3:` held-facet rule). Every limit
-(20 s wall clock, 50,000 packages, 32 MiB per file or header, 1 GiB of rpm headers) and every damaged record
+(20 s wall clock, 50,000 packages, 32 MiB of dpkg text in total across the status file and `status.d`, 32 MiB per
+rpm header, 1 GiB of rpm headers) and every damaged record
 degrades the whole read instead of returning a shorter roster. Reading rpm signer data and non-installed dpkg
 states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
 change; it needs a server change and is tracked as SAM-45b (#8361).

@@ -4719,6 +4719,19 @@ test('installed_apps windows roots lexical gate',
   timeout: 30,
 )
 
+# Installed-apps package-database wiring (SAM-45): the Linux actions read the dpkg and rpm databases
+# in-process, never through dpkg-query or rpm. Parity is the design, so no output assertion can tell
+# the two acquisitions apart and the Linux block is `#ifdef __linux__`; this pins that no literal
+# names those executables, that each Linux collector calls the bounded read once and keeps only the
+# pacman and apk legs, and the guard / stop flag / shutdown quiesce / init re-arm of the bounded
+# read. Carries its own in-memory mutation self-test. No build required.
+test('installed_apps package-database wiring lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_pkgdb_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # Command-dedup fleet telemetry (#3663): the agent's `yuzu.dedup_*` heartbeat tags and the
 # server's yuzu_fleet_agents_dedup_* table share no header (no upward server -> agent edge), so
 # nothing in the compiler binds them. This pins that every emitted tag has a server row and vice

@@ -44,6 +44,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <unordered_set>
@@ -105,31 +106,36 @@ struct Stanza {
 inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architecture", "Maintainer",
                                                 "Status"};
 
-/// Splits "want flag state" on single spaces into exactly three non-empty words.
-[[nodiscard]] inline bool split_status(std::string_view s, DpkgPackage& out) {
+/// The three words of a Status field.
+struct StatusWords {
+    std::string_view want;
+    std::string_view flag;
+    std::string_view state;
+};
+
+/// Splits "want flag state" on single spaces into exactly three non-empty words, or nullopt.
+/// The words view `s`.
+[[nodiscard]] inline std::optional<StatusWords> split_status(std::string_view s) {
     const std::size_t a = s.find(' ');
     if (a == std::string_view::npos || a == 0)
-        return false;
+        return std::nullopt;
     const std::size_t b = s.find(' ', a + 1);
     if (b == std::string_view::npos || b == a + 1)
-        return false;
-    const std::string_view state = s.substr(b + 1);
-    if (state.empty() || state.find(' ') != std::string_view::npos)
-        return false;
-    const std::string_view want = s.substr(0, a);
-    const std::string_view flag = s.substr(a + 1, b - a - 1);
-    for (const std::string_view w : {want, flag, state})
-        if (w.find('\t') != std::string_view::npos)
-            return false;
-    out.want.assign(want);
-    out.flag.assign(flag);
-    out.status.assign(state);
-    return true;
+        return std::nullopt;
+    const StatusWords w{s.substr(0, a), s.substr(a + 1, b - a - 1), s.substr(b + 1)};
+    if (w.state.empty() || w.state.find(' ') != std::string_view::npos)
+        return std::nullopt;
+    for (const std::string_view v : {w.want, w.flag, w.state})
+        if (v.find('\t') != std::string_view::npos)
+            return std::nullopt;
+    return w;
 }
 
 /// Closes a stanza: appends it unless it is `not-installed`. Charges one row per
 /// stanza seen (a skipped one too: a hostile file of a million not-installed
-/// stanzas is bounded by the row budget, not only by the byte cap).
+/// stanzas is bounded by the row budget, not only by the byte cap). The references are the
+/// streaming parser's running state (the stanza under construction, the output, the stanza
+/// count), not results; the result is the returned std::expected.
 [[nodiscard]] inline PkgDbVoid finish(Stanza& st, PkgDbBudget& budget,
                                       std::vector<DpkgPackage>& out, std::size_t& stanzas,
                                       MissingStatus missing) {
@@ -143,8 +149,12 @@ inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architect
     if (!st.seen[0] || st.pkg.name.empty())
         return std::unexpected(PkgDbCause::corrupt); // a stanza without a Package
     if (st.seen[4]) {
-        if (!split_status(st.status_raw, st.pkg))
+        const auto words = split_status(st.status_raw);
+        if (!words)
             return std::unexpected(PkgDbCause::corrupt); // a Status that is not three words
+        st.pkg.want.assign(words->want);
+        st.pkg.flag.assign(words->flag);
+        st.pkg.status.assign(words->state);
     } else if (missing == MissingStatus::installed) {
         st.pkg.want = "install"; // a status.d control stanza: present means installed
         st.pkg.flag = "ok";

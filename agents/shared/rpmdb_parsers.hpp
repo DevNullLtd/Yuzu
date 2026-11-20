@@ -158,6 +158,9 @@ public:
         if (nul == nullptr)
             return std::unexpected(PkgDbCause::corrupt); // not NUL-terminated inside the data
         const auto len = static_cast<std::size_t>(static_cast<const std::uint8_t*>(nul) - d);
+        // uint8_t -> char is a permitted aliasing cast; the length is bounded by the memchr over
+        // `room` above (so d + len stays inside the data region) and the bytes are copied out, so
+        // nothing here outlives data_.
         return std::optional<std::string>{std::string(reinterpret_cast<const char*>(d), len)};
     }
 

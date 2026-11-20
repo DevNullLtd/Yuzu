@@ -21,6 +21,11 @@
  * full, untrimmed S-7 captures: a tree of <capture>/{status|rpmdb.sqlite|Packages.db|Packages} +
  * inventory.tsv + list.txt in the old formats. It then prints one package count per capture.
  *
+ * The bounded form (read_host_packages_bounded) is exercised through an injected reader: a reader parked on
+ * a latch stands in for a wedged volume, so no timing is assumed beyond "a reader that never returns is
+ * given up on at the wall". The Linux-only plugin wiring around it (the tracked-call guard, the shutdown
+ * quiesce) is pinned by tests/test_installed_apps_pkgdb_wiring_lexical.py.
+ *
  * POSIX only: the shell compiles out on Windows (the plugin walks the registry there).
  */
 
@@ -37,7 +42,10 @@
 #include <sqlite3.h>
 
 #include <algorithm>
+#include <array>
+#include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -46,11 +54,16 @@
 #include <fstream>
 #include <functional>
 #include <iterator>
+#include <memory>
+#include <mutex>
+#include <new>
 #include <optional>
 #include <set>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 namespace fs = std::filesystem;
@@ -109,6 +122,34 @@ struct Root {
         return at(rel);
     }
 };
+
+// A sqlite handle that is closed even when a REQUIRE below throws (a raw handle would leak, and on a
+// rollback-journal copy keep its lock for the rest of the run).
+using SqliteDb = std::unique_ptr<sqlite3, pkgdb::detail::SqliteCloser>;
+using SqliteStmt = std::unique_ptr<sqlite3_stmt, pkgdb::detail::StmtFinalizer>;
+
+SqliteDb open_sqlite(const fs::path& path) {
+    sqlite3* raw = nullptr;
+    const int rc = sqlite3_open(path.string().c_str(), &raw);
+    SqliteDb db{raw}; // owns the handle even on a failed open
+    REQUIRE(rc == SQLITE_OK);
+    return db;
+}
+
+void exec_sql(sqlite3* db, const char* sql) {
+    char* err = nullptr;
+    const int rc = sqlite3_exec(db, sql, nullptr, nullptr, &err);
+    INFO(sql << " -> " << (err ? err : "ok"));
+    sqlite3_free(err);
+    REQUIRE(rc == SQLITE_OK);
+}
+
+// EDITED copy: switched from WAL to the rollback journal, the mode in which a reader takes a SHARED
+// lock (exactly what `rpm -qa` took). A WAL-mode copy is never locked this way.
+void switch_to_rollback_journal(const fs::path& db_path) {
+    const auto db = open_sqlite(db_path);
+    exec_sql(db.get(), "PRAGMA journal_mode=DELETE");
+}
 
 // The kind of database a fixture directory holds, by which file is in it.
 struct DbFile {
@@ -302,14 +343,11 @@ TEST_CASE("pkgdb sqlite: fedora41 and alma9 read through the real connection, wi
             // lives only in the -wal. A reader that ignored the WAL would still see every row.
             Root root;
             const fs::path db = root.put("var/lib/rpm/rpmdb.sqlite", src / "rpmdb.sqlite");
-            sqlite3* writer = nullptr;
-            REQUIRE(sqlite3_open(db.string().c_str(), &writer) == SQLITE_OK);
-            REQUIRE(sqlite3_exec(writer, "PRAGMA wal_autocheckpoint=0", nullptr, nullptr, nullptr) == SQLITE_OK);
-            REQUIRE(sqlite3_exec(writer, "DELETE FROM Packages WHERE hnum = (SELECT min(hnum) FROM Packages)",
-                                 nullptr, nullptr, nullptr) == SQLITE_OK);
+            const auto writer = open_sqlite(db);
+            sqlite3_wal_autocheckpoint(writer.get(), 0);
+            exec_sql(writer.get(), "DELETE FROM Packages WHERE hnum = (SELECT min(hnum) FROM Packages)");
             REQUIRE(fs::file_size(root.at("var/lib/rpm/rpmdb.sqlite-wal")) > 0);
             const auto host = read_root(root);
-            sqlite3_close(writer);
             REQUIRE(host.failure.empty());
             CHECK(host.rpm.size() + 1 == expect_names.size());
         }
@@ -347,33 +385,30 @@ TEST_CASE("pkgdb sqlite hostile: not sqlite, no Packages table, wrong column typ
     SECTION("a real sqlite database without a Packages table is corrupt") {
         Root root;
         fs::create_directories(root.at("var/lib/rpm"));
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open(root.at("var/lib/rpm/rpmdb.sqlite").string().c_str(), &db) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db, "CREATE TABLE Other(x INTEGER); INSERT INTO Other VALUES (1)", nullptr,
-                             nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
+        {
+            const auto db = open_sqlite(root.at("var/lib/rpm/rpmdb.sqlite"));
+            exec_sql(db.get(), "CREATE TABLE Other(x INTEGER); INSERT INTO Other VALUES (1)");
+        }
         CHECK(failure_of(root) == "rpm_sqlite:corrupt");
     }
     SECTION("a Packages row whose blob column is TEXT is corrupt") {
         Root root;
         fs::create_directories(root.at("var/lib/rpm"));
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open(root.at("var/lib/rpm/rpmdb.sqlite").string().c_str(), &db) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db, "CREATE TABLE Packages(hnum INTEGER PRIMARY KEY, blob TEXT); "
-                                 "INSERT INTO Packages(blob) VALUES ('not a header')",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
+        {
+            const auto db = open_sqlite(root.at("var/lib/rpm/rpmdb.sqlite"));
+            exec_sql(db.get(), "CREATE TABLE Packages(hnum INTEGER PRIMARY KEY, blob TEXT); "
+                               "INSERT INTO Packages(blob) VALUES ('not a header')");
+        }
         CHECK(failure_of(root) == "rpm_sqlite:corrupt");
     }
     SECTION("a blob that is not an rpm header is corrupt") {
         Root root;
         fs::create_directories(root.at("var/lib/rpm"));
-        sqlite3* db = nullptr;
-        REQUIRE(sqlite3_open(root.at("var/lib/rpm/rpmdb.sqlite").string().c_str(), &db) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(db, "CREATE TABLE Packages(hnum INTEGER PRIMARY KEY, blob BLOB); "
-                                 "INSERT INTO Packages(blob) VALUES (x'00112233445566778899')",
-                             nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(db);
+        {
+            const auto db = open_sqlite(root.at("var/lib/rpm/rpmdb.sqlite"));
+            exec_sql(db.get(), "CREATE TABLE Packages(hnum INTEGER PRIMARY KEY, blob BLOB); "
+                               "INSERT INTO Packages(blob) VALUES (x'00112233445566778899')");
+        }
         CHECK(failure_of(root) == "rpm_sqlite:corrupt");
     }
     SECTION("a small length limit is oversized") {
@@ -403,22 +438,16 @@ TEST_CASE("pkgdb sqlite hostile: not sqlite, no Packages table, wrong column typ
         CHECK(failure_of(root, default_limits(), [] { return true; }) == "rpm_sqlite:timeout");
     }
     SECTION("a second connection holding BEGIN EXCLUSIVE on a rollback-journal copy is locked") {
-        // EDITED copy: switched from WAL to the rollback journal, the mode in which a reader takes a
-        // SHARED lock (exactly what `rpm -qa` took). A WAL-mode copy is never locked this way.
+        // EDITED copy (switch_to_rollback_journal).
         Root root;
         const fs::path db = root.put("var/lib/rpm/rpmdb.sqlite", fedora);
-        sqlite3* a = nullptr;
-        REQUIRE(sqlite3_open(db.string().c_str(), &a) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(a, "PRAGMA journal_mode=DELETE", nullptr, nullptr, nullptr) == SQLITE_OK);
-        sqlite3_close(a);
-        sqlite3* holder = nullptr;
-        REQUIRE(sqlite3_open(db.string().c_str(), &holder) == SQLITE_OK);
-        REQUIRE(sqlite3_exec(holder, "BEGIN EXCLUSIVE", nullptr, nullptr, nullptr) == SQLITE_OK);
+        switch_to_rollback_journal(db);
+        const auto holder = open_sqlite(db);
+        exec_sql(holder.get(), "BEGIN EXCLUSIVE");
         pkgdb::Limits lim;
         lim.sqlite_busy_ms = 0;
         const std::string failure = failure_of(root, lim);
-        sqlite3_exec(holder, "ROLLBACK", nullptr, nullptr, nullptr);
-        sqlite3_close(holder);
+        exec_sql(holder.get(), "ROLLBACK");
         CHECK(failure == "rpm_sqlite:locked");
         // Released, the same copy reads cleanly: the rollback-journal path works when nobody holds it.
         const auto ok = read_root(root);
@@ -457,7 +486,8 @@ TEST_CASE("pkgdb detection: dpkg wins over rpm; an empty status falls through to
     CHECK(read_root(root).ecosystem == Eco::rpm);
 }
 
-TEST_CASE("pkgdb detection: usr/lib/sysimage/rpm wins over var/lib/rpm; a symlinked directory is skipped",
+TEST_CASE("pkgdb detection: usr/lib/sysimage/rpm wins over var/lib/rpm; a symlinked directory is never "
+          "followed, and is a refusal when a database sits behind it",
           "[installed_apps][pkgdb]") {
     const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
     const fs::path alma9 = default_fixture_root() / "alma9" / "rpmdb.sqlite";
@@ -471,16 +501,50 @@ TEST_CASE("pkgdb detection: usr/lib/sysimage/rpm wins over var/lib/rpm; a symlin
         CHECK_FALSE(names_of(h).contains("dbus"));
     }
     {
-        // /var/lib/rpm -> a directory elsewhere: skipped, never followed; with nothing else present the
-        // host has no rpm database as far as this reader may tell.
+        // /var/lib/rpm -> a directory elsewhere that holds a database: never followed (nothing is opened
+        // through the link, only stat'ed), and with no other candidate it is a refusal -- a database that
+        // exists but may not be read is never an empty list.
         Root root;
         root.put("elsewhere/rpmdb.sqlite", alma9);
         fs::create_directories(root.at("var/lib"));
         fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
         const auto h = read_root(root);
-        CHECK(h.failure.empty());
+        CHECK(h.failure == "rpmdb:symlink_refused");
         CHECK(h.ecosystem == Eco::none);
         CHECK(h.rpm.empty());
+    }
+    {
+        // The same for each kind of database file behind the link, and a data.mdb.
+        for (const char* name : {"Packages.db", "Packages", "data.mdb"}) {
+            INFO(name);
+            Root root;
+            root.put_text(std::string{"elsewhere/"} + name, "x");
+            fs::create_directories(root.at("var/lib"));
+            fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
+            CHECK(read_root(root).failure == "rpmdb:symlink_refused");
+        }
+    }
+    {
+        // A link to a directory with NO database behind it is as before: skipped, no failure, no rpm.
+        Root root;
+        fs::create_directories(root.at("elsewhere"));
+        fs::create_directories(root.at("var/lib"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+    }
+    {
+        // The older layout: usr/lib/sysimage/rpm is the link and var/lib/rpm is the real directory. The
+        // link is skipped, the later candidate yields the database, and nothing is refused.
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", fedora);
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink("../../../var/lib/rpm", root.at("usr/lib/sysimage/rpm"));
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::rpm);
+        CHECK(h.rpm.size() == 4);
     }
     {
         // The real modern layout: var/lib/rpm links to the sysimage copy, which is read directly.
@@ -817,6 +881,18 @@ TEST_CASE("pkgdb status.d hostile: symlink entry refused, directory entry skippe
         CHECK(h.dpkg.empty());
         CHECK(h.ecosystem == Eco::none);
     }
+    SECTION("the dpkg byte limit is one TOTAL across status and status.d: each fits, together byte_cap") {
+        Root root;
+        root.put_text("var/lib/dpkg/status", rest);
+        root.put_text("var/lib/dpkg/status.d/libacl1", stanza);
+        pkgdb::Limits lim;
+        lim.dpkg_max_bytes = std::max(rest.size(), stanza.size()) + 1; // neither file alone is oversized
+        CHECK(read_root(root, lim).failure == "dpkg_status_d:byte_cap");
+        lim.dpkg_max_bytes = rest.size() + stanza.size(); // an exact fill is admitted
+        const auto h = read_root(root, lim);
+        CHECK(h.failure.empty());
+        CHECK(h.dpkg.size() == 10);
+    }
 }
 
 // ── mapping ─────────────────────────────────────────────────────────────────
@@ -972,19 +1048,489 @@ TEST_CASE("pkgdb degraded contract: a named reason reaches the typed status and 
     }
 }
 
-TEST_CASE("pkgdb tokens: every failure the shell can produce is a source:cause pair from the closed vocabulary",
+// ── the stamp: a file that changes under the read ───────────────────────────
+
+TEST_CASE("pkgdb stamp: a database file that changes during the read is changed_during_read whatever the "
+          "read made of it",
           "[installed_apps][pkgdb]") {
-    const std::set<std::string> sources{"dpkg_status", "dpkg_status_d", "rpm_sqlite", "rpm_ndb", "rpm_bdb", "rpmdb"};
-    const std::set<std::string> causes{"unreadable", "symlink_refused", "not_regular", "oversized", "corrupt",
-                                       "truncated", "unsupported_format", "locked", "changed_during_read",
-                                       "row_cap", "byte_cap", "timeout", "busy"};
-    const pkgdb::Limits lim{};
-    for (const std::string t : {"dpkg_status:corrupt", "rpm_sqlite:locked", "rpmdb:unsupported_format"}) {
-        const auto colon = t.find(':');
-        CHECK(sources.contains(t.substr(0, colon)));
-        CHECK(causes.contains(t.substr(colon + 1)));
+    // The expired callback is first polled INSIDE the reader, after the first stamp was taken (ndb once per
+    // slot page, bdb at page 1, sqlite per row), so a callback that edits the file is a rewrite under the
+    // read. The appended byte leaves the parse valid: the stamp wins over a successful read.
+    struct Format {
+        const char* capture;
+        const char* file;
+        const char* dir;
+        const char* source;
+        std::size_t packages;
+    };
+    const Format formats[] = {{"tumbleweed", "Packages.db", "usr/lib/sysimage/rpm", "rpm_ndb", 11},
+                              {"alma8", "Packages", "var/lib/rpm", "rpm_bdb", 5},
+                              {"fedora41", "rpmdb.sqlite", "var/lib/rpm", "rpm_sqlite", 4}};
+    for (const auto& f : formats) {
+        for (const std::string_view how : {"control", "append a byte", "move only the mtime"}) {
+            INFO(f.source << ": " << how);
+            Root root;
+            const fs::path file =
+                root.put(std::string{f.dir} + "/" + f.file, default_fixture_root() / f.capture / f.file);
+            int polls = 0;
+            const auto h = read_root(root, default_limits(), [&] {
+                if (++polls == 1) {
+                    if (how == "append a byte") { // EDITED copy
+                        std::ofstream o(file, std::ios::binary | std::ios::app);
+                        o.put('x');
+                    } else if (how == "move only the mtime") {
+                        fs::last_write_time(file, fs::last_write_time(file) + std::chrono::hours(1));
+                    }
+                }
+                return false;
+            });
+            REQUIRE(polls > 0); // the callback really ran inside the read
+            if (how == "control") {
+                REQUIRE(h.failure.empty());
+                CHECK(h.rpm.size() == f.packages);
+            } else {
+                CHECK(h.failure == std::string{f.source} + ":changed_during_read");
+                CHECK(h.ecosystem == Eco::none);
+                CHECK(h.rpm.empty());
+            }
+        }
     }
-    // The defaults the plugin runs with: bounded in rows, bytes and time.
+}
+
+// ── a writer that commits while the read is running ─────────────────────────
+
+namespace {
+
+// A second connection that never waits (busy timeout 0) and never checkpoints (autocheckpoint 0), and
+// is kept open until the read returns. Its BEGIN IMMEDIATE / self-assigning UPDATE / COMMIT run once,
+// from the reader's first expired poll -- i.e. while the read statement is active.
+struct PollWriter {
+    explicit PollWriter(const fs::path& db_path) : db{open_sqlite(db_path)} {
+        sqlite3_busy_timeout(db.get(), 0);
+        sqlite3_wal_autocheckpoint(db.get(), 0);
+    }
+    SqliteDb db;
+    std::array<int, 3> rc{-1, -1, -1}; // BEGIN IMMEDIATE, UPDATE, COMMIT
+    int polls = 0;
+    bool operator()() {
+        if (++polls == 1) {
+            rc[0] = sqlite3_exec(db.get(), "BEGIN IMMEDIATE", nullptr, nullptr, nullptr);
+            rc[1] = sqlite3_exec(db.get(),
+                                 "UPDATE Packages SET blob = blob WHERE hnum = (SELECT max(hnum) FROM Packages)",
+                                 nullptr, nullptr, nullptr);
+            rc[2] = sqlite3_exec(db.get(), "COMMIT", nullptr, nullptr, nullptr);
+        }
+        return false;
+    }
+};
+
+} // namespace
+
+TEST_CASE("pkgdb sqlite: a writer commits DURING the read -- a WAL database never blocks it, a rollback-journal "
+          "one makes it wait",
+          "[installed_apps][pkgdb]") {
+    const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
+
+    SECTION("WAL copy without sidecars (read immutable): every writer step succeeds, the read succeeds") {
+        Root root;
+        const fs::path db = root.put("var/lib/rpm/rpmdb.sqlite", fedora);
+        PollWriter writer{db};
+        const auto host = read_root(root, default_limits(), [&writer] { return writer(); });
+        REQUIRE(writer.polls > 0);
+        CHECK(writer.rc == std::array<int, 3>{SQLITE_OK, SQLITE_OK, SQLITE_OK});
+        REQUIRE(host.failure.empty());
+        CHECK(host.rpm.size() == 4);
+    }
+    SECTION("WAL copy with a live -wal (read read-only): every writer step succeeds, the read succeeds") {
+        Root root;
+        const fs::path db = root.put("var/lib/rpm/rpmdb.sqlite", fedora);
+        PollWriter writer{db};
+        exec_sql(writer.db.get(), "DELETE FROM Packages WHERE hnum = (SELECT min(hnum) FROM Packages)");
+        REQUIRE(fs::file_size(root.at("var/lib/rpm/rpmdb.sqlite-wal")) > 0); // the commit lives only in the -wal
+        const auto host = read_root(root, default_limits(), [&writer] { return writer(); });
+        REQUIRE(writer.polls > 0);
+        CHECK(writer.rc == std::array<int, 3>{SQLITE_OK, SQLITE_OK, SQLITE_OK});
+        REQUIRE(host.failure.empty());
+        CHECK(host.rpm.size() == 3);
+    }
+    SECTION("EDITED rollback-journal copy: the COMMIT is SQLITE_BUSY during the read, the read succeeds, "
+            "and the same COMMIT succeeds once it has returned") {
+        // The documented limit, measured: a rollback-journal database is read under a SHARED lock, so a
+        // transaction that commits during the read waits for it (at most the wall bound).
+        Root root;
+        const fs::path db = root.put("var/lib/rpm/rpmdb.sqlite", fedora);
+        switch_to_rollback_journal(db);
+        PollWriter writer{db};
+        const auto host = read_root(root, default_limits(), [&writer] { return writer(); });
+        REQUIRE(writer.polls > 0);
+        CHECK(writer.rc[0] == SQLITE_OK);
+        CHECK(writer.rc[1] == SQLITE_OK);
+        CHECK(writer.rc[2] == SQLITE_BUSY);
+        REQUIRE(host.failure.empty());
+        CHECK(host.rpm.size() == 4);
+        CHECK(sqlite3_exec(writer.db.get(), "COMMIT", nullptr, nullptr, nullptr) == SQLITE_OK);
+    }
+}
+
+// ── delimiter-bearing text and an absent RELEASE, from input bytes to rows ───
+
+namespace {
+
+std::uint32_t be32_at(const std::vector<std::uint8_t>& b, std::size_t o) {
+    return (std::uint32_t{b[o]} << 24) | (std::uint32_t{b[o + 1]} << 16) | (std::uint32_t{b[o + 2]} << 8) |
+           std::uint32_t{b[o + 3]};
+}
+
+// The header blob of the real fedora41 package `name`, read with immutable=1 so nothing is created beside
+// the fixture.
+std::vector<std::uint8_t> fedora_blob(std::string_view name) {
+    sqlite3* raw = nullptr;
+    const std::string uri = pkgdb::detail::sqlite_uri((default_fixture_root() / "fedora41" / "rpmdb.sqlite").string(), true);
+    const int open_rc = sqlite3_open_v2(uri.c_str(), &raw, SQLITE_OPEN_READONLY | SQLITE_OPEN_URI, nullptr);
+    SqliteDb db{raw};
+    REQUIRE(open_rc == SQLITE_OK);
+    sqlite3_stmt* raw_stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(db.get(), "SELECT blob FROM Packages ORDER BY hnum", -1, &raw_stmt, nullptr) ==
+            SQLITE_OK);
+    SqliteStmt stmt{raw_stmt};
+    while (sqlite3_step(stmt.get()) == SQLITE_ROW) {
+        const auto* p = static_cast<const std::uint8_t*>(sqlite3_column_blob(stmt.get(), 0));
+        std::vector<std::uint8_t> blob(p, p + sqlite3_column_bytes(stmt.get(), 0));
+        const auto header = yuzu::shared::RpmHeader::parse(blob);
+        REQUIRE(header.has_value());
+        const auto n = header->string(1000);
+        if (n && *n && **n == name)
+            return blob;
+    }
+    FAIL("no such package in the fedora41 capture: " << name);
+    return {};
+}
+
+// Where a tag sits in a header blob: its index entry (tag, type, offset, count at 8 + 16 * i, big-endian)
+// and the absolute offset of its data.
+struct TagAt {
+    std::size_t entry;
+    std::size_t data;
+};
+TagAt tag_at(const std::vector<std::uint8_t>& blob, std::uint32_t tag) {
+    const std::size_t il = be32_at(blob, 0);
+    for (std::size_t i = 0; i < il; ++i) {
+        const std::size_t e = 8 + 16 * i;
+        if (be32_at(blob, e) == tag)
+            return {e, 8 + 16 * il + be32_at(blob, e + 8)};
+    }
+    FAIL("tag " << tag << " not in the header");
+    return {};
+}
+
+// Both edits keep every length, so the header stays structurally valid.
+void overwrite_string_prefix(std::vector<std::uint8_t>& blob, std::uint32_t tag, std::string_view with) {
+    const TagAt at = tag_at(blob, tag);
+    for (std::size_t i = 0; i < with.size(); ++i) {
+        REQUIRE(blob[at.data + i] != 0); // inside the value, not past its NUL
+        blob[at.data + i] = static_cast<std::uint8_t>(with[i]);
+    }
+}
+void renumber_tag(std::vector<std::uint8_t>& blob, std::uint32_t tag) {
+    const TagAt at = tag_at(blob, tag);
+    constexpr std::uint32_t kUnusedTag = 60001; // outside rpm's tag space; find() is a linear scan
+    blob[at.entry] = static_cast<std::uint8_t>(kUnusedTag >> 24);
+    blob[at.entry + 1] = static_cast<std::uint8_t>(kUnusedTag >> 16);
+    blob[at.entry + 2] = static_cast<std::uint8_t>(kUnusedTag >> 8);
+    blob[at.entry + 3] = static_cast<std::uint8_t>(kUnusedTag);
+}
+
+// A one-package rpm sqlite database holding exactly `blob`.
+void write_one_package_db(const Root& root, const std::vector<std::uint8_t>& blob) {
+    fs::create_directories(root.at("var/lib/rpm"));
+    const auto db = open_sqlite(root.at("var/lib/rpm/rpmdb.sqlite"));
+    exec_sql(db.get(), "PRAGMA synchronous=OFF; CREATE TABLE Packages(hnum INTEGER PRIMARY KEY, blob BLOB)");
+    sqlite3_stmt* raw_stmt = nullptr;
+    REQUIRE(sqlite3_prepare_v2(db.get(), "INSERT INTO Packages(blob) VALUES (?)", -1, &raw_stmt, nullptr) == SQLITE_OK);
+    SqliteStmt stmt{raw_stmt};
+    REQUIRE(sqlite3_bind_blob(stmt.get(), 1, blob.data(), static_cast<int>(blob.size()), SQLITE_STATIC) == SQLITE_OK);
+    REQUIRE(sqlite3_step(stmt.get()) == SQLITE_DONE);
+}
+
+std::vector<std::string> split_on(const std::string& row, char sep) {
+    std::vector<std::string> out;
+    std::size_t at = 0;
+    for (;;) {
+        const std::size_t next = row.find(sep, at);
+        if (next == std::string::npos) {
+            out.push_back(row.substr(at));
+            return out;
+        }
+        out.push_back(row.substr(at, next - at));
+        at = next + 1;
+    }
+}
+
+// Tokens of a row on its UNESCAPED '|' (a '\|' is part of a token).
+std::size_t unescaped_pipes(const std::string& row) {
+    std::size_t n = 0;
+    for (std::size_t i = 0; i < row.size(); ++i) {
+        if (row[i] == '\\')
+            ++i; // skip the escaped character
+        else if (row[i] == '|')
+            ++n;
+    }
+    return n;
+}
+
+// The only row of a one-package host, in each wire form.
+std::string only_inv_row(const pkgdb::HostPackages& h) {
+    const auto rows = new_inv_rows(h);
+    REQUIRE(rows.size() == 1);
+    return rows[0];
+}
+std::string only_list_row(const pkgdb::HostPackages& h) {
+    const auto rows = new_list_rows(h);
+    REQUIRE(rows.size() == 1);
+    return rows[0];
+}
+
+// `row` with token `index` (split on a plain '|') replaced; the pristine rows have no escaped pipe.
+std::string with_token(const std::string& row, std::size_t index, const std::string& token) {
+    auto parts = split_on(row, '|');
+    REQUIRE(index < parts.size());
+    parts[index] = token;
+    std::string out;
+    for (std::size_t i = 0; i < parts.size(); ++i)
+        out += (i ? "|" : "") + parts[i];
+    return out;
+}
+
+constexpr std::size_t kInvVersion = 2, kInvPublisher = 3, kInvRelease = 8;
+constexpr std::size_t kListVersion = 2, kListPublisher = 3;
+
+} // namespace
+
+TEST_CASE("pkgdb rows: a Maintainer holding a pipe and a tab keeps its whole value in one row (EDITED real "
+          "debian12 stanza)",
+          "[installed_apps][pkgdb]") {
+    // EDITED: the real libacl1 stanza with its Maintainer replaced. The old line parsers cut the value at
+    // the first tab and the row at the pipe; the readers keep the value whole and the formatter strips
+    // (inv) or escapes (list) the separators.
+    const auto [rest, stanza] = split_stanza("libacl1");
+    const std::size_t at = stanza.find("Maintainer: ");
+    REQUIRE(at != std::string::npos);
+    std::string edited = stanza;
+    edited.replace(at, edited.find('\n', at) - at, "Maintainer: Pkg|Team\tOps");
+    Root root;
+    root.put_text("var/lib/dpkg/status", edited);
+    const auto h = read_root(root);
+    REQUIRE(h.failure.empty());
+    REQUIRE(h.dpkg.size() == 1);
+    CHECK(h.dpkg[0].maintainer == "Pkg|Team\tOps");
+
+    const std::string inv_row = only_inv_row(h);
+    CHECK(inv_row == "inv|libacl1|2.3.1|PkgTeamOps||package|deb||3|arm64||||");
+    CHECK(unescaped_pipes(inv_row) == 13);
+    const std::string list_row = only_list_row(h);
+    CHECK(list_row == "app|libacl1|2.3.1-3|Pkg\\|Team\tOps|-|-|-");
+    CHECK(unescaped_pipes(list_row) == 6);
+}
+
+TEST_CASE("pkgdb rows: a VENDOR holding a pipe, a tab and a newline keeps its whole value in one row (EDITED "
+          "real fedora41 header)",
+          "[installed_apps][pkgdb]") {
+    Root pristine_root;
+    pristine_root.put("var/lib/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+    const auto pristine = read_root(pristine_root);
+    REQUIRE(pristine.failure.empty());
+    const auto find_row = [](const std::vector<std::string>& rows, std::string_view prefix) {
+        const auto it = std::find_if(rows.begin(), rows.end(),
+                                     [&](const std::string& r) { return r.starts_with(prefix); });
+        REQUIRE(it != rows.end());
+        return *it;
+    };
+    const std::string pristine_inv = find_row(new_inv_rows(pristine), "inv|libssh-config|");
+    const std::string pristine_list = find_row(new_list_rows(pristine), "app|libssh-config|");
+    REQUIRE(pristine_inv.find("|Fedora Project|") != std::string::npos);
+
+    // EDITED in memory: the first three bytes of VENDOR ("Fed") become a pipe, a tab and a newline.
+    auto blob = fedora_blob("libssh-config");
+    overwrite_string_prefix(blob, 1011, "|\t\n");
+    Root root;
+    write_one_package_db(root, blob);
+    const auto h = read_root(root);
+    REQUIRE(h.failure.empty());
+    REQUIRE(h.rpm.size() == 1);
+    CHECK(h.rpm[0].vendor == "|\t\nora Project");
+
+    const std::string inv_row = only_inv_row(h);
+    CHECK(inv_row == with_token(pristine_inv, kInvPublisher, "ora Project")); // separators stripped, one row
+    CHECK(unescaped_pipes(inv_row) == 13);
+    const std::string list_row = only_list_row(h);
+    CHECK(list_row == with_token(pristine_list, kListPublisher, "\\|\t ora Project")); // '|' escaped, newline a space
+    CHECK(unescaped_pipes(list_row) == 6);
+}
+
+TEST_CASE("pkgdb rows: PACKAGER is the inventory publisher when VENDOR is absent, delimiters stripped (EDITED real "
+          "fedora41 header)",
+          "[installed_apps][pkgdb]") {
+    auto blob = fedora_blob("libssh-config");
+    renumber_tag(blob, 1011);                      // EDITED: VENDOR now an unused tag, i.e. absent
+    overwrite_string_prefix(blob, 1015, "|\t\n");  // EDITED: PACKAGER's first three bytes
+    Root root;
+    write_one_package_db(root, blob);
+    const auto h = read_root(root);
+    REQUIRE(h.failure.empty());
+    REQUIRE(h.rpm.size() == 1);
+    CHECK(h.rpm[0].vendor.empty());
+    CHECK(h.rpm[0].packager == "|\t\nora Project");
+
+    const std::string inv_row = only_inv_row(h);
+    CHECK(split_on(inv_row, '|')[kInvPublisher] == "ora Project"); // the fallback, separators stripped
+    CHECK(unescaped_pipes(inv_row) == 13);
+    // `list` shows the VENDOR only: absent reads "-" whatever PACKAGER holds.
+    const std::string list_row = only_list_row(h);
+    CHECK(split_on(list_row, '|')[kListPublisher] == "-");
+    CHECK(unescaped_pipes(list_row) == 6);
+}
+
+TEST_CASE("pkgdb rows: an absent RELEASE reads empty in the inventory and as VERSION- in the list (EDITED real "
+          "fedora41 header)",
+          "[installed_apps][pkgdb]") {
+    auto blob = fedora_blob("libssh-config");
+    renumber_tag(blob, 1002); // EDITED: RELEASE now an unused tag, i.e. absent; the other tags still resolve
+    Root root;
+    write_one_package_db(root, blob);
+    const auto h = read_root(root);
+    REQUIRE(h.failure.empty());
+    REQUIRE(h.rpm.size() == 1);
+    CHECK(h.rpm[0].release.empty());
+    CHECK(h.rpm[0].version == "0.11.3");
+
+    const auto inv_tokens = split_on(only_inv_row(h), '|');
+    REQUIRE(inv_tokens.size() == 14);
+    CHECK(inv_tokens[kInvVersion] == "0.11.3");
+    CHECK(inv_tokens[kInvRelease].empty());
+    CHECK(split_on(only_list_row(h), '|')[kListVersion] == "0.11.3-");
+}
+
+// ── the bounded form ────────────────────────────────────────────────────────
+
+namespace {
+
+// A reader parked on a latch: stands in for a pread on a wedged volume. State is shared, so the worker
+// (which may outlive the call) never points at the test's stack.
+struct Parked {
+    std::mutex m;
+    std::condition_variable cv;
+    bool release = false;
+    bool exited = false;
+};
+
+pkgdb::HostReader parked_reader(std::shared_ptr<Parked> st) {
+    return [st](const std::string&, const pkgdb::Limits&, const std::function<bool()>&) {
+        std::unique_lock lock(st->m);
+        st->cv.wait(lock, [&] { return st->release; });
+        st->exited = true;
+        st->cv.notify_all();
+        return pkgdb::HostPackages{};
+    };
+}
+
+} // namespace
+
+TEST_CASE("pkgdb bounded: a completed read returns its rows; a parked reader is given up on at the wall",
+          "[installed_apps][pkgdb]") {
+    using yuzu::shared::detail::g_outstanding_bounded_calls;
+
+    SECTION("a fixture root completes with rows") {
+        Root root;
+        root.put("var/lib/dpkg/status", default_fixture_root() / "debian12" / "status");
+        const auto h = pkgdb::read_host_packages_bounded(root.str(), default_limits());
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::dpkg);
+        CHECK(h.dpkg.size() == 10);
+    }
+    SECTION("a reader that never returns is pkgdb:timeout with no rows; released, its worker ends") {
+        const int baseline = g_outstanding_bounded_calls.load();
+        auto st = std::make_shared<Parked>();
+        pkgdb::Limits lim;
+        lim.wall = std::chrono::milliseconds{30};
+        const auto h = pkgdb::read_host_packages_bounded("/does/not/matter", lim, {}, parked_reader(st));
+        CHECK(h.failure == "pkgdb:timeout");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.dpkg.empty());
+        CHECK(h.rpm.empty());
+        {
+            std::lock_guard lock(st->m);
+            st->release = true;
+        }
+        st->cv.notify_all();
+        std::unique_lock lock(st->m);
+        st->cv.wait(lock, [&] { return st->exited; }); // the reader is done; every capture of the worker is by value
+        lock.unlock();
+        // The worker gives its slot on the ceiling back when its lambda is destroyed, a moment after the
+        // reader returns; wait for it (a completion, not a delay) so no later case sees the straggler.
+        while (g_outstanding_bounded_calls.load() > baseline)
+            std::this_thread::yield();
+    }
+    SECTION("with the ceiling saturated the answer is pkgdb:busy and the reader never runs") {
+        using yuzu::shared::detail::kMaxOutstandingBoundedCalls;
+        using yuzu::shared::detail::OutstandingCallGuard;
+        std::vector<OutstandingCallGuard> held;
+        while (g_outstanding_bounded_calls.load() <= kMaxOutstandingBoundedCalls) {
+            auto g = OutstandingCallGuard::try_acquire();
+            if (!g)
+                break;
+            held.push_back(std::move(*g));
+        }
+        auto ran = std::make_shared<std::atomic<bool>>(false);
+        const pkgdb::HostReader reader = [ran](const std::string&, const pkgdb::Limits&,
+                                               const std::function<bool()>&) {
+            ran->store(true);
+            return pkgdb::HostPackages{};
+        };
+        const auto h = pkgdb::read_host_packages_bounded("/does/not/matter", default_limits(), {}, reader);
+        held.clear(); // release the ceiling for later cases
+        CHECK(h.failure == "pkgdb:busy");
+        CHECK_FALSE(ran->load());
+    }
+    SECTION("a true stop predicate ends a real read with a :timeout cause") {
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        const auto h = pkgdb::read_host_packages_bounded(root.str(), default_limits(), [] { return true; });
+        CHECK(h.failure == "rpm_sqlite:timeout");
+        CHECK(h.rpm.empty());
+        CHECK(h.ecosystem == Eco::none);
+    }
+    SECTION("a stop predicate that stays false changes nothing") {
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        const auto h = pkgdb::read_host_packages_bounded(root.str(), default_limits(), [] { return false; });
+        CHECK(h.failure.empty());
+        CHECK(h.rpm.size() == 4);
+    }
+    SECTION("a reader that throws is pkgdb:unreadable at once, not a wall-long pkgdb:timeout") {
+        // Default 20 s wall: if the throw were left to bounded_call_ex this call would wait it out and
+        // answer pkgdb:timeout. A std exception and a non-std one are both caught.
+        const pkgdb::HostReader bad_alloc = [](const std::string&, const pkgdb::Limits&,
+                                               const std::function<bool()>&) -> pkgdb::HostPackages {
+            throw std::bad_alloc{};
+        };
+        const pkgdb::HostReader not_std = [](const std::string&, const pkgdb::Limits&,
+                                             const std::function<bool()>&) -> pkgdb::HostPackages { throw 42; };
+        for (const auto& reader : {bad_alloc, not_std}) {
+            const auto h = pkgdb::read_host_packages_bounded("/does/not/matter", default_limits(), {}, reader);
+            CHECK(h.failure == "pkgdb:unreadable");
+            CHECK(h.ecosystem == Eco::none);
+            CHECK(h.dpkg.empty());
+            CHECK(h.rpm.empty());
+        }
+    }
+}
+
+TEST_CASE("pkgdb limits: the defaults the plugin runs with are bounded in rows, bytes and time",
+          "[installed_apps][pkgdb]") {
+    // The closed vocabulary of causes is pinned from production in test_rpmdb_parsers.cpp (every
+    // PkgDbCause through pkgdb_cause_token), and every failure the shell produces is asserted by exact
+    // token in the cases above; the tokens of the bounded wrapper are asserted below.
+    const pkgdb::Limits lim{};
     CHECK(lim.max_packages == 50000);
     CHECK(lim.dpkg_max_bytes == 32ull * 1024 * 1024);
     CHECK(lim.rpm_max_header_bytes == 32ull * 1024 * 1024);
