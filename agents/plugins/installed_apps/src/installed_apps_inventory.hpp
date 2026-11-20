@@ -10,6 +10,12 @@
 // vectors, without needing dpkg/rpm/pacman/apk on the test host (same
 // header-for-testability pattern as installed_apps_registry_utf8.hpp, #1662).
 //
+// SAM-45: the Linux dpkg and rpm rows are mapped from the in-process database readers' records
+// (inv_record_from_dpkg / inv_record_from_rpm below). The CLI-output line parsers that used to
+// build them (parse_dpkg_inv_line, parse_rpm_inv_line and their helpers) are no longer product
+// code; they live on, verbatim, in tests/unit/installed_apps_old_path_oracle.hpp as the test-only
+// interpreter of the old path's captured output.
+//
 // Publisher derivation per leg (empty here = the agent core labels the row `via:<ecosystem>`):
 //   rpm      VENDOR, else PACKAGER (a person), else empty      deb   Maintainer (empty -> via:deb)
 //   pacman   empty (no vendor field without a second subprocess) -> via:pacman
@@ -21,10 +27,16 @@
 
 #include <algorithm>
 #include <cctype>
+#include <cstdint>
+#include <ctime>
+#include <functional>
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
+
+#include <dpkg_status_parsers.hpp> // yuzu::shared::DpkgPackage
+#include <rpmdb_parsers.hpp>       // yuzu::shared::RpmPackage, rpm_date_c_locale
 
 namespace yuzu::installed_apps::inventory {
 
@@ -86,25 +98,6 @@ inline bool all_digits(std::string_view s) {
     });
 }
 
-// Split a query-output line on '\t'. Tab is the internal separator for the
-// format strings we control (rpm --queryformat, dpkg-query -f): rpm's own
-// conditional syntax uses '|', and Maintainer/PACKAGER free text may legally
-// contain '|', so pipe-separated internal formats would be ambiguous.
-inline std::vector<std::string_view> split_tabs(std::string_view line) {
-    std::vector<std::string_view> out;
-    std::size_t p = 0;
-    while (true) {
-        const std::size_t t = line.find('\t', p);
-        if (t == std::string_view::npos) {
-            out.push_back(line.substr(p));
-            break;
-        }
-        out.push_back(line.substr(p, t - p));
-        p = t + 1;
-    }
-    return out;
-}
-
 // [epoch:]version[-release] -- the shape shared by deb `${Version}` and pacman
 // `-Q` version strings. Epoch is a strictly numeric prefix (Debian policy;
 // pacman likewise) -- a non-numeric prefix before ':' is part of the version,
@@ -130,39 +123,6 @@ inline EvrParts split_evr(std::string_view v) {
 }
 
 } // namespace detail
-
-// rpm --queryformat prints the literal "(none)" for an unset tag (EPOCH,
-// PACKAGER, ARCH on gpg-pubkey pseudo-packages). Map it to honest-empty.
-inline std::string map_rpm_none(std::string_view v) {
-    return v == "(none)" ? std::string{} : std::string{v};
-}
-
-// A signature tag counts as present only if it holds a real value -- not
-// empty, not "(none)", and not an unexpanded literal "%{...}" (an rpm too
-// old to know the tag echoes the format string back, which must NOT read as
-// "signed"). Mirrors vuln_identity.hpp::rpm_sig_present (PR #1804) exactly --
-// the two agent-side collectors emit the same PackageRecord shape for the
-// same rpm and must agree on this security-posture-relevant field, or an
-// operator/matcher sees a different signed/unsigned answer depending on
-// which collector happened to report the device.
-//
-// Assumes rpm's default formatting of an RPM_BIN_TYPE tag (SIGPGP/RSAHEADER,
-// absent an explicit :base64/:pgpsig format extension) is a tab/newline-free
-// hex string -- undocumented empirically (no rpm host was reachable to
-// verify against a live package), but consistent with rpm's documented
-// BIN-tag default and with PR #1804 shipping the identical assumption.
-inline bool rpm_sig_present(std::string_view raw) {
-    const std::string v = map_rpm_none(raw);
-    return !v.empty() && v.rfind("%{", 0) != 0;
-}
-
-// A free-text rpm tag (VENDOR, PACKAGER) as honest-empty: "(none)" and an
-// unexpanded literal "%{...}" echo (an rpm too old to know the tag) both read
-// as empty, so the publisher falls through to the next source instead of
-// carrying the format string. Same guard as rpm_sig_present.
-inline std::string rpm_text_value(std::string_view raw) {
-    return rpm_sig_present(raw) ? std::string{raw} : std::string{};
-}
 
 // deb `${Version}` = [epoch:]upstream[-revision].
 inline EvrParts split_deb_version(std::string_view v) {
@@ -237,91 +197,53 @@ inline std::string parse_os_release(std::string_view content, std::string_view k
     return {};
 }
 
-// One dpkg-query line:
-//   ${Package}\t${db:Status-Abbrev}\t${Version}\t${Architecture}\t${Maintainer}
-// Status-Abbrev is <want><status><eflag> (3 chars -- dpkg emits a trailing
-// space for the usual empty eflag, e.g. "ii "); the 2nd char 'i' == installed --
-// matches vuln_identity.hpp::parse_dpkg_line (PR #1804) exactly. Covers "ii"
-// (want=install) AND "hi" (want=hold: apt-mark hold / kernel pin), so a
-// held-but-installed package is present and scannable -- the legacy `list`
-// action's "install ok installed" substring filter excludes held, this does
-// not. "rc" (removed, config-files) and "un" (unknown) are correctly
-// excluded. nullopt for a structurally wrong or not-installed line.
-//
-// Maintainer is free text and the LAST field, so a tab inside it never drops the
-// row: the publisher is its head segment (the text before the first tab). The
-// first four fields are tab/newline-free by the dpkg grammar.
-inline std::optional<InvRecord> parse_dpkg_inv_line(std::string_view line) {
-    const auto tok = detail::split_tabs(line);
-    if (tok.size() < 5 || tok[1].size() < 2 || tok[1][1] != 'i')
+
+
+// ── dpkg / rpm: records from the in-process database readers ─────────────────
+
+// One installed dpkg package -> its `inv|` record, or nullopt when the package is not installed.
+// dpkg-query's `${db:Status-Abbrev}` second character was 'i' exactly when the state word is
+// `installed`, whatever the want (install, hold, deinstall, purge) and the error flag
+// (ok, reinstreq ...): the OLD rule, kept, so a held package is present and scannable while "rc"
+// (removed, config-files) and "un" are not. Matches vuln_identity.hpp::parse_dpkg_line (PR #1804).
+inline std::optional<InvRecord> inv_record_from_dpkg(const yuzu::shared::DpkgPackage& p) {
+    if (p.status != "installed")
         return std::nullopt;
     InvRecord r;
-    r.name = std::string(tok[0]);
-    const EvrParts evr = split_deb_version(tok[2]);
+    r.name = p.name;
+    const EvrParts evr = split_deb_version(p.version);
     r.epoch = evr.epoch;
     r.version = evr.version;
     r.release = evr.release;
-    r.arch = std::string(tok[3]);
-    r.publisher = std::string(tok[4]); // Maintainer
+    r.arch = p.architecture;
+    r.publisher = p.maintainer;
     r.kind = "package";
     r.ecosystem = "deb";
     return r;
 }
 
-// The rpm `--queryformat` whose output parse_rpm_inv_line reads: ONE copy, passed to rpm by the
-// plugin and fed back through the parser by the unit test, so the producer and the parser cannot
-// drift apart. The two free-text tags (VENDOR, PACKAGER) stay last (see below).
-inline constexpr std::string_view kRpmInvQueryFormat =
-    "%{NAME}\t%{EPOCH}\t%{VERSION}\t%{RELEASE}\t%{ARCH}\t"
-    "%{INSTALLTIME:date}\t%{SIGPGP}\t%{RSAHEADER}\t%{VENDOR}\t%{PACKAGER}\n";
-
-// One rpm line (at least 9 tab-separated tokens):
-//   NAME EPOCH VERSION RELEASE ARCH INSTALLTIME:date SIGPGP RSAHEADER VENDOR PACKAGER
-// The publisher is the declared VENDOR when set, else PACKAGER (a person, kept only as the
-// fallback), else empty (the agent core then labels the row `via:rpm`). `(none)` = unset.
+// One installed rpm package -> its `inv|` record. `to_local_tm` turns the stored INSTALLTIME into a
+// broken-down local time (localtime_r in the plugin, gmtime in a test), so the date renders exactly as
+// rpm's `%{INSTALLTIME:date}` did in the C locale and the formatter owns no timezone.
 //
-// The two free-text tags (VENDOR, PACKAGER) are LAST so a tab inside either never drops the
-// row: the first eight tags are fixed by position and the publisher is the head segment of
-// VENDOR, else of PACKAGER (a tab inside VENDOR shifts PACKAGER right; only its head is read
-// as a fallback when VENDOR is empty or its first byte is the tab). The first eight tags are
-// tab/newline-free because rpmbuild enforces it at build time; the rpmdb does not, so a
-// hand-built header with a tab in one of them can still shift a field (disclosed residual,
-// as is a newline inside a free-text tag, which rpm prints as a second line).
-// SIGPGP is the payload (v3 OpenPGP) signature tag; RSAHEADER is the header
-// signature tag. Both are checked (via rpm_sig_present) because modern
-// RHEL/Fedora packages are frequently header-signed only -- SIGPGP alone
-// would mislabel a validly-signed package as unsigned. Signature is read
-// from these STORED rpmdb tags only, never a live `rpm -K` verification.
-//
-// Two deliberate behavior shifts vs. this file's prior (pre-PR-#1804-parity)
-// scheme, both adopted for cross-collector agreement with vuln_identity.hpp:
-//   1. signature_status is now ALWAYS "signed" or "unsigned" -- never empty.
-//      The prior scheme left it honest-empty when the queryformat produced
-//      an unrecognized token (e.g. an rpm too old to expand the conditional
-//      syntax at all). That "indeterminate" case is now folded into an
-//      AFFIRMATIVE "unsigned" (rpm_sig_present's %{...}-literal-echo guard).
-//      This is a stronger negative claim on a security-posture-relevant
-//      field than "unrecorded" -- deliberate, not an oversight.
-//   2. The tag set checked narrows from four (DSAHEADER/RSAHEADER/SIGGPG/
-//      SIGPGP) to two (SIGPGP/RSAHEADER). A DSA-header-only- or GPG-payload-
-//      only-signed package -- legacy, uncommon on a modern RHEL/Fedora/SUSE
-//      fleet -- now reads "unsigned" where the old scheme read "signed".
-inline std::optional<InvRecord> parse_rpm_inv_line(std::string_view line) {
-    const auto tok = detail::split_tabs(line);
-    if (tok.size() < 9)
-        return std::nullopt;
+//   epoch     the decimal EPOCH, or empty when the tag is absent (rpm printed "(none)")
+//   publisher the declared VENDOR, else PACKAGER (a person, kept only as the fallback), else empty
+//   signature "signed" when SIGPGP (payload) or RSAHEADER (header) holds bytes, else "unsigned" --
+//             the STORED tags only, never a live verification (modern RHEL/Fedora/SUSE packages are
+//             frequently header-signed only, so SIGPGP alone would mislabel them; PR #1804 parity)
+inline InvRecord inv_record_from_rpm(const yuzu::shared::RpmPackage& p,
+                                     const std::function<std::tm(std::int64_t)>& to_local_tm) {
     InvRecord r;
-    r.name = std::string(tok[0]);
-    r.epoch = map_rpm_none(tok[1]);
-    r.version = std::string(tok[2]);
-    r.release = map_rpm_none(tok[3]);
-    r.arch = map_rpm_none(tok[4]); // gpg-pubkey pseudo-packages have (none) arch
-    r.publisher = rpm_text_value(tok[8]); // VENDOR: the declared vendor (head segment)
-    if (r.publisher.empty() && tok.size() >= 10)
-        r.publisher = rpm_text_value(tok[9]); // PACKAGER: a person, fallback only
-    r.install_date = map_rpm_none(tok[5]);
-    r.signature_status =
-        (rpm_sig_present(tok[6]) || rpm_sig_present(tok[7])) ? "signed" : "unsigned";
+    r.name = p.name;
+    if (p.epoch)
+        r.epoch = std::to_string(*p.epoch);
+    r.version = p.version;
+    r.release = p.release;
+    r.arch = p.arch;
+    r.publisher = !p.vendor.empty() ? p.vendor : p.packager;
+    if (p.install_time)
+        r.install_date = yuzu::shared::rpm_date_c_locale(to_local_tm(static_cast<std::int64_t>(*p.install_time)));
+    r.signature_status = (p.sigpgp || p.rsaheader) ? "signed" : "unsigned";
     r.kind = "package";
     r.ecosystem = "rpm";
     return r;

@@ -1,0 +1,191 @@
+Package: debconf
+Status: install ok installed
+Priority: required
+Section: admin
+Installed-Size: 491
+Maintainer: Debconf Developers <debconf-devel@lists.alioth.debian.org>
+Architecture: all
+Multi-Arch: foreign
+Version: 1.5.82
+Replaces: debconf-tiny
+Provides: debconf-2.0
+Recommends: apt-utils, debconf-i18n
+Suggests: debconf-doc, debconf-kde-helper, debconf-utils, libgtk3-perl, libnet-ldap-perl, libterm-readline-gnu-perl, perl, whiptail | dialog
+Conflicts: debconf-tiny, whiptail-utf8 (<= 0.50.17-13)
+Conffiles:
+ /etc/apt/apt.conf.d/70debconf 7e9d09d5801a42b4926b736b8eeabb73
+ /etc/debconf.conf 8c0619be413824f1fc7698cee0f23811
+Description: Debian configuration management system
+ Debconf is a configuration management system for debian packages. Packages
+ use Debconf to ask questions when they are installed.
+
+Package: hostname
+Essential: yes
+Status: install ok installed
+Priority: required
+Section: admin
+Installed-Size: 90
+Maintainer: Michael Meskes <meskes@debian.org>
+Architecture: arm64
+Version: 3.23+nmu1
+Replaces: nis (<< 3.17-30)
+Pre-Depends: libc6 (>= 2.34)
+Breaks: nis (<< 3.17-30)
+Description: utility to set/show the host name or domain name
+ This package provides commands which can be used to display the system's
+ DNS name, and to display or set its hostname or NIS domain name.
+
+Package: libacl1
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 101
+Maintainer: Guillem Jover <guillem@debian.org>
+Architecture: arm64
+Multi-Arch: same
+Source: acl
+Version: 2.3.1-3
+Depends: libc6 (>= 2.33)
+Description: access control list - shared library
+ This package contains the shared library containing the POSIX 1003.1e
+ draft standard 17 functions for manipulating access control lists.
+Homepage: https://savannah.nongnu.org/projects/acl/
+
+Package: libattr1
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 99
+Maintainer: Guillem Jover <guillem@debian.org>
+Architecture: arm64
+Multi-Arch: same
+Source: attr
+Version: 1:2.5.1-4
+Depends: libc6 (>= 2.17)
+Conffiles:
+ /etc/xattr.conf 743ca3f83ea263f1f56ad1f63f907bdb
+Description: extended attribute handling - shared library
+ Contains the runtime environment required by programs that make use
+ of extended attributes.
+Homepage: https://savannah.nongnu.org/projects/attr/
+
+Package: libaudit-common
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 22
+Maintainer: Laurent Bigonville <bigon@debian.org>
+Architecture: all
+Multi-Arch: foreign
+Source: audit
+Version: 1:3.0.9-1
+Conffiles:
+ /etc/libaudit.conf cdc703f9d27f0d980271a9e95d0f18b2
+Description: Dynamic library for security auditing - common files
+ The audit-libs package contains the dynamic libraries needed for
+ applications to use the audit framework. It is used to monitor systems for
+ security related events.
+ .
+ This package contains the libaudit.conf configuration file and the associated
+ manpage.
+Homepage: https://people.redhat.com/sgrubb/audit/
+
+Package: libgmp10
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 855
+Maintainer: Debian Science Team <debian-science-maintainers@lists.alioth.debian.org>
+Architecture: arm64
+Multi-Arch: same
+Source: gmp
+Version: 2:6.2.1+dfsg1-1.1
+Depends: libc6 (>= 2.17)
+Breaks: libmath-gmp-perl (<< 2.20-1), libmath-prime-util-gmp-perl (<< 0.51-2), postgresql-pgmp (<< 1.0.3-1)
+Description: Multiprecision arithmetic library
+ GNU MP is a programmer's library for arbitrary precision
+ arithmetic (ie, a bignum package).  It can operate on signed
+ integer, rational, and floating point numeric types.
+ .
+ It has a rich set of functions, and the functions have a regular
+ interface.
+Homepage: https://gmplib.org/
+
+Package: libtinfo6
+Status: install ok installed
+Priority: optional
+Section: libs
+Installed-Size: 533
+Maintainer: Craig Small <csmall@debian.org>
+Architecture: arm64
+Multi-Arch: same
+Source: ncurses
+Version: 6.4-4
+Depends: libc6 (>= 2.34)
+Description: shared low-level terminfo library for terminal handling
+ The ncurses library routines are a terminal-independent method of
+ updating character screens with reasonable optimization.
+ .
+ This package contains the shared low-level terminfo library.
+Homepage: https://invisible-island.net/ncurses/
+
+Package: login
+Essential: yes
+Status: install ok installed
+Priority: required
+Section: admin
+Installed-Size: 2718
+Maintainer: Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>
+Architecture: arm64
+Multi-Arch: foreign
+Source: shadow
+Version: 1:4.13+dfsg1-1+deb12u2
+Pre-Depends: libaudit1 (>= 1:2.2.1), libc6 (>= 2.34), libcrypt1 (>= 1:4.1.0), libpam0g (>= 0.99.7.1), libpam-runtime, libpam-modules
+Conflicts: python-4suite (<< 0.99cvs20060405-1)
+Conffiles:
+ /etc/login.defs f43a7b1eb7e082f1d4e2cb8f8376e71b
+ /etc/pam.d/login 5afbc06eb5f71fef25170cf3c936a442
+Description: system login tools
+ This package provides some required infrastructure for logins and for
+ changing effective user or group IDs, including:
+  * login, the program that invokes a user shell on a virtual terminal;
+  * nologin, a dummy shell for disabled user accounts;
+Homepage: https://github.com/shadow-maint/shadow
+
+Package: sed
+Essential: yes
+Status: install ok installed
+Priority: required
+Section: utils
+Installed-Size: 995
+Maintainer: Clint Adams <clint@debian.org>
+Architecture: arm64
+Multi-Arch: foreign
+Version: 4.9-1+deb12u1
+Pre-Depends: libacl1 (>= 2.2.23), libc6 (>= 2.34), libselinux1 (>= 3.1~)
+Description: GNU stream editor for filtering/transforming text
+ sed reads the specified files or the standard input if no
+ files are specified, makes editing changes according to a
+ list of commands, and writes the results to the standard
+ output.
+Homepage: https://www.gnu.org/software/sed/
+
+Package: tzdata
+Status: install ok installed
+Priority: required
+Section: localization
+Installed-Size: 2571
+Maintainer: GNU Libc Maintainers <debian-glibc@lists.debian.org>
+Architecture: all
+Multi-Arch: foreign
+Version: 2026f-0+deb12u1
+Provides: tzdata-bookworm
+Depends: debconf (>= 0.5) | debconf-2.0
+Description: time zone and daylight-saving time data
+ This package contains data required for the implementation of
+ standard local time for many representative locations around the
+ globe. It is updated periodically to reflect changes made by
+ political bodies to time zone boundaries, UTC offsets, and
+ daylight-saving rules.
+Homepage: https://www.iana.org/time-zones
+

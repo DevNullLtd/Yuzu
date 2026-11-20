@@ -1919,6 +1919,49 @@ neither end carries handling for a peer that predates it.
   withheld collectors, carrying a per-OS or per-action kill switch (only the plugin-wide switch is carried,
   which is the one the effective-settings route shows), and zone conversion on the agent.
 
+### 2026-11-20 — Linux dpkg and rpm rows are read from the package databases in-process (SAM-45)
+
+**What changed.** The `installed_apps` plugin no longer runs `dpkg-query` or `rpm -qa` on Linux for
+`list_inventory`, `list`, `query` or `list_per_user`. It reads the databases itself, read-only: the dpkg
+status text (and the `status.d` directory minimal images use), and the rpm database in whichever format the
+host keeps, sqlite (Fedora, RHEL 9 and later), ndb (SUSE) or Berkeley DB hash (RHEL 7 and 8). All three rpm
+formats store the same rpm header blob, so one header parser serves them. `pacman` and `apk` keep their
+subprocess legs. The readers live in `agents/shared` (`dpkg_status_parsers.hpp`, `rpmdb_parsers.hpp`,
+`pkgdb_budget.hpp`) and the plugin's POSIX shell is `installed_apps_pkgdb_read.hpp`.
+
+**What did not change.** The rows, the wire and the section hash. Every `inv|` and `app|` row the readers
+produce equals, as a set, the row the subprocess path produced for the same database on every capture taken
+for this change (eleven captures: Debian 12, Ubuntu 24.04, Fedora 41, AlmaLinux 8 on arm64 and on s390x,
+AlmaLinux 9, openSUSE Leap 15.6 and Tumbleweed, plus a dense variant of Debian, Fedora and Leap). There is no server
+change, no resend and no change-ledger event on upgrade. The earlier text of this ADR that names the line
+parsers (`parse_dpkg_inv_line`, `parse_rpm_inv_line`, `kRpmInvQueryFormat`, `parse_dpkg_list`,
+`parse_rpm_list`) describes the OLD path: those functions are now test-only, kept verbatim in
+`tests/unit/installed_apps_old_path_oracle.hpp` as the independent interpreter of the old path's captured
+output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label) and the dpkg rule (any
+`installed` state, held packages included) are the ones the subprocess path applied.
+
+**Deliberate differences, none of which changes a row on any capture.**
+
+- The package manager is detected by its DATABASE file rather than its tool binary, and an empty dpkg status
+  falls through to rpm.
+- A tab, pipe or newline inside a Maintainer, VENDOR or PACKAGER value no longer truncates the value or splits
+  the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time).
+- A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout distroless images use, which
+  `dpkg-query` never read) now reports them: new install rows and install events for that host.
+- An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
+  image: `rpm -qa` fails there).
+- A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the
+  result's provenance, the `list`/`query` error row and the agent log. The section token the daily sync sends
+  is still the generic constrained one (`sync_source_installed_software.cpp` reads only the exit code) until a
+  follow-up carries the reason end to end.
+
+**Failure semantics are unchanged in kind.** A degraded answer is rc 1 with no rows and CONSTRAINED/PARTIAL,
+so the writer's status-only section keeps the server's stored rows (the `v3:` held-facet rule). Every limit
+(20 s wall clock, 50,000 packages, 32 MiB per file or header, 1 GiB of rpm headers) and every damaged record
+degrades the whole read instead of returning a shorter roster. Reading rpm signer data and non-installed dpkg
+states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
+change; it needs a server change and is tracked as SAM-45b (#8361).
+
 ## Routed-concern invariants
 
 Moved verbatim from the `Agent daily-sync framework` row of `.claude/routed-concerns.md` on 2026-11-12, when that always-loaded row was compressed to its catastrophic clauses plus a pointer here. This text is the authoritative long form of that row.

@@ -7,7 +7,8 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "collection_settings_agent.hpp" // the golden settings documents feed the collector switches
-#include "installed_apps_inventory.hpp" // the plugin's own row parsers/builder feed the publisher cases
+#include "installed_apps_inventory.hpp" // the plugin's own row builder feeds the publisher cases
+#include "installed_apps_old_path_oracle.hpp" // parse_dpkg_inv_line / parse_rpm_inv_line (test-only since SAM-45)
 #include "installed_software_v3.hpp"
 #include "local_dispatcher.hpp"
 #include "sync_canonical.hpp" // sha256_hex

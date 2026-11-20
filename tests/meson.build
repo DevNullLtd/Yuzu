@@ -528,6 +528,9 @@ agent_test_exe = executable(
                                                 # TU elsewhere via the file's own #ifdef _WIN32 guard)
     'unit/test_installed_apps_parsers.cpp',   # Wave 4 PR4.3a: pure dpkg/rpm/pacman/system_profiler/
                                                 # brew/pkgutil parsers (installed_apps_parsers.hpp)
+    'unit/test_dpkg_status_parsers.cpp',      # SAM-45: dpkg status text parser (agents/shared/dpkg_status_parsers.hpp) over real captures, [dpkg][pkgdb], portable
+    'unit/test_rpmdb_parsers.cpp',            # SAM-45: rpm header blob + ndb + Berkeley DB hash readers (agents/shared/rpmdb_parsers.hpp) over real captures, [rpmdb][pkgdb], portable
+    'unit/test_installed_apps_pkgdb.cpp',     # SAM-45: installed_apps package-database shell, detection, limits, status.d, row-set parity with the old path, [installed_apps][pkgdb] (POSIX; no-op TU on Windows)
     'unit/test_installed_apps_actions.cpp',   # Wave 4 PR4.3a remediation: real installed_apps.dylib/.so
                                                 # driven end to end via LocalDispatcher (POSIX-only; a
                                                 # no-op TU on Windows via the file's own #ifndef _WIN32 guard)

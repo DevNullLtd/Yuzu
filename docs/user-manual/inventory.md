@@ -14,7 +14,7 @@ cadences.
   `install_location`. The daily sync calls eleven inventory actions in-process,
   one at a time, and reports each as its own section (see "The per-source
   report (blob v3)" below): `installed_apps` `list_inventory` (Windows: `HKLM`
-  plus the agent service account's own `HKCU`; Linux: `dpkg`/`rpm`/`pacman`/`apk`;
+  plus the agent service account's own `HKCU`; Linux: the `dpkg` and `rpm` databases read in-process, `pacman`/`apk` run as tools;
   macOS: `system_profiler`), `pkg_inventory` `packages` and `managers` (Homebrew;
   Chocolatey and winget on Windows) and `store_packages` (Linux snaps and
   flatpaks; the Windows Appx roster), and
@@ -81,8 +81,9 @@ cadences.
   `bundle_id` is `-` for rows the bounded bundle-id pass (30 s, at most 5000
   applications, one pass in flight) did not reach; that run leads with a
   `warning|bundle_id_*` row and reports CONSTRAINED -- never silently.
-  A degraded acquisition on any OS (Linux/macOS: timeout, kill, spawn failure,
-  truncation, or a nonzero exit; Windows: an unreadable Uninstall root or
+  A degraded acquisition on any OS (Linux pacman/apk and macOS: timeout, kill, spawn failure,
+  truncation, or a nonzero exit; Linux dpkg/rpm: an unreadable, locked, damaged
+  or over-limit package database; Windows: an unreadable Uninstall root or
   application subkey) now emits a single `error|installed_apps: acquisition
   degraded (...)` row and a nonzero result instead of an empty or partial
   `app|` list; on macOS a `list` may begin with a `warning|bundle_id_*` row --
@@ -346,6 +347,29 @@ cadences.
   GUI applications and installer receipts, so zero means the tool failed. On
   Linux an empty result is often honest — a host may legitimately have `rpm`
   installed and no rpm packages — so that check is not applied there.
+
+  **Linux dpkg and rpm rows come from an in-process database read.** The agent no
+  longer runs `dpkg-query` or `rpm`: it reads the dpkg status file (and the
+  `/var/lib/dpkg/status.d/` directory minimal images use) and the rpm database
+  (sqlite, ndb or Berkeley DB, whichever the host uses) itself, read-only and
+  without following symlinks, within 20 seconds, 50,000 packages and fixed byte
+  limits. The rows, and therefore the section hash, are byte-for-byte what the
+  tools produced on every host measured, so a fleet upgrade resends nothing. The
+  one visible difference is a host whose packages live only in `status.d`
+  (distroless-style images): its packages now appear, as new install rows. When
+  the read fails, the collection is degraded exactly as above, with no rows and
+  a named reason in the agent log, the `list`/`query` error row and the result's
+  provenance (`installed_apps:<source>:<cause>`): `locked` (the package manager
+  holds its database write-locked), `changed_during_read` (a transaction rewrote it
+  during the read), `corrupt` or `truncated` (a damaged database or record: one
+  bad rpm header fails the whole read rather than publishing a shorter list),
+  `unsupported_format` (a database layout the reader does not decode, for example
+  an LMDB rpm database or a Berkeley DB hash version other than 9),
+  `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
+  `symlink_refused` and `not_regular` (the database is a link or not a regular
+  file), and `unreadable` (a permission or I/O error). The daily sync's own
+  constrained token does not carry the reason yet; read it from the agent log. A degraded Linux host keeps its last-known rows,
+  shown as unconfirmed, until the database is readable again.
 
   **Windows degrades the same way (#4711).** The registry walk is native, so the
   subprocess cases above do not apply, but an Uninstall root that cannot be
