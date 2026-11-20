@@ -48,6 +48,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -309,7 +310,8 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
  *
  *   offset 0   'RpmP', version (must be 0), generation, slotnpages, nextpkgidx
  *   offset 32  the slot table, 16-byte slots, up to slotnpages * 4096:
- *                 'Slot', pkgidx (0 = empty), blkoff, blkcnt
+ *                 'Slot', pkgidx (0 = empty), blkoff, blkcnt; a pkgidx that appears in two slots
+ *                 is corrupt
  *   blkoff*16  the package blob: 'BlbS', pkgidx (must match the slot), generation, length,
  *              then `length` header bytes; the LAST 12 bytes of the slot's blkcnt*16 bytes
  *              are  checksum, length (must equal), 'BlbE'.
@@ -343,6 +345,9 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
         return std::unexpected(PkgDbCause::truncated);
 
     std::vector<std::uint8_t> blob;
+    // Every id inserted is followed by an error return or a charged row, so this never holds more
+    // ids than the row budget admits plus one.
+    std::unordered_set<std::uint32_t> seen;
     for (std::uint32_t pg = 0; pg < slotnpages; ++pg) {
         if (auto t = budget.check_time(); !t)
             return t;
@@ -354,6 +359,8 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
             const std::uint32_t pkgidx = load_u32(page, s + 4, false);
             if (pkgidx == 0)
                 continue; // empty slot
+            if (!seen.insert(pkgidx).second)
+                return std::unexpected(PkgDbCause::corrupt); // one package id in two slots
             const std::uint64_t blk_start = std::uint64_t{load_u32(page, s + 8, false)} * 16;
             const std::uint64_t blk_len = std::uint64_t{load_u32(page, s + 12, false)} * 16;
             if (blk_len < kBlobHead + kBlobTail)
@@ -409,8 +416,9 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
  *   overflow page (type 7) next page u32 at 16, bytes used u16 at 22, data from byte 26
  *
  * Items come in (key, data) pairs; a key is a 4-byte inline record number and the all-zero key is
- * rpm's own counter record, which is skipped. Pages 1..last_pgno are scanned in order and only
- * hash pages are read, so bucket and overflow-bucket pages need no chain walk of their own. A page
+ * rpm's own counter record, which is skipped. A record number that appears twice is corrupt.
+ * Pages 1..last_pgno are scanned in order and only hash pages are read, so bucket and
+ * overflow-bucket pages need no chain walk of their own. A page
  * of type 2 (P_HASH_UNSORTED, the pre-sort layout an in-place upgrade of an older file can leave
  * inside a version 9 file) holds real key/data pairs this reader does not decode, so it answers
  * `unsupported_format` rather than being skipped: a shorter roster must never pass as complete.
@@ -461,6 +469,9 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
     std::vector<std::uint8_t> opage(pagesize);
     std::vector<std::uint8_t> chain;
     std::vector<std::size_t> off;
+    // Every key inserted is followed by an error return or a charged row, so this never holds more
+    // keys than the row budget admits plus one.
+    std::unordered_set<std::uint32_t> seen;
 
     // Spends one row and the bytes of one header, then hands it over.
     const auto deliver = [&](std::span<const std::uint8_t> bytes) -> PkgDbVoid {
@@ -503,8 +514,11 @@ using RpmBlobFn = std::function<PkgDbVoid(std::span<const std::uint8_t>)>;
                 return std::unexpected(PkgDbCause::unsupported_format);
             if (ktype != kItemKeyData || item_end(i) - off[i] != 5)
                 return std::unexpected(PkgDbCause::corrupt); // not a 4-byte inline key
-            if (load_u32(page, off[i] + 1, false) == 0)
+            const std::uint32_t key = load_u32(page, off[i] + 1, false);
+            if (key == 0)
                 continue; // rpm's counter record
+            if (!seen.insert(key).second)
+                return std::unexpected(PkgDbCause::corrupt); // one record number twice
 
             const std::size_t dlen = item_end(i + 1) - off[i + 1];
             if (dtype == kItemKeyData) {

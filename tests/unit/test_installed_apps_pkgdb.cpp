@@ -44,11 +44,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
@@ -892,6 +894,104 @@ TEST_CASE("pkgdb status.d hostile: symlink entry refused, directory entry skippe
         const auto h = read_root(root, lim);
         CHECK(h.failure.empty());
         CHECK(h.dpkg.size() == 10);
+    }
+}
+
+namespace {
+
+// A scripted readdir: hands out `names` in order, then ends the listing with `end_errno` (0 = a clean
+// end of directory, anything else = the listing failed there). The DIR* is ignored.
+struct ScriptedReadDir {
+    std::vector<std::string> names;
+    int end_errno = 0;
+    std::size_t next = 0;
+    struct dirent entry {};
+
+    struct dirent* operator()(DIR*) {
+        if (next >= names.size()) {
+            errno = end_errno;
+            return nullptr;
+        }
+        std::strncpy(entry.d_name, names[next].c_str(), sizeof(entry.d_name) - 1);
+        entry.d_name[sizeof(entry.d_name) - 1] = '\0';
+        ++next;
+        return &entry;
+    }
+};
+
+// Two real control files from the debian12-statusd capture in a scratch status.d.
+void put_two_status_d_files(const Root& root) {
+    for (const char* name : {"base-files", "netbase"})
+        root.put(std::string{"var/lib/dpkg/status.d/"} + name, kStatusDCapture / name);
+}
+
+pkgdb::detail::DpkgRead list_status_d(const Root& root, ScriptedReadDir& script) {
+    const pkgdb::Limits lim = default_limits();
+    yuzu::shared::PkgDbBudget budget{.rows_left = lim.max_packages,
+                                     .bytes_left = lim.dpkg_max_bytes,
+                                     .max_item_bytes = lim.dpkg_max_bytes,
+                                     .expired = {}};
+    return pkgdb::detail::read_dpkg_status_d(root.str(), lim, budget, script);
+}
+
+} // namespace
+
+TEST_CASE("pkgdb status.d: a directory listing that fails part-way fails the read, never a shorter list",
+          "[installed_apps][pkgdb]") {
+    Root root;
+    put_two_status_d_files(root);
+
+    SECTION("control: a clean end after one name reads that one package") {
+        ScriptedReadDir script{{"base-files"}, 0};
+        const auto r = list_status_d(root, script);
+        CHECK(r.failure.empty());
+        REQUIRE(r.packages.size() == 1);
+        CHECK(r.packages[0].name == "base-files");
+    }
+    SECTION("one real name, then the listing fails with EIO") {
+        ScriptedReadDir script{{"base-files"}, EIO};
+        const auto r = list_status_d(root, script);
+        CHECK(r.failure == "dpkg_status_d:unreadable");
+        CHECK(r.packages.empty());
+    }
+    SECTION("the listing fails on the first call") {
+        ScriptedReadDir script{{}, EIO};
+        const auto r = list_status_d(root, script);
+        CHECK(r.failure == "dpkg_status_d:unreadable");
+        CHECK(r.packages.empty());
+    }
+}
+
+TEST_CASE("pkgdb status.d: skipped names are bounded and poll the deadline like any other entry",
+          "[installed_apps][pkgdb]") {
+    SECTION("a status.d of only skipped names still polls the deadline, and an expired one is timeout") {
+        Root root;
+        root.put_text("var/lib/dpkg/status.d/.hidden", "x");
+        root.put_text("var/lib/dpkg/status.d/netbase.md5sums", "x");
+        std::size_t polls = 0;
+        const auto h = read_root(root, default_limits(), [&] {
+            ++polls;
+            return true;
+        });
+        REQUIRE(polls > 0);
+        CHECK(h.failure == "dpkg_status_d:timeout");
+        CHECK(h.dpkg.empty());
+    }
+    SECTION("the entry bound is twice max_packages: over it is row_cap, an exact fill reads") {
+        const auto [rest, stanza] = split_stanza("libacl1");
+        Root root; // one control file and five skipped names: six entries
+        root.put_text("var/lib/dpkg/status.d/libacl1", stanza);
+        for (const char* junk : {".a", ".b", "a.md5sums", "b.md5sums", "c.md5sums"})
+            root.put_text(std::string{"var/lib/dpkg/status.d/"} + junk, "x");
+        pkgdb::Limits lim;
+        lim.max_packages = 2; // bound 4
+        const auto over = read_root(root, lim);
+        CHECK(over.failure == "dpkg_status_d:row_cap");
+        CHECK(over.dpkg.empty());
+        lim.max_packages = 3; // bound 6
+        const auto fill = read_root(root, lim);
+        CHECK(fill.failure.empty());
+        CHECK(fill.dpkg.size() == 1);
     }
 }
 

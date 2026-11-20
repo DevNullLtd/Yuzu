@@ -625,6 +625,18 @@ TEST_CASE("ndb hostile: edited real file with a bad magic, version, slot count, 
         f[s.blk_start + s.blk_len - 1] = 'X';
         CHECK(cause(f) == PkgDbCause::corrupt);
     }
+    SECTION("edited duplicate package id: an occupied slot copied over an empty one is corrupt") {
+        // The unedited file reads; the same slot in two places would read as a repeated package.
+        std::size_t empty = 0;
+        for (std::size_t off = 32; off < get32(good, 12, false) * 4096ull && empty == 0; off += 16)
+            if (get32(good, off + 4, false) == 0)
+                empty = off;
+        REQUIRE(empty != 0);
+        Bytes f = good;
+        std::copy_n(good.begin() + static_cast<std::ptrdiff_t>(s.slot), 16,
+                    f.begin() + static_cast<std::ptrdiff_t>(empty));
+        CHECK(cause(f) == PkgDbCause::corrupt);
+    }
     SECTION("edited file cut at every length: a truncated file never reads as complete") {
         // The last block ends at `last_end`; any shorter file must fail.
         std::uint64_t last_end = 0;
@@ -701,6 +713,23 @@ BdbView view_of(const Bytes& f) {
     }
     FAIL("no off-page item in the bdb fixture");
     return v;
+}
+
+// File offsets of the 4-byte inline key of every record whose key is not rpm's all-zero counter key.
+std::vector<std::size_t> bdb_key_offsets(const Bytes& f, const BdbView& v) {
+    std::vector<std::size_t> out;
+    for (std::uint32_t pg = 1; pg <= v.last_pgno; ++pg) {
+        const std::size_t base = std::size_t{pg} * v.pagesize;
+        if (f[base + 25] != 13)
+            continue;
+        const std::size_t n = get16(f, base + 20, v.be);
+        for (std::size_t i = 0; i < n; i += 2) {
+            const std::size_t key = base + get16(f, base + 26 + 2 * i, v.be) + 1;
+            if (get32(f, key, false) != 0)
+                out.push_back(key);
+        }
+    }
+    return out;
 }
 
 } // namespace
@@ -803,6 +832,14 @@ TEST_CASE("bdb hostile: edited real file with a bad magic, version, page size, c
             REQUIRE(f[page_base + 25] == 13);
             f[page_base + 25] = 2;
             CHECK(cause(f) == PkgDbCause::unsupported_format);
+        }
+        SECTION("edited record number repeated: one key overwritten with another's is corrupt") {
+            const auto keys = bdb_key_offsets(good, v);
+            REQUIRE(keys.size() >= 2);
+            Bytes f = good;
+            std::copy_n(good.begin() + static_cast<std::ptrdiff_t>(keys[0]), 4,
+                        f.begin() + static_cast<std::ptrdiff_t>(keys[1]));
+            CHECK(cause(f) == PkgDbCause::corrupt);
         }
         SECTION("edited off-page first pgno outside [1, last_pgno]") {
             Bytes f = good;

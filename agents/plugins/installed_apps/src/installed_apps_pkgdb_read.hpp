@@ -60,6 +60,7 @@
 #include <ctime>
 #include <expected>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <span>
@@ -76,6 +77,7 @@
 #include <bounded_wait.hpp>
 #include <dpkg_status_parsers.hpp>
 #include <pkgdb_budget.hpp>
+#include <posix_dir_walk.hpp>
 #include <posix_secure_read.hpp>
 #include <rpmdb_parsers.hpp>
 
@@ -211,10 +213,16 @@ struct DpkgRead {
 /// `install ok installed` (MissingStatus::installed); a stanza that does have one is held to the
 /// three-word rule. One component per call through the dir-fd forms; regular files only. A symlink
 /// entry fails the read (never followed), a directory, FIFO or device entry is skipped, an
-/// oversized file fails it, and the number of files is bounded by max_packages (row_cap). A
-/// missing directory is normal and benign.
-[[nodiscard]] inline DpkgRead read_dpkg_status_d(const std::string& root, const Limits& lim,
-                                                 PkgDbBudget& budget) {
+/// oversized file fails it, and the number of packages is bounded by max_packages (row_cap). The
+/// listing is bounded in entries too (twice max_packages: a package is one control file and one
+/// .md5sums sibling; over it is row_cap) and polls the deadline on every entry, skipped or not. A
+/// listing that fails part-way fails the read (unreadable), never a shorter list. A missing
+/// directory is normal and benign. `readdir_fn` defaults to the real readdir and is overridable
+/// only for tests.
+template <typename ReadDirFn = yuzu::shared::detail::DefaultReadDirFn>
+[[nodiscard]] inline DpkgRead
+read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budget,
+                   ReadDirFn&& readdir_fn = &yuzu::shared::detail::default_readdir) {
     constexpr std::string_view kSource = "dpkg_status_d";
     DpkgRead out;
     const std::string path = join(root, "var/lib/dpkg/status.d");
@@ -231,15 +239,33 @@ struct DpkgRead {
     }
 
     std::vector<std::string> names;
-    while (const struct dirent* e = ::readdir(dir.dir.get())) {
-        const std::string_view name{e->d_name};
-        if (name == "." || name == ".." || status_d_skips(name))
-            continue;
-        if (names.size() >= lim.max_packages) {
-            out.failure = failure_token(kSource, PkgDbCause::row_cap);
-            return out;
-        }
-        names.emplace_back(name);
+    std::optional<PkgDbCause> stopped; // why the callback ended the walk early
+    const std::size_t entry_bound = lim.max_packages > std::numeric_limits<std::size_t>::max() / 2
+                                        ? std::numeric_limits<std::size_t>::max()
+                                        : lim.max_packages * 2;
+    const auto walk = yuzu::shared::walk_dir_capped(
+        dir.dir.get(), entry_bound,
+        [&](const struct dirent* e) {
+            if (auto t = budget.check_time(); !t) {
+                stopped = t.error();
+                return false;
+            }
+            const std::string_view name{e->d_name};
+            if (status_d_skips(name))
+                return true;
+            if (names.size() >= lim.max_packages) {
+                stopped = PkgDbCause::row_cap;
+                return false;
+            }
+            names.emplace_back(name);
+            return true;
+        },
+        std::forward<ReadDirFn>(readdir_fn));
+    if (stopped || walk.enumeration_error || walk.truncated) {
+        out.failure = failure_token(kSource, stopped                ? *stopped
+                                             : walk.enumeration_error ? PkgDbCause::unreadable
+                                                                      : PkgDbCause::row_cap);
+        return out;
     }
     std::sort(names.begin(), names.end()); // readdir order is arbitrary; the answer must not be
 
