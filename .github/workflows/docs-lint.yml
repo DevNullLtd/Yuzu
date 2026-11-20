@@ -135,6 +135,13 @@ jobs:
       - name: Plugin init failed wiring gate self-test
         run: python3 -I tests/test_plugin_init_failed_wiring_lexical_selftest.py
 
+      # WP13c/C-2: the root macOS agent must never exec a user-owned Homebrew `brew`.
+      - name: vuln_scan no-brew gate (WP13c)
+        run: python3 -I tests/test_vuln_scan_no_brew_lexical.py
+
+      - name: vuln_scan no-brew gate self-test (WP13c)
+        run: python3 -I tests/test_vuln_scan_no_brew_lexical_selftest.py
+
       # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
       # no source or manual claims an absent command_id proves a step was never sent.
       - name: Workflow execute docs gate (#2146)
@@ -322,6 +329,27 @@ jobs:
       - name: Agent installer trust-anchor ACL lint
         run: python3 tests/test_agent_installer_acl_lint.py
 
+      # Every plugin the root meson.build builds has a Source line in the
+      # Windows agent installer (yuzu-agent.iss) or a recorded
+      # `; plugin-not-installed:` exclusion (#4867). The release zip takes
+      # plugins by glob, so a missing line ships in the zip and silently not
+      # in the installer. Mutation-tests itself. Stdlib only.
+      - name: Agent installer plugin coverage lint
+        run: python3 -I tests/test_agent_installer_plugin_coverage_lint.py
+
+      # The Windows agent zip and installer ship the Visual C++ runtime
+      # app-local (deploy/packaging/windows/stage-msvc-runtime.ps1), and
+      # release.yml's build-windows checks every shipped binary's DLL imports
+      # against both payloads (scripts/ci/check-windows-payload-imports.py)
+      # before ISCC runs. Behavioural over synthetic PE images, the staging
+      # script under pwsh, and lexical wiring pins with mutants.
+      - name: Windows payload import closure
+        env:
+          # The runner image ships pwsh: require it so the staging-script
+          # behaviour cannot skip silently.
+          YUZU_REQUIRE_PWSH_TEST: '1'
+        run: python3 -I tests/test_windows_payload_imports.py
+
       # Gateway scrape (#5695): every shipped Prometheus config, and every
       # compose stack that runs a Prometheus next to a gateway, scrapes the
       # gateway's metrics port. Stdlib only.
@@ -333,6 +361,15 @@ jobs:
       # and a release missing one fails before publishing. Stdlib + bash.
       - name: Release artifact gate
         run: python3 tests/test_check_release_artifacts.py
+
+      # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py
+      # describes one shipped file with its vcpkg closure (agent or server),
+      # never test or helper ports, and its `check` refuses a checkout-scale
+      # SBOM, one listing a checkout/build/test-tree path and one whose artifact
+      # hash differs. syft, pkgutil and rpm2cpio are stubbed. Stdlib only (the
+      # `cbom-schema` job runs it again with jsonschema, validating the SBOMs).
+      - name: Per-artifact SBOM generator
+        run: python3 -I tests/test_artifact_sbom.py
 
       # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): no
       # server build or server installer in release.yml's Windows/macOS jobs,
@@ -360,6 +397,20 @@ jobs:
       # --suite docs`.
       - name: Server feature option lint
         run: python3 -I tests/test_server_feature_option.py
+
+      # Security dependency pins: every vcpkg.json `overrides` entry has a row
+      # (what it fixes, when to delete it) in docs/build-guide.md "Security
+      # dependency pins", and every row an entry. Mutation-tests itself.
+      # Stdlib only.
+      - name: vcpkg overrides documented
+        run: python3 -I tests/test_vcpkg_overrides_documented.py
+
+      # Every SHA-256 a vendored *-NOTICE.txt under server/core/{static,vendor}
+      # records is the hash of the file it names (a same-size vendor edit keeps
+      # test_static_js_bundle.cpp's byte pin green). Mutation-tests itself on a
+      # scratch copy. Stdlib only.
+      - name: Vendored NOTICE hashes
+        run: python3 -I tests/test_vendored_notice_hashes.py
 
       # Code-to-docs fact parity (docs/docs-drift-gate.md): every /api/vN/
       # route, MCP tool and server/agent CLI flag is named in the user manual,
@@ -456,8 +507,10 @@ jobs:
   # (tests/fixtures/cyclonedx/golden/, kept byte-equal to cbom_json by
   # test_crypto_cbom.cpp) against the vendored official schema. jsonschema is
   # hash-pinned in requirements-ci.txt. YUZU_REQUIRE_JSONSCHEMA=1 turns the
-  # test's local skip-without-jsonschema into a hard failure here. Its own job
-  # for the same PyPI-outage reason as definition-descriptions below.
+  # test's local skip-without-jsonschema into a hard failure here. The job also
+  # schema-validates the per-artifact SBOMs tests/test_artifact_sbom.py
+  # generates (CycloneDX 1.7 and SPDX 2.3). Its own job for the same
+  # PyPI-outage reason as definition-descriptions below.
   cbom-schema:
     name: CBOM schema
     runs-on: ubuntu-24.04
@@ -476,6 +529,17 @@ jobs:
         env:
           YUZU_REQUIRE_JSONSCHEMA: "1"
         run: python3 tests/test_cbom_schema.py
+
+      # The per-artifact SBOM suite again (docs-lint's "Per-artifact SBOM
+      # generator" step runs it without jsonschema), here validating every SBOM
+      # its tests generate (syft stubbed) against the vendored CycloneDX 1.7 and
+      # SPDX 2.3 schemas (tests/fixtures/cyclonedx, tests/fixtures/spdx).
+      # YUZU_REQUIRE_JSONSCHEMA=1 makes a missing jsonschema a failure. No -I:
+      # jsonschema is in the user site the step above installs into.
+      - name: Validate generated SBOMs against CycloneDX 1.7 and SPDX 2.3
+        env:
+          YUZU_REQUIRE_JSONSCHEMA: "1"
+        run: python3 tests/test_artifact_sbom.py
 
   # #5557: the self-test of the execution owner key tripwire that `changelog-order` runs. It mutates
   # the server sources in memory and proves each mutation is caught. ITS OWN JOB, deliberately,

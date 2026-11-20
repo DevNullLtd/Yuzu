@@ -278,6 +278,8 @@ agent_test_exe = executable(
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_single_flight.cpp', # vuln_scan single-flight/cache helper cannot wedge (portable)
+    'unit/test_vuln_macos_software.cpp', # macOS enumeration status/abs-path contract (macos_software.hpp), portable
     'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
@@ -309,6 +311,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
+    'unit/test_session_log_fingerprint.cpp', # #8159: session id never logged raw
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
@@ -352,6 +355,7 @@ agent_test_exe = executable(
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
+    'unit/test_ioc_parsers.cpp',  # #7710: exact hostname-column match of /etc/hosts (pure)
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
@@ -668,6 +672,14 @@ agent_test_exe = executable(
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
+    'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
+    'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
+    'unit/test_file_search_cursor.cpp',          # file search core: walk position order + fs1 cursor codec (agents/shared/file_search_{position,cursor}.hpp), portable
+    'unit/test_file_search_names.cpp',           # file search core: reversible name encoding, file identity, match row (agents/shared/file_search_names.hpp), portable
+    'unit/test_file_search_query.cpp',           # file search core: leaf-name pattern + query hash (agents/shared/file_search_query.hpp), portable
+    'unit/test_file_search_coverage.cpp',        # file search core: coverage envelope rows (agents/shared/file_search_coverage.hpp), portable
+    'unit/test_file_search_governor.cpp',        # file search core: slice governor with injected clock and sleep (agents/shared/file_search_governor.hpp), portable
+    'unit/test_file_search_resume_contract.cpp', # file search core: walk_ordered + cursor transitions + governor + coverage composed over MemTree (the resume contract), portable
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
@@ -695,6 +707,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/ioc/src'),        # ioc_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
@@ -1484,20 +1497,21 @@ echo_test_exe = executable(
 )
 # The sizing cases fold 20,000 distinct keys per source, so they run as their own test() with a
 # longer timeout; the main run excludes them (the same filter-split shape as the server shards below).
-# 180s (#7135; was 90s). Unlike agent shard C above this is not an exception to the budget rule in
-# docs/testing/unit-test-conventions.md: no split is planned, and at 180s the measured passing runs
-# sit under the rule's 50% line. It took 51.04s on a Windows CI runner when
-# it passed (run 41919798385 attempt 5, 28% of 180s) and 82s on a standalone Windows host (#7135
-# comment, 46%), and it timed out at 90.09s on a loaded runner (attempt 4, job 126911227871) in
-# the same job where agent shard C also timed out; both passed on the rerun, so that was load,
-# not a hang. A timeout is a floor, not a measurement: the limit is 2x that floor, and the
-# deepest-load worst case is not measured, so the margin over it may be smaller than 2x. A failed
-# live-registry case adds its own 15s waits on top. Revisit the value once #7173/#7135 settle; there
-# is no commitment to lower it, because the 50% rule is met at 180s.
 # The schema-v10 migration cases ([v10]: a seeded v9 database folded over all 17 sources, chunked
-# folds, rollbacks) are about a quarter of the suite's run time on their own, which pushed the main
-# run past its 90 s limit on the Windows debug runner (about 55 s before them), so they are a
-# third test() too. Together the three filters cover every case exactly once.
+# folds, rollbacks) also get a separate test() entry, because together with the main run they
+# overran its limit on the Windows debug runner. The three filters cover every case exactly once.
+#
+# Limits, with the measurements they were set against. No limit changed in this block, and none is
+# raised without a recorded measurement.
+#  - echo unit tests, 180 s (#7135; was 90 s): 40.1-82.3 s over 17 Windows MSVC debug runs after
+#    PR #8081 (2026-11-17, closing comment on #7135); the worst is 46% of 180 s. The 90 s limit is
+#    history: it timed out at 90.09 s on a loaded runner (job 126911227871), having passed at
+#    51.04 s on another attempt (run 41919798385 attempt 5) and 82 s on a standalone Windows host.
+#    A failed live-registry case adds its own 15 s waits on top.
+#  - echo v10 migration, 300 s: 10.1-38.8 s in the same 17 runs; the worst is 13% of 300 s. Before
+#    PR #8081 it took 34-43 s on a quiet runner and 175-225 s when loaded.
+#  - echo fold sizing, 300 s: 37.32 s on the slowest of those runs (job 133878633910, 2026-11-17),
+#    12% of 300 s, and 40 s on run 42793514851 (2026-11-10).
 test('echo unit tests', echo_test_exe, args: ['~[fold_sizing]~[v10]', '--durations=yes'], suite: 'echo', timeout: 180)
 test('echo fold sizing', echo_test_exe, args: ['[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
 test('echo v10 migration', echo_test_exe, args: ['[v10]~[fold_sizing]', '--durations=yes'], suite: 'echo', timeout: 300)
@@ -1575,6 +1589,7 @@ if build_server
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_server_encoding.cpp', # WP07: boot-time UTF8 database-encoding check (warn-only)
       'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
@@ -3547,6 +3562,42 @@ test('qa-stack gateway crash signatures',
   suite: 'docs',
   timeout: 30,
 )
+# WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
+# fails closed, run against a stub trivy; plus lexical tripwires that every
+# release.yml publish job runs it before its push and pre-release.yml scans
+# every published image. Hermetic, no Docker; the bash cases skip on Windows.
+test('image vulnerability gate',
+  _python3_test,
+  args: [files('test_image_vuln_gate.py')],
+  suite: 'docs',
+  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
+  # limit of 60): many cases each run the gate script and a stub trivy.
+  timeout: 240,
+)
+
+# WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
+# outcomes x stop points x publish shapes runs release.yml's publish steps in
+# the workflow's order against a stub registry and checks the journal never
+# claims less than the registry holds; cross-attempt rows run the attach job;
+# step-reorder and script mutants must be killed. Cancels are delivered to the
+# step's PID only, as the Actions runner delivers them, and some rows wait out
+# a stall or a cancelled run, hence the timeout. Bash + PyYAML, no Docker.
+test('image publish journal',
+  _python3_test,
+  args: [files('test_image_publish.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
+# release publish jobs' buildx type=local caches, removes only unreferenced
+# blobs and never leaves an index naming a removed blob. Synthetic layout.
+test('buildx cache prune',
+  _python3_test,
+  args: [files('test_prune_buildcache.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
 # against a synthetic complete artifacts directory, then with each expected
@@ -3554,6 +3605,21 @@ test('qa-stack gateway crash signatures',
 test('release artifact gate',
   _python3_test,
   args: [files('test_check_release_artifacts.py')],
+  suite: 'docs',
+  timeout: 120,
+)
+
+# Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
+# stubbed. Pins the vcpkg closure (agent vs server, no test/helper/host ports),
+# the artifact hash and name on the SBOM root, every artifact kind (the macOS
+# .pkg in its shipped layout, the installer from its compiler's manifest), the
+# incompleteness mark, and the release check's bound and forbidden paths. The
+# generate tests skip on Windows (the stubs are #! scripts); the rest run. When
+# jsonschema is importable, every generated SBOM is also validated against the
+# vendored CycloneDX 1.7 and SPDX 2.3 schemas (YUZU_REQUIRE_JSONSCHEMA=1: required).
+test('per-artifact SBOM generator',
+  _python3_test,
+  args: [files('test_artifact_sbom.py')],
   suite: 'docs',
   timeout: 60,
 )
@@ -3614,6 +3680,16 @@ test('local test runner platform selftest 3 of 3',
   timeout: 30,
 )
 
+# scripts/deploy_build_dlls.py (the Windows build's DLL deploy step) fails on
+# a DLL copy that did not happen instead of swallowing it, warns on a locked
+# destination that keeps an older copy, and copies the same DLLs as before.
+test('deploy build DLLs selftest',
+  _python3_test,
+  args: [files('test_deploy_build_dlls.py')],
+  suite: 'platform',
+  timeout: 30,
+)
+
 # Windows agent installer trust-anchor lockdown (#5196): the .iss is compiled
 # only by release.yml, so this lints its source text -- no /T on the icacls
 # grant, a Constrained-Language-safe exact SDDL check, the user manual's copy of
@@ -3633,6 +3709,28 @@ test('agent installer enrollment-token lint',
   args: [files('test_agent_installer_token_lint.py')],
   suite: 'docs',
   timeout: 30,
+)
+
+# Every agent plugin meson.build produces has a Source line in the Windows
+# agent installer, or a recorded `; plugin-not-installed:` exclusion (#4867).
+# The plugin set is derived from the root meson.build, not hand-kept.
+test('agent installer plugin coverage lint',
+  _python3_test,
+  args: [files('test_agent_installer_plugin_coverage_lint.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
+# The Windows agent payloads (zip and installer) ship the Visual C++ runtime
+# app-local, and release.yml checks every shipped binary's DLL imports against
+# each payload before ISCC runs. Behavioural over synthetic PE images (stdlib),
+# the staging script under pwsh when present, plus lexical wiring pins with a
+# mutation self-test.
+test('windows payload import closure',
+  _python3_test,
+  args: [files('test_windows_payload_imports.py')],
+  suite: 'docs',
+  timeout: 300,
 )
 
 # Compose certs volume (#5370): every tracked compose that keeps Postgres on a
@@ -4409,6 +4507,25 @@ test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   timeout: 30,
 )
 
+# WP07: static lexical gate that every Echo diff source scrubs its identity strings at collection
+# (echo_plugin.cpp's scrub_wire_strings call sites); deleting one fabricates phantom events every
+# tick and no unit test can reach the anonymous helpers. Source text only, so Python, no build needed.
+test('Echo scrub-wiring lexical gate (WP07)',
+  _python3_test,
+  args: [files('test_echo_scrub_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
+# pg::report_server_encoding (neither is reachable from a unit test). Source text only.
+test('WP07 metrics wiring lexical gate',
+  _python3_test,
+  args: [files('test_wp07_metrics_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #5291 / PR #6311: static lexical gate over Echo's Windows-only bounded hive-mount call site --
 # the module must be pinned before the first mount and the walk must stop mounting after a timeout
 # (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
@@ -4818,6 +4935,36 @@ test('plugin allowlist startup wiring lexical gate',
 test('installed_apps no-brew lexical gate',
   _python3_test,
   args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
+test('agent session id log wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_session_log_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# #8159: the session_fp -> session id join in scripts/lib/agent-session-fp.sh, on LF and CRLF fixtures.
+test('agent session fp shell join',
+  _python3_test,
+  args: [files('test_agent_session_fp_shell.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# F56: yuzu_pg_canary prints a fixed cause on a connect failure, never libpq's text. Server-only.
+if is_variable('pg_canary_exe')
+  test('pg canary connect failure line',
+    _python3_test,
+    args: [files('test_pg_canary_connect_failure.py'), pg_canary_exe],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
+# WP04-X: the readiness probe's query-phase sites never use the connect classifier.
+test('pg probe query-phase classifier lexical gate',
+  _python3_test,
+  args: [files('test_pg_probe_query_phase_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )
@@ -5341,6 +5488,21 @@ test('plugin init failed wiring lexical selftest',
   timeout: 30,
 )
 
+# vuln_scan never executes Homebrew's brew (the macOS agent is root; a Homebrew prefix is
+# user-owned). String-literal-aware lexical gate over agents/plugins/vuln_scan/src/**; the selftest
+# injects each evasion shape (URL-in-string, "br" "ew", .mm, absolute path) and requires RED.
+test('vuln_scan no-brew lexical',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('vuln_scan no-brew lexical selftest',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 # WP11: the processes / network_config bypass / installed_apps user_app rows are built by the
 # neutralising formatters at every site (best-effort lexical tripwire, self-checked in memory).
 test('plugin row formatters wiring lexical',
@@ -5373,6 +5535,15 @@ test('Echo security wiring lexical gate',
   _python3_test,
   args: [files('test_echo_security_wiring_lexical.py')],
   suite: 'docs',
+  timeout: 30,
+)
+# The Echo test-writing standard (docs/testing/echo-test-standard.md): no sleeps, no std::async,
+# no unguarded wait, no size CHECK before an index in tests/unit/**/test_echo*.cpp. In suite 'echo',
+# not 'docs', because the docs suite is excluded on the Windows and macOS legs and echo runs on all.
+test('Echo test standard lexical gate',
+  _python3_test,
+  args: [files('test_echo_test_standard_lexical.py')],
+  suite: 'echo',
   timeout: 30,
 )
 
@@ -5518,6 +5689,12 @@ test('contract evidence CI step', _python3_test,
 # One CCACHE_MAXSIZE per self-hosted pool: a smaller cap trims the shared cache.
 test('ci ccache cap', _python3_test,
   args: [files('test_ci_ccache_cap.py')], suite: 'docs', timeout: 30)
+# Each vcpkg.json override has a row in docs/build-guide.md "Security dependency pins".
+test('vcpkg overrides documented', _python3_test,
+  args: [files('test_vcpkg_overrides_documented.py')], suite: 'docs', timeout: 30)
+# Each SHA-256 a vendored *-NOTICE.txt records is the hash of the file it names.
+test('vendored notice hashes', _python3_test,
+  args: [files('test_vendored_notice_hashes.py')], suite: 'docs', timeout: 30)
 if get_option('build_contract_tests')
   _contract_adapter = files('../scripts/test/contract-evidence.py')
   test('contract.plugin.loader.reserved-name.reject', _python3_test,

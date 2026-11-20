@@ -1,0 +1,1 @@
+src/plugins/file_search/main.cpp

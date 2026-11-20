@@ -39,6 +39,8 @@ export LC_ALL=C
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$HERE/../.." && pwd)"
+# shellcheck source=../lib/agent-session-fp.sh
+. "$REPO_ROOT/scripts/lib/agent-session-fp.sh"
 COMPOSE_BASE="$REPO_ROOT/deploy/docker/docker-compose.ha-gateway-failover.yml"
 COMPOSE_OVERLAY="$REPO_ROOT/deploy/docker/docker-compose.ha-gateway-two-replica.yml"
 CLIENT="$HERE/ha-two-replica-probe-client.py"
@@ -290,14 +292,28 @@ sampler_stop() {
     kill "$(cat "$1/sampler.pid")" 2>/dev/null; rm -f "$1/sampler.pid"; wait 2>/dev/null; return 0
 }
 
-agent_map() { # container,agent id,session per agent (from the agent log)
+agent_map() { # container,agent id,session per agent (session via the route table, joined on the agent log session_fp)
     local run="$1"
     for c in $(compose ps -q agent); do
         local name sess
         name="$(docker inspect -f '{{.Name}}' "$c" | tr -d /)"
-        sess="$(docker logs "$c" 2>&1 | sed -n 's/.*Registered with server (session=\([^,]*\),.*/\1/p' | tail -1)"
+        # The agent log carries only session_fp= (#8159): the first 8 hex of SHA-256(session id).
+        # Join it to the id in the route table, the same key the rest of this script uses.
+        local fp alog
+        alog="$(docker logs "$c" 2>&1 | tr -d '\r')"
+        fp="$(printf '%s\n' "$alog" | grep -a 'Registered with server' | grep -aoE 'session_fp=[0-9a-f]{8}' | tail -1 | cut -d= -f2)"
+        sess=""
+        if [ -n "$fp" ]; then
+            # Exactly one route row or the whole map fails (shared with the tests, scripts/lib).
+            sess="$(route_session_for_fp "$fp")" || { echo "agent_map: cannot resolve the session for $name" >&2; rm -f "$run/agent_map.csv.tmp"; return 1; }
+        else
+            echo "agent_map: no session_fp on the Registered line of $name; cannot resolve its session" >&2
+            rm -f "$run/agent_map.csv.tmp"
+            return 1
+        fi
         echo "$name,$c,$sess"
-    done > "$run/agent_map.csv"
+    done > "$run/agent_map.csv.tmp" || { rm -f "$run/agent_map.csv.tmp"; return 1; }
+    mv "$run/agent_map.csv.tmp" "$run/agent_map.csv"
 }
 
 # settle_fleet : undo faults and restart the agents so every scenario starts from the same shape
@@ -366,7 +382,7 @@ cmd_scenario() {
     local run="$STATE/run-$id-$(date +%H%M%S)"; mkdir -p "$run"; RUN_ACTIVE="$run"
     local total; total="$(compose ps -q agent | wc -l)"
     say "scenario $id agents=$total window=${window}s sample=$sample -> $run"
-    agent_map "$run"
+    agent_map "$run" || die "agent_map failed; refusing to measure on a partial agent map"
 
     # victim = the requested gateway, else the one holding the most agents
     local vc="$victim_c" victim_node=""

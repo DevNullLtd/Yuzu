@@ -14,6 +14,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../scoped_env.hpp"
+#include "../test_log_capture.hpp" // F56: pq_error logs a fixed cause
 
 #include <libpq-fe.h>
 
@@ -424,6 +425,22 @@ TEST_CASE("PgReachabilityProbe (libpq): a refused port is Unreachable after the 
     // Refused, not timed out: well inside two deadlines even where the OS retries
     // a refused loopback SYN (Windows, ~2s per attempt).
     CHECK(std::chrono::steady_clock::now() - t < 2 * pr::kConnectDeadline);
+}
+
+TEST_CASE("PgReachabilityProbe (libpq): a connect failure logs a fixed cause, never libpq's text (F56)",
+          "[server][readyz][pg_reachability][log_injection]") {
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    auto probe = PgReachabilityProbe::make_libpq(
+        "host=127.0.0.1 port=1 dbname=yuzu_test_secretdb user=yuzu connect_timeout=2");
+    probe->probe_once();
+    cap.stop();
+    const std::string text = cap.text();
+    INFO(text);
+    CHECK(text.find("Postgres not reachable") != std::string::npos);
+    CHECK(text.find("server not reachable") != std::string::npos);
+    CHECK(text.find("127.0.0.1") == std::string::npos);        // libpq quotes the host
+    CHECK(text.find("yuzu_test_secretdb") == std::string::npos);
+    CHECK(text.find("Is the server running") == std::string::npos);
 }
 
 #ifndef _WIN32
