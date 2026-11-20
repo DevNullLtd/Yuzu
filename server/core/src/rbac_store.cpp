@@ -566,7 +566,7 @@ void RbacStore::seed_defaults() {
          "ON CONFLICT (key) DO NOTHING");
 
     // Securable types.
-    const std::array<std::string_view, 39> types = {
+    const std::array<std::string_view, 40> types = {
         "Infrastructure",  "UserManagement",  "InstructionDefinition",
         "InstructionSet",  "Execution",       "Schedule",
         "Approval",        "Tag",             "AuditLog",
@@ -685,7 +685,16 @@ void RbacStore::seed_defaults() {
         // is ALSO gated on the durable-administrator predicate (revocation_source_admin_gate.hpp),
         // so a custom role granted it under RBAC on is still refused, and `Read` is in the
         // topology floor so an RBAC-off install stays admin-only.
-        "RevocationSource"
+        "RevocationSource",
+        // Slice-2 PR 2a-2b (ADR-0070 D12): the dedicated securable of the fleet certificate
+        // inventory - subjects and SANs can be personal data, so no other surface shares it.
+        // Administrator gets CRUD via the loop below; NO other role is seeded and it is
+        // deliberately ABSENT from the Viewer read-list (never reachable through
+        // Security:Read, Inventory:Read or a read-only role). `Read` gates every certificate
+        // read; `Write` is reserved for the tombstone list/purge (PR 2a-2c, behind the
+        // administrator predicate). The (CertificateInventory, Read) pair is also in
+        // authz_topology_floor.hpp so an RBAC-off install stays admin-only.
+        "CertificateInventory"
     };
     for (auto t : types)
         exec("INSERT INTO rbac_store.securable_types (name, is_system) VALUES ($1, TRUE) "

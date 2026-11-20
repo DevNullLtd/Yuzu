@@ -6667,7 +6667,13 @@ groups:
         # a /crypto read refused by its per-process in-flight bound BEFORE any store call.
         # The
         # /crypto Yuzu-issued (source=ca_issued) and layout (source=crypto_layout)
-        # reads count here too; ca_issued has its own longer-held alert below. Sustained for 5m
+        # reads count here too (and source=cert_inventory, the fleet certificate reads, where
+        # reason=pool_too_small is a PERMANENT misconfiguration: a Postgres pool below 4
+        # connections refuses the read until a restart with a larger --postgres-pool-size;
+        # reason=reconciling is the RETRYABLE post-start wait for the substring dictionary and
+        # clears on its own, while substring_index_missing (a failed dictionary) and scale_limit
+        # (a summary over its wall budget) are NOT retryable and need an operator);
+        # ca_issued has its own longer-held alert below. Sustained for 5m
         # that is saturation of the bound (a poll storm or slow summary reads), which
         # is worth the same warning. The rule is rate([5m]) > 0 held for 5m, so
         # refusals recurring within every 5m window keep it firing; a single
@@ -6685,7 +6691,9 @@ groups:
             read for the labelled authoritative inventory source returned a
             degrade (no data) rather than a result. pool_acquire_timeout/query_error correlate
             with yuzu_pg_* saturation or outage; store_not_open means the store
-            failed to open at boot; admission_full means /crypto reads are being
+            failed to open at boot; pool_too_small (source=cert_inventory) is NOT
+            transient: the Postgres pool is below the 4 connections a certificate read
+            needs, so restart with a larger --postgres-pool-size; admission_full means /crypto reads are being
             refused because its in-flight bound (two reads) stayed full - check for
             a poll storm or slow summary reads, not for a database fault. For the
             store-side reasons (pool_acquire_timeout, query_error, store_not_open) a
@@ -7171,6 +7179,64 @@ groups:
             yuzu_inventory_stale_count_unavailable_total is rising: the freshness
             count keeps timing out, so yuzu_inventory_stale_agents is held at its
             last value and may read healthy during an actual outage. Investigate
+            Postgres pool saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds).
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCertSubstringDictionaryMissing
+        # The DN dictionary behind the fleet certificate substring filters is not built (or has an
+        # invalid index): issuer_dn_contains and subject_dn_contains are REFUSED, non-retryable, which
+        # is the design's "find every device holding a distrusted CA" query. The gauge is rechecked
+        # about every five minutes and exported by every replica, so `min` catches any one. Not a
+        # transient condition: held 30m so the minutes of a manual repair do not page.
+        expr: |
+          min(yuzu_server_cert_inventory_substring_index_available) == 0
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate substring filters are unavailable (DN dictionary not built)"
+          description: >-
+            yuzu_server_cert_inventory_substring_index_available is 0: issuer_dn_contains and
+            subject_dn_contains are refused: a retryable 503 while the leader's reconcile is
+            pending, non-retryable once it failed. See server-admin.md, "The substring-filter
+            dictionary"; the gauge flips back within five minutes of the repair, no restart needed.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+
+      - alert: YuzuCertDnDictionaryPruneStale
+        # The distinct-DN dictionary only grows between prunes; the leader prunes hourly from the
+        # database clock and exports the last success. >3h without one means the prune is failing
+        # or no replica is leading. `max` across replicas: any replica's refresh of the shared
+        # database value counts (every replica exports the same timestamp).
+        expr: |
+          time() - max(yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds) > 10800
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Certificate DN dictionary has not been pruned for over 3 hours"
+          description: >-
+            yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds is more than 3h old:
+            the hourly prune is failing or no replica is leading. Check
+            yuzu_server_cert_inventory_dn_dict_runs_total{step="prune"} and the leader's log.
+          runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+      - alert: YuzuCertStoreStatusUnavailable
+        # The fleet certificate store-status rollup (background pass
+        # cert_inventory.fleet_store_status, slice-2 PR 2a-2b) could not be computed (pool
+        # saturation or its 500ms wall budget), so yuzu_fleet_cert_store_status is HELD at its
+        # prior value - a healthy-looking reading may be stale. The pass runs about every five
+        # minutes, so the counter moves at most once per sweep: two or more increments in 15m,
+        # held for 10m, is a sustained freeze rather than one unlucky sweep. The gauge itself is
+        # published by EVERY replica and is not summable across them (use max).
+        expr: |
+          increase(yuzu_fleet_cert_store_status_unavailable_total[15m]) >= 2
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Fleet certificate store-status gauge may be frozen"
+          description: >-
+            yuzu_fleet_cert_store_status_unavailable_total is rising: the certificate
+            store-status rollup keeps timing out, so yuzu_fleet_cert_store_status is held at
+            its last value and may read healthy during an actual outage. Investigate
             Postgres pool saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds).
           runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
       - alert: YuzuInventoryCatalogRollupStale

@@ -936,6 +936,11 @@ public:
     // Build JSON array of all agents for the web UI (structured).
     nlohmann::json to_json_obj() const;
 
+    /// The locally connected agents' (agent_id, reported OS) pairs: two string copies per agent
+    /// under the registry lock, never to_json_obj()'s per-agent JSON build on the heartbeat and
+    /// dispatch mutex (gov perf-S2). For background rollups that need only the OS.
+    [[nodiscard]] std::vector<std::pair<std::string, std::string>> id_os_snapshot() const;
+
     // Build JSON array as a serialized string.
     std::string to_json() const;
 

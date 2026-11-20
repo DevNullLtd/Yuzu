@@ -3492,7 +3492,9 @@ TEST_CASE(
         auto tools = h.mcp_call(list.dump());
         REQUIRE(tools);
         bool schema_found = false;
-        for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+        // Bound to a local: ranging over a subobject of a temporary dangles.
+        nlohmann::json tools_json = nlohmann::json::parse(tools->body);
+        for (const auto& t : tools_json["result"]["tools"]) {
             if (t["name"] != "get_access_review")
                 continue;
             schema_found = true;
@@ -3831,7 +3833,9 @@ TEST_CASE("access-review writes: both machine contracts declare the degraded-aud
     auto tools = h.mcp_call(list.dump());
     REQUIRE(tools);
     int seen = 0;
-    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json tools_json = nlohmann::json::parse(tools->body);
+    for (const auto& t : tools_json["result"]["tools"]) {
         const std::string name = t.value("name", std::string{});
         if (name != "open_access_review" && name != "record_attestation" &&
             name != "close_access_review")
@@ -3871,7 +3875,9 @@ TEST_CASE("attestation limits: the MCP input schema and description and the Open
     auto tools = h.mcp_call(list.dump());
     REQUIRE(tools);
     bool found = false;
-    for (const auto& t : nlohmann::json::parse(tools->body)["result"]["tools"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json listed_json = nlohmann::json::parse(tools->body);
+    for (const auto& t : listed_json["result"]["tools"]) {
         if (t["name"] != "record_attestation")
             continue;
         found = true;

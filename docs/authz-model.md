@@ -90,7 +90,7 @@ classifies a capability; it never grants one.
 
 ### Seed catalogue
 
-`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 39 securables × 8
+`kSeedCatalogue` is eight representative rows, not a full mirror of `RbacStore`'s 40 securables × 8
 operations — it exists so PR1.9 has real rows to migrate and so this header's own tests exercise
 `is_valid`, not to be the registry itself. It includes an ordinary CRUD read (`Response:Read`), a
 `Tag:Write` (mirrors `mcp_policy.hpp`'s existing Tag special-case), `Execution:Execute` (the
@@ -420,6 +420,29 @@ same one list.
 - **Audit.** Every request that passes parameter validation writes `dex.apps.usage.view` before the read, fail-closed (`503` with `Sec-Audit-Failed: true`); a `400` for a malformed parameter is refused before the row and leaves none. It records the admitted request (window, platform, slice, the tag key or group id asked for, floor), not the outcome, so a later unknown-group `400` or a `503` still leaves the row. It carries no agent id and names no device.
 - **No agent id in the answer.** The response holds counts, run seconds and launches per application and cell, and the exposure rate. Cell labels are tag values or group ids supplied by operators or agents, and are escaped.
 - **The disclosure floor protects one table only.** A cell or an application below the floor is merged or withheld, but two slices or windows can be differenced to isolate a small group, and at the default floor of 1 a cell can be one device's figures. Read access to the route is therefore the control for that residue, not the floor.
+
+
+## 5. The fleet certificate read surface: `CertificateInventory` (40th securable)
+
+The fleet certificate inventory (ADR-0070 D12) gets a dedicated securable appended to
+`rbac_store.cpp`'s `types[]` (39 to 40) and its `mcp_server.cpp` `kRbacSecurables[]` mirror (same
+binding test). Subjects and SANs can be personal data, so no other surface shares it.
+
+| Securable | Gates | Ops | Seeded to |
+|---|---|---|---|
+| `CertificateInventory` | `GET /api/v1/crypto/certificates`, `/summary`, MCP `list_crypto_certificates` and `get_crypto_certificate_summary`, and the `/fragments/crypto/certificates` fragments | `Read` (every certificate read); `Write` reserved for the decommission-tombstone list and purge (a later change) | Administrator (CRUD via the loop). No other role; absent from the Viewer read-list |
+
+- **Floor:** `{CertificateInventory, Read}` is in `kTopologyFloor`, so it is admin-only while RBAC is
+  off. The floor header gains a new-data inclusion class for it (see `docs/auth-architecture.md`,
+  "The authorization topology floor").
+- **Gate:** `require_fleet_read` (admit-then-filter, ADR-0017), never `require_list_read`, which
+  does not apply the floor. The gate's visible-device set becomes `agent_id = ANY($n)` in every
+  certificate statement; present-empty is deny-all, never "no filter".
+- **Service-scoped tokens:** 403 in both RBAC states (RBAC off: `require_fleet_read` refuses every
+  service-scoped session; RBAC on: the ITServiceOwner ceiling does not hold the pair). The MCP
+  tools are `ServiceScopeClass::denied`.
+- **Denial text** names the permission actually required (`CertificateInventory:Read`). A dashboard
+  fragment whose certificate half is denied says so, never "no certificates".
 
 ## Testing
 

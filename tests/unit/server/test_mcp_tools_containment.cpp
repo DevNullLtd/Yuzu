@@ -735,7 +735,9 @@ TEST_CASE("list_quarantined_devices: every served body conforms to the output sc
     lres.status = 200;
     h.handler(lr, lres);
     nlohmann::json schema;
-    for (const auto& t : nlohmann::json::parse(lres.body)["result"]["tools"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_738 = nlohmann::json::parse(lres.body);
+    for (const auto& t : range_root_738["result"]["tools"])
         if (t["name"] == "list_quarantined_devices")
             schema = t["outputSchema"];
     REQUIRE(schema.is_object());

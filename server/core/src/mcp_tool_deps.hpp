@@ -114,11 +114,11 @@ struct ToolDeps {
     QuarantineListFn quarantine_owed_list_fn;
 
     // ── /crypto (mcp_tools_crypto.cpp) ──────────────────────────────────────────────────
-    // One closure per CryptoApi method the seven /crypto tools call, each a thin forward to
+    // One closure per CryptoApi method the nine /crypto tools call, each a thin forward to
     // the SAME CryptoApi instance CryptoRoutes serves (server.cpp builds them from
     // `crypto_api_`), so an MCP twin cannot read a different answer than the REST route or the
     // page. The CryptoApi object itself is deliberately NOT a member: ToolDeps holds provider
-    // closures, never a seam object. All five are EMPTY when the deployment has no CryptoApi
+    // closures, never a seam object. All seven are EMPTY when the deployment has no CryptoApi
     // (no inventory store), and a handler then answers an internal error, never an empty
     // result. The Yuzu-issued reads take no scope: the handler gates them (Inventory:Read,
     // withheld from a confined caller), see handle_get_crypto_ca_stats.
@@ -126,6 +126,11 @@ struct ToolDeps {
         const CryptoSummaryQuery&, const authz::VisibleSet&)>;
     using CryptoDevicesFn = std::function<std::expected<CryptoDevicesPage, CryptoReadError>(
         const CryptoDevicesQuery&, const authz::VisibleSet&)>;
+    // The fleet certificate reads (slice-2 PR 2a-2b): same scope contract as the library reads.
+    using CryptoCertificatesFn = std::function<std::expected<CertPage, CryptoReadError>(
+        const CertQuery&, const authz::VisibleSet&)>;
+    using CryptoCertificateSummaryFn = std::function<std::expected<CertSummary, CryptoReadError>(
+        const CertSummaryQuery&, const authz::VisibleSet&)>;
     using CryptoCaStatsFn = std::function<std::expected<CaCertStats, CryptoReadError>(
         std::optional<std::int64_t> as_of)>;
     using CryptoLayoutFn = std::function<std::expected<CryptoDashboardLayout, CryptoReadError>(
@@ -146,6 +151,8 @@ struct ToolDeps {
 
     CryptoSummaryFn crypto_library_summary_fn;
     CryptoDevicesFn crypto_library_devices_fn;
+    CryptoCertificatesFn crypto_certificates_fn;
+    CryptoCertificateSummaryFn crypto_certificate_summary_fn;
     CryptoCaStatsFn crypto_ca_stats_fn;
     CryptoLayoutFn crypto_dashboard_layout_fn;
     CryptoSetLayoutFn crypto_set_dashboard_layout_fn;

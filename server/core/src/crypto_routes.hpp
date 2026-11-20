@@ -41,6 +41,17 @@
 /// certificate ROWS behind a count are the filtered `GET /api/v1/ca/issued` (ca_routes, Security
 /// :Read) - this file only serves their dashboard fragment.
 ///
+/// FLEET CERTIFICATES (slice-2 PR 2a-2b, ADR-0070 D10/D12). `GET /api/v1/crypto/certificates[/summary]`
+/// and the `/fragments/crypto/certificates[/devices]` fragments read the fleet certificate inventory
+/// through the same `CryptoApi` seam, gated SOLELY on `FleetReadFn` with the dedicated
+/// `CertificateInventory:Read` securable (never `Inventory:Read`, and never `require_list_read`,
+/// which does not apply the topology floor). Confinement is admit-then-filter: the gate's
+/// VisibleSet becomes `agent_id = ANY($n)` in the SQL. Audited `crypto.certificates.view` /
+/// `crypto.certificates.summary` with filter NAMES and operators only, never a value, a subject or
+/// a SAN. Unlike the slice-1 reads the REST routes FAIL CLOSED on a lost audit row (OD-2, the
+/// `device_ci` behavioural-PII tier): 503 + `Sec-Audit-Failed`, no data. The fragments stay
+/// set-and-proceed with the visible notice.
+///
 /// The `/crypto` page body is the widget dashboard: `/fragments/crypto/dashboard` draws the
 /// caller's layout and EVERY card inline from at most one library summary and one Yuzu-issued
 /// stats read, each behind its own gate and audited ONCE per render (`widgets=<n>` in the

@@ -1,8 +1,9 @@
 // Registry-resident /crypto tools (see mcp_tool_registry.hpp): the MCP twins of
 // GET /api/v1/crypto/libraries[/devices], GET /api/v1/crypto/cbom, GET /api/v1/crypto/widgets,
-// GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/stats. Seven tools, carved
+// GET/PUT /api/v1/crypto/dashboard/layout and GET /api/v1/crypto/ca/stats - seven tools carved
 // out of mcp_server.cpp's legacy kTools[] + if/else chain (#6558 PR 2, the pilot carve of the
-// ADR-0031 WS-A4 MCP seam). `crypto` was the pilot because its REST half (crypto_routes.cpp) was
+// ADR-0031 WS-A4 MCP seam) - plus the two fleet certificate twins of
+// GET /api/v1/crypto/certificates[/summary] (slice-2 PR 2a-2b, born here). `crypto` was the pilot because its REST half (crypto_routes.cpp) was
 // already carved and enforced and CryptoApi is already store-free.
 //
 // Every tool is shaped by the SAME pure model the REST routes and the /crypto page use
@@ -18,6 +19,9 @@
 //     tier_allows or ctx.perm_fn (stacking either is the BLOCKING defect authz_gates.hpp
 //     documents). Its composed meet(management-group, service-scope) VisibleSet is pushed into
 //     the SQL by the CryptoApi seam, so a confined caller gets a real, filtered answer.
+//   * list_crypto_certificates, get_crypto_certificate_summary: the same confined-read shape on
+//     the dedicated CertificateInventory:Read (topology-floored, admin-only under RBAC off);
+//     service-scope class `denied`.
 //   * list_crypto_widgets, get_crypto_dashboard_layout, set_crypto_dashboard_layout: the caller's
 //     OWN catalogue / layout, tier-gated by the generic check alone (Infrastructure Read / Write,
 //     the result-set precedent), no RBAC gate in the handler. The layout is keyed on the session
@@ -63,6 +67,7 @@
 
 #include "authz_model.hpp"             // authz::VisibleSet
 #include "crypto_api.hpp"              // CryptoReadError and the CryptoApi result types
+#include "certificate_read_model.hpp"  // list_crypto_certificates / get_crypto_certificate_summary
 #include "crypto_cbom.hpp"             // export_crypto_cbom (CycloneDX 1.7 shaper)
 #include "crypto_library_model.hpp"    // the shared library model, Params, dump_safe
 #include "crypto_widget_catalogue.hpp" // the shared widget catalogue and layout model
@@ -140,6 +145,13 @@ void answer_invalid_params(const ToolCallContext& ctx, const std::string& messag
 void refuse_params(const ToolCallContext& ctx, const std::string& message) {
     (void)ctx.audit("denied", "invalid arguments: " + message);
     answer_invalid_params(ctx, message);
+}
+
+/// The certificate tools' caller-input refusal: the same -32602, but as an A4 error.data (correlation
+/// id plus a remediation), identically to the REST twins' 400 body.
+void refuse_cert_params(const ToolCallContext& ctx, const std::string& message) {
+    (void)ctx.audit("denied", "invalid arguments: " + message);
+    answer(ctx, ctx.a4_error(kInvalidParams, message, "correct the named argument (see the tool's input schema) and call again", -1, {}, true)); // retry-hint-exempt: caller-input rejection
 }
 
 /// The generic mcp.<tool> row, written the way the legacy branches' `mcp_audit` lambda wrote it.
@@ -607,6 +619,161 @@ void handle_get_crypto_ca_stats(const ToolCallContext& ctx) {
                                                          kObjectOutputSchema)));
 }
 
+// ── list_crypto_certificates / get_crypto_certificate_summary (slice-2 PR 2a-2b) ──────────
+// MCP twins of GET /api/v1/crypto/certificates[/summary], shaped by certificate_read_model.hpp
+// and read through the SAME CryptoApi instance as the REST routes and the /crypto fragments
+// (ToolDeps::crypto_certificates_fn / crypto_certificate_summary_fn). fleet_read_fn with
+// CertificateInventory:Read is the SOLE gate (it applies the topology floor and the
+// service-scope refusal); its VisibleSet is pushed into the SQL by the seam. The audit row is
+// the generic mcp.<tool> row, set-and-proceed (OD-2): a lost row is reported in the body as
+// audit_persisted false. The detail names the filters and their operators, never their values.
+// ONE handler per tool (the A5 retry-hint gate scans each tool's own handler body).
+void handle_list_crypto_certificates(const ToolCallContext& ctx) {
+    namespace crt = cert_read;
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "list_crypto_certificates: fleet_read_fn or audit_fn unwired - "
+                       "misconfigured call site; failing closed");
+        return;
+    }
+    auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "CertificateInventory", "Read");
+    if (!gate.admitted)
+        return; // gate already wrote the A4 error body + status
+    // Strict input (the one validator REST also uses), judged before any read.
+    if (const auto bad = crt::strict_list_args_error(ctx.args)) {
+        refuse_cert_params(ctx, *bad);
+        return;
+    }
+    if (!ctx.deps->crypto_certificates_fn) {
+        answer_unwired(ctx, "Fleet certificate data unavailable", "certificate provider unwired");
+        return;
+    }
+    const auto parsed = crt::parse_list_params(crt::params_from_args(ctx.args));
+    if (!parsed) {
+        refuse_cert_params(ctx, parsed.error());
+        return;
+    }
+    const bool confined = gate.scope.has_value();
+    // The seam's caller-input refusal (a bad cursor) is answered through this helper so the
+    // `if (!read)` block below holds only the store-fault answers.
+    auto refuse_input = [&](const std::string& message) { refuse_cert_params(ctx, message); };
+    auto query = *parsed;
+    // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
+    if (ctx.deps->username_fn)
+        query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
+    auto read = ctx.deps->crypto_certificates_fn(query, gate.scope);
+    if (!read) {
+        if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+            refuse_input(read.error().message);
+            return;
+        }
+        (void)domain_row(ctx, "crypto.certificates.view", "failure", "CertificateInventory",
+                         std::string(crt::kAuditTarget),
+                         crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
+        mcp_row(ctx, "failure",
+                crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
+        if (read.error().unavailable_until_restart) { // pool too small, substring dictionary failed/absent
+            answer(ctx, ctx.a4_error(kInternalError, read.error().message, read.error().remediation.empty() ? std::string(kCryptoPoolTooSmallRemedy) : read.error().remediation, -1, {}, true)); // retry-hint-exempt: lasts until an operator acts (larger --postgres-pool-size, or the dictionary repaired); a retry fails identically
+            return;
+        }
+        answer(ctx, ctx.a4_error(kInternalError,
+                                 read.error().retry_after_ms
+                                     ? read.error().message
+                                     : std::string(crt::degraded_message(read.error().cause)),
+                                 "retry the request",
+                                 /*retry_after_ms=*/static_cast<long>(
+                                     read.error().retry_after_ms.value_or(kMcpStoreFaultRetryMs)),
+                                 {}, true));
+        return;
+    }
+    // The domain verb REST and the fragments write, so a verb-based audit of certificate
+    // reads sees agentic-worker reads too; the generic mcp.<tool> row is kept alongside.
+    const std::string ok_detail = crt::audit_detail("", parsed->filter, read->rows.size(),
+                                                    read->result_truncated,
+                                                    !parsed->cursor.empty(), confined);
+    const bool domain_ok = domain_row(ctx, "crypto.certificates.view", "success",
+                                      "CertificateInventory", std::string(crt::kAuditTarget),
+                                      ok_detail);
+    const bool generic_ok = mcp_row(ctx, "success", ok_detail);
+    const bool audit_ok = domain_ok && generic_ok;
+    auto payload = crt::list_json(*read);
+    if (!audit_ok)
+        payload["audit_persisted"] = false;
+    answer(ctx, success_response(ctx.id, ctx.tool_result(crt::dump_safe(payload),
+                                                         kObjectOutputSchema)));
+}
+
+void handle_get_crypto_certificate_summary(const ToolCallContext& ctx) {
+    namespace crt = cert_read;
+    if (ctx.deps == nullptr || !ctx.deps->fleet_read_fn || !ctx.deps->audit_fn) {
+        answer_unwired(ctx, "service unavailable", "crypto provider unwired", {},
+                       "get_crypto_certificate_summary: fleet_read_fn or audit_fn unwired - "
+                       "misconfigured call site; failing closed");
+        return;
+    }
+    auto gate = ctx.deps->fleet_read_fn(ctx.req, ctx.res, "CertificateInventory", "Read");
+    if (!gate.admitted)
+        return; // gate already wrote the A4 error body + status
+    if (const auto bad = crt::strict_summary_args_error(ctx.args)) {
+        refuse_cert_params(ctx, *bad);
+        return;
+    }
+    if (!ctx.deps->crypto_certificate_summary_fn) {
+        answer_unwired(ctx, "Fleet certificate data unavailable", "certificate provider unwired");
+        return;
+    }
+    const auto parsed = crt::parse_summary_params(crt::params_from_args(ctx.args));
+    if (!parsed) {
+        refuse_cert_params(ctx, parsed.error());
+        return;
+    }
+    const bool confined = gate.scope.has_value();
+    auto refuse_input = [&](const std::string& message) { refuse_cert_params(ctx, message); };
+    auto query = *parsed;
+    // The per-principal read cap's key (#6333); "" (unresolved) shares one slot.
+    if (ctx.deps->username_fn)
+        query.principal = ctx.deps->username_fn(ctx.req).value_or(std::string{});
+    auto read = ctx.deps->crypto_certificate_summary_fn(query, gate.scope);
+    if (!read) {
+        if (read.error().kind == CryptoReadError::Kind::kInvalid) {
+            refuse_input(read.error().message);
+            return;
+        }
+        (void)domain_row(ctx, "crypto.certificates.summary", "failure", "CertificateInventory",
+                         std::string(crt::kAuditTarget),
+                         crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
+        mcp_row(ctx, "failure",
+                crt::audit_detail_degraded("", parsed->filter, read.error().cause, confined));
+        if (read.error().unavailable_until_restart) { // pool too small, substring dictionary failed/absent, or a summary scale limit
+            answer(ctx, ctx.a4_error(kInternalError, read.error().message, read.error().remediation.empty() ? std::string(kCryptoPoolTooSmallRemedy) : read.error().remediation, -1, {}, true)); // retry-hint-exempt: lasts until an operator acts (larger pool, repaired dictionary) or the caller narrows the filter; no honest retry interval exists (a summary scale limit says one later retry may succeed)
+            return;
+        }
+        answer(ctx, ctx.a4_error(kInternalError,
+                                 read.error().retry_after_ms
+                                     ? read.error().message
+                                     : std::string(crt::degraded_message(read.error().cause)),
+                                 "retry the request",
+                                 /*retry_after_ms=*/static_cast<long>(
+                                     read.error().retry_after_ms.value_or(kMcpStoreFaultRetryMs)),
+                                 {}, true));
+        return;
+    }
+    // Domain verb as on REST and the fragment; the generic mcp.<tool> row is kept alongside.
+    const std::string ok_detail = crt::audit_detail(
+        "", parsed->filter, static_cast<std::size_t>(read->totals.certificate_count),
+        read->result_truncated, false, confined);
+    const bool domain_ok = domain_row(ctx, "crypto.certificates.summary", "success",
+                                      "CertificateInventory", std::string(crt::kAuditTarget),
+                                      ok_detail);
+    const bool generic_ok = mcp_row(ctx, "success", ok_detail);
+    const bool audit_ok = domain_ok && generic_ok;
+    auto payload = crt::summary_json(*read);
+    if (!audit_ok)
+        payload["audit_persisted"] = false;
+    answer(ctx, success_response(ctx.id, ctx.tool_result(crt::dump_safe(payload),
+                                                         kObjectOutputSchema)));
+}
+
 // Positional initialisation only (no designated initialisers): the lexical CI gates
 // (check-api-parity.py, check-mcp-retry-hints.py) read this slice. The schema text is the legacy
 // kTools[] text, moved verbatim; the six ReadOnly descriptions gain a closing "Read-only." sentence,
@@ -845,6 +1012,126 @@ constexpr ToolRecord kToolRecords[] = {
      R"j(},"required":["scope","scope_note","rule_set_version","as_of","as_of_iso","active","expiring_within_days","expired_within_days","revoked_within_days","issued_within_days","week_basis","weeks"]})j",
      "Inventory", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
      "Get Yuzu-issued certificate counts", &handle_get_crypto_ca_stats},
+
+    // Fleet certificates: gated on fleet_read_fn CertificateInventory:Read (the floor-applying
+    // gate). The inventory has no per-service slice to narrow to and the pair is not in the
+    // seeded-empty kServiceScopeGlobalSafe, so a service-scoped token stays `denied` - 403 in both
+    // RBAC states. The REST twins answer the same while ITServiceOwner lacks the pair (no seed
+    // grants it); an administrator who grants it lets REST admit such a token, confined.
+    {"list_crypto_certificates",
+     "List the certificates held in the fleet's machine certificate stores, one row per (device, "
+     "certificate), with raw X.509 facts: subject and issuer DN, validity, public-key algorithm "
+     "and size, signature algorithm, SPKI and key identifiers, basic constraints, key usage, EKUs, "
+     "SANs, where each copy was seen and the status of that store. Evidence is the daily-synced "
+     "certificate_inventory report of each device; stores[] gives the status of every store on "
+     "every device in the page (ok, absent, unreadable, constrained, not_observed), so a kept row "
+     "is never shown without the status that explains it. Use the filters to drill: "
+     "issuer_dn_contains / subject_dn_contains (with is_ca=true) / aki_key_id find every device "
+     "holding one CA's certificates or the certificates it signed under any of its names; "
+     "spki_sha256 finds every certificate over one key; not_after_before, rsa_modulus_bits_lt and "
+     "the like take YOUR threshold. Ordered by device then certificate SHA-256; page with "
+     "next_cursor passed back as cursor (a cursor is bound to its filter set; paged reads make no "
+     "cross-page consistency promise, so use them to browse, not to recompute a count). "
+     "result_truncated is true when ANY cut happened (page limit, byte budget, a capped list, a "
+     "constrained store or certificate) and truncated_parts says which; it is false only on a page "
+     "that is complete. facts only; the only built-in checks are D13's named rules and windows, "
+     "each shown with its criterion. Revocation is not checked by this "
+     "version. not_read lists what the collector does not read: an empty result is NOT proof that "
+     "no certificate exists. Subjects and SANs can be personal data: they are returned here only, "
+     "and never appear in audit details. Requires CertificateInventory:Read: Administrator only "
+     "by default, and admin-only even while RBAC enforcement is off; a management-group-confined "
+     "caller sees only its visible devices; a service-scoped token is refused (403). Input is "
+     "strict: an unknown parameter, a wrong JSON type, a malformed OID, hex or instant, a value "
+     "out of range or subject_dn_contains without is_ca=true is rejected (invalid_params naming "
+     "the parameter); string lengths are counted in bytes. A degraded inventory store, or crypto "
+     "read capacity in use, is a retryable error with retry_after_ms - never an empty result. "
+     "A substring matching more than 20,000 distinct names is invalid_params (make it longer). "
+     "issuer_dn_contains / subject_dn_contains before the leader's background pass has "
+     "completed after a server start (or after a transient failure of it) is ALSO retryable, "
+     "with retry_after_ms 10000 (or 300000 after a transient failure). "
+     "NOT retryable (error.data.retry_after_ms is null; the error says what to do): "
+     "those filters when the distinct-DN dictionary failed deterministically or is absent "
+     "(use issuer_dn or agent_id, or ask an administrator), and a Postgres pool "
+     "below 4 connections. A lost audit row is reported as audit_persisted false (the data is "
+     "still served). Audited as "
+     "mcp.list_crypto_certificates (filter names, never values). Mirrors GET "
+     "/api/v1/crypto/certificates. Read-only.",
+     R"j({"type":"object","properties":{)j"
+     R"j("store":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact store_id (free text, no enum): certificates with a location in this store, e.g. LocalMachine\\Root or a Linux trust-file root"},)j"
+     R"j("scope":{"type":"string","enum":["machine"],"description":"Certificate scope; only machine stores are read in this release"},)j"
+     R"j("key_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
+     R"j("sig_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
+     R"j("ec_curve_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
+     R"j("not_after_before":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
+     R"j("not_after_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
+     R"j("not_before_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
+     R"j("rsa_modulus_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"RSA certificates whose modulus is smaller than this many bits (your threshold)"},)j"
+     R"j("ec_order_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"EC certificates whose curve order is smaller than this many bits (your threshold)"},)j"
+     R"j("is_ca":{"type":"boolean","description":"The certificate's own basic-constraints CA claim"},)j"
+     R"j("self_signed":{"type":"boolean","description":"Issuer equals subject and the signature verifies under its own key, as the collector reported it"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact device id; still confined to the devices you may see"},)j"
+     R"j("issuer_dn":{"type":"string","maxLength":1024,"description":"Exact issuer DN (RFC 4514 string); empty string selects certificates with an empty issuer"},)j"
+     R"j("issuer_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of issuer_dn (% and _ are not wildcards). Finds a CA's certificates under any of its names, e.g. eMudhra then emSign"},)j"
+     R"j("subject_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of subject_dn. Accepted ONLY together with is_ca=true (a subject search over end-entity certificates would be a search for a person); otherwise refused naming is_ca"},)j"
+     R"j("sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
+     R"j("spki_sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
+     R"j("aki_key_id":{"type":"string","maxLength":128,"pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
+     R"j("cursor":{"type":"string","maxLength":2048,"description":"Opaque next_cursor from the previous page; bound to the filter set (refused if reused with other filters). Paged reads make no cross-page consistency promise"},)j"
+     R"j("limit":{"type":"integer","minimum":1,"maximum":500,"default":100,"description":"Page size"})j"
+     R"j(},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"certificates":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"hostname":{"type":["string","null"]},"sha256":{"type":"string"},"sha1":{"type":["string","null"]},"tbs_sha256":{"type":["string","null"]},"serial":{"type":["string","null"]},"subject_dn":{"type":["string","null"]},"issuer_dn":{"type":["string","null"]},"not_before":{"type":["string","null"]},"not_after":{"type":["string","null"]},"key_alg_oid":{"type":["string","null"]},"rsa_modulus_bits":{"type":["integer","null"]},"ec_curve_oid":{"type":["string","null"]},"ec_order_bits":{"type":["integer","null"]},"sig_alg_oid":{"type":["string","null"]},"pss_hash_oid":{"type":["string","null"]},"spki_sha256":{"type":["string","null"]},"ski":{"type":["string","null"]},"aki_key_id":{"type":["string","null"]},"is_ca":{"type":["boolean","null"]},"path_len":{"type":["integer","null"]},"self_signed":{"type":["boolean","null"]},"key_usage":{"type":["array","null"],"items":{"type":"string"}},"eku_oids":{"type":"array","items":{"type":"string"}},"sans":{"type":"array","items":{"type":"object","properties":{"type":{"type":"string"},"value":{"type":"string"}}}},"key_association":{"type":["string","null"]},"key_provider":{"type":["string","null"]},"key_exportable":{"type":["string","null"]},"locations":{"type":"array","items":{"type":"object","properties":{"store_id":{"type":"string"},"path":{"type":"string"},"store_status":{"type":"string"},"observed_at":{"type":["string",)j"
+     R"j("null"]},"last_seen":{"type":"string"}}}},"last_seen":{"type":"string"},"constrained_fields":{"type":"array","items":{"type":"string"}}},"required":["agent_id","sha256","locations","last_seen","constrained_fields"]}},"stores":{"type":"array","items":{"type":"object","properties":{"agent_id":{"type":"string"},"store_id":{"type":"string"},"status":{"type":"string","enum":["ok","absent","unreadable","constrained","not_observed"]},"reason":{"type":"string"},"observed_at":{"type":["string","null"]},"status_at":{"type":"string"}}},"description":"The status of every store on every device in the page, so a kept row is never shown without it"},"next_cursor":{"type":["string","null"]},"count":{"type":"integer"},"not_read":{"type":"array","items":{"type":"string"},"description":"What the collector does not read; an empty result is not proof of absence"},"coverage":{"type":"object","properties":{"devices_reporting":{"type":"integer","description":"In-scope devices with a certificate report"},"devices_included":{"type":"integer"},"confined":{"type":"boolean"}},"required":["devices_reporting","devices_included","confined"]},"result_truncated":{"type":"boolean","description":"True when ANY cut happened (see truncated_parts)"},"truncated_parts":{"type":"array","items":{"type":"string","enum":["page_limit","row_ceiling","byte_budget","locations_cap","sans_cap","constrained_store","constrained_certificate"]}},"blob_versions":{"type":"array","items":{"type":["integer","string"]}},"audit_persisted":{"type":"boolean",)j"
+     R"j("description":"Present and false only when the access audit row failed to persist"}},"required":["certificates","stores","not_read","coverage","result_truncated","truncated_parts","next_cursor","blob_versions","count"]})j",
+     "CertificateInventory", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
+     "List fleet certificates", &handle_list_crypto_certificates},
+
+    {"get_crypto_certificate_summary",
+     "Raw-value rollups of the fleet's machine certificate inventory: distinct-device and "
+     "distinct-certificate counts grouped by public-key algorithm and size, signature algorithm "
+     "(with PSS hash), elliptic curve, issuer (top 50 by devices) and store, the stores-per-status "
+     "coverage, and a not_after histogram over bucket edges YOU supply in not_after_edges (no edge "
+     "is chosen for you). Subject DNs and SANs are never a grouping key, and a self-signed or self-issued certificate that is not a CA is never an issuer group (its issuer repeats its subject). The same filters as "
+     "list_crypto_certificates narrow the set. Nothing is graded: facts only; the only built-in checks are D13's "
+     "named rules and windows, each shown with its criterion. Counts are distinct devices and "
+     "distinct certificate SHA-256 values, computed in one snapshot at read time and not stored; "
+     "recompute-grade drills go through list_crypto_certificates. result_truncated / "
+     "truncated_parts say when a group hit its row ceiling (issuers keep the top 50). not_read "
+     "lists what the collector does not read: an empty result is NOT proof of absence. Requires "
+     "CertificateInventory:Read (admin-only while RBAC enforcement is off); a confined caller's "
+     "counts cover only its visible devices; a service-scoped token is refused (403). Input is "
+     "strict like list_crypto_certificates. A degraded store or crypto read capacity in use is a "
+     "retryable error with retry_after_ms, never zeros. NOT retryable (retry_after_ms null): a "
+     "summary that exceeds its 15 s read budget for the visible fleet (a scale limit: it is "
+     "reliable for roughly 1-2 thousand confined devices; narrow it with agent_id, store or "
+     "another filter), a substring filter on a deterministically failed or absent dictionary, and a pool below 4 connections. A substring filter before the leader's background pass has completed after a start is retryable (retry_after_ms 10000; 300000 after a transient failure of the pass). A lost audit "
+     "row sets audit_persisted false. Audited as mcp.get_crypto_certificate_summary. Mirrors GET "
+     "/api/v1/crypto/certificates/summary. Read-only.",
+     R"j({"type":"object","properties":{)j"
+     R"j("store":{"type":"string","minLength":1,"maxLength":1024,"description":"Exact store_id (free text, no enum): certificates with a location in this store, e.g. LocalMachine\\Root or a Linux trust-file root"},)j"
+     R"j("scope":{"type":"string","enum":["machine"],"description":"Certificate scope; only machine stores are read in this release"},)j"
+     R"j("key_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact public-key algorithm OID, dotted decimal (any well-formed OID is accepted)"},)j"
+     R"j("sig_alg_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact signature algorithm OID, dotted decimal"},)j"
+     R"j("ec_curve_oid":{"type":"string","maxLength":1024,"pattern":"^[0-2](\\.[0-9]+){1,32}$","description":"Exact elliptic-curve OID, dotted decimal"},)j"
+     R"j("not_after_before":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant YYYY-MM-DDTHH:MM:SSZ: certificates whose not_after is strictly before it. The threshold is yours; nothing is chosen for you"},)j"
+     R"j("not_after_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_after is strictly after it"},)j"
+     R"j("not_before_after":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$","description":"RFC 3339 UTC instant: certificates whose not_before is strictly after it"},)j"
+     R"j("rsa_modulus_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"RSA certificates whose modulus is smaller than this many bits (your threshold)"},)j"
+     R"j("ec_order_bits_lt":{"type":"integer","minimum":1,"maximum":65536,"description":"EC certificates whose curve order is smaller than this many bits (your threshold)"},)j"
+     R"j("is_ca":{"type":"boolean","description":"The certificate's own basic-constraints CA claim"},)j"
+     R"j("self_signed":{"type":"boolean","description":"Issuer equals subject and the signature verifies under its own key, as the collector reported it"},)j"
+     R"j("agent_id":{"type":"string","minLength":1,"maxLength":256,"description":"Exact device id; still confined to the devices you may see"},)j"
+     R"j("issuer_dn":{"type":"string","maxLength":1024,"description":"Exact issuer DN (RFC 4514 string); empty string selects certificates with an empty issuer"},)j"
+     R"j("issuer_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of issuer_dn (% and _ are not wildcards). Finds a CA's certificates under any of its names, e.g. eMudhra then emSign"},)j"
+     R"j("subject_dn_contains":{"type":"string","minLength":3,"maxLength":256,"description":"Case-insensitive literal substring of subject_dn. Accepted ONLY together with is_ca=true (a subject search over end-entity certificates would be a search for a person); otherwise refused naming is_ca"},)j"
+     R"j("sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact certificate SHA-256 (hex, either case)"},)j"
+     R"j("spki_sha256":{"type":"string","maxLength":64,"pattern":"^[0-9a-fA-F]{64}$","description":"Exact SPKI SHA-256: every certificate over one key, cross-signed and re-issued copies included (hex, either case)"},)j"
+     R"j("aki_key_id":{"type":"string","maxLength":128,"pattern":"^([0-9a-fA-F]{2}){1,64}$","description":"Exact authority key identifier (hex, either case): every certificate one CA key signed, whatever name the issuer used"},)j"
+     R"j("not_after_edges":{"type":"array","minItems":1,"maxItems":32,"items":{"type":"string","maxLength":20,"pattern":"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}Z$"},"description":"Your bucket edges for the not_after histogram: strictly ascending RFC 3339 UTC instants. No edge is chosen for you; omit for no histogram"})j"
+     R"j(},"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"totals":{"type":"object","properties":{"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}},"key_algorithms":{"type":"array","items":{"type":"object","properties":{"key_alg_oid":{"type":"string"},"rsa_modulus_bits":{"type":["integer","null"]},"ec_order_bits":{"type":["integer","null"]},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"signature_algorithms":{"type":"array","items":{"type":"object","properties":{"sig_alg_oid":{"type":"string"},"pss_hash_oid":{"type":["string","null"]},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"ec_curves":{"type":"array","items":{"type":"object","properties":{"ec_curve_oid":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"issuers":{"type":"array","items":{"type":"object","properties":{"issuer_dn":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"stores":{"type":"array","items":{"type":"object","properties":{"store_id":{"type":"string"},"device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"store_statuses":{"type":"array","items":{"type":"object","properties":{"status":{"type":"string"},"store_count":{"type":"integer"},"device_count":{"type":"integer"}}}},"not_after_histogram":{"type":"array","items":{"type":"object","properties":{"from":{"type":["string","null"]},"to":{"type":["string","null"]},"unknown":{"type":"boolean"},)j"
+     R"j("device_count":{"type":"integer"},"certificate_count":{"type":"integer"}}}},"not_read":{"type":"array","items":{"type":"string"},"description":"What the collector does not read; an empty result is not proof of absence"},"coverage":{"type":"object","properties":{"devices_reporting":{"type":"integer","description":"In-scope devices with a certificate report"},"devices_included":{"type":"integer"},"confined":{"type":"boolean"}},"required":["devices_reporting","devices_included","confined"]},"issuers_note":{"type":"string","description":"Why self-signed or self-issued non-CA certificates are never an issuer group"},"result_truncated":{"type":"boolean","description":"True when ANY cut happened (see truncated_parts)"},"truncated_parts":{"type":"array","items":{"type":"string","enum":["page_limit","row_ceiling","byte_budget","locations_cap","sans_cap","constrained_store","constrained_certificate"]}},"blob_versions":{"type":"array","items":{"type":["integer","string"]}},"audit_persisted":{"type":"boolean","description":"Present and false only when the access audit row failed to persist"}},"required":["totals","key_algorithms","signature_algorithms","ec_curves","issuers","stores","store_statuses","not_after_histogram","not_read","coverage","result_truncated","truncated_parts","blob_versions"]})j",
+     "CertificateInventory", "Read", ServiceScopeClass::denied, ToolEffect::ReadOnly, true,
+     "Summarise fleet certificates by raw value", &handle_get_crypto_certificate_summary},
 };
 
 static_assert(records_well_formed(kToolRecords),

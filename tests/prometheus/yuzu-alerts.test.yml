@@ -11003,3 +11003,82 @@ tests:
         exp_samples:
           - labels: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing", job="yuzu", severity="warning"}'
             value: 1
+
+  # CASE: the certificate store-status freeze detector. s1 is frozen (the counter moves on every
+  # 5-minute sweep); s2 had one unlucky sweep; s3 never degrades.
+  - interval: 1m
+    name: fleet certificate store-status gauge - a sustained freeze fires, one failed sweep and a flat series stay quiet
+    input_series:
+      - series: 'yuzu_fleet_cert_store_status_unavailable_total{job="yuzu",instance="s1"}'
+        values: "0+1x4 5 5 5 5 5 6 6 6 6 6 7 7 7 7 7 8 8 8 8 8 9 9 9 9 9 10 10 10 10 10 11 11 11 11 11"
+      - series: 'yuzu_fleet_cert_store_status_unavailable_total{job="yuzu",instance="s2"}'
+        values: "0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'yuzu_fleet_cert_store_status_unavailable_total{job="yuzu",instance="s3"}'
+        values: "0x38"
+    alert_rule_test:
+      - eval_time: 35m
+        alertname: YuzuCertStoreStatusUnavailable
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+              instance: s1
+              job: yuzu
+            exp_annotations:
+              summary: "Fleet certificate store-status gauge may be frozen"
+              runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+              description: "yuzu_fleet_cert_store_status_unavailable_total is rising: the certificate store-status rollup keeps timing out, so yuzu_fleet_cert_store_status is held at its last value and may read healthy during an actual outage. Investigate Postgres pool saturation (yuzu_pg_pool_waiters, yuzu_pg_acquire_wait_seconds)."
+
+  # CASE: the substring dictionary alert fires only when the gauge stays 0 (s1), and not for a
+  # repaired one (s2: 0 for 10m then 1) or a healthy one (s3).
+  - interval: 1m
+    name: certificate substring dictionary - a gauge held at 0 for 30m fires, a repaired or healthy one stays quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_substring_index_available{job="yuzu",instance="s1"}'
+        values: "0x60"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: YuzuCertSubstringDictionaryMissing
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Certificate substring filters are unavailable (DN dictionary not built)"
+              runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+              description: "yuzu_server_cert_inventory_substring_index_available is 0: issuer_dn_contains and subject_dn_contains are refused: a retryable 503 while the leader's reconcile is pending, non-retryable once it failed. See server-admin.md, \"The substring-filter dictionary\"; the gauge flips back within five minutes of the repair, no restart needed."
+  - interval: 1m
+    name: certificate substring dictionary - repaired within 10m and healthy stay quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_substring_index_available{job="yuzu",instance="s2"}'
+        values: "0x9 1x60"
+      - series: 'yuzu_server_cert_inventory_substring_index_available{job="yuzu",instance="s3"}'
+        values: "1x70"
+    alert_rule_test:
+      - eval_time: 45m
+        alertname: YuzuCertSubstringDictionaryMissing
+        exp_alerts: []
+
+  # CASE: no successful prune for over 3h fires; a fresh timestamp (s2) stays quiet.
+  - interval: 1m
+    name: certificate dn dictionary prune - stale for over 3h fires, a fresh timestamp stays quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds{job="yuzu",instance="s1"}'
+        values: "0x300"
+    alert_rule_test:
+      - eval_time: 250m
+        alertname: YuzuCertDnDictionaryPruneStale
+        exp_alerts:
+          - exp_labels:
+              severity: warning
+            exp_annotations:
+              summary: "Certificate DN dictionary has not been pruned for over 3 hours"
+              runbook_url: "https://docs.yuzu.io/runbooks/inventory-ingest"
+              description: "yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds is more than 3h old: the hourly prune is failing or no replica is leading. Check yuzu_server_cert_inventory_dn_dict_runs_total{step=\"prune\"} and the leader's log."
+  - interval: 1m
+    name: certificate dn dictionary prune - a recent prune stays quiet
+    input_series:
+      - series: 'yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds{job="yuzu",instance="s2"}'
+        values: "86400+60x300"
+    alert_rule_test:
+      - eval_time: 250m
+        alertname: YuzuCertDnDictionaryPruneStale
+        exp_alerts: []

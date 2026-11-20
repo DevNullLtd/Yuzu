@@ -56,6 +56,27 @@ public:
         return devices_result;
     }
 
+    // ── Fleet certificates (slice-2 PR 2a-2b) ──
+    std::expected<CertPage, CryptoReadError> cert_page_result{CertPage{}};
+    std::expected<CertSummary, CryptoReadError> cert_summary_result{CertSummary{}};
+    mutable std::vector<CertQuery> cert_queries;
+    mutable std::vector<CertSummaryQuery> cert_summary_queries;
+    mutable int cert_calls_total{0};
+    std::expected<CertPage, CryptoReadError> certificates(const CertQuery& q,
+                                                          const authz::VisibleSet& scope) const override {
+        ++cert_calls_total;
+        scopes.push_back(scope);
+        cert_queries.push_back(q);
+        return cert_page_result;
+    }
+    std::expected<CertSummary, CryptoReadError>
+    certificate_summary(const CertSummaryQuery& q, const authz::VisibleSet& scope) const override {
+        ++cert_calls_total;
+        scopes.push_back(scope);
+        cert_summary_queries.push_back(q);
+        return cert_summary_result;
+    }
+
     // ── Dashboard widget methods ──
     std::expected<CaCertStats, CryptoReadError> stats_result{CaCertStats{}};
     std::expected<CaCertPage, CryptoReadError> certs_result{CaCertPage{}};
@@ -154,6 +175,7 @@ struct Harness {
     int deny_status{403}; // 503 = the gate DEGRADED (RBAC store unreadable) rather than refused
     authz::VisibleSet scope; // nullopt = TOP
     int gate_calls{0};
+    std::vector<std::string> gate_securables; // the securable each gate call asked for
     // The Yuzu-issued gate (perm_fn Security:Read) and the drawing probe (has_perm_fn).
     bool security_read{true};
     int security_deny_status{403};
@@ -226,7 +248,8 @@ struct Harness {
                                      const std::string& securable,
                                      const std::string& op) -> authz::FleetReadGate {
                 ++gate_calls;
-                CHECK(securable == "Inventory");
+                gate_securables.push_back(securable);
+                CHECK((securable == "Inventory" || securable == "CertificateInventory"));
                 CHECK(op == "Read");
                 if (!admitted) {
                     res.status = deny_status;
@@ -1854,7 +1877,9 @@ TEST_CASE("crypto routes: REST cbom - a scoped caller's exact scope reaches the 
     auto confined = h.sink.dispatch("GET", "/api/v1/crypto/cbom");
     REQUIRE(confined);
     bool marked = false;
-    for (const auto& p : body_of(*confined)["metadata"]["properties"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json confined_json = body_of(*confined);
+    for (const auto& p : confined_json["metadata"]["properties"])
         if (p["name"] == "yuzu:crypto:scope")
             marked = p["value"] == "confined";
     CHECK(marked);
@@ -1944,7 +1969,9 @@ TEST_CASE("crypto routes: REST cbom - a lost audit row is flagged in the header 
     CHECK(res->status == 200);
     CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
     bool flagged = false;
-    for (const auto& p : body_of(*res)["metadata"]["properties"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    nlohmann::json bom_json = body_of(*res);
+    for (const auto& p : bom_json["metadata"]["properties"])
         if (p["name"] == "yuzu:crypto:audit_persisted")
             flagged = p["value"] == "false";
     CHECK(flagged);
@@ -1963,4 +1990,540 @@ TEST_CASE("crypto routes: REST cbom - a CSPRNG failure is a retryable 503 BEFORE
     // The identity is minted first: a CSPRNG failure costs no store read and no read slot.
     CHECK(h.api->summary_calls == 0);
     CHECK(h.api->scopes.empty());
+}
+
+// ── Fleet certificates (slice-2 PR 2a-2b) ────────────────────────────────────
+
+namespace {
+
+CertReadRow cert_row(int n, const std::string& agent = "agent-1") {
+    CertReadRow r;
+    r.agent_id = agent;
+    r.hostname = "host-" + std::to_string(n);
+    r.sha256 = std::string(63, '0') + std::to_string(n);
+    r.subject_dn = "CN=Jane Doe " + std::to_string(n);
+    r.issuer_dn = "CN=Test CA";
+    r.not_after = "2030-01-01T00:00:00Z";
+    r.key_alg_oid = "1.2.840.113549.1.1.1";
+    r.rsa_modulus_bits = 2048;
+    r.sans = {{"rfc822", "jane" + std::to_string(n) + "@example.org"}};
+    r.locations = {{"LocalMachine\\Root", "", "ok", "2026-10-23T00:00:00Z", "2026-10-23T00:00:00Z"}};
+    r.last_seen = "2026-10-23T00:00:00Z";
+    return r;
+}
+
+CertPage cert_page(int rows = 2) {
+    CertPage p;
+    for (int i = 1; i <= rows; ++i)
+        p.rows.push_back(cert_row(i));
+    p.stores = {{"agent-1", "LocalMachine\\Root", "ok", "", "2026-10-23T00:00:00Z", "2026-10-23T00:00:00Z"}};
+    p.coverage = {4, 1, false};
+    p.blob_versions = {"1"};
+    return p;
+}
+
+CertSummary cert_summary_sample() {
+    CertSummary s;
+    s.totals = {2, 3};
+    s.key_algorithms = {{"1.2.840.113549.1.1.1", 2048, std::nullopt, {2, 3}}};
+    s.issuers = {{"CN=Test CA", {2, 3}}};
+    s.coverage = {4, 2, false};
+    return s;
+}
+
+const char* kCertList = "/api/v1/crypto/certificates";
+const char* kCertSum = "/api/v1/crypto/certificates/summary";
+
+} // namespace
+
+TEST_CASE("crypto routes: REST certificates - gated on CertificateInventory:Read, scope pushed, audited",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}};
+    auto res = h.sink.dispatch("GET", std::string(kCertList) + "?issuer_dn_contains=Test&limit=50");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["certificates"].size() == 2);
+    CHECK(j["data"]["certificates"][0]["sans"][0]["value"] == "jane1@example.org");
+    CHECK(j["data"]["stores"].size() == 1);
+    CHECK(j["data"]["not_read"].is_array());
+    CHECK(j["data"]["result_truncated"] == false);
+    CHECK(j["data"]["next_cursor"].is_null());
+    // The dedicated securable gates it - never Inventory:Read.
+    REQUIRE(h.gate_securables.size() == 1);
+    CHECK(h.gate_securables[0] == "CertificateInventory");
+    // The gate's exact visible set reaches the seam, and the parsed filter with it.
+    REQUIRE(h.api->scopes.size() == 1);
+    CHECK(h.api->scopes[0] == authz::VisibleSet{std::unordered_set<std::string>{"agent-1"}});
+    REQUIRE(h.api->cert_queries.size() == 1);
+    CHECK(*h.api->cert_queries[0].filter.issuer_dn_contains == "Test");
+    CHECK(h.api->cert_queries[0].limit == 50);
+    CHECK(res->get_header_value("Cache-Control") == "no-store, private");
+    CHECK_THAT(res->get_header_value("Vary"), ContainsSubstring("Authorization"));
+    // Audited with its own verb, scope=confined, rows, the filter NAME - never its value.
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.certificates.view");
+    CHECK(h.audits[0].result == "success");
+    CHECK(h.audits[0].target_type == "CertificateInventory");
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("scope=confined"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("rows=2"));
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("issuer_dn_contains=contains"));
+    CHECK_THAT(h.audits[0].detail, !ContainsSubstring("Test"));
+}
+
+TEST_CASE("crypto routes: every certificate surface keys the per-principal read cap on the session user",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertList) + "?issuer_dn_contains=k%5Cs")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertSum))->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates?issuer_dn_contains=Test")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?issuer_dn_contains=Test")->status == 200);
+    REQUIRE(h.api->cert_queries.size() + h.api->cert_summary_queries.size() >= 3);
+    for (const auto& q : h.api->cert_queries)
+        CHECK(q.principal == h.username);
+    for (const auto& q : h.api->cert_summary_queries)
+        CHECK(q.principal == h.username);
+    CHECK(*h.api->cert_queries[0].filter.issuer_dn_contains == "k\\s"); // a literal backslash, unchanged
+    // An ordinary REST page carries no substring filter and never resolves the principal.
+    h.api->cert_queries.clear();
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertList))->status == 200);
+    REQUIRE(h.api->cert_queries.size() == 1);
+    CHECK(h.api->cert_queries[0].principal.empty());
+}
+
+TEST_CASE("crypto routes: every certificate surface refuses a bare subject substring, is_ca=false and a NUL "
+          "needle (guards 21/22)",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    for (const std::string path : {std::string(kCertList), std::string(kCertSum),
+                                   std::string("/fragments/crypto/certificates"),
+                                   std::string("/fragments/crypto/certificates/devices")}) {
+        for (const char* q : {"?subject_dn_contains=emSign", "?subject_dn_contains=emSign&is_ca=false",
+                              "?issuer_dn_contains=eMu%00dhra", "?subject_dn_contains=emS%00ign&is_ca=true"}) {
+            INFO(path << q);
+            auto res = h.sink.dispatch("GET", path + q);
+            REQUIRE(res);
+            // REST answers 400; a fragment renders its caveat in place (never a 5xx, never a read).
+            if (path.rfind("/api/", 0) == 0)
+                CHECK(res->status == 400);
+            else
+                CHECK(res->status < 500);
+        }
+    }
+    CHECK(h.api->cert_calls_total == 0);
+    CHECK(h.audits.empty());
+}
+
+TEST_CASE("crypto routes: certificate audit rows never carry a subject, SAN or filter value",
+          "[crypto][routes][rest][certs][privacy]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    const auto q = std::string("?issuer_dn=CN%3DJane%20Doe&agent_id=agent-secret&sha256=") +
+                   std::string(64, 'a');
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertList) + q)->status == 200);
+    REQUIRE(h.sink.dispatch("GET", std::string(kCertSum) + q)->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates/devices" + q)->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/certificates" + q)->status == 200);
+    REQUIRE(h.audits.size() == 4);
+    for (const auto& a : h.audits) {
+        INFO(a.action);
+        for (const char* leaked : {"Jane", "jane", "example.org", "agent-secret", "aaaaaaaa"}) {
+            CHECK_THAT(a.detail, !ContainsSubstring(leaked));
+            CHECK_THAT(a.target_id, !ContainsSubstring(leaked));
+        }
+        CHECK_THAT(a.detail, ContainsSubstring("issuer_dn=eq"));
+        CHECK_THAT(a.detail, ContainsSubstring("agent_id=eq"));
+        CHECK_THAT(a.detail, ContainsSubstring("sha256=eq"));
+    }
+    // The summary itself carries no subject or SAN.
+    const auto sj = body_of(*h.sink.dispatch("GET", kCertSum));
+    CHECK(sj.dump().find("jane") == std::string::npos);
+}
+
+TEST_CASE("crypto routes: REST certificates - a lost audit row fails CLOSED with no data",
+          "[crypto][routes][rest][certs][audit]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    h.api->cert_summary_result = cert_summary_sample();
+    h.audit_ok = false;
+    for (const char* path : {kCertList, kCertSum}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+        const auto j = body_of(*res);
+        CHECK(j.contains("error"));
+        CHECK_FALSE(j.contains("data"));
+        CHECK(res->body.find("jane") == std::string::npos); // no certificate data in the body
+        CHECK(res->body.find("CN=Jane") == std::string::npos);
+        CHECK(j["error"]["retry_after_ms"].is_number()); // a retry hint
+    }
+}
+
+TEST_CASE("crypto routes: REST certificates - a degraded read is a 503 with a retry hint, never an empty 200",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    SECTION("store degraded") {
+        h.api->cert_page_result = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "certificate inventory read degraded",
+            CryptoReadCause::kStoreDegraded});
+    }
+    SECTION("admission shed") {
+        h.api->cert_page_result = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "crypto read capacity in use; retry",
+            CryptoReadCause::kCapacity});
+    }
+    for (const char* path : {kCertList}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body_of(*res)["error"]["retry_after_ms"] == 5000);
+    }
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.certificates.view");
+    CHECK(h.audits[0].result == "failure");
+}
+
+TEST_CASE("crypto routes: REST certificates - a pool too small is a 503 without a retry hint",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "refused: pool too small",
+                      CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    h.api->cert_page_result = std::unexpected(e);
+    auto res = h.sink.dispatch("GET", kCertList);
+    REQUIRE(res);
+    CHECK(res->status == 503);
+    CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
+}
+
+TEST_CASE("crypto routes: REST certificates - parameter refusals are 400 and never reach the seam",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_page_result = cert_page();
+    for (const char* q : {"?scope=user", "?key_alg_oid=1", "?not_after_before=tomorrow",
+                          "?rsa_modulus_bits_lt=0", "?is_ca=maybe", "?sha256=abc",
+                          "?aki_key_id=abc", "?issuer_dn_contains=ab",
+                          "?subject_dn_contains=emSign", "?limit=501", "?nonsense=1",
+                          "?agent_id=a&agent_id=b"}) {
+        INFO(q);
+        auto res = h.sink.dispatch("GET", std::string(kCertList) + q);
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        CHECK(body_of(*res).contains("error"));
+    }
+    CHECK(h.api->cert_calls_total == 0);
+    CHECK(h.audits.empty()); // a refused request is not a read
+    // The subject substring is accepted with is_ca=true.
+    CHECK(h.sink.dispatch("GET", std::string(kCertList) + "?subject_dn_contains=emSign&is_ca=true")->status == 200);
+    // A bad cursor from the seam is a 400 too.
+    h.api->cert_page_result = std::unexpected(
+        CryptoReadError{CryptoReadError::Kind::kInvalid, "invalid cursor"});
+    CHECK(h.sink.dispatch("GET", std::string(kCertList) + "?cursor=junk")->status == 400);
+}
+
+TEST_CASE("crypto routes: REST certificates - a refused gate reaches neither the seam nor the audit",
+          "[crypto][routes][rest][certs][security]") {
+    Harness h;
+    h.admitted = false;
+    for (const char* path : {kCertList, kCertSum}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 403);
+    }
+    CHECK(h.api->cert_calls_total == 0);
+    CHECK(h.audits.empty());
+    // An unwired gate fails closed, never open.
+    Harness open(/*wire_gate=*/false);
+    CHECK(open.sink.dispatch("GET", kCertList)->status == 503);
+    CHECK(open.api->cert_calls_total == 0);
+    // An unwired seam is a 503 too.
+    Harness noapi(true, /*wire_api=*/false);
+    CHECK(noapi.sink.dispatch("GET", kCertList)->status == 503);
+}
+
+TEST_CASE("crypto routes: REST certificate summary - shape, scope and audit",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    h.api->cert_summary_result = cert_summary_sample();
+    h.scope = authz::VisibleSet{std::unordered_set<std::string>{"agent-1", "agent-2"}};
+    auto res = h.sink.dispatch(
+        "GET", std::string(kCertSum) + "?not_after_edges=2026-01-01T00:00:00Z,2027-01-01T00:00:00Z");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    const auto j = body_of(*res);
+    CHECK(j["data"]["totals"]["certificate_count"] == 3);
+    CHECK(j["data"]["key_algorithms"][0]["rsa_modulus_bits"] == 2048);
+    CHECK(j["data"]["issuers"][0]["issuer_dn"] == "CN=Test CA");
+    CHECK(h.gate_securables == std::vector<std::string>{"CertificateInventory"});
+    REQUIRE(h.api->cert_summary_queries.size() == 1);
+    CHECK(h.api->cert_summary_queries[0].not_after_edges.size() == 2);
+    CHECK(h.api->scopes[0] == h.scope);
+    REQUIRE(h.audits.size() == 1);
+    CHECK(h.audits[0].action == "crypto.certificates.summary");
+    CHECK_THAT(h.audits[0].detail, ContainsSubstring("scope=confined"));
+    // The summary takes no cursor or limit.
+    CHECK(h.sink.dispatch("GET", std::string(kCertSum) + "?limit=5")->status == 400);
+    CHECK(h.sink.dispatch("GET", std::string(kCertSum) + "?not_after_edges=junk")->status == 400);
+}
+
+TEST_CASE("crypto routes: certificate fragments - gate, notices and escaping",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    auto page = cert_page();
+    page.rows[0].subject_dn = "CN=<script>alert(1)</script>";
+    page.rows[0].hostname = "<b>host</b>";
+    h.api->cert_page_result = page;
+    h.api->cert_summary_result = cert_summary_sample();
+
+    SECTION("the rows render, escaped, with the blind-spot caveat") {
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?issuer_dn=CN%3DTest%20CA");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("&lt;script&gt;"));
+        CHECK_THAT(res->body, !ContainsSubstring("<script>alert"));
+        CHECK_THAT(res->body, !ContainsSubstring("<b>host</b>"));
+        CHECK_THAT(res->body, ContainsSubstring("Not read"));
+        CHECK_THAT(res->body, ContainsSubstring("not proof of absence"));
+        CHECK_THAT(res->body, !ContainsSubstring("hx-on"));
+        CHECK(h.gate_securables == std::vector<std::string>{"CertificateInventory"});
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "crypto.certificates.view");
+    }
+    SECTION("the summary renders its groups") {
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("CN=Test CA"));
+        CHECK_THAT(res->body, ContainsSubstring("1.2.840.113549.1.1.1"));
+        REQUIRE(h.audits.size() == 1);
+        CHECK(h.audits[0].action == "crypto.certificates.summary");
+    }
+    SECTION("a lost audit row proceeds with a VISIBLE notice (the fragments are set-and-proceed)") {
+        h.audit_ok = false;
+        for (const char* path : {"/fragments/crypto/certificates/devices", "/fragments/crypto/certificates"}) {
+            auto res = h.sink.dispatch("GET", path);
+            REQUIRE(res);
+            CHECK(res->status == 200);
+            CHECK_THAT(res->body, ContainsSubstring("Audit not recorded"));
+            CHECK(res->get_header_value("Sec-Audit-Failed") == "true");
+            CHECK_THAT(res->body, ContainsSubstring("CN=Test CA")); // the data is still served
+        }
+    }
+    SECTION("a continuation page is table rows and a failure there is ONE row") {
+        auto cont = cert_page(2);
+        cont.next_cursor = "c1:next";
+        h.api->cert_page_result = cont;
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?cursor=c1%3Aprev");
+        REQUIRE(res);
+        CHECK_THAT(res->body, ContainsSubstring("<tr"));
+        CHECK_THAT(res->body, ContainsSubstring("Load more certificates"));
+        CHECK_THAT(res->body, ContainsSubstring("cursor=c1%3Anext"));
+        h.api->cert_page_result = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+        auto bad = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?cursor=c1%3Aprev");
+        REQUIRE(bad);
+        CHECK(bad->status == 200);
+        CHECK_THAT(bad->body, ContainsSubstring("<tr class=\"cry-more\""));
+        CHECK_THAT(bad->body, ContainsSubstring("not</b> \"no certificates\""));
+    }
+    SECTION("a degraded read is a banner with Retry, never an empty table") {
+        h.api->cert_summary_result = std::unexpected(CryptoReadError{
+            CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("Fleet certificates unavailable."));
+        CHECK_THAT(res->body, ContainsSubstring("Retry"));
+        CHECK_THAT(res->body, !ContainsSubstring("<tbody>"));
+    }
+    SECTION("a bad parameter is a 200 note and no read") {
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices?limit=0");
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("limit"));
+        CHECK(h.api->cert_calls_total == 0);
+    }
+}
+
+TEST_CASE("crypto routes: certificate fragments - a denied certificate half says it was denied",
+          "[crypto][routes][fragment][certs][security]") {
+    Harness h;
+    h.admitted = false;
+    for (const char* path : {"/fragments/crypto/certificates", "/fragments/crypto/certificates/devices",
+                             "/fragments/crypto/certificates/devices?cursor=c1%3Ax"}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 200); // htmx does not swap a 4xx
+        CHECK_THAT(res->body, ContainsSubstring("CertificateInventory:Read is required"));
+        CHECK_THAT(res->body, !ContainsSubstring("Inventory:Read is required. Ask"));
+        CHECK_THAT(res->body, !ContainsSubstring("No matching certificates")); // never "no certificates"
+    }
+    CHECK(h.api->cert_calls_total == 0);
+    // A gate that DEGRADED (503) is an outage, not a refusal.
+    h.deny_status = 503;
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates");
+    REQUIRE(res);
+    CHECK(res->status == 200);
+    CHECK_THAT(res->body, ContainsSubstring("access check could not be completed"));
+    CHECK_THAT(res->body, !ContainsSubstring("is not available to this account"));
+}
+
+TEST_CASE("crypto routes: slice-1 surfaces keep asking for Inventory:Read", "[crypto][routes][certs]") {
+    Harness h;
+    h.api->summary_result = sample_summary();
+    REQUIRE(h.sink.dispatch("GET", "/api/v1/crypto/libraries")->status == 200);
+    REQUIRE(h.sink.dispatch("GET", "/fragments/crypto/libraries")->status == 200);
+    CHECK(h.gate_securables == std::vector<std::string>{"Inventory", "Inventory"});
+}
+
+TEST_CASE("crypto dashboard: the Fleet certificates entry point is offered only to a CertificateInventory:Read holder",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    const auto dash = [&] {
+        auto res = h.sink.dispatch("GET", "/fragments/crypto/dashboard");
+        REQUIRE(res);
+        return res->body;
+    };
+    SECTION("a holder gets a plain hx-get button into the drill panel (no hx-on)") {
+        h.held.insert("CertificateInventory:Read");
+        const auto body = dash();
+        CHECK_THAT(body, ContainsSubstring("hx-get=\"/fragments/crypto/certificates\""));
+        CHECK_THAT(body, ContainsSubstring("hx-target=\"#cry-drill\""));
+        CHECK_THAT(body, ContainsSubstring("Fleet certificates"));
+        CHECK_THAT(body, !ContainsSubstring("hx-on"));
+    }
+    SECTION("a caller without it is not offered a dead link") {
+        h.held.erase("CertificateInventory:Read");
+        CHECK_THAT(dash(), !ContainsSubstring("/fragments/crypto/certificates"));
+    }
+}
+
+TEST_CASE("crypto fragments: the certificate summary loads the per-certificate drill by HTMX",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    h.api->cert_summary_result = cert_summary_sample();
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("hx-get=\"/fragments/crypto/certificates/devices\""));
+}
+
+TEST_CASE("crypto fragments: Show certificates carries the summary's filters to the list",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    h.api->cert_summary_result = cert_summary_sample();
+    auto res = h.sink.dispatch(
+        "GET", "/fragments/crypto/certificates?issuer_dn_contains=eMudhra&is_ca=true&"
+               "subject_dn_contains=emSign&not_after_before=2030-01-01T00:00:00Z&"
+               "not_after_edges=2026-01-01T00:00:00Z");
+    REQUIRE(res);
+    // The drill URL repeats every FILTER (and not the histogram edges, which the list has no use for).
+    CHECK_THAT(res->body, ContainsSubstring("/fragments/crypto/certificates/devices?"));
+    CHECK_THAT(res->body, ContainsSubstring("issuer_dn_contains=eMudhra"));
+    CHECK_THAT(res->body, ContainsSubstring("subject_dn_contains=emSign"));
+    CHECK_THAT(res->body, ContainsSubstring("is_ca=true"));
+    CHECK_THAT(res->body, ContainsSubstring("not_after_before=2030-01-01T00%3A00%3A00Z"));
+    CHECK_THAT(res->body, !ContainsSubstring("devices?not_after_edges"));
+    // And following that URL reaches the list seam with the same filter set.
+    const auto url_at = res->body.find("/fragments/crypto/certificates/devices?");
+    const auto url_end = res->body.find('"', url_at);
+    std::string url = res->body.substr(url_at, url_end - url_at);
+    for (std::size_t p; (p = url.find("&amp;")) != std::string::npos;)
+        url.replace(p, 5, "&");
+    h.api->cert_page_result = cert_page();
+    auto drill = h.sink.dispatch("GET", url);
+    REQUIRE(drill);
+    REQUIRE(h.api->cert_queries.size() == 1);
+    const auto& f = h.api->cert_queries[0].filter;
+    CHECK(*f.issuer_dn_contains == "eMudhra");
+    CHECK(*f.subject_dn_contains == "emSign");
+    CHECK(*f.is_ca == true);
+    CHECK(*f.not_after_before == "2030-01-01T00:00:00Z");
+}
+
+TEST_CASE("crypto fragments: a permanent certificate failure says what to do and offers no Retry",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "the substring filters are unavailable: build the dictionary",
+                      CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    h.api->cert_page_result = std::unexpected(e);
+    h.api->cert_summary_result = std::unexpected(e);
+    for (const char* path : {"/fragments/crypto/certificates/devices", "/fragments/crypto/certificates"}) {
+        INFO(path);
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 200);
+        CHECK_THAT(res->body, ContainsSubstring("build the dictionary"));
+        CHECK_THAT(res->body, !ContainsSubstring("Retry"));
+    }
+    // A transient failure keeps its Retry, which now replaces just the banner.
+    h.api->cert_page_result = std::unexpected(CryptoReadError{
+        CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kStoreDegraded});
+    auto t = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices");
+    REQUIRE(t);
+    CHECK_THAT(t->body, ContainsSubstring("hx-target=\"closest .cry-degrade\""));
+    CHECK_THAT(t->body, !ContainsSubstring("#guardian-detail"));
+}
+
+TEST_CASE("crypto routes: the reconciling wait is a RETRYABLE 503 with its hint, and the fragment says so",
+          "[crypto][routes][rest][fragment][certs]") {
+    Harness h;
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "substring filters reconciling",
+                      CryptoReadCause::kReconciling};
+    e.retry_after_ms = 10000;
+    h.api->cert_page_result = std::unexpected(e);
+    h.api->cert_summary_result = std::unexpected(e);
+    for (const char* path : {"/api/v1/crypto/certificates?issuer_dn_contains=abc",
+                             "/api/v1/crypto/certificates/summary"}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body_of(*res)["error"]["retry_after_ms"] == 10000);
+    }
+    for (const char* path : {"/fragments/crypto/certificates/devices", "/fragments/crypto/certificates"}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK_THAT(res->body, ContainsSubstring("still being prepared"));
+        CHECK_THAT(res->body, !ContainsSubstring("Postgres pool/query degraded"));
+        CHECK_THAT(res->body, ContainsSubstring("Retry"));
+    }
+}
+
+TEST_CASE("crypto fragments: a transient pass failure says retry in about five minutes",
+          "[crypto][routes][fragment][certs]") {
+    Harness h;
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "x", CryptoReadCause::kReconcileFailedTransient};
+    e.retry_after_ms = 300000;
+    h.api->cert_page_result = std::unexpected(e);
+    auto res = h.sink.dispatch("GET", "/fragments/crypto/certificates/devices");
+    REQUIRE(res);
+    CHECK_THAT(res->body, ContainsSubstring("about five minutes"));
+    CHECK_THAT(res->body, !ContainsSubstring("still being prepared"));
+}
+
+TEST_CASE("crypto routes: a refused substring filter and a summary scale limit are 503 with NO retry hint",
+          "[crypto][routes][rest][certs]") {
+    Harness h;
+    CryptoReadError e{CryptoReadError::Kind::kDegraded, "the substring filters are unavailable",
+                      CryptoReadCause::kStoreDegraded};
+    e.unavailable_until_restart = true;
+    h.api->cert_page_result = std::unexpected(e);
+    h.api->cert_summary_result = std::unexpected(e);
+    for (const char* path : {"/api/v1/crypto/certificates?issuer_dn_contains=abc",
+                             "/api/v1/crypto/certificates/summary"}) {
+        auto res = h.sink.dispatch("GET", path);
+        REQUIRE(res);
+        CHECK(res->status == 503);
+        CHECK(body_of(*res)["error"]["retry_after_ms"].is_null());
+    }
 }

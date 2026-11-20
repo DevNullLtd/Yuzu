@@ -8,12 +8,17 @@
 // test_agent_service_impl.cpp.
 
 #include <catch2/catch_test_macros.hpp>
+#include <catch2/generators/catch_generators.hpp>
+#include <catch2/generators/catch_generators_range.hpp>
+#include <catch2/matchers/catch_matchers_string.hpp>
 
 #include "agent.pb.h"
 #include "agent_decommission.hpp"
 #include "certificate_inventory_ingestion.hpp"
 #include "certificate_inventory_store.hpp"
+#include "certificate_read_model.hpp"
 #include "crypto_widget_catalogue.hpp"
+#include "dn_dict_pass_guard.hpp"
 #include "pg/pg_exec.hpp"
 #include "pg/pg_migration_runner.hpp"
 #include "pg/pg_pool.hpp"
@@ -27,14 +32,19 @@
 
 #include <algorithm>
 #include <atomic>
+#include <cstdio>
+#include <cstdlib>
+#include <mutex>
 #include <cctype>
 #include <chrono>
 #include <initializer_list>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 using namespace yuzu::server;
@@ -99,6 +109,7 @@ struct Cert {
     std::optional<std::string> sans_field;
     std::string tail_ext; // raw text appended as an extra (unknown) field
     std::string der_omitted, flags;
+    std::string key_usage{"Digital Signature, Key Encipherment"};
 };
 
 std::string sha_of(const Cert& c) { return c.sha_override.value_or(hexn(c.id)); }
@@ -130,7 +141,7 @@ std::string cert_group(const Cert& c) {
         "CCDD",                 // aki_key_id
         "1",                    // is_ca
         "0",                    // path_len
-        "Digital Signature, Key Encipherment",
+        c.key_usage,
         "0",       // self_signed
         "none",    // key_association
         "",        // key_provider
@@ -267,7 +278,8 @@ void cert_reset() {
     auto lease = cert_shared().pool->acquire();
     REQUIRE(lease);
     auto t = pg::exec_params(lease.get(),
-                             "TRUNCATE certificate_inventory_store.agent_state CASCADE",
+                             "TRUNCATE certificate_inventory_store.agent_state, "
+                             "certificate_inventory_store.dn_dict, certificate_inventory_store.dn_dict_state CASCADE",
                              std::vector<std::string>{});
     REQUIRE(t.status() == PGRES_COMMAND_OK);
 }
@@ -718,7 +730,7 @@ TEST_CASE("CertificateInventoryStore: opens and migrates on a fresh database",
     CHECK(store.is_open());
     CHECK(scalar(pool,
                  "SELECT count(*) FROM information_schema.tables WHERE table_schema = "
-                 "'certificate_inventory_store'") == "7");
+                 "'certificate_inventory_store'") == "9");
 }
 
 TEST_CASE("CertificateInventoryStore: a report round-trips facts, children and locations",
@@ -1747,4 +1759,1658 @@ TEST_CASE("CertificateInventoryStore: sample_key is NOT NULL on both tables and 
     CHECK(scalar(pool, "SELECT indexdef FROM pg_indexes WHERE schemaname = 'certificate_inventory_store' "
                        "AND indexname = 'cert_fact_sample_idx'")
               .find("(sha256, sample_key, agent_id)") != std::string::npos);
+}
+
+// ── Store: the read half (slice-2 PR 2a-2b) ──────────────────────────────────
+
+namespace {
+
+CertFactRow rfact(int id) {
+    CertFactRow f;
+    f.sha256 = hexn(id);
+    f.subject_dn = "CN=host" + std::to_string(id) + ".example";
+    f.issuer_dn = "CN=Test CA";
+    f.not_before = "2020-01-01T00:00:00Z";
+    f.not_after = "2030-01-01T00:00:00Z";
+    f.key_alg_oid = "1.2.840.113549.1.1.1";
+    f.rsa_modulus_bits = 2048;
+    f.sig_alg_oid = "1.2.840.113549.1.1.11";
+    f.spki_sha256 = hexn(500 + id);
+    f.ski = "AABB";
+    f.aki_key_id = "CCDD";
+    f.is_ca = false;
+    f.self_signed = false;
+    f.key_usage = "Digital Signature, Key Encipherment";
+    return f;
+}
+
+// One report for `agent`: every fact placed in `store` (status ok unless given).
+void put_report(CertificateInventoryStore& st, const std::string& agent,
+                std::vector<CertFactRow> facts, const std::string& store_id = "LocalMachine\\Root",
+                const std::string& status = "ok", const std::string& blob_version = "1") {
+    CertReportData d;
+    d.blob_version = blob_version;
+    d.stores.push_back({store_id, "machine", status, ""});
+    for (const auto& f : facts)
+        d.locations.push_back({store_id, "", f.sha256});
+    d.facts = std::move(facts);
+    REQUIRE(st.ingest_full(agent, d, "hash-" + agent).outcome == CertIngestOutcome::kStored);
+}
+
+std::vector<std::string> shas(const CertPage& p) {
+    std::vector<std::string> o;
+    for (const auto& r : p.rows)
+        o.push_back(r.sha256);
+    return o;
+}
+
+std::vector<std::string> ids_of(std::initializer_list<int> ns) {
+    std::vector<std::string> o;
+    for (const int n : ns)
+        o.push_back(hexn(n));
+    return o;
+}
+
+CertPage must_list(CertificateInventoryStore& st, const CertReadFilter& f = {},
+                   const CertScopeIds& scope = std::nullopt, int limit = 100,
+                   const std::optional<CertReadAfter>& after = std::nullopt) {
+    auto r = st.list_certificates(f, scope, after, limit);
+    REQUIRE(r.has_value());
+    return std::move(*r);
+}
+
+} // namespace
+
+TEST_CASE("CertificateInventoryStore reads: a page carries facts, children, locations and store status",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    CertReportData d;
+    d.blob_version = "1";
+    d.stores = {{"LocalMachine\\Root", "machine", "ok", ""},
+                {"LocalMachine\\My", "machine", "constrained", "row_cap"}};
+    auto f = rfact(1);
+    f.sans = {{"dns", "a.example"}, {"rfc822", "p@example.org"}};
+    f.ekus = {"1.3.6.1.5.5.7.3.1"};
+    f.constrained_fields = "utf8_replaced:subject_dn";
+    d.facts = {f};
+    d.locations = {{"LocalMachine\\Root", "", f.sha256}, {"LocalMachine\\My", "", f.sha256}};
+    REQUIRE(store.ingest_full("agent-1", d, "h").outcome == CertIngestOutcome::kStored);
+
+    const auto p = must_list(store);
+    REQUIRE(p.rows.size() == 1);
+    const auto& r = p.rows[0];
+    CHECK(r.agent_id == "agent-1");
+    CHECK(r.sha256 == hexn(1));
+    CHECK(*r.subject_dn == "CN=host1.example");
+    CHECK(*r.not_after == "2030-01-01T00:00:00Z");
+    CHECK(*r.rsa_modulus_bits == 2048);
+    CHECK(*r.aki_key_id == "CCDD");
+    CHECK(*r.is_ca == false);
+    CHECK(r.constrained_fields == "utf8_replaced:subject_dn");
+    REQUIRE(r.sans.size() == 2);
+    CHECK(r.sans[1].value == "p@example.org");
+    CHECK(r.ekus == std::vector<std::string>{"1.3.6.1.5.5.7.3.1"});
+    REQUIRE(r.locations.size() == 2);
+    CHECK(r.locations[0].store_id == "LocalMachine\\My"); // ordered by store_id
+    CHECK(r.locations[0].store_status == "constrained");
+    CHECK(r.locations[1].store_status == "ok");
+    CHECK(r.locations[1].observed_at.has_value());
+    CHECK_FALSE(r.last_seen.empty());
+    REQUIRE(p.stores.size() == 2); // every store of the device, so a kept row shows its status
+    CHECK(p.blob_versions == std::vector<std::string>{"1"});
+    CHECK(p.coverage.devices_reporting == 1);
+    CHECK(p.coverage.devices_included == 1);
+    CHECK_FALSE(p.coverage.confined);
+    CHECK_FALSE(p.has_more);
+}
+
+TEST_CASE("CertificateInventoryStore reads: every filter selects exactly its row",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    std::vector<CertFactRow> a;
+    a.push_back(rfact(1));
+    {
+        auto f = rfact(2);
+        f.key_alg_oid = "1.2.840.10045.2.1";
+        f.rsa_modulus_bits.reset();
+        f.ec_curve_oid = "1.2.840.10045.3.1.7";
+        f.ec_order_bits = 256;
+        f.sig_alg_oid = "1.2.840.10045.4.3.2";
+        f.not_after = "2021-06-01T00:00:00Z";
+        f.is_ca = true;
+        f.self_signed = true;
+        f.subject_dn = "CN=Test CA";
+        f.issuer_dn = "CN=Test CA";
+        f.aki_key_id = "EEFF";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(3);
+        f.rsa_modulus_bits = 1024;
+        f.not_before = "2024-03-01T00:00:00Z";
+        f.issuer_dn = "O=Other";
+        a.push_back(f);
+    }
+    put_report(store, "agent-1", a);
+    put_report(store, "agent-2", {rfact(4)}, "/etc/ssl/certs");
+
+    const auto only = [&](const CertReadFilter& f, std::initializer_list<int> want) {
+        INFO("filter " << want.size());
+        CHECK(shas(must_list(store, f)) == ids_of(want));
+    };
+    CertReadFilter f;
+    f = {}; f.store = "/etc/ssl/certs"; only(f, {4});
+    f = {}; f.scope = "machine"; only(f, {1, 2, 3, 4});
+    f = {}; f.key_alg_oid = "1.2.840.10045.2.1"; only(f, {2});
+    f = {}; f.sig_alg_oid = "1.2.840.10045.4.3.2"; only(f, {2});
+    f = {}; f.ec_curve_oid = "1.2.840.10045.3.1.7"; only(f, {2});
+    f = {}; f.not_after_before = "2022-01-01T00:00:00Z"; only(f, {2});
+    f = {}; f.not_after_after = "2029-12-31T23:59:59Z"; only(f, {1, 3, 4});
+    f = {}; f.not_before_after = "2023-01-01T00:00:00Z"; only(f, {3});
+    f = {}; f.rsa_modulus_bits_lt = 2048; only(f, {3});
+    f = {}; f.ec_order_bits_lt = 384; only(f, {2});
+    f = {}; f.is_ca = true; only(f, {2});
+    f = {}; f.self_signed = true; only(f, {2});
+    f = {}; f.agent_id = "agent-2"; only(f, {4});
+    f = {}; f.issuer_dn = "O=Other"; only(f, {3});
+    f = {}; f.sha256 = hexn(3); only(f, {3});
+    f = {}; f.spki_sha256 = hexn(504); only(f, {4});
+    f = {}; f.aki_key_id = "EEFF"; only(f, {2});
+    // Strict boundaries: the instant itself is not "before" nor "after".
+    f = {}; f.not_after_before = "2021-06-01T00:00:00Z"; only(f, {});
+    f = {}; f.not_after_after = "2021-06-01T00:00:00Z"; only(f, {1, 3, 4});
+    // A conjunction narrows.
+    f = {}; f.key_alg_oid = "1.2.840.113549.1.1.1"; f.agent_id = "agent-1"; only(f, {1, 3});
+}
+
+TEST_CASE("CertificateInventoryStore reads: the one-CA substring filters are literal and CA-only",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    std::vector<CertFactRow> a;
+    {
+        auto f = rfact(1); // a CA certificate named in the CN
+        f.is_ca = true;
+        f.subject_dn = "CN=emSign Root CA,O=eMudhra Technologies Limited";
+        f.issuer_dn = "CN=emSign Root CA,O=eMudhra Technologies Limited";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(2); // an end-entity certificate carrying the same words
+        f.subject_dn = "CN=Jane Doe,O=eMudhra Technologies Limited";
+        f.issuer_dn = "CN=emSign Issuing CA,O=eMudhra Technologies Limited";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(3);
+        f.issuer_dn = "CN=100% Real CA";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(4);
+        f.issuer_dn = "CN=1000 Other CA";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(5);
+        f.issuer_dn = "CN=a_b CA";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(6);
+        f.issuer_dn = "CN=axb CA";
+        a.push_back(f);
+    }
+    {
+        auto f = rfact(7);
+        f.issuer_dn = "CN=back\\slash CA";
+        a.push_back(f);
+    }
+    put_report(store, "agent-1", a);
+    REQUIRE(store.run_dn_dictionary_maintenance()); // the background pass (leader) builds it
+
+    CertReadFilter f;
+    SECTION("issuer substring is case-insensitive and finds the CA under any of its names") {
+        f.issuer_dn_contains = "EMUDHRA";
+        CHECK(shas(must_list(store, f)) == ids_of({1, 2}));
+        f.issuer_dn_contains = "emsign issuing";
+        CHECK(shas(must_list(store, f)) == ids_of({2}));
+    }
+    SECTION("a percent sign is a literal, not a pattern") {
+        f.issuer_dn_contains = "100%";
+        CHECK(shas(must_list(store, f)) == ids_of({3})); // an unescaped % would also match 1000
+    }
+    SECTION("an underscore is a literal, not a one-character wildcard") {
+        f.issuer_dn_contains = "a_b";
+        CHECK(shas(must_list(store, f)) == ids_of({5})); // an unescaped _ would also match axb
+    }
+    SECTION("a backslash is a literal") {
+        f.issuer_dn_contains = "back\\slash";
+        CHECK(shas(must_list(store, f)) == ids_of({7}));
+    }
+    SECTION("the subject substring only ever reaches CA certificates") {
+        f.subject_dn_contains = "emudhra";
+        f.is_ca = true;
+        CHECK(shas(must_list(store, f)) == ids_of({1})); // the end-entity row with the same words is not returned
+    }
+    SECTION("the store refuses a subject substring without is_ca=true, never searching people") {
+        f.subject_dn_contains = "Jane";
+        auto r = store.list_certificates(f, std::nullopt, std::nullopt, 10);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().kind == CertReadError::Kind::kInvalid);
+        f.is_ca = false;
+        CHECK_FALSE(store.list_certificates(f, std::nullopt, std::nullopt, 10).has_value());
+        CertSummaryQuery sq;
+        sq.filter = f;
+        CHECK_FALSE(store.summarize_certificates(sq, std::nullopt).has_value());
+    }
+}
+
+TEST_CASE("CertificateInventoryStore reads: the visible set is pushed into the SQL; present-empty is deny-all",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "agent-1", {rfact(1), rfact(2)});
+    put_report(store, "agent-2", {rfact(3)});
+    put_report(store, "agent-3", {rfact(4)});
+
+    SECTION("unfiltered sees the fleet") {
+        const auto p = must_list(store);
+        CHECK(p.rows.size() == 4);
+        CHECK(p.coverage.devices_reporting == 3);
+    }
+    SECTION("a confined set sees only its devices, and so does the denominator") {
+        const auto p = must_list(store, {}, CertScopeIds{std::vector<std::string>{"agent-2", "agent-3"}});
+        CHECK(shas(p) == ids_of({3, 4}));
+        CHECK(p.coverage.devices_reporting == 2);
+        CHECK(p.coverage.confined);
+        // A filter naming a device outside the set reaches nothing.
+        CertReadFilter f;
+        f.agent_id = "agent-1";
+        CHECK(must_list(store, f, CertScopeIds{std::vector<std::string>{"agent-2"}}).rows.empty());
+    }
+    SECTION("present-empty denies everything, with no error and a zero denominator") {
+        const auto p = must_list(store, {}, CertScopeIds{std::vector<std::string>{}});
+        CHECK(p.rows.empty());
+        CHECK(p.coverage.devices_reporting == 0);
+        CHECK(p.coverage.confined);
+        CertSummaryQuery q;
+        auto s = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{}});
+        REQUIRE(s.has_value());
+        CHECK(s->totals.certificate_count == 0);
+        CHECK(s->coverage.confined);
+    }
+    SECTION("the summary totals are confined (every other figure: the dedicated test below)") {
+        CertSummaryQuery q;
+        auto s = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{"agent-1"}});
+        REQUIRE(s.has_value());
+        CHECK(s->totals.device_count == 1);
+        CHECK(s->totals.certificate_count == 2);
+    }
+}
+
+TEST_CASE("CertificateInventoryStore reads: keyset paging walks every row once", "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "agent-1", {rfact(1), rfact(2), rfact(3)});
+    put_report(store, "agent-2", {rfact(4), rfact(5)});
+    std::vector<std::string> seen;
+    std::optional<CertReadAfter> after;
+    int pages = 0;
+    for (;;) {
+        const auto p = must_list(store, {}, std::nullopt, 2, after);
+        ++pages;
+        for (const auto& r : p.rows)
+            seen.push_back(r.sha256);
+        if (!p.has_more)
+            break;
+        after = CertReadAfter{p.rows.back().agent_id, p.rows.back().sha256};
+        REQUIRE(pages < 10);
+    }
+    CHECK(pages == 3);
+    CHECK(seen == ids_of({1, 2, 3, 4, 5}));
+    CHECK_FALSE(store.list_certificates({}, std::nullopt, std::nullopt, 0).has_value());
+    CHECK_FALSE(store.list_certificates({}, std::nullopt, std::nullopt, kCertPageMax + 1).has_value());
+}
+
+TEST_CASE("CertificateInventoryStore reads: a self-issued end-entity certificate is never an issuer group, "
+          "even when self_signed is unknown",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    auto leaf = rfact(7);
+    leaf.subject_dn = "CN=Bob Person";
+    leaf.issuer_dn = "CN=Bob Person"; // self-issued
+    leaf.self_signed.reset();         // the collector could not tell (NULL)
+    leaf.is_ca = false;
+    auto ca = rfact(8);
+    ca.subject_dn = "CN=Root CA";
+    ca.issuer_dn = "CN=Root CA";
+    ca.self_signed.reset();
+    ca.is_ca = true; // a self-issued CA still names a CA
+    auto nosub = rfact(9);
+    nosub.subject_dn.reset(); // no subject: cannot be shown to differ from its issuer
+    nosub.issuer_dn = "CN=Carol Person";
+    nosub.self_signed.reset();
+    nosub.is_ca = false;
+    put_report(store, "agent-1", {rfact(1), leaf, ca, nosub});
+    auto r = store.summarize_certificates(CertSummaryQuery{}, std::nullopt);
+    REQUIRE(r.has_value());
+    bool saw_root = false;
+    for (const auto& g : r->issuers) {
+        CHECK(g.issuer_dn.find("Bob") == std::string::npos);
+        CHECK(g.issuer_dn.find("Carol") == std::string::npos);
+        saw_root = saw_root || g.issuer_dn == "CN=Root CA";
+    }
+    CHECK(saw_root);
+    CHECK(r->totals.certificate_count == 4); // excluded from the issuer groups only
+}
+
+TEST_CASE("CertificateInventoryStore reads: the summary groups raw values and buckets the caller's edges",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    auto ec = rfact(3);
+    ec.key_alg_oid = "1.2.840.10045.2.1";
+    ec.rsa_modulus_bits.reset();
+    ec.ec_curve_oid = "1.2.840.10045.3.1.7";
+    ec.ec_order_bits = 256;
+    ec.not_after = "2021-06-01T00:00:00Z";
+    ec.subject_dn = "CN=Alice Person,E=alice@example.org";
+    auto unk = rfact(4);
+    unk.not_after.reset(); // no known validity end
+    put_report(store, "agent-1", {rfact(1), rfact(2), ec});
+    put_report(store, "agent-2", {rfact(1), unk}, "LocalMachine\\CA");
+    put_report(store, "agent-3", {rfact(5)}, "LocalMachine\\My", "unreadable");
+
+    CertSummaryQuery q;
+    q.not_after_edges = {"2022-01-01T00:00:00Z", "2031-01-01T00:00:00Z"};
+    auto r = store.summarize_certificates(q, std::nullopt);
+    REQUIRE(r.has_value());
+    const auto& s = *r;
+    CHECK(s.totals.device_count == 2); // agent-3's unreadable store holds no row
+    CHECK(s.totals.certificate_count == 4); // 1, 2, 3, 4
+    REQUIRE(s.key_algorithms.size() == 2);
+    CHECK(s.key_algorithms[0].key_alg_oid == "1.2.840.113549.1.1.1"); // most devices first
+    CHECK(*s.key_algorithms[0].rsa_modulus_bits == 2048);
+    CHECK(s.key_algorithms[0].counts.device_count == 2);
+    CHECK(s.key_algorithms[0].counts.certificate_count == 3);
+    REQUIRE(s.ec_curves.size() == 1);
+    CHECK(s.ec_curves[0].ec_curve_oid == "1.2.840.10045.3.1.7");
+    REQUIRE(s.issuers.size() == 1);
+    CHECK(s.issuers[0].issuer_dn == "CN=Test CA");
+    CHECK(s.stores.size() == 2);
+    REQUIRE_FALSE(s.store_statuses.empty());
+    bool saw_unreadable = false;
+    for (const auto& g : s.store_statuses)
+        if (g.status == "unreadable") {
+            saw_unreadable = true;
+            CHECK(g.device_count == 1);
+        }
+    CHECK(saw_unreadable);
+    // Edges: [-inf,2022) -> {3}; [2022,2031) -> {1,2}; [2031,inf) -> {}; unknown -> {4}
+    REQUIRE(s.not_after_histogram.size() == 4);
+    CHECK(s.not_after_histogram[0].counts.certificate_count == 1);
+    CHECK_FALSE(s.not_after_histogram[0].from.has_value());
+    CHECK(s.not_after_histogram[1].counts.certificate_count == 2);
+    CHECK(*s.not_after_histogram[1].from == "2022-01-01T00:00:00Z");
+    CHECK(s.not_after_histogram[2].counts.certificate_count == 0);
+    CHECK_FALSE(s.not_after_histogram[2].to.has_value());
+    CHECK(s.not_after_histogram[3].unknown);
+    CHECK(s.not_after_histogram[3].counts.certificate_count == 1);
+    CHECK(s.coverage.devices_reporting == 3);
+    // Subject DNs and SANs are never a group: no group carries the personal-data subject.
+    for (const auto& g : s.issuers)
+        CHECK(g.issuer_dn.find("Alice") == std::string::npos);
+
+    SECTION("a filter narrows the rollup, and a histogram needs the caller's edges") {
+        CertSummaryQuery f;
+        f.filter.key_alg_oid = "1.2.840.10045.2.1";
+        auto fr = store.summarize_certificates(f, std::nullopt);
+        REQUIRE(fr.has_value());
+        CHECK(fr->totals.certificate_count == 1);
+        CHECK(fr->not_after_histogram.empty()); // no edges, no histogram
+    }
+}
+
+TEST_CASE("CertificateInventoryStore reads: a store that is not open degrades, never answers empty",
+          "[certinv][read]") {
+    PgPool bad{{.conninfo = "host=127.0.0.1 port=1 connect_timeout=1 dbname=yuzu_test_none",
+                .size = 1}};
+    CertificateInventoryStore store{bad};
+    REQUIRE_FALSE(store.is_open());
+    const auto l = store.list_certificates({}, std::nullopt, std::nullopt, 10);
+    REQUIRE_FALSE(l.has_value());
+    CHECK(l.error().kind == CertReadError::Kind::kNotOpen);
+    CHECK_FALSE(store.summarize_certificates({}, std::nullopt).has_value());
+    CHECK_FALSE(store.fleet_status_counts({}, {}).has_value());
+}
+
+TEST_CASE("CertificateInventoryStore reads: fleet_status_counts folds stores per (OS, status) in SQL",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "agent-1", {rfact(1)}, "S1", "ok");
+    put_report(store, "agent-2", {rfact(2)}, "S2", "constrained");
+    put_report(store, "agent-3", {rfact(3)}, "S3", "ok");
+    // agent-3 is not in the snapshot (not connected here): `unknown`.
+    auto c = store.fleet_status_counts({"agent-1", "agent-2"}, {"windows", "linux"});
+    REQUIRE(c.has_value());
+    using K = std::pair<std::string, std::string>;
+    CHECK(c->at(K{"windows", "ok"}) == 1);
+    CHECK(c->at(K{"linux", "constrained"}) == 1);
+    CHECK(c->at(K{"unknown", "ok"}) == 1);
+    CHECK_FALSE(c->contains(K{"windows", "constrained"})); // zero counts are omitted
+    for (const auto& [k, n] : *c) {
+        (void)n;
+        CHECK((k.second == "ok" || k.second == "absent" || k.second == "unreadable" ||
+               k.second == "constrained" || k.second == "not_observed"));
+    }
+    // Arrays of different lengths are refused, never misaligned.
+    auto bad = store.fleet_status_counts({"agent-1"}, {});
+    REQUIRE_FALSE(bad.has_value());
+    CHECK(bad.error().kind == CertReadError::Kind::kInvalid);
+    // A wall budget of nothing fails the read (a degrade), never a partial rollup.
+    auto none = store.fleet_status_counts({}, {}, std::chrono::milliseconds{3000}, std::chrono::milliseconds{0});
+    CHECK_FALSE(none.has_value());
+}
+
+TEST_CASE("cert read model: the fleet gauge OS bucket bounds its label set",
+          "[certread][model][gauge]") {
+    using namespace yuzu::server;
+    CHECK(cert_read::fleet_os_bucket("windows") == "windows");
+    CHECK(cert_read::fleet_os_bucket("linux") == "linux");
+    CHECK(cert_read::fleet_os_bucket("darwin") == "darwin");
+    CHECK(cert_read::fleet_os_bucket("freebsd") == "other");
+    CHECK(cert_read::fleet_os_bucket("") == "other");
+    CHECK(cert_read::fleet_os_bucket("Windows") == "other"); // exact, never folded
+}
+
+TEST_CASE("CertificateInventoryStore reads: EVERY summary figure is confined, foreign values never appear",
+          "[certinv][pg][read][confinement]") {
+    CERT_SHARED(store, pool);
+    // Mine: one ok store, blob version 1, an RSA certificate under "CN=Mine CA".
+    auto mine = rfact(1);
+    mine.issuer_dn = "CN=Mine CA";
+    put_report(store, "mine", {mine}, "MineStore", "ok", "1");
+    // Foreign: every dimension differs - status, blob version, store, key algorithm, curve, issuer.
+    auto foreign = rfact(2);
+    foreign.issuer_dn = "CN=Foreign CA";
+    foreign.key_alg_oid = "1.2.840.10045.2.1";
+    foreign.rsa_modulus_bits.reset();
+    foreign.ec_curve_oid = "1.2.840.10045.3.1.7";
+    foreign.ec_order_bits = 256;
+    foreign.sig_alg_oid = "1.2.840.10045.4.3.2";
+    CertReportData d;
+    d.blob_version = "2";
+    d.stores = {{"ForeignStore", "machine", "unreadable", "permission_denied"},
+                {"ForeignOk", "machine", "ok", ""}};
+    d.facts = {foreign};
+    d.locations = {{"ForeignOk", "", foreign.sha256}};
+    REQUIRE(store.ingest_full("foreign", d, "h-f").outcome == CertIngestOutcome::kStored);
+
+    CertSummaryQuery q;
+    q.not_after_edges = {"2025-01-01T00:00:00Z"};
+    const auto no_foreign = [&](const CertSummary& s) {
+        CHECK(s.totals.device_count == 0);
+        for (const auto& g : s.issuers)
+            CHECK(g.issuer_dn != "CN=Foreign CA");
+        for (const auto& g : s.stores)
+            CHECK(g.store_id.rfind("Foreign", 0) != 0);
+        for (const auto& g : s.key_algorithms)
+            CHECK(g.key_alg_oid != "1.2.840.10045.2.1");
+        CHECK(s.ec_curves.empty());
+        for (const auto& g : s.store_statuses)
+            CHECK(g.status != "unreadable"); // only the foreign device has an unreadable store
+        for (const auto& v : s.blob_versions)
+            CHECK(v != "2");
+    };
+    SECTION("a confined set sees only its own figures, in every dimension") {
+        auto r = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{"mine"}});
+        REQUIRE(r.has_value());
+        CHECK(r->totals.device_count == 1);
+        CHECK(r->totals.certificate_count == 1);
+        CHECK(r->coverage.devices_reporting == 1);
+        CHECK(r->blob_versions == std::vector<std::string>{"1"});
+        REQUIRE(r->store_statuses.size() == 1);
+        CHECK(r->store_statuses[0].status == "ok");
+        CHECK(r->store_statuses[0].store_count == 1);
+        REQUIRE(r->issuers.size() == 1);
+        CHECK(r->issuers[0].issuer_dn == "CN=Mine CA");
+        CHECK(r->ec_curves.empty());
+        REQUIRE(r->stores.size() == 1);
+        CHECK(r->stores[0].store_id == "MineStore");
+        // the unfiltered view does see the foreign values (the assertions above are not vacuous)
+        auto all = store.summarize_certificates(q, std::nullopt);
+        REQUIRE(all.has_value());
+        CHECK(all->coverage.devices_reporting == 2);
+        CHECK(all->blob_versions.size() == 2);
+        CHECK(all->store_statuses.size() >= 2);
+    }
+    SECTION("present-empty is deny-all in every dimension, and runs no SQL") {
+        auto r = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{}});
+        REQUIRE(r.has_value());
+        no_foreign(*r);
+        CHECK(r->totals.certificate_count == 0);
+        CHECK(r->coverage.devices_reporting == 0);
+        CHECK(r->coverage.confined);
+        CHECK(r->blob_versions.empty());
+        CHECK(r->store_statuses.empty());
+        CHECK(r->issuers.empty());
+        CHECK(r->stores.empty());
+        CHECK(r->key_algorithms.empty());
+        REQUIRE(r->not_after_histogram.size() == 3); // the caller's edges still frame the (empty) buckets
+        for (const auto& b : r->not_after_histogram)
+            CHECK(b.counts.certificate_count == 0);
+    }
+    SECTION("a set naming only foreign-free devices sees nothing foreign") {
+        auto r = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{"nobody"}});
+        REQUIRE(r.has_value());
+        no_foreign(*r);
+        CHECK(r->coverage.devices_reporting == 0);
+    }
+}
+
+TEST_CASE("CertificateInventoryStore reads: a SQL fault is a degrade on every read, never empty",
+          "[certinv][pg][read]") {
+    // Its OWN database: the schema is dropped, which the shared fixture must never see.
+    YUZU_REQUIRE_PG_DB_TPL(db, certinv_tpl);
+    PgPool own{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(own.valid());
+    CertificateInventoryStore store{own};
+    REQUIRE(store.is_open());
+    put_report(store, "agent-1", {rfact(1)});
+    {
+        auto lease = own.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "DROP SCHEMA certificate_inventory_store CASCADE",
+                                std::vector<std::string>{})
+                    .status() == PGRES_COMMAND_OK);
+    }
+    const auto l = store.list_certificates({}, std::nullopt, std::nullopt, 10);
+    REQUIRE_FALSE(l.has_value());
+    CHECK(l.error().kind == CertReadError::Kind::kQueryError);
+    const auto s = store.summarize_certificates({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CertReadError::Kind::kQueryError);
+    CHECK_FALSE(store.fleet_status_counts({}, {}).has_value());
+    // deny-all still answers with no SQL
+    CHECK(store.list_certificates({}, CertScopeIds{std::vector<std::string>{}}, std::nullopt, 10)
+              .has_value());
+}
+
+// ── The distinct-DN dictionary behind the substring filters ───────────────────────────────────
+
+namespace {
+CertFactRow dn_fact(int id, const std::string& issuer, const std::string& subject, bool ca) {
+    auto f = rfact(id);
+    f.issuer_dn = issuer;
+    f.subject_dn = subject;
+    f.is_ca = ca;
+    return f;
+}
+std::string dict_state(PgPool& pool) {
+    return scalar(pool, "SELECT obj_description('certificate_inventory_store.dn_dict'::regclass, 'pg_class')");
+}
+} // namespace
+
+TEST_CASE("CertificateInventoryStore: ingest maintains the DN dictionary and the filters resolve through it",
+          "[certinv][pg][read][dict]") {
+    CERT_SHARED(store, pool);
+    // The build is a background pass: not ready until it has run after this store opened.
+    CHECK_FALSE(store.substring_index_available());
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    REQUIRE(store.substring_index_available());
+    CHECK_THAT(dict_state(pool), Catch::Matchers::StartsWith("ready:"));
+    put_report(store, "a1",
+               {dn_fact(1, "CN=emSign Root,O=eMudhra", "CN=emSign Root,O=eMudhra", true),
+                dn_fact(2, "CN=emSign Root,O=eMudhra", "CN=Jane Doe", false),
+                dn_fact(3, "CN=100% Real CA", "CN=h3", false)});
+    put_report(store, "a2", {dn_fact(4, "CN=emSign Root,O=eMudhra", "CN=h4", false)});
+    // Distinct DNs only: the shared issuer is ONE dictionary row, flagged issuer; the CA's subject
+    // equals its issuer so the same row also carries the CA-subject role; "Jane Doe" (an end-entity
+    // subject) is never in the dictionary at all.
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict") == "2");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn = "
+                       "'CN=emSign Root,O=eMudhra' AND is_issuer AND is_ca_subject") == "1");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn LIKE '%Jane%'") == "0");
+    // A re-report of unchanged facts writes nothing to the dictionary (xmin does not move).
+    const auto xmin = scalar(pool, "SELECT xmin::text FROM certificate_inventory_store.dn_dict WHERE "
+                                   "dn = 'CN=emSign Root,O=eMudhra'");
+    put_report(store, "a1",
+               {dn_fact(1, "CN=emSign Root,O=eMudhra", "CN=emSign Root,O=eMudhra", true),
+                dn_fact(2, "CN=emSign Root,O=eMudhra", "CN=Jane Doe", false),
+                dn_fact(3, "CN=100% Real CA", "CN=h3", false)});
+    CHECK(scalar(pool, "SELECT xmin::text FROM certificate_inventory_store.dn_dict WHERE "
+                       "dn = 'CN=emSign Root,O=eMudhra'") == xmin);
+
+    CertReadFilter f;
+    f.issuer_dn_contains = "EMUDHRA";
+    CHECK(shas(must_list(store, f)) == ids_of({1, 2, 4}));
+    f = {};
+    f.issuer_dn_contains = "100%";
+    CHECK(shas(must_list(store, f)) == ids_of({3}));
+    f = {};
+    f.is_ca = true;
+    f.subject_dn_contains = "emsign";
+    CHECK(shas(must_list(store, f)) == ids_of({1}));
+    f.subject_dn_contains = "jane"; // an end-entity subject is not searchable
+    CHECK(must_list(store, f).rows.empty());
+    f = {};
+    // A literal backslash in the needle matches a literal backslash (like_literal escapes `\`
+    // itself, the ILIKE's ESCAPE character), never an escape of the next byte.
+    put_report(store, "a3", {dn_fact(5, "CN=Back\\slash CA", "CN=h5", false),
+                             dn_fact(6, "CN=Backslash CA", "CN=h6", false)});
+    f.issuer_dn_contains = "k\\s";
+    CHECK(shas(must_list(store, f)) == ids_of({5}));
+    f.issuer_dn_contains = "_CA"; // `_` is literal, not one-character wildcard
+    CHECK(must_list(store, f).rows.empty());
+    f = {};
+    f.issuer_dn_contains = "no-such-ca";
+    CHECK(must_list(store, f).rows.empty());
+    // The summary resolves the same way.
+    CertSummaryQuery q;
+    q.filter.issuer_dn_contains = "emudhra";
+    auto sum = store.summarize_certificates(q, std::nullopt);
+    REQUIRE(sum.has_value());
+    CHECK(sum->totals.certificate_count == 3);
+    // The exact filters now ride the same btree indexes.
+    CHECK(scalar(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'certificate_inventory_store' "
+                       "AND indexname IN ('cert_fact_issuer_dn_idx', 'cert_fact_subject_ca_dn_idx')") == "2");
+}
+
+TEST_CASE("CertificateInventoryStore: the background pass backfills an existing store (migration v2 only creates the table)",
+          "[certinv][pg][read][dict]") {
+    YUZU_REQUIRE_PG_DB(db); // fresh: this test runs the migrations itself
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        // A store frozen at v1 (the 2a-2a schema) that already holds facts.
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        const auto& all = certificate_inventory_migrations();
+        REQUIRE(pg::PgMigrationRunner::run(lease.get(), "certificate_inventory_store",
+                                           std::vector<pg::PgMigration>{all[0]}));
+        const auto exec = [&](const char* sql) {
+            REQUIRE(pg::exec_params(lease.get(), sql, std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+        };
+        exec("INSERT INTO certificate_inventory_store.agent_state (agent_id, content_hash, blob_version, "
+             "first_seen, last_seen, last_full_at, sample_key) VALUES ('a1','h','1',now(),now(),now(),7)");
+        exec("INSERT INTO certificate_inventory_store.cert_fact (agent_id, sha256, issuer_dn, subject_dn, is_ca, sample_key) VALUES "
+             "('a1','" "0000000000000000000000000000000000000000000000000000000000000001" "','CN=Old CA','CN=Old CA',true,7),"
+             "('a1','" "0000000000000000000000000000000000000000000000000000000000000002" "','CN=Old CA','CN=leaf',false,7)");
+    }
+    CertificateInventoryStore store{pool}; // runs v2: an EMPTY table, nothing built, boot immediate
+    REQUIRE(store.is_open());
+    CHECK_FALSE(store.substring_index_available());
+    CHECK(dict_state(pool) == "building");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict") == "0");
+    CHECK(scalar(pool, "SELECT count(*) FROM pg_indexes WHERE schemaname = 'certificate_inventory_store' AND "
+                       "indexname LIKE 'cert_fact_%dn_idx'") == "0");
+    REQUIRE(store.run_dn_dictionary_maintenance()); // the leader's background pass
+    CHECK(store.substring_index_available());
+    CHECK_THAT(dict_state(pool), Catch::Matchers::StartsWith("ready:"));
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn = 'CN=Old CA' "
+                       "AND is_issuer AND is_ca_subject") == "1");
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict") == "1");
+    CertReadFilter f;
+    f.issuer_dn_contains = "old ca";
+    CHECK(shas(must_list(store, f)) == ids_of({1, 2}));
+}
+
+TEST_CASE("CertificateInventoryStore: a failed dictionary build never fails boot and refuses the filters, "
+          "with the real error recorded",
+          "[certinv][pg][read][dict]") {
+    YUZU_REQUIRE_PG_DB(db);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::PgMigrationRunner::run(lease.get(), "certificate_inventory_store",
+                                           std::vector<pg::PgMigration>{certificate_inventory_migrations()[0]}));
+        const auto exec = [&](const std::string& sql) {
+            REQUIRE(pg::exec_params(lease.get(), sql.c_str(), std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+        };
+        exec("INSERT INTO certificate_inventory_store.agent_state (agent_id, content_hash, "
+             "blob_version, first_seen, last_seen, last_full_at, sample_key) VALUES ('a1','h','1',now(),now(),now(),7)");
+        // A DN far past the btree entry limit: the CREATE INDEX inside the protected unit fails.
+        exec("INSERT INTO certificate_inventory_store.cert_fact (agent_id, sha256, issuer_dn, sample_key) VALUES ('a1','" +
+             std::string(63, '0') + "1', (SELECT string_agg(md5(i::text), '') FROM generate_series(1, 400) i), 7)");
+    }
+    CertificateInventoryStore store{pool};
+    REQUIRE(store.is_open()); // boot is NOT refused (and builds nothing)
+    CHECK_FALSE(store.run_dn_dictionary_maintenance()); // the CONCURRENTLY build fails: real error
+    CHECK_FALSE(store.substring_index_available());
+    CHECK_THAT(dict_state(pool), Catch::Matchers::StartsWith("failed: "));
+    CHECK_THAT(dict_state(pool), Catch::Matchers::ContainsSubstring("index row requires"));
+    // A failed CONCURRENTLY build leaves an INVALID index behind; the retry must drop and rebuild it.
+    CHECK(scalar(pool, "SELECT count(*) FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE "
+                       "c.relname = 'cert_fact_issuer_dn_idx' AND NOT i.indisvalid") == "1");
+    // The migration did not roll back the rest: the dictionary table exists, ingest keeps filling it.
+    put_report(store, "a2", {dn_fact(7, "CN=New CA", "CN=h7", false)});
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn = 'CN=New CA'") == "1");
+    // Substring filters are refused, non-retryable; every other filter still answers.
+    CertReadFilter f;
+    f.issuer_dn_contains = "new ca";
+    auto r = store.list_certificates(f, std::nullopt, std::nullopt, 10);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == CertReadError::Kind::kSubstringIndexMissing);
+    CertSummaryQuery q;
+    q.filter = f;
+    auto s = store.summarize_certificates(q, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CertReadError::Kind::kSubstringIndexMissing);
+    CertReadFilter exact;
+    exact.issuer_dn = "CN=New CA";
+    CHECK(store.list_certificates(exact, std::nullopt, std::nullopt, 10).has_value());
+    // The repair is the same background pass: remove the offender, run it again; it drops the
+    // INVALID leftover, rebuilds, reconciles and marks ready.
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(), "TRUNCATE certificate_inventory_store.agent_state CASCADE",
+                                std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    }
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    CHECK(store.substring_index_available());
+    put_report(store, "a2", {dn_fact(7, "CN=New CA", "CN=h7", false)});
+    CHECK(shas(must_list(store, f)) == ids_of({7}));
+    // A DIFFERENT process (a fresh store object, started later) is not ready until a reconcile
+    // completes after ITS start - the rollback / re-upgrade guard.
+    CertificateInventoryStore later{pool};
+    CHECK_FALSE(later.substring_index_available());
+    REQUIRE(later.run_dn_dictionary_maintenance());
+    CHECK(later.substring_index_available());
+}
+
+TEST_CASE("CertificateInventoryStore: a read past its wall budget is classified by SQLSTATE/deadline, "
+          "and a summary's is a non-retryable scale limit",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "a1", {rfact(1)});
+    store.set_read_budget_for_test(std::chrono::milliseconds{0});
+    const auto l = store.list_certificates({}, std::nullopt, std::nullopt, 10);
+    REQUIRE_FALSE(l.has_value());
+    CHECK(l.error().kind == CertReadError::Kind::kQueryError); // a page: a retryable degrade
+    CHECK(l.error().timed_out);
+    const auto s = store.summarize_certificates({}, std::nullopt);
+    REQUIRE_FALSE(s.has_value());
+    CHECK(s.error().kind == CertReadError::Kind::kScaleLimit);  // a summary: do not retry
+    CHECK(s.error().timed_out);
+    // A real server-side cancel carries SQLSTATE 57014, whatever lc_messages says.
+    store.set_read_budget_for_test(std::chrono::milliseconds{15000});
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        pg::exec_params(lease.get(), "SET lc_messages = 'C'", std::vector<std::string>{});
+    }
+    store.set_read_budget_for_test(std::chrono::milliseconds{1});
+    // 1 ms is long enough to send the statement; pg_sleep inside a filter-free page is not
+    // injectable, so this case asserts only that SOME timeout shape is flagged, not which.
+    const auto t = store.list_certificates({}, std::nullopt, std::nullopt, 10);
+    if (!t.has_value())
+        CHECK(t.error().timed_out);
+}
+
+TEST_CASE("cert parse: the legacy key_usage display sentinels never become a fact",
+          "[certinv][parse]") {
+    const auto key_usage_of = [](const std::string& ku) {
+        Cert c = cert(1, {{"S", ""}});
+        c.key_usage = ku;
+        const auto p = parse_certificate_inventory_blob(blob(store_rec("S", "ok"), {c}));
+        REQUIRE(p.data.facts.size() == 1);
+        return p.data.facts[0].key_usage;
+    };
+    CHECK_FALSE(key_usage_of("(none)").has_value());                  // also means "extraction failed": UNKNOWN
+    CHECK_FALSE(key_usage_of("(unknown)").has_value());               // unparsable: UNKNOWN
+    CHECK(key_usage_of("") == std::optional<std::string>{""});        // what the 2a-2e writer sends
+    CHECK(key_usage_of("Digital Signature") == std::optional<std::string>{"Digital Signature"});
+    CHECK(key_usage_of("(none), Digital Signature") ==
+          std::optional<std::string>{"(none), Digital Signature"});   // only the whole-field sentinel
+}
+
+TEST_CASE("CertificateInventoryStore reads: a substring matching more than 20,000 distinct names is refused as input",
+          "[certinv][pg][read][dict]") {
+    CERT_SHARED(store, pool);
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    {
+        auto lease = pool.acquire();
+        REQUIRE(lease);
+        REQUIRE(pg::exec_params(lease.get(),
+                                "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer) SELECT "
+                                "'CN=bulk ' || i, true FROM generate_series(1, 20001) i",
+                                std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    }
+    CertReadFilter f;
+    f.issuer_dn_contains = "bulk";
+    auto r = store.list_certificates(f, std::nullopt, std::nullopt, 10);
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind == CertReadError::Kind::kInvalid);
+    CHECK_THAT(r.error().message, Catch::Matchers::ContainsSubstring("longer"));
+    // A longer substring that matches few names answers normally.
+    f.issuer_dn_contains = "bulk 20001";
+    CHECK(store.list_certificates(f, std::nullopt, std::nullopt, 10).has_value());
+}
+
+TEST_CASE("CertificateInventoryStore reads: a substring filter never reaches a device outside the scope",
+          "[certinv][pg][read][dict][confinement]") {
+    CERT_SHARED(store, pool);
+    // A and B share an issuer DN (the dictionary is fleet-wide and shared); B also has a private one.
+    put_report(store, "A", {dn_fact(1, "CN=Shared CA,O=Org", "CN=a1", false)});
+    put_report(store, "B", {dn_fact(2, "CN=Shared CA,O=Org", "CN=b2", false),
+                            dn_fact(3, "CN=B Private CA", "CN=b3", false)});
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    CertReadFilter f;
+    f.issuer_dn_contains = "shared ca";
+    // Unconfined: both. Scope = {A}: only A's certificate, B is ABSENT from rows, stores and coverage.
+    CHECK(shas(must_list(store, f)) == ids_of({1, 2}));
+    const auto p = must_list(store, f, CertScopeIds{std::vector<std::string>{"A"}});
+    CHECK(shas(p) == ids_of({1}));
+    CHECK(p.coverage.devices_reporting == 1);
+    for (const auto& r : p.rows)
+        CHECK(r.agent_id == "A");
+    for (const auto& st : p.stores)
+        CHECK(st.agent_id == "A");
+    // A name only B holds resolves in the dictionary but reaches nothing for scope {A}.
+    f.issuer_dn_contains = "private";
+    CHECK(shas(must_list(store, f)) == ids_of({3}));
+    CHECK(must_list(store, f, CertScopeIds{std::vector<std::string>{"A"}}).rows.empty());
+    // The summary honours the same rule.
+    CertSummaryQuery q;
+    q.filter.issuer_dn_contains = "shared ca";
+    auto s = store.summarize_certificates(q, CertScopeIds{std::vector<std::string>{"A"}});
+    REQUIRE(s.has_value());
+    CHECK(s->totals.device_count == 1);
+    CHECK(s->totals.certificate_count == 1);
+}
+
+TEST_CASE("CertificateInventoryStore: concurrent multi-chunk reports sharing issuers never deadlock",
+          "[certinv][pg][dict][chaos]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    (void)GENERATE(range(0, 25)); // run 25x: the deadlocks this guards against were intermittent
+    constexpr int kThreads = 8, kRounds = 2, kFacts = 1100; // 3 chunks of kChunkRows (500) per report
+    // Its OWN pool (>= one connection per thread): starving the shared 4-connection pool would turn
+    // pool-acquire timeouts into a false failure unrelated to lock ordering.
+    PgPool pool{{.conninfo = cert_shared().db.dsn(), .size = kThreads + 2}};
+    REQUIRE(pool.valid());
+    CertificateInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    const auto deadlocks = [&] {
+        return std::stoll(scalar(pool, "SELECT deadlocks FROM pg_stat_database WHERE datname = "
+                                       "current_database()"));
+    };
+    std::this_thread::sleep_for(std::chrono::milliseconds{1500}); // stats flush is idle-driven
+    const auto dl_before = deadlocks();
+    std::atomic<int> failures{0}, stored{0};
+    std::vector<std::thread> ts;
+    for (int t = 0; t < kThreads; ++t)
+        ts.emplace_back([&, t] {
+            for (int r = 0; r < kRounds; ++r) {
+                std::vector<CertFactRow> facts;
+                for (int i = 0; i < kFacts; ++i) {
+                    auto f = rfact(t * 100000 + r * 2000 + i + 1);
+                    // 90% share 60 roots (chunk membership differs per device), the rest are new.
+                    // Rotating the order per thread makes the per-chunk DN sets disjoint between reports.
+                    const int root = (i * (t + 3)) % 60;
+                    f.issuer_dn = i % 10 == 0 ? "CN=Fresh " + std::to_string(t) + "-" + std::to_string(r) + "-" +
+                                                    std::to_string(i)
+                                              : "CN=Root " + std::to_string(root);
+                    f.subject_dn = "CN=leaf " + std::to_string(f.sha256.size() + i);
+                    f.is_ca = i % 7 == 0;
+                    facts.push_back(f);
+                }
+                CertReportData d;
+                d.blob_version = "1";
+                d.stores.push_back({"S", "machine", "ok", ""});
+                for (const auto& f : facts)
+                    d.locations.push_back({"S", "", f.sha256});
+                d.facts = std::move(facts);
+                // At most kMaxConcurrentFull (4) long ingests run at once; the rest are deferred
+                // (kBusy) by design (2a-2a), so retry the deferral as the agent's next cycle would.
+                CertIngestResult res;
+                for (int attempt = 0; attempt < 200; ++attempt) {
+                    res = store.ingest_full("agent-" + std::to_string(t), d,
+                                            "h" + std::to_string(t) + "-" + std::to_string(r));
+                    if (res.outcome != CertIngestOutcome::kBusy)
+                        break;
+                    std::this_thread::sleep_for(std::chrono::milliseconds{50});
+                }
+                if (res.outcome == CertIngestOutcome::kStored)
+                    ++stored;
+                else
+                    ++failures;
+            }
+        });
+    for (auto& th : ts)
+        th.join();
+    // Assert ONLY on deadlocks (40P01) - the server's own counter, read after the idle stats flush.
+    std::this_thread::sleep_for(std::chrono::milliseconds{1500});
+    CHECK(deadlocks() == dl_before);
+    // Contention is 4-way, not 8-way: 2a-2a caps concurrent full ingests at 4 and the loop above
+    // retries the by-design kBusy deferral, so every report must end up stored.
+    CHECK(failures.load() == 0);
+    CHECK(stored.load() == kThreads * kRounds);
+    // Every referenced name is in the dictionary exactly once, with its role flags.
+    CHECK(scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn LIKE 'CN=Root %'") ==
+          "60");
+    CHECK(scalar(pool, "SELECT count(*) FROM (SELECT DISTINCT issuer_dn FROM certificate_inventory_store.cert_fact "
+                       "EXCEPT SELECT dn FROM certificate_inventory_store.dn_dict) x") == "0");
+}
+
+TEST_CASE("CertificateInventoryStore: the dictionary does not outlive the facts (prune and decommission)",
+          "[certinv][pg][dict]") {
+    CERT_SHARED(store, pool);
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    put_report(store, "A", {dn_fact(1, "CN=Only A", "CN=a1", false), dn_fact(2, "CN=Shared", "CN=a2", false)});
+    put_report(store, "B", {dn_fact(3, "CN=Shared", "CN=b3", false)});
+    const auto has = [&](const char* dn) {
+        return scalar(pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn = $1", {dn}) == "1";
+    };
+    REQUIRE(has("CN=Only A"));
+    REQUIRE(has("CN=Shared"));
+    SECTION("decommission erases a name only that device referenced; a shared name stays") {
+        REQUIRE(store.delete_agent("A"));
+        CHECK_FALSE(has("CN=Only A"));
+        CHECK(has("CN=Shared")); // B still holds it
+        REQUIRE(store.delete_agent("B"));
+        CHECK_FALSE(has("CN=Shared"));
+    }
+    SECTION("the background prune removes names nothing references (a fact removed other than by decommission)") {
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            // What a store prune (PR 2a-2d) or a replace-away does: the fact goes, the name stays.
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "DELETE FROM certificate_inventory_store.cert_fact WHERE sha256 = $1",
+                                    std::vector<std::string>{hexn(1)}).status() == PGRES_COMMAND_OK);
+        }
+        CHECK(has("CN=Only A"));
+        REQUIRE(store.prune_dn_dictionary());
+        CHECK_FALSE(has("CN=Only A"));
+        CHECK(has("CN=Shared"));
+        // And a name that a certificate DOES reference is never pruned, nor is a flag-only role lost.
+        CHECK(has("CN=Shared"));
+    }
+    SECTION("a name pruned in the instant an ingest referenced it is healed by the next reconcile") {
+        {
+            auto lease = pool.acquire();
+            REQUIRE(lease);
+            REQUIRE(pg::exec_params(lease.get(),
+                                    "DELETE FROM certificate_inventory_store.dn_dict WHERE dn = 'CN=Shared'",
+                                    std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+        }
+        CHECK_FALSE(has("CN=Shared"));
+        REQUIRE(store.run_dn_dictionary_maintenance()); // the reconcile adds back what facts name
+        CHECK(has("CN=Shared"));
+    }
+}
+
+TEST_CASE("CertificateInventoryStore: a prune racing ingest never deletes a still-referenced name",
+          "[certinv][pg][dict][chaos]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    PgPool pool{{.conninfo = cert_shared().db.dsn(), .size = 6}};
+    REQUIRE(pool.valid());
+    CertificateInventoryStore store{pool};
+    REQUIRE(store.is_open());
+    std::atomic<bool> done{false};
+    std::atomic<int> pruned_runs{0};
+    std::thread pruner([&] {
+        while (!done.load()) {
+            (void)store.prune_dn_dictionary();
+            ++pruned_runs;
+        }
+    });
+    int missing = 0;
+    for (int round = 0; round < 150; ++round) {
+        std::vector<CertFactRow> facts;
+        for (int i = 0; i < 20; ++i) {
+            auto f = dn_fact(round * 100 + i + 1, "CN=Race " + std::to_string(i % 8), "CN=race-leaf", false);
+            facts.push_back(f);
+        }
+        CertReportData d;
+        d.blob_version = "1";
+        d.stores.push_back({"S", "machine", "ok", ""});
+        for (const auto& f : facts)
+            d.locations.push_back({"S", "", f.sha256});
+        d.facts = std::move(facts);
+        const auto res = store.ingest_full("race", d, "h" + std::to_string(round));
+        if (res.outcome != CertIngestOutcome::kStored)
+            continue;
+        // NO reconcile in between: the ingest's own txn must have left every name present.
+        if (scalar(pool, "SELECT count(*) FROM (SELECT DISTINCT issuer_dn FROM "
+                         "certificate_inventory_store.cert_fact EXCEPT SELECT dn FROM "
+                         "certificate_inventory_store.dn_dict) x") != "0")
+            ++missing;
+        // Drop the facts but keep the names, so the pruner has something to chew on next round.
+        exec_ok(pool, "DELETE FROM certificate_inventory_store.cert_fact");
+    }
+    done = true;
+    pruner.join();
+    CHECK(missing == 0);
+    CHECK(pruned_runs.load() > 0);
+}
+
+TEST_CASE("pg background build helper: a changed index spec is dropped and rebuilt; stop is typed",
+          "[certinv][pg][dict]") {
+    CERT_SHARED(store, pool);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::BuildCancel cancel;
+    const auto stamp = [&] {
+        auto r = pg::exec_params(lease.get(),
+                                 "SELECT obj_description('certificate_inventory_store.hlp_idx'::regclass, "
+                                 "'pg_class')",
+                                 std::vector<std::string>{});
+        return r.status() == PGRES_TUPLES_OK && PQntuples(r.get()) == 1 ? std::string(PQgetvalue(r.get(), 0, 0))
+                                                                         : std::string("?");
+    };
+    pg::IndexSpec spec{"certificate_inventory_store", "hlp_idx", "cert_fact", "btree", "issuer_dn", ""};
+    REQUIRE(pg::ensure_index_concurrently(lease.get(), spec, &cancel).ok);
+    const auto first = stamp();
+    CHECK(first == spec.spec_text());
+    // Same name, DIFFERENT definition: never kept via IF NOT EXISTS - rebuilt to the new spec.
+    spec.columns = "subject_dn";
+    REQUIRE(pg::ensure_index_concurrently(lease.get(), spec, &cancel).ok);
+    CHECK(stamp() == spec.spec_text());
+    CHECK(stamp() != first);
+    CHECK(pg::index_is_valid(lease.get(), "certificate_inventory_store", "hlp_idx"));
+    // A stop requested before the build is a TYPED stopped result, not an error-string match.
+    cancel.cancel();
+    spec.name = "hlp_idx2";
+    auto r = pg::ensure_index_concurrently(lease.get(), spec, &cancel);
+    CHECK_FALSE(r.ok);
+    CHECK(r.stopped);
+    exec_ok(pool, "DROP INDEX IF EXISTS certificate_inventory_store.hlp_idx");
+}
+
+namespace {
+// A fresh store over its OWN pool (no shared-fixture starvation) for interleave tests.
+struct OwnStore {
+    PgPool pool;
+    CertificateInventoryStore store;
+    explicit OwnStore(std::size_t size = 6)
+        : pool{PgPool::Options{.conninfo = cert_shared().db.dsn(), .size = size}}, store{pool} {}
+};
+CertReportData one_report(std::vector<CertFactRow> facts) {
+    CertReportData d;
+    d.blob_version = "1";
+    d.stores.push_back({"S", "machine", "ok", ""});
+    for (const auto& f : facts)
+        d.locations.push_back({"S", "", f.sha256});
+    d.facts = std::move(facts);
+    return d;
+}
+} // namespace
+
+TEST_CASE("CertificateInventoryStore: reports raising opposite role flags on shared names never deadlock",
+          "[certinv][pg][dict][chaos]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    OwnStore o;
+    REQUIRE(o.store.is_open());
+    // A and B are both issuers already. Report 1 raises ONLY B's CA-subject flag (and carries A);
+    // report 2 raises ONLY A's CA-subject flag (and carries B). Both hold their flag-UPDATE lock
+    // before either pins: a lock mode that conflicts with the other's key-share pin is a 40P01.
+    exec_ok(o.pool, "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer, is_ca_subject) VALUES "
+                    "('CN=A', true, false), ('CN=B', true, false)");
+    // Rendezvous at BOTH points: the dictionary INSERT of one report waits for an uncommitted flag
+    // UPDATE of the same row by the other (ON CONFLICT checks the conflicting tuple), so the cycle
+    // only exists if both reports finish their inserts before either raises a flag, and both hold
+    // their flag locks before either pins.
+    std::atomic<int> at_insert{0}, at_update{0};
+    const auto rendezvous = [](std::atomic<int>& n) {
+        ++n;
+        for (int i = 0; i < 400 && n.load() < 2; ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds{5});
+    };
+    o.store.set_test_hook_dict([&](std::string_view point) {
+        if (point == "after_dict_insert")
+            rendezvous(at_insert);
+        else if (point == "after_flag_update")
+            rendezvous(at_update);
+    });
+    CertIngestResult r1, r2;
+    std::thread t1([&] {
+        r1 = o.store.ingest_full("a1", one_report({dn_fact(1, "CN=A", "CN=x", false), dn_fact(2, "CN=B", "CN=B", true)}), "h1");
+    });
+    std::thread t2([&] {
+        r2 = o.store.ingest_full("a2", one_report({dn_fact(3, "CN=A", "CN=A", true), dn_fact(4, "CN=B", "CN=y", false)}), "h2");
+    });
+    t1.join();
+    t2.join();
+    CHECK(at_insert.load() == 2);
+    CHECK(at_update.load() == 2);
+    CHECK(r1.outcome == CertIngestOutcome::kStored);
+    CHECK(r2.outcome == CertIngestOutcome::kStored);
+    CHECK(scalar(o.pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE is_issuer AND "
+                         "is_ca_subject") == "2");
+}
+
+TEST_CASE("CertificateInventoryStore: a prune or decommission interleaved with an ingest never strands a name",
+          "[certinv][pg][dict][chaos]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    OwnStore o;
+    REQUIRE(o.store.is_open());
+    const auto present = [&](const char* dn) {
+        return scalar(o.pool, "SELECT count(*) FROM certificate_inventory_store.dn_dict WHERE dn = $1", {dn}) ==
+               "1";
+    };
+    SECTION("a prune BEFORE the pin: the ingest re-inserts the name it finds missing") {
+        exec_ok(o.pool, "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer, is_ca_subject) VALUES "
+                        "('CN=Z', true, false)");
+        bool fired = false;
+        o.store.set_test_hook_dict([&](std::string_view point) {
+            if (point == "after_dict_insert" && !fired) {
+                fired = true;
+                // Z is committed and unreferenced (our fact is not committed): the prune deletes it.
+                REQUIRE(o.store.prune_dn_dictionary());
+            }
+        });
+        REQUIRE(o.store.ingest_full("a1", one_report({dn_fact(1, "CN=Z", "CN=l", false)}), "h").outcome ==
+                CertIngestOutcome::kStored);
+        CHECK(fired);
+        CHECK(present("CN=Z")); // dropping the re-insert leaves a committed fact naming an absent name
+    }
+    SECTION("a prune AFTER the pin: the key-share lock makes it skip the name") {
+        exec_ok(o.pool, "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer, is_ca_subject) VALUES "
+                        "('CN=Z', true, false)");
+        bool fired = false;
+        o.store.set_test_hook_dict([&](std::string_view point) {
+            if (point == "after_pin" && !fired) {
+                fired = true;
+                REQUIRE(o.store.prune_dn_dictionary());
+                // Still there while the ingest is open: the prune skipped the locked row.
+                CHECK(present("CN=Z"));
+            }
+        });
+        REQUIRE(o.store.ingest_full("a1", one_report({dn_fact(1, "CN=Z", "CN=l", false)}), "h").outcome ==
+                CertIngestOutcome::kStored);
+        CHECK(fired);
+        CHECK(present("CN=Z")); // dropping FOR KEY SHARE lets the prune delete it from under the ingest
+    }
+    SECTION("a decommission AFTER the pin: the name another device still needs survives") {
+        put_report(o.store, "other", {dn_fact(9, "CN=Z", "CN=o", false)});
+        // The indexes the decommission's erasure needs must exist for it to run its prune.
+        REQUIRE(o.store.run_dn_dictionary_maintenance());
+        bool fired = false;
+        o.store.set_test_hook_dict([&](std::string_view point) {
+            if (point == "after_pin" && !fired) {
+                fired = true;
+                REQUIRE(o.store.delete_agent("other"));
+            }
+        });
+        REQUIRE(o.store.ingest_full("a1", one_report({dn_fact(1, "CN=Z", "CN=l", false)}), "h").outcome ==
+                CertIngestOutcome::kStored);
+        CHECK(fired);
+        CHECK(present("CN=Z"));
+    }
+}
+
+TEST_CASE("BuildCancel: a stop requested before the arm refuses the arm and cancels nothing late",
+          "[certinv][pg][dict]") {
+    CERT_SHARED(store, pool);
+    auto lease = pool.acquire();
+    REQUIRE(lease);
+    pg::BuildCancel cancel;
+    {
+        pg::BuildCancel::ScopedArm arm{cancel, lease.get()};
+        CHECK(arm.armed()); // nothing requested yet
+        cancel.cancel();    // a stop while armed PQcancels the (idle) statement slot, harmlessly
+    }
+    CHECK(cancel.stop_requested());
+    // The stop-before-arm race: the caller's own check can pass just before cancel() lands; the arm
+    // re-checks under the same mutex and refuses, so the statement is never started unbounded.
+    pg::BuildCancel::ScopedArm late{cancel, lease.get()};
+    CHECK_FALSE(late.armed());
+    // The pooled connection is still sound (the cancel above hit no running statement).
+    CHECK(scalar(pool, "SELECT 1") == "1");
+}
+
+TEST_CASE("CertificateInventoryStore: marker states decide retryable vs failed readiness",
+          "[certinv][pg][dict]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    OwnStore o;
+    REQUIRE(o.store.is_open());
+    const auto set_marker = [&](const std::string& m) {
+        exec_ok(o.pool, ("COMMENT ON TABLE certificate_inventory_store.dn_dict IS '" + m + "'").c_str());
+        (void)o.store.refresh_substring_index_state();
+    };
+    CertReadFilter f;
+    f.issuer_dn_contains = "anything";
+    SECTION("`building` / an earlier process's ready: is a RETRYABLE wait, flagged reconciling") {
+        set_marker("building");
+        CHECK(o.store.substring_state() == SubstringState::kReconciling);
+        auto r = o.store.list_certificates(f, std::nullopt, std::nullopt, 10);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error().reconciling);
+        CHECK(r.error().kind != CertReadError::Kind::kSubstringIndexMissing);
+        set_marker("ready:1");
+        CHECK(o.store.substring_state() == SubstringState::kReconciling);
+    }
+    SECTION("an earlier process's ready: WITH a recorded failure is FAILED, not an endless wait") {
+        // A replica that started after the leader's last good pass, while the leader's passes fail.
+        set_marker("ready:1;last_failure:reconcile: 54000 index row size exceeds");
+        CHECK(o.store.substring_state() == SubstringState::kFailed);
+        auto r = o.store.list_certificates(f, std::nullopt, std::nullopt, 10);
+        REQUIRE_FALSE(r.has_value());
+        CHECK_FALSE(r.error().reconciling);
+        CHECK(r.error().kind == CertReadError::Kind::kSubstringIndexMissing);
+    }
+    SECTION("a failed pass on a usable ready: records last_failure and keeps THIS process ready") {
+        REQUIRE(o.store.run_dn_dictionary_maintenance());
+        REQUIRE(o.store.substring_index_available());
+        // A certificate naming a DN the dictionary lacks, and a trigger that rejects dictionary
+        // inserts: the next reconcile fails.
+        exec_ok(o.pool, "INSERT INTO certificate_inventory_store.agent_state (agent_id, "
+                        "content_hash, blob_version, first_seen, last_seen, last_full_at, sample_key) VALUES "
+                        "('a1','h','1',now(),now(),now(),7)");
+        exec_ok(o.pool, ("INSERT INTO certificate_inventory_store.cert_fact (agent_id, sha256, issuer_dn, "
+                         "sample_key) VALUES ('a1','" + std::string(63, '0') + "1', 'CN=Missing', 7)").c_str());
+        exec_ok(o.pool, "CREATE FUNCTION certificate_inventory_store.dd_reject() RETURNS trigger LANGUAGE "
+                        "plpgsql AS $$ BEGIN RAISE EXCEPTION 'dictionary insert rejected'; END $$");
+        exec_ok(o.pool, "CREATE TRIGGER dd_reject BEFORE INSERT ON certificate_inventory_store.dn_dict FOR "
+                        "EACH ROW EXECUTE FUNCTION certificate_inventory_store.dd_reject()");
+        CHECK_FALSE(o.store.run_dn_dictionary_maintenance());
+        const auto m = scalar(o.pool, "SELECT obj_description('certificate_inventory_store.dn_dict'::regclass, "
+                                      "'pg_class')");
+        CHECK_THAT(m, Catch::Matchers::StartsWith("ready:"));
+        CHECK_THAT(m, Catch::Matchers::ContainsSubstring(";last_failure:"));
+        CHECK(o.store.substring_index_available()); // this process's working dictionary is not flipped off
+        exec_ok(o.pool, "DROP TRIGGER dd_reject ON certificate_inventory_store.dn_dict");
+        exec_ok(o.pool, "DROP FUNCTION certificate_inventory_store.dd_reject()");
+    }
+}
+
+TEST_CASE("pg background build: a stop cancels a CIC blocked behind an old snapshot",
+          "[certinv][pg][dict]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    PgPool pool{{.conninfo = cert_shared().db.dsn(), .size = 3}};
+    REQUIRE(pool.valid());
+    auto holder = pool.acquire();
+    auto builder = pool.acquire();
+    REQUIRE(holder);
+    REQUIRE(builder);
+    // An old REPEATABLE READ snapshot: a CREATE INDEX CONCURRENTLY (timeouts lifted) waits on it.
+    for (const char* sql : {"BEGIN ISOLATION LEVEL REPEATABLE READ",
+                            "SELECT count(*) FROM certificate_inventory_store.cert_fact"})
+        REQUIRE(pg::exec_params(holder.get(), sql, std::vector<std::string>{}).status() != PGRES_FATAL_ERROR);
+    pg::BuildCancel cancel;
+    pg::BuildResult res;
+    const auto t0 = std::chrono::steady_clock::now();
+    std::thread th([&] {
+        res = pg::ensure_index_concurrently(
+            builder.get(),
+            pg::IndexSpec{"certificate_inventory_store", "blocked_idx", "cert_fact", "btree", "sha256", ""},
+            &cancel);
+    });
+    std::this_thread::sleep_for(std::chrono::milliseconds{600});
+    // Watchdog: if the stop does NOT cancel the build (a regression), release the old snapshot after
+    // 6 s so the test fails instead of hanging.
+    std::atomic<bool> finished{false};
+    std::thread dog([&] {
+        for (int i = 0; i < 60 && !finished.load(); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds{100});
+        if (!finished.load())
+            (void)pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    });
+    cancel.cancel();
+    th.join();
+    finished = true;
+    dog.join();
+    const auto took = std::chrono::steady_clock::now() - t0;
+    CHECK_FALSE(res.ok);
+    CHECK(res.stopped);
+    CHECK(took < std::chrono::seconds{5});
+    (void)pg::exec_params(holder.get(), "ROLLBACK", std::vector<std::string>{});
+    // The lifted timeouts are back on the connection the builder leased.
+    builder.reset();
+    auto again = pool.acquire();
+    REQUIRE(again);
+    auto t = pg::exec_params(again.get(), "SELECT current_setting('statement_timeout') <> '0'",
+                             std::vector<std::string>{});
+    REQUIRE(t.status() == PGRES_TUPLES_OK);
+    CHECK(std::string(PQgetvalue(t.get(), 0, 0)) == "t");
+    exec_ok(pool, "DROP INDEX IF EXISTS certificate_inventory_store.blocked_idx");
+}
+
+TEST_CASE("CertificateInventoryStore reads: a summary cancelled early is a retryable degrade, never a scale limit",
+          "[certinv][pg][read]") {
+    CERT_SHARED(store, pool);
+    put_report(store, "agent-1", {rfact(1), rfact(2)});
+    PgPool side{{.conninfo = cert_shared().db.dsn(), .size = 2}};
+    REQUIRE(side.valid());
+    auto locker = side.acquire();
+    REQUIRE(locker);
+    REQUIRE(pg::exec_params(locker.get(), "BEGIN", std::vector<std::string>{}).status() == PGRES_COMMAND_OK);
+    REQUIRE(pg::exec_params(locker.get(),
+                            "LOCK TABLE certificate_inventory_store.cert_fact IN ACCESS EXCLUSIVE MODE",
+                            std::vector<std::string>{})
+                .status() == PGRES_COMMAND_OK);
+    const int locker_pid = PQbackendPID(locker.get());
+    std::atomic<bool> done{false};
+    auto killer_lease = side.acquire();
+    REQUIRE(killer_lease);
+    std::thread killer([&] {
+        std::this_thread::sleep_for(std::chrono::milliseconds{400}); // far from the 15 s wall deadline
+        while (!done.load())
+            (void)pg::exec_params(killer_lease.get(),
+                                  "SELECT pg_cancel_backend(pid) FROM pg_stat_activity "
+                                  "WHERE datname = current_database() AND wait_event_type = 'Lock' "
+                                  "AND pid <> pg_backend_pid() AND pid <> $1::int",
+                                  std::vector<std::string>{std::to_string(locker_pid)});
+    });
+    auto r = store.summarize_certificates(CertSummaryQuery{}, std::nullopt);
+    done = true;
+    killer.join();
+    (void)pg::exec_params(locker.get(), "ROLLBACK", std::vector<std::string>{});
+    REQUIRE_FALSE(r.has_value());
+    CHECK(r.error().kind != CertReadError::Kind::kScaleLimit); // an operator cancel, not fleet size
+    CHECK(r.error().kind == CertReadError::Kind::kQueryError);
+}
+
+TEST_CASE("pg background build: a cancel burst never returns a connection with the timeouts lifted",
+          "[certinv][pg][dict]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    PgPool pool{{.conninfo = cert_shared().db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    int lifted = 0;
+    for (int iter = 0; iter < 60; ++iter) {
+        std::atomic<bool> stop{false};
+        int pid = 0;
+        {
+            auto l = pool.acquire();
+            REQUIRE(l);
+            auto p = pg::exec_params(l.get(), "SELECT pg_backend_pid()", std::vector<std::string>{});
+            pid = std::stoi(PQgetvalue(p.get(), 0, 0));
+            auto killer_lease = pool.acquire();
+            REQUIRE(killer_lease);
+            std::thread killer([&] {
+                while (!stop.load())
+                    (void)pg::exec_params(killer_lease.get(), "SELECT pg_cancel_backend($1::int)",
+                                          std::vector<std::string>{std::to_string(pid)});
+            });
+            {
+                pg::UnboundedSession lift{l.get()};
+                std::this_thread::sleep_for(std::chrono::milliseconds{2});
+            } // RESET races the cancel spam
+            stop = true;
+            killer.join();
+        }
+        auto again = pool.acquire();
+        REQUIRE(again);
+        auto t = pg::exec_params(again.get(), "SELECT current_setting('statement_timeout') = '0'",
+                                 std::vector<std::string>{});
+        if (t.status() == PGRES_TUPLES_OK && std::string(PQgetvalue(t.get(), 0, 0)) == "t")
+            ++lifted;
+    }
+    CHECK(lifted == 0);
+}
+
+TEST_CASE("pg background build: a failed RESET discards the session; a doubtful one is terminated",
+          "[certinv][pg][dict]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    PgPool pool{{.conninfo = cert_shared().db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    struct Reset {
+        ~Reset() { pg::UnboundedSession::force_reset_failure_for_test = 0; }
+    } reset_flag;
+    SECTION("RESET failed: PQreset opens a fresh session with the pool's timeouts") {
+        auto l = pool.acquire();
+        REQUIRE(l);
+        {
+            pg::UnboundedSession lift{l.get()};
+            REQUIRE(lift.armed());
+            pg::UnboundedSession::force_reset_failure_for_test = 1;
+        }
+        pg::UnboundedSession::force_reset_failure_for_test = 0;
+        REQUIRE(PQstatus(l.get()) == CONNECTION_OK);
+        auto t = pg::exec_params(l.get(), "SELECT current_setting('statement_timeout') <> '0'",
+                                 std::vector<std::string>{});
+        REQUIRE(t.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(t.get(), 0, 0)) == "t"); // not left lifted
+    }
+    SECTION("verification doubtful too: the backend is terminated so the pool discards it") {
+        auto l = pool.acquire();
+        REQUIRE(l);
+        {
+            pg::UnboundedSession lift{l.get()};
+            REQUIRE(lift.armed());
+            pg::UnboundedSession::force_reset_failure_for_test = 2;
+        }
+        pg::UnboundedSession::force_reset_failure_for_test = 0;
+        CHECK(PQstatus(l.get()) != CONNECTION_OK);
+        l.reset(); // the pool finishes the BAD connection rather than reusing it
+        auto again = pool.acquire();
+        REQUIRE(again);
+        auto t = pg::exec_params(again.get(), "SELECT current_setting('statement_timeout') <> '0'",
+                                 std::vector<std::string>{});
+        REQUIRE(t.status() == PGRES_TUPLES_OK);
+        CHECK(std::string(PQgetvalue(t.get(), 0, 0)) == "t");
+    }
+}
+
+TEST_CASE("DnDictPassGuard: a throw out of the pass still joins the watcher and runs done()",
+          "[certinv][dict]") {
+    std::atomic<int> cancels{0};
+    std::atomic<bool> done_called{false};
+    bool threw = false;
+    try {
+        yuzu::server::DnDictPassGuard guard([] { return false; }, // leadership already lost
+                                            [&] { ++cancels; }, [&] { done_called = true; });
+        std::this_thread::sleep_for(std::chrono::milliseconds{250});
+        throw std::bad_alloc{}; // the pass throws: the guard's dtor must join, not terminate
+    } catch (const std::bad_alloc&) {
+        threw = true;
+    }
+    CHECK(threw);
+    CHECK(done_called.load());
+    CHECK(cancels.load() >= 1);
+}
+
+TEST_CASE("CertificateInventoryStore: the reconcile's flag UPDATE does not wait on an ingest's key-share pin",
+          "[certinv][pg][dict][chaos]") {
+    if (yuzu::test::pg_admin_dsn_env() == nullptr)
+        SKIP("YUZU_TEST_POSTGRES_DSN not set - Postgres test skipped");
+    cert_reset();
+    OwnStore o;
+    REQUIRE(o.store.is_open());
+    // "other" holds a committed CA certificate whose SUBJECT is CN=Z2; the dictionary row lost its
+    // ca flag, so the reconcile wants to raise it. A concurrent ingest naming CN=Z2 only as an issuer
+    // pins the row FOR KEY SHARE; a reconcile locking FOR UPDATE would wait on that pin.
+    put_report(o.store, "other", {dn_fact(9, "CN=Root", "CN=Z2", true)});
+    exec_ok(o.pool, "UPDATE certificate_inventory_store.dn_dict SET is_ca_subject = false WHERE dn = 'CN=Z2'");
+    exec_ok(o.pool, "INSERT INTO certificate_inventory_store.dn_dict (dn, is_issuer) VALUES ('CN=Z2', true) "
+                    "ON CONFLICT (dn) DO UPDATE SET is_issuer = true");
+    // Build the indexes FIRST: a CREATE INDEX CONCURRENTLY inside the hook would wait for the open
+    // ingest transaction (this very thread) for ever.
+    REQUIRE(o.store.run_dn_dictionary_maintenance());
+    exec_ok(o.pool, "UPDATE certificate_inventory_store.dn_dict SET is_ca_subject = false WHERE dn = 'CN=Z2'");
+    bool fired = false, pass_ok = false;
+    const auto t0 = std::chrono::steady_clock::now();
+    o.store.set_test_hook_dict([&](std::string_view point) {
+        if (point == "after_pin" && !fired) {
+            fired = true;
+            pass_ok = o.store.run_dn_dictionary_maintenance();
+        }
+    });
+    REQUIRE(o.store.ingest_full("a1", one_report({dn_fact(1, "CN=Z2", "CN=leaf", false)}), "h").outcome ==
+            CertIngestOutcome::kStored);
+    CHECK(fired);
+    CHECK(pass_ok);
+    CHECK(std::chrono::steady_clock::now() - t0 < std::chrono::seconds{8}); // not the 10 s lock timeout
+    CHECK(scalar(o.pool, "SELECT is_ca_subject::text FROM certificate_inventory_store.dn_dict WHERE dn = "
+                         "'CN=Z2'") == "true");
+}
+
+TEST_CASE("CertificateInventoryStore: the maintenance schedule, nudge and observer", "[certinv][pg][dict]") {
+    CERT_SHARED(store, pool);
+    std::vector<std::pair<std::string, std::string>> seen;
+    std::mutex mu;
+    store.set_dn_dict_observer([&](std::string_view step, std::string_view result) {
+        std::lock_guard<std::mutex> lk(mu);
+        seen.emplace_back(step, result);
+    });
+    // Never pruned: due. A first pass stamps the prune, so the schedule says "not due" afterwards.
+    auto before = store.read_dn_dictionary_schedule();
+    REQUIRE(before);
+    CHECK(before->last_prune_ms == 0);
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    auto after = store.read_dn_dictionary_schedule();
+    REQUIRE(after);
+    CHECK(after->last_prune_ms > 0);
+    CHECK(after->last_pass_start_ms > 0);
+    CHECK(store.dn_dict_last_prune_unix_s() == after->last_prune_ms / 1000);
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        const auto has = [&](const char* st, const char* r) {
+            return std::find(seen.begin(), seen.end(), std::make_pair(std::string(st), std::string(r))) !=
+                   seen.end();
+        };
+        CHECK(has("index", "ok"));
+        CHECK(has("reconcile", "ok"));
+        CHECK(has("prune", "ok"));
+        CHECK(has("marker", "ok"));
+        seen.clear();
+    }
+    // A second pass inside the hour does NOT prune again (DB-clock schedule).
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    {
+        std::lock_guard<std::mutex> lk(mu);
+        CHECK(std::none_of(seen.begin(), seen.end(), [](const auto& p) { return p.first == "prune"; }));
+    }
+    auto again = store.read_dn_dictionary_schedule();
+    REQUIRE(again);
+    CHECK(again->last_prune_ms == after->last_prune_ms);
+    // The nudge: recorded once, rate-limited (a second request within 20 s does not move it).
+    CHECK(again->reconcile_requested_ms == 0);
+    store.request_dn_reconcile();
+    auto nudged = store.read_dn_dictionary_schedule();
+    REQUIRE(nudged);
+    CHECK(nudged->reconcile_requested_ms > 0);
+    store.request_dn_reconcile();
+    auto nudged2 = store.read_dn_dictionary_schedule();
+    REQUIRE(nudged2);
+    CHECK(nudged2->reconcile_requested_ms == nudged->reconcile_requested_ms);
+}
+
+// Opt-in measurement (hidden: `yuzu_server_tests "[.certperf]"` with CERTPERF_DSN naming a database that
+// already holds a LARGE v1-shaped store with schema_meta at version 1). Runs the background DN-dictionary
+// build while concurrent ingests keep going, and reports the figures. Not part of any suite.
+TEST_CASE("certperf: background dictionary build over a large store keeps ingest working",
+          "[.certperf]") {
+    const char* dsn = std::getenv("CERTPERF_DSN");
+    if (!dsn)
+        SKIP("CERTPERF_DSN not set");
+    PgPool pool{{.conninfo = dsn, .size = 6}};
+    REQUIRE(pool.valid());
+    using clk = std::chrono::steady_clock;
+    const auto t_open = clk::now();
+    CertificateInventoryStore store{pool}; // runs migration v2: creates the EMPTY table only
+    const auto open_ms =
+        std::chrono::duration_cast<std::chrono::milliseconds>(clk::now() - t_open).count();
+    REQUIRE(store.is_open());
+    std::printf("PERF store open (boot path, includes migration v2): %lld ms; substring ready=%d\n",
+                static_cast<long long>(open_ms), store.substring_index_available() ? 1 : 0);
+    std::atomic<bool> stop{false};
+    std::vector<double> lat_ms;
+    std::mutex mu;
+    std::atomic<int> errs{0};
+    std::thread ingester([&] {
+        int n = 0;
+        while (!stop.load()) {
+            CertReportData d;
+            d.blob_version = "1";
+            d.stores.push_back({"S", "machine", "ok", ""});
+            for (int i = 0; i < 300; ++i) {
+                auto f = rfact(900000000 + n * 1000 + i);
+                f.issuer_dn = i % 3 == 0 ? "CN=perf fresh " + std::to_string(n) + "-" + std::to_string(i)
+                                         : "CN=perf shared root " + std::to_string(i % 50);
+                d.facts.push_back(f);
+                d.locations.push_back({"S", "", f.sha256});
+            }
+            const auto t0 = clk::now();
+            const auto r = store.ingest_full("perf-live-" + std::to_string(n % 20), d, "h" + std::to_string(n));
+            const double ms = std::chrono::duration<double, std::milli>(clk::now() - t0).count();
+            if (r.outcome != CertIngestOutcome::kStored)
+                ++errs;
+            std::lock_guard<std::mutex> lk(mu);
+            lat_ms.push_back(ms);
+            ++n;
+        }
+    });
+    const auto t0 = clk::now();
+    const bool ok = store.run_dn_dictionary_maintenance();
+    const double build_s = std::chrono::duration<double>(clk::now() - t0).count();
+    stop = true;
+    ingester.join();
+    std::sort(lat_ms.begin(), lat_ms.end());
+    const auto pc = [&](double p) { return lat_ms.empty() ? 0.0 : lat_ms[std::min(lat_ms.size() - 1, static_cast<std::size_t>(p * lat_ms.size()))]; };
+    std::printf("PERF maintenance ok=%d took %.1f s; ready=%d\n", ok ? 1 : 0, build_s,
+                store.substring_index_available() ? 1 : 0);
+    std::printf("PERF concurrent ingest during the build: %zu reports, errors=%d, p50=%.0f ms p95=%.0f ms "
+                "p99=%.0f ms max=%.0f ms\n",
+                lat_ms.size(), errs.load(), pc(.5), pc(.95), pc(.99), lat_ms.empty() ? 0.0 : lat_ms.back());
+    CHECK(ok);
+    CHECK(errs.load() == 0);
+}
+
+TEST_CASE("CertificateInventoryStore reads: the internal sample_key never appears in any read or export",
+          "[certinv][pg][read][samplekey]") {
+    CERT_SHARED(store, pool);
+    REQUIRE(store.run_dn_dictionary_maintenance());
+    put_report(store, "a1",
+               {dn_fact(1, "CN=Sample Root", "CN=Sample Root", true),
+                dn_fact(2, "CN=Sample Root", "CN=leaf2", false)});
+    put_report(store, "a2", {dn_fact(1, "CN=Sample Root", "CN=Sample Root", true)});
+
+    // Every per-agent key the database holds; none may reach any output, by name or by value.
+    const auto keys = scalar(pool, "SELECT string_agg(sample_key::text, ',') FROM "
+                                   "certificate_inventory_store.agent_state");
+    REQUIRE_FALSE(keys.empty());
+    std::vector<std::string> key_values;
+    for (std::size_t p = 0; p <= keys.size();) {
+        const auto e = keys.find(',', p);
+        key_values.push_back(keys.substr(p, e == std::string::npos ? std::string::npos : e - p));
+        if (e == std::string::npos)
+            break;
+        p = e + 1;
+    }
+    const auto clean = [&](const std::string& out, const char* what) {
+        INFO(what);
+        CHECK(out.find("sample_key") == std::string::npos);
+        for (const auto& k : key_values)
+            CHECK(out.find(k) == std::string::npos);
+    };
+
+    CertReadFilter issuer;       // the selective path: materialised CTE
+    issuer.issuer_dn_contains = "sample root";
+    CertReadFilter subject;
+    subject.subject_dn_contains = "sample root";
+    subject.is_ca = true;
+    for (const auto& [name, f] : std::vector<std::pair<const char*, CertReadFilter>>{
+             {"unfiltered page", CertReadFilter{}}, {"issuer substring", issuer},
+             {"subject substring", subject}}) {
+        const auto page = must_list(store, f);
+        REQUIRE_FALSE(page.rows.empty());
+        for (const auto& r : page.rows)
+            clean(cert_read::row_json(r).dump(), name);
+        clean(cert_read::list_json(page).dump(), name);
+        clean(cert_read::audit_detail("cid", f, page.rows.size(), false, false, false), name);
+        clean(cert_read::filter_names(f), name);
+    }
+
+    CertSummaryQuery q;
+    q.not_after_edges = {"2025-01-01T00:00:00Z", "2035-01-01T00:00:00Z"};
+    const auto summary = store.summarize_certificates(q, std::nullopt);
+    REQUIRE(summary.has_value());
+    clean(cert_read::summary_json(*summary).dump(), "summary");
 }

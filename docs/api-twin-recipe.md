@@ -556,6 +556,17 @@ row drops and answers a retryable `kInternalError`, with no `audit_persisted` ke
 posture. State the choice explicitly in the PR, and do not copy it onto a tool whose data is not
 behavioural PII.
 
+**Fleet certificate reads (slice-2 PR 2a-2b, owner decision OD-2) take the behavioural-PII split
+explicitly, and this section is its written basis** (it reconciles the table above with
+`docs/user-manual/audit-log.md`, #6122 item 8). Subjects and SANs can be personal data, so the REST
+routes `GET /api/v1/crypto/certificates[/summary]` **fail closed** on a lost audit row (`503`,
+`Sec-Audit-Failed: true`, no data, a retry hint), through `emit_behavioral_audit`'s return value
+exactly as `device_ci` does. The `/crypto` certificate fragments and the MCP tools stay
+set-and-proceed, as slice 1 does: the data is served and the lost row is visible (the "Audit not
+recorded." notice, `audit_persisted: false`). The MCP certificate twins do **not** copy the
+`get_agent_app_usage` fail-closed MCP posture: the choice is set-and-proceed, stated here so a later
+reader does not infer the other.
+
 ### The two functions involved
 
 `server/core/src/rest_audit.hpp` layers two functions:

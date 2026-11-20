@@ -1733,7 +1733,9 @@ TEST_CASE("REST inventory/software: the lookup row schema is typed in the OpenAP
     // The lookup keys are exactly those list_row_json adds to device_row_json.
     std::set<std::string> added;
     const auto base = software_catalogue::device_row_json(SoftwareFleetRow{});
-    for (const auto& [k, v] : software_list::list_row_json(SoftwareFleetRow{}, {}).items())
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_1736 = software_list::list_row_json(SoftwareFleetRow{}, {});
+    for (const auto& [k, v] : range_root_1736.items())
         if (!base.contains(k))
             added.insert(k);
     CHECK(properties == added);
@@ -2175,7 +2177,9 @@ TEST_CASE("REST inventory/software: rows carry purl (null when empty); purl= sel
     InvHarness h{&store};
 
     std::map<std::string, nlohmann::json> by_agent;
-    for (const auto& r : get_lookup(h, "?name=git").at("data").at("software"))
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_2178 = get_lookup(h, "?name=git");
+    for (const auto& r : range_root_2178.at("data").at("software"))
         by_agent[r["agent_id"].get<std::string>()] = r["purl"];
     CHECK(by_agent.at("dev-a") == purl_a);
     CHECK(by_agent.at("dev-b") == compose_purl(b));

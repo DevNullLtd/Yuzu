@@ -962,7 +962,9 @@ TEST_CASE("Engine-principal REST: GET list and GET one answer 503, not zero cred
     REQUIRE(list);
     REQUIRE(list->status == 200);
     bool found = false;
-    for (const auto& row : nlohmann::json::parse(list->body)["data"]) {
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_965 = nlohmann::json::parse(list->body);
+    for (const auto& row : range_root_965["data"]) {
         if (row["principal_id"] == pid) {
             found = true;
             CHECK(row["active_credential_count"].get<int>() == 1);

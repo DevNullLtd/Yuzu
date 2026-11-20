@@ -9698,6 +9698,115 @@ The devices (and matching package rows) behind one family, optionally one versio
 | 403 | Caller lacks `Inventory:Read` (written by the gate); while RBAC enforcement is off, service-scoped tokens are refused `403` |
 | 503 | `crypto library read degraded` or `crypto read capacity in use; retry`: `retry_after_ms: 5000` either way; **never an empty 200**. An absent store or an unwired gate is a `503` without `retry_after_ms`. A server whose Postgres pool is smaller than 2 connections refuses these reads with a `503` and **no** `retry_after_ms` (`crypto library reads (and the CBOM export) refused: the server's Postgres pool is smaller than 2 connections; restart the server with --postgres-pool-size 2 or more`): a retry fails the same way until that restart. |
 
+#### `GET /api/v1/crypto/certificates`
+
+One row per (device, certificate) from the fleet's **machine** certificate stores, as raw X.509
+facts: facts only; the only built-in checks are D13's named rules and windows, each shown with its
+criterion. Nothing is graded and revocation is not checked by this version. Requires
+`CertificateInventory:Read` (a dedicated securable, Administrator only; admin-only while RBAC
+enforcement is off; a service-scoped token is `403` in both RBAC states); a management-group-confined
+caller sees only its visible devices. See [crypto.md](crypto.md#fleet-certificates).
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/crypto/certificates?issuer_dn_contains=eMudhra&limit=50"
+```
+
+Query parameters:
+
+| Parameter | Shape | Meaning |
+|---|---|---|
+| `store` | free text, 1 to 1,024 bytes | Exact `store_id`: certificates with a location in that store. No enum: a store id that exists nowhere matches nothing. |
+| `scope` | `machine` | Closed. Only machine stores are read in this release. Anything else is a `400`. |
+| `key_alg_oid`, `sig_alg_oid`, `ec_curve_oid` | dotted-decimal OID (`^[0-2](\.[0-9]+){1,32}$`) | Exact. Any well-formed OID is accepted. |
+| `not_after_before`, `not_after_after`, `not_before_after` | RFC 3339 UTC to the second, `YYYY-MM-DDTHH:MM:SSZ` | The instant is **yours**: the certificates whose `not_after` is strictly before / after it, or whose `not_before` is strictly after it. Nothing is chosen for you. |
+| `rsa_modulus_bits_lt`, `ec_order_bits_lt` | integer 1 to 65536 | RSA certificates whose modulus is smaller than, or EC certificates whose curve order is smaller than, your threshold. |
+| `is_ca`, `self_signed` | `true` or `false` | The certificate's own basic-constraints claim, and whether the collector reported it self-signed. |
+| `agent_id` | free text, 1 to 256 bytes | Exact device id, still confined to the devices you may see. |
+| `issuer_dn` | free text, at most 1,024 bytes | Exact RFC 4514 string. A present empty value selects certificates whose issuer is the empty string. |
+| `issuer_dn_contains` | free text, 3 to 256 bytes, no NUL | Case-insensitive **literal** substring of `issuer_dn` (PostgreSQL `ILIKE`, so case folds by the database's locale: under a UTF-8 locale `é` matches `É`, under `C` only ASCII letters fold). `%`, `_` and `\` are escaped, never a pattern. The match is against the stored RFC 4514 string, escapes included (a comma in a value is `\,`). At most **one** certificate summary or filtered page (any filter other than `agent_id`, `sha256` or `scope`) per user is in flight; a second is a retryable `503` (`retry_after_ms` 15000). |
+| `subject_dn_contains` | free text, 3 to 256 bytes, no NUL | The same match on `subject_dn`, accepted **only together with `is_ca=true`**; without it, or with `is_ca=false`, the request is a `400` naming `is_ca`. |
+| `sha256` | 64 hex characters | Exact certificate SHA-256 (either case). |
+| `spki_sha256` | 64 hex characters | Exact (either case): every certificate over one public key, cross-signed and re-issued copies included. |
+| `aki_key_id` | 2 to 128 hex characters (whole bytes, either case) | Exact authority key identifier: every certificate one CA key signed, whatever name the issuer used. Matches only certificates whose authority key identifier carries a `keyIdentifier`; one with no AKI, or an issuer-and-serial-only AKI, is never matched. For a compromised key prefer `spki_sha256`, then this, then the name filters. |
+| `cursor`, `limit` | opaque / integer 1 to 500 (default 100) | Per-certificate read only. A `limit` outside 1 to 500 is refused, never clamped. |
+| `not_after_edges` | 1 to 32 comma-separated, strictly ascending RFC 3339 UTC instants | Summary only: **your** bucket edges for the `not_after` histogram. |
+
+Hex values compare case-insensitively against the stored case. An unknown parameter, a repeated
+parameter with differing values, invalid UTF-8 and an over-long value are all refused with a `400`
+that names the parameter: a typo'd filter is never silently ignored, because an ignored filter
+would return the whole fleet. The same value is refused identically on REST and MCP.
+
+Response `data` (the `meta` envelope is the usual `{"api_version":"v1"}`):
+
+```json
+{
+  "certificates": [{
+    "agent_id": "...", "hostname": "host-1", "sha256": "...", "sha1": "...", "tbs_sha256": "...",
+    "serial": "0A1B", "subject_dn": "...", "issuer_dn": "...",
+    "not_before": "2025-01-09T00:00:00Z", "not_after": "2026-01-09T23:59:59Z",
+    "key_alg_oid": "1.2.840.113549.1.1.1", "rsa_modulus_bits": 2048,
+    "ec_curve_oid": null, "ec_order_bits": null,
+    "sig_alg_oid": "1.2.840.113549.1.1.11", "pss_hash_oid": null,
+    "spki_sha256": "...", "ski": "...", "aki_key_id": "...",
+    "is_ca": false, "path_len": null, "self_signed": false,
+    "key_usage": ["Digital Signature"], "eku_oids": ["1.3.6.1.5.5.7.3.1"],
+    "sans": [{"type": "dns", "value": "..."}],
+    "key_association": "none", "key_provider": "", "key_exportable": "unknown",
+    "locations": [{"store_id": "LocalMachine\\My", "path": "", "store_status": "ok",
+                   "observed_at": "...", "last_seen": "..."}],
+    "last_seen": "...", "constrained_fields": []
+  }],
+  "stores": [{"agent_id": "...", "store_id": "...", "status": "unreadable",
+              "reason": "permission_denied", "observed_at": null, "status_at": "..."}],
+  "not_read": ["Java cacerts", "PKCS#12 files", "..."],
+  "coverage": {"devices_reporting": 0, "devices_included": 0, "confined": true},
+  "result_truncated": false, "truncated_parts": [], "next_cursor": null,
+  "blob_versions": [1], "count": 1
+}
+```
+
+A field the device did not report is `null`. `stores[]` is the status of every store on every device in
+the page (`ok`, `absent`, `unreadable`, `constrained`, `not_observed`). `result_truncated` is the OR of
+every cut and `truncated_parts` names them: `page_limit`, `byte_budget`, `locations_cap`, `sans_cap`,
+`constrained_store`, `constrained_certificate`. Paged reads make no cross-page consistency promise.
+
+| Status | When |
+|---|---|
+| `200` | The page. |
+| `400` | An unknown, repeated or malformed parameter, a value out of range, a bad or other-filter `cursor`, or `subject_dn_contains` without `is_ca=true` (A4 envelope naming the parameter). |
+| `401` | Unauthenticated. |
+| `403` | Caller lacks `CertificateInventory:Read` (A4 envelope naming it); service-scoped tokens are refused in both RBAC states, as long as the `ITServiceOwner` role does not hold `CertificateInventory:Read` (no seed grants it; an administrator who adds it lets REST admit such a token, confined to its tagged devices, while MCP still refuses it). |
+| `503` | The inventory store is degraded, two `/crypto` reads are already running, or another certificate summary or filtered page (any filter other than `agent_id`, `sha256` or `scope`) by the same user is still running (one per user; reason `principal_busy`, `retry_after_ms` 15000) (`retry_after_ms` 5000 for each), **or the access-audit row could not be recorded**: this route **fails closed**, so the response carries `Sec-Audit-Failed: true` and no data. A substring filter (`issuer_dn_contains` / `subject_dn_contains`) before the leader's background pass has completed after a start answers a RETRYABLE `503` (`retry_after_ms` 10000, a poll hint), and so does one after a transient failure of that pass (cancelled or lock-timed-out statement, deadlock, connection or resource error: `retry_after_ms` 300000; the database error is never sent). The degrade reasons `reconciling` and `reconcile_failed_transient` appear only in the metric, not in the response body. A `503` WITHOUT `retry_after_ms` (a retry would fail identically) is also returned for a Postgres pool below 4 connections, for those filters when the distinct-DN dictionary failed or is absent (`substring_index_missing`), and for a summary that exceeded its 15 s read budget for the visible fleet (`scale_limit`); the message says what to do ([crypto.md](crypto.md#when-a-read-is-refused-503-classes)). Never an empty `200`. |
+
+Audited as `crypto.certificates.view` (detail: `scope`, row count, truncation, filter **names** and
+operators, never values). Responses are `Cache-Control: no-store, private`. MCP twin:
+`list_crypto_certificates`. Dashboard twin: `/fragments/crypto/certificates/devices`.
+
+#### `GET /api/v1/crypto/certificates/summary`
+
+Distinct-device and distinct-certificate counts of the same inventory grouped by raw value: public-key
+algorithm (OID with RSA modulus bits or EC order bits), signature algorithm (OID with PSS hash),
+elliptic curve, issuer (top 50 by devices) and store, the stores per status, and a `not_after`
+histogram over the bucket edges **you** pass in `not_after_edges` (plus an `unknown` bucket). Subject DNs
+and SANs are never a grouping key. facts only; the only built-in checks are D13's named rules and
+windows, each shown with its criterion. Takes every filter of `GET /api/v1/crypto/certificates`
+(above) plus `not_after_edges`, and no `cursor` or `limit`. Same gate, scope, admission and fail-closed
+audit (`crypto.certificates.summary`). Counts are computed in one snapshot at read time and are not
+stored; `result_truncated` / `truncated_parts` (`row_ceiling`) name a group that hit its ceiling. `issuers_note` (a string) says why a self-signed or self-issued certificate that is not a CA is never an issuer group.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" \
+  "https://yuzu.example.com/api/v1/crypto/certificates/summary?not_after_edges=2026-01-01T00:00:00Z,2027-01-01T00:00:00Z"
+```
+
+Response `data`: `totals{device_count,certificate_count}`, `key_algorithms[]`,
+`signature_algorithms[]`, `ec_curves[]`, `issuers[]`, `stores[]` (each with `device_count` and
+`certificate_count`), `store_statuses[{status,store_count,device_count}]`,
+`not_after_histogram[{from,to,unknown,device_count,certificate_count}]`, `not_read`, `coverage`,
+`result_truncated`, `truncated_parts`, `blob_versions`. Errors are those of the list route. MCP twin:
+`get_crypto_certificate_summary`. Dashboard twin: `/fragments/crypto/certificates`.
+
 #### `GET /api/v1/crypto/cbom`
 
 A CycloneDX **1.7** inventory of the cryptographic *library* packages installed across the fleet (library components only; no algorithms, certificates, keys or protocols yet), exported as a JSON bill of materials (a CBOM). Same gate, confinement, read-capacity bound and degrade behaviour as `GET /api/v1/crypto/libraries`; the response is the BOM itself (no `data`/`meta` envelope) with `Content-Type: application/vnd.cyclonedx+json; version=1.7`, `Cache-Control: no-store, private` and `Vary: Authorization, Cookie, X-Yuzu-Token`. MCP twin: `export_crypto_cbom`. The document model, the `yuzu:crypto:` properties and the truncation flags are described in [crypto.md](crypto.md#exporting-a-cbom).

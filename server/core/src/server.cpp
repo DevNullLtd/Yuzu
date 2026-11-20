@@ -143,6 +143,7 @@
 #include "app_usage_store.hpp"
 #include "certificate_inventory_ingestion.hpp"
 #include "certificate_inventory_store.hpp"
+#include "dn_dict_pass_guard.hpp"
 #include "app_usage_routes.hpp"
 #include "product_registry_store.hpp"
 #include "sle_routes.hpp"
@@ -232,6 +233,7 @@
 #include "compliance_api_local.hpp" // ADR-0031 WS-A4: core-only compliance/policy seam factory
 #include "compliance_routes.hpp"
 #include "crypto_access.hpp" // /crypto availability composition (M4, unit-tested)
+#include "certificate_read_model.hpp"
 #include "crypto_api_local.hpp" // /crypto slice 1: make_local_crypto_api (core-only store-backed factory)
 #include "crypto_dashboard_layout_store.hpp" // /crypto widgets: per-operator layout (born-on-PG, ADR-0071)
 #include "crypto_layout_erasure.hpp" // ADR-0071: erase-failure reason set + mapping
@@ -2663,6 +2665,52 @@ public:
                           "staleness window (two missed daily cycles) - a freshness/liveness signal, "
                           "by source (installed_software, app_usage)",
                           "gauge");
+        // Seed every certificate-read degrade reason at 0, so increase() sees the first event
+        // (a series created on first use makes its first increment invisible to rate()).
+        for (const char* reason : {"admission_full", "pool_too_small", "substring_index_missing",
+                                   "scale_limit", "reconciling", "reconcile_failed_transient", "store_not_open", "pool_acquire_timeout",
+                                   "query_error", "principal_busy"})
+            metrics_.counter("yuzu_inventory_read_degrade_total",
+                             {{"reason", reason}, {"source", "cert_inventory"}});
+        metrics_.describe("yuzu_server_cert_inventory_substring_index_available",
+                          "1 when the distinct-DN dictionary behind the fleet certificate substring "
+                          "filters (issuer_dn_contains, subject_dn_contains) is built with valid "
+                          "indexes; 0 when it is not, and those filters are refused: "
+                          "retryable while the leader's reconcile is pending, non-retryable when it "
+                          "failed. Rechecked about every five minutes",
+                          "gauge");
+        metrics_.describe("yuzu_server_cert_inventory_dn_dict_runs_total",
+                          "Outcomes of the certificate DN-dictionary maintenance steps (index, "
+                          "reconcile, prune, marker, lease) by result (ok, failed, cancelled, "
+                          "stopped, skipped, timeout)",
+                          "counter");
+        for (const char* step : {"index", "reconcile", "prune", "marker", "lease"})
+            for (const char* result : {"ok", "failed", "cancelled", "stopped", "skipped", "timeout"})
+                metrics_.counter("yuzu_server_cert_inventory_dn_dict_runs_total",
+                                 {{"step", step}, {"result", result}});
+        metrics_.describe("yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds",
+                          "Unix time of the last successful DN-dictionary prune (database clock; "
+                          "0 until one has ever completed). Alert when it is more than 3 h old: "
+                          "the dictionary only grows",
+                          "gauge");
+        // Present-as-0 from boot: a store that has NEVER pruned reads as infinitely stale, so a
+        // restart cannot mask a prune that always fails; the DB value replaces it each tick.
+        metrics_.gauge("yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds").set(0.0);
+        metrics_.describe("yuzu_fleet_cert_store_status",
+                          "Certificate stores by device OS and read status (ok, absent, unreadable, "
+                          "constrained, not_observed) from the fleet certificate inventory; "
+                          "os unknown = the device is not connected to this replica. "
+                          "Absent until the first successful read, and held at its prior value "
+                          "when a read degrades",
+                          "gauge");
+        metrics_.describe("yuzu_fleet_cert_store_status_unavailable_total",
+                          "Times the fleet certificate store-status rollup could not be computed "
+                          "(pool saturation / statement timeout) and yuzu_fleet_cert_store_status "
+                          "was held at its prior value - a non-zero rate means that gauge may be "
+                          "frozen, not genuinely low",
+                          "counter");
+        // Seeded at 0 so increase() sees the first failure (a series born at 1 hides its 0->1 step).
+        metrics_.counter("yuzu_fleet_cert_store_status_unavailable_total");
         metrics_.describe("yuzu_inventory_stale_count_unavailable_total",
                           "Times the stale-agents freshness count could not be computed (pool "
                           "saturation / query timeout) and the yuzu_inventory_stale_agents gauge "
@@ -8888,6 +8936,11 @@ public:
                 startup_failed_ = true;
             } else {
                 certificate_inventory_store_->set_metrics(&metrics_);
+                // 1 when the distinct-DN dictionary behind the substring filters is built and its
+                // indexes are valid, 0 otherwise (the filters are then refused: retryable while reconciling, non-retryable if failed; see
+                // server-admin.md "The substring-filter dictionary"). Refreshed by the gauge pass.
+                metrics_.gauge("yuzu_server_cert_inventory_substring_index_available")
+                    .set(certificate_inventory_store_->substring_index_available() ? 1.0 : 0.0);
                 agent_service_.set_certificate_inventory_store(certificate_inventory_store_.get());
                 if (gateway_service_)
                     gateway_service_->set_certificate_inventory_store(
@@ -10375,9 +10428,107 @@ public:
             });
         }
 
+        // Certificate DN-dictionary maintenance (slice-2 PR 2a-2b). A FencedLeaderOnly pass: only the
+        // leader builds the indexes (CREATE INDEX CONCURRENTLY twice at once would fight) and scans
+        // cert_fact. The loop ticks every 5 s: the leader runs a pass on its first leader tick, every
+        // five minutes, and whenever a non-leader recorded a reconcile request newer than its last
+        // pass; the prune is due hourly by the DATABASE clock. Boot, /readyz, /livez and gRPC never
+        // wait on it; until it completes the two substring filters are refused (retryable while
+        // reconciling, non-retryable if it failed). One pooled connection is held for the run's
+        // statements; reading the prune schedule and recording a failure each take a second,
+        // short lease (250 ms acquire), so a run can briefly hold two.
+        if (certificate_inventory_store_ && certificate_inventory_store_->is_open()) {
+            certificate_inventory_store_->set_dn_dict_observer([this](std::string_view step, std::string_view result) {
+                metrics_.counter("yuzu_server_cert_inventory_dn_dict_runs_total",
+                                 {{"step", std::string{step}}, {"result", std::string{result}}})
+                    .increment();
+            });
+            cert_dn_dict_thread_ = std::thread([this]() {
+                using namespace std::chrono_literals;
+                const auto is_leader = [this] {
+                    return leader_gate_permits<background_job_class("cert_inventory.dn_dict_maintenance")>(
+                        leader_elector_.get());
+                };
+                bool led_before = false;
+                std::int64_t last_failed_ms = 0;
+                std::int64_t last_pass_end_ms = 0; // DB clock: requests older than this are served
+                while (!stop_requested_.load(std::memory_order_acquire)) {
+                    try {
+                        auto sch = certificate_inventory_store_->read_dn_dictionary_schedule();
+                        if (sch) {
+                            const auto ts = certificate_inventory_store_->dn_dict_last_prune_unix_s();
+                            if (ts > 0)
+                                metrics_.gauge("yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds")
+                                    .set(static_cast<double>(ts));
+                        }
+                        if (!is_leader()) {
+                            led_before = false;
+                            certificate_inventory_store_->refresh_substring_index_state();
+                            // A non-leader that finds no fresh marker asks the leader to reconcile
+                            // now instead of waiting out its five-minute cadence.
+                            // Only a dictionary that is merely waiting (not a FAILED one: a repeat
+                            // cannot fix it) asks, so a persistent failure does not keep the
+                            // leader running back-to-back passes.
+                            if (certificate_inventory_store_->substring_state() ==
+                                SubstringState::kReconciling)
+                                certificate_inventory_store_->request_dn_reconcile();
+                        } else if (sch) {
+                            const bool requested = sch->reconcile_requested_ms >
+                                                   std::max(sch->last_pass_start_ms, last_pass_end_ms);
+                            const bool due = !led_before ||
+                                             sch->db_now_ms - sch->last_pass_start_ms >=
+                                                 CertificateInventoryStore::kPassIntervalMs;
+                            const bool backoff = last_failed_ms != 0 &&
+                                                 sch->db_now_ms - last_failed_ms < 60000;
+                            if ((due || requested) && !backoff) {
+                                led_before = true;
+                                YUZU_ASSERT_BACKGROUND_JOB("cert_inventory.dn_dict_maintenance");
+                                // A running CREATE INDEX CONCURRENTLY is one long statement the
+                                // between-statement poll cannot reach: a watcher PQcancels it when
+                                // leadership is lost (the new leader rebuilds; the DDL is idempotent).
+                                bool ok = false;
+                                {
+                                    // RAII: the watcher is stopped and joined on every exit, a throw
+                                    // from the pass included (a joinable std::thread destroyed
+                                    // un-joined would std::terminate). The sticky stop was for THIS
+                                    // run (leadership); a shutdown stop is re-issued by stop().
+                                    DnDictPassGuard guard(
+                                        is_leader,
+                                        [this] { certificate_inventory_store_->cancel_running_build(); },
+                                        [this] {
+                                            if (!stop_requested_.load(std::memory_order_acquire))
+                                                certificate_inventory_store_->clear_build_stop();
+                                        });
+                                    ok = certificate_inventory_store_->run_dn_dictionary_maintenance(
+                                        [this, &is_leader] {
+                                            return stop_requested_.load(std::memory_order_acquire) ||
+                                                   !is_leader();
+                                        });
+                                }
+                                last_failed_ms = ok ? 0 : sch->db_now_ms;
+                                // A request made WHILE this pass ran is served by it (it started
+                                // before the request but reconciles everything referenced so far).
+                                if (auto after = certificate_inventory_store_->read_dn_dictionary_schedule())
+                                    last_pass_end_ms = after->db_now_ms;
+                            }
+                        }
+                    } catch (const std::exception& e) {
+                        spdlog::warn("cert dn-dictionary maintenance tick failed: {}", e.what());
+                    } catch (...) {
+                        spdlog::warn("cert dn-dictionary maintenance tick failed: unknown exception");
+                    }
+                    for (int i = 0; i < 5 && !stop_requested_.load(std::memory_order_acquire); ++i)
+                        std::this_thread::sleep_for(1s);
+                }
+                cert_dn_dict_done_.store(true, std::memory_order_release);
+            });
+        }
+
         // Spawn fleet health recomputation thread (aggregates agent heartbeat data)
         health_recompute_thread_ = std::thread([this]() {
             spdlog::info("Fleet health recomputation thread started (interval=15s)");
+            std::uint64_t cert_status_sweeps = 0;
+            std::set<std::pair<std::string, std::string>> cert_status_published;
             while (!stop_requested_.load(std::memory_order_acquire)) {
                 // Sleep in small increments for responsive shutdown
                 for (int i = 0; i < 3 && !stop_requested_.load(std::memory_order_acquire); ++i) {
@@ -10507,6 +10658,60 @@ public:
                             .set(static_cast<double>(*stale));
                     else
                         metrics_.counter("yuzu_inventory_stale_count_unavailable_total").increment();
+                }
+                // Fleet certificate store-status gauge (slice-2 PR 2a-2b, background pass
+                // `cert_inventory.fleet_store_status`, ReplicaSafe: a read-only rollup every
+                // replica may publish): stores per (os, status) from the cert_inventory
+                // store_state table, OS from the presence registry ("unknown" = not connected).
+                // Run every 20th sweep (about 5 minutes) with the same bounded posture as the
+                // freshness gauges above (250ms acquire, 500ms statement), because this serial
+                // thread also carries the revocation-teardown backstop. On a degrade every
+                // series HOLDS its prior value and the unavailable counter is bumped - never a
+                // fabricated 0 (absent-not-zero: a series exists only once a read succeeded).
+                if (certificate_inventory_store_ && cert_status_sweeps++ % 20 == 0) {
+                    YUZU_ASSERT_BACKGROUND_JOB("cert_inventory.fleet_store_status");
+                    // Re-check the dictionary state (catalog read, no DDL) so an operator's repair is
+                    // seen without a restart, and the gauge never stays at its boot value.
+                    certificate_inventory_store_->refresh_substring_index_state();
+                    metrics_.gauge("yuzu_server_cert_inventory_substring_index_available")
+                        .set(certificate_inventory_store_->substring_index_available() ? 1.0 : 0.0);
+                    // With a reachable server this pass holds the sweep thread for at most TWO 250 ms
+                    // acquires (the readiness re-check above and the rollup) plus the connect timeout
+                    // (a pool that must open a new connection) plus the 500 ms WALL budget of the
+                    // rollup; the budget is server-side, so a dead network path is bounded only by
+                    // the pool's tcp_user_timeout / keepalive settings, as for the freshness gauges. The
+                    // registry snapshot is two string copies per agent (id_os_snapshot, never the
+                    // per-agent JSON build under the heartbeat mutex, gov perf-S2), and the fold is
+                    // in SQL, so at most 25 rows come back whatever the fleet size.
+                    std::vector<std::string> snap_ids, snap_os;
+                    {
+                        auto snap = registry_.id_os_snapshot();
+                        snap_ids.reserve(snap.size());
+                        snap_os.reserve(snap.size());
+                        for (auto& [id, os] : snap) {
+                            snap_os.push_back(cert_read::fleet_os_bucket(os));
+                            snap_ids.push_back(std::move(id));
+                        }
+                    }
+                    if (auto counts = certificate_inventory_store_->fleet_status_counts(
+                            snap_ids, snap_os, std::chrono::milliseconds{250},
+                            std::chrono::milliseconds{500})) {
+                        const auto& now_counts = *counts;
+                        for (const auto& [key, n] : now_counts) {
+                            metrics_.gauge("yuzu_fleet_cert_store_status",
+                                           {{"os", key.first}, {"status", key.second}})
+                                .set(static_cast<double>(n));
+                            cert_status_published.insert(key);
+                        }
+                        for (const auto& key : cert_status_published)
+                            if (!now_counts.contains(key))
+                                metrics_.gauge("yuzu_fleet_cert_store_status",
+                                               {{"os", key.first}, {"status", key.second}})
+                                    .set(0.0);
+                    } else {
+                        metrics_.counter("yuzu_fleet_cert_store_status_unavailable_total")
+                            .increment();
+                    }
                 }
                 // #2530 B7 — KEK cluster-state gauges, sampled HERE rather
                 // than from GET /status (a gauge refreshed only on a /status
@@ -11815,6 +12020,19 @@ public:
         // (#881). It touches quarantine_store_ and quarantine_snapshot_ only.
         if (quarantine_snapshot_refresh_thread_.joinable()) {
             quarantine_snapshot_refresh_thread_.join();
+        }
+
+        // Join the certificate DN-dictionary maintenance thread (borrows certificate_inventory_store_
+        // and the pool; its batches poll stop_requested_ between statements).
+        if (cert_dn_dict_thread_.joinable()) {
+            // PQcancel a running CIC, and keep doing so until the thread has exited: one cancel can land
+            // in the microseconds between the statement being armed and reaching the server (measured:
+            // a lost cancel let the build run 58 s).
+            while (certificate_inventory_store_ && !cert_dn_dict_done_.load(std::memory_order_acquire)) {
+                certificate_inventory_store_->cancel_running_build();
+                std::this_thread::sleep_for(std::chrono::milliseconds{500});
+            }
+            cert_dn_dict_thread_.join();
         }
 
         // Join the fleet health recomputation thread
@@ -21480,7 +21698,8 @@ private:
         // page, the REST routes and the MCP twins (set_crypto_api below). Built whenever ANY
         // backing store exists; a missing store degrades only the methods that read it (503 /
         // the degrade banner), never an empty answer and never the other methods.
-        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_) {
+        if (software_inventory_store_ || ca_store_ || crypto_dashboard_layout_store_ ||
+            certificate_inventory_store_) {
             crypto_device_api_ = device_api;
             // Admission is narrowed to a quarter of the pool (B9); the unconfined library summary
             // is shared for a minute (B8) - the Yuzu-issued stats read never is (ADR-0070: bounded
@@ -21491,6 +21710,7 @@ private:
                 .devices = crypto_device_api_.get(),
                 .ca = ca_store_.get(),
                 .layouts = crypto_dashboard_layout_store_.get(),
+                .certificates = certificate_inventory_store_.get(),
                 .pool_size = pg_pool_ ? static_cast<int>(pg_pool_->size()) : 0,
                 .shared_read_ttl = std::chrono::seconds(60),
                 .note_degrade =
@@ -24595,6 +24815,14 @@ private:
                                                             const authz::VisibleSet& scope) {
                     return api->library_devices(q, scope);
                 };
+                tool_deps.crypto_certificates_fn = [api](const CertQuery& q,
+                                                         const authz::VisibleSet& scope) {
+                    return api->certificates(q, scope);
+                };
+                tool_deps.crypto_certificate_summary_fn = [api](const CertSummaryQuery& q,
+                                                                const authz::VisibleSet& scope) {
+                    return api->certificate_summary(q, scope);
+                };
                 tool_deps.crypto_ca_stats_fn = [api](std::optional<std::int64_t> as_of) {
                     return api->ca_stats(as_of);
                 };
@@ -26270,6 +26498,8 @@ private:
         kMaxConcurrentContainmentReads};
     std::thread quarantine_snapshot_refresh_thread_; // #881; joined before stores
     std::thread health_recompute_thread_;
+    std::atomic<bool> cert_dn_dict_done_{false}; // set when cert_dn_dict_thread_'s loop has exited
+    std::thread cert_dn_dict_thread_; // slice-2 PR 2a-2b: leader-gated DN dictionary build; joined before stores
     std::thread policy_eval_thread_;
     std::thread app_perf_rollup_thread_;
     std::thread preflight_runner_thread_; // joined before stores in stop()

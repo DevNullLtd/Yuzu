@@ -170,6 +170,25 @@ public:
     /// `/api/v1/devices/{id}` handler).
     [[nodiscard]] virtual std::expected<std::optional<DeviceDetail>, DeviceReadError>
     lookup_device(const std::string& agent_id) const = 0;
+
+    /// The rows (no tags) of just these ids, in input order, for the ids the registry knows;
+    /// an unknown id is simply absent. For a consumer that needs hostnames for ONE PAGE of
+    /// results (a certificate page names at most a few hundred devices): it must not pay for a
+    /// copy of the whole fleet. Same UNSCOPED-provider caveat as `list_devices` (the consumer
+    /// has already confined the ids it passes). The default filters `list_devices()`, so a
+    /// test double need not override it; the local implementation does point lookups.
+    [[nodiscard]] virtual std::vector<DeviceListRow>
+    list_devices_by_id(const std::vector<std::string>& agent_ids) const {
+        std::vector<DeviceListRow> out;
+        const auto all = list_devices();
+        for (const auto& id : agent_ids)
+            for (const auto& r : all)
+                if (r.agent_id == id) {
+                    out.push_back(r);
+                    break;
+                }
+        return out;
+    }
 };
 
 } // namespace yuzu::server

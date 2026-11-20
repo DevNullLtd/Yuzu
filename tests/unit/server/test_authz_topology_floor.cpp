@@ -184,15 +184,18 @@ constexpr FloorPair kExpectedFloorPairs[] = {
     {"AuditLog", "Read"},
     // ADR-0070 R1 (slice 2b-1a) - registered CRL sources: operator-registered egress targets.
     {"RevocationSource", "Read"},
+    // Slice-2 PR 2a-2b (ADR-0070 D12) — the fleet certificate inventory (the floor header's
+    // new-data-class inclusion class: new fleet-wide data the design requires admin-only).
+    {"CertificateInventory", "Read"},
 };
 
 } // namespace
 
 // ── 1. Lock the set ──────────────────────────────────────────────────────
 
-TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floored",
+TEST_CASE("topology_floor_applies: exactly the thirteen documented pairs are floored",
           "[authz][floor]") {
-    // Positive: the twelve floored pairs (a change to kTopologyFloor's
+    // Positive: the thirteen floored pairs (a change to kTopologyFloor's
     // MEMBERSHIP must break these). #4028 (api-parity programme #2146)
     // added the four Settings read-twin securables to the original three;
     // #4031 added Enrollment/OidcConfig; Wave 7 PR7.2 added Forensics; #5771
@@ -214,6 +217,7 @@ TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floor
     // legacy branch already.
     CHECK(topology_floor_applies("RevocationSource", "Read"));
     CHECK_FALSE(topology_floor_applies("RevocationSource", "Write"));
+    CHECK(topology_floor_applies("CertificateInventory", "Read")); // slice-2 PR 2a-2b
 
     // Negative: a representative spread of pairs that must NOT be floored —
     // proves the set is narrow, not "every Read" or "every op on these
@@ -228,11 +232,13 @@ TEST_CASE("topology_floor_applies: exactly the twelve documented pairs are floor
     CHECK_FALSE(topology_floor_applies("Enrollment", "Write"));
     CHECK_FALSE(topology_floor_applies("Forensics", "Write"));
     CHECK_FALSE(topology_floor_applies("AuditLog", "Write")); // #5771: the READ pair only
+    CHECK_FALSE(topology_floor_applies("CertificateInventory", "Write")); // the Read pair only
+    CHECK_FALSE(topology_floor_applies("Inventory", "Read")); // the certificate pair is its own securable
 
-    // Cardinality lock: a twelfth pair silently added to kTopologyFloor
+    // Cardinality lock: a fourteenth pair silently added to kTopologyFloor
     // without updating this file's positive/negative lists must still break
     // this test even though every entry it DOES check still round-trips.
-    CHECK(std::size(kTopologyFloor) == 12);
+    CHECK(std::size(kTopologyFloor) == 13);
 }
 
 // ── 1b. Every floored securable must actually EXIST in the catalogue ─────

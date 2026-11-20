@@ -1,8 +1,9 @@
 /// @file test_mcp_tools_crypto.cpp
-/// The seven /crypto MCP tools (mcp_tools_crypto.cpp): `get_crypto_libraries`,
-/// `list_crypto_library_devices`, `export_crypto_cbom`, `list_crypto_widgets`,
-/// `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and `get_crypto_ca_stats`,
-/// carved out of mcp_server.cpp (#6558 PR 2).
+/// The /crypto MCP tools (mcp_tools_crypto.cpp): the seven carved out of mcp_server.cpp (#6558
+/// PR 2) - `get_crypto_libraries`, `list_crypto_library_devices`, `export_crypto_cbom`,
+/// `list_crypto_widgets`, `get_crypto_dashboard_layout`, `set_crypto_dashboard_layout` and
+/// `get_crypto_ca_stats` (kAllTools) - and the two fleet certificate reads
+/// `list_crypto_certificates` and `get_crypto_certificate_summary` (their own cases at the end).
 ///
 /// The fixture (`Twin`) drives a real `McpServer` through its in-process handler with a
 /// `ToolDeps` whose closures forward to ONE fake `CryptoApi`, the way server.cpp forwards its
@@ -63,6 +64,10 @@ public:
     std::expected<CryptoDashboardLayout, CryptoReadError> layout{
         CryptoDashboardLayout{{"ca.active"}, false, 3, 0}};
     std::optional<CryptoReadError> set_error;
+    std::expected<CertPage, CryptoReadError> cert_page{CertPage{}};
+    std::expected<CertSummary, CryptoReadError> cert_summary{CertSummary{}};
+    mutable std::vector<CertQuery> cert_queries;
+    mutable std::vector<CertSummaryQuery> cert_summary_queries;
 
     mutable std::vector<authz::VisibleSet> scopes;
     mutable std::vector<CryptoSummaryQuery> summary_queries;
@@ -88,6 +93,18 @@ public:
     ca_stats(std::optional<std::int64_t> as_of) const override {
         stats_as_of.push_back(as_of);
         return stats;
+    }
+    std::expected<CertPage, CryptoReadError>
+    certificates(const CertQuery& q, const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        cert_queries.push_back(q);
+        return cert_page;
+    }
+    std::expected<CertSummary, CryptoReadError>
+    certificate_summary(const CertSummaryQuery& q, const authz::VisibleSet& scope) const override {
+        scopes.push_back(scope);
+        cert_summary_queries.push_back(q);
+        return cert_summary;
     }
     std::expected<CaCertPage, CryptoReadError> ca_certificates(const CaCertQuery&) const override {
         return certs;
@@ -241,6 +258,13 @@ struct Twin {
             td.crypto_library_devices_fn = [a](const CryptoDevicesQuery& q,
                                                const authz::VisibleSet& s) {
                 return a->library_devices(q, s);
+            };
+            td.crypto_certificates_fn = [a](const CertQuery& q, const authz::VisibleSet& s) {
+                return a->certificates(q, s);
+            };
+            td.crypto_certificate_summary_fn = [a](const CertSummaryQuery& q,
+                                                   const authz::VisibleSet& s) {
+                return a->certificate_summary(q, s);
             };
             td.crypto_ca_stats_fn = [a](std::optional<std::int64_t> as_of) {
                 return a->ca_stats(as_of);
@@ -1050,4 +1074,114 @@ TEST_CASE("mcp crypto tools: a flood of malformed `arguments` is refused before 
     }
     CHECK(t.api->layout_writes.empty());
     CHECK(t.api->stats_as_of.empty());
+}
+
+// ───────────────────────── fleet certificate reads ────────────────────────────
+
+TEST_CASE("mcp crypto tools: list_crypto_certificates and get_crypto_certificate_summary gate on "
+          "CertificateInventory:Read, serve schema-valid bodies and audit",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    const auto sec = mcp::tool_security_rows_for_test();
+    for (const char* tool : {"list_crypto_certificates", "get_crypto_certificate_summary"}) {
+        INFO(tool);
+        const auto it = std::find_if(sec.begin(), sec.end(), [&](const auto& r) { return r.name == tool; });
+        REQUIRE(it != sec.end());
+        CHECK(it->securable == "CertificateInventory");
+        CHECK(it->operation == "Read");
+        CHECK(it->service_scope == mcp::ServiceScopeClassForTest::kDenied);
+        t.clear_audit();
+        t.api->scopes.clear();
+        const json schema = t.output_schema(tool);
+        const json r = t.call(tool, json{{"issuer_dn_contains", "eMudhra"}});
+        INFO(r.dump());
+        REQUIRE_FALSE(r.contains("error"));
+        CHECK(schema_violation(schema, r["result"]["structuredContent"]) == "");
+        CHECK(t.gate_calls == std::vector<std::string>{"CertificateInventory:Read"});
+        REQUIRE(t.api->scopes.size() == 1);
+        CHECK(audit_count(t.generic_rows, std::string("mcp.") + tool + "|success") == 1);
+        REQUIRE(t.generic_details.size() == 1);
+        // Filter names and operators, never the value (#6333).
+        CHECK(t.generic_details[0].find("issuer_dn_contains=contains") != std::string::npos);
+        CHECK(t.generic_details[0].find("eMudhra") == std::string::npos);
+    }
+}
+
+TEST_CASE("mcp crypto tools: the certificate reads key the per-principal read cap on username_fn and answer "
+          "its refusal with the seam's retry hint",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    t.resolved_username = "alice";
+    REQUIRE_FALSE(t.call("list_crypto_certificates", json{{"issuer_dn_contains", "emSign"}}).contains("error"));
+    REQUIRE_FALSE(t.call("get_crypto_certificate_summary", json{{"issuer_dn_contains", "emSign"}})
+                      .contains("error"));
+    REQUIRE(t.api->cert_queries.size() == 1);
+    REQUIRE(t.api->cert_summary_queries.size() == 1);
+    CHECK(t.api->cert_queries[0].principal == "alice");
+    CHECK(t.api->cert_summary_queries[0].principal == "alice");
+
+    CryptoReadError busy = degraded(CryptoReadCause::kCapacity);
+    busy.message = "another certificate summary or substring-filtered certificate read of yours is still running";
+    busy.retry_after_ms = 5000;
+    t.api->cert_page = std::unexpected(busy);
+    t.clear_audit();
+    const json r = t.call("list_crypto_certificates", json{{"issuer_dn_contains", "emSign"}});
+    INFO(r.dump());
+    REQUIRE(r.contains("error"));
+    CHECK(r["error"]["data"]["retry_after_ms"] == 5000);
+    CHECK(audit_count(t.generic_rows, "mcp.list_crypto_certificates|failure") == 1);
+}
+
+TEST_CASE("mcp crypto tools: the certificate reads write the domain audit verb REST writes, plus the "
+          "generic mcp row",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    t.clear_audit();
+    REQUIRE_FALSE(t.call("list_crypto_certificates", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.view|success|CertificateInventory|fleet_certificates") == 1);
+    CHECK(audit_count(t.generic_rows, "mcp.list_crypto_certificates|success") == 1);
+    t.clear_audit();
+    REQUIRE_FALSE(t.call("get_crypto_certificate_summary", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.summary|success|CertificateInventory|fleet_certificates") == 1);
+    CHECK(audit_count(t.generic_rows, "mcp.get_crypto_certificate_summary|success") == 1);
+
+    t.api->cert_page = std::unexpected(degraded(CryptoReadCause::kCapacity));
+    t.api->cert_summary = std::unexpected(degraded(CryptoReadCause::kCapacity));
+    t.clear_audit();
+    REQUIRE(t.call("list_crypto_certificates", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.view|failure|CertificateInventory|fleet_certificates") == 1);
+    t.clear_audit();
+    REQUIRE(t.call("get_crypto_certificate_summary", json::object()).contains("error"));
+    CHECK(audit_count(t.domain_rows,
+                      "crypto.certificates.summary|failure|CertificateInventory|fleet_certificates") == 1);
+}
+
+TEST_CASE("mcp crypto tools: the certificate reads refuse a bare subject substring, is_ca=false and a NUL "
+          "needle before any read (guards 21/22)",
+          "[mcp][crypto][certs]") {
+    Twin t;
+    for (const char* tool : {"list_crypto_certificates", "get_crypto_certificate_summary"}) {
+        for (const json& args :
+             {json{{"subject_dn_contains", "emSign"}},
+              json{{"subject_dn_contains", "emSign"}, {"is_ca", false}},
+              json{{"issuer_dn_contains", std::string("eMu\0dhra", 8)}},
+              json{{"subject_dn_contains", std::string("emS\0ign", 7)}, {"is_ca", true}}}) {
+            INFO(tool << " " << args.dump());
+            t.clear_audit();
+            const json r = t.call(tool, args);
+            REQUIRE(r.contains("error"));
+            CHECK(r["error"]["code"] == -32602);
+        }
+    }
+    CHECK(t.api->cert_queries.empty());
+    CHECK(t.api->cert_summary_queries.empty());
+    // The principal is the session username, never a parameter.
+    Twin u;
+    REQUIRE_FALSE(u.call("list_crypto_certificates", json{{"issuer_dn_contains", "k\\s"}}).contains("error"));
+    REQUIRE(u.api->cert_queries.size() == 1);
+    CHECK(u.api->cert_queries[0].principal == u.username);
+    CHECK(*u.api->cert_queries[0].filter.issuer_dn_contains == "k\\s"); // a literal backslash reaches the seam unchanged
 }

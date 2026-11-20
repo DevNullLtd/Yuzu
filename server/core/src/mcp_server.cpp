@@ -6507,7 +6507,10 @@ constexpr std::string_view kRbacSecurables[] = {
     "Decommission",
     // ADR-0070 R1: registered CRL sources; mirrors rbac_store.cpp's types[] addition. Seeded to
     // Administrator only and ALSO behind the administrator predicate.
-    "RevocationSource"};
+    "RevocationSource",
+    // Slice-2 PR 2a-2b: mirrors rbac_store.cpp's types[] addition (MOVE TOGETHER; same binding
+    // test) - the dedicated fleet certificate inventory securable.
+    "CertificateInventory"};
 
 // Borrowed (name, input_schema_json) row for the registration validator's
 // 4th sequence (#2405). Views are valid only for the duration of the call.

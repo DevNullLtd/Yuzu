@@ -1928,7 +1928,9 @@ TEST_CASE("REST GET /api/v1/quarantine?include=release_owed: owed rows follow th
     const auto get = [&](const std::string& q) { return h.sink.Get("/api/v1/quarantine" + q); };
     const auto agents = [](const std::string& body) {
         std::vector<std::pair<std::string, std::string>> out;
-        for (const auto& row : parse_body(body)["data"])
+        // Bound to a local: ranging over a subobject of a temporary dangles.
+        auto range_root_1931 = parse_body(body);
+        for (const auto& row : range_root_1931["data"])
             out.emplace_back(row["agent_id"].get<std::string>(), row["status"].get<std::string>());
         return out;
     };

@@ -604,6 +604,14 @@ private:
                   text(27, 32, "key_exportable", c.key_exportable) &&
                   count(28, "sans", g_.want_sans) && count(29, "ekus", g_.want_ekus) &&
                   count(30, "cdps", g_.want_cdps) && text(31, 32, "der_omitted", c.der_omitted);
+        // The legacy `certificates.list` display sentinels never describe a fact. "(none)" there
+        // means "no KeyUsage extension" but ALSO "extraction failed" (a BIO/print failure, a Windows
+        // API error, bits the display does not map), so it can NOT be taken as a real empty value:
+        // it is UNKNOWN, the safe direction. "(unknown)" is "could not be parsed": UNKNOWN. The
+        // 2a-2e writer sends "" for a genuine absent extension and `?` for a failure, so neither
+        // sentinel arrives from it; they can only come from an older or hand-built blob.
+        if (ok && c.key_usage && (*c.key_usage == "(none)" || *c.key_usage == "(unknown)"))
+            c.key_usage.reset();
         if (ok && c.key_association && *c.key_association != "present" &&
             *c.key_association != "none" && *c.key_association != "unknown")
             ok = false;

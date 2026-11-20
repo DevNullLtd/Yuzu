@@ -19,6 +19,7 @@ namespace yuzu::server {
 class SoftwareInventoryStore;
 class DeviceApi;
 class CaStore;
+class CertificateInventoryStore;
 class CryptoDashboardLayoutStore;
 
 /// What the store-backed implementation reads. EVERY store is NULLABLE: a null store degrades
@@ -44,9 +45,12 @@ class CryptoDashboardLayoutStore;
 /// stats read is NEVER shared: every call reads at request time through the admission gate
 /// (ADR-0070 "The CaStore count method": bounded by admission limits, not a cached count).
 ///
-/// `note_degrade(source, reason)` is told of every shed and degraded read on the Yuzu-issued and
-/// layout paths, with closed label values only: source `ca_issued` | `crypto_layout`, reason
-/// `admission_full` | `store_not_open` | `pool_acquire_timeout` | `query_error`. The library
+/// `note_degrade(source, reason)` is told of every shed and degraded read on the Yuzu-issued,
+/// certificate and layout paths, with closed label values only: source `ca_issued` |
+/// `cert_inventory` | `crypto_layout`, reason
+/// `admission_full` | `store_not_open` | `pool_acquire_timeout` | `query_error`, and on the
+/// certificate path also `pool_too_small` | `reconciling` | `reconcile_failed_transient` |
+/// `substring_index_missing` | `scale_limit` | `principal_busy` (all seeded in server.cpp). The library
 /// path keeps `SoftwareInventoryStore::note_read_shed`. Never a username or widget id.
 ///
 /// LIFETIME CONTRACT: every pointer is BORROWED, NOT owned, and must outlive every call to the
@@ -56,7 +60,13 @@ struct LocalCryptoApiDeps {
     const DeviceApi* devices = nullptr;
     CaStore* ca = nullptr;
     CryptoDashboardLayoutStore* layouts = nullptr;
+    /// The fleet certificate inventory. Null degrades the two certificate
+    /// reads (kDegraded), never an empty answer; `devices` supplies hostnames for its rows.
+    CertificateInventoryStore* certificates = nullptr;
     int max_concurrent_reads = kMaxConcurrentCryptoReads;
+    /// The per-principal read cap (#6333, crypto_read_gate.hpp). Null (production) = the api's own instance;
+    /// a test injects one to hold a principal's slot and observe the refusal.
+    CertPrincipalReadCap* principal_cap = nullptr;
     int pool_size = 0;
     std::chrono::seconds shared_read_ttl{0};
     std::function<void(std::string_view source, std::string_view reason)> note_degrade;
@@ -75,6 +85,8 @@ struct LocalCryptoApiDeps {
 
 /// Pools this small refuse the Yuzu-issued reads outright (see LocalCryptoApiDeps).
 inline constexpr int kCryptoCaMinPoolSize = 4;
+/// Pools this small refuse the certificate reads outright (a multi-statement snapshot read).
+inline constexpr int kCryptoCertMinPoolSize = 4;
 /// Pools this small refuse the library reads outright too (M3): a pool of one connection must
 /// stay free for the mTLS-accept revocation check.
 inline constexpr int kCryptoLibraryMinPoolSize = 2;

@@ -138,6 +138,9 @@ fi
 psql -v ON_ERROR_STOP=1 \
      --username "${POSTGRES_USER}" --dbname "${YUZU_DB_NAME}" <<'EOSQL'
 CREATE EXTENSION IF NOT EXISTS vector;
+-- pg_trgm is OPTIONAL: the fleet certificate substring filters work without it (they resolve through
+-- a distinct-DN dictionary); with it the store also adds a trigram index on that small dictionary.
+CREATE EXTENSION IF NOT EXISTS pg_trgm;
 REVOKE CREATE ON SCHEMA public FROM PUBLIC;
 EOSQL
 

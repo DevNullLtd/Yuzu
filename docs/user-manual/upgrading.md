@@ -2094,7 +2094,7 @@ the session store it uses to end the account's sessions the same way.
 
 ## ⚠️ Breaking: the OpenAPI document is larger and typed, every operation has an `operationId`, and there is a `/swagger` page
 
-**What changed.** `GET /api/v1/openapi.json` now gives 305 of its 307 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 64 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) and `GET`, `PUT` and `DELETE /dex/score-policy`; all 64 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
+**What changed.** `GET /api/v1/openapi.json` now gives 307 of its 309 operations a success response with a content block (the previous release's document listed 241 operations and did so for 14), and every operation carries an `operationId` (the earlier document had none; the stored-definition execute route is `postInstructionsByIdExecute`). The document also lists 66 operations that the previous release's document did not, among them `GET /config`, `PUT /config/{key}`, `POST /workflows/{id}/execute` (`postWorkflowsByIdExecute`) `GET`, `PUT` and `DELETE /dex/score-policy`, and `GET /crypto/certificates` and `GET /crypto/certificates/summary`; all 66 are typed. Five operations the previous release's document listed (`GET /tar/capture-sources`, `GET /tar/process-tree`, `GET /tar/retention-paused`, `POST /tar/retention-paused/purge` and `POST /result-sets/from-tar-query`) are no longer listed. The default form of the document, which is also what the MCP resource `yuzu://openapi` serves, grew from about 314 KB (the previous release, v0.14.1) to about 670 KB as served. A second form, `GET /api/v1/openapi.json?guides=true` (the value must be exactly `true` or `1`), adds a prose guide to each of the 48 tag groups. The MCP resource and the discover tools never serve the guide form, short of a build defect. A new dashboard page, `/swagger`, renders the guide form in the browser. Both the route and the page need `Infrastructure:Read`, and the page has no navigation entry. The default form is re-serialised by the server, so its key order and whitespace differ from the guide form. Making the document typed changes the description of the API, not a route, request or response (the routes this release adds and the behaviour it changes are described in their own sections of this document), so the version rule in `docs/api-versioning-policy.md`, which governs routes and fields, does not call for a new version on account of the typing. It is marked Breaking because a generated client, a byte-for-byte pin of the document or a size-limited context stops working as before.
 
 **Who is affected.** Anyone who generates a client from the document (typed return types, renamed methods and a changed security-scheme model can break generated code), anyone who compares or hash-pins the document byte for byte, and any agentic worker that reads `yuzu://openapi` into its context.
 
@@ -2329,7 +2329,7 @@ unlimited/no-expiry behaviour, or size them to the rollout window and the number
 
 ## Behaviour change: a new Postgres schema for the fleet certificate inventory, and an eighth decommission store
 
-The server now creates the Postgres schema `certificate_inventory_store` at boot (seven tables, no
+The server now creates the Postgres schema `certificate_inventory_store` at boot (nine tables - seven per-device plus the shared `dn_dict` and `dn_dict_state` - no
 data until a certificate-collecting agent reports). The server's database role needs `CREATE` on the
 database, as for every other store; if the schema cannot be created the server refuses to start
 (fail-closed, ADR-0007). `/readyz` includes `certificate_inventory_store` once the server is up, so a degraded store after boot shows there.
@@ -2391,6 +2391,44 @@ bounded at 1 MiB per device, so a large fleet is storage- and WAL-heavy (see
 While a version 2 document is stored, new and old replicas return different Apps figures. An older replica's `GET /api/v1/dex/score-policy` shows the shipped defaults, not the stored document, and a `PUT` or `DELETE` from it replaces the whole document. The audit row records the new document and the prior revision, not the replaced text, so keep a copy of the version 2 document (`GET` it from a current replica) before any such write. After a rollback, save the policy again without the model block first; `DELETE` only if resetting tiers and weights too is intended. The `unsupported_version` fault is described in [REST API](rest-api.md#get--put--delete-apiv1dexscore-policy).
 
 **No action on upgrade.** There is no schema change. A stored version 1 document stays valid and is read as before.
+
+## Behaviour change: fleet certificate read surface and a store schema upgrade
+
+**What changed.** The server now serves the certificate inventory it already stored:
+`GET /api/v1/crypto/certificates` and `/summary`, the MCP tools `list_crypto_certificates` and
+`get_crypto_certificate_summary`, and a "Fleet certificates" panel on `/crypto`. Nothing in the fleet reports
+certificates until the agent-side collector ships, so on upgrade the views are empty. Once certificates arrive, an
+unconfined fleet-wide summary on a large fleet (measured: 100,000 devices) can exceed its 15-second
+read budget and answer a non-retryable `503` (`scale_limit`); narrow it with `agent_id`, `store` or another
+filter.
+
+**New permission.** `CertificateInventory:Read` is a new, 40th securable. It is seeded to **Administrator only** and is
+**admin-floored even while RBAC enforcement is off** (the default), so on the first day non-admin sessions and
+service-scoped API tokens get `403` naming the permission. It cannot yet be delegated (custom roles are not creatable);
+read from an administrator session or an administrator-minted token. No existing role loses or gains any other permission.
+
+**Schema upgrade.** The certificate store gains an empty distinct-DN dictionary table (store migration v2). The upgrade
+itself is **instant on a store of any size** and builds nothing: the server's readiness, liveness and gRPC listener are not
+held up and certificate ingest is not blocked. A leader-gated background pass builds the two indexes (`CREATE INDEX CONCURRENTLY`),
+reconciles the dictionary from the stored certificates and marks it ready, at every start and every five minutes. Until it has
+completed after the start, `issuer_dn_contains` and `subject_dn_contains` answer a retryable `503` (`reconciling`) until the leader's pass completes; everything else works. If
+the pass fails, the real error is logged and recorded on the table and it retries; see
+[server-admin.md](server-admin.md#the-substring-filter-dictionary-fleet-certificate-substring-filters). **Rollback is safe**:
+the upgrade only adds objects, and a rollback followed by another upgrade is reconciled at that start, so the dictionary is not read as
+ready until a reconcile that started after this process has completed. Do not run an older replica beside a new one: the older binary does not maintain the dictionary. No `startupProbe` change is needed (nothing waits at boot).
+
+**Personal data.** The dictionary holds issuer and CA-subject distinguished names, which can name a person (a self-signed certificate's
+issuer is its subject). It does not outlive the certificates: decommissioning a device deletes the names only that device
+referenced, and an hourly background prune deletes any name nothing references. While either dictionary index is missing or invalid
+(for example after an interrupted build, until the next pass rebuilds it) both the decommission delete and the prune are paused,
+so a name can outlive its certificates until the indexes are repaired; the decommission itself still succeeds.
+
+**Pool floor.** `--postgres-pool-size` below 4 refuses every certificate read until a restart with a larger pool
+(`pool_too_small`, no retry hint, one warning at boot). The default (16) is unaffected.
+
+**New observability.** Gauges `yuzu_fleet_cert_store_status{os,status}` and
+`yuzu_server_cert_inventory_substring_index_available`, and alerts `YuzuCertStoreStatusUnavailable` and
+`YuzuCertSubstringDictionaryMissing` (see [metrics.md](metrics.md)).
 
 ## ⚠️ Breaking: `POST` and `DELETE /api/v1/quarantine` now apply the dispatch approval check (#6065)
 
@@ -3204,7 +3242,7 @@ devices.
 - **If the layout schema did not open** (see the section above), every operator sees the default
   layout, read-only, under a notice; the layout REST routes answer `503` with no retry hint and the
   MCP layout tools `kInternalError` with no retry hint.
-- **Capacity.** The Yuzu-issued reads share the existing two-read `/crypto` bound per process;
+- **Capacity.** The Yuzu-issued reads and the fleet certificate reads share the existing two-read `/crypto` bound per process (the certificate reads are also refused on a pool of fewer than 4 connections, counted as `pool_too_small`);
   on a connection pool of 3 or fewer (`--postgres-pool-size`) they are always refused, and on a
   pool of one connection the library reads and the CBOM export (`GET /api/v1/crypto/cbom`,
   MCP `export_crypto_cbom`) are refused too. That refusal lasts until a restart with a larger

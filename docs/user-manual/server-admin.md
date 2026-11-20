@@ -5105,6 +5105,126 @@ sudo bash install-server-postgres.sh
 
 The helper is **non-fatal when no local cluster is found** (prints install hints and exits 0) — this posture flips to a hard failure when the server starts requiring the DSN. The app role's credential is freshly random and never shared with the `postgres` superuser. Per-store schemas are *not* created by the helper; the server's migration runner owns those at startup (ADR-0008). The database should be UTF8-encoded: the access-review history read cuts a superseded justification by characters, which assumes UTF8. The HA image sets UTF8 explicitly, and the single-node image, measured on 2026-11-04 with the image built from `Dockerfile.postgres` (the published `yuzu-postgres` image is built from the same Dockerfile; the CI image `postgres:18.4-bookworm` and `postgres:18` were measured as well), created a UTF8 database. The helper creates a database in an existing cluster (`CREATE DATABASE`, which inherits the encoding of `template1`) and sets no encoding of its own, so a native cluster follows its `initdb` locale and a host in the `C` locale yields `SQL_ASCII`. Check with `SHOW server_encoding;` in the Yuzu database, which must answer `UTF8`. An existing database cannot be converted in place: back up first, create a NEW database under a different name (for example `CREATE DATABASE yuzu_utf8 OWNER yuzu ENCODING 'UTF8' TEMPLATE template0;`, verified on a `postgres:18` cluster initialised with the `C` locale; the same command against the existing name fails with "already exists"), move the data across (a dump taken from a single-byte database can contain bytes that are not valid UTF8 and may need cleaning; not verified in detail), and repoint the DSN at the new database. On a database with a single-byte encoding a cut counts bytes and can fall inside a multibyte sequence; the effect on the validity of the JSON response was not verified. Sizing: one read of a campaign of 1000 frozen grants with 100 decisions each needed a server peak of about 331 MB to 779 MB on 2026-11-04 (see `docs/auth-architecture.md`, "The decision history"), the cost grows linearly with the number of frozen grants (no cap), and each concurrent read holds its own copies, so set a server memory limit above that peak for the number of such reads you expect at once. No shipped deployment file sets a limit. Alert on `yuzu_server_memory_bytes{type="rss"}` (exposed on `/metrics`) and on restarts; one out-of-memory kill is one reset of `yuzu_server_uptime_seconds`, below the `YuzuServerRestartLoop` threshold (more than 3 resets in 3 hours), so that alert does not fire on a single kill.
 
+### The substring-filter dictionary (fleet certificate substring filters)
+
+The fleet certificate read surface has two literal substring filters: `issuer_dn_contains`, and
+`subject_dn_contains` (only with `is_ca=true`). They answer "which devices hold a certificate issued under
+any name of this CA", the query you reach for when a CA is distrusted. On a large fleet they cannot scan
+27 million certificate rows, so the store keeps a **distinct-DN dictionary** (`dn_dict`): every distinct
+issuer DN, and every distinct CA subject DN, once. A substring filter first matches the dictionary (thousands
+of rows), then reaches the certificates through ordinary btree indexes on `issuer_dn` and `subject_dn`
+(`cert_fact_issuer_dn_idx`, `cert_fact_subject_ca_dn_idx`). **No PostgreSQL extension is required.**
+
+- **Nothing is built at upgrade or boot.** The schema upgrade only creates the empty `dn_dict` table (instant on a
+  table of any size), so the server's readiness, liveness and gRPC listener are never held up, and certificate ingest
+  keeps working throughout. Ingest maintains the dictionary from then on (a known name writes nothing).
+- **A background pass builds the rest, on the leader only.** A leader-gated background thread (pass
+  `cert_inventory.dn_dict_maintenance`) runs, at **every process start** and then **every five minutes** (a non-leader replica that finds no fresh marker records a
+  "reconcile requested" row in the database and the leader, which polls every ~5 s, runs a pass at once):
+  (1) `CREATE INDEX CONCURRENTLY` for the two indexes (an invalid leftover of a cancelled attempt is dropped first; the
+  build does not block writes); (2) a **reconcile** of the dictionary from the certificates, in batches of 1,000 names,
+  each its own short statement; (3) an optional trigram index on the small dictionary if the `pg_trgm` extension is
+  available; and (4) a **prune** of names no certificate references, due when the database clock says an hour has passed since the last
+  one (stored in the database, so it survives restarts and leader changes, and runs even when (1)-(2) failed as long as the
+  indexes exist); then (5) it marks the
+  dictionary ready. The reconcile runs at every start before the dictionary reads as ready, so a rollback to a version that
+  did not maintain the dictionary followed by an upgrade can never read as ready with names missing. It holds one pooled
+  connection while it runs.
+- **Until it has completed after a server start, the two substring filters are refused** with a **retryable** `503`
+  (`reason="reconciling"`, `retry_after_ms` about 10,000; MCP: the same hint). A pass that **failed on a transient cause**
+  (cancelled or lock-timed-out statement, deadlock or serialization failure, connection or resource error) is also retryable, with
+  `retry_after_ms` 300,000 (the pass interval); the database error text is never sent to the client. Only a dictionary that
+  failed on a **deterministic** cause (or is absent) answers the non-retryable `503` (`reason="substring_index_missing"`, no
+  retry hint). Every other certificate read is unaffected.
+  On a store with no certificates (every deployment until the agent-side collector ships) it completes within seconds
+  of start. At fleet scale see the measured figures below. A replica that is not the leader becomes ready as soon as the
+  leader's pass has completed after that replica started. **Windows:** single replica - the pass duration (seconds on an
+  empty store; about 2 minutes at 26.8 million certificates); non-leader restart - the leader's next poll (~5 s) plus one pass,
+  not the five-minute cadence; leader change - the new leader's first pass (its first leader tick runs one) plus the pass
+  duration; leader stuck (a `CREATE INDEX CONCURRENTLY` waits behind an idle-in-transaction session, or the pool is saturated)
+  - unbounded until the blocker clears: the filters stay retryable-503 and the lease/step metrics below show it.
+  A readiness marker (`ready:<ms>`) written by an EARLIER process never counts: only a pass that started at or after this
+  process started does.
+- **A failed run is retried, and recorded.** If a step fails (for example a distinguished name too long for a btree entry,
+  or an administrator cancelling the build), the real database error is logged and counted
+  (`dn_dict_runs_total{result="failed"}`), and the pass retries after a minute. The table comment
+  (`SELECT obj_description('certificate_inventory_store.dn_dict'::regclass, 'pg_class')`) is rewritten from the failure,
+  on a fresh pooled connection if the pass's own connection was lost:
+  `failed: <step>: <SQLSTATE> <message>` unless THIS process already holds a usable `ready:` marker. A usable one is NOT
+  flipped off by a failed periodic run: the failure is appended as `ready:<ms>;last_failure:<step>: <error>`, so a replica
+  that started later (and cannot count that marker as ready) still sees the true state. A `ready:` left by an EARLIER
+  process is never kept: it is replaced by `failed:`.
+- **Watch it.** `yuzu_server_cert_inventory_substring_index_available` is `1` when the dictionary is ready for this
+  process and both indexes are valid; it is rechecked about every five minutes (a catalog read, no DDL), and the alert
+  `YuzuCertSubstringDictionaryMissing` fires when it stays `0` for 30 minutes.
+  `yuzu_server_cert_inventory_dn_dict_runs_total{step,result}` counts each maintenance step (including lease timeouts), and
+  `yuzu_server_cert_inventory_dn_dict_last_prune_timestamp_seconds` is the last successful prune (database clock);
+  `YuzuCertDnDictionaryPruneStale` fires when it is more than 3 hours old.
+- **A transaction-mode connection pooler is unsupported for this step** (ADR-2002 list): the build needs session affinity
+  (session `SET`s lifted and `RESET`, one connection held across a `CREATE INDEX CONCURRENTLY`). Point the server at the
+  database directly or use a session-mode pooler.
+- **Manual procedure (only if the background pass cannot complete).** The pass is idempotent; to run its steps by hand, as a
+  role that owns the schema (the role's default `statement_timeout` will cancel a build on a large store, so lift it for the
+  session; `CREATE INDEX CONCURRENTLY` cannot run inside a transaction):
+
+  ```sql
+  SET statement_timeout = 0;  SET lock_timeout = 0;
+  SET search_path TO certificate_inventory_store, public;
+  -- an index left INVALID by a cancelled build must be dropped first:
+  --   SELECT indexrelid::regclass FROM pg_index WHERE NOT indisvalid;  DROP INDEX CONCURRENTLY <name>;
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS cert_fact_issuer_dn_idx ON cert_fact (issuer_dn);
+  CREATE INDEX CONCURRENTLY IF NOT EXISTS cert_fact_subject_ca_dn_idx ON cert_fact (subject_dn) WHERE is_ca;
+  -- stamp the definitions so the background pass recognises them (a differing stamp is dropped and rebuilt):
+  COMMENT ON INDEX cert_fact_issuer_dn_idx IS 'btree (issuer_dn)';
+  COMMENT ON INDEX cert_fact_subject_ca_dn_idx IS 'btree (subject_dn) WHERE is_ca';
+  INSERT INTO dn_dict (dn, is_issuer) SELECT DISTINCT issuer_dn, true FROM cert_fact
+    WHERE issuer_dn <> '' ON CONFLICT (dn) DO UPDATE SET is_issuer = true;
+  INSERT INTO dn_dict (dn, is_ca_subject) SELECT DISTINCT subject_dn, true FROM cert_fact
+    WHERE is_ca AND subject_dn <> '' ON CONFLICT (dn) DO UPDATE SET is_ca_subject = true;
+  ```
+
+  The next background cycle completes the marker (it is a no-op reconcile), so the dictionary reads ready within five minutes
+  and no restart is needed.
+- **Optional trigram index.** If `pg_trgm` is available (the bundled Postgres image enables it when it creates a new data directory, not on an existing volume, where you run `CREATE EXTENSION pg_trgm` yourself if you want it; on managed
+  PostgreSQL run `CREATE EXTENSION pg_trgm`, and on Azure add it to `azure.extensions` first), the pass adds a trigram index on the
+  dictionary only. It is a convenience for a dictionary of millions of names; the filters work without it.
+- **Retention.** The dictionary does not outlive the certificates: the decommission cascade deletes the names a device referenced that
+  no other device holds, (best effort: under concurrent decommissions some names are skipped and stay) and the hourly prune deletes any name
+  nothing references, so a name outlives the certificates that named it by at most one prune interval (about an hour while a
+  leader is healthy and both indexes are valid; while an index is missing or invalid both the delete and the prune pause until
+  the next pass rebuilds it). **A decommission while an index is missing skips the name delete** (the anti-join would otherwise
+  exceed the statement timeout at fleet scale and roll the decommission back) and leaves it for the prune. A prune racing an ingest cannot delete a name the ingest
+  references: the prune locks candidates `FOR UPDATE SKIP LOCKED` (an ingest holds `FOR KEY SHARE` on its names) and deletes
+  only names still unreferenced in a fresh snapshot; an ingest re-inserts any name it finds missing, in the same transaction.
+  The five-minute reconcile remains the backstop, not the mechanism.
+- **Disk and write cost.** The two btrees are small (equal values are stored once); the dictionary holds distinct names only.
+  A certificate that is new or changed costs one extra index entry.
+- **Backup and restore.** `pg_dump` restores the dictionary and its indexes; the pass re-reconciles it after the restart.
+- **Pool floor.** The certificate reads need `--postgres-pool-size` of at least 4; below that every certificate read is
+  refused (`503`, reason `pool_too_small`, no retry hint) until the server is restarted with a larger pool.
+- **One caller-priced read per user.** At most one certificate summary, or page carrying any filter other than `agent_id`,
+  `sha256` or `scope`, runs at a time per user (callers whose identity cannot be resolved share one slot); a second answers a
+  retryable `503` (`retry_after_ms` 15000, reason `principal_busy`) and takes none of the two shared `/crypto` read slots. An
+  unfiltered page, or one addressed by `agent_id` or `sha256`, is never counted.
+- **Capacity limit.** A substring that matches more than 20,000 distinct names is refused with a `400` ("make it longer");
+  with the dictionary holding names nothing references any more, they count toward that limit until the prune removes them.
+
+**Measured** on 100,000 devices and 26.8 million certificates (PostgreSQL 18, a laptop, default settings):
+the upgrade (store open, migration v2) took **11-15 ms** (it creates an empty table); the background build (two
+`CREATE INDEX CONCURRENTLY` indexes of about 200 MB each, then the reconcile) took **121 seconds** from a cold start, **with
+certificate ingest running throughout**: 854 concurrent full reports (300 certificates each, a third carrying new names) were
+stored with **0 errors** and no lock-timeout failures (p50 103 ms, p95 303 ms, p99 767 ms, worst 2.5 s). Once built, a re-run
+of the whole pass over the 26.8 million rows took under one second. Substring page reads: `issuer_dn_contains` on a rare name about
+20 ms (unconfined) and 20-32 ms (confined to 1,000 or 10,000 devices); a common name 7-13 ms; a name that matches nothing 1-4 ms; `subject_dn_contains`
+with `is_ca=true` 22-29 ms. The substring match itself is a scan of the dictionary (about 1 ms for 3,000 names).
+
+The summary (`GET /api/v1/crypto/certificates/summary`) scans every certificate the caller can see inside a 15-second
+budget. Measured, it finishes reliably for roughly **1,000 to 2,000 confined devices**; an unconfined summary at
+100,000 devices, or a confined one over about 10,000, exceeds the budget and answers a **non-retryable** `503`
+(`reason="scale_limit"`, message "narrow it"). Use the per-certificate read with an exact key (`spki_sha256`,
+`aki_key_id`, `issuer_dn`) for the one-CA question, and the summary only for a confined device set, until the fleet-wide counts and snapshot export
+of a later release.
+
 ### Backing up PostgreSQL state
 
 A complete backup is the Postgres dump below **plus** the whole `--ca-dir`, taken at the same point in time and restored as a pair (see the restore-pairing invariant under [Key management](#key-management-secrets-kek)), together with the `--data-dir` state files, the NVD cache `nvd_cves.db`, and the blob directories `agent-updates/` (or `--update-dir`) and `upload-blobs/` listed in [Configuration Files](#configuration-files). The dump holds only the OTA-package and completed-upload records; restoring it without those two directories leaves records that point at files that no longer exist.

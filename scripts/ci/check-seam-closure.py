@@ -665,6 +665,9 @@ FAMILIES = {
     "crypto": {
         "tus": [
             "server/core/src/crypto_types.hpp",
+            "server/core/src/certificate_read_types.hpp",
+            "server/core/src/certificate_read_model.hpp",
+            "server/core/src/certificate_read_model.cpp",
             "server/core/src/crypto_library_model.hpp",
             "server/core/src/crypto_library_model.cpp",
             "server/core/src/crypto_widget_catalogue.hpp",

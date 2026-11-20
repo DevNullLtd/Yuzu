@@ -1230,7 +1230,9 @@ namespace {
 // Agent ids of the rows an /agents response served, in served order.
 std::vector<std::string> served_agent_ids(const httplib::Response& res) {
     std::vector<std::string> ids;
-    for (const auto& row : nlohmann::json::parse(res.body)["data"])
+    // Bound to a local: ranging over a subobject of a temporary dangles.
+    auto range_root_1233 = nlohmann::json::parse(res.body);
+    for (const auto& row : range_root_1233["data"])
         ids.push_back(row["agent_id"].get<std::string>());
     return ids;
 }

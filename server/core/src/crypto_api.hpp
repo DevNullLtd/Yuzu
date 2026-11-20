@@ -17,6 +17,7 @@
 /// present-empty = deny-all.
 
 #include "authz_model.hpp"
+#include "certificate_read_types.hpp"
 #include "crypto_types.hpp"
 
 #include <cstdint>
@@ -52,7 +53,14 @@ struct CryptoReadError {
     /// below the library or Yuzu-issued minimum; `message` names the remedy). A retry cannot
     /// help, so every transport answers WITHOUT retry_after_ms; for the layout, the dashboard
     /// draws the default layout with a notice instead of the unavailable banner.
+    /// (Also set for an answer that a retry cannot change - a refused substring filter, a summary past
+    /// its scale limit: `remediation` then says what to do.)
     bool unavailable_until_restart{false};
+    /// kDegraded only, optional: what the operator must do (a transport that has a remediation
+    /// channel, MCP, uses it instead of its generic one).
+    std::string remediation;
+    /// kDegraded + retryable only: an honest estimate of the wait (ms); unset = the transport default.
+    std::optional<std::int64_t> retry_after_ms;
 };
 
 class CryptoApi {
@@ -66,6 +74,24 @@ public:
     /// One family's device drill behind `GET /api/v1/crypto/libraries/devices` and its twins.
     [[nodiscard]] virtual std::expected<CryptoDevicesPage, CryptoReadError>
     library_devices(const CryptoDevicesQuery& q, const authz::VisibleSet& scope) const = 0;
+
+    // ── Fleet certificates (slice-2 PR 2a-2b, ADR-0070 D12) ──────────────────────────
+    // Read through the SAME admission bound as the library reads, behind
+    // `CertificateInventory:Read` (the CALLER gates; the seam takes the gate's VisibleSet and
+    // pushes it into the SQL: nullopt = unfiltered, present-empty = deny-all). A degraded
+    // inventory read, a store that did not open and a shed admission are ALL kDegraded - 503 +
+    // retry, NEVER an empty result. kInvalid = a bad cursor (malformed, or bound to another
+    // filter set).
+
+    /// One page of (device, certificate) rows behind `GET /api/v1/crypto/certificates` and its
+    /// twins. Hostnames are filled from the device registry when wired; truncation flags and the
+    /// cursor are applied here (the pure model).
+    [[nodiscard]] virtual std::expected<CertPage, CryptoReadError>
+    certificates(const CertQuery& q, const authz::VisibleSet& scope) const = 0;
+
+    /// The raw-value rollups behind `GET /api/v1/crypto/certificates/summary` and its twins.
+    [[nodiscard]] virtual std::expected<CertSummary, CryptoReadError>
+    certificate_summary(const CertSummaryQuery& q, const authz::VisibleSet& scope) const = 0;
 
     // ── Dashboard widgets (ADR-0070 D13) ────────────────────────────────────────────
     // The Yuzu-issued reads take no VisibleSet: Yuzu's own PKI inventory has no per-device
