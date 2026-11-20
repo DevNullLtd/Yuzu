@@ -8813,7 +8813,7 @@ surfaces, not reads. `from-echo-query` runs SQL on Echo agents; `from-instructio
 runs an `InstructionDefinition` and filters responders by `matcher`; `{id}/re-eval`
 re-runs a set's own source query and creates a **sibling** (same parent, new id).
 
-A NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value) of `from-instruction-result`, or in `parent_id` is refused with `400` (`RESULT_SET_BAD_REQUEST`) before an execution row is written or anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The refusal is audited as `result_set.create` with `result=denied` and `reason=field_contains_nul`. The MCP twins refuse it as invalid params (-32602) with the same audit row.
+A NUL byte in the `name`, in the `sql` of `from-echo-query`, in an instruction parameter (name or value) of `from-instruction-result`, or in `parent_id` is refused with `400` (`RESULT_SET_BAD_REQUEST`) before an execution row is written or anything is dispatched, so a command is never run and then reported as failed because the result-set row could not be stored. The refusal is audited as `result_set.create` with `result=denied` and `reason=field_contains_nul`. The MCP twins refuse it as invalid params (-32602) with the same audit row, and report a lost row as `error.data` `{"audit_persisted":false}`.
 
 **Permission:** `Execution:Execute`, **confined per device**
 
