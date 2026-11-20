@@ -1068,7 +1068,7 @@ TEST_CASE("pkg_inventory macos user prefixes: network mounts are never touched",
     CHECK(*token == "macos:user_homes:network_mount");
 
     // One home on a mount: a token, and the other home is still walked.
-    cfg.network_mounts = {"/Users/alpha"};
+    cfg.network_mounts = {"/Users/alpha"};  // personal-data-ok: synthetic test path
     auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
     REQUIRE(token.has_value());
     CHECK(*token == "macos:user_homes:network_mount");
@@ -1076,7 +1076,7 @@ TEST_CASE("pkg_inventory macos user prefixes: network mounts are never touched",
     CHECK(rows[0] == user_row("tool", "2.0", "beta", "homebrew"));
 
     // A mount INSIDE a candidate prefix: that prefix is never opened.
-    cfg.network_mounts = {"/Users/alpha/homebrew/Cellar"};
+    cfg.network_mounts = {"/Users/alpha/homebrew/Cellar"};  // personal-data-ok: synthetic test path
     rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
     REQUIRE(token.has_value());
     CHECK(*token == "macos:homebrew_user_prefix:network_mount");

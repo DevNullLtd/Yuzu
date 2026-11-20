@@ -87,7 +87,7 @@ namespace yuzu::shared {
 }
 
 /// True iff `path` (absolute, normalised) is on or under a listed mount point: a segment-boundary
-/// match (`/Users/js` is not under `/Users/jsmith`), and a `/` mount covers every path.
+/// match (`/Users/js` is not under `/Users/jsmith`), and a `/` mount covers every path. personal-data-ok: synthetic example path
 [[nodiscard]] inline bool under_network_mount(std::string_view path,
                                               std::span<const std::string> mounts) noexcept {
     for (const std::string_view m : mounts) {

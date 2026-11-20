@@ -169,23 +169,23 @@ TEST_CASE("mount_entries: hostile input neither overflows, throws nor loops", "[
 
 TEST_CASE("under_network_mount: segment-boundary match, a root mount covers everything",
           "[network_fstype]") {
-    const std::vector<std::string> mounts{"/Users/js", "/mnt/nfs"};
-    CHECK(under_network_mount("/Users/js", mounts));            // exact
-    CHECK(under_network_mount("/Users/js/homebrew", mounts));   // a child
+    const std::vector<std::string> mounts{"/Users/js", "/mnt/nfs"};  // personal-data-ok: synthetic test path
+    CHECK(under_network_mount("/Users/js", mounts));            // exact  // personal-data-ok: synthetic test path
+    CHECK(under_network_mount("/Users/js/homebrew", mounts));   // a child  // personal-data-ok: synthetic test path
     CHECK_FALSE(under_network_mount("/Users/jsmith", mounts));  // shared name prefix, other segment
     CHECK_FALSE(under_network_mount("/Users", mounts));         // an ancestor is not under
-    CHECK_FALSE(under_network_mount("/Users/js", {}));          // empty mount list
+    CHECK_FALSE(under_network_mount("/Users/js", {}));          // empty mount list  // personal-data-ok: synthetic test path
     const std::vector<std::string> root{"/"};
-    CHECK(under_network_mount("/Users/anyone", root));
+    CHECK(under_network_mount("/Users/anyone", root));  // personal-data-ok: synthetic test path
 }
 
 TEST_CASE("touches_network_mount: under a mount or containing one", "[network_fstype]") {
-    const std::vector<std::string> mounts{"/Users/js/homebrew"};
-    CHECK(touches_network_mount("/Users/js/homebrew/Cellar", mounts)); // under
-    CHECK(touches_network_mount("/Users/js", mounts));                 // contains
+    const std::vector<std::string> mounts{"/Users/js/homebrew"};  // personal-data-ok: synthetic test path
+    CHECK(touches_network_mount("/Users/js/homebrew/Cellar", mounts)); // under  // personal-data-ok: synthetic test path
+    CHECK(touches_network_mount("/Users/js", mounts));                 // contains  // personal-data-ok: synthetic test path
     CHECK(touches_network_mount("/Users", mounts));                    // contains
     CHECK(touches_network_mount("/", mounts));                         // contains
     CHECK_FALSE(touches_network_mount("/Users/jsmith", mounts));       // unrelated sibling
-    CHECK_FALSE(touches_network_mount("/Users/js/homebrew2", mounts)); // segment boundary
-    CHECK_FALSE(touches_network_mount("/Users/js", {}));
+    CHECK_FALSE(touches_network_mount("/Users/js/homebrew2", mounts)); // segment boundary  // personal-data-ok: synthetic test path
+    CHECK_FALSE(touches_network_mount("/Users/js", {}));  // personal-data-ok: synthetic test path
 }
