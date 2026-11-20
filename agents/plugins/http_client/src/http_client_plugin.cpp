@@ -370,7 +370,8 @@ int download_url(std::string_view url, std::string& body, bool hash_will_verify,
 }
 
 // HTTP GET via httplib (no shell, no command injection)
-std::string http_get(std::string_view url, int& status_code) {
+std::string http_get(std::string_view url, int& status_code, bool& truncated) {
+    truncated = false;
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
@@ -387,30 +388,33 @@ std::string http_get(std::string_view url, int& status_code) {
     bool https_unsupported = false;
     // The body is received through a capped receiver: the cap aborts the transfer, so a hostile peer
     // cannot make the agent buffer an unbounded body before the size is judged.
+    // A body over kMaxGetBodyBytes (1 MiB) is cut there and reported as truncated, with the status
+    // the peer answered (a cancelled transfer returns no result, so the status is read in the
+    // response handler).
     std::string body;
-    bool size_exceeded = false;
+    int seen_status = 0;
     auto res = try_vetted(parsed, ips, 60, kRequestTotalTimeout, /*identity_encoding=*/true,
                           https_unsupported, [&](auto& cli) {
                               body.clear();
-                              size_exceeded = false;
+                              truncated = false;
+                              seen_status = 0;
                               return cli.Get(
-                                  parsed.path, [](const httplib::Response&) { return true; },
-                                  [&](const char* data, size_t len) {
-                                      if (body.size() + len > kMaxDownloadSize) {
-                                          size_exceeded = true;
-                                          return false;
-                                      }
-                                      body.append(data, len);
+                                  parsed.path,
+                                  [&](const httplib::Response& r) {
+                                      seen_status = r.status;
                                       return true;
+                                  },
+                                  [&](const char* data, size_t len) {
+                                      return yuzu::http_client::append_get_body(body, data, len, truncated);
                                   });
                           });
     if (https_unsupported) {
         status_code = 0;
         return "HTTPS not supported (OpenSSL not available)";
     }
-    if (size_exceeded) {
-        status_code = res ? res->status : 0;
-        return "response body exceeds maximum size limit";
+    if (truncated) {
+        status_code = res ? res->status : seen_status;
+        return body;
     }
     if (!res) {
         status_code = 0;
@@ -622,9 +626,13 @@ private:
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
         int status = 0;
-        auto body = http_get(url, status);
+        bool truncated = false;
+        auto body = http_get(url, status, truncated);
         ctx.write_output(std::format("status|{}", status));
-        ctx.write_output(std::format("body|{}", body));
+        body.insert(0, "body|"); // one buffer: no second copy of a body up to 1 MiB
+        ctx.write_output(body);
+        if (truncated)
+            ctx.write_output(std::format("truncated|{}", yuzu::http_client::kMaxGetBodyBytes));
         return status >= 200 && status < 400 ? 0 : 1;
     }
 

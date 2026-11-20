@@ -18,12 +18,32 @@
 #include <atomic_file_write.hpp>
 #include <sha256.hpp>
 
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <string>
 #include <string_view>
 
 namespace yuzu::http_client {
+
+/// `get` returns at most this many body bytes, then a `truncated` row: a get result is one output
+/// line the server must accept whole (a frame over its receive limit ends the agent's whole stream),
+/// so it is bounded far below `download`'s 100 MiB.
+inline constexpr std::size_t kMaxGetBodyBytes = 1024 * 1024;
+
+/// Receiver for the `get` body: appends up to the cap and reports whether to keep receiving. The
+/// first byte past the cap sets `truncated` and stops the transfer (the bytes already held are kept).
+[[nodiscard]] inline bool append_get_body(std::string& body, const char* data, std::size_t len,
+                                          bool& truncated, std::size_t cap = kMaxGetBodyBytes) {
+    if (body.size() >= cap || len > cap - body.size()) {
+        const std::size_t room = body.size() >= cap ? 0 : cap - body.size();
+        body.append(data, room);
+        truncated = true;
+        return false;
+    }
+    body.append(data, len);
+    return true;
+}
 
 struct DownloadObservation {
     bool https_unsupported{false}; ///< https URL on a build without OpenSSL

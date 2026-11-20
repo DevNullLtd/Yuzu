@@ -1528,3 +1528,29 @@ TEST_CASE("local_path: a guard built from a mountinfo table refuses a path under
     CHECK_FALSE(lp::refused(guard.refusal("/")));
 }
 #endif
+
+TEST_CASE("http_client get: the body is cut at the cap with a truncated flag, never refused whole",
+          "[http_client][get]") {
+    namespace hc = yuzu::http_client;
+    std::string body;
+    bool truncated = false;
+    // A body that fits is kept whole and the transfer continues.
+    CHECK(hc::append_get_body(body, "abcd", 4, truncated, /*cap=*/10));
+    CHECK(hc::append_get_body(body, "efghij", 6, truncated, 10)); // lands exactly on the cap
+    CHECK(body == "abcdefghij");
+    CHECK_FALSE(truncated);
+    // The first byte past the cap stops the transfer and flags it; the held bytes stay.
+    CHECK_FALSE(hc::append_get_body(body, "k", 1, truncated, 10));
+    CHECK(truncated);
+    CHECK(body == "abcdefghij");
+
+    // A single chunk straddling the cap keeps the bytes up to it.
+    std::string b2;
+    bool t2 = false;
+    CHECK_FALSE(hc::append_get_body(b2, "0123456789ABCDEF", 16, t2, 10));
+    CHECK(t2);
+    CHECK(b2 == "0123456789");
+
+    // The shipped cap is 1 MiB, far below a gRPC frame limit.
+    CHECK(hc::kMaxGetBodyBytes == 1024u * 1024u);
+}

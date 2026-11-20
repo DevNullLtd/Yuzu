@@ -388,8 +388,14 @@ struct CommandContextImpl {
             capture->append(text, len);
             return;
         }
-        output_buffer.emplace_back(text, len);
-        output_buffer_bytes += len;
+        // One plugin line is bounded so a frame never exceeds the server's receive limit.
+        if (len > yuzu::agent::kMaxOutputLineBytes) {
+            output_buffer.push_back(yuzu::agent::clamp_output_line(std::string_view{text, len}));
+            output_buffer_bytes += output_buffer.back().size();
+        } else {
+            output_buffer.emplace_back(text, len);
+            output_buffer_bytes += len;
+        }
         if (output_buffer_bytes >= kOutputFlushThreshold) {
             flush_output_locked();
         }

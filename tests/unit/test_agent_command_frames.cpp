@@ -45,3 +45,27 @@ TEST_CASE("agent command frames: the final frame carries the action and the exit
     CHECK(none_out.action().empty());
     CHECK(none_fin.action().empty());
 }
+
+TEST_CASE("agent command frames: one oversized output line is cut under the frame cap at a UTF-8 boundary",
+          "[agent][command_frames]") {
+    using yuzu::agent::clamp_output_line;
+    using yuzu::agent::kMaxOutputLineBytes;
+    CHECK(clamp_output_line("short") == "short");
+    const std::string at_cap(kMaxOutputLineBytes, 'a');
+    CHECK(clamp_output_line(at_cap) == at_cap);
+
+    const std::string big(kMaxOutputLineBytes + 12345, 'b');
+    const auto cut = clamp_output_line(big);
+    CHECK(cut.size() <= kMaxOutputLineBytes);
+    CHECK(cut.ends_with(yuzu::agent::kOutputLineTruncatedMarker));
+
+    // A multi-byte character straddling the cut point is dropped whole, never split.
+    std::string wide;
+    while (wide.size() < kMaxOutputLineBytes + 100)
+        wide += "\xC3\xA9"; // U+00E9, two bytes
+    const auto wcut = clamp_output_line(wide);
+    CHECK(wcut.size() <= kMaxOutputLineBytes);
+    const auto body = wcut.substr(0, wcut.size() - yuzu::agent::kOutputLineTruncatedMarker.size());
+    CHECK(body.size() % 2 == 0);
+    CHECK(body.size() > 0);
+}
