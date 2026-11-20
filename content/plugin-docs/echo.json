@@ -2851,7 +2851,8 @@
       "changelog.d/7420-echo-followups-mixed.changed.md",
       "changelog.d/7420-echo-followups-mixed.fixed.md",
       "changelog.d/7466-echo-mcp-hourly-rows.changed.md",
-      "changelog.d/7507-echo-drop-live-shims.removed.md"
+      "changelog.d/7507-echo-drop-live-shims.removed.md",
+      "changelog.d/8184-wp13-echo-module-signing-cache-usn.security.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
@@ -2939,6 +2940,7 @@
     "tests": [
       "tests/test_echo_adoption_wiring_lexical.py",
       "tests/test_echo_mapdrive_pin_lexical.py",
+      "tests/test_echo_module_signing_wiring_lexical.py",
       "tests/test_echo_scrub_wiring_lexical.py",
       "tests/test_echo_security_wiring_lexical.py",
       "tests/test_echo_test_standard_lexical.py",

@@ -1675,7 +1675,7 @@ class InstallerFailedHelper(unittest.TestCase):
             "macos_create_user() { :; }",
             "linux_user_exists() { return 0; }",
             "create_state_dirs() { :; }",
-            "apply_setcap() { :; }",
+            "strip_file_capabilities() { :; }",
             "chown() { :; }",
             "SUDOERS_FILE='%s'" % sudoers,
             "FW_HELPER_PATH='%s'" % os.path.join(helper_dir, "yuzu-fw-helper"),
