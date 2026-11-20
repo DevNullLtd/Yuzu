@@ -335,7 +335,7 @@ the open fails before that write and nothing is persisted: the fact is then in
 the agent log and the kept file only, and the next start judges the file at
 `echo.db` afresh.
 
-**Store shape (`config|schema_version`, `config|warehouse_tables_ok`).** Both lines are always present after `db_health`. `config|schema_version|<N>` is the store's schema version. `config|warehouse_tables_ok|false` means the database opened but the agent could not create every warehouse table (a table or index of the expected name that has the wrong shape, for instance), so collectors and roll-ups that need the missing ones fail on every pass; the agent log carries the SQLite error at `error` level. The store is otherwise usable, so this is the line to alert on rather than a failed `status`.
+**Store shape (`config|schema_version`, `config|warehouse_tables_ok`).** Both lines are always present after `db_health`. `config|schema_version|<N>` is the store's schema version. `config|warehouse_tables_ok|false` means the database opened but the agent could not create every warehouse table, so collectors and roll-ups that need the missing ones fail on every pass. The create runs as one batch at every open and fails as a whole. The usual causes are an existing table that lacks a column one of its indexes needs, a name already taken by another object, a database that was busy (locked by another process) at open, or a full disk; an existing table that merely has different columns does not fail the create and is not reported here. The store is otherwise usable, so this is the line to alert on rather than a failed `status`. **What to do:** read the agent log, which carries the SQLite error at `error` level (`EchoDatabase::create_warehouse_tables failed: ...`), clear the cause (free disk space, stop whatever holds the file) and restart the agent: the create is retried only at the next open, and the value does not change while the agent runs. If it is still `false` after a restart, the file itself holds the conflicting table or index. Only then, as a last resort, stop the agent and move `echo.db` (with its `-wal` and `-shm` files) aside so that a fresh store is created; the fresh store starts with no history, and the rows in the moved file are no longer served by the agent.
 
 **Per-source health.** `<source>_last_status` is the terminal outcome token of
 the source's most recent collection (`never_ran` until it has run in this agent
@@ -427,9 +427,11 @@ re-`configure`d. Collection stops, and the rows of a source that was not paused 
 `retention_guard_declines_total` counts retention passes this agent declined
 (see [The retention clock guard](#the-retention-clock-guard) for the four
 triggers and which of them are benign), and
-`retention_guard_failures_total` counts tables that
+`retention_guard_failures_total` counts failures: a table that
 could not be retained at all -- whether the probes could not be read or the
-delete itself failed (see "The retention clock guard" below). Both
+delete itself failed -- and the three conditions that are not tables,
+`__clock_state__`, `__implausible_stored__` and `__implausible_now__`, described
+below (see "The retention clock guard" below). Both
 are always emitted. **Read them together**: a zero declines total only means the
 clock is behaving if the failures total is also zero -- a table whose probes fail
 every pass has silently stopped being retained, and would otherwise report as
@@ -448,7 +450,7 @@ retention_guard_failures_total|2
 Only tables with a non-zero count appear, so a healthy agent emits just the two
 totals. `__clock_state__` is not a table: it reports that the agent could not
 persist its own clock reading, which leaves the guard without a comparison point
-after the next restart. `__budget__` is not a table either: the byte-budget pass was skipped because the retention clock guard refused this pass's clock (it is counted in neither total, because the decline or failure that caused it is already counted). `__implausible_stored__` is not a table either: the stored comparison point was unreadable, negative or ahead of the clock, so the pass re-anchored it to the current reading; it is counted once per pass in which that was found, whether or not any table had rows to remove. `__implausible_now__` is also not a table: it reports
+after the next restart. `__budget__` is not a table either: the byte-budget pass was skipped because the retention clock guard refused this pass's clock (it is counted in neither total, because the decline or failure that caused it is already counted). `__implausible_stored__` is not a table either: the stored comparison point was unparseable, negative or ahead of the clock. It is counted once per pass in which that was found, whether or not any table had rows to remove, and that pass also skips the byte-budget pass (so `retention_guard|__budget__` rises with it). The pass then writes the current reading over the bad one, so a single count heals itself and needs no action; a clock that was legitimately set back produces exactly one. A count that rises on every pass means the bad reading keeps coming back: either something keeps rewriting the `retention_guard_last_pass` row in `echo_config`, or the write of the new reading is failing, in which case `__clock_state__` rises with it and the store is read-only or full (check the disk and the file's permissions). The byte budget stays skipped for as long as it recurs. `__implausible_now__` is also not a table: it reports
 that the clock reading **handed to a pass** (not the stored comparison point)
 was too far ahead to trust, so the whole pass declined before touching any
 table -- see "The retention clock guard" below. The per-table counters are in-memory and reset when the agent restarts
@@ -649,7 +651,8 @@ this pass:
 
   1. it would delete **every** datable row of that table;
   2. more than **a fixed 30 days** elapsed since the previous pass;
-  3. the stored reading is **ahead** of the current clock;
+  3. the stored reading is **ahead** of the current clock, negative or
+     unparseable;
   4. there is **no stored reading at all** -- the first pass after an agent
      upgrade or a restore.
 

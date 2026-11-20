@@ -2006,10 +2006,20 @@ TEST_CASE("Echo #3104: an implausible stored reading is counted once per pass, w
         seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
         REQUIRE(f.db->set_config("retention_guard_last_pass", stored));
 
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
         run_retention(*f.db, kT0, f.guard);
         CHECK(failures_of(f.guard, "__implausible_stored__") == 1);
         CHECK(declines_of(f.guard, "process_hourly") == 0); // per-table behaviour unchanged
         CHECK(row_count(*f.db, "process_hourly") == 3);
+        // The sentinel is a clock event: do_rollup skips the byte-budget pass when this
+        // total rises across run_retention, so a corrupt reading costs one budget pass.
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 1);
+        // And it reaches `echo status` as its own line, inside the failures total.
+        const auto lines = yuzu::echo::format_retention_guard_lines(f.guard);
+        REQUIRE(lines.size() == 3);
+        CHECK(lines[0] == "retention_guard_failed|__implausible_stored__|1");
+        CHECK(lines[1] == "retention_guard_declines_total|0");
+        CHECK(lines[2] == "retention_guard_failures_total|1");
         // Re-anchored to now, so the corruption is not counted again.
         CHECK(f.db->get_config("retention_guard_last_pass", "") == std::to_string(kT0));
         run_retention(*f.db, kT0 + 1, f.guard);
@@ -2024,6 +2034,29 @@ TEST_CASE("Echo #3104: an implausible stored reading is counted once per pass, w
     seed_process_hourly_at(*f.db, kT0 - 3600, 3);
     run_retention(*f.db, kT0, f.guard);
     CHECK(failures_of(f.guard, "__implausible_stored__") == 0);
+    CHECK(yuzu::echo::retention_clock_events(f.guard) == 0);
+}
+
+TEST_CASE("Echo #3104: a corrupt stored reading that cannot be re-anchored is counted every pass",
+          "[echo][retention][clock-guard]") {
+    // The re-anchor is what makes the sentinel a once-only count. When that write
+    // fails the bad reading stays, so each pass reports it again, beside the
+    // `__clock_state__` failure for the write itself.
+    EchoGuardFixture f;
+    seed_process_hourly_at(*f.db, kT0 - 3600, 3); // in-window only: nothing is expired
+    REQUIRE(f.db->set_config("retention_guard_last_pass", "not-a-number"));
+    REQUIRE(f.db->execute_sql("CREATE TRIGGER block_cfg BEFORE UPDATE ON echo_config "
+                              "WHEN NEW.key = 'retention_guard_last_pass' "
+                              "BEGIN SELECT RAISE(ABORT, 'blocked'); END;"));
+
+    for (int pass = 1; pass <= 3; ++pass) {
+        run_retention(*f.db, kT0 + pass, f.guard);
+        CHECK(failures_of(f.guard, "__implausible_stored__") == pass);
+        CHECK(failures_of(f.guard, "__clock_state__") == pass);
+        CHECK(yuzu::echo::retention_clock_events(f.guard) == 2 * pass);
+    }
+    CHECK(f.db->get_config("retention_guard_last_pass", "") == "not-a-number");
+    CHECK(row_count(*f.db, "process_hourly") == 3); // nothing deleted meanwhile
 }
 
 TEST_CASE("Echo #2361: a failed persist of the clock reading is reported",

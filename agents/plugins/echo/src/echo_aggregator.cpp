@@ -664,7 +664,8 @@ void run_retention(EchoDatabase& db, int64_t now_epoch, RetentionGuardState& gua
     }
     // #3104: say so once per pass, whether or not any table has expired rows to
     // decline. The re-anchor below overwrites the bad reading, so the next pass
-    // counts nothing more unless the row is corrupted again.
+    // counts nothing more unless the row is corrupted again or that write fails
+    // (then the bad reading stays, and this repeats beside kClockStateFailureKey).
     if (prev_implausible) {
         spdlog::warn("Echo retention: the stored comparison point ({}) is not plausible (unparseable, "
                      "negative or ahead of this pass); re-anchoring it to the current reading",

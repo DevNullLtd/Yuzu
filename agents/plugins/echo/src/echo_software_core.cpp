@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <tuple>
 #include <utility>
 
 namespace yuzu::echo {
@@ -55,7 +56,13 @@ void dedup(std::vector<SoftwareInfo>& apps) {
     std::sort(apps.begin(), apps.end(), [](const SoftwareInfo& a, const SoftwareInfo& b) {
         if (a.name != b.name)
             return a.name < b.name;
-        return compare_versions(a.version, b.version) > 0; // descending → unique keeps the highest
+        if (int c = compare_versions(a.version, b.version); c != 0)
+            return c > 0; // descending → unique keeps the highest
+        // Versions that rank equal can still differ as strings ("1.0" and "1"), and the diff
+        // compares the string, so the tie is broken on the bytes of every field: the kept
+        // entry is a function of the set of entries, never of their order.
+        return std::tie(b.version, b.publisher, b.install_date) <
+               std::tie(a.version, a.publisher, a.install_date);
     });
     apps.erase(std::unique(apps.begin(), apps.end(),
                            [](const SoftwareInfo& a, const SoftwareInfo& b) {

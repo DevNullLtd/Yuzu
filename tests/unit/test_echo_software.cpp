@@ -16,6 +16,7 @@
 
 #include <algorithm>
 #include <array>
+#include <random>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -109,6 +110,12 @@ TEST_CASE("compare_versions: long numeric segments compare by value, not by inte
     CHECK(compare_versions(big, big) == 0);
     CHECK(compare_versions("007", "7") == 0);
     CHECK(compare_versions("1.007", "1.7.0") == 0);
+    // 2^64 + 1 and 2^64 wrap to 1 and 0 in a 64-bit accumulator, so a comparator
+    // that converts the segment calls these pairs equal. The checks above do not
+    // catch that: both of their operands wrap, and still land in the right order.
+    CHECK(compare_versions("18446744073709551617", "1") > 0);
+    CHECK(compare_versions("1", "18446744073709551617") < 0);
+    CHECK(compare_versions("18446744073709551616", "0") > 0);
 }
 
 TEST_CASE("dedup: the kept entry does not depend on input order", "[echo][software][version]") {
@@ -129,6 +136,69 @@ TEST_CASE("dedup: the kept entry does not depend on input order", "[echo][softwa
         triple.begin(), triple.end(),
         [](const SoftwareInfo& a, const SoftwareInfo& b) { return a.version < b.version; }));
     CHECK(orderings == 6);
+}
+
+// Versions that rank equal under compare_versions can still differ as strings,
+// and compute_software_events compares the string. Without a tie-break the kept
+// one followed the sort's layout, so the diff recorded an upgrade ("1.0" to "1")
+// that never happened.
+TEST_CASE("dedup: equal-ranking versions that differ as strings keep one fixed entry",
+          "[echo][software][version]") {
+    std::vector<std::string> versions = {"01", "1", "1-0", "1.0", "1.0.0"}; // byte-sorted
+    for (const auto& v : versions)
+        REQUIRE(compare_versions(v, "1") == 0);
+    int orderings = 0;
+    do {
+        std::vector<SoftwareInfo> apps;
+        for (const auto& v : versions)
+            apps.push_back(sw("App", v));
+        dedup(apps);
+        REQUIRE(apps.size() == 1);
+        CHECK(apps[0].version == "1.0.0"); // the greatest as bytes
+        ++orderings;
+    } while (std::next_permutation(versions.begin(), versions.end()));
+    CHECK(orderings == 120);
+}
+
+TEST_CASE("dedup: the kept entry is the same in any layout of a large list",
+          "[echo][software][version]") {
+    // std::sort is unstable, so one unrelated entry elsewhere in the list was
+    // enough to change which of the tied entries came first.
+    std::vector<SoftwareInfo> base;
+    for (int i = 0; i < 60; ++i)
+        base.push_back(sw("Other" + std::to_string(i), std::to_string(i)));
+    for (const char* v : {"1.0", "1", "01", "1-0", "1.0.0"})
+        base.push_back(sw("App", v));
+    // Same name and version: publisher, then install_date, settle it.
+    base.push_back(sw("Twin", "2.0"));
+    auto zeta = sw("Twin", "2.0");
+    zeta.publisher = "Zeta";
+    base.push_back(zeta);
+    zeta.install_date = "20270101";
+    base.push_back(zeta);
+
+    auto named = [](const std::vector<SoftwareInfo>& apps, std::string_view name) {
+        auto it = std::find_if(apps.begin(), apps.end(),
+                               [&](const SoftwareInfo& s) { return s.name == name; });
+        REQUIRE(it != apps.end());
+        return *it;
+    };
+    std::mt19937 rng(7482); // fixed seed: the property holds for every layout
+    std::vector<SoftwareInfo> previous;
+    for (int round = 0; round < 200; ++round) {
+        auto apps = base;
+        for (int k = 0; k < round % 7; ++k) // a different length changes the sort's layout
+            apps.push_back(sw("Extra" + std::to_string(k), "1"));
+        std::shuffle(apps.begin(), apps.end(), rng);
+        dedup(apps);
+        CHECK(named(apps, "App").version == "1.0.0");
+        CHECK(named(apps, "Twin").publisher == "Zeta");
+        CHECK(named(apps, "Twin").install_date == "20270101");
+        // The consequence: an unrelated install or removal never reads as an upgrade.
+        for (const auto& e : compute_software_events(previous, apps, 1000, 1))
+            CHECK((round == 0 || e.action != "upgraded"));
+        previous = std::move(apps);
+    }
 }
 
 TEST_CASE("dedup: distinct names are untouched and come back sorted by name",

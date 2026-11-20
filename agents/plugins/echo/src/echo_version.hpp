@@ -21,9 +21,14 @@ namespace yuzu::echo {
 // then bytes), never converted, so a 30-digit segment cannot overflow. Known
 // behaviour change: "1a" now ranks above "9".
 //
-// Mirrors the comparator in agents/plugins/vuln_scan/src/cve_rules.hpp; kept as
-// a self-contained agent-side copy rather than a shared dependency, the same
-// deliberate duplication documented in server/core/src/nvd_db.cpp.
+// Equal (0) does not mean identical: "1.0", "1", "01", "1-0" and "1.0.0" all
+// rank equal, so a caller that needs one deterministic survivor (dedup()) breaks
+// the tie itself.
+//
+// A self-contained agent-side comparator, not a shared dependency. It began as a
+// copy of the one in agents/plugins/vuln_scan/src/cve_rules.hpp and now
+// deliberately differs from it (the numeric-before-non-numeric segment order and
+// the no-conversion numeric compare above).
 inline int compare_versions(std::string_view a, std::string_view b) {
     auto next_segment = [](std::string_view& s) -> std::string_view {
         if (s.empty()) {
