@@ -16,11 +16,14 @@
  * Detection order (the old tool-binary order, now by DATABASE file):
  *   1. dpkg    <root>/var/lib/dpkg/status (+ status.d/): the text database. An absent
  *              status is "not dpkg". It is the answer only when at least one stanza is
- *              `installed` (the state both row mappers require); one with none (empty, or only
- *              config-files, half-installed and other non-installed states) falls through, so an
- *              rpm host that carries a stale dpkg tree is still read as rpm. A pending update
- *              journal (a digits-named file in var/lib/dpkg/updates) is dpkg_updates:locked, with
- *              no rows and no fall-through: see read_dpkg.
+ *              `installed` (what inv_record_from_dpkg requires, and the least app_record_from_dpkg
+ *              requires: it also wants flag ok and want install or deinstall, so a host whose
+ *              installed stanzas are all flagged reinstreq is dpkg with inventory rows and no list
+ *              row, as on the old path); one with none (empty, or only config-files, half-installed
+ *              and other non-installed states) falls through, so an rpm host that carries a stale
+ *              dpkg tree is still read as rpm. A pending update journal (a digits-named file in
+ *              var/lib/dpkg/updates) is dpkg_updates:locked, with no rows and no fall-through: see
+ *              read_dpkg.
  *   2. rpm     the first of usr/lib/sysimage/rpm, var/lib/rpm, usr/share/rpm that holds a database
  *              file (a symlinked candidate directory is never followed: on current Fedora, RHEL and
  *              SUSE /var/lib/rpm links to the sysimage copy, which is tried first), and in it the
@@ -418,6 +421,8 @@ dpkg_updates_failure(const std::string& root, const Limits& lim, PkgDbBudget& bu
     }
     // A pending update journal makes the status file alone an incomplete roster (see
     // dpkg_updates_failure): refuse, discarding what was parsed, exactly as the status.d failure does.
+    // Checked whether or not a status file or status.d exists: a journal record with no status beside
+    // it is a dpkg tree this reader cannot interpret, and a named refusal beats a guessed "not dpkg".
     if (auto journal = dpkg_updates_failure(root, lim, budget); !journal.empty()) {
         out.packages.clear();
         out.failure = std::move(journal);
@@ -567,6 +572,13 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
     return out;
 }
 
+/// The lock query rpm_transaction_refusal makes: the real fcntl(F_GETLK). A function pointer type so a
+/// test's own callable (a lambda with capture) overrides it through the template parameter.
+using LockQueryFn = int (*)(int, struct flock*);
+[[nodiscard]] inline int default_lock_query(int fd, struct flock* probe) noexcept {
+    return ::fcntl(fd, F_GETLK, probe);
+}
+
 /// Is another process inside an rpm transaction? Answers the cause that refuses the read, or
 /// nullopt when the database may be read. For the ndb and Berkeley DB files only: rpm rewrites them
 /// IN PLACE (ndb clears a slot and zeroes its blob, moving neighbours; Berkeley DB pages reach the
@@ -584,7 +596,20 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
 /// out of the database directory is not seen. The stamp stays as the second line of defence: with
 /// the lock free after the first stamp, a writer already running has finished and a later one moves
 /// the stamp.
-[[nodiscard]] inline std::optional<PkgDbCause> rpm_transaction_refusal(int dir_fd) {
+///
+/// The probe is a WRITE lock on purpose, so it also reports a SHARED holder. rpm 4.14's rpmlock.c only
+/// ever asks for a write lock on the file, but rpm 4.20's rpmts.c takes a read lock for a transaction
+/// begun without RPMTXN_WRITE (rpmtsVerifyDB, `rpmdb --verifydb`); other rpm files may do the same.
+/// No query (`rpm -qa`) begins a transaction, so what a read-lock holder costs is one degraded read
+/// while it runs (no rows, stored rows kept; the next read succeeds). A read-lock probe would be
+/// exact, but it changes the mechanism and its kernel semantics cannot be shown on every host; this
+/// is the conservative side. The probe type is pinned by test.
+///
+/// `lock_query` is fcntl(fd, F_GETLK, probe) and is overridable only for tests: no real filesystem
+/// can be made to refuse the query, and a failed query must read as `unreadable`, never as free.
+template <typename LockQuery = LockQueryFn>
+[[nodiscard]] inline std::optional<PkgDbCause>
+rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query) {
     const auto lock = yuzu::shared::open_file_no_follow_at(dir_fd, ".rpm.lock");
     if (!lock.opened()) {
         if (lock.error == yuzu::shared::ReadError::io && lock.err == ENOENT)
@@ -596,7 +621,7 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
     probe.l_whence = SEEK_SET;
     probe.l_start = 0;
     probe.l_len = 0; // the whole file
-    if (::fcntl(lock.file.fd(), F_GETLK, &probe) != 0)
+    if (lock_query(lock.file.fd(), &probe) != 0)
         return PkgDbCause::unreadable;
     if (probe.l_type != F_UNLCK)
         return PkgDbCause::locked;
@@ -727,9 +752,11 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         out.failure = std::move(dpkg.failure);
         return out;
     }
-    // dpkg is the answer only when a stanza is `installed`: the state inv_record_from_dpkg and
-    // app_record_from_dpkg both require. A status holding only config-files, half-installed and other
-    // non-installed states (a stale tree on an rpm host) would yield no row, so it falls through.
+    // dpkg is the answer only when a stanza is `installed`: what inv_record_from_dpkg requires, and the
+    // least app_record_from_dpkg requires (it also wants flag ok and want install or deinstall). A
+    // status holding only config-files, half-installed and other non-installed states (a stale tree on
+    // an rpm host) would yield no row, so it falls through. One whose installed stanzas all fail the
+    // list mapper's extra test is still dpkg: inventory rows, no list row, as on the old path.
     if (std::any_of(dpkg.packages.begin(), dpkg.packages.end(),
                     [](const DpkgPackage& p) { return p.status == "installed"; })) {
         out.ecosystem = HostPackages::Ecosystem::dpkg;

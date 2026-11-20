@@ -1121,14 +1121,14 @@ TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no r
             root.put(std::string{f.dir} + "/" + f.file, default_fixture_root() / f.capture / f.file);
         };
         const std::string lock_rel = std::string{f.dir} + "/.rpm.lock";
-        SECTION("no lock file: no transaction has run there, it reads") {
+        DYNAMIC_SECTION(f.source << ": no lock file: no transaction has run there, it reads") {
             Root root;
             scratch(root);
             const auto h = read_root(root);
             REQUIRE(h.failure.empty());
             CHECK(h.rpm.size() == f.packages);
         }
-        SECTION("a lock file nobody holds reads") {
+        DYNAMIC_SECTION(f.source << ": a lock file nobody holds reads") {
             Root root;
             scratch(root);
             root.put_text(lock_rel, "");
@@ -1136,7 +1136,7 @@ TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no r
             REQUIRE(h.failure.empty());
             CHECK(h.rpm.size() == f.packages);
         }
-        SECTION("a symlinked lock file is refused by name, never followed") {
+        DYNAMIC_SECTION(f.source << ": a symlinked lock file is refused by name, never followed") {
             Root root;
             scratch(root);
             root.put_text("elsewhere/lock", "");
@@ -1146,7 +1146,7 @@ TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no r
             CHECK(h.ecosystem == Eco::none);
             CHECK(h.rpm.empty());
         }
-        SECTION("a directory in place of the lock file is refused by name") {
+        DYNAMIC_SECTION(f.source << ": a directory in place of the lock file is refused by name") {
             Root root;
             scratch(root);
             fs::create_directories(root.at(lock_rel));
@@ -1155,7 +1155,7 @@ TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no r
             CHECK(h.rpm.empty());
         }
 #ifdef __linux__
-        SECTION("a write lock held on the lock file is locked with no rows; released, every row reads") {
+        DYNAMIC_SECTION(f.source << ": a held write lock is locked, no rows; released, all rows read") {
             // An open-file-description lock belongs to its descriptor, not the process, so the reader's
             // F_GETLK in this process sees it: no second process is needed. Linux only: F_OFD_SETLK.
             Root root;
@@ -1206,6 +1206,50 @@ TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no r
         CHECK(h.rpm.size() == 4);
     }
 #endif
+}
+
+TEST_CASE("pkgdb rpm lock: the lock query's own answer decides, and a failed query is never read as free",
+          "[installed_apps][pkgdb]") {
+    // The query is the injected boundary (fcntl F_GETLK in production): no real filesystem can be made
+    // to refuse it, and the held-lock mapping needs no second process on a host without OFD locks.
+    Root root;
+    root.put_text(".rpm.lock", "");
+    const auto dir = yuzu::shared::open_dir_no_follow(root.str());
+    REQUIRE(dir.opened());
+    using yuzu::shared::PkgDbCause;
+    SECTION("a query that fails is unreadable") {
+        const auto r = pkgdb::detail::rpm_transaction_refusal(dir.dir.fd(), [](int, struct flock*) {
+            errno = ENOLCK;
+            return -1;
+        });
+        REQUIRE(r.has_value());
+        CHECK(*r == PkgDbCause::unreadable);
+    }
+    SECTION("a query that reports a holder is locked") {
+        const auto r = pkgdb::detail::rpm_transaction_refusal(dir.dir.fd(), [](int, struct flock* probe) {
+            probe->l_type = F_WRLCK;
+            probe->l_pid = 1;
+            return 0;
+        });
+        REQUIRE(r.has_value());
+        CHECK(*r == PkgDbCause::locked);
+    }
+    SECTION("a query that reports no holder reads; the probe it was handed is a whole-file write lock") {
+        int calls = 0;
+        struct flock seen {};
+        const auto r = pkgdb::detail::rpm_transaction_refusal(dir.dir.fd(), [&](int, struct flock* probe) {
+            ++calls;
+            seen = *probe;
+            probe->l_type = F_UNLCK;
+            return 0;
+        });
+        CHECK_FALSE(r.has_value());
+        CHECK(calls == 1);
+        CHECK(seen.l_type == F_WRLCK);
+        CHECK(seen.l_whence == SEEK_SET);
+        CHECK(seen.l_start == 0);
+        CHECK(seen.l_len == 0);
+    }
 }
 
 namespace {
@@ -1281,6 +1325,18 @@ TEST_CASE("pkgdb dpkg update journal: a pending record is a refusal, never the p
         const auto h = read_root(root);
         CHECK(h.failure == "dpkg_updates:locked");
         CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("a record with no status file and no status.d is still locked, even beside an rpm database") {
+        // The journal is checked whether or not a dpkg database exists: a stale digit-named file on an
+        // rpm host is a refusal, not a guessed "not dpkg" that falls through to rpm.
+        Root root;
+        root.put_text("var/lib/dpkg/updates/0000", "");
+        root.put("usr/lib/sysimage/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_updates:locked");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.dpkg.empty());
         CHECK(h.rpm.empty());
     }
     SECTION("a status.d-only host is held to the same journal rule") {
@@ -1369,7 +1425,31 @@ TEST_CASE("pkgdb kept text: a small kept-text bound is byte_cap with no rows in 
         CHECK(h.failure == std::string{f.source} + ":byte_cap");
         CHECK(h.ecosystem == Eco::none);
         CHECK(h.rpm.empty());
-        CHECK(read_root(root).failure.empty()); // control: the default bound admits the same file
+
+        // The allowance is ONE total for the whole database file, not one per package. 20 bytes is
+        // passed by the first package alone, so it cannot tell the two apart; a bound that admits
+        // every package singly but not their sum can. The kept bytes are what rpm_package_from_header
+        // charges: the six strings it copies.
+        const auto full = read_root(root); // control: the default bound admits the same file
+        REQUIRE(full.failure.empty());
+        std::uint64_t sum = 0;
+        std::uint64_t largest = 0;
+        for (const auto& p : full.rpm) {
+            const std::uint64_t kept = p.name.size() + p.version.size() + p.release.size() +
+                                       p.arch.size() + p.vendor.size() + p.packager.size();
+            sum += kept;
+            largest = std::max(largest, kept);
+        }
+        REQUIRE(largest < sum); // no single package fills the bound, so a first-package overflow is out
+        lim.rpm_max_kept_bytes = sum - 1;
+        const auto one_short = read_root(root, lim);
+        CHECK(one_short.failure == std::string{f.source} + ":byte_cap");
+        CHECK(one_short.ecosystem == Eco::none);
+        CHECK(one_short.rpm.empty());
+        lim.rpm_max_kept_bytes = sum; // an exact fill is admitted
+        const auto exact = read_root(root, lim);
+        CHECK(exact.failure.empty());
+        CHECK(exact.rpm.size() == full.rpm.size());
     }
 }
 
