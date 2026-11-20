@@ -500,9 +500,8 @@ else the `PACKAGER` tag.
 > tokens, for either manager, on purpose. A five-token Homebrew row maps as before, with
 > empty `install_date` and `install_location`. Any other width is dropped under a
 > `supported` status, and a supported answer with fewer rows is an authoritative section,
-> so a stricter width would delete a device's stored rows whenever a plugin and an agent
-> core of different builds meet. That mix is unsupported; this adds no version-skew guard,
-> it keeps the width the adapter already accepted. An eleven-token `machine` row fills
+> so narrowing the accepted widths would delete a device's stored rows. Five is the width
+> the adapter already accepted, kept as it was. An eleven-token `machine` row fills
 > `install_date` (the install receipt's install time, formula rows only) and
 > `install_location` (the machine prefix, kept by the slot 13 allowlist), so a formula or
 > cask installed under both machine prefixes is two rows, one per `install_location`. A

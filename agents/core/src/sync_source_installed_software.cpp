@@ -343,12 +343,12 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
     // tap, installed_on_request and the owner have no column and are not mapped. A `user`-scope
     // row (or any scope other than `machine`) is seen and not mapped: a user's own prefix is
     // never machine software.
-    // Five or eleven tokens are accepted for either manager ON PURPOSE. A wrong-width row is
-    // dropped under a `supported` status, and a supported answer with fewer rows is an
-    // authoritative section, so a stricter width would delete the device's stored Homebrew rows
-    // whenever a plugin and an agent core of different builds meet (an unsupported mix, but one a
-    // partial deployment can produce). A five-token
-    // Homebrew row therefore maps as it always did, with empty install_date and install_location.
+    // Five or eleven tokens are accepted for either manager ON PURPOSE: five is the width this
+    // adapter has always accepted, kept as it was. A wrong-width row is dropped under a
+    // `supported` status, and a supported answer with fewer rows is an authoritative section,
+    // so narrowing the accepted widths would delete the device's stored Homebrew rows. A
+    // five-token Homebrew row maps as it always did, with empty install_date and
+    // install_location.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
