@@ -20,10 +20,11 @@
 /// serializes). It keeps the same honesty rules and adds its own: every device count is printed
 /// beside the reporting population it is read against (an application row and a cell row alike);
 /// a withheld, estimated or ambiguous figure reads in words and never as a number; the rate is
-/// printed per hour of use, exactly as the payload carries it, to about four significant digits so
-/// a small value never collapses to "<0.1"; and a refusal prints the chrome and the controls and
-/// nothing derived from a model. The Stability page gains only the View chips and, for a caller
-/// who may not read usage, one line of words; with `DexAppsUsageEntry::Hidden` it is unchanged.
+/// printed per hour of use, from the same figure the payload carries and rounded to about four
+/// significant digits so a small value never collapses to "<0.1"; and a refusal prints the chrome
+/// and the controls and nothing derived from a model. The Stability page gains only the View
+/// chips and, for a caller who may not read usage, one line of words; with
+/// `DexAppsUsageEntry::Hidden` it is unchanged.
 
 #include "dex_apps_ui.hpp"
 
@@ -736,8 +737,9 @@ std::string usage_captions(const DexAppsUsageControls& c, const DexAppsUsageMode
 
 // ── figures ──
 
-// The rate as the payload carries it: per hour of use, about four significant digits, so a small
-// value never collapses to "<0.1". Zero prints "0"; the caller handles a non-finite value.
+// The rate printed from the figure the payload carries: per hour of use, rounded to about four
+// significant digits, so a small value never collapses to "<0.1". Zero prints "0"; the caller
+// handles a non-finite value.
 std::string fmt_rate(double x) {
     if (!(x > 0.0))
         return "0";

@@ -125,11 +125,15 @@ disagree. It makes no HTTP call.
 The table has one row per application: the application name (it links to the
 existing per-application drill-down), **Devices that ran it**, **Run time, 30
 days** (process-hours), **Launches, 30 days**, and **Crashes and hangs per hour of
-use**. The rate is printed exactly as the REST route returns it, per hour of use,
-to about four significant digits, so a small value keeps its digits instead of
-reading as zero. Beside the estimate sit its interval, the counts and the hours it
-divides, a tag **estimated from 30-day usage** on every rate, and **under 20
-events** when the rate rests on fewer than 20 events.
+use**. The rate is printed from the same figure the REST route returns, per hour
+of use, rounded to about four significant digits, so a small value keeps its
+digits instead of reading as zero. Beside the estimate sit its interval, the
+counts and the hours it divides, a tag **estimated from 30-day usage** on every
+rate, and **under 20 events** when the rate rests on fewer than 20 events.
+
+The crashes and hangs shown beside a rate are those on devices that reported
+usage for the application, so they can be fewer than the Crashes and Hangs on the
+Stability view for the same application, window and platform.
 
 Controls, each a request to the same fragment:
 
@@ -202,10 +206,14 @@ Every state reads in words and never as a number:
 
 An operator without `Forensics:Read` still sees the **Usage** chip. Choosing it
 shows the Stability page as it is, with one line: "Usage is not shown: it needs the
-Forensics read permission, which this account does not hold". The permission gate
-records the refusal, as it does for the REST route. If the permission check itself
-fails, the same page shows "the permission check could not be completed". The view
-checks `GuaranteedState:Read` and then `Forensics:Read`, in the REST route's order.
+Forensics read permission, which this account does not hold". The fleet-read
+permission gate records the refusal as an `auth.fleet_read_required` audit row, as
+it does for the REST route. An administrator grants the permission by assigning a
+role that holds `Forensics:Read` (see [Role-Based Access Control](../user-manual/rbac.md)).
+If the permission check itself fails, the same page shows "the permission check
+could not be completed". The view checks `GuaranteedState:Read` first, whose
+refusal leaves `auth.permission_required`, and then `Forensics:Read`, in the REST
+route's order.
 
 Each Usage view that passes its parameter checks writes one `dex.apps.usage.view`
 audit row (the verb REST writes, target type `Forensics`, empty target, detail
@@ -353,7 +361,8 @@ Read the health row of `summary` before treating a result as complete.
 
 A service-scoped token is refused on the REST route and the MCP tool, and the
 dashboard panel shows a permission note instead of data, because the service
-owner role does not hold `Forensics:Read`.
+owner role does not hold `Forensics:Read`. The Apps tab Usage view likewise shows
+no usage figures to a service-scoped token.
 
 ## Limits and privacy
 

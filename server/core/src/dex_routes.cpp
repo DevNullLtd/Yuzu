@@ -2570,15 +2570,18 @@ void DexRoutes::register_routes(HttpRouteSink& sink, AuthFn auth_fn, PermFn perm
     //     caller (403) gets the Stability page plus one line of words, any other failure or an
     //     unwired gate the same page plus "the permission check could not be completed". The gate
     //     still writes its own denial row, as it does for REST. gate.scope is the caller's visible
-    //     devices and is passed to apps_usage, which reads only those.
+    //     devices and is passed to apps_usage, which reads only those for the usage figures; the
+    //     application list (the Apps row set) is built from the unfiltered fleet snapshot, as
+    //     docs/dex/app-usage.md states.
     //
     // Audit: one dex.apps.usage.view row (the verb REST writes; target type Forensics, detail
     // starting "dashboard") per view that passes its parameter checks, written BEFORE the read and
     // FAIL CLOSED: when the row is known not to have persisted nothing is read and a words panel is
-    // drawn, still at status 200 so htmx swaps it (an HTML fragment otherwise proceeds on an audit
-    // failure; this one is Forensics-tier data, as the device-data routes treat theirs). The row
-    // records the admitted request, not the outcome: a refusal by the API still leaves it, as for
-    // REST. A bad parameter writes no row and reads nothing.
+    // drawn, still at status 200 so htmx swaps it. This is stricter than the other DEX fragments in
+    // this file, which set the audit and proceed on a failure ((void) emit_behavioral_audit); the
+    // fail-closed precedents are device_data_routes.cpp and app_usage_routes.cpp, because this one
+    // serves Forensics-tier data. The row records the admitted request, not the outcome: a refusal
+    // by the API still leaves it, as for REST. A bad parameter writes no row and reads nothing.
     //
     // Parameters follow REST (rest_api_v1.cpp, /api/v1/dex/apps/usage): platform, slice, group and
     // tag_key are checked as REST checks them, including that `group` is refused outside slice=group
