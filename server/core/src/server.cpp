@@ -6388,6 +6388,22 @@ public:
             }
         }
 
+        // SAM-22: component_inventory's `native` action ships switched off — an operator must
+        // enable it explicitly via PUT /api/v1/plugin-config/component_inventory/kill-switch with
+        // action=native. An ACTION-level seed: `scan` stays on. ON CONFLICT DO NOTHING, so an
+        // operator's own row is never overwritten on a restart.
+        if (plugin_config_store_ && !startup_failed_) {
+            if (!plugin_config_store_->seed_action_kill_switch_default_off(
+                    "component_inventory", "native",
+                    "default-off: reads every shared library under the application roots; enable per "
+                    "PUT /api/v1/plugin-config/component_inventory/kill-switch with action=native")) {
+                spdlog::error(
+                    "[PG] Refusing to start: component_inventory.native default-off kill-switch "
+                    "seed failed");
+                startup_failed_ = true;
+            }
+        }
+
         // process_introspect ships default-off (Forensics class, like remote_access_audit);
         // enable via PUT /api/v1/plugin-config/process_introspect/kill-switch.
         if (plugin_config_store_ && !startup_failed_) {

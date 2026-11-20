@@ -14,7 +14,8 @@
 // (previously inline istringstream loops in installed_apps_plugin.cpp), the
 // macOS `system_profiler SPApplicationsDataType -detailLevel mini` text
 // parse (previously piped through `| grep` before reaching C++), the macOS
-// `brew list --versions` line parse, and adds the #2273 macOS enrichment
+// (the `brew list --versions` parse was removed in WP13/F19: the root agent no longer
+// runs brew), and adds the #2273 macOS enrichment
 // acquisition's own pure parsers (`pkgutil --pkgs` id list, `pkgutil
 // --pkg-info <id>` version/install-time extraction).
 
@@ -284,35 +285,6 @@ inline void strip_trailing_cr(std::string& line) {
         }
     }
     flush();
-    return apps;
-}
-
-// ── macOS: brew list --versions ─────────────────────────────────────────
-
-// One line of `brew list --versions`: "name version[ version...]". Only the
-// first version token is kept (matches the legacy shell-out's own
-// `line.substr(sp + 1)`, which keeps everything after the first space --
-// a multi-version brew formula line's later tokens ride along as part of
-// `version`, unchanged from the prior behaviour).
-[[nodiscard]] inline std::vector<AppRecord> parse_brew_list(std::string_view output) {
-    std::vector<AppRecord> apps;
-    std::string buf(output);
-    std::istringstream ss(buf);
-    std::string line;
-    while (std::getline(ss, line)) {
-        detail::strip_trailing_cr(line);
-        if (line.empty())
-            continue;
-        const auto sp = line.find(' ');
-        AppRecord r;
-        if (sp != std::string::npos) {
-            r.name = line.substr(0, sp);
-            r.version = line.substr(sp + 1);
-        } else {
-            r.name = line;
-        }
-        apps.push_back(std::move(r));
-    }
     return apps;
 }
 

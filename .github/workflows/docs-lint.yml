@@ -126,6 +126,18 @@ jobs:
       - name: Execution owner key tripwire (#5557)
         run: python3 -I tests/test_execution_owner_key_tripwire.py
 
+      # WP13 (agent privilege and trust): installer file capabilities (none set, any found are
+      # stripped, --check status), plugin-allowlist refusal wiring, no brew as root, /proc refusal status.
+      - name: WP13 agent privilege lint
+        run: |
+          python3 -I tests/test_plugin_allowlist_wiring_lexical.py
+          python3 -I tests/test_installed_apps_no_brew_lexical.py
+          python3 -I tests/test_agent_installer_no_file_caps.py
+          python3 -I tests/test_proc_access_status_lexical.py
+          python3 -I tests/cpp_lex_helper.py
+          python3 -I tests/test_echo_module_signing_wiring_lexical.py
+          python3 -I tests/test_services_readback_wiring_lexical.py
+
       # The one set_known_plugins(...) line in server.cpp bounds the yuzu_fleet_plugin_init_failed
       # label; no unit test builds ServerImpl, so dropping it leaves every test green.
       - name: Plugin init failed wiring gate
@@ -133,6 +145,13 @@ jobs:
 
       - name: Plugin init failed wiring gate self-test
         run: python3 -I tests/test_plugin_init_failed_wiring_lexical_selftest.py
+
+      # WP13c/C-2: the root macOS agent must never exec a user-owned Homebrew `brew`.
+      - name: vuln_scan no-brew gate (WP13c)
+        run: python3 -I tests/test_vuln_scan_no_brew_lexical.py
+
+      - name: vuln_scan no-brew gate self-test (WP13c)
+        run: python3 -I tests/test_vuln_scan_no_brew_lexical_selftest.py
 
       # #2146: the workflow-execute zero-reach status list is named in the REST and MCP manuals, and
       # no source or manual claims an absent command_id proves a step was never sent.

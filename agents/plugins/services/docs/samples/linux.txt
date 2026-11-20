@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 69a0749ab7aa
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash pending
 == action=list
 [result_status] UNAVAILABLE / PARTIAL / subprocess_runner:spawn_error
 [rc] 1
