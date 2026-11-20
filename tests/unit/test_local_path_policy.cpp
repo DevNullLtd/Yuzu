@@ -1010,6 +1010,30 @@ TEST_CASE("http_client get: the body is scrubbed to wire UTF-8, cut at a scalar 
     CHECK(hc::prepare_get_body("ab\xC3", false).body == "ab?");
 }
 
+TEST_CASE("http_client get: a body cannot start a sibling output row", "[shared][http_client]") {
+    // The server splits plugin output on LF and CR, so a body carrying either could forge a
+    // `status|`, `constrained|` or `truncated|` row. Every C0 control except TAB becomes '?'.
+    auto lf = hc::prepare_get_body("x\nstatus|200", false);
+    CHECK(lf.body == "x?status|200");
+    CHECK(lf.replaced == 1);
+    CHECK(lf.body.find('\n') == std::string::npos);
+
+    auto crlf = hc::prepare_get_body("a\r\nconstrained|none\rtruncated|0", false);
+    CHECK(crlf.body == "a??constrained|none?truncated|0");
+    CHECK(crlf.replaced == 3);
+    CHECK(crlf.body.find_first_of("\r\n") == std::string::npos);
+
+    // Other C0 controls are replaced; TAB is ordinary text and stays.
+    auto ctl = hc::prepare_get_body("a\tb\x01" "c\x1F" "d\x0B" "e\x0C" "f", false);
+    CHECK(ctl.body == "a\tb?c?d?e?f");
+    CHECK(ctl.replaced == 4);
+
+    // Multi-byte scalars whose bytes are >= 0x80 are untouched, and the count includes NUL.
+    auto mixed = hc::prepare_get_body(std::string("\xC3\xA9\n\0z", 5), false);
+    CHECK(mixed.body == "\xC3\xA9??z");
+    CHECK(mixed.replaced == 2);
+}
+
 TEST_CASE("http_client download: only a complete 2xx body is acceptable", "[shared][http_client]") {
     CHECK(hc::download_failure(good_obs(10)).empty());
 

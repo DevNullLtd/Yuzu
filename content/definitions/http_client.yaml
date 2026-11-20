@@ -100,12 +100,12 @@ spec:
         platforms: [windows, linux, darwin]
       - name: body
         type: string
-        description: 'Response body text, at most the first 1 MiB (a longer body is cut at a character boundary and a truncated row follows); NUL and invalid UTF-8 bytes are replaced with ? and a constrained row reports how many. Values: free text, or an error string on failure.'
+        description: 'Response body text, at most the first 1 MiB (a longer body is cut at a character boundary and a truncated row follows); NUL, LF, CR, any other control byte below 0x20 except TAB, and invalid UTF-8 bytes are replaced with ? and a constrained row reports how many. Values: free text, or an error string on failure.'
         example: '<!doctype html><html lang="en"><head><title>Example Domain</title>...'
         platforms: [windows, linux, darwin]
       - name: constrained
         type: string
-        description: 'Present only when body bytes were replaced: body_bytes_replaced:<count> of NUL or invalid UTF-8 bytes. Values: body_bytes_replaced:<count>.'
+        description: 'Present only when body bytes were replaced: body_bytes_replaced:<count> of NUL, LF, CR, other control bytes below 0x20 except TAB, or invalid UTF-8 bytes. Values: body_bytes_replaced:<count>.'
         example: 'body_bytes_replaced:3'
         platforms: [windows, linux, darwin]
       - name: truncated

@@ -49,8 +49,9 @@ inline constexpr std::size_t kMaxGetBodyBytes = 1024 * 1024;
 }
 
 /// What `get` puts on the wire for one body: cut back to a scalar boundary when the transfer was
-/// truncated at the cap, then every byte that may not reach the wire (NUL, anything outside
-/// well-formed UTF-8) replaced with '?' through the shared `yuzu::shared::scrub_wire_bytes`.
+/// truncated at the cap, then every byte that may not reach the wire replaced with '?': NUL and
+/// anything outside well-formed UTF-8 (through the shared `yuzu::shared::scrub_wire_bytes`), and
+/// every other C0 control except TAB (LF and CR would start a sibling output row).
 /// `replaced` is how many bytes were replaced; non-zero means the row is reported constrained.
 struct GetBodyRow {
     std::string body;
@@ -74,6 +75,15 @@ struct GetBodyRow {
     }
     GetBodyRow row;
     row.replaced = yuzu::shared::scrub_wire_bytes(body);
+    // The server splits plugin output on LF and CR, so a body that carries either could start a
+    // sibling row (`status|`, `constrained|`, `truncated|`). Replace every C0 control except TAB.
+    for (char& c : body) {
+        const auto b = static_cast<unsigned char>(c);
+        if (b < 0x20 && b != '\t') {
+            c = '?';
+            ++row.replaced;
+        }
+    }
     row.body = std::move(body);
     return row;
 }

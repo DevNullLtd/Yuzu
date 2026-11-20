@@ -630,7 +630,8 @@ private:
         auto body = http_get(url, status, truncated);
         ctx.write_output(std::format("status|{}", status));
         // A body is peer data: cut at a scalar boundary when truncated and scrubbed to well-formed
-        // UTF-8 without NUL before it is one wire row (a NUL would silently cut the row at the ABI).
+        // UTF-8 without NUL, LF, CR or any other C0 control but TAB before it is one wire row (a NUL
+        // would silently cut the row at the ABI; LF or CR would let the body start a sibling row).
         auto row = yuzu::http_client::prepare_get_body(std::move(body), truncated);
         row.body.insert(0, "body|"); // one buffer: no second copy of a body up to 1 MiB
         ctx.write_output(row.body);
