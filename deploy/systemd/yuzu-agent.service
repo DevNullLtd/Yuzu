@@ -65,7 +65,8 @@ RestartSec=10
 # `systemctl stop` that completes is not restarted). The wait also covers a protective
 # action (a firewall containment) that runs while the command pool closes: its drain is
 # unbounded and inside this budget, so a long drain ends in SIGKILL too, and a command killed
-# mid-execution leaves an in-flight dedup row that answers RUNNING for its command id.
+# mid-execution leaves an in-flight dedup row that answers RUNNING for its command id; to clear
+# it, stop the agent, remove /var/lib/yuzu-agent/command_dedup.db, start it (docs/command-dedup.md).
 # The server unit uses 210 s and
 # the gateway unit 40 s.
 TimeoutStopSec=60

@@ -146,8 +146,8 @@ std::vector<ProcessInfo> enumerate_processes() {
 
         ProcessInfo pi;
         pi.pid = std::stoul(entry->d_name);
-        // The start time is read BEFORE the status file is opened and AFTER the name read: a pid
-        // recycled in between would otherwise pair one process's name with another's start time.
+        // The start time is read BEFORE the status file (the name) is read and once more AFTER it:
+        // a pid recycled in between would otherwise pair one process's name with another's start time.
         const auto ticks_before = read_start_ticks(pi.pid);
         std::string status_path = std::string("/proc/") + entry->d_name + "/status";
         std::ifstream ifs(status_path);

@@ -4556,7 +4556,8 @@ private:
             // Check expiration after the delay — skip stale commands. A protective action is never
             // rejected as expired (command_may_expire): the stored-state reconciler stays the
             // authority, so a late containment is applied rather than dropped.
-            if (command_may_expire(cmd.plugin(), cmd.action()) && cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+            if (command_may_expire(cmd.plugin(), cmd.action()) && cmd.has_expires_at() &&
+                cmd.expires_at().millis_epoch() > 0) {
                 auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();

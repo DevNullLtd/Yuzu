@@ -6827,12 +6827,11 @@ dispatcher returns; the log-teardown grace (2s) then runs separately, in
 to that 20s rather than being covered by it. `deploy/systemd/yuzu-agent.service` sets `TimeoutStopSec=60`: a stop still
 waiting at 60 s (a command blocked in the kernel holds the pool join, which the
 20-second watchdog above does not cover) ends in SIGKILL (`status=9/KILL`) and
-`Restart=always` restarts the agent. A protective action (the `firewall` containment set) that runs while the pool closes is part of that wait: its drain is unbounded and runs inside the same 60 s budget, so a long drain also ends in `status=9/KILL`; `yuzu_agent_protective_commands_run_closing_total` (agent process only) and a WARN in the agent log count it. A command killed in the middle of execution, including by that 60 s timeout, leaves an in-flight dedup row that answers `RUNNING` for that command id until the agent's dedup database is removed (nothing evicts or sweeps an in-flight row; tracked as a follow-up issue, #3664); containment is re-dispatched under a fresh command id, and any other command is re-issued under a new id. `deploy/packaging/macos/com.yuzu.agent.plist`
+`Restart=always` restarts the agent. A protective action (the `firewall` containment set) that runs while the pool closes is part of that wait: its drain is unbounded and runs inside the same 60 s budget, so a long drain also ends in `status=9/KILL`; `yuzu_agent_protective_commands_run_closing_total` (agent process only) and a WARN in the agent log count it. A command killed in the middle of execution, including by that 60 s timeout, leaves an in-flight dedup row that answers `RUNNING` for that command id until the agent's dedup database is removed (nothing evicts or sweeps an in-flight row; tracked as a follow-up issue, #3664). To clear it, stop the agent, remove `<data-dir>/command_dedup.db` (`/var/lib/yuzu-agent/command_dedup.db` under the packaged unit), then start it; this forfeits replay protection for commands issued before the removal; containment is re-dispatched under a fresh command id, and any other command is re-issued under a new id. `deploy/packaging/macos/com.yuzu.agent.plist`
 does not set `ExitTimeOut`, so launchd's own default applies there; check
 `launchd.plist(5)` on your own host for the exact figure. On Windows a stop that
 does not complete is ended by finding the process id with `sc.exe queryex YuzuAgent`
-and terminating it with `taskkill /F /PID <pid>`; the service then stays stopped
-until `sc.exe start YuzuAgent` is run.
+and terminating it with `taskkill /F /PID <pid>`. `--install-service` configures three restart recovery actions (60 s apart, failure count reset after 24 h); once those are used up the service does not restart itself and stays stopped until `sc.exe start YuzuAgent` is run.
 
 **Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
 agent above, applied to the server. If a stop appears to hang: **send the

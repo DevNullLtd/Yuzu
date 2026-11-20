@@ -7,6 +7,7 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <chrono>
 #include <string>
 #include <condition_variable>
 #include <mutex>
@@ -63,8 +64,18 @@ TEST_CASE("a protective task queued behind a blocker still runs at teardown; an 
                 cv.wait(lk, [&] { return release; });
             }));
         }
-        while (blockers_started.load() < kBlockers)
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (blockers_started.load() < kBlockers) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                {
+                    std::lock_guard lk(m);
+                    release = true;
+                }
+                cv.notify_all();
+                FAIL("the blocker tasks did not all start within 30 s");
+            }
             std::this_thread::yield();
+        }
         auto task = [&](const char* plugin, const char* action, std::atomic<int>& ran,
                         std::atomic<int>* rejected) {
             return [&, plugin, action, rejected] {

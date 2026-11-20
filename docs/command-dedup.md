@@ -117,8 +117,9 @@ claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
 A command killed in the middle of its plugin call (SIGKILL, including the 60 s `TimeoutStopSec` of the
 packaged unit) leaves its in-flight row in `command_outcomes`. The ring (`prune_locked`) evicts
 TERMINAL rows only, nothing sweeps an in-flight row at boot, and `release` runs only from a live
-process, so the row answers `RUNNING` for that command id until the agent's dedup database is removed
-(a reinstall); it is never evicted. The quarantine reconciler re-dispatches containment under a fresh
+process, so the row answers `RUNNING` for that command id until the agent's dedup database is removed; it is never evicted. To clear it, stop the agent, remove
+`<data-dir>/command_dedup.db` (`/var/lib/yuzu-agent/command_dedup.db` under the packaged unit), then start it;
+this forfeits replay protection for commands issued before the removal. The quarantine reconciler re-dispatches containment under a fresh
 command id, and an operator re-issues any other command under a new id. A boot sweep is not part of
 this build and is tracked as a follow-up issue (#3664).
 
