@@ -9,7 +9,7 @@
 # We satisfy that with a single static busybox exposing its full applet set.
 #
 # Two deviations from the alpine production image:
-#   1. Builder is glibc Erlang (erlang:28, debian-based), NOT erlang:28-alpine.
+#   1. Builder is glibc Erlang (erlang:28, debian-based), NOT the Alpine hexpm/erlang.
 #      The bundled ERTS + crypto NIF must link the SAME libc family as the
 #      chiselled Ubuntu (glibc) runtime — a musl ERTS cannot run here.
 #   2. Runtime is chiselled Ubuntu 26.04 instead of alpine:3.23.
@@ -22,7 +22,7 @@
 # image's ERTS and OTP libraries into the shipped release, so this digest decides
 # the OTP the chisel gateway runs. It is held in an ARG default, which Dependabot
 # does not see: refresh it by hand (last: 2026-11-17). It is a separate pin from
-# Dockerfile.gateway's erlang:28-alpine, which #6711/#6740 hold on 28.5.0.2.
+# Dockerfile.gateway's hexpm/erlang:28.5.0.8-alpine-3.23.8 builder (WP15).
 ARG ERLANG_IMAGE=erlang:28@sha256:fe3425a5d92e03aa3696b951b128f6c55c6f76d4ddf341c8e511ae9c515ac8d2
 FROM ${ERLANG_IMAGE} AS deps
 
