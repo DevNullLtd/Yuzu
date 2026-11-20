@@ -51,6 +51,18 @@ struct Targets {
 /// /usr/local, /opt/homebrew, /Applications.
 [[nodiscard]] std::vector<std::string> candidate_roots();
 
+/// The machine roots the `native` action walks, in walk order. Linux: /opt, /usr/local/lib (never
+/// /usr/lib and the other trees the package manager owns: those are not roots at all). macOS:
+/// /Applications, /usr/local, /opt/homebrew.
+[[nodiscard]] std::vector<std::string> native_candidate_roots();
+
+/// Directories the `native` walk must not list, by exact path: the macOS Homebrew package trees
+/// (/usr/local/Cellar, /opt/homebrew/Cellar), which held most of a measured host's native libraries
+/// and are the package manager's, not an application's. Empty on Linux, where the package-owned trees
+/// are excluded by not being roots. Each one the walk meets is counted (WalkStats::dirs_excluded) and
+/// reported, never skipped silently.
+[[nodiscard]] std::vector<std::string> native_excluded_dirs();
+
 /// Pure. Keeps the `candidates` that are not on or under one of `network_mount_points` (a segment
 /// match: /opt/java2 is not under /opt/java), counting the rest; every mount strictly below a kept
 /// root goes into network_mounts. `table_ok` false: no roots, mount_table_unreadable set.
@@ -95,6 +107,10 @@ using MountTableReader = std::function<std::optional<std::vector<std::string>>()
 /// macOS yuzu::shared::read_macos_network_mounts), plans candidate_roots() against it and drops the
 /// unreachable ones.
 [[nodiscard]] Targets scan_targets();
+
+/// scan_targets for the `native` action: native_candidate_roots() against the same live mount table,
+/// with the same mount-table guard, link refusal and network-mount skip.
+[[nodiscard]] Targets scan_native_targets();
 
 /// Types one entry of the directory `dir` (open as `dir_fd`). A path in `network_mounts` is
 /// network_mount decided from the path alone, whatever d_type says: it is never passed to stat. DT_UNKNOWN
