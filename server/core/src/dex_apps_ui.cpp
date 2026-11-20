@@ -686,15 +686,6 @@ std::string usage_head(const DexAppsUsageControls& c, const std::string& window,
 
 constexpr std::int64_t kUsageFreshHours = kDexUsageFreshSecs / 3600;
 
-// "date" and "time" in separate no-wrap spans, split at the 'T' of the ISO instant.
-std::string instant_text(const std::string& iso) {
-    const auto t = iso.find('T');
-    if (t == std::string::npos)
-        return "<span class=\"nw\">" + esc(iso) + "</span>";
-    return "<span class=\"nw\">" + esc(iso.substr(0, t)) + "</span> <span class=\"nw\">" +
-           esc(iso.substr(t + 1)) + "</span>";
-}
-
 std::string usage_captions(const DexAppsUsageControls& c, const DexAppsUsageModel& m,
                            const std::string& window) {
     const std::string basis = scope_label(m.platform_scope);
@@ -720,7 +711,7 @@ std::string usage_captions(const DexAppsUsageControls& c, const DexAppsUsageMode
         h += ". The All window has no length, so no rate is calculated; choose 24h, 7d or 30d for a rate";
     else
         h += ", and the rate scales run time to the " + window + " window";
-    h += ". Read at " + instant_text(dex_iso_at(m.as_of_epoch)) +
+    h += ". Read at " + last_seen_text(dex_iso_at(m.as_of_epoch)) +
          "; an answer is reused for up to 30 seconds.</div>";
 
     h += "<div class=\"gp-sub dx-cl\"><b>Reporting floor</b> " + plural_count(m.floor, "device", "devices") +
