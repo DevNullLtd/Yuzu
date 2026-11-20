@@ -1034,6 +1034,39 @@ TEST_CASE("http_client get: a body cannot start a sibling output row", "[shared]
     CHECK(mixed.replaced == 2);
 }
 
+TEST_CASE("http_client head: a peer header cannot start a sibling output row", "[shared][http_client]") {
+    std::string out;
+    std::size_t replaced = 0;
+
+    // Clean headers pass through untouched, one line each.
+    hc::append_header_line(out, "Content-Type", "text/html; charset=utf-8", replaced);
+    hc::append_header_line(out, "X-Tab", "a\tb", replaced);
+    CHECK(out == "Content-Type: text/html; charset=utf-8\nX-Tab: a\tb\n");
+    CHECK(replaced == 0);
+
+    // A '|' in a header name would let the line read as `status|200`.
+    out.clear();
+    hc::append_header_line(out, "status|200", "x", replaced);
+    CHECK(out == "status?200: x\n");
+    CHECK(replaced == 1);
+
+    // Control bytes in a name (TAB included) and in a value (TAB excepted) are replaced, and a
+    // line break can never be smuggled into either.
+    out.clear();
+    replaced = 0;
+    hc::append_header_line(out, "a\nb\tc", "v\r\nstatus|200\x01", replaced);
+    CHECK(out == "a?b?c: v??status|200?\n");
+    CHECK(replaced == 5);
+    CHECK(std::count(out.begin(), out.end(), '\n') == 1);
+
+    // Invalid UTF-8 is replaced in both; a valid scalar survives.
+    out.clear();
+    replaced = 0;
+    hc::append_header_line(out, "N\xFF", "\xC3\xA9\xC3", replaced);
+    CHECK(out == "N?: \xC3\xA9?\n");
+    CHECK(replaced == 2);
+}
+
 TEST_CASE("http_client download: only a complete 2xx body is acceptable", "[shared][http_client]") {
     CHECK(hc::download_failure(good_obs(10)).empty());
 

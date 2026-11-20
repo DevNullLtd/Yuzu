@@ -425,7 +425,7 @@ std::string http_get(std::string_view url, int& status_code, bool& truncated) {
 }
 
 // HTTP HEAD via httplib (no shell, no command injection)
-std::string http_head(std::string_view url, int& status_code) {
+std::string http_head(std::string_view url, int& status_code, std::size_t& replaced) {
     ParsedUrl parsed;
     if (!parse_url(url, parsed)) {
         status_code = 0;
@@ -457,7 +457,7 @@ std::string http_head(std::string_view url, int& status_code) {
     // by platform).
     std::string headers_str;
     for (const auto& [k, v] : res->headers) {
-        headers_str += k + ": " + v + "\n";
+        yuzu::http_client::append_header_line(headers_str, k, v, replaced);
     }
     return headers_str;
 }
@@ -648,9 +648,12 @@ private:
         if (!is_valid_url(url)) { ctx.write_output("error|only http:// and https:// URLs allowed"); return 1; }
 
         int status = 0;
-        auto headers = http_head(url, status);
+        std::size_t replaced = 0;
+        auto headers = http_head(url, status, replaced);
         ctx.write_output(std::format("status|{}", status));
         ctx.write_output(std::format("headers|{}", headers));
+        if (replaced != 0)
+            ctx.write_output(std::format("constrained|headers_bytes_replaced:{}", replaced));
         return status >= 200 && status < 400 ? 0 : 1;
     }
 };

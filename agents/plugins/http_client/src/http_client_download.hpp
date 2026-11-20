@@ -88,6 +88,35 @@ struct GetBodyRow {
     return row;
 }
 
+/// One peer response header as a `head` output line. The server splits plugin output on newlines
+/// and reads `<key>|<value>` from each line, so a peer-chosen header name carrying '|' (or any
+/// control byte) could forge a sibling row such as `status|200`. In the name, '|' and every C0
+/// control byte (TAB included) become '?'; in the value, every C0 control byte except TAB does;
+/// bytes outside well-formed UTF-8 become '?' in both. `replaced` counts every byte replaced.
+inline void append_header_line(std::string& out, std::string name, std::string value,
+                               std::size_t& replaced) {
+    replaced += yuzu::shared::scrub_wire_bytes(name);
+    replaced += yuzu::shared::scrub_wire_bytes(value);
+    for (char& c : name) {
+        const auto b = static_cast<unsigned char>(c);
+        if (b < 0x20 || c == '|') {
+            c = '?';
+            ++replaced;
+        }
+    }
+    for (char& c : value) {
+        const auto b = static_cast<unsigned char>(c);
+        if (b < 0x20 && b != '\t') {
+            c = '?';
+            ++replaced;
+        }
+    }
+    out += name;
+    out += ": ";
+    out += value;
+    out += '\n';
+}
+
 struct DownloadObservation {
     bool https_unsupported{false}; ///< https URL on a build without OpenSSL
     bool out_of_memory{false};     ///< the body buffer could not be allocated
