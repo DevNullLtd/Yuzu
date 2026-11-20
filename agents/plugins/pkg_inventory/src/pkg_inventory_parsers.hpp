@@ -373,18 +373,17 @@ namespace detail {
     return std::nullopt;
 }
 
-[[nodiscard]] inline bool receipt_ident(char c) noexcept {
-    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+/// ASCII `[0-9A-Za-z]`. Not std::isalnum (locale-dependent, undefined on a negative char).
+[[nodiscard]] inline bool ascii_alnum(char c) noexcept {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
 }
 
+[[nodiscard]] inline bool receipt_ident(char c) noexcept { return ascii_alnum(c) || c == '_'; }
+
 [[nodiscard]] inline bool tap_segment_ok(std::string_view seg) noexcept {
-    if (seg.empty()) return false;
-    const auto alnum = [](char c) {
-        return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z');
-    };
-    if (!alnum(seg.front())) return false;
+    if (seg.empty() || !ascii_alnum(seg.front())) return false;
     return std::all_of(seg.begin(), seg.end(),
-                       [&](char c) { return alnum(c) || c == '.' || c == '_' || c == '-'; });
+                       [](char c) { return ascii_alnum(c) || c == '.' || c == '_' || c == '-'; });
 }
 
 } // namespace detail
@@ -392,44 +391,40 @@ namespace detail {
 /// Extracts and validates `time`, `source.tap` (the first `"tap"` key) and
 /// `installed_on_request` from INSTALL_RECEIPT.json text. Each claim is the FIRST hit of its
 /// key; a value of any other shape (or no hit) leaves that member empty -- never a failed row,
-/// never a token. Never throws.
-[[nodiscard]] inline BrewReceipt parse_brew_receipt(std::string_view text) noexcept {
+/// never a token. No receipt content makes it throw (every index is bounds-checked); an
+/// allocation failure in the three output strings is contained by the plugin's run_guarded seam.
+[[nodiscard]] inline BrewReceipt parse_brew_receipt(std::string_view text) {
     BrewReceipt r;
-    try {
-        if (const auto v = detail::receipt_value_after(text, "time")) {
-            std::size_t n = 0;
-            while (n < v->size() && (*v)[n] >= '0' && (*v)[n] <= '9') ++n;
-            const bool end_ok =
-                n < v->size() && ((*v)[n] == ',' || (*v)[n] == '}' || detail::receipt_ws((*v)[n]));
-            long long t = 0;
-            if (n == 10 && end_ok &&
-                std::from_chars(v->data(), v->data() + n, t).ec == std::errc{} &&
-                t >= kMinBrewInstallTime && t < kMaxBrewInstallTime)
-                r.install_time = std::to_string(t);
-        }
-        if (const auto v = detail::receipt_value_after(text, "tap")) {
-            if (!v->empty() && v->front() == '"') {
-                const auto close = v->find('"', 1);
-                if (close != std::string_view::npos) {
-                    const auto tap = v->substr(1, close - 1);
-                    const auto slash = tap.find('/');
-                    if (tap.size() <= kMaxBrewTapLen && slash != std::string_view::npos &&
-                        tap.find('/', slash + 1) == std::string_view::npos &&
-                        detail::tap_segment_ok(tap.substr(0, slash)) &&
-                        detail::tap_segment_ok(tap.substr(slash + 1)))
-                        r.tap = std::string{tap};
-                }
+    if (const auto v = detail::receipt_value_after(text, "time")) {
+        std::size_t n = 0;
+        while (n < v->size() && (*v)[n] >= '0' && (*v)[n] <= '9') ++n;
+        const bool end_ok =
+            n < v->size() && ((*v)[n] == ',' || (*v)[n] == '}' || detail::receipt_ws((*v)[n]));
+        long long t = 0;
+        if (n == 10 && end_ok && std::from_chars(v->data(), v->data() + n, t).ec == std::errc{} &&
+            t >= kMinBrewInstallTime && t < kMaxBrewInstallTime)
+            r.install_time = std::to_string(t);
+    }
+    if (const auto v = detail::receipt_value_after(text, "tap")) {
+        if (!v->empty() && v->front() == '"') {
+            const auto close = v->find('"', 1);
+            if (close != std::string_view::npos) {
+                const auto tap = v->substr(1, close - 1);
+                const auto slash = tap.find('/');
+                if (tap.size() <= kMaxBrewTapLen && slash != std::string_view::npos &&
+                    tap.find('/', slash + 1) == std::string_view::npos &&
+                    detail::tap_segment_ok(tap.substr(0, slash)) &&
+                    detail::tap_segment_ok(tap.substr(slash + 1)))
+                    r.tap = std::string{tap};
             }
         }
-        if (const auto v = detail::receipt_value_after(text, "installed_on_request")) {
-            for (const std::string_view word : {std::string_view{"true"}, std::string_view{"false"}}) {
-                if (v->starts_with(word) && v->size() > word.size() &&
-                    !detail::receipt_ident((*v)[word.size()]))
-                    r.on_request = std::string{word};
-            }
+    }
+    if (const auto v = detail::receipt_value_after(text, "installed_on_request")) {
+        for (const std::string_view word : {std::string_view{"true"}, std::string_view{"false"}}) {
+            if (v->starts_with(word) && v->size() > word.size() &&
+                !detail::receipt_ident((*v)[word.size()]))
+                r.on_request = std::string{word};
         }
-    } catch (...) {
-        return {};
     }
     return r;
 }

@@ -805,6 +805,25 @@ TEST_CASE("pkg_inventory macos seam: the plugin's own run_macos entry point walk
     CHECK(rows[0] == "status|packages|constrained|macos:packages:busy");
     CHECK(busy.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
+
+TEST_CASE("pkg_inventory macos: production_user_prefix_config maps the mount reader's answer onto the "
+          "user-walk guard",
+          "[pkg_inventory][macos][user][mounts]") {
+    using namespace yuzu::pkg_inventory;
+    // This mapping is the only production setter of the fail-closed flag: a failed read must be
+    // `mounts_unreadable` (the user walk is then skipped with a token), never an empty guard.
+    // MUTATION: `cfg.mounts_unreadable = !mounts` -> `= false` fails the first block.
+    const auto failed = mac::production_user_prefix_config(
+        []() -> std::optional<std::vector<std::string>> { return std::nullopt; });
+    CHECK(failed.mounts_unreadable);
+    CHECK(failed.network_mounts.empty());
+
+    const auto ok = mac::production_user_prefix_config([]() -> std::optional<std::vector<std::string>> {
+        return std::vector<std::string>{"/Volumes/x"};
+    });
+    CHECK_FALSE(ok.mounts_unreadable);
+    CHECK(ok.network_mounts == std::vector<std::string>{"/Volumes/x"});
+}
 #endif // defined(__APPLE__)
 
 TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exactly as they found them",
