@@ -1821,6 +1821,64 @@ TEST_CASE("echo plugin: a failed v10 migration loads Echo offline with the reaso
     CHECK(raw_sql(db_path, "SELECT COUNT(*) FROM process_daily")[0][0] == "1");
 }
 
+// #6366: the v8 step flips the eight formerly opt-in sources' stored "false" to "true" once. This
+// drives it through the real plugin init(): a file below v8 reads them enabled in `status` and is
+// at the current schema version; a file already at v8 keeps an operator's "false".
+TEST_CASE("echo plugin: init upgrades a pre-v8 database's formerly-off sources, and a v8 file keeps an opt-out",
+          "[echo][local_dispatcher][upgrade]") {
+    const auto plugin_path = find_echo_plugin();
+    if (plugin_path.empty()) {
+        if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+            FAIL("echo plugin library not found under meson test");
+        WARN("echo plugin library not found -- skipping (run from the build root or via meson test)");
+        return;
+    }
+    auto handle = yuzu::agent::PluginHandle::load(plugin_path);
+    REQUIRE(handle.has_value());
+    const auto* desc = handle->descriptor();
+    REQUIRE(desc != nullptr);
+    REQUIRE(desc->init != nullptr);
+
+    yuzu::test::TempDir dir_guard{"yuzu_test_echo_v8_upgrade_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    const auto db_path = dir_guard.path / "echo.db";
+
+    const auto seed = [&](const char* version) {
+        raw_sql(db_path,
+                "CREATE TABLE echo_config (key TEXT PRIMARY KEY, value TEXT NOT NULL DEFAULT '');"
+                "INSERT INTO echo_config VALUES ('schema_version', '" + std::string{version} + "');"
+                "INSERT INTO echo_config VALUES ('procperf_enabled', 'false');"
+                "INSERT INTO echo_config VALUES ('netqual_enabled', 'false');");
+        REQUIRE(raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'procperf_enabled'")[0][0] ==
+                "false");
+    };
+
+    SECTION("a v7 file: the formerly-off sources read enabled and the file is at the current version") {
+        seed("7");
+        EchoSession session{desc, dir_guard.path, *kv};
+        auto& d = session.d;
+        const auto rows = rows_of(d.run(desc, "status").captured);
+        CHECK(row_with_prefix(rows, "config|procperf_enabled|true").has_value());
+        CHECK(row_with_prefix(rows, "config|netqual_enabled|true").has_value());
+        CHECK(raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'schema_version'")[0][0] ==
+              "10");
+    }
+
+    SECTION("a v8 file: an operator's false is kept") {
+        seed("8");
+        EchoSession session{desc, dir_guard.path, *kv};
+        auto& d = session.d;
+        const auto rows = rows_of(d.run(desc, "status").captured);
+        CHECK(row_with_prefix(rows, "config|procperf_enabled|false").has_value());
+        CHECK(row_with_prefix(rows, "config|netqual_enabled|false").has_value());
+        CHECK(raw_sql(db_path, "SELECT value FROM echo_config WHERE key = 'schema_version'")[0][0] ==
+              "10");
+    }
+}
+
 TEST_CASE("echo plugin: a failing cursor source backs off on the real tick, and a changed "
           "slow_interval ends the back-off",
           "[echo][local_dispatcher][cursor][retry]") {

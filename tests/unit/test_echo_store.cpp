@@ -4793,6 +4793,337 @@ TEST_CASE("EchoDatabase: a rollback journal beside echo.db is owner-only after o
     CHECK((fs::status(journal).permissions() & fs::perms::mask) ==
           (fs::perms::owner_read | fs::perms::owner_write));
 }
+
+// #7472 end to end. The sidecar cannot be renamed and its copy fails part-way (the injected copy
+// writes a few bytes and reports a full disk). A truncated `<claimed>-wal` left in the set would
+// pass for the real one, so the primitive removes it; the fresh database must open with nothing
+// of the old sidecar beside it. The shared primitive's own cases are in test_command_dedup_store.cpp.
+TEST_CASE("EchoDatabase: a corrupt open whose sidecar move and copy both fail leaves no partial sidecar (#7472)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_partialwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+    // A second connection keeps a real, non-empty WAL alive across the corrupt reopen (closing the
+    // last connection would checkpoint and delete it, and a garbage -wal does not survive that).
+    SqliteOwner keeper;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &keeper.db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(keeper.db, "PRAGMA journal_mode=WAL");
+    exec_sql(keeper.db, "PRAGMA wal_autocheckpoint=0");
+    exec_sql(keeper.db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+    REQUIRE(fs::exists(wal));
+    REQUIRE(fs::file_size(wal) > 0);
+    const std::string wal_bytes = slurp_file(wal);
+    spit_file(db, "this is not a SQLite database -- corrupt main file beside a live WAL");
+
+    std::vector<std::string> copied; // the sidecars that reached the copy step (-wal, and -shm)
+    OpenSeams seams;
+    seams.quarantine_ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    seams.quarantine_ops.copy = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        copied.push_back(from.filename().string());
+        spit_file(to, "partial"); // the part that landed before the volume filled
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+
+    auto opened = EchoDatabase::open(db, seams);
+    REQUIRE(std::find(copied.begin(), copied.end(), "echo.db-wal") != copied.end()); // not vacuous
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->quarantined_this_open().has_value());
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 1); // the main file alone: no `-wal` or `-shm` partial in the set
+    CHECK(kept[0].find("-wal") == std::string::npos);
+    CHECK(kept[0].find("-shm") == std::string::npos);
+    CHECK((!fs::exists(wal) || slurp_file(wal) != wal_bytes)); // nothing stale beside the fresh file
+    CHECK(opened->get_config("process_enabled", "true") == "true"); // a fresh database
+}
+
+// #7473. A directory whose filesystem cannot hard-link answers the claim with ENOTSUP: the open
+// fails closed, the corrupt file stays where it is byte for byte, and nothing carries a quarantine
+// name. The refusal names the cause in the log (the primitive's note), not in the open error.
+TEST_CASE("EchoDatabase: a filesystem that cannot hard-link refuses the open and moves nothing (#7473)",
+          "[echo][store][lifecycle][corruption][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_nolink_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    const std::string bytes = "this is not a SQLite database -- no hard links here";
+    spit_file(db, bytes);
+
+    int link_calls = 0;
+    yuzu::shared::sqlite_quarantine::FsOps ops;
+    ops.link = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++link_calls;
+        ec = std::make_error_code(std::errc::operation_not_supported);
+    };
+    OpenSeams seams;
+    seams.quarantine_ops = ops;
+
+    auto refused = EchoDatabase::open(db, seams);
+    REQUIRE(link_calls == 1);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("corrupt and unmovable") != std::string::npos);
+    CHECK(slurp_file(db) == bytes);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    // The log line the operator reads comes from the primitive's note: it names hard links.
+    const auto direct = yuzu::shared::sqlite_quarantine::quarantine_corrupt_db(db, 1, ops);
+    CHECK_FALSE(direct.dest.has_value());
+    REQUIRE(direct.notes.size() == 1);
+    CHECK(direct.notes[0].find("hard links") != std::string::npos);
+    CHECK(slurp_file(db) == bytes);
+}
+
+// #7473. A non-empty WAL with no main file is not a database: SQLite creates the main file fresh
+// and discards the orphan WAL instead of replaying its frames into it.
+TEST_CASE("EchoDatabase: a non-empty -wal beside an absent echo.db is not replayed (#7473)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_orphanwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+    std::string wal_bytes;
+    {
+        SqliteOwner keeper;
+        REQUIRE(sqlite3_open_v2(db.string().c_str(), &keeper.db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        exec_sql(keeper.db, "PRAGMA journal_mode=WAL");
+        exec_sql(keeper.db, "PRAGMA wal_autocheckpoint=0");
+        exec_sql(keeper.db, "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+        REQUIRE(fs::exists(wal));
+        REQUIRE(fs::file_size(wal) > 0);
+        wal_bytes = slurp_file(wal); // taken while the keeper holds it: closing checkpoints it away
+    }
+    for (const char* sfx : {"", "-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    spit_file(wal, wal_bytes);
+    REQUIRE_FALSE(fs::exists(db));
+
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    CHECK_FALSE(opened->quarantined_this_open().has_value());
+    CHECK(opened->get_config("wal_row", "absent") == "absent");
+    CHECK(opened->get_config("process_enabled", "true") == "true"); // an empty, fresh database
+}
+
+// #7470. The state an interrupted claim leaves on POSIX: the corrupt file under echo.db AND under
+// echo.db.corrupt-<epoch>. The link seam plants the first name (a real hard link) and then runs
+// the real claim, which finds the name taken and moves on to the next suffix.
+TEST_CASE("EchoDatabase: a corrupt echo.db already hard-linked to a quarantine name is quarantined again under the next name (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_relinked_"};
+    REQUIRE(fs::create_directories(dir.path));
+    const auto db = dir.path / "echo.db";
+    spit_file(db, "this is not a SQLite database -- interrupted claim");
+
+    int link_calls = 0;
+    OpenSeams seams;
+    seams.quarantine_ops.link = [&](const fs::path& from, const fs::path& to, std::error_code& ec) {
+        if (++link_calls == 1) {
+            fs::create_hard_link(from, to, ec); // the earlier, interrupted claim
+            REQUIRE_FALSE(ec);
+        }
+        fs::create_hard_link(from, to, ec); // first call: EEXIST; later calls: the real claim
+    };
+
+    auto opened = EchoDatabase::open(db, seams);
+    REQUIRE(link_calls == 2);
+    REQUIRE(opened.has_value());
+    REQUIRE(opened->quarantined_this_open().has_value());
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 2);
+    CHECK(fs::equivalent(dir.path / kept[0], dir.path / kept[1])); // one inode, two names
+    CHECK_FALSE(fs::equivalent(db, dir.path / kept[0]));            // echo.db is the fresh file
+    CHECK(opened->get_config("process_enabled", "true") == "true");
+}
+
+// #7470. A corrupt file another connection holds EXCLUSIVE is not quarantined: the open waits out
+// its busy timeout once and refuses as busy. The corruption is in every page after the first, so
+// the holder can still read the schema and take the lock while the integrity check would fail.
+// Once the holder is gone the next open quarantines the same bytes and recovers.
+TEST_CASE("EchoDatabase: a corrupt echo.db held exclusively is refused as busy, then quarantined once released (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_corruptbusy_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    for (const char* sfx : {"-wal", "-shm"}) {
+        std::error_code ec;
+        fs::remove(fs::path{db.string() + sfx}, ec);
+    }
+    {
+        auto bytes = slurp_file(db);
+        REQUIRE(bytes.size() > 1024);
+        std::size_t page = (static_cast<unsigned char>(bytes[16]) << 8) |
+                           static_cast<unsigned char>(bytes[17]);
+        if (page == 1)
+            page = 65536;
+        REQUIRE(bytes.size() % page == 0);
+        REQUIRE(bytes.size() / page >= 2);
+        for (std::size_t off = page; off < bytes.size(); off += page)
+            bytes[off] = '\xff'; // an invalid b-tree page type on every page but the first
+        spit_file(db, bytes);
+    }
+    const std::string corrupt_bytes = slurp_file(db);
+
+    auto holder = std::make_unique<SqliteOwner>();
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &holder->db, SQLITE_OPEN_READWRITE, nullptr) ==
+            SQLITE_OK);
+    exec_sql(holder->db, "PRAGMA locking_mode=EXCLUSIVE");
+    exec_sql(holder->db, "BEGIN EXCLUSIVE");
+
+    auto refused = EchoDatabase::open(db);
+    REQUIRE_FALSE(refused.has_value());
+    CHECK(refused.error().find("echo.db is busy") != std::string::npos);
+    CHECK(refused.error().find("not quarantined") != std::string::npos);
+    CHECK(slurp_file(db) == corrupt_bytes);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    exec_sql(holder->db, "ROLLBACK");
+    holder.reset();
+
+    auto recovered = EchoDatabase::open(db);
+    REQUIRE(recovered.has_value());
+    REQUIRE(recovered->quarantined_this_open().has_value()); // the corruption was real
+    const auto kept = names_with_prefix(dir.path, "echo.db.corrupt-");
+    REQUIRE(kept.size() == 1);
+    CHECK(slurp_file(dir.path / kept[0]) == corrupt_bytes); // the evidence is the bytes refused above
+    CHECK(recovered->get_config("process_enabled", "true") == "true");
+}
+
+// #7470. A file the agent's account cannot read at all (mode 000) is neither corrupt nor busy:
+// the open refuses (SQLite cannot open it) and quarantines nothing, and once the mode is back the
+// next open reads it.
+TEST_CASE("EchoDatabase: an echo.db with mode 000 is refused and opens once the mode is restored (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    if (::geteuid() == 0)
+        SKIP("root reads a mode-000 file; cannot provoke the refusal");
+    yuzu::test::TempDir dir{"yuzu_test_echo_mode000_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    struct ModeGuard {
+        fs::path p;
+        ~ModeGuard() {
+            std::error_code ec;
+            fs::permissions(p, fs::perms::owner_read | fs::perms::owner_write,
+                            fs::perm_options::replace, ec);
+        }
+    } guard{db};
+    std::error_code ec;
+    fs::permissions(db, fs::perms::none, fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = EchoDatabase::open(db);
+    REQUIRE_FALSE(refused.has_value());
+    // Observed: the failure is at SQLite's open, so the text is `failed to open echo.db: unable to
+    // open database file` (no path, no "could not be checked").
+    CHECK(refused.error().find("failed to open echo.db: unable to open database file") !=
+          std::string::npos);
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    fs::permissions(db, fs::perms::owner_read | fs::perms::owner_write, fs::perm_options::replace,
+                    ec);
+    REQUIRE_FALSE(ec);
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false"); // its data, intact
+}
+
+// #7470. A data directory the account cannot write to: SQLite cannot create the WAL, so the open
+// refuses; nothing is quarantined, and restoring the directory lets the next open succeed.
+TEST_CASE("EchoDatabase: a read-only data directory is refused and opens once restored (#7470)",
+          "[echo][store][lifecycle][corruption]") {
+    if (::geteuid() == 0)
+        SKIP("root bypasses directory permissions; cannot make the directory read-only");
+    yuzu::test::TempDir dir{"yuzu_test_echo_rodir_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    struct DirGuard {
+        fs::path d;
+        ~DirGuard() {
+            std::error_code ec;
+            fs::permissions(d, fs::perms::owner_all, fs::perm_options::add, ec);
+        }
+    } guard{dir.path};
+    std::error_code ec;
+    fs::permissions(dir.path,
+                    fs::perms::owner_write | fs::perms::group_write | fs::perms::others_write,
+                    fs::perm_options::remove, ec);
+    REQUIRE_FALSE(ec);
+
+    auto refused = EchoDatabase::open(db);
+    REQUIRE_FALSE(refused.has_value());
+    INFO("open error: " << refused.error());
+    CHECK_FALSE(refused.error().empty());
+    CHECK(names_with_prefix(dir.path, "echo.db.corrupt-").empty());
+
+    fs::permissions(dir.path, fs::perms::owner_all, fs::perm_options::add, ec);
+    REQUIRE_FALSE(ec);
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    CHECK_FALSE(reopened->quarantined_this_open().has_value());
+    CHECK(reopened->get_config("process_enabled", "true") == "false");
+}
+
+// #6366. The WAL a corrupt echo.db leaves is held open by a second, READ-ONLY connection (a
+// reader that began before the writer closed keeps it from being checkpointed away). The
+// quarantine carries the WAL: present, non-empty, owner-only.
+TEST_CASE("EchoDatabase: a non-empty -wal held open by a read connection is quarantined owner-only (#6366)",
+          "[echo][store][lifecycle][corruption]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_readerwal_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path wal{db.string() + "-wal"};
+
+    SqliteOwner reader;
+    REQUIRE(sqlite3_open_v2(db.string().c_str(), &reader.db, SQLITE_OPEN_READONLY, nullptr) ==
+            SQLITE_OK);
+    exec_sql(reader.db, "BEGIN");
+    exec_sql(reader.db, "SELECT count(*) FROM echo_config");
+    {
+        SqliteOwner writer;
+        REQUIRE(sqlite3_open_v2(db.string().c_str(), &writer.db, SQLITE_OPEN_READWRITE, nullptr) ==
+                SQLITE_OK);
+        exec_sql(writer.db, "PRAGMA wal_autocheckpoint=0");
+        exec_sql(writer.db,
+                 "INSERT OR REPLACE INTO echo_config(key, value) VALUES ('wal_row', 'x')");
+    } // the writer closes while the reader still holds the WAL
+    REQUIRE(fs::exists(wal));
+    REQUIRE(fs::file_size(wal) > 0);
+    const std::string wal_bytes = slurp_file(wal);
+    spit_file(db, "this is not a SQLite database -- corrupt main file beside a read-held WAL");
+
+    auto reopened = EchoDatabase::open(db);
+    REQUIRE(reopened.has_value());
+    REQUIRE(reopened->quarantined_this_open().has_value());
+    const std::string qfile = reopened->get_config("db_health_last_quarantine_file", "");
+    REQUIRE_FALSE(qfile.empty());
+    const fs::path qwal = dir.path / (qfile + "-wal");
+    REQUIRE(fs::exists(qwal));
+    CHECK(fs::file_size(qwal) > 0);
+    CHECK(slurp_file(qwal) == wal_bytes);
+    CHECK((fs::status(qwal).permissions() & fs::perms::mask) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
+
+// #6366. A rollback journal with a ZERO header (not hot, so SQLite leaves it) that holds bytes
+// after the header, left group/other-readable: open() re-modes it owner-only and keeps it.
+TEST_CASE("EchoDatabase: a non-empty zero-header rollback journal is owner-only after open (#6366)",
+          "[echo][store][lifecycle][hardening]") {
+    yuzu::test::TempDir dir{"yuzu_test_echo_zjmode_"};
+    const auto db = make_healthy_echo_db(dir.path);
+    const fs::path journal{db.string() + "-journal"};
+    spit_file(journal, std::string(512, '\0') + "left over after a PERSIST commit");
+    REQUIRE(fs::file_size(journal) > 512);
+    std::error_code ec;
+    fs::permissions(journal, fs::perms::owner_read | fs::perms::owner_write | fs::perms::group_read |
+                                 fs::perms::others_read,
+                    fs::perm_options::replace, ec);
+    REQUIRE_FALSE(ec);
+
+    auto opened = EchoDatabase::open(db);
+    REQUIRE(opened.has_value());
+    REQUIRE(fs::exists(journal));
+    CHECK((fs::status(journal).permissions() & fs::perms::mask) ==
+          (fs::perms::owner_read | fs::perms::owner_write));
+}
 #endif // !_WIN32
 
 // #6695. The both-present arm's decisions, driven with a fake owner probe so they run on every

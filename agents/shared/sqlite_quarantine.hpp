@@ -146,6 +146,13 @@ struct FsOps {
     /// Drop a name: the original after a claim, or the claim itself when it is given back
     /// (default: `std::filesystem::remove`).
     std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
+    /// Copy a sidecar when it could not be moved (default: `std::filesystem::copy_file` with
+    /// `copy_options::none`, which fails rather than overwrite). It is only called when no
+    /// directory entry of any kind, a dangling link included, exists at `to`; a copy that fails
+    /// part-way has its partial file at `to` removed.
+    std::function<void(const std::filesystem::path& from, const std::filesystem::path& to,
+                       std::error_code&)>
+        copy;
 };
 
 struct QuarantineResult {
@@ -296,7 +303,11 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// cannot be renamed is COPIED to its quarantine name (never over an existing file) and the
 /// original then removed, so the fresh database can neither replay a stale WAL nor lose the
 /// evidence; if even the copy fails the original is still removed (a note says the evidence was
-/// lost) because replaying it is worse. If that remove also fails a stale sidecar survives
+/// lost) because replaying it is worse. The copy runs only when NO directory entry of any kind
+/// (a dangling link included, examined without following it) exists at the quarantine name;
+/// otherwise nothing is copied or removed there. A copy that ran and failed part-way has its
+/// partial file at that name removed (it was free when checked, so it is not another recovery's
+/// evidence); the note says so. If that remove also fails a stale sidecar survives
 /// beside the fresh file: the Echo caller's post-reopen integrity check is the backstop. The
 /// moved files are then set owner-only, best effort (0600 on POSIX; a read-only-attribute
 /// toggle on Windows).
@@ -399,13 +410,40 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         }
         // Rename failed: preserve by copy (fails rather than overwrite), then drop the original.
         // Never through a link: copy_file follows one, and a link's target is not the evidence.
+        // The copy runs only when no entry of any kind (a dangling link included) is at the
+        // destination, examined without following a link: copy_file's own exists check follows
+        // one, and a link's target is not ours to write.
         std::error_code cec = std::make_error_code(std::errc::not_supported);
-        if (is_regular_file_no_follow(side))
-            fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+        bool copy_ran = false;
+        if (is_regular_file_no_follow(side)) {
+            std::error_code dec;
+            if (fs::symlink_status(side_dest, dec).type() != fs::file_type::not_found) {
+                cec = std::make_error_code(std::errc::file_exists);
+            } else {
+                cec.clear();
+                copy_ran = true;
+                if (ops.copy)
+                    ops.copy(side, side_dest, cec);
+                else
+                    fs::copy_file(side, side_dest, fs::copy_options::none, cec);
+            }
+        }
         if (cec) {
+            std::string removed;
+            // A copy that failed part-way (disk full) can leave a truncated file at the name that
+            // was free when this call checked it; a truncated sidecar is not evidence and would
+            // pass for the real one. file_exists means the entry is not ours: never removed.
+            if (copy_ran && cec != std::errc::file_exists && is_regular_file_no_follow(side_dest)) {
+                std::error_code pec;
+                fs::remove(side_dest, pec);
+                removed = pec ? std::format("; the partial copy at {} could not be removed ({})",
+                                            side_dest.string(), pec.message())
+                              : std::format("; the partial copy at {} was removed",
+                                            side_dest.string());
+            }
             result.notes.push_back(std::format(
-                "could not preserve {} as {} ({}); its content is not kept", side.string(),
-                side_dest.string(), cec.message()));
+                "could not preserve {} as {} ({}); its content is not kept{}", side.string(),
+                side_dest.string(), cec.message(), removed));
         } else {
             secure(side_dest);
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "

@@ -1034,6 +1034,110 @@ TEST_CASE("dedup_quarantine: a sidecar quarantine name that is taken is never ov
     CHECK(r.notes[0].find("could not preserve") != std::string::npos);
 }
 
+TEST_CASE("sqlite_quarantine: a sidecar whose copy fails part-way leaves no partial file in the set",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // #7472: a full disk can leave a truncated `<claimed>-wal` that would pass for the evidence.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied); // the injected rename failure
+    };
+    ops.copy = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        ++copy_calls;
+        write_bytes(to, "wal"); // the part that landed before the disk filled
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(copy_calls == 1);
+    REQUIRE(r.dest.has_value());
+    CHECK(read_bytes(*r.dest) == "main");
+    CHECK(fs::symlink_status(fs::path(r.dest->string() + "-wal")).type() ==
+          fs::file_type::not_found);
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found); // source sidecar gone
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") != std::string::npos);
+    CHECK(r.notes[0].find("was removed") != std::string::npos);
+}
+
+TEST_CASE("sqlite_quarantine: a failed copy onto a quarantine name that already exists never removes it",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The destructive step must be unreachable when anything was already at the name: the copy
+    // seam fails with a NON-file_exists error, which would trigger the removal if the destination
+    // check were bypassed.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "new wal");
+    const fs::path kept{db.string() + ".corrupt-1234-wal"};
+    write_bytes(kept, "stray older wal");
+
+    int copy_calls = 0;
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++copy_calls;
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    CHECK(copy_calls == 0);
+    REQUIRE(fs::is_regular_file(kept));
+    CHECK(read_bytes(kept) == "stray older wal");
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("partial copy") == std::string::npos);
+}
+
+#ifndef _WIN32
+TEST_CASE("sqlite_quarantine: a dangling link at the sidecar quarantine name is neither followed nor removed",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // exists() reads a dangling link as absent, so the rename step runs; the move hook plants the
+    // link at its destination (as a racing writer could) and fails. The copy step must then treat
+    // the link as an entry: no copy through it, and the link stays.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes");
+    const auto nowhere = dir.path / "nowhere.bin";
+
+    int copy_calls = 0;
+    bool planted = false;
+    sq::FsOps ops;
+    ops.move = [&](const fs::path&, const fs::path& to, std::error_code& ec) {
+        std::error_code lec;
+        fs::create_symlink(nowhere, to, lec);
+        planted = !lec;
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    ops.copy = [&](const fs::path&, const fs::path&, std::error_code& ec) {
+        ++copy_calls;
+        ec = std::make_error_code(std::errc::no_space_on_device);
+    };
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(planted);
+    REQUIRE(r.dest.has_value());
+    const fs::path link{r.dest->string() + "-wal"};
+    CHECK(copy_calls == 0);
+    CHECK(fs::is_symlink(link));
+    CHECK_FALSE(fs::exists(nowhere)); // nothing was created through the link
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+}
+#endif
+
 #ifndef _WIN32
 TEST_CASE("dedup_quarantine: a dangling symlink at a sidecar name travels into the quarantine set as a link",
           "[command_dedup][corruption][quarantine_fs]") {
