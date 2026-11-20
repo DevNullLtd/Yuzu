@@ -24,6 +24,7 @@ namespace {
 constexpr const char* kDeclaredColumnsKey = "declared_columns";
 constexpr const char* kPluginKey = "plugin";
 constexpr const char* kRowDiscriminatorKey = "row_discriminator";
+constexpr const char* kPartialWhenConstrainedKey = "partial_when_constrained";
 
 // Split `text` on '\n' into non-owning views, dropping a trailing empty
 // fragment. Deliberately keeps EVERY '\r' (even a trailing one): the cells decide result-set
@@ -63,28 +64,24 @@ std::vector<std::string_view> split_cells(std::string_view line) {
     return out;
 }
 
-bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher) {
+// A matcher's `value_set` strings, built once by ParsedMatcher (`in_set_` says why ordered).
+using ValueSet = std::set<std::string_view>;
+
+bool cell_satisfies(std::string_view cell, const std::string& op, const nlohmann::json& matcher,
+                    const ValueSet& in_set) {
     if (op == "exists")
         return !cell.empty();
     if (op == "eq") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell == matcher["value"].get<std::string>();
+        return cell == matcher["value"].get_ref<const std::string&>();
     }
     if (op == "contains") {
         if (!matcher.contains("value") || !matcher["value"].is_string())
             return false;
-        return cell.find(matcher["value"].get<std::string>()) != std::string_view::npos;
+        return cell.find(matcher["value"].get_ref<const std::string&>()) != std::string_view::npos;
     }
-    if (op == "in") {
-        if (!matcher.contains("value_set") || !matcher["value_set"].is_array())
-            return false;
-        for (const auto& v : matcher["value_set"])
-            if (v.is_string() && cell == v.get<std::string>())
-                return true;
-        return false;
-    }
-    return false;
+    return op == "in" && in_set.contains(cell);
 }
 
 // True when `output` carries an echo `__schema__` header line that does not name `column`
@@ -106,7 +103,7 @@ bool echo_schema_lacks_column(std::string_view output, const std::string& column
 // Column matcher over the echo `__schema__` / row / `__total__` shape. Returns
 // true iff any data row's named column satisfies the op.
 bool echo_column_match(std::string_view output, const std::string& column, const std::string& op,
-                      const nlohmann::json& matcher) {
+                      const nlohmann::json& matcher, const ValueSet& in_set) {
     auto lines = split_lines(output);
     int col_idx = -1;
     for (const auto& line : lines) {
@@ -129,7 +126,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
         auto cells = split_cells(line);
         if (static_cast<size_t>(col_idx) >= cells.size())
             continue;
-        if (cell_satisfies(cells[col_idx], op, matcher))
+        if (cell_satisfies(cells[col_idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -139,7 +136,7 @@ bool echo_column_match(std::string_view output, const std::string& column, const
 // Best-effort fallback for instructions that emit structured JSON rather than
 // the echo pipe format. Returns true iff any object's column satisfies the op.
 bool json_column_match(std::string_view output, const std::string& column, const std::string& op,
-                       const nlohmann::json& matcher) {
+                       const nlohmann::json& matcher, const ValueSet& in_set) {
     auto doc = nlohmann::json::parse(output, nullptr, false);
     if (doc.is_discarded())
         return false;
@@ -167,7 +164,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
             cell = field.get<bool>() ? "true" : "false";
         else
             continue;
-        if (cell_satisfies(cell, op, matcher))
+        if (cell_satisfies(cell, op, matcher, in_set))
             return true;
     }
     return false;
@@ -183,7 +180,7 @@ bool json_column_match(std::string_view output, const std::string& column, const
 // declared width: a line of any other width (status|not_found, not_available|<reason>, a longer
 // trailer, a malformed row) or that equals the header is skipped.
 bool declared_column_match(std::string_view output, const std::string& column, const std::string& op,
-                           const nlohmann::json& matcher) {
+                           const nlohmann::json& matcher, const ValueSet& in_set) {
     std::vector<std::string> declared;
     for (const auto& c : matcher[kDeclaredColumnsKey])
         declared.push_back(c.get<std::string>());
@@ -206,7 +203,7 @@ bool declared_column_match(std::string_view output, const std::string& column, c
                                      : yuzu::server::split_fields(plugin, line);
         if (cells.size() != declared.size() || cells == declared)
             continue;
-        if (cell_satisfies(cells[idx], op, matcher))
+        if (cell_satisfies(cells[idx], op, matcher, in_set))
             return true;
     }
     return false;
@@ -261,6 +258,8 @@ std::optional<std::string> column_shape_defect(const nlohmann::json& m) {
         return "matcher.plugin must be a string";
     if (m.contains(kRowDiscriminatorKey) && !m[kRowDiscriminatorKey].is_boolean())
         return "matcher.row_discriminator must be a boolean";
+    if (m.contains(kPartialWhenConstrainedKey) && !m[kPartialWhenConstrainedKey].is_boolean())
+        return "matcher.partial_when_constrained must be a boolean";
     return std::nullopt;
 }
 
@@ -282,17 +281,25 @@ bool declares_row_discriminator(const std::string& result_schema_json) {
            first["discriminator"].get<bool>();
 }
 
+// True when `j` is an object whose `key` is the boolean true. Never throws on a wrong type.
+bool flag_is_true(const nlohmann::json& j, const char* key) {
+    return j.is_object() && j.contains(key) && j[key].is_boolean() && j[key].get<bool>();
+}
+
 } // namespace
 
 std::optional<std::string> validate_matcher(std::string_view matcher_json) {
     if (matcher_json.empty())
         return std::nullopt;
+    if (matcher_json.size() > kMatcherMaxBytes)
+        return std::string(kMatcherTooLargeMessage);
     const auto m = nlohmann::json::parse(matcher_json, nullptr, false);
     if (m.is_discarded() || !m.is_object())
         return std::nullopt; // the unrecognised-shape default is unchanged
     if (m.contains("kind") && !m["kind"].is_string())
         return "matcher.kind must be a string";
-    for (const char* key : {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey})
+    for (const char* key :
+         {kDeclaredColumnsKey, kPluginKey, kRowDiscriminatorKey, kPartialWhenConstrainedKey})
         if (m.contains(key))
             return std::string("matcher.") + key + " is server-authored and cannot be supplied";
     if (!m.contains("kind"))
@@ -318,6 +325,16 @@ std::optional<std::string> validate_matcher(std::string_view matcher_json) {
 std::optional<std::string> validate_matcher_object(const nlohmann::json& matcher) {
     if (!matcher.is_object())
         return "matcher must be a JSON object";
+    // The per-field bounds, read from the parsed value before it is serialised. Only a string
+    // has a length here; a key of any other type is not measured.
+    const auto too_long = [&matcher](const char* key, std::size_t bound) {
+        const auto it = matcher.find(key);
+        return it != matcher.end() && it->is_string() &&
+               it->get_ref<const std::string&>().size() > bound;
+    };
+    if (too_long("column", kMatcherColumnMaxBytes) || too_long("op", kMatcherOpMaxBytes) ||
+        too_long("value", kMatcherValueMaxBytes))
+        return std::string(kMatcherFieldTooLargeMessage);
     return validate_matcher(matcher.dump());
 }
 
@@ -341,6 +358,11 @@ void bind_declared_columns(nlohmann::json& matcher, const std::string& result_sc
     matcher[kPluginKey] = plugin;
     if (declares_row_discriminator(result_schema_json))
         matcher[kRowDiscriminatorKey] = true;
+    // `partialWhenConstrained: true` on the result schema (object form; search_dir): opt-in only,
+    // so a definition without it, a stored one that predates the key included, binds as before.
+    if (flag_is_true(nlohmann::json::parse(result_schema_json, nullptr, false),
+                     "partialWhenConstrained"))
+        matcher[kPartialWhenConstrainedKey] = true;
 }
 
 int echo_row_count(std::string_view output) {
@@ -366,25 +388,41 @@ int echo_row_count(std::string_view output) {
     return n;
 }
 
-bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
-    if (matcher_json.empty())
-        return false;
-    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+// The one parse of a stored matcher. Text that does not parse, the empty default included, is
+// held as a discarded value, which every member below reads as the default matcher.
+ParsedMatcher::ParsedMatcher(std::string_view matcher_json)
+    : matcher_(std::make_unique<const nlohmann::json>(
+          nlohmann::json::parse(matcher_json, nullptr, false))) {
+    // `value_set` is walked here, once. An entry that is not a string never matched: left out.
+    const auto& m = *matcher_;
+    if (m.is_object() && m.contains("value_set") && m["value_set"].is_array())
+        for (const auto& v : m["value_set"])
+            if (v.is_string())
+                in_set_.insert(v.get_ref<const std::string&>());
+}
+
+ParsedMatcher::~ParsedMatcher() = default;
+
+bool ParsedMatcher::answer_lacks_matcher_column(std::string_view output) const {
+    const auto& m = *matcher_;
     if (m.is_discarded() || !m.is_object() || m.contains("kind") || !m.contains("column") ||
         !m["column"].is_string())
         return false;
     return echo_schema_lacks_column(output, m["column"].get<std::string>());
 }
 
-bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+bool ParsedMatcher::constrained_answer_is_unresolved(int plugin_result_status) const {
+    return plugin_result_status == kPluginResultConstrained &&
+           flag_is_true(*matcher_, kPartialWhenConstrainedKey);
+}
+
+bool ParsedMatcher::response_matches(int status, std::string_view output) const {
     // A non-success response is never a hit, whatever the matcher says.
     if (status != kStatusSuccess)
         return false;
 
-    // Empty matcher → default: any SUCCESS responder qualifies.
-    if (matcher_json.empty())
-        return true;
-    auto m = nlohmann::json::parse(matcher_json, nullptr, false);
+    // Empty or unparseable matcher → default: any SUCCESS responder qualifies.
+    const auto& m = *matcher_;
     if (m.is_discarded() || !m.is_object() || m.empty())
         return true;
 
@@ -418,14 +456,28 @@ bool response_matches(std::string_view matcher_json, int status, std::string_vie
         const auto op = m["op"].get<std::string>();
         // Try the echo pipe shape first (its schema line is unambiguous),
         // then the JSON array-of-objects fallback.
-        if (echo_column_match(output, column, op, m) || json_column_match(output, column, op, m))
+        if (echo_column_match(output, column, op, m, in_set_) ||
+            json_column_match(output, column, op, m, in_set_))
             return true;
-        return m.contains(kDeclaredColumnsKey) && declared_column_match(output, column, op, m);
+        return m.contains(kDeclaredColumnsKey) &&
+               declared_column_match(output, column, op, m, in_set_);
     }
 
     // Matcher present but a recognised key is MISSING (or no recognised key at all) → fall back to
     // default so a typo can't silently empty the set; the operator still gets responders.
     return true;
+}
+
+bool answer_lacks_matcher_column(std::string_view matcher_json, std::string_view output) {
+    return ParsedMatcher(matcher_json).answer_lacks_matcher_column(output);
+}
+
+bool constrained_answer_is_unresolved(std::string_view matcher_json, int plugin_result_status) {
+    return ParsedMatcher(matcher_json).constrained_answer_is_unresolved(plugin_result_status);
+}
+
+bool response_matches(std::string_view matcher_json, int status, std::string_view output) {
+    return ParsedMatcher(matcher_json).response_matches(status, output);
 }
 
 bool references_raw_capture_table(std::string_view sql) {

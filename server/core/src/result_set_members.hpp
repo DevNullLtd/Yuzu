@@ -46,8 +46,11 @@ inline constexpr std::string_view kSourceNotSupportedMessage =
 /// needs the members (the forensics tier tests) reads it exactly as before.
 struct ResultSetMembers : std::vector<std::string> {
     /// Distinct agents with NO row satisfying the matcher and at least one failed row (status not
-    /// success, output starting `error|`, or a success answer whose `__schema__` header lacks the
-    /// column matcher's column). Matching decides first: an agent with any matching row is a
+    /// success, output starting `error|`, a success answer whose `__schema__` header lacks the
+    /// column matcher's column, or an answer the plugin reported CONSTRAINED when the definition
+    /// sets `partialWhenConstrained`: `rs_matcher::constrained_answer_is_unresolved`, search_dir
+    /// only today; it reads the stored status of rows this read already returned and adds no
+    /// member). Matching decides first: an agent with any matching row is a
     /// member and is never counted here, so under the default matcher a success-status `error|`
     /// answer is a member, and the count only moves for an agent whose every row failed or failed
     /// to match while at least one failed. Agents that never answered are not counted: the read
@@ -81,6 +84,8 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
     std::unordered_set<std::string> failed;
     ResponseQuery page;
     page.limit = page_rows;
+    // The matcher is one text for the whole set: parsed once here, asked about every row below.
+    const rs_matcher::ParsedMatcher matcher(pending.matcher);
     for (int read = 0;;) {
         auto rows = responses.query_by_execution(pending.source_execution_id, tier, page);
         if (!rows)
@@ -91,9 +96,10 @@ result_set_members(ResponseStore& responses, const ForensicsPluginSet* plugins,
             break;
         }
         for (const auto& r : *rows) {
-            if (!rs_matcher::response_matches(pending.matcher, r.status, r.output)) {
+            if (!matcher.response_matches(r.status, r.output)) {
                 if (r.status != rs_matcher::kStatusSuccess || r.output.starts_with("error|") ||
-                    rs_matcher::answer_lacks_matcher_column(pending.matcher, r.output))
+                    matcher.answer_lacks_matcher_column(r.output) ||
+                    matcher.constrained_answer_is_unresolved(r.plugin_result_status))
                     failed.insert(r.agent_id);
                 continue;
             }
