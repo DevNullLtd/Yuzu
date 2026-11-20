@@ -1,9 +1,9 @@
 # ADR-0075: Criteria runs: three-valued verdicts over several inputs, stored as a result set
 
-- **Status:** Proposed (draft 2)
-- **Date:** 2026-11-18 (draft 1); 2026-11-20 (draft 2)
+- **Status:** Proposed (draft 3)
+- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3)
 - **Owner:** Nathan Dornbrook / platform (block `0xxx`; see `docs/adr/README.md`)
-- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D49, made between 2026-11-07 and
+- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D53, made between 2026-11-07 and
   2026-11-20 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
   cites them by number in brackets, for example (D25). It writes them down; it does not reopen them.
   Where a later decision replaced part of an earlier one, the later one is cited.
@@ -22,8 +22,9 @@
 - **Depends on drafts not in the repository:** ADR-1012 (explicit response completeness), ADR-1013
   (the instruction operation digest) and ADR-1014 (armed conduits), all Proposed in the `1xxx`
   block. The response-store ADR (D30) is not yet written.
-- **Code references:** every `path:line` in this ADR is at `DevNullLtd/Yuzu@f4cc683af1`. Draft 2
-  was written on a branch whose only change from that commit is this file, so the code is the same.
+- **Code references:** every `path:line` in this ADR is at `DevNullLtd/Yuzu@f4cc683af1`. Drafts 2
+  and 3 were written on a branch whose only change from that commit is this file, so the code is
+  the same.
 
 ## Binding status
 
@@ -34,8 +35,10 @@ Slice 1 is a **breaking change** to three shipping surfaces (R3.3). It ships wit
 fragment and an upgrade note in `docs/user-manual/upgrading.md`, not with a deprecation window
 (D48). Both are owed by the implementing PR; this ADR adds neither.
 
-Four points are deliberately left open. Each is marked **Open (Qnn pending)** where it arises, and
-none may be decided by an implementing PR. They are listed together under *Open points*.
+One point is deliberately left open. It is marked **Open (Q54 pending)** where it arises, and no
+implementing PR may decide it. Four further points are this ADR's own design rather than an owner
+decision; each is marked **Proposed, awaiting owner confirmation** where it arises, and none binds
+until the owner confirms it. Both kinds are listed together under *Open points*.
 
 ## Context
 
@@ -72,7 +75,9 @@ version reports and acts on nothing (D1).
 | Its version operators use a private segment comparator in `inventory_eval.cpp`, not the `compare_versions` of `nvd_db`, which the agent-update path uses. | `inventory_eval.cpp:62-82`, `:539-540`; `nvd_db.cpp:29`; `agent_service_impl.cpp:2663` |
 | The MCP tool's input schema requires `conditions`. | `mcp_server.cpp:1623-1640` |
 | The other single-input producer routes: direct create, `from-echo-query`, `from-instruction-result`. | `rest_api_v1.cpp:15816`, `:16548`, `:16660` |
-| `from-instruction-result` and re-eval are gated by `Execution:Execute`. Re-eval checks the gate before it loads the set, so the gate cannot depend on the set's kind. | `rest_api_v1.cpp:16660`, `:16677`, `:16871`, `:16888-16890`; `mcp_server.cpp:5784` |
+| `from-instruction-result` and re-eval are gated by `Execution:Execute`. Re-eval checks the gate before it loads the set, so the gate cannot depend on the set's kind. The check was added as a missing-authorization (CWE-862) fix. The MCP tool does the same. | `rest_api_v1.cpp:16660`, `:16677`, `:16871`, `:16877-16890`; `mcp_server.cpp:5784`, `:18290-18311` |
+| An MCP tool's security row carries one `(securable, operation)` pair, and the tier and approval rules are keyed on that pair: the operator tier admits `Execution:Execute`, and the supervised tier needs approval for it. | `mcp_server.cpp:5558-5566`; `mcp_policy.hpp:25`, `:129`, `:148`, `:160` |
+| Before a supervised-tier approval ticket is minted or redeemed for `reevaluate_result_set`, the server checks `Execution:Execute`, reads the stored set and binds the ticket to the `(plugin, action)` it would run. A set of any kind other than `echo_query` or `instruction_result` binds `unresolved`, which no real pair can equal. | `mcp_server.cpp:10191-10208`, `:10238-10291` |
 | Re-eval is refused unless the set is `echo_query` or `instruction_result`, and its route description says sync sources are not supported. | `rest_api_v1.cpp:16945-16950`, `:2987`; `mcp_server.cpp:18362-18369` |
 | The `from_result_set:` scope atom admits every member of an owned set. | `server/core/src/agent_registry.cpp:2295-2335` |
 | An incomplete set resolves under a positive reference; under `NOT`, `LEN` or `STARTSWITH` it aborts with `result_set_unusable`. | `docs/scope-walking-design.md:164` |
@@ -92,7 +97,8 @@ version reports and acts on nothing (D1).
 | The audit trail is kept 365 days, as a floor. | `docs/enterprise-readiness-soc2-first-customer.md:836` |
 | `ClickHouseSink` is write-only, plain `INSERT ... FORMAT JSONEachRow`, with no deduplication token. | `server/core/src/analytics_sinks.cpp:38`, `:61`; `deploy/clickhouse/init.sql:27-30` |
 | ADR-0006 says ClickHouse is the analytics sink, not the substrate. | `docs/adr/0006-server-postgresql-substrate.md:72-75` |
-| No `vers:` comparator exists in the server. The VERS specification lists `generic` but says its comparison algorithm "will be specified later". | `server/core/src/` (none); `package-url/vers-spec@be215c54ee`, `docs/types/vers-types.md:60-63` |
+| No `vers:` comparator exists in the server. The VERS specification lists `generic` but says its comparison algorithm "will be specified later", likely "similar to libversion". | `server/core/src/` (none); `package-url/vers-spec@be215c54ee`, `docs/types/vers-types.md:60-63` |
+| At the pinned vcpkg baseline, the registry has a `libversion` port: version 3.0.4, port-version 1, MIT, source fixed by SHA512. It declares `supports: "!(windows & static)"`, because a static build produces a `version.lib` that clashes with the Windows SDK. The Windows triplet links dynamically except for the grpc stack, so on Windows it would build as a DLL. | `vcpkg.json:8`; `microsoft/vcpkg@9eec002df1`, `ports/libversion/vcpkg.json`, `ports/libversion/portfile.cmake`; `triplets/x64-windows.cmake:3`, `:83-85` |
 
 ## Vocabulary
 
@@ -159,6 +165,11 @@ It does not make the run itself act on anything (D46).
    - The three callers share this one evaluation: `POST /api/v1/inventory/evaluate`,
      `POST /api/v1/result-sets/from-inventory-query` and MCP
      `create_result_set_from_inventory_query`.
+   - **Proposed, awaiting owner confirmation:** sharing the one evaluation means
+     `POST /api/v1/inventory/evaluate` also gains `installed_software` reads, under its existing
+     fleet-read `Inventory:Read` gate (`rest_api_v1.cpp:15013`). The decisions list it among the
+     moved surfaces but do not say so explicitly; this ADR draws the consequence and the owner has
+     not yet confirmed it.
 3. **The old condition-list shape is refused, not translated** (D48). The three surfaces accept
    matcher JSON only.
    - A request carrying `conditions` (or `combine`) gets an A4 `400`, MCP `-32602`, whose message
@@ -234,7 +245,7 @@ Forensics-sanitised (#4990). The closed list, by slice:
 The plugin and completeness causes follow ADR-1012 when it lands; this ADR does not name them. A new
 cause is a change to this list, never free text.
 
-#### Ordering and typed comparison (D14, D48)
+#### Ordering and typed comparison (D14, D48, D50 to D52)
 
 The design below is new. `inventory_eval.hpp:14-60` was read as input to it, not as a contract to
 keep (D48). Where it differs, the old result is not preserved.
@@ -246,75 +257,71 @@ keep (D48). Where it differs, the old result is not preserved.
    an ordering test without one. The domain is never inferred from the operand's JSON type, as the
    old grammar did. `eq` and `in` may carry `as` to compare in that domain. Without `as` they stay
    today's text compares, so existing matchers keep their results (D31).
-9. **The number domain compares exact decimal values.** Nothing is rounded through a double.
+9. **The number domain is strict, and compares exact decimal values** (D50). Nothing is rounded
+   through a double.
    - The operand is a JSON integer (within int64 or uint64), or a string in plain decimal form
      (optional `-`, digits with an optional fraction, an optional exponent). A JSON float operand is
      refused at admission, because its text is gone once parsed; this reason is unchanged from
-     `inventory_eval.hpp:73-77`.
+     `inventory_eval.hpp:74-77`.
    - A stored JSON integer is exact. A stored JSON float is compared by the exact value it holds.
-     A stored string that is wholly in plain decimal form reads as that number, so stored `"10.0"`
-     equals operand `10`.
-   - Any other stored value is `malformed_value`, never false and never compared as text: a boolean,
-     an array, an object, an empty string, a string with a unit or a dotted version (see Q50). A
-     missing or null value is `missing_value`.
-   - `-0` equals `0`. A lexeme longer than 64 bytes, or an exponent outside -1000 to 1000, is refused
-     as an operand and is `malformed_value` when stored. These bounds keep the comparison cheap; they
-     are server constants.
-10. **The version domain uses one comparator, `vers:generic`** (D14, D48). `nvd_db`'s
+     A stored string counts as a number only when the **whole** string is in plain decimal form, so
+     stored `"10.0"` equals operand `10`.
+   - Any other stored value is `not_assessed` with cause `malformed_value`, never false and never
+     compared as text: a boolean, an array, an object, an empty string, or a string that only starts
+     with a number. `"5 GB"`, `"1.2.3"` and `"N/A"` all settle this way, and the run page counts them
+     under that cause. A missing or null value is `missing_value`.
+   - The old grammar's leading-number reading, which read `"5 GB"` as 5 and `"1.2.3"` as 1.2 under a
+     string operand "so devices that matched before keep matching" (`inventory_eval.hpp:43-57`;
+     `inventory_eval.cpp:556-566`, and the older leading-number read at `:568-597`), ends with that
+     grammar. No flag brings it back. A value that carries a unit is fixed at the collector, which
+     should report a typed numeric field.
+   - `-0` equals `0`.
+   - **Proposed, awaiting owner confirmation:** a lexeme longer than 64 bytes, or an exponent outside
+     -1000 to 1000, is refused as an operand and is `malformed_value` when stored. These bounds keep
+     the comparison cheap and would be server constants. They are this ADR's proposal, not an owner
+     decision.
+   - Accepted cost: a single-input producer used without K3 folds unknown to false at the top
+     (R4.3), so a device storing `"5 GB"` drops out of that set without a trace, as a device storing
+     `"N/A"` does today. Runs are always K3 (R4.4) and show it.
+10. **The version domain orders by libversion's comparison algorithm** (D14, D48, D51), from
+    `repology/libversion`. The VERS specification says `vers:generic` will likely be similar to it,
+    but has not written the algorithm down (`package-url/vers-spec@be215c54ee`,
+    `docs/types/vers-types.md:60-63`), so this ADR names libversion itself rather than an unwritten
+    scheme. `nvd_db`'s
     `compare_versions` and `nvd_version_compare` are not used for criteria, and `inventory_eval`'s
-    private comparator is deleted. The comparator is a total order. The operand must parse under it
-    at admission; a stored value that does not parse is `malformed_value`. Equality under
-    `"as":"version"` is the comparator's equality, not text equality.
-11. **There is no text ordering** (see Q52). Ordering a string lexically depends on collation and
-    is not offered.
+    private comparator is deleted. The comparator is a total order. Equality under `"as":"version"`
+    is the comparator's equality, not text equality.
+    - **The pin is a content hash, never a release tag.** A tag can be moved upstream; a hash cannot.
+      A release name such as 3.0.4 is a label for people only. The implementing PR chooses one of two
+      routes, and either way names its pin as a hash:
+      - *A vcpkg dependency.* The pin is the manifest's `builtin-baseline` commit (`vcpkg.json:8`),
+        which fixes the port version, and the port fixes the source tarball by SHA512. At today's
+        baseline that is `libversion` 3.0.4, port-version 1 (see *What exists today*). Its port
+        refuses a static Windows build, and Yuzu's Windows triplet is dynamic outside the grpc stack
+        (`triplets/x64-windows.cmake:3`, `:83-85`), so on Windows it builds as a DLL. The port's own
+        comment warns of a `version.lib` name clash with the Windows SDK. Both are `build-ci` items in
+        the implementing PR.
+      - *A reimplementation.* The algorithm and libversion's test corpus are pinned to one libversion
+        commit SHA, and the corpus runs as a conformance test.
+    - **Changing the pin is a breaking change**, because it can change which devices match the same
+      stored data. It ships with a `changelog.d/` fragment, an upgrade note and the diff of the
+      corpus results.
+    - **Ecosystem orders are not modelled in slice 1:** dpkg epochs and `~`, and RPM release fields.
+      The user documentation says so.
+11. **There is no text ordering** (D52). `lt`, `le`, `gt` and `ge` are admitted only under
+    `"as":"number"` or `"as":"version"`. Text supports `eq`, `in`, `contains` and `exists` only.
+    - An ordering test with no `as`, or naming any other domain, is refused at admission. It never
+      falls back to comparing text.
+    - The old lexical fallback (`inventory_eval.hpp:54-56`; `inventory_eval.cpp:599-606`) ends with
+      the old grammar.
+    - `"as":"text"`, byte-wise over UTF-8, can be added later without breaking anything. Comparing
+      dates, if wanted, is a future `"as":"date"` domain that really parses dates, not a byte order
+      that happens to sort ISO dates correctly.
+    - Accepted cost: "installed before a date" cannot be expressed until a date domain exists.
 12. **The cases are pinned by tests.** Each numeric and version case in today's `inventory_eval`
     tests is re-expressed in matcher JSON, and every case whose result changes is listed in the
     upgrade note. For example, a stored `"5 GB"` against `>` with the string operand `"4"` is a
     match today; under `gt` it is `malformed_value`.
-
-> **Open (Q50 pending):** whether a stored string that only *starts* with a number is read as that
-> number. The old grammar did this under a string operand "so devices that matched before keep
-> matching" (`inventory_eval.hpp:43-58`): `"5 GB"` read as 5, `"10.0.19045"` as 10.0.
-> - (a) Strict, as R4.9 proposes: only a wholly numeric string is a number; anything else is
->   `malformed_value`, so a run shows the device as `not_assessed` rather than guessing.
-> - (b) Keep prefix reading in the number domain, as today, under string operands only.
-> - (c) Prefix reading only behind an explicit flag on the test (for example `"prefix":true`).
->
-> Recommendation (a): with no callers to keep matching, (b) keeps a rule whose only reason was
-> compatibility, and a dotted version read as a decimal is wrong in a way K3 cannot show. (c) is a
-> second rule to document for little gain.
-
-> **Open (Q51 pending):** what `vers:generic` orders by. D14 and D48 name it, but the VERS
-> specification leaves its algorithm unwritten ("will be specified later, likely based on a split on
-> any wholly alpha or wholly numeric segments ... similar to libversion";
-> `package-url/vers-spec@be215c54ee`, `docs/types/vers-types.md:60-63`). Some algorithm must be
-> written down before slice 1.
-> - (a) Define the algorithm in this ADR: split into maximal runs of digits and of letters, ignore
->   separators, compare digit runs as integers without leading zeros and letter runs byte-wise, with
->   a fixed rule for runs of different kinds and for a shorter version. Record it with a revision
->   number, so a later VERS definition that differs becomes a new revision with its own breaking
->   change note.
-> - (b) Adopt libversion's published comparison as the algorithm, pinned at a named release and
->   its test corpus. It is the algorithm the specification points at. It also has rules for
->   pre-release and post-release words (`alpha`, `rc`, `patch`, and so on) that (a) would have to
->   invent.
-> - (c) Use the specification's `intdot` scheme, which is fully written: digits and dots only,
->   reading stops at the first other character. It would order `1.1.1f` equal to `1.1.1`, and using
->   it means reading D48's "`vers:generic` only" as "a VERS scheme".
->
-> Recommendation (b), with the release and corpus pinned in the implementing PR: it follows the
-> direction the specification has stated and brings tested answers for the suffix cases. Under any
-> option, an ecosystem's own order (dpkg epochs, RPM release fields) is not modelled in slice 1, and
-> the documentation must say so.
-
-> **Open (Q52 pending):** whether ordering operators get a text domain. The old grammar fell back
-> to a lexical compare for a string operand that was not a number (`inventory_eval.hpp:55-57`).
-> - (a) None, as R4.11 proposes: text supports `eq`, `in`, `contains` and `exists` only.
-> - (b) `"as":"text"`, byte-wise over UTF-8 with no normalisation, as the VERS `lexicographic`
->   scheme defines it.
->
-> Recommendation (a): no criteria in the plan need it, and a byte order on display strings gives
-> answers that look plausible and are wrong. (b) can be added later without breaking anything.
 
 ### R5. Coverage comes from the facet state (D34, D35, D43)
 
@@ -386,10 +393,12 @@ path uses it.
 
 ### R8. Run status (D16, D41)
 
-1. **Run status is the run's own lifecycle**: `gathering` from creation, then `final` (D41). The
-   result set's store status reads `pending` while gathering and `materialized` at final, so the
-   existing readiness rules apply unchanged: a gathering run used as a scope aborts as pending
-   (`docs/scope-walking-design.md:164`). A run whose store write fails is `failed`.
+1. **Run status is the run's own lifecycle**: `gathering` from creation, then `final` (D41).
+   **Proposed, awaiting owner confirmation:** the result set's store status reads `pending` while
+   gathering and `materialized` at final, so the existing readiness rules apply unchanged: a
+   gathering run used as a scope aborts as pending (`docs/scope-walking-design.md:164`). A run whose
+   store write fails is `failed`. D41 names only the lifecycle; this mapping onto the store statuses
+   is this ADR's design.
 2. **The verdict counts sit beside the status**: `matched`, `not_matched`, and `not_assessed` by
    cause, plus the count of devices excluded from the cohort (R9.4). They say what the answers mean;
    the status says only whether the run is still gathering.
@@ -483,7 +492,7 @@ prerequisites:
    90 days the record can say "device D was in a cohort of N, of which M matched", but not D's own
    verdict.
 
-### R12. Re-runs and refusals (D13, D32, D38, D42)
+### R12. Re-runs and refusals (D13, D32, D38, D42, D53)
 
 1. **An operator may re-run a run, from slice 1** (D42). The existing re-eval action
    (`POST /api/v1/result-sets/{id}/re-eval`, MCP `reevaluate_result_set`) accepts
@@ -503,22 +512,47 @@ prerequisites:
    `enabled: false` is refused at creation with `definition_disabled`, the word the schedule runner
    already uses (`schedule_runner.cpp:98`), naming the input and the definition. Deliveries already
    under way continue, because they are built from the stored specs.
+6. **The re-run gate: a floor, then the owned set, then its stored kind** (D53). On
+   `POST /api/v1/result-sets/{id}/re-eval` and MCP `reevaluate_result_set` the order is:
+   1. **Floor, before the load.** The caller must hold `Execution:Execute` or
+      `CriteriaRun:Execute`. A session with neither grant is refused before any stored row is read,
+      which keeps the missing-authorization fix recorded at `rest_api_v1.cpp:16877-16887`. Today the
+      floor is the single `Execution:Execute` check at `rest_api_v1.cpp:16888` and
+      `mcp_server.cpp:18291`.
+   2. **`load_owned`** (`rest_api_v1.cpp:16891`; `mcp_server.cpp:18309`). It is owner-scoped, so
+      another owner's set reads as not found and the reorder reveals nothing about it.
+   3. **The gate by stored `source_kind`.** The kind is written by the server at creation, not read
+      from the request body, so this is not the gate-by-body-field pattern D49 rejected.
+      - A `criteria_run` set needs `CriteriaRun:Execute`, narrowed by each input's own gate, as at
+        creation (R9.3, D21). An input that dispatches, from slice 3, still needs
+        `Execution:Execute`.
+      - Every other kind keeps `Execution:Execute`, unchanged.
+   4. **MCP.** The tier row for `reevaluate_result_set` (`mcp_server.cpp:5784`) admits either
+      securable, and the per-kind RBAC check runs after the load. Tier still runs before RBAC.
+   5. **The supervised-tier approval pre-check** follows the same order. It checks
+      `Execution:Execute` and reads the stored set before a ticket is minted or redeemed
+      (`mcp_server.cpp:10191-10208`, `:10238-10291`), so its check becomes the same floor. What its
+      ticket binds to for a `criteria_run` set is Q54.
+   6. There is still one re-run path (R12.1). There is no criteria-run-specific re-run route.
 
-> **Open (Q53 pending):** which gate admits a re-run of a `criteria_run` set. Re-eval checks
-> `Execution:Execute` before it loads the set (`rest_api_v1.cpp:16888-16890`; MCP tier row
-> `mcp_server.cpp:5784`), so the gate cannot depend on the set's kind as the code stands. A
-> slice-1 run sends no command, so `Execution:Execute` is not the authority it uses.
-> - (a) Load the owned set first, then gate by its stored `source_kind`: a `criteria_run` set needs
->   `CriteriaRun:Execute` narrowed by each input's gate, as at creation; other kinds keep
->   `Execution:Execute`. The kind is server-written, not a caller's body field, so this is not the
->   gate-by-field pattern D49 rejected. The owner check already runs first, so the reorder reveals
->   nothing about another operator's sets.
-> - (b) Keep the route gate and add `CriteriaRun:Execute` for this kind, so a re-run needs both.
->   An operator granted only `CriteriaRun` could create a run but not re-run it.
-> - (c) Re-run through the run entry point (for example a `rerun_of` field), leaving re-eval
->   unchanged. This departs from D42's "re-eval accepts `criteria_run`".
+> **Open (Q54 pending):** what a supervised-tier approval ticket binds to when an MCP caller re-runs
+> a `criteria_run` set. Today the pre-check binds a ticket to the `(plugin, action)` the re-run
+> would dispatch, read from the stored set. Any kind other than `echo_query` or
+> `instruction_result` binds `unresolved`, which no real pair can equal, so the call is refused
+> (`mcp_server.cpp:10249-10258`, `:10286-10290`). A slice-1 run dispatches nothing, so there is no
+> pair to bind. Whether a supervised re-run needs approval at all also turns on how the tier and
+> approval rules, which are keyed on one `(securable, operation)` pair per tool
+> (`mcp_server.cpp:5558-5566`; `mcp_policy.hpp:129`, `:160`), treat `CriteriaRun:Execute`.
+> - (a) Bind the ticket to the stored kind and a digest of the stored input specs and target, so
+>   an approval is for exactly the re-run it names, and give a re-run the same approval rule as
+>   creating a run.
+> - (b) Need no approval for a re-run that dispatches nothing (slice 1); from slice 3, bind to the
+>   live inputs' `(plugin, action)` pairs.
+> - (c) Leave it as it is: a supervised-tier token cannot re-run a `criteria_run` set over MCP.
 >
-> Recommendation (a).
+> Recommendation (a): the re-run is the same act as the creation it repeats, so it should need the
+> same approval, and a digest gives the ticket something exact to bind to. (b) makes the approval
+> rule change between slices, and (c) leaves a gap between REST and MCP that nothing records.
 
 ### R13. Live delivery, from slice 3 (D17, D23, D25, D30)
 
@@ -548,8 +582,11 @@ prerequisites:
    rule (`docs/scope-walking-design.md:164`). A positive reference resolves. `NOT`, `LEN` or
    `STARTSWITH` over it aborts with `result_set_unusable`, permanently, because retrying does not
    change it; the remedy is a re-run.
-3. Both rules ship in slice 1, because the atom can resolve a run's set as soon as it exists. Tests
-   cover the inversion hazard (a `NOT` over a run with unassessed devices).
+3. **Proposed, awaiting owner confirmation:** both rules ship in slice 1, because the atom can
+   resolve a run's set as soon as it exists (`agent_registry.cpp:2295-2335`). D46 places the change
+   in "the slice that wires runs into scope walking"; this ADR reads that as slice 1. The
+   alternative is to refuse `from_result_set:<run>` in slice 1 instead. Tests cover the inversion
+   hazard (a `NOT` over a run with unassessed devices).
 4. **Approvals over a run's matched set.** ADR-1013's D5 (the approver can read what was hashed, for
    as long as the digest is evidence) applies only when an approval or a conduit binds a run's
    matched set, which is the act phase. Then the approval store, or the arm record, copies the
@@ -561,8 +598,8 @@ prerequisites:
 ### Slice 1: stored inventory only
 
 **What it builds:**
-- the matcher's K3 evaluation, quantifiers, combinators, ordering operators and version comparator
-  (R4), under the one validator;
+- the matcher's K3 evaluation, quantifiers, combinators, ordering operators, the strict number
+  domain and the libversion version order (R4), under the one validator;
 - `inventory_query` moved onto the matcher, reading `installed_software` through
   `SoftwareInventoryStore` (R3.2), shared by its three surfaces; the old `conditions[]` shape
   refused on all three (R3.3), and `inventory_eval`'s grammar deleted;
@@ -573,7 +610,8 @@ prerequisites:
   read-on-receipt hook (R6);
 - write-once verdicts with typed causes on the members (R7, R4), and the lifecycle status with the
   counts beside it (R8);
-- re-eval of `criteria_run` sets (R12.1, R12.2);
+- re-eval of `criteria_run` sets, behind the floor, the owned-set load and the stored-kind gate
+  (R12.1, R12.2, R12.6);
 - the matched-only scope atom and the incomplete-set marking (R14.1 to R14.3);
 - the export to ClickHouse and the reap guard (R11).
 
@@ -594,8 +632,13 @@ prerequisites:
 **Prerequisites, each its own change:**
 - the agent's v3 writer (D34): already shipped (`sync_source_installed_software.cpp:1099-1111`);
 - the `CriteriaRun` securable and the widened class 2 with its floor entry (R9.1, R9.2);
-- the matcher's K3, quantifiers, combinators and typed comparison (R4), which need Q50 to Q52
-  answered;
+- the matcher's K3, quantifiers, combinators and typed comparison (R4.1 to R4.12);
+- the libversion pin, by content hash (R4.10): either the vcpkg port at the pinned baseline, with
+  its Windows DLL build and the `version.lib` name clash settled by `build-ci`, or a reimplementation
+  pinned to one libversion commit with its corpus as a conformance test;
+- the owner's confirmation of the four points marked *Proposed, awaiting owner confirmation*
+  (R3.2, R4.9, R8.1, R14.3);
+- Q54 answered, before the MCP re-run of a `criteria_run` set ships (R12.6);
 - the move of `inventory_query` onto the matcher and the refusal of the old shape (R3.2, R3.3),
   with its `changelog.d/` fragment and upgrade note;
 - the four store changes (R10);
@@ -629,7 +672,11 @@ response-store ADR and ADR-1013's digest.
     inventory-query surfaces must rewrite its requests on the day it ships. There are no production
     users, so no translation layer is kept (D48).
   - Stored values the old grammar matched by a leading number or a lexical compare no longer match
-    in the two-valued mode, and read `malformed_value` in K3 (subject to Q50 and Q52).
+    in the two-valued mode, and read `malformed_value` in K3 (R4.9, R4.11). A value with a unit
+    has to be fixed at its collector.
+  - Changing the libversion pin is a breaking change of its own, with a fragment, an upgrade note
+    and the corpus diff (R4.10). Ecosystem version orders such as dpkg epochs are not modelled.
+  - "Installed before a date" cannot be expressed until an `"as":"date"` domain exists (R4.11).
   - Slice 1 waits on four store changes, the securable, the matcher work and the cold store.
   - Until every agent sends v3, `NONE` and `ALL` read `not_assessed:coverage_unproven` on old agents.
   - Under a facet that stays Partial, `ANY` reads `not_assessed:unconfirmed` once its rows are older
@@ -702,7 +749,10 @@ reaches, as of `f4cc683af1`:
 - scope walking (the matched-only atom and the incomplete-set marking);
 - the executions-history ladder and the Forensics tier on stored responses, from slice 3;
 - agentic-first A1 to A5 (the new REST route and MCP tool, and the changed input schema of
-  `create_result_set_from_inventory_query`).
+  `create_result_set_from_inventory_query`);
+- the MCP server's tier-before-RBAC ordering and approval rules (the `reevaluate_result_set` row and
+  its approval pre-check, R12.6);
+- the build and vcpkg toolchain, if the libversion pin is taken as a vcpkg dependency (R4.10).
 
 ## Not decided here
 
@@ -712,17 +762,31 @@ reaches, as of `f4cc683af1`:
 - Whether `kMaxPerOwner` counts `criteria_run` sets separately.
 - The byte budget and eviction rule of the member cache (R10.1).
 - The by-id execute routes ignoring `enabled` for every definition: a separate change.
+- Which route carries the libversion pin, a vcpkg dependency or a reimplementation (R4.10). The
+  implementing PR chooses; either way the pin is named as a hash.
+- How the `reevaluate_result_set` security row admits either securable (R12.6), given that a row
+  carries one `(securable, operation)` pair today (`mcp_server.cpp:5558-5566`).
 
 ## Open points
 
 | Mark | Section | Question |
 |---|---|---|
-| Q50 | R4.9 | Whether a stored string that only starts with a number reads as that number. |
-| Q51 | R4.10 | What `vers:generic` orders by, since the VERS specification has not written it. |
-| Q52 | R4.11 | Whether ordering operators get a text domain. |
-| Q53 | R12 | Which gate admits a re-run of a `criteria_run` set. |
+| Q54 | R12.6 | What a supervised-tier MCP approval ticket binds to when a `criteria_run` set is re-run, and whether such a re-run needs approval. |
+
+Proposed by this ADR and awaiting owner confirmation (each is marked where it arises):
+
+| Section | Proposal |
+|---|---|
+| R3.2 | `POST /api/v1/inventory/evaluate` shares the one evaluation, so it also gains `installed_software` reads under its fleet-read `Inventory:Read` gate. |
+| R4.9 | The number domain's bounds: a lexeme of at most 64 bytes and an exponent between -1000 and 1000, as server constants. |
+| R8.1 | `gathering` and `final` map onto the store statuses `pending` and `materialized`, with `failed` when the store write fails. |
+| R14.3 | The matched-only scope filter and the incomplete-set marking ship in slice 1, rather than refusing `from_result_set:<run>` there. |
 
 Settled since draft 1: run status and causes (R8, R4; D41), re-runs in slice 1 (R12.1; D42), a row
 under a Partial facet (R5.4; D43), an early transient status (R7.2 to R7.4; D44), retention against
 evidence norms (R11.7, R11.8; D45), the act phase and K3, and a run used as a scope (R4.4, R14; D46),
 and the inventory grammar and entry points (R3; D47 to D49).
+
+Settled since draft 2: the strict number domain (R4.9; D50), the libversion version order pinned by
+content hash (R4.10; D51), no text ordering (R4.11; D52), and the re-run gate by stored kind
+(R12.6; D53).
