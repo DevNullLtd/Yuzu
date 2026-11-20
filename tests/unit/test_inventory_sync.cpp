@@ -1724,9 +1724,10 @@ TEST_CASE("pkg_inventory packages adapter: the old five-field shape maps as befo
         {supported_status("packages"), "package|homebrew|old|1|formula",
          "package|chocolatey|choc|2|pkg",
          "package|homebrew|w6|1|formula|-",
-         "package|homebrew|w7|1|formula|-|-|-",
-         "package|homebrew|w8|1|formula|-|-|-|machine",
-         "package|homebrew|w9|1|formula|-|-|-|machine|-",
+         "package|homebrew|w7|1|formula|-|-",
+         "package|homebrew|w8|1|formula|-|-|-",
+         "package|homebrew|w9|1|formula|-|-|-|machine",
+         "package|homebrew|w10|1|formula|-|-|-|machine|-",
          "package|homebrew|w12|1|formula|-|-|-|machine|-|/opt/homebrew|extra",
          "package|homebrew|w13|1|formula|-|-|-|machine|-|/opt/homebrew|extra|more"}));
     REQUIRE(r.status == Status::ok);

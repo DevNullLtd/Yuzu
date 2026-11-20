@@ -1127,6 +1127,27 @@ TEST_CASE("pkg_inventory macos user prefixes: every bound stops the user walk an
     REQUIRE(token.has_value());
     CHECK(*token == "macos:user_homes:walk_budget");
 
+    // Whole-action walk budget spent between homes. /Users lists 2 entries; alpha's Cellar lists
+    // 2 ids and one version each (4 more), so 6 ends exactly as alpha's Cellar is done: the
+    // first home's two rows are kept, the Caskroom boundary check records the stop, and the
+    // second home is never read.
+    budget.max_walk_entries = 6;
+    rows = mac::macos_package_rows_at(dir.path, token, budget, cfg);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0] == user_row("a", "1.0", "alpha", "homebrew"));
+    CHECK(rows[1] == user_row("b", "1.0", "alpha", "homebrew"));
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_caskroom:walk_budget");
+
+    // One more entry: alpha finishes, and the budget dies inside beta's Cellar listing before
+    // any beta id is opened (the per-id check records the stop under the Cellar source).
+    budget.max_walk_entries = 7;
+    rows = mac::macos_package_rows_at(dir.path, token, budget, cfg);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[1] == user_row("b", "1.0", "alpha", "homebrew"));
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_cellar:walk_budget");
+
     // Row cap under the user source: one row, then the walk stops (the second home is not read).
     Limits row_cap;
     row_cap.max_package_rows = 1;
@@ -1149,16 +1170,27 @@ TEST_CASE("pkg_inventory macos user prefixes: a home name that cannot be a wire 
           "and a home with only an empty ~/.homebrew yields nothing",
           "[pkg_inventory][macos][walk][user]") {
     using namespace yuzu::pkg_inventory;
-    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_name_"};
-    make_user_formula(dir.path, "caf\xc3\xa9", "homebrew", "wget", "1.0"); // non-ASCII name
-    make_user_formula(dir.path, "zed", "homebrew", "tool", "2.0");
-    fs::create_directories(dir.path / "Users/n\xc3\xa9" "e/.homebrew"); // Homebrew's state dir only
-    std::optional<std::string> token;
-    const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
-    REQUIRE(token.has_value());
-    CHECK(*token == "macos:homebrew_user_prefix:owner_name_unsupported");
-    REQUIRE(rows.size() == 1); // the refused home gave no row; the next home is still read
-    CHECK(rows[0] == user_row("tool", "2.0", "zed", "homebrew"));
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_name_"};
+        make_user_formula(dir.path, "caf\xc3\xa9", "homebrew", "wget", "1.0"); // non-ASCII name
+        make_user_formula(dir.path, "zed", "homebrew", "tool", "2.0");
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        REQUIRE(token.has_value());
+        CHECK(*token == "macos:homebrew_user_prefix:owner_name_unsupported");
+        REQUIRE(rows.size() == 1); // the refused home gave no row; the next home is still read
+        CHECK(rows[0] == user_row("tool", "2.0", "zed", "homebrew"));
+    }
+    {
+        // Its own tree: a repeated token is dropped by the accumulator, so beside the home
+        // above this half could not fail. Only a bad-name home, with Homebrew's state dir.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_name_empty_"};
+        fs::create_directories(dir.path / "Users/n\xc3\xa9" "e/.homebrew");
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        CHECK(rows.empty());
+        CHECK_FALSE(token.has_value());
+    }
 }
 
 TEST_CASE("pkg_inventory macos user prefixes: the prefix owner must equal the home's (injected "
