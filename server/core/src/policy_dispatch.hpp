@@ -5,7 +5,8 @@
 // Policy evaluation applies the action approval requirement before dispatch. This
 // header holds that decision, applied before anything is sent: a pair is dispatched
 // only when it is classified, is not reserved for the server's own use, has no
-// execute gate and is not Destructive.
+// execute gate, is not Destructive, and its definition's own approval_mode is `auto`
+// (policy evaluation has no approval step).
 //
 // Pure and header-only: no store, no I/O, no allocation, so it is `noexcept`
 // and can be unit tested against any registry. The evaluator calls it in
@@ -23,6 +24,8 @@
 //   4. system_reserved: Reserved
 //   5. any execute gate other than None: Gated
 //   6. Destructive class: Destructive
+//   7. the definition's approval_mode is anything but exactly `auto` (`role-gated`, `always`,
+//      empty or unrecognised): ApprovalRequired
 //   otherwise the row is returned and the pair may be dispatched.
 
 #include "command_capability.hpp"
@@ -50,6 +53,7 @@ enum class PolicyDispatchDenialReason : uint8_t {
     Reserved,                  ///< the row is reserved for the server's own dispatch
     Unwired,                   ///< the evaluator holds no registry (fails closed)
     DispatchIdentifierInvalid, ///< plugin or action over 128 bytes or off the authoring charset
+    ApprovalRequired,          ///< the definition's approval_mode is not `auto`
 };
 
 /// The reason only: keeps the seam `noexcept` and allocation free. The caller holds
@@ -77,6 +81,7 @@ enum class DispatchOrigin : uint8_t {
         case PolicyDispatchDenialReason::Unwired: return "unwired";
         case PolicyDispatchDenialReason::DispatchIdentifierInvalid:
             return "dispatch_identifier_invalid";
+        case PolicyDispatchDenialReason::ApprovalRequired: return "approval_required";
     }
     return "";
 }
@@ -108,7 +113,7 @@ enum class DispatchOrigin : uint8_t {
 /// The refusal decision. Returns the classified row when the pair may be dispatched.
 [[nodiscard]] inline std::expected<CommandCapability, PolicyDispatchDenial>
 authorize_policy_dispatch(const CommandCapabilityRegistry& registry, std::string_view plugin,
-                          std::string_view action) noexcept {
+                          std::string_view action, std::string_view approval_mode) noexcept {
     if (!dispatch_pair_well_formed(plugin, action))
         return std::unexpected(
             PolicyDispatchDenial{PolicyDispatchDenialReason::DispatchIdentifierInvalid});
@@ -137,6 +142,14 @@ authorize_policy_dispatch(const CommandCapabilityRegistry& registry, std::string
     switch (cap.dispatch_class) {
         case DispatchClass::ReadOnly:
         case DispatchClass::Mutating:
+            // Decided last, so every reason above keeps its precedence: the pair is one
+            // policy evaluation would dispatch, and only the definition's own approval
+            // requirement remains. Policy evaluation has no approval step to satisfy it, and
+            // an unknown or empty mode is refused as the interactive path reads it
+            // (`definition_needs_approval`), never as `auto`.
+            if (approval_mode != "auto")
+                return std::unexpected(
+                    PolicyDispatchDenial{PolicyDispatchDenialReason::ApprovalRequired});
             return cap;
         case DispatchClass::Destructive:
             return std::unexpected(PolicyDispatchDenial{PolicyDispatchDenialReason::Destructive});

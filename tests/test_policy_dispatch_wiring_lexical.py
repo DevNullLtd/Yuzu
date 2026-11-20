@@ -22,6 +22,9 @@ Required statements (each is one requirement id below):
                         so one refusal covers the check, the fix and the verify;
   * seam-first          `authorize_policy_dispatch(*d_.capability_registry, ...)` is called before
                         that dispatch, and the refusal returns before it;
+  * approval-mode       both `authorize_policy_dispatch` calls (the dispatch and the advisory
+                        authoring check) pass the definition's `approval_mode`, so a definition that
+                        needs approval is refused by both;
   * unwired-closed      an evaluator with no registry is refused (`Unwired`), never allowed;
   * denial-recorded     the check, fix and verify callers each record a refused dispatch.
   * denial-audit-emitted the fix caller writes its audit row (emit_denial_audit) after the release.
@@ -153,6 +156,15 @@ def problems(sources: dict[str, str]) -> list[str]:
                        "called before d_.dispatch_fn(")
         if refused_return < 0 or refused_return > calls[0]:
             out.append("seam-first: a refused dispatch does not return before d_.dispatch_fn(")
+
+    seam_calls = re.findall(r"authorize_policy_dispatch\(\*d_\.capability_registry,[^;]*;", evaluator)
+    if not seam_calls or any("approval_mode" not in c for c in seam_calls):
+        out.append("approval-mode: every authorize_policy_dispatch(*d_.capability_registry, ...) call "
+                   "in policy_evaluator.cpp must pass the definition's approval_mode (the dispatch "
+                   "site and the advisory authoring check)")
+    if len(seam_calls) != 2:
+        out.append(f"approval-mode: expected exactly 2 authorize_policy_dispatch calls in "
+                   f"policy_evaluator.cpp (dispatch and authoring check), found {len(seam_calls)}")
 
     if "if(!d_.capability_registry){denial=PolicyDispatchDenial{PolicyDispatchDenialReason::Unwired}" \
             not in evaluator:

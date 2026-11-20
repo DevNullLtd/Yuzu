@@ -36,6 +36,7 @@
 #include <chrono>
 #include <stdexcept>
 #include <string>
+#include <tuple>
 #include <vector>
 
 using namespace yuzu::server;
@@ -573,9 +574,11 @@ struct RefusalRoutes {
         routes.register_routes(sink, auth_fn, perm_fn, audit_fn, emit_fn, &ps, &*evaluator, nullptr);
     }
 
-    std::string define(const std::string& id, const std::string& plugin, const std::string& action) {
+    std::string define(const std::string& id, const std::string& plugin, const std::string& action,
+                       const std::string& approval_mode = {}) {
         InstructionDefinition d;
         d.id = id;
+        d.approval_mode = approval_mode;
         d.name = id;
         d.version = "1.0.0";
         d.type = "question";
@@ -956,5 +959,70 @@ TEST_CASE("authoring routes refuse a fragment, policy or enable whose FIX or POS
         refused_body(enabled, "destructive", post_destructive);
         last_denied("policy.enable", "destructive", post_destructive);
     }
+    CHECK(r.dispatch_calls == 0);
+}
+
+TEST_CASE("authoring and dispatch routes refuse a definition whose approval_mode is not auto, "
+          "with the approval_required reason",
+          "[pg][policy][admin][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    // echo.status is an allowed pair: only the definition's approval_mode refuses it.
+    const auto check = r.define("i.status", "echo", "status");
+    const auto always = r.define("i.status.always", "echo", "status", "always");
+    const auto role_gated = r.define("i.status.rg", "echo", "status", "role-gated");
+
+    // Authoring: fragment create, policy create and policy enable answer 400 naming the reason.
+    for (const auto& [name, def, token] :
+         {std::tuple<std::string, std::string, std::string>{"always fragment", always, "always"},
+          std::tuple<std::string, std::string, std::string>{"role-gated fragment", role_gated, "role-gated"}}) {
+        INFO("definition mode " << token);
+        auto bad = r.sink.Post("/api/policy-fragments", fragment_yaml(name, def), "text/plain");
+        REQUIRE(bad);
+        CHECK(bad->status == 400);
+        const auto body = nlohmann::json::parse(bad->body);
+        const auto msg = body.at("error").at("message").get<std::string>();
+        CHECK(msg.find("(approval_required)") != std::string::npos);
+        CHECK(msg.find(def) != std::string::npos);
+        const auto rem = body.at("error").at("remediation").get<std::string>();
+        CHECK(rem.rfind("policy_dispatch_refused: approval_required", 0) == 0);
+        REQUIRE_FALSE(r.audit_calls.empty());
+        CHECK(r.audit_calls.back().action == "policy_fragment.create");
+        CHECK(r.audit_calls.back().result == "denied");
+        CHECK(r.audit_calls.back().detail == "reason=approval_required instruction=" + def);
+    }
+    // The allowed definition is accepted (the control).
+    auto ok = r.sink.Post("/api/policy-fragments", fragment_yaml("ok fragment", check), "text/plain");
+    REQUIRE(ok);
+    CHECK(ok->status == 201);
+
+    // A fragment that reached the store another way: policy create and enable refuse it.
+    const auto stored = r.fragment("stored always", always);
+    auto created = r.sink.Post("/api/policies",
+                               "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p\nspec:\n  fragment: " +
+                                   stored + "\n  managementGroups:\n    - " + r.group_id + "\n",
+                               "text/plain");
+    REQUIRE(created);
+    CHECK(created->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.create");
+    CHECK(r.audit_calls.back().detail.find("reason=approval_required") != std::string::npos);
+
+    const auto pid = r.policy("always policy", stored, r.group_id);
+    auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+    REQUIRE(enabled);
+    CHECK(enabled->status == 400);
+    CHECK(r.audit_calls.back().action == "policy.enable");
+    CHECK(r.audit_calls.back().detail.find("reason=approval_required") != std::string::npos);
+
+    // Dispatch: evaluate answers a 409 of its own with the reason, and nothing is sent.
+    auto ev = r.sink.Post("/api/policies/" + pid + "/evaluate", "");
+    REQUIRE(ev);
+    CHECK(ev->status == 409);
+    const auto err = nlohmann::json::parse(ev->body).at("error");
+    CHECK(err.at("message") == "policy dispatch refused");
+    const auto rem = err.at("remediation").get<std::string>();
+    CHECK(rem.rfind("policy_dispatch_refused: approval_required", 0) == 0);
+    // The text names the approval mode, not an action, and says what to do.
+    CHECK(rem.find("approval mode") != std::string::npos);
     CHECK(r.dispatch_calls == 0);
 }

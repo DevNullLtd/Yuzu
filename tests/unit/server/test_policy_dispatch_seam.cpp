@@ -27,6 +27,7 @@
 #include <string>
 #include <string_view>
 #include <type_traits>
+#include <utility>
 
 using namespace yuzu::server;
 using yuzu::server::test::policy_fixture_registry;
@@ -41,8 +42,8 @@ const CommandCapabilityRegistry& full_registry() {
 
 // The reason the seam gave, or nullopt when it allowed the pair.
 std::optional<Reason> refusal(const CommandCapabilityRegistry& reg, std::string_view plugin,
-                              std::string_view action) {
-    auto r = authorize_policy_dispatch(reg, plugin, action);
+                              std::string_view action, std::string_view approval_mode = "auto") {
+    auto r = authorize_policy_dispatch(reg, plugin, action, approval_mode);
     if (r)
         return std::nullopt;
     return r.error().reason;
@@ -51,7 +52,8 @@ std::optional<Reason> refusal(const CommandCapabilityRegistry& reg, std::string_
 } // namespace
 
 static_assert(noexcept(authorize_policy_dispatch(std::declval<const CommandCapabilityRegistry&>(),
-                                                 std::string_view{}, std::string_view{})),
+                                                 std::string_view{}, std::string_view{},
+                                                 std::string_view{})),
               "the seam is noexcept: it runs on the dispatch path and allocates nothing");
 
 TEST_CASE("policy dispatch seam: each denial reason has its own lowercase token",
@@ -63,6 +65,40 @@ TEST_CASE("policy dispatch seam: each denial reason has its own lowercase token"
     CHECK(to_string(Reason::Reserved) == "reserved");
     CHECK(to_string(Reason::Unwired) == "unwired");
     CHECK(to_string(Reason::DispatchIdentifierInvalid) == "dispatch_identifier_invalid");
+    CHECK(to_string(Reason::ApprovalRequired) == "approval_required");
+}
+
+TEST_CASE("policy dispatch seam: a definition whose approval_mode is not auto is refused",
+          "[policy][dispatch_seam][approval_mode]") {
+    const auto& reg = full_registry();
+    // A read-only pair with no gate and a Mutating pair with no gate: allowed under auto.
+    for (const auto& pair : {std::pair<std::string_view, std::string_view>{"echo", "status"},
+                             std::pair<std::string_view, std::string_view>{"tags", "set"}}) {
+        INFO("pair " << pair.first << "." << pair.second);
+        CHECK_FALSE(refusal(reg, pair.first, pair.second, "auto").has_value());
+        // The two modes the authoring vocabulary has, refused.
+        CHECK(refusal(reg, pair.first, pair.second, "role-gated") == Reason::ApprovalRequired);
+        CHECK(refusal(reg, pair.first, pair.second, "always") == Reason::ApprovalRequired);
+        // Anything else fails closed, as the interactive path does: an empty value, a value
+        // outside the vocabulary and a different case are each refused, never read as auto.
+        CHECK(refusal(reg, pair.first, pair.second, "") == Reason::ApprovalRequired);
+        CHECK(refusal(reg, pair.first, pair.second, "manual") == Reason::ApprovalRequired);
+        CHECK(refusal(reg, pair.first, pair.second, "Auto") == Reason::ApprovalRequired);
+        CHECK(refusal(reg, pair.first, pair.second, "auto ") == Reason::ApprovalRequired);
+    }
+}
+
+TEST_CASE("policy dispatch seam: approval_mode is decided last, so each pair reason keeps its "
+          "precedence", "[policy][dispatch_seam][approval_mode]") {
+    const auto& reg = full_registry();
+    // Whatever the mode, a pair the catalogue refuses keeps its own reason.
+    for (const char* mode : {"auto", "role-gated", "always", ""}) {
+        INFO("mode '" << mode << "'");
+        CHECK(refusal(reg, "content_dist", "execute_staged", mode) == Reason::Gated);
+        CHECK(refusal(reg, "echo", "purge_source", mode) == Reason::Destructive);
+        CHECK(refusal(reg, "__guard__", "push_rules", mode) == Reason::Reserved);
+        CHECK(refusal(reg, "no_such_plugin", "run", mode) == Reason::Unclassified);
+    }
 }
 
 TEST_CASE("policy dispatch seam: the identifier rule is the one instruction authoring applies",
@@ -218,7 +254,18 @@ TEST_CASE("policy dispatch seam: sweep over every production capability row",
         const bool should_refuse = cap.execute_gate != ExecuteGate::None ||
                                    cap.dispatch_class == DispatchClass::Destructive ||
                                    cap.system_reserved;
-        const auto result = authorize_policy_dispatch(reg, cap.plugin, cap.action);
+        const auto result = authorize_policy_dispatch(reg, cap.plugin, cap.action, "auto");
+
+        // A row the seam allows under `auto` is refused, as approval_required, under every
+        // other mode; a row it refuses keeps its own reason.
+        {
+            const auto always = authorize_policy_dispatch(reg, cap.plugin, cap.action, "always");
+            REQUIRE_FALSE(always.has_value());
+            if (result)
+                CHECK(always.error().reason == Reason::ApprovalRequired);
+            else
+                CHECK(always.error().reason == result.error().reason);
+        }
 
         if (!result && result.error().reason == Reason::Ambiguous) {
             // The same pair declared twice: refused, and `classify` agrees it is ambiguous.
@@ -271,7 +318,8 @@ TEST_CASE("policy dispatch seam: the interactive chokepoint's refusals are a sub
     reg.for_each_row([&](const CommandCapability& cap) {
         ++rows;
         INFO("row " << cap.plugin << "." << cap.action);
-        const bool seam_allows = authorize_policy_dispatch(reg, cap.plugin, cap.action).has_value();
+        const bool seam_allows =
+            authorize_policy_dispatch(reg, cap.plugin, cap.action, "auto").has_value();
         const bool operator_allowed =
             detail::classify_and_authorize_dispatch(reg, operator_caller, cap.plugin, cap.action, allow_all)
                 .has_value();

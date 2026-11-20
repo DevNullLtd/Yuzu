@@ -78,6 +78,14 @@ expect("the seam call removed",
               "classify_only(*d_.capability_registry,"), "seam-first")
 expect("the refusal no longer returns",
        mutate(real, E, "return refused;", "(void)refused;"), "seam-first")
+expect("the dispatch seam call no longer passes the approval mode",
+       mutate(real, E, "authorize_policy_dispatch(*d_.capability_registry, def.plugin, def.action,\n"
+                       "                                         def.approval_mode);",
+              "authorize_policy_dispatch(*d_.capability_registry, def.plugin, def.action,\n"
+              "                                         \"auto\");"), "approval-mode")
+expect("the authoring check no longer passes the approval mode",
+       mutate(real, E, "(*def)->action,\n                                 (*def)->approval_mode);",
+              "(*def)->action,\n                                 std::string_view{\"auto\"});"), "approval-mode")
 expect("the unwired arm removed",
        mutate(real, E, "denial = PolicyDispatchDenial{PolicyDispatchDenialReason::Unwired};",
               "denial = std::nullopt;"), "unwired-closed")

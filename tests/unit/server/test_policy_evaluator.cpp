@@ -1763,9 +1763,10 @@ const CommandCapabilityRegistry& full_registry() {
 // Define an instruction on a <plugin>.<action> pair (id = "pair.<plugin>.<action>" unless one is
 // given; a definition id is limited to 128 bytes, so a pair with a very long part needs one).
 std::string define_real_pair(Harness& h, const std::string& plugin, const std::string& action,
-                             const std::string& id = {}) {
+                             const std::string& id = {}, const std::string& approval_mode = {}) {
     InstructionDefinition d;
     d.id = id.empty() ? "pair." + plugin + "." + action : id;
+    d.approval_mode = approval_mode;
     d.name = d.id;
     d.version = "1.0.0";
     d.type = "question";
@@ -2141,7 +2142,7 @@ TEST_CASE("policy dispatch approval: a refusal is counted once per call, a block
     // reading it cannot create it).
     const auto exposition = metrics.serialize();
     for (const char* reason : {"unclassified", "ambiguous", "gated", "destructive", "reserved",
-                               "unwired", "dispatch_identifier_invalid"}) {
+                               "unwired", "dispatch_identifier_invalid", "approval_required"}) {
         INFO("reason " << reason);
         CHECK(exposition.find(std::string("yuzu_server_policy_dispatch_denied_total{reason=\"") +
                               reason + "\"} 0") != std::string::npos);
@@ -2828,4 +2829,148 @@ TEST_CASE("policy dispatch approval: a chunk failure part-way through a large re
     REQUIRE(st->has_value());
     CHECK(static_cast<int64_t>(std::time(nullptr)) - (*st)->last_check_at < 60);
     CHECK(h.dispatch_calls == 0);
+}
+
+// ---------------------------------------------------------------------------
+// A definition whose own approval_mode is not `auto` is not dispatched by policy evaluation,
+// whatever its pair: policy evaluation has no approval step. The pair used below is an allowed
+// one (echo.status, tags.set), so the refusal is the approval_mode's doing alone.
+// ---------------------------------------------------------------------------
+
+TEST_CASE("policy dispatch approval: a check whose definition needs approval is not dispatched, "
+          "on operator request and on a tick",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    // The same allowed pair as the control tests, but the definition says `always`.
+    const auto check = define_real_pair(h, "echo", "status", "pair.echo.status.always", "always");
+    const auto pid = author_real_pairs(h, check);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    auto kicked = ev.evaluate_now(pid);
+    h.fake_now += 20;
+    ev.tick(true);
+
+    CHECK_FALSE(pair_was_dispatched(h, kReadControlPair));
+    CHECK(h.dispatch_calls == 0);
+    REQUIRE(kicked.has_value());
+    CHECK(kicked->execution_id.empty());
+    REQUIRE(kicked->denial.has_value());
+    CHECK(kicked->denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    check_blocked(h, pid, "check", "approval_required", "echo", "status");
+    CHECK(denied(metrics, "approval_required") >= 1);
+    CHECK(denied(metrics, "gated") == 0);
+}
+
+TEST_CASE("policy dispatch approval: a role-gated definition is refused as well, and an auto "
+          "definition over the same pair still dispatches",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    can_non_compliant(h, "echo");
+    const auto gated_def = define_real_pair(h, "echo", "status", "pair.echo.status.rg", "role-gated");
+    const auto auto_def = define_real_pair(h, "echo", "status", "pair.echo.status.auto", "auto");
+    const auto refused_pid = author_real_pairs(h, gated_def);
+    const auto control_pid = author_real_pairs(h, auto_def);
+
+    PolicyEvaluator ev(h.deps());
+    auto refused = ev.evaluate_now(refused_pid);
+    REQUIRE(refused.has_value());
+    REQUIRE(refused->denial.has_value());
+    CHECK(refused->denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    CHECK(h.dispatch_calls == 0);
+
+    auto control = ev.evaluate_now(control_pid);
+    REQUIRE_FALSE(exec_id_of(control).empty());
+    CHECK_FALSE(control->denial.has_value());
+    CHECK(h.dispatch_calls == 1);
+    CHECK(pair_was_dispatched(h, kReadControlPair));
+}
+
+TEST_CASE("policy dispatch approval: a fix whose definition needs approval is not dispatched on "
+          "operator remediate",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"};
+    const auto check = define_real_pair(h, "echo", "status");
+    // tags.set has no execute gate and is Mutating, so only the approval_mode refuses it.
+    const auto fix = define_real_pair(h, "tags", "set", "pair.tags.set.always", "always");
+    const auto pid = author_real_pairs(h, check, fix);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr = ev.remediate(pid, {"agentA"});
+
+    CHECK_FALSE(pair_was_dispatched(h, "tags.set"));
+    CHECK_FALSE(rr.ok);
+    CHECK_FALSE(rr.degraded);
+    REQUIRE(rr.denial.has_value());
+    CHECK(rr.denial->reason == PolicyDispatchDenialReason::ApprovalRequired);
+    REQUIRE(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "fix");
+    CHECK(j["reason"] == "approval_required");
+    CHECK(denied(metrics, "approval_required") == 1);
+    // The claim was released, so the target can be claimed again.
+    auto reclaim = h.ps.claim_remediation(pid, {"agentA"}, 1800);
+    REQUIRE(reclaim.has_value());
+    CHECK(reclaim->ids.size() == 1);
+}
+
+TEST_CASE("policy dispatch approval: a post-fix check whose definition needs approval is not "
+          "dispatched, and the targets are blocked, not in error",
+          "[pg][policy][evaluator][dispatch_approval][approval_mode]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    Harness h(pool);
+    h.capability_registry = &full_registry();
+    yuzu::MetricsRegistry metrics;
+    can_non_compliant(h, "echo");
+    h.canned["agentA|tags"] = {1, "ok"};
+    const auto check = define_real_pair(h, "echo", "status");
+    const auto fix = define_real_pair(h, "tags", "set"); // allowed: auto
+    const auto verify = define_real_pair(h, "echo", "status", "pair.echo.status.verify.always", "always");
+    const auto pid = author_real_pairs(h, check, fix, verify);
+
+    auto deps = h.deps();
+    deps.metrics = &metrics;
+    PolicyEvaluator ev(deps);
+    REQUIRE_FALSE(exec_id_of(ev.evaluate_now(pid)).empty());
+    h.fake_now += 20;
+    ev.tick(true);
+    REQUIRE(h.status_of(pid, "agentA") == "non_compliant");
+
+    auto rr = ev.remediate(pid, {"agentA"});
+    REQUIRE(rr.ok);
+    REQUIRE(pair_was_dispatched(h, "tags.set"));
+    const int before = h.dispatch_calls;
+
+    h.fake_now += 20;
+    ev.tick(false); // the fix matures; its verify dispatch is refused
+    CHECK(h.dispatch_calls == before);
+    CHECK(h.status_of(pid, "agentA") == "blocked");
+    const auto j = row_json(h, pid, "agentA");
+    CHECK(j["phase"] == "verify");
+    CHECK(j["reason"] == "approval_required");
+    CHECK(metrics.counter("yuzu_server_policy_eval_errors_total", {{"phase", "verify"}}).value() == 0);
+    CHECK(denied(metrics, "approval_required") == 1);
 }

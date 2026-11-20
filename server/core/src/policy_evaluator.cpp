@@ -354,13 +354,14 @@ PolicyEvaluator::PolicyEvaluator(Deps deps) : d_(std::move(deps)) {
             "Policy dispatches refused before anything was sent, labelled by reason. One increment "
             "per refused dispatch call (per policy and phase per attempt, not per target), "
             "whether or not an audit row is written. Reasons: unclassified, ambiguous, gated, "
-            "destructive, reserved, unwired, dispatch_identifier_invalid.",
+            "destructive, reserved, unwired, dispatch_identifier_invalid, approval_required.",
             "counter");
         for (const auto reason :
              {PolicyDispatchDenialReason::Unclassified, PolicyDispatchDenialReason::Ambiguous,
               PolicyDispatchDenialReason::Gated, PolicyDispatchDenialReason::Destructive,
               PolicyDispatchDenialReason::Reserved, PolicyDispatchDenialReason::Unwired,
-              PolicyDispatchDenialReason::DispatchIdentifierInvalid}) {
+              PolicyDispatchDenialReason::DispatchIdentifierInvalid,
+              PolicyDispatchDenialReason::ApprovalRequired}) {
             d_.metrics->counter("yuzu_server_policy_dispatch_denied_total",
                                 {{"reason", std::string(to_string(reason))}});
         }
@@ -462,7 +463,8 @@ PolicyEvaluator::dispatch_instruction(const std::string& instruction_id,
         if (!d_.capability_registry) {
             denial = PolicyDispatchDenial{PolicyDispatchDenialReason::Unwired};
         } else if (auto allowed =
-                       authorize_policy_dispatch(*d_.capability_registry, def.plugin, def.action);
+                       authorize_policy_dispatch(*d_.capability_registry, def.plugin, def.action,
+                                         def.approval_mode);
                    !allowed) {
             denial = allowed.error();
         }
@@ -835,7 +837,8 @@ PolicyEvaluator::authorize_instruction(const std::string& instruction_id) const 
     if (!*def)
         return {InstructionCheck::Kind::Allowed, std::nullopt};
     auto allowed =
-        authorize_policy_dispatch(*d_.capability_registry, (*def)->plugin, (*def)->action);
+        authorize_policy_dispatch(*d_.capability_registry, (*def)->plugin, (*def)->action,
+                                 (*def)->approval_mode);
     if (!allowed)
         return {InstructionCheck::Kind::Refused, allowed.error()};
     return {InstructionCheck::Kind::Allowed, std::nullopt};

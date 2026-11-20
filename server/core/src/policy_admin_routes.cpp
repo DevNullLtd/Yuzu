@@ -85,6 +85,15 @@ std::string refusal_remediation(PolicyDispatchDenialReason reason, bool authorin
         return out + "Policy evaluation cannot check this action now, because the server's "
                      "capability registry is not available. Try again later, and tell the "
                      "administrator if it persists.";
+    if (reason == PolicyDispatchDenialReason::ApprovalRequired) {
+        if (authoring)
+            return out + "The instruction has an approval mode that needs approval, and policy "
+                         "evaluation has no approval step. Use an instruction whose approval "
+                         "mode is auto.";
+        return out + "The policy's check or fix names an instruction whose approval mode needs "
+                     "approval, and policy evaluation has no approval step. Change the "
+                     "instruction the policy uses, or set its approval mode to auto.";
+    }
     if (authoring)
         return out + "The instruction names an action that policy evaluation does not "
                      "dispatch. Use a different instruction.";
@@ -145,11 +154,16 @@ bool PolicyAdminRoutes::refuse_unusable_instructions(
         detail::A4ErrorOpts opts;
         const std::string remediation = refusal_remediation(check.denial->reason, /*authoring=*/true);
         opts.remediation = remediation;
-        res.set_content(detail::a4_error(res,
-                                         "instruction " + id +
-                                             " names an action that policy evaluation does not "
-                                             "dispatch (" + token + ")",
-                                         opts),
+        res.set_content(detail::a4_error(
+                            res,
+                            check.denial->reason == PolicyDispatchDenialReason::ApprovalRequired
+                                ? "instruction " + id +
+                                      " has an approval mode that policy evaluation does not "
+                                      "dispatch (" + token + ")"
+                                : "instruction " + id +
+                                      " names an action that policy evaluation does not "
+                                      "dispatch (" + token + ")",
+                            opts),
                         "application/json");
         return true;
     }

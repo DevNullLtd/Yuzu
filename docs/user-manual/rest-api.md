@@ -5354,7 +5354,7 @@ Create a new policy fragment from YAML.
 
 **Response (409):** Returned when a fragment with the same `name` already exists. Body is `{"error": "policy fragment named '<name>' already exists"}`. Audit event recorded as `policy_fragment.create / denied / duplicate_name`. Choose a different name (existing fragments are immutable on rename).
 
-**Response (400), refused instruction:** a fragment whose `check`, `fix` or `postCheck` instruction names an action policy evaluation will not dispatch (an execute gate, a destructive or reserved action, or one the server cannot classify) is refused before it is stored. Body is the A4 error envelope, `{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)","correlation_id":"<id>","retry_after_ms":null,"remediation":"policy_dispatch_refused: <reason>. ..."},"meta":{"api_version":"v1"}}`, with the same `X-Correlation-Id` header, where `<reason>` is `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved` or `dispatch_identifier_invalid` (`unwired` answers `503`, below). Unlike the other `400`s on these routes, whose `error` is a string, the `error` of this one is an object, and its `remediation` starts `policy_dispatch_refused: ` followed by the reason; that is how a client tells it apart. Audit event `policy_fragment.create / denied`, detail `reason=<reason> instruction=<id>`. The check is advisory: an instruction that does not exist yet is accepted, and the dispatch check is the control.
+**Response (400), refused instruction:** a fragment whose `check`, `fix` or `postCheck` instruction names an action policy evaluation will not dispatch (an execute gate, a destructive or reserved action, or one the server cannot classify) is refused before it is stored. Body is the A4 error envelope, `{"error":{"code":400,"message":"instruction <id> names an action that policy evaluation does not dispatch (<reason>)","correlation_id":"<id>","retry_after_ms":null,"remediation":"policy_dispatch_refused: <reason>. ..."},"meta":{"api_version":"v1"}}`, with the same `X-Correlation-Id` header, where `<reason>` is `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `approval_required` or `dispatch_identifier_invalid` (`unwired` answers `503`, below). For `approval_required` the message reads `instruction <id> has an approval mode that policy evaluation does not dispatch (approval_required)`: the instruction's approval mode is not `auto`. Unlike the other `400`s on these routes, whose `error` is a string, the `error` of this one is an object, and its `remediation` starts `policy_dispatch_refused: ` followed by the reason; that is how a client tells it apart. Audit event `policy_fragment.create / denied`, detail `reason=<reason> instruction=<id>`. The check is advisory: an instruction that does not exist yet is accepted, and the dispatch check is the control.
 
 **Response (503):** Policy store not yet initialized, or a genuine internal store failure on the write (safe to retry — distinct from the 400/409 rejections above, and the internal error string is never included in the body). Also `503` when the refused-instruction check cannot be answered, and the fragment is never accepted in that case. The body is the A4 error envelope with a correlation id. When the instruction store failed (a retry may clear it) the message is `instruction lookup unavailable, try again` and `retry_after_ms` is 5000; when the evaluator has no capability registry or instruction store (`unwired`, which no retry clears) the message is `instruction lookup unavailable` and `retry_after_ms` is `null`.
 
@@ -5639,11 +5639,11 @@ verdicts appear a few seconds later.
 **Response (404):** policy not found. **Response (409):** the policy's fragment
 has no `check` instruction, the policy matches no agents, or a check for this
 policy is already in flight; or the check names an action that policy evaluation
-does not run (a refused dispatch). The refused dispatch has its own error body,
+does not run, or an instruction whose approval mode is not `auto` (a refused dispatch). The refused dispatch has its own error body,
 built like every other A4 error (`error.code` 409, `message` "policy dispatch
 refused", a `correlation_id`, and a `remediation` text that starts
 `policy_dispatch_refused: ` followed by the reason: `gated`, `destructive`,
-`reserved`, `unclassified`, `ambiguous`, `unwired` or
+`reserved`, `unclassified`, `ambiguous`, `unwired`, `approval_required` or
 `dispatch_identifier_invalid`; the text tells the caller to change the instruction, except for
 `unwired`, where it says to try again later). Nothing was sent; the policy's devices are
 `blocked` and the attempt is audited as `policy.evaluate` `denied`. **Response (503):** either the policy evaluator
@@ -5709,7 +5709,7 @@ from the count, so `agents` may be smaller than the number of `agent_ids`
 requested.
 
 **Response (404):** policy not found. **Response (409):** the fix names an action
-that policy evaluation does not run (a refused dispatch, with the same error body
+that policy evaluation does not run, or an instruction whose approval mode is not `auto` (a refused dispatch, with the same error body
 as `/evaluate` above; the targets become `blocked` and their claims are released;
 this is decided at dispatch, after the no-fix-instruction, no-agents and claim rejections below, which answer first), the fragment defines no
 `fix` instruction, there are no non-compliant agents to remediate, or a target
@@ -5860,7 +5860,7 @@ Per-policy compliance detail with per-agent statuses.
 }
 ```
 
-`blocked` counts devices whose check or fix policy evaluation refused to dispatch, because the instruction names an action with an execute gate, a destructive or reserved action, or one the server cannot classify (see "Action approval and the `blocked` status" in the policy engine manual). It counts as failing, nothing was sent, and the other routes in this section carry the same field. For a `blocked` device `check_result` is not agent output but a JSON string the server wrote: `{"action":"execute_staged","phase":"check","plugin":"content_dist","reason":"gated","result":"blocked"}` (keys in this order; `result` is always `blocked`). `phase` is `check`, `fix` or `verify`; `reason` is one of `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired` and `dispatch_identifier_invalid`; `plugin` and `action` are `null` when the refused pair was not a well formed identifier (the reason is then `dispatch_identifier_invalid`).
+`blocked` counts devices whose check or fix policy evaluation refused to dispatch, because the instruction names an action with an execute gate, a destructive or reserved action, or one the server cannot classify, or has an approval mode other than `auto` (see "Action approval and the `blocked` status" in the policy engine manual). It counts as failing, nothing was sent, and the other routes in this section carry the same field. For a `blocked` device `check_result` is not agent output but a JSON string the server wrote: `{"action":"execute_staged","phase":"check","plugin":"content_dist","reason":"gated","result":"blocked"}` (keys in this order; `result` is always `blocked`). `phase` is `check`, `fix` or `verify`; `reason` is one of `unclassified`, `ambiguous`, `gated`, `destructive`, `reserved`, `unwired`, `approval_required` and `dispatch_identifier_invalid`; `plugin` and `action` are `null` when the refused pair was not a well formed identifier (the reason is then `dispatch_identifier_invalid`).
 
 **Response (503):** `policy store degraded`, on either the summary or the
 per-agent-status read.

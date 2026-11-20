@@ -276,7 +276,7 @@ The policy engine tracks compliance status per agent per policy. Each
 | `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (output nested past the depth guard, an evaluation that threw, or a compliance expression that fails to evaluate, such as a division by zero; all three are counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; a numeric JSON value is compared as text and is not an error; `reason="expression"` covers an expression that evaluates to no value: a division by zero, a type error, a timeout, or an expression that does not parse or is over-long. A `result.<field>` the response lacks reads as an empty string, which is false: the verdict is `non_compliant`, not `error`, and nothing is counted; only that device is affected) |
-| `blocked` | Policy evaluation did not dispatch the check or fix, because its instruction names an action that policy evaluation does not run (see [Action approval and the `blocked` status](#action-approval-and-the-blocked-status)). Nothing was sent to the device. A check that runs a Forensics-tier plugin shows `blocked` for this reason (`gated`). It counts as failing and clears when a later dispatch records a real result. |
+| `blocked` | Policy evaluation did not dispatch the check or fix, because its instruction names an action that policy evaluation does not run, or has an approval mode other than `auto` (see [Action approval and the `blocked` status](#action-approval-and-the-blocked-status)). Nothing was sent to the device. A check that runs a Forensics-tier plugin shows `blocked` for this reason (`gated`). It counts as failing and clears when a later dispatch records a real result. |
 
 ### Action approval and the `blocked` status
 
@@ -289,7 +289,10 @@ dispatches it only when all of these hold:
 - the pair is classified, with exactly one catalogue row;
 - the row is not reserved for the server's own use;
 - the row has no execute gate (no approval requirement);
-- the row is not Destructive.
+- the row is not Destructive;
+- the instruction's own approval mode is `auto`. Policy evaluation has no approval step, so an
+  instruction whose approval mode is `role-gated` or `always` is refused, and so is an empty or
+  unrecognised mode (the interactive path reads such a value as needing approval too).
 
 Otherwise nothing is sent, and the policy shows `blocked` for its devices. The device's
 `check_result` records the `phase` (`check`, `fix` or `verify`), the `reason`, and the
@@ -303,6 +306,7 @@ Otherwise nothing is sent, and the policy shows `blocked` for its devices. The d
 | `unclassified` | No catalogue row names the pair, or its row has no execute gate recorded. |
 | `ambiguous` | More than one catalogue row names the pair. |
 | `unwired` | The server holds no capability catalogue for policy evaluation, so every dispatch is refused. |
+| `approval_required` | The instruction's approval mode is not `auto` (`role-gated`, `always`, or a value that is not one of the modes). The action itself is one policy evaluation would dispatch; only the instruction's own approval requirement refuses it. It is reported after every other reason, so an action that is also gated, destructive or reserved shows that reason. |
 | `dispatch_identifier_invalid` | The plugin or action is over 128 bytes or uses a character other than letters, digits, `_`, `.` and `-`. The row stores no plugin or action text. |
 
 What this means in use:
@@ -357,6 +361,16 @@ What this means in use:
   needs any other action has to be run another way, for example by an operator running the
   action interactively, where the approval requirement applies. The Remediate button is still
   shown for a fix that will be refused: it is shown whenever the fragment has a fix.
+- **An instruction that needs approval is not run by a policy either.** A check, fix or post-fix
+  check whose instruction has approval mode `role-gated` or `always` is refused as
+  `approval_required` and the devices show `blocked`, whatever its action. To use such an
+  instruction in a policy, set its approval mode to `auto` (an instruction's approval mode is
+  edited through `PUT /api/instructions/{id}` or `PUT /api/v1/instructions/{id}`); to keep it
+  approval-gated, run it interactively or on a schedule, where the approval requirement
+  applies. Of the shipped definitions, the 79 that set `role-gated` or `always` already name an action
+  that has an execute gate or one policy evaluation cannot classify, so a policy dispatches
+  none of them for that reason alone; this rule is the one that applies to a definition that
+  is authored or edited.
 - A refusal is counted in `yuzu_server_policy_dispatch_denied_total{reason}` and a
   `policy.dispatch` audit row is attempted (see the [audit log](audit-log.md) for when one is
   written and when one can be lost).
@@ -493,7 +507,7 @@ when the signed-in role holds the permission (the server re-checks every call).
 | **Evaluate** | `Policy:Execute` | Dispatches a read-only check now. The toast shows the execution id, not a device count. |
 | **Invalidate all** | `Policy:Execute` | Resets every result to unknown; fleet compliance reads 0% until devices check in. Confirmation required. |
 | **New policy** / **New fragment** | `Policy:Write` | Paste YAML (up to 1 MiB); a refused document shows the server's message. Not available in this build: the controls appear only once the shared dialog script (`/static/yuzu-dialog.js`) is shipped, so create policies and fragments with `POST /api/policies` and `POST /api/policy-fragments` until then. |
-| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm. A fix whose action has an execute gate, is destructive or is reserved for the server is refused, not dispatched, and the devices show `blocked`; the toast names the reason. |
+| **Remediate** | `Policy:Execute` | Shown only when the policy's fragment has a fix. Runs the fix on whichever devices are non-compliant when you confirm. A fix whose action has an execute gate, is destructive or is reserved for the server, or whose instruction needs approval, is refused, not dispatched, and the devices show `blocked`; the toast names the reason. |
 | **Invalidate cache** | `Policy:Execute` | Resets one policy's results and its fix attempt counts. Confirmation required. |
 | **Delete** (policy, fragment) | `Policy:Delete` | Confirmation required. A fragment still used by a policy cannot be deleted. |
 
