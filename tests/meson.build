@@ -278,6 +278,8 @@ agent_test_exe = executable(
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_single_flight.cpp', # vuln_scan single-flight/cache helper cannot wedge (portable)
+    'unit/test_vuln_macos_software.cpp', # macOS enumeration status/abs-path contract (macos_software.hpp), portable
     'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
@@ -5417,6 +5419,21 @@ test('plugin init failed wiring lexical selftest',
   timeout: 30,
 )
 
+# vuln_scan never executes Homebrew's brew (the macOS agent is root; a Homebrew prefix is
+# user-owned). String-literal-aware lexical gate over agents/plugins/vuln_scan/src/**; the selftest
+# injects each evasion shape (URL-in-string, "br" "ew", .mm, absolute path) and requires RED.
+test('vuln_scan no-brew lexical',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('vuln_scan no-brew lexical selftest',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 # WP11: the processes / network_config bypass / installed_apps user_app rows are built by the
 # neutralising formatters at every site (best-effort lexical tripwire, self-checked in memory).
 test('plugin row formatters wiring lexical',
