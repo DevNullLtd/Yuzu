@@ -268,6 +268,18 @@ struct Harness {
         return {};
     }
 
+    // Overwrite a schedule's stored parameter text with arbitrary text (bypassing create-time
+    // canonicalisation).
+    void set_stored_parameters(const std::string& id, const std::string& text) {
+        yuzu::server::pg::PgConn conn{PQconnectdb(instr_db.dsn().c_str())};
+        REQUIRE(PQstatus(conn.get()) == CONNECTION_OK);
+        const char* values[2] = {text.c_str(), id.c_str()};
+        yuzu::server::pg::PgResult res{PQexecParams(
+            conn.get(), "UPDATE schedule_engine.schedules SET parameter_values = $1 WHERE id = $2", 2,
+            nullptr, values, nullptr, nullptr, 0)};
+        REQUIRE(res.status() == PGRES_COMMAND_OK);
+    }
+
     // Force an already-advanced schedule due again (a "next occurrence").
     // ScheduleEngine now lives in Postgres (instr_pool) — poke it via a
     // second raw connection, same as the interval-floor test below.
@@ -1783,8 +1795,12 @@ TEST_CASE("ScheduleRunner: stored parameters that do not decode are a denial and
         ++arming_calls;
         return true; // would admit: only the undecodable text can be what denies
     });
-    auto bad_json = h.make_due("test.def", "interval", /*requires_approval=*/false, "not json {");
-    auto not_object = h.make_due("test.def", "interval", /*requires_approval=*/false, "[1,2]");
+    // The engine canonicalises parameters on create, so the undecodable text is written to the
+    // stored row directly (a hand-edited or damaged row is the case being pinned).
+    auto bad_json = h.make_due("test.def", "interval");
+    auto not_object = h.make_due("test.def", "interval");
+    h.set_stored_parameters(bad_json, "not json {");
+    h.set_stored_parameters(not_object, "[1,2]");
 
     h.runner.tick();
 

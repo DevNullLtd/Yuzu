@@ -1717,8 +1717,8 @@ public:
         // execute_instruction counts it under yuzu_mcp_tool_args_too_large_total instead;
         // execute_instruction_definition counts route="mcp" here (the shared execute core), and
         // execute_bundle counts route="bundle".
-        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule",
-                                  "bundle", "policy_fragment"})
+        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle",
+                                  "policy_fragment"})
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonParamKeyInvalid)}});

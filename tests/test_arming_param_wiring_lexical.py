@@ -51,12 +51,12 @@ SCHEDULE_DEPS = re.compile(r"register_schedule_routes\(\s*inline_sink,\s*yuzu::s
 PRESEED = re.compile(
     r'for \(const char\* route : \{([^}]*)\}\)\s*metrics_\.counter\("yuzu_server_dispatch_target_rejected_total",\s*'
     r'\{\{"route", route\},\s*\{"reason", std::string\(yuzu::server::kReasonParamKeyInvalid\)\}\}\);', re.S)
-ROUTES = {"command", "command_v1", "instruction_execute", "schedule", "bundle", "policy_fragment"}
+ROUTES = {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle", "policy_fragment"}
 
 
 def check_param_key_wiring(source):
     """The `param_key_invalid` counter wiring: the schedule routes get the metrics registry and the
-    six counted route labels are pre-seeded (absent() alerting needs the series at zero). Searched in
+    seven counted route labels are pre-seeded (absent() alerting needs the series at zero). Searched in
     the raw text (the one-pass comment stripper above is not trustworthy across a whole file with
     string literals that hold comment markers); the patterns span no comment."""
     src = source
@@ -82,7 +82,8 @@ def selftest(source):
         "passes the argument from a first lambda only": source.replace("plugin, action, parameters);", "plugin, action);", 1),
     }
     mutants["schedule Deps without metrics"] = source.replace("                             .metrics = &metrics_,\n                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API","                         });\n\n        // #2542 PR-11: the 3-route legacy pre-v1 Responses API",1)
-    mutants["pre-seed drops a route"] = source.replace('"instruction_execute", "schedule", "bundle",\n                                  "policy_fragment"}','"instruction_execute", "bundle",\n                                  "policy_fragment"}',1)
+    mutants["pre-seed drops a route"] = source.replace('"mcp", "schedule", "bundle",\n                                  "policy_fragment"}','"mcp", "bundle",\n                                  "policy_fragment"}',1)
+    mutants["pre-seed drops mcp"] = source.replace('"instruction_execute", "mcp", "schedule"','"instruction_execute", "schedule"',1)
     for name, mutated in mutants.items():
         if mutated == source:
             print(f"SELFTEST SETUP FAILED: mutation '{name}' did not change the source")
