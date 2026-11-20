@@ -1008,7 +1008,7 @@ When using OIDC (for example with Keycloak or Microsoft Entra ID):
 
 ## Agent re-registration proof: alert runbook
 
-The alerts below belong to `--agent-reregistration-proof` (see [Upgrading: re-registration proof](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01) for the modes, the soak and the recovery rules). Each heading is the alert name; every `runbook_url` in `docs/prometheus/yuzu-alerts.yml` for these alerts points here. The authoritative count of decisions is always `yuzu_register_reregistration_total`; audit rows are bounded and can be dropped.
+The alerts below belong to `--agent-reregistration-proof` (see [Upgrading: re-registration proof](upgrading.md#behaviour-change-re-registering-an-already-enrolled-agent-can-require-proof-of-its-identity-wp01) for the modes, the soak and the recovery rules). Each heading is the alert name; every `runbook_url` in `docs/prometheus/yuzu-alerts.yml` for these alerts points here. These are sample rules: `docs/prometheus/yuzu-alerts.yml` is not loaded by anything this repo ships (no compose file mounts it, no Alertmanager configuration ships), so they fire only where an operator has wired the rules and routed their severities. The authoritative count of decisions is always `yuzu_register_reregistration_total`; audit rows are bounded and can be dropped.
 
 ### YuzuAgentReregistrationWouldRefuse
 
@@ -1041,6 +1041,10 @@ A single-use token was consumed to re-enrol a live-leaf id but no leaf was issue
 ### YuzuAgentReregistrationAuditWriteFailed
 
 A re-registration audit row could not be written (`reason` `store_unavailable` or `write_failed`). Restore the audit store. The decision still happened and is counted in `yuzu_register_reregistration_total`; the call itself is not changed by the failed write.
+
+### YuzuAgentReregistrationRefusalAuditDropped
+
+An enforce-mode `agent.reregistration_refused` audit row lost its per-key budget (10 rows per outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per 10 s window) and was not written. Unlike the audit-mode `agent.reregistration_unproven` rows, a dropped refusal row has no chunked summary: it is counted only by action in `yuzu_register_reregistration_audit_dropped_total{action="agent.reregistration_refused"}`, its id is named nowhere, and `yuzu_register_reregistration_audit_ids_truncated_total` does not count it. The unbudgeted `yuzu_register_reregistration_total{mode="enforce"}` still counts every refusal. A sustained rise means one source is looping refusals or many ids are being refused at once: find it in the gateway and firewall logs and in the refusal rows that were written.
 
 ### YuzuAgentReregistrationAuditIdsTruncated
 
