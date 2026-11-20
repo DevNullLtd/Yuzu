@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Tests for the release image vulnerability gate (WP15/S9).
 
-scripts/ci/image-vuln-gate.sh runs a pinned Trivy on each image and must fail
-CLOSED: a fixable CRITICAL, a Trivy error, a wrong Trivy version, a missing
-ignore file, or an ignore entry without a reason or an expiry all fail it. The
-cases here run the real script with a stub `trivy` (TRIVY_BIN) that records
-its arguments and answers as told, so no Docker, network or Trivy DB is needed.
+scripts/ci/image-vuln-gate.sh runs a pinned Trivy and a pinned grype on each
+image and must fail CLOSED: a fixable CRITICAL from either, a scanner error, a
+wrong scanner version, a missing ignore file, or an ignore entry without a
+reason or an expiry all fail it. The cases here run the real script with a
+stub `trivy` (TRIVY_BIN), a stub `grype` (GRYPE_BIN) and a stub `docker` on
+PATH, each recording its arguments and answering as told, so no Docker,
+network or vulnerability DB is needed.
 
 scripts/ci/image-identity.sh (pin a build by image ID, then prove the pushed
 image has the scanned image's layers) runs against a stub `docker` the same way.
@@ -34,6 +36,7 @@ ROOT = Path(__file__).resolve().parent.parent
 GATE = ROOT / "scripts" / "ci" / "image-vuln-gate.sh"
 IDENTITY = ROOT / "scripts" / "ci" / "image-identity.sh"
 IGNORE = ROOT / ".trivyignore.yaml"
+GRYPE_IGNORE = ROOT / ".grypeignore.yaml"
 RELEASE = ROOT / ".github" / "workflows" / "release.yml"
 PRE_RELEASE = ROOT / ".github" / "workflows" / "pre-release.yml"
 
@@ -166,6 +169,118 @@ STUB = textwrap.dedent(
 )
 DB_DIGEST = "sha256:" + "d" * 64
 
+# grype, as the gate drives it: `--version`, `db import`, `db status -o json`,
+# a record scan (`-o json=F -o table=F docker-archive:A`) and a gate scan
+# (`--only-fixed --fail-on critical`). STUB_GRYPE_MODE picks the answer.
+GRYPE_STUB = textwrap.dedent(
+    """\
+    import json, os, sys
+    args = sys.argv[1:]
+    log = os.environ["STUB_GRYPE_LOG"]
+    with open(log, "a", encoding="utf-8") as f:
+        f.write(" ".join(args) + "\\n")
+    with open(log + ".env", "a", encoding="utf-8") as f:
+        f.write(json.dumps({"grype_env": sorted(k for k in os.environ if k.startswith("GRYPE_")),
+                            "env": {k: os.environ[k] for k in os.environ if k.startswith("GRYPE_")},
+                            "cwd": os.getcwd(), "home": os.environ.get("HOME", ""),
+                            "tmpdir": os.environ.get("TMPDIR", "")}) + "\\n")
+    mode = os.environ.get("STUB_GRYPE_MODE", "clean")
+    if args == ["--version"]:
+        print("grype " + ("0.120.0" if mode == "wrong-version" else "0.121.3"))
+        sys.exit(0)
+    cache = os.environ.get("GRYPE_DB_CACHE_DIR", "")
+    if args[:2] == ["db", "import"]:
+        if mode == "import-error":
+            sys.exit(1)
+        os.makedirs(os.path.join(cache, "6"), exist_ok=True)
+        open(os.path.join(cache, "6", "vulnerability.db"), "w").write(open(args[2]).read())
+        sys.exit(0)
+    if args[:2] == ["db", "status"]:
+        db = os.path.join(cache, "6", "vulnerability.db")
+        st = {"schemaVersion": os.environ["STUB_GRYPE_SCHEMA"], "built": os.environ["STUB_GRYPE_BUILT"],
+              "path": db, "valid": os.path.exists(db)}
+        if mode == "status-mismatch":
+            st["built"] = "2001-01-01T00:00:00Z"
+        if mode == "status-invalid":
+            st["valid"] = False
+        print(json.dumps(st))
+        sys.exit(0 if st["valid"] else 1)
+    target = args[-1]
+    if not target.startswith("docker-archive:") or not os.path.exists(target.split(":", 1)[1]):
+        sys.exit(1)
+    def opt(name):
+        return args[args.index(name) + 1] if name in args else ""
+    cfg = opt("-c")
+    fid = os.environ.get("STUB_GRYPE_FINDING", "CVE-2001-0001")
+    suppressed = bool(cfg) and json.dumps(fid) in open(cfg).read()
+    if "--fail-on" in args:
+        if mode == "gate-error":
+            sys.exit(1)
+        if mode == "findings" and not suppressed:
+            print("CRITICAL finding table")
+            sys.exit(2)
+        sys.exit(0)
+    if mode == "report-error":
+        sys.exit(1)
+    outs = dict(a.split("=", 1) for a in args if a.startswith(("json=", "table=")))
+    distro = os.environ.get("STUB_GRYPE_DISTRO", "debian:12.15")
+    fam, _, ver = distro.partition(":")
+    match = {"vulnerability": {"id": fid, "severity": "Critical", "fix": {"state": "fixed"}},
+             "artifact": {"name": "erlang", "version": "28.5.0.2", "type": "binary"}}
+    rep = {"descriptor": {"name": "grype", "version": "0.121.3"},
+           "source": {"type": "image", "target": {"imageID": "sha256:" + "9" * 64}},
+           "distro": {"name": fam, "version": ver} if fam else {},
+           "matches": [match] if mode == "findings" and not suppressed else [],
+           "ignoredMatches": [match] if mode == "findings" and suppressed else []}
+    if mode == "not-grype":
+        rep = {"SchemaVersion": 2}
+    open(outs["json"], "w").write(json.dumps(rep))
+    open(outs["table"], "w").write("" if mode == "empty-table" else "NAME INSTALLED TYPE VULNERABILITY\\n")
+    sys.exit(0)
+    """
+)
+
+# docker, as the gate drives it for grype: `image inspect --format {{.Id}} IMG`
+# and `save -o FILE ID`. An image in STUB_MISSING_IMAGES is not in the daemon.
+GATE_DOCKER_STUB = textwrap.dedent(
+    """\
+    import os, sys
+    args = sys.argv[1:]
+    with open(os.environ["STUB_DOCKER_LOG"], "a", encoding="utf-8") as f:
+        f.write(" ".join(args) + "\\n")
+    mode = os.environ.get("STUB_DOCKER_MODE", "ok")
+    if args[:2] == ["image", "inspect"]:
+        if args[-1] in os.environ.get("STUB_MISSING_IMAGES", "").split(","):
+            sys.exit(1)
+        print("not-an-id" if mode == "garbage-id" else "sha256:" + "9" * 64)
+        sys.exit(0)
+    if args[0] == "save":
+        if mode == "save-error":
+            sys.exit(1)
+        open(args[args.index("-o") + 1], "w").write("archive of " + args[-1])
+        sys.exit(0)
+    sys.exit(2)
+    """
+)
+GRYPE_DB_ARCHIVE = "vulnerability-db_v6.1.10_2026-11-20T00:20:17Z_1795155660.tar.zst"
+GRYPE_DB_SCHEMA = "v6.1.10"
+
+
+def grype_db_fixture(root, built_hours_ago=2, body=b"grype db", tamper=False, listing_over=None):
+    """A directory holding latest.json and the archive it names (the gate's
+    YUZU_GATE_TEST_GRYPE_DB_DIR). Returns (dir, built)."""
+    import hashlib
+    d = Path(root)
+    d.mkdir(parents=True, exist_ok=True)
+    built = (datetime.datetime.now(datetime.timezone.utc)
+             - datetime.timedelta(hours=built_hours_ago)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    (d / GRYPE_DB_ARCHIVE).write_bytes(body + (b"x" if tamper else b""))
+    listing = {"status": "active", "schemaVersion": GRYPE_DB_SCHEMA, "built": built,
+               "path": GRYPE_DB_ARCHIVE, "checksum": "sha256:" + hashlib.sha256(body).hexdigest()}
+    listing.update(listing_over or {})
+    (d / "latest.json").write_text(json.dumps(listing), encoding="utf-8")
+    return d, built
+
 def have_bash():
     return os.name != "nt" and shutil.which("bash") is not None
 
@@ -211,15 +326,45 @@ class GateBehaviour(unittest.TestCase):
         self.stub.write_text(f"#!{sys.executable}\n" + STUB, encoding="utf-8")
         self.stub.chmod(self.stub.stat().st_mode | stat.S_IXUSR)
         self.log = self.tmp / "calls.log"
+        self.grype = self.tmp / "grype"
+        self.grype.write_text(f"#!{sys.executable}\n" + GRYPE_STUB, encoding="utf-8")
+        self.grype.chmod(self.grype.stat().st_mode | stat.S_IXUSR)
+        self.glog = self.tmp / "grype.log"
+        self.bin = self.tmp / "bin"
+        self.bin.mkdir()
+        docker = self.bin / "docker"
+        docker.write_text(f"#!{sys.executable}\n" + GATE_DOCKER_STUB, encoding="utf-8")
+        docker.chmod(docker.stat().st_mode | stat.S_IXUSR)
+        self.dlog = self.tmp / "docker.log"
+        self.gdb, self.gdb_built = grype_db_fixture(self.tmp / "grype-db-src")
+
+    def grype_env(self, grype_mode="clean", grype_ignore=GRYPE_IGNORE, distro="debian:12.15", gdb=None,
+                  built=None):
+        return dict(
+            GRYPE_BIN=str(self.grype),
+            STUB_GRYPE_LOG=str(self.glog),
+            STUB_GRYPE_MODE=grype_mode,
+            STUB_GRYPE_DISTRO=distro,
+            STUB_GRYPE_BUILT=built or self.gdb_built,
+            STUB_GRYPE_SCHEMA=GRYPE_DB_SCHEMA,
+            STUB_DOCKER_LOG=str(self.dlog),
+            YUZU_GRYPEIGNORE=str(grype_ignore),
+            YUZU_GATE_TEST_GRYPE_DB_DIR=str(gdb or self.gdb),
+        )
 
     def run_gate(self, *images, mode="clean", ignore=IGNORE, bad_image="", extra=(), missing="",
-                 db="fresh", os_pkgs="5", env_extra=None, gate=GATE):
+                 db="fresh", os_pkgs="5", env_extra=None, gate=GATE, grype_mode="clean",
+                 grype_ignore=GRYPE_IGNORE, distro=None):
         env = dict(os.environ)
         for k in list(env):
-            if k.startswith("TRIVY_") or k.startswith("STUB_"):
+            if k.startswith("TRIVY_") or k.startswith("STUB_") or k.startswith("GRYPE_"):
                 del env[k]
         env.pop("GITHUB_ACTIONS", None)
         env.pop("GITHUB_STEP_SUMMARY", None)
+        # grype detects the OS the Trivy stub reports unless told otherwise.
+        distro = os.environ.get("STUB_OS", "debian:12.15") if distro is None else distro
+        if env_extra and "STUB_OS" in env_extra and distro == "debian:12.15":
+            distro = env_extra["STUB_OS"]
         env.update(
             TRIVY_BIN=str(self.stub),
             STUB_LOG=str(self.log),
@@ -231,6 +376,8 @@ class GateBehaviour(unittest.TestCase):
             YUZU_TRIVYIGNORE=str(ignore),
             YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST,
             RUNNER_TEMP=str(self.tmp),
+            PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+            **self.grype_env(grype_mode, grype_ignore, distro),
         )
         env.update(env_extra or {})
         for k, v in list(env.items()):
@@ -243,6 +390,16 @@ class GateBehaviour(unittest.TestCase):
 
     def calls(self):
         return self.log.read_text(encoding="utf-8").splitlines() if self.log.exists() else []
+
+    def gcalls(self):
+        return self.glog.read_text(encoding="utf-8").splitlines() if self.glog.exists() else []
+
+    def gscans(self):
+        """grype's image scans (not --version, not db)."""
+        return [c.split() for c in self.gcalls() if c != "--version" and not c.startswith("db ")]
+
+    def dcalls(self):
+        return self.dlog.read_text(encoding="utf-8").splitlines() if self.dlog.exists() else []
 
     def scans(self):
         """The image scans: not --version, not the DB download, not convert."""
@@ -838,7 +995,8 @@ class GateBehaviour(unittest.TestCase):
         r = self.run_gate("img:1", extra=("--report-dir", str(rep), "--attempt", "2"))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         names = sorted(p.name for p in rep.iterdir())
-        self.assertEqual(names, [f"trivy-img.attempt-{n}.{s}" for n in (1, 2) for s in ("gate.txt", "json", "txt")])
+        self.assertEqual(names, sorted(f"{sc}-img.attempt-{n}.{s}" for sc in ("grype", "trivy") for n in (1, 2)
+                                       for s in ("gate.txt", "json", "txt")))
         a1 = (rep / "trivy-img.attempt-1.gate.txt").read_text(encoding="utf-8")
         a2 = (rep / "trivy-img.attempt-2.gate.txt").read_text(encoding="utf-8")
         self.assertIn("run attempt: 1\n", a1)
@@ -858,11 +1016,12 @@ class GateBehaviour(unittest.TestCase):
     def start_gate(self, *images, extra=(), mode="hang"):
         env = dict(os.environ)
         for k in list(env):
-            if k.startswith("TRIVY_") or k.startswith("STUB_") or k.startswith("GITHUB_"):
+            if k.startswith(("TRIVY_", "STUB_", "GITHUB_", "GRYPE_")):
                 del env[k]
         env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE=mode,
                    YUZU_TRIVYIGNORE=str(IGNORE), YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST,
-                   RUNNER_TEMP=str(self.tmp))
+                   RUNNER_TEMP=str(self.tmp), PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}",
+                   **self.grype_env())
         return subprocess.Popen(["bash", str(GATE), *extra, *images], env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
 
@@ -958,7 +1117,13 @@ class GateBehaviour(unittest.TestCase):
         text = GATE.read_text(encoding="utf-8")
         code = [ln.split(" #", 1)[0] for ln in text.splitlines() if not ln.lstrip().startswith("#")]
         calls = [m for ln in code for m in re.findall(r"(?:^|[\s!&|])child (.*)", ln)]
-        self.assertGreaterEqual(len(calls), 6, calls)
+        # run_grype's own `child "$limit" ...` passes on the deadline its
+        # callers name; every run_grype call is held to the same rule.
+        inner = [c for c in calls if c.startswith('"$limit" env -C ')]
+        self.assertEqual(len(inner), 1, calls)
+        calls = [c for c in calls if c not in inner]
+        calls += [m for ln in code for m in re.findall(r"(?:^|[\s!&|])run_grype (.*)", ln)]
+        self.assertGreaterEqual(len(calls), 12, calls)
         for c in calls:
             self.assertRegex(c, r'^("\$[A-Z_]+_DEADLINE"|\$\(\([A-Z_]+_DEADLINE \+ [0-9]+\)\)) ', c)
         self.assertIn('SCAN_TIMEOUT=(--timeout "$((SCAN_DEADLINE - 10))s")', text)
@@ -966,6 +1131,286 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         for scan in self.scans() + self.canaries():
             self.assertIn("--timeout", scan)
+
+
+    # ── grype, the second scanner (WP15) ──
+    def grype_entry(self, **over):
+        f = {"id": "CVE-2001-0001", "package_name": "erlang", "package_version": "28.5.0.2",
+             "package_type": "binary", "statement": "not reachable", "expired_at": days(30),
+             "approved_by": "some-login", "approved_on": days(-1), "approval_ref": '"#1234"'}
+        f.update(over)
+        out = [f"  - id: {f['id']}"]
+        for k in ("package_name", "package_version", "package_type", "statement", "expired_at",
+                  "approved_by", "approved_on", "approval_ref"):
+            if f.get(k) is not None:
+                out.append(f"    {k}: {f[k]}")
+        return "\n".join(out) + "\n"
+
+    def write_grype_ignore(self, body):
+        p = self.tmp / "grypeignore.yaml"
+        p.write_text("vulnerabilities:\n" + body, encoding="utf-8")
+        return p
+
+    def test_grype_scans_a_docker_save_of_the_local_id(self):
+        r = self.run_gate("img:1")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(self.dcalls()[0], "image inspect --format {{.Id}} img:1")
+        save = self.dcalls()[1].split()
+        self.assertEqual(save[0], "save")
+        self.assertEqual(save[-1], "sha256:" + "9" * 64, "grype must read the image ID, not the tag")
+        archive = save[save.index("-o") + 1]
+        self.assertTrue(archive.startswith(str(self.tmp / "yuzu-image-vuln-gate.")), archive)
+        scans = self.gscans()
+        self.assertEqual(len(scans), 2, self.gcalls())
+        record, gate = scans
+        for a in scans:
+            self.assertEqual(a[-1], "docker-archive:" + archive, "never `docker:`, which pulls a missing image")
+            cfg = a[a.index("-c") + 1]
+            self.assertTrue(cfg.endswith("/grype-config.yaml") and cfg != str(GRYPE_IGNORE), cfg)
+        self.assertTrue(any(x.startswith("json=") for x in record) and any(x.startswith("table=") for x in record))
+        self.assertNotIn("--only-fixed", record, "the record keeps every match")
+        self.assertIn("--only-fixed", gate)
+        self.assertEqual(gate[gate.index("--fail-on") + 1], "critical")
+
+    def test_grype_finding_fails_the_image_even_when_trivy_is_clean(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", grype_mode="findings", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("grype found a fixable CRITICAL", r.stderr)
+        self.assertIn("gate: pass", (rep / "trivy-img.gate.txt").read_text(encoding="utf-8"))
+        g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        for field in ("gate: FAIL: fixable CRITICAL", "grype: 0.121.3", "image id: sha256:" + "9" * 64,
+                      "grype db: https://grype.anchore.io/databases/v6/" + GRYPE_DB_ARCHIVE + " (sha256:",
+                      "schema " + GRYPE_DB_SCHEMA, "distro: debian 12.15"):
+            self.assertIn(field, g)
+        for suffix in (".json", ".txt"):
+            self.assertTrue((rep / f"grype-img{suffix}").is_file(), suffix)
+
+    def test_grype_errors_fail_closed(self):
+        for mode, why in (("gate-error", "FAIL: grype exited 1"), ("report-error", "could not scan"),
+                          ("not-grype", "could not scan"), ("empty-table", "could not scan")):
+            with self.subTest(mode=mode):
+                rep = self.tmp / ("rep-" + mode)
+                r = self.run_gate("img:1", grype_mode=mode, extra=("--report-dir", str(rep)))
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(why, (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_grype_never_scans_an_image_missing_from_the_daemon(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("gone:1", missing="gone:1", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertEqual([c for c in self.dcalls() if c.startswith("save")], [])
+        self.assertEqual(self.gscans(), [])
+        self.assertIn("FAIL: not an image in the local Docker daemon",
+                      (rep / "grype-gone.gate.txt").read_text(encoding="utf-8"))
+
+    def test_an_export_failure_or_a_non_id_answer_fails(self):
+        for dmode, why in (("save-error", "could not export"), ("garbage-id", "not an image in the local")):
+            with self.subTest(docker=dmode):
+                rep = self.tmp / ("rep-" + dmode)
+                r = self.run_gate("img:1", extra=("--report-dir", str(rep)), env_extra={"STUB_DOCKER_MODE": dmode})
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(why, (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_a_trivy_failure_still_runs_grype_for_the_record(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", mode="report-error", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("FAIL: Trivy could not scan", (rep / "trivy-img.gate.txt").read_text(encoding="utf-8"))
+        self.assertIn("gate: pass", (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_wrong_grype_version_is_refused_before_any_scan(self):
+        r = self.run_gate("img:1", grype_mode="wrong-version")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("is not grype 0.121.3", r.stderr)
+        self.assertEqual(self.scans(), [])
+        self.assertEqual(self.gscans(), [])
+
+    def test_grype_bin_is_refused_on_github_actions_and_the_db_hook_needs_it(self):
+        r = self.run_gate("img:1", env_extra={"GITHUB_ACTIONS": "true", "TRIVY_BIN": None})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("GRYPE_BIN is for local runs", r.stdout + r.stderr)
+        r = self.run_gate("img:1", env_extra={"GRYPE_BIN": None})
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("YUZU_GATE_TEST_GRYPE_DB_DIR is a test hook", r.stdout + r.stderr)
+
+    def test_grype_environment_is_the_gates_own(self):
+        hostile = {"GRYPE_EXCLUDE": "**", "GRYPE_IGNORE_STATES": "fixed", "GRYPE_DB_CACHE_DIR": "/nowhere",
+                   "GRYPE_CONFIG": "/etc/x.yaml", "GRYPE_DB_AUTO_UPDATE": "true"}
+        r = self.run_gate("img:1", env_extra=hostile)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        envs = [json.loads(ln) for ln in Path(str(self.glog) + ".env").read_text().splitlines()]
+        want = {"GRYPE_CHECK_FOR_APP_UPDATE": "false", "GRYPE_DB_AUTO_UPDATE": "false",
+                "GRYPE_DB_MAX_ALLOWED_BUILT_AGE": "72h", "GRYPE_DB_REQUIRE_UPDATE_CHECK": "false",
+                "GRYPE_DB_VALIDATE_AGE": "true"}
+        self.assertEqual(len(envs), len(self.gcalls()))
+        for call, e in zip(self.gcalls(), envs):
+            self.assertEqual({k: v for k, v in e["env"].items() if k != "GRYPE_DB_CACHE_DIR"}, want, e)
+            self.assertTrue(e["env"]["GRYPE_DB_CACHE_DIR"].startswith(str(self.tmp / "yuzu-image-vuln-gate.")))
+            # TMPDIR moves into the work directory after the version checks, as for Trivy.
+            for k in ("cwd", "home") + (("tmpdir",) if call != "--version" else ()):
+                self.assertTrue(e[k].startswith(str(self.tmp / "yuzu-image-vuln-gate.")), (k, call, e))
+        self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
+
+    def run_with_db(self, grype_mode="clean", **fixture):
+        gdb, built = grype_db_fixture(self.tmp / ("gdb-" + str(len(list(self.tmp.glob("gdb-*"))))), **fixture)
+        env = self.grype_env(grype_mode, gdb=gdb, built=built)
+        return self.run_gate("img:1", env_extra=env)
+
+    def test_grype_db_must_be_fresh_verified_and_the_one_imported(self):
+        cases = {
+            "stale listing": ({"built_hours_ago": 100}, "clean", "more than 72"),
+            "future listing": ({"built_hours_ago": -5}, "clean", "in the future"),
+            "tampered archive": ({"tamper": True}, "clean", "does not match the listing"),
+            "not active": ({"listing_over": {"status": "deprecated"}}, "clean", "is not 'active'"),
+            "schema v5": ({"listing_over": {"schemaVersion": "v5.0.1"}}, "clean", "is not v6"),
+            "path escapes": ({"listing_over": {"path": "../vulnerability-db_v6.1.10_x_1.tar.zst"}}, "clean",
+                             "bare vulnerability-db_v6 archive name"),
+            "bad checksum": ({"listing_over": {"checksum": "md5:00"}}, "clean", "is not sha256"),
+            "import fails": ({}, "import-error", "could not import"),
+            "status mismatch": ({}, "status-mismatch", "not the DB this run verified"),
+            "status invalid": ({}, "status-invalid", "not valid"),
+        }
+        for label, (fixture, gmode, why) in cases.items():
+            with self.subTest(label):
+                self.glog.unlink(missing_ok=True)
+                r = self.run_with_db(gmode, **fixture)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn(why, r.stdout + r.stderr)
+                self.assertEqual(self.gscans(), [], "no image is scanned with an unverified or stale DB")
+
+    def test_grype_acceptance_is_honoured_by_scope_and_only_when_approved(self):
+        ok = self.write_grype_ignore(self.grype_entry())
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=ok, extra=("--release",))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # A pending approval is not honoured by a release, and is outside one.
+        pend = self.write_grype_ignore(self.grype_entry(approved_on=None, approval_ref="pending"))
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=pend, extra=("--release",))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("NOT IN FORCE", r.stdout)
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=pend)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        # An expired acceptance is not in force.
+        old = self.write_grype_ignore(self.grype_entry(expired_at=days(-1)))
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=old)
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_grype_ignore_file_missing_or_malformed_is_refused_before_any_scan(self):
+        cases = {
+            "absent": self.tmp / "absent.yaml",
+            "no version": self.write_grype_ignore(self.grype_entry(package_version=None)),
+        }
+        for label, path in cases.items():
+            with self.subTest(label):
+                self.log.unlink(missing_ok=True)
+                r = self.run_gate("img:1", grype_ignore=path)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertEqual(self.scans(), [])
+                self.assertEqual(self.gscans(), [])
+
+    def test_grype_must_detect_the_os_trivy_scanned(self):
+        for distro in ("", "alpine:3.23.8"):
+            with self.subTest(distro=distro or "none"):
+                rep = self.tmp / ("rep-" + (distro.replace(":", "-") or "none"))
+                r = self.run_gate("img:1", distro=distro, extra=("--report-dir", str(rep)))
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                self.assertIn("FAIL: grype did not detect the OS (debian)",
+                              (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_no_os_cross_check_for_an_image_listed_as_not_covered(self):
+        ci = self.tmp / "tree" / "scripts" / "ci"
+        ci.mkdir(parents=True)
+        for f in (GATE, CHECKS):
+            shutil.copy2(f, ci / f.name)
+        (ci / NOT_COVERED.name).write_text(nc_line(), encoding="utf-8")
+        r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", distro="", gate=ci / GATE.name)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_budget_and_cancel_reports_cover_grype_too(self):
+        rep = self.tmp / "rep"
+        p = self.start_gate("a=img:1", extra=("--budget", "3", "--report-dir", str(rep)), mode="hang-stubborn")
+        out, err = p.communicate(timeout=60)
+        self.assertEqual(p.returncode, 1, out + err)
+        g = (rep / "grype-a.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("gate: FAIL: gate stopped before this image was judged: the gate ran out of its 3s budget", g)
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(Path(str(self.log) + ".pid").read_text()), 0)
+
+
+@unittest.skipUnless(have_bash(), "the gate is a bash script")
+class GrypeMutants(unittest.TestCase):
+    """Each grype rule the gate adds (WP15) must be load-bearing: a copy of the
+    gate (and its checker) with that one rule mutated away must give the WRONG
+    answer on the scenario that rule exists for, while the real gate gives the
+    right one. A mutant that still fails the scenario closed would mean the
+    scenario does not test the rule. The original text must be present exactly
+    once, so a rewrite of the gate re-aims this test instead of passing it."""
+
+    setUp = GateBehaviour.setUp
+    grype_env = GateBehaviour.grype_env
+    run_gate = GateBehaviour.run_gate
+    grype_entry = GateBehaviour.grype_entry
+    write_grype_ignore = GateBehaviour.write_grype_ignore
+
+    def mutant(self, label, gate_edits=(), checks_edits=()):
+        ci = self.tmp / ("mutant-" + re.sub(r"[^a-z0-9]+", "-", label.lower())) / "scripts" / "ci"
+        ci.mkdir(parents=True)
+        for src, edits in ((GATE, gate_edits), (CHECKS, checks_edits)):
+            text = src.read_text(encoding="utf-8")
+            for old, new in edits:
+                self.assertEqual(text.count(old), 1, f"{label}: re-aim this mutant, {old!r} is not in {src.name} once")
+                text = text.replace(old, new)
+            (ci / src.name).write_text(text, encoding="utf-8")
+        shutil.copy2(NOT_COVERED, ci / NOT_COVERED.name)
+        return ci / GATE.name
+
+    def assert_killed(self, label, scenario, gate_edits=(), checks_edits=()):
+        real = scenario(GATE)
+        self.assertEqual(real.returncode, 1, f"{label}: the real gate must refuse this scenario\n"
+                         + real.stdout + real.stderr)
+        mutated = scenario(self.mutant(label, gate_edits, checks_edits))
+        self.assertEqual(mutated.returncode, 0, f"mutant '{label}' survived: the scenario does not test the rule\n"
+                         + mutated.stdout + mutated.stderr)
+
+    def test_mutants_of_the_grype_rules_are_killed(self):
+        findings = lambda gate: self.run_gate("img:1", grype_mode="findings", gate=gate)  # noqa: E731
+        no_os = lambda gate: self.run_gate("img:1", distro="", gate=gate)  # noqa: E731
+
+        def with_db(gmode="clean", **fixture):
+            def run(gate):
+                n = len(list(self.tmp.glob("gdb-*")))
+                gdb, built = grype_db_fixture(self.tmp / f"gdb-{n}", **fixture)
+                return self.run_gate("img:1", gate=gate, env_extra=self.grype_env(gmode, gdb=gdb, built=built))
+            return run
+
+        def pending_in_release(gate):
+            ign = self.write_grype_ignore(self.grype_entry(approved_on=None, approval_ref="pending"))
+            return self.run_gate("img:1", grype_mode="findings", grype_ignore=ign, extra=("--release",), gate=gate)
+
+        cases = [
+            ("grype exit 2 read as a pass", findings,
+             [('--fail-on critical -o table \\\n        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?',
+               '--fail-on critical -o table \\\n        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || true')], []),
+            ("grype not run on a Trivy-covered image", findings,
+             [('    grype_scan "$name" "$image" "$want_family"\n', "")], []),
+            ("DB archive checksum not checked", with_db(tamper=True),
+             [('echo "${gdb_sum#sha256:}  $WORK/$gdb_path" | sha256sum -c --quiet - \\',
+               'echo "${gdb_sum#sha256:}  $WORK/$gdb_path" | cat >/dev/null \\')], []),
+            ("imported DB status not checked", with_db("status-mismatch"),
+             [('if ! gstat="$("${CHECKS[@]}" grype-db-status "$WORK/grype-db-status.json" --built "$gdb_built" '
+               '--schema "$gdb_schema")"; then',
+               'if ! gstat="$(true)"; then')], []),
+            ("DB age not checked", with_db(built_hours_ago=100),
+             [], [("    if age_h > MAX_DB_AGE_HOURS:\n        return (f\"{what}", "    if False:\n        return (f\"{what}")]),
+            ("OS cross-check dropped", no_os,
+             [('if [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then',
+               'if false; then')], []),
+            ("pending grype acceptance honoured in a release", pending_in_release,
+             [('[ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)', ':')], []),
+        ]
+        for label, scenario, gate_edits, checks_edits in cases:
+            with self.subTest(mutant=label):
+                self.assert_killed(label, scenario, gate_edits, checks_edits)
 
 
 @unittest.skipUnless(have_bash(), "uses the gate's checker the same way the gate does")
@@ -1202,17 +1647,17 @@ class Checks(unittest.TestCase):
         ign = self.tmp / "ign.yaml"
         ign.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0001"), encoding="utf-8")
         ok_nc = self.nc(nc_line())
-        r = self.run_checks("pending", ign, ok_nc)
+        r = self.run_checks("pending", ign, ok_nc, GRYPE_IGNORE)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         pend = self.tmp / "pend.yaml"
         pend.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0002", approved_on=None, approval_ref="pending"),
                         encoding="utf-8")
-        r = self.run_checks("pending", pend, ok_nc)
+        r = self.run_checks("pending", pend, ok_nc, GRYPE_IGNORE)
         self.assertEqual(r.returncode, 1)
         self.assertIn("CVE-2000-0002: approval_ref is pending", r.stderr)
         p_nc = self.tmp / "pnc.txt"
         p_nc.write_text(nc_line(on="-", ref="pending"), encoding="utf-8")
-        r = self.run_checks("pending", ign, p_nc)
+        r = self.run_checks("pending", ign, p_nc, GRYPE_IGNORE)
         self.assertEqual(r.returncode, 1)
         self.assertIn("yuzu-server-chisel: approval_ref is pending", r.stderr)
         # An expired entry is not pending, but it is not in force either: a
@@ -1220,7 +1665,7 @@ class Checks(unittest.TestCase):
         old = self.tmp / "old.yaml"
         old.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0003", approved_on=None, approval_ref="pending",
                                                      expired_at=days(-1)), encoding="utf-8")
-        r = self.run_checks("pending", old, ok_nc)
+        r = self.run_checks("pending", old, ok_nc, GRYPE_IGNORE)
         self.assertEqual(r.returncode, 1)
         self.assertIn("CVE-2000-0003: expired on", r.stderr)
         self.assertNotIn("approval_ref is pending", r.stderr)
@@ -1228,12 +1673,12 @@ class Checks(unittest.TestCase):
         for n in (0, 1):
             soon = self.tmp / f"soon{n}.yaml"
             soon.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0004", expired_at=days(n)), encoding="utf-8")
-            r = self.run_checks("pending", soon, ok_nc)
+            r = self.run_checks("pending", soon, ok_nc, GRYPE_IGNORE)
             self.assertEqual(r.returncode, 1, n)
             self.assertIn("CVE-2000-0004: expires on", r.stderr)
         later = self.tmp / "later.yaml"
         later.write_text("vulnerabilities:\n" + entry(id="CVE-2000-0005", expired_at=days(2)), encoding="utf-8")
-        r = self.run_checks("pending", later, ok_nc)
+        r = self.run_checks("pending", later, ok_nc, GRYPE_IGNORE)
         self.assertEqual(r.returncode, 0, r.stderr)
         self.assertIn("warning:", r.stdout)
         # The same for a not-covered listing: expired, expiring, and a warning.
@@ -1241,15 +1686,15 @@ class Checks(unittest.TestCase):
                               (days(1), 1, "yuzu-server-chisel: expires on"),
                               (days(10), 0, "warning:")):
             with self.subTest(listing_expires=exp):
-                r = self.run_checks("pending", ign, self.nc(nc_line(exp=exp)))
+                r = self.run_checks("pending", ign, self.nc(nc_line(exp=exp)), GRYPE_IGNORE)
                 self.assertEqual(r.returncode, rc, r.stdout + r.stderr)
                 self.assertIn(text, r.stdout + r.stderr)
         bad = self.tmp / "bad.yaml"
         bad.write_text("vulnerabilities:\n" + entry(paths=['"**"']), encoding="utf-8")
-        self.assertEqual(self.run_checks("pending", bad, ok_nc).returncode, 1)
+        self.assertEqual(self.run_checks("pending", bad, ok_nc, GRYPE_IGNORE).returncode, 1)
         bad_nc = self.tmp / "bnc.txt"
         bad_nc.write_text("junk\n", encoding="utf-8")
-        self.assertEqual(self.run_checks("pending", ign, bad_nc).returncode, 1)
+        self.assertEqual(self.run_checks("pending", ign, bad_nc, GRYPE_IGNORE).returncode, 1)
 
     def test_emitted_copy_is_the_entries_in_force_only(self):
         src = self.tmp / "src.yaml"
@@ -1268,6 +1713,191 @@ class Checks(unittest.TestCase):
         self.assertNotIn("approved_by", text)
         r = self.run_checks("ignore-file", src, "--emit", out)
         self.assertIn("- id: CVE-2000-0002", out.read_text())
+
+
+    # ── grype (WP15): the acceptance file, the DB listing and status, the report ──
+    def gentry(self, **over):
+        f = {"id": "CVE-2001-0001", "package_name": "erlang", "package_version": "28.5.0.2",
+             "package_type": "binary", "statement": "not reachable", "expired_at": days(30),
+             "approved_by": "some-login", "approved_on": days(-1), "approval_ref": '"#1234"'}
+        f.update(over)
+        out = [f"  - id: {f['id']}"]
+        for k, v in f.items():
+            if k != "id" and v is not None:
+                out.append(f"    {k}: {v}")
+        return "\n".join(out) + "\n"
+
+    def gfile(self, *entries, name="g.yaml"):
+        p = self.tmp / name
+        p.write_text("vulnerabilities:\n" + "".join(entries), encoding="utf-8")
+        return p
+
+    def test_repository_grype_ignore_file_is_valid(self):
+        r = self.run_checks("grype-ignore-file", GRYPE_IGNORE, "--require-approved")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_grype_ignore_file_emits_only_the_entries_in_force_as_ignore_rules(self):
+        src = self.gfile(self.gentry(), self.gentry(id="CVE-2001-0002", approved_on=None, approval_ref="pending"),
+                         self.gentry(id="CVE-2001-0003", expired_at=days(-1)),
+                         self.gentry(id="CVE-2001-0004", package_type=None))
+        out = self.tmp / "grype.yaml"
+        r = self.run_checks("grype-ignore-file", src, "--emit", out, "--require-approved")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("in_force=2", r.stdout)
+        self.assertIn("pending_not_honoured=1", r.stdout)
+        text = out.read_text(encoding="utf-8")
+        self.assertEqual(text.splitlines()[1:], [
+            "ignore:",
+            '  - vulnerability: "CVE-2001-0001"', "    package:", '      name: "erlang"',
+            '      version: "28.5.0.2"', '      type: "binary"',
+            '  - vulnerability: "CVE-2001-0004"', "    package:", '      name: "erlang"',
+            '      version: "28.5.0.2"'])
+        # Nothing but the rules: no statement, approval or any key grype could read as config.
+        for word in ("statement", "approved", "expired", "exclude", "only-fixed"):
+            self.assertNotIn(word, text)
+        empty = self.gfile(name="empty.yaml")
+        r = self.run_checks("grype-ignore-file", empty, "--emit", out)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(out.read_text(encoding="utf-8").splitlines()[1:], ["ignore: []"])
+
+    def test_grype_entries_need_a_package_name_and_version_without_globs(self):
+        bad = {
+            "no name": {"package_name": None},
+            "no version": {"package_version": None},
+            "glob name": {"package_name": "erl*"},
+            "glob version": {"package_version": "28.*"},
+            "bracket version": {"package_version": '"28.5.[0-9]"'},
+            "space name": {"package_name": '"erl ang"'},
+            "upper type": {"package_type": "Binary"},
+            "no statement": {"statement": None},
+            "no expiry": {"expired_at": None},
+            "expiry too far": {"expired_at": days(93)},
+            "no approver": {"approved_by": None},
+            "bad ref": {"approval_ref": '"PR 12"'},
+            "pending with a date": {"approval_ref": "pending"},
+            "bad id": {"id": "cve-1"},
+        }
+        for label, over in bad.items():
+            with self.subTest(label):
+                r = self.run_checks("grype-ignore-file", self.gfile(self.gentry(**over)))
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+
+    def test_grype_file_refuses_trivy_keys_and_unknown_keys(self):
+        for line in ('    paths:\n      - "usr/bin/x"\n', '    purls:\n      - "pkg:apk/alpine/x@1"\n',
+                     "    exclude: yes\n", "    package:\n"):
+            with self.subTest(line=line.strip()):
+                r = self.run_checks("grype-ignore-file", self.gfile(self.gentry() + line))
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        p = self.tmp / "top.yaml"
+        p.write_text("ignore:\n  - vulnerability: CVE-2001-0001\n", encoding="utf-8")
+        self.assertEqual(self.run_checks("grype-ignore-file", p).returncode, 1)
+
+    def test_grype_duplicate_entry_is_refused(self):
+        r = self.run_checks("grype-ignore-file", self.gfile(self.gentry(), self.gentry()))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("duplicate entry", r.stderr)
+
+    def test_trivy_file_still_refuses_grype_keys(self):
+        p = self.tmp / "t.yaml"
+        p.write_text("vulnerabilities:\n" + entry() + "    package_name: x\n", encoding="utf-8")
+        self.assertEqual(self.run_checks("ignore-file", p).returncode, 1)
+
+    def test_pending_needs_the_grype_file_and_checks_it(self):
+        ign = self.tmp / "ign.yaml"
+        ign.write_text("vulnerabilities:\n" + entry(), encoding="utf-8")
+        ok_nc = self.nc(nc_line())
+        self.assertEqual(self.run_checks("pending", ign, ok_nc).returncode, 2, "the grype file is required")
+        r = self.run_checks("pending", ign, ok_nc, self.gfile(self.gentry()))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        r = self.run_checks("pending", ign, ok_nc,
+                            self.gfile(self.gentry(approved_on=None, approval_ref="pending"), name="p.yaml"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CVE-2001-0001: approval_ref is pending", r.stderr)
+        r = self.run_checks("pending", ign, ok_nc, self.gfile(self.gentry(expired_at=days(1)), name="s.yaml"))
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("CVE-2001-0001: expires on", r.stderr)
+        r = self.run_checks("pending", ign, ok_nc, self.gfile(self.gentry(package_version=None), name="b.yaml"))
+        self.assertEqual(r.returncode, 1)
+
+    def listing(self, raw=None, **over):
+        built = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        d = {"status": "active", "schemaVersion": "v6.1.10", "built": built, "path": GRYPE_DB_ARCHIVE,
+             "checksum": "sha256:" + "a" * 64}
+        d.update(over)
+        p = self.tmp / "latest.json"
+        p.write_text(raw if raw is not None else json.dumps(d), encoding="utf-8")
+        return p, built
+
+    def test_grype_db_listing(self):
+        p, built = self.listing()
+        r = self.run_checks("grype-db-listing", p)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn(f"path={GRYPE_DB_ARCHIVE}", r.stdout)
+        self.assertIn(f"built={built}", r.stdout)
+        old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=73)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        bad = {"stale": {"built": old}, "future": {"built": "2999-01-01T00:00:00Z"}, "no time": {"built": "x"},
+               "deprecated": {"status": "deprecated"}, "v5": {"schemaVersion": "v5.0.0"},
+               "slash": {"path": "a/" + GRYPE_DB_ARCHIVE}, "dotdot": {"path": "../" + GRYPE_DB_ARCHIVE},
+               "url": {"path": "https://x/" + GRYPE_DB_ARCHIVE}, "md5": {"checksum": "md5:" + "a" * 32},
+               "short": {"checksum": "sha256:abc"}}
+        for label, over in bad.items():
+            with self.subTest(label):
+                p, _ = self.listing(**over)
+                self.assertEqual(self.run_checks("grype-db-listing", p).returncode, 1)
+        for raw in ("{", "[]", "null"):
+            with self.subTest(raw=raw):
+                p, _ = self.listing(raw=raw)
+                self.assertEqual(self.run_checks("grype-db-listing", p).returncode, 1)
+        self.assertEqual(self.run_checks("grype-db-listing", self.tmp / "absent.json").returncode, 1)
+
+    def test_grype_db_status(self):
+        built = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=2)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+
+        def status(**over):
+            d = {"schemaVersion": "v6.1.10", "built": built, "valid": True, "path": "/x/6/vulnerability.db"}
+            d.update(over)
+            p = self.tmp / "status.json"
+            p.write_text(json.dumps(d), encoding="utf-8")
+            return self.run_checks("grype-db-status", p, "--built", built, "--schema", "v6.1.10")
+
+        self.assertEqual(status().returncode, 0)
+        old = (datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(hours=80)).strftime(
+            "%Y-%m-%dT%H:%M:%SZ")
+        for label, over in {"invalid": {"valid": False}, "valid string": {"valid": "true"},
+                            "other build": {"built": old}, "other schema": {"schemaVersion": "v6.1.9"}}.items():
+            with self.subTest(label):
+                self.assertEqual(status(**over).returncode, 1)
+        p = self.tmp / "status.json"
+        p.write_text(json.dumps({"schemaVersion": "v6.1.10", "built": old, "valid": True}), encoding="utf-8")
+        r = self.run_checks("grype-db-status", p, "--built", old, "--schema", "v6.1.10")
+        self.assertEqual(r.returncode, 1, "a stale DB is refused even when it is the listed one")
+        self.assertEqual(self.run_checks("grype-db-status", p, "--built", old).returncode, 2)
+
+    def test_grype_report(self):
+        def report(d):
+            p = self.tmp / "g.json"
+            p.write_text(d if isinstance(d, str) else json.dumps(d), encoding="utf-8")
+            return self.run_checks("grype-report", p)
+
+        crit = {"vulnerability": {"severity": "Critical", "fix": {"state": "fixed"}}}
+        unfixed = {"vulnerability": {"severity": "Critical", "fix": {"state": "not-fixed"}}}
+        good = {"descriptor": {"name": "grype", "version": "0.121.3"}, "matches": [crit, unfixed],
+                "ignoredMatches": [crit], "distro": {"name": "alpine", "version": "3.23.8"},
+                "source": {"target": {"imageID": "sha256:" + "9" * 64}}}
+        r = report(good)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        for line in ("distro_family=alpine", "distro_version=3.23.8", "matches=2", "ignored=1",
+                     "fixable_critical=1", "image_id=sha256:" + "9" * 64, "grype_version=0.121.3"):
+            self.assertIn(line, r.stdout.splitlines())
+        for label, d in {"trivy report": {"SchemaVersion": 2, "ArtifactName": "x", "Results": []},
+                         "no matches": {"descriptor": {"name": "grype"}},
+                         "matches not a list": dict(good, matches={}),
+                         "bad match": dict(good, matches=["x"]), "array": [], "not json": "{"}.items():
+            with self.subTest(label):
+                self.assertEqual(report(d).returncode, 1)
 
 
 DOCKER_STUB = textwrap.dedent(

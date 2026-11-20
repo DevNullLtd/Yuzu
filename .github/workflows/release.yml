@@ -1710,14 +1710,15 @@ jobs:
 
       # ── Image vulnerability gate (WP15/S9) ─────────────────────────────
       # Scans the image just built and probed (by its pinned ID), BEFORE
-      # "Build and push": a CRITICAL vulnerability with a fix, not accepted in
-      # .trivyignore.yaml, fails this leg, so no tag is pushed and the release
-      # job (which needs this job) does not run. The push build normally
-      # reuses this build's layers from the same buildkitd (see above);
-      # "Verify the pushed image is the scanned one" proves it did.
-      # The script installs its own pinned, checksum-verified Trivy and keeps
-      # the DB under RUNNER_TEMP, never $HOME (one OS identity for all Big Tam
-      # runners, #1871). Recovery: docs/ci-architecture.md "Release image
+      # "Build and push": a CRITICAL vulnerability with a fix that Trivy or
+      # grype reports, not accepted in .trivyignore.yaml / .grypeignore.yaml,
+      # fails this leg, so no tag is pushed and the release job (which needs
+      # this job) does not run. The push build normally reuses this build's
+      # layers from the same buildkitd (see above); "Verify the pushed image
+      # is the scanned one" proves it did. The script installs its own pinned,
+      # checksum-verified Trivy and grype and keeps their DBs (and grype's
+      # `docker save` of the image) under RUNNER_TEMP, never $HOME (one OS
+      # identity for all Big Tam runners, #1871). Recovery: docs/ci-architecture.md "Release image
       # vulnerability gate".
       - name: Scan image for fixable CRITICAL vulnerabilities (pre-push gate)
         id: gate
@@ -1951,7 +1952,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -2298,7 +2300,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -2737,7 +2740,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-<image>.attempt-<run attempt>.txt when the gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
         # bare `if:` would be success() only, and a refusal, the control
@@ -3034,7 +3038,8 @@ jobs:
         # Trivy report: image ID, layers, every package, the findings and the
         # accepted ones), .txt (the table) and .gate.txt (Trivy version, the DB's
         # repository@digest and dates, image ID, coverage, advisory canary,
-        # result), each named .attempt-<run attempt>, and the publish journal
+        # result), grype's grype-*.{json,txt,gate.txt} beside them (WP15),
+        # each named .attempt-<run attempt>, and the publish journal
         # publish-yuzu-agent-bundle-chisel.attempt-<run attempt>.txt when the
         # gate passed. It runs whenever
         # the gate ran, PASS, FAIL OR CANCELLED (an explicit status function: a
@@ -3473,7 +3478,7 @@ jobs:
           # *.zip glob covers both yuzu-agent-windows-x64.zip and yuzu-compose-wizard-*.zip.
           # SBOMs (*.cdx.json, *.spdx.json) are included so customers can
           # verify the SBOM they download matches the SBOM we shipped.
-          # trivy-* (and grype-*, once a second scanner writes reports) are the
+          # trivy-* and grype-* (each scanner's reports) are the
           # image vulnerability gate's reports (WP15/S9), the evidence of what
           # each image was scanned with and found. nullglob for that list only:
           # a scanner with no reports adds nothing, while every other pattern
@@ -3764,10 +3769,11 @@ jobs:
           for the full verification workflow (\`gh attestation verify\`,
           \`cosign verify\`, CycloneDX / SPDX validation).
 
-          Each image was scanned for vulnerabilities before it was pushed; the
-          reports are the \`trivy-yuzu-*\` assets (inside \`SHA256SUMS\`): the
-          full Trivy JSON, a table, and a \`.gate.txt\` summary with the Trivy
-          version, the vulnerability DB digest and date, the image ID and which
+          Each image was scanned for vulnerabilities by two scanners, Trivy and
+          grype, before it was pushed; the reports are the \`trivy-yuzu-*\` and
+          \`grype-yuzu-*\` assets (inside \`SHA256SUMS\`): each scanner's full
+          JSON, a table, and a \`.gate.txt\` summary with the scanner version,
+          the vulnerability DB it used, the image ID and (Trivy's) which
           images' OS packages the scanner could not see. The agent-bundle
           image's report is attached after the release, with its own signed
           checksum list (\`yuzu-agent-bundle-chisel-image-vuln-gate.attempt-N.SHA256SUMS\`).

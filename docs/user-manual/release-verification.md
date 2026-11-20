@@ -68,8 +68,8 @@ certificate at build time and cannot be restamped.
 | SPDX SBOMs | `*.spdx.json`, the same set | `spdx-tools validate` |
 | SLSA provenance | `<artifact>.intoto.jsonl` where present: the platform archives and native installers of v0.11.0-rc2 and later (the Docker images' provenance is in GitHub's attestation registry only; which releases the registry holds is in section 4) | `gh attestation verify` |
 | Docker images | `ghcr.io/${OWNER}/yuzu-{server,gateway,postgres}:<tag>` and `ghcr.io/${OWNER}/yuzu-{server,gateway,agent}-chisel:<tag>` (the `-chisel` variants' operating-system packages are not vulnerability-scanned: [below](#image-vulnerability-scan-before-publishing)) | `cosign verify` |
-| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
-| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
+| Image vulnerability scan reports | `trivy-yuzu-{server,gateway,postgres}.attempt-<N>.{json,txt,gate.txt}` and `trivy-yuzu-{server,gateway,agent}-chisel.attempt-<N>.{json,txt,gate.txt}`, and the same names with `grype-` for the second scanner, `<N>` being the workflow run attempt, and each passing attempt's publish journal `publish-<image>.attempt-<N>.txt` (none on v0.15.0 or any earlier release: the scan postdates them) | `sha256sum -c SHA256SUMS`; see [below](#image-vulnerability-scan-before-publishing) |
+| Agent-bundle image scan report | `trivy-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}`, `grype-yuzu-agent-bundle-chisel.attempt-<N>.{json,txt,gate.txt}` and `publish-yuzu-agent-bundle-chisel.attempt-<N>.txt`, attached after the release with its own checksum list `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` and `.sigstore` (none on v0.15.0 or any earlier release) | `cosign verify-blob` with the same identity as `SHA256SUMS`, then `sha256sum -c` that list ([commands below](#image-vulnerability-scan-before-publishing)) |
 
 **Do not trust an image tag that has no GitHub Release.** The images are pushed, signed and tagged
 before the GitHub Release is created, and a failed publish job stops the release. A release workflow
@@ -119,14 +119,15 @@ whether any attempt moved the tag.
 
 ## Image vulnerability scan before publishing
 
-Before `release.yml` pushes an image, it scans the locally built image (by image ID) with a pinned
-Trivy and refuses to push it when the scanner finds a **CRITICAL vulnerability that has a fix
-available** in what it can see and the finding is not an accepted one. "What it can see" is narrower
-than the image: the list below says what it does not cover. Accepted findings are listed in
-`.trivyignore.yaml` in the repository at the release tag; the release scan honours an entry only when
-it is scoped to concrete file paths inside the image (each a path with a `/`, with no wildcard
-character and not a scanner result name such as `Python`) or to packages at exact versions, never to
-a bare vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
+Before `release.yml` pushes an image, it scans the locally built image (by image ID) with two pinned
+scanners, Trivy and grype, and refuses to push it when either finds a **CRITICAL vulnerability that
+has a fix available** in what it can see and the finding is not an accepted one. grype reads an export
+of that local image (`docker save`), never a registry. "What they can see" is narrower than the image:
+the list below says what is not covered. Accepted findings are listed in the repository at the
+release tag, in `.trivyignore.yaml` for Trivy and `.grypeignore.yaml` for grype; the release scan
+honours an entry only when it is scoped to concrete file paths inside the image (each a path with a
+`/`, with no wildcard character and not a scanner result name such as `Python`) or to packages at
+exact versions (for grype: a package name and its exact version), never to a bare vulnerability id; states why the finding does not apply; expires at most 92 days out; and carries an
 approver's login, an approval date and a pull-request reference that are not `pending`. The release
 scan checks those three approval fields for **format only**: it does not confirm with GitHub that the
 pull request exists or that the named person approved it, and nothing stops the approver it names
@@ -146,7 +147,11 @@ The release scan also refuses to push, rather than report a clean scan, when:
   `_rc`, `~rc1`, `-rc`, Debian testing or sid, Alpine edge, and similar markers) or not a plain
   release number; or a test scan of that release holding packages older than every fix matches
   nothing. A clean scan of such an image would prove nothing about what it ships;
-- the vulnerability database is older than 72 hours, or was not downloaded by that run.
+- either vulnerability database is older than 72 hours, or was not downloaded by that run (for
+  grype: the database archive does not match the checksum its publisher's listing gives, or grype
+  does not report the imported database as that one);
+- grype does not detect the operating-system release whose packages Trivy scanned (it would then
+  match none of them).
 
 After the release, the pre-release QA workflow scans the published tags again with a newer database;
 a finding there is reported, it cannot unpublish anything.
@@ -161,18 +166,23 @@ What this does **not** gate:
   them. Choose the non-chisel image if you need its OS packages covered by this scan.
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
-- The gateway's bundled Erlang/OTP runtime, and anything statically linked into the server and agent
-  binaries.
-- The integrity of the vulnerability database itself: its publisher does not sign it. Each report
-  records the database's registry digest, so the database a scan used can be identified afterwards,
-  but a database altered before the download is not detected.
+- Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP
+  runtime is matched by grype only (Trivy does not identify it): a vulnerability grype's data does not
+  attribute to that OTP version is not gated.
+- The integrity of the vulnerability databases themselves: their publishers do not sign them. Each
+  report records which database the scan used (Trivy's registry digest; grype's archive name, checksum
+  and build time), so it can be identified afterwards, but a database altered before the download is
+  not detected.
 
 Each release carries the reports for the six images it publishes (inside `SHA256SUMS`):
 `trivy-<image>.attempt-<N>.json` (the full report, including the image ID, the layer digests and
 every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
 `trivy-<image>.attempt-<N>.gate.txt` (the run attempt, the Trivy version, the database's digest and
 date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
-file's hash and the result). `<N>` is the release workflow's run attempt; every attempt's reports are
+file's hash and the result), and grype's `grype-<image>.attempt-<N>.json`, `.txt` and `.gate.txt`
+(the grype version, the database's archive, checksum and build time, the image ID, the detected
+distribution, the match counts, the accepted-findings file's hash and grype's result). `<N>` is the
+release workflow's run attempt; every attempt's reports are
 kept, a refused or cancelled attempt's (`gate: FAIL: <reason>`, `gate: FAIL: cancelled ...`)
 included. Beside each attempt whose scan passed is its publish journal,
 `publish-<image>.attempt-<N>.txt`: one line per publishing step that attempt completed, in this
@@ -263,6 +273,7 @@ TAG=vX.Y.Z
 gh release download "$TAG" --repo DevNullLtd/Yuzu --dir bundle-scan \
   --pattern 'yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*' \
   --pattern 'trivy-yuzu-agent-bundle-chisel.attempt-*' \
+  --pattern 'grype-yuzu-agent-bundle-chisel.attempt-*' \
   --pattern 'publish-yuzu-agent-bundle-chisel.attempt-*'
 cd bundle-scan
 for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
@@ -272,7 +283,7 @@ for sums in yuzu-agent-bundle-chisel-image-vuln-gate.attempt-*.SHA256SUMS; do
     "$sums"
   sha256sum -c "$sums"
 done
-grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt
+grep -H '^gate:' trivy-yuzu-agent-bundle-chisel.attempt-*.gate.txt grype-yuzu-agent-bundle-chisel.attempt-*.gate.txt
 for f in $(ls publish-yuzu-agent-bundle-chisel.attempt-*.txt | sort -V); do echo "$f: $(tail -n 1 "$f")"; done
 docker buildx imagetools inspect "ghcr.io/${OWNER}/yuzu-agent-bundle-chisel:${TAG#v}" --format '{{.Manifest.Digest}}'
 ```
