@@ -197,7 +197,8 @@ decomposition (the share and rate count only affected devices that are online no
 **Usage view.** A **View** row above the platform chips switches between **Stability** and **Usage**. **Usage**
 shows each application's devices, run time and launches over the last 30 days and its crashes and hangs per hour
 of use, marked *estimated from 30-day usage*, and can be split by platform, tag or management group. The crashes
-and hangs counted beside a rate are only those on devices that reported usage for the application, so they can be
+and hangs counted beside a rate are only those on devices that reported usage for the application in the last 48
+hours, so they can be
 fewer than the Crashes and Hangs on the Stability view. It needs
 `Forensics:Read` as well as `GuaranteedState:Read` (administrators only while RBAC is off); without
 `Forensics:Read` the **Usage** chip shows the Stability page and one line saying so. Each Usage view is audited as

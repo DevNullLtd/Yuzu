@@ -132,7 +132,7 @@ counts and the hours it divides, a tag **estimated from 30-day usage** on every
 rate, and **under 20 events** when the rate rests on fewer than 20 events.
 
 The crashes and hangs shown beside a rate are those on devices that reported
-usage for the application, so they can be fewer than the Crashes and Hangs on the
+usage for the application in the last 48 hours, so they can be fewer than the Crashes and Hangs on the
 Stability view for the same application, window and platform.
 
 Controls, each a request to the same fragment:
