@@ -1450,8 +1450,11 @@ groups:
         # code="16" is the raw grpc-status trailer (a binary digit string, see
         # yuzu_gw_upstream.erl do_rpc/4 and yuzu_gw_heartbeat_buffer.erl) for
         # UNAUTHENTICATED. The gateway-upstream service returns UNAUTHENTICATED
-        # from the peer-authorization guard (gateway_peer_guard.cpp), and that is
-        # the only place in the gateway-upstream code that returns it.
+        # from the peer-authorization guard (gateway_peer_guard.cpp) and, under
+        # --agent-reregistration-proof=enforce, from the uniform refusal of one
+        # agent's re-registration (agent_reregistration_gate.hpp). The gateway
+        # counts both as code 16 (the breaker treats the second as neutral), so a
+        # lost-key agent retrying through a healthy gateway also moves this alert.
         expr: |
           sum by (instance, rpc_name) (increase(yuzu_gw_upstream_rpc_errors_total{code="16"}[10m])) > 0
         for: 2m
@@ -1462,8 +1465,14 @@ groups:
           description: >-
             {{ $labels.instance }} received gRPC status 16 (UNAUTHENTICATED) on
             {{ $labels.rpc_name }} for at least 2 minutes. On the gateway-upstream
-            service that is the server's peer-authorization guard refusing this
-            gateway's certificate. Look at the server side for the reason:
+            service that is either the server's peer-authorization guard refusing this
+            gateway's certificate or, under --agent-reregistration-proof=enforce, the
+            server's uniform refusal of one agent's re-registration (the gateway counts
+            it as code 16 too, and does not treat it as a breaker failure). Tell them
+            apart first: if yuzu_register_reregistration_total{mode="enforce"} refusals
+            are rising while yuzu_server_gateway_peer_denied_total is flat, the gateway
+            and its pin are healthy and YuzuAgentReregistrationRefused is the alert to
+            follow. For the guard, look at the server side for the reason:
             yuzu_server_gateway_peer_denied_total by reason, or the server log
             line "gateway peer denied" with the spki= prefix of the key the
             gateway presented, then follow the YuzuGatewayPeerDenied remedies
@@ -4149,6 +4158,22 @@ groups:
             written (reason store_unavailable or write_failed). Absence of a row is not proof that
             nothing happened: the authoritative count is yuzu_register_reregistration_total.
           runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationauditwritefailed"
+
+      - alert: YuzuAgentReregistrationRefusalAuditDropped
+        expr: |
+          sum by (job, instance) (increase(yuzu_register_reregistration_audit_dropped_total{action="agent.reregistration_refused"}[15m])) > 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "Enforce-mode re-registration refusal rows were dropped and are named nowhere"
+          description: >-
+            An agent.reregistration_refused audit row lost the older per-key budget (10 rows per
+            outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per
+            10 s window). Unlike audit-mode agent.reregistration_unproven rows, a dropped refusal row
+            is counted only by action: no summary row names its id and
+            yuzu_register_reregistration_audit_ids_truncated_total does not count it. The unbudgeted
+            yuzu_register_reregistration_total still counts every decision.
+          runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationrefusalauditdropped"
 
       # First-weeks-after-flip alert (owner ruling 2026-11-19): the soak cannot exercise the token
       # path (audit mode neither checks nor consumes a token for an approved live-leaf id), so for the

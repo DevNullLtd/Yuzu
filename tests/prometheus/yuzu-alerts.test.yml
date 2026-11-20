@@ -4468,6 +4468,23 @@ tests:
         eval_time: 30m
         exp_samples: []
 
+  # WP01 review fix: the enforce refusal is counted as code 16 on a healthy gateway, so the alert text
+  # must say the peer guard is not the only source. RED if the amended description is lost.
+  - interval: 1m
+    name: gateway upstream auth refused - the text names the enforce re-registration refusal as a second source
+    input_series:
+      - series: 'yuzu_gw_upstream_rpc_errors_total{job="yuzu-gateway",instance="g1",rpc_name="proxy_register",code="16"}'
+        values: "_x5 1+1x30"
+    alert_rule_test:
+      - alertname: YuzuGatewayUpstreamAuthRefused
+        eval_time: 15m
+        exp_alerts:
+          - exp_labels: {instance: g1, rpc_name: proxy_register, severity: warning}
+            exp_annotations:
+              summary: "The server refused this gateway's upstream call as unauthenticated (proxy_register on g1)"
+              description: "g1 received gRPC status 16 (UNAUTHENTICATED) on proxy_register for at least 2 minutes. On the gateway-upstream service that is either the server's peer-authorization guard refusing this gateway's certificate or, under --agent-reregistration-proof=enforce, the server's uniform refusal of one agent's re-registration (the gateway counts it as code 16 too, and does not treat it as a breaker failure). Tell them apart first: if yuzu_register_reregistration_total{mode=\"enforce\"} refusals are rising while yuzu_server_gateway_peer_denied_total is flat, the gateway and its pin are healthy and YuzuAgentReregistrationRefused is the alert to follow. For the guard, look at the server side for the reason: yuzu_server_gateway_peer_denied_total by reason, or the server log line \"gateway peer denied\" with the spki= prefix of the key the gateway presented, then follow the YuzuGatewayPeerDenied remedies (a pin that does not match the gateway's current certificate key, a certificate that expired while the connection was open, a certificate without serverAuth). Status 16 is an RPC result, not a transport failure, so the gateway does not redial by itself. If the cause was on the server side (a pin or acknowledgement), fix it, restart the serving replicas, and do not restart the gateways first unless the checks below fail, because on agents without the #5183 fix (shipped in 0.15.0) a gateway restart leaves released agents wedged; see \"What happens when the server restarts\" in docs/user-manual/gateway.md. Only on a gateway that has the #1197 consumer (#5383) does the gateway then recover through its replay path. Check three separate things: the registration counts with sum(yuzu_gw_agents_current) - sum(yuzu_agents_connected{job=\"yuzu-server\"}) (summed across all gateway nodes and all replicas; the server gauge also counts direct agents and counts registration, not placement), no rise in the raw yuzu_gw_upstream_rpc_errors_total{rpc_name=\"notify_stream\",code=\"16\"} or yuzu_gw_upstream_notify_dropped_total, and a read-only command to a sample agent that returns a result (the exact request is in the runbook). Agreeing counts alone do not prove placement. If the cause is on the gateway side (a certificate that expired or was renewed, a rotated key), the gateway presents its current files only when it redials, and a server restart forces a redial, so first check whether it already has: read yuzu_server_gateway_peer_denied_total and yuzu_gw_upstream_rpc_errors_total{code=\"16\"} twice, a minute apart, and see that they have stopped rising, and compute the SPKI prefix of the certificate file the gateway is configured with. A redial can still present the old certificate for about 2 minutes after the files change (Erlang ssl PEM cache; measured on OTP 28.4.2 with a stub, not on a Yuzu gateway). Restart that gateway node, one at a time, only if denials continue and its agents can take the disconnect, because unless the agents run a build with the #5183 fix (shipped in 0.15.0) a gateway restart leaves released agents wedged. For placement loss after a refusal window, restart the agent service on the unreachable agents (the observed fix), and restart the gateway node only if many agents behind one node are affected and the checks still fail. This alert stays active for about 11 minutes after the last refusal (a 10 minute window, so the gateway's circuit breaker, which can leave up to 300 seconds between two calls it makes, cannot blank it): check that the counter is flat rather than waiting for it to clear. See docs/user-manual/server-admin.md \"Gateway upstream peer authorization\"."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/server-admin.md#gateway-upstream-peer-authorization"
+
   # CASE T -- sustained TLS handshake failures fire the warning after the 5m
   # `for:`, labelled with instance and kind (the rpc_name label is aggregated
   # away). RED if the `for:` were shortened (it would fire at 7m) or the aggregation
@@ -11078,11 +11095,11 @@ tests:
   - interval: 1m
     name: would-refuse - single step fires within 1h only, severity warning, every alternative
     input_series:
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x150"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0x10 1 1x150"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="audit"}', values: "0x10 1 1x150"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x150"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="audit"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="audit"}', values: "0x10 1 1x65"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}'
         eval_time: 25m
@@ -11091,16 +11108,16 @@ tests:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing", instance="d", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationWouldRefuse", alertstate="firing"}', eval_time: 75m, exp_samples: []}
 
   - interval: 1m
     name: enforce refusals - each alternative fires per instance at warning, window 15m, exact threshold
     input_series:
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="enforce"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="revoked_identity",mode="enforce"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="d",path="direct",outcome="no_proof",mode="audit"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="e",path="direct",outcome="proven_by_leaf",mode="enforce"}', values: "0x10 1 1x25"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}'
         eval_time: 20m
@@ -11108,112 +11125,112 @@ tests:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="b", job="yuzu", severity="warning"}', value: 1}
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationRefused", alertstate="firing"}', eval_time: 30m, exp_samples: []}
 
   - interval: 1m
     name: enforce lookup_failed - critical, enforce only, window 10m
     input_series:
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="direct",outcome="lookup_failed",mode="enforce"}', values: "0x10 1 1x20"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="lookup_failed",mode="audit"}', values: "0x10 1 1x20"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="c",path="direct",outcome="no_proof",mode="enforce"}', values: "0x10 1 1x20"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}'
         eval_time: 15m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing", instance="a", job="yuzu", severity="critical"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}', eval_time: 30m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationLookupFailed", alertstate="firing"}', eval_time: 25m, exp_samples: []}
 
   - interval: 1m
     name: token refusal burst - exact boundary (4 and 5 refusals quiet, 6 fires), window 15m, per instance
     input_series:
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="multi_use_token"}', values: "0x5 1 2 3 4 4x60"}
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="not_found"}', values: "0x5 1 2 3 4 5 5x60"}
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x5 1 2 3 4 5 6 6x60"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="multi_use_token"}', values: "0x5 1 2 3 4 4x35"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="not_found"}', values: "0x5 1 2 3 4 5 5x35"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x5 1 2 3 4 5 6 6x35"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}'
         eval_time: 14m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing", instance="c", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}', eval_time: 60m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenRefusedBurst", alertstate="firing"}', eval_time: 40m, exp_samples: []}
 
   - interval: 1m
     name: supersede failed - single step fires within 1h at warning, quiet after
     input_series:
-      - {series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="a"}', values: "0x10 1 1x150"}
-      - {series: 'yuzu_server_ca_superseded_leaf_total{job="yuzu",instance="b"}', values: "0x10 1 1x150"}
+      - {series: 'yuzu_server_ca_supersede_failed_total{job="yuzu",instance="a"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_server_ca_superseded_leaf_total{job="yuzu",instance="b"}', values: "0x10 1 1x65"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentLeafSupersedeFailed", alertstate="firing"}', eval_time: 75m, exp_samples: []}
 
   - interval: 1m
     name: audit write failures fire at warning and stay quiet after the window
     input_series:
-      - {series: 'yuzu_register_reregistration_audit_write_failures_total{job="yuzu",instance="a",reason="store_unavailable"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_audit_write_failures_total{job="yuzu",instance="a",reason="store_unavailable"}', values: "0x10 1 1x25"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditWriteFailed", alertstate="firing"}', eval_time: 30m, exp_samples: []}
 
   # WP01 Gate 8 pass 4: the new alerts, and the UnattestedGateway window.
   - interval: 1m
     name: unattested gateway - fires inside its 30m window, quiet after it (a 2h window would still fire)
     input_series:
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="gateway_proxy",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x200"}
-      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x200"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="a",path="gateway_proxy",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x40"}
+      - {series: 'yuzu_register_reregistration_total{job="yuzu",instance="b",path="direct",outcome="unattested_gateway",mode="enforce"}', values: "0x10 1 1x40"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}'
         eval_time: 25m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}', eval_time: 100m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationUnattestedGateway", alertstate="firing"}', eval_time: 45m, exp_samples: []}
 
   - interval: 1m
     name: token consumed but no leaf - fires at warning per instance, quiet after 15m, ignores other counters
     input_series:
-      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="a",reason="no_csr"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="b",reason="signer_threw"}', values: "0x70"}
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="a",reason="no_csr"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="b",reason="signer_threw"}', values: "0x40"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="c",reason="expired"}', values: "0x10 1 1x25"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReenrolTokenNoLeaf", alertstate="firing"}', eval_time: 30m, exp_samples: []}
 
   - interval: 1m
     name: audit ids truncated - fires at warning, window 1h
     input_series:
-      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="a"}', values: "0x10 4700 4700x200"}
-      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="b"}', values: "0x210"}
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="a"}', values: "0x10 4700 4700x65"}
+      - {series: 'yuzu_register_reregistration_audit_ids_truncated_total{job="yuzu",instance="b"}', values: "0x80"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}'
         eval_time: 30m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}', eval_time: 150m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditIdsTruncated", alertstate="firing"}', eval_time: 75m, exp_samples: []}
 
   - interval: 1m
     name: audit summary dropped - fires at warning, window 15m
     input_series:
-      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="queue_full"}', values: "0x10 1 1x60"}
-      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="b",reason="shutdown"}', values: "0x70"}
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="queue_full"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="b",reason="shutdown"}', values: "0x40"}
     promql_expr_test:
       - expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}'
         eval_time: 20m
         exp_samples:
           - {labels: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing", instance="a", job="yuzu", severity="warning"}', value: 1}
-      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}', eval_time: 40m, exp_samples: []}
+      - {expr: 'ALERTS{alertname="YuzuAgentReregistrationAuditSummaryDropped", alertstate="firing"}', eval_time: 30m, exp_samples: []}
 
   # WP01 Gate 8 pass 6: the alloc_failed reason fires too, and the annotation names the right counter.
   - interval: 1m
     name: audit summary dropped - alloc_failed fires, and the description points at the ids counter
     input_series:
-      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="alloc_failed"}', values: "0x10 1 1x60"}
+      - {series: 'yuzu_register_reregistration_audit_summary_dropped_total{job="yuzu",instance="a",reason="alloc_failed"}', values: "0x10 1 1x15"}
     alert_rule_test:
       - alertname: YuzuAgentReregistrationAuditSummaryDropped
         eval_time: 20m
@@ -11228,9 +11245,9 @@ tests:
   - interval: 1m
     name: token refused first weeks - one refusal fires (info), quiet after 1h, other reasons and counters count
     input_series:
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="not_found"}', values: "0x10 1 1x200"}
-      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="multi_use_token"}', values: "0x210"}
-      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="c",reason="no_csr"}', values: "0x10 1 1x200"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="a",reason="not_found"}', values: "0x10 1 1x65"}
+      - {series: 'yuzu_register_reenrol_token_refused_total{job="yuzu",instance="b",reason="multi_use_token"}', values: "0x80"}
+      - {series: 'yuzu_register_reenrol_token_no_leaf_total{job="yuzu",instance="c",reason="no_csr"}', values: "0x10 1 1x65"}
     alert_rule_test:
       - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
         eval_time: 30m
@@ -11241,7 +11258,26 @@ tests:
               description: "An enrollment token was refused for an agent id that holds a live leaf (reason multi_use_token, not_found, expired, revoked, already_consumed or invalid_input_length). The audit-mode soak cannot exercise the token path, so for the first weeks after --agent-reregistration-proof=enforce was switched on every refusal is a lost-key agent that still has no way back in, or a wrong token. Mint a fresh single-use token (max_uses 1); if the agent still holds a certificate file, remove its cert_dir first."
               runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreenroltokenrefusedfirstweeks"
       - alertname: YuzuAgentReenrolTokenRefusedFirstWeeks
-        eval_time: 150m
+        eval_time: 75m
+        exp_alerts: []
+
+  # WP01 review fix: an enforce refusal row dropped by the older budget is counted by action only.
+  - interval: 1m
+    name: refusal audit dropped - only the refused action fires, window 15m, at warning
+    input_series:
+      - {series: 'yuzu_register_reregistration_audit_dropped_total{job="yuzu",instance="a",action="agent.reregistration_refused"}', values: "0x10 1 1x25"}
+      - {series: 'yuzu_register_reregistration_audit_dropped_total{job="yuzu",instance="b",action="agent.reregistration_unproven"}', values: "0x10 1 1x25"}
+    alert_rule_test:
+      - alertname: YuzuAgentReregistrationRefusalAuditDropped
+        eval_time: 20m
+        exp_alerts:
+          - exp_labels: {job: yuzu, instance: a, severity: warning}
+            exp_annotations:
+              summary: "Enforce-mode re-registration refusal rows were dropped and are named nowhere"
+              description: "An agent.reregistration_refused audit row lost the older per-key budget (10 rows per outcome and agent id, 64 distinct keys, then one overflow allowance per outcome, per 10 s window). Unlike audit-mode agent.reregistration_unproven rows, a dropped refusal row is counted only by action: no summary row names its id and yuzu_register_reregistration_audit_ids_truncated_total does not count it. The unbudgeted yuzu_register_reregistration_total still counts every decision."
+              runbook_url: "https://github.com/DevNullLtd/Yuzu/blob/main/docs/user-manual/security-hardening.md#yuzuagentreregistrationrefusalauditdropped"
+      - alertname: YuzuAgentReregistrationRefusalAuditDropped
+        eval_time: 30m
         exp_alerts: []
 
   # CASE WP07-A -- a sustained stream of skipped collect targets fires YuzuPolicyCollectSkipped.
