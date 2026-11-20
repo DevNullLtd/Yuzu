@@ -98,6 +98,26 @@ message RegisterRequest {
   // enrollment (the CSR's own subject/SAN are ignored). Empty = legacy / no-mTLS.
   // Transport-agnostic: lives in the message, not in transport metadata.
   string csr_pem = 7;
+
+  // WP01 (agent re-registration identity): the TLS client certificate the agent
+  // presented to the GATEWAY's agent listener, as witnessed by the gateway.
+  // PEM text of the leaf (empty when the agent presented none).
+  //
+  // GATEWAY-AUTHORITATIVE, exactly like gateway_observed_peer: the gateway
+  // OVERWRITES both fields on every Register it proxies, discarding whatever the
+  // agent sent, and the DIRECT Register path IGNORES them entirely (a direct
+  // agent cannot use them to claim an identity). `gateway_attests_peer_cert` is
+  // true iff the gateway's LISTENER can witness client certificates, so a server can tell "a
+  // witnessing listener saw no certificate" from "a listener that cannot witness"; the server
+  // cannot distinguish a gateway that overwrites honestly from a compromised one
+  // (same trust level as gateway_observed_peer; R-6 residual).
+  //
+  // The TLS handshake proves the agent holds the leaf's private key. The gateway
+  // does not validate the chain (a stale or foreign leaf must not abort the
+  // handshake and lock the agent out); the SERVER re-verifies the leaf against
+  // its own CA, the agent_id binding and revocation before treating it as proof.
+  string gateway_attested_peer_cert_pem = 8;
+  bool   gateway_attests_peer_cert      = 9;
 }
 
 message RegisterResponse {

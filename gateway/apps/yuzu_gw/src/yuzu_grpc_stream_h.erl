@@ -301,7 +301,7 @@ call(StreamId, Req, Headers, Route, Timeout, Env, St0) ->
     Conn = self(),
     Peer = maps:get(peer, Req, undefined),
     Ctx = yuzu_grpc:new_ctx(Headers, Conn, Peer, origin(Env, Peer, Req, Headers),
-                            maps:get(cert, Req, undefined)),
+                            maps:get(cert, Req, undefined), maps:get(witness, Env, false)),
     Stream = #yuzu_grpc_stream{conn = Conn, stream_id = StreamId, ctx = Ctx,
                                method = Path, pb = Pb, output = Output,
                                send_timeout = maps:get(send_timeout_ms, Limits,

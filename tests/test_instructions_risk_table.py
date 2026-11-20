@@ -30,6 +30,11 @@ FRAGMENTS = sorted((ROOT / "server/core/src/capability_decls").glob("*.hpp"))
 ROW = re.compile(r'\.plugin\s*=\s*"([^"]+)",\s*\.action\s*=\s*"([^"]+)",(.*?)\n\s*\},', re.S)
 DESTRUCTIVE = re.compile(r"\.dispatch_class\s*=\s*DispatchClass::Destructive")
 FORENSICS = re.compile(r'\.securable\s*=\s*"Forensics"')
+SERVER_CPP = ROOT / "server/core/src/server.cpp"
+# One boot-time action-level default-off seed: seed_action_kill_switch_default_off("plugin", "action", ...).
+# The whole-plugin seed (seed_kill_switch_default_off) is a different name and is not matched here: every
+# plugin it covers is a Forensics row, which the explicit-target check above already classifies.
+ACTION_SEED = re.compile(r'seed_action_kill_switch_default_off\(\s*"([^"]+)",\s*"([^"]+)"')
 
 
 # The opt-in classes a definition may carry, by the kind of row it targets.
@@ -48,6 +53,12 @@ def explicit_target_rows(texts):
             elif DESTRUCTIVE.search(body):
                 rows[(plugin, action)] = "destructive"
     return rows, total
+
+
+def default_off_action_pairs(text):
+    """{(plugin, action)} that server.cpp boot-seeds kill-switched at action level (comments stripped)."""
+    code = re.sub(r"(?m)^\s*//.*$", "", text)
+    return set(ACTION_SEED.findall(code))
 
 
 def misclassified(rows, defs):
@@ -114,7 +125,7 @@ class RiskTable(unittest.TestCase):
         self.assertEqual({self.rows[(d.plugin, d.action)] for d in matched}, {"forensic", "destructive"})
 
     def test_default_run_excludes_every_opt_in_class(self):
-        opt_in = {"destructive", "forensic", "server-internal", "network-disrupt", "interactive"}
+        opt_in = {"destructive", "forensic", "server-internal", "network-disrupt", "interactive", "default-off"}
         self.assertEqual(set(ir.DEFAULT_RISKS) & opt_in, set())
 
     def test_risk_table_matches_definitions(self):
@@ -127,6 +138,24 @@ class RiskTable(unittest.TestCase):
         self.assertEqual(bad, [], "definitions the server refuses to broadcast carry the wrong class in "
                                   "scripts/test/instructions-risk-classification.json; a Forensics row "
                                   "needs forensic, a Destructive row destructive")
+
+    def test_default_off_action_definitions_stay_out_of_the_default_run(self):
+        # The server refuses a pair it boot-seeds kill-switched, so a default-run (safe/mutating)
+        # definition on one fails the gate on every run: HTTP 503 from the legacy execute route.
+        pairs = default_off_action_pairs(SERVER_CPP.read_text(encoding="utf-8"))
+        self.assertTrue(pairs, "no seed_action_kill_switch_default_off call site parsed from server.cpp")
+        matched = [d for d in self.defs if (d.plugin, d.action) in pairs]
+        self.assertTrue(matched, "no definition matches a default-off action seed")
+        bad = sorted(d.id for d in matched if d.risk in ir.DEFAULT_RISKS)
+        self.assertEqual(bad, [], "definitions on a default-off action seed are in the default run; classify "
+                                  "them default-off in scripts/test/instructions-risk-classification.json")
+
+    def test_default_off_action_seed_parse_on_synthetic_data(self):
+        text = ('// seed_action_kill_switch_default_off("c", "commented", "r")\n'
+                'if (!store->seed_action_kill_switch_default_off(\n'
+                '        "p", "a", "reason")) {}\n'
+                'store->seed_kill_switch_default_off("whole", "reason");\n')
+        self.assertEqual(default_off_action_pairs(text), {("p", "a")})
 
     def test_failure_mode_on_synthetic_data(self):
         rows = {("p", "a"): "destructive", ("p", "b"): "forensic"}

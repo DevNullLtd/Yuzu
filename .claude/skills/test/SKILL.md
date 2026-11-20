@@ -603,8 +603,8 @@ fi
 # Instructions content-suite gate — schema-driven REST exerciser.
 # Drives every default-risk (safe + mutating) InstructionDefinition and
 # records per-instruction pass/fail/timing into the test-runs DB.
-# The destructive, forensic, server-internal, interactive and network-disrupt
-# classes are opt-in via --risks; default-mode invocation excludes them.
+# The destructive, forensic, server-internal, interactive, network-disrupt and
+# default-off classes are opt-in via --risks; default-mode invocation excludes them.
 # Destructive and forensic additionally need --target-agent-id, --confirm-target,
 # --run-id, a --params-override file and (off loopback) --allow-remote; /test never runs them.
 gate_run "Instructions" "instructions.log" \

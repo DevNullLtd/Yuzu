@@ -1225,6 +1225,12 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "under the machine-wide application roots, with name, version, version source, path, "
          "size and anchor application (Linux and macOS; Windows planned; read-only, no "
          "subprocess, machine roots only)"},
+        {"component_inventory.native",
+         "List versioned shared libraries (ELF .so on Linux, Mach-O .dylib on macOS) shipped "
+         "inside applications under the machine-wide application roots, with name, version, "
+         "version source, path, size and anchor application, at most 5,000 rows (Linux and "
+         "macOS; Windows planned; read-only, no subprocess; package-owned trees are not read; "
+         "switched off until an operator enables it)"},
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "

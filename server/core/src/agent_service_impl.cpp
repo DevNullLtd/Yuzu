@@ -1,5 +1,7 @@
 #include "agent_service_impl.hpp"
 
+#include "agent_reregistration_apply.hpp"
+
 #include "ota_signature_sidecar.hpp"
 
 #include "ota_audit_key.hpp"
@@ -312,6 +314,10 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
     // client cert (it obtains one via this very call), so a no-cert Register is
     // permitted even when mTLS identity is required. But a PRESENTED cert (re-auth
     // after enrollment) MUST match the claimed agent_id and must not be revoked.
+    // WP01: set only when the presented certificate is a Yuzu-issued, CN-matching, unrevoked
+    // leaf for THIS agent id (the end of the block below, after every refusal). The re-registration
+    // gate treats nothing else as proof of the existing identity.
+    bool cert_proves_identity = false;
     if (require_client_identity_ && context) {
         const auto idents = extract_peer_identities(*context);
         if (!idents.empty()) {
@@ -338,9 +344,17 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
                                         "client certificate is revoked");
                 }
+                // With a recognizer wired (our own CA is active) reaching here means the leaf
+                // chains to OUR CA, names this agent and is unrevoked. Without one this is the
+                // legacy operator-CA posture, which has no ca_issued leaf and so no gate (the
+                // hooks are only wired together with the recognizer).
+                cert_proves_identity = peer_cert_recognizer_ != nullptr;
             }
         }
     }
+
+    if (cert_proof_override_for_test_)
+        cert_proves_identity = cert_proof_override_for_test_(info.agent_id());
 
     // -- Tiered enrollment -------------------------------------------------------
 
@@ -356,6 +370,37 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             .increment();
         return grpc::Status(grpc::StatusCode::INVALID_ARGUMENT,
                             "agent_id may only contain letters, digits, '.', '_', ':' and '-'");
+    };
+
+    // WP01: an already-enrolled id whose live leaf is not proven re-enrols through the token
+    // block below, as a re-enrolment (single-use token required, older leaf superseded).
+    bool reenrol_via_token = false;
+    bool reenrolled_with_token = false; // the token block accepted a re-enrolment
+    // The refusal of an unusable re-enrolment token: a gRPC status, NEVER accepted=false (a
+    // permanent rejection to the agent), so the agent keeps retrying until it holds a good token.
+    const auto reenrol_token_refusal = [&](std::string_view reason) {
+        metrics_.counter("yuzu_register_reenrol_token_refused_total", {{"reason", std::string(reason)}})
+            .increment();
+        spdlog::warn("Register: re-enrolment token refused for agent {} ({})", safe_agent_id,
+                     reason);
+        return grpc::Status(grpc::StatusCode::UNAUTHENTICATED,
+                            std::string(yuzu::server::kReregistrationRefusalPublicMessage));
+    };
+
+    const auto run_reregistration_gate = [&]() {
+        return yuzu::server::apply_reregistration_gate(
+            reregistration_mode_, require_client_identity_ ? agent_identity_hooks_.get() : nullptr,
+            "direct", info.agent_id(), safe_agent_id,
+            yuzu::server::ReregistrationEvidence{
+                .cert_proves_identity = cert_proves_identity,
+                .token_presented = !request->enrollment_token().empty(),
+                .transport_can_prove = true},
+            &metrics_,
+            yuzu::server::make_reregistration_audit_sink(
+                audit_store_, "direct", info.agent_id(),
+                context ? extract_peer_ip(context->peer()) : std::string{}, nullptr,
+                [&] { signal_grpc_audit_failed(context); }, &metrics_),
+            context ? extract_peer_ip(context->peer()) : std::string{});
     };
 
     // Fast path: agent already enrolled from a prior connection — skip enrollment
@@ -385,7 +430,32 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
         if (prior && *prior == auth::PendingStatus::approved) {
             spdlog::info("Agent {} re-registering (already enrolled)", safe_agent_id);
             is_reauth = true;
-            goto enrolled;
+            // WP01: the approved row is not proof of WHO is calling. Decide it here, before
+            // registry_.register_agent (which would replace the live session and revoke device
+            // tokens), so a refused caller cannot displace the real agent. Plain-TLS and
+            // --no-tls listeners (no client identity required) have no proof to offer: inert.
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true; // fall through to the token block
+            else
+                goto enrolled;
+        }
+        // WP01 / UP-2: the gate keys on the LEAF STATE, not on the pending row. An operator who
+        // deleted the enrollment row of an id that still holds a live leaf must not make that id
+        // enrol afresh (auto-approve or a token) and be issued a second live leaf without proof:
+        // an absent row runs the same decision, and so does a PENDING one (a leftover or
+        // attacker-provoked pending row, or one created while still in audit mode, must not let a
+        // token or auto-approve issue a second live leaf: a pending row with NO leaf is the
+        // normal first-enrolment path and falls through as NoLeafOnRecord, unchanged). The result only matters when it refuses or asks
+        // for a single-use token; a proven/no-leaf verdict continues the ordinary flow below.
+        if (!prior || *prior == auth::PendingStatus::pending) {
+            const auto verdict = run_reregistration_gate();
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::Refuse)
+                return *verdict.refusal;
+            if (verdict.route == yuzu::server::ReregistrationVerdict::Route::TokenReenrol)
+                reenrol_via_token = true;
         }
         // #1067: reject an admin-DENIED agent BEFORE consuming any enrollment
         // token. Previously the consume happened first and the admin-deny check
@@ -461,6 +531,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                                      {"token_length", enrollment_token.size()}};
                     analytics_store->emit(std::move(ae));
                 }
+                if (reenrol_via_token)
+                    return reenrol_token_refusal("invalid_input_length");
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -491,7 +563,8 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                           yuzu::server::sanitize_enrollment_text(info.platform().os()),
                           yuzu::server::sanitize_enrollment_text(info.platform().arch()),
                           yuzu::server::sanitize_enrollment_text(info.agent_version()),
-                          /*enforce_new_id_charset=*/true)
+                          /*enforce_new_id_charset=*/true,
+                          /*require_single_use=*/reenrol_via_token)
                     : std::expected<auth::ConsumeEnrollResult, StoreError>{
                           auth::ConsumeEnrollResult{
                               .kind = auth::ConsumeEnrollResult::Kind::token_rejected,
@@ -607,6 +680,9 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     analytics_store->emit(std::move(ae));
                 }
 
+                if (reenrol_via_token)
+                    return reenrol_token_refusal(consumed->not_single_use ? std::string_view{"multi_use_token"}
+                                                                      : std::string_view{variant});
                 response->set_accepted(false);
                 response->set_reject_reason(
                     std::string(yuzu::server::kEnrollmentTokenRejectionPublicMessage));
@@ -618,6 +694,16 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
             // ONE store transaction (consume_and_enroll), so the success audit row
             // below only ever describes a completed enrollment.
             const auto& claim = consumed->claim;
+            if (reenrol_via_token) {
+                // WP01 / owner decision D5: a MULTI-USE (fleet) token is not proof of an existing
+                // identity - it is shared by every holder - so only a single-use token (max_uses ==
+                // 1) re-enrols an id that already holds a live leaf. That is decided INSIDE the
+                // consume UPDATE (require_single_use), so a multi-use token is never consumed and
+                // never reaches here; this is a defence-in-depth backstop only.
+                if (claim.max_uses != 1)
+                    return reenrol_token_refusal("multi_use_token");
+                reenrolled_with_token = true;
+            }
             spdlog::info("Agent {} auto-enrolled via enrollment token id={} ({}/{})", safe_agent_id,
                          claim.token_id, claim.use_count_after,
                          claim.max_uses == 0 ? -1 : claim.max_uses);
@@ -644,6 +730,20 @@ grpc::Status AgentServiceImpl::Register(grpc::ServerContext* context,
                     ev.source_ip = extract_peer_ip(context->peer());
                 ev.result = "success";
                 enroll_audit_ok = audit_store_->log(ev);
+                if (reenrolled_with_token) {
+                    // WP01: the re-enrolment of an id that holds a live leaf is its own,
+                    // countable event (the token authorised it, not the old credential).
+                    AuditEvent re = ev;
+                    re.action = "agent.reenrolled_with_token";
+                    re.target_type = "Agent";
+                    re.target_id = info.agent_id();
+                    re.detail = "token_id=" + claim.token_id + " via=direct";
+                    enroll_audit_ok = audit_store_->log(re) && enroll_audit_ok;
+                }
+            } else if (audit_store_) {
+                // A wired but closed store cannot record the enrolment (nor the re-enrolment row):
+                // that is the same dropped-evidence degradation as a failed write, never silence.
+                enroll_audit_ok = false;
             }
             // #1065 / #1063: a dropped SUCCESS audit row is the same
             // evidence-chain degradation as a dropped failure row — was
@@ -901,6 +1001,11 @@ enrolled:
     // a per-agent client leaf bound to agent_id and return it; the agent persists
     // it and reconnects with mutual TLS. Signing failure is non-fatal — the agent
     // stays on the bootstrap (request-but-don't-require) posture and can retry.
+    std::string_view no_leaf_reason; // set only when NO new leaf is issued below
+    if (request->csr_pem().empty())
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoCsr;
+    else if (!agent_cert_signer_)
+        no_leaf_reason = yuzu::server::kReenrolNoLeafNoSigner;
     if (!request->csr_pem().empty() && agent_cert_signer_) {
         // #1273 B-2: contain any exception out of the signer — it runs in this sync
         // handler; a throw would terminate the server. Degrade to no-cert (the
@@ -911,17 +1016,46 @@ enrolled:
             issued = agent_cert_signer_(request->csr_pem(), info.agent_id(),
                                         CertIssuanceSource::Direct);
         } catch (const std::exception& e) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw for agent {}: {}", safe_agent_id, e.what());
         } catch (...) {
+            no_leaf_reason = yuzu::server::kReenrolNoLeafSignerThrew;
             spdlog::error("Register: signer threw a non-std exception for agent {}", safe_agent_id);
         }
         if (issued) {
             response->set_issued_certificate(issued->first);
             response->set_issued_ca_chain(issued->second);
             spdlog::info("Issued per-agent client cert for {}", safe_agent_id);
+            // WP01 / D4: the old leaf must not stay valid beside its replacement - the key was
+            // lost, and a lost key may be a stolen key. Only AFTER the new leaf exists (revoking
+            // first would trip sign_agent_csr's revoked-identity guard) and never without one
+            // (that would strand the agent).
+            if (reenrolled_with_token && agent_identity_hooks_ &&
+                agent_identity_hooks_->supersede_older_leaves) {
+                try {
+                    if (!agent_identity_hooks_->supersede_older_leaves(info.agent_id(),
+                                                                       issued->first))
+                        spdlog::warn("agent {}: older leaves not superseded (see "
+                                     "ca.cert.supersede_failed)",
+                                     safe_agent_id);
+                } catch (...) {
+                    spdlog::error("Register: superseding older leaves threw for agent {}",
+                                  safe_agent_id);
+                    metrics_.counter("yuzu_server_ca_supersede_failed_total").increment();
+                }
+            }
         } else {
             spdlog::warn("Register: client-cert signing failed for agent {}", safe_agent_id);
+            if (no_leaf_reason.empty())
+                no_leaf_reason = yuzu::server::kReenrolNoLeafSignerFailed;
         }
+    }
+    // WP01: a single-use token was consumed to re-enrol a live-leaf id but NO leaf was issued: the
+    // token is spent and the old leaf stays. Count it (alert YuzuAgentReenrolTokenNoLeaf).
+    if (reenrolled_with_token && !no_leaf_reason.empty()) {
+        yuzu::server::count_reenrol_token_no_leaf(&metrics_, no_leaf_reason);
+        spdlog::warn("agent {}: re-enrolment token consumed but no leaf issued ({})", safe_agent_id,
+                     no_leaf_reason);
     }
 
     PendingRegistration pending;

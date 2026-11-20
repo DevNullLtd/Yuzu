@@ -246,7 +246,8 @@
         {grpc_listeners, [
             %% Agent listener (:50051): ONE-WAY (server-authenticated) TLS --
             %% encrypts the hop and authenticates the GATEWAY to agents WITHOUT
-            %% requiring a client cert (verify_none + fail_if_no_peer_cert=false).
+            %% requiring a client cert (fail_if_no_peer_cert=false); a client cert that is
+            %% presented is only WITNESSED (witness_client_cert, WP01) and forwarded to the server.
             %% This closes the plaintext command-fan-out edge while still letting
             %% an UNENROLLED agent bootstrap (it has no client cert until it
             %% completes CSR enrollment). Agent identity is app-layer (the
@@ -271,8 +272,11 @@
               tls => #{certfile   => "/etc/yuzu/certs/default-gateway.pem",
                        keyfile    => "/etc/yuzu/certs/default-gateway.key",
                        cacertfile => "/etc/yuzu/certs/default-ca.pem",
-                       verify => verify_none,
-                       fail_if_no_peer_cert => false},
+                       %% WP01: ask for a client certificate and WITNESS it (no chain check here;
+                       %% the server verifies the leaf); an agent with none is still served.
+                       verify => verify_peer,
+                       fail_if_no_peer_cert => false,
+                       witness_client_cert => true},
               acceptors => 32,
               http2 => #{idle_timeout => 180000, max_concurrent_streams => 32},
               %% Ceilings on the unauthenticated edge. max_connections bounds file

@@ -31,6 +31,10 @@
 #include <system_error>
 #include <vector>
 
+#ifndef _WIN32
+#include <sys/stat.h> // mkfifo (the FIFO allowlist test)
+#endif
+
 namespace fs = std::filesystem;
 
 namespace {
@@ -569,6 +573,162 @@ TEST_CASE("defer_legacy_echo_adoption sees a stale tar plugin the allowlist refu
     CHECK(fs::path{result.errors.front().path}.stem() == "tar");
     const std::vector<std::string_view> none;
     CHECK(yuzu::agent::defer_legacy_echo_adoption(result.errors, none));
+}
+
+// ─── WP13 / F52: a configured allowlist must never fail open ─────────────────
+
+namespace {
+void write_allowlist(const fs::path& p, const std::string& body) {
+    std::ofstream f(p, std::ios::binary);
+    f << body;
+}
+} // namespace
+
+TEST_CASE("load_plugin_allowlist: unconfigured is distinct from configured-but-unusable",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_"};
+    fs::create_directories(tmp.path);
+
+    CHECK(yuzu::agent::load_plugin_allowlist({}).status == AllowlistStatus::NotConfigured);
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "absent.txt").status ==
+          AllowlistStatus::Missing);
+    // A directory is not a readable allowlist file.
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path).status == AllowlistStatus::Unreadable);
+
+    write_allowlist(tmp.path / "empty.txt", "");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "empty.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "comments.txt", "# only a comment\n\n# another\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "comments.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "bad.txt", "loneword\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "bad.txt").status ==
+          AllowlistStatus::NoValidEntries);
+
+    write_allowlist(tmp.path / "ok.txt", "# c\n" + std::string(64, 'A') + "  /x/y/foo.so\nloneword\n");
+    auto ok = yuzu::agent::load_plugin_allowlist(tmp.path / "ok.txt");
+    REQUIRE(ok.status == AllowlistStatus::Loaded);
+    REQUIRE(ok.entries.size() == 1);
+    CHECK(ok.entries.at("foo.so") == std::string(64, 'a'));
+}
+
+TEST_CASE("load_plugin_allowlist: wrong-format content is NoValidEntries, a BOM does not eat "
+          "the first entry (UP1)",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_shape_"};
+    fs::create_directories(tmp.path);
+    const std::string h(64, 'c');
+
+    // Junk that has two tokens per line but is not a sha256 must refuse.
+    write_allowlist(tmp.path / "md5.txt", "d41d8cd98f00b204e9800998ecf8427e  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "md5.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "words.txt", "plugin foo.so\nanother bar.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "words.txt").status ==
+          AllowlistStatus::NoValidEntries);
+    write_allowlist(tmp.path / "nonhex.txt", std::string(64, 'z') + "  foo.so\n");
+    CHECK(yuzu::agent::load_plugin_allowlist(tmp.path / "nonhex.txt").status ==
+          AllowlistStatus::NoValidEntries);
+
+    // UTF-8 BOM before the first entry: the entry must survive.
+    write_allowlist(tmp.path / "bom.txt", std::string("\xEF\xBB\xBF") + h + "  first.so\n" + h + "  second.so\n");
+    auto bom = yuzu::agent::load_plugin_allowlist(tmp.path / "bom.txt");
+    REQUIRE(bom.status == AllowlistStatus::Loaded);
+    CHECK(bom.entries.count("first.so") == 1);
+    CHECK(bom.entries.count("second.so") == 1);
+
+    // CRLF and sha256sum binary-mode '*' marker.
+    write_allowlist(tmp.path / "crlf.txt", h + " *bin.so\r\n");
+    auto crlf = yuzu::agent::load_plugin_allowlist(tmp.path / "crlf.txt");
+    REQUIRE(crlf.status == AllowlistStatus::Loaded);
+    CHECK(crlf.entries.count("bin.so") == 1);
+}
+
+#ifndef _WIN32
+TEST_CASE("load_plugin_allowlist: an unreadable file is Unreadable, not empty",
+          "[plugin_loader][allowlist][f52]") {
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_perm_"};
+    fs::create_directories(tmp.path);
+    const auto f = tmp.path / "locked.txt";
+    write_allowlist(f, std::string(64, 'a') + " foo.so\n");
+    fs::permissions(f, fs::perms::none);
+    std::ifstream probe(f);
+    if (probe) {
+        SKIP("running with privileges that bypass file modes (root)");
+    }
+    CHECK(yuzu::agent::load_plugin_allowlist(f).status == yuzu::agent::AllowlistStatus::Unreadable);
+    fs::permissions(f, fs::perms::owner_all);
+}
+#endif
+
+#ifndef _WIN32
+TEST_CASE("load_plugin_allowlist: a FIFO is Unreadable and is never opened (no hang) (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_fifo_"};
+    fs::create_directories(tmp.path);
+    const auto fifo = tmp.path / "allow.fifo";
+    REQUIRE(::mkfifo(fifo.c_str(), 0600) == 0);
+    // Opening a FIFO for read with no writer blocks forever; the loader must refuse it from the
+    // stat result alone.
+    CHECK(yuzu::agent::load_plugin_allowlist(fifo).status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
+#ifdef __linux__
+TEST_CASE("load_plugin_allowlist: a read error mid-file is Unreadable, not a short allowlist (F5)",
+          "[plugin_loader][allowlist][f52]") {
+    // /proc/self/mem is a regular file that opens but fails every read at offset 0 with EIO,
+    // which sets badbit: the f.bad() branch. A truncated map must not enforce as if complete.
+    std::ifstream probe("/proc/self/mem");
+    std::string x;
+    if (!probe || std::getline(probe, x) || !probe.bad())
+        SKIP("this host does not fail reads of /proc/self/mem with a stream error");
+    CHECK(yuzu::agent::load_plugin_allowlist("/proc/self/mem").status ==
+          yuzu::agent::AllowlistStatus::Unreadable);
+}
+#endif
+
+TEST_CASE("evaluate_allowlist_startup refuses every configured-but-unusable allowlist",
+          "[plugin_loader][allowlist][f52]") {
+    using yuzu::agent::AllowlistStatus;
+    yuzu::agent::PluginAllowlistLoad load;
+
+    // Unconfigured: proceed, whatever the load said.
+    CHECK_FALSE(yuzu::agent::evaluate_allowlist_startup({}, load).has_value());
+
+    const fs::path configured{"/etc/yuzu/plugins.allow"};
+    for (auto st : {AllowlistStatus::Missing, AllowlistStatus::Unreadable,
+                    AllowlistStatus::NoValidEntries, AllowlistStatus::NotConfigured}) {
+        load.status = st;
+        auto r = yuzu::agent::evaluate_allowlist_startup(configured, load);
+        INFO("status " << static_cast<int>(st));
+        REQUIRE(r.has_value());
+        CHECK(r->find("/etc/yuzu/plugins.allow") != std::string::npos);
+    }
+    // Loaded but somehow empty must still refuse.
+    load.status = AllowlistStatus::Loaded;
+    CHECK(yuzu::agent::evaluate_allowlist_startup(configured, load).has_value());
+
+    load.entries["a.so"] = std::string(64, '0');
+    CHECK_FALSE(yuzu::agent::evaluate_allowlist_startup(configured, load).has_value());
+}
+
+TEST_CASE("PluginLoader::scan with allowlist_required and no entries loads nothing",
+          "[plugin_loader][allowlist][f52]") {
+    // Plain bytes suffice: the refusal happens before dlopen.
+    yuzu::test::TempDir tmp{"yuzu_test_allowlist_required_"};
+    fs::create_directories(tmp.path);
+    {
+        std::ofstream pf(tmp.path / (std::string{"anything"} + kPluginExt), std::ios::binary);
+        pf << "bytes";
+    }
+    auto result = yuzu::agent::PluginLoader::scan(tmp.path, {}, {}, /*allowlist_required=*/true);
+    REQUIRE(result.loaded.empty());
+    REQUIRE(result.errors.size() == 1);
+    CHECK(result.errors.front().reason == "not in plugin allowlist");
 }
 
 // ─── Plugin config-sync (covers agent.cpp post-load sync invariant) ─────────

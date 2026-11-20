@@ -4253,3 +4253,45 @@ TEST_CASE("AuthDB generation trigger fires under session_replication_role = repl
 }
 
 #endif // YUZU_TEST_ENABLE_PG
+
+TEST_CASE("AuthDB consume_and_enroll(require_single_use): a multi-use token is refused INSIDE the "
+          "consume UPDATE, never counted, never enrolling; a single-use token still works (WP01)",
+          "[pg][auth_db][enrollment][wp01]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, auth_db_tpl);
+    Harness h{db.dsn()};
+    auto multi = h.db.create_token("fleet", 5, std::chrono::seconds(3600), "admin");
+    auto unlimited = h.db.create_token("unlimited", 0, std::chrono::seconds(3600), "admin");
+    auto single = h.db.create_token("recover", 1, std::chrono::seconds(3600), "admin");
+    REQUIRE(multi.has_value());
+    REQUIRE(unlimited.has_value());
+    REQUIRE(single.has_value());
+
+    for (const auto& t : {*multi, *unlimited}) {
+        auto r = h.db.consume_and_enroll(t.raw_token, "agent-su", "h", "", "", "",
+                                         /*enforce_new_id_charset=*/true, /*require_single_use=*/true);
+        REQUIRE(r.has_value());
+        CHECK(r->kind == CEK::token_rejected);
+        CHECK(r->not_single_use);
+        // Nothing was consumed and no enrollment row was created.
+        CHECK(scalar(h.conn.get(),
+                     "SELECT use_count::text FROM auth.enrollment_tokens WHERE token_id = $1",
+                     {t.token_id}) == "0");
+        CHECK(scalar(h.conn.get(), "SELECT count(*) FROM auth.pending_agents WHERE agent_id = $1",
+                     {"agent-su"}) == "0");
+    }
+    // The same multi-use token is still usable WITHOUT the requirement (ordinary enrolment).
+    auto ok = h.db.consume_and_enroll(multi->raw_token, "agent-su", "h", "", "", "");
+    REQUIRE(ok.has_value());
+    CHECK(ok->kind == CEK::enrolled);
+    CHECK_FALSE(ok->not_single_use);
+
+    auto s1 = h.db.consume_and_enroll(single->raw_token, "agent-su2", "h", "", "", "", true, true);
+    REQUIRE(s1.has_value());
+    CHECK(s1->kind == CEK::enrolled);
+    // A spent single-use token is "already consumed", not "not single use".
+    auto s2 = h.db.consume_and_enroll(single->raw_token, "agent-su3", "h", "", "", "", true, true);
+    REQUIRE(s2.has_value());
+    CHECK(s2->kind == CEK::token_rejected);
+    CHECK_FALSE(s2->not_single_use);
+    CHECK(s2->token_error == EnrollmentTokenError::already_consumed);
+}

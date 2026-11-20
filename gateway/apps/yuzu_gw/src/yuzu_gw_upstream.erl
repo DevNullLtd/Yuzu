@@ -114,7 +114,9 @@
 %%%   stale replays after a reconnect storm cannot trip the breaker. A replay
 %%%   answered with any other request-fault status stays neutral.
 %%%   Every other status still counts as a failure: UNAVAILABLE, INTERNAL,
-%%%   DEADLINE_EXCEEDED, UNKNOWN, PERMISSION_DENIED, UNAUTHENTICATED,
+%%%   DEADLINE_EXCEEDED, UNKNOWN, PERMISSION_DENIED, UNAUTHENTICATED (except the
+%%%   server's uniform re-registration refusal, matched on its exact message and
+%%%   neutral like a request fault: it is one caller's refusal, WP01),
 %%%   RESOURCE_EXHAUSTED (a server out of memory answers it), CANCELLED,
 %%%   UNIMPLEMENTED, ABORTED and DATA_LOSS, and so does every transport error,
 %%%   HTTP-level error and exception out of the client. A request over the
@@ -654,6 +656,9 @@
 %% fails nor recovers the breaker (see record_result/2); the one exception, a
 %% replay answered FAILED_PRECONDITION, is a breaker success (do_replay_one).
 %% Every other status counts.
+%% The message the server answers a refused re-registration with (the C++ constant
+%% kReregistrationRefusalPublicMessage in agent_reregistration_gate.hpp: keep the two in step).
+-define(REREGISTRATION_REFUSAL_MESSAGE, <<"re-registration requires proof of the agent identity">>).
 -define(IS_REQUEST_FAULT(Status), (Status =:= ?GRPC_STATUS_BIN_INVALID_ARGUMENT orelse
                                    Status =:= ?GRPC_STATUS_BIN_NOT_FOUND orelse
                                    Status =:= ?GRPC_STATUS_BIN_ALREADY_EXISTS orelse
@@ -2333,6 +2338,14 @@ record_result({error, {Status, _Message}}, State) when ?IS_REQUEST_FAULT(Status)
     %% breaker on a request that says nothing about the upstream) nor a success (it would
     %% reset real failures, and a closed breaker's success after failures
     %% triggers a replay): the state is untouched.
+    State;
+record_result({error, {?GRPC_STATUS_BIN_UNAUTHENTICATED, ?REREGISTRATION_REFUSAL_MESSAGE}}, State) ->
+    %% WP01: the server's uniform refusal of a re-registration that shows no proof of the agent's
+    %% identity (--agent-reregistration-proof=enforce). The server answered and is healthy: this is
+    %% a fact about ONE caller, so it neither fails the breaker (five refusals in a row, or a
+    %% consumed-token retry loop, would open it for the whole gateway) nor recovers it. Matched on
+    %% the exact message only: any other UNAUTHENTICATED (the gateway-peer guard refusing THIS
+    %% gateway) is a real upstream fault and still counts below.
     State;
 record_result({error, _}, State) ->
     on_failure(State);

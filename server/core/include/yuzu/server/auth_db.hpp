@@ -1092,7 +1092,7 @@ public:
     consume_and_enroll(std::string_view raw_token, const std::string& agent_id,
                        const std::string& hostname, const std::string& os,
                        const std::string& arch, const std::string& agent_version,
-                       bool enforce_new_id_charset = false);
+                       bool enforce_new_id_charset = false, bool require_single_use = false);
 
     /// Five-state pending lookup: a value = approved/denied/pending; `nullopt` =
     /// absent; `unexpected` = ERROR (callers MUST NOT treat as absent).
