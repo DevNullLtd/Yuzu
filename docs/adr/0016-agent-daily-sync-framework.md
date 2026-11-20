@@ -496,6 +496,16 @@ else the `PACKAGER` tag.
 > affected; the per-item shortfall rule above is unchanged. See the Update of
 > 2026-11-09 below.)
 
+> **Update (2026-11-20):** a `pkg_inventory.packages` Homebrew row is five or eleven
+> tokens; any other width is dropped. An eleven-token `machine` row fills
+> `install_date` (the install receipt's install time, formulae only) and
+> `install_location` (the machine prefix, kept by the slot 13 allowlist), so a
+> formula or cask installed under both machine prefixes is two rows, one per
+> `install_location`. A `user`-scope row is never collected, and the receipt's tap,
+> its requested flag and the owner have no slot. The v3 contract, its slots and the
+> hash functions are unchanged; each Mac's Homebrew rows change content once, so each
+> sends one delta.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no

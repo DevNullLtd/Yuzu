@@ -443,7 +443,7 @@ Not implemented. Desktop interaction to enumerate visible application windows.
 
 ### 7.7 Package-Manager Inventory :white_check_mark: `T2` *(new row, v4.1)*
 
-`pkg_inventory` plugin: `managers`, `packages` and `store_packages` — machine-scope package-manager inventory on Windows, macOS and Linux (`Inventory:Read`). On macOS `packages` also reads install receipts (tap, install time, requested flag) and user-owned Homebrew prefixes (`~/homebrew`, `~/.homebrew`); other per-user package stores are out of scope. *(Evidence: `agents/plugins/pkg_inventory/README.md`.)*
+`pkg_inventory` plugin: `managers`, `packages` and `store_packages` — package-manager inventory on Windows, macOS and Linux (`Inventory:Read`), at machine scope plus, on macOS `packages`, install receipts (tap, install time, requested flag) and user-owned Homebrew prefixes (`~/homebrew`, `~/.homebrew`); other per-user package stores are out of scope. *(Evidence: `agents/plugins/pkg_inventory/README.md`.)*
 
 ### 7.8 Language-Runtime Inventory :white_check_mark: `T2` *(new row, v4.1)*
 

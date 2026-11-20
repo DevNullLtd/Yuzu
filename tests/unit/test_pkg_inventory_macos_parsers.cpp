@@ -52,6 +52,7 @@
 #include "pkg_inventory_test_support.hpp"
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -1131,12 +1132,21 @@ TEST_CASE("pkg_inventory macos user prefixes: every bound stops the user walk an
     const auto cfg = any_uid_config();
     std::optional<std::string> token;
 
-    // /Users listing cut at the entry cap: the one home read is kept, the cut is named.
+    // /Users listing cut at the entry cap: the one home read is kept, the cut is named. The cap
+    // also cuts that home's Cellar to one id, so exactly one row survives. Which home and which id
+    // is readdir order (the listing is capped before it is sorted), so the row is matched against
+    // every candidate rather than a fixed pair.
     Limits entry_cap;
     entry_cap.max_entries_per_dir = 1;
     auto rows = mac::macos_package_rows_at(dir.path, token, entry_cap, cfg);
     REQUIRE(token.has_value());
     CHECK(token->find("macos:user_homes:entry_cap") != std::string::npos);
+    REQUIRE(rows.size() == 1);
+    std::vector<std::string> candidates;
+    for (const char* id : {"a", "b"})
+        for (const char* home : {"alpha", "beta"})
+            candidates.push_back(user_row(id, "1.0", home, "homebrew"));
+    CHECK(std::find(candidates.begin(), candidates.end(), rows[0]) != candidates.end());
 
     // Whole-action walk budget spent by the /Users listing itself: nothing is opened.
     Limits budget;

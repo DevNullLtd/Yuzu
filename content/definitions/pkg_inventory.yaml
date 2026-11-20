@@ -21,8 +21,11 @@
 ##            flatpak apps and runtimes (/var/lib/flatpak/{app,runtime}).
 ##   macOS:   managers/packages -- Homebrew Library/Taps, Cellar and Caskroom
 ##            directory names under BOTH /opt/homebrew (Apple silicon) and
-##            /usr/local (Intel). store_packages -- UNSUPPORTED by design:
-##            installed_apps owns the macOS application list.
+##            /usr/local (Intel). packages also reads each formula's install
+##            receipt and the user-owned ~/homebrew and ~/.homebrew prefixes of
+##            each real /Users home (managers reads the two machine prefixes
+##            only). store_packages -- UNSUPPORTED by design: installed_apps
+##            owns the macOS application list.
 ##   Windows: managers -- Chocolatey (C:\ProgramData\chocolatey\lib listable,
 ##            directory count as a fact) and winget (the App Installer package
 ##            in the HKLM Appx roster; version from its key name).
@@ -31,12 +34,15 @@
 ##            {Applications, InboxApplications, Deprovisioned} subkey names.
 ##            Registry and directory reads only; no choco or winget process.
 ##
-## SCOPE: Machine scope only: per-user package stores are out of scope, deferred to the user-session helper (ADR-3003).
+## SCOPE: machine stores, plus on macOS `packages` the Homebrew install receipts and the user-owned
+## ~/homebrew and ~/.homebrew prefixes (read without running brew). Other per-user package stores
+## are out of scope, deferred to the user-session helper (ADR-3003).
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
 ## bundles that installed_apps' macOS `list` also reports via system_profiler, and
 ## installed_apps' `list_per_user` no longer lists Homebrew (WP13/F19: it ran the user-owned
-## brew as root); this plugin is the machine-scope, zero-subprocess view of the same store and
-## adds the manager identity and the cask version.
+## brew as root); this plugin is the zero-subprocess view of the same store (the machine prefixes,
+## and for `packages` the user-owned prefixes too) and adds the manager identity and the cask
+## version.
 
 ---
 apiVersion: yuzu.io/v1alpha1

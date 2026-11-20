@@ -117,8 +117,9 @@ AdaptedRows adapt_pkg_inventory(const std::string& out, std::string_view action,
     std::optional<yuzu::shared::StatusLevel> level;
     std::string reason;
     for_each_line(out, [&](std::string_view line) {
-        // One more than the widest row (store rows are nine tokens, driver rows ten) so an
-        // over-wide row fails the `!= N` width checks instead of being truncated to a valid width.
+        // Each caller passes its widest row plus one (store rows are nine tokens, driver rows ten,
+        // Homebrew package rows eleven) so an over-wide row fails the `!= N` width checks instead
+        // of being truncated to a valid width.
         const auto tok = split_tokens(line, max_tokens, escaped);
         if (yuzu::shared::is_status_line(tok)) {
             if (auto row = yuzu::shared::parse_status_row(tok, action)) {
@@ -371,7 +372,7 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
         }
         entries.push_back(std::move(e));
         return true;
-    }, false, 12);
+    }, /*escaped=*/false, /*max_tokens=*/12); // the widest Homebrew row is eleven tokens, plus one
 }
 
 AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out) {

@@ -721,8 +721,12 @@ macos_package_rows_at(const std::filesystem::path& root, std::optional<std::stri
 /// fixture tree through a real CommandContext. MUTATION: passing std::nullopt
 /// instead of `constraint` below fails the forced-constraint seam case in
 /// test_pkg_inventory_macos_parsers.cpp.
+///
+/// `ucfg` has no default here or on run_macos_guarded: the user-prefix walk reads /Users as root
+/// over trees any local account can write, so an empty mount guard is a choice the caller makes on
+/// purpose, never an omission.
 inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesystem::path& root,
-                        const UserPrefixConfig& ucfg = {}) {
+                        const UserPrefixConfig& ucfg) {
     std::optional<std::string> constraint;
     std::vector<std::string> rows;
     switch (a) {
@@ -740,7 +744,7 @@ inline int run_macos_at(yuzu::CommandContext& ctx, Action a, const std::filesyst
 /// run_macos_at behind the single-flight slot: the shape production runs.
 inline int run_macos_guarded(yuzu::CommandContext& ctx, Action a,
                              const std::filesystem::path& root,
-                             const UserPrefixConfig& ucfg = {}) {
+                             const UserPrefixConfig& ucfg) {
     // `store_packages` is unsupported by design and walks nothing: answer it without the slot
     // so an overlapping dispatch is never told `busy` for an action that cannot be in flight.
     if (a == Action::store_packages) return run_macos_at(ctx, a, root, ucfg);

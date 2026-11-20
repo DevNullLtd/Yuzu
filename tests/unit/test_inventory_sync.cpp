@@ -1989,6 +1989,33 @@ TEST_CASE("pkg_inventory managers adapter: a constrained answer contributes no r
     }
 }
 
+TEST_CASE("collector: a formula under both Homebrew machine prefixes is two records, one per "
+          "install_location",
+          "[sync][collector]") {
+    fake_mac();
+    // Same id, version, kind and receipt under both prefixes: install_location is the only field
+    // that differs, and the writer de-duplicates on the whole record, so both must survive.
+    const pkg::BrewReceipt receipt{"1767225600", "homebrew/core", "true"};
+    g_fake[1].out["packages"] = nl(
+        {supported_status("packages"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/opt/homebrew"),
+         pkg::format_homebrew_package_row("wget", "1.24", pkg::PackageKind::formula, receipt,
+                                          pkg::BrewScope::machine, "", "/usr/local")});
+    const auto sec = section_of(all_plugins(), "pkg_inventory.packages");
+    REQUIRE(sec.has_value());
+    const auto entries = entries_of(*sec);
+    REQUIRE(entries.size() == 2);
+    std::vector<std::string> locations;
+    for (const auto& e : entries) {
+        CHECK(e.name == "wget");
+        CHECK(e.source == "pkg_inventory.packages");
+        locations.push_back(e.install_location);
+    }
+    std::sort(locations.begin(), locations.end());
+    CHECK(locations == std::vector<std::string>{"/opt/homebrew", "/usr/local"});
+}
+
 TEST_CASE("collector: Linux store_packages rows are collected, and a degraded row does not constrain the facet",
           "[sync][collector]") {
     fake_mac();

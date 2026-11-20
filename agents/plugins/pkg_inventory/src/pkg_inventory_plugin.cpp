@@ -1,5 +1,5 @@
 /**
- * pkg_inventory_plugin.cpp — machine-scope package-manager inventory for Yuzu.
+ * pkg_inventory_plugin.cpp — package-manager inventory for Yuzu.
  *
  * Actions:
  *   "managers"       — which package managers are present on this host and their
