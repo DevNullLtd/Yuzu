@@ -1957,8 +1957,16 @@ does not, or the reverse.
   the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time). A host that carries
   one has those rows hashed over the full value, so they are sent once more on the first cycle after upgrade; every
   other row and hash is unchanged.
-- `list` renders an rpm header with no INSTALLTIME as `-` where the old path printed `(none)` (the `inv` row writes
-  it empty, as before). Only a hostile or damaged header lacks the tag.
+- `list` renders an rpm header with no INSTALLTIME as `-` and one with no RELEASE as `VERSION-`, where the old path
+  printed `(none)` for each (the `inv` row writes both empty, as before: the old path mapped `(none)` to empty there).
+  Only a hostile or damaged header lacks either tag.
+- A dpkg `Status` is accepted only as dpkg writes it: three lowercase words of dpkg's vocabulary (want `unknown`,
+  `install`, `hold`, `deinstall` or `purge`; flag `ok` or `reinstreq`; state `not-installed`, `config-files`,
+  `half-installed`, `unpacked`, `half-configured`, `triggers-awaited`, `triggers-pending` or `installed`) separated
+  by single spaces. A word outside its table is `dpkg_status:corrupt` for the whole read, as it was for `dpkg-query`,
+  which exited nonzero on it: a package is never silently left out of a roster published as complete. `dpkg-query` also
+  read mixed case and repeated blanks, which dpkg never writes, so a hand-edited file of that kind is
+  `dpkg_status:corrupt` until dpkg next rewrites it.
 - A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout minimal images with no shell use,
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present

@@ -22,8 +22,15 @@
  * is refused as `corrupt` for a NUL byte, a non-continuation line without a
  * colon, a continuation line before any field, a stanza without a Package, a
  * duplicate of a field this parser reads, and a Status that is not exactly
- * three space-separated words (`<want> <flag> <state>`). dpkg itself rejects
- * the same inputs, so a database dpkg can read is never refused here.
+ * three space-separated words of dpkg's vocabulary (`<want> <flag> <state>`,
+ * see kWants, kFlags and kStates). dpkg-query exited nonzero on a Status word
+ * outside that vocabulary, so the old read degraded on it and so does this one:
+ * a record that cannot be read is never dropped from a roster that is then
+ * published as complete.
+ * The reader accepts only the form dpkg WRITES (lowercase words, single
+ * spaces); dpkg's own reader also takes mixed case and runs of blanks, which it
+ * never writes, so a hand-edited file of that kind is refused here until dpkg
+ * next rewrites it.
  *
  * A stanza with no Status field at all is the caller's policy (MissingStatus).
  * The status file is dpkg's own record and always carries one, so there the
@@ -32,7 +39,8 @@
  * real minimal image's carry NO Status field: that caller asks for
  * MissingStatus::installed, because a package whose file is present in status.d
  * is installed by construction. A Status that IS present is checked by the same
- * three-word rule in both places, and `not-installed` is skipped in both.
+ * rule (three words, each in dpkg's vocabulary) in both places, and `not-installed` is
+ * skipped in both.
  *
  * A stanza whose state word is `not-installed` is skipped (dpkg-query -W prints
  * none). Every other stanza is returned WITH its three words: which states count
@@ -41,6 +49,7 @@
  * unpacked and config-files states stay visible to the next consumer.
  */
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -61,7 +70,7 @@ struct DpkgPackage {
     std::string architecture;
     std::string maintainer;
     std::string want;   ///< unknown | install | hold | deinstall | purge
-    std::string flag;   ///< ok | reinstreq | hold | hold-reinstreq
+    std::string flag;   ///< ok | reinstreq
     std::string status; ///< installed | not-installed | config-files | half-installed | ...
 };
 
@@ -105,6 +114,16 @@ struct Stanza {
 
 inline constexpr std::string_view kFields[5] = {"Package", "Version", "Architecture", "Maintainer",
                                                 "Status"};
+
+/// dpkg's Status vocabulary (pkg-namevalue.c wantinfos, eflaginfos, statusinfos), spelled as dpkg
+/// writes it (dump.c w_status), compared exactly. A word outside its table is a damaged record, not
+/// a new state.
+inline constexpr std::string_view kWants[] = {"unknown", "install", "hold", "deinstall", "purge"};
+inline constexpr std::string_view kFlags[] = {"ok", "reinstreq"};
+inline constexpr std::string_view kStates[] = {"not-installed",    "config-files",
+                                               "half-installed",   "unpacked",
+                                               "half-configured",  "triggers-awaited",
+                                               "triggers-pending", "installed"};
 
 /// The three words of a Status field.
 struct StatusWords {
@@ -150,8 +169,12 @@ struct StatusWords {
         return std::unexpected(PkgDbCause::corrupt); // a stanza without a Package
     if (st.seen[4]) {
         const auto words = split_status(st.status_raw);
-        if (!words)
-            return std::unexpected(PkgDbCause::corrupt); // a Status that is not three words
+        const auto known = [](const auto& table, std::string_view w) {
+            return std::ranges::find(table, w) != std::ranges::end(table);
+        };
+        if (!words || !known(kWants, words->want) || !known(kFlags, words->flag) ||
+            !known(kStates, words->state))
+            return std::unexpected(PkgDbCause::corrupt); // not three words of dpkg's vocabulary
         st.pkg.want.assign(words->want);
         st.pkg.flag.assign(words->flag);
         st.pkg.status.assign(words->state);

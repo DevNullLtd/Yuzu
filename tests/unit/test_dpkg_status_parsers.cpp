@@ -217,7 +217,7 @@ TEST_CASE("dpkg status: field names match case-insensitively and values are trim
 }
 
 TEST_CASE("dpkg status: edited real stanza keeps every state word (half-installed, unpacked, "
-          "half-configured, triggers-pending, config-files, hold, reinstreq)",
+          "half-configured, triggers-awaited, triggers-pending, config-files, hold, unknown, reinstreq)",
           "[dpkg][pkgdb]") {
     // EDITED: the Status line of the real debian12 libacl1 stanza is replaced.
     const auto status = read_text(pkgdb_fixture("debian12", "status"));
@@ -231,9 +231,11 @@ TEST_CASE("dpkg status: edited real stanza keeps every state word (half-installe
     for (const Case& c : {Case{"install ok half-installed", "install", "ok", "half-installed"},
                           Case{"install ok unpacked", "install", "ok", "unpacked"},
                           Case{"install ok half-configured", "install", "ok", "half-configured"},
+                          Case{"install ok triggers-awaited", "install", "ok", "triggers-awaited"},
                           Case{"install ok triggers-pending", "install", "ok", "triggers-pending"},
                           Case{"deinstall ok config-files", "deinstall", "ok", "config-files"},
                           Case{"hold ok installed", "hold", "ok", "installed"},
+                          Case{"unknown ok installed", "unknown", "ok", "installed"},
                           Case{"install reinstreq installed", "install", "reinstreq", "installed"},
                           Case{"deinstall ok installed", "deinstall", "ok", "installed"}}) {
         INFO(c.status);
@@ -246,6 +248,39 @@ TEST_CASE("dpkg status: edited real stanza keeps every state word (half-installe
         CHECK(parsed->front().flag == c.flag);
         CHECK(parsed->front().status == c.state);
     }
+}
+
+TEST_CASE("dpkg status: a Status word outside dpkg's vocabulary degrades the whole read, never drops "
+          "the package",
+          "[dpkg][pkgdb]") {
+    // EDITED: the Status line of the real debian12 libacl1 stanza is replaced; its two real
+    // siblings stay valid, so the refusal below is the one bad word, not the text as a whole.
+    const auto status = read_text(pkgdb_fixture("debian12", "status"));
+    const std::string before = stanza_of(status, "libattr1") + "\n\n";
+    const std::string after = "\n\n" + stanza_of(status, "libgmp10") + "\n\n";
+    const std::string base = stanza_of(status, "libacl1");
+    for (const char* bad : {"install ok installeX",            // an unknown state word
+                            "install okay installed",          // an unknown flag word
+                            "install hold installed",          // `hold` is a want, never a flag
+                            "install hold-reinstreq installed",
+                            "installed ok installed",          // an unknown want word
+                            "install ok triggers-awaiting",    // dpkg's word is triggers-awaited
+                            "Install ok installed",            // dpkg writes lowercase only
+                            "install OK installed", "install ok Installed"}) {
+        INFO(bad);
+        const std::string text = before + with_status(base, bad) + after;
+        for (const MissingStatus m : {MissingStatus::corrupt, MissingStatus::installed}) {
+            auto b = generous();
+            const auto r = parse_dpkg_status(text, b, m);
+            REQUIRE_FALSE(r.has_value());
+            CHECK(r.error() == PkgDbCause::corrupt);
+        }
+    }
+    // The same text with a vocabulary word in each slot is read, so the refusal is the word.
+    auto b = generous();
+    const auto ok = parse_dpkg_status(before + with_status(base, "install ok installed") + after, b);
+    REQUIRE(ok.has_value());
+    CHECK(ok->size() == 3);
 }
 
 TEST_CASE("dpkg status: edited real stanza with not-installed is skipped", "[dpkg][pkgdb]") {
