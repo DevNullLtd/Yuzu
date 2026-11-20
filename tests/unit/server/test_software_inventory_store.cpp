@@ -7611,3 +7611,34 @@ TEST_CASE("query_software: selects the install_* columns and facet state; the st
     q.match = NameMatch::kContains;
     CHECK(store.query_software(q)->size() == 17);
 }
+
+// WP07 gate-8 CH-21: a constrained / timeout / oversize section (what the agent ships when a
+// capture was truncated by a dropped output write) must be status-only: no row is deleted or
+// inserted, NO change-ledger row (a fabricated "uninstall") is written, and the section hash and
+// the report hash are untouched. Pinned against real Postgres, on top of the status/hash test above.
+TEST_CASE("v3: a status-only section writes NO change-ledger rows and deletes nothing",
+          "[pg][software_inventory][v3]") {
+    SWINV_SHARED(store, pool);
+    const auto a1 = v3_entry("Alpha", kV3Apps);
+    const auto a2 = v3_entry("Beta", kV3Apps);
+    REQUIRE(store.apply_installed_software_v3("agent-ch21", v3_report({v3_full(kV3Apps, {a1, a2})}))[0]
+                .outcome == V3SectionOutcome::kStored);
+    const auto ledger = [&] {
+        return sql_rows(pool, "SELECT count(*)::text FROM software_inventory_store.software_changes "
+                              "WHERE agent_id = 'agent-ch21'")[0][0];
+    };
+    const auto ledger_before = ledger();
+    for (const auto st : {V3Status::kConstrained, V3Status::kTimeout, V3Status::kOversize}) {
+        const auto res = store.apply_installed_software_v3(
+            "agent-ch21", v3_report({v3_status(kV3Apps, st, "truncated")}));
+        REQUIRE(res.size() == 1);
+        CHECK(res[0].outcome == V3SectionOutcome::kStatusOnly);
+        CHECK(names_of(pool, "agent-ch21", kV3Apps) == std::vector<std::string>{"Alpha", "Beta"});
+        CHECK(ledger() == ledger_before); // nothing fabricated as removed
+        CHECK(sql_rows(pool, "SELECT section_hash FROM software_inventory_store.software_facet_state "
+                             "WHERE agent_id = 'agent-ch21' AND facet = $1",
+                       {kV3Apps})[0][0] == section_hash_of({a1, a2}));
+    }
+    // The report hash moves only because the facet left full/delta; it never covers a short set.
+    CHECK(stored_hash(pool, "agent-ch21") == SoftwareInventoryStore::v3_report_hash({}));
+}

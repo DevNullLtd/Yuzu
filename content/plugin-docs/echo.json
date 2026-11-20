@@ -2850,7 +2850,8 @@
       "changelog.d/7420-echo-followups-mixed.changed.md",
       "changelog.d/7420-echo-followups-mixed.fixed.md",
       "changelog.d/7466-echo-mcp-hourly-rows.changed.md",
-      "changelog.d/7507-echo-drop-live-shims.removed.md"
+      "changelog.d/7507-echo-drop-live-shims.removed.md",
+      "changelog.d/8184-wp13-echo-module-signing-cache-usn.security.md"
     ],
     "definitions": [
       "content/definitions/echo.yaml",
@@ -2931,13 +2932,17 @@
       "agents/plugins/echo/src/echo_user_collector.cpp",
       "agents/plugins/echo/src/echo_version.hpp",
       "agents/plugins/echo/src/echo_win_process_name.hpp",
-      "agents/plugins/echo/src/echo_win_raii_guards.hpp"
+      "agents/plugins/echo/src/echo_win_raii_guards.hpp",
+      "agents/plugins/echo/src/echo_wire_scrub.hpp"
     ],
     "privilege_row": true,
     "tests": [
       "tests/test_echo_adoption_wiring_lexical.py",
       "tests/test_echo_mapdrive_pin_lexical.py",
+      "tests/test_echo_module_signing_wiring_lexical.py",
+      "tests/test_echo_scrub_wiring_lexical.py",
       "tests/test_echo_security_wiring_lexical.py",
+      "tests/test_echo_test_standard_lexical.py",
       "tests/test_echo_timeline_script_behaviour.py",
       "tests/unit/server/test_echo_process_tree.cpp",
       "tests/unit/server/test_echo_rename_migration_pg.cpp",

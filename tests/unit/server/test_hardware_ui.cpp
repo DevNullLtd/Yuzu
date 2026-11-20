@@ -708,3 +708,37 @@ TEST_CASE("software lens links into the Software host view", "[hardware][ui]") {
                   .find("/software#host=") == std::string::npos);
     }
 }
+
+// F7: the stored output is agent bytes. A deeply nested array must never reach
+// the recursive dump() (SIGSEGV on stack exhaustion); it renders as plain text.
+TEST_CASE("hardware action result: deeply nested agent JSON is rendered as text, not dumped (F7)",
+          "[hardware][ui]") {
+    HwActionResultView v;
+    v.phase = HwActionResultView::Phase::Rendered;
+    v.output = std::string(200000, '[') + std::string(200000, ']');
+    std::string html;
+    REQUIRE_NOTHROW(html = render_hardware_action_result("filesystem", "list_dir", v));
+    CHECK(html.find("<pre>") != std::string::npos);
+    CHECK(html.find("<table>") == std::string::npos);
+
+    // Shallow JSON still gets the table / pretty-print path.
+    v.output = R"([{"a":"1","b":[1,2]}])";
+    CHECK(render_hardware_action_result("filesystem", "list_dir", v).find("<table>") !=
+          std::string::npos);
+}
+
+// F7 boundary: json_exceeds_depth(kMcpMaxJsonDepth = 32) lets depth 31 and 32 through to the
+// parser (pretty-printed <pre>, no per-line spans) and refuses 33 (plain-text line spans).
+TEST_CASE("hardware action result: depth guard boundary at 31/32/33 (F7)", "[hardware][ui]") {
+    const auto render = [](int depth) {
+        HwActionResultView v;
+        v.phase = HwActionResultView::Phase::Rendered;
+        v.output = std::string(static_cast<std::size_t>(depth), '[') +
+                   std::string(static_cast<std::size_t>(depth), ']');
+        return render_hardware_action_result("filesystem", "list_dir", v);
+    };
+    const std::string span = "<span class=\"hw-line\">";
+    CHECK(render(31).find(span) == std::string::npos);
+    CHECK(render(32).find(span) == std::string::npos);
+    CHECK(render(33).find(span) != std::string::npos);
+}

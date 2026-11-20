@@ -4,6 +4,8 @@
 #include "pg_migration_runner.hpp"
 #include "pg_raii.hpp"
 
+#include <yuzu/log_token.hpp> // log_key_token: DB-sourced kcv_alg in an InitError message (F54)
+
 #include <openssl/rand.h>
 
 #include <nlohmann/json.hpp>
@@ -757,7 +759,8 @@ std::expected<void, SecretCodec::InitError> SecretCodec::init(PGconn* conn) {
             !std::equal(kcv->begin(), kcv->end(), expected->begin()))
             return std::unexpected{InitError{
                 InitError::Kind::kek_corrupt,
-                "KEK '" + key_id + "' resolves but its check value (kcv_alg='" + kcv_alg +
+                "KEK '" + key_id + "' resolves but its check value (kcv_alg='" +
+                    ::yuzu::log_key_token(kcv_alg) +
                     "') does not match the registered fingerprint — a torn/corrupt key file, "
                     "foreign key material (NOT row tamper), or a version minted by a different "
                     "KeyProvider that this provider cannot verify. Restore the keys directory "

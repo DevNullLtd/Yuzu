@@ -81,7 +81,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `update_source_trust` | 🟡 🟡 ✅ | Package and update-source trust posture (facts only) | [README](../../agents/plugins/update_source_trust/README.md) |
 | `users` | ✅ ✅ ✅ | Reports logged-on users, sessions, local accounts, admin group members, group membership, primary user, and session history | [README](../../agents/plugins/users/README.md) |
 | `virtualization` | 🟡 ✅ ✅ | Virtualization facts: VM or not, which hypervisor, container membership, WSL distributions, container-runtime posture | [README](../../agents/plugins/virtualization/README.md) |
-| `vuln_scan` | ✅ ✅ ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
+| `vuln_scan` | ✅ 🟡 ✅ | Host vulnerability scanning — CVE matching and configuration compliance checks | [README](../../agents/plugins/vuln_scan/README.md) |
 | `wifi` | ✅ 🟡 🟡 | Scans visible WiFi networks and reports current connection status | [README](../../agents/plugins/wifi/README.md) |
 | `windows_optional_features` | ✅ ⛔ ⛔ | Windows optional OS feature state (enabled/disabled/pending) via the DISM API | [README](../../agents/plugins/windows_optional_features/README.md) |
 | `windows_updates` | ✅ ✅ ✅ | Updates/packages: installed, available, pending-reboot, patch connectivity | [README](../../agents/plugins/windows_updates/README.md) |
@@ -157,6 +157,7 @@ sha256sum /opt/yuzu/plugins/*.so > /etc/yuzu/plugin-allowlist.txt
 **Behavior:**
 
 - If `--plugin-allowlist` is not set, all plugins in the plugin directory are loaded (default).
+- If `--plugin-allowlist` IS set but the file is missing, unreadable, empty or has no valid entry, the agent refuses to start (critical log, non-zero exit, nothing loaded) rather than loading every plugin unverified. Individually malformed lines are skipped with a warning as long as at least one valid entry remains.
 - If set, only plugins listed in the allowlist file are loaded, and only if their hash matches.
 - Plugins not in the allowlist or with a hash mismatch are logged as errors and skipped.
 - The allowlist is checked **before** `dlopen`/`LoadLibrary`, so tampered binaries never execute code.

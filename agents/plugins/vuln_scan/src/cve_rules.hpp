@@ -1,6 +1,7 @@
 #pragma once
 
 #include <array>
+#include <limits>
 #include <string_view>
 
 namespace yuzu::vuln {
@@ -13,6 +14,22 @@ struct CveRule {
     std::string_view severity;       // CRITICAL, HIGH, MEDIUM, LOW
     std::string_view description;
 };
+
+/// True when a '.'/'-'-separated, all-digit segment of `v` has more digits than a long long holds
+/// (more than 18 after leading zeros), so compare_versions would saturate it.
+inline bool version_has_overflowing_segment(std::string_view v) {
+    while (!v.empty()) {
+        const auto pos = v.find_first_of(".-");
+        std::string_view seg = pos == std::string_view::npos ? v : v.substr(0, pos);
+        v = pos == std::string_view::npos ? std::string_view{} : v.substr(pos + 1);
+        if (seg.find_first_not_of("0123456789") != std::string_view::npos)
+            continue;
+        const auto nz = seg.find_first_not_of('0');
+        if (nz != std::string_view::npos && seg.size() - nz > 18)
+            return true;
+    }
+    return false;
+}
 
 // ── Version comparison ─────────────────────────────────────────────────────
 // Returns <0 if a<b, 0 if a==b, >0 if a>b.
@@ -37,13 +54,22 @@ inline int compare_versions(std::string_view a, std::string_view b) {
     auto to_num = [](std::string_view seg) -> std::pair<bool, long long> {
         if (seg.empty())
             return {true, 0};
+        // A segment too large for long long SATURATES (no signed overflow); such a version is not
+        // orderable and callers that need a trustworthy answer test version_has_overflowing_segment().
         long long val = 0;
+        bool saturated = false;
         for (char c : seg) {
             if (c < '0' || c > '9')
                 return {false, 0};
-            val = val * 10 + (c - '0');
+            if (!saturated) {
+                const int d = c - '0';
+                if (val > ((std::numeric_limits<long long>::max)() - d) / 10)
+                    saturated = true;
+                else
+                    val = val * 10 + d;
+            }
         }
-        return {true, val};
+        return {true, saturated ? (std::numeric_limits<long long>::max)() : val};
     };
 
     std::string_view ra = a, rb = b;

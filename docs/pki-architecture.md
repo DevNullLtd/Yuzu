@@ -421,6 +421,13 @@ The Erlang gateway (`gateway/`) is an optional scale-out fan-out plane that sits
 between agents and the server. It has two TLS roles, handled by two different
 pieces of code:
 
+> **Not covered by this PKI: gateway-to-gateway Erlang distribution.** The
+> inter-node channel of a multi-node gateway cluster is plain TCP authenticated
+> only by a shared cookie at connect time. It does not use the install CA or any
+> certificate, and it provides no encryption or per-message integrity. The
+> cluster network must be trusted and firewalled (see
+> [Distribution Cookie](user-manual/gateway.md#distribution-cookie-required-in-production)).
+
 - **Its two listeners** (agent `:50051`, management `:50063`) are served by the
   gateway's own gRPC layer over Cowboy/Ranch (`yuzu_grpc_listener`; ADR-0066
   amendment). TLS is the `tls` map of a `{yuzu_gw, grpc_listeners}` entry. A

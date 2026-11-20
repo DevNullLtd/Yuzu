@@ -12,18 +12,15 @@ name: CLA Assistant
 #  ACTIVE on DevNullLtd/Yuzu (activated 2026-05-21, while the repo was
 #  Tr3kkR/Yuzu; transferred to the DevNullLtd org 2026-09-28).
 # ─────────────────────────────────────────────────────────────────────────
-# Provisioning (in place):
-#   - Secret `CLA_REPO_ACCESS_TOKEN`: classic PAT (`repo` scope) able to
-#     write the signatures store.
-#
-#     KNOWN POSTURE DEBT (raised in review of PR #5101, not introduced by it).
-#     A classic `repo`-scope PAT is org-wide once its owner is a DevNullLtd
-#     owner: its authority is NOT confined to the signatures repo, and it is
-#     consumed here in a `pull_request_target` job, which runs with repository
-#     secrets against a pull request's base. Durable shape is a fine-grained
-#     token limited to `contents: write` on `Yuzu-cla-signatures` alone, held
-#     by an org machine account (or a GitHub App installation), rotated on a
-#     schedule. Do this when the signatures store moves into the org.
+# Provisioning (owner setup; see docs/dependency-updates.md, "The cla environment"):
+#   - Secret `CLA_REPO_ACCESS_TOKEN`: a token able to write the signatures
+#     store. It is to be stored in the `cla` environment, which only the
+#     default branch may use. Once the owner has moved it there and deleted
+#     the repository copy (docs/dependency-updates.md, "The cla environment"),
+#     a workflow on another branch cannot read it; until then it is still a
+#     repository secret. Only cla-check may
+#     declare the environment or read the secret
+#     (tests/shell/test_cla_environment.sh).
 #   - Signatures store: private repo `Tr3kkR/Yuzu-cla-signatures`, branch
 #     `main`, file `signatures/cla.json` (auto-created on first signature).
 #     DELIBERATELY still on the personal account after the DevNullLtd
@@ -39,10 +36,16 @@ name: CLA Assistant
 # a signed CLA, so it is AGPL-only and cannot be relicensed commercially.
 # See CONTRIBUTING.md.
 
+# zizmor dangerous-triggers is ignored on both triggers below (reviewed
+# 2026-11-17). The CLA bot must comment on and set statuses for FORK pull
+# requests, which a plain `pull_request` run cannot (read-only token, no
+# secrets). The job never checks out or executes pull-request code: it runs
+# one SHA-pinned action that reads event metadata through the API. The token
+# it hands that action is to be stored in the `cla` environment (Provisioning above).
 on:
-  issue_comment:
+  issue_comment:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     types: [created]
-  pull_request_target:
+  pull_request_target:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     types: [opened, synchronize, closed]
 
 permissions:
@@ -58,10 +61,26 @@ jobs:
       statuses: write
     # Live on the canonical repo only; forks of Yuzu skip the CLA gate.
     if: github.repository == 'DevNullLtd/Yuzu'
+    # CLA_REPO_ACCESS_TOKEN is to be stored in this environment, whose only
+    # deployment branch is `main` (owner setup; until then it is still a
+    # repository secret). Both triggers run the default branch's copy of this
+    # file with GITHUB_REF set to the default branch, which is what the
+    # environment's branch rule is matched against, so fork pull requests
+    # pass it too. `deployment: false` keeps GitHub from creating a
+    # deployment record on every pull request event and comment; the branch
+    # rule still applies.
+    environment:
+      name: cla
+      deployment: false
     steps:
       - name: CLA Assistant
         if: (github.event.comment.body == 'recheck' || github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') || github.event_name == 'pull_request_target'
-        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1
+        # zizmor archived-uses ignored (reviewed 2026-11-17): upstream
+        # archived this repository, so it gets no security fixes. It stays
+        # SHA-pinned until the maintainers choose a replacement CLA bot that
+        # can keep reading the existing signatures store; that is an owner
+        # decision, not a CI fix.
+        uses: contributor-assistant/github-action@ca4a40a7d1004f18d9960b404b97e5f30a505a08 # v2.6.1 # zizmor: ignore[archived-uses] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # PAT with `repo` scope; required because GITHUB_TOKEN cannot write

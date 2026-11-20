@@ -5,6 +5,7 @@
 /// Used by: SSE row rendering, ResponseStore facet extraction, DashboardRoutes
 /// fragment rendering.
 
+#include <algorithm>
 #include <string>
 #include <unordered_map>
 #include <unordered_set>
@@ -201,7 +202,9 @@ inline std::vector<std::string> split_fields(const std::string& plugin,
 
 // -- Output line iteration ----------------------------------------------------
 
-/// Split multi-line output into individual lines, trimming trailing \r.
+/// Split multi-line output into individual lines. Every \r is dropped (a CRLF
+/// terminator and a bare interior CR alike): a lone CR is a line break to the SSE
+/// parser, so it must never survive into a row cell (F69).
 inline std::vector<std::string> split_output_lines(const std::string& raw_output) {
     std::vector<std::string> lines;
     size_t pos = 0;
@@ -210,7 +213,7 @@ inline std::vector<std::string> split_output_lines(const std::string& raw_output
         std::string line = (nl == std::string::npos)
                                ? raw_output.substr(pos)
                                : raw_output.substr(pos, nl - pos);
-        if (!line.empty() && line.back() == '\r') line.pop_back();
+        line.erase(std::remove(line.begin(), line.end(), '\r'), line.end());
         if (!line.empty()) lines.push_back(std::move(line));
         pos = (nl == std::string::npos) ? raw_output.size() : nl + 1;
     }

@@ -17,6 +17,7 @@
 #include "pg/pg_raii.hpp"
 
 #include "../test_helpers.hpp"
+#include "../test_log_capture.hpp" // F56: the dedicated-connection failure line
 
 #include <catch2/catch_test_macros.hpp>
 
@@ -1195,6 +1196,21 @@ TEST_CASE("LeaderElector fails closed on an invalid lock_name",
     CHECK_FALSE(e.is_open());
     CHECK_FALSE(e.try_acquire());
     CHECK_FALSE(e.is_leader());
+}
+
+TEST_CASE("LeaderElector logs a connect failure as a fixed cause, never libpq's text (F56)",
+          "[leader-elector][log_injection]") {
+    const std::string marker = "yuzu_test_leader_nosuchdir";
+    yuzu::test::LogCapture cap{spdlog::level::warn};
+    LeaderElector e(LeaderElector::Config{
+        .dsn = "host=/" + marker + " user=u dbname=d connect_timeout=2", .holder_id = "holder-a"});
+    (void)e.try_acquire();
+    cap.stop();
+    const std::string text = cap.text();
+    INFO(text);
+    CHECK(text.find("leader_elector: dedicated connection failed: ") != std::string::npos);
+    CHECK(text.find(marker) == std::string::npos); // libpq would quote the socket path
+    CHECK(text.find('\t') == std::string::npos);
 }
 
 TEST_CASE("LeaderElector fails closed on an empty dsn (no libpq-default fallback)",

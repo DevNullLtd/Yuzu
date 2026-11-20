@@ -4,6 +4,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <expected>
+#include <functional>
 #include <fstream>
 #include <format>
 #include <istream>
@@ -15,9 +16,12 @@
 #include <utility>
 #include <vector>
 
+#include "macos_software.hpp"
+
 #if defined(__linux__) || defined(__APPLE__)
 #include <sstream>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #endif
 
@@ -230,21 +234,48 @@ inline std::optional<ConfigCheckResult> tmp_noexec_check(const LinesResult& r) {
 #if defined(__linux__) || defined(__APPLE__)
 namespace detail {
 
-inline std::string run_cmd(const char* cmd) {
+// The popen helpers below are Linux-only: no macOS leg spawns a shell (the macOS reads go through
+// the bounded argv runner supplied by the plugin).
+#ifdef __linux__
+// popen with RAII ownership: an exception (std::bad_alloc while appending) between popen and the
+// close still closes the FILE* and reaps the child. Move-less by design.
+struct Pipe {
+    FILE* f = nullptr;
+    explicit Pipe(const char* cmd) : f(popen(cmd, "r")) {}
+    Pipe(const Pipe&) = delete;
+    Pipe& operator=(const Pipe&) = delete;
+    // Returns pclose's status (-1 when never opened or already closed); nulls the handle.
+    int close() {
+        if (!f)
+            return -1;
+        FILE* p = f;
+        f = nullptr;
+        return pclose(p);
+    }
+    ~Pipe() { close(); }
+};
+
+// `exited_ok` (optional): the command started and exited 0.
+inline std::string run_cmd(const char* cmd, bool* exited_ok = nullptr) {
     std::string result;
     std::array<char, 256> buf{};
-    FILE* pipe = popen(cmd, "r");
-    if (!pipe)
+    if (exited_ok)
+        *exited_ok = false;
+    Pipe pipe(cmd);
+    if (!pipe.f)
         return result;
-    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe)) {
+    while (fgets(buf.data(), static_cast<int>(buf.size()), pipe.f)) {
         result += buf.data();
     }
-    pclose(pipe);
+    const int rc = pipe.close();
+    if (exited_ok)
+        *exited_ok = rc != -1 && WIFEXITED(rc) && WEXITSTATUS(rc) == 0;
     while (!result.empty() && (result.back() == '\n' || result.back() == '\r')) {
         result.pop_back();
     }
     return result;
 }
+#endif // __linux__
 
 // Open failure -> errno from open. A fault after open (badbit, libstdc++) -> the
 // errno the kernel set during the read, else EIO. (libc++ reports a read fault as
@@ -497,67 +528,205 @@ inline std::vector<ConfigCheckResult> run_linux_checks() {
 }
 #endif
 
+// ── macOS config decisions (portable, pure) ────────────────────────────────
+//
+// What a verdict needs (every rule is exercised by tests/unit/test_vuln_macos_software.cpp):
+//   - the tool's WHOLE trimmed output is judged, line by line, empty lines ignored;
+//   - GOOD needs exactly ONE non-empty line that EQUALS the good text, from a run that exited 0;
+//   - BAD is judged from any COMPLETED run (the exit code is not relied on) and WINS over any other
+//     line, so contradictory or multi-line output can never read as good;
+//   - ABSENT (the setting is not set) needs exactly one line equal to the absent text, from any
+//     completed run (measured: `defaults read` exits 1 for an absent key);
+//   - anything else (missing tool, cut-short run, empty output, a permission message, localized or
+//     near-miss text such as "enabled (Custom Configuration).") is
+//     `UNREADABLE|config|<check>|Unknown (read failed)`: never a verdict and never a pass.
+//   A prefix match is never enough. The Firewall state digit must agree with the text.
+//
+// ONE TABLE: everything to correct from a real Mac capture lives in kMacosCheckSpecs below (expected
+// lines, state digits, severities, details, the good-state exit-zero policy, stderr merging).
+//
+// MEASURED on ONE macOS 27.0.1 Apple Silicon host (13-15 NOT measured):
+//   spctl --status               -> "assessments enabled", exit 0
+//   fdesetup status              -> "FileVault is On.", exit 0
+//   csrutil status               -> "System Integrity Protection status: enabled.", exit 0
+//   socketfilterfw --getglobalstate -> "Firewall is disabled. (State = 0)", exit 0 (the DISABLED
+//                                      state: the enabled line and its digit are NOT measured)
+//   systemsetup -getremotelogin  -> "Remote Login: Off", exit 0 (run via sudo, not as the daemon)
+//   defaults read <PATH form: /Library/Preferences/com.apple.SoftwareUpdate> AutomaticCheckEnabled
+//                                -> "Error: Could not find key ... ." (key absent), exit 1
+// The BARE-domain defaults read printed its key-absent text on macOS 27.0.1 as euid 501 only (both
+// reads absent and in agreement: the INFO "not set" row).
+// UNMEASURED (a read whose text differs is UNREADABLE): a bare-domain value of 0 or 1, a system plist
+// at 0, 1, absent or shadowed by a per-user/managed value as the LaunchDaemon account, any tool's
+// exit code in its BAD state, the enabled Firewall `State` digit ("12" below is accepted on Apple's
+// documentation, unverified; the only measured pairing is disabled <-> 0), `systemsetup` as the
+// launchd daemon, Full Disk Access / PPPC needs, and `system_profiler` under a non-English language.
+// A digit that does not agree with the text reads UNREADABLE. The bare "Firewall is enabled." line
+// (no State suffix) is ACCEPTED as good on purpose: the suffix is optional, and the line is still
+// exact and single. The update-check setting is read twice (bare domain and path form) and the
+// worse answer wins.
+
+struct CommandRead {
+    std::string out;
+    bool ok = false;  // started, not cut short, exit status 0
+    bool ran = false; // started and ran to completion (any exit status), not cut short
+};
+
+// Runs one pre-split argv (stderr merged into the captured text when `merge_stderr`) and reports
+// the captured text and how the run ended.
+using MacosReader = std::function<CommandRead(const Argv&, bool merge_stderr)>;
+
+enum class MacosCheck { Gatekeeper, FileVault, Sip, Firewall, RemoteLogin, AutoUpdate };
+
+struct MacosCheckSpec {
+    MacosCheck check;
+    std::string_view title;
+    const Argv* argv;
+    std::string_view good_line;     // whole trimmed line of the "good" state
+    std::string_view bad_line;      // whole trimmed line of the "bad" state
+    std::string_view good_digits;   // allowed " (State = <d>)" digits after good_line ("" = no suffix)
+    std::string_view bad_digits;    // same for bad_line
+    bool good_requires_exit_zero;   // a good verdict also needs exit 0 (true for every tool)
+    std::string_view good_detail;
+    std::string_view bad_severity;
+    std::string_view bad_detail;
+    bool merge_stderr;              // capture stderr too (only where the tool reports on stderr)
+    std::string_view absent_line;   // whole line meaning "setting not set" ("" = none)
+    std::string_view absent_detail; // INFO detail for the absent case
+    const Argv* argv_alt;           // optional SECOND read of the same setting (nullptr = none); the
+                                    // worse of the two answers wins (macos_check_result_dual)
+};
+
+inline const std::array<MacosCheckSpec, 6> kMacosCheckSpecs = {{
+    {MacosCheck::Gatekeeper, "Gatekeeper", &kMacosSpctlCmd, "assessments enabled",
+     "assessments disabled", "", "", true, "Enabled - only verified apps can run", "HIGH",
+     "Disabled - unsigned apps can run without restriction", false, "", "", nullptr},
+    {MacosCheck::FileVault, "FileVault Disk Encryption", &kMacosFdesetupCmd, "FileVault is On.",
+     "FileVault is Off.", "", "", true, "Enabled", "HIGH", "Disabled - disk is not encrypted", false,
+     "", "", nullptr},
+    {MacosCheck::Sip, "System Integrity Protection (SIP)", &kMacosCsrutilCmd,
+     "System Integrity Protection status: enabled.",
+     "System Integrity Protection status: disabled.", "", "", true, "Enabled", "CRITICAL",
+     "Disabled - system files are unprotected", false, "", "", nullptr},
+    {MacosCheck::Firewall, "Application Firewall", &kMacosSocketfilterfwCmd, "Firewall is enabled.",
+     "Firewall is disabled.", "12", "0", true, "Enabled", "MEDIUM", "Disabled", false, "", "", nullptr},
+    {MacosCheck::RemoteLogin, "Remote Login (SSH)", &kMacosSystemsetupCmd, "Remote Login: Off",
+     "Remote Login: On", "", "", true, "Disabled", "MEDIUM", "Enabled - SSH access is open", false,
+     "", "", nullptr},
+    // The key covers the update CHECK only, not installation: the title and detail say so. Read
+    // twice (bare domain, then the /Library/Preferences path form); see kMacosDefaultsCmd.
+    {MacosCheck::AutoUpdate, "Automatic update check", &kMacosDefaultsCmd, "1", "0", "", "", true,
+     "Enabled (check only; install not assessed)", "MEDIUM",
+     "Disabled - the update check is off; patches may be missed", true,
+     "Error: Could not find key 'AutomaticCheckEnabled' in domain 'com.apple.SoftwareUpdate'.",
+     "Automatic update check: not set (macOS default applies)", &kMacosDefaultsPathCmd},
+}};
+
+inline const MacosCheckSpec& macos_spec(MacosCheck c) {
+    for (const auto& s : kMacosCheckSpecs)
+        if (s.check == c)
+            return s;
+    return kMacosCheckSpecs[0]; // unreachable: every enumerator has a row
+}
+
+// `line` equals `text`, or `text` followed by exactly " (State = <d>)" with <d> one of `digits`.
+inline bool macos_line_matches(std::string_view line, std::string_view text,
+                               std::string_view digits) {
+    if (line == text)
+        return true;
+    if (digits.empty() || !line.starts_with(text))
+        return false;
+    const std::string_view rest = line.substr(text.size());
+    constexpr std::string_view kOpen = " (State = ";
+    return rest.size() == kOpen.size() + 2 && rest.starts_with(kOpen) &&
+           digits.find(rest[kOpen.size()]) != std::string_view::npos && rest.back() == ')';
+}
+
+inline ConfigCheckResult macos_check_result(MacosCheck check, const CommandRead& r) {
+    const MacosCheckSpec& sp = macos_spec(check);
+    const ConfigCheckResult unknown{"UNREADABLE", sp.title, std::string(kConfigUnknownDetail),
+                                    false};
+    if (!(r.ran || r.ok))
+        return unknown; // never completed: nothing to judge
+
+    // The whole output, trimmed per line, empty lines dropped.
+    std::vector<std::string_view> lines;
+    std::string_view rest = r.out;
+    while (!rest.empty()) {
+        const auto nl = rest.find('\n');
+        const auto line = detail::trim(rest.substr(0, nl));
+        if (!line.empty())
+            lines.push_back(line);
+        rest = nl == std::string_view::npos ? std::string_view{} : rest.substr(nl + 1);
+    }
+    bool saw_bad = false;
+    for (const auto l : lines)
+        if (macos_line_matches(l, sp.bad_line, sp.bad_digits))
+            saw_bad = true;
+    if (saw_bad) // any bad line wins, from any completed run
+        return {sp.bad_severity, sp.title, std::string(sp.bad_detail), false};
+    if (lines.size() != 1)
+        return unknown; // good and absent need exactly one line
+    if (!sp.absent_line.empty() && lines[0] == sp.absent_line)
+        return {"INFO", sp.title, std::string(sp.absent_detail), true};
+    if (macos_line_matches(lines[0], sp.good_line, sp.good_digits) &&
+        (r.ok || !sp.good_requires_exit_zero))
+        return {"INFO", sp.title, std::string(sp.good_detail), true};
+    return unknown;
+}
+
+// Combine two reads of the SAME setting. The worse answer wins: a bad verdict over UNREADABLE over
+// INFO. INFO needs BOTH reads to be good-or-absent AND to agree (same detail): a good read paired
+// with an absent read is a DISAGREEMENT and reads UNREADABLE, because the bare-domain read may
+// cascade differently from the system plist or be shadowed by a per-user or managed value.
+inline ConfigCheckResult macos_combine_reads(const ConfigCheckResult& a, const ConfigCheckResult& b) {
+    const auto rank = [](const ConfigCheckResult& r) {
+        return r.severity == "UNREADABLE" ? 2 : (r.passed ? 0 : 3);
+    };
+    const int ra = rank(a), rb = rank(b);
+    if (ra == 3 || rb == 3)
+        return ra >= rb ? a : b;
+    if (ra == 2)
+        return a;
+    if (rb == 2)
+        return b;
+    if (a.detail != b.detail)
+        return {"UNREADABLE", a.title, std::string(kConfigUnknownDetail), false};
+    return a;
+}
+
+inline ConfigCheckResult macos_check_result_dual(MacosCheck check, const CommandRead& first,
+                                                 const CommandRead& second) {
+    return macos_combine_reads(macos_check_result(check, first), macos_check_result(check, second));
+}
+
+// True when any check could not be read (severity UNREADABLE). macOS callers only: Linux's file
+// checks also use UNREADABLE and must not raise the macOS status token.
+inline bool any_config_unreadable(const std::vector<ConfigCheckResult>& results) {
+    for (const auto& r : results)
+        if (r.severity == "UNREADABLE" && r.detail != kOpenPortUnavailableDetail)
+            return true;
+    return false;
+}
+
 // ── macOS config checks ───────────────────────────────────────────────────
 
+// Runs every table row through `reader`; a null reader fails closed (every check UNREADABLE).
+inline std::vector<ConfigCheckResult> run_macos_checks_table(const MacosReader& reader) {
+    std::vector<ConfigCheckResult> out;
+    for (const auto& sp : kMacosCheckSpecs) {
+        const auto read = [&](const Argv& a) { return reader ? reader(a, sp.merge_stderr) : CommandRead{}; };
+        out.push_back(sp.argv_alt ? macos_check_result_dual(sp.check, read(*sp.argv), read(*sp.argv_alt))
+                                  : macos_check_result(sp.check, read(*sp.argv)));
+    }
+    return out;
+}
+
 #ifdef __APPLE__
-inline std::vector<ConfigCheckResult> run_macos_checks() {
-    std::vector<ConfigCheckResult> results;
-
-    // Gatekeeper
-    {
-        auto out = detail::run_cmd("spctl --status 2>&1");
-        bool enabled = out.find("enabled") != std::string::npos;
-        results.push_back({enabled ? "INFO" : "HIGH", "Gatekeeper",
-                           enabled ? "Enabled - only verified apps can run"
-                                   : "Disabled - unsigned apps can run without restriction",
-                           enabled});
-    }
-
-    // FileVault
-    {
-        auto out = detail::run_cmd("fdesetup status 2>&1");
-        bool on = out.find("On") != std::string::npos;
-        results.push_back({on ? "INFO" : "HIGH", "FileVault Disk Encryption",
-                           on ? "Enabled" : "Disabled - disk is not encrypted", on});
-    }
-
-    // SIP (System Integrity Protection)
-    {
-        auto out = detail::run_cmd("csrutil status 2>&1");
-        bool enabled = out.find("enabled") != std::string::npos;
-        results.push_back({enabled ? "INFO" : "CRITICAL", "System Integrity Protection (SIP)",
-                           enabled ? "Enabled" : "Disabled - system files are unprotected",
-                           enabled});
-    }
-
-    // Firewall
-    {
-        auto out = detail::run_cmd(
-            "/usr/libexec/ApplicationFirewall/socketfilterfw --getglobalstate 2>&1");
-        bool enabled = out.find("enabled") != std::string::npos;
-        results.push_back({enabled ? "INFO" : "MEDIUM", "Application Firewall",
-                           enabled ? "Enabled" : "Disabled", enabled});
-    }
-
-    // Remote Login (SSH)
-    {
-        auto out = detail::run_cmd("systemsetup -getremotelogin 2>&1");
-        bool off = out.find("Off") != std::string::npos;
-        results.push_back({off ? "INFO" : "MEDIUM", "Remote Login (SSH)",
-                           off ? "Disabled" : "Enabled - SSH access is open", off});
-    }
-
-    // Automatic updates
-    {
-        auto out = detail::run_cmd("defaults read /Library/Preferences/com.apple.SoftwareUpdate "
-                                   "AutomaticCheckEnabled 2>&1");
-        bool enabled = out.find("1") != std::string::npos;
-        results.push_back({enabled ? "INFO" : "MEDIUM", "Automatic Software Updates",
-                           enabled ? "Enabled" : "Disabled - system may miss security patches",
-                           enabled});
-    }
-
-    return results;
+// `reader` runs one argv through the bounded runner (supplied by the plugin, which links
+// agent-core). A null reader fails closed: every check reads Unknown.
+inline std::vector<ConfigCheckResult> run_macos_checks(const MacosReader& reader) {
+    return run_macos_checks_table(reader);
 }
 #endif
 
@@ -566,7 +735,13 @@ inline std::vector<ConfigCheckResult> run_macos_checks() {
 inline std::vector<ConfigCheckResult> run_cross_platform_checks() {
     std::vector<ConfigCheckResult> results;
 
-#if defined(__linux__) || defined(__APPLE__)
+#ifdef __APPLE__
+    // `ss` is not present on macOS and `netstat -tlnp` is not valid there, so no open-port check
+    // runs. Absence of rows must not read as "no risky ports": report the check as UNREADABLE.
+    // It is a standing unavailability, not a failed read, so any_config_unreadable() ignores it
+    // (otherwise every Mac would report CONSTRAINED permanently); the row itself is the signal.
+    results.push_back({"UNREADABLE", "Open Ports", std::string(kOpenPortUnavailableDetail), false});
+#elif defined(__linux__)
     // Check for common risky ports listening on all interfaces
     auto listeners = detail::run_cmd("ss -tlnH 2>/dev/null || netstat -tlnp 2>/dev/null");
     if (!listeners.empty()) {
@@ -608,7 +783,7 @@ inline std::vector<ConfigCheckResult> run_cross_platform_checks() {
 
 // ── Run all platform checks ───────────────────────────────────────────────
 
-inline std::vector<ConfigCheckResult> run_all_config_checks() {
+inline std::vector<ConfigCheckResult> run_all_config_checks([[maybe_unused]] const MacosReader& macos_reader = {}) {
     std::vector<ConfigCheckResult> results;
 
 #ifdef _WIN32
@@ -618,7 +793,7 @@ inline std::vector<ConfigCheckResult> run_all_config_checks() {
     auto lin = run_linux_checks();
     results.insert(results.end(), lin.begin(), lin.end());
 #elif defined(__APPLE__)
-    auto mac = run_macos_checks();
+    auto mac = run_macos_checks(macos_reader);
     results.insert(results.end(), mac.begin(), mac.end());
 #endif
 

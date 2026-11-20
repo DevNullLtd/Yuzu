@@ -1062,9 +1062,13 @@ by each handler.
   73 REST rows are still `kPendingRuling` (among them CA revoke and
   issue-code-signing, and `PUT /api/config/*`), and MCP is governed by the MCP tier
   and approval ladder (`docs/mcp-server.md`). The MCP tools are classified in
-  a second table, `step_up_mcp_policy.hpp` (83 rows: 33 `kExempt`, 50
+  a second table, `step_up_mcp_policy.hpp` (88 rows: 38 `kExempt`, 50
   `kPendingRuling`, none `kRequired`), which is data only and changes no MCP
-  behaviour. The pending rows are a frozen baseline of 44 whose count only goes down,
+  behaviour. The exempt rows draw on a closed list of 11 reasons; the two newest
+  (`kLifecycleRules`, `kReferenceDataReplace`) are the REST twins' own reasons,
+  carried by the five software lifecycle-rule and curation writes (SAM-29), whose
+  REST rows are exempt pending an owner ruling on MFA step-up: when it comes, the
+  REST and MCP rows move together. The pending rows are a frozen baseline of 44 whose count only goes down,
   plus a separate list of tools added after it (today six), legal only for a tool
   whose REST twin is `kRequired`, which a compile-time check ties to the REST
   table. Every pending tool with a `kRequired` twin is pending because no MCP
@@ -2142,8 +2146,11 @@ user-editable IdP profile field, controls it. `detail` is a flat
 inject `;`/`=` to forge additional fields or `\r`/`\n`/other control
 bytes to inject fake log lines. `detail::sanitize_detail_value`
 (`auth_routes.hpp`/`.cpp`) is the single chokepoint that neutralises
-this: it replaces `;`, `=`, `\r`, `\n`, and any control byte (incl. DEL)
-with `_`, then truncates to 128 bytes on a UTF-8 code-point boundary.
+this: it first folds the value through `log_key_token` (C0, DEL, well-formed C1
+(U+0080-U+009F), U+2028 and U+2029 become `_`; input over 256 bytes is shortened
+before the 128-byte head clip), then replaces `;`, `=`, `\r`, `\n` and any
+remaining control byte with `_`, then truncates to 128 bytes on a UTF-8
+code-point boundary.
 Every `display=`/`email=`/`oidc_sub`/`name` value attached in
 `/auth/callback` is run through it before concatenation. **It is
 audit-detail-field-injection defense only — it does NOT strip HTML
@@ -2515,7 +2522,7 @@ applies to these two flags).
 | Action | Result | When |
 |---|---|---|
 | `auth.saml_login` | `ok` | ACS validation passed; session minted |
-| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.) |
+| `auth.saml_login_failed` | `error` | ACS validation failed (signature, audience, expiry, replay, etc.). Detail = `detail::neutralise_saml_error`: `log_key_token` (folds C0/C1/Unicode line separators, caps 256) then `sanitize_detail_value` (`;`/`=` to `_`, head-only clip to 128 bytes, no marker); the log line uses `log_key_token` alone (256) |
 
 ### Security posture
 

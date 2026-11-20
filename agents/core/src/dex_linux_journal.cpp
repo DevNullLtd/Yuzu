@@ -2,6 +2,8 @@
 
 #include "dex_linux_kmsg.hpp" // classify_kernel_message — all _TRANSPORT=kernel free-text markers
 
+#include <yuzu/log_token.hpp> // log_key_token: fold CR/LF/C0/C1 in journal-supplied text (F59)
+
 #include <nlohmann/json.hpp>
 
 #include <charconv>
@@ -40,6 +42,46 @@ std::optional<int> to_int(std::string_view s) {
     return v;
 }
 
+// WP13 / F58 (#3872). MESSAGE_ID, COREDUMP_*, UNIT and UNIT_RESULT are ordinary
+// client-settable journal fields (sd_journal_send / `logger --journald`), so they prove
+// nothing about who wrote the entry. The underscore-prefixed "trusted" fields are stamped by
+// journald from the sender's socket credentials and cannot be set by the client. A MISSING or
+// malformed trusted field is untrusted (fail closed): a forged record is dropped.
+//
+// System manager (PID 1, root): the genuine "<unit>: Failed with result" entries.
+bool from_system_manager(const json& j) {
+    return jstr(j, "_PID") == "1" && jstr(j, "_UID") == "0";
+}
+
+// systemd-coredump runs as root; its comm is the 15-char truncation "systemd-coredum" and its
+// unit is systemd-coredump@<n>.service. Root is the load-bearing term (a non-root process
+// cannot claim _UID=0); the name terms bind it to the coredump helper rather than any root
+// sender. NOT yet confirmed against a live capture (none on the measuring host) - see
+// docs/dex-signal-catalog.md.
+bool from_coredump_helper(const json& j) {
+    // Safe superset (WP13 governance S3): root is the load-bearing term; ONE name term binds it
+    // to the helper. The comm is matched by prefix because the kernel truncates it to 15 chars
+    // and a distro may suffix it; the unit form covers a service-launched helper. The identity
+    // is derived from systemd documentation, not from a captured journal entry on every distro
+    // family; a mismatch would silently drop process.crashed there, which is why a drop here is
+    // counted and logged by the collector. One specimen per distro family is an open follow-up.
+    if (jstr(j, "_UID") != "0")
+        return false;
+    if (jstr(j, "_COMM").starts_with("systemd-coredum"))
+        return true;
+    return jstr(j, "_SYSTEMD_UNIT").starts_with("systemd-coredump@");
+}
+
+// chronyd: `_COMM` is settable with prctl(PR_SET_NAME) (#3871), so it is NOT sufficient.
+// `_SYSTEMD_UNIT` is derived from the sender's cgroup; only root can place a process in the
+// chrony service's cgroup. Require both.
+bool from_chronyd_service(const json& j) {
+    if (jstr(j, "_COMM") != "chronyd")
+        return false;
+    const std::string unit = jstr(j, "_SYSTEMD_UNIT");
+    return unit == "chronyd.service" || unit == "chrony.service";
+}
+
 } // namespace
 
 std::string crash_signal_name(int signo) {
@@ -72,7 +114,11 @@ JournalLine parse_journal_line(std::string_view line) {
     // core-generating signal), so no intentional-stop filtering is needed. Subject
     // is the comm only — COREDUMP_EXE (a full path) is never shipped.
     if (mid == kMsgIdCoredump) {
-        const std::string comm = jstr(j, "COREDUMP_COMM");
+        if (!from_coredump_helper(j)) {
+            out.untrusted_dropped = true;
+            return out; // forged / untrusted sender: no observation
+        }
+        const std::string comm = ::yuzu::log_key_token(jstr(j, "COREDUMP_COMM"));
         if (comm.empty())
             return out; // no safe subject
         SignalObservation o;
@@ -103,10 +149,14 @@ JournalLine parse_journal_line(std::string_view line) {
     // classifier deliberately avoids. UNIT_RESULT (exit-code / signal / core-dump /
     // timeout / oom-kill) is the reason when present; absent → empty reason.
     if (mid == kMsgIdUnitFailed || mid == kMsgIdUnitResult) {
-        const std::string unit = jstr(j, "UNIT");
+        if (!from_system_manager(j)) {
+            out.untrusted_dropped = true;
+            return out; // forged / user-manager / untrusted sender: no observation
+        }
+        const std::string unit = ::yuzu::log_key_token(jstr(j, "UNIT"));
         if (unit.empty())
             return out;
-        const std::string result = jstr(j, "UNIT_RESULT");
+        const std::string result = ::yuzu::log_key_token(jstr(j, "UNIT_RESULT"));
         SignalObservation o;
         o.subject = unit;
         o.kind = "unit";
@@ -146,11 +196,16 @@ JournalLine parse_journal_line(std::string_view line) {
     // produce NO observation — the cursor still advances. The raw MESSAGE can carry NTP
     // source IPs, so it is NEVER shipped — a fixed sentence + subject "clock" only.
     //
-    // INTEGRITY: gate on `_COMM` (a journald-trusted "address" field, set from the
-    // sender's /proc/PID/comm) — NOT `SYSLOG_IDENTIFIER`, which the logging process sets
-    // freely (`logger -t chronyd …`) and could forge an os.time_unsynced signal that
-    // feeds fleet alerting. _COMM raises the bar to actually being the chronyd process.
+    // INTEGRITY (#3871): `SYSLOG_IDENTIFIER` is client-set, and `_COMM` alone is also
+    // forgeable (prctl(PR_SET_NAME), or an executable named chronyd). The decisive term is
+    // `_SYSTEMD_UNIT` (chronyd.service / chrony.service), journald-derived from the sender's
+    // cgroup, which an unprivileged process cannot join; `_COMM` stays as a second term.
     if (jstr(j, "_COMM") == "chronyd") {
+        if (!from_chronyd_service(j)) {
+            out.untrusted_dropped = true;
+            return out; // right comm, wrong/absent service cgroup: forged
+        }
+
         const std::string m = jstr(j, "MESSAGE");
         if (m.find("Can't synchronise: no selectable sources") != std::string::npos ||
             m.find("System clock wrong by") != std::string::npos) {
@@ -196,22 +251,31 @@ std::optional<std::string> build_journald_after_cursor_query(std::string_view cu
     cmd.reserve(256);
     cmd += "timeout 30 journalctl --after-cursor='";
     cmd.append(cursor); // the ONLY external input, confined to this single-quoted slot
+    // journalctl ANDs distinct fields, ORs repeats of one field, and `+` separates whole
+    // disjuncts. WP13/F58: every reliability disjunct also carries the journald-stamped
+    // sender terms (parse_journal_line re-checks them), so forged entries are never fetched
+    // and cannot reach the rate limiter:
+    //   (coredump id AND _UID=0)
+    //   + (unit-failed/result ids AND _PID=1 AND _UID=0)
+    //   + (kernel transport lines, classified in dex_linux_kmsg)
+    //   + (chronyd comm AND the chrony service unit; only the clock-unsynchronised markers
+    //      map to an observation, chronyd is low-volume).
     cmd += "' -o json --no-pager MESSAGE_ID=";
     cmd.append(kMsgIdCoredump);
-    cmd += " MESSAGE_ID=";
+    cmd += " _UID=0";
+    cmd += " + MESSAGE_ID=";
     cmd.append(kMsgIdUnitFailed);
     cmd += " MESSAGE_ID=";
     cmd.append(kMsgIdUnitResult);
-    // `+` is journalctl's OR: (the reliability MESSAGE_IDs) OR (all kernel-transport
-    // lines, classified in dex_linux_kmsg) OR (chronyd's own process lines, of which only
-    // the clock-unsynchronised markers map to an observation). `_COMM=chronyd` (a
-    // journald-trusted field) — not SYSLOG_IDENTIFIER — so an unprivileged process cannot
-    // forge the source. chronyd is a low-volume daemon, so the extra fetch is negligible.
-    cmd += " + _TRANSPORT=kernel + _COMM=chronyd 2>/dev/null";
+    cmd += " _PID=1 _UID=0";
+    cmd += " + _TRANSPORT=kernel";
+    cmd += " + _COMM=chronyd _SYSTEMD_UNIT=chronyd.service _SYSTEMD_UNIT=chrony.service";
+    cmd += " 2>/dev/null";
     return cmd;
 }
 
-std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor) {
+std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& cursor,
+                                                  std::size_t* untrusted_dropped) {
     std::vector<SignalObservation> out;
     std::string newest = cursor;
     std::string line;
@@ -219,6 +283,8 @@ std::vector<SignalObservation> drain_journal_pipe(std::FILE* pipe, std::string& 
         JournalLine jl = parse_journal_line(line);
         if (!jl.cursor.empty())
             newest = std::move(jl.cursor); // chronological → last non-empty wins
+        if (jl.untrusted_dropped && untrusted_dropped)
+            ++*untrusted_dropped;
         if (jl.obs)
             out.push_back(std::move(*jl.obs));
     }

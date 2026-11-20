@@ -2,7 +2,23 @@ name: Pre-release QA
 
 # Runs after a release workflow completes, or manually for any tag.
 on:
-  workflow_run:
+  # workflow_run accepted (zizmor dangerous-triggers, reviewed 2026-11-17).
+  # It matches the triggering workflow by NAME, so besides release.yml any
+  # workflow named "Release" that completes successfully can start this one,
+  # including one added on a branch or in a pull request (a fork's run needs a
+  # maintainer's approval first). Such a trigger can pick only which tag is
+  # tested, and nothing it built is used: every job runs on a GitHub-hosted
+  # runner and checks out this repository's default branch (never the
+  # triggering run's head), so only that branch's code ever holds the
+  # read-only GITHUB_TOKEN or the GHCR_PAT some jobs log in with to pull
+  # images; the triggering run is read only for its conclusion and
+  # head_branch, which `resolve` binds through env and must shape-check as a
+  # release tag; and the assets tested are the PUBLISHED release's, verified
+  # against its SHA256SUMS, never the triggering run's artifacts. The ignore
+  # covers the whole trigger, so a later edit that checks out the triggering
+  # head or downloads its artifacts would not be flagged: review such an edit
+  # by hand.
+  workflow_run:  # zizmor: ignore[dangerous-triggers] approver: fjarvis (2026-11-18), revisit: 2027-05-18 (#8228)
     workflows: ["Release"]
     types: [completed]
   workflow_dispatch:
@@ -24,7 +40,7 @@ permissions:
 # job does it once and publishes `needs.resolve.outputs.registry`. The jobs that
 # pull images by name (artifact-verify, security-scan) set
 # `env: REGISTRY: ${{ needs.resolve.outputs.registry }}`, and steps that cannot
-# read env (action `with:` inputs, e.g. trivy's image-ref) reference the output
+# read env (action `with:` inputs, e.g. an `image-ref`) reference the output
 # directly. Defining a mixed-case default here again would just re-arm the trap
 # for the next job that forgets to override it.
 #
@@ -85,7 +101,7 @@ jobs:
       # name (DevNullLtd/yuzu-server) must be lowercase`. release.yml lowercases the
       # owner for this reason; this workflow never did. Every job below that
       # touches an image overrides REGISTRY with this value, and steps that
-      # cannot read env (action `with:` inputs, e.g. trivy's image-ref) use the
+      # cannot read env (action `with:` inputs, e.g. an `image-ref`) use the
       # output directly.
       - name: Lowercase registry owner
         id: reg
@@ -1150,7 +1166,10 @@ jobs:
     name: "Security scan (Trivy)"
     needs: resolve
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # Seven images, each pulled and scanned twice (report + gate; the second
+    # scan reuses the first's layer cache) plus one Trivy DB download. About
+    # 3 minutes locally for six images; 30 leaves room for a slow registry.
+    timeout-minutes: 30
     env:
       REGISTRY: ${{ needs.resolve.outputs.registry }}
     steps:
@@ -1174,47 +1193,51 @@ jobs:
       # the authoritative SBOMs ship from release.yml via
       # `anchore/sbom-action` (Syft). Two generators would produce two
       # SBOMs that disagree on component enumeration for the same image.
-      # Agents are installed natively on managed endpoints and not
-      # published as a container image; only server + gateway are
-      # scanned here.
+      #
+      # Every image release.yml publishes is scanned (WP15/S9): server,
+      # gateway, postgres, the three chisel variants and the agent bundle.
+      # release.yml already ran the same gate on each image BEFORE pushing it
+      # (scripts/ci/image-vuln-gate.sh); this re-run, with a fresher Trivy DB,
+      # catches a CRITICAL disclosed after the push. Like the rest of this
+      # workflow it is detective: a fixable CRITICAL not accepted in
+      # .trivyignore.yaml fails this job, which cannot unpublish anything.
       - name: Pull images for scanning
         env:
           VERSION: ${{ needs.resolve.outputs.version }}
         run: |
           # A missing image must fail here: Trivy would otherwise scan nothing and
           # the job would read as a clean scan (#5151). One retry for a registry blip.
-          for img in yuzu-server yuzu-gateway; do
+          for img in yuzu-server yuzu-gateway yuzu-postgres yuzu-server-chisel \
+                     yuzu-gateway-chisel yuzu-agent-chisel yuzu-agent-bundle-chisel; do
             docker pull -q "$REGISTRY/$img:$VERSION" || { sleep 15; docker pull -q "$REGISTRY/$img:$VERSION"; } \
               || { echo "::error::$img:$VERSION could not be pulled from $REGISTRY"; exit 1; }
           done
 
-      - name: Scan yuzu-server
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-server:${{ needs.resolve.outputs.version }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: '0'
-          format: table
-          output: trivy-yuzu-server.txt
-
-      - name: Scan yuzu-gateway
-        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ${{ needs.resolve.outputs.registry }}/yuzu-gateway:${{ needs.resolve.outputs.version }}
-          severity: HIGH,CRITICAL
-          ignore-unfixed: true
-          exit-code: '0'
-          format: table
-          output: trivy-yuzu-gateway.txt
+      - name: Scan published images (fixable CRITICAL fails)
+        env:
+          VERSION: ${{ needs.resolve.outputs.version }}
+        run: |
+          images=()
+          for img in yuzu-server yuzu-gateway yuzu-postgres yuzu-server-chisel \
+                     yuzu-gateway-chisel yuzu-agent-chisel yuzu-agent-bundle-chisel; do
+            images+=("$REGISTRY/$img:$VERSION")
+          done
+          # --report-dir . keeps the trivy-* names the upload below expects.
+          # --budget 1200: the gate stops itself, with a report per image,
+          # 20 minutes in, inside this job's 30-minute timeout (checkout and
+          # the pulls above come first).
+          scripts/ci/image-vuln-gate.sh --budget 1200 --report-dir . "${images[@]}"
 
       - name: Upload scan results
         if: always()
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: security-scan
+          # Every scanner's reports (trivy-*, and grype-* once a second scanner
+          # writes them): the JSON, the table and the .gate.txt verdict.
           path: |
-            trivy-*.txt
+            trivy-*
+            grype-*
           retention-days: 90
 
   # ── Soak test (10 min stability) ────────────────────────────────────

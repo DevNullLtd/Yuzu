@@ -221,8 +221,9 @@ differ, it governs.
 bucket of the Slice 1 summary (`server/core/src/crypto_cbom.*`), validated in CI against the
 vendored `bom-1.7.schema.json`. Algorithms, certificates, keys and protocols are not exported yet;
 they follow their own slices. Separately, release tooling generates SBOMs of Yuzu's release
-artifacts and images with `anchore/sbom-action`, and `scripts/check-release-artifacts.sh` checks
-that they exist.
+artifacts (`scripts/ci/artifact-sbom.py`, one per file) and images (`anchore/sbom-action`), and
+`scripts/check-release-artifacts.sh` and `artifact-sbom.py check` check that they exist and match
+their files.
 
 **Background.** CycloneDX added cryptographic assets in 1.6 (2024-04-09). 1.7 keeps the same model and
 extends it:
@@ -309,7 +310,7 @@ change.
   PID-reuse protection (PID plus start time) and a privacy review.
 - **Privilege varies by platform.** The agent is designed to run unprivileged, but that is not yet
   true on Windows (it runs as LocalSystem, #1442) or macOS (it runs as root, #1455). On Linux the
-  install script grants `cap_net_admin`, `cap_net_raw`, `cap_dac_read_search` and `cap_sys_ptrace`
+  packaged unit grants `cap_dac_read_search` only and the dev install script sets no file capability
   (`docs/agent-privilege-model.md`). A collector reports what it could read, never what it assumes
   it can.
 

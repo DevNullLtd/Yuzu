@@ -41,6 +41,7 @@
 
 #include "filesystem_acl_parsers.hpp"
 #include "filesystem_find_by_hash.hpp"
+#include "filesystem_posix_names.hpp"
 #include <atomic_file_write.hpp> // yuzu::shared::write_file_atomic
 #include <network_fstype.hpp>
 
@@ -463,6 +464,20 @@ yuzu::filesystem::find_by_hash::MountList find_by_hash_network_mounts(const std:
 }
 
 #endif
+
+// ── Regex subject SIZE limit (F9) ──────────────────────────────────────
+// Operator-pattern regex runs only on subjects up to this size. This is a SIZE limit and nothing
+// more: it does NOT prevent stack exhaustion. libstdc++'s std::regex executor recurses per matched
+// character; measured with a subject of 'a' characters on an 8 MiB stack it overflowed the worker
+// stack (SIGSEGV, not catchable by the dispatch try/catch): with g++ -O2 at roughly 20 to 24 KiB
+// for `(a|b)*c` and 48 KiB for `a*b`; with -O0 at 12 KiB and 24 KiB (an independent probe saw -O0
+// at 16 and 32 KiB); and at roughly 2 to 8 KiB on a 1 MiB stack (-O0). The threshold depends on
+// pattern and flags;
+// none is a safe bound. It also does not bound catastrophic backtracking time (see
+// has_nested_quantifiers, a heuristic). The real fix is a
+// linear-time, non-recursive engine (RE2); lowering this cap or running regex on a large-stack
+// thread is an open owner decision. Issue #3866 stays open.
+constexpr std::size_t kMaxRegexSubjectBytes = 64 * 1024;
 
 // ── Regex safety check ─────────────────────────────────────────────────
 // Reject patterns with nested quantifiers that cause catastrophic backtracking.
@@ -1464,10 +1479,12 @@ private:
         }
 
         // Owner info
-        struct passwd* pw = getpwuid(st.st_uid);
-        struct group* gr = getgrgid(st.st_gid);
-        ctx.write_output(std::format("owner|{}", pw ? pw->pw_name : std::to_string(st.st_uid)));
-        ctx.write_output(std::format("group|{}", gr ? gr->gr_name : std::to_string(st.st_gid)));
+        // Reentrant lookups, names copied out at once, numeric id when unresolved (F63):
+        // see filesystem_posix_names.hpp.
+        const std::string owner_name = yuzu::filesystem::owner_name_or_numeric(st.st_uid);
+        const std::string group_name = yuzu::filesystem::group_name_or_numeric(st.st_gid);
+        ctx.write_output(std::format("owner|{}", owner_name));
+        ctx.write_output(std::format("group|{}", group_name));
 
         // Permission string
         auto perm_char = [](mode_t mode, mode_t bit, char c) { return (mode & bit) ? c : '-'; };
@@ -1987,6 +2004,12 @@ private:
 
             bool matched = false;
             if (use_regex) {
+                if (line.size() > kMaxRegexSubjectBytes) {
+                    // Typed skip, never a silent non-match: the caller must see lines went unsearched.
+                    ctx.write_output(std::format("skipped|{}|line exceeds regex limit ({} bytes)",
+                                                 line_num, kMaxRegexSubjectBytes));
+                    continue;
+                }
                 matched = std::regex_search(line, re);
             } else {
                 if (case_sensitive) {
@@ -2065,6 +2088,12 @@ private:
             }
             if (has_nested_quantifiers(search_s)) {
                 ctx.write_output("error|regex rejected: nested quantifiers risk catastrophic backtracking");
+                return 1;
+            }
+            if (content.size() > kMaxRegexSubjectBytes) {
+                ctx.write_output(std::format(
+                    "error|regex replace refused: file exceeds {} bytes (use a literal search)",
+                    kMaxRegexSubjectBytes));
                 return 1;
             }
             auto flags = std::regex::ECMAScript | std::regex::optimize;

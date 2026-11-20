@@ -85,7 +85,9 @@ ADMIN_PASS='YuzuUatAdmin1!'
 # When `--as-user USER` is passed, the yuzu-agent process is launched
 # via `sudo -u USER -H env ...` instead of as the current user. This
 # exercises the privilege model defined in docs/agent-privilege-model.md
-# end-to-end: the agent itself is unprivileged, but the firewall containment /
+# end-to-end (on Linux through `setpriv --ambient-caps`, so the process holds only
+# cap_dac_read_search and the binary carries NO file capability, WP13/F21): the agent itself is
+# unprivileged, but the firewall containment /
 # services plugins shell out via `sudo -n` to the narrow
 # NOPASSWD entries in /etc/sudoers.d/yuzu-agent.
 #
@@ -516,6 +518,42 @@ verify_as_user_prereqs() {
         ok "plugin dir readable by '$target_user'"
     fi
 
+    # 4b. WP13 governance R3: the binary ACTUALLY LAUNCHED must carry no file capability. The
+    # installer strips only the --binary-path it is given (default /usr/local/bin), not a
+    # build-tree binary that carries a file capability. A file
+    # capability on a world-executable binary is a local privilege escalation (the invoker chooses
+    # the plugin dir), so refuse rather than launch it.
+    if [ "$(uname -s)" = "Linux" ]; then
+        if command -v getcap >/dev/null 2>&1; then
+            local launched_caps getcap_err getcap_rc
+            # A real getcap can exit 0 with its error only on stderr: that is UNVERIFIABLE, never
+            # "no file capabilities".
+            getcap_err="$(mktemp "${TMPDIR:-/tmp}/yuzu-getcap.XXXXXX")" || getcap_err=""
+            if [ -z "$getcap_err" ]; then
+                fail "cannot create a temp file to read getcap's stderr for $agent_bin"
+                return 1
+            fi
+            launched_caps="$(getcap "$agent_bin" 2>"$getcap_err")"
+            getcap_rc=$?
+            if [ "$getcap_rc" -ne 0 ] || [ -s "$getcap_err" ]; then
+                fail "getcap could not read $agent_bin (exit $getcap_rc: $(cat "$getcap_err")): cannot verify it carries no file capability"
+                rm -f "$getcap_err"
+                return 1
+            fi
+            rm -f "$getcap_err"
+            if [ -n "$launched_caps" ]; then
+                fail "$agent_bin carries file capabilities: $launched_caps"
+                info "  fix: sudo setcap -r \"$agent_bin\"   (the capability is granted to the process by setpriv)"
+                return 1
+            fi
+            ok "no file capabilities on $agent_bin"
+        else
+            fail "getcap not installed - cannot verify $agent_bin carries no file capabilities"
+            info "  fix: install libcap2-bin (apt) / libcap (dnf)"
+            return 1
+        fi
+    fi
+
     # 5. Test that sudo -n actually works FROM the target user (NOPASSWD
     # in /etc/sudoers.d/yuzu-agent). Run a harmless probe: sudo -u USER -n
     # /sbin/pfctl -s rules (macOS) — that's a read-only command we already
@@ -825,8 +863,28 @@ start_all() {
         # for _yuzu — that's intentional, the agent doesn't need a HOME).
         # `env -i` would scrub everything; we keep PATH so sudo -n itself
         # works, and propagate YUZU_* envs so debug knobs survive.
-        sudo -u "$AGENT_AS_USER" -H \
-            env PATH="/usr/bin:/bin:/usr/sbin:/sbin" \
+        #
+        # WP13/F21: capabilities are granted to THIS PROCESS only, via an ambient set, never as a
+        # file capability on the binary (a file capability on a world-executable binary is a
+        # local privilege escalation: the invoker picks the plugin dir the agent dlopens).
+        # setpriv drops root to the target uid/gid and leaves only $UAT_AGENT_CAPS (default
+        # dac_read_search, the same single capability the packaged unit grants) ambient. If
+        # setpriv is unavailable the agent runs with NO capabilities (degraded, never unsafe):
+        # serial/UUID read "unknown" and a few Forensics plugins report constrained.
+        local -a launch_prefix
+        local agent_gid
+        agent_gid="$(id -g "$AGENT_AS_USER" 2>/dev/null || true)"
+        if [ "$(uname -s)" = "Linux" ] && command -v setpriv >/dev/null 2>&1 && [ -n "$agent_gid" ]; then
+            local caps="${UAT_AGENT_CAPS:-dac_read_search}"
+            launch_prefix=(sudo -n setpriv --reuid "$AGENT_AS_USER" --regid "$agent_gid" --init-groups
+                           --inh-caps "+${caps//,/,+}" --ambient-caps "+${caps//,/,+}" --)
+            info "  capabilities (ambient, this process only): $caps"
+        else
+            launch_prefix=(sudo -u "$AGENT_AS_USER" -H)
+            warn "  setpriv unavailable (or not Linux): agent runs with no ambient capabilities"
+        fi
+        "${launch_prefix[@]}" \
+            env PATH="/usr/bin:/bin:/usr/sbin:/sbin" HOME=/var/empty \
                 YUZU_AGENT_LAUNCHED_AS="$AGENT_AS_USER" \
             "$BUILDDIR/agents/core/yuzu-agent" \
             --server localhost:50051 \
@@ -873,7 +931,13 @@ start_all() {
         exit 1
     fi
     local session_id
-    session_id=$(grep "Registered with server" "$UAT_DIR/agent.log" | grep -oE 'session=[^ ,)]+' | tail -1)
+    # The agent log carries only a session_fp (#8159); the id comes from the server's own
+    # "ProxyRegister succeeded" line, joined on the fingerprint.
+    # shellcheck source=lib/agent-session-fp.sh
+    # shellcheck disable=SC1091
+    . "$YUZU_ROOT/scripts/lib/agent-session-fp.sh"
+    session_id=$(resolve_agent_session "$UAT_DIR/agent.log" "$UAT_DIR/server.log") \
+        || { fail "Cannot resolve the agent session (see message above)"; exit 1; }
     ok "Agent up (PID $agent_pid) — $session_id"
 
     # Verify it routed through gateway (gw-session prefix)

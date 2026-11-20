@@ -313,6 +313,8 @@ The Hardware CI record's own **Live** lens (`/hardware` → device → **Live** 
 | **Network adapters** — adapter name, MAC, link speed, status | `network_config/adapters` | `device.live.adapters` | all |
 | **Wi-Fi** — current association: SSID, signal, security, BSSID/channel | `wifi/connected` | `device.live.wifi` | all |
 
+The **Memory** and **Processors** cards read rows in which the plugin writes a pipe in a slot name or CPU model as `\|` (and a backslash as `/`); each shows it in its own cell. The other cards, including **Disks** and **Drivers**, still split on every pipe, so a pipe in a disk model or driver name shifts that card's columns (#7957).
+
 All ten are machine-health reads (hardware attributes, not per-user behavioral data) and require **`Execution:Execute`** plus `GuaranteedState:Read`, scoped to the device's management group — same gating as every other live card. **Drivers** is Windows- and Linux-only: the agent enumerates no equivalent driver registry on macOS. **Disk health (SMART)** and **Volumes** are Windows- and macOS-only: the `disk_actions` plugin's Linux leg does not back either action. The remaining six (Disks, Memory, Processors, Battery, Thermal, Network adapters, Wi-Fi) report on all three platforms.
 
 **Deferred: disk-encryption status.** BitLocker/FileVault/LUKS state (`bitlocker/state`) was investigated for this round and dropped, not shipped. Its three platform legs return incompatible wire shapes — Windows a 5-field volume/conversion/percent/method/protection record, Linux a 3-field volume/crypto-type/active-or-inactive record with entirely different field semantics at the same positions, and macOS a bare 1-field enabled/disabled flag — so one generic column table would mislabel the Linux and macOS data. It needs a bespoke per-OS renderer rather than the shared card table; filed as a follow-up.
@@ -489,6 +491,8 @@ The agent exports the full certificate chain (leaf + intermediates) as PEM in me
 ## Over-the-Air Agent Updates
 
 Administrators can upload new agent binaries to the server and promote them to production. Connected agents will download and apply the update automatically.
+
+**Windows agents.** Agent self-update replaces `yuzu-agent.exe` only. It does not install or refresh the Visual C++ runtime the agent carries in its `bin` directory, or any plugin (#8219, #8218), so a Windows agent updated this way mixes builds and is not a supported configuration (see [Windows agent: Visual C++ runtime](README.md#windows-agent-visual-c-runtime) and "Deployment contract (hard cutover)" in [Upgrading](upgrading.md)). Agents check for updates automatically by default, so do not publish a Windows package for self-update; not publishing one is the only control that a run of the installer does not undo. `--no-auto-update` turns the check off for one agent, but the installer has no option that sets it, so it can only be added to the `YuzuAgent` service's command line by hand, and every run of the installer writes that command line without it: the agent then checks for updates. Deploy each Windows agent from the installer or archive of a single release.
 
 ### Upload a New Binary
 

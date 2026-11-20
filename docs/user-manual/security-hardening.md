@@ -220,6 +220,20 @@ new connections wait in the kernel backlog (agents already connected are unaffec
 they reconnect). Limit connections per source address at the L4 balancer or firewall; see
 [Connection ceilings and the unauthenticated ports](gateway.md#grpc-listeners).
 
+**Gateway Erlang distribution is outside the PKI and unencrypted.** Between
+gateway nodes of a cluster, commands and results (including plugin parameters)
+travel over plain TCP guarded only by the shared cookie handshake; there is no
+encryption and no per-message integrity. Keep the cluster network trusted and
+firewalled to the gateway nodes only (EPMD 4369 and the distribution range
+9100-9105), and give every node a strong cookie. TLS distribution is tracked as
+#8158 (decision pending; owner: Fraser Jarvis; review by 2027-02-17). If a node
+will not start and you cannot reach the vendor docs, read the
+refusal text: the container logs it on stderr (`[gateway-entrypoint] FATAL: ...`)
+and the systemd unit in the journal (`yuzu-gateway: ...`); it names the fix and
+never prints the cookie. A conforming cookie is 32 to 255 characters from
+`[A-Za-z0-9._~+=-]` (`openssl rand -hex 32`), identical on every node. See
+[Distribution Cookie](gateway.md#distribution-cookie-required-in-production).
+
 ## Secret Management
 
 **Never pass secrets via CLI flags** — they are visible in `ps aux`.
@@ -586,8 +600,10 @@ curl -s -X POST http://localhost:8080/api/v1/quarantine \
 
 ### The whitelist (read this before quarantining a dual-stack host)
 
-The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32**. Each address
-is sent to the plugin as an outbound and an inbound exception. A port, a prefix length, an
+The whitelist is a comma-separated list of **bare IPv4 or IPv6 addresses, at most 32 and at most 512
+characters in total**. Each address is sent to the plugin as an outbound and an inbound exception. A
+list over 512 characters is refused with `400` (`whitelist exceeds 512 characters`; about 13 full-length
+IPv6 addresses reach it, well under 32 entries). A port, a prefix length, an
 IPv4-mapped form (`::ffff:1.2.3.4`), an IPv4 octet with a leading zero or a host name is refused
 with `400`; nothing is silently dropped. Containment covers **both address families**: a v4-only
 whitelist leaves IPv6 fully contained.
@@ -658,7 +674,8 @@ verified proof confirms). Confirmed means **the device reports its rules in forc
   `note|allow_set_unchanged_use_quarantine_allow=1`. For a record that has never been confirmed the
   server then does **not** confirm it and does not read status: the device is contained, but not under
   this record's whitelist. The record stays unconfirmed, one `quarantine.reapply` failure row
-  (`allow_set_not_applied record_id=<id> command_id=<id>`) is written, and
+  (`allow_set_not_applied record_id=<id> command_id=<id>`, one per record, and one more after a server
+  restart) is written, and
   `YuzuQuarantineEndpointUnconfirmed` fires after its usual delay. **The new whitelist is still not on
   the device.** To get it there, release the device and quarantine it again (the release ends the record
   once the device confirms, and the new quarantine then applies the whitelist to a device that holds no
@@ -674,7 +691,18 @@ reads `releasing`, stays listed, and keeps the dispatch refusal, so a device tha
 containment is never treated as free. The reconciler reads the device's status first (`inactive` ends
 the record), otherwise sends `firewall.release` and reads status again, and no answer to the release
 itself ends anything. A record that cannot finish stays listed with commands refused until it is forced,
-and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device.
+and `YuzuQuarantineReleasePending` fires after 15 minutes for a connected device. That gauge carries no
+device label: find the devices with `GET /api/v1/quarantine` and read the records whose `status` is
+`releasing`.
+
+**How a `202` finishes.** There is no callback. The record leaves `GET /api/v1/quarantine` when the
+device confirms, and a `DELETE` repeated after that answers `400` (`device is not quarantined`), the
+same as for a device that was never quarantined: poll the list. A `202` is also the answer when the
+device did say `inactive` but an apply reached it, or was being sent to it, after that observation: the
+record could not end on a word the apply may have overtaken, so it stays `releasing` and the next
+status read settles it (the audit row's `detail` says `apply_in_flight=1`). The same holds for an apply
+sent before the release whose reply the reconciler has not read yet: about a minute after a reconciler
+apply, and up to 120 seconds after an MCP `quarantine_device` call, which reads no reply.
 
 **The two ways a record ends, and no other:**
 
@@ -690,9 +718,14 @@ not end the record either; the quarantine routes set no time limit.
 finish a release (such as the Linux packaged unit, which refuses mutation). Authority is the release's
 own: scoped `Security:Execute`, the same-principal check and the dispatch check for `firewall.release`.
 It **does not release the device**: the device may still be contained, the server stops refusing
-commands to it, the reconciler sends the release it owes once per reconnect and then parks the device
-after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert fires
-on it), and an operator can send `firewall.release` through the generic routes at any time. A device
+commands to it, the reconciler sends the release it owes once per reconnect and once per server start
+(the bookkeeping is in memory, and a restart drops every device's stream anyway) and then parks the
+device after one unconfirmed cycle (`yuzu_server_quarantine_forced_release_owed` counts them; no alert
+fires on it), and an operator can send `firewall.release` through the generic routes at any time.
+A forced end answers `released: false`, because the device's word is what `released` reports.
+`GET /api/v1/quarantine?include=release_owed` (MCP `list_quarantined_devices` with
+`include=release_owed`) lists the records that were ended by force and whose device has not yet
+confirmed a release, so the forced-end runbook can find them: each has `status: "release_owed"`. A device
 whose firewall plugin does not load cannot be released from the server at all (#7444).
 
 Until the device confirms that owed release, **the release lifts whatever containment the device holds,
@@ -794,8 +827,10 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
 `QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:
 
 - **Trigger.** A heartbeat from the device (the fast path) or a periodic ~20-second tick (the
-  backstop). Deliberately **not** agent registration itself: the command stream does not exist yet
-  there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
+  backstop). A heartbeat only **marks** the device due; it reads no store and dispatches nothing, so
+  heartbeat ingest never waits on the database. The reconciler thread, which does all of this work,
+  acts on the marks every second. Deliberately **not** agent registration itself: the command stream
+  does not exist yet there. Full confirmation is a state machine (apply, a follow-up `firewall.quarantine_status` after a
   short grace window, confirm), so it spans a few heartbeat intervals from reconnect to a confirmed
   record.
 - **What it dispatches.** The **stored** whitelist, mapped to the plugin's `exceptions` (`<ip>/out,<ip>/in`
@@ -806,9 +841,13 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   `validation_failed`.
 - **Re-verify and drift.** A confirmed record is re-read every 5 minutes while its device is connected,
   and stays confirmed meanwhile (the unconfirmed gauge and its alert do not blink); the CONFIRMED audit
-  row is written once per transition. A re-verify that no longer confirms is **drift**: one
-  `quarantine.reapply` failure row (`drift status=<name>`), then the next cycle re-applies through the
-  same chokepoint. A device whose live session changes (a reboot) re-verifies via status first, and a
+  row is written once per transition. A re-verify that no longer confirms is read against the store
+  again before it is called **drift** (the record may have ended or begun releasing while the status
+  command was in flight): a failed read writes no row and re-verifies, a release requested in the
+  meantime makes it a release, and only a record that still reads active gets one `quarantine.reapply`
+  failure row (`drift status=<name>`, counted as `result="drift"`), then the next cycle re-applies
+  through the same chokepoint. `YuzuQuarantineDriftRepeated` fires at three drift rows in an hour across
+  the server's devices (the counter has no device label; the audit rows name each device). A device whose live session changes (a reboot) re-verifies via status first, and a
   record that is replaced (released and re-quarantined while the agent stayed connected) resets to a
   fresh apply. A confirm is checked against the session that was live when the verifying status was
   sent. A restarted server applies first (its in-memory state starts empty), then reads status.
@@ -825,7 +864,10 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   release only on a new session. A `busy` answer (the device's mutation gate was held, so the release
   did not run) does not spend the session's release: the reconciler waits an escalating backoff, reads
   status and sends the release again, so a gate that stays busy costs at most one release and one
-  `forced_release_sent` row per 15 minutes.
+  `forced_release_sent` row per 15 minutes. The bookkeeping that remembers a session's release is in
+  memory: a server restart sends the release once more (and writes the `forced_release_*` rows again),
+  which is harmless because a release is idempotent on the device.
+- **What the server keeps as evidence.** The reconciler's re-verify replies are working data, kept 24 hours (or forever on a server set to keep responses forever). What lasts is the record's `last_confirmed_at` stamp, which every confirming re-verify moves, the audit rows written on each change (`CONFIRMED`, `drift`, the release rows, `forced_release_unconfirmed`) and the counters; no reply is kept as proof that re-verify kept running. The lasting evidence for a parked owed release is its `forced_release_unconfirmed status=<name>` row, not the reply.
 - **Audit.** `quarantine.reapply` (`principal: system`): `record_id=<id> command_id=<id>
   trigger=tick|heartbeat` per apply, `CONFIRMED ...`, `drift ...`, `allow_set_not_applied ...`. `quarantine.disable`: the release
   rows described in the audit log reference. `record_id` is the internal `QuarantineRecord::id`, so a
@@ -836,30 +878,54 @@ refuses it), but its own firewall cannot be touched until a dispatch reaches it.
   instances; `offline` is expected and not alerted on, a sustained `connected` count is the signal
   (`YuzuQuarantineEndpointUnconfirmed`, `YuzuQuarantineReleasePending` in [Metrics](metrics.md)).
   `yuzu_server_quarantine_reapply_total{result}` breaks down every outcome (`reapplied`, `confirmed`,
-  `unconfirmed`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
+  `unconfirmed`, `drift`, `busy`, `offline`, `not_reached`, `rate_limited`, `pending`, `degraded`,
   `validation_failed`, `dispatch_error`, `release_sent`, `released`).
   `yuzu_server_quarantine_reconciler_tick_healthy` (0/1) distinguishes an empty queue from a tick that
   could not read at all: check it first when a gauge looks suspiciously static.
+  `yuzu_server_quarantine_reconciler_last_tick_unixtime` is when a tick last finished, and
+  `YuzuQuarantineReconcilerStalled` fires when no server of the job has finished one for about ten minutes
+  (five minutes stale, held for five): while it fires, the gauges above are frozen at their last values.
 
-**Known limitation.** A release request landing at the exact moment the reconciler is mid-apply for the
-same device can end with the apply arriving after the release, in one of two ways:
+**The apply fence, and what it does not close.** A record ends on the device's `inactive` answer, and an
+apply that reaches the device after the observation that produced that answer would leave the device
+contained with no record naming it. Two parts close that:
 
-- The apply lands while the record still reads releasing: the release_pending guard and the
-  status-first rule make the next cycle correct it, but for up to one cycle the device can be contained
-  under a record that reads releasing.
-- The release completes first and the apply lands after it: the device is firewalled and **no record
-  names it**. Nothing re-reads it, so nothing corrects it. The only trace is a `quarantine.reapply`
-  failure row in the audit log, `dispatch accepted record_id=<id> command_id=<id> but the durable stamp
-  failed: device is not quarantined`, and the way back is `firewall.release` sent through the generic
-  command routes.
+- Every stored-record apply (the reconciler's and the MCP `quarantine_device` retry's) first **claims** the
+  record, which moves a durable apply generation. A dispatch that returned is not a delivery (a gateway
+  only queues the command), and a delivered command is not a run (the agent executes commands on a
+  thread pool, and the firewall plugin takes its own gate in the order its workers reach it). So an apply
+  that reached a device **keeps its claim** until the reconciler has read the apply's reply, and
+  otherwise until the claim stops counting; while it is held no generation is issued and no end is
+  accepted, whether it rests on a release's `inactive` answer or on a status read. An apply that threw or
+  reached no device drops its claim at once. The generation outlives the claim. A claim stops counting
+  120 seconds after it was stamped, and both the stamp and that test use the database's clock, so a
+  server whose own clock steps cannot make a live claim read as expired or a dead one as live. The
+  server also keeps the claims it stamped on its own monotonic clock for the same 120 seconds, so a
+  step of the database's clock cannot make one of them read expired early; after a restart (or for a
+  claim another replica stamped) the database clock alone judges the window. MCP
+  `quarantine_device` reads no reply, so after any call that reached a device (the first as well as a retry) a second call, a
+  release's confirmed end and the reconciler's own apply are held back until the claim expires, at most 120
+  seconds; the second call answers a retryable fault.
+- Whoever will act on an `inactive` answer reads the generation **before it sends the command whose
+  answer it will use** (the reconciler before its status read, `DELETE` before its release), and the
+  write that ends the record presents it. The store refuses the end when an apply was claimed since
+  (`apply_in_flight`). The record then stays `releasing` and the next status read takes a fresh
+  generation and settles it. A forced end rests on no observation and is not refused.
+
+This relies on commands to one device arriving in the order one server dispatched them (one stream, a
+first-in first-out gateway queue). **Still open:** a transport that reorders commands to one device;
+an apply and a release dispatched by two different server replicas; a claim older than 120 seconds (an
+apply that stays unexecuted that long is ignored); and the two check-then-dispatch windows below. In each the
+trace is the same, a `quarantine.reapply` failure row and a device that is contained under no record or
+a releasing one, and the way back is `firewall.release` sent through the generic command routes.
 
 The release a `DELETE` sends and the owed release both check the record and then dispatch, so each has the
 same narrow window against a new quarantine of the same device (the new record's re-verify corrects it
 within 5 minutes). The same outcome follows when a release sent earlier is run by the device after a later
 record's apply, because commands are not ordered on the device: the new record can be confirmed and the
-device then released, uncontained until the re-verify re-applies it. If you release and immediately re-quarantine the same device with a different
-whitelist, a follow-up `firewall.quarantine_status` check is a reasonable sanity step. Tracked for a
-proper fix (a claim or generation token on the active record).
+device then released, uncontained until the re-verify re-applies it. If you release and immediately
+re-quarantine the same device with a different whitelist, a follow-up `firewall.quarantine_status` check
+is a reasonable sanity step.
 
 ## IOC Checking
 
@@ -891,6 +957,8 @@ curl -s -X POST http://localhost:8080/api/v1/executions \
     "scope": "tag:env == \"production\""
   }'
 ```
+
+**Domain checks and the Windows DNS cache.** On Windows a `domains` check reads the resolver cache once per command. If the cache cannot be read (the DNS API is unavailable, or returns failure, which some Windows 11 builds do on every call), the result is marked **constrained / partial** with provenance `windows:ioc:dns_cache_unreadable`, and each domain row says `DNS resolver cache could not be read`. Treat that as **unknown, not clean**: a constrained domain answer says nothing about whether the endpoint resolved the domain. Earlier builds reported `Not in DNS cache` in this case. At most 100 domains are accepted per command; more is refused whole with `error|domains|false|Too many domains (N, max 100)`.
 
 IOC checks run locally on each endpoint, querying active connections (Windows: `GetExtendedTcpTable`, Linux: `/proc/net/tcp`, macOS: `lsof`), DNS cache, and filesystem state. Results include matched indicators and the source of the match.
 
