@@ -8,8 +8,8 @@ The unit tests drive the pure formatters directly, so a plugin leg reverted to a
   * processes_plugin.cpp: exactly one call each of format_query_row (list + query = 2 sites),
     format_hashed_row and format_tree_row, and no raw `std::format("proc|`;
   * network_config_plugin.cpp: three format_bypass_row sites and no raw `std::format("bypass|`;
-  * installed_apps_plugin.cpp: format_query_row once and format_user_app_row at the four
-    list_per_user legs (Windows, Linux, macOS system, macOS brew), no raw `"user_app|` format;
+  * installed_apps_plugin.cpp: format_query_row once and format_user_app_row at the three
+    list_per_user legs (Windows, Linux, macOS system; the macOS brew leg is removed, WP13/F19), no raw `"user_app|` format;
   * network_config_plugin.cpp: FOUR format_proxy_address_row sites (the credential chokepoint:
     a raw `std::format("proxy_address|` would leak proxy credentials) and no raw proxy_address row;
   * procfetch_plugin.cpp: three yuzu::procfetch::format_row sites, no raw `"{}|{}|{}|{}"` row;
@@ -54,8 +54,8 @@ def check(files: dict) -> list:
     ia = files["installed_apps"]
     if ia.count("parsers::format_query_row(") != 1:
         errs.append("installed_apps_plugin.cpp: expected 1 x parsers::format_query_row")
-    if ia.count("parsers::format_user_app_row(") != 4:
-        errs.append(f"installed_apps_plugin.cpp: expected 4 x parsers::format_user_app_row, got "
+    if ia.count("parsers::format_user_app_row(") != 3:
+        errs.append(f"installed_apps_plugin.cpp: expected 3 x parsers::format_user_app_row, got "
                     f"{ia.count('parsers::format_user_app_row(')}")
     if re.search(r'"user_app\|', ia):
         errs.append('installed_apps_plugin.cpp: raw "user_app|..." row format')

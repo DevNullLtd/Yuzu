@@ -7,7 +7,7 @@
       ],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): procfetch:exe_unreadable",
           "mechanism": "/proc enumeration + OpenSSL EVP SHA-1",
           "rung": "1",
           "support": "supported"
@@ -29,10 +29,10 @@
   ],
   "caveats": [
     "**Windows hashing opens a UTF-8 path via the ANSI `CreateFileA`.** `get_process_image_path` converts the wide image path to UTF-8 via `from_wide` (`procfetch_plugin.cpp:263`), then `sha1_of_file` passes that UTF-8 string straight to `CreateFileA` (`procfetch_plugin.cpp:267`), which interprets it as the ANSI code page, not UTF-8. A process whose executable path contains non-ASCII characters will fail to open, silently leaving `sha1` empty with no error surfaced.",
-    "**This plugin never sets a typed result status.** Both captured samples read `UNDECLARED / UNKNOWN /` regardless of whether any row's path/hash resolution failed — a caller cannot distinguish \"clean run\" from \"every row's hash silently failed\" without inspecting the rows themselves.",
+    "**Typed result status only for one Linux gap.** On Linux, `fetch` sets `CONSTRAINED`/`PARTIAL` (`procfetch:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable. On Windows and macOS, and for any failure of a row's hash resolution on any OS, the status stays `UNDECLARED / UNKNOWN /` (both captured samples read it), so a caller cannot distinguish \"clean run\" from \"every row's hash silently failed\" without inspecting the rows themselves.",
     "**Protected Windows processes report name only.** `OpenProcess` is refused even running as SYSTEM for a handful of processes (`[System Process]`, `System`, `Secure System`, `Registry` in the sample); those rows carry empty `path` and `sha1` with no row-level error indicator.",
     "**SHA-1, not SHA-256.** The metadata description positions this action for \"security auditing\" and \"IOC matching\" (`content/definitions/procfetch.yaml:16-17`), but the hash is SHA-1 on every leg (`EVP_sha1()` / `BCRYPT_SHA1_ALGORITHM`), which is broken for collision resistance; it remains adequate for matching against a known-hash IOC list (a preimage property SHA-1 still holds) but not for detecting a deliberately-collided binary.",
-    "**Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe` (`procfetch_plugin.cpp:134-140`); the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there."
+    "**Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe`; the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there."
   ],
   "definitions": [
     {
@@ -146,14 +146,27 @@
     },
     {
       "grant": "`resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail",
-      "if_refused": "`std::filesystem::read_symlink` throws `filesystem_error`, caught and turned into an empty path, so `path` and `sha1` are empty and the row still emits (`procfetch_plugin.cpp:134-140`)",
+      "if_refused": "`resolve_exe` makes one `readlink` call through `readlink_noting`; a failure returns an empty path and an EACCES/EPERM refusal is counted, so `path` and `sha1` are empty and the row still emits",
       "measured": "2026-09-06, Debian 13 (trixie) aarch64 container, euid 0",
       "os": "Linux",
       "runs_as": "root (captured in a container; not measured unprivileged)"
     }
   ],
   "readme": "agents/plugins/procfetch/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "UNKNOWN",
+      "provenance": "(empty)",
+      "status": "`UNDECLARED` (default)",
+      "when": "Every Windows and macOS run, and a Linux run where every process was readable."
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`procfetch:exe_unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "The readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha1` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked in #8165)."
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [

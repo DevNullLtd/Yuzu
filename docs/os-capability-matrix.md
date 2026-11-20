@@ -149,7 +149,7 @@ duplicates.
 | runtimes | 🟡 | ✅ | 🟡 | `dotnet`/`jvm`/`python` installed-runtime inventory, read-only and zero-subprocess (rung 1). Linux: directory-name walks, `release` file reads, a `bin/java` probe for release-less homes and a `python3.<minor>` file listing over an injected root (`runtimes_linux_parsers.hpp`), skipping network mounts read from `/proc/self/mountinfo`. `python` ships on all three OSes: Windows reads the python.org PEP 514 keys under `HKLM\SOFTWARE\Python\PythonCore` in both registry views (full `x.y.z`; per-user hives never read), macOS reads each `/Library/Frameworks/Python.framework/Versions/<x.y>/Resources/Info.plist` (full `x.y.z`; network mounts skipped via `getmntinfo_r_np(MNT_NOWAIT)`), Linux reports major.minor only (the patch level needs the interpreter; the leg is declared `constrained` for that reason). Coverage: the standard roots only (`/usr/share/dotnet`, `/usr/lib/dotnet`, `/usr/lib64/dotnet`; `/usr/lib/jvm`, `/opt/java`, `/usr/lib64/jvm`, `/var/opt/java`; `/usr/bin`, `/usr/local/bin`, `/var/usrlocal/bin`, the last present only on rpm-ostree hosts), so `supported` with no rows means none found there, not none installed (an Oracle-RPM `/usr/java`, `/opt/jdk-*`, SDKMAN, pyenv, conda, Homebrew and bundled runtimes are not walked). `dotnet` and `jvm` ship on all three OSes: macOS lists `/usr/local/share/dotnet` and `/Library/Java/JavaVirtualMachines` (the macOS Java leg is fixture-verified only), Windows `dotnet` is registry-only (both views) and Windows `jvm` reads the JavaSoft, Eclipse Adoptium, Microsoft and Azul Zulu registrations plus one bounded `release` read per home on a fixed drive. See `agents/plugins/runtimes/README.md` |
 | sccm | ✅ | ⛔ | ⛔ | Windows-only. macOS returns an honest `sccm\|unsupported` (points at Jamf/MDM); Linux `installed\|false` + "platform not supported" — `sccm_plugin.cpp` `__APPLE__` branch |
 | script_exec | ✅ | ✅ | ✅ | win/apple/linux. Different action sets per OS (`bash` POSIX-only; powershell/cmd on Windows) |
-| services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable) |
+| services | ✅ | ✅ | ✅ | win/linux/apple branches. macOS `list`/`running` now emit `startup_type` (automatic/disabled/unknown) from a bulk `launchctl print-disabled` join (parser `services_macos_launchd.hpp`); `set_start_mode` rejects `manual` (launchd is binary enable/disable); Linux `set_start_mode` reads `systemctl is-enabled` back and reports `CONSTRAINED`/`PARTIAL` (`services:start_mode_unchangeable`, exit 0) for a `static`, `indirect`, `alias` or `generated` unit, which `systemctl` cannot enable or disable; the typed status is stored and carried on the event payload, not yet shown on the REST, MCP or dashboard surfaces |
 | shares | ✅ | ✅ | ✅ | Read-only listing of what this host serves over SMB and NFS, one `list` action, names and paths only (never ACLs or security descriptors; NFS client patterns are reduced to a count and an anonymous flag). Linux (rung 1): bounded no-follow reads of `/etc/exports`, `/etc/exports.d/*.exports` and `/etc/samba/smb.conf`, the configuration as written, not live nfsd/smbd state; Samba's registry backend, `include =` and usershares are declared unreached scope. Windows (rung 1): `NetShareEnum` level 2 (level 1, names without paths, when level 2 is refused), the live shares of the Server service, paged (64 KiB requested per call; a memory bound, not a time bound); the administrative `ADMIN$`, `C$` and `IPC$` shares are flagged `special`, never hidden, any other share whose name ends in `$` is flagged `hidden`, a multi-page drain whose count differs from the first page's total is `constrained` (`inconsistent_drain`), and a stopped Server service is `unsupported` with a named token, never an empty list. macOS (rung 2): the share points `/usr/sbin/sharing -l -f json` records (a bounded argv leaf, 5 s deadline, no shell; a record with SMB sharing off is flagged `unavailable`, SMB encryption required `sealed`; the tool never prints AFP or FTP state, so a share point enabled only for those appears as an SMB row) plus a byte-capped no-follow read of `/etc/exports` in Apple's BSD grammar, emulated best-effort (as written, not live nfsd state; host-dependent checks not modelled; an IPv6 network with no or a zero mask is anonymous as the kernel treats it, an IPv4 network never is); a tool that cannot start, times out, exits nonzero (other than printing its no-records text) or prints anything but a JSON object or its no-records text fails the `sharing` source with a named token, never an empty list. |
 | software_actions | ✅ | ✅ | ✅ | win/linux/apple branches |
 | status | ✅ | ✅ | ✅ | linux/apple/win branches |
@@ -542,7 +542,7 @@ implementation is.
 | installed_apps | query | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | query | windows | supported | 1 | Reg*W enumeration of the Uninstall key(s) | - |
 | installed_apps | list_per_user | linux | supported | 2 | dpkg-query/rpm/pacman via bounded argv runner | - |
-| installed_apps | list_per_user | macos | supported | 2 | system_profiler + brew via bounded argv runner | - |
+| installed_apps | list_per_user | macos | supported | 2 | system_profiler via bounded argv runner | - |
 | installed_apps | list_per_user | windows | supported | 1 | Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via RegLoadKeyW when not already loaded | - |
 | installed_apps | list_inventory | linux | supported | 2 | dpkg-query/rpm/pacman/apk via bounded argv runner | - |
 | installed_apps | list_inventory | macos | supported | 2 | system_profiler + pkgutil via bounded argv runner + native SecCode/CFBundle enrichment | - |
@@ -607,10 +607,10 @@ implementation is.
 | netprobe | dns | linux | supported | 1 | getaddrinfo | - |
 | netprobe | dns | macos | supported | 1 | getaddrinfo | - |
 | netprobe | dns | windows | supported | 1 | getaddrinfo | - |
-| netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | - |
+| netstat | netstat_list | linux | supported | 1 | /proc/net/{tcp,udp}[6] | CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable |
 | netstat | netstat_list | macos | supported | 1 | libproc | - |
 | netstat | netstat_list | windows | supported | 1 | GetExtendedTcpTable/GetExtendedUdpTable | - |
-| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | - |
+| netstat | attribution | linux | supported | 1 | /proc/net/* + /proc/[pid]/{comm,exe,fd} | CONSTRAINED/PARTIAL when another user's /proc/<pid>/fd is unreadable (no CAP_SYS_PTRACE): netstat:proc_fd_unreadable |
 | netstat | attribution | macos | supported | 1 | libproc | - |
 | netstat | attribution | windows | supported | 1 | IP Helper API + QueryFullProcessImageNameW | - |
 | network_actions | flush_dns | linux | constrained | 2 | resolvectl/systemd-resolve via bounded argv runner (sudo -n) | requires resolvectl (systemd-resolved) or the legacy systemd-resolve CLI; an honest failure is reported if neither is present |
@@ -715,16 +715,16 @@ implementation is.
 | processes | list | linux | supported | 1 | /proc enumeration | - |
 | processes | list | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | list | windows | supported | 1 | CreateToolhelp32Snapshot | - |
-| processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_hashed | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable |
 | processes | list_hashed | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_hashed | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
-| processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | - |
+| processes | list_tree | linux | supported | 1 | /proc enumeration + readlink(/proc/<pid>/exe) + SHA-256 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable |
 | processes | list_tree | macos | supported | 1 | sysctl(KERN_PROC_ALL) + proc_pidpath + SHA-256 | - |
 | processes | list_tree | windows | supported | 1 | CreateToolhelp32Snapshot + QueryFullProcessImageNameW + SHA-256 | - |
 | processes | query | linux | supported | 1 | /proc enumeration | - |
 | processes | query | macos | supported | 1 | sysctl(KERN_PROC_ALL) | - |
 | processes | query | windows | supported | 1 | CreateToolhelp32Snapshot | - |
-| procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | - |
+| procfetch | procfetch_fetch | linux | supported | 1 | /proc enumeration + OpenSSL EVP SHA-1 | CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): procfetch:exe_unreadable |
 | procfetch | procfetch_fetch | macos | supported | 1 | libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | - |
 | procfetch | procfetch_fetch | windows | supported | 1 | CreateToolhelp32Snapshot + BCrypt SHA-1 | - |
 | rdp_control | set_state | linux | unsupported | - | - | - |
@@ -802,7 +802,7 @@ implementation is.
 | services | running | linux | supported | 2 | runner argv 'systemctl list-units' | - |
 | services | running | macos | supported | 2 | runner argv 'launchctl list' | - |
 | services | running | windows | supported | 1 | win32_service_api | - |
-| services | set_start_mode | linux | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) | - |
+| services | set_start_mode | linux | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl enable\|disable\|mask\|unmask' (a root agent runs systemctl directly) | CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read |
 | services | set_start_mode | macos | supported | 3 | sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl enable\|disable' (a root agent runs launchctl directly) | - |
 | services | set_start_mode | windows | supported | 1 | win32_service_api | - |
 | shares | list | linux | supported | 1 | bounded no-follow reads of /etc/exports, /etc/exports.d/*.exports and /etc/samba/smb.conf (pure parsers); one lstat of the usershares directory | configured shares as written, not live nfsd/smbd state; Samba registry backend, include= files and usershares are not read (constrained token); a symlinked config file or exports.d is refused |

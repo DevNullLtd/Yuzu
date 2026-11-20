@@ -6,6 +6,8 @@
 
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cstdint> // std::uintmax_t (sha256_file bounded-read counter, used before the #ifdef)
 #include <cstring>
@@ -203,22 +205,45 @@ std::optional<std::string> verify_plugin_signature(const std::filesystem::path& 
     return std::string{prefix} + ": " + err->detail;
 }
 
-std::unordered_map<std::string, std::string>
-load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
-    std::unordered_map<std::string, std::string> result;
-    if (allowlist_path.empty() || !std::filesystem::exists(allowlist_path))
-        return result;
+PluginAllowlistLoad load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
+    PluginAllowlistLoad out;
+    if (allowlist_path.empty())
+        return out; // NotConfigured
+
+    // error_code overloads only: the throwing exists() raised filesystem_error on a
+    // permission fault in a parent directory, which escaped run() as a crash.
+    std::error_code ec;
+    const auto st = std::filesystem::status(allowlist_path, ec);
+    if (st.type() == std::filesystem::file_type::not_found) {
+        out.status = AllowlistStatus::Missing;
+        out.detail = "file not found";
+        return out;
+    }
+    if (ec || st.type() != std::filesystem::file_type::regular) {
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = ec ? ec.message() : "not a regular file";
+        return out;
+    }
 
     std::ifstream f(allowlist_path);
     if (!f) {
-        spdlog::error("Cannot open plugin allowlist: {}", allowlist_path.string());
-        return result;
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = "cannot open file";
+        return out;
     }
 
+    auto& result = out.entries;
     std::string line;
     int lineno = 0;
     while (std::getline(f, line)) {
         ++lineno;
+        // A UTF-8 BOM (Windows editors / PowerShell) would otherwise glue itself to the first
+        // hash, so the first real entry fails the shape check and its plugin is refused.
+        if (lineno == 1 && line.size() >= 3 && static_cast<unsigned char>(line[0]) == 0xEF &&
+            static_cast<unsigned char>(line[1]) == 0xBB && static_cast<unsigned char>(line[2]) == 0xBF)
+            line.erase(0, 3);
+        if (!line.empty() && line.back() == '\r')
+            line.pop_back(); // CRLF file
         if (line.empty() || line[0] == '#')
             continue;
         // Format: "hash  filename" or "hash filename" (sha256sum compatible)
@@ -228,18 +253,76 @@ load_plugin_allowlist(const std::filesystem::path& allowlist_path) {
             spdlog::warn("Allowlist line {} malformed, skipping: {}", lineno, line);
             continue;
         }
+        // sha256sum "binary mode" marks the filename with a leading '*'.
+        if (!filename.empty() && filename.front() == '*')
+            filename.erase(0, 1);
         // Normalize hash to lowercase
         for (auto& c : hash)
             c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        // A SHA-256 is exactly 64 hex digits. Anything else (a wrong-format file, a different
+        // digest, junk) can never match a plugin, so it is NOT an entry: counting it would turn
+        // a bad file into "enforcement on, every plugin refused, agent healthy with no plugins".
+        const bool hex64 = hash.size() == 64 &&
+                           std::all_of(hash.begin(), hash.end(), [](unsigned char c) {
+                               return std::isxdigit(c) != 0;
+                           });
+        if (!hex64 || filename.empty()) {
+            spdlog::warn("Allowlist line {} is not '<64-hex sha256>  <filename>', skipping", lineno);
+            continue;
+        }
         // Strip path prefix if present — match on filename only
         auto fname = std::filesystem::path(filename).filename().string();
+        if (fname.empty()) {
+            spdlog::warn("Allowlist line {} names no file, skipping", lineno);
+            continue;
+        }
         result[fname] = hash;
         spdlog::debug("Allowlist entry: {} -> {}", fname, hash);
     }
+    if (f.bad()) {
+        // A mid-read I/O fault: a truncated map must not enforce as if it were complete.
+        out.status = AllowlistStatus::Unreadable;
+        out.detail = "read error";
+        out.entries.clear();
+        return out;
+    }
 
+    if (result.empty()) {
+        out.status = AllowlistStatus::NoValidEntries;
+        out.detail = "no valid entries (empty, comments only, or every line malformed)";
+        return out;
+    }
+    out.status = AllowlistStatus::Loaded;
     spdlog::info("Loaded {} plugin allowlist entries from {}", result.size(),
                  allowlist_path.string());
-    return result;
+    return out;
+}
+
+std::optional<std::string> evaluate_allowlist_startup(const std::filesystem::path& configured_path,
+                                                      const PluginAllowlistLoad& load) {
+    if (configured_path.empty())
+        return std::nullopt; // not configured: nothing to enforce
+    if (load.status == AllowlistStatus::Loaded && !load.entries.empty())
+        return std::nullopt;
+    const char* cause = "no valid entries";
+    switch (load.status) {
+    case AllowlistStatus::Missing:
+        cause = "file is missing";
+        break;
+    case AllowlistStatus::Unreadable:
+        cause = "file is unreadable";
+        break;
+    case AllowlistStatus::NoValidEntries:
+        cause = "file has no valid entries";
+        break;
+    default:
+        break;
+    }
+    std::string reason = "--plugin-allowlist '" + configured_path.string() + "' is configured but " +
+                         cause;
+    if (!load.detail.empty())
+        reason += " (" + load.detail + ")";
+    return reason;
 }
 
 // ── PluginHandle ──────────────────────────────────────────────────────────────
@@ -347,7 +430,7 @@ std::expected<PluginHandle, LoadError> PluginHandle::load(const std::filesystem:
 PluginLoader::ScanResult
 PluginLoader::scan(const std::filesystem::path& plugin_dir,
                    const std::unordered_map<std::string, std::string>& allowlist,
-                   const PluginSigningPolicy& signing) {
+                   const PluginSigningPolicy& signing, bool allowlist_required) {
     ScanResult result;
 
     if (!std::filesystem::is_directory(plugin_dir)) {
@@ -372,7 +455,7 @@ PluginLoader::scan(const std::filesystem::path& plugin_dir,
     // the dlopen()-mapped .so stays loaded independently.
     std::vector<int> linux_fd_keepalive; // POSIX-only; empty on macOS, no fd flow there
 
-    const bool enforce_allowlist = !allowlist.empty();
+    const bool enforce_allowlist = allowlist_required || !allowlist.empty();
     const bool enforce_signing = signing.enabled();
     if (enforce_allowlist) {
         spdlog::info("Plugin allowlist enforcement active ({} entries)", allowlist.size());

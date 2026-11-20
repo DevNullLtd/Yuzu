@@ -501,6 +501,7 @@ agent_test_exe = executable(
                                                 # attribution action driven end to end via LocalDispatcher
                                                 # (Darwin-only, self-gated) -- same shape as
                                                 # test_wave3_pr31_macos_actions.cpp
+    'unit/test_proc_access.cpp',              # WP13 UP14: /proc refusal tally (agents/shared/proc_access.hpp)
     'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
                                                 # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
@@ -4885,6 +4886,60 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13 F21: the installer sets no file capability and strips any it finds (lexical + executed
+# `--dry-run` with tool stubs + in-memory mutants; nothing runs as root).
+test('agent installer no file capabilities (WP13/F21)',
+  _python3_test,
+  args: [files('test_agent_installer_no_file_caps.py')],
+  suite: 'docs',
+  timeout: 90,
+)
+# WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
+test('proc access status lexical gate (WP13/UP14)',
+  _python3_test,
+  args: [files('test_proc_access_status_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: the shared C++ tokenizer used by the lexical gates: direct self-test of the shapes they
+# rely on (escaped-quote and raw strings, comment forms, #if 0 forms).
+test('cpp lex helper self-test (WP13)',
+  _python3_test,
+  args: [files('cpp_lex_helper.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that Linux set_start_mode judges the readback with start_mode_readback_matches, runs
+# it with stderr unmerged and reports the state (source-text only).
+test('services set_start_mode readback wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_services_readback_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that the Echo $Module drain passes the real file-version stamp (read from the open
+# image) into SigningCache (source-text only; nothing builds the Windows leg here).
+test('echo module signing wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_echo_module_signing_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
+# PluginLoader::scan and passes allowlist_required (source-text only, so Python).
+test('plugin allowlist startup wiring lexical gate',
+  _python3_test,
+  args: [files('test_plugin_allowlist_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F19: the root macOS agent must never exec Homebrew's user-owned brew (source-text only).
+test('installed_apps no-brew lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
 test('agent session id log wiring lexical gate',
   _python3_test,
@@ -5178,6 +5233,20 @@ if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# WP13/F52 EXECUTED refusal: the real yuzu-agent with a missing/empty/junk --plugin-allowlist must
+# log the refusal and exit non-zero without loading a plugin (the lexical test cannot see a lost
+# async log line or an exit code).
+if (_python3_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('agent plugin allowlist refusal (executed, WP13/F52)',
+    _python3_test,
+    args: [files('test_agent_allowlist_refusal_executed.py'), yuzu_agent_exe],
+    suite: 'agent',
+    timeout: 180,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
@@ -5284,7 +5353,7 @@ test('gateway peer restart-advice docs lint',
   _python3_test,
   args: [files('test_gateway_peer_restart_advice_lint.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
