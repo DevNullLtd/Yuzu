@@ -1639,7 +1639,9 @@ user prefix (`macos:user_homes:...`, `macos:homebrew_user_prefix:...`,
 The agent also walks the `~/homebrew` and `~/.homebrew` prefixes of each home under `/Users`, and a
 failed read of any of them makes the whole `packages` answer constrained: the server keeps the
 device's stored Homebrew rows, shown as unconfirmed, and no other source is affected. Find the
-token with `GET /api/v1/inventory/software/plugin-health` and then `/hosts/{agent_id}`, and look
+affected device from its unconfirmed Homebrew row (`GET /api/v1/inventory/software/plugin-health` shows
+only whether the facet is affected across the fleet and lists the ten slowest devices), read the
+token on `/hosts/{agent_id}`, and look
 the detail up here and in the plugin's README (`agents/plugins/pkg_inventory/README.md`, caveats 1
 and 4). The tokens never name a user or a path.
 
@@ -1647,8 +1649,8 @@ and 4). The tokens never name a user or a path.
 |---|---|---|
 | `user_homes:mounts_unreadable` | The mount table could not be read, so no home is opened. | Clears when the table reads again. |
 | `user_homes:network_mount`, `homebrew_user_prefix:network_mount` | `/Users`, a home or a candidate prefix is on a network mount and is never touched. | None while it is mounted. |
-| `user_homes:not_a_directory` | `/Users` or a home is a symlink and was refused. A symlinked `/Users` constrains every run. | Make it a real directory. |
-| `user_homes:permission_denied` | The agent cannot open `/Users` or a home: a non-root agent against another account's home. | Run the agent as root. |
+| `user_homes:not_a_directory` | `/Users` is a symlink and was refused. It constrains every run. (A symlinked home under `/Users` is skipped silently, as "not a home".) | Make `/Users` a real directory. |
+| `user_homes:permission_denied` | The agent cannot open `/Users` or a home: a non-root agent against another account's home (unless its group or an ACL admits it). | Run the agent as root, or remove the prefix (the section stays unconfirmed until then). |
 | `homebrew_user_prefix:owner_mismatch` | The prefix is not owned by its home's owner; nothing under it is opened. | Fix the ownership, or remove the prefix. |
 | `homebrew_user_prefix:owner_name_unsupported` | A home whose directory name has a non-ASCII, control, pipe or backslash character (or is over 255 bytes) holds a Cellar or Caskroom. | Rename the home, or remove the prefix. It never clears on its own. |
 | `homebrew_user_cellar:not_a_directory`, `homebrew_user_caskroom:not_a_directory` | The Cellar or Caskroom is a symlink or a file. | Replace it with a real directory, or remove it. |
@@ -1658,7 +1660,8 @@ and 4). The tokens never name a user or a path.
 A local account can hold its own Homebrew section at "unconfirmed" this way; that is an accepted
 trade-off (README caveat 1). There is no switch for the user-prefix walk alone. The collection
 setting `plugins.pkg_inventory=false` and the plugin-wide kill switch each switch off all three
-`pkg_inventory` facets (a kill switch set for one operating system or one action does not stop the
+`pkg_inventory` facets of the scheduled collection; an on-demand `pkg_inventory.packages` dispatch still
+walks the user homes unless the plugin kill switch is set (a kill switch set for one operating system or one action does not stop the
 daily collection; see [Collection settings](#collection-settings)); otherwise remove or re-own the
 prefix. A `timeout` or `busy` token recovers when the worker returns or the agent restarts (the
 paragraph above). The first sync of a build that fills `install_location` can also add one `remove`

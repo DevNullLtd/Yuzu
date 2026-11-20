@@ -346,8 +346,8 @@ AdaptedRows parse_pkg_inventory_packages_output(const std::string& out) {
     // Five or eleven tokens are accepted for either manager ON PURPOSE. A wrong-width row is
     // dropped under a `supported` status, and a supported answer with fewer rows is an
     // authoritative section, so a stricter width would delete the device's stored Homebrew rows
-    // whenever a plugin and an agent core of different builds meet (an unsupported mix that agent
-    // self-update can still produce, as it replaces the agent binary and no plugin). A five-token
+    // whenever a plugin and an agent core of different builds meet (an unsupported mix, but one a
+    // partial deployment can produce). A five-token
     // Homebrew row therefore maps as it always did, with empty install_date and install_location.
     return adapt_pkg_inventory(out, kActionPackages,
                                [](const std::vector<std::string_view>& tok,

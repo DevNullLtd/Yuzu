@@ -80,6 +80,9 @@ def main() -> int:
     if not files:
         print(f"FAIL: no sources under {PLUGIN}")
         return 1
+    if WIRING_FILE not in {f.name for f in files}:
+        print(f"FAIL: {WIRING_FILE} not found: the production-wiring pin would pass vacuously")
+        return 1
     for f in files:
         errs += findings(f.name, f.read_text(encoding="utf-8"))
     if MANIFEST_ROW.search(MANIFEST.read_text(encoding="utf-8")):
