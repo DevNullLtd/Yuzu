@@ -3111,6 +3111,50 @@ groups:
             reach 'fixing' after an operator remediate, and review any recent
             change to claim_remediation or the collect_ready gen threading.
 
+      # WP07: the compliance collect pass skipped a target (collect_target) or a whole ready
+      # item (collect_item) because evaluating it threw -- the response-store read, the verdict
+      # write or an allocation failure. A skipped target keeps its PREVIOUS status (no verdict is
+      # recorded this cycle), so a skip that stays above zero for 15 minutes means compliance data is going stale for
+      # someone. The per-device "unevaluable response" case is NOT this alert: it scores that
+      # device `error` and is counted by yuzu_server_policy_unevaluable_responses_total{reason}.
+      - alert: YuzuPolicyCollectSkipped
+        expr: |
+          sum(increase(yuzu_server_policy_eval_errors_total{phase=~"collect_item|collect_target"}[1h])) > 0
+        for: 15m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Policy collect pass is skipping targets ({{ $value }} in 1h)"
+          description: >-
+            yuzu_server_policy_eval_errors_total{phase="collect_target"|"collect_item"}
+            incremented: evaluating a policy check response (or the response-store read behind it)
+            threw, so that target's or item's verdict was not recorded this cycle and its previous
+            status stands. Look in the server log for "policy_evaluator: ... skipped" lines (they
+            carry the policy id and, for a std::exception, its sanitised text; a non-std
+            exception line carries the policy id only), check Postgres health and memory
+            pressure, and remember the status shown for the affected devices may be stale.
+
+      # WP07: the server's boot-time check found the PostgreSQL database encoding is not UTF8.
+      # The gauge is per replica but the fact is per database (every replica shares one), so the
+      # alert groups by job only: one alert for the deployment, not one per replica. The check is
+      # WARN-ONLY (refusing to start is an undecided owner call), so this alert is
+      # the only thing that keeps the condition visible after the one-off log line scrolls away.
+      - alert: YuzuPgServerEncodingNotUtf8
+        expr: |
+          max by (job) (yuzu_pg_server_encoding_not_utf8) == 1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "The PostgreSQL database encoding is not UTF8 (reported by at least one {{ $labels.job }} server)"
+          description: >-
+            yuzu_pg_server_encoding_not_utf8 is 1: at start the server found the database
+            encoding is not UTF8. Postgres then does not reject invalid UTF-8 from agents, and
+            surfaces that re-serialise stored text with a strict JSON writer can throw. Create a
+            new database with ENCODING 'UTF8' and move the data (an existing database's encoding
+            cannot be changed); see server-admin.md "PostgreSQL database encoding". The gauge is
+            set once at start, so restart the server after the move.
+
       - alert: YuzuQuarantineGateServingStaleState
         expr: |
           sum(increase(yuzu_server_quarantine_gate_total{outcome="stale"}[10m])) > 0
@@ -4749,14 +4793,23 @@ groups:
             The dedicated Postgres reachability probe on {{ $labels.instance }}
             has failed for over 2 minutes; /readyz reports not ready with a
             `pg` reason (unreachable, stale, or read_only). Check the server log
-            for the "[readyz] Postgres not reachable" line (it carries the libpq
-            detail), the database, and the network or proxy path to it.
+            for the "[readyz] Postgres not reachable" line. For a connect failure it
+            carries a FIXED cause ("server not reachable", "authentication failed",
+            "no free connection slots" (slot exhaustion, the #4943 shape) or "no
+            writable host" (read-only or standby only)), never libpq's connect text,
+            which can quote part of a DSN password; for a failed probe query it
+            carries the failing step plus the first line of libpq's message (the libpq
+            portion is folded and capped at 120 bytes, the step name is added to it),
+            and a connect failure matching no fixed cause logs the step followed by
+            "(libpq details withheld)". Probe
+            from the server host with psql against the same DSN for more detail, check the
+            database, and the network or proxy path to it.
             read_only means the probe reached a server that refuses writes: a
             standby (check that the proxy routes to the current primary) or a
             primary with default_transaction_read_only on (often a full disk on
             managed Postgres). With a multi-host DSN (target_session_attrs=read-write)
             libpq refuses read-only hosts itself, so a cluster with no writable
-            host shows as unreachable, with the reason in the log line.
+            host shows as unreachable, with the fixed cause in the log line.
 
       - alert: YuzuPgConnectFailing
         # The pool's connect-failure breaker has armed — NEW pool connections

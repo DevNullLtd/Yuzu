@@ -132,6 +132,7 @@
 #include "offline_endpoint_store.hpp"
 #include "plugin_absence_confirmation.hpp"
 #include "pg/pg_collation_check.hpp"
+#include "pg/pg_server_encoding.hpp" // boot-time UTF8 database-encoding check (warn-only)
 #include "pg/pg_pool.hpp"
 #include "pg/pg_raii.hpp"
 #include "pg/secret_codec.hpp"
@@ -5704,6 +5705,19 @@ public:
                     spdlog::info("[PG] PostgreSQL substrate connected (pool size {})",
                                  pg_pool_->size());
                     pg_probe_ok = true;
+                    // WARN-ONLY (owner decision pending on refusing to boot): the strict JSON
+                    // dumps and PG's own invalid-UTF-8 rejection assume a UTF8 database.
+                    {
+                        std::string enc;
+                        const bool utf8 = pg::report_server_encoding(probe.get(), metrics_, &enc);
+                        if (!utf8)
+                            spdlog::error("[PG] database encoding is '{}', not UTF8: PostgreSQL "
+                                          "will not reject invalid UTF-8 from agents and strict "
+                                          "JSON serialisation of stored text can throw. Recreate "
+                                          "the database with ENCODING 'UTF8'. (Warning only; the "
+                                          "server keeps starting.)",
+                                          ::yuzu::log_key_token(enc));
+                    }
                 }
                 // The probe lease is released here. At start, before any store serves: compare the
                 // database's recorded collation version with the operating system's. Never stops

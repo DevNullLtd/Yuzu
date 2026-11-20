@@ -278,6 +278,8 @@ agent_test_exe = executable(
     'unit/test_confined_fs_win.cpp',
     'unit/test_string_utils.cpp',
     'unit/test_vuln_rules.cpp',
+    'unit/test_vuln_single_flight.cpp', # vuln_scan single-flight/cache helper cannot wedge (portable)
+    'unit/test_vuln_macos_software.cpp', # macOS enumeration status/abs-path contract (macos_software.hpp), portable
     'unit/test_vuln_config_checks.cpp', # #4961: pure config-check decisions over injected reads (vuln_scan config_checks.hpp), portable
     'unit/test_metrics.cpp',
     'unit/test_metrics_perf.cpp',
@@ -309,6 +311,7 @@ agent_test_exe = executable(
     'unit/test_dex_linux_proc.cpp',
     'unit/test_dex_macos_perf.cpp',
     'unit/test_dex_linux_journal.cpp',
+    'unit/test_session_log_fingerprint.cpp', # #8159: session id never logged raw
     'unit/test_dex_linux_kmsg.cpp',
     'unit/test_dex_linux_sysfs.cpp',
     'unit/test_dex_rate_limiter.cpp',
@@ -352,6 +355,7 @@ agent_test_exe = executable(
     'unit/test_netprobe_stats.cpp',
     'unit/test_antivirus_parsers.cpp',
     'unit/test_firewall_parsers.cpp',
+    'unit/test_ioc_parsers.cpp',  # #7710: exact hostname-column match of /etc/hosts (pure)
     'unit/test_disk_actions_local_dispatcher.cpp', # Wave 6 PR6.1-a-1: real disk_actions dylib/.so/.dll
     'unit/test_disk_actions_partitions.cpp', # H.5b: pure layer of the Windows partitions leg (runs on every host)
     'unit/test_firewall_local_dispatcher.cpp',
@@ -495,6 +499,7 @@ agent_test_exe = executable(
                                                 # attribution action driven end to end via LocalDispatcher
                                                 # (Darwin-only, self-gated) -- same shape as
                                                 # test_wave3_pr31_macos_actions.cpp
+    'unit/test_proc_access.cpp',              # WP13 UP14: /proc refusal tally (agents/shared/proc_access.hpp)
     'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
                                                 # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
@@ -704,6 +709,7 @@ agent_test_exe = executable(
     include_directories('../agents/plugins/netprobe/src'),   # netprobe_stats.hpp (pure helpers)
     include_directories('../agents/plugins/antivirus/src'),  # antivirus_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/firewall/src'),   # firewall_parsers.hpp (pure helpers)
+    include_directories('../agents/plugins/ioc/src'),        # ioc_parsers.hpp (pure helpers)
     include_directories('../agents/plugins/installed_apps/src'),  # installed_apps_registry_utf8.hpp (#1662 test)
     include_directories('../agents/plugins/disk_actions/src'), # disk_actions_legs.hpp (pure formatters)
     include_directories('../agents/plugins/printing/src'),  # printing_ipp.hpp / printing_parsers.hpp (pure helpers)
@@ -1585,6 +1591,7 @@ if build_server
       'unit/server/test_background_jobs.cpp',
       'unit/server/test_pg_retention_guard.cpp',
       'unit/server/test_pg_collation_check.cpp',
+      'unit/server/test_pg_server_encoding.cpp', # WP07: boot-time UTF8 database-encoding check (warn-only)
       'unit/server/test_pg_collation_recheck.cpp',
       'unit/server/test_audit_retention_rules.cpp',
       'unit/server/test_log_token.cpp',
@@ -3557,6 +3564,42 @@ test('qa-stack gateway crash signatures',
   suite: 'docs',
   timeout: 30,
 )
+# WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
+# fails closed, run against a stub trivy; plus lexical tripwires that every
+# release.yml publish job runs it before its push and pre-release.yml scans
+# every published image. Hermetic, no Docker; the bash cases skip on Windows.
+test('image vulnerability gate',
+  _python3_test,
+  args: [files('test_image_vuln_gate.py')],
+  suite: 'docs',
+  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
+  # limit of 60): many cases each run the gate script and a stub trivy.
+  timeout: 240,
+)
+
+# WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
+# outcomes x stop points x publish shapes runs release.yml's publish steps in
+# the workflow's order against a stub registry and checks the journal never
+# claims less than the registry holds; cross-attempt rows run the attach job;
+# step-reorder and script mutants must be killed. Cancels are delivered to the
+# step's PID only, as the Actions runner delivers them, and some rows wait out
+# a stall or a cancelled run, hence the timeout. Bash + PyYAML, no Docker.
+test('image publish journal',
+  _python3_test,
+  args: [files('test_image_publish.py')],
+  suite: 'docs',
+  timeout: 600,
+)
+
+# WP15/S9 (K14): scripts/ci/prune-buildcache.py, run by cache-prune.yml on the
+# release publish jobs' buildx type=local caches, removes only unreferenced
+# blobs and never leaves an index naming a removed blob. Synthetic layout.
+test('buildx cache prune',
+  _python3_test,
+  args: [files('test_prune_buildcache.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 
 # Release artifact gate (#5242): runs scripts/check-release-artifacts.sh
 # against a synthetic complete artifacts directory, then with each expected
@@ -3565,7 +3608,7 @@ test('release artifact gate',
   _python3_test,
   args: [files('test_check_release_artifacts.py')],
   suite: 'docs',
-  timeout: 60,
+  timeout: 120,
 )
 
 # Per-artifact SBOMs (supply-chain S8): scripts/ci/artifact-sbom.py, with syft
@@ -4466,6 +4509,25 @@ test('log handoff wiring lexical gate (#4666 PR-2 W3a)',
   timeout: 30,
 )
 
+# WP07: static lexical gate that every Echo diff source scrubs its identity strings at collection
+# (echo_plugin.cpp's scrub_wire_strings call sites); deleting one fabricates phantom events every
+# tick and no unit test can reach the anonymous helpers. Source text only, so Python, no build needed.
+test('Echo scrub-wiring lexical gate (WP07)',
+  _python3_test,
+  args: [files('test_echo_scrub_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
+# WP07: lexical pins for the agent's output-dropped counter increment and the server's boot call to
+# pg::report_server_encoding (neither is reachable from a unit test). Source text only.
+test('WP07 metrics wiring lexical gate',
+  _python3_test,
+  args: [files('test_wp07_metrics_wiring_lexical.py')],
+  suite: 'agent',
+  timeout: 30,
+)
+
 # #5291 / PR #6311: static lexical gate over Echo's Windows-only bounded hive-mount call site --
 # the module must be pinned before the first mount and the walk must stop mounting after a timeout
 # (a detached mount thread, abandoned or not, keeps running plugin code with nothing joining it).
@@ -4824,6 +4886,90 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13 F21: the installer sets no file capability and strips any it finds (lexical + executed
+# `--dry-run` with tool stubs + in-memory mutants; nothing runs as root).
+test('agent installer no file capabilities (WP13/F21)',
+  _python3_test,
+  args: [files('test_agent_installer_no_file_caps.py')],
+  suite: 'docs',
+  timeout: 90,
+)
+# WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
+test('proc access status lexical gate (WP13/UP14)',
+  _python3_test,
+  args: [files('test_proc_access_status_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: the shared C++ tokenizer used by the lexical gates: direct self-test of the shapes they
+# rely on (escaped-quote and raw strings, comment forms, #if 0 forms).
+test('cpp lex helper self-test (WP13)',
+  _python3_test,
+  args: [files('cpp_lex_helper.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that Linux set_start_mode judges the readback with start_mode_readback_matches, runs
+# it with stderr unmerged and reports the state (source-text only).
+test('services set_start_mode readback wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_services_readback_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that the Echo $Module drain passes the real file-version stamp (read from the open
+# image) into SigningCache (source-text only; nothing builds the Windows leg here).
+test('echo module signing wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_echo_module_signing_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
+# PluginLoader::scan and passes allowlist_required (source-text only, so Python).
+test('plugin allowlist startup wiring lexical gate',
+  _python3_test,
+  args: [files('test_plugin_allowlist_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F19: the root macOS agent must never exec Homebrew's user-owned brew (source-text only).
+test('installed_apps no-brew lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
+test('agent session id log wiring lexical gate',
+  _python3_test,
+  args: [files('test_agent_session_log_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# #8159: the session_fp -> session id join in scripts/lib/agent-session-fp.sh, on LF and CRLF fixtures.
+test('agent session fp shell join',
+  _python3_test,
+  args: [files('test_agent_session_fp_shell.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+# F56: yuzu_pg_canary prints a fixed cause on a connect failure, never libpq's text. Server-only.
+if is_variable('pg_canary_exe')
+  test('pg canary connect failure line',
+    _python3_test,
+    args: [files('test_pg_canary_connect_failure.py'), pg_canary_exe],
+    suite: 'docs',
+    timeout: 60,
+  )
+endif
+# WP04-X: the readiness probe's query-phase sites never use the connect classifier.
+test('pg probe query-phase classifier lexical gate',
+  _python3_test,
+  args: [files('test_pg_probe_query_phase_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #4160: pins the sso-only runtime-wiring check + provider gauges in ServerImpl (source-text only;
 # its own in-file selftest mutates each pinned statement, so no separate selftest entry).
 test('sso-only runtime wiring lexical gate',
@@ -5087,6 +5233,20 @@ if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# WP13/F52 EXECUTED refusal: the real yuzu-agent with a missing/empty/junk --plugin-allowlist must
+# log the refusal and exit non-zero without loading a plugin (the lexical test cannot see a lost
+# async log line or an exit code).
+if (_python3_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('agent plugin allowlist refusal (executed, WP13/F52)',
+    _python3_test,
+    args: [files('test_agent_allowlist_refusal_executed.py'), yuzu_agent_exe],
+    suite: 'agent',
+    timeout: 180,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
@@ -5193,7 +5353,7 @@ test('gateway peer restart-advice docs lint',
   _python3_test,
   args: [files('test_gateway_peer_restart_advice_lint.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
@@ -5330,6 +5490,21 @@ test('plugin init failed wiring lexical selftest',
   timeout: 30,
 )
 
+# vuln_scan never executes Homebrew's brew (the macOS agent is root; a Homebrew prefix is
+# user-owned). String-literal-aware lexical gate over agents/plugins/vuln_scan/src/**; the selftest
+# injects each evasion shape (URL-in-string, "br" "ew", .mm, absolute path) and requires RED.
+test('vuln_scan no-brew lexical',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('vuln_scan no-brew lexical selftest',
+  _python3_test,
+  args: [files('test_vuln_scan_no_brew_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 60,
+)
 # WP11: the processes / network_config bypass / installed_apps user_app rows are built by the
 # neutralising formatters at every site (best-effort lexical tripwire, self-checked in memory).
 test('plugin row formatters wiring lexical',

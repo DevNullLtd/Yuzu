@@ -8,6 +8,7 @@
 
 #include "hardware_routes.hpp"
 
+#include "mcp_jsonrpc.hpp"    // json_exceeds_depth, kMcpMaxJsonDepth
 #include "result_parsing.hpp" // columns_for_plugin, split_fields
 #include "web_utils.hpp"      // html_escape, agent_error_display
 
@@ -264,7 +265,9 @@ std::string render_output_table_from_json_array(const nlohmann::json& arr) {
         for (const auto& k : keys) {
             std::string v;
             if (row.is_object() && row.contains(k) && !row.at(k).is_null())
-                v = row.at(k).is_string() ? row.at(k).get<std::string>() : row.at(k).dump();
+                v = row.at(k).is_string() ? row.at(k).get<std::string>()
+                                           : row.at(k).dump(-1, ' ', false,
+                                                            nlohmann::json::error_handler_t::replace);
             h += "<td>" + html_escape(v) + "</td>";
         }
         h += "</tr>";
@@ -276,14 +279,20 @@ std::string render_output_table_from_json_array(const nlohmann::json& arr) {
 std::string render_action_output(const std::string& plugin, const std::string& output) {
     if (output.empty())
         return "<div class=\"gp-mute\">(no output)</div>";
-    auto parsed = nlohmann::json::parse(output, nullptr, false);
+    // F7: `output` is agent-supplied. dump() recurses once per nesting level and a
+    // sub-1-MiB `[[[[...` overflows the stack, so deep input never reaches the
+    // parser; it falls through to the plain-text rendering below.
+    const bool too_deep = yuzu::server::mcp::json_exceeds_depth(
+        output, yuzu::server::mcp::kMcpMaxJsonDepth);
+    auto parsed = too_deep ? nlohmann::json(nlohmann::json::value_t::discarded)
+                           : nlohmann::json::parse(output, nullptr, false);
     if (!parsed.is_discarded()) {
         if (parsed.is_array()) {
             std::string tbl = render_output_table_from_json_array(parsed);
             if (!tbl.empty())
                 return tbl;
         }
-        return "<pre>" + html_escape(parsed.dump(2)) + "</pre>";
+        return "<pre>" + html_escape(parsed.dump(2, ' ', false, nlohmann::json::error_handler_t::replace)) + "</pre>";
     }
     // Not JSON — try the pipe-delimited plugin-output convention.
     const auto& cols = columns_for_plugin(plugin);

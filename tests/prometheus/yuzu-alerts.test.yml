@@ -10923,3 +10923,83 @@ tests:
       - expr: 'ALERTS{alertname="YuzuCrlSourceResolverBusy", alertstate=~"firing|pending"}'
         eval_time: 17m
         exp_samples: []
+
+  # CASE WP07-A -- a sustained stream of skipped collect targets fires YuzuPolicyCollectSkipped.
+  - interval: 1m
+    name: policy collect skipped - a sustained skip fires
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="collect_target"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE WP07-B -- the other phases of the same counter (dispatch, claim, ...) are NOT this alert.
+  - interval: 1m
+    name: policy collect skipped - other phases stay quiet
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="dispatch"}'
+        values: "0+1x120"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples: []
+
+  # CASE WP07-C -- a counter that is pre-seeded at 0 and then increments (the first skip) fires.
+  # Without the pre-seed the series would be born at 1 and increase() would see no increase.
+  - interval: 1m
+    name: policy collect skipped - the first skip after a pre-seeded 0 fires
+    input_series:
+      - series: 'yuzu_server_policy_eval_errors_total{job="yuzu",instance="s1",phase="collect_item"}'
+        values: "0x20 1x100"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing"}'
+        eval_time: 45m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPolicyCollectSkipped", alertstate="firing", severity="warning"}'
+            value: 1
+
+  # CASE WP07-D -- the encoding gauge at 1 fires YuzuPgServerEncodingNotUtf8; at 0 it stays quiet.
+  - interval: 1m
+    name: pg server encoding - not UTF8 fires
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "1x30"
+    promql_expr_test:
+      # Still inside `for: 5m`: pending, not firing (catches a `for: 0m` regression).
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 3m
+        exp_samples: []
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
+
+  - interval: 1m
+    name: pg server encoding - UTF8 stays quiet
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "0x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples: []
+
+  # CASE WP07-E -- two replicas of one deployment share ONE database, so both reporting 1 is ONE alert.
+  - interval: 1m
+    name: pg server encoding - two replicas report one alert
+    input_series:
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s1"}'
+        values: "1x30"
+      - series: 'yuzu_pg_server_encoding_not_utf8{job="yuzu",instance="s2"}'
+        values: "1x30"
+    promql_expr_test:
+      - expr: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing"}'
+        eval_time: 10m
+        exp_samples:
+          - labels: 'ALERTS{alertname="YuzuPgServerEncodingNotUtf8", alertstate="firing", job="yuzu", severity="warning"}'
+            value: 1
