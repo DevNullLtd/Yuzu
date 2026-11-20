@@ -46,7 +46,9 @@ set -euo pipefail
 
 SOFT_EXIT=1   # flipped 0->1 when #1320 PR 1 shipped the [pg] test suites
 
-# Same pinned multi-arch image as deploy/docker/Dockerfile.postgres's base.
+# PostgreSQL 18.4 on bookworm, pinned multi-arch. Deliberately NOT moved with
+# deploy/docker/Dockerfile.postgres's base (18.6 since WP15/S9): this is the
+# persistent CI test server, and moving it is a separate change.
 PG_IMAGE="postgres:18.4-bookworm@sha256:efef99e1558f86089bc84bece29208c0777a185ff717ec7fa288a652ce2d0adf"
 CONTAINER="yuzu-ci-postgres"
 DOCKER_PORT=15432

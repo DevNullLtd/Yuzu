@@ -11,6 +11,23 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## ⚠️ Breaking: some log lines and audit details changed shape (log parsers and runbooks)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: anything that parses the server or agent logs, a runbook that sends on-call to a log line for Postgres detail, and a SIEM rule keyed on a changed string. Alert expressions and metric names are unchanged (alert annotation text changed).
+
+**What changed.**
+
+- **The agent's registration line** is now `Registered with server (session_fp=<8 hex>, enrollment=...)`. It was `(session=<id>, enrollment=...)`. The fingerprint is the first 8 hex of the SHA-256 of the session id, which is a bearer credential; this build's agent logs only the fingerprint. A parser that took `session=` from this line must take the id from the server's `[gateway] ProxyRegister succeeded: agent=<id>, session=<id>` line (or the gateway route table) and match on the fingerprint; the bundled UAT and HA scripts do. <!-- tripwire-allow: upgrade note quotes the old line -->
+- **Postgres connect-phase failures** (only the connect step; errors after a connection exists, for example in a store query, still print libpq's text unfolded, as before; #5964 tracks neutralising it) (the pool's `PgPool: connection attempt failed:` line, the leader elector's `dedicated connection failed:` line, the `[readyz] Postgres not reachable` line, `yuzu_pg_canary`) now log one of a fixed set of causes (`authentication failed ...`, `server not reachable ...`, `connection timed out`, and so on) instead of libpq's text, and `PgPool::last_error()` returns the same cause. Host, port and database name are no longer printed. Diagnose with `psql` against the same DSN and the PostgreSQL server log. The `YuzuServerPostgresUnreachable` alert is unchanged; its annotation now says this.
+- **`auth.saml_login_failed` audit detail** (and the matching analytics event field) is the rejection reason with control and C1 characters folded, `;` and `=` replaced by `_`, and clipped to its first 128 bytes with no truncation marker; it used to be the raw text. The server log line for the same failure keeps up to 256 bytes. A SIEM rule that matches a rejection reason in this detail must match the first 128 bytes of the folded text (a long reason is cut and `;`/`=` inside it read as `_`), or key on `action=auth.saml_login_failed` instead and read the server log for the full text.
+- **Other audit detail values** that pass through the shared detail sanitiser (OIDC and SAML `display=`, `email=` and subject values, `idp error:`, and the MCP and REST denial details) now also fold C1 controls (U+0080-U+009F), U+2028 and U+2029 to `_`. Values without those characters are unchanged.
+- **Login and SSO log lines** that print a user name or NameID (`Auth failed: unknown user '...'`, `Login blocked ...`, `SAML session created ...`, `SamlProvider: assertion accepted (name_id=...)` and similar) now fold control characters, C1 controls and Unicode line separators to `_` in the printed copy; stored values are unchanged.
+- **`audit_token` and `log_key_token`** now fold every well-formed C1 code point (U+0080-U+009F), not just NEL.
+
+**What to do.** Update log parsers and runbooks as above. No data migration.
+
 ## Behaviour change: the Windows agent carries the Visual C++ runtime, and its installer installs five more plugins (0.16.0)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
@@ -231,6 +248,25 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 **What to do.** Treat not found on an execution you dispatched with another credential as "not yet" until an in-scope agent has replied, or read it with the credential that dispatched it. Bound the poll: every not-found answer to a service-scoped token writes a `denied` audit row (`execution.detail.fetch` for the REST detail route, `execution.read` for the legacy routes and the children routes, `api.v1.events.subscribe`, `execution.live_subscribe`, `execution.detail.view` for the detail fragment, and `mcp.get_execution_status` for the MCP tool), one per request and with no throttle (a throttle is tracked as #7818), so poll no faster than about once every 5 seconds and stop after a timeout. Do not derive the poll interval from a visible execution's 2 s hint (`retry_after_ms` on the MCP `get_execution_status` result of a still running execution): a not-found answer carries none. An execution whose targets are all outside the service scope never becomes visible to the token (no in-scope agent ever has a status row for it), so the poll timeout is what ends such a poll. A SIEM rule on those denied verbs can false-positive on a legitimate poller; exclude the token's principal or alert on a rate rather than on a single row. The minting account's own dispatches no longer reach a service-scoped token, so the earlier advice to mint it from an account that only dispatches inside the service scope no longer applies. Expect the new refusal counter to stay at zero; a non-zero value means a credential row or the server needs investigating. For `site="engine_entry"` (the `403`), find the credential from the audit row's principal, revoke it and create a new one (or revoke and re-create the engine principal), and investigate how the row came to carry a service scope, because minting refuses that combination. The `403` message text still reads `permission denied: <permission>` and so names the pair although no grant of it admits the caller; the body carries no `permission` field, and granting the permission does not help. For `site="postcondition"` (the non-retryable `500`) there is no credential to fix: the server logged a `critical` line and wrote a `failure` audit row for the principal, so capture both and report a defect.
 
 **Rolling upgrade.** The rule is applied per replica, so a replica that has not been upgraded still shows a service-scoped token its minting account's executions, and a client can see the old and the new answer on consecutive requests; finish the roll promptly. An old replica does not expose the new refusal counter, so its series is absent rather than zero: run `up{job=~"<server job regex>"} == 1 unless on(instance) count by (instance) (yuzu_server_authz_service_scope_unrestricted_refused_total)` to find any scraped replica that has not been upgraded (a replica that is down also lacks the series, and `up == 1` does not list it, so check the replica's health separately).
+
+## Behaviour change: malformed agent data is contained per device (WP07)
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
+**In short.** Affected: everyone who runs policies or reads result rows. To do: nothing; read "Known limits" for the limits.
+
+**What the server does.** A policy check response nested past the depth guard, whose evaluation throws, or whose compliance expression fails to evaluate scores that device `error` (the check result carries `{"reason":"unevaluable_response"}` when evaluation threw) and increments `yuzu_server_policy_unevaluable_responses_total{reason="depth|exception|expression"}`; the collect pass carries on with every other device, and each target is its own failure domain. A numeric JSON value in a row is compared as text (`{"hostname":1}` reads as `"1"`). The Hardware action-result fragment renders over-deep agent JSON as plain text. The shared `/events` SSE stream treats a bare CR, CRLF and LF as one line break, and result rows lose every embedded carriage return.
+
+**What the agent does.** The agent daemon replaces non-UTF-8 bytes in plugin output with `?`, scrubs plugin `heartbeat.*` tag values the same way, and Echo scrubs the identity strings of its snapshot-diff sources, its fleet snapshot and its module-load rows at collection (its cursor-based sources keep their own codecs, replacing or allowlisted values only; removable-media events, the macOS nstat connection stream, the start-up and history backfills and the network-quality rows are stored as collected and are not scrubbed, so they can hold raw path or process-name bytes in `echo.db`).
+
+**Known limits.**
+- Filesystem plugin path bytes are not escaped upstream (#6480): the host scrub turns them into `?`, so a name with an invalid byte reads with `?` in it.
+- An exception in one Echo collect leg can skip the later legs of that fast tick (per-leg isolation is not done).
+- A device that persistently sends an unevaluable policy response scores `error` at every interval; nothing quarantines it or backs off (tracked in #8179).
+- The SSE per-connection queue is capped by event count, not bytes (#2235), so one very large agent-supplied row occupies a slot at full size.
+- The result-set matcher keeps carriage returns in cell text on purpose (it decides result-set membership); see `docs/scope-walking-design.md`.
+- **A non-UTF8 PostgreSQL database.** The server only WARNS at start (log line, gauge `yuzu_pg_server_encoding_not_utf8` = 1, alert `YuzuPgServerEncodingNotUtf8`); it does not refuse to start. On such a database Postgres does not reject invalid UTF-8 agent text; see [server-admin.md](server-admin.md#postgresql-database-encoding).
+- **Where to see the signals.** A command whose plugin output was lost to an allocation failure reports `constrained`/`partial` (provenance `host:output_dropped`); the agent also reports the heartbeat tag `yuzu.output_dropped` and keeps the agent-local counter `yuzu_agent_plugin_output_dropped_total` (neither has a server rollup). Skipped policy targets raise `YuzuPolicyCollectSkipped`.
 
 ## Behaviour change: MCP `execute_instruction` progress follows the caller's `Execution:Read` scope (#7817)
 
@@ -706,6 +742,44 @@ This describes the build in a fresh deployment (see "Deployment contract (hard c
 - **What changed:** the Windows agent now reports the `pkg_inventory` Windows legs in its daily installed-software sync. Each Windows endpoint adds `appx` rows (every Store and inbox app registered for all users, roughly 100-300 rows per host, inbox apps included), `chocolatey` rows (one per Chocolatey package, plus a presence row) and a `winget` presence row.
 - **Affected:** per-device software counts and the `/software` catalogue for Windows devices rise, and a saved filter on `ecosystem` or "Found by" now also matches the new rows. A client that validates `ecosystem` against a fixed list (the MCP `get_crypto_libraries` tool refuses an unknown value) must add `chocolatey`, `winget` and `appx`.
 - **Not affected:** per-user Store packages and anything winget itself installed are not collected. Servers need no setting; the server learns the three ecosystems from its own build, so bring up every server replica before the agents of the same build enroll.
+
+## Upgrade note: the `yuzu-postgres` image moves to PostgreSQL 18.6, and published images take current packages
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying an existing database forward.
+
+The `yuzu-postgres` image (and `yuzu-postgres-ha`, which is built on it) moves from PostgreSQL
+18.4 to 18.6, which carries the server security fixes released after 18.4. There was no 18.5:
+PostgreSQL withdrew it before release.
+
+- **Fresh database only.** Deploy this build's `yuzu-postgres` image on a freshly provisioned data
+  volume, as the deployment contract requires. A volume written by the v0.15.0 image or by any
+  earlier build is a database written by an earlier build: this page describes no in-place
+  upgrade of it. The same holds for a `yuzu-postgres-ha` cluster, which is provisioned fresh, so
+  there is no replica-by-replica procedure to follow.
+- **When the new image is used.** The composes pin `yuzu-postgres:${YUZU_VERSION:-X.Y.Z}`, so the
+  18.6 image arrives with the rest of this release when `YUZU_VERSION` (or the compose default)
+  names it. A deployment pinned to an earlier tag keeps that tag's image.
+- **Collation.** The image stays on Debian bookworm with glibc 2.36 and ICU 72, so a database it
+  initialises records the collation version `2.36` and the collation check
+  ([server-admin.md](server-admin.md#postgresql-collation-version)) reports `ok`. The image build
+  fails if a package update would move libc6 off glibc 2.36 or ICU off 72; a change of sort data
+  within glibc 2.36 is not visible to that check or to the build (item (11) of that section's
+  "What this does not cover").
+- **Returning to an earlier image** is not supported (see "Deployment contract (hard cutover)").
+
+Every image the release publishes now takes its distribution's security updates when it is built
+(`apt-get upgrade` / `apk upgrade`; the chisel images cut their slices from the current archive),
+except the PostgreSQL packages in `yuzu-postgres`, which stay at the pinned minor until the
+image's base is moved to a newer one. The release refuses to push an image that has a CRITICAL
+vulnerability with a fix available, as far as its scanner can see it, or whose operating-system
+release it cannot show the scanner has advisory data for (end of life, a pre-release or rolling
+release, or a distribution other than Debian, Ubuntu and Alpine): the OS packages of the four
+chiselled images,
+PostgreSQL itself, the gateway's Erlang/OTP runtime and the statically linked server and agent
+binaries are not covered (see
+[release-verification.md](release-verification.md#image-vulnerability-scan-before-publishing)).
+Nothing needs configuring.
+
 ## Upgrade note: the server now requires a `revocation_source_store` schema (CRL sources, ADR-0070 R1)
 
 This release adds the registered-CRL-source store (`/api/v1/crypto/revocation-sources`). It is
