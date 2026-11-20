@@ -14,7 +14,10 @@
  *    the far side of a network mount fails the access assertions (the fake leg erases pruned entries
  *    exactly as the real search leg does and records what was listed and opened).
  *  - refused rows: emitting one twice, with another reason, or not counting it into the verdict fails the
- *    refused cases; treating a refused mount's appearance as the end of the search fails the churn case.
+ *    refused cases; treating a refused mount's appearance as the end of the search fails the churn case;
+ *    the macOS data volume under '/' stated as not_searched instead of partial fails the macOS case.
+ *  - resumed root: a resumed slice whose unit root cannot be listed that ends with a cursor, no gap, or a
+ *    complete verdict fails the resumed-root case.
  *  - single flight: the busy answer calling the runner or touching the state, or a release by anything but
  *    the slice that took the slot, fails the busy, late-completion and two-abandoned cases.
  *  - stall: a timeout not recorded as abandoned, a volume read as stalled after its worker returned, or a
@@ -702,6 +705,29 @@ TEST_CASE("file_search driver: with no searchable mount in scope the answer is p
     CHECK(rig.runner_calls == 0);
 }
 
+TEST_CASE("file_search driver: on macOS a search from '/' reports the data volume as partial through the firmlinks, never not_searched",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.b.os = Os::macos;
+    rig.mounts = Mounts{};
+    rig.mounts.add("/", "apfs", "1:1", "/", "/dev/disk3s1s1").add("/System/Volumes/Data", "apfs", "1:2", "/", "/dev/disk3s5");
+    rig.fs.dirs["/"] = {{"Users", Type::dir}};
+    rig.fs.add_dir("/Users");
+    rig.fs.add_dir("/Users/alex");
+    rig.fs.add_file("/Users/alex/yuzu-fs-control-1.bin", "");
+    const Run run = search(rig, kCtl, "/");
+    CHECK(run.slices.size() == 1);
+    CHECK(run.last().status == Status::ok);
+    CHECK(run.last().cursor.empty());
+    CHECK(found(run) == Strs{"/Users/alex/yuzu-fs-control-1.bin"}); // reached through the system volume, once
+    CHECK(count_rows(run, "volume|/System/Volumes/Data|apfs|partial|firmlinks_only|") == 1);
+    CHECK(count_rows(run, "volume|/System/Volumes/Data|") == 1);
+    CHECK(row_of(run.last(), "volume|/|").find("volume|/|apfs|complete|none|") == 0); // the '/' unit itself
+    CHECK_FALSE(complete(run)); // the refused row is still carried into the verdict
+    CHECK(starts(row_of(run.last(), "coverage|"), "coverage|partial|"));
+    CHECK(std::ranges::find(rig.fs.listed, "/System/Volumes/Data") == rig.fs.listed.end());
+}
+
 // ---- single flight, stall and abandonment ----
 
 TEST_CASE("file_search driver: a second concurrent slice answers busy without calling the runner or touching state",
@@ -1225,6 +1251,34 @@ TEST_CASE("file_search driver: a refused mount appearing between slices is repor
     CHECK(three.cursor.empty());
     CHECK(count_rows(Run{{three}}, "volume|/r/tmpx|") == 0); // not re-emitted: the set did not change again
     CHECK_FALSE(starts(row_of(three, "coverage|"), "coverage|complete|"));
+}
+
+TEST_CASE("file_search driver: a resumed slice whose unit root can no longer be listed completes with one gap and a partial verdict",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    for (int i = 0; i < 4; ++i) {
+        rig.fs.add_file("/r/a/yuzu-fs-control-a" + std::to_string(i) + ".bin", "");
+        rig.fs.add_file("/r/b/yuzu-fs-control-b" + std::to_string(i) + ".bin", "");
+    }
+    rig.b.limits.max_entries = 3; // the first slice stops inside the unit
+    const SliceResult one = run_slice(make_request(kCtl), rig.b);
+    REQUIRE(one.status == Status::ok);
+    REQUIRE_FALSE(one.cursor.empty());
+    const auto cursor = decode_volume_cursor(one.cursor, fsr::query_hash(make_request(kCtl).query));
+    REQUIRE(cursor.has_value());
+    REQUIRE_FALSE(cursor->inner.position == fsr::Position{}); // a position inside the unit, not a fresh start
+
+    rig.fs.dirs.erase("/r"); // replaced by something unreadable between the slices
+    const SliceResult two = run_slice(make_request(kCtl, "/r", "files", one.cursor), rig.b);
+    CHECK(two.status == Status::ok);
+    CHECK(two.reason == "none");
+    CHECK(two.cursor.empty()); // the slice completed, so the search is finished
+    CHECK(count_rows(Run{{two}}, "match|") == 0);
+    CHECK(count_rows(Run{{two}}, "gap|") == 1);
+    CHECK(row_of(two, "gap|") == "gap|/r|dir_unreadable");
+    CHECK(row_of(two, "volume|").find("volume|/|ext4|complete|none|") == 0);
+    CHECK(starts(row_of(two, "coverage|"), "coverage|partial|"));
+    CHECK(starts(row_of(two, "search|"), "search|ok|none|"));
 }
 
 TEST_CASE("file_search driver: lost-response replays and a throwing slice leave a verdict that depends only on the issued cursors",

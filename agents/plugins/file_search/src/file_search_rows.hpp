@@ -80,14 +80,8 @@ static_assert(fsr::kMaxGaps * (3 * kMaxGapPathBytes + 64) +
                   kTailReserveBytes,
               "the tail of a slice must fit its reserve in the worst case");
 
-/// What the match and extents rows may use.
+/// What the match and extents rows may use: the `max_bytes` of the driver's RowByteBudget.
 inline constexpr std::size_t kMatchRowBudget = kSliceRowBytes - kTailReserveBytes;
-
-/// True once one more match with its extents might not fit kMatchRowBudget: the byte cap the walker is
-/// given as its second row cap, so the slice ends BEFORE a row would overflow and never drops one.
-[[nodiscard]] constexpr bool match_budget_full(std::size_t bytes_used) noexcept {
-    return bytes_used + 2 * kMaxMatchRowBytes > kMatchRowBudget;
-}
 
 // ---- scope tag ----
 

@@ -26,6 +26,7 @@
 
 #include <file_search_coverage.hpp>
 #include <file_search_governor.hpp>
+#include <row_byte_budget.hpp>
 
 #include <algorithm>
 #include <chrono>
@@ -250,10 +251,16 @@ TEST_CASE("file_search rows: a gap path over the bound is counted, never emitted
 
 TEST_CASE("file_search rows: the byte budget leaves a reserve a row can never overflow",
           "[file_search][file_search_rows]") {
-    CHECK_FALSE(match_budget_full(0));
-    CHECK_FALSE(match_budget_full(kMatchRowBudget - 2 * kMaxMatchRowBytes));
-    CHECK(match_budget_full(kMatchRowBudget - 2 * kMaxMatchRowBytes + 1));
-    CHECK(match_budget_full(kMatchRowBudget));
+    // The driver's test for "one more match with its extents might not fit": the walker's second row cap.
+    const auto full_at = [](std::size_t used) {
+        const yuzu::shared::RowByteBudget budget{.max_bytes = kMatchRowBudget, .bytes = used};
+        return !budget.fits(2 * kMaxMatchRowBytes, 0);
+    };
+    CHECK_FALSE(full_at(0));
+    CHECK_FALSE(full_at(kMatchRowBudget - 2 * kMaxMatchRowBytes));
+    CHECK(full_at(kMatchRowBudget - 2 * kMaxMatchRowBytes + 1));
+    CHECK(full_at(kMatchRowBudget));
+    CHECK(full_at(kMatchRowBudget + 1)); // an overcharged budget reads full, never wraps
     CHECK(kMatchRowBudget + kTailReserveBytes == kSliceRowBytes);
 }
 

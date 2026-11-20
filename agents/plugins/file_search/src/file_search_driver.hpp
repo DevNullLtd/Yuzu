@@ -40,6 +40,7 @@
 
 #include <file_search_coverage.hpp>
 #include <file_search_governor.hpp>
+#include <row_byte_budget.hpp>
 
 #include "component_walk.hpp"
 #include "file_search_extents.hpp"
@@ -204,7 +205,7 @@ struct DirTally {
             return list(dir, cap);
         };
 
-        std::size_t bytes = 0;
+        yuzu::shared::RowByteBudget budget{.max_bytes = kMatchRowBudget}; // the match and extents rows of this slice
         std::unordered_map<std::string, DirTally> per_dir;
         const auto add_gap = [&out](std::string path, fsr::GapCause cause) {
             if (!gap_path_fits(path) || out.gaps.size() >= fsr::kMaxGaps)
@@ -260,13 +261,18 @@ struct DirTally {
                 add_gap(full, fsr::GapCause::name_too_long); // cannot be reported within the row bound
                 return false;
             }
-            bytes += row.size() + 1 + (extents_row.empty() ? 0 : extents_row.size() + 1);
+            budget.add(row.size() + 1 + (extents_row.empty() ? 0 : extents_row.size() + 1),
+                       extents_row.empty() ? 1 : 2);
             out.rows.push_back(std::move(row));
             if (!extents_row.empty())
                 out.rows.push_back(std::move(extents_row));
             return true;
         };
-        const std::function<bool()> rows_full = [&] { return match_budget_full(bytes) || (in.stop && in.stop()); };
+        // Full once one more match with its extents might not fit the budget: the walker's second row cap,
+        // so the slice ends BEFORE a row would overflow and never drops one.
+        const std::function<bool()> rows_full = [&] {
+            return !budget.fits(2 * kMaxMatchRowBytes, 0) || (in.stop && in.stop());
+        };
 
         out.walk = ci::walk_ordered(in.walk_root, in.resume, in.walk, ops, gov.deadline(), visit,
                                     ci::kMaxOrderedRetainedBytes, rows_full);
@@ -282,7 +288,9 @@ struct DirTally {
     fsr::VolumeCoverage v;
     v.mount_point = r.mount_point;
     v.fstype = r.fstype;
-    v.state = fsr::VolumeState::not_searched;
+    // A macOS data volume under "/" is searched through the firmlinks of the system volume, so its row says
+    // partial; every other refused mount is never searched.
+    v.state = r.reason == fsr::Reason::firmlinks_only ? fsr::VolumeState::partial : fsr::VolumeState::not_searched;
     v.reason = r.reason;
     return v;
 }
