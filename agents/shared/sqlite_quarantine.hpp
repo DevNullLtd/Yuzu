@@ -56,8 +56,10 @@
 /// the file, and a copy that fails part-way has its partial file removed, with no identity check
 /// between those steps. A file a third party puts at that name inside the gap may be overwritten
 /// by the copy on a standard library that does not create its destination exclusively, and one put
-/// there after a failed copy and before the removal is removed with it; both need write access to
-/// the data directory.
+/// there after a failed copy and before the removal is removed with it. The same gap admits a link
+/// (dangling or hard) or an empty directory put at the name: a non-exclusive copy writes through a
+/// link, and the removal acts on whatever regular file is there by name. All of it needs write
+/// access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
@@ -427,8 +429,14 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         bool copy_ran = false;
         if (is_regular_file_no_follow(side)) {
             std::error_code dec;
-            if (fs::symlink_status(side_dest, dec).type() != fs::file_type::not_found) {
-                cec = std::make_error_code(std::errc::file_exists);
+            const auto dest_status = fs::symlink_status(side_dest, dec);
+            if (dest_status.type() != fs::file_type::not_found) {
+                // Something is at the name, or it could not be examined: either way it is not
+                // ours to write or remove. An examination that failed outright (type none) says
+                // so rather than reporting a file that may not exist.
+                cec = fs::status_known(dest_status)
+                          ? std::make_error_code(std::errc::file_exists)
+                          : (dec ? dec : std::make_error_code(std::errc::io_error));
             } else {
                 cec.clear();
                 copy_ran = true;
