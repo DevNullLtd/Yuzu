@@ -9976,6 +9976,15 @@ The `quarantine` plugin's Windows/Linux/macOS `netsh`/`iptables`/`pfctl` invocat
 
 > **Fresh deployment only for 0.15.0.** See the banner at the top of this page: the steps below are not a supported upgrade, rollback or restore path for an earlier build's database or backups (see "Deployment contract (hard cutover)" in the Forensics section of this page).
 
+### `component_inventory` plugin: a new action, `native`, that ships switched off
+
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page); it is not a procedure for carrying a fleet forward.
+
+- **What changed:** the `component_inventory` plugin (1.1.0) has a second action, `native`, instruction `crossplatform.components.native`. It lists the versioned shared libraries (ELF `.so` on Linux, Mach-O `.dylib` on macOS) shipped inside applications, at most 5,000 rows, read in-process with no subprocess. Windows answers one `unsupported` status row (`windows:planned`). The first action, `scan`, is unchanged.
+- **It ships switched off:** at boot the server writes an action-level kill-switch row for `component_inventory.native`, disabled, and refuses the action until an operator enables it. Enable it with `PUT /api/v1/plugin-config/component_inventory/kill-switch` and `action` set to `native` (`enabled` true). `scan` is a separate row and stays on. A restart never overwrites an operator's own setting, in either direction.
+- **Affected:** an operator or automation that expects `native` to answer on a fresh server gets the dispatch refusal until the row is lifted. Nothing else changes for the fleet: no daily report carries these rows, and the action runs only when it is dispatched.
+- **What it costs when on:** one run walks `/opt` and `/usr/local/lib` (Linux) or `/Applications`, `/usr/local` and `/opt/homebrew` (macOS) for up to 400,000 directory entries or 45 seconds, and reads only the header of each library it finds. The package manager's own trees are not read. `native` publishes no heartbeat cost counters.
+
 ## Rollback
 
 A return to an earlier build is outside the "Deployment contract (hard cutover)" in the Forensics section of this

@@ -329,6 +329,22 @@ std::vector<std::string> candidate_roots() {
 #endif
 }
 
+std::vector<std::string> native_candidate_roots() {
+#if defined(__APPLE__)
+    return {"/Applications", "/usr/local", "/opt/homebrew"};
+#else
+    return {"/opt", "/usr/local/lib"};
+#endif
+}
+
+std::vector<std::string> native_excluded_dirs() {
+#if defined(__APPLE__)
+    return {"/usr/local/Cellar", "/opt/homebrew/Cellar"};
+#else
+    return {};
+#endif
+}
+
 Targets plan_targets(const std::vector<std::string>& candidates, const std::vector<std::string>& network_mount_points,
                      bool table_ok) {
     Targets t;
@@ -378,6 +394,10 @@ Targets scan_targets(const std::vector<std::string>& candidates, const MountTabl
 
 Targets scan_targets() {
     return scan_targets(candidate_roots(), read_network_mounts);
+}
+
+Targets scan_native_targets() {
+    return scan_targets(native_candidate_roots(), read_network_mounts);
 }
 
 FsOps make_fs_ops(const Targets& targets, AccessLog on_access) {

@@ -15,7 +15,8 @@
 # and a non-loopback --dashboard also needs --allow-remote; the runner's --help
 # has the full rules and the side effects),
 # server-internal (catalog-only definitions the dispatch chokepoint denies, so they
-# cannot pass),
+# cannot pass), default-off (an action the server boot-seeds kill-switched: refused until
+# an operator enables its kill switch, then broadcast like a safe row),
 # interactive, and network-disrupt (the firewall containment actions: --risks network-disrupt
 # runs scripts/test/instructions_firewall_containment.py against --target-agent-id, the disposable
 # agent on this host, instead of dispatching them; see that script for its guards).
@@ -92,10 +93,13 @@ Optional:
                            runner takes them space-separated)
                            (default: safe,mutating; choices: safe, mutating,
                            destructive, forensic, server-internal,
-                           network-disrupt, interactive; destructive and
+                           network-disrupt, interactive, default-off;
+                           destructive and
                            forensic need --target-agent-id, --confirm-target,
                            --run-id and --params-override, and
-                           server-internal cannot pass; network-disrupt
+                           server-internal cannot pass; default-off passes
+                           only once an operator has enabled the action's
+                           kill switch on the stack; network-disrupt
                            runs alone, as the firewall containment
                            ceremony against --target-agent-id)
   --target-agent-id ID     the id of the one connected agent sent as the target
