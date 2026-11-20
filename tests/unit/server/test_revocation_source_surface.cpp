@@ -24,6 +24,7 @@
 #include "openapi_spec_access.hpp"
 #include "revocation_source_admin_gate.hpp"
 #include "revocation_source_routes.hpp"
+#include "pg/pg_raii.hpp"
 #include "revocation_source_store.hpp"
 #include "step_up_policy.hpp"
 
@@ -36,10 +37,12 @@
 #include "bounded_resolver.hpp"
 
 #include <catch2/catch_test_macros.hpp>
+#include <libpq-fe.h>
 #include <catch2/matchers/catch_matchers_string.hpp>
 
 #include <algorithm>
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <memory>
 #include <mutex>
@@ -166,8 +169,35 @@ struct Fx {
     auto rest_delete(std::int64_t id) {
         return h.sink.Delete(std::string(kBase) + "/" + std::to_string(id));
     }
-    auto rest_reset(std::int64_t id, const std::string& body = "{}") {
+    /// A reset body naming every key the source holds now (so none is removed) at its current
+    /// config_version: the two members #6590 made REQUIRED, filled in where a test did not set
+    /// them so the case under test stays about what it names. `rest_reset_raw` sends the body
+    /// exactly as given.
+    json with_reset_preconditions(std::int64_t id, json b) {
+        if (!b.is_object())
+            return b;
+        const auto cur = store.get(id);
+        if (!b.contains("expected_config_version"))
+            b["expected_config_version"] = cur ? cur->config_version : 1;
+        if (!b.contains("keep_key_sha256")) {
+            json keys = json::array();
+            if (cur)
+                for (const auto& k : cur->keys)
+                    keys.push_back(k.cert_sha256);
+            if (keys.empty())
+                keys.push_back(std::string(64, 'a'));
+            b["keep_key_sha256"] = keys;
+        }
+        return b;
+    }
+    auto rest_reset_raw(std::int64_t id, const std::string& body) {
         return h.sink.Post(std::string(kBase) + "/" + std::to_string(id) + "/reset-high-water", body);
+    }
+    auto rest_reset(std::int64_t id, const std::string& body = "{}") {
+        const auto j = json::parse(body, nullptr, false);
+        if (j.is_discarded() || !j.is_object())
+            return rest_reset_raw(id, body);
+        return rest_reset_raw(id, with_reset_preconditions(id, j).dump());
     }
 
     /// Register a source straight through the service (setup that is not under test).
@@ -482,6 +512,7 @@ TEST_CASE("revocation source validation: URL syntax", "[revocation_source][pg]")
         const auto v = fx.svc.validate_registration(with_url("HTTPS://CRL.Example.COM:8443/a.crl?x=1"));
         REQUIRE(v.has_value());
         CHECK(v->urls[0].host == "crl.example.com");
+        CHECK(v->urls[0].url == "https://crl.example.com:8443/a.crl?x=1"); // the canonical form
         const std::string max = "http://crl.example.com/" + std::string(2048 - 23, 'a');
         REQUIRE(max.size() == 2048);
         CHECK(fx.svc.validate_registration(with_url(max)).has_value());
@@ -756,13 +787,14 @@ TEST_CASE("revocation source REST: errors are the A4 envelope", "[revocation_sou
     CHECK(fx.rest_reset(999)->status == 404);
     // 413: over the 128 KiB cap
     CHECK(fx.h.sink.Post(kBase, std::string(rs::kBodyMaxBytes + 1, ' '))->status == 413);
-    // 400: reset body must be an object with only reset_at
+    // 400: a reset body must be an object with only the reset's own keys
     const auto id = fx.seed();
     CHECK(fx.rest_reset(id, R"({"surprise":1})")->status == 400);
     CHECK(fx.rest_reset(id, R"({"reset_at":"yesterday"})")->status == 400);
     CHECK(fx.rest_reset(id, R"({"reset_at":"2999-01-01T00:00:00Z"})")->status == 400); // later than now
     CHECK(fx.rest_reset(id, "[1]")->status == 400);
-    CHECK(fx.rest_reset(id, "")->status == 200); // an empty body is `{}`
+    // An empty body is `{}`, which names neither keep_key_sha256 nor expected_config_version (#6590).
+    CHECK(fx.rest_reset_raw(id, "")->status == 400);
     CHECK(fx.rest_reset(id, R"({"reset_at":"2020-01-02T03:04:05Z"})")->status == 200);
 }
 
@@ -1259,8 +1291,12 @@ TEST_CASE("revocation source MCP: the lifecycle as an administrator, RBAC off an
         CHECK(changed["changed"] == true);
         CHECK(changed["config_version"] == 2);
 
-        const auto reset = mcp_payload(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}}));
+        json reset_args = fx.with_reset_preconditions(id, json::object());
+        reset_args["id"] = id;
+        const auto reset = mcp_payload(*fx.h.mcp_call_tool_approved(kReset, reset_args));
         CHECK(reset["crls_deleted"] == 0);
+        CHECK(reset["dropped_ca_certificates"] == 0);
+        CHECK(reset["config_version"] == 3);
         CHECK(reset["reset_at"].get<std::string>().size() == 20);
 
         const auto removed = mcp_payload(*fx.h.mcp_call_tool_approved(kRemove, {{"id", id}}));
@@ -1284,7 +1320,7 @@ TEST_CASE("revocation source MCP: a supervised token needs an approval ticket fo
         {kRegister, rstest::valid_body("Another CA")},
         {kUpdate, upd},
         {kRemove, json{{"id", id}}},
-        {kReset, json{{"id", id}}},
+        {kReset, fx.with_reset_preconditions(id, {{"id", id}})},
     };
     for (const auto& [tool, args] : calls) {
         INFO(tool);
@@ -1319,7 +1355,8 @@ TEST_CASE("revocation source MCP: admin-only in both RBAC states, not grantable"
         upd["expected_config_version"] = 1;
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kRegister, rstest::valid_body("New CA"))) == code);
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kUpdate, upd)) == code);
-        CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}})) == code);
+        CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}}))) ==
+              code);
         CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kRemove, {{"id", id}})) == code);
         const auto all = fx.store.list();
         REQUIRE(all.has_value());
@@ -1447,10 +1484,15 @@ TEST_CASE("revocation source MCP: arguments are strict", "[revocation_source][mc
     CHECK(mcp_error_code(*fx.h.mcp_call_tool(kGet, {{"id", "1"}})) == invalid);
     CHECK(mcp_error_code(*fx.h.mcp_call_tool(kGet, {{"id", id}, {"x", 1}})) == invalid);
     CHECK(mcp_error_code(*fx.h.mcp_call_tool(kGet, {{"id", 99999}})) == invalid); // not found
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}, {"reset_at", "tomorrow"}})) ==
+    const auto reset_with = [&](json extra) {
+        json a = fx.with_reset_preconditions(id, std::move(extra));
+        a["id"] = id;
+        return a;
+    };
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, reset_with({{"reset_at", "tomorrow"}}))) ==
           invalid);
-    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(kReset, {{"id", id}, {"reset_at", "2999-01-01T00:00:00Z"}})) ==
-          invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+              kReset, reset_with({{"reset_at", "2999-01-01T00:00:00Z"}}))) == invalid);
 }
 
 // ═════════════════════════════════════════════════════════════════════════════════════════════
@@ -1478,7 +1520,8 @@ TEST_CASE("revocation source MCP: a DENY on the grant is honoured as on REST (se
     CHECK(fx.h.mcp_call_tool(kList, json::object())->body == R"({"error":"forbidden"})");
     CHECK(fx.h.mcp_call_tool(kGet, {{"id", id}})->body == R"({"error":"forbidden"})");
     CHECK(json::parse(fx.h.mcp_call_tool_approved(kRemove, {{"id", id}})->body).contains("error"));
-    CHECK(json::parse(fx.h.mcp_call_tool_approved(kReset, {{"id", id}})->body).contains("error"));
+    CHECK(json::parse(fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}}))->body)
+              .contains("error"));
     CHECK(fx.store.list()->size() == 1);
     for (const char* verb :
          {"crypto.revocation_source.remove", "crypto.revocation_source.reset_high_water"})
@@ -2029,7 +2072,8 @@ TEST_CASE("revocation source: the service's error classifier maps every store er
     CHECK(ver.error().kind == K::kVersionConflict);
     CHECK(ver.error().existing_id == 1);
     // kBadResetTime -> kInvalidParams naming reset_at
-    const auto future = fx.svc.reset_high_water(id, json{{"reset_at", "2999-01-01T00:00:00Z"}});
+    const auto future = fx.svc.reset_high_water(
+        id, fx.with_reset_preconditions(id, json{{"reset_at", "2999-01-01T00:00:00Z"}}));
     REQUIRE_FALSE(future.has_value());
     CHECK(future.error().param == "reset_at");
     // A held pool -> kUnavailable (retryable). kOutcomeUnknown is driven through the store's write-fault
@@ -2190,6 +2234,7 @@ TEST_CASE("RevocationSource: the REST and MCP kind -> status table is locked",
         {SK::kLimitReached, 409, yuzu::server::mcp::kInvalidParams},
         {SK::kConflict, 409, yuzu::server::mcp::kInvalidParams},
         {SK::kInvalidInput, 400, yuzu::server::mcp::kInvalidParams},
+        {SK::kUnknownKey, 400, yuzu::server::mcp::kInvalidParams},
     };
     for (const auto& row : rows) {
         INFO("fault " << static_cast<int>(row.fault));
@@ -2243,7 +2288,7 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
         {"remove", [&] { last_rest = fx.rest_delete(id); return last_rest->status; },
          [&] { last = fx.h.mcp_call_tool_approved(kRemove, {{"id", id}}); return mcp_error_code(*last); }},
         {"reset", [&] { last_rest = fx.rest_reset(id); return last_rest->status; },
-         [&] { last = fx.h.mcp_call_tool_approved(kReset, {{"id", id}}); return mcp_error_code(*last); }},
+         [&] { last = fx.h.mcp_call_tool_approved(kReset, fx.with_reset_preconditions(id, {{"id", id}})); return mcp_error_code(*last); }},
     };
     struct Expect {
         SK fault;
@@ -2266,6 +2311,7 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
         {SK::kVersionConflict, 409, kInvalid, -1},
         {SK::kSubjectChanged, 400, kInvalid, -1},
         {SK::kBadResetTime, 400, kInvalid, -1},
+        {SK::kUnknownKey, 400, kInvalid, -1},
     };
     for (const auto& route : routes) {
         for (const auto& e : table) {
@@ -2285,3 +2331,290 @@ TEST_CASE("RevocationSource: every mutating route maps faults the same way on RE
 
 // ─── round 9: mutation guards for the flight release and the clamped-budget rule ─────────────
 
+
+// =============================================================================================
+// Migration v2: the #6590 rulings (owner, 2026-11-18) on the transports
+// =============================================================================================
+
+namespace {
+// Run one statement on a pooled lease (a fixture write the store has no method for: the fetcher
+// owns fetch_status).
+void rs_sql(Fx& fx, const std::string& sql) {
+    auto lease = fx.h.auth_db.pool().acquire();
+    REQUIRE(lease);
+    yuzu::server::pg::PgResult r{PQexec(lease.get(), sql.c_str())};
+    INFO(PQresultErrorMessage(r.get()));
+    REQUIRE((r.status() == PGRES_COMMAND_OK || r.status() == PGRES_TUPLES_OK));
+}
+} // namespace
+
+TEST_CASE("revocation source REST: URLs are stored and returned canonical; a cosmetic PUT keeps "
+          "the URL and its fetch status",
+          "[revocation_source][pg]") {
+    Fx fx;
+    fx.admin(false);
+    json body = rstest::valid_body();
+    body["crl_urls"] = json::array({rstest::url_entry("HTTP://CRL.Example.COM:0080/ca.crl", {"public"})});
+    auto created = fx.rest_post(body);
+    REQUIRE(created->status == 201);
+    const auto cd = data_of(*created)["data"];
+    const auto id = cd["id"].get<std::int64_t>();
+    CHECK(cd["crl_urls"][0]["url"] == "http://crl.example.com/ca.crl");
+    CHECK(cd["crl_urls"][0]["host"] == "crl.example.com");
+    const auto uid = cd["crl_urls"][0]["id"].get<std::int64_t>();
+    rs_sql(fx, "INSERT INTO revocation_source_store.fetch_status (url_id, last_attempt_at, "
+               "last_success_at) VALUES (" + std::to_string(uid) + ", now(), now())");
+
+    // The same certificates and the same URL spelled differently: the configuration is equal,
+    // so nothing changes, and the URL keeps its id and its fetch status.
+    body["crl_urls"] = json::array({rstest::url_entry("http://crl.EXAMPLE.com:80/ca.crl", {"public"})});
+    auto put = fx.rest_put(id, body);
+    REQUIRE(put->status == 200);
+    const auto pd = data_of(*put)["data"];
+    CHECK(pd["changed"] == false);
+    CHECK(pd["dropped_urls"] == 0);
+    CHECK(pd["config_version"] == 1);
+    REQUIRE(pd["crl_urls"].size() == 1);
+    CHECK(pd["crl_urls"][0]["id"] == uid);
+    CHECK(pd["crl_urls"][0]["url"] == "http://crl.example.com/ca.crl");
+    CHECK(pd["crl_urls"][0]["fetch_status"]["state"] == "ok");
+
+    // A PUT that renames the source AND respells the URL changes the source but keeps the URL.
+    body["name"] = "Renamed";
+    body["crl_urls"] = json::array({rstest::url_entry("Http://Crl.Example.Com/ca.crl", {"public"})});
+    auto put2 = fx.rest_put(id, body);
+    REQUIRE(put2->status == 200);
+    const auto p2 = data_of(*put2)["data"];
+    CHECK(p2["changed"] == true);
+    CHECK(p2["dropped_urls"] == 0);
+    CHECK(p2["crl_urls"][0]["id"] == uid);
+    CHECK(p2["crl_urls"][0]["fetch_status"]["state"] == "ok");
+
+    // The canonical form of an IPv6 literal, an empty path and a query.
+    {
+        const auto v = fx.svc.validate_registration(
+            json{{"name", "v6"},
+                 {"ca_certificates", json::array({rstest::make_ca_pem({.cn = "V6 CA"})})},
+                 {"crl_urls", json::array({rstest::url_entry(
+                                  "http://[2606:2800:0220:0001:0248:1893:25C8:1946]:80", {"public"})})}});
+        REQUIRE(v.has_value());
+        CHECK(v->urls[0].url == "http://[2606:2800:220:1:248:1893:25c8:1946]/");
+        CHECK(v->urls[0].host == "2606:2800:220:1:248:1893:25c8:1946");
+    }
+    {
+        json q = rstest::valid_body("Q CA");
+        q["crl_urls"] = json::array({rstest::url_entry("HTTPS://crl.example.com:443?Name=%7EA", {"public"})});
+        const auto v = fx.svc.validate_registration(q);
+        REQUIRE(v.has_value());
+        CHECK(v->urls[0].url == "https://crl.example.com/?Name=%7EA"); // the query as sent
+    }
+}
+
+TEST_CASE("revocation source REST: a reset names the surviving keys and the version it read",
+          "[revocation_source][pg]") {
+    Fx fx;
+    fx.admin(false);
+    const json first = rstest::valid_body();
+    auto created = fx.rest_post(first);
+    REQUIRE(created->status == 201);
+    const auto id = data_of(*created)["data"]["id"].get<std::int64_t>();
+    const auto old_key =
+        data_of(*created)["data"]["ca_certificates"][0]["cert_sha256"].get<std::string>();
+    // The rebuilt CA's certificate is added with PUT first (same subject, a new key).
+    json both = first;
+    both["ca_certificates"].push_back(rstest::make_ca_pem({.cn = "Registered Test CA"}));
+    auto put = fx.rest_put(id, both);
+    REQUIRE(put->status == 200);
+    REQUIRE(data_of(*put)["data"]["config_version"] == 2);
+    std::string new_key;
+    const auto stored = fx.store.get(id);
+    REQUIRE(stored.has_value());
+    REQUIRE(stored->keys.size() == 2);
+    for (const auto& k : stored->keys)
+        if (k.cert_sha256 != old_key)
+            new_key = k.cert_sha256;
+    REQUIRE(new_key.size() == 64);
+
+    const auto refused = [&](const std::string& body, int status, const std::string& param) {
+        INFO(body);
+        auto r = fx.rest_reset_raw(id, body);
+        REQUIRE(r->status == status);
+        if (!param.empty())
+            CHECK_THAT(data_of(*r)["error"]["remediation"].get<std::string>(), ContainsSubstring(param));
+    };
+    const std::string v2 = R"("expected_config_version":2)";
+    refused("", 400, "keep_key_sha256");
+    refused("{}", 400, "keep_key_sha256");
+    refused(R"({"keep_key_sha256":[],)" + v2 + "}", 400, "keep_key_sha256");
+    refused(R"({"keep_key_sha256":")" + new_key + R"(",)" + v2 + "}", 400, "keep_key_sha256");
+    refused(R"({"keep_key_sha256":[")" + new_key + R"("]})", 400, "expected_config_version");
+    refused(R"({"keep_key_sha256":[")" + new_key + R"("],"expected_config_version":0})", 400,
+            "expected_config_version");
+    std::string upper = new_key;
+    std::ranges::transform(upper, upper.begin(), [](unsigned char c) { return static_cast<char>(std::toupper(c)); });
+    if (upper != new_key)
+        refused(R"({"keep_key_sha256":[")" + upper + R"("],)" + v2 + "}", 400, "keep_key_sha256[0]");
+    refused(R"({"keep_key_sha256":[")" + new_key + R"(",")" + new_key + R"("],)" + v2 + "}", 400,
+            "keep_key_sha256[1]");
+    // A key the source does not hold, named by its index.
+    refused(R"({"keep_key_sha256":[")" + new_key + R"(",")" + std::string(64, 'e') + R"("],)" + v2 + "}",
+            400, "keep_key_sha256[1]");
+    // A stale read: 409, nothing changed.
+    refused(R"({"keep_key_sha256":[")" + new_key + R"("],"expected_config_version":1})", 409, "");
+    {
+        // Its remediation says to check whether the reset already landed before resending.
+        auto stale = fx.rest_reset_raw(id, R"({"keep_key_sha256":[")" + new_key +
+                                               R"("],"expected_config_version":1})");
+        REQUIRE(stale->status == 409);
+        const auto fix = data_of(*stale)["error"]["remediation"].get<std::string>();
+        CHECK_THAT(fix, ContainsSubstring("do not resend"));
+        CHECK_THAT(fix, ContainsSubstring("expected_config_version=2"));
+    }
+    // No refusal changed anything, and none was a mutation attempt.
+    auto now = fx.store.get(id);
+    REQUIRE(now.has_value());
+    CHECK(now->keys.size() == 2);
+    CHECK(now->config_version == 2);
+    CHECK_FALSE(now->reset_at.has_value());
+    for (const auto& r : fx.rows("crypto.revocation_source.reset_high_water"))
+        CHECK(r.result != "success");
+
+    // Keep only the rebuilt CA's key: the old one goes in the reset's transaction.
+    auto ok = fx.rest_reset_raw(id, R"({"keep_key_sha256":[")" + new_key + R"("],)" + v2 + "}");
+    REQUIRE(ok->status == 200);
+    const auto d = data_of(*ok)["data"];
+    CHECK(d["dropped_ca_certificates"] == 1);
+    CHECK(d["config_version"] == 3);
+    now = fx.store.get(id);
+    REQUIRE(now.has_value());
+    REQUIRE(now->keys.size() == 1);
+    CHECK(now->keys[0].cert_sha256 == new_key);
+    CHECK(now->config_version == 3);
+    // The attempted row written just before the success row is the evidence of what the reset
+    // kept (the refused unknown-key and stale attempts above wrote their own attempted rows).
+    const auto rows = fx.rows("crypto.revocation_source.reset_high_water");
+    std::optional<std::size_t> success_at;
+    for (std::size_t i = 0; i < rows.size(); ++i)
+        if (rows[i].result == "success")
+            success_at = i;
+    REQUIRE(success_at.has_value());
+    REQUIRE(*success_at > 0);
+    const auto& attempted = rows[*success_at - 1];
+    CHECK(attempted.result == "attempted");
+    CHECK_THAT(attempted.detail, ContainsSubstring("keep_key_sha256=" + new_key));
+    CHECK_THAT(attempted.detail, ContainsSubstring("expected_config_version=2"));
+    CHECK_THAT(rows[*success_at].detail, ContainsSubstring("dropped_ca_certificates=1"));
+    CHECK_THAT(rows[*success_at].detail, ContainsSubstring("dropped_key_sha256=" + old_key));
+    // The refused stale attempt is on record as attempted with the version it sent, then denied.
+    bool stale_attempt = false;
+    for (std::size_t i = 0; i + 1 < rows.size(); ++i)
+        if (rows[i].result == "attempted" &&
+            rows[i].detail.find("expected_config_version=1") != std::string::npos) {
+            stale_attempt = true;
+            CHECK(rows[i + 1].result == "denied");
+        }
+    CHECK(stale_attempt);
+    // The same body again (a retry after an unknown outcome) is a conflict, not a second reset.
+    CHECK(fx.rest_reset_raw(id, R"({"keep_key_sha256":[")" + new_key + R"("],)" + v2 + "}")->status ==
+          409);
+}
+
+TEST_CASE("revocation source MCP: the reset requires the surviving keys and the version",
+          "[revocation_source][mcp][pg]") {
+    Fx fx;
+    fx.admin(false);
+    const auto id = fx.seed();
+    const auto key = fx.store.get(id)->keys.at(0).cert_sha256;
+    const auto invalid = yuzu::server::mcp::kInvalidParams;
+    // A body missing a required member is refused by the input schema, before any approval
+    // ticket is minted.
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(kReset, {{"id", id}})) == invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(
+              kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}})) == invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool(kReset, {{"id", id}, {"expected_config_version", 1}})) ==
+          invalid);
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+              kReset, {{"id", id},
+                       {"keep_key_sha256", json::array({std::string(64, 'e')})},
+                       {"expected_config_version", 1}})) == invalid);
+    // A repeated entry passes the schema (it cannot state distinctness) and is refused by the
+    // service as invalid_params, changing nothing.
+    CHECK(mcp_error_code(*fx.h.mcp_call_tool_approved(
+              kReset, {{"id", id},
+                       {"keep_key_sha256", json::array({key, key})},
+                       {"expected_config_version", 1}})) == invalid);
+    CHECK(fx.store.get(id)->config_version == 1);
+    const auto ok = mcp_payload(*fx.h.mcp_call_tool_approved(
+        kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}, {"expected_config_version", 1}}));
+    CHECK(ok["dropped_ca_certificates"] == 0);
+    CHECK(ok["config_version"] == 2);
+    // A stale version is refused and changes nothing; the remediation says to check whether the
+    // reset already landed and to retry as a RESET, never as an update.
+    const auto stale = fx.h.mcp_call_tool_approved(
+        kReset, {{"id", id}, {"keep_key_sha256", json::array({key})}, {"expected_config_version", 1}});
+    CHECK(mcp_error_code(*stale) == invalid);
+    const auto stale_fix =
+        json::parse(stale->body)["error"]["data"]["remediation"].get<std::string>();
+    CHECK_THAT(stale_fix, ContainsSubstring("resend reset_revocation_source_high_water"));
+    CHECK_THAT(stale_fix, ContainsSubstring("expected_config_version=2"));
+    CHECK_THAT(stale_fix, ContainsSubstring("do not resend"));
+    CHECK(stale_fix.find("update_revocation_source") == std::string::npos);
+    CHECK(fx.store.get(id)->config_version == 2);
+    // The schema states both members as required.
+    const auto tools = tools_list(fx);
+    const auto* reset = find_tool(tools, kReset);
+    REQUIRE(reset != nullptr);
+    CHECK((*reset)["inputSchema"]["required"] ==
+          json::array({"id", "keep_key_sha256", "expected_config_version"}));
+    const auto& keep = (*reset)["inputSchema"]["properties"]["keep_key_sha256"];
+    CHECK(keep["minItems"] == 1);
+    CHECK(keep["maxItems"] == 8);
+    CHECK(keep["items"]["pattern"] == "^[0-9a-f]{64}$");
+    // Distinctness is enforced by parse_reset (a repeat is invalid_params naming its index); the
+    // MCP input-schema checker does not admit `uniqueItems`, so the schema cannot state it.
+    CHECK((*reset)["inputSchema"]["properties"]["expected_config_version"]["minimum"] == 1);
+    const auto& out = (*reset)["outputSchema"];
+    for (const char* f : {"dropped_ca_certificates", "config_version"}) {
+        INFO(f);
+        CHECK(out["properties"].contains(f));
+        CHECK(std::ranges::find(out["required"], json(f)) != out["required"].end());
+    }
+}
+
+TEST_CASE("revocation source: an update that drops a key names its hash in the success audit row",
+          "[revocation_source][pg]") {
+    // REST and MCP share one audit helper; each transport is asserted so a handler that stops
+    // using it fails here.
+    const auto dropped_in_success = [](const std::vector<AuditRecord>& rows, const std::string& key) {
+        for (const auto& r : rows)
+            if (r.result == "success" &&
+                r.detail.find("dropped_key_sha256=" + key) != std::string::npos)
+                return true;
+        return false;
+    };
+    SECTION("REST PUT") {
+        Fx fx;
+        fx.admin(false);
+        auto created = fx.rest_post(rstest::valid_body());
+        REQUIRE(created->status == 201);
+        const auto id = data_of(*created)["data"]["id"].get<std::int64_t>();
+        const auto old_key =
+            data_of(*created)["data"]["ca_certificates"][0]["cert_sha256"].get<std::string>();
+        auto put = fx.rest_put(id, rstest::valid_body()); // a renewal key replaces the old one
+        REQUIRE(put->status == 200);
+        CHECK(dropped_in_success(fx.rows("crypto.revocation_source.update"), old_key));
+    }
+    SECTION("MCP update_revocation_source") {
+        Fx fx;
+        fx.admin(false);
+        const auto src = mcp_payload(*fx.h.mcp_call_tool_approved(kRegister, rstest::valid_body()));
+        const auto id = src["id"].get<std::int64_t>();
+        const auto old_key = src["ca_certificates"][0]["cert_sha256"].get<std::string>();
+        json upd = rstest::valid_body();
+        upd["id"] = id;
+        upd["expected_config_version"] = 1;
+        const auto changed = mcp_payload(*fx.h.mcp_call_tool_approved(kUpdate, upd));
+        REQUIRE(changed["changed"] == true);
+        CHECK(dropped_in_success(fx.rows("crypto.revocation_source.update"), old_key));
+    }
+}

@@ -773,13 +773,35 @@ start**.
   after the earlier schemas were created will now fail here.
 - **The refusing-to-start log line** is `[PG] Refusing to start: revocation-source store
   migration/open failed (database reachable but the revocation_source_store schema could not be
-  created/opened)`, followed by exit status `1`. It names this store, not a generic database
-  failure; the lines above it carry the PostgreSQL error.
+  created/opened, or its open-time canonical URL pass refused; the preceding RevocationSourceStore
+  line names the cause)`, followed by exit status `1`. It names this store, not a generic database
+  failure; the `RevocationSourceStore:` line above it carries the PostgreSQL error or the refusal.
+  A refusal that names SQLSTATE `55P03` is transient: another transaction held the lock the pass
+  needed for more than 10 seconds; end it and restart.
 - **`/readyz`** includes `revocation_source_store` in its gating checks; a node that did not open it
   does not serve.
 - **Rolling back** to an older server leaves the `revocation_source_store` schema in place; the older
   binary ignores it. Nothing is dropped, and upgrading again reuses it (registrations, and the CAs'
   anti-rollback marks, survive a rollback).
+- **Schema version 2 (#6590), development databases only.** A database written by an earlier
+  development build of this store is upgraded at start: each held CRL's scope key gains its
+  `:base` or `:delta` suffix, and each stored CRL URL is rewritten to the canonical form (it keeps
+  its id and fetch status). The server **refuses to start** when two URLs of one source become one
+  URL in that form, logging `RevocationSourceStore: refusing to open: CRL URL ids <a> and <b> of
+  revocation source <id> are one URL in the canonical form`; delete one of the two
+  `revocation_source_store.source_url` rows (keep the one whose id carries a `fetch_status` row;
+  deleting a URL also deletes its fetch status and the CRLs held from it) and restart. A stored URL that cannot be put in the
+  canonical form refuses the start the same way (`CRL URL id <n> of revocation source <id> cannot
+  be put in the canonical form`); remove that `source_url` row and restart, or, when it is the
+  source's only URL, delete the whole `revocation_source_store.source` row and register the source
+  again (a source with no URL is not a state the API can create). A scope key that cannot
+  take the new form also fails the start, rather than dropping an anti-rollback mark. A
+  development build from before version 2 still writes registrations if you roll back to it, and
+  can store two spellings of one URL; rolling forward again then refuses to start as above.
+- **The high-water reset body changed.** `POST .../reset-high-water` and MCP
+  `reset_revocation_source_high_water` now require `keep_key_sha256` and
+  `expected_config_version`; an empty body or `{}` is refused `400`. See
+  [Registering a CRL source](server-admin.md#registering-a-crl-source).
 - **Four new step-up routes and 39 securable types.** The four mutating routes are step-up gated (41 gated
   routes in total), and RBAC now seeds a `RevocationSource` securable (Administrator only; see
   [RBAC](rbac.md)). Nothing is fetched yet: this release registers CRL sources only.

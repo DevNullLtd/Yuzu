@@ -5087,10 +5087,16 @@ static const ToolDef kTools[] = {
      "replay window, because a CRL that verifies and is dated at or after the reset is accepted "
      "whatever its number. reset_at (RFC 3339 UTC, optional, no later than the server clock; "
      "default now) sets the floor: a value below the CA's current thisUpdate widens that window "
-     "to everything since it. The response echoes the window opened. NOT idempotent: each call "
-     "sets a new reset_at and deletes the held CRLs again, so a repeat after a CRL was accepted "
-     "discards it. After a reset whose outcome is unknown, read get_revocation_source: "
-     "high_water.reset_at shows the floor in force. Optional pin_crl_sha256 (64 hex) names the "
+     "to everything since it. The response echoes the window opened. NOT idempotent: each "
+     "accepted reset sets a new reset_at, deletes the held CRLs and moves config_version, so a "
+     "replay of the same arguments is refused as a version conflict and changes nothing. After a reset whose outcome is unknown, read get_revocation_source: "
+     "high_water.reset_at shows the floor in force (a retry is then refused as a version "
+     "conflict, because the reset moved config_version). REQUIRED keep_key_sha256: 1 to 8 "
+     "ca_certificates[].cert_sha256 values already registered on the source (add a rebuilt CA's "
+     "certificates with update_revocation_source first); every other key of the source is "
+     "removed with the held CRLs in the reset's transaction, and an entry the source does not "
+     "hold is refused. REQUIRED expected_config_version, as update_revocation_source takes: a "
+     "mismatch is a conflict and changes nothing. Optional pin_crl_sha256 (64 hex) names the "
      "only first CRL to accept afterwards; the reset also clears each scope's CRL number and "
      "thisUpdate and bumps config_version. Requires RevocationSource:Write AND a durable Administrator role, the "
      "supervised MCP tier (approval-gated) and is denied outright to a service-scoped token and "
@@ -5098,11 +5104,14 @@ static const ToolDef kTools[] = {
      "attempted row first, carrying the reset_at you supplied). Scope: facts only; the only built-in "
      "checks are D13's named rules and windows, each shown with its criterion. Mirrors POST "
      "/api/v1/crypto/revocation-sources/{id}/reset-high-water.",
-     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},"reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
+     R"j({"type":"object","properties":{"id":{"type":"integer","minimum":1,"description":"The source id"},)j"
+     R"j("keep_key_sha256":{"type":"array","minItems":1,"maxItems":8,"items":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$"},"description":"Required: the distinct ca_certificates[].cert_sha256 values that survive the reset, each already registered on the source (a repeated entry is invalid_params naming its index); every other key is removed"},)j"
+     R"j("expected_config_version":{"type":"integer","minimum":1,"description":"Required: the source's config_version as you last read it; a mismatch is a conflict and changes nothing"},)j"
+     R"j("reset_at":{"type":"string","maxLength":40,"description":"Optional RFC 3339 UTC time from 1970 on, no later than the server clock"},)j"
      R"j("pin_crl_sha256":{"type":"string","minLength":64,"maxLength":64,"pattern":"^[0-9a-f]{64}$","description":"Optional SHA-256 of the one CRL to accept first afterwards"},)j"
      R"j("approval_id":{"type":"string","minLength":1,"maxLength":64,"description":"Approval ticket id (32 hex characters) from a prior approval_required response; supply it after the approval to execute"})j"
-     R"j(},"required":["id"],"additionalProperties":false})j",
-     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned"]})j"},
+     R"j(},"required":["id","keep_key_sha256","expected_config_version"],"additionalProperties":false})j",
+     R"j({"type":"object","properties":{"reset_at":{"type":"string","description":"The floor now in force, RFC 3339 UTC time"},"crls_deleted":{"type":"integer","minimum":0},"replay_window_opens_at":{"type":"string","description":"RFC 3339 UTC time: a CRL that verifies and is dated at or after it is accepted again, whatever its number"},"pinned":{"type":"boolean","description":"A first-CRL pin was recorded"},"dropped_ca_certificates":{"type":"integer","minimum":0,"description":"Registered keys the reset removed (those not in keep_key_sha256)"},"config_version":{"type":"integer","minimum":1,"description":"The source's config_version after the reset"},"audit_persisted":{"type":"boolean","description":"Present and false only when the outcome audit row failed to persist"}},"required":["reset_at","crls_deleted","replay_window_opens_at","pinned","dropped_ca_certificates","config_version"]})j"},
     // ── #2146 batch C: the instruction-definition / instruction-set authoring twins ─────────────
     // MCP twins of the nine v1 REST routes in instruction_authoring_routes.cpp (and the legacy
     // /api/instructions and /api/instruction-sets writes). Legacy kTools[] path, helper TU
@@ -7220,8 +7229,9 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // ADR-0070 R1 (slice 2b-1a). register: Additive, NOT idempotent (a second registration of the
     // same CA is a 409). update: a full replace - Destructive (dropping a URL or key deletes its
     // held CRLs) and idempotent (an equal body changes nothing). remove: Destructive, idempotent
-    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each call
-    // sets a new reset_at and discards the held CRLs again). openWorldHint is true ONLY for
+    // (a repeat is a 404 and changes nothing). reset: Destructive and NOT idempotent (each
+    // accepted call sets a new reset_at, discards the held CRLs and moves config_version, so a
+    // replay is a version conflict). openWorldHint is true ONLY for
     // register and update: they resolve the administrator-registered host, the only outbound
     // reach any tool has (no tool fetches a CRL; the refresh job does).
     {"list_revocation_sources", {ToolEffect::ReadOnly, true, "List registered CRL sources"}},
@@ -7232,7 +7242,7 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
      {ToolEffect::Destructive, true, "Replace a CRL source's keys and URLs", /*open_world=*/true}},
     {"remove_revocation_source", {ToolEffect::Destructive, true, "Remove a CRL source"}},
     {"reset_revocation_source_high_water",
-     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks"}},
+     {ToolEffect::Destructive, false, "Reset a CA's CRL anti-rollback marks and keep only the named keys"}},
 };
 
 // The registry header spells the PermFn signature out (it must not include the
@@ -13936,7 +13946,10 @@ McpServer::HandlerFn McpServer::build_handler(
             // assign_rbac_role family gates on the predicate INSTEAD OF perm_fn; this surface
             // does not.) The shared helpers are declared once here; every tool branch below keeps its
             // own block (the retry-hint gate scans each tool's block).
-            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e) {
+            // `reset` selects the reset tool's version-conflict remediation: a stale reset must
+            // be retried as a reset (after checking it has not already landed), never as an update.
+            auto rs_fail = [&](const yuzu::server::revocation_source::ServiceError& e,
+                               bool reset = false) {
                 using RsKind = yuzu::server::revocation_source::ServiceError::Kind;
                 switch (e.kind) {
                 case RsKind::kInvalidParams:
@@ -13952,9 +13965,18 @@ McpServer::HandlerFn McpServer::build_handler(
                     return;
                 case RsKind::kVersionConflict:
                     res.set_content(a4_error(kInvalidParams, e.message,
-                                             "read the source with get_revocation_source and resend "
-                                             "update_revocation_source with expected_config_version=" +
-                                                 std::to_string(e.existing_id)),
+                                             reset
+                                                 ? "read the source with get_revocation_source; if "
+                                                   "it already shows the reset you meant "
+                                                   "(high_water.reset_at and the kept "
+                                                   "ca_certificates) do not resend, otherwise "
+                                                   "resend reset_revocation_source_high_water with "
+                                                   "expected_config_version=" +
+                                                       std::to_string(e.existing_id)
+                                                 : "read the source with get_revocation_source "
+                                                   "and resend update_revocation_source with "
+                                                   "expected_config_version=" +
+                                                       std::to_string(e.existing_id)),
                                     "application/json"); // retry-hint-exempt: stale version, resending it fails identically
                     return;
                 case RsKind::kConflict:
@@ -14306,7 +14328,7 @@ McpServer::HandlerFn McpServer::build_handler(
                     (void)audit_fn(req, verb, rs::audit_result_for(done.error()), rs::kAuditTargetType, target,
                                    rs::audit_detail_error("", done.error()));
                     mcp_audit(rs::audit_result_for(done.error()), done.error().message);
-                    rs_fail(done.error());
+                    rs_fail(done.error(), /*reset=*/true);
                     return;
                 }
                 const bool audit_ok = audit_fn(req, verb, "success", rs::kAuditTargetType, target,
