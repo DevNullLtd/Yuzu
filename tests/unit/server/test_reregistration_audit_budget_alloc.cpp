@@ -378,18 +378,22 @@ TEST_CASE("budget: a re-queue that must allocate a deque node (a node boundary) 
 
 TEST_CASE("flush: a chunk that cannot be handed back after a failed write is counted once, as alloc_failed",
           "[reregistration_gate][wp01][audit_budget][alloc]") {
-    // The writer fails and arms the very next allocation, which is the re-queue's push_front. That
-    // allocates only when the front chunk sits in the last slot of a deque node, so pad the queue
-    // (each push that had to allocate leaves the front there) until it does, on any library.
+    // The writer fails and arms the very next allocation, which is the re-queue's push_front. Whether
+    // that allocates depends on the standard library: libstdc++ frees a node when a pop crosses its
+    // boundary, so the hand-back can need a new one; libc++ keeps the spare node, so it never does
+    // here (the push-only test above covers the node-allocation path on every library). Pad the
+    // queue over every start offset up to a node's worth of rows; where an allocation is reached the
+    // counting is checked, and libstdc++ must reach it.
+    B seed;
+    for (long i = 0; i < 400; ++i)
+        (void)seed.admit("i" + std::to_string(i), "s", 0);
+    (void)seed.poll_closed(20000, true);
+    (void)seed.take_ids_truncated();
+    auto base = seed.take_pending();
+    REQUIRE(base.has_value());
     bool fired_any = false;
-    for (int pad = 0; pad < 64 && !fired_any; ++pad) {
+    for (int pad = 0; pad < 1100 && !fired_any; ++pad) {
         B b;
-        for (long i = 0; i < 400; ++i)
-            (void)b.admit("i" + std::to_string(i), "s", 0);
-        (void)b.poll_closed(20000, true);
-        (void)b.take_ids_truncated();
-        auto base = b.take_pending();
-        REQUIRE(base.has_value());
         for (int k = 0; k < pad; ++k) {
             auto c = *base;
             b.requeue_front_unconditional(std::move(c));
@@ -415,7 +419,9 @@ TEST_CASE("flush: a chunk that cannot be handed back after a failed write is cou
         CHECK(b.take_alloc_failed() == 1);    // it is counted once, on the next round's report
         CHECK(r.ids_truncated > 0);           // and its ids are counted (this round's report)
     }
+#if defined(__GLIBCXX__)
     REQUIRE(fired_any);
+#endif
 }
 
 // ---- three windows, flush rounds under fault: ids are conserved ---------------------------------
