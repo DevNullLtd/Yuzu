@@ -174,7 +174,7 @@ std::vector<ProcessInfo> enumerate_processes() {
         }
         const auto ticks_after = read_start_ticks(pi.pid);
         if (ticks_before && ticks_after && *ticks_before != *ticks_after)
-            continue; // recycled while its name was read: the row would be a mixed identity
+            continue; // recycled while its name was read: the row would carry two processes' fields
         pi.start_ticks = ticks_before;
         procs.push_back(std::move(pi));
     }
@@ -523,8 +523,8 @@ private:
     // The name, the path and the hash of one row are three separate reads of a pid that can be
     // recycled in between. A row is kept only when the process start time read before the name and
     // the one read after the hash agree. On a mismatch the path is dropped and a real digest reads
-    // `hash_unavailable:pid_reused` (the pid now belongs to another process) or
-    // `hash_unavailable:pid_exited` (its stat is no longer readable); an existing `timeout`/`skipped`
+    // `hash_unavailable:pid_reused` (the pid belongs to another process) or
+    // `hash_unavailable:pid_exited` (its stat is unreadable); an existing `timeout`/`skipped`
     // marker or empty hash is left as it was. Linux only: Windows and macOS have no such guard.
     static void settle_row([[maybe_unused]] const ProcessInfo& p, [[maybe_unused]] std::string& path,
                            [[maybe_unused]] std::string& hash) {

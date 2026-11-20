@@ -57,8 +57,8 @@ namespace yuzu::shared {
 /// What the second start-time reading says about the row's pid.
 enum class PidState {
     Same,     ///< both readings known and equal: the same process
-    Reused,   ///< the pid now belongs to another process, or the first reading is unknown (cannot be checked)
-    Exited    ///< the pid's stat is no longer readable: the process exited after it was listed
+    Reused,   ///< the pid belongs to another process, or the first reading is unknown (cannot be checked)
+    Exited    ///< the pid's stat is unreadable: the process exited after it was listed
 };
 
 [[nodiscard]] inline PidState classify_pid(std::optional<std::uint64_t> at_enumeration,
