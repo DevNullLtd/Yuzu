@@ -36,24 +36,35 @@ Before invoking the skill, the operator should already have:
 
   ```bash
   SHA=$(git rev-parse origin/main)
-  gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
-    if .total_count > 100 then "WARN: \(.total_count) check runs; only the first 100 were read" else empty end,
-    ([.check_runs[] | select(.name | IN("Preflight (runner health)","Proto backward-compat","Linux gcc-15 debug","Windows MSVC debug","macOS debug","CHANGELOG order","CBOM schema"))]
-     | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)")'
+  # One query per check: a promoted main commit carries over 1,000 check runs, more
+  # than one page, so an unfiltered query can miss a required check entirely.
+  for CHECK in "Preflight (runner health)" "Proto backward-compat" "Linux gcc-15 debug" \
+               "Windows MSVC debug" "macOS debug" "CHANGELOG order" "CBOM schema"; do
+    printf '%s\t' "$CHECK"
+    gh api -X GET "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs" -f check_name="$CHECK" -f per_page=100 \
+      --jq '([.check_runs[]] | max_by(.id)) as $r | if $r then "\($r.status)\t\($r.conclusion)" else "missing" end'
+  done
   ```
 
-  It must print all seven names, each `completed` with `success` or `skipped` (`CBOM schema` is a `docs-lint.yml` job and runs on every push, docs-only included). The ruleset that lists them is the repo's "Protect Main" setting, not this file, and it changes outside git: if `gh api repos/DevNullLtd/Yuzu/rulesets/13631572 --jq '[.rules[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'` names a check missing from the list above, add it here and check it too.
-- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging:
+  It must print all seven names, each `completed` with `success` or `skipped`; `missing` is a stop (`CBOM schema` is a `docs-lint.yml` job and runs on every push, docs-only included). The ruleset that lists them is the repo's "Protect Main" setting, not this file, and it changes outside git: if `gh api repos/DevNullLtd/Yuzu/rulesets/13631572 --jq '[.rules[]|select(.type=="required_status_checks")|.parameters.required_status_checks[].context]'` names a check missing from the list above, add it here and check it too.
+- The release/LTO legs green on `main`'s tip, and no open `release-legs-broken` issue. These legs are not required checks, but they are the only place the test suite runs in release/NDEBUG mode: `release.yml` builds with `-Dbuild_tests=false`. Since Tier 2b (`docs/ci-architecture.md`) they no longer run on dev pushes, only on `main` pushes and a daily dispatch on dev. An open issue means dev's release legs were red at the last dispatch, or the daily workflow itself failed (its reconcile or dispatch job; the issue says which). Find out whether that defect reached `main` before tagging.
+
+  **No open issue proves nothing unless the daily workflow is actually running.** Its cron and its alert listener fire only from the copy on `main` (`docs/ci-architecture.md`, *Go-live and interim gap*), so until a dev → `main` promotion carries `release-legs-daily.yml`, no daily run happens and no issue can open. The first command below shows which case you are in: a 404 means the workflow is not on `main` yet; no run in the last two days means it is not firing (the doc's *Dead-man* note). In either case dev has had no release-mode coverage since the last promotion, and the four `main` check runs below are the only evidence.
 
   ```bash
   SHA=$(git rev-parse origin/main)
+  gh run list --repo DevNullLtd/Yuzu --workflow release-legs-daily.yml --limit 1
   gh issue list --repo DevNullLtd/Yuzu --label release-legs-broken --state open
-  gh api "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs?per_page=100" --jq '
-    [.check_runs[] | select(.name | test("^(Linux (gcc-15|clang-21)|Windows MSVC|macOS) release$"))]
-    | group_by(.name) | map(max_by(.id)) | .[] | "\(.name)\t\(.status)\t\(.conclusion)"'
+  # One query per leg: a promoted main commit carries over 1,000 check runs, so an
+  # unfiltered first page of 100 can miss the release legs entirely.
+  for LEG in "Linux gcc-15 release" "Linux clang-21 release" "Windows MSVC release" "macOS release"; do
+    printf '%s\t' "$LEG"
+    gh api -X GET "repos/DevNullLtd/Yuzu/commits/$SHA/check-runs" -f check_name="$LEG" -f per_page=100 \
+      --jq '([.check_runs[]] | max_by(.id)) as $r | if $r then "\($r.status)\t\($r.conclusion)" else "missing" end'
+  done
   ```
 
-  Expect four names, each `completed`/`success`. If the tip is a docs-only commit (the usual case for the final `promote --append --date` commit), it built nothing and the query prints nothing. In that case, set `SHA` to the most recent `main` commit whose push run built code (its run shows the build legs, not the `docs-required-checks` stubs) and re-run it there. No output on a code commit is a stop.
+  Expect four names, each `completed`/`success` (the latest run of each leg counts, so a red leg that was re-run green passes). If the tip is a docs-only commit (the usual case for the final `promote --append --date` commit), it built nothing and every leg prints `missing`. In that case, set `SHA` to the most recent `main` commit whose push run built code (its run shows the build legs, not the `docs-required-checks` stubs) and re-run it there. A `missing` leg on a code commit is a stop.
 - All tracked compose files updated to `${YUZU_VERSION:-<BASE_VERSION>}` defaults — the **base** version with any `-rcN`/`-betaN` suffix stripped (e.g., for tag `v0.12.0-rc0` the default is `0.12.0`, NOT `0.12.0-rc0`). The workflow's `Validate docker-compose image versions` gate inside the `Create Release` job invokes `bash scripts/check-compose-versions.sh "$BASE_VERSION"` and will hard-fail the release after the full build matrix has run if the defaults don't match. Local dry-run **must use the same base version**: `bash scripts/check-compose-versions.sh 0.12.0` (NOT `0.12.0-rc0`) — the script accepts whatever you pass and is happy with consistent garbage, so passing the rc-suffixed version locally green-lights a doomed release. Preflight (`scripts/release-preflight.sh`) does the right thing automatically because it strips the suffix internally; the lesson from v0.12.0-rc0's first cut was that local one-off `check-compose-versions.sh` invocations are misleading on RC tags.
 
 - No image-gate acceptance or not-covered listing still pending approval, expired, or expiring within two days (WP15/S9). The release gate (`--release`) does not honour an entry whose `approval_ref` is `pending` or that has expired, and each publish leg re-reads the date, so a tag cut with one fails at that image's publish leg, after the other legs that reached "Tag the release" have moved `:X.Y.Z` (and `:X.Y`/`:latest` on a stable tag) to their verified, signed digests. Check the tagged tree:

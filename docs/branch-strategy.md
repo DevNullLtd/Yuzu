@@ -87,7 +87,10 @@ is actually used.
    - a push to `dev` runs the **debug legs only** (`ci.yml` drops the release legs on a
      `refs/heads/dev` push), so a green `dev` push run says nothing about release builds;
    - the release and LTO legs run on `dev` **once a day**, dispatched by
-     `release-legs-daily.yml` against `dev`'s tip; a red run opens a `release-legs-broken` issue;
+     `release-legs-daily.yml` against `dev`'s tip; a red run opens a `release-legs-broken` issue.
+     That schedule fires only from the copy on `main`, so it starts at the first promotion
+     that carries it; until then `dev` gets no release-mode run at all, and the absence of
+     an issue proves nothing (`docs/ci-architecture.md`, *Go-live and interim gap*);
    - only a push to `main` runs the **full matrix**, debug and release legs together.
 3. **Run `/governance <base>..HEAD` locally before asking for review** (`CLAUDE.md` → *Agent team
    & governance*). It reviews a commit range, so commit first. It writes one JSONL fragment per
@@ -214,7 +217,9 @@ tips; (10, `--full` only) a local compile.
 Preflight does not look at the release legs. Before tagging, the release skill also requires
 the release/LTO legs green on `main`'s tip and no open `release-legs-broken` issue
 (`.claude/skills/release/SKILL.md`, *Pre-conditions*): those legs are the only place the tests
-run in release mode, and on `dev` they run once a day, not per push (§2 step 2).
+run in release mode, and on `dev` they run once a day, not per push (§2 step 2). The issue check
+counts only once the daily workflow is live on `main` and firing; the skill shows how to tell,
+and until then the release legs of `main`'s own push run are the only evidence.
 
 **Preflight is the only enforcement of 4b and 9, and it runs only on the operator's machine.**
 The tag push below triggers no preflight; `release.yml` checks neither fragments nor divergence.
