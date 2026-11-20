@@ -5,8 +5,9 @@
 /// is closing (a reconnect teardown or a stop) an ordinary task that has not started its plugin is
 /// rejected, because the pool destructor waits for every task. A PROTECTIVE action (the closed set in
 /// `yuzu/protective_actions.hpp`: the four firewall containment actions and `__guard__.push_rules`)
-/// is never rejected there and never sleeps a stagger or delay: a containment or rule push queued ahead
-/// of a teardown still runs. It uses the one `is_protective_action` predicate that also chooses the
+/// is never rejected there and never sleeps a stagger or delay: a containment queued ahead
+/// of a teardown still runs (`__guard__.push_rules` is answered inline in the command loop and is
+/// never queued in the pool). It uses the one `is_protective_action` predicate that also chooses the
 /// reserved lane at submit; never keep a second list.
 
 #include <yuzu/protective_actions.hpp>

@@ -9,6 +9,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <mutex>
+#include <thread>
 
 using yuzu::agent::command_may_stagger;
 using yuzu::agent::command_may_start;
@@ -39,7 +40,10 @@ TEST_CASE("a protective task queued behind a blocker still runs at teardown; an 
     std::mutex m;
     std::condition_variable cv;
     bool release = false;
-    std::atomic<bool> blocker_started{false};
+    // ThreadPool clamps its size to at least 4 workers, so occupy all of them: only then do the
+    // three tasks below queue behind running work instead of starting at once.
+    constexpr int kBlockers = 4;
+    std::atomic<int> blockers_started{0};
     std::atomic<bool> closing{false};
     std::atomic<int> protective_ran{0};
     std::atomic<int> ordinary_ran{0};
@@ -47,12 +51,14 @@ TEST_CASE("a protective task queued behind a blocker still runs at teardown; an 
     {
         // Declared AFTER the state its tasks capture, so ~ThreadPool joins first.
         ThreadPool pool(1);
-        REQUIRE(pool.submit([&] {
-            blocker_started = true;
-            std::unique_lock lk(m);
-            cv.wait(lk, [&] { return release; });
-        }));
-        while (!blocker_started.load())
+        for (int i = 0; i < kBlockers; ++i) {
+            REQUIRE(pool.submit([&] {
+                ++blockers_started;
+                std::unique_lock lk(m);
+                cv.wait(lk, [&] { return release; });
+            }));
+        }
+        while (blockers_started.load() < kBlockers)
             std::this_thread::yield();
         auto task = [&](const char* plugin, const char* action, std::atomic<int>& ran,
                         std::atomic<int>* rejected) {

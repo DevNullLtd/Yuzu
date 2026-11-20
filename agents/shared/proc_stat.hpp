@@ -35,7 +35,7 @@ namespace yuzu::shared {
                     return std::nullopt;
                 const auto digit = static_cast<std::uint64_t>(c - '0');
                 // More than 2^64 - 1 would wrap and could equal a different process's start time.
-                if (v > (std::numeric_limits<std::uint64_t>::max() - digit) / 10)
+                if (v > ((std::numeric_limits<std::uint64_t>::max)() - digit) / 10)
                     return std::nullopt;
                 v = v * 10 + digit;
             }
@@ -57,7 +57,8 @@ namespace yuzu::shared {
 /// What the second start-time reading says about the row's pid.
 enum class PidState {
     Same,     ///< both readings known and equal: the same process
-    Reused,   ///< the pid belongs to another process, or the first reading is unknown (cannot be checked)
+    Reused,   ///< both readings known and different: the pid belongs to another process
+    Unverified, ///< the first reading is unknown, so a recycled pid cannot be told from the same process
     Exited    ///< the pid's stat is unreadable: the process exited after it was listed
 };
 
@@ -65,7 +66,9 @@ enum class PidState {
                                            std::optional<std::uint64_t> after_hash) {
     if (!after_hash)
         return PidState::Exited;
-    return at_enumeration && *at_enumeration == *after_hash ? PidState::Same : PidState::Reused;
+    if (!at_enumeration)
+        return PidState::Unverified;
+    return *at_enumeration == *after_hash ? PidState::Same : PidState::Reused;
 }
 
 /// True for a real SHA-256 digest (64 lowercase hex), as opposed to an empty value or a
@@ -87,14 +90,16 @@ struct RowSettle {
 
 /// A mismatch always drops the path, but only a real digest is converted to a cause token: an
 /// existing `hash_unavailable:timeout` / `skipped` marker (or an empty hash) keeps its own, more
-/// specific reading. `Reused` and `Exited` are distinct tokens (`pid_reused`, `pid_exited`).
+/// specific reading. `Reused`, `Unverified` and `Exited` are distinct tokens (`pid_reused`, `pid_unverified`, `pid_exited`).
 [[nodiscard]] inline RowSettle settle_row_for(PidState state, std::string_view hash) {
     if (state == PidState::Same)
         return {};
     RowSettle r;
     r.drop_path = true;
     if (is_sha256_digest(hash))
-        r.hash_cause = state == PidState::Reused ? "pid_reused" : "pid_exited";
+        r.hash_cause = state == PidState::Reused       ? "pid_reused"
+                       : state == PidState::Unverified ? "pid_unverified"
+                                                       : "pid_exited";
     return r;
 }
 

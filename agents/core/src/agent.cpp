@@ -3957,9 +3957,10 @@ public:
                     // so concurrent dispatch is required.
                     // Each task captures the shared_ptr to guarantee the stream
                     // outlives all writers (fixes use-after-free risk from #66).
-                    // ADR-2005: a protective action (the closed firewall containment set and
-                    // __guard__.push_rules) goes to the pool's reserved lane; every other command
-                    // can never occupy the last reserved worker.
+                    // ADR-2005: a protective action that reaches the pool (the closed firewall
+                    // containment set) goes to its reserved lane; every other command can never
+                    // occupy the last reserved worker. __guard__.push_rules is also protective
+                    // but never reaches the pool: it is answered inline in this loop, above.
                     const bool protective_lane =
                         yuzu::protective::is_protective_action(cmd.plugin(), cmd.action());
                     bool submitted = thread_pool_->submit([this, target, cmd, stream, claimed_here]() {
@@ -4506,8 +4507,8 @@ private:
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
                               const std::shared_ptr<SubscribeStream>& stream, bool claimed_here) {
         // A task still queued (or about to sleep) when the pool closes never starts, EXCEPT a protective
-        // action (ADR-2005): a containment or rule push queued ahead of a teardown still runs, so the
-        // close can never strand it. The same single predicate chooses the reserved lane at submit.
+        // action (ADR-2005): a containment queued ahead of a teardown still runs, so the
+        // close can never strand it (a rule push is answered inline and is never queued). The same single predicate chooses the reserved lane at submit.
         if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {
             reject_unstarted_command(stream, cmd, claimed_here);
             return;

@@ -61,7 +61,8 @@ RestartSec=10
 # return (the command pool's join; a command blocked in the kernel on a stalled mount or resolver
 # holds it, and the agent's 20 s shutdown watchdog does not cover it). 60 s lets an ordinary
 # stop finish and then ends a stuck one with SIGKILL (status=9/KILL) instead of waiting out
-# systemd's default. A killed agent is restarted by Restart=always. The server unit uses 210 s and
+# systemd's default. An agent ended by that SIGKILL is restarted by Restart=always (an explicit
+# `systemctl stop` that completes is not restarted). The server unit uses 210 s and
 # the gateway unit 40 s.
 TimeoutStopSec=60
 WorkingDirectory=/var/lib/yuzu-agent

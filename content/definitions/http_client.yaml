@@ -100,8 +100,18 @@ spec:
         platforms: [windows, linux, darwin]
       - name: body
         type: string
-        description: 'Response body text; a body over the 100 MiB cap is replaced with an error string, though the full response is already received over the wire before that check runs. Values: free text, or an error string on failure.'
+        description: 'Response body text, at most the first 1 MiB (a longer body is cut at a character boundary and a truncated row follows); NUL and invalid UTF-8 bytes are replaced with ? and a constrained row reports how many. Values: free text, or an error string on failure.'
         example: '<!doctype html><html lang="en"><head><title>Example Domain</title>...'
+        platforms: [windows, linux, darwin]
+      - name: constrained
+        type: string
+        description: 'Present only when body bytes were replaced: body_bytes_replaced:<count> of NUL or invalid UTF-8 bytes. Values: body_bytes_replaced:<count>.'
+        example: 'body_bytes_replaced:3'
+        platforms: [windows, linux, darwin]
+      - name: truncated
+        type: int64
+        description: 'Present only when the body was cut at the cap: the cap in bytes (1048576). The status is still the peer status and the exit code is unchanged. Values: 1048576.'
+        example: 1048576
         platforms: [windows, linux, darwin]
   approval:
     mode: auto

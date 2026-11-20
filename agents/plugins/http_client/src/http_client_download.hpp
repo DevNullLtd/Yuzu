@@ -23,6 +23,9 @@
 #include <filesystem>
 #include <string>
 #include <string_view>
+#include <utility>
+
+#include <wire_utf8.hpp>
 
 namespace yuzu::http_client {
 
@@ -43,6 +46,36 @@ inline constexpr std::size_t kMaxGetBodyBytes = 1024 * 1024;
     }
     body.append(data, len);
     return true;
+}
+
+/// What `get` puts on the wire for one body: cut back to a scalar boundary when the transfer was
+/// truncated at the cap, then every byte that may not reach the wire (NUL, anything outside
+/// well-formed UTF-8) replaced with '?' through the shared `yuzu::shared::scrub_wire_bytes`.
+/// `replaced` is how many bytes were replaced; non-zero means the row is reported constrained.
+struct GetBodyRow {
+    std::string body;
+    std::size_t replaced{0};
+};
+
+[[nodiscard]] inline GetBodyRow prepare_get_body(std::string body, bool truncated) {
+    if (truncated && !body.empty()) {
+        // A cut at the byte cap may fall inside a scalar: drop the incomplete tail whole.
+        const std::size_t n = body.size();
+        for (std::size_t back = 1; back <= 4 && back <= n; ++back) {
+            const std::size_t i = n - back;
+            const auto b = static_cast<unsigned char>(body[i]);
+            if ((b & 0xC0) == 0x80)
+                continue; // continuation byte: keep looking for the lead
+            const std::size_t want = b >= 0xF0 ? 4 : b >= 0xE0 ? 3 : b >= 0xC0 ? 2 : 1;
+            if (want > back)
+                body.resize(i); // the lead's scalar runs past the end of what was received
+            break;
+        }
+    }
+    GetBodyRow row;
+    row.replaced = yuzu::shared::scrub_wire_bytes(body);
+    row.body = std::move(body);
+    return row;
 }
 
 struct DownloadObservation {

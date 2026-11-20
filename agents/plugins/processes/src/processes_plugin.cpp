@@ -144,16 +144,15 @@ std::vector<ProcessInfo> enumerate_processes() {
         if (!is_pid)
             continue;
 
+        ProcessInfo pi;
+        pi.pid = std::stoul(entry->d_name);
+        // The start time is read BEFORE the status file is opened and AFTER the name read: a pid
+        // recycled in between would otherwise pair one process's name with another's start time.
+        const auto ticks_before = read_start_ticks(pi.pid);
         std::string status_path = std::string("/proc/") + entry->d_name + "/status";
         std::ifstream ifs(status_path);
         if (!ifs.is_open())
             continue;
-
-        ProcessInfo pi;
-        pi.pid = std::stoul(entry->d_name);
-        // The start time is read BEFORE and AFTER the name read: a pid recycled in between would
-        // otherwise pair one process's name with another's start time.
-        const auto ticks_before = read_start_ticks(pi.pid);
         std::string line;
         bool have_name = false, have_ppid = false;
         while (std::getline(ifs, line)) {
@@ -523,8 +522,9 @@ private:
     // The name, the path and the hash of one row are three separate reads of a pid that can be
     // recycled in between. A row is kept only when the process start time read before the name and
     // the one read after the hash agree. On a mismatch the path is dropped and a real digest reads
-    // `hash_unavailable:pid_reused` (the pid belongs to another process) or
-    // `hash_unavailable:pid_exited` (its stat is unreadable); an existing `timeout`/`skipped`
+    // `hash_unavailable:pid_reused` (the pid belongs to another process),
+    // `hash_unavailable:pid_unverified` (the first start-time read failed, so reuse cannot be told
+    // from the same process) or `hash_unavailable:pid_exited` (its stat is unreadable); an existing `timeout`/`skipped`
     // marker or empty hash is left as it was. Linux only: Windows and macOS have no such guard.
     static void settle_row([[maybe_unused]] const ProcessInfo& p, [[maybe_unused]] std::string& path,
                            [[maybe_unused]] std::string& hash) {

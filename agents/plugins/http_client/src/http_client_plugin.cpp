@@ -629,8 +629,13 @@ private:
         bool truncated = false;
         auto body = http_get(url, status, truncated);
         ctx.write_output(std::format("status|{}", status));
-        body.insert(0, "body|"); // one buffer: no second copy of a body up to 1 MiB
-        ctx.write_output(body);
+        // A body is peer data: cut at a scalar boundary when truncated and scrubbed to well-formed
+        // UTF-8 without NUL before it is one wire row (a NUL would silently cut the row at the ABI).
+        auto row = yuzu::http_client::prepare_get_body(std::move(body), truncated);
+        row.body.insert(0, "body|"); // one buffer: no second copy of a body up to 1 MiB
+        ctx.write_output(row.body);
+        if (row.replaced != 0)
+            ctx.write_output(std::format("constrained|body_bytes_replaced:{}", row.replaced));
         if (truncated)
             ctx.write_output(std::format("truncated|{}", yuzu::http_client::kMaxGetBodyBytes));
         return status >= 200 && status < 400 ? 0 : 1;

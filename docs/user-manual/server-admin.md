@@ -6824,13 +6824,15 @@ including the F3 orphan grace and `~Agent`, as one bounded 20-second window,
 regardless of which specific phase `service_main` is actually in when the
 dispatcher returns; the log-teardown grace (2s) then runs separately, in
 `main()`, strictly after `run_service()` itself has already returned, adding
-to that 20s rather than being covered by it. Neither `deploy/systemd/yuzu-agent.service`
-nor `deploy/packaging/macos/com.yuzu.agent.plist` overrides its supervisor's
-own stop-timeout default (`TimeoutStopSec=` is absent from the unit;
-`ExitTimeOut` is absent from the plist); systemd's and launchd's own
-defaults apply on top of everything above, and this document does not assert
-what those defaults are. Check `systemd.service(5)`/`launchd.plist(5)` on
-your own host if you need the exact figure.
+to that 20s rather than being covered by it. `deploy/systemd/yuzu-agent.service` sets `TimeoutStopSec=60`: a stop still
+waiting at 60 s (a command blocked in the kernel holds the pool join, which the
+20-second watchdog above does not cover) ends in SIGKILL (`status=9/KILL`) and
+`Restart=always` restarts the agent. `deploy/packaging/macos/com.yuzu.agent.plist`
+does not set `ExitTimeOut`, so launchd's own default applies there; check
+`launchd.plist(5)` on your own host for the exact figure. On Windows a stop that
+does not complete is ended by finding the process id with `sc.exe queryex YuzuAgent`
+and terminating it with `taskkill /F /PID <pid>`; the service then stays stopped
+until `sc.exe start YuzuAgent` is run.
 
 **Stopping a wedged server (Linux/macOS, #3007).** Identical mechanism to the
 agent above, applied to the server. If a stop appears to hang: **send the

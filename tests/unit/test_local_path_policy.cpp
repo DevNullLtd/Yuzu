@@ -982,6 +982,34 @@ hc::DownloadObservation good_obs(std::uint64_t n) {
 }
 } // namespace
 
+TEST_CASE("http_client get: the body is scrubbed to wire UTF-8, cut at a scalar boundary, and reported",
+          "[shared][http_client]") {
+    // Clean text passes through untouched and unreported.
+    auto clean = hc::prepare_get_body("h\xC3\xA9llo", false);
+    CHECK(clean.body == "h\xC3\xA9llo");
+    CHECK(clean.replaced == 0);
+
+    // A NUL is replaced (never a silent cut of the row) and counted.
+    auto nul = hc::prepare_get_body(std::string("ab\0cd", 5), false);
+    CHECK(nul.body == "ab?cd");
+    CHECK(nul.replaced == 1);
+
+    // An invalid byte is replaced too.
+    auto bad = hc::prepare_get_body("a\xFF" "b", false);
+    CHECK(bad.body == "a?b");
+    CHECK(bad.replaced == 1);
+
+    // A truncation that lands inside a scalar drops the partial scalar whole, for every width.
+    CHECK(hc::prepare_get_body("ab\xC3", true).body == "ab");
+    CHECK(hc::prepare_get_body("ab\xE2\x82", true).body == "ab");
+    CHECK(hc::prepare_get_body("ab\xF0\x9F\x98", true).body == "ab");
+    auto whole = hc::prepare_get_body("ab\xF0\x9F\x98\x80", true); // complete scalar is kept
+    CHECK(whole.body == "ab\xF0\x9F\x98\x80");
+    CHECK(whole.replaced == 0);
+    // Without truncation an incomplete tail is just invalid bytes and is scrubbed instead.
+    CHECK(hc::prepare_get_body("ab\xC3", false).body == "ab?");
+}
+
 TEST_CASE("http_client download: only a complete 2xx body is acceptable", "[shared][http_client]") {
     CHECK(hc::download_failure(good_obs(10)).empty());
 

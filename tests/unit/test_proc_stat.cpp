@@ -53,7 +53,7 @@ TEST_CASE("parse_stat_start_ticks: a start time above 2^64 - 1 is refused, never
 TEST_CASE("classify_pid: same, recycled, or exited", "[proc_stat][processes]") {
     CHECK(classify_pid(5u, 5u) == PidState::Same);
     CHECK(classify_pid(5u, 6u) == PidState::Reused);
-    CHECK(classify_pid(std::nullopt, 6u) == PidState::Reused); // the first reading is unknown: unverifiable
+    CHECK(classify_pid(std::nullopt, 6u) == PidState::Unverified); // first reading unknown: not claimed reused
     CHECK(classify_pid(5u, std::nullopt) == PidState::Exited);
     CHECK(classify_pid(std::nullopt, std::nullopt) == PidState::Exited);
 }
@@ -67,6 +67,9 @@ TEST_CASE("settle_row_for: only a real digest is converted, a marker keeps its o
     const auto reused = settle_row_for(PidState::Reused, digest);
     CHECK(reused.drop_path);
     CHECK(reused.hash_cause == "pid_reused");
+    const auto unverified = settle_row_for(PidState::Unverified, digest);
+    CHECK(unverified.drop_path);
+    CHECK(unverified.hash_cause == "pid_unverified"); // never labelled a recycled pid
     const auto exited = settle_row_for(PidState::Exited, digest);
     CHECK(exited.drop_path);
     CHECK(exited.hash_cause == "pid_exited"); // a process that legitimately exited is its own token
