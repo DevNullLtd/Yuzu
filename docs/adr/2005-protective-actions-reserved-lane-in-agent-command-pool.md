@@ -42,10 +42,11 @@ must not be starvable by ordinary commands. The agent command pool therefore has
 ## What this does NOT establish
 
 Owner decision, Fraser Jarvis, 2026-11-18: the pool-teardown join (#8247), the bounded-helper unload
-residual (#8204), the ~60 s `patch_connectivity` ordinary-worker hold, the ordinary-lane filesystem stall,
-and protective-lane starvation (#8288) are documented residuals the owner accepted for this change.
+residual (#8204), the ~60 s `patch_connectivity` ordinary-worker hold and the ordinary-lane filesystem
+stall are documented residuals the owner accepted for this change. Protective-lane starvation (#8288) is
+not owner-accepted: it is tracked in #8288.
 
-- **Pool teardown is not covered.** The reserved lane governs worker admission while a pool is running. It does not cover pool teardown: when the stream drops the agent destroys the pool: a queued task that has not started is answered REJECTED ("agent reconnecting") without running and a staggered command's sleep ends within about a second, but the agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait.
+- **Pool teardown is not bounded.** The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait.
 - **Independence is asserted, not verified.** The reserve guarantees a WORKER is available to a
   protective command. It does not prove the protective action's own blocking calls (a firewall
   backend, a resolver, the filesystem it touches) are independent of whatever stalled the ordinary
@@ -55,11 +56,12 @@ and protective-lane starvation (#8288) are documented residuals the owner accept
   or for an ordinary one (four stuck protective tasks on `ThreadPool(4, .., 1)` were verified to block
   both). Capping protective running at `workers - 1`, or one in-flight protective task per
   `(plugin, action)`, is a follow-up tracked in #8288, not part of this change.
-- **A stagger or delay sleep runs on the worker.** A command carrying `stagger_seconds` or
-  `delay_seconds` (up to 600 s) sleeps on its worker, protective commands included; the protective lane
-  does not skip it. The sleep is taken in slices of at most one second and ends when the pool is closing
-  for a reconnect or the agent is stopping: the command is then not started, is answered REJECTED
-  ("agent reconnecting" or "agent stopping") and its claim is released so a redelivery can run it.
+- **A protective action never sleeps a stagger or delay.** An ordinary command carrying `stagger_seconds` or
+  `delay_seconds` (up to 600 s) sleeps on its worker in slices of at most one second, and the sleep ends when
+  the pool is closing for a reconnect or the agent is stopping: the command is then not started, is answered
+  REJECTED ("agent reconnecting" or "agent stopping") and its claim is released so a redelivery can run it.
+  A protective action skips the sleep and, while the pool is closing, is not rejected: it starts at once
+  (`command_start_gate.hpp`, the same `is_protective_action` predicate that picks the lane).
 - **Result writes share `stream_write_mu_`.** A protective result waits on the same stream write mutex as
   every ordinary result.
 - **The `firewall` plugin has no plugin-level mutex**, so two protective commands can enter it together.

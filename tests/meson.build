@@ -314,6 +314,7 @@ agent_test_exe = executable(
     'unit/test_resilience_strategy.cpp',
     'unit/test_thread_pool.cpp',
     'unit/test_interruptible_wait.cpp', # a stagger sleep is sliced and stop-aware
+    'unit/test_command_start_gate.cpp', # a protective task still runs at teardown (ADR-2005)
     'unit/test_proc_stat.cpp', # a recycled pid is detected by the process start time
     'unit/test_command_params.cpp', # sg10: agent NUL-parameter refusal predicate
     'unit/test_shutdown_pipe.cpp',

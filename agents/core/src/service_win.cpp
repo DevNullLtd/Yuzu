@@ -124,8 +124,14 @@ DWORD WINAPI handler_ex(DWORD control, DWORD /*event_type*/, LPVOID /*event_data
         // comment has the exact call-graph reasoning) - up to ~40s total, past this 30s hint,
         // with neither individual watchdog firing (external review, PR #3737). In that specific
         // composed-but-neither-fires case the outcome is a CLEAN stop, not a crash: teardown
-        // eventually completes on its own and this handler reaches report_status(SERVICE_STOPPED)
-        // below (line ~260) with its default NO_ERROR exit code. Per SERVICE_FAILURE_ACTIONS_FLAG's
+        // completes and this handler reaches report_status(SERVICE_STOPPED) below (line ~260)
+        // with its default NO_ERROR exit code.
+        //
+        // Neither watchdog covers the command pool's join. The pool destructor waits, with no
+        // bound, for every command still running its plugin to return (#8247, an owner-accepted
+        // residual): a command blocked in the kernel keeps this service in Stopping, with no
+        // reconnect and no restart action, until that call returns. Only a queued ordinary
+        // command is rejected at teardown; a running one is waited for. Per SERVICE_FAILURE_ACTIONS_FLAG's
         // documented semantics, --install-service's SC_ACTION_RESTART recovery actions (main.cpp,
         // #1822) fire ONLY on a process that terminates WITHOUT reporting SERVICE_STOPPED, or one
         // that reports it with a non-zero exit code - a slow-but-clean SERVICE_STOPPED/NO_ERROR

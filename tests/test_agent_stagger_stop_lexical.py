@@ -36,8 +36,12 @@ def check(src):
     elif not any(0 < r - c < 400 for c in closing for r in resets):
         defects.append("command_pool_closing_.store(true) is not immediately before thread_pool_.reset()")
     body = re.search(r"void execute_command_task\([^)]*\)\s*\{(.*?)Stagger/delay", src, re.S)
-    if not body or "command_pool_closing()" not in body.group(1) or "reject_unstarted_command" not in body.group(1):
-        defects.append("execute_command_task does not reject an unstarted command when the pool is closing")
+    if (not body or not re.search(r"command_may_start\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*,\s*command_pool_closing\(\)\s*\)", body.group(1))
+            or "reject_unstarted_command" not in body.group(1)):
+        defects.append("execute_command_task does not reject an unstarted ordinary command when the pool is closing "
+                       "through command_may_start (protective actions are exempt)")
+    if not re.search(r"total_delay\s*>\s*0\s*&&\s*command_may_stagger\(\s*cmd\.plugin\(\)\s*,\s*cmd\.action\(\)\s*\)", src):
+        defects.append("the stagger/delay sleep is not gated on command_may_stagger (a protective action never sleeps)")
     rej = re.search(r"void reject_unstarted_command\(.*?\n    \}\n", src, re.S)
     if not rej or "release(cmd.command_id())" not in rej.group(0):
         defects.append("reject_unstarted_command does not release the dedup claim")
@@ -48,7 +52,9 @@ def selftest(src):
     mutants = {
         "bare sleep": src.replace("if (!sleep_interruptible(std::chrono::seconds(total_delay),", "std::this_thread::sleep_for(std::chrono::seconds(total_delay)); if (!sleep_interruptible(std::chrono::seconds(0),", 1),
         "no closing flag set": src.replace("command_pool_closing_.store(true, std::memory_order_release);", "", 1),
-        "no start check": src.replace("        if (command_pool_closing()) {\n            reject_unstarted_command(stream, cmd, claimed_here);\n            return;\n        }", "", 1),
+        "no start check": src.replace("if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {", "if (false) {", 1),
+        "protective exemption dropped": src.replace("command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())", "command_pool_closing()", 1),
+        "protective sleeps a stagger": src.replace(" && command_may_stagger(cmd.plugin(), cmd.action())", "", 1),
     }
     for name, mutated in mutants.items():
         if mutated == src:

@@ -9,6 +9,7 @@
 #include <algorithm>
 #include <chrono>
 #include <thread>
+#include <utility>
 
 namespace yuzu::agent {
 

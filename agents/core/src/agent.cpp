@@ -54,6 +54,7 @@ __declspec(allocate(".CRT$XCB"))
 #include "log_handoff.hpp"               // drain_log_bounded: breadcrumb before that hard_exit
 #include "command_dedup_decision.hpp"            // dedup claim/replay decision core (pure, unit-tested)
 #include "command_params.hpp"                    // command_params_have_nul (sg10 / UP-1)
+#include "command_start_gate.hpp"                // command_may_start/command_may_stagger: protective actions run at teardown
 #include "interruptible_wait.hpp"                 // sleep_interruptible: a stagger never outlives a reconnect or stop
 #include "collection_settings_agent.hpp"       // __sync__.settings decision core (pure, unit-tested)
 #include "sync_now_decision.hpp"               // __sync__.now decision core (pure, unit-tested)
@@ -4461,7 +4462,8 @@ private:
     // inside the lambda.
     /// True while the command pool is being destroyed for a reconnect, or the agent is stopping: a task
     /// that has not started its plugin yet must not start (and must not sleep a stagger), because the
-    /// pool destructor waits for every task (#8247 is the unbounded join of a RUNNING task).
+    /// pool destructor waits for every task (#8247 is the unbounded join of a RUNNING task). A
+    /// protective action is the one exemption (`command_may_start`): it still runs, with no stagger.
     [[nodiscard]] bool command_pool_closing() const {
         return command_pool_closing_.load(std::memory_order_acquire) ||
                stop_requested_.load(std::memory_order_acquire);
@@ -4495,8 +4497,10 @@ private:
 
     void execute_command_task(const YuzuPluginDescriptor* target, const pb::CommandRequest& cmd,
                               const std::shared_ptr<SubscribeStream>& stream, bool claimed_here) {
-        // A task still queued (or about to sleep) when the pool closes never starts.
-        if (command_pool_closing()) {
+        // A task still queued (or about to sleep) when the pool closes never starts, EXCEPT a protective
+        // action (ADR-2005): a containment or rule push queued ahead of a teardown still runs, so the
+        // close can never strand it. The same single predicate chooses the reserved lane at submit.
+        if (!command_may_start(cmd.plugin(), cmd.action(), command_pool_closing())) {
             reject_unstarted_command(stream, cmd, claimed_here);
             return;
         }
@@ -4516,7 +4520,8 @@ private:
             spdlog::debug("Command {} stagger {}s + delay {}s = {}s", cmd.command_id(),
                           random_stagger, delay_s, total_delay);
 
-            if (total_delay > 0) {
+            // A protective action never sleeps a stagger or delay: it runs at once, even at teardown.
+            if (total_delay > 0 && command_may_stagger(cmd.plugin(), cmd.action())) {
                 // Sliced (<= 1 s) and stop-aware: a long stagger can never hold this worker past a
                 // reconnect or a stop. An interrupted command never ran: reject it and let it be
                 // redelivered.
