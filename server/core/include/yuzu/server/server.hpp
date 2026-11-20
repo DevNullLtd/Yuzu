@@ -208,6 +208,12 @@ struct Config {
     // `yuzu_auth_fresh_start_reset_total`.
     bool auth_fresh_start_seeded{false};
 
+    // WP01: proof of identity when an already-enrolled agent id re-registers
+    // (--agent-reregistration-proof, agent_reregistration_gate.hpp): "off" | "audit" | "enforce".
+    // `audit` (the default) decides and counts like `enforce` but admits as before; `enforce`
+    // refuses an unproven re-registration with a gRPC status. Validated by CLI11 at parse time.
+    std::string agent_reregistration_proof{"audit"};
+
     // Gateway upstream (Erlang gateway → C++ server control plane)
     std::string gateway_upstream_address; // Empty = disabled; e.g. "0.0.0.0:50053"
     std::string gateway_command_address;  // Gateway ManagementService for command forwarding
