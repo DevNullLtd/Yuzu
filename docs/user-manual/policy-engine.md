@@ -351,8 +351,9 @@ What this means in use:
   actions, content distribution, scripts, service start mode, certificate deletion, the power
   plan and others. The mutating actions that remain usable as a policy fix are exactly four:
   `tags.set`, `tags.delete`, `agent_actions.set_log_level` and `chargen.chargen_stop`. Every
-  read-only action without a gate is usable as a check; a read-only action that carries a gate
-  (including every action of the Forensics-tier plugins) is refused. A remediation policy that
+  read-only action that has no execute gate and is not reserved for the server is usable as a
+  check; a read-only action that carries a gate or is reserved (including every action of the
+  Forensics-tier plugins) is refused. A remediation policy that
   needs any other action has to be run another way, for example by an operator running the
   action interactively, where the approval requirement applies. The Remediate button is still
   shown for a fix that will be refused: it is shown whenever the fragment has a fix.
