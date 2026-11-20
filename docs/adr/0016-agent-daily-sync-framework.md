@@ -1951,7 +1951,7 @@ does not, or the reverse.
   when at least one stanza is `installed` (the state both row mappers require): an empty one, or one holding only
   config-files, half-installed and other non-installed states, falls through to rpm. An rpm database that was read and
   holds no package does not end detection either: the next candidate directory is tried, and when none yields a package
-  the host is read by the `pacman` and `apk` legs as before. The old path chose by binary and did not fall through;
+  the host is read by the `pacman` leg (and, for `list_inventory` only, the `apk` leg) as before. The old path chose by binary and did not fall through;
   what is new is a database present without its binary.
 - A tab, pipe or newline inside a Maintainer, VENDOR or PACKAGER value no longer truncates the value or splits
   the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time). A host that carries
@@ -1978,10 +1978,12 @@ does not, or the reverse.
 - A symlinked leaf is refused where the tools followed it: a symlinked status file, `status.d` directory or rpm
   database file is `symlink_refused` (the directories above the leaf are reached by path and are followed, as before).
   An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
-  such a link and no candidate directory yielded a database at all, the read is `rpmdb:symlink_refused` (a stat only;
-  nothing is opened through the link) instead of an empty list. The current Fedora, RHEL and SUSE layout
-  (`/var/lib/rpm` linking to the sysimage copy, which is read first) is unaffected, and a database that was read, even
-  an empty one, means a skipped link is not a refusal.
+  such a link, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through the link) instead of an
+  empty list, unless the link resolves, by device and inode, to a directory whose database this reader read itself (an
+  empty one counts). That is decided once every candidate has been tried, because on the older layout the sysimage
+  link is seen before the `/var/lib/rpm` directory it points at. The current Fedora, RHEL and SUSE layout
+  (`/var/lib/rpm` linking to the sysimage copy, which is read first) and the older one are unaffected; a link to a
+  populated directory elsewhere, beside an emptied database, is refused.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
   AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).
 - **A running rpm transaction answers `locked` on ndb and Berkeley DB.** rpm rewrites those two files in place and
@@ -2003,8 +2005,10 @@ does not, or the reverse.
   every other name is ignored) is `dpkg_updates:locked`, with no rows, no fall-through to rpm and the status packages
   discarded as a `status.d` failure discards them. The directory is listed by name only (nothing in it is opened); an
   absent directory means no journal, and a link or non-directory in its place, or a listing that fails, is a named
-  failure. The operator's remedy is `dpkg --configure -a` when no dpkg run is in progress. A merged view can be added
-  on top of this refusal later if wanted.
+  failure. The operator's remedy is `dpkg --configure -a` when no dpkg run is in progress. The check runs on any host
+  with such a file, whether or not a status file or `status.d` exists, including an rpm host that carries a stale dpkg
+  tree: no dpkg exists there to run, so the leftover record is removed by hand. A merged view can be added on top of
+  this refusal later if wanted.
 - A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the
   result's provenance, the `list`/`query` error row and the agent log. The section token the daily sync sends
   is still the generic constrained one (`sync_source_installed_software.cpp` reads only the exit code) until a

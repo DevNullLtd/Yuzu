@@ -31,9 +31,11 @@
  *              and holds no package does not end detection: the next candidate directory is tried,
  *              and when none yields a package the answer is ecosystem none. A lone data.mdb (an LMDB
  *              rpmdb) is unsupported_format, not "no rpm". A skipped symlink that has a database file
- *              behind it (a stat, nothing opened) is rpmdb:symlink_refused only when no candidate
- *              directory yielded a database at all (an empty one that was read counts): a database
- *              that exists but may not be read is never an empty list.
+ *              behind it (a stat, nothing opened) is rpmdb:symlink_refused unless it resolves to a
+ *              directory whose database this reader read itself (an empty one counts): on current
+ *              Fedora, RHEL and SUSE /var/lib/rpm links to the sysimage directory that is read, and
+ *              on the older layout the sysimage link points at var/lib/rpm. A database that exists
+ *              but was never read is never an empty list.
  *   3. nothing the plugin's pacman and apk legs run as before (ecosystem none, no failure).
  *
  * Every failure is a "<source>:<cause>" token (HostPackages::failure) and returns NO packages:
@@ -203,6 +205,18 @@ struct Stamp {
                  static_cast<std::int64_t>(st.st_size), static_cast<std::int64_t>(m.tv_sec),
                  static_cast<std::int64_t>(m.tv_nsec), static_cast<std::int64_t>(c.tv_sec),
                  static_cast<std::int64_t>(c.tv_nsec)};
+}
+
+/// Which directory, whatever path or link reached it: st_dev and st_ino, nothing else (a Stamp also
+/// carries size and times, which a directory comparison must not).
+struct DirId {
+    std::uint64_t dev = 0;
+    std::uint64_t ino = 0;
+    friend bool operator==(const DirId&, const DirId&) = default;
+};
+
+[[nodiscard]] inline DirId dir_id_of(const struct stat& st) noexcept {
+    return DirId{static_cast<std::uint64_t>(st.st_dev), static_cast<std::uint64_t>(st.st_ino)};
 }
 
 /// A ByteSource over an open descriptor: pread, EINTR retried, a short read (the file shrank under
@@ -436,7 +450,12 @@ dpkg_updates_failure(const std::string& root, const Limits& lim, PkgDbBudget& bu
 
 struct RpmRead {
     bool found = false; ///< a database file (or an unsupported marker) exists in this directory
-    bool symlinked_db = false; ///< this candidate is a symlink with a database file behind it (never followed)
+    /// The directory this candidate was opened as (fstat of the descriptor); empty when that failed,
+    /// which can only turn a link to it into a refusal.
+    std::optional<DirId> opened;
+    /// This candidate is a symlink (never followed) with a database file behind it: the directory the
+    /// link resolves to. read_host_packages refuses unless that directory is one it read itself.
+    std::optional<DirId> symlinked_db;
     std::vector<RpmPackage> packages;
     std::string failure;
 };
@@ -628,16 +647,20 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
     return std::nullopt;
 }
 
-/// True when `dir_path` is a symlink and a database file exists behind it. stat only: nothing is
-/// opened or read through the link.
-[[nodiscard]] inline bool symlink_hides_database(const std::string& dir_path) {
+/// The directory `dir_path` resolves to when it is a symlink with a database file behind it, else
+/// nothing (not a link, a dangling one, or no database file). stat only, which follows the whole
+/// chain (a link to a link resolves to the same directory): nothing is opened or read through it.
+[[nodiscard]] inline std::optional<DirId> symlink_hides_database(const std::string& dir_path) {
     struct stat st {};
     if (::lstat(dir_path.c_str(), &st) != 0 || !S_ISLNK(st.st_mode))
-        return false;
+        return std::nullopt;
+    struct stat target {};
+    if (::stat(dir_path.c_str(), &target) != 0)
+        return std::nullopt;
     for (const char* name : {"rpmdb.sqlite", "Packages.db", "Packages", "data.mdb"})
         if (::stat((dir_path + '/' + name).c_str(), &st) == 0)
-            return true;
-    return false;
+            return dir_id_of(target);
+    return std::nullopt;
 }
 
 /// Reads the rpm database in `rel_dir`, if there is one. `found == false` with no failure means this
@@ -660,6 +683,9 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
         out.failure = failure_token("rpmdb", PkgDbCause::unreadable);
         return out;
     }
+
+    if (struct stat st {}; ::fstat(dir.dir.fd(), &st) == 0)
+        out.opened = dir_id_of(st);
 
     using BlobReader = yuzu::shared::PkgDbVoid (*)(const yuzu::shared::ByteSource&, PkgDbBudget&,
                                                    const yuzu::shared::RpmBlobFn&);
@@ -766,8 +792,8 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
 
     static constexpr std::string_view kRpmDirs[] = {"usr/lib/sysimage/rpm", "var/lib/rpm",
                                                     "usr/share/rpm"};
-    bool db_read = false;      // a database was read in some candidate directory, even an empty one
-    bool symlinked_db = false; // some candidate is a link with a database behind it
+    std::vector<detail::DirId> read_dirs; // directories whose database was read, even an empty one
+    std::vector<detail::DirId> link_dirs; // directories behind the skipped links that hide a database
     for (const auto dir : kRpmDirs) {
         auto rpm = detail::read_rpm_dir(root, dir, lim, expired);
         if (!rpm.failure.empty()) {
@@ -775,7 +801,8 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
             return out;
         }
         if (rpm.found) {
-            db_read = true;
+            if (rpm.opened)
+                read_dirs.push_back(*rpm.opened);
             if (!rpm.packages.empty()) {
                 out.ecosystem = HostPackages::Ecosystem::rpm;
                 out.rpm = std::move(rpm.packages);
@@ -783,12 +810,18 @@ rpm_transaction_refusal(int dir_fd, LockQuery&& lock_query = &default_lock_query
             }
             continue; // a database with no package does not end detection
         }
-        symlinked_db = symlinked_db || rpm.symlinked_db;
+        if (rpm.symlinked_db)
+            link_dirs.push_back(*rpm.symlinked_db);
     }
-    // The refusal is for its stated case only: a database exists solely behind a link this reader never
-    // follows. Once one was read, even empty, a skipped link is not a refusal: on current Fedora, RHEL
-    // and SUSE /var/lib/rpm links to the directory that was just read.
-    if (symlinked_db && !db_read)
+    // A database that exists behind a link this reader never follows is a refusal, not an empty list,
+    // unless the link resolves to a directory whose database was read here: on current Fedora, RHEL and
+    // SUSE /var/lib/rpm links to the sysimage directory just read, and on the older layout the sysimage
+    // link points at var/lib/rpm, which is read AFTER the link is seen. So the comparison is made once
+    // the loop is done.
+    const auto was_read = [&read_dirs](const detail::DirId& id) {
+        return std::find(read_dirs.begin(), read_dirs.end(), id) != read_dirs.end();
+    };
+    if (!std::all_of(link_dirs.begin(), link_dirs.end(), was_read))
         out.failure = detail::failure_token("rpmdb", PkgDbCause::symlink_refused);
     return out; // otherwise neither: the plugin's pacman and apk legs run
 }

@@ -1102,6 +1102,40 @@ TEST_CASE("pkgdb detection: an rpm database that was read and holds no package d
         fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
         CHECK(read_root(root).failure == "rpmdb:symlink_refused");
     }
+    SECTION("an emptied database plus a link to a populated directory elsewhere is symlink_refused") {
+        // The link is not the directory that was read, so the database behind it is one this reader
+        // never saw: an empty list here would be published as the host's complete one.
+        Root root;
+        put_emptied_sqlite(root, "usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        root.put("elsewhere/rpmdb.sqlite", alma9);
+        fs::create_directories(root.at("var/lib"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpmdb:symlink_refused");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("older layout, emptied database: the link is seen first and still resolves to the directory read") {
+        // usr/lib/sysimage/rpm links to var/lib/rpm, which is read AFTER the link is skipped: the
+        // identities are compared once the loop is done, so this is none, not a refusal.
+        Root root;
+        put_emptied_sqlite(root, "var/lib/rpm/rpmdb.sqlite", fedora);
+        fs::create_directories(root.at("usr/lib/sysimage"));
+        fs::create_directory_symlink("../../../var/lib/rpm", root.at("usr/lib/sysimage/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("an emptied first candidate followed by a damaged second one is that failure, with no rows") {
+        Root root;
+        put_emptied_sqlite(root, "usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        root.put_text("var/lib/rpm/rpmdb.sqlite", std::string(8192, 'x'));
+        const auto h = read_root(root);
+        CHECK(h.failure == "rpm_sqlite:corrupt");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
 }
 
 TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no rpm transaction holds .rpm.lock",

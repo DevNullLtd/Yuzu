@@ -370,8 +370,13 @@ cadences.
   - **Which manager is read.** It is chosen by its database file, not its binary.
     A dpkg status with no installed package (empty, or only config-files and
     half-installed stanzas) falls through to rpm, and an rpm database that holds no
-    package falls through to `pacman` and `apk`; a host with such an empty database
-    and no other manager reports an empty collection, not a degraded one.
+    package falls through to `pacman` (and, for `list_inventory`, the daily sync,
+    `apk`); a host with such an empty database and no other manager reports an
+    empty collection, not a degraded one.
+  - **dpkg `Status`.** A `Status` is accepted only as dpkg writes it (dpkg's own
+    words, lowercase, one space between them). A status file hand-edited to mixed
+    case or repeated blanks, which `dpkg-query` read, is `dpkg_status:corrupt` (no
+    rows, the server keeps its stored ones) until dpkg next rewrites it.
   - **Symlinks.** A symlinked status file, `status.d` directory or rpm database
     file is refused (`symlink_refused`) where the tools followed the link. A
     symlinked rpm directory is skipped, never followed (the current Fedora, RHEL
@@ -379,14 +384,16 @@ cadences.
     unaffected).
   - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm
     database, a running rpm transaction answers `locked` (the reader asks whether
-    rpm's transaction lock is held and never takes it); and on a dpkg host, a
+    rpm's transaction lock is held and never takes it); and on any host with a
     pending update journal (a file named with digits only in
-    `/var/lib/dpkg/updates`, left by a dpkg run in progress or an interrupted one)
-    answers `dpkg_updates:locked`, where `dpkg-query` printed the merged view. Both
+    `/var/lib/dpkg/updates`, left by a dpkg run in progress or an interrupted one),
+    including an rpm host that carries a stale dpkg tree, the read answers
+    `dpkg_updates:locked`, where `dpkg-query` printed the merged view. Both
     keep the server's stored rows. The rpm one clears when the transaction ends;
     the dpkg one when dpkg next completes a run, and after an interrupted run
     `dpkg --configure -a` (when no dpkg run is in progress) completes the journal
-    and clears it. An rpm lock file moved out of the database directory is not
+    and clears it; on an rpm host there is no dpkg to run, so the leftover record
+    is removed by hand. An rpm lock file moved out of the database directory is not
     seen.
   - **Unprivileged read.** An rpm sqlite database without its WAL sidecars is
     readable by an unprivileged account (measured on one AlmaLinux 9 image, where
