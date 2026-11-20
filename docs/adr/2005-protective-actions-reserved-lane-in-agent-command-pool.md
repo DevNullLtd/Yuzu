@@ -62,6 +62,16 @@ not owner-accepted: it is tracked in #8288.
   REJECTED ("agent reconnecting" or "agent stopping") and its claim is released so a redelivery can run it.
   A protective action skips the sleep and, while the pool is closing, is not rejected: it starts at once
   (`command_start_gate.hpp`, the same `is_protective_action` predicate that picks the lane).
+- **A protective action is never rejected as expired.** An ordinary command whose `expires_at` has passed
+  when its stagger or delay ends is answered REJECTED ("command expired after stagger/delay"). A
+  protective action is exempt (`command_may_expire`, `command_start_gate.hpp`, the same predicate): a
+  protective command that was queued longer than its expiry still runs. The stored-state reconciler stays
+  the authority and re-applies drift, so a late containment is applied rather than dropped.
+- **The protective drain is not bounded, and it is counted.** A protective task that is queued or starts
+  while the pool is closing runs to completion, and the pool destructor waits for it. That wait is inside
+  the `TimeoutStopSec=60` stop budget, so a long protective drain ends in SIGKILL (`status=9/KILL`). The
+  agent counts each such run on `yuzu_agent_protective_commands_run_closing_total` and logs a WARN for the
+  first five and then every hundredth run. There is no bounded drain.
 - **Result writes share `stream_write_mu_`.** A protective result waits on the same stream write mutex as
   every ordinary result.
 - **The `firewall` plugin has no plugin-level mutex**, so two protective commands can enter it together.

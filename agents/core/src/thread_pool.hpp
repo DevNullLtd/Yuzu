@@ -21,7 +21,9 @@
 // commands (with one reserved slot) never leave a protective task without a worker while one is
 // free. NOT covered (ADR-2005): no reserve between protective tasks (they may use any worker), and
 // the destructor runs every queued task (the agent's tasks reject at once when the pool is closing) and
-// waits, unbounded, for every task already running (#8247); protective tasks have
+// waits, unbounded, for every task already running (#8247). A protective task that runs during
+// the close is part of that wait, inside the agent's 60 s stop budget (counted by
+// `yuzu_agent_protective_commands_run_closing_total`); protective tasks have
 // their own queue, taken first, and may use any worker. The invariant lives HERE, at the one place
 // a task is chosen to run, never at a caller.
 

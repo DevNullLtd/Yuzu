@@ -823,6 +823,12 @@ public:
                           "a protective action is never counted",
                           "counter");
         metrics_.counter("yuzu_agent_commands_rejected_closing_total");
+        metrics_.describe("yuzu_agent_protective_commands_run_closing_total",
+                          "Protective commands that ran while the command pool was closing for a "
+                          "reconnect or the agent was stopping; the close waits for them inside the "
+                          "stop budget",
+                          "counter");
+        metrics_.counter("yuzu_agent_protective_commands_run_closing_total");
         metrics_.describe("yuzu_agent_plugins_loaded", "Number of loaded plugins", "gauge");
         metrics_.describe("yuzu_agent_plugin_rejected_total",
                           "Plugins rejected at load time, labeled by reason", "counter");
@@ -4513,6 +4519,12 @@ private:
             reject_unstarted_command(stream, cmd, claimed_here);
             return;
         }
+        if (protective_runs_while_closing(cmd.plugin(), cmd.action(), command_pool_closing()) &&
+            note_protective_run_closing(metrics_, protective_closing_runs_)) {
+            spdlog::warn("Protective command {} ({}.{}) runs while the command pool is closing; the "
+                         "close waits for it inside the stop budget (TimeoutStopSec=60)",
+                         cmd.command_id(), cmd.plugin(), cmd.action());
+        }
         // -- Stagger/delay: prevent thundering herd on large-fleet dispatch --
         const int32_t stagger_s = std::min(cmd.stagger_seconds(), int32_t{300}); // cap 5 min
         const int32_t delay_s = std::min(cmd.delay_seconds(), int32_t{300});     // cap 5 min
@@ -4541,8 +4553,10 @@ private:
                 }
             }
 
-            // Check expiration after the delay — skip stale commands
-            if (cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
+            // Check expiration after the delay — skip stale commands. A protective action is never
+            // rejected as expired (command_may_expire): the stored-state reconciler stays the
+            // authority, so a late containment is applied rather than dropped.
+            if (command_may_expire(cmd.plugin(), cmd.action()) && cmd.has_expires_at() && cmd.expires_at().millis_epoch() > 0) {
                 auto now_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                   std::chrono::system_clock::now().time_since_epoch())
                                   .count();
@@ -4972,6 +4986,7 @@ private:
     // shutdown so a trigger never fires into a half-torn-down plugin.
     TriggerEngine trigger_engine_;
     yuzu::MetricsRegistry metrics_;
+    std::atomic<std::uint64_t> protective_closing_runs_{0}; // throttles the closing-run WARN
     std::chrono::steady_clock::time_point start_time_;
     std::string session_id_;
     std::atomic<bool> stop_requested_{false};

@@ -7,11 +7,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include <atomic>
+#include <string>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
 
+using yuzu::agent::closing_run_warn_due;
+using yuzu::agent::command_may_expire;
 using yuzu::agent::command_may_stagger;
+using yuzu::agent::note_protective_run_closing;
+using yuzu::agent::protective_runs_while_closing;
 using yuzu::agent::command_may_start;
 using yuzu::agent::ThreadPool;
 
@@ -84,4 +89,33 @@ TEST_CASE("a protective task queued behind a blocker still runs at teardown; an 
     CHECK(protective_ran.load() == 2);
     CHECK(ordinary_ran.load() == 0);
     CHECK(ordinary_rejected.load() == 1);
+}
+
+TEST_CASE("command_may_expire: a protective action is never rejected as expired",
+          "[command_start_gate][protective]") {
+    CHECK(command_may_expire("echo", "run"));
+    CHECK(command_may_expire("firewall", "state")); // an ordinary firewall action
+    CHECK_FALSE(command_may_expire("firewall", "quarantine"));
+    CHECK_FALSE(command_may_expire("firewall", "release"));
+    CHECK_FALSE(command_may_expire("firewall", "quarantine_status"));
+    CHECK_FALSE(command_may_expire("firewall", "quarantine_allow"));
+    CHECK_FALSE(command_may_expire("__guard__", "push_rules"));
+    CHECK_FALSE(command_may_expire("FIREWALL", "Quarantine"));
+}
+
+TEST_CASE("a protective run at a pool close is counted and its WARN is throttled",
+          "[command_start_gate][protective]") {
+    CHECK_FALSE(protective_runs_while_closing("firewall", "quarantine", false));
+    CHECK_FALSE(protective_runs_while_closing("echo", "run", true));
+    CHECK(protective_runs_while_closing("firewall", "quarantine", true));
+
+    yuzu::MetricsRegistry metrics;
+    std::atomic<std::uint64_t> seq{0};
+    int warns = 0;
+    for (int i = 0; i < 250; ++i)
+        if (note_protective_run_closing(metrics, seq))
+            ++warns;
+    CHECK(warns == 7); // runs 1-5, 100 and 200
+    CHECK(metrics.counter("yuzu_agent_protective_commands_run_closing_total").value() == 250.0);
+    CHECK_FALSE(closing_run_warn_due(0));
 }
