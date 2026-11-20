@@ -5333,7 +5333,7 @@ TEST_CASE("WP01: a wired but CLOSED audit store drops the enrolment evidence LOU
     }
 }
 
-TEST_CASE("WP01: the summary chunks reach the audit log through the health-tick flush only, in order, and a "
+TEST_CASE("WP01: the summary chunks reach the audit log through the flush only, in order, and a "
           "deadline or a failing store keeps them queued",
           "[pg][agent_service][wp01][reregistration][audit]") {
     using yuzu::server::detail::UnprovenAuditBudget;

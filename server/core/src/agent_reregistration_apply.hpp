@@ -284,8 +284,8 @@ apply_reregistration_gate(ReregistrationProofMode mode, const AgentIdentityHooks
         if (!audit)
             return;
         if (result == "success") {
-            // A window this call closes is queued inside the budget and written ONLY by the health
-            // tick / stop() (flush_reregistration_audit_summary): never on a Register thread.
+            // A window this call closes is queued inside the budget and written ONLY by the flush thread
+            // / stop() (flush_reregistration_audit_summary): never on a Register thread.
             // admit() contains its own failures (a throw costs this row only); the catch is a
             // second belt: an exception out of the audit decision must never reach gRPC.
             bool admitted = false;

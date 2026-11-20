@@ -46,7 +46,8 @@ namespace yuzu::server::detail {
 /// every 5 s from its own thread, and at stop()), never on a Register thread. A dropped id is
 /// NAMED in a row only when that flush succeeds.
 /// WHAT IS NOT GUARANTEED (MEDIUM residual, conditional on this wording and on the alerts
-/// `YuzuAgentReregistrationAuditIdsTruncated` / `...AuditSummaryDropped`): the open window and the
+/// `YuzuAgentReregistrationAuditIdsTruncated` / `...AuditSummaryDropped`, which are SAMPLE rules
+/// that nothing this repo ships loads or routes): the open window and the
 /// queue are memory only, so a process kill loses the ids of up to one open window plus the unflushed
 /// chunks (measured 47-65% of recent ids in a kill test); ids are cut to 24 characters in a row; more
 /// than `kMaxDroppedIds` distinct drops in one window (the figure `distinct_dropped_ids_max` and the
@@ -474,7 +475,11 @@ ReregistrationFlushResult flush_reregistration_budget(UnprovenAuditBudget& budge
             continue;
         }
         r.any_failed = true;
-        if (!budget.requeue_front(std::move(*row)))
+        // A chunk that hit kMaxWriteAttempts is a write_failed drop. One that could not be handed
+        // back (an allocation failure) was already counted by requeue_front as alloc_failed:
+        // counting it here too would report one chunk twice.
+        const bool attempts_exhausted = row->attempts + 1 >= UnprovenAuditBudget::kMaxWriteAttempts;
+        if (!budget.requeue_front(std::move(*row)) && attempts_exhausted)
             ++r.write_failed;
         break; // a failing store: retry on the next round, not in a tight loop
     }

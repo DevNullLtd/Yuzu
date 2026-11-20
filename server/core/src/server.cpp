@@ -9885,7 +9885,14 @@ public:
                             .gauge("yuzu_server_agent_reregistration_proof_mode",
                                    {{"mode", std::string(to_string(m))}})
                             .set(m == proof_mode ? 1.0 : 0.0);
-                    if (proof_mode == ReregistrationProofMode::Enforce) {
+                    if (proof_mode != ReregistrationProofMode::Off &&
+                        !(cfg_.tls_enabled && !cfg_.tls_ca_cert.empty())) {
+                        // The gate runs only on a listener that requires a client identity (TLS
+                        // with a client CA): without one it is inert, whatever the flag says.
+                        spdlog::warn("PKI: agent re-registration proof mode = {} is NOT in force: "
+                                     "the agent listener has no TLS client CA, so the gate is inert",
+                                     to_string(proof_mode));
+                    } else if (proof_mode == ReregistrationProofMode::Enforce) {
                         spdlog::info("PKI: agent re-registration proof mode = enforce");
                     } else {
                         // Audit/off do NOT close the takeover: say so at every boot.
@@ -9920,8 +9927,17 @@ public:
                     spdlog::warn("PKI: initial CRL publish failed; GET /api/v1/ca/crl will 503 until "
                                  "the leader's freshness pass or the next revocation republishes");
             }
-            // else: nullopt — genuinely no root (operator brought their own certs) —
-            // no signer/recognizer/revocation-checker wiring, same as before.
+            else {
+                // nullopt — genuinely no root (operator brought their own certs) — no
+                // signer/recognizer/revocation-checker wiring, and no re-registration gate either:
+                // say so rather than leave a configured mode unexplained.
+                const auto proof_mode = parse_reregistration_proof_mode(cfg_.agent_reregistration_proof)
+                                            .value_or(ReregistrationProofMode::Enforce);
+                if (proof_mode != ReregistrationProofMode::Off)
+                    spdlog::warn("PKI: agent re-registration proof mode = {} is NOT in force: this "
+                                 "install has no CA of its own, so the gate is inert",
+                                 to_string(proof_mode));
+            }
         }
 
         grpc::EnableDefaultHealthCheckService(true);
