@@ -1044,10 +1044,14 @@ TEST_CASE("compliance page: the remediate copy says what policy evaluation refus
           "dispatch toast carries its reason",
           "[compliance][fragments]") {
     const std::string page = kComplianceHtml;
-    // The confirm copy no longer says the fix has no approval step: a fix that needs approval,
-    // is destructive or is reserved for the server is refused, not dispatched.
+    // The confirm copy no longer says the fix has no approval step: a fix whose action has an
+    // execute gate, is destructive or is reserved for the server is refused, not dispatched.
+    // The claim is about the execute gate, not about every kind of approval: a definition's own
+    // approval_mode is a separate control that policy evaluation does not read.
     CHECK(page.find("with no approval step") == std::string::npos);
-    CHECK(page.find("is refused, not dispatched") != std::string::npos);
+    CHECK(page.find("A fix whose action has an execute gate, is destructive or is reserved for "
+                    "the server is refused, not dispatched") != std::string::npos);
+    CHECK(page.find("A fix that needs approval") == std::string::npos);
     // The toast text is composed from the A4 body's remediation when the 409 is a refused
     // dispatch, so the reason reaches the operator and not only "policy dispatch refused".
     CHECK(page.find("policy_dispatch_refused: ") != std::string::npos);
