@@ -169,7 +169,9 @@ Once all juniors (code + doc) complete:
 2. Run the authoritative **`/test`** (default; `--full` for release-bound work). The juniors'
    `/test --quick` runs were smoke checks — not a substitute. Fix or re-delegate failures.
 3. **Commit before governing.** `/governance` reviews a commit range, not the working tree.
-   Branch first if on the default branch, commit, then run `/governance <base>..HEAD`.
+   If you are on `dev` or `main`, branch first — from `origin/dev` (a hotfix from `origin/main`;
+   `docs/branch-strategy.md` §2/§4), never from the default branch `main` for ordinary work —
+   then commit, then run `/governance <base>..HEAD`.
 4. CRITICAL/HIGH governance findings block merge. Apply fixes, recommit, re-run governance.
 5. Report to the user: what each junior did, escalations and resolutions, architect verdict
    (if run), governed range, `/test` + `/governance` outcome.

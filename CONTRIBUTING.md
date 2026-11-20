@@ -73,12 +73,22 @@ See [`docs/capability-map.md`](docs/capability-map.md) for the target feature se
 
 ## Branch Naming
 
-- `feature/<short-description>` for new functionality
-- `fix/<short-description>` for bug fixes
-- `fix/<finding-id>-<short-description>` for RC sprint findings (e.g., `fix/C1-gateway-tls`)
+- `feat/<short-description>` for new functionality
+- `fix/<short-description>` for bug fixes; `fix/<issue>-<short-description>` when there is an issue
+- `docs/`, `ci/`, `chore/`, `refactor/`, `test/`, `perf/` for changes of that kind
+- `hotfix/<issue>-<short-description>` for a fix to a released version (see below)
+- `release/` and `chore/release-*` for release preparation (maintainers)
 
-Branch from `dev` — all work merges into `dev`; `main` is release-only. Keep branches focused
-on a single change.
+Branch from `origin/dev` — all work merges into `dev`; `main` is release-only. The repository's
+default branch is `main`, so do not branch from "wherever you are". The exceptions: a hotfix to a
+released version branches from `main`, merges to `main`, and is carried back to `dev`
+afterwards; maintainers' release-prep branches (`release/*`, `chore/release-*`) are cut from
+`main` for a patch or a changelog fold and from `dev` for a promotion; a sub-PR of a long-lived
+`feat/*` branch is cut from that branch. Keep branches focused on a single change.
+
+How a change travels from `dev` to a tagged release, how release candidates and hotfixes are
+handled, and who decides what counts as a hotfix and who cuts releases:
+[`docs/branch-strategy.md`](docs/branch-strategy.md).
 
 ## Erlang Gateway
 
