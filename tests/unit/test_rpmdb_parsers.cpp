@@ -25,6 +25,7 @@
 #include "test_helpers.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstdint>
 #include <cstring>
 #include <ctime>
@@ -32,6 +33,7 @@
 #include <fstream>
 #include <iterator>
 #include <map>
+#include <memory>
 #include <set>
 #include <span>
 #include <sstream>
@@ -145,17 +147,21 @@ std::vector<Bytes> blobs_of_sqlite(std::string_view capture) {
     fs::create_directories(dir.path);
     const fs::path copy = dir.path / "rpmdb.sqlite";
     fs::copy_file(pkgdb_fixture(capture, "rpmdb.sqlite"), copy);
-    sqlite3* db = nullptr;
-    REQUIRE(sqlite3_open(copy.string().c_str(), &db) == SQLITE_OK);
-    sqlite3_stmt* st = nullptr;
-    REQUIRE(sqlite3_prepare_v2(db, "SELECT blob FROM Packages", -1, &st, nullptr) == SQLITE_OK);
+    // Both handles are owned before any REQUIRE can throw (a failed open still hands back a handle);
+    // the statement is declared second, so it is finalized before the connection closes.
+    sqlite3* raw_db = nullptr;
+    const int open_rc = sqlite3_open(copy.string().c_str(), &raw_db);
+    const std::unique_ptr<sqlite3, int (*)(sqlite3*)> db{raw_db, &sqlite3_close};
+    REQUIRE(open_rc == SQLITE_OK);
+    sqlite3_stmt* raw_st = nullptr;
+    const int prep_rc = sqlite3_prepare_v2(db.get(), "SELECT blob FROM Packages", -1, &raw_st, nullptr);
+    const std::unique_ptr<sqlite3_stmt, int (*)(sqlite3_stmt*)> st{raw_st, &sqlite3_finalize};
+    REQUIRE(prep_rc == SQLITE_OK);
     std::vector<Bytes> out;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        const auto* p = static_cast<const std::uint8_t*>(sqlite3_column_blob(st, 0));
-        out.emplace_back(p, p + sqlite3_column_bytes(st, 0));
+    while (sqlite3_step(st.get()) == SQLITE_ROW) {
+        const auto* p = static_cast<const std::uint8_t*>(sqlite3_column_blob(st.get(), 0));
+        out.emplace_back(p, p + sqlite3_column_bytes(st.get(), 0));
     }
-    sqlite3_finalize(st);
-    sqlite3_close(db);
     return out;
 }
 
@@ -182,7 +188,8 @@ std::vector<Bytes> blobs_of(const Capture& c) {
 RpmPackage package_of(const Bytes& blob) {
     auto h = RpmHeader::parse(blob);
     REQUIRE(h.has_value());
-    auto p = rpm_package_from_header(*h);
+    auto budget = generous();
+    auto p = rpm_package_from_header(*h, budget);
     REQUIRE(p.has_value());
     return std::move(*p);
 }
@@ -372,7 +379,8 @@ TEST_CASE("rpm header hostile: edited real blob with a bad il, dl, offset, strin
     const auto package_err = [](const Bytes& b) {
         const auto h = RpmHeader::parse(b);
         REQUIRE(h.has_value());
-        const auto p = rpm_package_from_header(*h);
+        auto budget = generous();
+        const auto p = rpm_package_from_header(*h, budget);
         REQUIRE_FALSE(p.has_value());
         return p.error();
     };
@@ -453,6 +461,68 @@ TEST_CASE("rpm header hostile: edited real blob with a bad il, dl, offset, strin
         Bytes longer = good;
         longer.push_back(0);
         REQUIRE_FALSE(RpmHeader::parse(longer).has_value());
+    }
+}
+
+// ── header kept text (edited real blob) ─────────────────────────────────────
+
+TEST_CASE("rpm header kept text: string tags aliased onto one stored string are each charged",
+          "[rpmdb][pkgdb]") {
+    // EDITED real alma9 blob: every other string entry is re-pointed at NAME's offset, so the stored
+    // bytes stay one string while the package keeps six copies of it. The read budget charges the
+    // blob once; only the kept budget sees the multiple.
+    constexpr std::array<std::uint32_t, 5> kOthers{rpm_tag::kVersion, rpm_tag::kRelease, rpm_tag::kArch,
+                                                   rpm_tag::kVendor, rpm_tag::kPackager};
+    const auto has_all = [&kOthers](const Bytes& b) {
+        return std::all_of(kOthers.begin(), kOthers.end(),
+                           [&b](std::uint32_t t) { return entry_of(b, t) != 0; });
+    };
+    Bytes blob;
+    for (auto& b : blobs_of(kCaptures[1]))
+        if (has_all(b)) {
+            blob = std::move(b);
+            break;
+        }
+    REQUIRE_FALSE(blob.empty());
+    const std::size_t name_entry = entry_of(blob, rpm_tag::kName);
+    for (const std::uint32_t t : kOthers) {
+        const std::size_t e = entry_of(blob, t);
+        put_be32(blob, e + 4, rpm_type::kString);
+        put_be32(blob, e + 8, get_be32(blob, name_entry + 8));
+        put_be32(blob, e + 12, 1);
+    }
+    const auto header = RpmHeader::parse(blob);
+    REQUIRE(header.has_value());
+    const std::string name = package_of(blob).name;
+    REQUIRE_FALSE(name.empty());
+    const std::uint64_t kept = 6ull * name.size(); // NAME plus the five aliases
+
+    const auto read_with = [&header](std::uint64_t kept_left) {
+        auto budget = generous();
+        budget.kept_left = kept_left;
+        return rpm_package_from_header(*header, budget);
+    };
+    SECTION("one byte short of the sum of the kept strings is byte_cap") {
+        const auto p = read_with(kept - 1);
+        REQUIRE_FALSE(p.has_value());
+        CHECK(p.error() == PkgDbCause::byte_cap);
+    }
+    SECTION("the exact sum passes and every alias reads as the name") {
+        const auto p = read_with(kept);
+        REQUIRE(p.has_value());
+        CHECK(p->version == name);
+        CHECK(p->release == name);
+        CHECK(p->arch == name);
+        CHECK(p->vendor == name);
+        CHECK(p->packager == name);
+    }
+    SECTION("the read budget is untouched by the copies") {
+        auto budget = generous();
+        budget.kept_left = kept;
+        const std::uint64_t read_before = budget.bytes_left;
+        REQUIRE(rpm_package_from_header(*header, budget).has_value());
+        CHECK(budget.bytes_left == read_before);
+        CHECK(budget.kept_left == 0);
     }
 }
 

@@ -15,28 +15,39 @@
  *
  * Detection order (the old tool-binary order, now by DATABASE file):
  *   1. dpkg    <root>/var/lib/dpkg/status (+ status.d/): the text database. An absent
- *              status is "not dpkg"; an empty one (no installed package) falls through,
- *              so an rpm host that carries a stale dpkg tree is still read as rpm.
- *   2. rpm     the first of usr/lib/sysimage/rpm, var/lib/rpm, usr/share/rpm that is a
- *              real directory (a symlinked one is never followed: on current Fedora, RHEL and SUSE
- *              /var/lib/rpm links to the sysimage copy, which is tried first), and in it the
- *              first of rpmdb.sqlite, Packages.db, Packages that exists. A lone data.mdb
- *              (an LMDB rpmdb) is unsupported_format, not "no rpm". A skipped symlink that has a
- *              database file behind it (a stat, nothing opened) is rpmdb:symlink_refused when no
- *              other candidate directory yields a database: a database that exists but may not be
- *              read is never an empty list.
- *   3. nothing the plugin's pacman and apk legs run as before (ecosystem none).
+ *              status is "not dpkg". It is the answer only when at least one stanza is
+ *              `installed` (the state both row mappers require); one with none (empty, or only
+ *              config-files, half-installed and other non-installed states) falls through, so an
+ *              rpm host that carries a stale dpkg tree is still read as rpm. A pending update
+ *              journal (a digits-named file in var/lib/dpkg/updates) is dpkg_updates:locked, with
+ *              no rows and no fall-through: see read_dpkg.
+ *   2. rpm     the first of usr/lib/sysimage/rpm, var/lib/rpm, usr/share/rpm that holds a database
+ *              file (a symlinked candidate directory is never followed: on current Fedora, RHEL and
+ *              SUSE /var/lib/rpm links to the sysimage copy, which is tried first), and in it the
+ *              first of rpmdb.sqlite, Packages.db, Packages that exists. A database that was read
+ *              and holds no package does not end detection: the next candidate directory is tried,
+ *              and when none yields a package the answer is ecosystem none. A lone data.mdb (an LMDB
+ *              rpmdb) is unsupported_format, not "no rpm". A skipped symlink that has a database file
+ *              behind it (a stat, nothing opened) is rpmdb:symlink_refused only when no candidate
+ *              directory yielded a database at all (an empty one that was read counts): a database
+ *              that exists but may not be read is never an empty list.
+ *   3. nothing the plugin's pacman and apk legs run as before (ecosystem none, no failure).
  *
  * Every failure is a "<source>:<cause>" token (HostPackages::failure) and returns NO packages:
  * one unreadable record fails the whole read, so the caller reports a degraded answer
  * (CONSTRAINED, rows kept by the server) and never publishes a smaller roster as complete.
  *
  * Hardening that is not in the parsers:
- *   - the file is opened O_NOFOLLOW relative to its directory descriptor, regular files only
- *     (posix_secure_read.hpp); the sqlite leg then reopens it BY PATH (sqlite needs the path to
- *     find its -wal/-shm siblings), a documented residual for root-owned directories;
- *   - size, mtime and ctime of the OPENED file are stamped before and after the read; a
- *     difference is changed_during_read whatever else happened;
+ *   - the LEAF is opened O_NOFOLLOW relative to its directory descriptor, regular files only
+ *     (posix_secure_read.hpp); the directories above it are reached by path and their symlinks ARE
+ *     followed, as the old tools followed them. The sqlite leg then reopens the file BY PATH
+ *     (sqlite needs the path to find its -wal/-shm siblings), a documented residual for root-owned
+ *     directories;
+ *   - the RPM database file's size, mtime and ctime are stamped from the OPENED descriptor before and
+ *     after the read; a difference is changed_during_read whatever else happened. (dpkg has no
+ *     stamp: a text file read whole in one pass.) For the ndb and Berkeley DB files the stamp is
+ *     not enough on its own, because rpm rewrites them in place, so the reader also refuses to read
+ *     while rpm's transaction lock is held: see rpm_transaction_refusal;
  *   - sqlite is opened read-only with the untrusted-database posture (defensive, no trusted
  *     schema, a length limit, a progress-handler deadline, query_only, cell_size_check);
  *   - a WAL-mode database whose -wal sidecar is absent or empty is opened immutable=1: an
@@ -97,7 +108,13 @@ struct Limits {
     /// single file over it is `oversized`; files that each fit but sum over it are `byte_cap`.
     std::uint64_t dpkg_max_bytes = 32ull * 1024 * 1024;
     std::uint64_t rpm_max_header_bytes = 32ull * 1024 * 1024; ///< one rpm header blob
-    std::uint64_t rpm_max_total_bytes = 1ull << 30;           ///< all rpm headers of one read
+    std::uint64_t rpm_max_total_bytes = 1ull << 30;           ///< all rpm headers of one read: bytes READ
+    /// The strings the rpm readers KEEP, in total (PkgDbBudget::kept_left). Apart from the read bound
+    /// because one stored string can be named by several fields: six copies of a 32 MiB header's
+    /// text would otherwise be admitted under the 1 GiB read bound. 8 MiB is the old inner capture cap
+    /// of the `rpm -qa` call (kToolOutputCap in installed_apps_plugin.cpp), above the collector's
+    /// 3.5 MiB outer cap, so no host the old path could report is newly refused.
+    std::uint64_t rpm_max_kept_bytes = 8ull * 1024 * 1024;
     std::chrono::milliseconds wall{20000};                    ///< milliseconds so a test can use a short wall
     int sqlite_busy_ms = 2000;
 };
@@ -109,7 +126,7 @@ struct HostPackages {
     Ecosystem ecosystem = Ecosystem::none;
     std::vector<DpkgPackage> dpkg;
     std::vector<RpmPackage> rpm;
-    std::string failure; ///< "<source>:<cause>", source in dpkg_status, dpkg_status_d, rpm_sqlite, rpm_ndb, rpm_bdb, rpmdb, pkgdb
+    std::string failure; ///< "<source>:<cause>", source in dpkg_status, dpkg_status_d, dpkg_updates, rpm_sqlite, rpm_ndb, rpm_bdb, rpmdb, pkgdb
 };
 
 namespace detail {
@@ -140,6 +157,23 @@ namespace detail {
     base += '/';
     base += rel;
     return base;
+}
+
+/// Why a directory under the database tree could not be opened (the caller has already treated ENOENT
+/// as "absent"): a link is refused by name, a non-directory is not_regular, anything else unreadable.
+[[nodiscard]] inline PkgDbCause dir_open_cause(const std::string& path, int err) {
+    struct stat st {};
+    if (::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode))
+        return PkgDbCause::symlink_refused;
+    return err == ENOTDIR ? PkgDbCause::not_regular : PkgDbCause::unreadable;
+}
+
+/// The most entries one directory listing may visit: twice max_packages (a status.d package is one
+/// control file and one `.md5sums` sibling). Over it is row_cap.
+[[nodiscard]] inline std::size_t dir_entry_bound(const Limits& lim) noexcept {
+    return lim.max_packages > std::numeric_limits<std::size_t>::max() / 2
+               ? std::numeric_limits<std::size_t>::max()
+               : lim.max_packages * 2;
 }
 
 /// What identifies the opened file's state: taken from the descriptor before the first read and
@@ -231,19 +265,13 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
     if (!dir.opened()) {
         if (dir.err == ENOENT)
             return out; // benign absent
-        struct stat st {};
-        const bool is_link = ::lstat(path.c_str(), &st) == 0 && S_ISLNK(st.st_mode);
-        out.failure = failure_token(kSource, is_link ? PkgDbCause::symlink_refused
-                                    : dir.err == ENOTDIR ? PkgDbCause::not_regular
-                                                         : PkgDbCause::unreadable);
+        out.failure = failure_token(kSource, dir_open_cause(path, dir.err));
         return out;
     }
 
     std::vector<std::string> names;
     std::optional<PkgDbCause> stopped; // why the callback ended the walk early
-    const std::size_t entry_bound = lim.max_packages > std::numeric_limits<std::size_t>::max() / 2
-                                        ? std::numeric_limits<std::size_t>::max()
-                                        : lim.max_packages * 2;
+    const std::size_t entry_bound = dir_entry_bound(lim);
     const auto walk = yuzu::shared::walk_dir_capped(
         dir.dir.get(), entry_bound,
         [&](const struct dirent* e) {
@@ -304,6 +332,54 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
     return out;
 }
 
+/// A name in var/lib/dpkg/updates that is an update-journal record: ASCII digits only. dpkg's own
+/// rule (cleanupdates() in dbmodify.c); `tmp.i` and every other name is ignored.
+[[nodiscard]] inline bool is_dpkg_journal_record(std::string_view name) noexcept {
+    return !name.empty() && std::all_of(name.begin(), name.end(), [](char c) { return c >= '0' && c <= '9'; });
+}
+
+/// Is a dpkg update journal pending? Returns the failure token, or "" when the directory holds no
+/// record. `dpkg-query -W` printed the status file MERGED with these records (it replays them in
+/// memory before it answers, whether or not it may write them back); this reader reads the status
+/// file alone, so while a dpkg run is in progress, or after an interrupted one until dpkg next runs,
+/// the status file alone is the PRE-journal roster. Merging means re-implementing dpkg's
+/// record-replacement rules, a larger risk than the gap, so the answer is `dpkg_updates:locked` with
+/// no rows. An absent directory means no journal; a link or non-directory in its place, or a listing
+/// that fails, is a named failure and never "no journal". Nothing in the directory is opened or read:
+/// only names are listed, through the same capped walk as status.d, the deadline polled per entry.
+template <typename ReadDirFn = yuzu::shared::detail::DefaultReadDirFn>
+[[nodiscard]] inline std::string
+dpkg_updates_failure(const std::string& root, const Limits& lim, PkgDbBudget& budget,
+                     ReadDirFn&& readdir_fn = &yuzu::shared::detail::default_readdir) {
+    constexpr std::string_view kSource = "dpkg_updates";
+    const std::string path = join(root, "var/lib/dpkg/updates");
+    auto dir = yuzu::shared::open_dir_no_follow(path);
+    if (!dir.opened())
+        return dir.err == ENOENT ? std::string{} : failure_token(kSource, dir_open_cause(path, dir.err));
+
+    std::optional<PkgDbCause> stopped; // why the callback ended the walk early
+    const std::size_t entry_bound = dir_entry_bound(lim);
+    const auto walk = yuzu::shared::walk_dir_capped(
+        dir.dir.get(), entry_bound,
+        [&](const struct dirent* e) {
+            if (auto t = budget.check_time(); !t) {
+                stopped = t.error();
+                return false;
+            }
+            if (is_dpkg_journal_record(e->d_name)) {
+                stopped = PkgDbCause::locked;
+                return false;
+            }
+            return true;
+        },
+        std::forward<ReadDirFn>(readdir_fn));
+    if (stopped)
+        return failure_token(kSource, *stopped);
+    if (walk.enumeration_error || walk.truncated)
+        return failure_token(kSource, walk.enumeration_error ? PkgDbCause::unreadable : PkgDbCause::row_cap);
+    return {};
+}
+
 [[nodiscard]] inline DpkgRead read_dpkg(const std::string& root, const Limits& lim,
                                         const std::function<bool()>& expired) {
     constexpr std::string_view kSource = "dpkg_status";
@@ -340,6 +416,13 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
         out.failure = std::move(status_d.failure);
         return out;
     }
+    // A pending update journal makes the status file alone an incomplete roster (see
+    // dpkg_updates_failure): refuse, discarding what was parsed, exactly as the status.d failure does.
+    if (auto journal = dpkg_updates_failure(root, lim, budget); !journal.empty()) {
+        out.packages.clear();
+        out.failure = std::move(journal);
+        return out;
+    }
     yuzu::shared::merge_dpkg_status_d(out.packages, std::move(status_d.packages));
     return out;
 }
@@ -353,13 +436,14 @@ struct RpmRead {
     std::string failure;
 };
 
-/// One header blob -> one package, or the cause the whole read fails with.
+/// One header blob -> one package, or the cause the whole read fails with. The strings the package
+/// keeps are charged to `budget`'s kept-text bound (Limits::rpm_max_kept_bytes).
 [[nodiscard]] inline std::expected<RpmPackage, PkgDbCause>
-collect_header(std::span<const std::uint8_t> blob) {
+collect_header(std::span<const std::uint8_t> blob, PkgDbBudget& budget) {
     auto header = yuzu::shared::RpmHeader::parse(blob);
     if (!header)
         return std::unexpected(header.error());
-    return yuzu::shared::rpm_package_from_header(*header);
+    return yuzu::shared::rpm_package_from_header(*header, budget);
 }
 
 /// sqlite's URI for `path`: `%`, `?` and `#` are the only characters a URI path reads specially.
@@ -474,12 +558,49 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         if (auto r = budget.charge_bytes(static_cast<std::uint64_t>(len)); !r)
             return std::unexpected(r.error());
         auto pkg = collect_header(std::span<const std::uint8_t>(static_cast<const std::uint8_t*>(data),
-                                                                static_cast<std::size_t>(len)));
+                                                                static_cast<std::size_t>(len)),
+                                  budget);
         if (!pkg)
             return std::unexpected(pkg.error());
         out.push_back(std::move(*pkg));
     }
     return out;
+}
+
+/// Is another process inside an rpm transaction? Answers the cause that refuses the read, or
+/// nullopt when the database may be read. For the ndb and Berkeley DB files only: rpm rewrites them
+/// IN PLACE (ndb clears a slot and zeroes its blob, moving neighbours; Berkeley DB pages reach the
+/// file when a write cursor closes), and every writer holds rpm's transaction lock for the whole run
+/// (rpmtsRun -> rpmtxnBegin(RPMTXN_WRITE): an fcntl write lock on `.rpm.lock`, created by rpm
+/// beside the database). `rpm -qa` was isolated from a writer by the lock the library takes for it
+/// (ndb: a shared flock on Packages.db; Berkeley DB: the shared environment), a read-only reader of
+/// the raw file is not, and a read torn between a writer's steps can be a structurally valid, wrong
+/// roster. So: ask fcntl(F_GETLK) whether a write lock would conflict, and read nothing if it would.
+///
+/// NEVER takes a lock (no flock, no F_SETLK): this reader must not delay rpm. The lock file is opened
+/// through the database's own directory descriptor, the leaf not followed. ENOENT means no
+/// transaction has ever run there: not locked. A link, a non-regular file or a failed fcntl is its own
+/// cause, never "not locked". Residual: rpm's lock path is configurable (%_rpmlock_path); one moved
+/// out of the database directory is not seen. The stamp stays as the second line of defence: with
+/// the lock free after the first stamp, a writer already running has finished and a later one moves
+/// the stamp.
+[[nodiscard]] inline std::optional<PkgDbCause> rpm_transaction_refusal(int dir_fd) {
+    const auto lock = yuzu::shared::open_file_no_follow_at(dir_fd, ".rpm.lock");
+    if (!lock.opened()) {
+        if (lock.error == yuzu::shared::ReadError::io && lock.err == ENOENT)
+            return std::nullopt;
+        return cause_of(lock.error);
+    }
+    struct flock probe {};
+    probe.l_type = F_WRLCK;
+    probe.l_whence = SEEK_SET;
+    probe.l_start = 0;
+    probe.l_len = 0; // the whole file
+    if (::fcntl(lock.file.fd(), F_GETLK, &probe) != 0)
+        return PkgDbCause::unreadable;
+    if (probe.l_type != F_UNLCK)
+        return PkgDbCause::locked;
+    return std::nullopt;
 }
 
 /// True when `dir_path` is a symlink and a database file exists behind it. stat only: nothing is
@@ -538,8 +659,17 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         }
         const int fd = file.file.fd();
         const auto before = stamp_of(fd);
+        // After the first stamp and before the first read: a writer already running has not finished,
+        // and what it leaves is read by nobody. sqlite keeps its own isolation (a shared lock).
+        if (c.read_blobs) {
+            if (const auto refusal = rpm_transaction_refusal(dir.dir.fd())) {
+                out.failure = failure_token(c.source, *refusal);
+                return out;
+            }
+        }
         PkgDbBudget budget{.rows_left = lim.max_packages,
                            .bytes_left = lim.rpm_max_total_bytes,
+                           .kept_left = lim.rpm_max_kept_bytes,
                            .max_item_bytes = lim.rpm_max_header_bytes,
                            .expired = expired};
         std::expected<std::vector<RpmPackage>, PkgDbCause> result;
@@ -549,8 +679,8 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
             std::vector<RpmPackage> packages;
             const auto r = c.read_blobs(
                 fd_source(fd, file.size), budget,
-                [&packages](std::span<const std::uint8_t> blob) -> yuzu::shared::PkgDbVoid {
-                    auto pkg = collect_header(blob);
+                [&packages, &budget](std::span<const std::uint8_t> blob) -> yuzu::shared::PkgDbVoid {
+                    auto pkg = collect_header(blob, budget);
                     if (!pkg)
                         return std::unexpected(pkg.error());
                     packages.push_back(std::move(*pkg));
@@ -597,7 +727,11 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
         out.failure = std::move(dpkg.failure);
         return out;
     }
-    if (!dpkg.packages.empty()) {
+    // dpkg is the answer only when a stanza is `installed`: the state inv_record_from_dpkg and
+    // app_record_from_dpkg both require. A status holding only config-files, half-installed and other
+    // non-installed states (a stale tree on an rpm host) would yield no row, so it falls through.
+    if (std::any_of(dpkg.packages.begin(), dpkg.packages.end(),
+                    [](const DpkgPackage& p) { return p.status == "installed"; })) {
         out.ecosystem = HostPackages::Ecosystem::dpkg;
         out.dpkg = std::move(dpkg.packages);
         return out;
@@ -605,7 +739,8 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
 
     static constexpr std::string_view kRpmDirs[] = {"usr/lib/sysimage/rpm", "var/lib/rpm",
                                                     "usr/share/rpm"};
-    bool symlinked_db = false;
+    bool db_read = false;      // a database was read in some candidate directory, even an empty one
+    bool symlinked_db = false; // some candidate is a link with a database behind it
     for (const auto dir : kRpmDirs) {
         auto rpm = detail::read_rpm_dir(root, dir, lim, expired);
         if (!rpm.failure.empty()) {
@@ -613,13 +748,20 @@ read_rpm_sqlite(const std::string& db_path, int dir_fd, const char* name, int fd
             return out;
         }
         if (rpm.found) {
-            out.ecosystem = HostPackages::Ecosystem::rpm;
-            out.rpm = std::move(rpm.packages);
-            return out;
+            db_read = true;
+            if (!rpm.packages.empty()) {
+                out.ecosystem = HostPackages::Ecosystem::rpm;
+                out.rpm = std::move(rpm.packages);
+                return out;
+            }
+            continue; // a database with no package does not end detection
         }
         symlinked_db = symlinked_db || rpm.symlinked_db;
     }
-    if (symlinked_db) // a database exists only behind a link this reader never follows
+    // The refusal is for its stated case only: a database exists solely behind a link this reader never
+    // follows. Once one was read, even empty, a skipped link is not a refusal: on current Fedora, RHEL
+    // and SUSE /var/lib/rpm links to the directory that was just read.
+    if (symlinked_db && !db_read)
         out.failure = detail::failure_token("rpmdb", PkgDbCause::symlink_refused);
     return out; // otherwise neither: the plugin's pacman and apk legs run
 }

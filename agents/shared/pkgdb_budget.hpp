@@ -16,7 +16,13 @@
  *     size, the per-item cap and the byte budget;
  *   - a failure returns no partial result: one unreadable record fails the
  *     whole read, so a caller never publishes a smaller roster as the host's
- *     complete one.
+ *     complete one;
+ *   - text a reader KEEPS (a string it copies out of a record into its result) is
+ *     charged against `kept_left`, apart from the bytes it READS (`bytes_left`).
+ *     One stored string can be named by several fields of one record, so what a
+ *     record keeps can be a multiple of what it was charged for reading; only
+ *     charging the copies bounds the memory a hostile database can make the
+ *     reader hold.
  *
  * The cause names are an operator-facing vocabulary (they reach the typed
  * result's provenance token and the `list`/`query` error row), so adding one is
@@ -39,7 +45,8 @@ enum class PkgDbCause {
     corrupt,             ///< a bound, magic or structure check failed on bytes that were read
     truncated,           ///< a header promises more bytes than the file holds
     unsupported_format,  ///< a recognised container this reader does not decode
-    locked,              ///< the database is write-locked by its owner past the busy timeout
+    locked,              ///< a writer holds the database: sqlite busy past its timeout, an rpm transaction
+                         ///< running (ndb and Berkeley DB), or a dpkg update journal pending
     changed_during_read, ///< the file's size or times moved while it was being read
     row_cap,             ///< more rows than the budget admits
     byte_cap,            ///< more bytes than the budget admits
@@ -74,13 +81,14 @@ inline constexpr std::uint64_t kPkgDbMaxItemBytes = 256ull * 1024 * 1024;
 
 using PkgDbVoid = std::expected<void, PkgDbCause>;
 
-/// Rows, bytes and time one read may spend. Plain arithmetic, never sticky: an
+/// Rows, bytes read, bytes kept and time one read may spend. Plain arithmetic, never sticky: an
 /// exact fill is admitted, the next charge is refused. `expired` may be empty
 /// (no deadline); it is called from check_time() only, so a reader decides how
 /// often a clock read is worth paying for.
 struct PkgDbBudget {
     std::size_t rows_left = static_cast<std::size_t>(-1);
-    std::uint64_t bytes_left = static_cast<std::uint64_t>(-1);
+    std::uint64_t bytes_left = static_cast<std::uint64_t>(-1); ///< bytes READ (a header blob, a status file)
+    std::uint64_t kept_left = static_cast<std::uint64_t>(-1);  ///< bytes KEPT (strings copied into the result)
     std::uint64_t max_item_bytes = kPkgDbMaxItemBytes; ///< one rpm header, one status file
     std::function<bool()> expired;
 
@@ -95,6 +103,15 @@ struct PkgDbBudget {
         if (n > bytes_left)
             return std::unexpected(PkgDbCause::byte_cap);
         bytes_left -= n;
+        return {};
+    }
+
+    /// One charge per string a reader copies out of a record, made BEFORE the copy: two fields that
+    /// name the same stored bytes are each charged, because each is its own allocation.
+    [[nodiscard]] PkgDbVoid charge_kept(std::uint64_t n) noexcept {
+        if (n > kept_left)
+            return std::unexpected(PkgDbCause::byte_cap);
+        kept_left -= n;
         return {};
     }
 

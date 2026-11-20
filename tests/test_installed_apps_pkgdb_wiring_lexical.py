@@ -13,11 +13,18 @@ never spawns a process or depends on host privilege:
      `get_inventory_linux` each call the bounded database read exactly once, and that every
      `probe_tool_path` literal left in them names pacman or apk.
   2. The lifecycle of the bounded read: the tracked-call guard is held across the call (the WAIT is
-     counted on the calling thread, never inside the detached worker), the stop flag is the one
-     handed to the reader, `shutdown()` quiesces, `init()` re-arms, and the quiesce waits the bounded
-     five seconds. The behaviour of the wall bound, the `pkgdb:timeout|busy|unreadable` tokens and the
-     stop predicate is tested in the unit suite (read_host_packages_bounded is in the shell header);
-     a behavioural quiesce test belongs with the shared tracked-call primitive (#8364).
+     counted on the calling thread, never inside the detached worker), the stop predicate handed to
+     the reader is the plugin's flag OR the agent's shutdown latch (the old subprocess leg ended at
+     an agent stop, so a read must too), `shutdown()` quiesces, `init()` re-arms, and the quiesce
+     waits the bounded five seconds. The behaviour of the wall bound, the
+     `pkgdb:timeout|busy|unreadable` tokens and the stop predicate is tested in the unit suite
+     (read_host_packages_bounded is in the shell header); a behavioural quiesce test belongs with the
+     shared tracked-call primitive (#8364).
+  3. The failure return of both collectors: a failed read answers an EMPTY collection, degraded
+     true, with the reader's reason (routed clause: a degraded answer is status-only, never rows).
+     The unit tests drive the readers and the status templates, never this block, which only compiles
+     on Linux, so nothing else would notice a collector that returned the packages it had, or
+     reported the failure as a clean empty answer.
 
 Lexical only: it cannot see an acquisition built another way (a literal assembled at run time, an
 executable named by a variable), nor control flow that keeps these tokens. Beyond the tokens it is
@@ -85,6 +92,7 @@ OLD_TOOL = re.compile(r"dpkg-query|^rpm$|^/.*bin/rpm$")
 HEAD_APPS = r"AppCollection\s+get_installed_apps_linux\(\s*\)\s*\{"
 HEAD_INV = r"InvCollection\s+get_inventory_linux\(\s*\)\s*\{"
 HEAD_WRAP = r"pkgdb::HostPackages\s+read_host_packages_bounded\(\s*\)\s*\{"
+FAILED_READ_IF = r"if\s*\(\s*!host\.failure\.empty\(\s*\)\s*\)\s*\{"
 HEAD_QUIESCE = r"void\s+quiesce_pkgdb_calls\(\s*\)\s*noexcept\s*\{"
 HEAD_GUARD = r"class\s+PkgDbCallGuard\s*\{"
 HEAD_INIT = r"yuzu::Result<void>\s+init\(\s*yuzu::PluginContext&[^)]*\)\s*override\s*\{"
@@ -104,12 +112,21 @@ def problems(plugin_src, shell_src):
                 out.append(f'{name}: the string literal "{lit}" names a dpkg-query or rpm executable')
 
     # 2. Each Linux collector reads the database once and keeps only the pacman and apk legs.
-    for fn, head in (("get_installed_apps_linux", HEAD_APPS), ("get_inventory_linux", HEAD_INV)):
-        body = body_of(plugin, head)
-        if body is None:
+    for fn, head, ret in (("get_installed_apps_linux", HEAD_APPS, "AppCollection"),
+                          ("get_inventory_linux", HEAD_INV, "InvCollection")):
+        raw_body = body_of(plugin, head)
+        if raw_body is None:
             out.append(f"{fn}() is not defined")
             continue
-        body = norm(body)
+        # 3. A failed read returns an empty collection, degraded, with the reader's reason.
+        failed = body_of(raw_body, FAILED_READ_IF)
+        if failed is None:
+            out.append(f"{fn}() has no `if (!host.failure.empty())` branch")
+        elif not re.search(rf"\breturn {ret}\{{ ?\{{\}}, ?true, ?std::move\( ?host\.failure ?\) ?\}};",
+                           norm(failed)):
+            out.append(f"{fn}() failure branch no longer returns an empty {ret} with degraded true and "
+                       f"the reader's reason ({ret}{{{{}}, true, std::move(host.failure)}})")
+        body = norm(raw_body)
         calls = len(re.findall(r"(?<![:\w])read_host_packages_bounded\( ?\)", body))
         if calls != 1:
             out.append(f"{fn}() calls read_host_packages_bounded() {calls} times, expected exactly once")
@@ -146,6 +163,10 @@ def problems(plugin_src, shell_src):
             out.append('read_host_packages_bounded() no longer takes the PkgDbCallGuard first and then '
                        'calls pkgdb::read_host_packages_bounded("/", pkgdb::Limits{}, <g_pkgdb_stop '
                        'predicate>)')
+        if not re.search(r"\[\] \{ return g_pkgdb_stop\.load\(std::memory_order_relaxed\) \|\| "
+                         r"yuzu::agent::subprocess_cancel_requested\( ?\); \}\)", w):
+            out.append("read_host_packages_bounded() stop predicate is no longer g_pkgdb_stop OR "
+                       "yuzu::agent::subprocess_cancel_requested() (a read must end at an agent stop)")
 
     quiesce = body_of(plugin, HEAD_QUIESCE)
     if quiesce is None:
@@ -199,12 +220,24 @@ MUTATIONS = [
     ("plugin", r"    PkgDbCallGuard guard; // counts the wait", "    // counts the wait", 0,
      ["exactly one PkgDbCallGuard"]),
     # 8. the guard moved into the worker's predicate (counted from inside the detached worker)
-    ("plugin", r"    PkgDbCallGuard guard;[^\n]*\n(    return pkgdb::read_host_packages_bounded\(\n"
-     r"        \"/\", pkgdb::Limits\{\}, \[\] \{ )(return g_pkgdb_stop)",
+    ("plugin", r"    PkgDbCallGuard guard;[^\n]*\n(    return pkgdb::read_host_packages_bounded\("
+     r"\"/\", pkgdb::Limits\{\}, \[\] \{\n        )(return g_pkgdb_stop)",
      r"\g<1>PkgDbCallGuard guard; \g<2>", 0, ["no longer takes the PkgDbCallGuard first"]),
     # 9. the stop predicate no longer the plugin's flag
-    ("plugin", r"\[\] \{ return g_pkgdb_stop\.load\(std::memory_order_relaxed\); \}\);\n\}",
-     "[] { return false; });\n}", 0, ["no longer takes the PkgDbCallGuard first"]),
+    ("plugin", r"\[\] \{\n        return g_pkgdb_stop\.load\(std::memory_order_relaxed\) \|\| "
+     r"yuzu::agent::subprocess_cancel_requested\(\);\n    \}\);",
+     "[] { return false; });", 0,
+     ["no longer takes the PkgDbCallGuard first", "stop predicate is no longer"]),
+    # 15. the predicate drops the agent's shutdown latch (the old subprocess leg ended at an agent stop)
+    ("plugin", r" \|\| yuzu::agent::subprocess_cancel_requested\(\)", "", 0,
+     ["stop predicate is no longer g_pkgdb_stop OR yuzu::agent::subprocess_cancel_requested()"]),
+    # 16. the list collector reports a failed read as a clean empty answer (degraded flipped to false)
+    ("plugin", r"return AppCollection\{\{\}, true, std::move\(host\.failure\)\};",
+     "return AppCollection{{}, false, std::move(host.failure)};", 0,
+     ["get_installed_apps_linux() failure branch no longer returns an empty AppCollection"]),
+    # 17. the inventory collector falls through after a failed read instead of returning (early return removed)
+    ("plugin", r"\n        return InvCollection\{\{\}, true, std::move\(host\.failure\)\};", "", 0,
+     ["get_inventory_linux() failure branch no longer returns an empty InvCollection"]),
     # 10. shutdown() no longer quiesces
     ("plugin", r"        quiesce_pkgdb_calls\(\);", "", 0, ["shutdown() does not call quiesce_pkgdb_calls()"]),
     # 11. init() no longer clears the stop flag

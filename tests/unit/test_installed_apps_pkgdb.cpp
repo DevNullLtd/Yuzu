@@ -26,7 +26,10 @@
  * given up on at the wall". The Linux-only plugin wiring around it (the tracked-call guard, the shutdown
  * quiesce) is pinned by tests/test_installed_apps_pkgdb_wiring_lexical.py.
  *
- * POSIX only: the shell compiles out on Windows (the plugin walks the registry there).
+ * POSIX only: the shell compiles out on Windows (the plugin walks the registry there). The cases that
+ * HOLD rpm's transaction lock use an open-file-description lock (F_OFD_SETLK) and run on Linux only,
+ * the one `#ifdef __linux__` part of this file; the unlocked, symlinked and directory lock-file cases
+ * run everywhere. One case (the stamp's ctime variant) reads a kernel timestamp: its comment says why.
  */
 
 #ifndef _WIN32
@@ -995,6 +998,427 @@ TEST_CASE("pkgdb status.d: skipped names are bounded and poll the deadline like 
     }
 }
 
+// ── detection edges: no installed stanza, an empty database, the rpm transaction lock, the dpkg journal ──
+
+namespace {
+
+// EDITED real debian12 status: every stanza's Status rewritten, alternately to config-files and to
+// half-installed, so no stanza is `installed` (both words are real dpkg states; the packages stay).
+std::string status_without_installed_stanza() {
+    std::string text = read_text(default_fixture_root() / "debian12" / "status");
+    const std::string_view from = "Status: install ok installed";
+    std::size_t rewritten = 0;
+    for (std::size_t at = text.find(from); at != std::string::npos; at = text.find(from, at)) {
+        const std::string_view to = rewritten++ % 2 == 0 ? "Status: deinstall ok config-files"
+                                                         : "Status: install reinstreq half-installed";
+        text.replace(at, from.size(), to);
+        at += to.size();
+    }
+    REQUIRE(rewritten == 10);
+    return text;
+}
+
+// EDITED copy of a real sqlite rpm database with every package row deleted: a database that was read
+// and holds no package. Closed (and so checkpointed) before it returns.
+fs::path put_emptied_sqlite(const Root& root, std::string_view rel, const fs::path& src) {
+    const fs::path db_path = root.put(rel, src);
+    const auto db = open_sqlite(db_path);
+    exec_sql(db.get(), "DELETE FROM Packages");
+    return db_path;
+}
+
+} // namespace
+
+TEST_CASE("pkgdb detection: a dpkg status with no installed stanza falls through to rpm, or to nothing",
+          "[installed_apps][pkgdb]") {
+    const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
+    SECTION("beside a real rpm database the host reads as rpm") {
+        Root root;
+        root.put_text("var/lib/dpkg/status", status_without_installed_stanza());
+        root.put("usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::rpm);
+        CHECK(h.rpm.size() == 4);
+        CHECK(h.dpkg.empty());
+    }
+    SECTION("alone it is ecosystem none with no failure, so the pacman and apk legs run") {
+        Root root;
+        root.put_text("var/lib/dpkg/status", status_without_installed_stanza());
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.dpkg.empty());
+        CHECK(h.rpm.empty());
+    }
+    SECTION("one installed stanza among the others is enough: it is dpkg, and every parsed stanza is kept") {
+        Root root;
+        root.put_text("var/lib/dpkg/status",
+                      status_without_installed_stanza() +
+                          "Package: extra\nStatus: install ok installed\nArchitecture: all\nVersion: 1\n\n");
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::dpkg);
+        CHECK(h.dpkg.size() == 11);
+    }
+}
+
+TEST_CASE("pkgdb detection: an rpm database that was read and holds no package does not end detection",
+          "[installed_apps][pkgdb]") {
+    const fs::path fedora = default_fixture_root() / "fedora41" / "rpmdb.sqlite";
+    const fs::path alma9 = default_fixture_root() / "alma9" / "rpmdb.sqlite";
+    SECTION("alone (EDITED copy, rows deleted) it is ecosystem none with no failure") {
+        Root root;
+        put_emptied_sqlite(root, "var/lib/rpm/rpmdb.sqlite", fedora);
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("with a populated var/lib/rpm behind it, that one is read") {
+        Root root;
+        put_emptied_sqlite(root, "usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        root.put("var/lib/rpm/rpmdb.sqlite", alma9);
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::rpm);
+        CHECK(h.rpm.size() == 5);
+    }
+    SECTION("var/lib/rpm linking to the emptied directory is ecosystem none, never symlink_refused") {
+        // The modern layout (a link to the directory just read), where the link is the NEXT candidate.
+        Root root;
+        put_emptied_sqlite(root, "usr/lib/sysimage/rpm/rpmdb.sqlite", fedora);
+        fs::create_directories(root.at("var/lib"));
+        fs::create_directory_symlink("../../usr/lib/sysimage/rpm", root.at("var/lib/rpm"));
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("a link with a database behind it and nothing else read is still symlink_refused") {
+        Root root;
+        root.put("elsewhere/rpmdb.sqlite", fedora);
+        fs::create_directories(root.at("var/lib"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/rpm"));
+        CHECK(read_root(root).failure == "rpmdb:symlink_refused");
+    }
+}
+
+TEST_CASE("pkgdb rpm lock: the ndb and Berkeley DB files are read only when no rpm transaction holds .rpm.lock",
+          "[installed_apps][pkgdb]") {
+    struct Format {
+        const char* capture;
+        const char* file;
+        const char* dir;
+        const char* source;
+        std::size_t packages;
+    };
+    const Format formats[] = {{"tumbleweed", "Packages.db", "usr/lib/sysimage/rpm", "rpm_ndb", 11},
+                              {"alma8", "Packages", "var/lib/rpm", "rpm_bdb", 5}};
+    for (const auto& f : formats) {
+        INFO(f.source);
+        const auto scratch = [&f](const Root& root) {
+            root.put(std::string{f.dir} + "/" + f.file, default_fixture_root() / f.capture / f.file);
+        };
+        const std::string lock_rel = std::string{f.dir} + "/.rpm.lock";
+        SECTION("no lock file: no transaction has run there, it reads") {
+            Root root;
+            scratch(root);
+            const auto h = read_root(root);
+            REQUIRE(h.failure.empty());
+            CHECK(h.rpm.size() == f.packages);
+        }
+        SECTION("a lock file nobody holds reads") {
+            Root root;
+            scratch(root);
+            root.put_text(lock_rel, "");
+            const auto h = read_root(root);
+            REQUIRE(h.failure.empty());
+            CHECK(h.rpm.size() == f.packages);
+        }
+        SECTION("a symlinked lock file is refused by name, never followed") {
+            Root root;
+            scratch(root);
+            root.put_text("elsewhere/lock", "");
+            fs::create_symlink(root.at("elsewhere/lock"), root.at(lock_rel));
+            const auto h = read_root(root);
+            CHECK(h.failure == std::string{f.source} + ":symlink_refused");
+            CHECK(h.ecosystem == Eco::none);
+            CHECK(h.rpm.empty());
+        }
+        SECTION("a directory in place of the lock file is refused by name") {
+            Root root;
+            scratch(root);
+            fs::create_directories(root.at(lock_rel));
+            const auto h = read_root(root);
+            CHECK(h.failure == std::string{f.source} + ":not_regular");
+            CHECK(h.rpm.empty());
+        }
+#ifdef __linux__
+        SECTION("a write lock held on the lock file is locked with no rows; released, every row reads") {
+            // An open-file-description lock belongs to its descriptor, not the process, so the reader's
+            // F_GETLK in this process sees it: no second process is needed. Linux only: F_OFD_SETLK.
+            Root root;
+            scratch(root);
+            const fs::path lock_path = root.put_text(lock_rel, "");
+            std::optional<yuzu::shared::ScopedFile> holder{
+                yuzu::shared::ScopedFile{::open(lock_path.c_str(), O_RDWR | O_CLOEXEC)}};
+            REQUIRE(holder->valid());
+            struct flock fl {};
+            fl.l_type = F_WRLCK;
+            fl.l_whence = SEEK_SET;
+            REQUIRE(::fcntl(holder->fd(), F_OFD_SETLK, &fl) == 0);
+            {
+                const auto h = read_root(root);
+                CHECK(h.failure == std::string{f.source} + ":locked");
+                CHECK(h.ecosystem == Eco::none);
+                CHECK(h.rpm.empty());
+            }
+            holder.reset(); // closing the descriptor releases the lock
+            const auto h = read_root(root);
+            REQUIRE(h.failure.empty());
+            CHECK(h.rpm.size() == f.packages);
+        }
+#endif
+    }
+    SECTION("a sqlite database beside a symlinked lock file still reads: the lock is not its isolation") {
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        root.put_text("elsewhere/lock", "");
+        fs::create_symlink(root.at("elsewhere/lock"), root.at("var/lib/rpm/.rpm.lock"));
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.rpm.size() == 4);
+    }
+#ifdef __linux__
+    SECTION("a sqlite database beside a HELD lock still reads") {
+        Root root;
+        root.put("var/lib/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        const fs::path lock_path = root.put_text("var/lib/rpm/.rpm.lock", "");
+        const yuzu::shared::ScopedFile holder{::open(lock_path.c_str(), O_RDWR | O_CLOEXEC)};
+        REQUIRE(holder.valid());
+        struct flock fl {};
+        fl.l_type = F_WRLCK;
+        fl.l_whence = SEEK_SET;
+        REQUIRE(::fcntl(holder.fd(), F_OFD_SETLK, &fl) == 0);
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.rpm.size() == 4);
+    }
+#endif
+}
+
+namespace {
+
+// The update-journal listing alone, with a scripted readdir over a real (empty) updates directory.
+std::string updates_failure_of(const Root& root, ScriptedReadDir& script, std::function<bool()> expired = {}) {
+    fs::create_directories(root.at("var/lib/dpkg/updates"));
+    const pkgdb::Limits lim = default_limits();
+    yuzu::shared::PkgDbBudget budget{.rows_left = lim.max_packages,
+                                     .bytes_left = lim.dpkg_max_bytes,
+                                     .max_item_bytes = lim.dpkg_max_bytes,
+                                     .expired = std::move(expired)};
+    return pkgdb::detail::dpkg_updates_failure(root.str(), lim, budget, script);
+}
+
+} // namespace
+
+TEST_CASE("pkgdb dpkg update journal: a pending record is a refusal, never the pre-journal roster",
+          "[installed_apps][pkgdb]") {
+    const fs::path debian = default_fixture_root() / "debian12" / "status";
+
+    SECTION("a record 0000 beside the debian12 status is dpkg_updates:locked with nothing returned") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        root.put_text("var/lib/dpkg/updates/0000", "");
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_updates:locked");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.dpkg.empty());
+        CHECK(h.rpm.empty());
+    }
+    SECTION("only tmp.i and a dotfile are ignored: it reads all ten") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        root.put_text("var/lib/dpkg/updates/tmp.i", "");
+        root.put_text("var/lib/dpkg/updates/.hidden", "");
+        root.put_text("var/lib/dpkg/updates/0000.bak", ""); // not ASCII digits only
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.ecosystem == Eco::dpkg);
+        CHECK(h.dpkg.size() == 10);
+    }
+    SECTION("an empty updates directory reads") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        fs::create_directories(root.at("var/lib/dpkg/updates"));
+        const auto h = read_root(root);
+        REQUIRE(h.failure.empty());
+        CHECK(h.dpkg.size() == 10);
+    }
+    SECTION("a symlinked updates directory is refused by name, never followed") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        fs::create_directories(root.at("elsewhere"));
+        fs::create_directory_symlink(root.at("elsewhere"), root.at("var/lib/dpkg/updates"));
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_updates:symlink_refused");
+        CHECK(h.dpkg.empty());
+    }
+    SECTION("a regular file in place of the updates directory is refused by name") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        root.put_text("var/lib/dpkg/updates", "x");
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_updates:not_regular");
+        CHECK(h.dpkg.empty());
+    }
+    SECTION("a pending record with an rpm database also present is still locked: no fall-through") {
+        Root root;
+        root.put("var/lib/dpkg/status", debian);
+        root.put_text("var/lib/dpkg/updates/0001", "");
+        root.put("usr/lib/sysimage/rpm/rpmdb.sqlite", default_fixture_root() / "fedora41" / "rpmdb.sqlite");
+        const auto h = read_root(root);
+        CHECK(h.failure == "dpkg_updates:locked");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    SECTION("a status.d-only host is held to the same journal rule") {
+        Root root;
+        put_two_status_d_files(root);
+        root.put_text("var/lib/dpkg/updates/0002", "");
+        CHECK(read_root(root).failure == "dpkg_updates:locked");
+    }
+    SECTION("control: a clean scripted listing of ignored names has no failure") {
+        Root root;
+        ScriptedReadDir script{{"tmp.i", ".x"}, 0};
+        CHECK(updates_failure_of(root, script).empty());
+    }
+    SECTION("a record name stops the walk before the rest of the listing is read") {
+        Root root;
+        ScriptedReadDir script{{"tmp.i", "0000"}, EIO}; // the EIO is never reached
+        CHECK(updates_failure_of(root, script) == "dpkg_updates:locked");
+    }
+    SECTION("a listing that fails part-way is unreadable, never an empty journal") {
+        Root root;
+        ScriptedReadDir script{{"tmp.i"}, EIO};
+        CHECK(updates_failure_of(root, script) == "dpkg_updates:unreadable");
+    }
+    SECTION("an expired deadline is polled per entry and is timeout") {
+        Root root;
+        ScriptedReadDir script{{"tmp.i"}, 0};
+        CHECK(updates_failure_of(root, script, [] { return true; }) == "dpkg_updates:timeout");
+    }
+    SECTION("the entry bound is twice max_packages: over it is row_cap") {
+        Root root;
+        fs::create_directories(root.at("var/lib/dpkg/updates"));
+        for (const char* junk : {"a", "b", "c", "d", "e"})
+            root.put_text(std::string{"var/lib/dpkg/updates/"} + junk, "");
+        // One stanza, not the ten-stanza capture: a small max_packages would fail the status read first.
+        root.put_text("var/lib/dpkg/status", "Package: p\nStatus: install ok installed\n\n");
+        pkgdb::Limits lim;
+        lim.max_packages = 2; // bound 4
+        CHECK(read_root(root, lim).failure == "dpkg_updates:row_cap");
+        lim.max_packages = 3; // bound 6
+        CHECK(read_root(root, lim).failure.empty());
+    }
+}
+
+// ── reader limits and edge branches through the shell ───────────────────────
+
+TEST_CASE("pkgdb ndb and bdb: a package cap below the row count answers row_cap with no rows",
+          "[installed_apps][pkgdb]") {
+    pkgdb::Limits lim;
+    lim.max_packages = 2;
+    {
+        Root root;
+        root.put("usr/lib/sysimage/rpm/Packages.db", default_fixture_root() / "tumbleweed" / "Packages.db");
+        const auto h = read_root(root, lim);
+        CHECK(h.failure == "rpm_ndb:row_cap");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+    {
+        Root root;
+        root.put("var/lib/rpm/Packages", default_fixture_root() / "alma8" / "Packages");
+        const auto h = read_root(root, lim);
+        CHECK(h.failure == "rpm_bdb:row_cap");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+}
+
+TEST_CASE("pkgdb kept text: a small kept-text bound is byte_cap with no rows in every rpm format",
+          "[installed_apps][pkgdb]") {
+    struct Format {
+        const char* capture;
+        const char* file;
+        const char* dir;
+        const char* source;
+    };
+    const Format formats[] = {{"fedora41", "rpmdb.sqlite", "var/lib/rpm", "rpm_sqlite"},
+                              {"tumbleweed", "Packages.db", "usr/lib/sysimage/rpm", "rpm_ndb"},
+                              {"alma8", "Packages", "var/lib/rpm", "rpm_bdb"}};
+    for (const auto& f : formats) {
+        INFO(f.source);
+        Root root;
+        root.put(std::string{f.dir} + "/" + f.file, default_fixture_root() / f.capture / f.file);
+        pkgdb::Limits lim;
+        lim.rpm_max_kept_bytes = 20; // the first package's text alone passes it quickly
+        const auto h = read_root(root, lim);
+        CHECK(h.failure == std::string{f.source} + ":byte_cap");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+        CHECK(read_root(root).failure.empty()); // control: the default bound admits the same file
+    }
+}
+
+TEST_CASE("pkgdb fd_source: a read across the end of the file fails, one that ends at it reads",
+          "[installed_apps][pkgdb]") {
+    // A real file, and a source that claims 4096 bytes more than it holds: the range check passes, so
+    // only pread's own end-of-file answer (0 bytes) stands between the reader and bytes that are not
+    // there. The EINTR retry in the same loop needs a signal to reach and is not exercised here.
+    const fs::path file = default_fixture_root() / "alma8" / "Packages";
+    const std::uint64_t size = fs::file_size(file);
+    const yuzu::shared::ScopedFile fd{::open(file.c_str(), O_RDONLY | O_CLOEXEC)};
+    REQUIRE(fd.valid());
+    const auto src = pkgdb::detail::fd_source(fd.fd(), size + 4096);
+    std::array<std::uint8_t, 64> buf{};
+    CHECK(src.read_at(size - buf.size(), buf)); // ends exactly at the end of the file
+    CHECK_FALSE(src.read_at(size - 10, buf));   // ten bytes, then end of file
+    CHECK_FALSE(src.read_at(size, buf));        // nothing left at all
+    CHECK_FALSE(src.read_at(size + 4096 - 10, buf)); // past the claimed size: refused before any pread
+    CHECK(src.read_at(0, buf));
+    const std::string text = read_text(file);
+    CHECK(std::memcmp(buf.data(), text.data(), buf.size()) == 0);
+}
+
+TEST_CASE("pkgdb sqlite: the progress handler is the only deadline poll when the statement returns no row",
+          "[installed_apps][pkgdb]") {
+    // EDITED input, built here: a database whose `Packages` is a view over a recursive CTE of about
+    // 100,000 steps that never yields a row. The per-row poll never runs, so only sqlite's progress
+    // handler can end the statement.
+    Root root;
+    fs::create_directories(root.at("var/lib/rpm"));
+    {
+        const auto db = open_sqlite(root.at("var/lib/rpm/rpmdb.sqlite"));
+        exec_sql(db.get(), "CREATE VIEW Packages(blob) AS WITH RECURSIVE c(x) AS "
+                           "(SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 100000) "
+                           "SELECT x FROM c WHERE x < 0");
+    }
+    SECTION("control: with no deadline the statement runs to its end and the database is empty") {
+        const auto h = read_root(root);
+        CHECK(h.failure.empty());
+        CHECK(h.ecosystem == Eco::none);
+    }
+    SECTION("an expired deadline interrupts it: rpm_sqlite:timeout") {
+        const auto h = read_root(root, default_limits(), [] { return true; });
+        CHECK(h.failure == "rpm_sqlite:timeout");
+        CHECK(h.ecosystem == Eco::none);
+        CHECK(h.rpm.empty());
+    }
+}
+
 // ── mapping ─────────────────────────────────────────────────────────────────
 
 TEST_CASE("pkgdb mapping: dpkg states decide inventory and list membership separately",
@@ -1150,6 +1574,41 @@ TEST_CASE("pkgdb degraded contract: a named reason reaches the typed status and 
 
 // ── the stamp: a file that changes under the read ───────────────────────────
 
+namespace {
+
+// Rewrites byte 0 of `path` with the value it already holds (size and bytes unchanged), restores the
+// mtime, and repeats until the file's ctime differs from what it was on entry. Returns whether it
+// moved. This is the one case that reads a kernel timestamp: no program can set a ctime, and its
+// granularity is the kernel's (one jiffy before Linux 6.13), so the write and the fixture copy before
+// it can share a tick and leave the ctime unmoved. The bounded repeat waits that tick out; no sleep.
+// A bool, not a REQUIRE: it runs inside the reader's deadline callback, where a throw would unwind
+// through sqlite's progress handler.
+bool rewrite_byte_restoring_mtime(const fs::path& path) {
+    struct stat first {};
+    if (::stat(path.c_str(), &first) != 0)
+        return false;
+    const yuzu::shared::ScopedFile fd{::open(path.c_str(), O_RDWR | O_CLOEXEC)};
+    if (!fd.valid())
+        return false;
+    std::uint8_t byte = 0;
+    if (::pread(fd.fd(), &byte, 1, 0) != 1)
+        return false;
+    const struct timespec times[2] = {{0, UTIME_OMIT}, yuzu::shared::mtime_of(first)};
+    const struct timespec before = yuzu::shared::ctime_of(first);
+    for (int attempt = 0; attempt < 2'000'000; ++attempt) {
+        struct stat now {};
+        if (::pwrite(fd.fd(), &byte, 1, 0) != 1 || ::futimens(fd.fd(), times) != 0 ||
+            ::fstat(fd.fd(), &now) != 0)
+            return false;
+        const struct timespec after = yuzu::shared::ctime_of(now);
+        if (after.tv_sec != before.tv_sec || after.tv_nsec != before.tv_nsec)
+            return true;
+    }
+    return false;
+}
+
+} // namespace
+
 TEST_CASE("pkgdb stamp: a database file that changes during the read is changed_during_read whatever the "
           "read made of it",
           "[installed_apps][pkgdb]") {
@@ -1167,11 +1626,15 @@ TEST_CASE("pkgdb stamp: a database file that changes during the read is changed_
                               {"alma8", "Packages", "var/lib/rpm", "rpm_bdb", 5},
                               {"fedora41", "rpmdb.sqlite", "var/lib/rpm", "rpm_sqlite", 4}};
     for (const auto& f : formats) {
-        for (const std::string_view how : {"control", "append a byte", "move only the mtime"}) {
+        for (const std::string_view how : {"control", "append a byte", "move only the mtime",
+                                           "rewrite a byte in place, mtime restored"}) {
             INFO(f.source << ": " << how);
             Root root;
             const fs::path file =
                 root.put(std::string{f.dir} + "/" + f.file, default_fixture_root() / f.capture / f.file);
+            const auto mtime_before = fs::last_write_time(file);
+            const auto size_before = fs::file_size(file);
+            bool ctime_moved = false;
             int polls = 0;
             const auto h = read_root(root, default_limits(), [&] {
                 if (++polls == 1) {
@@ -1180,11 +1643,20 @@ TEST_CASE("pkgdb stamp: a database file that changes during the read is changed_
                         o.put('x');
                     } else if (how == "move only the mtime") {
                         fs::last_write_time(file, fs::last_write_time(file) + std::chrono::hours(1));
+                    } else if (how == "rewrite a byte in place, mtime restored") {
+                        ctime_moved = rewrite_byte_restoring_mtime(file);
                     }
                 }
                 return false;
             });
             REQUIRE(polls > 0); // the callback really ran inside the read
+            if (how == "rewrite a byte in place, mtime restored") {
+                // Only the ctime moved: size and mtime are what they were, so the stamp's ctime field
+                // alone is what catches this write.
+                CHECK(ctime_moved);
+                CHECK(fs::file_size(file) == size_before);
+                CHECK((fs::last_write_time(file) == mtime_before)); // parenthesised: Catch cannot print a file_time
+            }
             if (how == "control") {
                 REQUIRE(h.failure.empty());
                 CHECK(h.rpm.size() == f.packages);
@@ -1298,7 +1770,7 @@ std::vector<std::uint8_t> fedora_blob(std::string_view name) {
         std::vector<std::uint8_t> blob(p, p + sqlite3_column_bytes(stmt.get(), 0));
         const auto header = yuzu::shared::RpmHeader::parse(blob);
         REQUIRE(header.has_value());
-        const auto n = header->string(1000);
+        const auto n = header->text(1000);
         if (n && *n && **n == name)
             return blob;
     }
@@ -1635,6 +2107,7 @@ TEST_CASE("pkgdb limits: the defaults the plugin runs with are bounded in rows, 
     CHECK(lim.dpkg_max_bytes == 32ull * 1024 * 1024);
     CHECK(lim.rpm_max_header_bytes == 32ull * 1024 * 1024);
     CHECK(lim.rpm_max_total_bytes == (1ull << 30));
+    CHECK(lim.rpm_max_kept_bytes == 8ull * 1024 * 1024);
     CHECK(lim.wall == std::chrono::seconds{20});
     CHECK(lim.sqlite_busy_ms == 2000);
 }

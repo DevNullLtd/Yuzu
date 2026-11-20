@@ -21,7 +21,7 @@
  * Linux acquisition (SAM-45): the dpkg and rpm package databases are read IN-PROCESS and
  * read-only -- the dpkg status text (+ status.d), and the rpm database in whichever of its three
  * formats the host uses (sqlite, ndb, Berkeley DB) -- by installed_apps_pkgdb_read.hpp over the
- * pure parsers in agents/shared. No dpkg-query or rpm process runs. pacman and apk have no
+ * pure parsers in agents/shared. This plugin runs no dpkg-query or rpm process. pacman and apk have no
  * database reader and keep their bounded argv-runner legs. The rows are byte-identical to what
  * the old subprocess output produced on every captured host.
  *
@@ -356,16 +356,21 @@ namespace pkgdb = yuzu::installed_apps::pkgdb;
 // The dpkg/rpm database read has no cancellation of its own (a pread on a wedged volume cannot be
 // interrupted), so pkgdb::read_host_packages_bounded (installed_apps_pkgdb_read.hpp, compiled and
 // tested on every POSIX host) runs it under yuzu::shared::bounded_call_ex: the caller waits at most
-// Limits::wall and gives up, and the worker polls the same deadline (and the stop flag below)
-// through the readers' budget and ends itself, so an abandoned worker is bounded too.
+// Limits::wall and gives up, and the worker polls the same deadline and TWO stop signals through the
+// readers' budget and ends itself, so an abandoned worker is bounded too. The signals are the plugin's
+// own g_pkgdb_stop (raised by quiesce_pkgdb_calls() from shutdown()) and the agent's sticky shutdown
+// latch, yuzu::agent::subprocess_cancel_requested(): the old dpkg-query and rpm leg ran through
+// run_bounded_subprocess, which polls that latch, so a read must end at an agent stop as promptly.
 //
-// Tracked-call + bounded shutdown quiesce: the same shape as printing_plugin.cpp and
+// Tracked-call + bounded shutdown quiesce: the tracked-call shape of printing_plugin.cpp and
 // power_health_plugin.cpp (see printing_plugin.cpp's long comment on why the guard counts the
-// WAIT, on the calling thread, never from inside the detached worker). shutdown() raises the stop
-// flag, so any worker still running ends at its next poll, then waits a bounded time for callers
-// still inside a read. What it cannot close is bounded_wait.hpp's own accepted residual: a worker
-// the kernel never returns from may outlive the unload. The guard, the flag and the quiesce are the
-// only part that lives here; tests/test_installed_apps_pkgdb_wiring_lexical.py pins their wiring.
+// WAIT, on the calling thread, never from inside the detached worker), PLUS two things those do not
+// have: the stop flag the readers poll, and a fixed 5 s quiesce (kPkgDbShutdownQuiesce). shutdown()
+// raises the flag, so any worker still running ends at its next poll, then waits a bounded time for
+// callers still inside a read. What it cannot close is bounded_wait.hpp's own accepted residual: a
+// worker the kernel never returns from may outlive the unload. The guard, the flag and the quiesce
+// are the only part that lives here; tests/test_installed_apps_pkgdb_wiring_lexical.py pins their
+// wiring.
 std::atomic<int> g_outstanding_pkgdb_calls{0};
 std::atomic<bool> g_pkgdb_stop{false};
 constexpr std::chrono::seconds kPkgDbShutdownQuiesce{5};
@@ -414,8 +419,9 @@ std::tm local_tm(std::int64_t t) {
 // reader failure) comes back as `failure` with no packages: the caller reports a degraded answer.
 pkgdb::HostPackages read_host_packages_bounded() {
     PkgDbCallGuard guard; // counts the wait on THIS thread, never from inside the detached worker
-    return pkgdb::read_host_packages_bounded(
-        "/", pkgdb::Limits{}, [] { return g_pkgdb_stop.load(std::memory_order_relaxed); });
+    return pkgdb::read_host_packages_bounded("/", pkgdb::Limits{}, [] {
+        return g_pkgdb_stop.load(std::memory_order_relaxed) || yuzu::agent::subprocess_cancel_requested();
+    });
 }
 
 AppCollection get_installed_apps_linux() {

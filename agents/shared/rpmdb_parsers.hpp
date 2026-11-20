@@ -145,12 +145,14 @@ public:
         return RpmHeader{blob, il, dl};
     }
 
-    /// A type-6 string tag. nullopt = tag absent; an error = present but malformed.
-    [[nodiscard]] std::expected<std::optional<std::string>, PkgDbCause>
-    string(std::uint32_t tag) const {
+    /// A type-6 string tag, as a view into the header's own bytes (valid while the blob is). nullopt =
+    /// tag absent; an error = present but malformed. Nothing is copied: a caller that keeps the text
+    /// charges it first (PkgDbBudget::charge_kept) and then copies.
+    [[nodiscard]] std::expected<std::optional<std::string_view>, PkgDbCause>
+    text(std::uint32_t tag) const {
         const auto e = find(tag);
         if (!e)
-            return std::optional<std::string>{};
+            return std::optional<std::string_view>{};
         if (e->type != rpm_type::kString || e->offset >= dl_)
             return std::unexpected(PkgDbCause::corrupt);
         const std::uint8_t* d = data_.data() + e->offset;
@@ -160,9 +162,8 @@ public:
             return std::unexpected(PkgDbCause::corrupt); // not NUL-terminated inside the data
         const auto len = static_cast<std::size_t>(static_cast<const std::uint8_t*>(nul) - d);
         // uint8_t -> char is a permitted aliasing cast; the length is bounded by the memchr over
-        // `room` above (so d + len stays inside the data region) and the bytes are copied out, so
-        // nothing here outlives data_.
-        return std::optional<std::string>{std::string(reinterpret_cast<const char*>(d), len)};
+        // `room` above, so d + len stays inside the data region.
+        return std::optional<std::string_view>{std::string_view(reinterpret_cast<const char*>(d), len)};
     }
 
     /// A type-4 (int32) tag: the first value. nullopt = absent.
@@ -235,15 +236,23 @@ struct RpmPackage {
 /// Lifts a RpmPackage out of a parsed header. No NAME is `corrupt`; every other
 /// absent tag reads empty / nullopt / false (the honest-empty contract); a tag that
 /// is present but malformed fails the record.
+///
+/// Every string it KEEPS is charged to `budget` (charge_kept) before it is copied, one charge per
+/// field: the header was charged once for the bytes read, but a hostile index can point six string
+/// tags at one stored string, so the copies can total six times the blob. A refused charge fails
+/// the record with byte_cap.
 [[nodiscard]] inline std::expected<RpmPackage, PkgDbCause>
-rpm_package_from_header(const RpmHeader& h) {
+rpm_package_from_header(const RpmHeader& h, PkgDbBudget& budget) {
     RpmPackage p;
-    const auto str = [&h](std::uint32_t tag, std::string& into) -> PkgDbVoid {
-        auto v = h.string(tag);
+    const auto str = [&h, &budget](std::uint32_t tag, std::string& into) -> PkgDbVoid {
+        auto v = h.text(tag);
         if (!v)
             return std::unexpected(v.error());
-        if (*v)
-            into = std::move(**v);
+        if (!*v)
+            return {};
+        if (auto c = budget.charge_kept((*v)->size()); !c)
+            return std::unexpected(c.error());
+        into = std::string(**v);
         return {};
     };
     if (auto r = str(rpm_tag::kName, p.name); !r)

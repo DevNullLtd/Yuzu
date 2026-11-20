@@ -4,7 +4,8 @@
 ##
 ## Sources by platform:
 ##   Windows: Registry Uninstall keys (64-bit, 32-bit WoW64, current user)
-##   Linux:   dpkg status and rpm database (read in-process), pacman or apk (their tools)
+##   Linux:   dpkg status and rpm database (read in-process), else pacman (its tool);
+##            apk is read by the daily-sync inventory action only, not by list or query
 ##   macOS:   system_profiler SPApplicationsDataType
 ##
 ## The `list` action carries six columns: name, version, publisher,

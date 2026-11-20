@@ -348,23 +348,57 @@ cadences.
   Linux an empty result is often honest — a host may legitimately have `rpm`
   installed and no rpm packages — so that check is not applied there.
 
-  **Linux dpkg and rpm rows come from an in-process database read.** The agent no
-  longer runs `dpkg-query` or `rpm`: it reads the dpkg status file (and the
-  `/var/lib/dpkg/status.d/` directory minimal images use) and the rpm database
-  (sqlite, ndb or Berkeley DB, whichever the host uses) itself, read-only and
-  without following symlinks, within 20 seconds, 50,000 packages and fixed byte
-  limits (32 MiB of dpkg text in total, 32 MiB per rpm header, 1 GiB of rpm headers). The rows, and therefore the section hash, are byte-for-byte what the
-  tools produced on every host measured, so a fleet upgrade resends nothing. The
-  visible differences are two, both about `status.d`: a host whose packages live
-  only there (minimal images with no shell) now reports them, as new install rows;
-  and a host with a healthy status file and one unparseable regular file in
-  `status.d` is degraded (`dpkg_status_d:corrupt`, no rows, the server keeps its
-  stored ones) where `dpkg-query` ignored the directory. Remove that file or give
-  it a leading dot, which is skipped. When
-  the read fails, the collection is degraded exactly as above, with no rows and
+  **Linux dpkg and rpm rows come from an in-process database read.** This plugin
+  no longer runs `dpkg-query` or `rpm` (other plugins still run their own tools):
+  it reads the dpkg status file (and the `/var/lib/dpkg/status.d/` directory
+  minimal images use) and the rpm database (sqlite, ndb or Berkeley DB, whichever
+  the host uses) itself, read-only and without following a symlink at the file,
+  within 20 seconds, 50,000 packages (for dpkg, stanzas) and fixed byte limits
+  (32 MiB of dpkg text in total, 32 MiB per rpm header, 1 GiB of rpm headers and
+  8 MiB of retained text across them). The rows, and therefore the section hash,
+  are byte-for-byte what the tools produced on every host measured, so a fleet
+  upgrade resends nothing, with one exception: a host that carries a tab, pipe or
+  newline inside a maintainer or vendor sends those rows once more, with the full
+  value the tools used to truncate. What else is different from the tools:
+
+  - **`status.d`.** A host whose packages live only there (minimal images with no
+    shell) now reports them, as new install rows; and a host with a healthy status
+    file and one unparseable regular file in `status.d` is degraded
+    (`dpkg_status_d:corrupt`, no rows, the server keeps its stored ones) where
+    `dpkg-query` ignored the directory. Remove that file or give it a leading dot,
+    which is skipped.
+  - **Which manager is read.** It is chosen by its database file, not its binary.
+    A dpkg status with no installed package (empty, or only config-files and
+    half-installed stanzas) falls through to rpm, and an rpm database that holds no
+    package falls through to `pacman` and `apk`; a host with such an empty database
+    and no other manager reports an empty collection, not a degraded one.
+  - **Symlinks.** A symlinked status file, `status.d` directory or rpm database
+    file is refused (`symlink_refused`) where the tools followed the link. A
+    symlinked rpm directory is skipped, never followed (the current Fedora, RHEL
+    and SUSE layout, where `/var/lib/rpm` links to the directory that is read, is
+    unaffected).
+  - **A writer is running.** On a host that keeps an ndb or Berkeley DB rpm
+    database, a running rpm transaction answers `locked` (the reader asks whether
+    rpm's transaction lock is held and never takes it); and on a dpkg host, a
+    pending update journal (a file named with digits only in
+    `/var/lib/dpkg/updates`, left by a dpkg run in progress or an interrupted one)
+    answers `dpkg_updates:locked`, where `dpkg-query` printed the merged view. Both
+    keep the server's stored rows. The rpm one clears when the transaction ends;
+    the dpkg one when dpkg next completes a run, and after an interrupted run
+    `dpkg --configure -a` (when no dpkg run is in progress) completes the journal
+    and clears it. An rpm lock file moved out of the database directory is not
+    seen.
+  - **Unprivileged read.** An rpm sqlite database without its WAL sidecars is
+    readable by an unprivileged account (measured on one AlmaLinux 9 image, where
+    `rpm -qa` failed as `nobody`); other accounts and images were not measured.
+
+  When the read fails, the collection is degraded exactly as above, with no rows and
   a named reason in the agent log, the `list`/`query` error row and the result's
-  provenance (`installed_apps:<source>:<cause>`): `locked` (the package manager
-  holds its database write-locked), `changed_during_read` (a transaction rewrote it
+  provenance (`installed_apps:<source>:<cause>`, source one of `dpkg_status`,
+  `dpkg_status_d`, `dpkg_updates`, `rpm_sqlite`, `rpm_ndb`, `rpm_bdb`, `rpmdb` or
+  `pkgdb`): `locked` (a writer holds the database: sqlite write-locked past its
+  timeout, an rpm transaction running on ndb or Berkeley DB, or a pending dpkg
+  update journal), `changed_during_read` (a transaction rewrote the rpm database
   during the read), `corrupt` or `truncated` (a damaged database or record: one
   bad rpm header fails the whole read rather than publishing a shorter list),
   `unsupported_format` (a database layout the reader does not decode, for example
@@ -372,8 +406,11 @@ cadences.
   `oversized`, `row_cap`, `byte_cap`, `timeout` and `busy` (a limit was reached),
   `symlink_refused` and `not_regular` (the database is a link or not a regular
   file), and `unreadable` (a permission or I/O error). The daily sync's own
-  constrained token does not carry the reason yet; read it from the agent log. A degraded Linux host keeps its last-known rows,
-  shown as unconfirmed, until the database is readable again.
+  constrained token does not carry the reason yet; read it from the agent log
+  (where that is, `--log-file` or the console and your service manager, is under
+  "Where the lines go" in the Guardian `T_*` log-lines entry of
+  [server-admin.md](server-admin.md)). A degraded Linux host keeps its last-known
+  rows, shown as unconfirmed, until the database is readable again.
 
   **Windows degrades the same way (#4711).** The registry walk is native, so the
   subprocess cases above do not apply, but an Uninstall root that cannot be

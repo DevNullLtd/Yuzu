@@ -500,7 +500,7 @@ Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no
   proto change, no gateway pb regen (§6 applies only to outer-envelope fields).
-- Collection is a new `installed_apps` action **`list_inventory`** (13-token
+- Collection is a new `installed_apps` action **`list_inventory`** (14-token
   `inv|` rows); the operator-facing `list`/`query`/`list_per_user` output is a
   stable contract whose fields this ADR left byte-unchanged (rpm `list` keeps
   VENDOR). On Windows, `get_installed_apps_windows()` feeds `list` and `query`, and
@@ -1389,11 +1389,13 @@ the fallback.
 | `runtimes.dotnet` | the constant `Microsoft` (.NET is a Microsoft product; the adapter drops the row's vendor column, which is `-` on Linux and on the native macOS root) | n/a |
 | `runtimes.jvm` | the row's vendor column: the `release` file's self-reported `IMPLEMENTOR`, or on macOS, for a bundle with an openable `Contents` and no `release` file under `Contents/Home`, its `Info.plist` `JVMVendor` | `via:jvm` when the column is `-` (the home reports no vendor, or it is a Windows home known only by its registry tag) |
 
-The rpm `list_inventory` query format (`kRpmInvQueryFormat`) has ten columns, the two free-text
-tags last: `%{VENDOR}` then `%{PACKAGER}`. The pinned argv literal in
-`docs/agent-spawn-sink-manifest.md` carries the same format. `parse_rpm_inv_line` takes at least
-nine tokens: the publisher is `VENDOR` when set, else `PACKAGER`, each read as the text before any
-tab it contains. The `list` action has its own columns.
+Until SAM-45 (see its Update below) the rpm `list_inventory` acquisition was a subprocess with a ten-column
+query format (`kRpmInvQueryFormat`, the two free-text tags last: `%{VENDOR}` then `%{PACKAGER}`), pinned as an argv
+literal in `docs/agent-spawn-sink-manifest.md`, and `parse_rpm_inv_line` took at least nine tokens and read each free-text
+field as the text before any tab it contained. All three of those are retired: the format and the parser are
+test-only now (`tests/unit/installed_apps_old_path_oracle.hpp`), the manifest rows are removed, and the rows come
+from the database through `inv_record_from_rpm`, where a tab, pipe or newline no longer truncates a value. The
+publisher rule is unchanged: `VENDOR` when set, else `PACKAGER`. The `list` action has its own columns.
 
 **The server rule.** `normalize_vendor` returns the empty vendor when the RAW value starts with
 `kOriginLabelPrefix` (`via:`), as its first statement, before lower-casing or tokenising. The test
@@ -1942,12 +1944,21 @@ parsers (`parse_dpkg_inv_line`, `parse_rpm_inv_line`, `kRpmInvQueryFormat`, `par
 output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label) and the dpkg rule (any
 `installed` state, held packages included) are the ones the subprocess path applied.
 
-**Deliberate differences, none of which changes a row on any capture.**
+**Deliberate differences.** None changes a row on any capture; each is a behaviour the old path had and this one
+does not, or the reverse.
 
-- The package manager is detected by its DATABASE file rather than its tool binary, and an empty dpkg status
-  falls through to rpm.
+- The package manager is detected by its DATABASE file rather than its tool binary. A dpkg status is the answer only
+  when at least one stanza is `installed` (the state both row mappers require): an empty one, or one holding only
+  config-files, half-installed and other non-installed states, falls through to rpm. An rpm database that was read and
+  holds no package does not end detection either: the next candidate directory is tried, and when none yields a package
+  the host is read by the `pacman` and `apk` legs as before. The old path chose by binary and did not fall through;
+  what is new is a database present without its binary.
 - A tab, pipe or newline inside a Maintainer, VENDOR or PACKAGER value no longer truncates the value or splits
-  the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time).
+  the row (the separators are removed from an `inv` row, or escaped in a `list` row, at format time). A host that carries
+  one has those rows hashed over the full value, so they are sent once more on the first cycle after upgrade; every
+  other row and hash is unchanged.
+- `list` renders an rpm header with no INSTALLTIME as `-` where the old path printed `(none)` (the `inv` row writes
+  it empty, as before). Only a hostile or damaged header lacks the tag.
 - A host whose packages live only in `/var/lib/dpkg/status.d/` (the layout minimal images with no shell use,
   which `dpkg-query` never read) now reports them: new install rows and install events for that host. Each
   package there is a control file with no `Status` field, plus a `.md5sums` sibling that is skipped; a present
@@ -1956,21 +1967,58 @@ output. The rpm publisher rule (VENDOR, else PACKAGER, else the `via:rpm` label)
   degraded (`dpkg_status_d:corrupt`, no rows) where `dpkg-query` ignored the directory, and the status file's own
   packages are withheld with it, because a roster without the `status.d`-only packages would be published as the
   host's complete one. The remedy is to remove the file or give it a leading dot (hidden names are skipped).
-- An rpm directory that is a symlink is never followed, and when a database file exists behind such a link and no
-  other candidate directory yields one, the read is `rpmdb:symlink_refused` (a stat only; nothing is opened through
-  the link) instead of an empty list. The current Fedora, RHEL and SUSE layout (`/var/lib/rpm` linking to the
-  sysimage copy, which is read first) is unaffected.
+- A symlinked leaf is refused where the tools followed it: a symlinked status file, `status.d` directory or rpm
+  database file is `symlink_refused` (the directories above the leaf are reached by path and are followed, as before).
+  An rpm candidate DIRECTORY that is a symlink is never followed and is skipped; when a database file exists behind
+  such a link and no candidate directory yielded a database at all, the read is `rpmdb:symlink_refused` (a stat only;
+  nothing is opened through the link) instead of an empty list. The current Fedora, RHEL and SUSE layout
+  (`/var/lib/rpm` linking to the sysimage copy, which is read first) is unaffected, and a database that was read, even
+  an empty one, means a skipped link is not a refusal.
 - An rpm sqlite database without its WAL sidecars is readable by an unprivileged account (measured on one
-  image: `rpm -qa` fails there).
+  AlmaLinux 9 image: `rpm -qa` fails there as `nobody`).
+- **A running rpm transaction answers `locked` on ndb and Berkeley DB.** rpm rewrites those two files in place and
+  every rpm writer holds its transaction lock (an fcntl write lock on `.rpm.lock`, beside the database) for the whole
+  run, while a read-only `rpm -qa` joined the library's own locking and so never saw a writer's half-finished state. The
+  reader takes the same precaution in the only way open to it: after the first change stamp and before the first
+  read it asks `fcntl(F_GETLK)` whether a write lock on `.rpm.lock` would conflict, and a held lock is
+  `<source>:locked` with no rows and the server keeping its stored ones. It never TAKES a lock, so it cannot delay
+  rpm; a missing lock file means no transaction has run; a symlinked or non-regular one is its named cause, never
+  "not locked". sqlite keeps its own isolation (a shared lock for a rollback journal, a snapshot for WAL) and does not
+  consult it. The change stamp stays as the second line of defence. Residual: rpm's lock path is configurable
+  (`%_rpmlock_path`), and a lock file moved out of the database directory is not seen. The old path would have printed
+  a roster read between the writer's steps.
+- **A pending dpkg update journal answers `locked`.** `dpkg-query -W` replays `/var/lib/dpkg/updates/` in memory
+  over the status file before it answers, so it printed the status MERGED with a run in progress, or left by an
+  interrupted one until dpkg next runs. This reader reads the status file alone, which in that state is the
+  pre-journal roster. It does not re-implement dpkg's record-replacement rules (multi-arch slots, a not-installed
+  record deleting an entry): a name made only of ASCII digits in that directory (dpkg's own selection rule; `tmp.i` and
+  every other name is ignored) is `dpkg_updates:locked`, with no rows, no fall-through to rpm and the status packages
+  discarded as a `status.d` failure discards them. The directory is listed by name only (nothing in it is opened); an
+  absent directory means no journal, and a link or non-directory in its place, or a listing that fails, is a named
+  failure. The operator's remedy is `dpkg --configure -a` when no dpkg run is in progress. A merged view can be added
+  on top of this refusal later if wanted.
 - A read that fails is a degraded acquisition with a NAMED reason, `installed_apps:<source>:<cause>`, in the
   result's provenance, the `list`/`query` error row and the agent log. The section token the daily sync sends
   is still the generic constrained one (`sync_source_installed_software.cpp` reads only the exit code) until a
   follow-up carries the reason end to end.
 
+**Where it runs.** The whole read is one bounded call (`bounded_call_ex`, 20 s, the inner bound; the daily sync's
+own outer bound is unchanged) on a worker, polled by the same deadline, by the plugin's stop flag and by the agent's
+shutdown latch (`subprocess_cancel_requested()`, the latch the old subprocess leg polled), so an agent stop ends a slow
+read at its next poll. `shutdown()` raises the flag and waits a fixed 5 s for callers still inside a read. What this
+cannot close is `bounded_wait.hpp`'s accepted residual: a worker blocked in a kernel read that never returns can
+outlive the unload (the ceiling on abandoned workers and the missing single-flight are #8364's). One trade is new: the
+parsers now run INSIDE the agent process, where the old path isolated `dpkg-query` and `rpm` in a child, so a memory
+error in a parser would take the agent with it. That is why every length is checked in 64-bit arithmetic before
+anything is allocated, every loop is bounded, the sqlite connection is opened read-only with the untrusted-database
+posture, and the parsers are tested against edited real databases.
+
 **Failure semantics are unchanged in kind.** A degraded answer is rc 1 with no rows and CONSTRAINED/PARTIAL,
 so the writer's status-only section keeps the server's stored rows (the `v3:` held-facet rule). Every limit
-(20 s wall clock, 50,000 packages, 32 MiB of dpkg text in total across the status file and `status.d`, 32 MiB per
-rpm header, 1 GiB of rpm headers) and every damaged record
+(20 s wall clock; 50,000 packages, which for dpkg is a cap on stanzas; 32 MiB of dpkg text in total across the status
+file and `status.d`; 32 MiB per rpm header; 1 GiB of rpm headers read; and 8 MiB of text KEPT across the rpm headers
+in total, charged apart from the bytes read because one stored string can be named by several fields of a hostile
+header, so what a record keeps is a multiple of what it was charged for reading) and every damaged record
 degrades the whole read instead of returning a shorter roster. Reading rpm signer data and non-installed dpkg
 states onto the wire (slot 14 of the v3 record, which the server consumes without keeping) is NOT part of this
 change; it needs a server change and is tracked as SAM-45b (#8361).
