@@ -60,6 +60,7 @@
 #include <ctime>
 #include <expected>
 #include <functional>
+#include <iterator>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -269,6 +270,9 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
     }
     std::sort(names.begin(), names.end()); // readdir order is arbitrary; the answer must not be
 
+    // Merged once after the loop: the merge indexes every package already collected, so a per-file
+    // merge is quadratic in the file count. A failure returns no rows (the readers' contract).
+    std::vector<DpkgPackage> collected;
     for (const auto& name : names) {
         if (auto t = budget.check_time(); !t) {
             out.failure = failure_token(kSource, t.error());
@@ -293,8 +297,10 @@ read_dpkg_status_d(const std::string& root, const Limits& lim, PkgDbBudget& budg
             out.failure = failure_token(kSource, parsed.error());
             return out;
         }
-        yuzu::shared::merge_dpkg_status_d(out.packages, std::move(*parsed));
+        collected.insert(collected.end(), std::make_move_iterator(parsed->begin()),
+                         std::make_move_iterator(parsed->end()));
     }
+    yuzu::shared::merge_dpkg_status_d(out.packages, std::move(collected));
     return out;
 }
 

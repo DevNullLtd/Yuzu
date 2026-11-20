@@ -236,7 +236,8 @@ parse_dpkg_status(std::string_view text, PkgDbBudget& budget,
 /// present in both keeps the status entry (the status file is dpkg's own record;
 /// status.d is the layout minimal images use in its place). A package is its
 /// (name, architecture) pair, so a multi-arch sibling is never mistaken for a
-/// duplicate. Within status.d the first occurrence wins. Compared exactly.
+/// duplicate. Within status.d the first occurrence wins. Compared exactly. Each call
+/// indexes all of `status`, so call it once per collection, never once per file.
 inline void merge_dpkg_status_d(std::vector<DpkgPackage>& status,
                                 std::vector<DpkgPackage>&& status_d) {
     const auto key = [](const DpkgPackage& p) { return p.name + '\x1f' + p.architecture; };
