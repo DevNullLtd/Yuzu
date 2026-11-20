@@ -315,61 +315,61 @@ inv|Grapher|2.8|macOS Software Signing|13/08/2026, 03:51|app|macos||||signed||
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-21 · euid 0 · leg-hash f58c3a5e2904
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 · leg-hash f58c3a5e2904
 
 ```
 == action=list
-app|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-|-|-
-app|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-|-|-
-app|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-|-|-
-app|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-|-|-
-app|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-|-|-
-app|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-|-|-
-app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-|-|-
-app|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-|-|-
-app|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-|-|-
-… 12 of 206 rows shown
+app|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-|-|-
+app|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|bsdutils|1:2.41.3-3ubuntu2.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-|-|-
+app|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+app|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
+… 12 of 87 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=query name=bash
 found|true
-app|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>
+app|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_per_user
-user_app|system|apt|3.0.3|APT Development Team <deity@lists.debian.org>|-
-user_app|system|autoconf|2.72-3.1|Alex Myczko <tar@debian.org>|-
-user_app|system|automake|1:1.17-4|Eric Dorland <eric@debian.org>|-
-user_app|system|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>|-
-user_app|system|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>|-
-user_app|system|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>|-
-user_app|system|bash|5.2.37-2+b9|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils-aarch64-linux-gnu|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|binutils-common|2.44-3|Matthias Klose <doko@debian.org>|-
-user_app|system|bison|2:3.8.2+dfsg-1+b2|Chuan-kai Lin <cklin@debian.org>|-
-user_app|system|bsdutils|1:2.41.5-0+deb13u1|Chris Hofstaedtler <zeha@debian.org>|-
-… 12 of 206 rows shown
+user_app|system|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-
+user_app|system|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|bash|5.3-2ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|bsdutils|1:2.41.3-3ubuntu2.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-
+user_app|system|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+user_app|system|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
+… 12 of 87 rows shown
 [result_status] UNDECLARED / UNKNOWN
 
 == action=list_inventory
-inv|apt|3.0.3|APT Development Team <deity@lists.debian.org>||package|deb|||arm64||debian|13
-inv|autoconf|2.72|Alex Myczko <tar@debian.org>||package|deb||3.1|all||debian|13
-inv|automake|1.17|Eric Dorland <eric@debian.org>||package|deb|1|4|all||debian|13
-inv|autotools-dev|20240727.1|Henrique de Moraes Holschuh <hmh@debian.org>||package|deb|||all||debian|13
-inv|base-files|13.8+deb13u6|Santiago Vila <sanvila@debian.org>||package|deb|||arm64||debian|13
-inv|base-passwd|3.6.7|Shadow package maintainers <pkg-shadow-devel@lists.alioth.debian.org>||package|deb|||arm64||debian|13
-inv|bash|5.2.37|Matthias Klose <doko@debian.org>||package|deb||2+b9|arm64||debian|13
-inv|binutils|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|binutils-aarch64-linux-gnu|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|binutils-common|2.44|Matthias Klose <doko@debian.org>||package|deb||3|arm64||debian|13
-inv|bison|3.8.2+dfsg|Chuan-kai Lin <cklin@debian.org>||package|deb|2|1+b2|arm64||debian|13
-inv|bsdutils|2.41.5|Chris Hofstaedtler <zeha@debian.org>||package|deb|1|0+deb13u1|arm64||debian|13
-… 12 of 206 rows shown
-[result_status] UNDECLARED / UNKNOWN
+inv|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>||package|deb|||amd64||ubuntu|26.04|
+inv|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+inv|base-passwd|3.6.8|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+inv|bash|5.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||2ubuntu1|amd64||ubuntu|26.04|
+inv|bsdutils|2.41.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|1|3ubuntu2.2|amd64||ubuntu|26.04|
+inv|coreutils|9.5|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||1ubuntu2+0.0.0~ubuntu25|all||ubuntu|26.04|
+inv|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
+inv|dash|0.5.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||12ubuntu3|amd64||ubuntu|26.04|
+inv|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
+inv|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>||package|deb|||amd64||ubuntu|26.04|
+inv|diffutils|3.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|1|1ubuntu0.1|amd64||ubuntu|26.04|
+inv|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
+… 12 of 87 rows shown
+[result_status] OK / FULL
 ```
 <!-- END GENERATED -->
 
