@@ -18,9 +18,9 @@
 /// sidecar's quarantine name is derived from that exclusively claimed name (`<claimed>-wal`), so
 /// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
 /// A sidecar that cannot be renamed is copied only when no directory entry of any kind (a
-/// dangling link included, examined without following it) is at its quarantine name; and the one
-/// removal this header makes at a quarantine name is a partial copy it just wrote there, at a name
-/// that was free when checked.
+/// dangling link included, examined without following it) is at its quarantine name; and the only
+/// thing the sidecar step ever removes at a quarantine name is a partial copy it just wrote there,
+/// at a name that was free when checked.
 /// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
 /// under both names: a POSIX open quarantines it again under the next free name, while the
 /// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
