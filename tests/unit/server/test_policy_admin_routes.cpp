@@ -587,12 +587,15 @@ struct RefusalRoutes {
     }
 
     // A fragment straight into the store (as a pack install would, written straight to the store).
-    std::string fragment(const std::string& name, const std::string& check, const std::string& fix = {}) {
+    std::string fragment(const std::string& name, const std::string& check, const std::string& fix = {},
+                         const std::string& post = {}) {
         std::string y = "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
                         "\nspec:\n  check:\n    instruction: " + check +
                         "\n    compliance: \"result.hostname != ''\"\n";
         if (!fix.empty())
             y += "  fix:\n    instruction: " + fix + "\n";
+        if (!post.empty())
+            y += "  postCheck:\n    instruction: " + post + "\n    compliance: \"result.hostname != ''\"\n";
         auto id = ps.create_fragment(y);
         REQUIRE(id.has_value());
         return *id;
@@ -611,6 +614,17 @@ std::string fragment_yaml(const std::string& name, const std::string& check) {
     return "apiVersion: yuzu.io/v1alpha1\nkind: PolicyFragment\ndisplayName: " + name +
            "\nspec:\n  check:\n    instruction: " + check +
            "\n    compliance: \"result.hostname != ''\"\n";
+}
+
+// The same document with a fix and a post-check section, either of which may be empty.
+std::string fragment_yaml3(const std::string& name, const std::string& check, const std::string& fix,
+                           const std::string& post) {
+    auto y = fragment_yaml(name, check);
+    if (!fix.empty())
+        y += "  fix:\n    instruction: " + fix + "\n";
+    if (!post.empty())
+        y += "  postCheck:\n    instruction: " + post + "\n    compliance: \"result.hostname != ''\"\n";
+    return y;
 }
 
 } // namespace
@@ -855,4 +869,92 @@ TEST_CASE("authoring routes carry retry_after_ms on a 503 only when the instruct
     CHECK(err.at("retry_after_ms") == 5000);
     for (const auto& c : r.audit_calls)
         CHECK(c.result != "denied");
+}
+
+TEST_CASE("authoring routes refuse a fragment, policy or enable whose FIX or POST-CHECK instruction "
+          "is refused, and accept the same shape when all three are allowed",
+          "[pg][policy][admin][dispatch_approval]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, policy_admin_store_tpl);
+    RefusalRoutes r(db.dsn(), &route_full_registry());
+    const auto check = r.define("i.status", "echo", "status");
+    const auto fix_ok = r.define("i.status.fix", "echo", "status");
+    const auto post_ok = r.define("i.status.post", "echo", "status");
+    const auto fix_gated = r.define("i.gated.fix", "content_dist", "execute_staged");
+    const auto post_destructive = r.define("i.destructive.post", "echo", "purge_source");
+
+    const auto policy_yaml = [&](const std::string& fragment_id) {
+        return "apiVersion: yuzu.io/v1alpha1\nkind: Policy\ndisplayName: p-" + fragment_id +
+               "\nspec:\n  fragment: " + fragment_id + "\n  managementGroups:\n    - " + r.group_id + "\n";
+    };
+    const auto last_denied = [&](const char* verb, const std::string& token, const std::string& instr) {
+        REQUIRE_FALSE(r.audit_calls.empty());
+        const auto& c = r.audit_calls.back();
+        CHECK(c.action == verb);
+        CHECK(c.result == "denied");
+        CHECK(c.detail.find("reason=" + token) != std::string::npos);
+        CHECK(c.detail.find("instruction=" + instr) != std::string::npos);
+    };
+    const auto refused_body = [](const std::unique_ptr<httplib::Response>& res, const std::string& token,
+                                 const std::string& instr) {
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        const auto msg = nlohmann::json::parse(res->body).at("error").at("message").get<std::string>();
+        CHECK(msg.find("instruction " + instr + " ") != std::string::npos);
+        CHECK(msg.find("(" + token + ")") != std::string::npos);
+    };
+
+    // Positive control: an allowed check, fix and post-check are accepted on all three routes,
+    // so the refusals below are the id list's doing and not the shape's.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("all allowed", check, fix_ok, post_ok), "text/plain");
+        REQUIRE(frag);
+        CHECK(frag->status == 201);
+        const auto stored = r.fragment("all allowed stored", check, fix_ok, post_ok);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        REQUIRE(created);
+        CHECK(created->status == 201);
+        const auto pid = r.policy("all allowed policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        REQUIRE(enabled);
+        CHECK(enabled->status == 200);
+    }
+
+    // A refused FIX instruction, behind an allowed check.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("gated fix", check, fix_gated, ""), "text/plain");
+        refused_body(frag, "gated", fix_gated);
+        last_denied("policy_fragment.create", "gated", fix_gated);
+
+        const auto stored = r.fragment("gated fix stored", check, fix_gated);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        refused_body(created, "gated", fix_gated);
+        last_denied("policy.create", "gated", fix_gated);
+
+        const auto pid = r.policy("gated fix policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        refused_body(enabled, "gated", fix_gated);
+        last_denied("policy.enable", "gated", fix_gated);
+    }
+
+    // A refused POST-CHECK instruction, behind an allowed check and an allowed fix.
+    {
+        auto frag = r.sink.Post("/api/policy-fragments",
+                                fragment_yaml3("destructive post", check, fix_ok, post_destructive),
+                                "text/plain");
+        refused_body(frag, "destructive", post_destructive);
+        last_denied("policy_fragment.create", "destructive", post_destructive);
+
+        const auto stored = r.fragment("destructive post stored", check, fix_ok, post_destructive);
+        auto created = r.sink.Post("/api/policies", policy_yaml(stored), "text/plain");
+        refused_body(created, "destructive", post_destructive);
+        last_denied("policy.create", "destructive", post_destructive);
+
+        const auto pid = r.policy("destructive post policy", stored, r.group_id);
+        auto enabled = r.sink.Post("/api/policies/" + pid + "/enable", "");
+        refused_body(enabled, "destructive", post_destructive);
+        last_denied("policy.enable", "destructive", post_destructive);
+    }
+    CHECK(r.dispatch_calls == 0);
 }
