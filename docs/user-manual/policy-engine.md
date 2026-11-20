@@ -273,10 +273,10 @@ The policy engine tracks compliance status per agent per policy. Each
 |---|---|
 | `compliant` | Check passed -- the endpoint is in the desired state |
 | `non_compliant` | Check failed -- the endpoint is not in the desired state |
-| `unknown` | Not yet evaluated, status invalidated, the agent did not respond to a check within the grace window, or the check instruction runs a Forensics-tier plugin (see below) |
+| `unknown` | Not yet evaluated, status invalidated, or the agent did not respond to a check within the grace window |
 | `fixing` | Fix instruction is currently running |
 | `error` | Check or fix instruction failed to execute, **or the policy is misconfigured** (e.g. an empty compliance expression — a policy that checks nothing is reported as `error`, never `compliant`), **or the agent's response could not be evaluated** (output nested past the depth guard, an evaluation that threw, or a compliance expression that fails to evaluate, such as a division by zero; all three are counted in `yuzu_server_policy_unevaluable_responses_total{reason}`; a numeric JSON value is compared as text and is not an error; `reason="expression"` covers an expression that evaluates to no value: a division by zero, a type error, a timeout, or an expression that does not parse or is over-long. A `result.<field>` the response lacks reads as an empty string, which is false: the verdict is `non_compliant`, not `error`, and nothing is counted; only that device is affected) |
-| `blocked` | Policy evaluation did not dispatch the check or fix, because its instruction names an action that policy evaluation does not run (see [Action approval and the `blocked` status](#action-approval-and-the-blocked-status)). Nothing was sent to the device. It counts as failing and clears when a later dispatch records a real result. |
+| `blocked` | Policy evaluation did not dispatch the check or fix, because its instruction names an action that policy evaluation does not run (see [Action approval and the `blocked` status](#action-approval-and-the-blocked-status)). Nothing was sent to the device. A check that runs a Forensics-tier plugin shows `blocked` for this reason (`gated`). It counts as failing and clears when a later dispatch records a real result. |
 
 ### Action approval and the `blocked` status
 
@@ -338,9 +338,24 @@ What this means in use:
   answered, with `retry_after_ms` 5000 if the instruction store failed and `null` if the
   evaluator is unwired). Both bodies are the A4 error envelope. The check is advisory: the dispatch check above is the control, and an
   instruction that does not exist yet is accepted, because product packs create their
-  instructions and fragments in any order. **Pack install does not refuse** a policy
+  instructions and fragments in any order, and so is a write whose policy or fragment cannot
+  be read at that moment (the lookup of the instruction is answered `503` as above, but a
+  failed read of the policy or its fragment skips the check). **Pack install does not refuse** a policy
   whose instruction is refused: it installs, and shows `blocked` at its first dispatch.
   Enabling such a policy through the route answers `400`.
+- **No policy can run an action that has an execute gate, and nothing approves one.** There
+  is no approval step for a policy and no setting that allows one, so a remediation attempt on a
+  policy whose fix runs such an action is refused (`409`) and its devices show `blocked` until the
+  policy's next check. This covers almost every
+  action that changes an endpoint: file writes, registry changes, firewall and quarantine
+  actions, content distribution, scripts, service start mode, certificate deletion, the power
+  plan and others. The mutating actions that remain usable as a policy fix are exactly four:
+  `tags.set`, `tags.delete`, `agent_actions.set_log_level` and `chargen.chargen_stop`. Every
+  read-only action without a gate is usable as a check; a read-only action that carries a gate
+  (including every action of the Forensics-tier plugins) is refused. A remediation policy that
+  needs any other action has to be run another way, for example by an operator running the
+  action interactively, where the approval requirement applies. The Remediate button is still
+  shown for a fix that will be refused: it is shown whenever the fragment has a fix.
 - A refusal is counted in `yuzu_server_policy_dispatch_denied_total{reason}` and a
   `policy.dispatch` audit row is attempted (see the [audit log](audit-log.md) for when one is
   written and when one can be lost).
@@ -375,20 +390,18 @@ Verdict semantics: a plugin failure / timeout / rejection / unevaluable response
 non-responder after the grace window → `unknown`; a successful response that
 fails the CEL → `non_compliant`; one that satisfies it → `compliant`.
 
-**A check that runs a Forensics-tier plugin scores `unknown`.** The evaluator
-reads each check's stored response with every Forensics-tier plugin
-(`app_usage`, `browser_inventory`, `execution_artifacts`,
+**A check that runs a Forensics-tier plugin is not dispatched.** Every action of the
+Forensics-tier plugins (`app_usage`, `browser_inventory`, `execution_artifacts`,
 `privacy_permissions`, `process_introspect`, `remote_access_audit`; the set is derived from the
-capability catalogue) excluded, because the verdict and the first bytes of the
-check output are shown to readers who do not hold `Forensics:Read`. Such a
-policy therefore shows `unknown` for every agent with an empty `check_result`,
-and never a verdict from, or a stored copy of, Forensics output. `unknown`
-there says nothing about the device. A Forensics-tier plugin is not a suitable
-policy check. The check instruction is still dispatched to the endpoints and the
-plugin's response row is still stored (it is readable only through the
-`Forensics:Read` tier and kept for the response retention window, 90 days by
-default); only the verdict and `check_result` are withheld. A separate
-follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+capability catalogue) carries an execute gate, so policy evaluation refuses such a check
+before anything is sent (see [Action approval and the `blocked`
+status](#action-approval-and-the-blocked-status)). The policy shows `blocked` for every
+agent, with reason `gated` and an empty output; it does not show `unknown`. The evaluator
+also reads each check's stored response with every Forensics-tier plugin excluded, because the
+verdict and the first bytes of the check output are shown to readers who do not hold
+`Forensics:Read`; so the verdict and a stored copy of Forensics output are never produced for
+a policy, whichever way a row got there. A Forensics-tier plugin is not a suitable policy
+check.
 
 This release stores no check output for such a policy, so there is nothing to
 clean up for it; deleting a policy (`DELETE /api/policies/{id}`, `Policy:Delete`)

@@ -5477,7 +5477,7 @@ Create a new policy from YAML.
 
 **Response (400), refused instruction:** when the policy's fragment names an instruction policy evaluation will not dispatch, the create is refused with the same body as `POST /api/policy-fragments` (the A4 error envelope, `error.code` 400, a `message` of `instruction <id> names an action that policy evaluation does not dispatch (<reason>)` and a `remediation` starting `policy_dispatch_refused: <reason>`) and audited `policy.create / denied`, detail `reason=<reason> instruction=<id>`. A fragment that does not exist yet is left to the store's own check below.
 
-**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body. Also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator).
+**Response (503):** A genuine internal store failure on the write — safe to retry, and the internal error string is never included in the body. Also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the fragment the policy names cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5550,7 +5550,7 @@ Enable a previously disabled policy.
 
 **Response (400):** `policy not found`. **Response (400), refused instruction:** enabling is where a policy starts to run, so the same refused-instruction check runs here (a policy installed by a product pack was never checked at install); same body as `POST /api/policy-fragments`, audited `policy.enable / denied`, detail `reason=<reason> instruction=<id>`. **Response (503):** a genuine internal
 store failure on the write — safe to retry, internal error string never
-included in the body; also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator).
+included in the body; also `503` when the refused-instruction check cannot be answered (the A4 error envelope: message `instruction lookup unavailable, try again` with `retry_after_ms` 5000 when the instruction store failed; message `instruction lookup unavailable` with `retry_after_ms` `null` for an unwired evaluator). The check is skipped, and the write goes ahead, when the policy or its fragment cannot be read at that moment (the dispatch check still applies at the policy's first dispatch).
 
 ---
 
@@ -5954,11 +5954,12 @@ field rather than a header/status code.
 
 **Forensics-tier checks.** The one case where `check_result` is not the check's output: when
 the check instruction runs a Forensics-tier plugin (`app_usage`, `browser_inventory`,
-`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), the agent's `status` is
-`unknown` and `check_result` is empty, because the evaluator does not read or store that plugin's
-output. `unknown` there says nothing about the device. Check output of such a policy is never
-stored. See "Forensics-tier rows" in the
-Command/Instruction Responses section.
+`execution_artifacts`, `privacy_permissions`, `process_introspect`, `remote_access_audit`), policy evaluation does not dispatch it: every action of these plugins has an execute gate, so the
+check is refused and the agent's `status` is `blocked` with a `check_result` of
+`{"phase":"check","result":"blocked","reason":"gated","plugin":...,"action":...}`. Check output of such a
+policy is never stored, and the evaluator would not read it if it were (a stored Forensics row is
+excluded from the evaluator's read). See "Forensics-tier rows" in the Command/Instruction Responses
+section.
 
 ---
 
@@ -8210,7 +8211,7 @@ browser sign-in does not), so expect denial rows from automation that polls stor
 The filter is per plugin, because only the `plugin` name is stored with a row, and it is a rule
 about these plugins' rows, not about a kind of data: other plugins can return comparable
 information under their own securables, and their stored rows stay under `Response:Read`. The same filter is applied to the
-server's own consumers of these rows: policy check output (such a policy scores `unknown`), result
+server's own consumers of these rows: policy check output (policy evaluation does not dispatch such a check, so the policy shows `blocked`; the filter excludes any stored row), result
 set membership (the set producers refuse such a command as a source, `RESULT_SET_SOURCE_NOT_SUPPORTED`) and the live output stream,
 which publishes no row of a Forensics-tier plugin on `GET /events`, `GET /sse/executions/{id}` or
 `GET /api/v1/events`. (Such a frame publishes nothing to the live output stream, not a row and not a notice, and
