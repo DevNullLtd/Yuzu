@@ -1379,8 +1379,11 @@ if $USE_TLS; then
               tls => #{certfile   => "$CA_DIR/default-gateway.pem",
                        keyfile    => "$CA_DIR/default-gateway.key",
                        cacertfile => "$CA_DIR/default-ca.pem",
-                       verify => verify_none,
-                       fail_if_no_peer_cert => false},
+                       %% WP01: ask for a client certificate and WITNESS it (no chain check here;
+                       %% the server verifies the leaf); an agent with none is still served.
+                       verify => verify_peer,
+                       fail_if_no_peer_cert => false,
+                       witness_client_cert => true},
               acceptors => 4,
               http2 => #{idle_timeout => 180000, max_concurrent_streams => 32}},
             #{name => mgmt,

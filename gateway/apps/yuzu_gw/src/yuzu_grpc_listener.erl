@@ -147,7 +147,8 @@
 %% key is refused. The former grpcbox keys are named, with where they went.
 -define(ENTRY_KEYS, [name, service_protos, services, listen, tls, auth_fun, origin,
                      http2, limits, acceptors]).
--define(TLS_KEYS, [certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert, ciphers]).
+-define(TLS_KEYS, [certfile, keyfile, cacertfile, verify, fail_if_no_peer_cert, ciphers,
+                   witness_client_cert]).
 -define(LISTEN_KEYS, [port, ip, socket_opts]).
 -define(LIMIT_KEYS, [max_message_bytes, send_timeout_ms, max_connections,
                      max_connection_memory_bytes, request_timeout_ms]).
@@ -291,7 +292,9 @@ ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
     Verify = maps:get(verify, Tls, verify_peer),
     [{certfile, Cert}, {keyfile, Key}, {cacertfile, CaCert},
      {verify, Verify},
-     {fail_if_no_peer_cert, maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer)},
+     {fail_if_no_peer_cert, maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer)}]
+    ++ witness_opts(Tls) ++
+    [
      {versions, ['tlsv1.2']},
      {ciphers, maps:get(ciphers, Tls, default_ciphers(Cert))},
      {alpn_preferred_protocols, [<<"h2">>]},
@@ -299,6 +302,25 @@ ssl_opts(#{certfile := Cert, keyfile := Key, cacertfile := CaCert} = Tls) ->
      {reuse_sessions, false},
      {client_renegotiation, false},
      {secure_renegotiate, true}].
+
+%% `witness_client_cert => true' (WP01): the listener asks for a client certificate
+%% so a handler can WITNESS it (`yuzu_grpc:peer_cert/1'), and the handshake is NOT
+%% aborted by a certificate the gateway cannot validate (expired, issued by another
+%% CA). The TLS CertificateVerify message still proves the client holds the
+%% certificate's private key; whether the certificate is one the install issued,
+%% names the claimed agent and is unrevoked is decided by the SERVER, which
+%% re-verifies the witnessed leaf. Nothing here is an authorization decision and
+%% a peer with no certificate is still served (`fail_if_no_peer_cert' false is
+%% required alongside, see check_witness/1): agents that have not enrolled yet have none.
+witness_opts(#{witness_client_cert := true}) ->
+    [{verify_fun, {fun witness_verify/3, []}}];
+witness_opts(_) ->
+    [].
+
+witness_verify(_Cert, {bad_cert, _}, State) -> {valid, State};
+witness_verify(_Cert, {extension, _}, State) -> {unknown, State};
+witness_verify(_Cert, valid, State) -> {valid, State};
+witness_verify(_Cert, valid_peer, State) -> {valid, State}.
 
 %% The suites for the key of the first certificate in the file.
 default_ciphers(CertFile) ->
@@ -455,6 +477,8 @@ protocol_opts(Entry, Routes) ->
                           listener => role(Entry),
                           auth_fun => maps:get(auth_fun, Entry, undefined),
                           origin => Origin,
+                          %% WP01: does this listener witness client certificates?
+                          witness => witnessing(Entry),
                           limits => Limits},
                  %% Cowboy reads the PROXY header itself, before the TLS
                  %% handshake; the stream handler decides whether to believe it.
@@ -465,6 +489,11 @@ protocol_opts(Entry, Routes) ->
                  %% a client that sends no ALPN at all is parsed as HTTP/2 too.
                  protocols => [http2],
                  alpn_default_protocol => http2}).
+
+%% True iff the entry has a `tls' map with `witness_client_cert => true': the only
+%% case in which "no certificate" from a client means the client had none to give.
+witnessing(#{tls := #{witness_client_cert := true}}) -> true;
+witnessing(_) -> false.
 
 %% The `limits' the stream handler reads. A listener that routes the
 %% ManagementService and does not serve the agent service gets no per-connection
@@ -671,11 +700,27 @@ check_tls_paths(Tls) ->
 check_tls_values(Tls) ->
     case [Key || {Key, Valid} <- [{verify, fun(V) -> V =:= verify_peer orelse V =:= verify_none end},
                                   {fail_if_no_peer_cert, fun is_boolean/1},
+                                  {witness_client_cert, fun is_boolean/1},
                                   {ciphers, fun valid_ciphers/1}],
                  maps:is_key(Key, Tls), not Valid(maps:get(Key, Tls))] of
-        [] -> ok;
+        [] -> check_witness(Tls);
         Bad -> {error, {bad_tls_values, Bad}}
     end.
+
+%% A witnessing listener must request a certificate (verify_peer) and must not
+%% require one: an unenrolled agent has none and must still reach Register.
+check_witness(#{witness_client_cert := true} = Tls) ->
+    %% The EFFECTIVE values, with the same defaults ssl_opts/1 applies (verify_peer, and
+    %% fail_if_no_peer_cert true under verify_peer): a map that sets only witness_client_cert
+    %% would otherwise pass here and then REQUIRE a client certificate at the handshake, cutting
+    %% off every agent that is still enrolling.
+    Verify = maps:get(verify, Tls, verify_peer),
+    case {Verify, maps:get(fail_if_no_peer_cert, Tls, Verify =:= verify_peer)} of
+        {verify_peer, false} -> ok;
+        _ -> {error, {bad_tls_values, [witness_client_cert]}}
+    end;
+check_witness(_) ->
+    ok.
 
 valid_ciphers([_ | _] = Ciphers) ->
     proper_list(Ciphers) andalso lists:all(fun(C) -> is_list(C) orelse is_tuple(C) end, Ciphers);

@@ -529,6 +529,19 @@ int main(int argc, char* argv[]) {
     // combination may boot) is made in ServerImpl::run() after certificate bootstrap.
     register_gateway_peer_options(app, cfg);
 
+    // WP01: proof of identity when an already-enrolled agent id re-registers
+    // (agent_reregistration_gate.hpp). Default `audit` for one release: decide and count, admit as
+    // before; `enforce` refuses an unproven re-registration; `off` is the pre-WP01 behaviour. An
+    // unknown spelling refuses to start (CLI::IsMember) rather than falling back to a weaker mode.
+    app.add_option("--agent-reregistration-proof", cfg.agent_reregistration_proof,
+                   "Proof required when an already-enrolled agent id re-registers: off | audit "
+                   "(default: count what enforce would refuse, admit as before) | enforce "
+                   "(refuse with a gRPC status unless the agent presents its current client "
+                   "certificate or a fresh single-use enrollment token). Only agents holding a "
+                   "certificate issued by this server's own CA are covered.")
+        ->check(CLI::IsMember({"off", "audit", "enforce"}))
+        ->envname("YUZU_AGENT_REREGISTRATION_PROOF");
+
     // Guardian heartbeat-reconcile admission budget (#5513): per-replica time budget, burst and
     // count ceiling. Registered from server_guardian_reconcile_options.hpp; a non-positive or
     // non-finite value is refused at startup (guardian_reconcile_options_error, below).

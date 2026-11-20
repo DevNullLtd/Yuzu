@@ -90,7 +90,18 @@ register_checked(Ctx, RegisterReq0) ->
     %% passing the agent's own value through would let an agent choose the
     %% address its registration is attributed to.
     Origin = origin_text(Ctx),
-    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin},
+    %% WP01: the client certificate the agent presented in the TLS handshake, as the
+    %% gateway witnessed it (PEM, empty when none), and whether THIS LISTENER can
+    %% witness at all (yuzu_grpc:witnessing/1: TLS with witness_client_cert). Both are gateway-authoritative on the same terms
+    %% as gateway_observed_peer: set here UNCONDITIONALLY, so whatever the agent put
+    %% in them is discarded (an agent must not be able to name a certificate or
+    %% claim an attestation), and the marker is what lets the server tell "a
+    %% witnessing listener saw no certificate" from "a listener that never asked"
+    %% (plaintext, or TLS without witness_client_cert). The
+    %% value is evidence, not a verdict: the server checks it against its own CA.
+    RegisterReq = RegisterReq0#{gateway_observed_peer => Origin,
+                                gateway_attested_peer_cert_pem => peer_cert_pem(Ctx),
+                                gateway_attests_peer_cert => yuzu_grpc:witnessing(Ctx)},
     PeerAddr = case Origin of
         <<>> -> <<"unknown">>;
         _ -> Origin
@@ -150,6 +161,15 @@ reservation_guard(Watched, Reservation) ->
             ok;
         {'DOWN', Mon, process, Watched, _Reason} ->
             yuzu_gw_registry:release_session(Reservation)
+    end.
+
+%% The DER certificate the agent presented on this connection as PEM text, or <<>>.
+peer_cert_pem(Ctx) ->
+    case yuzu_grpc:peer_cert(Ctx) of
+        Der when is_binary(Der), byte_size(Der) > 0 ->
+            public_key:pem_encode([{'Certificate', Der, not_encrypted}]);
+        _ ->
+            <<>>
     end.
 
 %% The origin address of a call as text (a bare IP), or <<>> when it has none.

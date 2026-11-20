@@ -24,6 +24,7 @@
 #include "gateway.grpc.pb.h"
 #include "management.grpc.pb.h"
 #include "agent_registry.hpp"
+#include "agent_reregistration_gate.hpp"
 #include "cert_issuance_source.hpp"
 #include "event_bus.hpp"
 #include "gateway_route_store.hpp"
@@ -211,6 +212,14 @@ public:
         const std::string& csr_pem, const std::string& agent_id, CertIssuanceSource src)>;
     void set_agent_cert_signer(AgentCertSigner signer) { agent_cert_signer_ = std::move(signer); }
 
+    /// WP01: proof of identity when an already-enrolled agent id re-registers through the gateway
+    /// (agent_reregistration_gate.hpp). The same hooks object and mode as the direct service, set
+    /// once during bring-up and cleared at shutdown like `set_agent_cert_signer`.
+    void set_agent_identity_hooks(std::shared_ptr<const AgentIdentityHooks> hooks) {
+        agent_identity_hooks_ = std::move(hooks);
+    }
+    void set_reregistration_proof_mode(ReregistrationProofMode m) { reregistration_mode_ = m; }
+
     grpc::Status ProxyRegister(grpc::ServerContext* context, const pb::RegisterRequest* request,
                                pb::RegisterResponse* response) override;
 
@@ -264,6 +273,8 @@ private:
     BlastRadiusDetector* blast_radius_detector_{nullptr};
     DexAlertRouter* dex_alert_router_{nullptr};
     AgentCertSigner agent_cert_signer_;
+    std::shared_ptr<const AgentIdentityHooks> agent_identity_hooks_;
+    ReregistrationProofMode reregistration_mode_{ReregistrationProofMode::Audit};
 
     // Map of gateway session_id -> agent_id for validation.
     mutable std::mutex sessions_mu_;
