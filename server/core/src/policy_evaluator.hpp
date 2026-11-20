@@ -111,9 +111,10 @@ public:
         ManagementGroupStore* mgmt_group_store{nullptr};
         yuzu::MetricsRegistry* metrics{nullptr}; // optional observability sink
         /// #4990: the Forensics plugin set. A check's stored response is read with every
-        /// Forensics-tier plugin excluded, so a policy whose check instruction runs a Forensics
-        /// plugin scores `unknown` (never a verdict from, or a stored copy of, Forensics output).
-        /// Borrowed. Unset (a harness) refuses every row, so every verdict is `unknown`.
+        /// Forensics-tier plugin excluded, so a Forensics row never yields a verdict or a stored
+        /// copy of its output (a policy whose check runs a Forensics plugin is refused at
+        /// dispatch and shows `blocked`). Borrowed. Unset (a harness) refuses every row, so
+        /// every verdict is `unknown`.
         const ForensicsPluginSet* forensics_plugins{nullptr};
         CommandDispatchFn dispatch_fn;
         NowFn now_fn;                          // defaults to system clock if unset

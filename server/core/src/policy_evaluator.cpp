@@ -1152,9 +1152,10 @@ void PolicyEvaluator::collect_ready() {
         // "unknown", never a fabricated compliant/drifted verdict.
         // #4990: the verdict and the first bytes of a check's output (`make_check_result`) are
         // served by the compliance routes and MCP to readers below the Forensics tier. So this
-        // read EXCLUDES the Forensics plugins outright (`deny_all()`): a Forensics check yields no
-        // row and scores `unknown`, never a verdict from, or a stored copy of, Forensics output.
-        // A separate follow-up (#6065) tracks the dispatch-side authorization of policy checks.
+        // read EXCLUDES the Forensics plugins outright (`deny_all()`), so a Forensics row never
+        // yields a verdict or a stored copy of its output, whichever way it got here. Policy
+        // evaluation does not dispatch such a check at all: every Forensics action carries an
+        // execute gate, so `dispatch_instruction` refuses it and the targets show `blocked`.
         const auto tier = d_.forensics_plugins
                               ? ResponseTierFilter::exclude(*d_.forensics_plugins, authz::deny_all())
                               : ResponseTierFilter::refuse_unwired();
