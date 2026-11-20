@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 (maintainer e-mail redacted to user@example.com) · leg-hash f58c3a5e2904
+captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 (maintainer e-mail redacted to user@example.com) · leg-hash 41d3c7502afe
 == action=list
 app|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-|-|-
 app|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-

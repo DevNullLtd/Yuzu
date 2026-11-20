@@ -54,19 +54,26 @@ ModuleSignVerdict catalog_lookup_verdict(CatalogLookup lookup, std::string catal
     return {ModuleSignedState::kUnknown, {}}; // never fabricate a verdict from a failed lookup
 }
 
-ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t mtime,
+ModuleSignVerdict SigningCache::get(const std::string& full_path, const FileVersionStamp& stamp,
                                     const ModuleVerifier& verify) {
     auto it = entries_.find(full_path);
-    if (it != entries_.end() && it->second.mtime == mtime) {
-        return it->second.verdict; // hit: same file, same version
+    if (stamp.available && it != entries_.end() && it->second.stamp == stamp) {
+        return it->second.verdict; // hit: same file id, same size, same USN
     }
-    // Miss or stale (file changed on disk) → (re)verify. A null verifier yields
-    // kUnknown — we never fabricate a verdict.
+    // Miss, stale (file changed on disk) or unprovable stamp → (re)verify. A null verifier
+    // yields kUnknown — we never fabricate a verdict.
     ModuleSignVerdict v = verify ? verify(full_path) : ModuleSignVerdict{};
+    if (!stamp.available) {
+        // Nothing the writer cannot reset to key on: serve nothing from the cache later, and
+        // drop any older entry for this path so it cannot be revived by a matching stamp.
+        if (it != entries_.end())
+            entries_.erase(it);
+        return v;
+    }
     if (it == entries_.end() && entries_.size() >= cap_) {
         entries_.clear(); // bounded flush; `it` was end() so this is safe
     }
-    entries_[full_path] = Entry{mtime, v};
+    entries_[full_path] = Entry{stamp, v};
     return v;
 }
 
@@ -101,12 +108,14 @@ ModuleSignVerdict SigningCache::get(const std::string& full_path, std::int64_t m
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
+#include <winioctl.h> // FSCTL_READ_FILE_USN_DATA (F47 cache stamp)
 #include <mscat.h> // CryptCATAdmin* (catalog lookup for catalog-signed system images)
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
 
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <cstddef> // offsetof
 #include <cstring> // std::memset (stale-session props reset)
 #include <thread>
 #include <type_traits>
@@ -487,6 +496,65 @@ std::int64_t image_mtime_unix(void* image) noexcept {
     return filetime_to_unix(li);
 }
 
+// F47: the cache key for the open image. Everything here is read from the HANDLE (no name is
+// re-resolved). The USN (FSCTL_READ_FILE_USN_DATA) is the term a file's writer cannot reset:
+// it advances on every data change and user mode cannot set it, unlike the last-write time.
+// Any failure, or a USN of 0 (the file has no change-journal record, e.g. journal off), leaves
+// `available == false`, so the verdict is not cached (never an mtime fallback).
+FileVersionStamp read_image_version_stamp(void* image) noexcept {
+    FileVersionStamp out;
+    if (image == nullptr)
+        return out;
+    const HANDLE h = static_cast<HANDLE>(image);
+
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(h, &info))
+        return out;
+    FILE_ID_INFO id{};
+    if (!GetFileInformationByHandleEx(h, FileIdInfo, &id, sizeof(id)))
+        return out; // no 128-bit id (pre-Win8 / unsupported FS): unprovable
+    // Output record: the largest of the V2/V3 records plus space for a name we ignore.
+    struct alignas(8) UsnBuf {
+        BYTE bytes[512];
+    } buf{};
+    READ_FILE_USN_DATA in{};
+    in.MinMajorVersion = 2;
+    in.MaxMajorVersion = 3;
+    DWORD returned = 0;
+    if (!DeviceIoControl(h, FSCTL_READ_FILE_USN_DATA, &in, sizeof(in), &buf, sizeof(buf),
+                         &returned, nullptr) ||
+        returned < sizeof(USN_RECORD_COMMON_HEADER))
+        return out;
+    // Read the fields with memcpy out of the byte buffer instead of casting it to a record type:
+    // no strict-aliasing or alignment assumption is needed (the buffer is also alignas(8)), and
+    // each read is bounds-checked against `returned`. Record layouts: USN_RECORD_V2/V3 both
+    // start with USN_RECORD_COMMON_HEADER {RecordLength, MajorVersion, MinorVersion} and carry a
+    // LONGLONG Usn at a fixed offset (offsetof), taken from the SDK definitions.
+    USN_RECORD_COMMON_HEADER hdr{};
+    std::memcpy(&hdr, buf.bytes, sizeof(hdr));
+    if (hdr.RecordLength > returned)
+        return out;
+    USN usn = 0;
+    if (hdr.MajorVersion == 2 && returned >= sizeof(USN_RECORD_V2)) {
+        std::memcpy(&usn, buf.bytes + offsetof(USN_RECORD_V2, Usn), sizeof(usn));
+    } else if (hdr.MajorVersion == 3 && returned >= sizeof(USN_RECORD_V3)) {
+        std::memcpy(&usn, buf.bytes + offsetof(USN_RECORD_V3, Usn), sizeof(usn));
+    } else {
+        return out;
+    }
+    if (usn == 0)
+        return out; // never journaled: proves nothing about the file's version
+
+    out.volume_serial = id.VolumeSerialNumber;
+    std::memcpy(&out.file_id_lo, id.FileId.Identifier, 8);
+    std::memcpy(&out.file_id_hi, id.FileId.Identifier + 8, 8);
+    out.size = (static_cast<std::uint64_t>(info.nFileSizeHigh) << 32) | info.nFileSizeLow;
+    out.mtime = image_mtime_unix(image);
+    out.usn = static_cast<std::int64_t>(usn);
+    out.available = true;
+    return out;
+}
+
 // The real Windows verifier the drain injects. Verifies the OPEN handle (no name is
 // re-resolved), maps the WinVerifyTrust verdict explicitly and NEVER fabricates kSigned: any
 // unrecognised status is kUnknown. Signer is best-effort, only when signed.
@@ -763,8 +831,9 @@ std::vector<ModuleEvent> ModuleEtwCollector::drain() {
             const ImageHandle img =
                 image_path_is_local(full) ? open_local_image_no_reparse(full) : ImageHandle{};
             if (img) {
-                const std::int64_t mtime = image_mtime_unix(img.get());
-                const ModuleSignVerdict v = sign_cache_.get(full, mtime, [&](const std::string&) {
+                // F47: key on file id + size + USN (read BEFORE verifying), never mtime alone.
+                const FileVersionStamp stamp = read_image_version_stamp(img.get());
+                const ModuleSignVerdict v = sign_cache_.get(full, stamp, [&](const std::string&) {
                     return verify_image_signature_win(img.get(), full);
                 });
                 e.signed_state = v.state;

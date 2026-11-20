@@ -393,6 +393,21 @@ TEST_CASE("catalog_lookup_verdict maps a lookup to a verdict, never risky on an 
 
 // ── SigningCache (injectable fake verifier) ─────────────────────────────────
 
+namespace {
+// A provable stamp (journaled file). Fields default to a plausible NTFS file.
+FileVersionStamp stamp(std::int64_t usn, std::int64_t mtime = 100, std::uint64_t file_id = 7,
+                       std::uint64_t size = 4096) {
+    FileVersionStamp s;
+    s.available = true;
+    s.volume_serial = 0xABCD;
+    s.file_id_lo = file_id;
+    s.size = size;
+    s.mtime = mtime;
+    s.usn = usn;
+    return s;
+}
+} // namespace
+
 TEST_CASE("SigningCache verifies on miss, caches on hit", "[echo][module][signcache]") {
     int calls = 0;
     ModuleVerifier fake = [&](const std::string&) {
@@ -403,29 +418,82 @@ TEST_CASE("SigningCache verifies on miss, caches on hit", "[echo][module][signca
         return v;
     };
     SigningCache c;
-    auto v1 = c.get(R"(C:\a\b.dll)", 100, fake);
-    auto v2 = c.get(R"(C:\a\b.dll)", 100, fake); // hit — no second verify
+    auto v1 = c.get(R"(C:\a\b.dll)", stamp(10), fake);
+    auto v2 = c.get(R"(C:\a\b.dll)", stamp(10), fake); // hit — no second verify
     CHECK(calls == 1);
     CHECK(v1.state == ModuleSignedState::kSigned);
     CHECK(v2.signer == "Acme");
 }
 
-TEST_CASE("SigningCache re-verifies when mtime changes", "[echo][module][signcache]") {
+TEST_CASE("SigningCache re-verifies when the USN, file id or size changes",
+          "[echo][module][signcache]") {
     int calls = 0;
     ModuleVerifier fake = [&](const std::string&) {
         ++calls;
         return ModuleSignVerdict{};
     };
     SigningCache c;
-    c.get(R"(C:\a\b.dll)", 100, fake);
-    c.get(R"(C:\a\b.dll)", 200, fake); // file changed on disk → re-verify
+    c.get(R"(C:\a\b.dll)", stamp(10), fake);
+    c.get(R"(C:\a\b.dll)", stamp(11), fake); // content change advances the USN
     CHECK(calls == 2);
+    c.get(R"(C:\a\b.dll)", stamp(11, 100, /*file_id=*/8), fake); // a different file at the path
+    CHECK(calls == 3);
+    c.get(R"(C:\a\b.dll)", stamp(11, 100, 8, /*size=*/9999), fake);
+    CHECK(calls == 4);
+}
+
+TEST_CASE("SigningCache: a restored last-write time does not revive a verdict (F47)",
+          "[echo][module][signcache][f47]") {
+    // The timestomp scenario expressed against the key: an attacker swaps the content (USN
+    // advances) and sets the last-write time and size back to the original. The old
+    // (path, mtime) key served the original signed verdict here; the new key cannot.
+    int calls = 0;
+    ModuleVerifier fake = [&](const std::string&) {
+        ++calls;
+        ModuleSignVerdict v;
+        v.state = calls == 1 ? ModuleSignedState::kSigned : ModuleSignedState::kUnsigned;
+        v.signer = calls == 1 ? "Trusted Publisher" : "";
+        return v;
+    };
+    SigningCache c;
+    const auto original = c.get(R"(C:\app\x.dll)", stamp(10, /*mtime=*/1000, 7, 4096), fake);
+    CHECK(original.state == ModuleSignedState::kSigned);
+    // Same path, same mtime, same size, same file id; only the USN moved.
+    const auto swapped = c.get(R"(C:\app\x.dll)", stamp(25, /*mtime=*/1000, 7, 4096), fake);
+    CHECK(calls == 2);
+    CHECK(swapped.state == ModuleSignedState::kUnsigned);
+    CHECK(swapped.signer.empty());
+}
+
+TEST_CASE("SigningCache never caches an unavailable stamp and never falls back to mtime",
+          "[echo][module][signcache][f47]") {
+    int calls = 0;
+    ModuleVerifier fake = [&](const std::string&) {
+        ++calls;
+        return ModuleSignVerdict{};
+    };
+    SigningCache c;
+    FileVersionStamp none; // available == false
+    none.mtime = 100;      // an mtime alone must not be a key
+    c.get(R"(C:\a\b.dll)", none, fake);
+    c.get(R"(C:\a\b.dll)", none, fake);
+    CHECK(calls == 2);
+    CHECK(c.size() == 0);
+
+    // An unprovable load also evicts an older provable entry for the path.
+    c.get(R"(C:\a\b.dll)", stamp(10), fake);
+    CHECK(c.size() == 1);
+    c.get(R"(C:\a\b.dll)", none, fake);
+    CHECK(c.size() == 0);
+    const int before = calls;
+    c.get(R"(C:\a\b.dll)", stamp(10), fake); // must re-verify, not revive the old verdict
+    CHECK(calls == before + 1);
 }
 
 TEST_CASE("SigningCache null verifier yields kUnknown (never fabricates signed)",
           "[echo][module][signcache]") {
     SigningCache c;
-    auto v = c.get(R"(C:\a\b.dll)", 1, nullptr);
+    auto v = c.get(R"(C:\a\b.dll)", stamp(1), nullptr);
     CHECK(v.state == ModuleSignedState::kUnknown);
     CHECK(v.signer.empty());
 }
@@ -434,7 +502,7 @@ TEST_CASE("SigningCache is bounded", "[echo][module][signcache]") {
     ModuleVerifier fake = [](const std::string&) { return ModuleSignVerdict{}; };
     SigningCache c(4);
     for (int i = 0; i < 20; ++i)
-        c.get("p" + std::to_string(i), i, fake);
+        c.get("p" + std::to_string(i), stamp(i), fake);
     CHECK(c.size() <= 4);
 }
 
@@ -442,9 +510,9 @@ TEST_CASE("SigningCache re-verifies an entry evicted by the bounded flush", "[ec
     int calls = 0;
     ModuleVerifier fake = [&](const std::string&) { ++calls; return ModuleSignVerdict{}; };
     SigningCache c(1);     // cap 1 → a 2nd distinct path flushes the 1st
-    c.get("A", 1, fake);   // verify #1, cache {A}
-    c.get("B", 1, fake);   // miss → flush {A} → verify #2, cache {B}
-    c.get("A", 1, fake);   // A was flushed → must re-verify (#3), not a stale hit
+    c.get("A", stamp(1), fake);   // verify #1, cache {A}
+    c.get("B", stamp(1), fake);   // miss → flush {A} → verify #2, cache {B}
+    c.get("A", stamp(1), fake);   // A was flushed → must re-verify (#3), not a stale hit
     CHECK(calls == 3);
 }
 
@@ -580,6 +648,48 @@ TEST_CASE("Windows module drain: a system image opens through the no-reparse han
     const auto image = open_local_image_no_reparse(nt_path_of(system_dir() + L"\\kernel32.dll"));
     REQUIRE(image);
     CHECK(image_mtime_unix(image.get()) > 0);
+}
+
+TEST_CASE("Windows module drain: a content rewrite with a restored last-write time changes the stamp",
+          "[echo][module][etw][windows][f47]") {
+    // Not built as Catch2 on a Windows host (WP13/F47; same logic measured by a standalone harness). Asserts key stability only, no attack:
+    // the stamp (file id + size + USN) must differ after a same-size rewrite even when the
+    // last-write time is restored. If the volume has no change journal the stamp is
+    // `available == false`, which is also safe (never cached), so that case is accepted.
+    yuzu::test::TempDir dir{"yuzu_test_echo_stamp_"};
+    std::filesystem::create_directories(dir.path);
+    const std::filesystem::path file = dir.path / L"stamp.dll";
+    {
+        std::ofstream f(file, std::ios::binary);
+        f << "AAAAAAAA";
+    }
+    auto open_stamp = [&]() {
+        const auto img = open_local_image_no_reparse(nt_path_of(file.wstring()));
+        REQUIRE(img);
+        return std::make_pair(read_image_version_stamp(img.get()), image_mtime_unix(img.get()));
+    };
+    const auto [before, mtime_before] = open_stamp();
+    {
+        std::ofstream f(file, std::ios::binary | std::ios::trunc);
+        f << "BBBBBBBB"; // same size, different content
+    }
+    // Restore the original last-write time through the file-time API.
+    HANDLE h = CreateFileW(file.c_str(), FILE_WRITE_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                           nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    REQUIRE(h != INVALID_HANDLE_VALUE);
+    // unix seconds -> FILETIME (100ns since 1601)
+    const std::uint64_t ft = (static_cast<std::uint64_t>(mtime_before) + 11644473600ULL) * 10000000ULL;
+    FILETIME wt{static_cast<DWORD>(ft & 0xFFFFFFFFu), static_cast<DWORD>(ft >> 32)};
+    REQUIRE(SetFileTime(h, nullptr, nullptr, &wt));
+    CloseHandle(h);
+    const auto [after, mtime_after] = open_stamp();
+    CHECK(mtime_after == mtime_before);
+    if (before.available && after.available) {
+        CHECK(before != after);
+        CHECK(after.usn != before.usn);
+    } else {
+        WARN("volume has no readable USN for this file; the cache is disabled for it (safe)");
+    }
 }
 
 TEST_CASE("Windows module drain: a FILE symlink is refused while the name still opens",

@@ -128,7 +128,10 @@ approval control; use a dedicated admin account on a disposable stack. If safe o
 are in the same --risks they are still sent to every agent (the run says so on stderr); target flags
 given with no destructive or forensic class selected are ignored, with a warning. A server-internal
 definition is never sent a target: it names no agent plugin, so if selected it is broadcast and the
-dispatch chokepoint denies it. A server.* row that the risk table classes destructive is skipped in
+dispatch chokepoint denies it. A definition the server boot-seeds kill-switched (an action-level
+default-off seed, today crossplatform.components.native) is classed default-off: the server refuses it
+until an operator enables its kill switch, so it runs only with --risks default-off, broadcast like a
+safe row, on a stack where that has been done. A server.* row that the risk table classes destructive is skipped in
 a targeted run for the same reason, as is testing.chargen.start (it streams until stopped; start and
 stop it by hand through the dashboard or REST with agent_ids).
 
@@ -192,7 +195,7 @@ LOOPBACK_HOSTS = ("127.0.0.1", "::1", "localhost")
 RUN_ID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")  # used with fullmatch
 
 ALL_RISKS = ("safe", "mutating", "destructive", "forensic", "server-internal", "network-disrupt",
-             "interactive")
+             "interactive", "default-off")
 
 
 # ── data classes ───────────────────────────────────────────────────────────

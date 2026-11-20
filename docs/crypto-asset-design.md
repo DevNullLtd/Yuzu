@@ -310,7 +310,7 @@ change.
   PID-reuse protection (PID plus start time) and a privacy review.
 - **Privilege varies by platform.** The agent is designed to run unprivileged, but that is not yet
   true on Windows (it runs as LocalSystem, #1442) or macOS (it runs as root, #1455). On Linux the
-  install script grants `cap_net_admin`, `cap_net_raw`, `cap_dac_read_search` and `cap_sys_ptrace`
+  packaged unit grants `cap_dac_read_search` only and the dev install script sets no file capability
   (`docs/agent-privilege-model.md`). A collector reports what it could read, never what it assumes
   it can.
 

@@ -11,6 +11,9 @@
  *   Linux:   svc|name|status|description
  *   macOS:   svc|label|pid|status|startup_type
  *   set_start_mode success: status|ok\nservice|<name>\nmode|<mode>
+ *                           Linux also: state|<is-enabled state>, and note|<text> (with a typed
+ *                           CONSTRAINED/PARTIAL result, services:start_mode_unchangeable) when the
+ *                           unit is static, indirect, alias or generated
  *   set_start_mode failure: error|<message>
  *
  * macOS startup_type (C-1.12): derived from ONE bulk `launchctl print-disabled
@@ -60,6 +63,7 @@
 #endif
 
 #include "services_parsers.hpp" // yuzu::services::{parse_systemctl_list_units,parse_launchctl_list,is_safe_service_name} (Wave-2 PR2.2a, ADR-3002)
+#include "services_set_start_mode.hpp" // the Linux set_start_mode body behind a runner seam (WP13)
 
 namespace {
 
@@ -371,7 +375,8 @@ std::vector<ServiceInfo> enumerate_services_macos(bool running_only, std::size_t
 /// the ABI4 result-status seam via yuzu::agent::forward_runner_failure --
 /// exactly the pattern network_actions_plugin.cpp's mutating call sites use.
 #if defined(__linux__) || defined(__APPLE__)
-yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) {
+yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv,
+                                         bool merge_stderr = true) {
     if (argv.empty() || argv.front().empty())
         return yuzu::agent::SubprocessResult{};
     // merge_stderr=true (matching network_actions_plugin.cpp's Linux
@@ -383,7 +388,7 @@ yuzu::agent::SubprocessResult run_command(const std::vector<std::string>& argv) 
     // outcome (services_parsers.hpp).
     return yuzu::agent::run_bounded_subprocess(
         argv, yuzu::agent::SubprocessOptions{.deadline = std::chrono::seconds{20},
-                                             .merge_stderr = true});
+                                             .merge_stderr = merge_stderr});
 }
 #endif
 
@@ -481,51 +486,13 @@ int do_set_start_mode_linux(yuzu::CommandContext& ctx, std::string_view name,
     //   manual    -> disable (available but not started at boot)
     //   disabled  -> mask    (cannot be started at all)
     const bool euid_is_root = ::geteuid() == 0;
-    std::vector<std::string> argv;
-    if (mode == "automatic") {
-        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "enable", name,
-                                                             euid_is_root);
-    } else if (mode == "manual") {
-        // If the service was previously masked, unmask it first so disable
-        // works. Best-effort, same as before: its result is intentionally
-        // not inspected (a service that was never masked has nothing to
-        // unmask, and the following disable is the actual mode change).
-        run_command(yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "unmask", name,
-                                                                  euid_is_root));
-        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "disable", name,
-                                                             euid_is_root);
-    } else if (mode == "disabled") {
-        argv = yuzu::services::systemctl_set_start_mode_argv(systemctl_path, "mask", name,
-                                                             euid_is_root);
-    } else {
-        ctx.write_output(
-            std::format("error|invalid mode '{}': must be automatic, manual, or disabled", mode));
-        return 1;
-    }
-
-    auto res = run_command(argv);
-    // A runner-level failure (spawn error / deadline / cancelled / signaled)
-    // must be reported through the ABI4 status seam as a distinguishable
-    // TIMEOUT/CONSTRAINED (or UNAVAILABLE) status -- never collapsed into
-    // the generic "exit=-1" error string below, which previously hid the
-    // difference between "systemctl ran and failed" and "the runner never
-    // got a real exit at all". The decision itself is the pure
-    // yuzu::services::decide_set_start_mode_outcome (services_parsers.hpp,
-    // fixture-tested in tests/unit/test_services_parsers.cpp); only the
-    // ctx.set_result_status forwarding stays here.
-    auto outcome = yuzu::services::decide_set_start_mode_outcome("systemctl", name, res);
-    if (outcome.runner_failed) {
-        yuzu::agent::forward_runner_failure(ctx, res);
-    }
-    if (!outcome.ok) {
-        ctx.write_output(outcome.message);
-        return 1;
-    }
-
-    ctx.write_output("status|ok");
-    ctx.write_output(std::format("service|{}", name));
-    ctx.write_output(std::format("mode|{}", mode));
-    return 0;
+    return yuzu::services::set_start_mode_linux(
+        ctx,
+        [](const std::vector<std::string>& a, bool merge_stderr = true) {
+            return run_command(a, merge_stderr);
+        },
+        [&ctx](const yuzu::agent::SubprocessResult& r) { yuzu::agent::forward_runner_failure(ctx, r); },
+        systemctl_path, name, mode, euid_is_root);
 }
 
 #elif defined(__APPLE__)
@@ -636,7 +603,9 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 3,
       "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper systemctl "
       "enable|disable|mask|unmask' (a root agent runs systemctl directly)",
-      nullptr},
+      "CONSTRAINED/PARTIAL (services:start_mode_unchangeable) for static, indirect, alias or "
+      "generated units; CONSTRAINED/PARTIAL (services:start_mode_runtime_mask) for a unit masked "
+      "for this boot only; CONSTRAINED/PARTIAL (services:start_mode_prior_unreadable) when the unit's prior state cannot be read"},
      /* macos   = */
      {YUZU_SUPPORT_SUPPORTED, 3,
       "sh: the root-owned yuzu-svc-helper, runner argv 'sudo -n -- yuzu-svc-helper launchctl "

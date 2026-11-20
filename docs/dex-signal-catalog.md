@@ -469,6 +469,21 @@ carries usernames / tenant / project names (`/home/jsmith/...`), which must not 
 `storage_low_observation` chokepoint the collector calls (subject / sentence / `detail_json`
 asserted free of any path component).
 
+**journald attribution is by journald-stamped sender fields only (F58 / #3872 / #3871).**
+`MESSAGE_ID`, `COREDUMP_*`, `UNIT` and `UNIT_RESULT` are client-settable, so alone they prove
+nothing. `service.crashed` / `service.hung` require `_PID=1` and `_UID=0` (the system manager;
+a user-manager entry carries `_UID=1000` and `USER_UNIT` and is dropped by design, as is any entry from a forged sender or a non-PID-1 process);
+`process.crashed` requires `_UID=0` plus the `systemd-coredump` helper identity (`_COMM`
+`systemd-coredum` - the 15-char comm truncation - or `_SYSTEMD_UNIT=systemd-coredump@*`); the
+`os.time_unsynced` branch requires `_COMM=chronyd` AND `_SYSTEMD_UNIT=chronyd.service|chrony.service`
+(`_COMM` alone is settable with `prctl`). A missing or malformed trusted field drops the entry
+(fail closed), and the same terms are in the `journalctl` match so forged entries are not fetched
+or counted against the rate cap. Container journals with remapped uids see the container's root
+as `_UID=0`. The coredump identity terms (systemd-coredump comm/unit) are derived from systemd
+documentation, not from a captured journal entry on every distro family; if they mismatch,
+`process.crashed` signals can be silently absent on that distro; the drop counter/log makes this
+visible. Capturing one specimen per distro family is an open follow-up.
+
 **journald egress is comm/unit-only.** `process.crashed` ships the process **comm**, never
 `COREDUMP_EXE` (a full binary path that can embed a user/tenant directory); `memory.exhausted`
 ships the OOM **victim comm**, never the kernel memory figures (total-vm / anon-rss / file-rss) or
