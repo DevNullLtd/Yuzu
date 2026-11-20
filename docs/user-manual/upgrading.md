@@ -13,6 +13,8 @@ Running `dev` between releases? Some entries below describe changes on `dev` tha
 
 ## Behaviour change: the installed-software read routes return `package_id` (#6090)
 
+This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.
+
 **In short.** Affected: anything that reads installed-software rows over REST, the CSV or XLSX export, or the `query_installed_software` MCP tool and pinned a column count, a column position or a closed row schema. To do: read columns by header name and accept an extra `package_id` key.
 
 **What changed.**
