@@ -32,7 +32,7 @@
 #include "device_routes.hpp" // device_agent_row_json/device_agent_detail_json — #4033 shared builders
 #include "group_agent_count_preview.hpp" // #4033 — create-group agent-count preview shared model
 #include "engine_principal_store.hpp" // PR 4.3 — /api/v1/engine-principals
-#include "live_kinds.hpp" // shared live-read kind table + wire-format parser (S2)
+#include "live_model.hpp" // the ONE live-read kind table + wire-format parsers (pure; #2146)
 #include "mcp_input_bounds.hpp" // #4373: reuse MCP's kExecInstrParam*/kInstructionIdMaxLen constants
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
 #include "mcp_policy.hpp" // mcp::is_valid_tier — canonical MCP-tier closed set
@@ -713,7 +713,7 @@ static std::string reply_dispatch_denied(httplib::Response& res, const std::stri
 
 // Render a live plugin output into the JSON `data` object for /dex/devices/{id}/live.
 // The wire-format parsing (kind table + field extraction) is shared with the
-// dashboard HTML path via live_kinds.hpp so the two cannot drift (governance S2);
+// dashboard HTML path via live_model.hpp so the two cannot drift (governance S2);
 // this only maps the parsed fields to JSON. The agent sanitizes '|'/CR/LF out of
 // every field, and the parser is bounds-safe on any input regardless.
 std::string live_result_json(const std::string& kind, const std::string& output) {
@@ -19907,7 +19907,7 @@ void RestApiV1::register_routes(
             // The label is the closed set {uptime, processes, unknown} (docs/user-manual/metrics.md):
             // `kind` is caller-chosen text, so an unresolved one is recorded as `unknown`, never as
             // itself (one series per distinct string a caller sends).
-            const auto lk = live::resolve_kind(kind);
+            const auto lk = live::resolve_rest_kind(kind);
             const std::string kind_label = lk ? kind : "unknown";
             struct OutcomeRecorder {
                 yuzu::MetricsRegistry* reg;

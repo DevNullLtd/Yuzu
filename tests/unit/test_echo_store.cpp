@@ -895,7 +895,7 @@ TEST_CASE("execute_user_query: SELECT on an allowlisted table succeeds",
 TEST_CASE("execute_user_query: the DEX per-app canned aggregate shape stays authorizer-compatible",
           "[echo][store][sandbox][procperf][pin]") {
     // The server's /dex per-app panel dispatches this exact SQL shape
-    // (dex_routes.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
+    // (dex_perf_model.cpp dex_procperf_sql(), with $ProcPerf_Hourly translated to
     // procperf_hourly). No other test runs aggregates through the REAL
     // authorizer on this table — an authorizer tightening that drops
     // SUM/MAX/CAST/COUNT/GROUP BY/ORDER BY-alias/LIMIT would otherwise break
