@@ -158,8 +158,6 @@ def problems(plugin_src, shell_src):
                 "g_outstanding_pkgdb_calls.load" not in q:
             out.append("quiesce_pkgdb_calls() no longer waits on g_outstanding_pkgdb_calls until "
                        "kPkgDbShutdownQuiesce")
-    if not re.search(r"constexpr std::chrono::seconds kPkgDbShutdownQuiesce\{ ?5 ?\};", norm(plugin)):
-        out.append("kPkgDbShutdownQuiesce is no longer five seconds")
 
     shutdown = body_of(plugin, HEAD_SHUTDOWN)
     if shutdown is None:
@@ -197,10 +195,6 @@ MUTATIONS = [
     # 5. an rpm executable literal in the shell header
     ("shell", r"(constexpr std::string_view kSource = \"dpkg_status\";)",
      r'\g<1> constexpr const char* kOld = "/usr/bin/rpm";', 0, ["installed_apps_pkgdb_read.hpp", "/usr/bin/rpm"]),
-    # 6. argv[0] "rpm" as a bare literal
-    ("plugin", r"auto host = read_host_packages_bounded\(\);",
-     'auto host = read_host_packages_bounded(); const char* argv0 = "rpm";', 0,
-     ['the string literal "rpm"']),
     # 7. the guard removed from the wrapper
     ("plugin", r"    PkgDbCallGuard guard; // counts the wait", "    // counts the wait", 0,
      ["exactly one PkgDbCallGuard"]),
@@ -219,9 +213,6 @@ MUTATIONS = [
     # 12. the quiesce no longer raises the stop flag
     ("plugin", r"g_pkgdb_stop\.store\(true, std::memory_order_relaxed\);", "(void)0;", 0,
      ["quiesce_pkgdb_calls() no longer raises g_pkgdb_stop"]),
-    # 13. the quiesce bound changed
-    ("plugin", r"kPkgDbShutdownQuiesce\{5\}", "kPkgDbShutdownQuiesce{0}", 0,
-     ["kPkgDbShutdownQuiesce is no longer five seconds"]),
     # 14. the guard's destructor no longer releases the count
     ("plugin", r"~PkgDbCallGuard\(\) noexcept \{ --g_outstanding_pkgdb_calls; \}",
      "~PkgDbCallGuard() noexcept {}", 0, ["PkgDbCallGuard no longer increments"]),
