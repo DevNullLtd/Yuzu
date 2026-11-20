@@ -77,19 +77,25 @@
  * A failed read of a user-owned prefix constrains the whole `packages` answer (a named,
  * compile-time token; never a user name or a path), like every other read failure here.
  * Rows carry the home directory's NAME as owner and the literal `~/<candidate>` as
- * prefix; no absolute home path reaches a row or a token. The owner is the directory
- * name, not a directory-service lookup.
+ * prefix; no absolute home path reaches a row or a token, and their install time, tap and
+ * requested flag are always `-` (RECEIPTS). The owner is the directory name, not a
+ * directory-service lookup.
  *
- * RECEIPTS. A formula's version directory may hold INSTALL_RECEIPT.json, the installing
- * account's own record of the install time, the tap and whether the user asked for it.
- * It is opened no-follow from the version directory's descriptor and read (bounded) only
- * when it is a regular file; its values reach a row only when the file's owner equals the
- * version directory's owner. The owner rule gates PARSING and reporting: the bounded read
- * has already happened (posix_secure_read.hpp returns the owner after the bytes), and
- * a file of another account is dropped unparsed. Receipt values are the owner's own
- * claim, validated for shape (parse_brew_receipt) and never trusted; a missing,
- * unreadable, foreign or malformed receipt is `-` in the row, never a token and never a
- * failed row. Casks have no receipt and are never read.
+ * RECEIPTS (machine prefixes only). A formula's version directory under /opt/homebrew or
+ * /usr/local may hold INSTALL_RECEIPT.json, the installing account's own record of the
+ * install time, the tap and whether the user asked for it. It is opened no-follow from the
+ * version directory's descriptor and read (bounded) only when it is a regular file; its
+ * values reach a row only when the file's owner equals the version directory's owner. That
+ * rule matters here because the machine prefix is owned by the installing admin account
+ * while the agent runs as root. The owner rule gates PARSING and reporting: the bounded
+ * read has already happened (posix_secure_read.hpp returns the owner after the bytes), and
+ * a file of another account is dropped unparsed. Receipt values are the owner's own claim,
+ * validated for shape (parse_brew_receipt) and never trusted; a missing, unreadable,
+ * foreign or malformed receipt is `-` in the row, never a token and never a failed row.
+ * Casks have no receipt and are never read. NO RECEIPT UNDER A USER-OWNED PREFIX IS EVER
+ * OPENED (owner ruling 2026-11-20): a user row is the home directory's name, a package and a
+ * version, and its install time, tap and requested flag are always `-`. A user version
+ * directory is classified (stat) and never opened.
  *
  * Compiled on POSIX only; the portable row/text layer is
  * pkg_inventory_parsers.hpp, the guarded walk primitives (`posix::`) are in
@@ -367,9 +373,11 @@ struct RowScope {
     std::string prefix;       ///< the logical prefix: `/opt/homebrew`, `~/homebrew`, ...
 };
 
-/// The receipt of one formula version: read only when `vdir` is a real directory whose owner is
-/// known, and parsed only when the file's owner equals `expected_owner` (the version directory's
-/// owner). `expected_owner` is a required parameter, so a test proves the refusal without root.
+/// The receipt of one formula version under a MACHINE prefix (the caller never asks for a user
+/// one): read only when `vdir` is a real directory whose owner is known, and parsed only when the
+/// file's owner equals `expected_owner` (the version directory's owner). The rule is needed there
+/// because a machine prefix is owned by the installing admin account and the agent is root.
+/// `expected_owner` is a required parameter, so a test proves the refusal without root.
 /// The owner check gates PARSING: read_file_no_follow_at has already read the bounded bytes before
 /// it reports the owner (posix_secure_read.hpp), and a foreign file's bytes are dropped unparsed.
 /// Every failure (symlink, FIFO, directory, oversized, unreadable, foreign) is an empty receipt.
@@ -445,9 +453,12 @@ append_package_rows_from(const posix::Dir& top, std::string_view source, Package
                 acc.mark_incomplete();
                 return WalkStop::cap;
             }
-            const BrewReceipt receipt = kind == PackageKind::formula
-                                            ? receipt_for_version(id_dir.dir, version)
-                                            : BrewReceipt{};
+            // A receipt is read for a machine-prefix formula only (banner: RECEIPTS): a user
+            // version directory is stat-ed above and never opened.
+            const bool read_receipt =
+                kind == PackageKind::formula && rs.scope == BrewScope::machine;
+            const BrewReceipt receipt =
+                read_receipt ? receipt_for_version(id_dir.dir, version) : BrewReceipt{};
             auto row = format_homebrew_package_row(id, version, kind, receipt, rs.scope, rs.owner,
                                                    rs.prefix);
             if (!budget.charge_row(row.size() + 1)) { // + the row separator

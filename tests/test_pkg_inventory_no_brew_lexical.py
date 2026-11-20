@@ -13,7 +13,10 @@ indirection is not caught. Checks:
      pass, while `/bin/brew`, "brew" and "brew list" fail);
   2. no `run_bounded_subprocess` and no `subprocess_runner` (the sanctioned-runner route that
      scripts/ci/check-plugin-spawn-lexical.sh allows);
-  3. docs/agent-spawn-sink-manifest.md holds no `pkg_inventory/<function>#<n>` row.
+  3. docs/agent-spawn-sink-manifest.md holds no `pkg_inventory/<function>#<n>` row;
+  4. pkg_inventory_macos.cpp builds the user-prefix configuration (the network-mount snapshot
+     that guards the /Users walk) for the `packages` action. run_macos cannot be called from a
+     test without walking the host's real / and /Users, so this one ternary is pinned here.
 """
 import pathlib
 import re
@@ -29,6 +32,8 @@ MANIFEST = ROOT / "docs/agent-spawn-sink-manifest.md"
 BREW = re.compile(r"\bbrew\b", re.I)
 SPAWN = re.compile(r"\b(run_bounded_subprocess|subprocess_runner)\b")
 MANIFEST_ROW = re.compile(r"pkg_inventory/\w+#\d+")
+WIRING_FILE = "pkg_inventory_macos.cpp"
+WIRING = re.compile(r"Action::packages\s*\?\s*mac::production_user_prefix_config\s*\(\s*\)")
 
 
 def findings(name: str, src: str) -> list[str]:
@@ -39,6 +44,8 @@ def findings(name: str, src: str) -> list[str]:
         out.append(f"{name}: names brew (a root agent must not run a user-writable script)")
     if SPAWN.search(code):
         out.append(f"{name}: uses the subprocess runner (pkg_inventory spawns nothing)")
+    if name == WIRING_FILE and not WIRING.search(code):
+        out.append(f"{name}: the packages action no longer gets production_user_prefix_config()")
     return out
 
 
@@ -53,6 +60,13 @@ def self_check() -> list[str]:
                  '// brew in a comment\nint x;', 'auto d = ".homebrew";'):
         if findings("self", good):
             errs.append(f"self-check: flagged {good!r}")
+    wired = "a == Action::packages\n    ? mac::production_user_prefix_config() : mac::UserPrefixConfig{};"
+    if findings(WIRING_FILE, wired):
+        errs.append("self-check: flagged the production wiring")
+    for unwired in ("mac::run_macos_guarded(ctx, a, \"/\", mac::UserPrefixConfig{});",
+                    "a == Action::managers ? mac::production_user_prefix_config() : x;"):
+        if not findings(WIRING_FILE, unwired):
+            errs.append(f"self-check: did not flag the unwired {unwired!r}")
     return errs
 
 

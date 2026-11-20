@@ -21,11 +21,12 @@
 ##            flatpak apps and runtimes (/var/lib/flatpak/{app,runtime}).
 ##   macOS:   managers/packages -- Homebrew Library/Taps, Cellar and Caskroom
 ##            directory names under BOTH /opt/homebrew (Apple silicon) and
-##            /usr/local (Intel). packages also reads each formula's install
-##            receipt and the user-owned ~/homebrew and ~/.homebrew prefixes of
-##            each real /Users home (managers reads the two machine prefixes
-##            only). store_packages -- UNSUPPORTED by design: installed_apps
-##            owns the macOS application list.
+##            /usr/local (Intel). packages also reads each machine-prefix
+##            formula's install receipt and the user-owned ~/homebrew and
+##            ~/.homebrew prefixes of each real /Users home (no receipt under a
+##            user-owned prefix is opened; managers reads the two machine
+##            prefixes only). store_packages -- UNSUPPORTED by design:
+##            installed_apps owns the macOS application list.
 ##   Windows: managers -- Chocolatey (C:\ProgramData\chocolatey\lib listable,
 ##            directory count as a fact) and winget (the App Installer package
 ##            in the HKLM Appx roster; version from its key name).
@@ -34,8 +35,8 @@
 ##            {Applications, InboxApplications, Deprovisioned} subkey names.
 ##            Registry and directory reads only; no choco or winget process.
 ##
-## SCOPE: machine stores, plus on macOS `packages` the Homebrew install receipts and the user-owned
-## ~/homebrew and ~/.homebrew prefixes (read without running brew). Other per-user package stores
+## SCOPE: machine stores, plus on macOS `packages` the machine-prefix Homebrew install receipts and
+## the user-owned ~/homebrew and ~/.homebrew prefixes (read without running brew). Other per-user package stores
 ## are out of scope, deferred to the user-session helper (ADR-3003).
 ## No overlap claim with installed_apps on macOS: Homebrew casks install .app
 ## bundles that installed_apps' macOS `list` also reports via system_profiler, and
@@ -164,10 +165,12 @@ metadata:
     user installed in their own home (~/homebrew or ~/.homebrew under each
     /Users home, accepted only when the prefix is owned by the home's owner).
     A formula or cask present under several prefixes yields one row per
-    prefix; each row names its prefix. A formula row also carries the install
-    time, the tap and whether the user asked for it, read from the formula's
-    INSTALL_RECEIPT.json without running Homebrew; those three values are the
-    installing account's own claim and are `-` when unknown. Linux is
+    prefix; each row names its prefix. A formula row under a machine prefix also
+    carries the install time, the tap and whether the user asked for it, read
+    from the formula's INSTALL_RECEIPT.json without running Homebrew; those
+    three values are the installing account's own claim and are `-` when
+    unknown, and always `-` on a user row (no receipt under a user-owned
+    prefix is opened) and on a cask. Linux is
     UNSUPPORTED by design: installed_apps owns the Linux package roster, so
     this action reports `status|packages|unsupported|linux:owned_by_installed_apps`
     and no package row. Windows reports the Chocolatey packages that have a
@@ -229,17 +232,17 @@ spec:
         platforms: [darwin]
       - name: install_time
         type: string
-        description: 'Homebrew formula rows: the install time, epoch seconds, from the formula''s INSTALL_RECEIPT.json. "-" when there is no receipt, it is not owned by the version directory''s owner, or the value is out of shape. A claim the installing account wrote: user-writable, never verified. Casks have no receipt, so "-".'
+        description: 'Homebrew formula rows under a machine prefix: the install time, epoch seconds, from the formula''s INSTALL_RECEIPT.json. "-" when there is no receipt, it is not owned by the version directory''s owner, or the value is out of shape. A claim the installing account wrote: user-writable, never verified. Always "-" on a user row (no receipt under a user-owned prefix is opened) and on a cask (casks have no receipt).'
         example: "1767225600"
         platforms: [darwin]
       - name: tap
         type: string
-        description: 'Homebrew formula rows: the tap the formula came from, <org>/<repo> (e.g. homebrew/core), from the receipt. "-" when unknown or out of shape. User-writable, never verified.'
+        description: 'Homebrew formula rows under a machine prefix: the tap the formula came from, <org>/<repo> (e.g. homebrew/core), from the receipt. "-" when unknown or out of shape, and always "-" on a user row. User-writable, never verified.'
         example: homebrew/core
         platforms: [darwin]
       - name: on_request
         type: string
-        description: 'Homebrew formula rows: whether the user asked for the formula (true) or it was pulled in as a dependency (false), from the receipt. "-" when unknown. User-writable, never verified.'
+        description: 'Homebrew formula rows under a machine prefix: whether the user asked for the formula (true) or it was pulled in as a dependency (false), from the receipt. "-" when unknown, and always "-" on a user row. User-writable, never verified.'
         values: ['true', 'false', '-']
         example: "true"
         platforms: [darwin]

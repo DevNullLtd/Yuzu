@@ -295,6 +295,7 @@ TEST_CASE("pkg_inventory receipt: install time must be exactly ten digits in ran
     CHECK(time_of("1767225600.5}").empty());        // float
     CHECK(time_of("176722560}").empty());           // 9 digits
     CHECK(time_of("17672256000}").empty());         // 11 digits
+    CHECK(time_of("01767225600}").empty());         // a leading zero: 11 characters
     CHECK(time_of("1230767999}").empty());          // below 2009
     CHECK(time_of("4102444800}").empty());          // 2100 and later
     CHECK(time_of("1767225600").empty());           // digits end at the end of the text
@@ -323,6 +324,14 @@ TEST_CASE("pkg_inventory receipt: tap is <org>/<repo> of a closed alphabet and b
     CHECK(pi::parse_brew_receipt(tap_doc("\"core\"")).tap.empty());        // no slash
     CHECK(pi::parse_brew_receipt(tap_doc("\"/core\"")).tap.empty());       // empty org
     CHECK(pi::parse_brew_receipt(tap_doc("\"org/\"")).tap.empty());        // empty repo
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a b/c\"")).tap.empty());       // space
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a@b/c\"")).tap.empty());       // at sign
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a\x7f/b\"")).tap.empty());     // DEL
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a\xc3\xa9/b\"")).tap.empty()); // bytes >= 0x80
+    CHECK(pi::parse_brew_receipt(tap_doc("\"-a/b\"")).tap.empty());        // leading `-`, org
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a/-b\"")).tap.empty());        // leading `-`, repo
+    CHECK(pi::parse_brew_receipt(tap_doc("\"_a/b\"")).tap.empty());        // leading `_`, org
+    CHECK(pi::parse_brew_receipt(tap_doc("\"a/_b\"")).tap.empty());        // leading `_`, repo
     CHECK(pi::parse_brew_receipt(tap_doc("null")).tap.empty());
     CHECK(pi::parse_brew_receipt(tap_doc("\"unterminated")).tap.empty());
     const std::string nul_tap = std::string{"{\"tap\":\"a"} + '\0' + "b/c\"}";

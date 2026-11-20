@@ -1,5 +1,6 @@
 // macos_user_home_entry.hpp -- the pure rule for which /Users entry is a real per-user home,
-// shared by every macOS leg that walks the user homes (privacy_permissions, pkg_inventory).
+// shared by its two users: privacy_permissions (which re-exports it) and pkg_inventory. The
+// autoruns and remote_access_audit legs keep their own copy of the rule.
 //
 // Pure constexpr, no OS call and no OS header (so it is not __APPLE__-gated and unit-tests on
 // every host). The caller does the I/O: an fstatat with AT_SYMLINK_NOFOLLOW supplies

@@ -16,7 +16,7 @@
 /// All three actions are ReadOnly/None. Every leg is a zero-subprocess read:
 /// on macOS and Linux a filesystem read (open/openat/readdir/readlinkat with
 /// O_NOFOLLOW over Homebrew Library/Taps, Cellar and Caskroom directory names,
-/// the Homebrew install receipts, the user-owned Homebrew prefixes,
+/// the machine-prefix Homebrew install receipts, the user-owned Homebrew prefixes,
 /// and the Linux snap and flatpak stores; see pkg_inventory_macos_parsers.hpp
 /// and pkg_inventory_linux_parsers.hpp); on Windows registry key reads
 /// (Reg*W over the HKLM Appx store keys, 64-bit view), a Chocolatey lib
@@ -31,9 +31,10 @@
 ///                directory names) under the machine prefixes AND the
 ///                user-owned ~/homebrew and ~/.homebrew prefixes of the
 ///                /Users homes (a user row carries the home directory's name
-///                as its owner, by owner decision 2026-11-18); one bounded
-///                INSTALL_RECEIPT.json read per formula version (tap, install
-///                time, installed-on-request); and Windows Chocolatey packages
+///                as its owner, by owner decision 2026-11-18, and no receipt
+///                field); one bounded INSTALL_RECEIPT.json read per
+///                machine-prefix formula version (tap, install time,
+///                installed-on-request); and Windows Chocolatey packages
 ///                (lib nuspec versions). Linux is UNSUPPORTED by construction
 ///                (`installed_apps` owns the Linux roster). Still ReadOnly/None
 ///                under `Inventory`: the same read-only file reads, no new

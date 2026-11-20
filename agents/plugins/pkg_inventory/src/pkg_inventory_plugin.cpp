@@ -8,7 +8,8 @@
  *                      dnf, pacman, apk, snap, flatpak) and Windows (Chocolatey
  *                      and winget presence) ship.
  *   "packages"       — macOS Homebrew formulae and casks (Cellar/Caskroom
- *                      directory names) and Windows Chocolatey packages (lib\<id>
+ *                      directory names; machine-prefix formula rows also carry
+ *                      receipt fields) and Windows Chocolatey packages (lib\<id>
  *                      nuspec versions). Linux is UNSUPPORTED by construction
  *                      (see below).
  *   "store_packages" — Linux snaps and flatpak apps/runtimes from the system
@@ -17,10 +18,11 @@
  *                      the application list).
  *
  * SCOPE. The macOS `packages` action reads the machine Homebrew prefixes and the
- * user-owned Homebrew prefixes under /Users (~/homebrew, ~/.homebrew), plus each
- * formula's install receipt (tap, install time, installed-on-request). Every other
- * per-user package store (npm global-vs-user, pip user installs, cargo) is out of
- * scope and deferred to the user-context session helper
+ * user-owned Homebrew prefixes under /Users (~/homebrew, ~/.homebrew). A machine-prefix
+ * formula row also carries its install receipt (tap, install time, installed-on-request);
+ * no receipt under a user-owned prefix is opened, and a user row carries directory names
+ * only. Every other per-user package store (npm global-vs-user, pip user installs, cargo)
+ * is out of scope and deferred to the user-context session helper
  * (docs/adr/3003-user-session-helper.md); `managers` reports machine prefixes only.
  *
  * LINUX SCOPE. `managers` is tool identity/presence plus a few capture-backed
@@ -94,8 +96,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_SUPPORTED, 1,
          "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names under the machine "
          "prefixes and the user-owned ~/homebrew and ~/.homebrew prefixes (owner must equal the "
-         "home's); one bounded INSTALL_RECEIPT.json read per formula version (tap, install time, "
-         "installed-on-request)",
+         "home's); one bounded INSTALL_RECEIPT.json read per machine-prefix formula version (tap, "
+         "install time, installed-on-request); no receipt under a user-owned prefix is opened",
          "cask rows, the Intel prefix and user-prefix rows are covered by in-code layouts and none is "
          "in the committed capture"},
         /* .windows_leg = */

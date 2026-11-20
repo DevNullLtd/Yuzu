@@ -30,8 +30,10 @@
  * owner `-` and prefix `/opt/homebrew` or `/usr/local`; user rows carry the home
  * directory's NAME as owner and the literal `~/homebrew` or `~/.homebrew` as prefix
  * (never an absolute home path). install_time, tap and installed_on_request are the
- * formula's INSTALL_RECEIPT.json claims (formulae only; `-` when unknown) -- the
- * installing account's own words, validated for shape and never trusted.
+ * formula's INSTALL_RECEIPT.json claims -- the installing account's own words, validated
+ * for shape and never trusted. They are read for MACHINE-prefix formulae only: a cask row,
+ * a formula without a usable receipt and EVERY user row carry `-` (no receipt under a
+ * user-owned prefix is opened).
  *
  * The status row is formatted (and read back by the installed-software
  * collector) by the shared yuzu::shared helper in agents/shared/inventory_status_row.hpp;
@@ -75,10 +77,10 @@
 #include <cerrno>
 #include <charconv>
 #include <cstddef>
-#include <system_error>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace yuzu::pkg_inventory {
 
@@ -86,25 +88,27 @@ namespace yuzu::pkg_inventory {
 
 /// Per-directory entry cap handed to walk_dir_capped.
 inline constexpr std::size_t kMaxEntriesPerDir = 4096;
-/// Whole-action package row cap (the macOS Homebrew and Linux snap/flatpak walks): once reached, no further row is
-/// added and the status carries `row_cap` (a later container is still opened, but
-/// stops at its first version directory).
+/// Whole-action package row cap (the macOS Homebrew walks, machine and user prefixes alike, and
+/// the Linux snap/flatpak walks): once reached, no further row is added and the status carries
+/// `row_cap` (a later container is still opened, but stops at its first version directory).
 inline constexpr std::size_t kMaxPackageRows = 20000;
-/// Whole-action cap on the bytes of package rows emitted (the row cap alone
-/// allows ~10 MB of maximum-length names, and the command path applies no output
-/// cap of its own). A real install is a few KB; beyond it no further row is
-/// added and the status carries `byte_cap`.
+/// Whole-action cap on the bytes of package rows emitted, user-prefix rows included (the row cap
+/// alone allows ~10 MB of maximum-length names, and the command path applies no output cap of its
+/// own). A real install is a few KB; beyond it no further row is added and the status carries
+/// `byte_cap`.
 inline constexpr std::size_t kMaxOutputBytes = 1024 * 1024;
-/// Whole-ACTION entries budget across each action's entire walk (macOS Homebrew
-/// `packages`: both prefixes x Cellar/Caskroom; `managers`: both prefixes x Taps,
-/// Cellar, Caskroom; Linux `store_packages`: the snap and flatpak trees): each directory's own listing is bounded by kMaxEntriesPerDir and
+/// Whole-ACTION entries budget across each action's entire walk (macOS Homebrew `packages`: both
+/// machine prefixes x Cellar/Caskroom, then the /Users listing and each home's two user prefixes
+/// x Cellar/Caskroom; `managers`: both prefixes x Taps, Cellar, Caskroom; Linux `store_packages`:
+/// the snap and flatpak trees): each directory's own listing is bounded by kMaxEntriesPerDir and
 /// rows are bounded by kMaxPackageRows, but neither bounds the walk as a whole
 /// -- a tree with kMaxEntriesPerDir id/org-directories x kMaxEntriesPerDir
 /// entries each (or a Cellar full of plain files that never trip the row cap)
 /// is otherwise read in full every call. Sized generously for a real large
 /// Homebrew, snap or flatpak install.
 inline constexpr std::size_t kMaxPackageWalkEntries = 200000;
-/// Whole-action wall-clock budget (seconds) for the same walks.
+/// Whole-action wall-clock budget (seconds) for the same walks, the user-prefix walk and the
+/// machine-prefix receipt reads included.
 inline constexpr std::size_t kMaxPackageWalkSeconds = 10;
 
 /// The resource bounds as ONE injectable value. Production always uses
@@ -322,6 +326,8 @@ private:
 inline constexpr std::size_t kMaxBrewReceiptBytes = 64 * 1024;
 /// `<org>/<repo>` total length cap.
 inline constexpr std::size_t kMaxBrewTapLen = 140;
+/// An install time is exactly this many decimal digits (every epoch second from 2009 to 2100).
+inline constexpr std::size_t kBrewInstallTimeDigits = 10;
 /// install time bounds, epoch seconds: 2009-01-01 (Homebrew's first release) up to, and
 /// excluding, 2100-01-01.
 inline constexpr long long kMinBrewInstallTime = 1230768000;
@@ -401,7 +407,8 @@ namespace detail {
         const bool end_ok =
             n < v->size() && ((*v)[n] == ',' || (*v)[n] == '}' || detail::receipt_ws((*v)[n]));
         long long t = 0;
-        if (n == 10 && end_ok && std::from_chars(v->data(), v->data() + n, t).ec == std::errc{} &&
+        if (n == kBrewInstallTimeDigits && end_ok &&
+            std::from_chars(v->data(), v->data() + n, t).ec == std::errc{} &&
             t >= kMinBrewInstallTime && t < kMaxBrewInstallTime)
             r.install_time = std::to_string(t);
     }
