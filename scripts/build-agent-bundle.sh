@@ -39,8 +39,13 @@
 #
 # Examples:
 #   bash scripts/build-agent-bundle.sh                       # build the default version locally
-#   bash scripts/build-agent-bundle.sh --version 0.11.0 --push
-#   bash scripts/build-agent-bundle.sh --multiarch --push    # linux/amd64+arm64 -> registry
+#   bash scripts/build-agent-bundle.sh --version 0.11.0      # build a release's bundle locally
+#   bash scripts/build-agent-bundle.sh --version 0.11.0 --registry ghcr.io/<your-account> --push
+#                                                            # test image in YOUR OWN registry
+#
+# Releases are published by release.yml. --push to the project's registry moves
+# a release tag outside it, bypassing the image gate and the publish journal: not
+# a release procedure (docs/ci-architecture.md, "Release tag policy", Limit 1).
 #
 # Default version tracks the current GA release line (must have published
 # Windows/macOS agent artifacts). Override with --version for another release.
@@ -452,7 +457,8 @@ Verify the image, then extract the whole tree
   DIGEST=\$(docker buildx imagetools inspect ${IMAGE_REF} --format '{{.Manifest.Digest}}')
 
   # 2. verify that digest against the exact, tag-bound signer identity; only a
-  #    successful verify sets VERIFIED
+  #    successful verify sets VERIFIED (needs cosign v3.0 or later: an older
+  #    cosign reports "no signatures found" for the genuine image)
   cosign verify ${IMAGE_REPO}@\$DIGEST \\
     --certificate-identity https://github.com/${SIGNER_REPO}/.github/workflows/release.yml@refs/tags/${TAG} \\
     --certificate-oidc-issuer ${SIGNER_ISSUER} && VERIFIED=\$DIGEST
@@ -663,5 +669,5 @@ echo "  Image:    $IMAGE_REF"
 echo "  Pull:     docker pull $IMAGE_REF"
 echo "  Extract:  docker run --rm -v \"\$PWD:/out\" $IMAGE_REF"
 echo "  Triplets: linux-x64, windows-x64, macos-arm64  (installers + raw payload)"
-[ "$PUSH" = 1 ] || echo "  (local only — re-run with --push, or --multiarch --push, to publish)"
+[ "$PUSH" = 1 ] || echo "  (local only — to test a push, re-run with --registry <your registry> --push; releases are published by release.yml)"
 echo ""

@@ -222,7 +222,7 @@ std::string encode_process_baseline(const std::vector<yuzu::agent::ProcessInfo>&
     nlohmann::json arr = nlohmann::json::array();
     for (const auto& p : procs)
         arr.push_back({{"pid", p.pid}, {"ppid", p.ppid}, {"name", p.name}, {"user", p.user}});
-    return arr.dump();
+    return arr.dump(-1, ' ', false, nlohmann::json::error_handler_t::replace);
 }
 
 std::vector<yuzu::agent::ProcessInfo> decode_process_baseline(const std::string& s) {

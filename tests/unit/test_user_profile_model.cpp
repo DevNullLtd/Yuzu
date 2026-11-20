@@ -331,7 +331,7 @@ TEST_CASE("sanitize_field: distinct inputs that fold to the same text are equal 
 }
 
 // fold_line_breaks keeps a set of its own on purpose (header comment); on the three Unicode line breaks it must agree
-// with log_key_token. They differ elsewhere: log_key_token folds TAB and passes C1 other than U+0085.
+// with log_key_token. They differ elsewhere: log_key_token folds TAB (it now folds the whole C1 block too, as fold_line_breaks does).
 TEST_CASE("fold_line_breaks agrees with log_key_token on U+0085, U+2028 and U+2029", "[profiles]") {
     for (const std::string_view in : {"a\xC2\x85" "b", "a\xE2\x80\xA8" "b", "a\xE2\x80\xA9" "b"}) {
         std::string folded{in};
@@ -344,7 +344,7 @@ TEST_CASE("fold_line_breaks agrees with log_key_token on U+0085, U+2028 and U+20
     CHECK(tab == "a\tb");
     CHECK(yuzu::log_key_token("a\tb") == "a_b");
     CHECK(csi == "a_b");
-    CHECK(yuzu::log_key_token("a\xC2\x9B" "b") == "a\xC2\x9B" "b");
+    CHECK(yuzu::log_key_token("a\xC2\x9B" "b") == "a_b"); // F71: C1 folds in log_key_token too
 }
 
 TEST_CASE("render_profile_row: ordinary profile", "[profiles]") {

@@ -1,6 +1,7 @@
 #include "key_provider.hpp"
 
 #include "aes_gcm.hpp"
+#include <yuzu/log_token.hpp> // log_key_token: DB-sourced kcv_alg in a log line (F54)
 
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -723,7 +724,7 @@ FileKeyProvider::kek_check_value(std::string_view key_ref, std::string_view kcv_
         // of mis-flagging valid material as corrupt (S2; ADR-0010 Amendment 4).
         spdlog::error("key_provider: unsupported kcv_alg '{}' for FileKeyProvider (expected "
                       "'sha256')",
-                      std::string(kcv_alg));
+                      ::yuzu::log_key_token(kcv_alg));
         return std::nullopt;
     }
     std::lock_guard lock{kek_mutex_};
