@@ -112,6 +112,9 @@ jobs:
       - name: Re-registration gate wiring gate self-test (WP01)
         run: python3 -I tests/test_reregistration_gate_wiring_lexical_selftest.py
 
+      - name: Re-registration refusal literal drift gate (WP01)
+        run: python3 -I tests/test_reregistration_refusal_literal_lexical.py
+
       # #5557: ownership-based execution admission is keyed on ExecutionOwnerKey, never a
       # service-scoped session's username, and neither list gate hands a service-scoped session
       # unrestricted authority. Best-effort lexical (not a control-flow proof): the dispatched_by

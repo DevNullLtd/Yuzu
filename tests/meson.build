@@ -5380,6 +5380,14 @@ test('reregistration gate wiring lexical selftest',
   suite: 'docs',
   timeout: 30,
 )
+# WP01: the refusal message is copied byte for byte into the gateway (neutral for its circuit
+# breaker), its eunit and the gateway manual; a drifted copy counts every refusal as a breaker failure.
+test('reregistration refusal literal lexical',
+  _python3_test,
+  args: [files('test_reregistration_refusal_literal_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # SAM-34: the collection-settings routes must register ahead of the generic inventory GET, and the
 # step-up, body-cap, OpenAPI and /readyz rows must exist.
 test('collection settings wiring lexical',
