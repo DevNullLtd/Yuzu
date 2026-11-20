@@ -18,9 +18,11 @@
 /// sidecar's quarantine name is derived from that exclusively claimed name (`<claimed>-wal`), so
 /// the plain exists-then-rename step used for sidecars cannot collide with another recovery.
 /// A sidecar that cannot be renamed is copied only when no directory entry of any kind (a
-/// dangling link included, examined without following it) is at its quarantine name; and the only
-/// thing the sidecar step ever removes at a quarantine name is a partial copy it just wrote there,
-/// at a name that was free when checked.
+/// dangling link included, examined without following it) is at its quarantine name. At a
+/// quarantine name the sidecar step deletes only a partial copy it just wrote there, at a name
+/// that was free when checked, subject to the by-name residual below: the removal acts on
+/// whatever entry is at the name when it runs. (The rename itself replaces a dangling link found
+/// at the name: such a link reads as absent to the exists check before the rename.)
 /// An interruption between the link and the remove (a crash, or a failed undo) leaves the file
 /// under both names: a POSIX open quarantines it again under the next free name, while the
 /// Windows Echo open refuses until the `.corrupt-<epoch>` name is removed (the second link reads
@@ -58,8 +60,11 @@
 /// by the copy on a standard library that does not create its destination exclusively, and one put
 /// there after a failed copy and before the removal is removed with it. The same gap admits a link
 /// (dangling or hard) or an empty directory put at the name: a non-exclusive copy writes through a
-/// link, and the removal acts on whatever regular file is there by name. All of it needs write
-/// access to the data directory.
+/// link, and the removal acts on whatever entry is at the name when it runs (its regular-file
+/// check is by name too). The source side of the copy is by name as well: the sidecar is checked
+/// regular without following a link and `copy_file` then follows a link at its source, so a link
+/// swapped in at the sidecar's live name inside that gap is copied through by name. All of it
+/// needs write access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
 /// it as the database (pre-existing; Linux protected_hardlinks refuses a link to a file the
@@ -160,8 +165,9 @@ struct FsOps {
     std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
     /// Copy a sidecar when it could not be moved (default: `std::filesystem::copy_file` with
     /// `copy_options::none`, which fails rather than overwrite). It is only called when no
-    /// directory entry of any kind, a dangling link included, exists at `to`; a copy that fails
-    /// part-way has its partial file at `to` removed.
+    /// directory entry of any kind, a dangling link included, exists at `to`. When it fails with
+    /// anything but `file_exists` and leaves a regular file at `to`, that partial file is removed,
+    /// best effort, and the note says whether it was.
     std::function<void(const std::filesystem::path& from, const std::filesystem::path& to,
                        std::error_code&)>
         copy;
@@ -318,11 +324,11 @@ claim_quarantine_name(const std::filesystem::path& file, std::int64_t epoch_seco
 /// lost) because replaying it is worse. The copy runs only when NO directory entry of any kind
 /// (a dangling link included, examined without following it) exists at the quarantine name;
 /// otherwise nothing is copied or removed there. A copy that ran and failed part-way has its
-/// partial file at that name removed (it was free when checked, so it is not another recovery's
-/// evidence); the note says so. If that remove also fails a stale sidecar survives
-/// beside the fresh file: the Echo caller's post-reopen integrity check is the backstop. The
-/// moved files are then set owner-only, best effort (0600 on POSIX; a read-only-attribute
-/// toggle on Windows).
+/// partial file at that name removed where possible (it was free when checked, so it is not
+/// another recovery's evidence); the note says whether it was. If the removal of the original
+/// also fails a stale sidecar survives beside the fresh file: the Echo caller's post-reopen
+/// integrity check is the backstop. The moved files are then set owner-only, best effort (0600
+/// on POSIX; a read-only-attribute toggle on Windows).
 /// Two recorded limits of the sidecar step. It is exists-then-rename on the derived name, so a
 /// writer of the directory who squats `<claimed>-wal` ahead of time makes the rename and the copy
 /// fail and the sidecar is removed under the rule above, its content not kept. And on Windows the
@@ -455,9 +461,8 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
                 std::error_code pec;
                 fs::remove(side_dest, pec);
                 partial_note =
-                    pec ? std::format("; the partial copy at {} could not be removed ({})",
-                                      side_dest.string(), pec.message())
-                        : std::format("; the partial copy at {} was removed", side_dest.string());
+                    pec ? std::format("; the partial copy could not be removed ({})", pec.message())
+                        : std::string{"; the partial copy was removed"};
             }
             result.notes.push_back(std::format(
                 "could not preserve {} as {} ({}); its content is not kept{}", side.string(),

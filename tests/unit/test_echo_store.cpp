@@ -4037,7 +4037,7 @@ std::vector<std::string> names_with_prefix(const fs::path& dir, const std::strin
 fs::path make_healthy_echo_db(const fs::path& dir) {
     REQUIRE(fs::create_directories(dir));
     const auto db = dir / "echo.db";
-    auto opened = EchoDatabase::open(db);
+    auto opened = yuzu::test::open_echo_db(db); // the migrated template, not a per-test migration
     REQUIRE(opened.has_value());
     REQUIRE(opened->set_config("process_enabled", "false")); // a paused source: must survive
     return db;
