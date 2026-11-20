@@ -178,7 +178,7 @@ struct ToolOutcome {
 // removed between the enumerating `--pkgs` call and this lookup exits 1
 // (verified on macOS 26: a nonexistent receipt id gives rc=1). That is a
 // single missing row, not a truncated enumeration. Every TOP-LEVEL enumerator
-// leaves it false: dpkg-query -W, rpm -qa, pacman -Q, apk info, brew list,
+// leaves it false: dpkg-query -W, rpm -qa, pacman -Q, apk info,
 // system_profiler and pkgutil --pkgs all exit 0 on a healthy host (verified),
 // so a nonzero exit there means the enumeration did not complete and its
 // output is a prefix -- which must never be published as the whole truth.
@@ -1078,7 +1078,7 @@ int do_query(yuzu::CommandContext& ctx, yuzu::Params params) {
 // RegLoadKeyW-mounted per-user hive walk in "list_per_user") — rung 1.
 // Linux and macOS now collect through the shared bounded argv runner
 // (yuzu::agent::run_bounded_subprocess, ADR-3002 rung 2) — dpkg-query/rpm/
-// pacman/apk on Linux, system_profiler(+brew for list_per_user)(+pkgutil +
+// pacman/apk on Linux, system_profiler(+pkgutil +
 // native SecCode/CFBundle enrichment for list_inventory, + CFBundle for `list`'s
 // bundle_id) on macOS — Wave 4 PR4.3a's de-shell migration off the prior
 // ungoverned rung-3 popen()/system() acquisition.
@@ -1108,7 +1108,7 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         /* .linux_leg   = */
         {YUZU_SUPPORT_SUPPORTED, 2, "dpkg-query/rpm/pacman via bounded argv runner", nullptr},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler + brew via bounded argv runner", nullptr},
+        {YUZU_SUPPORT_SUPPORTED, 2, "system_profiler via bounded argv runner", nullptr},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "Reg*W enumeration of HKU\\<SID>'s Uninstall key, mounting NTUSER.DAT via "
@@ -1285,8 +1285,7 @@ private:
         return 0;
 
 #elif defined(__APPLE__)
-        // On macOS, use brew list per user if Homebrew is installed
-        // First list system apps
+        // On macOS the per-user action reports the system apps only (see the F19 note below).
         auto apps = get_installed_apps_macos();
         if (!report_if_degraded(ctx, apps.degraded, "list_per_user"))
             return 1;
@@ -1295,20 +1294,10 @@ private:
                 "system", app.name, app.version, app.publisher, app.install_date)));
         }
 
-        // installed_apps/do_list_per_user#1 (docs/agent-spawn-sink-manifest.md)
-        // Try Homebrew per-user (runs under current user).
-        if (auto brew_path =
-                yuzu::agent::probe_tool_path({"/opt/homebrew/bin/brew", "/usr/local/bin/brew"});
-            !brew_path.empty()) {
-            auto brew_res = run_tool({brew_path, "list", "--versions"});
-            if (!report_if_degraded(ctx, brew_res.degraded, "list_per_user"))
-                return 1;
-            auto brew_out = std::move(brew_res.output);
-            for (auto& rec : parsers::parse_brew_list(brew_out)) {
-                ctx.write_output(yuzu::util::sanitize_utf8(
-                    parsers::format_user_app_row("brew", rec.name, rec.version, "", "")));
-            }
-        }
+        // F19 (WP13): no Homebrew rows and NO brew subprocess here. The agent is root on macOS
+        // and a Homebrew prefix is owned by the installing user, so executing its `brew` script
+        // would run a user-controlled file as root. The Homebrew inventory is
+        // pkg_inventory.packages (no-follow directory reads, no subprocess).
         return 0;
 #else
         ctx.write_output("error|per-user app inventory not supported on this platform");

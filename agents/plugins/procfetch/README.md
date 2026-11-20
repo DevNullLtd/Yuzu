@@ -23,7 +23,7 @@ flowchart LR
   EX --> WIN[Windows leg<br/>CreateToolhelp32Snapshot + BCrypt SHA-1]
   EX --> MAC[macOS leg<br/>libproc proc_listpids/proc_pidpath + OpenSSL EVP SHA-1]
   EX --> LIN[Linux leg<br/>/proc enumeration + OpenSSL EVP SHA-1]
-  WIN & MAC & LIN --> ROWS[rows, no typed status] --> RS[(ResponseStore)] --> API[REST /api/responses]
+  WIN & MAC & LIN --> ROWS[rows, typed status only for the Linux /proc gap] --> RS[(ResponseStore)] --> API[REST /api/responses]
 ```
 
 ## OS capability
@@ -32,6 +32,10 @@ flowchart LR
 | Action | Windows | macOS | Linux |
 |---|---|---|---|
 | `procfetch_fetch` | ✅ supported · rung 1 · CreateToolhelp32Snapshot + BCrypt SHA-1 | ✅ supported · rung 1 · libproc (proc_listpids/proc_pidpath) + OpenSSL EVP SHA-1 | ✅ supported · rung 1 · /proc enumeration + OpenSSL EVP SHA-1 |
+
+**Declared limits per leg** (descriptor fallback text, verbatim):
+
+- **`procfetch_fetch` / Linux** — CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): procfetch:exe_unreadable
 <!-- END GENERATED -->
 
 ## Privileges and prerequisites
@@ -40,7 +44,7 @@ flowchart LR
 |---|---|---|---|---|
 | Windows | SYSTEM (measured; no row in `docs/agent-privilege-model.md` for this plugin) | None observed at SYSTEM. Even as SYSTEM, `OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, ...)` is refused for a handful of protected/system processes — the sample's `[System Process]`, `System`, `Secure System`, `Registry` rows carry no path or hash. | 2026-09-07, bare-metal, `SYSTEM` | that row's `path` and `sha1` fields are empty; no error is surfaced and enumeration continues (`procfetch_plugin.cpp:251-264`) |
 | macOS | unprivileged (agent daemon) | None observed unprivileged — `proc_listpids`/`proc_pidpath` resolved paths and hashes for processes owned by root and other users in the sample (e.g. `postgres`, `XprotectService`) without elevation. | 2026-09-07, macOS 26.6.2, euid 501 (jsmith) | `proc_pidpath` failing falls back to `proc_name()` for a short name only, leaving `path` and `sha1` empty (`procfetch_plugin.cpp:216-223`) — not observed in this capture |
-| Linux | root (captured in a container; not measured unprivileged) | `resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail | 2026-09-06, Debian 13 (trixie) aarch64 container, euid 0 | `std::filesystem::read_symlink` throws `filesystem_error`, caught and turned into an empty path, so `path` and `sha1` are empty and the row still emits (`procfetch_plugin.cpp:134-140`) |
+| Linux | root (captured in a container; not measured unprivileged) | `resolve_exe` reads the `/proc/<pid>/exe` symlink, which the kernel restricts to the same UID or a reader holding `CAP_SYS_PTRACE`; an unprivileged, non-matching-UID read is expected to fail | 2026-09-06, Debian 13 (trixie) aarch64 container, euid 0 | `resolve_exe` makes one `readlink` call through `readlink_noting`; a failure returns an empty path and an EACCES/EPERM refusal is counted, so `path` and `sha1` are empty and the row still emits |
 
 No external binaries, no subprocesses, no network access — every leg is a native OS call plus an in-process hash (`agents/plugins/procfetch/src/procfetch_plugin.cpp`, no `popen`/`CreateProcess`/socket use anywhere in the file).
 
@@ -69,7 +73,12 @@ Pipe-delimited rows, one per process, in the fixed field order `pid|name|path|sh
 
 ### Result status
 
-This plugin does not set a typed result status; the agent records `UNDECLARED` and the sample shows `UNDECLARED / UNKNOWN /`.
+On Linux, `fetch` declares a typed status when the agent could not read another user's `/proc` entries (WP13 UP14). Otherwise the agent records `UNDECLARED` (every other leg and OS; a clean read).
+
+| Status | Completeness | Provenance | When |
+|---|---|---|---|
+| `UNDECLARED` (default) | UNKNOWN | (empty) | Every Windows and macOS run, and a Linux run where every process was readable. |
+| `CONSTRAINED` | PARTIAL | `procfetch:exe_unreadable` | The readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha1` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked in #8165). |
 
 ### Where the data goes
 
@@ -135,10 +144,10 @@ This plugin does not set a typed result status; the agent records `UNDECLARED` a
 ## Caveats and known gaps
 
 1. **Windows hashing opens a UTF-8 path via the ANSI `CreateFileA`.** `get_process_image_path` converts the wide image path to UTF-8 via `from_wide` (`procfetch_plugin.cpp:263`), then `sha1_of_file` passes that UTF-8 string straight to `CreateFileA` (`procfetch_plugin.cpp:267`), which interprets it as the ANSI code page, not UTF-8. A process whose executable path contains non-ASCII characters will fail to open, silently leaving `sha1` empty with no error surfaced.
-2. **This plugin never sets a typed result status.** Both captured samples read `UNDECLARED / UNKNOWN /` regardless of whether any row's path/hash resolution failed — a caller cannot distinguish "clean run" from "every row's hash silently failed" without inspecting the rows themselves.
+2. **Typed result status only for one Linux gap.** On Linux, `fetch` sets `CONSTRAINED`/`PARTIAL` (`procfetch:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable. On Windows and macOS, and for any failure of a row's hash resolution on any OS, the status stays `UNDECLARED / UNKNOWN /` (both captured samples read it), so a caller cannot distinguish "clean run" from "every row's hash silently failed" without inspecting the rows themselves.
 3. **Protected Windows processes report name only.** `OpenProcess` is refused even running as SYSTEM for a handful of processes (`[System Process]`, `System`, `Secure System`, `Registry` in the sample); those rows carry empty `path` and `sha1` with no row-level error indicator.
 4. **SHA-1, not SHA-256.** The metadata description positions this action for "security auditing" and "IOC matching" (`content/definitions/procfetch.yaml:16-17`), but the hash is SHA-1 on every leg (`EVP_sha1()` / `BCRYPT_SHA1_ALGORITHM`), which is broken for collision resistance; it remains adequate for matching against a known-hash IOC list (a preimage property SHA-1 still holds) but not for detecting a deliberately-collided binary.
-5. **Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe` (`procfetch_plugin.cpp:134-140`); the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there.
+5. **Linux exe resolution needs same-UID or `CAP_SYS_PTRACE`.** `resolve_exe` reads `/proc/<pid>/exe`; the capture was taken as root in a two-process container, so an unprivileged multi-user host was not exercised — expect `path`/`sha1` to go empty for other users' processes there.
 
 ## Source and tests
 
