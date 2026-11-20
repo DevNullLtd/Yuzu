@@ -560,7 +560,7 @@
         "leg_hash": "f58c3a5e2904",
         "os": "linux",
         "os_version": "Ubuntu 26.04.1 LTS x86_64",
-        "privilege": "euid 0"
+        "privilege": "euid 0 (maintainer e-mail redacted to user@example.com)"
       }
     },
     "macos": {

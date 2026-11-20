@@ -1,4 +1,4 @@
-captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 · leg-hash f58c3a5e2904
+captured: linux Ubuntu 26.04.1 LTS x86_64 · container · 2026-11-20 · euid 0 (maintainer e-mail redacted to user@example.com) · leg-hash f58c3a5e2904
 == action=list
 app|apt|3.2.1ubuntu0.1|APT Development Team <deity@lists.debian.org>|-|-|-
 app|base-files|14ubuntu6.3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
@@ -9,7 +9,7 @@ app|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discus
 app|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
 app|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
 app|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
-app|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-|-|-
+app|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>|-|-|-
 app|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
 app|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
 app|e2fsprogs|1.47.2-3ubuntu4|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-|-|-
@@ -104,7 +104,7 @@ user_app|system|coreutils|9.5-1ubuntu2+0.0.0~ubuntu25|Ubuntu Developers <ubuntu-
 user_app|system|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
 user_app|system|dash|0.5.12-12ubuntu3|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
 user_app|system|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
-user_app|system|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>|-
+user_app|system|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>|-
 user_app|system|diffutils|1:3.12-1ubuntu0.1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
 user_app|system|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
 user_app|system|e2fsprogs|1.47.2-3ubuntu4|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>|-
@@ -194,7 +194,7 @@ inv|coreutils|9.5|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||pac
 inv|coreutils-from-uutils|0.0.0~ubuntu25|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
 inv|dash|0.5.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||12ubuntu3|amd64||ubuntu|26.04|
 inv|debconf|1.5.92|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||all||ubuntu|26.04|
-inv|debianutils|5.23.2build1|Ileana Dumitrescu <ileanadumitrescu95@gmail.com>||package|deb|||amd64||ubuntu|26.04|
+inv|debianutils|5.23.2build1|Ileana Dumitrescu <user@example.com>||package|deb|||amd64||ubuntu|26.04|
 inv|diffutils|3.12|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|1|1ubuntu0.1|amd64||ubuntu|26.04|
 inv|dpkg|1.23.7ubuntu1|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb|||amd64||ubuntu|26.04|
 inv|e2fsprogs|1.47.2|Ubuntu Developers <ubuntu-devel-discuss@lists.ubuntu.com>||package|deb||3ubuntu4|amd64||ubuntu|26.04|
