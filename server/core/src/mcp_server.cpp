@@ -722,7 +722,7 @@ static_assert(kMaxFacetValueBytes == 2048,
 // nine result-set outputSchemas inside kTools[], so the nine copies cannot drift. They sit above the
 // array because scripts/ci/check-api-parity.py refuses a preprocessor line inside it; both are
 // #undef'd right after it.
-#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
+#define YUZU_MCP_RESULT_SET_ROW_PROPS R"j("id":{"type":"string"},"name":{"type":"string"},"owner_principal":{"type":"string"},"created_at":{"type":"integer"},"ttl_at":{"type":"integer"},"last_used_at":{"type":"integer"},"pinned":{"type":"boolean"},"parent_id":{"type":"string"},"source_kind":{"type":"string"},"status":{"type":"string","description":"pending, materialized or failed. failed: the fill was abandoned because the execution stored more than 100000 response rows; the set then reads device_count 0, agents_failed 0 and partial false, and the reason is in the server log only"},"source_execution_id":{"type":"string"},"device_count":{"type":"integer"},"agents_failed":{"type":"integer","description":"Agents that answered with a failure (or without the matcher's column, or with a constrained, partly completed answer when the definition sets partialWhenConstrained and the matcher's column is one it declares) and never matched; they are absent from the membership. Agents that never answered are counted in agents_unanswered. 0 for a failed set"},"agents_unanswered":{"type":"integer","description":"Targeted agents absent from the membership because they never answered before the set was filled, or because their answer was not fully stored. 1 can mean not known complete rather than an exact count. 0 for a failed set"},"partial":{"type":"boolean","description":"True when agents_failed or agents_unanswered is above zero: the set may be missing devices. A set created from a parent's members carries the parent's counters, summed along a lineage, so partial is the reliable signal. False for a failed set"})j"
 #define YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j("id","name","owner_principal","created_at","ttl_at","last_used_at","pinned","parent_id","source_kind","status","source_execution_id","device_count","agents_failed","agents_unanswered","partial")j"
 static const ToolDef kTools[] = {
     {"list_agents",
@@ -1739,7 +1739,7 @@ static const ToolDef kTools[] = {
      "RESULT_SET_STORE_FAULT_AFTER_DISPATCH (the store faulted after a real command "
      "already reached the fleet) carries no retry_after_ms and must NEVER be retried - "
      "poll executions for the outcome instead.",
-     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
+     R"j({"type":"object","properties":{"instruction_id":{"type":"string","minLength":1,"maxLength":256},"params":{"type":"object","additionalProperties":{"type":"string","maxLength":65536},"description":"InstructionDefinition parameters"},"matcher":{"type":"object","properties":{"column":{"type":"string","maxLength":128},"op":{"type":"string","maxLength":32},"value":{"type":"string","maxLength":512}},"description":"Selects which responders join the set; omit to accept every responder. {kind:echo_rows_ge,n} needs n to be an integer from 1 to 2147483647. At most 65536 bytes as compact JSON"},"parent_id":{"type":"string","maxLength":64},"name":{"type":"string","maxLength":256}},"required":["instruction_id"]})j",
      R"j({"type":"object","properties":{)j" YUZU_MCP_RESULT_SET_ROW_PROPS
      R"j(},"required":[)j" YUZU_MCP_RESULT_SET_ROW_REQUIRED R"j(]})j"},
 
@@ -18733,23 +18733,6 @@ McpServer::HandlerFn McpServer::build_handler(
                         rs_refuse_nul("parent_id", source_kind::kInstructionResult);
                         return;
                     }
-                    if (args.contains("matcher") && args["matcher"].is_object()) {
-                        const auto& m = args["matcher"];
-                        auto matcher_field_len = [&m](const char* key) -> std::size_t {
-                            return (m.contains(key) && m[key].is_string())
-                                       ? m[key].template get_ref<const std::string&>().size()
-                                       : 0;
-                        };
-                        if (matcher_field_len("column") > kMatcherColumnMaxLen ||
-                            matcher_field_len("op") > kMatcherOpMaxLen ||
-                            matcher_field_len("value") > kMatcherValueMaxLen) {
-                            reject_field_too_large(std::format(
-                                "a matcher field exceeds its bound (column<={}, op<={}, "
-                                "value<={} bytes)",
-                                kMatcherColumnMaxLen, kMatcherOpMaxLen, kMatcherValueMaxLen));
-                            return;
-                        }
-                    }
                     // #4644: a malformed echo_rows_ge threshold (`n`) is refused here, before
                     // anything is dispatched or stored, like the REST twin.
                     // A PRESENT matcher that is not a JSON object used to be dropped silently
@@ -18757,6 +18740,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     if (args.contains("matcher")) {
                         if (const auto bad =
                                 yuzu::server::rs_matcher::validate_matcher_object(args["matcher"])) {
+                            // A field or the whole matcher over its size bound is an input bound
+                            // like the fields above: counted and audited by the same responder.
+                            // The REST twin refuses both through this same check.
+                            if (*bad == yuzu::server::rs_matcher::kMatcherFieldTooLargeMessage) {
+                                reject_field_too_large(*bad);
+                                return;
+                            }
+                            if (*bad == yuzu::server::rs_matcher::kMatcherTooLargeMessage) {
+                                reject_field_too_large("RESULT_SET_BAD_REQUEST: " + *bad);
+                                return;
+                            }
                             res.set_content(
                                 error_response(id, kInvalidParams,
                                                "RESULT_SET_BAD_REQUEST: " + *bad),
