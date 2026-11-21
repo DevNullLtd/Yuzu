@@ -366,9 +366,12 @@ TEST_CASE("pkg_inventory receipt: the first hit of a key wins, and key-shaped te
     // an invalid first hit is not replaced by a later valid one
     CHECK(pi::parse_brew_receipt(R"({"time":"x","time":1767225600})").install_time.empty());
     // the escaped quotes keep the whole text one string value
-    CHECK(pi::parse_brew_receipt(R"({"note":"say \"time\": 1767225600, ok"})").install_time.empty());
-    CHECK(pi::parse_brew_receipt(R"({"note":"a \"time\": 1767225600 b","time":1700000000})")
-              .install_time == "1700000000");
+    // (plain literals, not raw ones: MSVC mis-lexes a raw string holding \" inside a macro argument)
+    const std::string only_in_note = "{\"note\":\"say \\\"time\\\": 1767225600, ok\"}";
+    const std::string note_then_time =
+        "{\"note\":\"a \\\"time\\\": 1767225600 b\",\"time\":1700000000}";
+    CHECK(pi::parse_brew_receipt(only_in_note).install_time.empty());
+    CHECK(pi::parse_brew_receipt(note_then_time).install_time == "1700000000");
 }
 
 TEST_CASE("pkg_inventory receipt: hostile text neither throws nor loops",
