@@ -845,6 +845,7 @@ TEST_CASE("file_search driver: an abandoned worker that completes late changes o
 TEST_CASE("file_search driver: a refused worker abandons nothing and the third refusal on one cursor ends stalled",
           "[file_search][file_search_driver]") {
     Rig rig;
+    rig.mounts.add("/r/data", "ext4", "8:2");
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.mode = Rig::Mode::reject;
     const SliceResult one = run_slice(make_request(kCtl), rig.b);
@@ -852,6 +853,7 @@ TEST_CASE("file_search driver: a refused worker abandons nothing and the third r
     CHECK(one.reason == "rejected");
     CHECK(one.counters.rejected == 1);
     CHECK(rig.state.abandoned_count() == 0);
+    CHECK(row_of(one, "volume|/r/data|").empty()); // a retryable end: the previous cursor stands, nothing is named
     // A slice with no result reads partial/stalled (see no_result): the attempt did not advance.
     CHECK(starts(row_of(one, "volume|"), "volume|/|ext4|partial|stalled|"));
     const auto qh = fsr::query_hash(make_request(kCtl).query);
@@ -861,6 +863,7 @@ TEST_CASE("file_search driver: a refused worker abandons nothing and the third r
     CHECK(three.status == Status::failed);
     CHECK(three.reason == "stalled"); // final
     CHECK(three.counters.stalled == 1);
+    CHECK(starts(row_of(three, "volume|/r/data|"), "volume|/r/data|ext4|not_searched|stalled|")); // the unit never reached
     CHECK_FALSE(rig.slot.load());
 }
 
@@ -926,6 +929,7 @@ TEST_CASE("file_search driver: a stop request ends the slice cancelled, carrying
 TEST_CASE("file_search driver: an identity that changes on every call ends unstable within the restart bound",
           "[file_search][file_search_driver]") {
     Rig rig;
+    rig.mounts.add("/r/data", "ext4", "8:2");
     for (int i = 0; i < 6; ++i)
         rig.fs.add_file("/r/noise" + std::to_string(i), "");
     rig.fs.add_file("/r/zzz-yuzu-fs-control-1.bin", "");
@@ -937,6 +941,8 @@ TEST_CASE("file_search driver: an identity that changes on every call ends unsta
     CHECK(run.last().reason == "unstable");
     CHECK(run.last().counters.unstable == 1);
     CHECK(run.last().cursor.empty());
+    CHECK(count_rows(run, "volume|/r/data|") == 1); // the last slice only: no earlier slice reached it
+    CHECK(starts(row_of(run.last(), "volume|/r/data|"), "volume|/r/data|ext4|not_searched|unstable|"));
     for (const auto& s : run.slices)
         CHECK_FALSE(starts(row_of(s, "coverage|"), "coverage|complete|"));
     CHECK(found(run).empty());

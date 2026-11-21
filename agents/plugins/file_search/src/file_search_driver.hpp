@@ -418,11 +418,13 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
     };
 
     // The cursor that follows this slice: the token, or no value when the search finished (a finished search
-    // has no cursor), or the reason it ends here. `at_max_slices` is the one end that also says what was
-    // left unsearched. `gap_delta` is what the running count grows by.
+    // has no cursor), or the reason it ends here. `rest` is set by an end that is final for the search (here
+    // max_slices; stalled and unstable below): the reason the units after this one are named with. A
+    // retryable end, cancelled, mount_table_changed and cursor_refused leave it empty. `gap_delta` is what
+    // the running count grows by.
     struct CursorEnd {
         std::string why;
-        bool at_max_slices = false;
+        std::optional<fsr::Reason> rest = std::nullopt;
     };
     using NextCursor = std::expected<std::optional<std::string>, CursorEnd>;
     const auto next_cursor_for = [&](bool unit_done, const fsr::Position& position, bool restarted,
@@ -432,7 +434,7 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         const fsr::Cursor next_inner = fsr::next_cursor(inner, unit_done ? fsr::Position{} : position,
                                                         unit_done ? false : restarted, gap_delta);
         if (next_inner.sequence >= kMaxSlices)
-            return std::unexpected(CursorEnd{fsr::to_token(fsr::Reason::max_slices), true});
+            return std::unexpected(CursorEnd{fsr::to_token(fsr::Reason::max_slices), fsr::Reason::max_slices});
         const VolumeCursor next{unit_done ? index + 1 : index, plan.units_hash, plan.refused_hash, next_inner};
         const VolumeCursor prev{index, plan.units_hash, plan.refused_hash, inner};
         if (!volume_advances(prev, next))
@@ -442,7 +444,9 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
             return std::unexpected(CursorEnd{to_token(Fault::internal_error)});
         return token;
     };
-    // The units not yet searched when the search ends early: said, never silent.
+    // The units after this one when the search ends for good before reaching them (max_slices, stalled,
+    // unstable): said, never silent, each with the reason on the `search` row. An end whose previous cursor
+    // stands, a cancel, a changed mount table and a refused cursor do not call it.
     const auto not_searched_rest = [&](std::size_t from, fsr::Reason why) {
         for (std::size_t i = from; i < plan.units.size(); ++i) {
             fsr::VolumeCoverage v;
@@ -462,8 +466,8 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         counters.stalled = 1;
         const NextCursor next = next_cursor_for(true, {}, false, 1 + refused_counted);
         if (!next) {
-            if (next.error().at_max_slices)
-                not_searched_rest(index + 1, fsr::Reason::max_slices);
+            if (next.error().rest)
+                not_searched_rest(index + 1, *next.error().rest);
             return conclude(env, {}, Status::failed, next.error().why, {}, 0);
         }
         env.has_cursor = next->has_value();
@@ -502,12 +506,12 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         vol.reason = fsr::Reason::stalled;
         emit_vol();
         std::string reason = to_token(fault);
-        if (gov.health == fsr::Health::stalled) {
-            counters.stalled = 1;
-            reason = fsr::to_token(fsr::Reason::stalled);
-        } else if (gov.health == fsr::Health::unstable) {
-            counters.unstable = 1;
-            reason = fsr::to_token(fsr::Reason::unstable);
+        if (gov.health != fsr::Health::ok) { // not retryable: the search ends here, so name what it never reached
+            const bool stalled = gov.health == fsr::Health::stalled;
+            const fsr::Reason why = stalled ? fsr::Reason::stalled : fsr::Reason::unstable;
+            (stalled ? counters.stalled : counters.unstable) = 1;
+            reason = fsr::to_token(why);
+            not_searched_rest(index + 1, why);
         }
         return conclude(env, {}, Status::failed, reason, {}, 0);
     };
@@ -564,23 +568,21 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
     if (!complete && gov.health != fsr::Health::ok) { // stalled or unstable: final
         counters.stalled = gov.health == fsr::Health::stalled ? 1 : 0;
         counters.unstable = gov.health == fsr::Health::unstable ? 1 : 0;
-        next = std::unexpected(CursorEnd{fsr::to_token(vol.reason)});
+        next = std::unexpected(CursorEnd{fsr::to_token(vol.reason), vol.reason}); // stalled or unstable
     } else if (!complete && !res.advanced && !res.restarted) { // no progress: retry this cursor
         next = std::unexpected(CursorEnd{to_token(Fault::no_progress)});
     } else {
         next = next_cursor_for(complete, res.position, res.restarted, gap_delta);
-        if (!next && next.error().at_max_slices) {
-            if (!complete)
-                vol.reason = fsr::Reason::max_slices;
-            emit_vol();
-            not_searched_rest(index + 1, fsr::Reason::max_slices);
-            return conclude(env, std::move(w.rows), Status::failed, next.error().why, {}, res.stats.links_skipped);
-        }
+        if (!next && next.error().rest && !complete)
+            vol.reason = *next.error().rest; // this unit was cut by the slice maximum
     }
 
     emit_vol();
-    if (!next)
+    if (!next) {
+        if (next.error().rest)
+            not_searched_rest(index + 1, *next.error().rest);
         return conclude(env, std::move(w.rows), Status::failed, next.error().why, {}, res.stats.links_skipped);
+    }
     env.has_cursor = next->has_value();
     return conclude(env, std::move(w.rows), Status::ok, fsr::to_token(vol.reason), next->value_or(std::string{}),
                     res.stats.links_skipped);
