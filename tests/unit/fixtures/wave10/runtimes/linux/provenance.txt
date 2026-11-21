@@ -26,9 +26,11 @@ image:     debian:bookworm, after `apt-get install -y openjdk-17-jre-headless py
            since-cut python action and does not affect the release file)
 command:   cat /usr/lib/jvm/java-17-openjdk-*/release   (resolved to
            /usr/lib/jvm/java-17-openjdk-arm64/release)
-note:      Debian's release file has NO IMAGE_TYPE key (the test asserts flavour
-           `unmodelled` for it); /usr/lib/jvm/java-1.17.0-openjdk-arm64 is a second entry
-           for the same install.
+note:      Debian's release file has NO IMAGE_TYPE key. The tests assert flavour `unmodelled`
+           for it only where nothing supplies a flavour: the bare jvm_row (no fallback) and the
+           tree.manifest walk, whose Debian home has no bin/ directory. Where bin/ exists the
+           bin/javac fallback decides (the SAM-48 captures below).
+           /usr/lib/jvm/java-1.17.0-openjdk-arm64 is a second entry for the same install.
 lines:     9 (budget 25)
 
 -- dotnet_shared_listing.txt --
@@ -91,7 +93,9 @@ files:     debian12_openjdk17_jre_release.txt   <- openjdk-17-jre-headless 17.0.
            opensuse156_openjdk17_release.txt    <- java-17-openjdk-devel 17.0.18.0-150400.3.63.1
                                                    (same fields as java-17-openjdk-headless, which also
                                                    has no IMAGE_TYPE and IMPLEMENTOR="N/A")
-           None of the six release files in the capture set carries an IMAGE_TYPE key.
+           Of the five release files among this directory's captures (temurin17_release.txt,
+           debian_openjdk17_release.txt and the three above), only temurin17_release.txt carries an
+           IMAGE_TYPE key; the four Debian, Ubuntu and SUSE files have none.
 
 -- SAM-48 captures in jdk_layouts.manifest (roots/debian12-openjdk17-{jdk,jre}, roots/ubuntu2404-openjdk21-{jdk,jre},
    roots/opensuse156-openjdk17-devel, and the existing roots/opensuse156-openjdk17 as the SUSE JRE) --

@@ -4,9 +4,9 @@
 # holds the images, package versions and capture commands.
 #
 # REAL CAPTURE structure, trimmed to the paths the walk reads (home directories, `release`, the
-# bin/java and jre/bin/java probes, the alias entries next to the homes). RECONSTRUCTION: every
-# regular file other than a `release` file is an EMPTY placeholder (the capture recorded names,
-# not contents), and the Ubuntu .jinfo file is empty.
+# bin/java, jre/bin/java and bin/javac probes, the alias entries next to the homes).
+# RECONSTRUCTION: every regular file other than a `release` file is an EMPTY placeholder (the
+# capture recorded names, not contents), and the Ubuntu .jinfo file is empty.
 #
 # -- ubuntu:22.04 + openjdk-8-jre-headless: NO `release` file anywhere in the home ---------------
 roots/ubuntu2204-openjdk8/usr/lib/jvm/.java-1.8.0-openjdk-arm64.jinfo	T:

@@ -258,7 +258,8 @@ cadences.
 
   **Java runtimes** are collected through `runtimes` `jvm` (all three OSes; `source`
   `runtimes.jvm`) as one `app` row per JVM home, `ecosystem` `jvm`, `name` `Java JDK`, `Java JRE`
-  or `Java` (when the build does not say), `version` from the home's `release` file (when the home has
+  or `Java` (when the build does not say; on Linux the `release` file's `IMAGE_TYPE` decides and,
+  where it has none, the home's `bin/javac` and java entries do), `version` from the home's `release` file (when the home has
   none: empty on Linux, the bundle's `Info.plist` version on macOS, the registry's version key on
   Windows) and `publisher` the file's `IMPLEMENTOR` (on macOS, a bundle with an openable `Contents` and no `release` file
   under `Contents/Home` reports its `Info.plist` `JVMVendor`), else `via:jvm` (the home reports no vendor, or it is a

@@ -4719,7 +4719,7 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
                                   "Microsoft.NETCore.App/8.0.31|-"});
     g_fake[4].out["jvm"] = nl({supported_status("jvm"),
                                "jvm|jdk|17.0.20|/opt/java/openjdk|Eclipse Adoptium",
-                               "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
+                               "jvm|jre|-|/usr/lib/jvm/java-8-openjdk-amd64|-"});
     g_fake[5].out["ibm_mq"] = nl({st("ibm_mq", "supported", "-"), kMqRow});
     // hardware.drivers_inventory: the WMI provider (else the signer) is the publisher on Windows;
     // the fixed Linux provider `kernel` is not a vendor, so a module is labelled by origin.

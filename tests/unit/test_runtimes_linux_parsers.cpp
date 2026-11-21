@@ -1117,10 +1117,27 @@ TEST_CASE("runtimes linux: the bin/javac flavour fallback is exact about what it
     probe(java_only, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
     // an unrecognised IMAGE_TYPE value is still the file's word: unmodelled, bin/ not consulted
     probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"SDK\"\n", "jvm|unmodelled|17.0.1|/opt/java/h|-", "");
+    // A BLANK IMAGE_TYPE says nothing: bin/ decides, exactly as if the key were absent. The quoted
+    // run of spaces is the case that tells has_image_type's trim from a bare empty() test (the
+    // parser keeps the inside of the quotes); the unquoted and empty-quoted spellings must agree.
+    // MUTATION (checked): has_image_type -> !image_type.empty() turns the spaces case into
+    // `unmodelled`, because the file would then be taken to have spoken.
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"   \"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    probe(java_only, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"   \"\n", "jvm|jre|17.0.1|/opt/java/h|-", "");
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
     // a symlink named javac is an entry (not followed, may dangle); a directory named javac is not a compiler
     probe([&](const fs::path& h) { java_only(h); fs::create_symlink("/nonexistent/javac", h / "bin/javac"); },
           kNoType, "jvm|jdk|17.0.1|/opt/java/h|Vendor", "");
     probe([&](const fs::path& h) { java_only(h); make_dir(h / "bin/javac"); },
+          kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // A FIFO named javac must not block (the probe only stats the entry, it never opens it). It is
+    // neither a regular file nor a symlink, so by the code's own rule (S_ISREG || S_ISLNK) it is not
+    // a present javac: the home reads as a JRE, with no constraint token.
+    probe([&](const fs::path& h) {
+              java_only(h);
+              REQUIRE(::mkfifo((h / "bin/javac").c_str(), 0644) == 0);
+          },
           kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
     // neither binary: the file alone cannot say, and nothing is guessed
     probe([](const fs::path& h) { make_dir(h / "bin"); }, kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", "");
@@ -1151,6 +1168,56 @@ TEST_CASE("runtimes linux: an unsearchable bin leaves the flavour unmodelled and
     const auto rows = lnx::jvm_rows_at(dir.path, acc);
     REQUIRE(rows.size() == 1);
     CHECK(rows[0] == "jvm|unmodelled|17.0.1|/opt/java/h|-");
+    CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
+}
+
+namespace {
+
+/// Two homes under /opt/java, probed in name order: `a-bad` (the caller breaks its bin) then
+/// `b-good` (release without IMAGE_TYPE, bin/java and bin/javac). The expected rows are the same
+/// whatever broke `a-bad`'s bin: its row is kept with an undecided (`unmodelled`) flavour, and the
+/// walk goes on to `b-good`.
+const std::vector<std::string> kBadThenGoodRows{"jvm|unmodelled|17.0.1|/opt/java/a-bad|Vendor",
+                                                "jvm|jdk|17.0.1|/opt/java/b-good|Vendor"};
+
+void write_bad_then_good(const fs::path& jvm) {
+    const std::string release = "JAVA_VERSION=\"17.0.1\"\nIMPLEMENTOR=\"Vendor\"\n";
+    write_text(jvm / "a-bad/release", release);
+    write_text(jvm / "b-good/release", release);
+    write_text(jvm / "b-good/bin/java", "");
+    write_text(jvm / "b-good/bin/javac", "");
+}
+
+} // namespace
+
+TEST_CASE("runtimes linux: a symlinked bin does not stop the walk of later homes (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // Homes are listed by name, so `a-bad` is probed before `b-good`. The bad home keeps its row (its
+    // flavour is undecided, never guessed) and the host is CONSTRAINED with the bin token; the good
+    // home after it is still read and still gets its flavour. MUTATIONS: breaking out of the walk
+    // when a probe is undecided drops the `b-good` row; recording no token loses the constraint.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_multi_"};
+    const fs::path jvm = dir.path / "opt/java";
+    write_bad_then_good(jvm);
+    write_text(jvm / "a-bad/real/java", "");
+    fs::create_symlink("real", jvm / "a-bad/bin"); // refused, never followed
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc) == kBadThenGoodRows);
+    CHECK(acc.reason() == std::string{lnx::kTokSymlinkRefused});
+}
+
+TEST_CASE("runtimes linux: an unreadable bin does not stop the walk of later homes (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // As above, with a bin whose open is refused (mode 000): permission_denied, same rows.
+    if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unreadable-bin case is not run");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_multi_perm_"};
+    const fs::path jvm = dir.path / "opt/java";
+    write_bad_then_good(jvm);
+    write_text(jvm / "a-bad/bin/javac", "");
+    REQUIRE(::chmod((jvm / "a-bad/bin").c_str(), 0000) == 0);
+    const PermRestore restore{jvm / "a-bad/bin"};
+    Acc acc;
+    CHECK(lnx::jvm_rows_at(dir.path, acc) == kBadThenGoodRows);
     CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
 }
 
