@@ -17,7 +17,10 @@
  * STALL COUNT. record_slice (file_search_governor.hpp) counts consecutive non-advancing attempts on ONE
  * cursor. The count is held here, per lineage (the cursor's query hash, sequence and generation), so the
  * agent is the holder and a caller needs no counter. The map is bounded; the oldest lineage is evicted,
- * and an evicted or never-seen lineage starts at zero.
+ * and an evicted or never-seen lineage starts at zero. Only a COUNT is kept: a terminal verdict (stalled or
+ * unstable) is delivered once, on the slice that reached it, and is not stored, so a later search of the
+ * same query, which starts at the same lineage, never inherits a dead search's verdict. `unstable` is
+ * re-derived from the cursor's generation on every slice, so forgetting it loses nothing.
  *
  * THREADS. Nothing here is synchronised: a SearchState is touched only by the pool thread that holds the
  * process-wide slot (file_search_driver.hpp), never by a worker.
@@ -97,11 +100,12 @@ public:
         return {};
     }
 
-    /// Remembers `state` for `lineage` as the newest entry, evicting the oldest past kMaxLineages. A
-    /// state that carries nothing (no stall, healthy) forgets the lineage instead.
+    /// Remembers `state` for `lineage` as the newest entry, evicting the oldest past kMaxLineages. Only a
+    /// healthy state with a stall count is kept: a state with no stall forgets the lineage, and so does a
+    /// terminal one (stalled or unstable), which the slice that reached it has already delivered.
     void store(const Lineage& lineage, const fsr::GovernorState& state) {
         std::erase_if(lineages_, [&](const auto& l) { return l.first == lineage; });
-        if (state.consecutive_stalls == 0 && state.health == fsr::Health::ok)
+        if (state.consecutive_stalls == 0 || state.health != fsr::Health::ok)
             return;
         if (lineages_.size() >= kMaxLineages)
             lineages_.erase(lineages_.begin());

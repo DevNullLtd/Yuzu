@@ -25,9 +25,12 @@
  * it: the module stays mapped for the life of the process, and the worker can finish on its own time. Init
  * fails if the pin cannot be taken.
  *
- * AFTER shutdown() RETURNS this plugin touches no heap or thread state of its own: the context pointer the
- * heartbeat writes through is cleared first, the stop flag ends a running walk at its next entry, and a
- * worker that is still blocked in a system call touches only state it co-owns.
+ * SHUTDOWN. shutdown() clears the context pointer the heartbeat writes through, sets the stop flag (a
+ * running walk ends at its next entry) and waits a short bounded quiesce for a call in flight. On the
+ * orderly stop the agent drains its thread pool before it calls shutdown(), so the stop flag never meets a
+ * running slice. When shutdown() runs first (the agent's exit path), a call still in flight when the
+ * quiesce bound passes finishes on its pool thread, inside the pinned module: it releases the slot, records
+ * its abandoned worker and writes its rows. An abandoned worker touches only state it co-owns.
  */
 
 #include <yuzu/plugin.hpp>
@@ -66,8 +69,8 @@ const YuzuActionDescriptor kActionDescriptors[] = {
          "constrained: only local filesystem types on the allow-list are searched and every other mount is "
          "reported by its own row; names compare byte for byte; a directory the agent cannot search is a "
          "gap, and the capability that lets the agent search directories of other accounts is held on the "
-         "walking thread only around opens (hygiene, not a boundary); the verdict reads partial when any "
-         "mount, directory or name was not searched"},
+         "walking thread only around directory opens, directory listings and the leaf open (hygiene, not a "
+         "boundary); the verdict reads partial when any mount, directory or name was not searched"},
         /* .macos_leg   = */
         {YUZU_SUPPORT_CONSTRAINED, 1,
          "resumable sorted depth-first search of the requested root, one slice per call, through no-follow "
@@ -118,6 +121,14 @@ constexpr std::string_view kExceptionProvenance = "linux:file_search:exception";
 constexpr std::array<std::string_view, 8> kHeartbeatKeys = {
     "heartbeat.slices",    "heartbeat.budget_stops", "heartbeat.stalled", "heartbeat.unstable",
     "heartbeat.timed_out", "heartbeat.rejected",     "heartbeat.failed",  "heartbeat.gaps"};
+
+// init deletes these through the C entry with data(): each must be the NUL-terminated literal it came from.
+static_assert([] {
+    for (const std::string_view k : kHeartbeatKeys)
+        if (k.data()[k.size()] != '\0')
+            return false;
+    return true;
+}());
 
 std::mutex g_heartbeat_mutex;              // guards the totals and the context pointer
 std::array<std::uint64_t, 8> g_totals{};   // under g_heartbeat_mutex
@@ -202,6 +213,14 @@ public:
         fs_plugin::posix_clear_stop();
         const std::lock_guard<std::mutex> lock(g_heartbeat_mutex);
         g_plugin_ctx = ctx.raw();
+        // "Since the agent started": the KV is a file that outlives the process and the totals restart at
+        // zero, so a key this process never counts would keep the last process's value. Delete them all: a
+        // tag is absent until this process counts something (a counter that never fired is absent, not
+        // zero). Through the C entry with the literal's own NUL-terminated data(): init must not throw, and
+        // PluginContext::storage_delete builds a std::string.
+        g_totals.fill(0);
+        for (const std::string_view key : kHeartbeatKeys)
+            (void)yuzu_ctx_storage_delete(g_plugin_ctx, key.data());
 #else
         (void)ctx;
 #endif

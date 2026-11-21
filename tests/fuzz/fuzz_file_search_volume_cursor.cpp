@@ -60,7 +60,9 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
     static const fs::CursorKey kOtherKey = key_of(0xa5);
 
     const std::string_view raw(reinterpret_cast<const char*>(data), size);
-    // As it came: total, and never accepted without a valid mac (which a mutation cannot make).
+    // As it came: total, and never accepted without a valid mac and a matching query hash (the hash is
+    // all zero here, so the shipped seeds stop at the query check; the re-signed pass below reaches the
+    // inner decoder).
     if (const auto as_is = fs::decode_volume_cursor(raw, fsr::QueryHash{}, kKey))
         require(fs::encode_volume_cursor(*as_is, kKey) == raw);
 

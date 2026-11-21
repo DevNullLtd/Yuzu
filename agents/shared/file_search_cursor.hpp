@@ -20,8 +20,8 @@
 //
 // Recovery: the agent keeps no cursor state, but a cursor is valid only in the agent process that issued
 // it. The same cursor replayed to that process re-walks the same slice (duplicates possible, no skip of
-// its own). A crash mid-slice issues no cursor, so the caller retries the previous one. After an agent
-// restart every earlier cursor is refused (bad_cursor) and the search starts again. A slice that
+// its own). A slice that fails without issuing a cursor is retried with the previous one; an agent crash
+// or restart refuses every earlier cursor (bad_cursor) and the search starts again. A slice that
 // completes the walk issues no cursor and may return the resume position itself, so strictly_advances
 // applies only to a cursor that is issued. One cursor covers one root, so a failing volume never advances
 // another volume's position.
@@ -44,8 +44,10 @@
 // RESTART). A comparison in this validator would be a second copy of the walker's rule. What no
 // resume can detect is listed in the walker's banner (walk_ordered, NOT DETECTED).
 //
-// Coverage: gap rows are slice-local. The cursor carries only their running count (prior_gaps),
-// so a final slice can never report complete after an earlier slice reported a gap. That count is
+// Coverage: gap rows are slice-local. The cursor carries only their running count (prior_gaps), so a
+// search that resumes from its latest cursor can never report complete after an earlier slice reported a
+// gap. An older authenticated cursor re-walks from its own point with the count it was issued with, so it
+// can finish complete if that gap is gone; the verdict is still true of what it walked. That count is
 // caller-held and unauthenticated in this token; it is trusted only because the enclosing fsv1 token
 // that carries it is authenticated, so a caller cannot edit it.
 //

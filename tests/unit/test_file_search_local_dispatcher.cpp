@@ -26,6 +26,8 @@
  *    or a typed status other than OK/FULL fails the slice case.
  *  - name rule: comparing bytes on macOS, or folding on Linux, fails the name case.
  *  - root: a root that is a link walked instead of refused fails the root case.
+ *  - heartbeat: an init that leaves the KV keys in place, or that does not zero the in-memory totals, fails
+ *    the heartbeat case (a seeded key survives init, or the count after one slice is not 1).
  *  - pin: an init that does not pin the module fails the pin case on a loader that unloads at the last
  *    dlclose (glibc) when the case runs before any other init in the process. macOS's dyld keeps this
  *    plugin's image resident whether or not it is pinned (checked with a bare dlopen/dlclose pair), so on
@@ -33,6 +35,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include <yuzu/agent/kv_store.hpp>
 #include <yuzu/agent/plugin_loader.hpp>
 #include <yuzu/plugin.h>
 #include <yuzu/plugin.hpp>
@@ -493,6 +496,43 @@ TEST_CASE("file_search plugin: init pins the module, so it stays mapped after th
     CHECK(still_mapped != nullptr);
     if (still_mapped != nullptr)
         ::dlclose(still_mapped);
+}
+
+// After the pin case on purpose: that case discriminates only when it runs before any other init.
+TEST_CASE("file_search plugin: the heartbeat totals count from this process's start, not from the KV file's",
+          "[file_search][file_search_dispatcher][file_search_heartbeat]") {
+    auto plugin = load_plugin();
+    if (!plugin) {
+        require_plugin_or_skip();
+        return;
+    }
+    yuzu::test::TempDir dir_guard{"yuzu_test_fs_hb_"};
+    std::error_code ec;
+    fs::create_directories(dir_guard.path, ec);
+    auto kv = yuzu::agent::KvStore::open(dir_guard.path / "kv_store.db");
+    REQUIRE(kv.has_value());
+    // what the last agent process left in the file: a counter this process never counts, and one it will
+    REQUIRE(kv->set("file_search", "heartbeat.stalled", "4"));
+    REQUIRE(kv->set("file_search", "heartbeat.slices", "9"));
+
+    yuzu::agent::StandalonePluginContext pctx("file_search", {}, &*kv);
+    REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+    // a tag is absent until this process counts something: neither survives init
+    CHECK_FALSE(kv->get("file_search", "heartbeat.stalled").has_value());
+    CHECK_FALSE(kv->get("file_search", "heartbeat.slices").has_value());
+
+    Fixture fx{"yuzu_test_fs_disp_"};
+    const std::string salt = fx.root.filename().string();
+    write_file(fx.root / ("yuzu-fs-control-" + salt + "-1.bin"), "control");
+    const auto r = Call{fx.root.string(), "yuzu-fs-control-" + salt + "-*.bin", "", ""}.run(plugin->descriptor);
+    REQUIRE(r.rc == 0);
+    // one real slice: its own count, digits, from zero (the 9 above is gone)
+    const auto slices = kv->get("file_search", "heartbeat.slices");
+    REQUIRE(slices.has_value());
+    CHECK(std::ranges::all_of(*slices, [](unsigned char c) { return c >= '0' && c <= '9'; }));
+    CHECK(*slices == "1");
+    CHECK_FALSE(kv->get("file_search", "heartbeat.stalled").has_value()); // a counter that never fired stays absent
 }
 
 #endif // !_WIN32

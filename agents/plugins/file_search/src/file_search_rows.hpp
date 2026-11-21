@@ -100,12 +100,19 @@ enum class Scope { system, user };
            (path.size() == prefix.size() || path[prefix.size()] == '/');
 }
 
-/// A user profile directory or anything below one. Linux: /home/<name> and /root. macOS: /Users/<name>
-/// except /Users/Shared, and /private/var/root (/var is a link there, so /var/root is never walked into
-/// and is not tagged). A home relocated elsewhere is NOT tagged: the tag is a path rule, not a lookup.
+/// A user profile directory or anything below one. Linux: /home/<name> and /root, and the same layout's
+/// spellings /var/home/<name> and /var/roothome (on an ostree-based system /home is a link the walk never
+/// follows, so every home is reached as /var/home/<name>). macOS: /Users/<name> except /Users/Shared, and
+/// /private/var/root (/var is a link there, so /var/root is never walked into and is not tagged); a path
+/// below /System/Volumes/Data (the root of a complete data-volume search) is read without that prefix. A
+/// home relocated elsewhere, or spelled in another case, is NOT tagged: the tag is a path rule, not a lookup.
 [[nodiscard]] constexpr bool is_user_profile_path(std::string_view path, Os os) noexcept {
     if (os == Os::linux_os)
-        return (path.size() > 6 && path.substr(0, 6) == "/home/") || under(path, "/root");
+        return (path.size() > 6 && path.substr(0, 6) == "/home/") || (path.size() > 10 && path.substr(0, 10) == "/var/home/") ||
+               under(path, "/root") || under(path, "/var/roothome");
+    constexpr std::string_view kDataVolume = "/System/Volumes/Data";
+    if (under(path, kDataVolume))
+        path.remove_prefix(kDataVolume.size());
     if (under(path, "/private/var/root"))
         return true;
     return path.size() > 7 && path.substr(0, 7) == "/Users/" && !under(path, "/Users/Shared");

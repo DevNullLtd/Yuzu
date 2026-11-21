@@ -46,6 +46,9 @@
  * signal is rc 1 (the double-throw arm), not a typed status. And their token
  * (`<os>:leg:exception`) carries no `:bad_alloc` suffix, so the provenance-shape check above
  * does not apply to them.
+ *
+ * The last case, for seam H, runs with a healthy allocator: a telemetry hook that throws after the answer
+ * was written is dropped where it is called, so the answer keeps its one `search` row and its typed status.
  */
 
 #include "browser_policy_legs.hpp"
@@ -62,6 +65,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <new>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 
@@ -337,4 +341,35 @@ TEST_CASE("file_search execute_search contains a slice that throws under sustain
     // whose containment is never exercised.
     REQUIRE(g_injected > 0);
     CHECK((rc == 1 || (g_status == YUZU_RESULT_STATUS_UNAVAILABLE && g_completeness == YUZU_RESULT_COMPLETENESS_UNKNOWN)));
+}
+
+// The after hook (heartbeat and log) runs once the answer is written. Its own throw is dropped where it is
+// called: it must not add a second `search` row or rewrite the typed status. Allocator healthy: this pins the
+// call site's containment, not the OOM arm above.
+TEST_CASE("file_search execute_search never rewrites a written answer when its after hook throws",
+          "[plugin][abi][file_search]") {
+    yuzu::CommandContext ctx{nullptr};
+    reset_stubs();
+    const auto slice = [](const yuzu::file_search::Request&) {
+        yuzu::file_search::SliceResult r;
+        r.status = yuzu::file_search::Status::ok;
+        r.rows = {"coverage|complete|1|0|0|0|consistency=not_a_snapshot", "search|ok|none|bytes|seq=0|q=a|links_skipped=0"};
+        return r;
+    };
+    const auto throwing_hook = [](const yuzu::file_search::SliceResult&) { throw std::runtime_error("telemetry"); };
+    bool escaped = false;
+    int rc = -1;
+    try {
+        rc = yuzu::file_search::execute_search(ctx, "search", "/", "yuzu-fs-control-*.bin", "", "",
+                                               &yuzu::shared::file_search::byte_exact, slice, throwing_hook,
+                                               "linux:file_search:exception");
+    } catch (...) {
+        escaped = true;
+    }
+    REQUIRE_FALSE(escaped);
+    CHECK(rc == 0);
+    CHECK(g_writes == 2); // the slice's own two rows, no second `search|failed|internal_error` trailer
+    CHECK(g_status_calls == 1);
+    CHECK(g_status == YUZU_RESULT_STATUS_OK);
+    CHECK(g_completeness == YUZU_RESULT_COMPLETENESS_FULL);
 }

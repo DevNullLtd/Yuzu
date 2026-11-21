@@ -131,11 +131,20 @@ namespace detail {
     return std::to_string(e.dev_major) + ":" + std::to_string(e.dev_minor);
 }
 
-/// A /tmp or /var/tmp mount that a service manager bound in from a private per-service directory.
+/// A /tmp or /var/tmp mount that a service manager bound in from a private per-service directory. The
+/// root field is relative to the SOURCE filesystem, so what precedes the directory depends on the layout
+/// (/tmp/..., /..., /@/tmp/... on a subvolume): the rule reads the last two components only. The root's
+/// last component is `tmp` and the one before it starts with `systemd-private-`.
 [[nodiscard]] inline bool is_private_tmp_bind(const yuzu::shared::MountEntry& e) {
     if (e.mount_point != "/tmp" && e.mount_point != "/var/tmp")
         return false;
-    return e.root.starts_with("/tmp/systemd-private-") || e.root.starts_with("/var/tmp/systemd-private-");
+    std::string_view r = e.root;
+    constexpr std::string_view kTail = "/tmp";
+    if (!r.ends_with(kTail))
+        return false;
+    r.remove_suffix(kTail.size());
+    const auto slash = r.rfind('/');
+    return slash != std::string_view::npos && r.substr(slash + 1).starts_with("systemd-private-");
 }
 
 inline constexpr const char* kMacosDataVolume = "/System/Volumes/Data";
@@ -323,6 +332,8 @@ namespace detail {
 }
 
 [[nodiscard]] inline std::string cursor_mac(const CursorKey& key, std::string_view message) {
+    // unsigned char to char: the aliasing every byte API permits; `key` outlives the call and the view is
+    // not kept.
     return yuzu::shared::hmac_sha256_hex(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()), message)
         .substr(0, kCursorMacHexBytes);
 }

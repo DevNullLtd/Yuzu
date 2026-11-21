@@ -22,7 +22,8 @@
  *    the slice that took the slot, fails the busy, late-completion and two-abandoned cases.
  *  - stall: a timeout not recorded as abandoned, a volume read as stalled after its worker returned, or a
  *    stall count shared between cursors fails the timeout, late-completion and lineage cases; a thrown worker read
- *    as a timeout fails the thrown case.
+ *    as a timeout fails the thrown case; a terminal verdict kept in the state (a later search of the same query
+ *    inheriting `stalled`) fails the state case and the fresh-search case.
  *  - cancel: a stop request whose slice carries state, issues a cursor, or reads as anything but a
  *    partial, cancelled volume fails the cancelled case.
  *  - limits and caps: a governor built from invalid limits, a sequence past kMaxSlices, a per-directory
@@ -420,6 +421,18 @@ TEST_CASE("file_search state: abandoned workers and stall counts are bounded and
     CHECK(t.carried(Lineage{other, kMaxLineages + 4, 0}).consecutive_stalls == 0); // so is the query
     t.store(Lineage{{}, kMaxLineages + 4, 0}, fsr::GovernorState{}); // a healthy state forgets
     CHECK(t.carried(Lineage{{}, kMaxLineages + 4, 0}).consecutive_stalls == 0);
+
+    // a terminal verdict is delivered once and not kept: only a healthy count is
+    for (const auto health : {fsr::Health::stalled, fsr::Health::unstable}) {
+        fsr::GovernorState dead;
+        dead.consecutive_stalls = 3;
+        dead.health = health;
+        const Lineage l{{}, kMaxLineages + 3, 0};
+        t.store(l, two); // a count is there to be replaced
+        t.store(l, dead);
+        CHECK(t.carried(l).health == fsr::Health::ok);
+        CHECK(t.carried(l).consecutive_stalls == 0);
+    }
 }
 
 // ---- the mapping and the seeding ----
@@ -893,6 +906,27 @@ TEST_CASE("file_search driver: a worker that throws is a failed slice, never a t
     CHECK(run_slice(make_request(kCtl), rig.b).status == Status::ok);
 }
 
+TEST_CASE("file_search driver: a search that ended stalled leaves no verdict for the next search of the same query",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/other.txt", ""); // a second entry, so a one-entry budget cuts the walk
+    rig.mode = Rig::Mode::reject;
+    CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
+    CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
+    CHECK(run_slice(make_request(kCtl), rig.b).reason == "stalled"); // the third: final
+    CHECK(rig.state.lineage_count() == 0);                          // delivered once, not kept
+
+    // a fresh search of the same query starts at the same lineage: its first slice is cut by a budget, which
+    // is not a stall, and the search runs to the end with every control found
+    rig.mode = Rig::Mode::run;
+    rig.b.limits.max_entries = 1;
+    const Run run = search(rig, kCtl);
+    CHECK(run.slices.size() > 1);
+    CHECK(found(run) == Strs{"/r/yuzu-fs-control-1.bin"});
+    CHECK(complete(run));
+}
+
 TEST_CASE("file_search driver: a stall count belongs to one cursor, and an evicted one starts again at zero",
           "[file_search][file_search_driver]") {
     Rig rig;
@@ -1061,7 +1095,7 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
         body,                                           // no mac at all
         signed_with(test_key(0x43), body),              // another process's key
         flipped_mac,
-        good_token + "0",                               // a mac one digit long
+        good_token + "0",                               // a mac one digit too long
         good_token.substr(0, good_token.size() - 1),
     };
     for (const auto& c : forged) {

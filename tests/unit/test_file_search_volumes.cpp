@@ -16,7 +16,10 @@
  *    keeping the first twin instead of the one that contains the root fails the second duplicate case.
  *  - behind a network mount: a unit beneath a network mount becoming a unit, or a unit beneath a tmpfs
  *    becoming a refused row, fails the pair.
- *  - private /tmp: not recognising the service manager's per-service directory fails the private case.
+ *  - private /tmp: not recognising the service manager's per-service directory fails the private case;
+ *    reading a fixed prefix of the root (instead of its last two components) fails the own-partition and
+ *    subvolume cases; matching a mount point other than /tmp and /var/tmp, or a root that does not end in
+ *    `tmp`, fails the negatives.
  *  - macOS: reporting the data volume as a duplicate instead of firmlinks_only, or applying the rule to a
  *    root below "/", fails the macOS cases.
  *  - caps: dropping units without counting them, or leaving a dropped mount out of a prune set, fails the
@@ -25,11 +28,11 @@
  *  - fsv1: accepting a non-canonical spelling (leading zero, sign, uppercase or short hash, an index of
  *    kMaxVolumes, a dot in the inner token, a mac that is not 32 lowercase hex digits) fails the refusal
  *    table; decoding without the query check fails the foreign-query refusal.
- *  - fsv1 mac: not checking it, checking only part of the token, comparing it under another key or with
- *    an early exit on a short mac, or reading the inner token before it, fails the forgery cases (an
- *    edited index, either hash, the gap count or the inner token under the old mac; every one-character
- *    edit of a token; a wrong key); a mac that is not HMAC-SHA-256 of the rest of the token truncated to
- *    16 bytes fails the pinned-vector case.
+ *  - fsv1 mac: not checking it, checking only part of the token, or comparing it under another key fails
+ *    the forgery cases (an edited index, either hash, the gap count or the inner token under the old mac;
+ *    every one-character edit of a token; a wrong key); a mac that is not HMAC-SHA-256 of the rest of the
+ *    token truncated to 16 bytes fails the pinned-vector case. (The compare's lack of an early exit and
+ *    the order of the mac check before the inner decode are not observable from a pure function.)
  *  - volume_advances: accepting a skipped index, a changed units hash, a backward sequence, a stale
  *    position or a changed generation on the move to the next unit fails the transition table; refusing a
  *    changed refused hash fails the accepting case.
@@ -269,6 +272,48 @@ TEST_CASE("file_search volumes: a /tmp bind from a private namespace is refused 
     Mounts n;
     n.add("/", "ext4", "8:1").add("/tmp", "ext4", "8:4");
     CHECK(mount_points(build_plan(n.table(), "/", Os::linux_os)) == Strs{"/", "/tmp"});
+}
+
+TEST_CASE("file_search volumes: a private tmp bind is recognised by its last two root components, whatever "
+          "precedes them",
+          "[file_search][file_search_volumes]") {
+    // /tmp and /var/tmp as their OWN partitions: the root field is relative to that partition, so it has no
+    // /tmp/ prefix (what systemd binds in for PrivateTmp=true on such a host)
+    Mounts own;
+    own.add("/", "ext4", "8:1")
+        .add("/tmp", "ext4", "8:2", "/systemd-private-abc-foo.service-xyz/tmp")
+        .add("/var/tmp", "ext4", "8:3", "/systemd-private-abc-foo.service-xyz/tmp");
+    const VolumePlan a = build_plan(own.table(), "/", Os::linux_os);
+    CHECK(mount_points(a) == Strs{"/"});
+    CHECK(reason_at(a, "/tmp") == fsr::Reason::private_namespace);
+    CHECK(reason_at(a, "/var/tmp") == fsr::Reason::private_namespace);
+
+    // a subvolume prefix, and /var/tmp inside a partition that holds all of /var
+    Mounts sub;
+    sub.add("/", "btrfs", "0:30", "/@")
+        .add("/tmp", "btrfs", "0:30", "/@/tmp/systemd-private-abc-foo.service-xyz/tmp")
+        .add("/var/tmp", "btrfs", "0:31", "/root/var/tmp/systemd-private-abc-foo.service-xyz/tmp");
+    const VolumePlan s = build_plan(sub.table(), "/", Os::linux_os);
+    CHECK(mount_points(s) == Strs{"/"});
+    CHECK(reason_at(s, "/tmp") == fsr::Reason::private_namespace);
+    CHECK(reason_at(s, "/var/tmp") == fsr::Reason::private_namespace);
+
+    // NEGATIVES: an ordinary own-partition /tmp (root "/") stays a unit, and the same private root on any
+    // other mount point is not matched (the rule names the two mount points)
+    Mounts neg;
+    neg.add("/", "ext4", "8:1")
+        .add("/tmp", "ext4", "8:2")
+        .add("/mnt/scratch", "ext4", "8:5", "/systemd-private-abc-foo.service-xyz/tmp");
+    const VolumePlan g = build_plan(neg.table(), "/", Os::linux_os);
+    CHECK(mount_points(g) == Strs{"/", "/mnt/scratch", "/tmp"});
+
+    // the root's last component must be `tmp` and the one before it must carry the marker
+    Mounts shape;
+    shape.add("/", "ext4", "8:1")
+        .add("/tmp", "ext4", "8:2", "/systemd-private-abc-foo.service-xyz/var")
+        .add("/var/tmp", "ext4", "8:3", "/data/tmp");
+    const VolumePlan h = build_plan(shape.table(), "/", Os::linux_os);
+    CHECK(mount_points(h) == Strs{"/", "/tmp", "/var/tmp"});
 }
 
 TEST_CASE("file_search volumes: macOS prunes the data volume under '/' as firmlinks_only, a root below is one unit",

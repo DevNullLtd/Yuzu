@@ -17,9 +17,12 @@
  *   failed  UNAVAILABLE, provenance file_search:<reason>
  * The status is a coarse summary for the host; the trailer and the coverage row are the answer.
  *
- * NO EXCEPTION CROSSES THE ABI. A throw anywhere in the body (parse, slice, row writes, the after hook)
- * becomes one `search|failed|internal_error` trailer and UNAVAILABLE; if even that cannot be built (the
- * allocator is failing) the call returns 1 rather than unwind through the SDK's extern "C" export.
+ * NO EXCEPTION CROSSES THE ABI. A throw in the body (parse, slice, row writes) becomes one
+ * `search|failed|internal_error` trailer and UNAVAILABLE; if even that cannot be built (the allocator is
+ * failing) the call returns 1 rather than unwind through the SDK's extern "C" export. The after hook is
+ * contained separately, where it is called: it runs once the answer is written, so what it throws is dropped
+ * and nothing is written for it. A slice's answer ends in exactly ONE `search` row, and telemetry never
+ * rewrites it.
  */
 #pragma once
 
@@ -52,8 +55,8 @@ using SemanticsFn = std::function<fsr::NameSemantics()>;
 /// One slice of a parsed request. Production: run_posix_slice. A test injects its own.
 using SliceFn = std::function<SliceResult(const Request&)>;
 
-/// Called once with a finished slice's result, after its rows were written: the plugin TU's heartbeat and
-/// log. Optional. It may throw; the seam below catches.
+/// Called once with a finished slice's result, after its rows and typed status were written: the plugin TU's
+/// heartbeat and log. Optional. It may throw: the call site below contains it and writes nothing for it.
 using AfterSliceFn = std::function<void(const SliceResult&)>;
 
 namespace execute_detail {
@@ -98,8 +101,12 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
         for (const auto& row : r.rows)
             ctx.write_output(row);
         execute_detail::report_status(ctx, r);
-        if (after)
-            after(r);
+        if (after) {
+            try {
+                after(r); // telemetry: a throw here must not add a second trailer to an answer already written
+            } catch (...) {
+            }
+        }
         return r.status == Status::invalid ? 1 : 0;
     } catch (...) {
         try {
@@ -139,8 +146,9 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
                                                    std::function<WorkResult()> work);
 
 /// Draws the process's cursor key (32 bytes from getentropy) if it has not been drawn; false if it cannot be,
-/// and then no search runs. Never drawn again once it succeeded, so a re-init keeps the cursors it issued
-/// valid for as long as the process lives.
+/// and then no search runs. The first draw is final either way: a failure is remembered and never retried, and
+/// a success is never drawn again, so a re-init keeps the cursors it issued valid for as long as the process
+/// lives.
 [[nodiscard]] bool posix_init_cursor_key() noexcept;
 
 /// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.

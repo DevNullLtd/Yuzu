@@ -13,7 +13,8 @@
  *  - 32 extents then a count: keeping more than kMaxExtents fails the size check; not counting the extents
  *    past it fails total; a lower bound printed without ">=" fails the lower-bound row.
  *  - user tag: tagging /home itself, /Users/Shared, /var/root (a link on macOS), or not tagging
- *    /private/var/root, /root or a name that merely starts with a prefix fails the table.
+ *    /private/var/root, /root, /var/home/<name>, /var/roothome, a home under /System/Volumes/Data, or a
+ *    name that merely starts with a prefix (/var/homes, /System/Volumes/Datax) fails the table.
  *  - gap path bound: a bound off by one fails the boundary pair.
  *  - constants: any figure changed without the plan changing fails the pin.
  */
@@ -233,6 +234,23 @@ TEST_CASE("file_search rows: the user-directory tag per OS", "[file_search][file
         {"/private/var/rooted/f", Os::macos, false},
         {"/home/alice", Os::macos, false}, // another platform's rule is not applied
         {"/Users/alice", Os::linux_os, false},
+        // the same layouts under other spellings: ostree homes on Linux, the data volume's own root on macOS
+        {"/var/home/alice", Os::linux_os, true},
+        {"/var/home/alice/docs/f.txt", Os::linux_os, true},
+        {"/var/home", Os::linux_os, false},
+        {"/var/home/", Os::linux_os, false},
+        {"/var/homes/x", Os::linux_os, false},
+        {"/var/roothome", Os::linux_os, true},
+        {"/var/roothome/.ssh/id", Os::linux_os, true},
+        {"/var/roothomes/x", Os::linux_os, false},
+        {"/System/Volumes/Data/Users/alice", Os::macos, true},
+        {"/System/Volumes/Data/Users/alice/Documents/f", Os::macos, true},
+        {"/System/Volumes/Data/Users/Shared/f", Os::macos, false},
+        {"/System/Volumes/Data/Users", Os::macos, false},
+        {"/System/Volumes/Data", Os::macos, false},
+        {"/System/Volumes/Data/private/var/root/f", Os::macos, true},
+        {"/System/Volumes/Datax/Users/alice", Os::macos, false},
+        {"/System/Volumes/Data/Users/alice", Os::linux_os, false},
     };
     for (const auto& r : rows) {
         INFO(r.path);

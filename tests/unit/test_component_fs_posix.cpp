@@ -30,6 +30,8 @@
  *    fails the roots_link_skipped counts.
  *  - replacing the descriptor compare in unchanged() with nothing fails the append and time cases.
  *  - adding, dropping or renaming a machine root in candidate_roots() fails the exact-set case.
+ *  - the spare slot: a deep hop that hands back the wrong handle fails the names of the deep-path case; a
+ *    stack that grows past kMaxPositionDepth + 1 descriptors, or a leg that leaks one, fails its counts.
  */
 #if !defined(_WIN32)
 
@@ -40,6 +42,7 @@
 #include "component_legs.hpp"
 #include "component_walk.hpp"
 
+#include <file_search_position.hpp>
 #include <network_fstype.hpp>
 
 #include <algorithm>
@@ -843,6 +846,73 @@ TEST_CASE("component_fs_posix: with the stack on, a directory swapped for a link
     CHECK(by_name(leg.ops.list((t.root / "app" / "inner").string(), 100)).at("kept.jar") == Type::file);
     fs::create_directory_symlink(t.root / "app", t.root / "app_link");
     CHECK(leg.ops.list((t.root / "app_link" / "inner").string(), 100).error);
+}
+
+namespace {
+
+// The descriptors this process holds, counted through /dev/fd (the iterator's own descriptor is in every count, so
+// a difference of two counts is exact).
+[[nodiscard]] std::size_t open_fd_count() {
+    std::error_code ec;
+    std::size_t n = 0;
+    for (const auto& e : fs::directory_iterator("/dev/fd", ec)) {
+        (void)e;
+        ++n;
+    }
+    return n;
+}
+
+[[nodiscard]] std::vector<std::string> listed_names(const SearchLeg& leg, const fs::path& dir) {
+    const auto r = leg.ops.list(dir.string(), 1000);
+    CHECK_FALSE(r.error);
+    std::vector<std::string> names;
+    for (const auto& e : r.entries)
+        names.push_back(e.name);
+    std::ranges::sort(names);
+    return names;
+}
+
+} // namespace
+
+TEST_CASE("component_fs_posix: with the stack on, a path deeper than the held stack still lists the right directories "
+          "and holds a bounded number of descriptors",
+          "[runtime][component_inventory][fs_posix][component_fs_posix]") {
+    // The stack holds kMaxPositionDepth directories (the root and the first components of the path); every
+    // deeper hop rolls through ONE spare slot, so the leg holds at most kMaxPositionDepth + 1 descriptors.
+    // The spare branch hands back a different handle than the stack top: a regression there is a wrong
+    // listing presented as the right one, which only the names can show.
+    constexpr std::size_t kStack = yuzu::shared::file_search::kMaxPositionDepth;
+    Tree t;
+    const std::size_t root_depth = static_cast<std::size_t>(std::ranges::count(t.root.string(), '/'));
+    REQUIRE(root_depth + 2 < kStack);
+    const std::size_t leaf_depth = kStack + 6 - root_depth;     // total depth kStack + 6: the last 7 hops use the spare
+    const std::size_t capped_depth = kStack - 1 - root_depth;   // total depth kStack - 1: the deepest directory held
+    const auto dir_at = [&](std::size_t depth) {
+        fs::path p = t.root;
+        for (std::size_t i = 1; i <= depth; ++i)
+            p /= "d" + std::to_string(i);
+        return p;
+    };
+    REQUIRE(fs::create_directories(dir_at(leaf_depth)));
+    write_file(dir_at(leaf_depth) / "leaf.txt", "L");
+    write_file(dir_at(leaf_depth - 1) / "mid.txt", "M");
+    write_file(dir_at(capped_depth) / "cap.txt", "C");
+    const auto child_of = [](std::size_t depth) { return "d" + std::to_string(depth + 1); };
+    using Names = std::vector<std::string>;
+
+    const std::size_t before = open_fd_count();
+    {
+        const auto leg = search_leg();
+        CHECK(listed_names(leg, dir_at(leaf_depth)) == Names{"leaf.txt"});
+        const std::size_t held = open_fd_count() - before;
+        CHECK(held > 0);
+        CHECK(held <= kStack + 1);
+        CHECK(listed_names(leg, dir_at(leaf_depth - 1)) == Names{child_of(leaf_depth - 1), "mid.txt"});
+        CHECK(listed_names(leg, dir_at(capped_depth)) == Names{"cap.txt", child_of(capped_depth)});
+        CHECK(listed_names(leg, dir_at(leaf_depth)) == Names{"leaf.txt"}); // back down through the spare
+        CHECK(open_fd_count() - before <= kStack + 1);
+    }
+    CHECK(open_fd_count() == before); // destroying the leg closes everything it held
 }
 
 TEST_CASE("component_fs_posix: a pruned mount point is never passed to stat or open, never listed, and costs no gap",

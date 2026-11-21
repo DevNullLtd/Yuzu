@@ -16,8 +16,8 @@ enablement table, the action descriptions and the kill-switch seed (a name-keyed
 path around the set); no second-tier or new-audit-verb spelling. The four
 `unrestricted_internal_consumer()` sites stay pinned, per site, by tests/test_response_store_read_tripwire.py.
 
-GREP LIMIT: lexical; it cannot see a branch that never runs or a plugin name built at run time (the unit
-tests assert the behaviour). `--selftest` deletes each required statement and appends each forbidden
+GREP LIMIT: lexical; it cannot see a branch that never runs, a plugin name built at run time or one split
+across adjacent string literals (the unit tests assert the behaviour). `--selftest` deletes each required statement and appends each forbidden
 spelling in memory and requires the gate to name it.
 
 Usage: python3 -I tests/test_file_search_read_tier_tripwire.py [--selftest]
@@ -89,12 +89,14 @@ FORBIDDEN: list[tuple[str, str, str]] = [
 TIER_FLAG_FILES = frozenset({CAP_HPP, SET_HPP, FRAGMENT})
 PLUGIN_NAME_FILES = frozenset({FRAGMENT, ENABLEMENT, DESCRIPTIONS, SERVER_CPP})
 TIER_FLAG = re.compile(r"\bStoredRowTier\b|\bstored_rows\b")
-PLUGIN_NAME = re.compile(r'"file_search\b')
+# A quote, or the raw-string opener `"(`, then the name, in any case: a SQL literal ('file_search' inside a
+# string), a case variant and R"(file_search)" are all names. A bare identifier is not (f(file_search)).
+PLUGIN_NAME = re.compile(r'(?:["\']|"\()file_search\b', re.IGNORECASE)
 
 # A cheap raw-text prefilter: only a file that mentions one of these is canonicalised.
 _PREFILTER = re.compile(
-    r'StoredRowTier|stored_rows|"file_search|response\.restricted|'
-    r"TierVisibility|restricted_names|same_securable")
+    r'file_search|StoredRowTier|stored_rows|response\.restricted|'
+    r"TierVisibility|restricted_names|same_securable", re.IGNORECASE)
 _SRC_EXTS = (".cpp", ".hpp", ".h", ".cc")
 
 
@@ -186,6 +188,13 @@ def selftest() -> int:
            "plugin-name-outside: the plugin named in another file was NOT detected")
     expect("plugin-name-outside" not in ids(dict(base, **{outside: canonical('// "file_search" in a comment')})),
            "plugin-name-outside: a comment mention must not count")
+    for what, spelling in (("a SQL literal", 'auto q = "WHERE plugin = \'file_search\'";'),
+                           ("a case variant", 'if (p == "File_Search") {}'),
+                           ("a raw string", 'auto r = R"(file_search)";')):
+        expect("plugin-name-outside" in ids(dict(base, **{outside: canonical(spelling)})),
+               f"plugin-name-outside: {what} in another file was NOT detected")
+    expect("plugin-name-outside" not in ids(dict(base, **{outside: canonical("use(file_search);")})),
+           "plugin-name-outside: a bare identifier must not count")
 
     print(f"selftest: {len(failures)} failure(s)")
     return 1 if failures else 0

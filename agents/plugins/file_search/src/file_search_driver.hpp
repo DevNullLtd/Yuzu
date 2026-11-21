@@ -108,12 +108,12 @@ struct WorkResult {
 struct Boundaries {
     SearchState& state;
     std::atomic<bool>& slot; // the process-wide single-flight slot
-    MountReader read_mounts;
-    LegFactory make_leg;
-    BoundedRunner<WorkResult> run_bounded;
-    std::function<fsr::Clock::time_point()> now;
-    std::function<void(std::chrono::milliseconds)> sleep;
-    std::function<bool()> stop_requested; // optional: polled between entries; true ends the walk
+    MountReader read_mounts{};
+    LegFactory make_leg{};
+    BoundedRunner<WorkResult> run_bounded{};
+    std::function<fsr::Clock::time_point()> now{};
+    std::function<void(std::chrono::milliseconds)> sleep{};
+    std::function<bool()> stop_requested{}; // optional: polled between entries; true ends the walk
     fsr::GovernorLimits limits{};         // the defaults are the ruled slice, entry and row budgets
     Os os{Os::linux_os};
     CursorKey cursor_key{};               // the process's cursor key; all zero (never set) is refused

@@ -10,8 +10,10 @@
  * worker touches only heap state it co-owns (its leg, its pattern, its done flag) and the operating system:
  * never the plugin context, the slot or the search state. On a timeout the pool thread stops waiting and the
  * worker runs on, abandoned, until its next syscall returns; the plugin module is pinned in memory at init
- * (file_search_plugin.cpp) so no worker can ever run unmapped code, and nothing here is touched after
- * shutdown() returns except by such a worker, through state it owns.
+ * (file_search_plugin.cpp) so no worker can ever run unmapped code. After shutdown() returns, a call still
+ * in flight when its quiesce bound passed finishes on its pool thread inside the pinned module (it releases
+ * the slot, records its abandoned worker and writes its rows), and an abandoned worker touches only state it
+ * owns.
  *
  * THE CURSOR KEY. 32 random bytes from getentropy, drawn once per process on first use and held for the life
  * of the (pinned) module: init draws it and fails if it cannot, and a re-init never draws another. It is
