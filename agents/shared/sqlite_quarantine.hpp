@@ -57,11 +57,13 @@
 /// The sidecar copy is by descriptor on POSIX: the sidecar is opened `O_NOFOLLOW` (a link
 /// swapped in at its live name is refused, never copied through) and must be a regular file, and
 /// the bytes go to a temporary beside the quarantine name (`<name>.partial-<pid>-<n>`, outside the
-/// name grammar below, so it is never counted, pruned or read as evidence) and are linked into
+/// name grammar below, so it is never counted or pruned) and are linked into
 /// place with `link(2)` only when complete: an entry of any kind that appears at the quarantine
 /// name (a link included) is neither overwritten nor written through, and a process that dies
 /// mid-copy leaves at most a stray temporary, never a truncated file at the quarantine name (the
-/// stray is not swept; it is not evidence). What stays by name is the publish (the `link(2)` from
+/// stray is not swept, and it is not evidence: it never holds the whole sidecar. The one exception
+/// is a publish refused by anything but an existing entry, which KEEPS the complete copy at its
+/// temporary name and logs where). What stays by name is the publish (the `link(2)` from
 /// the temporary to the quarantine name is by name at both ends, so a writer who replaces the
 /// temporary between its creation and the link has their entry published, and on macOS `link(2)` follows a
 /// link at its source), the removal of the temporary after a failed copy (a unique name this call
@@ -325,10 +327,10 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
     }
     partial.created = true;
     TemporaryRemoval cleanup{tmp, partial.removal};
-    partial.temporary = tmp;
     bool ok = true;
     {
         const yuzu::shared::ScopedFile dst{out};
+        partial.temporary = tmp; // allocates: after both owners exist, so nothing leaks on bad_alloc
         char buf[64 * 1024];
         for (;;) {
             const ssize_t n = ::read(src.fd(), buf, sizeof buf);
