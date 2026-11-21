@@ -212,15 +212,10 @@ std::expected<DexUsageMcpRequest, std::string> dex_usage_mcp_request(const json&
         // Integers only: a string, a float or a boolean is refused, and an unsigned value
         // above the bound is refused before it can wrap into the signed range.
         const std::string bad = "invalid floor (expected an integer from 1 to 10000)";
-        if (!it->is_number_integer())
+        if (!it->is_number_integer() ||
+            (it->is_number_unsigned() && it->get<std::uint64_t>() > 10000))
             return std::unexpected(bad);
-        if (it->is_number_unsigned()) {
-            if (it->get<std::uint64_t>() > 10000)
-                return std::unexpected(bad);
-            rq.floor = static_cast<std::int64_t>(it->get<std::uint64_t>());
-        } else {
-            rq.floor = it->get<std::int64_t>();
-        }
+        rq.floor = it->get<std::int64_t>();
         if (rq.floor < 1 || rq.floor > 10000)
             return std::unexpected(bad);
     }

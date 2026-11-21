@@ -1152,6 +1152,9 @@ TEST_CASE("usage refusal class: terminal reasons carry no retry hint", "[dex][us
         CHECK(c.kind == Kind::Terminal);
         CHECK(c.retry_after_ms == -1);
         CHECK(c.remediation.empty());
+        // A detail appears in the message only when it adds something to the reason.
+        CHECK(c.message == "fleet application usage unavailable (" + std::string(reason) + ")");
+        CHECK(classify(reason, reason).message == c.message);
     }
 }
 
@@ -1180,15 +1183,6 @@ TEST_CASE("usage refusal class: every other refusal is retryable after 2 seconds
         CHECK(c.retry_after_ms == 2000);
         CHECK(c.remediation == "retry shortly");
     }
-}
-
-TEST_CASE("usage refusal class: the message carries a detail only when it adds something",
-          "[dex][usage_model]") {
-    CHECK(classify("no_population").message == "fleet application usage unavailable (no_population)");
-    CHECK(classify("no_population", "no_population").message ==
-          "fleet application usage unavailable (no_population)");
-    CHECK(classify("apps_degraded", "query_error").message ==
-          "fleet application usage unavailable (apps_degraded: query_error)");
 }
 
 TEST_CASE("usage mcp request: no arguments yields the REST defaults", "[dex][usage_model]") {

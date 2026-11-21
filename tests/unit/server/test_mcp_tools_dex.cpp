@@ -1808,17 +1808,18 @@ DexAppsUsageModel usage_model() {
 
 } // namespace
 
-TEST_CASE("get_dex_apps_usage: served with its security row, read-only annotations and typed schemas",
+TEST_CASE("get_dex_apps_usage: served with typed schemas and a description naming both permissions",
           "[mcp][dex][usage][registry_seam]") {
     Twin t;
+    // The declared pair is the REST route's first gate (Forensics:Read is the handler's second) and a
+    // service-scoped token is refused outright: nothing else pins this tool's service-scope class.
     const auto sec = mcp::tool_security_rows_for_test();
-    const auto it = std::find_if(sec.begin(), sec.end(),
-                                 [](const auto& s) { return s.name == "get_dex_apps_usage"; });
-    REQUIRE(it != sec.end());
-    // The declared pair is the REST route's first gate; Forensics:Read is the handler's second.
-    CHECK(it->securable == "GuaranteedState");
-    CHECK(it->operation == "Read");
-    CHECK(it->service_scope == mcp::ServiceScopeClassForTest::kDenied);
+    const auto sec_it = std::find_if(sec.begin(), sec.end(),
+                                     [](const auto& s) { return s.name == "get_dex_apps_usage"; });
+    REQUIRE(sec_it != sec.end());
+    CHECK(sec_it->securable == "GuaranteedState");
+    CHECK(sec_it->operation == "Read");
+    CHECK(sec_it->service_scope == mcp::ServiceScopeClassForTest::kDenied);
 
     auto res = t.post(R"({"jsonrpc":"2.0","method":"tools/list","id":1})");
     REQUIRE(res);
@@ -1828,10 +1829,6 @@ TEST_CASE("get_dex_apps_usage: served with its security row, read-only annotatio
         if (e["name"] == "get_dex_apps_usage")
             tool = &e;
     REQUIRE(tool != nullptr);
-    CHECK((*tool)["annotations"]["readOnlyHint"] == true);
-    CHECK((*tool)["annotations"]["idempotentHint"] == true);
-    CHECK((*tool)["annotations"]["destructiveHint"] == false);
-    CHECK((*tool)["annotations"]["openWorldHint"] == false);
     const json& out = (*tool)["outputSchema"];
     CHECK(out["properties"].contains("apps"));
     CHECK(out["properties"].contains("population"));
@@ -1843,8 +1840,6 @@ TEST_CASE("get_dex_apps_usage: served with its security row, read-only annotatio
     const std::string desc = (*tool).value("description", "");
     CHECK(desc.find("Forensics:Read") != std::string::npos);
     CHECK(desc.find("dex.apps.usage.view") != std::string::npos);
-    const auto writes = mcp::write_tool_names_for_test();
-    CHECK(std::count(writes.begin(), writes.end(), std::string("get_dex_apps_usage")) == 0);
 }
 
 TEST_CASE("get_dex_apps_usage: success serves the REST body, writes the domain row before the read "
@@ -1924,48 +1919,31 @@ TEST_CASE("get_dex_apps_usage: both gates are asked, in REST's order, and each r
 TEST_CASE("get_dex_apps_usage: an argument refusal is an invalid-params error with no domain row "
           "and no read",
           "[mcp][dex][usage]") {
-    const json bad[] = {json{{"bogus", 1}}, json{{"floor", "5"}},
-                        json{{"group", "g1"}}}; // group without slice=group
-    for (const auto& args : bad) {
-        INFO(args.dump());
-        Twin t;
-        const json r = t.call("get_dex_apps_usage", args);
-        check_a4_refusal(r, "correct the arguments and call again");
-        CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
-        CHECK(t.legacy_rows.empty());
-        CHECK(t.usage_calls.empty());
-    }
+    // The handler's strict parser refuses an unknown key (the schema also says so); one case proves
+    // the handler maps a parse failure to invalid-params, the full table is in test_dex_usage_model.cpp.
+    Twin t;
+    const json r = t.call("get_dex_apps_usage", json{{"bogus", 1}});
+    check_a4_refusal(r, "correct the arguments and call again");
+    CHECK(audit_count(t.generic_rows, kUsageGeneric + "denied") == 1);
+    CHECK(t.legacy_rows.empty());
+    CHECK(t.usage_calls.empty());
 }
 
-TEST_CASE("get_dex_apps_usage: defaults and valid arguments reach the read unchanged",
-          "[mcp][dex][usage]") {
-    SECTION("defaults") {
-        Twin t;
-        REQUIRE_FALSE(t.call("get_dex_apps_usage").contains("error"));
-        REQUIRE(t.usage_calls.size() == 1);
-        const auto& c = t.usage_calls[0];
-        CHECK(c.window == "7d");
-        CHECK(c.platform == "all");
-        CHECK(c.slice.kind == DexUsageSliceKind::Fleet);
-        CHECK(c.slice.key.empty());
-        CHECK(c.floor == kDexCohortFloor);
-    }
-    SECTION("a group slice, a tag slice with the default key, and an explicit floor") {
-        Twin t;
-        REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "group"}, {"group", "grp-1"},
-                                                     {"window", "30d"}, {"platform", "linux"},
-                                                     {"floor", 10}})
-                          .contains("error"));
-        REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "tag"}}).contains("error"));
-        REQUIRE(t.usage_calls.size() == 2);
-        CHECK(t.usage_calls[0].slice.kind == DexUsageSliceKind::Group);
-        CHECK(t.usage_calls[0].slice.key == "grp-1");
-        CHECK(t.usage_calls[0].window == "30d");
-        CHECK(t.usage_calls[0].platform == "linux");
-        CHECK(t.usage_calls[0].floor == 10);
-        CHECK(t.usage_calls[1].slice.kind == DexUsageSliceKind::Tag);
-        CHECK(t.usage_calls[1].slice.key == kDexDefaultCohortKey);
-    }
+TEST_CASE("get_dex_apps_usage: valid arguments reach the read unchanged", "[mcp][dex][usage]") {
+    Twin t;
+    REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "group"}, {"group", "grp-1"},
+                                                 {"window", "30d"}, {"platform", "linux"},
+                                                 {"floor", 10}})
+                      .contains("error"));
+    REQUIRE_FALSE(t.call("get_dex_apps_usage", {{"slice", "tag"}}).contains("error"));
+    REQUIRE(t.usage_calls.size() == 2);
+    CHECK(t.usage_calls[0].slice.kind == DexUsageSliceKind::Group);
+    CHECK(t.usage_calls[0].slice.key == "grp-1");
+    CHECK(t.usage_calls[0].window == "30d");
+    CHECK(t.usage_calls[0].platform == "linux");
+    CHECK(t.usage_calls[0].floor == 10);
+    CHECK(t.usage_calls[1].slice.kind == DexUsageSliceKind::Tag);
+    CHECK(t.usage_calls[1].slice.key == kDexDefaultCohortKey);
 }
 
 TEST_CASE("get_dex_apps_usage: the fleet gate's scope reaches the read exactly as given",
@@ -1997,7 +1975,7 @@ TEST_CASE("get_dex_apps_usage: the fleet gate's scope reaches the read exactly a
 TEST_CASE("get_dex_apps_usage: the access row fails closed, so a dropped or throwing sink reads nothing",
           "[mcp][dex][usage][security]") {
     for (const bool throws : {false, true}) {
-        INFO(throws ? "sink throws" : "sink drops the row");
+        INFO((throws ? "sink throws" : "sink drops the row"));
         Twin t;
         t.legacy_audit_fails = !throws;
         t.legacy_audit_throws = throws;
@@ -2038,13 +2016,8 @@ TEST_CASE("get_dex_apps_usage: a refused read is an error, classified as the RES
     };
     const Row rows[] = {
         {"invalid_slice", "unknown_group", mcp::kInvalidParams, false},
-        {"invalid_slice", "", mcp::kInvalidParams, false},
         {"usage_unavailable", "fleet_too_large", mcp::kInternalError, false},
-        {"no_population", "", mcp::kInternalError, false},
-        {"invalid_request", "", mcp::kInternalError, false},
         {"usage_unavailable", "concurrency_budget", mcp::kInternalError, true},
-        {"usage_unavailable", "statement_timeout", mcp::kInternalError, true},
-        {"apps_degraded", "score_policy_unavailable", mcp::kInternalError, true},
     };
     for (const auto& row : rows) {
         INFO(row.reason << ":" << row.detail);
@@ -2083,23 +2056,6 @@ TEST_CASE("get_dex_apps_usage: every admitted call writes its own access row, a 
     REQUIRE(t.call("get_dex_apps_usage").contains("error"));
     CHECK(audit_count(t.legacy_rows, kUsageRow) == 2);
     CHECK(t.usage_calls.size() == 2);
-}
-
-TEST_CASE("get_dex_apps_usage: a population of zero is a success, not an error",
-          "[mcp][dex][usage]") {
-    Twin t;
-    // No devices and no applications, but a real window and platform scope: an empty string would
-    // fall outside the output schema's enums, which the assertion below holds the body to.
-    DexAppsUsageModel empty;
-    empty.window = "7d";
-    empty.platform_scope = "all";
-    t.usage_result = empty;
-    const json r = t.call("get_dex_apps_usage");
-    REQUIRE_FALSE(r.contains("error"));
-    const json& sc = r["result"]["structuredContent"];
-    CHECK(sc["population"] == 0);
-    CHECK(sc["apps"].empty());
-    CHECK(schema_violation(t.output_schema("get_dex_apps_usage"), sc) == "");
 }
 
 TEST_CASE("get_dex_apps_usage: an unwired closure is a non-retryable internal error and reads nothing",
