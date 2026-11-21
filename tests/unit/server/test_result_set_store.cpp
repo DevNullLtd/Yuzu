@@ -1170,7 +1170,7 @@ bool role_is_superuser(const std::string& dsn) {
 
 // The cascade from gc_sweep's header delete must not depend on temporary-file space: a DELETE
 // transition table would capture every cascaded member row and fail the sweep, every pass, under
-// a temp_file_limit. Setting temp_file_limit needs a superuser, so the case skips otherwise.
+// a temp_file_limit (and an AFTER row trigger would queue an in-memory event per row). Setting temp_file_limit needs a superuser, so the case skips otherwise.
 TEST_CASE("ResultSetStore: a GC sweep cascading many member rows succeeds under a small "
           "temp_file_limit",
           "[pg][result_set][gc][member_cache]") {
@@ -1251,6 +1251,23 @@ TEST_CASE("ResultSetStore: a store opened without the re-stamp triggers in force
                  "result_set_store.result_set_members_restamp(); " +
                  always + "result_set_members_restamp_trunc";
     }
+    SECTION("a DELETE trigger recreated with a WHEN clause that never fires") {
+        exec_sql(db.dsn(), "DROP TRIGGER result_set_members_restamp_del ON "
+                           "result_set_store.result_set_members; "
+                           "CREATE TRIGGER result_set_members_restamp_del BEFORE DELETE ON "
+                           "result_set_store.result_set_members FOR EACH ROW WHEN (false) "
+                           "EXECUTE FUNCTION "
+                           "result_set_store.result_set_members_restamp_deleted(); " +
+                               always + "result_set_members_restamp_del");
+        // Re-running v7 at the next open recreates the trigger.
+        repair = "UPDATE public.schema_meta SET version = 6 WHERE store = 'result_set_store'";
+    }
+    SECTION("a SECURITY DEFINER DELETE function") {
+        exec_sql(db.dsn(), "ALTER FUNCTION result_set_store.result_set_members_restamp_deleted() "
+                           "SECURITY DEFINER");
+        repair = "ALTER FUNCTION result_set_store.result_set_members_restamp_deleted() "
+                 "SECURITY INVOKER";
+    }
     SECTION("an altered DELETE function") {
         exec_sql(db.dsn(), "CREATE OR REPLACE FUNCTION "
                            "result_set_store.result_set_members_restamp_deleted() RETURNS trigger "
@@ -1268,6 +1285,80 @@ TEST_CASE("ResultSetStore: a store opened without the re-stamp triggers in force
     ResultSetStore repaired{pool};
     REQUIRE(repaired.is_open());
     CHECK(cached(repaired));
+}
+
+// SG8-1: a member write the trigger sees on a PENDING set (no generation yet) must be ordered
+// against the materialize fill. The re-stamp locks the header whatever its generation, so the
+// fill's stamping UPDATE waits for the out-of-band transaction to commit and its generation
+// covers that write. Without the lock the fill commits first, a reader caches its generation
+// without the write, and a warm replica then disagrees with a cold one.
+TEST_CASE("ResultSetStore: an out-of-band member write on a pending set is ordered against the "
+          "fill",
+          "[pg][result_set][member_cache][concurrency]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    ResultSetStore warm{pool};
+    REQUIRE(warm.is_open());
+    auto rs = warm.create_pending(req("alice"), "exec-race");
+    REQUIRE(rs.has_value());
+    const std::string id = "'" + rs->id + "'";
+
+    std::string write;
+    std::unordered_set<std::string> expected;
+    SECTION("INSERT") {
+        write = "INSERT INTO result_set_store.result_set_members VALUES (" + id + ", 'oob-dev')";
+        expected = {"dev-1", "oob-dev"};
+    }
+    SECTION("DELETE") {
+        exec_sql(db.dsn(), "INSERT INTO result_set_store.result_set_members VALUES (" + id +
+                               ", 'oob-dev')");
+        write = "DELETE FROM result_set_store.result_set_members WHERE result_set_id = " + id +
+                " AND device_id = 'oob-dev'";
+        expected = {"dev-1"};
+    }
+
+    PgConn oob{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(oob.get()) == CONNECTION_OK);
+    {
+        PgResult r{PQexec(oob.get(), ("BEGIN; " + write).c_str())};
+        INFO(PQresultErrorMessage(r.get()));
+        REQUIRE(r.ok());
+    }
+    std::atomic<bool> filled{false};
+    bool fill_ok = false;
+    std::thread fill([&] {
+        fill_ok = warm.materialize(rs->id, {"dev-1"}).has_value();
+        filled = true;
+    });
+    // Wait until the fill is blocked on a lock (the fix) or has finished (the defect).
+    bool fill_waited = false;
+    for (int i = 0; i < 500 && !filled; ++i) {
+        if (query_scalar(db.dsn(), "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                                   "current_database() AND wait_event_type = 'Lock'") != "0") {
+            fill_waited = true;
+            break;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    }
+    // A reader between the fill and the out-of-band commit.
+    auto mid = warm.member_set_owned(rs->id, "alice");
+    {
+        PgResult r{PQexec(oob.get(), "COMMIT")};
+        INFO(PQresultErrorMessage(r.get()));
+        CHECK(r.ok());
+    }
+    fill.join();
+    REQUIRE(fill_ok);
+    CHECK(fill_waited);
+    if (!mid.has_value())
+        CHECK(mid.error() == ResultSetError::NotReady); // the fill had not committed yet
+    auto after = warm.member_set_owned(rs->id, "alice");
+    REQUIRE(after.has_value());
+    CHECK(*after->ids == expected);
+    ResultSetStore cold{pool};
+    auto cold_read = cold.member_set_owned(rs->id, "alice");
+    REQUIRE(cold_read.has_value());
+    CHECK(*cold_read->ids == *after->ids); // warm and cold replicas agree
 }
 
 TEST_CASE("ResultSetStore: a materialize fill and a pending set stamp as the writer decides",

@@ -5158,6 +5158,8 @@ ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER result_set
 
 then restart every server. Logical replication into the `result_set_store` schema is not a supported topology: its apply worker fires row-level triggers only, so the `INSERT` and `UPDATE` re-stamps do not run there.
 
+The re-stamp can also be skipped on purpose: the `DELETE` trigger skips the rows of a set it has already re-stamped in the same transaction by a transaction-local setting, `result_set_store.restamped`, and any session that may delete from `result_set_members` can set that value itself. Treat a session that sets it like a direct `UPDATE` of `membership_generation`: restart every server afterwards. Yuzu's own servers never set it outside the trigger.
+
 Restart **every** server replica (stop them all, then start them) after any change to `result_set_store` that does not fire those triggers, or a server that had cached a set can keep using its old members while another server uses the new ones:
 
 - a restore run with `--disable-triggers`, or any session that ran `ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER ...` while servers were running (re-enable them afterwards with `ENABLE ALWAYS TRIGGER`, as above);

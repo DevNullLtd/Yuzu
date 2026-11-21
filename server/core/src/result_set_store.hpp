@@ -72,12 +72,15 @@
 /// (`insert_row_impl` in the header INSERT, `materialize` in its status-guarded UPDATE), and
 /// the v7 triggers enforce it for every other writer (manual SQL, a data-only restore, a
 /// delete issued from another trigger, a future code path): INSERT and UPDATE re-stamp, per
-/// statement, the sets named in their transition tables; DELETE re-stamps, per row but at most
-/// once per set per transaction, the set the row belonged to; TRUNCATE re-stamps every set that
-/// carries a generation. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
+/// statement, the sets named in their transition tables; DELETE (BEFORE, per row) re-stamps the
+/// set the row belonged to, skipping the following rows of the same set by a single-slot
+/// per-transaction marker; TRUNCATE re-stamps every set that carries a generation. Every
+/// re-stamp locks the header row, a pending one included, so an out-of-band write is ordered
+/// against `materialize`'s stamping UPDATE. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
 /// writes nothing: its header is gone and every cached copy reads `NotFound`. The constructor
-/// checks that the four triggers are present, ENABLE ALWAYS and bound to v7's function bodies;
-/// when they are not it logs an error and retains nothing, so every read takes the joined read.
+/// checks that the four triggers are present, ENABLE ALWAYS, of v7's shape and bound to v7's
+/// function bodies; when they are not, or the check cannot be read, it logs an error and
+/// retains nothing, so every read takes the joined read.
 /// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
 /// --disable-triggers`), or that writes `membership_generation` directly, while servers are
 /// running breaks the invariant; every replica must then be restarted

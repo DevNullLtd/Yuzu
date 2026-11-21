@@ -399,16 +399,20 @@ generation stays the same.** Every write to `result_set_members` must re-stamp t
 each affected set in the writing transaction. The two writers (`insert_row_impl`, `materialize`)
 stamp it themselves; v7 enforces it for every other writer with `ENABLE ALWAYS` triggers:
 INSERT and UPDATE are statement-level and re-stamp the sets in their transition tables, so a bulk
-load costs one header update per affected set per statement, never one per row; DELETE is
-row-level, at any trigger depth, and re-stamps each set at most once per transaction (a
-transaction-ID-keyed, transaction-local marker); TRUNCATE re-stamps every stamped set. DELETE is
-row-level on purpose: a DELETE transition table would capture every member row a `gc_sweep`
-cascade removes, spill it to temporary files and fail the sweep, on every pass, under a
-`temp_file_limit`. A cascade from a `result_sets` delete writes nothing, because the header is
-gone: one key probe per set and one comparison per row (about 0.9 s instead of 0.22 s for a
-1M-row cascade, measured once on PostgreSQL 16). At open the store checks that the four triggers
-are present, `ENABLE ALWAYS` and bound to v7's function bodies; otherwise it logs an error and
-serves membership uncached. A writer that disables the triggers while servers run, or writes
+load costs one header update per affected set per statement, never one per row; DELETE is a
+BEFORE row trigger, at any trigger depth, whose `WHEN` clause skips the rest of a run of one
+set's rows (a transaction-ID-keyed, transaction-local, single-slot marker: interleaved sets
+re-stamp more often, never less); TRUNCATE re-stamps every stamped set. Every re-stamp writes the
+header row whatever its generation (NULL stays NULL), so it holds the header lock to commit and
+is ordered against `materialize`'s stamping UPDATE of a pending set. DELETE is neither a
+transition table, which would capture every member row a `gc_sweep` cascade removes, spill to
+temporary files and fail the sweep under a `temp_file_limit` on every pass, nor an AFTER row
+trigger, which queues one in-memory event per cascaded row for the whole pass. A cascade from a
+`result_sets` delete writes nothing, because the header is gone: one key probe per set and one
+expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measured once on
+PostgreSQL 16). At open the store checks that the four triggers are present, `ENABLE ALWAYS`,
+of v7's shape and bound to v7's function bodies; otherwise, or if the check cannot be read, it
+logs an error and serves membership uncached. A writer that disables the triggers while servers run, or writes
 `membership_generation` directly, breaks the
 invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set
 membership after a restore or repair"). A new member writer keeps the stamp and never disables

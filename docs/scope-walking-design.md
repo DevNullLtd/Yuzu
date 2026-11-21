@@ -131,12 +131,14 @@ Reusing cached IDs is sound only because a set's members never change while its 
 stays the same. The two server writers stamp a new generation in the transaction that writes
 the members, and triggers on `result_set_members` (store migration v7) re-stamp it for any
 other writer: an INSERT or UPDATE re-stamps, per statement, the sets it touched; a DELETE
-re-stamps the set of each row it removes, at most once per set per transaction (also when
-issued from inside another trigger); a TRUNCATE re-stamps every set that has a generation. A
+re-stamps the set of each row it removes, once per run of one set's rows (also when issued
+from inside another trigger); a TRUNCATE re-stamps every set that has a generation. Each
+re-stamp locks the set's header, also a pending one, so an out-of-band write and the fill of a
+pending set are ordered and the fill's generation covers the write. A
 bulk load costs one header update per set per statement, never one per member row. A delete
 that cascades from `result_sets` writes nothing, since the header is gone and every cached copy
-reads it as not found; DELETE is row-level so that such a cascade (the GC sweep's) never
-captures its rows into temporary files. A server whose store opens without the four triggers in
+reads it as not found; DELETE is a BEFORE row trigger so that such a cascade (the GC sweep's)
+never captures its rows into temporary files or an in-memory event queue. A server whose store opens without the four triggers in
 force logs an error and serves membership uncached. A writer that disables the triggers, or
 writes the generation column directly, bypasses this; the
 operator procedure is in the server administration guide, "Result-set membership after a
