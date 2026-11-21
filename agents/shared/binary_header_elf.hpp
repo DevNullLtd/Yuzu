@@ -54,6 +54,7 @@ struct ElfProgramHeader {
     std::uint64_t align{0};
 };
 
+// owner and desc are not sanitised: the bytes of the file.
 struct ElfNote {
     std::string owner;
     std::uint32_t type{0};
@@ -68,6 +69,7 @@ struct ElfInfo {
     std::uint16_t machine{0};
     std::uint64_t entry{0};
     std::vector<ElfProgramHeader> program_headers;
+    // interpreter and soname are not sanitised: the bytes of the file, control characters included.
     std::string interpreter;
     std::string soname;
     std::string build_id;
