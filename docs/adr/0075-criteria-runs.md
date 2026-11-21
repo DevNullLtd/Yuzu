@@ -544,8 +544,20 @@ prerequisites:
    gets no datasource on these tables; Postgres stays the only substrate for transactional state.
 4. **Export starts at final** (D28). The set gains an `exported_at` stamp, written only when
    ClickHouse answers HTTP 200. `gc_sweep` reaps a `criteria_run` set only when its TTL has passed
-   **and** `exported_at` is set. An unexported set stays warm and readable, is retried every tick,
-   and raises a metric and an alert.
+   **and** `exported_at` is set. An unexported set stays warm and readable. Retry eligible batches with
+   bounded concurrency, jittered backoff and bounded recovery throughput. Release PostgreSQL
+   transactions and connections before waiting for ClickHouse.
+
+   **Backpressure (owner decision, 2026-11-21).** Before enabling export-dependent reaping,
+   enforce the ADR-0006 cold-record capacity policy on every create and re-run. Across replicas,
+   atomically reserve a conservative byte bound for the authorized cohort, its terminal rows and
+   indexes before materialization or scheduling. Charge through warm-space reclamation and
+   reconcile existing records and reservations on upgrade or restart. Preserve headroom for
+   ordinary writes, WAL and maintenance. Return a permanent size-limit error when the run can
+   never fit, or a retryable capacity error when available headroom is insufficient or unknown.
+   Resume admission below the recovery threshold. Measure charged bytes, headroom, oldest
+   unexported age and refusals; alert before PostgreSQL service is threatened. Size the defaults
+   from measured storage and WAL growth.
 5. **Deduplication, two layers** (D29). The table is `ReplacingMergeTree ORDER BY (result_set_id,
    device_id)`, partitioned by the day of final, with a 90-day TTL. Export batches are cut
    deterministically (by `device_id`, fixed size) and each is sent with
@@ -727,7 +739,7 @@ writer (D34; `sync_source_installed_software.cpp:1099-1111`).
 | 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2), with the warm-only retention stated in the user manual, the `changelog.d/` fragment and the upgrade note (R11.9; D61); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
 | 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window, through the in-memory waiting set (R6.4, R6.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`) |
 | 1.12 | Re-eval of `criteria_run` sets: the floor on either securable, `load_owned`, the gate by stored kind, the MCP row, the approval pre-check and the ticket bound to the kind and the input-spec digest; the route description; a test that a service-scoped re-run is refused (R12.1, R12.2, R12.6, R12.7, R9.9; D42, D53, D58, D59). | 1.10 | MCP server (the approval pre-check); authentication and RBAC; service-scoped confinement; headless platform (a changed approval gate); agentic-first A5; scope walking |
-| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, and the unexported-set metric and alert (R11.3 to R11.6); removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
+| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, cross-replica admission reservations, bounded retries, and capacity metrics and alerts (R11.3 to R11.6); removes PR 1.10's warm-only retention statement from the user manual, in the same change (R11.9; D61). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
 
 Every PR that changes C++ also triggers the C++ conventions and resource-ownership rows, and
 `docs-writer` reviews every PR. These are the rows this design reaches; each PR's governance run
