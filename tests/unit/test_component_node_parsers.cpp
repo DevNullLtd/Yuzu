@@ -49,22 +49,21 @@ TEST_CASE("node: real package.json captures give their name and version", "[runt
         const char* file;
         const char* path;
         const char* dir_name;
-        std::size_t nesting;
         const char* name;
         const char* version;
     };
     const Row rows[] = {
-        {"semver.package.json", "app/node_modules/semver/package.json", "semver", 1, "semver", "5.7.2"},
-        {"ms.package.json", "app/node_modules/ms/package.json", "ms", 1, "ms", "2.1.3"},
-        {"debug.package.json", "app/node_modules/debug/package.json", "debug", 1, "debug", "4.4.3"},
-        {"babel-core.package.json", "app/node_modules/@babel/core/package.json", "@babel/core", 1, "@babel/core",
+        {"semver.package.json", "app/node_modules/semver/package.json", "semver", "semver", "5.7.2"},
+        {"ms.package.json", "app/node_modules/ms/package.json", "ms", "ms", "2.1.3"},
+        {"debug.package.json", "app/node_modules/debug/package.json", "debug", "debug", "4.4.3"},
+        {"babel-core.package.json", "app/node_modules/@babel/core/package.json", "@babel/core", "@babel/core",
          "7.24.0"},
         {"babel-core-nested-semver.package.json", "app/node_modules/@babel/core/node_modules/semver/package.json",
-         "semver", 2, "semver", "6.3.2"},
+         "semver", "semver", "6.3.2"},
         {"jridgewell-sourcemap-codec.package.json", "app/node_modules/@jridgewell/sourcemap-codec/package.json",
-         "@jridgewell/sourcemap-codec", 1, "@jridgewell/sourcemap-codec", "1.6.0"},
+         "@jridgewell/sourcemap-codec", "@jridgewell/sourcemap-codec", "1.6.0"},
         {"babel-helper-string-parser.package.json",
-         "app/node_modules/@babel/helper-string-parser/package.json", "@babel/helper-string-parser", 1,
+         "app/node_modules/@babel/helper-string-parser/package.json", "@babel/helper-string-parser",
          "@babel/helper-string-parser", "7.29.15"},
     };
     for (const auto& r : rows) {
@@ -77,8 +76,7 @@ TEST_CASE("node: real package.json captures give their name and version", "[runt
 
         const auto np = node_package_from_path(r.path);
         REQUIRE(np.has_value());
-        CHECK(np->dir_name == r.dir_name);
-        CHECK(np->nesting == r.nesting);
+        CHECK(*np == r.dir_name);
 
         const auto c = node_component(r.path, text);
         CHECK(c.name == r.name);
@@ -91,21 +89,18 @@ TEST_CASE("node: package paths", "[runtime][component_inventory][node]") {
     SECTION("scoped and unscoped") {
         const auto a = node_package_from_path("/srv/app/node_modules/@scope/name/package.json");
         REQUIRE(a.has_value());
-        CHECK(a->dir_name == "@scope/name");
-        CHECK(a->nesting == 1);
+        CHECK(*a == "@scope/name");
         const auto b = node_package_from_path("/srv/app/node_modules/left-pad/package.json");
         REQUIRE(b.has_value());
-        CHECK(b->dir_name == "left-pad");
+        CHECK(*b == "left-pad");
     }
-    SECTION("nesting counts node_modules components") {
+    SECTION("a nested package is named by its own directory") {
         const auto n = node_package_from_path("a/node_modules/b/node_modules/c/package.json");
         REQUIRE(n.has_value());
-        CHECK(n->dir_name == "c");
-        CHECK(n->nesting == 2);
+        CHECK(*n == "c");
         const auto s = node_package_from_path("a/node_modules/b/node_modules/@s/c/package.json");
         REQUIRE(s.has_value());
-        CHECK(s->dir_name == "@s/c");
-        CHECK(s->nesting == 2);
+        CHECK(*s == "@s/c");
     }
     SECTION("everything else is not a package path") {
         for (const std::string_view p : {

@@ -59,7 +59,7 @@ ScanResult py(MemTree& tree, const WalkLimits& limits = python_limits(),
     return scan_python(roots, limits, fs);
 }
 
-ScanResult nd(MemTree& tree, const WalkLimits& limits = node_limits(),
+ScanResult nd(MemTree& tree, const WalkLimits& limits = WalkLimits{},
               const std::vector<std::string>& roots = {"/r"}) {
     const FsOps fs = tree.ops();
     return scan_node(roots, limits, fs);
@@ -197,10 +197,6 @@ TEST_CASE("python scan: the bounds are pinned by value", "[runtime][component_pk
     CHECK(p.max_rows == d.max_rows);
     CHECK(p.max_rows_per_anchor == d.max_rows_per_anchor);
     CHECK(p.max_dir_entries == d.max_dir_entries);
-    const auto n = node_limits();
-    CHECK(n.max_depth == d.max_depth);
-    CHECK(n.max_rows == d.max_rows);
-    CHECK(n.max_entries == d.max_entries);
 }
 
 TEST_CASE("python scan: a tree deeper than eight directories is a depth stop, never a silent cut",
@@ -368,7 +364,7 @@ TEST_CASE("pkg scan: the entry budget, the wall budget and the row caps give the
         MemTree tree;
         for (int i = 0; i < 4; ++i)
             tree.add_file("/r/node_modules/p" + std::to_string(i) + "/package.json", pkg_json("p", "1.0.0"));
-        WalkLimits l = node_limits();
+        WalkLimits l;
         l.max_rows = 2;
         CHECK(token_of(tree, false, l) == "status|node|constrained|linux:component_inventory:section_rows");
     }
@@ -376,7 +372,7 @@ TEST_CASE("pkg scan: the entry budget, the wall budget and the row caps give the
         MemTree tree;
         for (int i = 0; i < 4; ++i)
             tree.add_file("/r/node_modules/p" + std::to_string(i) + "/package.json", pkg_json("p", "1.0.0"));
-        WalkLimits l = node_limits();
+        WalkLimits l;
         l.max_rows_per_anchor = 2;
         CHECK(token_of(tree, false, l) == "status|node|constrained|linux:component_inventory:anchor_rows");
     }

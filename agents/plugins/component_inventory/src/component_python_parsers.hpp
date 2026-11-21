@@ -35,10 +35,6 @@ struct PythonComponent {
 
 namespace python_detail {
 
-inline bool ends_with(std::string_view s, std::string_view suffix) {
-    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
-}
-
 inline char lower(char c) {
     return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
 }
@@ -89,23 +85,22 @@ inline std::optional<PyDist> split_stem(std::string_view stem) {
 
 /// METADATA (dist-info), PKG-INFO (egg-info dir) or a single-file `*.egg-info`.
 inline bool is_python_metadata_leaf(std::string_view leaf) {
-    return leaf == "METADATA" || leaf == "PKG-INFO" || python_detail::ends_with(leaf, ".egg-info");
+    return leaf == "METADATA" || leaf == "PKG-INFO" || leaf.ends_with(".egg-info");
 }
 
 /// `<name>-<version>.dist-info`, `<name>-<version>.egg-info`, `<name>-<version>-py<X.Y>.egg-info`.
 inline std::optional<PyDist> python_dist_from_dir(std::string_view dir_leaf) {
-    using python_detail::ends_with;
     std::string_view stem;
-    if (ends_with(dir_leaf, ".dist-info"))
+    if (dir_leaf.ends_with(".dist-info"))
         stem = dir_leaf.substr(0, dir_leaf.size() - 10);
-    else if (ends_with(dir_leaf, ".egg-info"))
+    else if (dir_leaf.ends_with(".egg-info"))
         stem = dir_leaf.substr(0, dir_leaf.size() - 9);
     else
         return std::nullopt;
     auto d = python_detail::split_stem(stem);
     if (!d)
         return std::nullopt;
-    if (ends_with(dir_leaf, ".egg-info")) {
+    if (dir_leaf.ends_with(".egg-info")) {
         // Drop the `-py<X.Y>` interpreter tag; the version is what precedes it.
         const auto p = d->version.rfind("-py");
         if (p != std::string::npos && p + 3 < d->version.size() && d->version[p + 3] >= '0' &&
@@ -120,9 +115,8 @@ inline std::optional<PyDist> python_dist_from_dir(std::string_view dir_leaf) {
 /// The directory leaf that owns a METADATA / PKG-INFO path, or the leaf itself for a
 /// single-file `.egg-info`; nullopt when the parent is not a matching directory.
 inline std::optional<std::string_view> python_metadata_owner(std::string_view path) {
-    using python_detail::ends_with;
     const auto leaf = python_detail::leaf_of(path);
-    if (ends_with(leaf, ".egg-info"))
+    if (leaf.ends_with(".egg-info"))
         return leaf;
     const bool is_meta = leaf == "METADATA";
     if (!is_meta && leaf != "PKG-INFO")
@@ -132,7 +126,7 @@ inline std::optional<std::string_view> python_metadata_owner(std::string_view pa
         return std::nullopt;
     const auto trimmed = dir.substr(0, dir.size() - 1); // drop the separator
     const auto parent = python_detail::leaf_of(trimmed);
-    if (is_meta ? ends_with(parent, ".dist-info") : ends_with(parent, ".egg-info"))
+    if (is_meta ? parent.ends_with(".dist-info") : parent.ends_with(".egg-info"))
         return parent;
     return std::nullopt;
 }

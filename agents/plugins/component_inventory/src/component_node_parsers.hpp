@@ -38,11 +38,6 @@ inline constexpr int kMaxJsonDepth = 64;
 inline constexpr std::size_t kMaxNodeNameBytes = 256;
 inline constexpr std::size_t kMaxNodeVersionBytes = 128;
 
-struct NodePath {
-    std::string dir_name;    ///< `<name>` or `@<scope>/<name>`
-    std::size_t nesting{0};  ///< node_modules components in the whole path
-};
-
 struct NodeMeta {
     std::string name;    ///< '' when absent or invalid
     std::string version; ///< '' when absent or invalid
@@ -129,9 +124,10 @@ inline constexpr std::string_view kNodeModules = "node_modules";
 
 } // namespace node_detail
 
-/// The package a `.../node_modules/.../package.json` path names; nullopt for any other path
-/// (`app/package.json`, `node_modules/@scope/package.json`, a hidden package name).
-[[nodiscard]] inline std::optional<NodePath> node_package_from_path(std::string_view path) {
+/// The package directory name (`<name>` or `@<scope>/<name>`) a `.../node_modules/.../package.json`
+/// path names; nullopt for any other path (`app/package.json`, `node_modules/@scope/package.json`, a
+/// hidden package name).
+[[nodiscard]] inline std::optional<std::string> node_package_from_path(std::string_view path) {
     using namespace node_detail;
     const auto c = split(path);
     if (c.size() < 3 || c.back() != "package.json")
@@ -139,7 +135,7 @@ inline constexpr std::string_view kNodeModules = "node_modules";
     auto dir = package_dir_at(c, c.size() - 1);
     if (dir.empty())
         return std::nullopt;
-    return NodePath{std::move(dir), count_node_modules(c)};
+    return dir;
 }
 
 /// True when the walk must not descend into `dir_path`: a directory inside a package directory other
@@ -196,7 +192,7 @@ inline constexpr std::string_view kNodeModules = "node_modules";
     const auto np = node_package_from_path(path);
     NodeComponent out;
     if (np)
-        out.name = np->dir_name;
+        out.name = *np;
     if (!text)
         return out;
     const auto meta = parse_package_json(*text);

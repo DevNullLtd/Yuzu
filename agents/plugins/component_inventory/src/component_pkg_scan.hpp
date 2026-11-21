@@ -51,17 +51,10 @@ namespace yuzu::component_inventory {
 inline constexpr std::string_view kPythonAction = "python";
 inline constexpr std::string_view kNodeAction = "node";
 
-inline constexpr std::string_view kKindPython = "python";
-inline constexpr std::string_view kKindNode = "node";
-
 namespace pkg_detail {
 
 inline constexpr std::string_view kSitePackages = "site-packages";
 inline constexpr std::string_view kDistPackages = "dist-packages";
-
-[[nodiscard]] inline bool ends_with(std::string_view s, std::string_view suffix) noexcept {
-    return s.size() >= suffix.size() && s.substr(s.size() - suffix.size()) == suffix;
-}
 
 /// The leaf of the parent directory of `dir_path`: "" when it has none.
 [[nodiscard]] inline std::string_view parent_leaf(std::string_view dir_path) noexcept {
@@ -88,7 +81,7 @@ inline constexpr std::string_view kDistPackages = "dist-packages";
         if (parent != pkg_detail::kSitePackages && parent != pkg_detail::kDistPackages)
             return false;
         const auto leaf = scan_detail::leaf_of(dir);
-        return !pkg_detail::ends_with(leaf, ".dist-info") && !pkg_detail::ends_with(leaf, ".egg-info");
+        return !leaf.ends_with(".dist-info") && !leaf.ends_with(".egg-info");
     };
     return p;
 }
@@ -108,11 +101,6 @@ inline constexpr std::string_view kDistPackages = "dist-packages";
     WalkLimits l;
     l.max_depth = 8;
     return l;
-}
-
-/// The node action's bounds: the scan's. Nesting is bounded by the prune rule, not by depth.
-[[nodiscard]] inline WalkLimits node_limits() {
-    return WalkLimits{};
 }
 
 namespace pkg_detail {
@@ -187,7 +175,7 @@ template <class Keep, class Fill>
 [[nodiscard]] inline ScanResult scan_python(std::span<const std::string> roots, const WalkLimits& limits,
                                             const FsOps& fs) {
     return pkg_detail::scan_pkg(
-        kKindPython, roots, limits, fs, python_policy(), kMaxPythonMetadataBytes,
+        "python", roots, limits, fs, python_policy(), kMaxPythonMetadataBytes,
         [](const std::string& path) { return python_metadata_owner(path).has_value(); },
         [](const std::string& path, const std::optional<std::string>& bytes, Row& row) {
             auto c = python_component(path, bytes ? std::optional<std::string_view>{*bytes} : std::nullopt);
@@ -204,7 +192,7 @@ template <class Keep, class Fill>
 [[nodiscard]] inline ScanResult scan_node(std::span<const std::string> roots, const WalkLimits& limits,
                                           const FsOps& fs) {
     return pkg_detail::scan_pkg(
-        kKindNode, roots, limits, fs, node_policy(), kMaxPackageJsonBytes + 1,
+        "node", roots, limits, fs, node_policy(), kMaxPackageJsonBytes + 1,
         [](const std::string& path) { return node_package_from_path(path).has_value(); },
         [](const std::string& path, const std::optional<std::string>& bytes, Row& row) {
             auto c = node_component(path, bytes);
@@ -244,9 +232,10 @@ template <class Targets, class MakeFs, class OnPruned>
         on_pruned);
 }
 
+/// Node uses the scan's bounds unchanged: nesting is bounded by the prune rule, not by depth.
 template <class Targets, class MakeFs, class OnPruned>
 [[nodiscard]] inline Answer answer_node(std::string_view os, const Targets& t, MakeFs&& make_fs,
-                                        OnPruned&& on_pruned, const WalkLimits& limits = node_limits()) {
+                                        OnPruned&& on_pruned, const WalkLimits& limits = WalkLimits{}) {
     return answer_pkg(
         kNodeAction, os, t, make_fs,
         [&limits](std::span<const std::string> roots, const FsOps& fs) { return scan_node(roots, limits, fs); },
