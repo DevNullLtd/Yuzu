@@ -587,6 +587,8 @@ TEST_CASE("ResultSetStore: migration v4 applies on a v3 database and is a no-op 
                        "DROP COLUMN membership_generation");
     // A v3 database has no member triggers either: v7 must create them from nothing.
     exec_sql(db.dsn(), "DROP FUNCTION result_set_store.result_set_members_restamp() CASCADE");
+    exec_sql(db.dsn(),
+             "DROP FUNCTION result_set_store.result_set_members_restamp_deleted() CASCADE");
     exec_sql(db.dsn(), "UPDATE public.schema_meta SET version = 3 WHERE store = 'result_set_store'");
     REQUIRE(query_scalar(db.dsn(),
                          "SELECT count(*) FROM information_schema.columns WHERE table_schema = "
@@ -666,7 +668,7 @@ TEST_CASE("ResultSetStore: migration v5 applies on a v4 database and old rows re
         CHECK(owned->ids->contains("dev-1"));
         auto reread = store.member_set_owned(old_id, "alice");
         REQUIRE(reread.has_value());
-        CHECK(reread->ids != owned->ids); // a legacy snapshot carries no generation
+        CHECK(reread->ids != owned->ids); // a membership with no generation is never cached
         CHECK(*reread->ids == *owned->ids);
     }
 }
@@ -1007,12 +1009,12 @@ TEST_CASE("ResultSetStore: a promoted primary can materialize the same pending I
     SECTION("an out-of-band fill that stamps no generation is read uncached") {
         exec_sql(db.dsn(),
                  "BEGIN; INSERT INTO result_set_store.result_set_members (result_set_id, device_id) "
-                 "VALUES (" + id + ", 'legacy-device'); UPDATE result_set_store.result_sets "
+                 "VALUES (" + id + ", 'unstamped-device'); UPDATE result_set_store.result_sets "
                  "SET status = 'materialized', device_count = 1 WHERE id = " + id + "; COMMIT");
         auto fresh = store.member_set_owned(rs->id, "alice");
         REQUIRE(fresh.has_value());
         REQUIRE(fresh->ids->size() == 1);
-        CHECK(fresh->ids->contains("legacy-device"));
+        CHECK(fresh->ids->contains("unstamped-device"));
         auto reread = store.member_set_owned(rs->id, "alice");
         REQUIRE(reread.has_value());
         CHECK(reread->ids != fresh->ids);
@@ -1089,17 +1091,27 @@ TEST_CASE("ResultSetStore: an out-of-band member write re-stamps the generation 
                  "INSERT INTO public.yuzu_test_nested VALUES (1)");
         expected = {"dev-2"};
     }
+    SECTION("a DELETE after a deleting savepoint was rolled back, in one transaction") {
+        // The once-per-transaction marker rolls back with the savepoint, so the later DELETE
+        // still re-stamps.
+        exec_sql(db.dsn(), "BEGIN; SAVEPOINT s; DELETE FROM result_set_store.result_set_members "
+                           "WHERE result_set_id = " + id + " AND device_id = 'dev-2'; "
+                           "ROLLBACK TO SAVEPOINT s; DELETE FROM "
+                           "result_set_store.result_set_members WHERE result_set_id = " + id +
+                               " AND device_id = 'dev-1'; COMMIT");
+        expected = {"dev-2"};
+    }
     SECTION("TRUNCATE") {
         exec_sql(db.dsn(), "TRUNCATE result_set_store.result_set_members");
         expected = {};
     }
-    SECTION("a bulk multi-row INSERT in one transaction stamps once per statement") {
+    SECTION("a bulk multi-row INSERT in one transaction") {
         exec_sql(db.dsn(), "BEGIN; INSERT INTO result_set_store.result_set_members "
                            "SELECT " + id + ", 'bulk-' || g FROM generate_series(1, 5000) g; "
                            "COMMIT");
         expected = {"dev-1", "dev-2"};
         for (int i = 1; i <= 5000; ++i)
-            expected.insert("bulk-" + std::to_string(i));
+            expected.insert(std::format("bulk-{}", i));
     }
     CHECK(generation_of(db.dsn(), rs->id) != before);
     auto after = warm.member_set_owned(rs->id, "alice");
@@ -1145,6 +1157,113 @@ TEST_CASE("ResultSetStore: the product writers' cascades do not re-stamp other s
     exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE device_id = "
                        "'dev-2'");
     CHECK(generation_of(db.dsn(), kept->id) != kept_generation);
+}
+
+bool role_is_superuser(const std::string& dsn) {
+    return query_scalar(dsn, "SELECT rolsuper::text FROM pg_roles WHERE rolname = current_user") ==
+           "true";
+}
+
+// The cascade from gc_sweep's header delete must not depend on temporary-file space: a DELETE
+// transition table would capture every cascaded member row and fail the sweep, every pass, under
+// a temp_file_limit. Setting temp_file_limit needs a superuser, so the case skips otherwise.
+TEST_CASE("ResultSetStore: a GC sweep cascading many member rows succeeds under a small "
+          "temp_file_limit",
+          "[pg][result_set][gc][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    if (!role_is_superuser(db.dsn()))
+        SKIP("temp_file_limit needs a superuser test role");
+    exec_sql(db.dsn(),
+             "DO $$ BEGIN "
+             "EXECUTE format('ALTER DATABASE %I SET temp_file_limit = ''64kB''', "
+             "current_database()); "
+             "EXECUTE format('ALTER DATABASE %I SET work_mem = ''64kB''', current_database()); "
+             "END $$");
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    REQUIRE(pool.valid());
+    ResultSetStore store{pool};
+    REQUIRE(store.is_open());
+    REQUIRE(query_scalar(db.dsn(), "SHOW temp_file_limit") == "64kB");
+    auto live = store.create_materialized(req("alice", "fresh-tfl"), {"y"});
+    REQUIRE(live.has_value());
+    exec_sql(db.dsn(),
+             "INSERT INTO result_set_store.result_sets "
+             "(id, owner_principal, created_at, ttl_at, last_used_at, source_kind, "
+             "source_payload, membership_generation) "
+             "SELECT 'rs_tflbulk' || g, 'alice', 1, 2, 1, 'manual_curate', '{}', "
+             "gen_random_uuid() FROM generate_series(1, 4) AS g; "
+             "INSERT INTO result_set_store.result_set_members "
+             "SELECT 'rs_tflbulk' || g, 'dev-' || d FROM generate_series(1, 4) AS g, "
+             "generate_series(1, 10000) AS d");
+    CHECK(store.gc_sweep() == 4);
+    CHECK(query_scalar(db.dsn(), "SELECT count(*) FROM result_set_store.result_set_members "
+                                 "WHERE result_set_id LIKE 'rs_tflbulk%'") == "0");
+    CHECK(member_set_owned_ok(store, live->id, "alice") == std::unordered_set<std::string>{"y"});
+}
+
+// The constructor verifies the v7 triggers. A store opened while one is disabled, or demoted to
+// ENABLE ORIGIN (what pg_restore's DISABLE/ENABLE TRIGGER ALL leaves), or missing, or bound to an
+// altered function, retains nothing; restoring v7's state lets the next opened store cache again.
+TEST_CASE("ResultSetStore: a store opened without the re-stamp triggers in force serves "
+          "membership uncached",
+          "[pg][result_set][member_cache]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, result_set_tpl);
+    PgPool pool{{.conninfo = db.dsn(), .size = 2}};
+    std::string id;
+    {
+        ResultSetStore setup{pool};
+        auto rs = setup.create_materialized(req("alice"), {"dev-1", "dev-2"});
+        REQUIRE(rs.has_value());
+        id = rs->id;
+    }
+    const auto cached = [&](ResultSetStore& s) {
+        auto a = s.member_set_owned(id, "alice");
+        auto b = s.member_set_owned(id, "alice");
+        REQUIRE(a.has_value());
+        REQUIRE(b.has_value());
+        CHECK(*a->ids == *b->ids);
+        return a->ids == b->ids;
+    };
+    const std::string always =
+        "ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER ";
+    std::string repair;
+    SECTION("a disabled DELETE trigger") {
+        exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER "
+                           "result_set_members_restamp_del");
+        repair = always + "result_set_members_restamp_del";
+    }
+    SECTION("all triggers left ENABLE ORIGIN") {
+        exec_sql(db.dsn(), "ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER ALL; "
+                           "ALTER TABLE result_set_store.result_set_members ENABLE TRIGGER ALL");
+        repair = always + "result_set_members_restamp_ins; " + always +
+                 "result_set_members_restamp_upd; " + always + "result_set_members_restamp_del; " +
+                 always + "result_set_members_restamp_trunc";
+    }
+    SECTION("a dropped TRUNCATE trigger") {
+        exec_sql(db.dsn(), "DROP TRIGGER result_set_members_restamp_trunc ON "
+                           "result_set_store.result_set_members");
+        repair = "CREATE TRIGGER result_set_members_restamp_trunc AFTER TRUNCATE ON "
+                 "result_set_store.result_set_members FOR EACH STATEMENT EXECUTE FUNCTION "
+                 "result_set_store.result_set_members_restamp(); " +
+                 always + "result_set_members_restamp_trunc";
+    }
+    SECTION("an altered DELETE function") {
+        exec_sql(db.dsn(), "CREATE OR REPLACE FUNCTION "
+                           "result_set_store.result_set_members_restamp_deleted() RETURNS trigger "
+                           "LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS "
+                           "$$ BEGIN RETURN NULL; END $$");
+        // Re-running v7 at the next open restores the body.
+        repair = "UPDATE public.schema_meta SET version = 6 WHERE store = 'result_set_store'";
+    }
+    {
+        ResultSetStore degraded{pool};
+        REQUIRE(degraded.is_open());
+        CHECK_FALSE(cached(degraded));
+    }
+    exec_sql(db.dsn(), repair);
+    ResultSetStore repaired{pool};
+    REQUIRE(repaired.is_open());
+    CHECK(cached(repaired));
 }
 
 TEST_CASE("ResultSetStore: a materialize fill and a pending set stamp as the writer decides",
@@ -1260,6 +1379,12 @@ TEST_CASE("ResultSetStore: concurrent readers share the member cache under evict
         r.join();
     CHECK(failed.load() == 0);
     CHECK(wrong.load() == 0);
+    // The cache was really in use: two consecutive reads of one set share one snapshot.
+    auto a = store.member_set_owned(ids[0], "alice");
+    auto b = store.member_set_owned(ids[0], "alice");
+    REQUIRE(a.has_value());
+    REQUIRE(b.has_value());
+    CHECK(a->ids == b->ids);
 }
 
 TEST_CASE("ResultSetStore: member_set_owned's four outcomes (#4981 PR-1 A1 rewrite)",

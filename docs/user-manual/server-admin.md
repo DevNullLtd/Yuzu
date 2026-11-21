@@ -5147,9 +5147,20 @@ docker exec -i yuzu-postgres pg_restore --clean --if-exists --no-owner \
 
 Each server caches the member IDs of materialized result sets and reuses them only while the set's `result_sets.membership_generation` is unchanged. Every server write stamps a new generation, and the triggers that store migration v7 adds to `result_set_store.result_set_members` re-stamp it for any other write: `INSERT` (including `COPY` and a `pg_restore --data-only` of that table), `UPDATE` and `DELETE` re-stamp the sets they touch, also when issued from inside another trigger, and a `TRUNCATE` of the member table re-stamps every set that has a generation (so it makes every server reload every cached set once). The triggers are enabled `ALWAYS`, so they also fire under `session_replication_role = replica`. Deleting a `result_sets` row (which cascades to its members) needs nothing: every server reads it as not found at once.
 
+Each server checks the four triggers when it starts. If one is missing, disabled, enabled without `ALWAYS`, or bound to a changed function, the server logs `ResultSetStore: the result_set_members re-stamp triggers are missing, disabled, not ENABLE ALWAYS or altered` and serves result-set membership uncached (correct, but every scope use reads the member rows) until the triggers are restored and the server is restarted. `pg_restore --disable-triggers` re-enables them with a plain `ENABLE TRIGGER ALL`, which is not `ALWAYS`, so after such a restore run:
+
+```sql
+ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_ins;
+ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_upd;
+ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_del;
+ALTER TABLE result_set_store.result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_trunc;
+```
+
+then restart every server. Logical replication into the `result_set_store` schema is not a supported topology: its apply worker fires row-level triggers only, so the `INSERT` and `UPDATE` re-stamps do not run there.
+
 Restart **every** server replica (stop them all, then start them) after any change to `result_set_store` that does not fire those triggers, or a server that had cached a set can keep using its old members while another server uses the new ones:
 
-- a restore run with `--disable-triggers`, or any session that ran `ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER ...` (re-enable them afterwards with `ENABLE ALWAYS TRIGGER`);
+- a restore run with `--disable-triggers`, or any session that ran `ALTER TABLE result_set_store.result_set_members DISABLE TRIGGER ...` while servers were running (re-enable them afterwards with `ENABLE ALWAYS TRIGGER`, as above);
 - a restore of `result_sets` alone (for example `pg_restore --data-only -t result_sets`) that brings back headers whose `membership_generation` no longer matches the member rows, or any direct `UPDATE` of `membership_generation`;
 - any other write a trigger does not see, such as a file-level copy into a running cluster.
 

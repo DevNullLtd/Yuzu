@@ -149,6 +149,48 @@ constexpr std::chrono::milliseconds kWriteTimeout{4000};
 constexpr const char* kPoisonedPayloadNote =
     "original source_payload exceeded the JSON nesting limit and was discarded";
 
+// Migration v7's trigger function bodies (the text between the dollar quotes). Kept as constants
+// so check_member_triggers can compare pg_proc.prosrc byte for byte with what v7 installed.
+// Statement-level INSERT/UPDATE/TRUNCATE: re-stamp the sets the transition tables name (TRUNCATE:
+// every set). The primary-key lookup keeps a one-set statement off a result_sets scan.
+constexpr std::string_view kRestampStatementBody = R"sql(
+BEGIN
+  IF TG_OP = 'INSERT' THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL
+       AND r.id = ANY (ARRAY(SELECT DISTINCT a.result_set_id FROM added a));
+  ELSIF TG_OP = 'UPDATE' THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL
+       AND r.id = ANY (ARRAY(SELECT a.result_set_id FROM added a
+                             UNION SELECT d.result_set_id FROM removed d));
+  ELSE
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL;
+  END IF;
+  RETURN NULL;
+END )sql";
+
+// Row-level DELETE: re-stamp the row's set once per (top-level transaction, set). The marker is
+// a transaction-local setting keyed on the transaction ID, so a value left in the session by an
+// earlier transaction never matches, and a rolled-back savepoint reverts the marker together
+// with the UPDATE it recorded. The marker is set whether or not a row was updated: a header that
+// is gone (a cascade) or has no generation cannot be served from a cache, and any header that
+// gains one later in the same transaction gets a fresh random value, which no committed reader
+// has seen. A writer who sets the marker on purpose is writing the generation by other means:
+// the documented bypass, like a direct membership_generation UPDATE.
+constexpr std::string_view kRestampDeletedBody = R"sql(
+DECLARE
+  k text := pg_current_xact_id()::text || '/' || OLD.result_set_id;
+BEGIN
+  IF current_setting('result_set_store.restamped', true) IS DISTINCT FROM k THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.id = OLD.result_set_id AND r.membership_generation IS NOT NULL;
+    PERFORM set_config('result_set_store.restamped', k, true);
+  END IF;
+  RETURN NULL;
+END )sql";
+
 const std::vector<pg::PgMigration>& migrations() {
     // Unqualified DDL: the runner sets `search_path` to the store schema for
     // the migration transaction, so `result_sets` et al. land in
@@ -229,43 +271,33 @@ const std::vector<pg::PgMigration>& migrations() {
         // v7: enforce the cache invariant in the database, not only in the two C++ writers: any
         // write to result_set_members that a cache could have observed re-stamps the generation
         // of every affected set that carries one, in the writing transaction (see the header's
-        // "Member cache invariant"). Statement-level, so a bulk load costs one header UPDATE per
-        // affected set per statement, never one per member row:
-        //   INSERT/UPDATE/DELETE: the transition tables name the affected sets, at any trigger
-        //     depth (a DELETE issued from another trigger is re-stamped too). A cascade from a
-        //     result_sets delete finds its own header already gone, so it updates nothing; the
-        //     cost is the transition capture of the cascaded rows, no write (measured once on
-        //     PostgreSQL 16, local disk: a 200-set x 5,000-member cascade, 1M rows, took about
-        //     0.3 s instead of 0.22 s).
-        //   TRUNCATE has no transition table: every set carrying a generation is re-stamped.
+        // "Member cache invariant"). The trigger set and both function bodies are verified at
+        // open (check_member_triggers); the cache stays off when they are not in force.
+        //   INSERT/UPDATE: statement-level, the transition tables name the affected sets, so a
+        //     bulk load costs one header UPDATE per affected set per statement, never one per row.
+        //   DELETE: row-level, at any trigger depth (a DELETE issued from another trigger is
+        //     re-stamped too), deduplicated per (transaction, set), so a set is re-stamped at most
+        //     once per transaction however many of its rows go. Row-level rather than a DELETE
+        //     transition table on purpose: gc_sweep's cascade would capture every cascaded member
+        //     row in that table, which spills to temporary files and fails the whole sweep under a
+        //     temp_file_limit, every pass. A cascade from a result_sets delete finds its own
+        //     header already gone, so it writes nothing: one primary-key probe per set plus one
+        //     comparison per row (measured once on PostgreSQL 16, local disk: a 200-set x
+        //     5,000-member cascade, 1M rows, took about 0.9 s instead of 0.22 s, and succeeded
+        //     under temp_file_limit = 10 MB).
+        //   TRUNCATE has no rows: every set carrying a generation is re-stamped.
         // ENABLE ALWAYS: also fires under session_replication_role = replica. It does not fire
         // when the trigger is disabled (ALTER TABLE ... DISABLE TRIGGER, pg_restore
         // --disable-triggers): the operator doc requires a restart of every replica then.
         // Idempotent (OR REPLACE / IF EXISTS) so a test that rolls the version back re-runs it.
-        {7, R"sql(
+        {7, std::string(R"sql(
 SET LOCAL client_min_messages = warning;
 CREATE OR REPLACE FUNCTION result_set_store.result_set_members_restamp() RETURNS trigger
-LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$
-BEGIN
-  IF TG_OP = 'INSERT' THEN
-    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
-     WHERE r.membership_generation IS NOT NULL
-       AND r.id IN (SELECT a.result_set_id FROM added a);
-  ELSIF TG_OP = 'UPDATE' THEN
-    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
-     WHERE r.membership_generation IS NOT NULL
-       AND (r.id IN (SELECT a.result_set_id FROM added a)
-            OR r.id IN (SELECT d.result_set_id FROM removed d));
-  ELSIF TG_OP = 'DELETE' THEN
-    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
-     WHERE r.membership_generation IS NOT NULL
-       AND r.id IN (SELECT d.result_set_id FROM removed d);
-  ELSE
-    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
-     WHERE r.membership_generation IS NOT NULL;
-  END IF;
-  RETURN NULL;
-END $$;
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$)sql") +
+                std::string(kRestampStatementBody) + std::string(R"sql($$;
+CREATE OR REPLACE FUNCTION result_set_store.result_set_members_restamp_deleted() RETURNS trigger
+LANGUAGE plpgsql SET search_path = pg_catalog, pg_temp AS $$)sql") +
+                std::string(kRestampDeletedBody) + std::string(R"sql($$;
 DROP TRIGGER IF EXISTS result_set_members_restamp_ins ON result_set_members;
 DROP TRIGGER IF EXISTS result_set_members_restamp_upd ON result_set_members;
 DROP TRIGGER IF EXISTS result_set_members_restamp_del ON result_set_members;
@@ -277,15 +309,14 @@ CREATE TRIGGER result_set_members_restamp_upd AFTER UPDATE ON result_set_members
   REFERENCING OLD TABLE AS removed NEW TABLE AS added
   FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
 CREATE TRIGGER result_set_members_restamp_del AFTER DELETE ON result_set_members
-  REFERENCING OLD TABLE AS removed
-  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+  FOR EACH ROW EXECUTE FUNCTION result_set_store.result_set_members_restamp_deleted();
 CREATE TRIGGER result_set_members_restamp_trunc AFTER TRUNCATE ON result_set_members
   FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
 ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_ins;
 ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_upd;
 ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_del;
 ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_trunc;
-)sql"},
+)sql")},
     };
     return kMigrations;
 }
@@ -297,6 +328,43 @@ std::int64_t to_i64(const char* s) {
 }
 int to_int(const char* s) { return static_cast<int>(to_i64(s)); }
 bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
+
+// True only when migration v7's four triggers are present, ENABLE ALWAYS, of the shape v7 creates
+// and bound to the v7 function bodies, pinned search_path included (the auth_db
+// check_factor_trigger precedent). pg_restore's DISABLE/ENABLE TRIGGER ALL leaves them enabled
+// ORIGIN only ('O'), which does not fire under session_replication_role = replica, so 'O' fails
+// the check too. Any other answer, an unreadable catalogue included, keeps the member cache off.
+[[nodiscard]] bool member_triggers_in_force(PGconn* conn) {
+    pg::PgResult res = pg::exec_params(
+        conn,
+        "SELECT count(*) = 4 AND COALESCE(bool_and("
+        "  t.tgenabled = 'A' AND t.tgqual IS NULL"
+        "  AND (t.tgtype & 127) = CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_ins' THEN 4"
+        "        WHEN 'result_set_members_restamp_upd' THEN 16"
+        "        WHEN 'result_set_members_restamp_del' THEN 9"
+        "        ELSE 32 END"
+        "  AND t.tgoldtable::text IS NOT DISTINCT FROM CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_upd' THEN 'removed' END"
+        "  AND t.tgnewtable::text IS NOT DISTINCT FROM CASE t.tgname"
+        "        WHEN 'result_set_members_restamp_ins' THEN 'added'"
+        "        WHEN 'result_set_members_restamp_upd' THEN 'added' END"
+        "  AND p.pronamespace = 'result_set_store'::regnamespace"
+        "  AND p.prolang = (SELECT oid FROM pg_catalog.pg_language WHERE lanname = 'plpgsql')"
+        "  AND COALESCE(p.proconfig = ARRAY['search_path=pg_catalog, pg_temp']::text[], false)"
+        "  AND CASE WHEN t.tgname = 'result_set_members_restamp_del'"
+        "        THEN p.proname = 'result_set_members_restamp_deleted' AND p.prosrc = $2::text"
+        "        ELSE p.proname = 'result_set_members_restamp' AND p.prosrc = $1::text END"
+        "), false) "
+        "FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_proc p ON p.oid = t.tgfoid "
+        "WHERE t.tgrelid = 'result_set_store.result_set_members'::regclass AND NOT t.tgisinternal"
+        "  AND t.tgname IN ('result_set_members_restamp_ins', 'result_set_members_restamp_upd',"
+        "                   'result_set_members_restamp_del', 'result_set_members_restamp_trunc')",
+        std::vector<std::string>{std::string(kRestampStatementBody),
+                                 std::string(kRestampDeletedBody)});
+    return res.status() == PGRES_TUPLES_OK && PQntuples(res.get()) == 1 &&
+           to_bool(PQgetvalue(res.get(), 0, 0));
+}
 
 constexpr const char* kRowCols =
     "id, name, owner_principal, created_at, ttl_at, last_used_at, pinned, parent_id, "
@@ -370,6 +438,12 @@ ResultSetStore::ResultSetStore(pg::PgPool& pool, std::size_t member_cache_bytes)
         spdlog::error("ResultSetStore: schema migration failed — result-set persistence disabled");
         return;
     }
+    member_cache_enforced_ = member_triggers_in_force(lease.get());
+    if (!member_cache_enforced_ && member_cache_budget_ > 0)
+        spdlog::error("ResultSetStore: the result_set_members re-stamp triggers are missing, "
+                      "disabled, not ENABLE ALWAYS or altered; result-set membership is served "
+                      "uncached on this server until they are restored (see the server admin "
+                      "guide, \"Result-set membership after a restore or repair\")");
     open_ = true;
 }
 
@@ -766,7 +840,7 @@ void ResultSetStore::forget_members(const std::string& id) {
 void ResultSetStore::retain_members(const std::string& id,
                                     CachedMembership snapshot,
                                     std::size_t bytes) {
-    if (bytes > member_cache_budget_)
+    if (!member_cache_enforced_ || bytes > member_cache_budget_)
         return;
     // Evicted and replaced entries are moved here and destroyed after the mutex is released.
     std::list<MemberCacheEntry> dropped;
@@ -815,7 +889,8 @@ ResultSetStore::member_set_owned(const std::string& id, const std::string& owner
     // Expiry is judged on this replica's clock ($3), the clock that wrote ttl_at
     // (insert_row_impl, touch, unpin) and that gc_sweep deletes by, so a set is refused here
     // exactly when this replica's GC would treat it as expired. A comparison against the
-    // database clock would refuse every unpinned set on a replica running behind it.
+    // database clock would refuse a set up to the skew before its expiry on a replica whose
+    // clock runs behind the database. (The quota counts still use the database clock.)
     static constexpr std::string_view columns =
         "SELECT (r.owner_principal = $2) AS owned, r.status, r.agents_failed, "
         "r.agents_unanswered, r.membership_generation ";

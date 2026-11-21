@@ -388,21 +388,28 @@ overloading a bare `nullopt`.
 `member_set_owned` now keeps a bounded (16 MiB, byte-estimated, FIFO) per-process cache of a
 materialized set's member IDs. The 2026-09-26 Update's guarantee is restated, not weakened:
 every call still makes ONE live, snapshot-consistent read of the set's header (existence,
-expiry, ownership, readiness, completeness), so a set deleted, expired, re-owned or moved out of
-`materialized` before that read is refused exactly as before. What changes is where the IDs come
-from on a hit: a cache entry read under the same `membership_generation` (v6, a random UUID, so
-a promoted standby that redid a lost fill carries a different value). A changed or NULL
-generation takes the original joined read.
+expiry, ownership, readiness, completeness), so a set deleted, re-owned or moved out of
+`materialized` before that read is refused exactly as before (expiry is new: see below). What
+changes is where the IDs come from on a hit: a cache entry read under the same
+`membership_generation` (v6, a random UUID, so a promoted standby that redid a lost fill
+carries a different value). A changed or NULL generation takes the original joined read.
 
 That equivalence holds only under one invariant: **a set's member rows never change while its
 generation stays the same.** Every write to `result_set_members` must re-stamp the generation of
 each affected set in the writing transaction. The two writers (`insert_row_impl`, `materialize`)
-stamp it themselves; v7 enforces it for every other writer with statement-level `ENABLE ALWAYS`
-triggers (INSERT/UPDATE/DELETE re-stamp the sets in their transition tables, at any trigger
-depth; TRUNCATE re-stamps every stamped set; a cascade from a `result_sets` delete updates
-nothing, because the header is gone). Statement-level, not row-level, so a bulk load costs one
-header update per affected set per statement and a cascade costs a transition capture but no
-write. A writer that disables the triggers, or writes `membership_generation` directly, breaks the
+stamp it themselves; v7 enforces it for every other writer with `ENABLE ALWAYS` triggers:
+INSERT and UPDATE are statement-level and re-stamp the sets in their transition tables, so a bulk
+load costs one header update per affected set per statement, never one per row; DELETE is
+row-level, at any trigger depth, and re-stamps each set at most once per transaction (a
+transaction-ID-keyed, transaction-local marker); TRUNCATE re-stamps every stamped set. DELETE is
+row-level on purpose: a DELETE transition table would capture every member row a `gc_sweep`
+cascade removes, spill it to temporary files and fail the sweep, on every pass, under a
+`temp_file_limit`. A cascade from a `result_sets` delete writes nothing, because the header is
+gone: one key probe per set and one comparison per row (about 0.9 s instead of 0.22 s for a
+1M-row cascade, measured once on PostgreSQL 16). At open the store checks that the four triggers
+are present, `ENABLE ALWAYS` and bound to v7's function bodies; otherwise it logs an error and
+serves membership uncached. A writer that disables the triggers while servers run, or writes
+`membership_generation` directly, breaks the
 invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set
 membership after a restore or repair"). A new member writer keeps the stamp and never disables
 the triggers.
@@ -410,4 +417,6 @@ the triggers.
 Also in this change: an unpinned set past `ttl_at` is refused (`NotFound`) by `member_set_owned`
 before `gc_sweep` deletes it, judged on the serving replica's clock (the clock that writes
 `ttl_at` and that `gc_sweep` deletes by). `get`, `members`, `list_by_owner` and `resolve_alias`
-are unchanged and still return an expired, unswept set (recorded follow-up).
+are unchanged and still return an expired, unswept set. That and moving `ttl_at` authoring and
+the quota counts onto one clock are follow-ups with no tracking issue yet (no issue was
+authorized in this change).

@@ -129,13 +129,16 @@ device visibility still bounds the result.
 
 Reusing cached IDs is sound only because a set's members never change while its generation
 stays the same. The two server writers stamp a new generation in the transaction that writes
-the members, and statement-level triggers on `result_set_members` (store migration v7)
-re-stamp it for any other writer: an INSERT, UPDATE or DELETE re-stamps the sets it touched
-(also when issued from inside another trigger), a TRUNCATE re-stamps every set that has a
-generation. A bulk load costs one header update per set per statement, never one per member
-row. A delete that cascades from `result_sets` updates nothing, since the header is gone and
-every cached copy reads it as not found. A writer that disables the triggers, or writes the
-generation column directly, bypasses this; the
+the members, and triggers on `result_set_members` (store migration v7) re-stamp it for any
+other writer: an INSERT or UPDATE re-stamps, per statement, the sets it touched; a DELETE
+re-stamps the set of each row it removes, at most once per set per transaction (also when
+issued from inside another trigger); a TRUNCATE re-stamps every set that has a generation. A
+bulk load costs one header update per set per statement, never one per member row. A delete
+that cascades from `result_sets` writes nothing, since the header is gone and every cached copy
+reads it as not found; DELETE is row-level so that such a cascade (the GC sweep's) never
+captures its rows into temporary files. A server whose store opens without the four triggers in
+force logs an error and serves membership uncached. A writer that disables the triggers, or
+writes the generation column directly, bypasses this; the
 operator procedure is in the server administration guide, "Result-set membership after a
 restore or repair".
 
@@ -144,10 +147,10 @@ restore or repair".
 | Lifecycle stage | TTL behaviour |
 |---|---|
 | Default creation | `ttl_at = now + 3600` (1 hour) — enough for an active operator session, short enough that abandoned sets do not accumulate |
-| Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning restores `ttl_at = max(now + 3600, original_ttl_at)` |
+| Pin | `pinned = 1`, `ttl_at = INT64_MAX`. Audit row written. Pin is reversible — unpinning sets `ttl_at = now + 3600` (the pinned value was `INT64_MAX`, so there is no original to restore) |
 | Use as input scope | Touching a set as the scope of a new query or action extends `ttl_at` to `max(ttl_at, now + 3600)` so an operator working a chain does not lose the head of the chain mid-investigation |
 | Pin storm guard | Per-operator cap of 50 pinned result sets; further pins return `409 PIN_LIMIT`. Operator must unpin or delete before pinning more |
-| Expiry before GC | From the moment `ttl_at` passes, an unpinned set is refused as a `from_result_set:` scope (not found, `404`), before the sweep deletes it. Using it as a scope no longer extends it: touch or pin it before it expires |
+| Expiry before GC | From the moment `ttl_at` passes, an unpinned set is refused as a `from_result_set:` scope (not found, `404`), before the sweep deletes it. Using it as a scope no longer extends it. Pin a set that a recurring job targets; pinning an expired set the sweep has not yet removed makes it usable again |
 | GC | Background sweep every 5 minutes deletes rows where `ttl_at < now AND pinned = 0`. Cascades via `ON DELETE CASCADE` to `result_set_members`. Audit row written summarising count of GC'd sets. Post-ADR-0036: one replica sweeps per pass (Postgres advisory lock); a retention-clock anomaly (unusable prior reading, big step, would-wipe) declines the pass once per distinct anomaly fact-set (routed-concern "Clock-guarded retention"); every accepted pass is capped (5,000 deletes) |
 
 Hard maximum cap: **10,000 result sets per operator** (enforced at create time, returns `429 RESULT_SET_QUOTA`). Prevents a runaway script from filling the table.

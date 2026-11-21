@@ -877,6 +877,7 @@ TEST_CASE("Echo rename: result_set_store v3 rewrites the source kind and matcher
                   " '{\"instruction_id\":\"crossplatform.o.q\"}', '{\"kind\":\"rows_ge\"}')");
     exec_sql(dsn, "ALTER TABLE result_set_store.result_sets DROP COLUMN membership_generation");
     exec_sql(dsn, "DROP FUNCTION result_set_store.result_set_members_restamp() CASCADE");
+    exec_sql(dsn, "DROP FUNCTION result_set_store.result_set_members_restamp_deleted() CASCADE");
     roll_back(dsn, "result_set_store", 2);
     {
         PgPool pool{{.conninfo = dsn, .size = 2}};

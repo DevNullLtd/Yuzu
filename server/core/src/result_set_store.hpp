@@ -70,14 +70,17 @@
 /// same: every write to `result_set_members` re-stamps the generation of each affected set
 /// that carries one, in the writing transaction. The two C++ writers stamp it themselves
 /// (`insert_row_impl` in the header INSERT, `materialize` in its status-guarded UPDATE), and
-/// the v7 statement-level triggers enforce it for every other writer (manual SQL, a
-/// data-only restore, a delete issued from another trigger, a future code path): INSERT,
-/// UPDATE and DELETE re-stamp the sets named in their transition tables, TRUNCATE re-stamps
-/// every set that carries a generation. A delete that cascades from `result_sets`
-/// (`delete_set`, `gc_sweep`) updates nothing: its header is gone and every cached copy reads
-/// `NotFound`. A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
-/// --disable-triggers`), or that writes `membership_generation` directly, breaks the
-/// invariant; every replica must then be restarted
+/// the v7 triggers enforce it for every other writer (manual SQL, a data-only restore, a
+/// delete issued from another trigger, a future code path): INSERT and UPDATE re-stamp, per
+/// statement, the sets named in their transition tables; DELETE re-stamps, per row but at most
+/// once per set per transaction, the set the row belonged to; TRUNCATE re-stamps every set that
+/// carries a generation. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
+/// writes nothing: its header is gone and every cached copy reads `NotFound`. The constructor
+/// checks that the four triggers are present, ENABLE ALWAYS and bound to v7's function bodies;
+/// when they are not it logs an error and retains nothing, so every read takes the joined read.
+/// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
+/// --disable-triggers`), or that writes `membership_generation` directly, while servers are
+/// running breaks the invariant; every replica must then be restarted
 /// (`docs/user-manual/server-admin.md`, "Result-set membership after a restore or repair").
 /// A new member writer must keep the generation stamp; never add one that disables the
 /// triggers.
@@ -589,6 +592,9 @@ private:
         std::size_t bytes;
     };
     const std::size_t member_cache_budget_;
+    // Set once in the constructor, before the store is shared: migration v7's triggers were
+    // verified in force. When false nothing is retained, so every read takes the joined read.
+    bool member_cache_enforced_{false};
     std::mutex member_cache_mutex_;
     std::size_t member_cache_bytes_{0};
     std::list<MemberCacheEntry> member_cache_fifo_;
