@@ -1405,6 +1405,10 @@ public:
             // see shutdown_deadline_guard.hpp — multiple concurrent guards need no
             // coordination with each other.
             yuzu::agent::ShutdownDeadlineGuard watchdog{kShutdownDeadlineGrace};
+            // Close the command start gate on EVERY run() exit, before any plugin is shut
+            // down: a task still queued in the pool would otherwise start against a plugin
+            // whose shutdown() has run (only protective commands may start while closing).
+            command_pool_closing_.store(true, std::memory_order_release);
             // Guardian BEFORE SparkEngine, on EVERY run() exit - not just the
             // externally-triggered Agent::stop() path (handler_ex / the shutdown
             // watcher / the console handler). A run() exit that never went
