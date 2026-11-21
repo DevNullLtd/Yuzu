@@ -1261,6 +1261,19 @@ ssize_t full_disk_write(int fd, const void* b, std::size_t n) {
     errno = ENOSPC;
     return -1;
 }
+int g_fsync_calls = 0;
+int failing_fsync(int) {
+    ++g_fsync_calls;
+    errno = EIO;
+    return -1;
+}
+int eintr_once_fsync(int fd) {
+    if (g_fsync_calls++ == 0) {
+        errno = EINTR;
+        return -1;
+    }
+    return ::fsync(fd);
+}
 std::string mode_of(const fs::path& p) {
     struct stat st {};
     REQUIRE(::lstat(p.c_str(), &st) == 0);
@@ -1402,6 +1415,42 @@ TEST_CASE("sqlite_quarantine: a descriptor copy that fails part-way removes the 
     CHECK_FALSE(partial.removal);
     CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // 3 bytes landed, then gone
     CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: a failed flush keeps the complete copy and reports it",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The earlier copy_file never fsynced, so a flush error must not turn a finished copy into none.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_fsync_calls = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &failing_fsync);
+    CHECK_FALSE(ec);
+    CHECK(partial.created);
+    CHECK(partial.unsynced);
+    CHECK(partial.sync_error == std::errc::io_error);
+    CHECK(g_fsync_calls == 1);
+    CHECK(read_bytes(dst) == "wal bytes");
+    CHECK(mode_of(dst) == "600");
+}
+
+TEST_CASE("sqlite_quarantine: an interrupted flush is retried",
+          "[command_dedup][corruption][quarantine_fs]") {
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    g_fsync_calls = 0;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &eintr_once_fsync);
+    CHECK_FALSE(ec);
+    CHECK_FALSE(partial.unsynced);
+    CHECK(g_fsync_calls == 2);
+    CHECK(read_bytes(dst) == "wal bytes");
 }
 
 TEST_CASE("sqlite_quarantine: the default sidecar copy preserves the bytes owner-only and drops the original",

@@ -61,8 +61,8 @@
 /// removal of a partial copy this call created (it acts on whatever entry is at the name when it
 /// runs: a third party who swaps a link or an empty directory in after a failed copy and before the
 /// removal loses it) and the final drop of the original sidecar. On Windows the copy is the
-/// standard library's `copy_file`, by name at both ends: a non-exclusive copy there can overwrite a
-/// file put at the destination inside the gap, and writes through a link. All of it needs write
+/// standard library's `copy_file`, by name at both ends: it follows a link at the source, and a file
+/// put at the destination inside the gap is not proven safe (unverified until the Windows leg runs). All of it needs write
 /// access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
 /// so it is judged, claimed and secured as that target: the open that judged it had already used
@@ -168,7 +168,8 @@ struct FsOps {
     std::function<void(const std::filesystem::path& name, std::error_code&)> remove;
     /// Copy a sidecar when it could not be moved. Default on POSIX: a copy by descriptor (the source
     /// opened `O_NOFOLLOW`, the destination created `O_EXCL|O_NOFOLLOW`, mode 0600, fsynced; a
-    /// failure after the create removes the destination it made); default on Windows:
+    /// failed read or write after the create removes the destination it made, a failed flush keeps
+    /// the complete copy and the note says so); default on Windows:
     /// `std::filesystem::copy_file` with `copy_options::none`, which fails rather than overwrite.
     /// When set it replaces the whole default. It is only called when no directory entry of any
     /// kind, a dangling link included, exists at `to`. When it fails with anything but
@@ -182,23 +183,31 @@ struct FsOps {
 #ifndef _WIN32
 namespace detail {
 
-/// What a failed descriptor copy left behind: `created` is true when THIS call made the destination
-/// (the `O_EXCL` create succeeded), and `removal` is the result of removing it by name.
+/// What a descriptor copy left behind: `created` is true when THIS call made the destination
+/// (the `O_EXCL` create succeeded), and `removal` is the result of removing it by name after a
+/// failure. `unsynced` is true when every byte was written but flushing the destination to disk
+/// failed: the complete copy is KEPT (`sync_error` says why) and the call still succeeds.
 struct PartialCopy {
     bool created = false;
     std::error_code removal;
+    bool unsynced = false;
+    std::error_code sync_error;
 };
 
 /// Copy `from` to `to` by descriptor. `from` is opened `O_NOFOLLOW` (a link at the name fails with
 /// ELOOP) and must be a regular file; `to` is created `O_EXCL|O_NOFOLLOW` with mode 0600 (an entry
 /// of ANY kind there, a link included, fails with `file_exists`: no overwrite, no write through a
-/// link). The bytes are copied in bounded chunks (EINTR retried, short writes continued), the
-/// destination is fsynced, and on any failure after the create the destination, which this call
-/// provably made, is removed by name and `partial` says so. `write_fn` is a test seam.
+/// link). The bytes are copied in bounded chunks (EINTR retried, short writes continued) and the
+/// destination is fsynced (EINTR retried). A failure to read or write after the create removes the
+/// destination, which this call provably made, by name and `partial` says so; a failed fsync does
+/// NOT: the complete copy is kept and `partial.unsynced` reports it, because the earlier
+/// `copy_file` never flushed and a finished copy is better evidence than none.
+/// `write_fn` and `fsync_fn` are test seams.
 inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
                                        const std::filesystem::path& to, std::error_code& ec,
                                        PartialCopy& partial,
-                                       ssize_t (*write_fn)(int, const void*, std::size_t) = &::write) {
+                                       ssize_t (*write_fn)(int, const void*, std::size_t) = &::write,
+                                       int (*fsync_fn)(int) = &::fsync) {
     ec.clear();
     partial = {};
     // O_NONBLOCK: a FIFO swapped in at the name must fail the regular-file check, not block the open.
@@ -252,9 +261,15 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
             if (!ok)
                 break;
         }
-        if (ok && ::fsync(dst.fd()) != 0) {
-            ec.assign(errno, std::generic_category());
-            ok = false;
+        if (ok) {
+            int rc = 0;
+            do {
+                rc = fsync_fn(dst.fd());
+            } while (rc != 0 && errno == EINTR);
+            if (rc != 0) { // keep the complete copy; the caller's note says it may not be durable
+                partial.unsynced = true;
+                partial.sync_error.assign(errno, std::generic_category());
+            }
         }
     }
     if (!ok)
@@ -579,9 +594,17 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
                 side_dest.string(), cec.message(), partial_note));
         } else {
             secure(side_dest);
+            std::string sync_note;
+#ifndef _WIN32
+            if (copy_ran && !ops.copy && by_fd.unsynced)
+                sync_note = std::format("; flushing it to disk failed ({}), so it may not survive "
+                                        "a power loss",
+                                        by_fd.sync_error.message());
+#endif
             result.notes.push_back(std::format("copied {} to {} because it could not be renamed "
-                                               "({})",
-                                               side.string(), side_dest.string(), mec.message()));
+                                               "({}){}",
+                                               side.string(), side_dest.string(), mec.message(),
+                                               sync_note));
         }
         std::error_code rm;
         fs::remove(side, rm);
