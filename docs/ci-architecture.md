@@ -1229,7 +1229,8 @@ that could not mean anything:
   three chisel images and the agent bundle. They are assembled FROM scratch from chisel slices,
   which leave no dpkg database (and no chisel manifest, because they do not cut
   `base-files_chisel`), so Trivy 0.70.0 reports "No OS package is detected". **Their libc6,
-  libssl3t64, zlib1g and other slices ship unscanned.** The gate learns an image's name from
+  libssl3t64, zlib1g and other slices ship unscanned by Trivy** (grype matches some of them, best
+  effort: "What it does not see" below). The gate learns an image's name from
   `NAME=IMAGE` (release.yml) or the tag (pre-release.yml); a bare image ID can never match the list.
 - an ignore file that `scripts/ci/image-vuln-gate-checks.py` does not accept (below).
 
@@ -1829,7 +1830,8 @@ except the agent bundle:
   check whether the mirror or Trivy's DB publishing is broken before anything else.
 - **OS packages not scanned** (an image newly showing 0 OS packages): something removed the
   package database from an image that used to have one. Fix the image; listing it in
-  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned.
+  `image-vuln-gate-not-covered.txt` is a reviewed decision that its OS packages ship unscanned by
+  Trivy.
   Either is a commit, so re-tag. On a listed image the log says why the listing is not in force:
   it expired (re-review it), or its `approval_ref` is `pending` (record the approval, above).
 - **An acceptance `NOT IN FORCE`**: its `approval_ref` is `pending`. Record the approval as

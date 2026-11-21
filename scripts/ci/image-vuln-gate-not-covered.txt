@@ -4,8 +4,11 @@
 # package at all: a scan that saw nothing is not a clean scan. An image listed
 # here passes that check anyway, and the gate prints NOT COVERED with the reason
 # for it on every run (and records it in the report). Listing an image is a
-# reviewed decision that its OS packages ship UNSCANNED; it is not an acceptance
-# of any vulnerability in them.
+# reviewed decision that its OS packages ship UNSCANNED by Trivy; it is not an
+# acceptance of any vulnerability in them. (The gate's second scanner, grype,
+# matches some of these images' OS packages and refuses a fixable CRITICAL it
+# reports there, but nothing proves that coverage: docs/ci-architecture.md
+# "What it does not see". Each listing's reason describes Trivy's view.)
 #
 # Format, one image per line (validated by image-vuln-gate-checks.py; a
 # malformed line refuses the whole list):
