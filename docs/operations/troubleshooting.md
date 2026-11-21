@@ -111,7 +111,7 @@ download host, besides Docker Hub and Hex.
 | Message | Fix |
 |---------|-----|
 | A download error at the `ADD --checksum=sha256:... rebar3` step | Give the build host access to `github.com`, or build where it has it (CI). |
-| A checksum mismatch at that step | The bytes are not the pinned rebar3 release. Do not change the checksum to make the build pass; see `docs/erlang-gateway-build.md` for how the pin is verified and bumped. |
+| A checksum mismatch at that step | The bytes are not the pinned rebar3 release. Do not change the checksum to make the build pass; the comments above that `ADD` in `Dockerfile.gateway` say how the pin is verified and bumped. |
 
 ## Certificate Errors
 

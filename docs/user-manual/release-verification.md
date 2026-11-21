@@ -167,8 +167,9 @@ What this does **not** gate:
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP
-  runtime (`yuzu-gateway` ships OTP 28.5.0.8, ERTS 16.4.0.7; grype's report lists it as the `erlang`
-  package; the release scan refuses a gateway image in which grype does not find it) is matched by
+  runtime (`yuzu-gateway` ships OTP 28.5.0.8, ERTS 16.4.0.7; grype's `.gate.txt` records it as
+  `required components: erlang <version>`, and the release scan refuses a gateway image in which grype
+  does not find it) is matched by
   grype only (Trivy does not identify it): a vulnerability grype's data does not attribute to that
   OTP version is not gated.
 - The integrity of the vulnerability databases themselves: their publishers do not sign them. Each

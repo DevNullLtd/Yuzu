@@ -185,20 +185,26 @@ GRYPE_SHA256_LINUX_ARM64="b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b
 # names one archive and its sha256; the gate downloads that archive itself and
 # checks it before grype imports it, so grype never fetches a DB on its own.
 GRYPE_DB_URL="https://grype.anchore.io/databases/v6"
-# The DB providers whose freshness the gate requires: the OS families of the
-# published images (each with a Trivy canary) and NVD, which supplies the
-# matches for binaries grype identifies by version, the gateway's Erlang/OTP
-# runtime among them.
-GRYPE_REQUIRED_PROVIDERS=(nvd alpine debian ubuntu)
+# The DB providers whose freshness the gate requires. NVD, for every run: it
+# supplies the matches for binaries grype identifies by version, the gateway's
+# Erlang/OTP runtime among them. Each image's OS family's provider (alpine,
+# debian, ubuntu: the canary families), checked per image, so a lagging
+# provider refuses only the images on that OS.
+GRYPE_REQUIRED_PROVIDERS=(nvd)
 # Components grype must catalogue in an image (NAME=component...): the reason
 # grype runs at all. Trivy does not see the gateway's Erlang/OTP runtime, and
 # grype's JSON lists only matches, so without this a runtime grype stopped
 # recognising would read as clean.
-# Both gateway images were checked to catalogue erlang 28.5.0.8 (from the
-# bundled ERTS's beam.smp) with grype 0.121.3 on 2026-11-20.
+# Each entry is component=version: grype must report that exact version, so a
+# version it misreads (an ERTS version, a truncated one) refuses the image
+# instead of being matched against the wrong advisories. The version is the OTP
+# each gateway Dockerfile pins (tests/test_image_vuln_gate.py checks they
+# agree, so a builder bump updates this table and re-runs the real gate). Both
+# gateway images were checked to catalogue erlang 28.5.0.8 (from the bundled
+# ERTS's beam.smp) with grype 0.121.3 on 2026-11-20.
 declare -A GRYPE_REQUIRED_COMPONENTS=(
-    [yuzu-gateway]="erlang"
-    [yuzu-gateway-chisel]="erlang"
+    [yuzu-gateway]="erlang=28.5.0.8"
+    [yuzu-gateway-chisel]="erlang=28.5.0.8"
 )
 
 # The DB sources, tried in order: Trivy 0.70.0's defaults (the Google mirror of
@@ -692,7 +698,7 @@ fi
 run_grype "$RESOLVE_DEADLINE" db providers -o json > "$WORK/grype-db-providers.json" 2>"$WORK/grype-db-status.err" || true
 if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then
     cat "$WORK/grype-db-status.err" >&2 || true
-    die "a grype DB provider the gate needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours (above); re-run once the published DB is current"
+    die "a grype DB provider every image needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours (above): an old one, re-run once the published DB is current; a missing one, the DB may have renamed it and GRYPE_REQUIRED_PROVIDERS needs updating"
 fi
 printf '%s\n' "$gprov" | sed 's/^/    /'
 GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
@@ -817,7 +823,12 @@ grype_scan() {
         "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?
     rm -f "$ARCHIVE"
     case "$rc" in
-        0) if [ "$comps_ok" != 1 ]; then
+        0) if [ -n "$want_family" ] && ! "${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" \
+                   "$want_family" > /dev/null; then
+               err "$img: grype's DB provider for $want_family is missing or older than 72 hours (above), so its $want_family advisories are not current (treated as a failure; re-run once the published DB is current)"
+               gres="FAIL: grype DB provider $want_family is stale"
+               failed=1
+           elif [ "$comps_ok" != 1 ]; then
                err "$img: grype did not catalogue $comps, the component it runs on this image for (above); a grype or base-image change stopped it recognising the runtime (treated as a failure)"
                gres="FAIL: grype did not catalogue $comps"
                failed=1

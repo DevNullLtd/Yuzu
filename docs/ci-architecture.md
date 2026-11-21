@@ -1278,18 +1278,25 @@ after Trivy:
   image; Trivy's report stays the only coverage reader.
 - **Required components.** grype's JSON lists matches only, so a runtime grype did not recognise
   would read as clean. For `yuzu-gateway` and `yuzu-gateway-chisel`, whose Erlang/OTP runtime is
-  the reason grype runs, the image fails unless grype catalogued `erlang` with a version
-  (`grype did not catalogue erlang`; both images were checked to show `erlang 28.5.0.8` on
-  2026-11-20). The table is `GRYPE_REQUIRED_COMPONENTS` in the script.
+  the reason grype runs, the image fails unless grype itself identified `erlang` (purl
+  `pkg:generic/erlang@<version>`, not an OS package of that name) at exactly the OTP version the
+  image's Dockerfile pins (`grype did not catalogue erlang`, or `erlang <version> (expected ...)`
+  for a version grype misread). Both images were checked to show `erlang 28.5.0.8` on 2026-11-20.
+  The table is `GRYPE_REQUIRED_COMPONENTS` in the script; `tests/test_image_vuln_gate.py` fails when
+  its versions differ from the OTP that `Dockerfile.gateway` and `Dockerfile.gateway.chisel` pin, so
+  a builder bump updates the table in the same change (and runs the real gate, "grype" below).
 - **The grype DB** is set up once per run: the gate fetches grype's v6 listing
   (`https://grype.anchore.io/databases/v6/latest.json`, grype 0.121.3's default, named explicitly),
   refuses it unless its status is `active`, its schema is v6, its `path` is a bare archive name,
   its checksum is a sha256, and its `built` time is at most 72 hours old and not more than an hour
   in the future; downloads the archive it names into its work directory; checks the archive's
   sha256 against the listing; has grype import it; and then requires `grype db status` to report
-  the DB valid with the listing's build time and schema, and `grype db providers` to list `nvd`,
-  `alpine`, `debian` and `ubuntu` each captured at most 72 hours ago (the DB's `built` time says when
-  it was assembled, not how fresh each source in it is; NVD supplies the OTP runtime's matches).
+  the DB valid with the listing's build time and schema, and `grype db providers` to list `nvd`
+  captured at most 72 hours ago (the DB's `built` time says when it was assembled, not how fresh each
+  source in it is; NVD supplies the OTP runtime's matches). Each image whose OS packages Trivy scanned
+  also needs that OS family's provider (`alpine`, `debian` or `ubuntu`) captured within 72 hours, or
+  that image fails (`grype DB provider <family> is stale`); a lagging provider refuses only the images
+  on its OS.
   Every scan runs with DB updates and the
   update check off and grype's own 72-hour age check on, so grype never fetches a DB of its own.
   **The listing is not signed upstream:** TLS to its host and the recorded URL and checksum are
@@ -1380,8 +1387,9 @@ Trivy's or grype's three non-empty reports. Earlier and later attempts' reports 
 kept as the evidence. The agent bundle's job runs after the release exists, so its reports cannot be
 inside `SHA256SUMS`; `attach-bundle-gate-report` attaches them to the GitHub Release afterwards. It
 runs whenever the bundle job ran at all (`needs.docker-publish-agent-bundle.result != 'skipped'`),
-downloads every attempt's bundle gate artifact the same way, fails when there is none, and attaches,
-per attempt, its reports, its journal and a checksum list
+downloads every attempt's bundle gate artifact the same way, fails when there is none, refuses an
+attempt with no Trivy `.gate.txt`, or one with a publish journal but no grype `.gate.txt`, and
+attaches, per attempt, its reports, its journal and a checksum list
 `yuzu-agent-bundle-chisel-image-vuln-gate.attempt-<N>.SHA256SUMS` signed keyless by the same
 `release.yml` identity and verified in-job. Each run of it converges: after the last one, every
 attempt's files are on the release.
@@ -1847,7 +1855,9 @@ except the agent bundle:
   version). For the gateway's Erlang/OTP runtime the fix is a newer OTP in `Dockerfile.gateway`'s
   pinned `hexpm/erlang` builder. Either is a commit, so re-tag.
 - **A stale or unverifiable grype DB** (`grype DB listing`, `does not match the listing`,
-  `grype db status`): wait and "Re-run failed jobs". grype's DB has one source (no mirror to fall
+  `grype db status`): wait and "Re-run failed jobs". When the log says the listing's status is not
+  `active`, the pinned grype's DB schema is retired: re-running will not help; bump grype (a commit,
+  so re-tag). grype's DB has one source (no mirror to fall
   back to, unlike Trivy's) and the gate has no override, so while grype's DB publishing is down or
   stale no release leg passes; check that publishing before anything else.
 - **A scanner could not be installed, fetch or import its DB, or scan** (`could not download`,
@@ -1859,15 +1869,17 @@ except the agent bundle:
   daemon fault. "Re-run failed jobs"; if it recurs, check the runner's free disk.
 - **grype did not detect the OS** (`grype did not detect the OS`): the image's OS release is one
   the pinned grype does not recognise; a newer grype or a supported OS release is a commit, so re-tag.
-- **grype did not catalogue erlang** (`grype did not catalogue erlang`): grype no longer recognises
-  the gateway's bundled OTP runtime (a grype bump, or a builder change that moved or stripped
-  `beam.smp`). Find which change did it; a fix is a commit, so re-tag. Do not drop the requirement
+- **grype did not catalogue erlang** (`grype did not catalogue erlang`, or `erlang <version>
+  (expected ...)`): grype no longer recognises the gateway's bundled OTP runtime, or reads another
+  version than the table pins (a grype bump, a builder change that moved or stripped `beam.smp`, or
+  a builder bump without the table). Find which change did it; a fix is a commit, so re-tag. Do not drop the requirement
   to pass: without it the runtime ships unscanned.
 - **grype's record and gate scans disagree** (`grype's record and gate scans disagree`): the gate
   scan passed while the record lists a fixable CRITICAL no acceptance covers. Treat it as a
   finding: read the record (`grype-<image>.attempt-<N>.txt`), and fix or accept it.
 - **A grype DB provider is stale** (`provider ... is not in the DB`, `provider ... built ... hours
-  ago`): as for a stale DB, wait and "Re-run failed jobs".
+  ago`, `grype DB provider <family> is stale`): the log names the provider and how old its capture
+  is. As for a stale DB, wait and "Re-run failed jobs"; there is no override.
 
 **When the agent bundle's gate fails, never re-tag.** `docker-publish-agent-bundle` runs after
 the `release` job has published the GitHub Release, so the tag is already a published release:

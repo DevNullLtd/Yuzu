@@ -153,9 +153,11 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       assembled, not how fresh each source in it is: a provider whose capture
       went stale would otherwise read as current.
 
-  grype-components CYCLONEDX_JSON NAME...
+  grype-components CYCLONEDX_JSON NAME[=VERSION]...
       Read grype's CycloneDX output (every catalogued component) and fail
-      unless each NAME is a component with a version. Used for an image whose
+      unless each NAME is a component with a version identified by grype
+      itself (purl pkg:generic/NAME@VERSION), not an OS package of that name;
+      with =VERSION, grype must report exactly that version. Used for an image whose
       point in running grype is a component Trivy cannot see (the gateway's
       Erlang/OTP runtime, `erlang`): grype's JSON report lists only matches, so
       a runtime grype never catalogued would otherwise read as clean.
@@ -1202,20 +1204,34 @@ def cmd_grype_components(path, names):
     except (OSError, ValueError, RecursionError) as e:
         print(f"grype components: cannot read {e}", file=sys.stderr)
         return 1
+    # A component counts only as grype's own binary identification of it
+    # (purl pkg:generic/<name>@<version>, as grype 0.121.3 reports the
+    # gateway's beam.smp), so an OS package of the same name cannot stand in.
     found = {}
     for comp in comps:
-        if isinstance(comp, dict) and isinstance(comp.get("name"), str) and isinstance(comp.get("version"), str) \
-                and comp["version"]:
-            found.setdefault(comp["name"], comp["version"])
-    missing = [n for n in names if n not in found]
-    for n in names:
-        if n in found:
+        if not isinstance(comp, dict):
+            continue
+        name, ver, purl = comp.get("name"), comp.get("version"), comp.get("purl")
+        if isinstance(name, str) and isinstance(ver, str) and ver and isinstance(purl, str) \
+                and purl == f"pkg:generic/{name}@{ver}":
+            found.setdefault(name, ver)
+    missing, wrong = [], []
+    for spec in names:
+        n, _, want = spec.partition("=")
+        if n not in found:
+            missing.append(n)
+        elif want and found[n] != want:
+            wrong.append(f"{n} {found[n]} (expected {want})")
+        else:
             print(f"component_{n}={found[n]}")
+    if wrong:
+        print(f"grype catalogued {', '.join(wrong)}: a version grype misread, or an image whose runtime is not "
+              f"the one the gate's table pins", file=sys.stderr)
     if missing:
-        print(f"grype did not catalogue {', '.join(missing)} (with a version) in the image, so it could not "
+        print(f"grype did not catalogue {', '.join(missing)} (as pkg:generic, with a version) in the image, so it "
+              f"could not "
               f"match its vulnerabilities", file=sys.stderr)
-        return 1
-    return 0
+    return 1 if missing or wrong else 0
 
 
 def cmd_grype_report(path):

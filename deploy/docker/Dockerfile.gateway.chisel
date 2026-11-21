@@ -18,7 +18,8 @@
 #   docker build -t yuzu-gateway:chisel -f deploy/docker/Dockerfile.gateway.chisel .
 
 # ── Stage 1: deps — fetch + compile Erlang dependencies (cached) ──────────
-# erlang:28 = OTP 28.5.0.8 (built 2026-11-05). `include_erts` puts this
+# erlang:28 = OTP 28.5.0.8 (built 2026-11-05; keep this OTP in step with
+# scripts/ci/image-vuln-gate.sh's GRYPE_REQUIRED_COMPONENTS, a test reads it). `include_erts` puts this
 # image's ERTS and OTP libraries into the shipped release, so this digest decides
 # the OTP the chisel gateway runs. It is held in an ARG default, which Dependabot
 # does not see: refresh it by hand (last: 2026-11-17). It is a separate pin from

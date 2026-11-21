@@ -3203,10 +3203,17 @@ jobs:
           done
           mapfile -t attempts < <(printf '%s\n' "${!seen[@]}" | sort -n)
           for n in "${attempts[@]}"; do
-            for scanner in trivy grype; do
-              [[ -s "${scanner}-${name}.attempt-${n}.gate.txt" ]] \
-                || { err "attempt $n has files but no ${scanner}-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
-            done
+            [[ -s "trivy-${name}.attempt-${n}.gate.txt" ]] \
+              || { err "attempt $n has files but no trivy-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            # grype's is required for an attempt that opened a journal (the
+            # journal check below, image-publish.sh gates_pass, refuses one
+            # without it). An attempt that never opened one is evidence of a
+            # refusal or a stop and is attached as it is: a gate killed before
+            # writing grype's verdict must not block every later attach.
+            if [[ -e "publish-${name}.attempt-${n}.txt" ]]; then
+              [[ -s "grype-${name}.attempt-${n}.gate.txt" ]] \
+                || { err "attempt $n has a publish journal but no grype-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            fi
           done
 
           # The journals: legal prefixes only, each beside a passing gate. Exit

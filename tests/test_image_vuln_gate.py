@@ -192,6 +192,11 @@ GRYPE_STUB = textwrap.dedent(
     if args[:2] == ["db", "import"]:
         if mode == "import-error":
             sys.exit(1)
+        if mode == "import-hang":
+            import time
+            open(log + ".pid", "w").write(str(os.getpid()))
+            time.sleep(60)
+            sys.exit(0)
         os.makedirs(os.path.join(cache, "6"), exist_ok=True)
         open(os.path.join(cache, "6", "vulnerability.db"), "w").write(open(args[2]).read())
         sys.exit(0)
@@ -203,6 +208,8 @@ GRYPE_STUB = textwrap.dedent(
             rows[0]["dateCaptured"] = "2001-01-01T00:00:00Z"
         if mode == "provider-missing":
             rows = rows[1:]
+        if mode == "provider-os-stale":
+            rows[2]["dateCaptured"] = "2001-01-01T00:00:00Z"  # debian
         print(json.dumps(rows))
         sys.exit(0)
     if args[:2] == ["db", "status"]:
@@ -248,7 +255,14 @@ GRYPE_STUB = textwrap.dedent(
         rep = {"SchemaVersion": 2}
     open(outs["json"], "w").write(json.dumps(rep))
     open(outs["table"], "w").write("" if mode == "empty-table" else "NAME INSTALLED TYPE VULNERABILITY\\n")
-    comps = [] if mode == "no-erlang" else [{"name": "erlang", "version": "28.5.0.8", "type": "application"}]
+    comps = [{"name": "erlang", "version": "28.5.0.8", "type": "application",
+              "purl": "pkg:generic/erlang@28.5.0.8"}]
+    if mode == "no-erlang":
+        comps = []
+    if mode == "erlang-misread":  # grype reads the ERTS version instead of OTP's
+        comps = [{"name": "erlang", "version": "16.4.0.7", "purl": "pkg:generic/erlang@16.4.0.7"}]
+    if mode == "os-erlang":  # an OS package of the same name is not the runtime
+        comps = [{"name": "erlang", "version": "28.5.0.8-r0", "purl": "pkg:apk/alpine/erlang@28.5.0.8-r0"}]
     if "cyclonedx-json" in outs:
         open(outs["cyclonedx-json"], "w").write(json.dumps({"bomFormat": "CycloneDX", "components": comps}))
     sys.exit(0)
@@ -1222,8 +1236,23 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
         self.assertIn("gate: FAIL: grype did not catalogue erlang",
                       (rep / "grype-yuzu-gateway.gate.txt").read_text(encoding="utf-8"))
+        r = self.run_gate("yuzu-gateway=img:1", grype_mode="os-erlang")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("did not catalogue erlang", r.stdout + r.stderr)
+        r = self.run_gate("yuzu-gateway=img:1", grype_mode="erlang-misread")
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("erlang 16.4.0.7 (expected 28.5.0.8)", r.stdout + r.stderr)
         # An image with no required component is not held to it.
         r = self.run_gate("yuzu-server=img:1", grype_mode="no-erlang")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_stale_os_provider_refuses_only_images_on_that_os(self):
+        rep = self.tmp / "rep-deb"
+        r = self.run_gate("img:1", grype_mode="provider-os-stale", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype DB provider debian is stale",
+                      (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+        r = self.run_gate("img:1", grype_mode="provider-os-stale", env_extra={"STUB_OS": "alpine:3.23.8"})
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
     def test_a_pass_beside_a_record_with_an_unaccepted_fixable_critical_fails(self):
@@ -1399,6 +1428,51 @@ class GateBehaviour(unittest.TestCase):
         r = self.run_gate("yuzu-server-chisel=img:3", os_pkgs="0", distro="", gate=ci / GATE.name)
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
 
+    def test_required_component_versions_are_the_otp_each_gateway_dockerfile_pins(self):
+        # A builder bump must update the gate's table (and so re-run the real
+        # gate by hand); a table naming another OTP than the image ships would
+        # refuse every gateway release leg.
+        text = GATE.read_text(encoding="utf-8")
+        table = dict(re.findall(r'^\s+\[([a-z0-9-]+)\]="erlang=([0-9.]+)"$', text, re.M))
+        self.assertEqual(set(table), {"yuzu-gateway", "yuzu-gateway-chisel"}, table)
+        df = (ROOT / "deploy" / "docker" / "Dockerfile.gateway").read_text(encoding="utf-8")
+        m = re.search(r"^FROM hexpm/erlang:([0-9.]+)-alpine-[0-9.]+@sha256:[0-9a-f]{64} AS deps$", df, re.M)
+        self.assertIsNotNone(m, "Dockerfile.gateway's hexpm/erlang builder line changed shape")
+        self.assertEqual(table["yuzu-gateway"], m.group(1))
+        chisel = (ROOT / "deploy" / "docker" / "Dockerfile.gateway.chisel").read_text(encoding="utf-8")
+        m = re.search(r"^# erlang:28 = OTP ([0-9.]+) ", chisel, re.M)
+        self.assertIsNotNone(m, "Dockerfile.gateway.chisel no longer states its builder's OTP")
+        self.assertEqual(table["yuzu-gateway-chisel"], m.group(1))
+
+    def test_a_cancel_during_the_grype_db_import_reports_and_leaves_nothing(self):
+        import signal
+        import time
+        rep = self.tmp / "rep"
+        env = dict(os.environ)
+        for k in list(env):
+            if k.startswith(("TRIVY_", "STUB_", "GITHUB_", "GRYPE_")):
+                del env[k]
+        env.update(TRIVY_BIN=str(self.stub), STUB_LOG=str(self.log), STUB_MODE="clean",
+                   YUZU_TRIVYIGNORE=str(IGNORE), YUZU_GATE_TEST_DB_DIGEST=DB_DIGEST, RUNNER_TEMP=str(self.tmp),
+                   PATH=f"{self.bin}{os.pathsep}{os.environ.get('PATH', '')}", **self.grype_env("import-hang"))
+        pidfile = Path(str(self.glog) + ".pid")
+        p = subprocess.Popen(["bash", str(GATE), "--report-dir", str(rep), "a=img:1"], env=env,
+                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        deadline = time.monotonic() + 30
+        while not pidfile.exists() and time.monotonic() < deadline:
+            time.sleep(0.05)
+        self.assertTrue(pidfile.exists(), "the stub import never started")
+        time.sleep(0.2)
+        p.send_signal(signal.SIGTERM)
+        out, err = p.communicate(timeout=30)
+        self.assertEqual(p.returncode, 143, out + err)
+        for sc in ("trivy", "grype"):
+            self.assertIn("gate: FAIL: cancelled (SIGTERM) before this image was judged",
+                          (rep / f"{sc}-a.gate.txt").read_text(encoding="utf-8"))
+        with self.assertRaises(ProcessLookupError):
+            os.kill(int(pidfile.read_text()), 0)  # the import was stopped, not left running
+        self.assertEqual(list(self.tmp.glob("yuzu-image-vuln-gate.*")), [], "WORK not removed")
+
     def test_budget_and_cancel_reports_cover_grype_too(self):
         rep = self.tmp / "rep"
         p = self.start_gate("a=img:1", extra=("--budget", "3", "--report-dir", str(rep)), mode="hang-stubborn")
@@ -1483,12 +1557,15 @@ class GrypeMutants(unittest.TestCase):
                'if false; then')], []),
             ("required component not checked", lambda gate: self.run_gate("yuzu-gateway=img:1",
                                                                           grype_mode="no-erlang", gate=gate),
-             [('        0) if [ "$comps_ok" != 1 ]; then', '        0) if false; then')], []),
+             [('           elif [ "$comps_ok" != 1 ]; then', '           elif false; then')], []),
             ("scan disagreement ignored", lambda gate: self.run_gate("img:1", grype_mode="disagree", gate=gate),
              [('           elif [ "$fcrit" != 0 ]; then', '           elif false; then')], []),
             ("provider freshness not checked", with_db("provider-stale"),
              [('if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" '
                '"${GRYPE_REQUIRED_PROVIDERS[@]}")"; then', 'if ! gprov="$(true)"; then')], []),
+            ("OS provider freshness not checked", lambda gate: self.run_gate("img:1", grype_mode="provider-os-stale",
+                                                                             gate=gate),
+             [('        0) if [ -n "$want_family" ] && ! "${CHECKS[@]}" grype-db-providers', '        0) if false && ! "${CHECKS[@]}" grype-db-providers')], []),
             ("pending grype acceptance honoured in a release", pending_in_release,
              [('[ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)', ':')], []),
         ]
@@ -2459,6 +2536,18 @@ class AttachBundleReport(unittest.TestCase):
                 self.assertIn(f"no {scanner}-yuzu-agent-bundle-chisel.attempt-2.gate.txt", r.stdout + r.stderr)
                 self.assertEqual(self.uploads(), [])
                 self.write_report()
+
+    def test_an_unjournaled_attempt_without_grypes_verdict_is_attached_as_it_is(self):
+        # A gate killed before grype's verdict leaves Trivy's files only; that
+        # attempt opened no journal and must not block every later attach.
+        d = self.work / "bundle-gate"
+        stem = "yuzu-agent-bundle-chisel.attempt-1"
+        for suf, body in (("json", '{"SchemaVersion": 2}\n'), ("txt", "table\n"),
+                          ("gate.txt", "image: x\nrun attempt: 1\ngate: FAIL: cancelled (SIGTERM)\n")):
+            (d / f"trivy-{stem}.{suf}").write_text(body)
+        r = self.run_attach()
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f"trivy-{stem}.gate.txt", self.assets())
 
     def test_attaches_every_report_with_a_signed_list(self):
         self.complete_first_run()
