@@ -130,11 +130,12 @@ device visibility still bounds the result.
 Reusing cached IDs is sound only because a set's members never change while its generation
 stays the same. The two server writers stamp a new generation in the transaction that writes
 the members, and statement-level triggers on `result_set_members` (store migration v7)
-re-stamp it for any other writer: an INSERT or UPDATE re-stamps the sets it touched, an
-out-of-band DELETE or a TRUNCATE re-stamps every set that has a generation. A bulk load
-costs one header update per set per statement, never one per member row. A delete that
-cascades from `result_sets` is not re-stamped, since the header is gone and every cached
-copy reads it as not found. A writer that disables the triggers bypasses this; the
+re-stamp it for any other writer: an INSERT, UPDATE or DELETE re-stamps the sets it touched
+(also when issued from inside another trigger), a TRUNCATE re-stamps every set that has a
+generation. A bulk load costs one header update per set per statement, never one per member
+row. A delete that cascades from `result_sets` updates nothing, since the header is gone and
+every cached copy reads it as not found. A writer that disables the triggers, or writes the
+generation column directly, bypasses this; the
 operator procedure is in the server administration guide, "Result-set membership after a
 restore or repair".
 

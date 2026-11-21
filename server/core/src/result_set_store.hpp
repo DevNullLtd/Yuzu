@@ -71,12 +71,13 @@
 /// that carries one, in the writing transaction. The two C++ writers stamp it themselves
 /// (`insert_row_impl` in the header INSERT, `materialize` in its status-guarded UPDATE), and
 /// the v7 statement-level triggers enforce it for every other writer (manual SQL, a
-/// data-only restore, a future code path): INSERT and UPDATE re-stamp the sets named in the
-/// transition tables, an out-of-band DELETE (trigger depth 0) and TRUNCATE re-stamp every
-/// set that carries a generation. A delete that cascades from `result_sets` (`delete_set`,
-/// `gc_sweep`) is not re-stamped: its header is gone and every cached copy reads `NotFound`.
-/// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
-/// --disable-triggers`) breaks the invariant; every replica must then be restarted
+/// data-only restore, a delete issued from another trigger, a future code path): INSERT,
+/// UPDATE and DELETE re-stamp the sets named in their transition tables, TRUNCATE re-stamps
+/// every set that carries a generation. A delete that cascades from `result_sets`
+/// (`delete_set`, `gc_sweep`) updates nothing: its header is gone and every cached copy reads
+/// `NotFound`. A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
+/// --disable-triggers`), or that writes `membership_generation` directly, breaks the
+/// invariant; every replica must then be restarted
 /// (`docs/user-manual/server-admin.md`, "Result-set membership after a restore or repair").
 /// A new member writer must keep the generation stamp; never add one that disables the
 /// triggers.

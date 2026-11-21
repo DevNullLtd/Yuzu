@@ -1078,6 +1078,17 @@ TEST_CASE("ResultSetStore: an out-of-band member write re-stamps the generation 
                            "result_set_id = " + id + " AND device_id = 'dev-1'");
         expected = {"dev-2"};
     }
+    SECTION("a DELETE issued from inside another trigger") {
+        exec_sql(db.dsn(),
+                 "CREATE TABLE public.yuzu_test_nested (x int); "
+                 "CREATE FUNCTION public.yuzu_test_nested_f() RETURNS trigger LANGUAGE plpgsql "
+                 "AS $$ BEGIN DELETE FROM result_set_store.result_set_members WHERE "
+                 "result_set_id = " + id + " AND device_id = 'dev-1'; RETURN NULL; END $$; "
+                 "CREATE TRIGGER yuzu_test_nested_t AFTER INSERT ON public.yuzu_test_nested "
+                 "FOR EACH ROW EXECUTE FUNCTION public.yuzu_test_nested_f(); "
+                 "INSERT INTO public.yuzu_test_nested VALUES (1)");
+        expected = {"dev-2"};
+    }
     SECTION("TRUNCATE") {
         exec_sql(db.dsn(), "TRUNCATE result_set_store.result_set_members");
         expected = {};
@@ -1127,9 +1138,12 @@ TEST_CASE("ResultSetStore: the product writers' cascades do not re-stamp other s
     CHECK(member_set_owned_ok(store, kept->id, "alice") ==
           std::unordered_set<std::string>{"dev-2"});
 
-    // An out-of-band member delete has no transition table: every stamped set is re-stamped.
+    // An out-of-band member delete re-stamps only the sets it touched.
     exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE device_id = "
                        "'no-such-device'");
+    CHECK(generation_of(db.dsn(), kept->id) == kept_generation);
+    exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE device_id = "
+                       "'dev-2'");
     CHECK(generation_of(db.dsn(), kept->id) != kept_generation);
 }
 

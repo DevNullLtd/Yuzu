@@ -398,10 +398,11 @@ That equivalence holds only under one invariant: **a set's member rows never cha
 generation stays the same.** Every write to `result_set_members` must re-stamp the generation of
 each affected set in the writing transaction. The two writers (`insert_row_impl`, `materialize`)
 stamp it themselves; v7 enforces it for every other writer with statement-level `ENABLE ALWAYS`
-triggers (INSERT/UPDATE re-stamp the sets in the transition tables; an out-of-band DELETE, at
-trigger depth 0, and TRUNCATE re-stamp every stamped set; a cascade from a `result_sets` delete
-is skipped, because the header is gone). Statement-level, not row-level, so a bulk load costs one
-header update per affected set per statement. A writer that disables the triggers breaks the
+triggers (INSERT/UPDATE/DELETE re-stamp the sets in their transition tables, at any trigger
+depth; TRUNCATE re-stamps every stamped set; a cascade from a `result_sets` delete updates
+nothing, because the header is gone). Statement-level, not row-level, so a bulk load costs one
+header update per affected set per statement and a cascade costs a transition capture but no
+write. A writer that disables the triggers, or writes `membership_generation` directly, breaks the
 invariant and requires a restart of every replica (`docs/user-manual/server-admin.md`, "Result-set
 membership after a restore or repair"). A new member writer keeps the stamp and never disables
 the triggers.

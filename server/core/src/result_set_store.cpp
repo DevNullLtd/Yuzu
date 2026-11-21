@@ -231,12 +231,13 @@ const std::vector<pg::PgMigration>& migrations() {
         // of every affected set that carries one, in the writing transaction (see the header's
         // "Member cache invariant"). Statement-level, so a bulk load costs one header UPDATE per
         // affected set per statement, never one per member row:
-        //   INSERT/UPDATE: the transition tables name the affected sets.
-        //   DELETE at trigger depth 0 (an out-of-band delete) and TRUNCATE: no transition table
-        //     (a DELETE trigger with one would also capture every cascaded row of a gc_sweep or
-        //     delete_set), so every set carrying a generation is re-stamped. A cascade from a
-        //     result_sets delete runs inside the FK trigger (depth >= 1) and is skipped: its
-        //     header row is gone, so every cached copy already reads NotFound.
+        //   INSERT/UPDATE/DELETE: the transition tables name the affected sets, at any trigger
+        //     depth (a DELETE issued from another trigger is re-stamped too). A cascade from a
+        //     result_sets delete finds its own header already gone, so it updates nothing; the
+        //     cost is the transition capture of the cascaded rows, no write (measured once on
+        //     PostgreSQL 16, local disk: a 200-set x 5,000-member cascade, 1M rows, took about
+        //     0.3 s instead of 0.22 s).
+        //   TRUNCATE has no transition table: every set carrying a generation is re-stamped.
         // ENABLE ALWAYS: also fires under session_replication_role = replica. It does not fire
         // when the trigger is disabled (ALTER TABLE ... DISABLE TRIGGER, pg_restore
         // --disable-triggers): the operator doc requires a restart of every replica then.
@@ -255,6 +256,10 @@ BEGIN
      WHERE r.membership_generation IS NOT NULL
        AND (r.id IN (SELECT a.result_set_id FROM added a)
             OR r.id IN (SELECT d.result_set_id FROM removed d));
+  ELSIF TG_OP = 'DELETE' THEN
+    UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
+     WHERE r.membership_generation IS NOT NULL
+       AND r.id IN (SELECT d.result_set_id FROM removed d);
   ELSE
     UPDATE result_set_store.result_sets r SET membership_generation = gen_random_uuid()
      WHERE r.membership_generation IS NOT NULL;
@@ -272,8 +277,8 @@ CREATE TRIGGER result_set_members_restamp_upd AFTER UPDATE ON result_set_members
   REFERENCING OLD TABLE AS removed NEW TABLE AS added
   FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
 CREATE TRIGGER result_set_members_restamp_del AFTER DELETE ON result_set_members
-  FOR EACH STATEMENT WHEN (pg_catalog.pg_trigger_depth() = 0)
-  EXECUTE FUNCTION result_set_store.result_set_members_restamp();
+  REFERENCING OLD TABLE AS removed
+  FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
 CREATE TRIGGER result_set_members_restamp_trunc AFTER TRUNCATE ON result_set_members
   FOR EACH STATEMENT EXECUTE FUNCTION result_set_store.result_set_members_restamp();
 ALTER TABLE result_set_members ENABLE ALWAYS TRIGGER result_set_members_restamp_ins;
