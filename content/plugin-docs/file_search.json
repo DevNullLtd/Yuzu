@@ -241,7 +241,7 @@
     {
       "grant": "None added by this plugin. The packaged unit already holds `CAP_DAC_READ_SEARCH` for every plugin; the search worker thread drops it from its effective set and raises it only around the lookups that need it (hygiene, not a boundary: caveat 5)",
       "if_refused": "A directory the account cannot search is a `permission_denied` gap row (`dir_unreadable` for another failure); a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial`",
-      "measured": "Not measured: no Linux capture exists yet, so no host, kernel or account is recorded here",
+      "measured": "2026-11-21, one Ubuntu 26.04.1 LTS x86_64 virtual machine, as root (euid 0) over a scratch tree only (the sample); the capability-scope cases ran as root there. Not measured as the packaged unprivileged `yuzu-agent` account holding the ambient capability over another account's directories",
       "os": "Linux",
       "runs_as": "agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`)"
     }
@@ -292,6 +292,38 @@
     }
   ],
   "samples": {
+    "linux": {
+      "actions": [
+        {
+          "action": "search",
+          "not_captured": null,
+          "params": "root=/tmp/yuzu_test_file_search_sample pattern=yuzu-fs-control-* kinds=both",
+          "rc": 0,
+          "result_status": {
+            "completeness": "FULL",
+            "provenance": "",
+            "status": "OK"
+          },
+          "row_count": 8,
+          "rows": [
+            "match|/tmp/yuzu_test_file_search_sample/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10/n11/yuzu-fs-control-d12.bin|file|0000000000000830:000000000004b5d6|8|1795264901|system",
+            "extents|0000000000000830:000000000004b5d6|ok|1|0:0:4096:delalloc",
+            "match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-d1.bin|file|0000000000000830:000000000004b5c7|8|1795264901|system",
+            "extents|0000000000000830:000000000004b5c7|ok|1|0:0:4096:delalloc",
+            "match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-dir|directory|0000000000000830:000000000004b5d7|-|-|system"
+          ],
+          "truncated": false
+        }
+      ],
+      "stamp": {
+        "date": "2026-11-21",
+        "host_class": "vm",
+        "leg_hash": "c2884861b725",
+        "os": "linux",
+        "os_version": "Ubuntu 26.04.1 LTS x86_64",
+        "privilege": "euid 0"
+      }
+    },
     "macos": {
       "actions": [
         {

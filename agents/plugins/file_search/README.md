@@ -110,7 +110,7 @@ What a search stores is a different matter from who may launch it. The stored ro
 |---|---|---|---|---|
 | Windows | n/a: the leg reads nothing (caveat 1) | None | n/a | `status\|search\|unsupported\|windows:planned`, result `UNAVAILABLE` |
 | macOS | agent daemon: a root LaunchDaemon today (`docs/agent-privilege-model.md`) | None: no new privilege. Folders protected by the system's privacy controls (TCC, Full Disk Access) are refused to a daemon without that access; how to grant it to the agent is not settled here | 2026-11-21, one macOS 26.6.2 arm64 bare-metal host, as an unprivileged account (euid 501), over a scratch tree only (the sample). Not measured as the root LaunchDaemon; the behaviour of a daemon with no Full Disk Access over protected folders is not measured | A directory that cannot be listed is a `permission_denied` gap row; a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial` |
-| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None added by this plugin. The packaged unit already holds `CAP_DAC_READ_SEARCH` for every plugin; the search worker thread drops it from its effective set and raises it only around the lookups that need it (hygiene, not a boundary: caveat 5) | Not measured: no Linux capture exists yet, so no host, kernel or account is recorded here | A directory the account cannot search is a `permission_denied` gap row (`dir_unreadable` for another failure); a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial` |
+| Linux | agent daemon, dedicated unprivileged account (`yuzu-agent` on the packaged unit), never root by design (`docs/agent-privilege-model.md`) | None added by this plugin. The packaged unit already holds `CAP_DAC_READ_SEARCH` for every plugin; the search worker thread drops it from its effective set and raises it only around the lookups that need it (hygiene, not a boundary: caveat 5) | 2026-11-21, one Ubuntu 26.04.1 LTS x86_64 virtual machine, as root (euid 0) over a scratch tree only (the sample); the capability-scope cases ran as root there. Not measured as the packaged unprivileged `yuzu-agent` account holding the ambient capability over another account's directories | A directory the account cannot search is a `permission_denied` gap row (`dir_unreadable` for another failure); a file that cannot be opened for its facts is a match row with size and time `-` and extents `failed`; the verdict reads `partial` |
 
 No external binaries, no subprocesses, no network use. The Linux leg reads `/proc/<pid>/mountinfo` of the agent's own process (opened without following a link, streamed, never held whole) and the macOS leg reads the kernel's mount table through `getmntinfo_r_np` without a call into any server. A worker runs on the idle I/O class on Linux and the throttled disk class on macOS, with dataless materialisation off on macOS for the whole walk.
 
@@ -195,6 +195,21 @@ match|/private/tmp/yuzu_test_file_search_sample/yuzu-fs-control-dir|directory|00
 volume|/|apfs|complete|none|extents=collected|entries=16
 coverage|complete|slices=1|prior_gaps=0|consistency=single_pass
 search|ok|none|macos_nfc_casefold_v1|seq=0|q=f25c9ba4|links_skipped=1
+[result_status] OK / FULL
+```
+
+**Linux** — captured: linux Ubuntu 26.04.1 LTS x86_64 · vm · 2026-11-21 · euid 0 · leg-hash c2884861b725
+
+```
+== action=search root=/tmp/yuzu_test_file_search_sample pattern=yuzu-fs-control-* kinds=both
+match|/tmp/yuzu_test_file_search_sample/n1/n2/n3/n4/n5/n6/n7/n8/n9/n10/n11/yuzu-fs-control-d12.bin|file|0000000000000830:000000000004b5d6|8|1795264901|system
+extents|0000000000000830:000000000004b5d6|ok|1|0:0:4096:delalloc
+match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-d1.bin|file|0000000000000830:000000000004b5c7|8|1795264901|system
+extents|0000000000000830:000000000004b5c7|ok|1|0:0:4096:delalloc
+match|/tmp/yuzu_test_file_search_sample/yuzu-fs-control-dir|directory|0000000000000830:000000000004b5d7|-|-|system
+volume|/tmp|ext4|complete|none|extents=collected|entries=16
+coverage|complete|slices=1|prior_gaps=0|consistency=single_pass
+search|ok|none|bytes|seq=0|q=a3032aca|links_skipped=1
 [result_status] OK / FULL
 ```
 <!-- END GENERATED -->
