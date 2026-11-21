@@ -224,15 +224,14 @@ inline constexpr const char* kMacosDataVolume = "/System/Volumes/Data";
     // Equal identity is one subtree mounted twice: keep the mount containing the root, else the first.
     std::vector<const MountEntry*> kept;
     std::unordered_map<std::string, const MountEntry*> by_identity;
+    const auto identity_of = [](const MountEntry& e) { return detail::label_of(e) + '\x1f' + e.root; };
     for (const auto* e : candidates) { // byte order of the mount point
-        const std::string id = detail::label_of(*e) + '\x1f' + e->root;
-        const auto [it, inserted] = by_identity.try_emplace(id, e);
+        const auto [it, inserted] = by_identity.try_emplace(identity_of(*e), e);
         if (!inserted && e == containing)
             it->second = e; // the containing mount wins over an earlier twin
     }
     for (const auto* e : candidates) {
-        const std::string id = detail::label_of(*e) + '\x1f' + e->root;
-        if (by_identity.at(id) == e)
+        if (by_identity.at(identity_of(*e)) == e)
             kept.push_back(e);
         else
             refused.push_back({e->mount_point, e->fstype.substr(0, kMaxFstypeBytes), fsr::Reason::duplicate_mount});

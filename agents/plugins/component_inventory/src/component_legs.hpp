@@ -89,8 +89,9 @@ using ReadChunk = std::function<ssize_t(char* buf, std::size_t len)>;
 [[nodiscard]] std::optional<std::vector<std::string>> read_mountinfo_stream(const ReadChunk& read_chunk,
                                                                             std::size_t max_total = kMaxMountTable);
 
-/// Mounts one mount-table read keeps: the entries `keep` accepts, the last entry of a mount point
-/// replacing an earlier one (an overmount shadows what it covers).
+/// The most distinct mount points one mount-table read keeps (the entries `keep` accepts, the last entry of
+/// a mount point replacing an earlier one: an overmount shadows what it covers). A table with more is a
+/// failed read, never a truncated one.
 inline constexpr std::size_t kMaxKeptMounts = 16'384;
 
 /// Predicate over one parsed mount: true keeps it.

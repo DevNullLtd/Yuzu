@@ -217,7 +217,8 @@ The CSV format includes the columns:
 `id`, `instruction_id`, `agent_id`, `timestamp`, `status`, `output`, `error_detail`.
 
 **An export omits the Forensics-tier rows a caller may not read.** For a caller without
-`Forensics:Read`, the rows of the six Forensics-tier plugins are left out of the file without a
+`Forensics:Read`, the rows of the Forensics-tier plugins (named under
+`GET /api/responses/{instruction_id}` above) are left out of the file without a
 marker, so such an export can under-report and is not evidence that a plugin returned nothing. An
 export that does serve such rows writes a `response.forensics.read` audit row (see the Audit log
 guide).

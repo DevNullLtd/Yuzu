@@ -23,6 +23,7 @@
 #pragma once
 
 #include <cstdint>
+#include <optional>
 
 namespace yuzu::shared::thread_caps {
 
@@ -83,17 +84,19 @@ static_assert(kCapDacReadSearch == CAP_DAC_READ_SEARCH);
 
 namespace detail {
 
-[[nodiscard]] inline bool read_caps(ThreadCaps& out) noexcept {
+/// The calling thread's three sets, or nothing when capget failed.
+[[nodiscard]] inline std::optional<ThreadCaps> read_caps() noexcept {
     __user_cap_header_struct header{_LINUX_CAPABILITY_VERSION_3, 0};
     __user_cap_data_struct data[2]{};
     if (::syscall(SYS_capget, &header, data) != 0)
-        return false;
+        return std::nullopt;
+    ThreadCaps out;
     for (int i = 0; i < 2; ++i) {
         out.effective.word[i] = data[i].effective;
         out.permitted.word[i] = data[i].permitted;
         out.inheritable.word[i] = data[i].inheritable;
     }
-    return true;
+    return out;
 }
 
 [[nodiscard]] inline bool write_caps(const ThreadCaps& c) noexcept {
@@ -111,15 +114,15 @@ namespace detail {
 
 /// Drops `cap` from the calling thread's effective set. true when the set changed.
 inline bool drop_effective(unsigned cap) noexcept {
-    ThreadCaps c;
-    return detail::read_caps(c) && plan_drop(c, cap) && detail::write_caps(c);
+    auto c = detail::read_caps();
+    return c && plan_drop(*c, cap) && detail::write_caps(*c);
 }
 
 /// Raises `cap` in the calling thread's effective set. true when the set changed; false when the bit is
 /// not permitted, is already effective, or either system call failed (nothing is then raised).
 inline bool raise_effective(unsigned cap) noexcept {
-    ThreadCaps c;
-    return detail::read_caps(c) && plan_raise(c, cap) && detail::write_caps(c);
+    auto c = detail::read_caps();
+    return c && plan_raise(*c, cap) && detail::write_caps(*c);
 }
 
 /// Raises `cap` for the life of the object and drops it again only if this object raised it.

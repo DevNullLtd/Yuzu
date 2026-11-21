@@ -31,7 +31,7 @@
 #include <cerrno>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
+#include <expected>
 
 namespace yuzu::file_search {
 
@@ -53,8 +53,9 @@ struct FiemapBuffer {
     }
 };
 
-[[nodiscard]] bool ask(int fd, FiemapBuffer& r, const FiemapRequest& want) noexcept {
-    std::memset(r.bytes, 0, sizeof r.bytes);
+/// The kernel's answer to `want`, or the errno it failed with (an interrupted call is retried).
+[[nodiscard]] std::expected<FiemapBuffer, int> ask(int fd, const FiemapRequest& want) noexcept {
+    FiemapBuffer r; // zeroed
     struct fiemap* m = r.map();
     m->fm_start = want.start;
     m->fm_length = want.length;
@@ -62,9 +63,9 @@ struct FiemapBuffer {
     m->fm_extent_count = want.extent_count;
     for (;;) {
         if (::ioctl(fd, FS_IOC_FIEMAP, m) == 0)
-            return true;
+            return r;
         if (errno != EINTR)
-            return false;
+            return std::unexpected(errno);
     }
 }
 
@@ -75,13 +76,14 @@ FileExtents read_file_extents(int fd, const struct stat& /*st*/) {
     struct statfs fs {};
     const bool logical = ::fstatfs(fd, &fs) == 0 && static_cast<std::uint32_t>(fs.f_type) == kBtrfsMagic;
 
-    FiemapBuffer r;
-    if (!ask(fd, r, fiemap_request())) {
-        const int err = errno;
+    auto first = ask(fd, fiemap_request());
+    if (!first) {
+        const int err = first.error();
         out.state = (err == ENOTTY || err == EOPNOTSUPP || err == ENOSYS) ? ExtentsState::unsupported
                                                                           : ExtentsState::failed;
         return out;
     }
+    FiemapBuffer& r = *first;
     out.state = ExtentsState::ok;
     const std::size_t mapped = std::min<std::size_t>(r.map()->fm_mapped_extents, kMaxExtents);
     bool last = false;
@@ -93,9 +95,9 @@ FileExtents read_file_extents(int fd, const struct stat& /*st*/) {
     if (mapped < kMaxExtents || last)
         return out; // the kernel returned them all
 
-    FiemapBuffer count;
-    if (ask(fd, count, fiemap_count_request()) && count.map()->fm_mapped_extents >= out.total)
-        out.total = count.map()->fm_mapped_extents;
+    auto count = ask(fd, fiemap_count_request());
+    if (count && count->map()->fm_mapped_extents >= out.total)
+        out.total = count->map()->fm_mapped_extents;
     else
         out.total_exact = false; // the count could not be had: what was seen is a lower bound
     return out;

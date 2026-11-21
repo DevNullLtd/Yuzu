@@ -336,6 +336,7 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
     }
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
 
     Fixture fx{"yuzu_test_fs_disp_"};
     const std::string salt = fx.root.filename().string();
@@ -411,7 +412,6 @@ TEST_CASE("file_search plugin: one real search over a fixture finds the controls
         CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "volume|") && r.find("|not_searched|") != std::string::npos; }));
         CHECK(std::ranges::any_of(s.rows, [](const std::string& r) { return starts(r, "coverage|partial|"); }));
     }
-    plugin->descriptor->shutdown(pctx.get());
 }
 
 TEST_CASE("file_search plugin: the name rule of the OS decides whether a different spelling matches",
@@ -424,6 +424,7 @@ TEST_CASE("file_search plugin: the name rule of the OS decides whether a differe
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
     Fixture fx{"yuzu_test_fs_disp_"};
     // The name on disk: lower case, decomposed (e then a combining acute). The pattern: upper case, composed.
     const std::string on_disk = "cafe\xCC\x81-yuzu-fs-name.bin";
@@ -439,7 +440,6 @@ TEST_CASE("file_search plugin: the name rule of the OS decides whether a differe
         CHECK(found_paths(s).empty()); // byte for byte: another case and another normal form is another name
 #endif
     }
-    plugin->descriptor->shutdown(pctx.get());
 }
 
 TEST_CASE("file_search plugin: a root that is a link is refused with its own token and nothing is walked",
@@ -453,6 +453,7 @@ TEST_CASE("file_search plugin: a root that is a link is refused with its own tok
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
     Fixture fx{"yuzu_test_fs_disp_"};
+    yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
     write_file(fx.root / "real" / "yuzu-fs-control-link-1.bin", "x");
     fs::create_directory_symlink(fx.root / "real", fx.root / "lnk");
 
@@ -472,7 +473,6 @@ TEST_CASE("file_search plugin: a root that is a link is refused with its own tok
         REQUIRE(mrows.size() == 1);
         CHECK(starts(mrows[0], "search|invalid|root_not_found|"));
     }
-    plugin->descriptor->shutdown(pctx.get());
 }
 
 TEST_CASE("file_search plugin: init pins the module, so it stays mapped after the handle that loaded it is released",

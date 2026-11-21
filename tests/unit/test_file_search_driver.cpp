@@ -852,6 +852,10 @@ TEST_CASE("file_search driver: a refused worker abandons nothing and the third r
     CHECK(one.reason == "rejected");
     CHECK(one.counters.rejected == 1);
     CHECK(rig.state.abandoned_count() == 0);
+    // The volume row reads stalled, the one token for "no result" (the attempt did not advance), though no
+    // worker is blocked: a later slice does not skip the volume.
+    CHECK(starts(row_of(one, "volume|"), "volume|/|ext4|partial|stalled|"));
+    CHECK_FALSE(rig.state.is_stalled(rig.plan().units[0].key()));
     const auto qh = fsr::query_hash(make_request(kCtl).query);
     CHECK(rig.state.carried(Lineage{qh, 0, 0}).consecutive_stalls == 1); // the failed-slice count rises
     CHECK(run_slice(make_request(kCtl), rig.b).reason == "rejected");
@@ -873,6 +877,8 @@ TEST_CASE("file_search driver: a worker that throws is a failed slice, never a t
     CHECK(r.counters.timed_out == 0);
     CHECK(r.counters.failed == 1);
     CHECK(rig.state.abandoned_count() == 0);
+    CHECK(starts(row_of(r, "volume|"), "volume|/|ext4|partial|stalled|")); // as for a refused worker
+    CHECK_FALSE(rig.state.is_stalled(rig.plan().units[0].key()));
     CHECK_FALSE(rig.slot.load());
     // and the worker still set its flag on the way out
     rig.facts_hook = nullptr;

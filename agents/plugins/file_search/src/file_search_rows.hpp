@@ -32,6 +32,7 @@
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
+#include <format>
 #include <optional>
 #include <string>
 #include <string_view>
@@ -187,12 +188,7 @@ enum class Fault { busy, timed_out, rejected, no_progress, internal_error, curso
 /// First 4 bytes of the query hash as lowercase hex: names a search in a log line, reveals neither the
 /// pattern nor the root.
 [[nodiscard]] inline std::string query_prefix(const fsr::QueryHash& h) {
-    std::string out(8, '0');
-    for (std::size_t i = 0; i < 4; ++i) {
-        out[2 * i] = fsr::detail::kHexLower[h[i] >> 4];
-        out[2 * i + 1] = fsr::detail::kHexLower[h[i] & 0x0F];
-    }
-    return out;
+    return std::format("{:02x}{:02x}{:02x}{:02x}", h[0], h[1], h[2], h[3]);
 }
 
 struct Trailer {

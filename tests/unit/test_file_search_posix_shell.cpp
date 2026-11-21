@@ -50,6 +50,7 @@
 #include <filesystem>
 #include <fstream>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -57,8 +58,12 @@
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <sys/mount.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
+#if defined(__linux__)
+#include <sys/syscall.h>
 #endif
 #if defined(__APPLE__)
 #include <sys/clonefile.h>
@@ -128,9 +133,9 @@ TEST_CASE("file_search thread caps: on a thread the bit is dropped outside a rai
           "[file_search][file_search_shell][file_search_caps]") {
     // The system calls act on the calling thread, so the cases run on a thread of their own and report
     // plain booleans back (Catch2 assertions are made on the test's own thread).
-    caps::ThreadCaps main_before;
-    REQUIRE(caps::detail::read_caps(main_before));
-    if (!main_before.permitted.has(caps::kCapDacReadSearch)) {
+    const auto main_before = caps::detail::read_caps();
+    REQUIRE(main_before.has_value());
+    if (!main_before->permitted.has(caps::kCapDacReadSearch)) {
         WARN("file_search thread caps: CAP_DAC_READ_SEARCH is not permitted here, the capability system calls are not exercised");
         return;
     }
@@ -146,23 +151,22 @@ TEST_CASE("file_search thread caps: on a thread the bit is dropped outside a rai
         bool permitted_after_scope{false};
     } seen;
     std::thread worker([&seen] {
-        caps::ThreadCaps c;
         seen.dropped = caps::drop_effective(caps::kCapDacReadSearch);
-        if (caps::detail::read_caps(c)) {
-            seen.clear_after_drop = !c.effective.has(caps::kCapDacReadSearch);
-            seen.permitted_after_drop = c.permitted.has(caps::kCapDacReadSearch);
+        if (const auto c = caps::detail::read_caps()) {
+            seen.clear_after_drop = !c->effective.has(caps::kCapDacReadSearch);
+            seen.permitted_after_drop = c->permitted.has(caps::kCapDacReadSearch);
         }
         {
             const caps::ScopedCapRaise raise;
             seen.raised = raise.raised();
-            if (caps::detail::read_caps(c))
-                seen.set_inside = c.effective.has(caps::kCapDacReadSearch);
+            if (const auto c = caps::detail::read_caps())
+                seen.set_inside = c->effective.has(caps::kCapDacReadSearch);
             const caps::ScopedCapRaise nested; // already effective: this one raises nothing and drops nothing
             seen.nested_raised = nested.raised();
         }
-        if (caps::detail::read_caps(c)) {
-            seen.clear_after_scope = !c.effective.has(caps::kCapDacReadSearch);
-            seen.permitted_after_scope = c.permitted.has(caps::kCapDacReadSearch);
+        if (const auto c = caps::detail::read_caps()) {
+            seen.clear_after_scope = !c->effective.has(caps::kCapDacReadSearch);
+            seen.permitted_after_scope = c->permitted.has(caps::kCapDacReadSearch);
         }
     });
     worker.join();
@@ -176,9 +180,9 @@ TEST_CASE("file_search thread caps: on a thread the bit is dropped outside a rai
     CHECK(seen.clear_after_scope);
     CHECK(seen.permitted_after_scope);
 
-    caps::ThreadCaps main_after;
-    REQUIRE(caps::detail::read_caps(main_after));
-    CHECK(main_after.effective.has(caps::kCapDacReadSearch) == main_before.effective.has(caps::kCapDacReadSearch));
+    const auto main_after = caps::detail::read_caps();
+    REQUIRE(main_after.has_value());
+    CHECK(main_after->effective.has(caps::kCapDacReadSearch) == main_before->effective.has(caps::kCapDacReadSearch));
 }
 
 TEST_CASE("file_search worker environment: the plugin's own runner drops the bit and its own hook raises it for a lookup only",
@@ -187,9 +191,9 @@ TEST_CASE("file_search worker environment: the plugin's own runner drops the bit
     // run_on_worker (the environment the driver's BoundedRunner is bound to) and the lookup through
     // around_lookup_hook (the hook the search leg is given). Everything is read from inside the worker and
     // handed back as plain booleans (Catch2 assertions are made on the test's own thread).
-    caps::ThreadCaps main_before;
-    REQUIRE(caps::detail::read_caps(main_before));
-    if (!main_before.permitted.has(caps::kCapDacReadSearch)) {
+    const auto main_before = caps::detail::read_caps();
+    REQUIRE(main_before.has_value());
+    if (!main_before->permitted.has(caps::kCapDacReadSearch)) {
         WARN("file_search worker environment: CAP_DAC_READ_SEARCH is not permitted here, the capability scope is not exercised");
         return;
     }
@@ -206,22 +210,19 @@ TEST_CASE("file_search worker environment: the plugin's own runner drops the bit
     };
     const auto seen = std::make_shared<Seen>(); // co-owned: a worker that timed out would outlive this frame
     const auto out = run_on_worker(std::chrono::seconds{60}, [seen, hook]() -> WorkResult {
-        const auto read = [&seen](caps::ThreadCaps& c) {
-            if (!caps::detail::read_caps(c))
+        const auto read = [&seen] { // a failed capget reads as empty sets and clears reads_ok
+            const auto c = caps::detail::read_caps();
+            if (!c)
                 seen->reads_ok = false;
+            return c.value_or(caps::ThreadCaps{});
         };
-        caps::ThreadCaps c;
-        read(c);
-        seen->clear_before_lookup = !c.effective.has(caps::kCapDacReadSearch);
-        seen->permitted_before_lookup = c.permitted.has(caps::kCapDacReadSearch);
-        hook([&] {
-            caps::ThreadCaps inside;
-            read(inside);
-            seen->set_inside_lookup = inside.effective.has(caps::kCapDacReadSearch);
-        });
-        read(c);
-        seen->clear_after_lookup = !c.effective.has(caps::kCapDacReadSearch);
-        seen->permitted_after_lookup = c.permitted.has(caps::kCapDacReadSearch);
+        const caps::ThreadCaps before = read();
+        seen->clear_before_lookup = !before.effective.has(caps::kCapDacReadSearch);
+        seen->permitted_before_lookup = before.permitted.has(caps::kCapDacReadSearch);
+        hook([&] { seen->set_inside_lookup = read().effective.has(caps::kCapDacReadSearch); });
+        const caps::ThreadCaps after = read();
+        seen->clear_after_lookup = !after.effective.has(caps::kCapDacReadSearch);
+        seen->permitted_after_lookup = after.permitted.has(caps::kCapDacReadSearch);
         return WorkResult{};
     });
 
@@ -235,9 +236,9 @@ TEST_CASE("file_search worker environment: the plugin's own runner drops the bit
     CHECK(seen->clear_after_lookup);
     CHECK(seen->permitted_after_lookup);
 
-    caps::ThreadCaps main_after;
-    REQUIRE(caps::detail::read_caps(main_after));
-    CHECK(main_after.effective.has(caps::kCapDacReadSearch) == main_before.effective.has(caps::kCapDacReadSearch));
+    const auto main_after = caps::detail::read_caps();
+    REQUIRE(main_after.has_value());
+    CHECK(main_after->effective.has(caps::kCapDacReadSearch) == main_before->effective.has(caps::kCapDacReadSearch));
 }
 #endif
 
@@ -282,6 +283,37 @@ std::uint64_t listed_length(const FileExtents& x) {
 }
 
 } // namespace
+
+// ---- the worker's I/O class ----
+
+TEST_CASE("file_search worker environment: the work function runs at the background I/O class",
+          "[file_search][file_search_shell][file_search_io]") {
+    // The class is a per-thread setting made with bare numbers, so a wrong one would run fleet searches at
+    // normal priority with nothing to show it. Read it back from inside the work function, and hand it out
+    // as a plain int (Catch2 assertions are made on the test's own thread).
+    const auto seen = std::make_shared<int>(-1);
+    const auto out = run_on_worker(std::chrono::seconds{60}, [seen]() -> WorkResult {
+#if defined(__linux__)
+        const long v = ::syscall(SYS_ioprio_get, 1 /* IOPRIO_WHO_PROCESS */, 0 /* the calling thread */);
+        *seen = v < 0 ? -1 : static_cast<int>(v >> 13); // the class bits of the priority value
+#else
+        *seen = ::getiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD);
+#endif
+        return WorkResult{};
+    });
+    REQUIRE(out.status == RunStatus::completed);
+    REQUIRE(out.value.has_value());
+    CHECK_FALSE(out.value->threw);
+    if (*seen < 0) {
+        WARN("file_search worker environment: the I/O class could not be read here, it is not checked");
+        return;
+    }
+#if defined(__linux__)
+    CHECK(*seen == 3); // IOPRIO_CLASS_IDLE
+#else
+    CHECK(*seen == IOPOL_THROTTLE);
+#endif
+}
 
 // ---- the extents shell over real descriptors ----
 

@@ -138,11 +138,12 @@ void publish_heartbeat(const fs_plugin::SliceCounters& c) {
     }
 }
 
-/// One WARN per search that ended without a result (the query prefix and the reason: never a path or a
-/// pattern), one INFO per slice that stopped at a budget.
+/// One WARN per slice that ended without a result (the query prefix and the reason: never a path or a
+/// pattern), one INFO per slice that stopped at a budget. A retryable slice logs here too: the search goes on
+/// from the same cursor, and the reason says which kind it was.
 void log_slice(const fs_plugin::SliceResult& r) {
     if (r.status == fs_plugin::Status::failed)
-        spdlog::warn("file_search: search {} ended: {}", r.query, r.reason);
+        spdlog::warn("file_search: search {} slice failed: {}", r.query, r.reason);
     else if (r.counters.budget_stops != 0)
         spdlog::info("file_search: search {} slice stopped at a budget: {}", r.query, r.reason);
 }
@@ -161,6 +162,8 @@ void pin_anchor() noexcept {} // an address inside this module, for dladdr
     if (handle != nullptr)
         return true;
     Dl_info info{};
+    // dladdr takes any address inside this module: the function-to-object pointer conversion is the one POSIX
+    // defines for dlsym and dladdr, and nothing is read through it.
     if (::dladdr(reinterpret_cast<const void*>(&pin_anchor), &info) == 0 || info.dli_fname == nullptr)
         return false;
     handle = ::dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);

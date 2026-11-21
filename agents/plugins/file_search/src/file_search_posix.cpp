@@ -251,6 +251,8 @@ std::string macos_canonical_name(std::string_view name) {
     }
     using yuzu::agent::ScopedCFRef;
     // Not well-formed UTF-8: CoreFoundation refuses it, and the name compares as the bytes it is.
+    // char to unsigned char: the aliasing every byte API permits; `name` outlives the call and CoreFoundation
+    // copies the bytes.
     const ScopedCFRef<CFStringRef> text(CFStringCreateWithBytes(
         kCFAllocatorDefault, reinterpret_cast<const UInt8*>(name.data()), static_cast<CFIndex>(name.size()),
         kCFStringEncodingUTF8, false));
