@@ -45,6 +45,11 @@ namespace {
     return RegStatus::failed;
 }
 
+/// After the key opened, a failure is `denied` or `failed`, never `absent`.
+[[nodiscard]] RegStatus fault_of(LSTATUS rc) noexcept {
+    return rc == ERROR_ACCESS_DENIED ? RegStatus::denied : RegStatus::failed;
+}
+
 [[nodiscard]] REGSAM view_flag(RegView v) noexcept {
     return v == RegView::v64 ? KEY_WOW64_64KEY : KEY_WOW64_32KEY;
 }
@@ -76,8 +81,7 @@ struct RealRegOps {
             }
             if (rc != ERROR_SUCCESS) {
                 out.names.clear();
-                out.status = status_of(rc) == RegStatus::denied ? RegStatus::denied
-                                                                  : RegStatus::failed;
+                out.status = fault_of(rc);
                 return out;
             }
             out.names.push_back(yuzu::win::from_wide(name, static_cast<int>(len)));
@@ -111,7 +115,7 @@ struct RealRegOps {
         const LSTATUS rc = RegQueryValueExW(h.get(), wvalue.c_str(), nullptr, &type,
                                             reinterpret_cast<LPBYTE>(buf.data()), &got);
         if (rc != ERROR_SUCCESS) { // grew between the two reads (ERROR_MORE_DATA) or vanished
-            out.status = status_of(rc) == RegStatus::denied ? RegStatus::denied : RegStatus::failed;
+            out.status = fault_of(rc);
             return out;
         }
         out.text = yuzu::win::reg_sz_to_utf8(buf.c_str(), got);

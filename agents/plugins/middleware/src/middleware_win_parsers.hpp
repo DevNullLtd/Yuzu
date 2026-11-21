@@ -40,6 +40,8 @@
 
 #include "middleware_runner.hpp"
 
+#include <user_profile_model.hpp> // yuzu::profiles::iequals_ascii
+
 #include <algorithm>
 #include <concepts>
 #include <cstddef>
@@ -90,16 +92,6 @@ concept RegOps = requires(O& o, RegView v, std::string_view s) {
 
 namespace detail {
 
-[[nodiscard]] inline char ascii_lower(char c) noexcept {
-    return (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
-}
-
-[[nodiscard]] inline bool ascii_ieq(std::string_view a, std::string_view b) noexcept {
-    return a.size() == b.size() &&
-           std::equal(a.begin(), a.end(), b.begin(),
-                      [](char x, char y) { return ascii_lower(x) == ascii_lower(y); });
-}
-
 [[nodiscard]] constexpr Read::Outcome to_outcome(RegStatus s) noexcept {
     switch (s) {
     case RegStatus::ok:        return Read::Outcome::ok;
@@ -133,7 +125,7 @@ public:
                     spent_ = true;
                 for (std::string& n : l.names) {
                     const auto same = [&](const std::string& have) {
-                        return detail::ascii_ieq(have, n);
+                        return yuzu::profiles::iequals_ascii(have, n);
                     };
                     if (!n.empty() && std::none_of(out.names.begin(), out.names.end(), same))
                         out.names.push_back(std::move(n));

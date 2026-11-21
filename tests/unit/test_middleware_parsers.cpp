@@ -31,7 +31,8 @@
  *  - plain enumerator path: reverting enumerator_well_formed to a leading-'/' check fails the
  *    kBadTrailingSlash / kBadDotComponent / kBadEmptyComponent rows.
  *  - registry shapes: dropping the per-leg kind check (a registry probe on the Linux leg, a file
- *    probe on the Windows leg) or is_plain_reg_path fails the kBadReg* rows.
+ *    probe on the Windows leg) fails the kBadRegOnLinux / kBadFileOnWindows rows; dropping
+ *    is_plain_reg_path fails kBadRegLeadingBackslash and the is_plain_reg_path section.
  *  - registry failure never reads as absent: mapping a denied or failed key to an empty `supported`
  *    fails the registry enumerator-outcome case; dropping the every-subkey-dropped token fails the
  *    "no usable FilePath" case.
@@ -458,19 +459,13 @@ constexpr std::array<Probe, 2> kProbesBadId = [] {
     return a;
 }();
 
-/// The Windows leg's probes with one change, for the registry well-formedness rows.
-constexpr std::array<Probe, 2> reg_probes_with_path(const char* path) {
+/// The Windows leg's probes with one change each, for the registry well-formedness rows. One row
+/// proves enumerator_well_formed calls is_plain_reg_path; the path rule itself is pinned directly.
+constexpr std::array<Probe, 2> kRegLeadingBackslash = [] {
     std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
-    a[0].path = path;
+    a[0].path = "\\SOFTWARE\\IBM";
     return a;
-}
-constexpr std::array<Probe, 2> kRegLeadingBackslash = reg_probes_with_path("\\SOFTWARE\\IBM");
-constexpr std::array<Probe, 2> kRegTrailingBackslash = reg_probes_with_path("SOFTWARE\\IBM\\");
-constexpr std::array<Probe, 2> kRegEmptyComponent = reg_probes_with_path("SOFTWARE\\\\IBM");
-constexpr std::array<Probe, 2> kRegDotComponent = reg_probes_with_path("SOFTWARE\\.\\IBM");
-constexpr std::array<Probe, 2> kRegDotDotComponent = reg_probes_with_path("SOFTWARE\\..\\IBM");
-constexpr std::array<Probe, 2> kRegForwardSlash = reg_probes_with_path("SOFTWARE/IBM");
-constexpr std::array<Probe, 2> kRegEmptyPath = reg_probes_with_path("");
+}();
 constexpr std::array<Probe, 2> kRegNoPathKey = [] {
     std::array<Probe, 2> a{{mw::kIbmMqWindowsProbes[0], mw::kIbmMqWindowsProbes[1]}};
     a[0].path_key = nullptr;
@@ -546,18 +541,6 @@ constexpr std::array<Product, 1> kBadProbeId{{mutated([](Product& p) { p.linux.p
 
 constexpr std::array<Product, 1> kBadRegLeadingBackslash{
     {mutated([](Product& p) { p.windows.probes = kRegLeadingBackslash; })}};
-constexpr std::array<Product, 1> kBadRegTrailingBackslash{
-    {mutated([](Product& p) { p.windows.probes = kRegTrailingBackslash; })}};
-constexpr std::array<Product, 1> kBadRegEmptyComponent{
-    {mutated([](Product& p) { p.windows.probes = kRegEmptyComponent; })}};
-constexpr std::array<Product, 1> kBadRegDotComponent{
-    {mutated([](Product& p) { p.windows.probes = kRegDotComponent; })}};
-constexpr std::array<Product, 1> kBadRegDotDotComponent{
-    {mutated([](Product& p) { p.windows.probes = kRegDotDotComponent; })}};
-constexpr std::array<Product, 1> kBadRegForwardSlash{
-    {mutated([](Product& p) { p.windows.probes = kRegForwardSlash; })}};
-constexpr std::array<Product, 1> kBadRegEmptyPath{
-    {mutated([](Product& p) { p.windows.probes = kRegEmptyPath; })}};
 constexpr std::array<Product, 1> kBadRegNoPathKey{
     {mutated([](Product& p) { p.windows.probes = kRegNoPathKey; })}};
 constexpr std::array<Product, 1> kBadRegValueFirst{
@@ -687,12 +670,6 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
     }
     SECTION("a registry key path is plain backslash-separated components") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegLeadingBackslash}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegTrailingBackslash}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegEmptyComponent}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegDotComponent}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegDotDotComponent}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegForwardSlash}));
-        STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegEmptyPath}));
     }
     SECTION("a registry leg is reg_subkeys then reg_value probes, each with its field") {
         STATIC_REQUIRE_FALSE(mw::products_well_formed(std::span<const Product>{kBadRegNoPathKey}));
@@ -712,6 +689,10 @@ TEST_CASE("middleware products: the same consteval check refuses a broken table"
         STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("\\"));
         STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\"));
         STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A/B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("\\A"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\\\B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\.\\B"));
+        STATIC_REQUIRE_FALSE(mw::detail::is_plain_reg_path("A\\..\\B"));
     }
 }
 

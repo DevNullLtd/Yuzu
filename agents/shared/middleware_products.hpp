@@ -213,10 +213,6 @@ namespace detail {
     return true;
 }
 
-[[nodiscard]] constexpr bool is_registry_kind(ProbeKind k) noexcept {
-    return k == ProbeKind::reg_subkeys || k == ProbeKind::reg_value;
-}
-
 /// An enumerator is a kv_file (file leg) or a reg_subkeys (registry leg) probe.
 [[nodiscard]] constexpr bool enumerator_well_formed(const Probe& p) noexcept {
     if (p.kind == ProbeKind::reg_subkeys)
@@ -225,8 +221,7 @@ namespace detail {
            !sv(p.name_key).empty() && !sv(p.path_key).empty() && !sv(p.stanza).empty();
 }
 
-/// A version probe follows its enumerator's shape: dir_name after kv_file, reg_value after
-/// reg_subkeys.
+/// A registry version probe is the value named by name_key on the candidate's own key.
 [[nodiscard]] constexpr bool reg_value_probe_well_formed(const Probe& p) noexcept {
     return p.kind == ProbeKind::reg_value && !sv(p.name_key).empty();
 }
@@ -255,8 +250,11 @@ namespace detail {
         for (std::size_t j = 0; j < i; ++j)
             if (sv(leg.probes[j].id) == sv(p.id))
                 return false;
-        if (is_registry_kind(p.kind) != registry)
+        const bool reg_kind = p.kind == ProbeKind::reg_subkeys || p.kind == ProbeKind::reg_value;
+        if (reg_kind != registry)
             return false;
+        // A version probe follows its enumerator's shape: dir_name after kv_file, reg_value after
+        // reg_subkeys.
         const bool version_ok =
             registry ? reg_value_probe_well_formed(p) : dir_probe_well_formed(p);
         if (!(i == 0 ? enumerator_well_formed(p) : version_ok))
