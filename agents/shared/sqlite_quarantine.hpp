@@ -61,10 +61,12 @@
 /// place with `link(2)` only when complete: an entry of any kind that appears at the quarantine
 /// name (a link included) is neither overwritten nor written through, and a process that dies
 /// mid-copy leaves at most a stray temporary, never a truncated file at the quarantine name (the
-/// stray is not swept; it is not evidence). What stays by name is the removal of the temporary
-/// after a failed copy (a unique name this call created; a third party who swaps a link or an
-/// empty directory in at it between the failure and the removal loses it) and the final drop of
-/// the original sidecar. On Windows the copy is the standard library's `copy_file`, by name at both
+/// stray is not swept; it is not evidence). What stays by name is the publish (the `link(2)` from
+/// the temporary to the quarantine name runs after the descriptor is closed, so a writer who
+/// replaces the temporary in that gap has their entry published, and on macOS `link(2)` follows a
+/// link at its source), the removal of the temporary after a failed copy (a unique name this call
+/// created; a third party who swaps a link or an empty directory in at it between the failure and
+/// the removal loses it) and the final drop of the original sidecar. On Windows the copy is the standard library's `copy_file`, by name at both
 /// ends: it follows a link at the source, and a file put at the destination inside the gap is not
 /// proven safe (unverified until the Windows leg runs), and a crash mid-copy there can leave a
 /// truncated file at the quarantine name. All of it needs write access to the data directory.
@@ -211,7 +213,9 @@ struct PartialCopy {
 /// stray temporary, never a truncated file at the quarantine name. A failure to read, write or
 /// publish removes the temporary, which this call provably made, by name and `partial` says so; a
 /// failed fsync does NOT: the complete copy is kept and `partial.unsynced` reports it, because the
-/// earlier `copy_file` never flushed and a finished copy is better evidence than none.
+/// earlier `copy_file` never flushed and a finished copy is better evidence than none. The temporary's
+/// create is by descriptor but the publish and the removals are by name (a writer of the data
+/// directory could replace the temporary between its close and the link; see the banner).
 /// `write_fn` and `fsync_fn` are test seams.
 inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
                                        const std::filesystem::path& to, std::error_code& ec,
@@ -572,7 +576,8 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         // The copy runs only when no entry of any kind (a dangling link included) is at the
         // destination, examined without following a link. That keeps a link out of an injected
         // copy and of Windows' copy_file (its own exists check follows one); the POSIX descriptor
-        // copy also refuses it itself (O_EXCL|O_NOFOLLOW). A link's target is not ours to write.
+        // copy also refuses it itself (its link(2) publish fails with EEXIST for any entry at the
+        // name). A link's target is not ours to write.
         std::error_code cec = std::make_error_code(std::errc::not_supported);
         bool copy_ran = false;
 #ifndef _WIN32

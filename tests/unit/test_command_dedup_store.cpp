@@ -1346,7 +1346,7 @@ TEST_CASE("sqlite_quarantine: the descriptor copy refuses a source that is not a
     CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found); // nothing created
 }
 
-TEST_CASE("sqlite_quarantine: the descriptor copy creates its destination exclusively",
+TEST_CASE("sqlite_quarantine: the descriptor copy publishes exclusively",
           "[command_dedup][corruption][quarantine_fs]") {
     // #7472: an entry that appears at the quarantine name after the pre-check is neither
     // overwritten nor written through, and is never removed as if it were a partial copy.
@@ -1989,7 +1989,7 @@ TEST_CASE("CommandDedupStore: a fresh store that cannot be created after a quara
 TEST_CASE("sqlite_quarantine: a failed default sidecar copy reports the partial copy removed "
           "(whole path, no copy seam)",
           "[command_dedup][corruption][quarantine_fs]") {
-    // Only the rename is made to fail; the real descriptor copy then creates its destination and
+    // Only the rename is made to fail; the real descriptor copy then creates its temporary and
     // every write fails (EFBIG), so it removes what it made. The note must carry that outcome: it
     // is the one branch that turns the descriptor copy's result into the operator's note.
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
