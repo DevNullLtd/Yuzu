@@ -1261,6 +1261,10 @@ ssize_t full_disk_write(int fd, const void* b, std::size_t n) {
     errno = ENOSPC;
     return -1;
 }
+// A publish that fails with something other than file_exists (a full directory).
+void full_directory_link(const fs::path&, const fs::path&, std::error_code& ec) {
+    ec = std::make_error_code(std::errc::no_space_on_device);
+}
 int g_fsync_calls = 0;
 int failing_fsync(int) {
     ++g_fsync_calls;
@@ -1474,6 +1478,56 @@ TEST_CASE("sqlite_quarantine: the descriptor copy never has a file at the quaran
     CHECK(g_probe_temps == 1);
     CHECK(read_bytes(dst) == big);
     CHECK(partial_temporaries(dir.path) == 0);
+}
+
+TEST_CASE("sqlite_quarantine: a publish that fails with another error keeps the complete copy",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // The original sidecar is dropped right after a failed copy, so a complete, synced copy whose
+    // only failure is the publish (the directory has no room for a second entry) is the last one:
+    // it is kept under its temporary name and the helper says where.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    const auto dst = dir.path / "x.db.corrupt-1-wal";
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+    sq::detail::copy_sidecar_by_descriptor(src, dst, ec, partial, &::write, &::fsync,
+                                           &full_directory_link);
+    CHECK(ec == std::errc::no_space_on_device);
+    CHECK(partial.kept);
+    CHECK(partial.created);
+    CHECK(partial.temporary.filename().string().find(std::string{sq::detail::kPartialInfix}) !=
+          std::string::npos);
+    CHECK(read_bytes(partial.temporary) == "wal bytes");
+    CHECK(mode_of(partial.temporary) == "600");
+    CHECK(fs::symlink_status(dst).type() == fs::file_type::not_found);
+    CHECK(partial_temporaries(dir.path) == 1);
+    CHECK(read_bytes(src) == "wal bytes");
+}
+
+TEST_CASE("sqlite_quarantine: the failed-copy note names what became of the bytes",
+          "[command_dedup][corruption][quarantine_fs]") {
+    const fs::path side{"/data/echo.db-wal"};
+    const fs::path dest{"/data/echo.db.corrupt-1-wal"};
+    const fs::path temp{"/data/echo.db.corrupt-1-wal.partial-7-0"};
+
+    const auto kept = sq::detail::failed_copy_note(side, dest, "No space left on device", "",
+                                                   temp.string());
+    CHECK(kept.find("the complete copy was kept as " + temp.string()) != std::string::npos);
+    CHECK(kept.find("its content is not kept") == std::string::npos);
+
+    const auto removed = sq::detail::failed_copy_note(
+        side, dest, "No space left on device", sq::detail::removal_note({}, temp), "");
+    CHECK(removed.find("its content is not kept; the partial copy was removed") !=
+          std::string::npos);
+
+    const auto stuck = sq::detail::failed_copy_note(
+        side, dest, "No space left on device",
+        sq::detail::removal_note(std::make_error_code(std::errc::permission_denied), temp), "");
+    CHECK(stuck.find("the partial copy could not be removed from " + temp.string()) !=
+          std::string::npos);
+    CHECK(stuck.find(std::make_error_code(std::errc::permission_denied).message()) !=
+          std::string::npos);
 }
 
 TEST_CASE("sqlite_quarantine: the descriptor copy never reuses a stale temporary name",

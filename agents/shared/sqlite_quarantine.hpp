@@ -189,6 +189,29 @@ struct FsOps {
         copy;
 };
 
+namespace detail {
+
+/// The part of a failed-copy note that says what became of a partial copy at `where`.
+inline std::string removal_note(const std::error_code& removal, const std::filesystem::path& where) {
+    return removal ? std::format("; the partial copy could not be removed from {} ({})",
+                                 where.string(), removal.message())
+                   : std::string{"; the partial copy was removed"};
+}
+
+/// The note for a sidecar that could not be preserved. `kept_as` is non-empty when the copy was
+/// complete and only its publish failed: that copy is kept under that name and the note says so.
+inline std::string failed_copy_note(const std::filesystem::path& side,
+                                    const std::filesystem::path& side_dest, const std::string& cause,
+                                    const std::string& partial_note, const std::string& kept_as) {
+    if (!kept_as.empty())
+        return std::format("could not publish {} as {} ({}); the complete copy was kept as {}",
+                           side.string(), side_dest.string(), cause, kept_as);
+    return std::format("could not preserve {} as {} ({}); its content is not kept{}", side.string(),
+                       side_dest.string(), cause, partial_note);
+}
+
+} // namespace detail
+
 #ifndef _WIN32
 namespace detail {
 
@@ -206,7 +229,37 @@ struct PartialCopy {
     std::error_code removal;
     bool unsynced = false;
     std::error_code sync_error;
+    std::filesystem::path temporary; // the temporary's path, set once it is created
+    bool kept = false; // the copy is complete but its publish failed: it is KEPT at `temporary`
 };
+
+/// Removes the temporary of a descriptor copy when it leaves scope unless dismissed, and records the
+/// result in `out`. Constructed right after the exclusive create (it neither throws nor allocates)
+/// so that no path out of the copy, an exception included, can leave the temporary behind. The
+/// armed rule: the create succeeded, so this call made the file.
+class TemporaryRemoval {
+public:
+    TemporaryRemoval(const std::filesystem::path& path, std::error_code& out) noexcept
+        : path_(path), out_(out) {}
+    TemporaryRemoval(const TemporaryRemoval&) = delete;
+    TemporaryRemoval& operator=(const TemporaryRemoval&) = delete;
+    ~TemporaryRemoval() {
+        if (armed_)
+            std::filesystem::remove(path_, out_);
+    }
+    void dismiss() noexcept { armed_ = false; }
+
+private:
+    const std::filesystem::path& path_;
+    std::error_code& out_;
+    bool armed_ = true;
+};
+
+/// The default publish: a hard link, which fails with `file_exists` for any entry at `link`.
+inline void hard_link(const std::filesystem::path& target, const std::filesystem::path& link,
+                      std::error_code& ec) noexcept {
+    std::filesystem::create_hard_link(target, link, ec);
+}
 
 /// Copy `from` to `to` by descriptor. `from` is opened `O_NOFOLLOW` (a link at the name fails with
 /// ELOOP) and must be a regular file. The bytes go to a TEMPORARY file beside `to`
@@ -222,12 +275,15 @@ struct PartialCopy {
 /// earlier `copy_file` never flushed and a finished copy is better evidence than none. The temporary's
 /// create is by descriptor but the publish and the removals are by name (a writer of the data
 /// directory could replace the temporary between its close and the link; see the banner).
-/// `write_fn` and `fsync_fn` are test seams.
+/// `write_fn`, `fsync_fn` and `link_fn` are test seams.
 inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
                                        const std::filesystem::path& to, std::error_code& ec,
                                        PartialCopy& partial,
                                        ssize_t (*write_fn)(int, const void*, std::size_t) = &::write,
-                                       int (*fsync_fn)(int) = &::fsync) {
+                                       int (*fsync_fn)(int) = &::fsync,
+                                       void (*link_fn)(const std::filesystem::path&,
+                                                       const std::filesystem::path&,
+                                                       std::error_code&) = &hard_link) {
     ec.clear();
     partial = {};
     // O_NONBLOCK: a FIFO swapped in at the name must fail the regular-file check, not block the open.
@@ -267,6 +323,8 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
         return;
     }
     partial.created = true;
+    TemporaryRemoval cleanup{tmp, partial.removal};
+    partial.temporary = tmp;
     bool ok = true;
     {
         const yuzu::shared::ScopedFile dst{out};
@@ -307,22 +365,21 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
             }
         }
     }
-    if (!ok) {
-        std::filesystem::remove(tmp, partial.removal); // the file this call created, by name
-        return;
-    }
-    // Publish: link(2) fails with EEXIST for an entry of any kind at `to` and follows none.
-    std::filesystem::create_hard_link(tmp, to, ec);
+    if (!ok)
+        return; // `cleanup` removes the temporary
+    // Publish: a hard link fails with EEXIST for an entry of any kind at `to` and follows none.
+    link_fn(tmp, to, ec);
     if (ec) {
-        std::filesystem::remove(tmp, partial.removal);
-        if (ec == std::errc::file_exists)
+        if (ec == std::errc::file_exists) {
             partial.created = false; // not ours: nothing of this call's is at the quarantine name
-        return;
+        } else {
+            // The copy is complete and synced and the original sidecar is dropped next: keep it.
+            cleanup.dismiss();
+            partial.kept = true;
+        }
     }
-    // A failure here is not reported: it leaves a second, inert name for the same file (the prune
-    // and every evidence read ignore a `.partial-` name), recorded in the banner.
-    std::error_code rm;
-    std::filesystem::remove(tmp, rm);
+    // On success `cleanup` removes the temporary name; a failure there is not reported and
+    // leaves a second, inert name for the same file (recorded in the banner).
 }
 
 } // namespace detail
@@ -619,29 +676,27 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         }
         if (cec) {
             std::string partial_note;
+            std::string kept_as;
             // A copy that failed part-way (disk full) can leave a truncated file at the name that
             // was free when this call checked it; a truncated sidecar is not evidence and would
             // pass for the real one. file_exists means the entry is not ours: never removed.
-            const auto partial_removal_note = [](const std::error_code& pec) {
-                return pec ? std::format("; the partial copy could not be removed ({})", pec.message())
-                           : std::string{"; the partial copy was removed"};
-            };
 #ifndef _WIN32
             if (copy_ran && !ops.copy) {
-                // The descriptor copy removed what it created itself; there is nothing else to do.
-                if (by_fd.created)
-                    partial_note = partial_removal_note(by_fd.removal);
+                // The descriptor copy cleaned up after itself, or kept the complete copy.
+                if (by_fd.kept)
+                    kept_as = by_fd.temporary.string();
+                else if (by_fd.created)
+                    partial_note = detail::removal_note(by_fd.removal, by_fd.temporary);
             } else
 #endif
                 if (copy_ran && cec != std::errc::file_exists &&
                     is_regular_file_no_follow(side_dest)) {
                 std::error_code pec;
                 fs::remove(side_dest, pec);
-                partial_note = partial_removal_note(pec);
+                partial_note = detail::removal_note(pec, side_dest);
             }
-            result.notes.push_back(std::format(
-                "could not preserve {} as {} ({}); its content is not kept{}", side.string(),
-                side_dest.string(), cec.message(), partial_note));
+            result.notes.push_back(detail::failed_copy_note(side, side_dest, cec.message(),
+                                                            partial_note, kept_as));
         } else {
             secure(side_dest);
             std::string sync_note;
