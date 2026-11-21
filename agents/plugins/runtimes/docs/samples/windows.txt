@@ -1,4 +1,4 @@
-captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 3cef2d295916
+captured: windows Windows 10.0.26200 x86_64 · bare-metal · 2026-11-04 · interactive user (elevated) · leg-hash 05bb94193f11
 == action=dotnet
 status|dotnet|supported|-
 dotnet|netfx|4.8.1|C:/Windows/Microsoft.NET/Framework/v4.0.30319/|Microsoft

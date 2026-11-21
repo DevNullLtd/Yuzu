@@ -1,6 +1,6 @@
 Directory: tests/unit/fixtures/wave10/runtimes/linux/
 Fixtures for the runtimes Linux-leg tests (tests/unit/test_runtimes_parsers.cpp loads the
-three capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
+capture files; tests/unit/test_runtimes_linux_parsers.cpp materializes tree.manifest and
 jdk_layouts.manifest and reads mountinfo_docker_nfs4.txt).
 One directory-level provenance file; every fixture below is labelled. The three capture
 files are REAL CAPTURE from command-only Docker containers (no long-running service,
@@ -68,6 +68,40 @@ opensuse156-openjdk17:  opensuse/leap:15.6 after `zypper -n in --no-recommends
            /usr/lib64/jvm/java-17-openjdk-17/release` verbatim (it has no IMAGE_TYPE, and
            IMPLEMENTOR="N/A").
 note:      none of the three OpenJDK 8 homes contains a `release` file (the find prints none).
+
+-- debian12_openjdk17_jre_release.txt, ubuntu2404_openjdk21_release.txt, opensuse156_openjdk17_release.txt --
+status:    REAL CAPTURE (each file is the package's `release` file verbatim)
+host:      Docker Desktop (linux/arm64 containers) on macOS, root in the container, command-only
+           `docker run --rm`, one throwaway container per package, 2026-11-21
+images:    debian:12        (digest sha256:268fb24c39bca92d326dd83ea3abebe4a3f7751c804ffef23bb6d857dd343ff8)
+           ubuntu:24.04     (digest sha256:73b999393d07f2bf65a40373778a44dc9a6d54ad7718d29247d8ff9413c4d6a8)
+           opensuse/leap:15.6 (digest sha256:79be7751205ea84559990fb76b1bec71e38d6fad41c70a4f6c921b803b58f421)
+files:     debian12_openjdk17_jre_release.txt   <- openjdk-17-jre-headless 17.0.21.1+2-1~deb12u1
+           ubuntu2404_openjdk21_release.txt     <- openjdk-21-jdk-headless 21.0.13.1+2-1~24.04.1
+                                                   (byte-identical to the openjdk-21-jre-headless one)
+           opensuse156_openjdk17_release.txt    <- java-17-openjdk-devel 17.0.18.0-150400.3.63.1
+                                                   (same fields as java-17-openjdk-headless, which also
+                                                   has no IMAGE_TYPE and IMPLEMENTOR="N/A")
+           None of the six release files in the capture set carries an IMAGE_TYPE key.
+
+-- SAM-48 captures in jdk_layouts.manifest (roots/debian12-openjdk17-{jdk,jre}, roots/ubuntu2404-openjdk21-{jdk,jre},
+   roots/opensuse156-openjdk17-devel, and the existing roots/opensuse156-openjdk17 as the SUSE JRE) --
+status:    REAL CAPTURE structure and release payloads; regular files other than `release` are EMPTY
+           placeholders (names were recorded, not contents); JDK-only directories are trimmed.
+host:      as above (Docker Desktop, linux/arm64, root, command-only `docker run --rm`, 2026-11-21)
+install:   debian:12        apt-get update && apt-get install -y --no-install-recommends openjdk-17-jdk-headless
+                            (and, separately, openjdk-17-jre-headless)
+           ubuntu:24.04     apt-get update && apt-get install -y --no-install-recommends openjdk-21-jdk-headless
+                            (and, separately, openjdk-21-jre-headless)
+           opensuse/leap:15.6  zypper -n in --no-recommends java-17-openjdk-devel
+                            (and, separately, java-17-openjdk-headless 17.0.18.0-150400.3.63.1)
+commands:  ls -la <jvm root>; for each home: ls -la <home>; ls -la <home>/bin; cat <home>/release
+           (<jvm root> = /usr/lib/jvm on Debian and Ubuntu, /usr/lib64/jvm on SUSE). No java binary was run.
+measured:  every JDK package has <home>/bin/javac (regular file) next to bin/java; every JRE package
+           has bin/java and NO bin/javac (Debian and Ubuntu JRE bin/: java jpackage keytool rmiregistry;
+           SUSE headless bin/: java). Debian and Ubuntu release IMPLEMENTOR is "Debian" / "Ubuntu";
+           SUSE's is "N/A". On SUSE the jre-17-openjdk alias symlink points at the same home, so the
+           `ls` of the alias shows javac too; it is an alias entry and the walk skips it.
 
 -- mountinfo_docker_nfs4.txt --
 status:    REAL CAPTURE (the file verbatim, 12 lines; the nfs4 mount is the last line)

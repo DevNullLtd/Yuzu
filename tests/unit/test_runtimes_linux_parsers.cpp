@@ -373,7 +373,8 @@ TEST_CASE("runtimes linux: jvm_rows_at reads both roots' release files, skips th
     Acc acc;
     const auto rows = lnx::jvm_rows_at(dir.path, acc);
     CHECK_FALSE(acc.any_failure());
-    // Root order: /usr/lib/jvm (Debian, no IMAGE_TYPE -> unmodelled), then /opt/java (Temurin).
+    // Root order: /usr/lib/jvm (Debian, no IMAGE_TYPE and this tree has no bin/ -> unmodelled), then
+    // /opt/java (Temurin).
     // java-1.17.0-openjdk-arm64 is a symlink alias of java-17-openjdk-arm64: not a second row.
     REQUIRE(rows.size() == 2);
     CHECK(rows[0] == kDebianRow);
@@ -983,16 +984,16 @@ TEST_CASE("runtimes linux: an OpenJDK 8 home with no release file is still a row
           "[runtimes][linux][walk][jdk8]") {
     // Ubuntu, Rocky and Alpine OpenJDK 8 packages ship NO `release` file (jdk_layouts.manifest).
     // MUTATION: dropping the java-binary probe leaves zero rows and `supported`; probing only
-    // bin/java fails Rocky (jre/bin/java only). The bin/java-only branch has no real capture, so the
-    // last case is SYNTHETIC.
+    // bin/java fails Rocky (jre/bin/java only). All three are JRE packages (no bin/javac), so the
+    // flavour is jre. The bin/java-only branch has no real capture, so the last case is SYNTHETIC.
     yuzu::test::TempDir dir{"yuzu_test_runtimes_jdk8_"};
     std::string err;
     REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
     struct Layout { const char* root; const char* row; };
     for (const Layout& l :
-         {Layout{"ubuntu2204-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-8-openjdk-arm64|-"},
-          Layout{"rocky9-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64|-"},
-          Layout{"alpine320-openjdk8", "jvm|unmodelled|-|/usr/lib/jvm/java-1.8-openjdk|-"}}) {
+         {Layout{"ubuntu2204-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-8-openjdk-arm64|-"},
+          Layout{"rocky9-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-1.8.0-openjdk-1.8.0.504.b01-1.2.el9_8.aarch64|-"},
+          Layout{"alpine320-openjdk8", "jvm|jre|-|/usr/lib/jvm/java-1.8-openjdk|-"}}) {
         INFO("layout: " << l.root);
         Acc acc;
         const auto rows = lnx::jvm_rows_at(dir.path / "roots" / l.root, acc); // aliases and .jinfo: no rows
@@ -1007,7 +1008,7 @@ TEST_CASE("runtimes linux: an OpenJDK 8 home with no release file is still a row
     Acc acc;
     const auto rows = lnx::jvm_rows_at(syn.path, acc);
     REQUIRE(rows.size() == 1);
-    CHECK(rows[0] == "jvm|unmodelled|-|/opt/java/only-bin|-");
+    CHECK(rows[0] == "jvm|jre|-|/opt/java/only-bin|-");
 }
 
 TEST_CASE("runtimes linux: a release-less home's java probe records what it cannot check (SYNTHETIC)",
@@ -1025,7 +1026,9 @@ TEST_CASE("runtimes linux: a release-less home's java probe records what it cann
     probe([&](const fs::path& j) { write_text(j / "h/real/java", ""); link("real", j / "h/bin"); },
           {}, lnx::kTokSymlinkRefused); // a symlinked bin is never followed, but never silent
     probe([&](const fs::path& j) { write_text(j / "g/jre/bin/java", ""); link("jre/bin", j / "g/bin"); },
-          {"jvm|unmodelled|-|/opt/java/g|-"}, lnx::kTokReleaseMissing); // found via jre: no refusal
+          {"jvm|unmodelled|-|/opt/java/g|-"},
+          std::string{lnx::kTokReleaseMissing} + "," + std::string{lnx::kTokSymlinkRefused});
+    // found via jre: the home is listed, but the symlinked bin leaves the flavour undecided and says so
     probe([&](const fs::path& j) {
               make_dir(j / "d/bin/java");
               make_dir(j / "f/bin");
@@ -1054,7 +1057,111 @@ TEST_CASE("runtimes linux: openSUSE keeps JVMs under /usr/lib64/jvm (REAL CAPTUR
     const auto rows = lnx::jvm_rows_at(dir.path / "roots/opensuse156-openjdk17", acc);
     CHECK_FALSE(acc.any_failure());
     REQUIRE(rows.size() == 1); // the four jre* alias symlinks are no rows
-    CHECK(rows[0] == "jvm|unmodelled|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A");
+    CHECK(rows[0] == "jvm|jre|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"); // headless: no javac
+}
+
+TEST_CASE("runtimes linux: JDK and JRE packages without IMAGE_TYPE read jdk or jre from bin/javac (REAL CAPTURE)",
+          "[runtimes][linux][walk][flavour]") {
+    // Debian 12, Ubuntu 24.04 and openSUSE Leap 15.6 JDK and JRE packages (provenance.txt): none of
+    // their release files has IMAGE_TYPE; every JDK has bin/javac and no JRE does. Vendor is the
+    // captured IMPLEMENTOR as written ("N/A" on SUSE). MUTATION: dropping the bin/javac probe turns
+    // every row back to unmodelled; testing bin/java instead of bin/javac makes every JRE a jdk.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_javac_"};
+    std::string err;
+    REQUIRE(materialize_manifest(dir.path, err, "jdk_layouts.manifest"));
+    struct Layout { const char* root; const char* row; };
+    for (const Layout& l : {
+             Layout{"debian12-openjdk17-jdk", "jvm|jdk|17.0.21.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian"},
+             Layout{"debian12-openjdk17-jre", "jvm|jre|17.0.21.1|/usr/lib/jvm/java-17-openjdk-arm64|Debian"},
+             Layout{"ubuntu2404-openjdk21-jdk", "jvm|jdk|21.0.13.1|/usr/lib/jvm/java-21-openjdk-arm64|Ubuntu"},
+             Layout{"ubuntu2404-openjdk21-jre", "jvm|jre|21.0.13.1|/usr/lib/jvm/java-21-openjdk-arm64|Ubuntu"},
+             Layout{"opensuse156-openjdk17-devel", "jvm|jdk|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"},
+             Layout{"opensuse156-openjdk17", "jvm|jre|17.0.18|/usr/lib64/jvm/java-17-openjdk-17|N/A"}}) {
+        INFO("layout: " << l.root);
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(dir.path / "roots" / l.root, acc); // aliases: no rows
+        CHECK_FALSE(acc.any_failure());
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == l.row);
+    }
+}
+
+TEST_CASE("runtimes linux: the bin/javac flavour fallback is exact about what it reads (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // Each case builds one home under /opt/java/h and checks its row and reason. MUTATIONS: letting
+    // the fallback override IMAGE_TYPE; counting a directory named javac; following a symlinked bin;
+    // reading an undecidable bin as "no javac" (a jre).
+    const auto probe = [](auto&& setup, const char* release, std::string_view row,
+                          std::string_view reason) {
+        yuzu::test::TempDir d{"yuzu_test_runtimes_flavour_"};
+        const fs::path home = d.path / "opt/java/h";
+        make_dir(home);
+        if (*release != '\0') write_text(home / "release", release);
+        setup(home);
+        Acc acc;
+        const auto rows = lnx::jvm_rows_at(d.path, acc);
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == row);
+        CHECK(acc.reason() == reason);
+    };
+    const char* const kNoType = "JAVA_VERSION=\"17.0.1\"\nIMPLEMENTOR=\"Vendor\"\n";
+    const auto both = [](const fs::path& h) { write_text(h / "bin/java", ""); write_text(h / "bin/javac", ""); };
+    const auto java_only = [](const fs::path& h) { write_text(h / "bin/java", ""); };
+
+    probe(both, kNoType, "jvm|jdk|17.0.1|/opt/java/h|Vendor", "");
+    probe(java_only, kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // no IMPLEMENTOR in the release file: vendor is `-`, never derived from the path
+    probe(both, "JAVA_VERSION=\"17.0.1\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    // IMAGE_TYPE present still decides, whatever bin/ says
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JRE\"\n", "jvm|jre|17.0.1|/opt/java/h|-", "");
+    probe(java_only, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n", "jvm|jdk|17.0.1|/opt/java/h|-", "");
+    // an unrecognised IMAGE_TYPE value is still the file's word: unmodelled, bin/ not consulted
+    probe(both, "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"SDK\"\n", "jvm|unmodelled|17.0.1|/opt/java/h|-", "");
+    // a symlink named javac is an entry (not followed, may dangle); a directory named javac is not a compiler
+    probe([&](const fs::path& h) { java_only(h); fs::create_symlink("/nonexistent/javac", h / "bin/javac"); },
+          kNoType, "jvm|jdk|17.0.1|/opt/java/h|Vendor", "");
+    probe([&](const fs::path& h) { java_only(h); make_dir(h / "bin/javac"); },
+          kNoType, "jvm|jre|17.0.1|/opt/java/h|Vendor", "");
+    // neither binary: the file alone cannot say, and nothing is guessed
+    probe([](const fs::path& h) { make_dir(h / "bin"); }, kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", "");
+    probe([](const fs::path&) {}, kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", "");
+    // a symlinked bin is refused, never followed: unmodelled, token recorded
+    probe([&](const fs::path& h) { both(h / "real"); fs::create_symlink("real/bin", h / "bin"); },
+          kNoType, "jvm|unmodelled|17.0.1|/opt/java/h|Vendor", lnx::kTokSymlinkRefused);
+    // no release file, java and javac present: the release_missing row carries the flavour
+    probe(both, "", "jvm|jdk|-|/opt/java/h|-", lnx::kTokReleaseMissing);
+    probe(java_only, "", "jvm|jre|-|/opt/java/h|-", lnx::kTokReleaseMissing);
+}
+
+TEST_CASE("runtimes linux: an unsearchable bin leaves the flavour unmodelled and says why (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    if (running_privileged()) SKIP("euid 0: permission bits are bypassed, the unsearchable-bin case is not run");
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_perm_"};
+    write_text(dir.path / "opt/java/h/release", "JAVA_VERSION=\"17.0.1\"\n");
+    write_text(dir.path / "opt/java/h/bin/javac", "");
+    REQUIRE(::chmod((dir.path / "opt/java/h/bin").c_str(), 0644) == 0); // listable, not searchable
+    const PermRestore restore{dir.path / "opt/java/h/bin"};
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc);
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "jvm|unmodelled|17.0.1|/opt/java/h|-");
+    CHECK(acc.reason() == std::string{lnx::kTokPermissionDenied});
+}
+
+TEST_CASE("runtimes linux: the bin/javac probe stays inside the walk budget (SYNTHETIC)",
+          "[runtimes][linux][walk][flavour]") {
+    // One extra open per home, no listing of bin: the entries-visited and row caps that bound the
+    // homes still bound the walk. MUTATION: a probe that lists bin/ would not be capped here.
+    yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_cap_"};
+    for (const char* n : {"a", "b", "c", "d", "e"}) {
+        write_text(dir.path / "usr/lib/jvm" / n / "release", "JAVA_VERSION=\"17.0.1\"\n");
+        write_text(dir.path / "usr/lib/jvm" / n / "bin/javac", "");
+    }
+    Acc acc;
+    const auto rows = lnx::jvm_rows_at(dir.path, acc, dir_cap(2));
+    CHECK(rows.size() == 2); // the cap admits two homes; both are jdk
+    for (const auto& r : rows) CHECK(r.rfind("jvm|jdk|17.0.1|", 0) == 0);
+    CHECK(acc.reason() == std::string{lnx::kTokRowCap});
 }
 
 TEST_CASE("runtimes linux: /opt -> var/opt (rpm-ostree) is a covered alias, not a refusal (SYNTHETIC)",
