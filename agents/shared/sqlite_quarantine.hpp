@@ -66,8 +66,8 @@
 /// replaces the temporary in that gap has their entry published, and on macOS `link(2)` follows a
 /// link at its source), the removal of the temporary after a failed copy (a unique name this call
 /// created; a third party who swaps a link or an empty directory in at it between the failure and
-/// the removal loses it) and the final drop of the original sidecar. On Windows the copy is the standard library's `copy_file`, by name at both
-/// ends: it follows a link at the source, and a file put at the destination inside the gap is not
+/// the removal loses it) and the final drop of the original sidecar. On Windows the copy is the
+/// standard library's `copy_file`, by name at both ends: it follows a link at the source, and a file put at the destination inside the gap is not
 /// proven safe (unverified until the Windows leg runs), and a crash mid-copy there can leave a
 /// truncated file at the quarantine name. All of it needs write access to the data directory.
 /// A HARD link planted at the name is a regular file with its target's identity,
@@ -190,6 +190,10 @@ struct FsOps {
 #ifndef _WIN32
 namespace detail {
 
+/// The infix of a copy's temporary name (`<destination>.partial-<pid>-<n>`); outside the quarantine
+/// name grammar, so `parse_quarantine_name` never matches it.
+inline constexpr std::string_view kPartialInfix = ".partial-";
+
 /// What a descriptor copy left behind: `created` is true when THIS call made a file (the `O_EXCL`
 /// create of the temporary succeeded; false again when the publish found an entry that is not
 /// ours at the destination), and `removal` is the result of removing that temporary by name after
@@ -248,7 +252,7 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
     int out = -1;
     for (int attempt = 0; attempt < 8 && out < 0; ++attempt) {
         tmp = to;
-        tmp += std::format(".partial-{}-{}", ::getpid(), counter.fetch_add(1));
+        tmp += std::format("{}{}-{}", kPartialInfix, ::getpid(), counter.fetch_add(1));
         out = ::open(tmp.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW | O_CLOEXEC, 0600);
         if (out < 0 && errno != EEXIST)
             break;

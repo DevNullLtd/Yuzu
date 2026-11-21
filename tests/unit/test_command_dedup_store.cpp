@@ -1278,12 +1278,23 @@ int eintr_once_fsync(int fd) {
 std::size_t partial_temporaries(const fs::path& dir) {
     std::size_t n = 0;
     for (const auto& e : fs::directory_iterator(dir)) {
-        if (e.path().filename().string().find(".partial-") != std::string::npos)
+        if (e.path().filename().string().find(std::string{sq::detail::kPartialInfix}) !=
+            std::string::npos)
             ++n;
     }
     return n;
 }
+// The name of a temporary in `dir` (empty when there is none).
+std::string temporary_name_in(const fs::path& dir) {
+    for (const auto& e : fs::directory_iterator(dir)) {
+        const auto name = e.path().filename().string();
+        if (name.find(std::string{sq::detail::kPartialInfix}) != std::string::npos)
+            return name;
+    }
+    return {};
+}
 // Records, at every write, whether anything is at the destination name and how many temporaries exist.
+std::string g_probe_temp_name;
 fs::path g_probe_dst;
 bool g_dst_seen = false;
 std::size_t g_probe_temps = 0;
@@ -1293,6 +1304,8 @@ ssize_t probing_write(int fd, const void* b, std::size_t n) {
         g_dst_seen = true;
     const auto t = partial_temporaries(g_probe_dst.parent_path());
     g_probe_temps = t > g_probe_temps ? t : g_probe_temps;
+    if (auto name = temporary_name_in(g_probe_dst.parent_path()); !name.empty())
+        g_probe_temp_name = std::move(name);
     return ::write(fd, b, n);
 }
 std::string mode_of(const fs::path& p) {
@@ -1422,7 +1435,7 @@ TEST_CASE("sqlite_quarantine: the descriptor copy is byte-exact, owner-only and 
     }
 }
 
-TEST_CASE("sqlite_quarantine: a descriptor copy that fails part-way removes the destination it created",
+TEST_CASE("sqlite_quarantine: a descriptor copy that fails part-way removes the temporary it wrote",
           "[command_dedup][corruption][quarantine_fs]") {
     yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
     const auto src = dir.path / "x.db-wal";
@@ -1461,6 +1474,53 @@ TEST_CASE("sqlite_quarantine: the descriptor copy never has a file at the quaran
     CHECK(g_probe_temps == 1);
     CHECK(read_bytes(dst) == big);
     CHECK(partial_temporaries(dir.path) == 0);
+}
+
+TEST_CASE("sqlite_quarantine: the descriptor copy never reuses a stale temporary name",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // A temporary left by a crashed copy (same pid, a later counter value) is never overwritten or
+    // reused: the copy takes the next name, and gives up with file_exists after eight collisions.
+    // The first copy reveals the counter value in use through the probe.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto src = dir.path / "x.db-wal";
+    write_bytes(src, "wal bytes");
+    std::error_code ec;
+    sq::detail::PartialCopy partial;
+
+    const auto first = dir.path / "x.db.corrupt-1-wal";
+    g_probe_dst = first;
+    g_probe_temp_name.clear();
+    sq::detail::copy_sidecar_by_descriptor(src, first, ec, partial, &probing_write);
+    REQUIRE_FALSE(ec);
+    REQUIRE_FALSE(g_probe_temp_name.empty());
+    const auto used = std::stoul(g_probe_temp_name.substr(g_probe_temp_name.rfind('-') + 1));
+    const auto pid = ::getpid();
+    const auto stale_for = [&](const fs::path& to, unsigned long n) {
+        return fs::path(to.string() + std::string{sq::detail::kPartialInfix} + std::to_string(pid) +
+                        "-" + std::to_string(n));
+    };
+
+    SECTION("one stale name is skipped and left as found") {
+        const auto second = dir.path / "x.db.corrupt-2-wal";
+        const auto stale = stale_for(second, used + 1); // the name the next copy tries first
+        write_bytes(stale, "stale bytes");
+        sq::detail::copy_sidecar_by_descriptor(src, second, ec, partial);
+        CHECK_FALSE(ec);
+        CHECK(read_bytes(second) == "wal bytes");
+        CHECK(read_bytes(stale) == "stale bytes");
+    }
+    SECTION("eight stale names exhaust the retries without touching any of them") {
+        const auto third = dir.path / "x.db.corrupt-3-wal";
+        for (unsigned long n = used + 1; n <= used + 8; ++n)
+            write_bytes(stale_for(third, n), "stale bytes");
+        sq::detail::copy_sidecar_by_descriptor(src, third, ec, partial);
+        CHECK(ec == std::errc::file_exists);
+        CHECK_FALSE(partial.created);
+        CHECK(fs::symlink_status(third).type() == fs::file_type::not_found);
+        for (unsigned long n = used + 1; n <= used + 8; ++n)
+            CHECK(read_bytes(stale_for(third, n)) == "stale bytes");
+    }
+    CHECK(read_bytes(src) == "wal bytes");
 }
 
 TEST_CASE("sqlite_quarantine: a stray temporary of a crashed copy is never read as quarantined evidence",
