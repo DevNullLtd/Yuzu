@@ -64,3 +64,11 @@ build_target fuzz_file_search_names \
 
 build_target fuzz_file_search_glob \
   "$SRC_DIR/tests/fuzz/fuzz_file_search_glob.cpp"
+
+# file_search_volumes.hpp includes the shared file_search headers and the walker by bare name, so this
+# harness needs the three include paths tests/fuzz/meson.build gives it.
+build_target fuzz_file_search_volume_cursor \
+  "-I$SRC_DIR/agents/shared" \
+  "-I$SRC_DIR/agents/plugins/file_search/src" \
+  "-I$SRC_DIR/agents/plugins/component_inventory/src" \
+  "$SRC_DIR/tests/fuzz/fuzz_file_search_volume_cursor.cpp"

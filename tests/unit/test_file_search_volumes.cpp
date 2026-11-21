@@ -157,7 +157,7 @@ TEST_CASE("file_search volumes: a prefix test is on a component boundary in the 
         return std::size_t{999};
     };
     CHECK(volume_for(p, "/home2/f") == idx("/home2"));
-    CHECK(volume_for(p, "/home/f") == idx("/home"));
+    CHECK(volume_for(p, "/home/f") == idx("/home"));  // personal-data-ok: synthetic test path
     CHECK(volume_for(p, "/homeX") == idx("/")); // a name that merely starts with a mount point
     CHECK(volume_for(p, "/home") == idx("/home"));
 

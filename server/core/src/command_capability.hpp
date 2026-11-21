@@ -84,6 +84,20 @@ enum class ExecuteGate : uint8_t {
     AlwaysApproval,
 };
 
+/// Which stored-response read tier a plugin's stored rows sit in, when that differs from what its
+/// dispatch securable implies. The response store records the PLUGIN of a row, never the action,
+/// so the tier is a per-plugin property (`forensics_plugin_set.hpp` refuses a plugin whose rows
+/// disagree). `Ordinary` is every row's default: the rows are read at `Response:Read`, except
+/// that a plugin with a row on the `Forensics` securable is Forensics-tier whatever this says.
+/// `ForensicsRead` puts the stored rows in the existing Forensics read tier (global
+/// `Forensics:Read`) while DISPATCH stays on the row's own securable, so a plugin that must be
+/// launched fleet-wide or by group (the single-target rule reads the row's securable, not this
+/// field) can still keep what it stored behind the Forensics read.
+enum class StoredRowTier : uint8_t {
+    Ordinary,
+    ForensicsRead,
+};
+
 /// One classified `plugin.action` row — view/enum over static storage only,
 /// so a `std::span<const CommandCapability>` fragment can live in a
 /// `constexpr` array with no static-init-order or heap concern.
@@ -106,6 +120,9 @@ struct CommandCapability {
     /// designated-initializer row value-initializes to `Unspecified` (the
     /// zero enumerator), which every fragment's compile-time sweep rejects.
     ExecuteGate execute_gate{ExecuteGate::Unspecified};
+    /// See `StoredRowTier`. Defaulted and last, so every existing designated-initializer row is
+    /// unchanged and only the one fragment that needs the Forensics read tier names it.
+    StoredRowTier stored_rows{StoredRowTier::Ordinary};
 };
 
 namespace detail {

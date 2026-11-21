@@ -162,6 +162,7 @@ FRAGMENT_FILES = [
     "server/core/src/capability_decls/plugin_action_catalogue_shares.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_remote_access_audit.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_process_introspect.hpp",
+    "server/core/src/capability_decls/plugin_action_catalogue_file_search.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_middleware.hpp",
     "server/core/src/capability_decls/plugin_action_catalogue_virtualization.hpp",
 ]
@@ -254,7 +255,8 @@ FRAGMENT_FILES = [
 # PRQ.2's 251 = 252, re-derived by running this test (parse_fragment_gate_rows over FRAGMENT_FILES), not by adding
 # to a baseline.
 # process_introspect (inspect, +1, ReadOnly, Forensics:Read, gate AdminOrApproval) on top of SAM-39's 252 = 253, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
-EXPECTED_TOTAL_ROWS = 253
+# file_search (search, +1, ReadOnly, FileRetrieval:Read, gate AdminOrApproval) on top of process_introspect's 253 = 254, re-derived by running parse_fragment_gate_rows over FRAGMENT_FILES
+EXPECTED_TOTAL_ROWS = 254
 
 # Decision 1 (#1398 design doc): the ONLY prefixes a content-declared pair
 # with no catalogue row may carry — server-side handlers with no

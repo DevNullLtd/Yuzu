@@ -457,7 +457,7 @@ TEST_CASE("file_search driver: controls at depth 1, depth 12 and under a user di
           "[file_search][file_search_driver]") {
     Rig rig;
     rig.fs.add_dir("/home");
-    rig.fs.add_file("/home/yuzu-fs-control-1.bin", "x");
+    rig.fs.add_file("/home/yuzu-fs-control-1.bin", "x");  // personal-data-ok: synthetic test path
     std::string deep = "/home";
     for (const char* d : {"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k"})
         deep += std::string("/") + d;
@@ -466,8 +466,8 @@ TEST_CASE("file_search driver: controls at depth 1, depth 12 and under a user di
     rig.fs.add_file("/home/alice/docs/other.txt", "");
 
     const Run run = search(rig, kCtl, "/home");
-    CHECK(sorted(found(run)) == Strs{"/home/a/b/c/d/e/f/g/h/i/j/k/yuzu-fs-control-2.bin",
-                                     "/home/alice/docs/yuzu-fs-control-3.bin", "/home/yuzu-fs-control-1.bin"});
+    CHECK(sorted(found(run)) == Strs{"/home/a/b/c/d/e/f/g/h/i/j/k/yuzu-fs-control-2.bin",  // personal-data-ok: synthetic test path
+                                     "/home/alice/docs/yuzu-fs-control-3.bin", "/home/yuzu-fs-control-1.bin"});  // personal-data-ok: synthetic test path
     for (const auto& s : run.slices)
         for (const auto& row : s.rows)
             if (starts(row, "match|")) {

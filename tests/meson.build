@@ -4152,6 +4152,17 @@ test('process_introspect definition columns',
   timeout: 30,
 )
 
+# file_search's definition contract (content/definitions/file_search.yaml): the row_kind-first
+# field_1..field_6 columns pinned to the wire rows the plugin and the shared coverage header emit
+# (nine row kinds, plus the planned-leg status row), the root/pattern/kinds/cursor parameter grammar
+# and its bounds, the approval mode against the catalogue gate and the never-disclosed wording.
+test('file_search definition columns',
+  _python3_test,
+  args: [files('test_file_search_definition.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+
 # update_source_trust's failure-token contract (#4874): every `note_failure` literal and every
 # errno_detail token in the plugin headers is named in the README's Result status row and gloss
 # table, and nothing in those tables is undefined in the source.
@@ -5414,6 +5425,23 @@ test('response store read tripwire selftest',
   # Runs the scan over a mutated copy of the whole server tree once per mutation. Memoised per file
   # it takes a few seconds; the headroom is for a loaded shared CI box, not for the work.
   timeout: 120,
+)
+
+# The stored rows of file_search stay in the EXISTING Forensics read tier through one catalogue flag:
+# no second tier, no second permission check, no new audit verb, and the flag and the plugin name are
+# read in a pinned handful of files. The self-test mutates the sources in memory and requires each
+# mutation to be named. Both also run in .github/workflows/docs-lint.yml on every PR.
+test('file_search read tier tripwire',
+  _python3_test,
+  args: [files('test_file_search_read_tier_tripwire.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('file_search read tier tripwire selftest',
+  _python3_test,
+  args: [files('test_file_search_read_tier_tripwire.py'), '--selftest'],
+  suite: 'docs',
+  timeout: 60,
 )
 
 # #4990: server.cpp must keep wiring the Forensics plugin set and the visibility resolver into every

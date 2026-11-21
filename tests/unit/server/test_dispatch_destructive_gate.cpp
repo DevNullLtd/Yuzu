@@ -65,6 +65,7 @@
 #include "capability_decls/plugin_action_catalogue_shares.hpp"
 #include "capability_decls/plugin_action_catalogue_remote_access_audit.hpp"
 #include "capability_decls/plugin_action_catalogue_process_introspect.hpp"
+#include "capability_decls/plugin_action_catalogue_file_search.hpp"
 #include "command_capability.hpp"
 #include "dispatch_caller.hpp"
 
@@ -448,6 +449,32 @@ TEST_CASE("remote_access_audit: the REAL catalogue fragment is Forensics-securab
         CHECK(refused.verdict == DestructiveTargetingVerdict::RefuseUntargeted);
         CHECK(refused.refusal_reason == kReasonForensicUntargeted);
         CHECK(refused.refusal_message == kForensicUntargetedMessage);
+    }
+}
+
+TEST_CASE("file_search: the REAL catalogue fragment is NOT single-target — its stored rows are "
+          "Forensics-tier through the stored-row flag, but its dispatch securable is FileRetrieval, so "
+          "a multi-target, group or fleet dispatch is not refused for targeting",
+          "[server][dispatch][security]") {
+    CommandCapabilityRegistry registry{
+        yuzu::server::capdecls::plugin_action_catalogue_file_search()};
+    auto classified = registry.classify("file_search", "search");
+    REQUIRE(classified.has_value());
+    CHECK(classified->securable != kForensicsSecurable);
+    CHECK(classified->dispatch_class == DispatchClass::ReadOnly);
+    CHECK_FALSE(requires_explicit_targets(*classified));
+
+    // The same decision the dispatch surfaces make: never RefuseUntargeted for this row, whatever
+    // the targeting (no ids, one id, two ids, a scope or the __all__ broadcast).
+    for (const bool ids : {false, true}) {
+        for (const bool scope : {false, true}) {
+            for (const std::size_t n : {std::size_t{0}, std::size_t{1}, std::size_t{2}}) {
+                const auto decision = evaluate_destructive_targeting(
+                    classified, /*valid_nonempty_agent_ids=*/ids, /*scope_key_present=*/scope,
+                    /*agent_id_count=*/n);
+                CHECK(decision.verdict == DestructiveTargetingVerdict::NotDestructive);
+            }
+        }
     }
 }
 

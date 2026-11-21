@@ -48,14 +48,14 @@ std::size_t columns(const std::string& row) {
 TEST_CASE("file_search rows: the arity and spelling of every row kind is pinned",
           "[file_search][file_search_rows]") {
     MatchInfo m;
-    m.path = "/home/a b/yuzu-fs-control-1.bin";
+    m.path = "/home/a b/yuzu-fs-control-1.bin";  // personal-data-ok: synthetic test path
     m.id = {0x1, 0x2};
     m.size = 4096;
     m.mtime = 1700000000;
     m.scope = Scope::user;
     const std::string match = format_match_row(m);
     CHECK(columns(match) == 7);
-    CHECK(match == "match|/home/a b/yuzu-fs-control-1.bin|file|0000000000000001:0000000000000002|4096|1700000000|user");
+    CHECK(match == "match|/home/a b/yuzu-fs-control-1.bin|file|0000000000000001:0000000000000002|4096|1700000000|user");  // personal-data-ok: synthetic test path
 
     MatchInfo d;
     d.path = "/srv/data";
@@ -226,7 +226,7 @@ TEST_CASE("file_search rows: the user-directory tag per OS", "[file_search][file
         {"/Users", Os::macos, false},
         {"/Users/Shared", Os::macos, false},
         {"/Users/Shared/f", Os::macos, false},
-        {"/Users/SharedFoo/f", Os::macos, true}, // a user whose name starts with "Shared"
+        {"/Users/SharedFoo/f", Os::macos, true}, // a user whose name starts with "Shared"  // personal-data-ok: synthetic test path
         {"/var/root/f", Os::macos, false},        // /var is a link there: never reached, never tagged
         {"/private/var/root", Os::macos, true},
         {"/private/var/root/f", Os::macos, true},

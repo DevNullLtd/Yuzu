@@ -73,13 +73,24 @@ fuzz_targets = {
     'sources': files('fuzz_file_search_glob.cpp'),
     'deps': [],
   },
+  'fuzz_file_search_volume_cursor': {
+    'sources': files('fuzz_file_search_volume_cursor.cpp'),
+    'deps': [],
+    # file_search_volumes.hpp includes the shared file_search headers and the walker by bare name.
+    # Mirror these -I paths in .clusterfuzzlite/build.sh.
+    'inc': [include_directories(
+      '../../agents/shared',
+      '../../agents/plugins/file_search/src',
+      '../../agents/plugins/component_inventory/src',
+    )],
+  },
 }
 
 foreach name, spec : fuzz_targets
   exe = executable(
     name,
     spec['sources'],
-    include_directories: server_src_inc,
+    include_directories: [server_src_inc] + spec.get('inc', []),
     cpp_args: fuzz_args,
     link_args: fuzz_args,
     dependencies: spec['deps'],
