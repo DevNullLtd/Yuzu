@@ -197,7 +197,7 @@ the paged shape and the export mode is recorded here rather than as a separate r
 
 **Streamed file export with no MCP twin by design (SAM-36).** `GET /api/v1/inventory/software/export` (installed software streamed as JSONL or CSV, or built as an XLSX workbook, up to a configurable size limit) is a REST v1 capability that has no MCP twin and is not expected to get one: a chunked or sized file download has no JSON-RPC result to carry it, and `query_installed_software` already returns the same rows page by page. It is the one row of this shape in the ledger: `scripts/ci/api-parity/inventory.json` keys an `exception:#7955 revisit:2027-05-31` row on the route (the v1-keyed shape described above), pinned in `STRICT_EXCEPTION_PINS`, and the exception is recorded in `docs/adr/1005-headless-platform-use-case-engines.md`. The row counts untwinned, which is why the baseline above rose from 195 to 196: a reviewed decision, not a missing twin.
 
-**New REST route with its MCP twin pending (fleet application usage).** `GET /api/v1/dex/apps/usage` (for each application on the Apps list: the devices that ran it, its run time and launches over a 30-day basis and its crashes and hangs per hour of use, in the cells of a chosen slice) is a REST v1 capability with no MCP tool yet. The routed invariant is "REST and MCP, or a recorded ledger exception", so `scripts/ci/api-parity/dex.json` keys an `exception:#8096 revisit:2026-12-31` row on the route (the v1-keyed shape described above), pinned in `STRICT_EXCEPTION_PINS`, and the exception is recorded in the 2026-11-17 entry of `docs/adr/1005-headless-platform-use-case-engines.md`. The row counts untwinned, which is why the baseline above rose from 196 to 197. It is retired, and the baseline lowered, when the MCP tool (issue #8096) lands.
+**New REST route with its MCP twin pending (fleet application usage).** `GET /api/v1/dex/apps/usage` (for each application on the Apps list: the devices that ran it, its run time and launches over a 30-day basis and its crashes and hangs per hour of use, in the cells of a chosen slice) is a REST v1 capability with no MCP tool yet. The routed invariant is "REST and MCP, or a recorded ledger exception", so `scripts/ci/api-parity/dex.json` keys an `exception:#8096 revisit:2026-12-31` row on the route (the v1-keyed shape described above), pinned in `STRICT_EXCEPTION_PINS`, and the exception is recorded in the 2026-11-17 entry of `docs/adr/1005-headless-platform-use-case-engines.md`. The row counts untwinned, which is why the baseline above rose from 196 to 197. The Apps tab Usage view (`GET /fragments/dex/apps/usage`) then added a second row, `get.fragments-dex-apps-usage` (`twinned-rest-only`), which took the baseline to 198. Both rows are retired, and the baseline lowered by two, when the MCP tool (issue #8096) lands.
 
 **Known asymmetry on the audit pair.** `GET /api/v1/audit` and `query_audit_log` share one row set, but the MCP tool also publishes `has_more` and refuses a string filter over 1024 characters; the REST route does neither (a short page is its last page, and its filters are unbounded). The row stays `twinned`; the gap is recorded here and tracked by `#5887` (revisit by 2026-11-15).
 
@@ -222,7 +222,7 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 |---|---:|---:|---:|
 | devices | 24 | 14 | 10 |
 | inventory | 6 | 5 | 1 |
-| dex | 32 | 22 | 10 |
+| dex | 33 | 22 | 11 |
 | guardian | 18 | 10 | 8 |
 | echo | 12 | 3 | 9 |
 | auto-preflight | 4 | 1 | 3 |
@@ -244,11 +244,11 @@ raw route is tracked by `#5856` (revisit by 2026-11-14).
 | enrollment | 21 | 4 | 17 |
 | crypto | 5 | 5 | 0 |
 | other | 82 | 34 | 48 |
-| **Total** | **354** | **157** | **197** |
+| **Total** | **355** | **157** | **198** |
 
 Registered `/api/vN/*` routes: 308. OpenAPI `paths` entries: 307. Missing from OpenAPI: 1 (1 carried in `check-api-parity.py`'s `ALLOWLIST_OPENAPI_MISSING` pending F2, 0 unallowlisted). MCP tools: 249.
 
-Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 197. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
+Ratchet baseline (untwinned rows; shrinks as routes are twinned, or rises only with a reviewed reason stated in the change that raises it): 198. Generic `planned:#2146` placeholder baseline (shrinks only; a new row names a specific issue): 69.
 
 <!-- END GENERATED -->
 

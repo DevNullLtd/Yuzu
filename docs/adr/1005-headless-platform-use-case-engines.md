@@ -2031,7 +2031,11 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        `BASELINE_UNTWINNED` rose by one (196 to 197). The row is retired, and
        the baseline lowered, when the MCP tool lands; the tool reuses
        `dex_apps_usage_json` and the `DexApi` `apps_usage` seam, not a second
-       copy of the model.
+       copy of the model. The Apps tab Usage view (`GET
+       /fragments/dex/apps/usage`) then added a second row,
+       `get.fragments-dex-apps-usage` (`twinned-rest-only`), which took the
+       baseline to 198; the MCP tool tracked by **#8096** retires both rows and
+       lowers the baseline by two.
      - **The exception relaxes no control.** The route is gated by
        `GuaranteedState:Read` and `Forensics:Read`, both required, and audited
        fail-closed as `dex.apps.usage.view` before the read; the usage figures

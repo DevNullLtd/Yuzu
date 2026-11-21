@@ -5640,8 +5640,9 @@ groups:
       # per-device unrepresented-pending read and the per-device order read:
       # their degrade is a REST 503 / MCP error, never an empty result, and
       # does not touch either gauge; dex_usage covers the fleet application usage
-      # read behind GET /api/v1/dex/apps/usage: its degrade is a 503, never zero
-      # figures), each
+      # read behind GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage
+      # view (GET /fragments/dex/apps/usage): its degrade is a 503 on REST and a
+      # 200 panel on the dashboard, never zero figures), each
       # keyed by reason
       # (store_not_open/pool_acquire_timeout/query_error, plus concurrency_budget
       # on guardian_state for the Apps list's in-flight budget, and
@@ -5725,8 +5726,12 @@ groups:
             retryable 503 because four were already running; look for a
             caller polling it in parallel.
             source="dex_usage" means the fleet application usage read behind
-            GET /api/v1/dex/apps/usage is degrading. It fails closed: the
-            request is a 503 naming the reason, never a 200 with zero figures.
+            GET /api/v1/dex/apps/usage and the dashboard Apps tab Usage view
+            (GET /fragments/dex/apps/usage), which share one read, is degrading.
+            It fails closed and never shows zero figures: the REST request is a
+            503 naming the reason, and the dashboard answers a 200 panel that
+            says the usage could not be read, so yuzu_http_requests_total does
+            not show a dashboard degrade.
             reason="concurrency_budget" is the same in-flight budget refusal
             (four at once, retryable). reason="statement_timeout" is the read
             running past its 10 s bound; three in a row spanning two minutes with
