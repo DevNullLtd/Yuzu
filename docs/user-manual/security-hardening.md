@@ -627,29 +627,52 @@ whitelist leaves IPv6 fully contained.
 ### A device that is its own server is never contained
 
 A device whose server or gateway address is one of its own addresses, loopback included, is
-never contained. The agent compares the control addresses (the address it is connected through,
-plus every address the configured server name resolved to at agent start) with every address the
-host answers to, and answers `refused|self_host` when one matches, or when a control address is
-loopback or unspecified. Containing such a host would cut the agent off from the very server that
-has to release it. An enumeration of the host's own addresses that cannot be read is refused too
-(`refused|own_addresses_unreadable`): an unknown is not "not this host". Either answer changes
-nothing and writes nothing, and there is no override.
+never contained. Every `firewall.quarantine` apply is checked, whoever sent it (an operator's
+dispatch, the server's reconciler or an MCP re-apply): the agent compares the control addresses (the
+address it is connected through, plus every address the configured server name resolved to at agent
+start) with every address the host answers to, and answers `refused|self_host` when one matches, or
+when a control address is loopback or unspecified. Containing such a host would cut the agent off
+from the very server that has to release it. A read of the host's own addresses that fails is refused
+too (`refused|own_addresses_unreadable`): an unknown is not "not this host". That read fails for good
+where the agent cannot read its interfaces, for example a unit or seccomp profile that denies
+`AF_NETLINK`: every quarantine is refused there until the agent is allowed `AF_NETLINK` (the agent
+log names the errno). Either answer changes nothing on the device and stores no record, and there is
+no override. The refusal is visible in the `status|refused|<token>` row of the command's stored reply
+and in the agent log (`firewall: quarantine -> refused:self_host`).
 
 - **A single-host stack cannot apply a containment.** An agent that talks to a server on the
   same machine, such as a one-machine evaluation stack or a loopback test rig, answers
-  `refused|self_host` to every operator quarantine. A containment round trip needs the server on
-  a separate host.
-- **Only an operator's quarantine is checked.** The agent's repair, its boot-time re-apply,
-  `firewall.release` and `firewall.quarantine_allow` never are, so a containment that is already
-  stored is still re-applied and can always be released.
+  `refused|self_host` to every quarantine apply. A containment round trip needs the server on
+  a separate host. The check runs before the privilege check, so a packaged Linux unit whose server
+  is the host itself (the unit's default) answers `self_host`, not `privilege_unavailable`. Each
+  refused apply counts as a failed command, so `YuzuHighCommandFailureRate` can fire on an otherwise
+  idle server while the record stands.
+- **Which applies are checked.** Every `firewall.quarantine` apply is checked, whoever sent it. Not
+  checked: an apply to a device whose own record is already active (it is answered from the stored
+  set: it only keeps or repairs the stored allow set and says when the requested set was not applied,
+  see "A new record on a contained device"), the agent's 60-second repair, its boot-time re-apply,
+  `firewall.release` and `firewall.quarantine_allow`. A containment that is already stored is
+  therefore still re-applied, and is released wherever the agent can elevate; on the packaged Linux
+  unit a release is refused too (`privilege_unavailable`), so only a forced end ends the record.
 - **The record of a refused device stays unconfirmed.** The server keeps re-dispatching to a
   device that refuses, so the record never confirms and `YuzuQuarantineEndpointUnconfirmed` fires
   after 15 minutes. Operator commands to the device stay refused while the record exists. End it
-  with `DELETE /api/v1/quarantine/{agent_id}`.
+  with `DELETE /api/v1/quarantine/{agent_id}`, with `?force=true` where the device refuses the
+  release (the packaged Linux unit).
 - **Known limit: addresses only.** The check compares addresses. A server that runs in a
   container or a VM on the same host and is reached at a bridge address (for example `172.17.0.2`
   behind `docker0`) is not one of the host's own addresses, so that host can still be contained.
-  Put the server on a separate host when containment matters.
+  NAT, floating and port-forwarded addresses (a cloud elastic IP, a Linux `local` route) are not
+  seen on any OS either, and a host that holds one of the addresses its server name resolves to is
+  never contained: the resolved set is read once at agent start, so restart the agent after the
+  server's address changes. A host contained this way has `forward` at policy drop with no rules, so
+  forwarded traffic is dropped and the server's published ports vanish for the whole fleet while the
+  containment stands; a server apply carries no time limit (`ttl_seconds`), and the 60-second repair
+  puts back a rule removed by hand. A host that runs the server while its agent reaches a remote
+  gateway or VIP passes the check the same way, and its new inbound connections are dropped. The
+  exits are `DELETE /api/v1/quarantine/{agent_id}` while the API is reachable, otherwise console
+  recovery: stop the agent service first, then remove the table. Put the server on a separate host
+  when containment matters.
 
 ### Reading the result honestly
 
@@ -669,7 +692,8 @@ unenforced or unreadable.
 
 Linux on the **packaged systemd unit** (`NoNewPrivileges`, no sudoers grant) refuses every mutating
 action `refused|privilege_unavailable`: `sudo` cannot elevate there, so a record on such a host stays
-unconfirmed and cannot be released from the server except by a forced end (below).
+unconfirmed and cannot be released from the server except by a forced end (below). A `quarantine`
+whose server is the host itself answers `refused|self_host` first.
 
 A result is a claim about firewall rules, not proof that traffic is blocked. For a device you
 believe is actively hostile, confirm with an independent probe.

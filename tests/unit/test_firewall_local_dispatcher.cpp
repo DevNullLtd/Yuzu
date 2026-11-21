@@ -74,8 +74,8 @@ constexpr const char* kPluginFile = "firewall.dll";
 constexpr const char* kPluginFile = "firewall.dylib";
 #endif
 
-// True when `captured` has a row that starts with `prefix`.
-bool has_row_starting_with(const std::vector<std::string>& rows, std::string_view prefix) {
+// True when `captured` has a row that starts with `prefix`. Used by the macOS cases only.
+[[maybe_unused]] bool has_row_starting_with(const std::vector<std::string>& rows, std::string_view prefix) {
     return std::any_of(rows.begin(), rows.end(),
                        [&](const std::string& r) { return r.rfind(prefix, 0) == 0; });
 }
@@ -125,6 +125,22 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall_p
     return yuzu::agent::PluginHandle::load(fs::path{"agents"} / "plugins" / "firewall" / kPluginFile);
 }
 
+// True when the plugin is not available and the case should skip. Under `meson test`
+// (MESON_BUILD_ROOT set) the agent shards depend on the plugin build, so a plugin that is
+// missing or does not load is a defect and FAILs: a green skip there would let a partial build
+// pass these cases without running one. A bare run of the test binary outside meson has no such
+// guarantee and skips (the same rule as firewall_plugin_built() in test_firewall_quarantine_live.cpp).
+[[nodiscard]] bool skip_without_plugin(
+    const std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError>& ph) {
+    if (ph)
+        return false;
+    if (std::getenv("MESON_BUILD_ROOT") != nullptr)
+        FAIL("firewall plugin missing or unloadable under MESON_BUILD_ROOT: the agent shards "
+             "depend on its build, so it must load");
+    WARN("firewall plugin not found in build tree -- skipping (build with -Dbuild_agent=true)");
+    return true;
+}
+
 } // namespace
 
 #if defined(__APPLE__)
@@ -132,9 +148,7 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall_p
 TEST_CASE("firewall macOS 'state' acquires through the real bounded-subprocess call sites",
           "[firewall][local_dispatcher][macos]") {
     auto ph = load_firewall_plugin();
-    if (!ph) {
-        WARN("firewall plugin dylib not found in build tree -- skipping "
-             "(build with -Dbuild_agent=true)");
+    if (skip_without_plugin(ph)) {
         SUCCEED();
         return;
     }
@@ -195,9 +209,7 @@ TEST_CASE("firewall macOS 'state' acquires through the real bounded-subprocess c
 TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess call site",
           "[firewall][local_dispatcher][macos]") {
     auto ph = load_firewall_plugin();
-    if (!ph) {
-        WARN("firewall plugin dylib not found in build tree -- skipping "
-             "(build with -Dbuild_agent=true)");
+    if (skip_without_plugin(ph)) {
         SUCCEED();
         return;
     }
@@ -271,9 +283,7 @@ TEST_CASE("firewall macOS 'rules' acquires through the real bounded-subprocess c
 TEST_CASE("firewall Windows 'state' reports three profiles and a rule count, or one honest error",
           "[firewall][local_dispatcher][windows]") {
     auto ph = load_firewall_plugin();
-    if (!ph) {
-        WARN("firewall plugin dll not found in build tree -- skipping "
-             "(build with -Dbuild_agent=true)");
+    if (skip_without_plugin(ph)) {
         SUCCEED();
         return;
     }
@@ -311,9 +321,7 @@ TEST_CASE("firewall Windows 'state' reports three profiles and a rule count, or 
 TEST_CASE("firewall Windows 'rules' lists at most 100 rules, with a count that matches",
           "[firewall][local_dispatcher][windows]") {
     auto ph = load_firewall_plugin();
-    if (!ph) {
-        WARN("firewall plugin dll not found in build tree -- skipping "
-             "(build with -Dbuild_agent=true)");
+    if (skip_without_plugin(ph)) {
         SUCCEED();
         return;
     }

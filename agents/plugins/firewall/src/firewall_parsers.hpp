@@ -863,10 +863,11 @@ struct NftDumpResult {
 constexpr std::size_t kNftDumpMaxBytes = 4 * 1024 * 1024;
 constexpr int kNftMaxForeignDatagrams = 64;
 
-/// Whether a dump's data may be trusted as a complete, honest enumeration —
-/// the gate try_nftables_state()/try_nftables_rules() must pass before
-/// treating either dump's rows as meaningful rather than "reachability
-/// unknown".
+/// Whether a dump's data may be trusted as a complete, honest enumeration.
+/// run_nft_probe's own gate is `failed.empty()` (every dump of the pass ended
+/// cleanly); this is the pure function's own guard, so nft_decide_state() below
+/// never reads partial content as a verdict even if a caller reaches it with an
+/// untrusted dump.
 [[nodiscard]] constexpr bool nft_dumps_trusted(bool chains_ok, bool rules_ok) noexcept {
     return chains_ok && rules_ok;
 }
@@ -1001,7 +1002,7 @@ constexpr unsigned kNftChurnThreshold = 3;
 
 /// One failed dump of a probe pass: its label (`chain`, `rule` or `generation`) and how it ended.
 struct NftFailedDump {
-    std::string_view dump;
+    std::string_view dump; // static storage only: every producer passes a string literal
     NftDumpResult result;
 };
 
@@ -1032,7 +1033,7 @@ struct NftFailedDump {
 /// A probe reads the ruleset at most this many times: the pass and, on churn, one re-run.
 constexpr int kNftMaxAttempts = 2;
 /// A re-run needs at least this long left in the overall acquisition budget.
-constexpr std::chrono::milliseconds kNftRerunFloor{2000};
+inline constexpr std::chrono::milliseconds kNftRerunFloor{2000};
 
 /// Whether to read the ruleset again. `only_churn_failures` is nft_churn_only() of the pass just
 /// finished; a timeout, an error or an oversized dump gets no second look, because the cause is
@@ -1084,9 +1085,11 @@ nft_dump_generation(std::span<const std::byte> buf, std::uint16_t expected_type)
 enum class OpenNftErrClass {
     fd_exhausted,      // EMFILE/ENFILE -- a system-wide condition worth surfacing
     unsupported,       // EPROTONOSUPPORT/EAFNOSUPPORT -- this kernel has no
-                       // NETLINK_NETFILTER at all; not worth a diagnostic row
+                       // NETLINK_NETFILTER at all; not worth a diagnostic row. A
+                       // denied address family (systemd RestrictAddressFamilies=
+                       // answers EAFNOSUPPORT) reads the same way: no row.
     permission_denied, // EPERM/EACCES -- socket()/bind() itself was refused
-                       // (RestrictAddressFamilies=, seccomp, AppArmor). Distinct
+                       // (seccomp, AppArmor). Distinct
                        // from `other`: this is diagnosable and actionable the
                        // same way the existing dump-level eperm token already is
                        // (governance gate6 sre finding, r2 -- previously fell
@@ -1268,8 +1271,12 @@ enum class OpenNftErrClass {
 // ── macOS rows ──────────────────────────────────────────────────────────
 //
 // Every macOS read below is gated on subprocess_complete(): an incomplete read yields no rows
-// built from its text, and a row that says `unknown` is followed by the error row that explains
-// it, so an unprivileged agent (pfctl exits 1) reads as "could not read", never as "no firewall".
+// built from its text, and a row that says `unknown` because the read did not complete is
+// followed by the error row that explains it, so an unprivileged agent (pfctl exits 1) reads as
+// "could not read", never as "no firewall". A read that completed but whose text is not
+// recognised (`pf|unknown` from a `pfctl -s info` with neither `Status: Enabled` nor
+// `Status: Disabled`, or `state|unknown` from a garbled socketfilterfw answer) is `unknown` alone:
+// nothing failed to run, so there is no error row.
 
 [[nodiscard]] inline std::string alf_decision_name(AlfDecision d) {
     switch (d) {
@@ -1403,7 +1410,7 @@ macos_rules_rows(const yuzu::agent::SubprocessResult& listapps, const yuzu::agen
 /// parse_ufw_status recognises is required. `Status: inactive` alone, and `Status: active` with
 /// no rules, carry no table (ufw prints no header then) and are in shape. When a dashed header
 /// line is present, every non-empty line after it must be a bracketed rule row; without one,
-/// nothing but blank lines may follow the Status line.
+/// only blank lines and the `To ...` column-title line may follow the Status line.
 [[nodiscard]] inline bool ufw_shape_ok(std::string_view out) {
     if (parse_ufw_status(out) == FwState::unknown)
         return false;

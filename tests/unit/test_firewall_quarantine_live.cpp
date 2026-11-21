@@ -7,11 +7,12 @@
  *    firewall -- each one dispatches along a path the plugin refuses (or answers)
  *    BEFORE its first OS call, over a fresh KV store. They prove the action
  *    routing, parameter checks, record read and result emission of the real
- *    plugin, which the pure-core tests cannot.
+ *    plugin, which the pure-core tests cannot. Every `quarantine` dispatch in
+ *    them carries a probe_target that does not parse, so none can reach the OS.
  *  - live cases, tagged [.][firewall_quarantine_live]: HIDDEN, so the shard
  *    partition never selects them; they change the firewall of the machine they
- *    run on and need root / Administrator. The rest of this comment is about
- *    those.
+ *    run on and need root / Administrator, or the agent account (see "Who runs
+ *    it"). The rest of this comment is about those.
  *
  * Running the live tag WITHOUT YUZU_FIREWALL_QUARANTINE_LIVE=1 skips every case
  * and Catch2 then exits 4 (all tests skipped), not 0: a harness that checks for
@@ -296,6 +297,14 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     return out;
 }
 
+/// The anchor read, decided by fr::pf_anchor_absent from the subprocess result.
+[[nodiscard, maybe_unused]] bool pf_anchor_absent(bool main_reads_complete,
+                                                  const yuzu::agent::SubprocessResult& anchor) {
+    return fr::pf_anchor_absent(main_reads_complete,
+                                anchor.tool_ran && !anchor.timed_out && !anchor.output_truncated,
+                                anchor.exit_code, anchor.output);
+}
+
 /// The host firewall as sectioned text (firewall_restore_compare.hpp), for the restore check.
 /// Every section is written by fr::write_section from the completeness of ITS read, so a read that
 /// did not run, timed out, was clipped or exited non-zero is `[failed]` here whoever ran it.
@@ -313,7 +322,10 @@ constexpr fr::Os kThisOs = fr::Os::lin;
     if (!running_as_root()) {
         // The agent account: the helper's read-only `snapshot` word, through the sudo grant the
         // installer wrote. Its text is the snapshot, used only when the call completed.
-        const auto res = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}));
+        // stderr is NOT merged: classic sudo's `unable to resolve host` warning would otherwise land
+        // ahead of the first header, and the helper already drops its tools' stderr.
+        const auto res = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}), 60s,
+                                        /*merge_stderr=*/false);
         return yuzu::firewall::subprocess_complete(res) ? res.output : failed_snapshot();
     }
     // Root: the same three tools with the helper's labels and arguments. A tool that is not
@@ -355,8 +367,16 @@ constexpr fr::Os kThisOs = fr::Os::lin;
                       fr::pf_status_line(info.output));
     const auto refs = pf({"-s", "References"});
     fr::write_section(out, fr::label::kPfReferences, yuzu::firewall::subprocess_complete(refs), refs.output);
+    // The yuzu anchor is simply not loaded on a clean host and after a release: pfctl then exits
+    // non-zero for it, which is an EMPTY section (the plugin reads it as "no anchor" the same way),
+    // never `[failed]`. Anything else that did not complete stays `[failed]`.
     const auto anchor = pf({"-a", std::string{fq::kPfAnchor}, "-s", "rules"});
-    fr::write_section(out, fr::label::kYuzuAnchor, yuzu::firewall::subprocess_complete(anchor), anchor.output);
+    const bool main_complete =
+        yuzu::firewall::subprocess_complete(rules) && yuzu::firewall::subprocess_complete(info);
+    if (yuzu::firewall::subprocess_complete(anchor))
+        fr::write_section(out, fr::label::kYuzuAnchor, true, anchor.output);
+    else
+        fr::write_section(out, fr::label::kYuzuAnchor, pf_anchor_absent(main_complete, anchor), "");
     fr::finish(out);
     return out;
 #endif
@@ -513,18 +533,18 @@ void close_sock(SockT s) { ::close(s); }
     const auto dst = resolve_endpoint(endpoint);
     if (!dst)
         return std::nullopt;
-    const SockT sock = ::socket(dst->family, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == kBadSock)
+    yuzu::shared::SocketGuard sock{::socket(dst->family, SOCK_DGRAM, IPPROTO_UDP)};
+    if (!sock.ok())
         return std::nullopt;
     std::optional<std::string> out;
-    if (::connect(sock, reinterpret_cast<const sockaddr*>(&dst->addr), dst->addr_len) == 0) {
+    if (::connect(sock.s, reinterpret_cast<const sockaddr*>(&dst->addr), dst->addr_len) == 0) {
         sockaddr_storage name{};
 #ifdef _WIN32
         int len = sizeof(name);
 #else
         socklen_t len = sizeof(name);
 #endif
-        if (::getsockname(sock, reinterpret_cast<sockaddr*>(&name), &len) == 0) {
+        if (::getsockname(sock.s, reinterpret_cast<sockaddr*>(&name), &len) == 0) {
             char text[INET6_ADDRSTRLEN]{};
             if (name.ss_family == AF_INET &&
                 ::inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(&name)->sin_addr, text, sizeof(text)))
@@ -535,7 +555,6 @@ void close_sock(SockT s) { ::close(s); }
                 out = text;
         }
     }
-    close_sock(sock);
     return out;
 }
 
@@ -600,6 +619,9 @@ enum class StreamReply { answered, silent, ended };
 /// A kept-open HTTP/1.1 connection: proves whether an ESTABLISHED stream survives.
 class KeptStream {
 public:
+    KeptStream() = default;
+    KeptStream(const KeptStream&) = delete;
+    KeptStream& operator=(const KeptStream&) = delete;
     ~KeptStream() {
         if (s_ != kBadSock)
             close_sock(s_);
@@ -1055,19 +1077,25 @@ TEST_CASE("quarantine repair=1: a dispatch that also names containment parameter
 
 TEST_CASE("quarantine: a control endpoint that is this host's own loopback is refused self_host",
           "[agent][firewall_quarantine]") {
-    // A server on 127.0.0.1 or ::1 is always this host, so no enumeration is needed to refuse
-    // it. The refusal comes before the privilege check, the staging check and any record, on
-    // every OS and for an unprivileged run, so this is what the built plugin answers here.
+    // A server on 127.0.0.1 or ::1 is always this host, so a loopback control address is
+    // refused whatever the read of this host's addresses returned. The refusal comes before
+    // the privilege check, the staging check and any apply, on every OS and for an
+    // unprivileged run, so this is what the built plugin answers here. Every `quarantine`
+    // dispatch in this suite carries a probe_target that does not parse (`nope`): with the
+    // check intact the answer is still self_host, and if the check ever regresses the
+    // dispatch ends in a parse refusal and a clean test failure instead of a real apply
+    // on a root runner.
     {
         PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
-        check_refused(rig.run("quarantine"), "self_host");
-        CHECK_FALSE(rig.record().has_value()); // a refusal writes nothing
+        check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
+        CHECK_FALSE(rig.record().has_value()); // a refusal stores no record
     }
     {
         PLUGIN_RIG_AT_OR_RETURN(rig, "[::1]:50051", "::1");
-        check_refused(rig.run("quarantine"), "self_host");
+        check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
         // valid optional parameters do not change the answer
-        check_refused(rig.run("quarantine", {{"ttl_seconds", "3600"},
+        check_refused(rig.run("quarantine", {{"probe_target", "nope"},
+                                             {"ttl_seconds", "3600"},
                                              {"exceptions", "198.18.0.9:22/tcp/in"}}),
                       "self_host");
         CHECK_FALSE(rig.record().has_value());
@@ -1084,6 +1112,84 @@ TEST_CASE("quarantine repair=1: a loopback rig still answers inactive, repair ne
     CHECK(r.rc == 0);
     CHECK(has_row(r.captured, "status|inactive"));
     CHECK(has_row(r.captured, "note|nothing_to_repair=1"));
+    CHECK_FALSE(rig.record().has_value());
+}
+
+TEST_CASE("quarantine: a control endpoint at one of this host's own addresses is refused self_host",
+          "[agent][firewall_quarantine]") {
+    // The wiring of the own-address read: the first non-loopback, non-link-local IPv4 this
+    // host answers to, used as the rig's server, must be refused. A host with no such
+    // address has nothing to measure here.
+    std::string own_ip;
+    if (const auto own = yuzu::agent::enumerate_own_addresses()) {
+        for (const auto& a : *own) {
+            if (a.find(':') == std::string::npos && !a.starts_with("127.") && !a.starts_with("169.254.")) {
+                own_ip = a;
+                break;
+            }
+        }
+    }
+    if (own_ip.empty()) {
+        WARN("this host has no non-loopback IPv4 address -- skipping");
+        SUCCEED();
+        return;
+    }
+    PLUGIN_RIG_AT_OR_RETURN(rig, own_ip + ":50051", own_ip);
+    check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
+    CHECK_FALSE(rig.record().has_value());
+}
+
+TEST_CASE("quarantine: the self_host check is skipped for a device whose own record is already active",
+          "[agent][firewall_quarantine]") {
+    // An apply to a device whose record is active only keeps or repairs the STORED set, and
+    // its answer is what tells the server the requested set was not applied; a refusal
+    // there would let the server confirm a record whose set the device never applied. Any
+    // other record (applying, releasing) is checked. The probe_target does not parse, so
+    // no case here reaches the OS: apply_and_verify refuses it before it loads the store.
+    PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
+    const auto stored = [&](fq::Phase phase) {
+        fq::QuarantineState st;
+        st.phase = phase;
+        st.generation = 3;
+        st.backend = fq::BackendKind::nft;
+        st.allow = *fq::build_allow_set("203.0.113.7", "203.0.113.7:50051", {},
+                                        *fq::parse_exceptions_csv("203.0.113.10"));
+        return st;
+    };
+    const auto raw_record = [&] { return rig.kv->get("firewall", std::string{fq::kStateKey}); };
+
+    for (const auto phase : {fq::Phase::applying, fq::Phase::releasing}) {
+        INFO(fq::to_string(phase));
+        rig.put_record(stored(phase));
+        const auto before = raw_record();
+        REQUIRE(before.has_value());
+        check_refused(rig.run("quarantine", {{"probe_target", "nope"}}), "self_host");
+        CHECK(raw_record() == before); // the refusal leaves the record as it was
+    }
+
+    rig.put_record(stored(fq::Phase::active));
+    const auto before = raw_record();
+    REQUIRE(before.has_value());
+    const auto r = rig.run("quarantine", {{"probe_target", "nope"}, {"exceptions", "203.0.113.20"}});
+    INFO(r.captured);
+    CHECK(r.rc == 1);
+    CHECK(has_prefix(r.captured, "status|refused|")); // the apply was answered, not skipped
+    CHECK_FALSE(has_row(r.captured, "status|refused|self_host"));
+    CHECK_FALSE(has_row(r.captured, "status|refused|own_addresses_unreadable"));
+    CHECK(raw_record() == before);
+}
+
+TEST_CASE("release and quarantine_allow: a loopback rig never answers self_host",
+          "[agent][firewall_quarantine]") {
+    // Only an apply is checked: a device with a loopback control endpoint can still be
+    // released, and its allow set still answers from the record (nothing is contained).
+    PLUGIN_RIG_AT_OR_RETURN(rig, "127.0.0.1:50051", "127.0.0.1");
+    const auto rel = rig.run("release", {{"if_ttl_expired", "1"}});
+    INFO(rel.captured);
+    CHECK(rel.rc == 0);
+    CHECK(has_row(rel.captured, "status|inactive"));
+    check_refused(rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", "198.18.0.9:22/tcp/in"}}),
+                  "not_active");
     CHECK_FALSE(rig.record().has_value());
 }
 
@@ -1132,6 +1238,19 @@ TEST_CASE("agent core: enumerate_own_addresses answers a non-empty list of liter
     for (const auto& lit : *own) {
         INFO("own address literal: " << lit);
         CHECK(fq::parse_ip(lit).has_value());
+    }
+    // enumerate_local_ips() is the same walk with the loopback and link-local scopes left out (the
+    // Echo snapshot reads it): every address it names is one the host answers to, and none is
+    // loopback (127.0.0.0/8, ::1) or link-local (169.254.0.0/16, fe80::/10).
+    for (const auto& lit : yuzu::agent::enumerate_local_ips()) {
+        INFO("local ip: " << lit);
+        CHECK(std::find(own->begin(), own->end(), lit) != own->end());
+        CHECK_FALSE(lit.starts_with("127."));
+        CHECK_FALSE(lit.starts_with("169.254."));
+        CHECK(lit != "::1");
+        const bool v6_link_local = lit.size() > 3 && lit.starts_with("fe") &&
+                                   (lit[2] == '8' || lit[2] == '9' || lit[2] == 'a' || lit[2] == 'b');
+        CHECK_FALSE(v6_link_local);
     }
 }
 
@@ -1608,7 +1727,8 @@ TEST_CASE("live: state reports what the OS tool reports, and the host is left as
     if (running_as_root()) {
         const auto status = fr::section(before, fr::label::kPfStatus).value_or("");
         CHECK(*pf == (status.find("Status: Enabled") != std::string::npos ? "enabled" : "disabled"));
-        CHECK(ruleset == std::to_string(section_lines(before, fr::label::kPfRules).value_or(0)));
+        CHECK(ruleset == std::to_string(fr::count_pf_rule_lines(
+                             fr::section(before, fr::label::kPfRules).value_or(""))));
     }
 #endif
     check_restored(before); // a read changes nothing
@@ -1663,7 +1783,8 @@ TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it 
     CHECK(count_prefixed(r.captured, "app|") == yuzu::firewall::parse_alf_listapps(listed.output).size());
     CHECK((*ruleset == "unknown") == has_prefix(r.captured, "error|pf:rules:"));
     if (running_as_root())
-        CHECK(*ruleset == std::to_string(section_lines(before, fr::label::kPfRules).value_or(0)));
+        CHECK(*ruleset == std::to_string(fr::count_pf_rule_lines(
+                              fr::section(before, fr::label::kPfRules).value_or(""))));
 #endif
     check_restored(before);
 }
@@ -1674,7 +1795,8 @@ TEST_CASE("live (linux, agent account): the helper's snapshot word answers throu
     LIVE_OR_SKIP(env);
     if (running_as_root())
         SKIP("runs as the agent account: a root run does not go through the helper");
-    const auto snap = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}));
+    const auto snap = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}), 60s,
+                                     /*merge_stderr=*/false);
     INFO(snap.output.substr(0, 2000));
     REQUIRE(yuzu::firewall::subprocess_complete(snap));
     CHECK(snap.output.size() <= 1048576);
@@ -1856,6 +1978,11 @@ std::optional<std::string> live_boot_time() {
     return capture_result(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what}));
 }
 
+/// One listing of the main pf ruleset (`rules`, `info`) as a whole result.
+[[nodiscard]] yuzu::agent::SubprocessResult pf_main_capture(const char* what) {
+    return capture_result(harness_sudo({"/sbin/pfctl", "-s", what}));
+}
+
 } // namespace
 
 TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release restores pf byte-identical",
@@ -1890,8 +2017,12 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
     // pre-quarantine values, and our anchor holds nothing
     check_restored(before);
     // our anchor is empty, not merely unreferenced
+    // An absence needs a read that completed, or the anchor's own absence (pfctl exits non-zero for
+    // an anchor that is not loaded) seen after the two main reads completed.
     const auto emptied = pf_anchor_capture("rules");
-    REQUIRE(yuzu::firewall::subprocess_complete(emptied)); // an absence needs a read that completed
+    const bool main_complete = yuzu::firewall::subprocess_complete(pf_main_capture("rules")) &&
+                               yuzu::firewall::subprocess_complete(pf_main_capture("info"));
+    REQUIRE((yuzu::firewall::subprocess_complete(emptied) || pf_anchor_absent(main_complete, emptied)));
     CHECK_FALSE(fq::pf_anchor_enforcing(emptied.output));
 }
 

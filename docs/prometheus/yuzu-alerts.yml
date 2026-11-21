@@ -3239,13 +3239,21 @@ groups:
             record_id + command_id + trigger=tick|heartbeat, or "CONFIRMED
             record_id=... command_id=..." once per transition to confirmed,
             or "drift status=..." when a re-verify no longer confirms).
-            This alert also fires when the device answers
-            status|refused|self_host or
-            status|refused|own_addresses_unreadable to every apply: a
-            device whose control endpoint is one of its own addresses is never
-            contained, so it never confirms. The record still blocks
-            operator commands to it and the device is not contained; the way
-            out is DELETE /api/v1/quarantine/{agent_id}.
+            This alert also fires when the device refuses the apply.
+            status|refused|self_host: the device's control endpoint is one of
+            its own addresses, so it is never contained and never confirms; the
+            way out is DELETE /api/v1/quarantine/{agent_id} (a device that was
+            never contained answers the release with inactive; add ?force=true
+            if the record stays releasing, as it does on the packaged Linux
+            unit). status|refused|own_addresses_unreadable: the agent could not
+            read its own addresses, so fix the read rather than delete the
+            record (a unit or seccomp profile that denies AF_NETLINK makes it
+            permanent: allow AF_NETLINK for the agent; the agent log names the
+            errno). The token is in the apply's reply under the command_id of
+            the quarantine.reapply row, and in the agent log
+            (firewall: quarantine -> refused:<token>). The record still blocks
+            operator commands to the device while it exists. A device whose own
+            record is already active is not refused this way.
             This alert also fires when the device's agent lacks the
             firewall plugin: the dispatch is accepted but never
             confirmed. An agent without the firewall plugin comes from an

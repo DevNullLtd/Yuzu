@@ -38,8 +38,11 @@ ONE HOST CANNOT RUN THE CONTAINMENT. A containment whose control endpoint is the
 by the agent (`refused|self_host`, exit 2 here, nothing changed, nothing released), by design: the server
 it must keep reaching would be the host that is cut off. So an --apply-containment run with the agent and
 the server on one host (a loopback dashboard against this host's own agent) ends that way whenever the
-agent's control endpoint is a host address, loopback included; a containment round trip needs the server on
-ANOTHER host and --remote.
+agent's control endpoint is one of the host's own addresses, loopback included; a containment round trip
+needs the server on ANOTHER host and --remote. The agent compares ADDRESSES only: a server in a container
+or VM on this host, reached at a bridge address, is not one of them (see the standing ruling below).
+Any other refusal the agent answers to the apply (`own_addresses_unreadable` among them) is not a
+precondition of this script: it ends exit 1 with the `NOT released` message, nothing released.
 
 --remote: this script runs on the server's host (or any other host), and the agent it contains is on a
 DIFFERENT machine that this script does not run on, so nothing here is cut off and the dashboard may be
@@ -79,12 +82,15 @@ fourth containment action) is not exercised here: it has no ceremony coverage, o
 
 --record PATH writes one JSON object when the run ends, on every exit path of a run (UTC time, mode local or
 remote, agent id, hostname, the statuses read in order, contained and released, the exit code, the
-agent's refusal token if it refused): the retained pass or fail record of the run. It is written mode
-0600 and a PATH that is a symlink is refused (exit 2, nothing dispatched).
+agent's refusal token if it refused): the retained pass or fail record of the run. The file is created
+for this run alone, mode 0600: a PATH that already exists (a file or a symlink) is refused (exit 2,
+nothing dispatched) and left as it was, so a second run never replaces the record of the first.
 
 A command that cannot be dispatched (the server refuses the POST, for example a user who is not an
 administrator) ends `dispatch refused: <reason>` (exit 1): nothing was applied, so there is nothing to
-release and RELEASE NOT CONFIRMED (exit 3) is not printed. A status read whose row stays RUNNING with no
+release and RELEASE NOT CONFIRMED (exit 3) is not printed. That holds for the refused apply, not for a
+release the server refuses AFTER an apply went out: the host may be contained, so that release is
+retried and can still end exit 3. A status read whose row stays RUNNING with no
 change for NO_PROGRESS_POLLS polls in a row ends that read early (`no progress`) instead of consuming
 its whole budget; an apply or release is never cut short that way, because its row legitimately stays
 RUNNING while the plugin works.
@@ -251,8 +257,10 @@ class Client(instructions_runner.YuzuClient):
 def take_run_lock() -> tuple[int | None, str | None, str]:
     """An exclusive, non-blocking lock on LOCK_PATH, held (by the returned descriptor) until the run ends, so a
     second containment run cannot release the first one's containment. Returns (fd, reason, error): `fd` is the
-    held descriptor, or None with a `reason` of "held" (another run holds the lock) or "open_failed" (the lock
-    file could not be opened; `error` says why). The two are different faults and are reported as such.
+    held descriptor, or None with a `reason` of "held" (another run holds the lock), "open_failed" (the lock
+    file could not be opened) or "lock_failed" (the lock call itself failed, for example ENOLCK on a file
+    system without locks); `error` says why for the last two. They are different faults and are reported as
+    such: only a lock another run holds is "held".
     LOCK_PATH is in the temp directory, which on macOS is per user (runs by different users, or under sudo,
     do not exclude each other); on Linux a lock file another user created there makes this run refuse to start."""
     try:
@@ -261,9 +269,12 @@ def take_run_lock() -> tuple[int | None, str | None, str]:
         return None, "open_failed", str(e)
     try:
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError:
+    except BlockingIOError:
         os.close(fd)
         return None, "held", ""
+    except OSError as e:
+        os.close(fd)
+        return None, "lock_failed", str(e)
     return fd, None, ""
 
 
@@ -280,8 +291,9 @@ def refusal(args: argparse.Namespace, env=os.environ) -> str | None:
         if ssh:
             return f"an SSH session is detected ({', '.join(ssh)}): containment could lock you out"
     record = getattr(args, "record", "")
-    if record and os.path.islink(record):
-        return f"--record {record!r} is a symlink: the record is never written through one"
+    if record and os.path.lexists(record):
+        return (f"--record {record!r} already exists: a record is never overwritten and never written through a "
+                "symlink (a second run keeps the first run's record: choose a new path)")
     return None
 
 
@@ -534,16 +546,28 @@ def dashboard_is_local(dashboard: str) -> bool:
         return False
 
 
+def cleartext_login(dashboard: str) -> bool:
+    """Is the dashboard plain http at an address that is not loopback? The login then sends the admin
+    password and the session cookie across the network unencrypted (pure)."""
+    return urllib.parse.urlparse(dashboard).scheme.lower() == "http" and not dashboard_is_local(dashboard)
+
+
+CLEARTEXT_WARNING = ("warning: the dashboard at {host} is plain http at a non-loopback address: the admin "
+                     "password and the session cookie cross the network unencrypted. Run this on the server's host "
+                     "(a loopback dashboard) or use an https dashboard")
+
 LOOPBACK_REFUSAL = ("refused: the dashboard must be loopback (http://127.0.0.1:<port>) so the release can reach it "
                     "while this host is contained, or pass --remote (the server on another host, with "
                     "--agent-hostname and --i-have-console-access-to-the-agent). A run where the agent and the "
                     "server are on one host ends refused|self_host (exit 2) by design: the agent will not contain "
-                    "the host its own control endpoint is on, so a containment round trip needs --remote")
+                    "the host its own control endpoint is on, so a containment round trip needs --remote. The "
+                    "check compares the host's own addresses only: a server in a container or VM on this host, "
+                    "reached at a bridge address, is not one, and that host is contained")
 
 SELF_HOST_TEXT = ("the agent's control endpoint is the agent host itself, so it refused to contain it "
-                  "(status|refused|self_host): nothing was changed and no release was dispatched. The ceremony "
-                  "needs the server on another host: run it with --remote (and --agent-hostname, "
-                  "--i-have-console-access-to-the-agent) against that server")
+                  "(status|refused|self_host): nothing was changed and no release was dispatched. The check compares "
+                  "the host's own addresses only. The ceremony needs the server on another host: run it with "
+                  "--remote (and --agent-hostname, --i-have-console-access-to-the-agent) against that server")
 
 REMOTE_NOTE = ("remote mode: the agent host is not this machine. The release goes through the server and depends "
                "on the agent's control endpoint staying reachable while it is contained; the time limit "
@@ -576,7 +600,10 @@ def parse_args(argv):
     p.add_argument("--remote", action="store_true",
                    help="this script runs on the server's host (or another one), NOT on the agent: the dashboard may "
                         "be any address and the SSH check does not apply. With --apply-containment it needs "
-                        "--agent-id, --agent-hostname and --i-have-console-access-to-the-agent")
+                        "--agent-id, --agent-hostname and --i-have-console-access-to-the-agent. A plain http "
+                        "dashboard at a non-loopback address sends the admin password and the session cookie "
+                        "across the network unencrypted (the script warns): run on the server's host or use "
+                        "an https dashboard")
     p.add_argument("--agent-hostname", default="",
                    help="--remote only: the agent's own hostname, typed by you; it must equal the hostname the "
                         "agent reported to the server and not be one of this machine's names")
@@ -586,7 +613,7 @@ def parse_args(argv):
                         "deliver can be done by hand")
     p.add_argument("--record", default="",
                    help="write one JSON record of the run to PATH when it ends, on every exit path of a run (mode 0600; "
-                        "a symlink is refused)")
+                        "a PATH that already exists, a symlink included, is refused: a record is never overwritten)")
     return p.parse_args(argv)
 
 
@@ -599,12 +626,12 @@ def new_record(args: argparse.Namespace) -> dict:
 
 
 def write_record(path: str, rec: dict) -> None:
-    """Write the run record: mode 0600, never through a symlink, and a failure to write it is reported and
-    never changes the run's exit code."""
+    """Write the run record to a file this call creates (O_EXCL: an existing path, a symlink included, is
+    never opened, truncated or written through), mode 0600 (a new file has at most the creation mode). A
+    failure to write it is reported and never changes the run's exit code."""
     try:
-        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(fd, "w") as f:
-            os.fchmod(f.fileno(), 0o600)
             json.dump(rec, f, indent=2, sort_keys=True)
             f.write("\n")
     except OSError as e:
@@ -620,7 +647,7 @@ def main(argv=None) -> int:
         return rc
     finally:
         rec["exit_code"] = rc
-        if getattr(args, "record", "") and not os.path.islink(args.record):
+        if getattr(args, "record", "") and not os.path.lexists(args.record):
             write_record(args.record, rec)
 
 
@@ -651,8 +678,9 @@ def checked_run(args: argparse.Namespace, rec: dict) -> int:
     lock = None
     if args.apply_containment:
         lock, reason, error = take_run_lock()
-        if lock is None and reason == "open_failed":
-            say(f"refused: could not open the run lock {LOCK_PATH}: {error}; nothing was dispatched",
+        if lock is None and reason in ("open_failed", "lock_failed"):
+            what = "open" if reason == "open_failed" else "take"
+            say(f"refused: could not {what} the run lock {LOCK_PATH}: {error}; nothing was dispatched",
                 file=sys.stderr)
             return EXIT_PRECONDITION
         if lock is None:
@@ -679,6 +707,8 @@ def run(args: argparse.Namespace, rec: dict | None = None) -> int:
             say(f"precondition failed: install-agent-user.sh --check exited {rc}: {last}", file=sys.stderr)
             return EXIT_PRECONDITION
     base = args.dashboard.rstrip("/")
+    if cleartext_login(base):  # every mode logs in the same way, a probe-only run included
+        say(CLEARTEXT_WARNING.format(host=urllib.parse.urlparse(base).hostname), file=sys.stderr)
     client = Client(base)
     try:
         agents = client.login(args.user, args.password)

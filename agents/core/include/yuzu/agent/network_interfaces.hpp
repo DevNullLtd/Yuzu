@@ -37,14 +37,20 @@ YUZU_EXPORT std::vector<std::string> enumerate_local_ips();
 
 /**
  * Enumerate every IP address (IPv4 + IPv6) this host answers to, loopback and
- * link-local included (on Windows the software-loopback adapter too; adapters
- * that are not up are still skipped). Same canonical text form and
- * deduplication as enumerate_local_ips().
+ * link-local included (on Windows the software-loopback adapter too). On
+ * Windows an adapter that is not up is skipped; the POSIX walk has no such
+ * test. Addresses that are not on an interface (a cloud floating or elastic
+ * IP, a port forward, a Linux `local` route) and other network namespaces are
+ * not enumerable on any OS. Same canonical text form and deduplication as
+ * enumerate_local_ips().
  *
  * Returns nullopt when the OS read fails or the platform is unsupported, so a
  * caller can tell "could not read" from "no addresses"; a decision that needs
  * the answer must fail closed on nullopt. On Windows the adapter read is tried
  * up to three times, so an adapter added mid-read does not read as a failure.
+ * Every failure is logged at warn with the OS error (errno or the Windows
+ * return code), so a permanent cause (for example AF_NETLINK denied to the
+ * agent) can be told from a transient one.
  */
 YUZU_EXPORT std::optional<std::vector<std::string>> enumerate_own_addresses();
 

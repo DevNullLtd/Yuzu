@@ -12,15 +12,17 @@ exiting 2, a host the apply found already contained is never released, and a pas
 this run's own that succeeded and undid something (otherwise exit 1, "release unproven"). A held run lock
 exits 2 with nothing dispatched, and a poll's error answer is reported, never swallowed.
 
-Also pinned (FW0.2): the run lock tells an open failure from a held lock; the remote mode (--remote,
+Also pinned (#8366, #8046): the run lock tells an open failure, a failed lock call and a held lock apart; the remote mode (--remote,
 --agent-hostname, --i-have-console-access-to-the-agent: the usage rules, the binding to a named agent that is
 not this machine, no local install check, no SSH refusal, the same lock, floor, retries and reads); a
 `refused|self_host` apply answer exits 2 with the one-host message and no release; the loopback refusal and
 --help name that outcome and --remote; and the #7860 items: a status read that sits RUNNING and unchanged ends
 early, a refused dispatch is `dispatch refused` (exit 1) and never RELEASE NOT CONFIRMED, and --record writes a
-0600 pass or fail record on every exit path and refuses a symlink.
+0600 pass or fail record on every exit path and refuses an existing path (a symlink included) without touching it.
+A plain http dashboard at a non-loopback address is warned about (the login crosses the network unencrypted).
 """
 import contextlib
+import errno
 import io
 import json
 import os
@@ -295,7 +297,7 @@ class Local(unittest.TestCase):
 
 class FlowHarness:
     """main() against a recording fake of the dispatch seam. `script` maps an action to the list of replies
-    (or exceptions) it answers with, in order. A mixin: the cases are in Flow and the FW0.2 classes below."""
+    (or exceptions) it answers with, in order. A mixin: the cases are in Flow and the remote-mode classes below."""
 
     def run_main(self, script, apply=True, extra=(), dashboard="http://127.0.0.1:9", agent=True, client=None,
                  lock=None, install=None):
@@ -735,7 +737,7 @@ class Flow(FlowHarness, unittest.TestCase):
         self.assertEqual(calls[-2:], ["release", "quarantine_status"])
 
 
-# ── FW0.2: the run lock, the remote mode, the self-host answer, #7860 ───────────────────────────────
+# ── #8366, #8046: the run lock, the remote mode, the self-host answer, #7860 ────────────────────────
 
 SELF_HOST = {"responses": [{"agent_id": "a", "status": 2, "output": "status|refused|self_host\nrefused|self_host"}]}
 REMOTE_HOST = "agent-box.example"
@@ -788,6 +790,25 @@ class RunLock(unittest.TestCase):
         self.assertIsNone(fd)
         self.assertEqual(reason, "open_failed")
         self.assertTrue(error)   # the operating system's own reason
+
+    def test_a_lock_call_that_fails_is_not_reported_as_another_run_holding_it(self):
+        # ENOLCK (a file system without locks) is neither a held lock nor an open failure
+        path = self.lock_path("enolck")
+        failing = mock.patch.object(fc.fcntl, "flock", side_effect=OSError(errno.ENOLCK, "No locks available"))
+        with mock.patch.object(fc, "LOCK_PATH", path), failing:
+            fd, reason, error = fc.take_run_lock()
+        self.assertIsNone(fd)
+        self.assertEqual(reason, "lock_failed")
+        self.assertIn("No locks available", error)
+
+        flow = self.harness()
+        err = io.StringIO()
+        with failing, contextlib.redirect_stderr(err):
+            rc, calls = flow.run_main({"quarantine_status": [row("inactive")]}, lock=path)
+        self.assertEqual((rc, calls), (fc.EXIT_PRECONDITION, []))   # exit 2, nothing dispatched
+        self.assertIn("could not take the run lock", err.getvalue())
+        self.assertIn("No locks available", err.getvalue())
+        self.assertNotIn("another containment run", err.getvalue())
 
     def test_main_names_each_fault_and_dispatches_nothing_in_either(self):
         flow = self.harness()
@@ -856,6 +877,48 @@ class Usage(unittest.TestCase):
             self.assertIn(needle, fc.LOOPBACK_REFUSAL)
         self.assertIn("one host", fc.__doc__)
         self.assertIn("refused|self_host", fc.__doc__)
+
+
+class Cleartext(FlowHarness, unittest.TestCase):
+    """A plain http dashboard at a non-loopback address sends the admin password and cookie unencrypted:
+    the run says so (on stderr, before the login) in every mode, and says nothing for loopback or https."""
+
+    def stderr_of(self, dashboard, apply, extra=(), client=None):
+        err = io.StringIO()
+        script = {"quarantine_status": [row("inactive"), row("active"), row("inactive")],
+                  "quarantine": [{}], "release": [REL]} if apply else {"quarantine_status": [row("inactive")]}
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            self.run_main(script, apply=apply, dashboard=dashboard, extra=extra, client=client)
+        return err.getvalue()
+
+    def test_the_predicate(self):
+        for dashboard in (OFF_HOST, "http://example.com", "HTTP://192.0.2.7:8080", "http://[2001:db8::1]:8080"):
+            with self.subTest(dashboard=dashboard):
+                self.assertTrue(fc.cleartext_login(dashboard))
+        for dashboard in ("http://127.0.0.1:9", "http://localhost:8080", "http://[::1]:8080", "https://192.0.2.7:8080",
+                          "https://example.com"):
+            with self.subTest(dashboard=dashboard):
+                self.assertFalse(fc.cleartext_login(dashboard))
+
+    def test_a_remote_run_and_a_probe_only_run_against_plain_http_are_warned(self):
+        for apply, extra in ((True, REMOTE_FLAGS), (False, ["--remote"]), (False, [])):
+            with self.subTest(apply=apply, extra=extra):
+                err = self.stderr_of(OFF_HOST, apply, extra, client=remote_client())
+                self.assertIn("unencrypted", err)
+                self.assertIn("192.0.2.7", err)
+                self.assertNotIn("8080", err)   # the host only: never a URL that could carry credentials
+
+    def test_loopback_and_https_are_not_warned(self):
+        self.assertNotIn("unencrypted", self.stderr_of("http://127.0.0.1:9", True))
+        self.assertNotIn("unencrypted", self.stderr_of("https://192.0.2.7:8080", True, REMOTE_FLAGS,
+                                                       client=remote_client()))
+
+    def test_the_remote_help_carries_the_same_clause(self):
+        r = subprocess.run([sys.executable, str(SCRIPT), "--help"], capture_output=True, text=True,
+                           timeout=CHILD_TIMEOUT_S)
+        flat = " ".join(r.stdout.split())
+        self.assertIn("unencrypted", flat)
+        self.assertIn("https dashboard", flat)
 
 
 class NamedRemote(unittest.TestCase):
@@ -1261,12 +1324,14 @@ class RunRecord(FlowHarness, unittest.TestCase):
             self.assertEqual(Path(target).read_text(), "keep")
             self.assertTrue(os.path.islink(link))
 
-    def test_an_existing_record_is_replaced_and_made_0600(self):
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_old_") as d:
+    def test_a_new_record_is_created_0600_and_a_write_that_cannot_happen_is_reported(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_new_") as d:
             path = os.path.join(d, "run.json")
-            Path(path).write_text("stale")
-            os.chmod(path, 0o666)
-            fc.write_record(path, {"exit_code": 0})
+            old_umask = os.umask(0)   # a permissive umask must not widen the mode
+            try:
+                fc.write_record(path, {"exit_code": 0})
+            finally:
+                os.umask(old_umask)
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
             self.assertEqual(json.loads(Path(path).read_text()), {"exit_code": 0})
             # a write that cannot happen is reported and never raises
@@ -1274,6 +1339,48 @@ class RunRecord(FlowHarness, unittest.TestCase):
             with contextlib.redirect_stderr(err):
                 fc.write_record(os.path.join(d, "no", "such", "dir.json"), {})
             self.assertIn("could not write the run record", err.getvalue())
+
+    def test_a_record_is_never_overwritten_by_write_record_or_by_a_second_run(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_old_") as d:
+            path = os.path.join(d, "run.json")
+            Path(path).write_text("the first run's record\n")
+            os.chmod(path, 0o644)
+            before = Path(path).read_bytes()
+            # the writer itself refuses to open an existing path (O_EXCL), and says so
+            err = io.StringIO()
+            with contextlib.redirect_stderr(err):
+                fc.write_record(path, {"exit_code": 0})
+            self.assertIn("could not write the run record", err.getvalue())
+            self.assertEqual(Path(path).read_bytes(), before)
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o644)   # not chmod-ed either
+            # a second run at the same path is refused before anything is dispatched, record untouched
+            with on("Linux"):
+                self.assertIn("already exists", fc.refusal(args(record=path), {}) or "")
+            with on("Linux"), mock.patch.object(fc, "Client") as client, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9", "--record", path]),
+                                 fc.EXIT_PRECONDITION)
+                client.assert_not_called()
+            self.assertEqual(Path(path).read_bytes(), before)
+
+    def test_a_refused_non_posix_run_writes_its_record_and_exits_2(self):
+        # refusal() stops a non-POSIX host first; the record is still written like on every exit path
+        # (it used to raise AttributeError from os.fchmod on Windows and leave a 0-byte file)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_win_") as d:
+            path = os.path.join(d, "run.json")
+            with on("Windows"), mock.patch.object(fc, "Client") as client, contextlib.redirect_stderr(io.StringIO()):
+                self.assertEqual(fc.main(["--dashboard", "http://127.0.0.1:9", "--record", path]),
+                                 fc.EXIT_PRECONDITION)
+                client.assert_not_called()
+            self.assertEqual(json.loads(Path(path).read_text())["exit_code"], fc.EXIT_PRECONDITION)
+
+    def test_the_record_is_written_when_the_run_raises(self):
+        # main()'s finally: whatever checked_run raises, the record is written first
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwc_raise_") as d:
+            path = os.path.join(d, "run.json")
+            with mock.patch.object(fc, "checked_run", side_effect=RuntimeError("boom")):
+                with self.assertRaises(RuntimeError):
+                    fc.main(["--dashboard", "http://127.0.0.1:9", "--record", path])
+            self.assertEqual(json.loads(Path(path).read_text())["exit_code"], fc.EXIT_FAIL)
 
 
 if __name__ == "__main__":

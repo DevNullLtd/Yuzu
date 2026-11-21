@@ -441,6 +441,66 @@ TEST_CASE("macOS: a non-empty yuzu anchor is residue", "[firewall]") {
     CHECK(compare(Os::mac, base, mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, "No ALTQ support in kernel\n")).restored);
 }
 
+TEST_CASE("macOS: pf_anchor_absent reads an anchor that is not loaded as absent, and nothing else",
+          "[firewall]") {
+    // what pfctl answers for an anchor that does not exist: it ran, exited 1 and printed its
+    // error; both main reads completed
+    const std::string_view invalid = "pfctl: DIOCGETRULES: Invalid argument\n";
+    CHECK(pf_anchor_absent(true, true, 1, invalid));
+    // the exit status decides, not the wording: another pfctl text with the same exit is absent too
+    CHECK(pf_anchor_absent(true, true, 1, "pfctl: some other wording\n"));
+    CHECK(pf_anchor_absent(true, true, 1, ""));
+
+    // an incomplete main read: nothing can be said about the anchor
+    CHECK_FALSE(pf_anchor_absent(false, true, 1, invalid));
+    // a read that did not run to an exit (timed out, clipped, never started)
+    CHECK_FALSE(pf_anchor_absent(true, false, 1, invalid));
+    // a clean exit is a completed read (the caller keeps its output), not an absence
+    CHECK_FALSE(pf_anchor_absent(true, true, 0, ""));
+    // death by signal has no exit status
+    CHECK_FALSE(pf_anchor_absent(true, true, -1, invalid));
+    // sudo refusing is never an absent anchor, whichever spelling and wherever the line sits
+    CHECK_FALSE(pf_anchor_absent(true, true, 1, "sudo: a password is required\n"));
+    CHECK_FALSE(pf_anchor_absent(true, true, 1, "sudo-rs: interactive authentication is required\n"));
+    CHECK_FALSE(pf_anchor_absent(true, true, 1, std::string{invalid} + "  sudo: a terminal is required\n"));
+
+    // composed the way the harness writes it: absent is an EMPTY section that reads and restores,
+    // a failed anchor read is `[failed]` and the snapshot is unreadable
+    std::string clean;
+    write_section(clean, label::kPfRules, true, kPfRulesMain);
+    write_section(clean, label::kPfStatus, true, kPfOn);
+    write_section(clean, label::kPfReferences, true, kPfRefs);
+    write_section(clean, label::kYuzuAnchor, true, ""); // the anchor is absent
+    finish(clean);
+    CHECK(readable(Os::mac, clean));
+    CHECK(compare(Os::mac, clean, mac_snapshot(kPfRulesMain, kPfOn, kPfRefs, "")).restored);
+    std::string broken;
+    write_section(broken, label::kPfRules, true, kPfRulesMain);
+    write_section(broken, label::kPfStatus, true, kPfOn);
+    write_section(broken, label::kPfReferences, true, kPfRefs);
+    write_section(broken, label::kYuzuAnchor, false, "");
+    finish(broken);
+    CHECK_FALSE(readable(Os::mac, broken));
+}
+
+TEST_CASE("macOS: count_pf_rule_lines leaves the ALTQ notices and blank lines out",
+          "[firewall]") {
+    // stderr merged into the snapshot: two notices, then two rules
+    const std::string merged =
+        "No ALTQ support in kernel\nALTQ related functions disabled\n"
+        "scrub-anchor \"com.apple/*\" all fragment reassemble\nanchor \"com.apple/*\" all\n";
+    CHECK(count_pf_rule_lines(merged) == 2);
+    CHECK(count_pf_rule_lines(std::string{kPfRulesMain}) == 2);
+    CHECK(count_pf_rule_lines("") == 0);
+    CHECK(count_pf_rule_lines("\n  \n") == 0);
+    CHECK(count_pf_rule_lines("No ALTQ support in kernel\nALTQ related functions disabled\n") == 0);
+    // a rule line that merely mentions the word is a rule
+    CHECK(count_pf_rule_lines("block drop log all label \"ALTQ related\"\n") == 1);
+    // and it reads the section the way the harness stores it
+    const auto snap = mac_snapshot(merged, kPfOn, kPfRefs, "");
+    CHECK(count_pf_rule_lines(section(snap, label::kPfRules).value_or("")) == 2);
+}
+
 // ── unreadable snapshots ─────────────────────────────────────────────────────
 
 TEST_CASE("unreadable: empty text, a missing == end trailer, a [failed] section, every section "
@@ -457,6 +517,12 @@ TEST_CASE("unreadable: empty text, a missing == end trailer, a [failed] section,
     CHECK_FALSE(readable(Os::lin, cut));
     // text after the trailer is not a snapshot either
     CHECK_FALSE(readable(Os::lin, lin_snapshot(kNftRuleset, kIpt, kIpt) + "stray\n"));
+    // and neither is text ahead of the first header (classic sudo's `unable to resolve host`
+    // warning, were stderr merged): the reason names it
+    const auto ahead = "sudo: unable to resolve host lab-guest\n" + lin_snapshot(kNftRuleset, kIpt, kIpt);
+    CHECK_FALSE(readable(Os::lin, ahead));
+    CHECK(detail::unreadable_reason(Os::lin, ahead) == "text ahead of the first section");
+    CHECK(readable(Os::lin, "\n\n" + lin_snapshot(kNftRuleset, kIpt, kIpt))); // blank lines are not text
 
     // a read that failed
     std::string failed;
@@ -609,6 +675,8 @@ TEST_CASE("the Windows snapshot script is ASCII, fails on a failing cmdlet, and 
     CHECK(script.find("Get-NetFirewallRule") != std::string::npos);
     // the rule line keeps the key first and the enabled flag where the comparison looks for it
     CHECK(script.find("'{0}|{1}|en={2}|") != std::string::npos);
+    // the display group sits in its field: the Yuzu-residue check reads `grp=`
+    CHECK(script.find("|grp={6}|") != std::string::npos);
     // what the script prints is what the reader reads
     CHECK(label::kProfiles == "profiles");
     CHECK(label::kRules == "rules");

@@ -7,6 +7,11 @@
 
 #include <yuzu/agent/network_interfaces.hpp>
 
+#include <spdlog/spdlog.h>
+
+#include <cerrno>
+#include <cstring>
+#include <memory>
 #include <optional>
 #include <set>
 #include <string>
@@ -83,8 +88,12 @@ std::optional<std::set<std::string>> collect(bool include_local_scopes) {
         rc = GetAdaptersAddresses(AF_UNSPEC, kFlags, nullptr,
                                   reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buf.data()), &bufsize);
     }
-    if (rc != ERROR_SUCCESS)
+    if (rc != ERROR_SUCCESS) {
+        // Every failure is logged (the callers bound the rate): a permanent cause cannot
+        // otherwise be told from a transient one.
+        spdlog::warn("GetAdaptersAddresses failed (rc={}): this host's addresses could not be read", rc);
         return std::nullopt;
+    }
 
     std::set<std::string> uniq;
     char text_buf[INET6_ADDRSTRLEN];
@@ -130,8 +139,16 @@ namespace {
 // See the Windows copy above: one walk, loopback and link-local kept only when asked.
 std::optional<std::set<std::string>> collect(bool include_local_scopes) {
     ifaddrs* head = nullptr;
-    if (getifaddrs(&head) != 0)
+    if (getifaddrs(&head) != 0) {
+        const int err = errno; // before anything else can change it
+        // Every failure is logged (the callers bound the rate): a permanent cause such as
+        // errno 97, AF_NETLINK denied, cannot otherwise be told from a transient one (EMFILE).
+        spdlog::warn("getifaddrs failed (errno {}: {}): this host's addresses could not be read", err,
+                     std::strerror(err));
         return std::nullopt;
+    }
+    // Freed on every path, a throw out of the set insertions included.
+    const std::unique_ptr<ifaddrs, decltype(&freeifaddrs)> guard{head, &freeifaddrs};
 
     std::set<std::string> uniq;
     char text_buf[INET6_ADDRSTRLEN];
@@ -156,7 +173,6 @@ std::optional<std::set<std::string>> collect(bool include_local_scopes) {
         }
     }
 
-    freeifaddrs(head);
     return uniq;
 }
 

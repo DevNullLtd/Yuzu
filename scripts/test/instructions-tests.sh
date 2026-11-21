@@ -19,9 +19,14 @@
 # an operator enables its kill switch, then broadcast like a safe row),
 # interactive, and network-disrupt (the firewall containment actions: --risks network-disrupt
 # runs scripts/test/instructions_firewall_containment.py against --target-agent-id, the disposable
-# agent, instead of dispatching them; see that script for its guards. A containment whose agent and
-# server are on ONE host ends refused|self_host (exit 2) by design, so a containment round trip needs
-# the server on another host: --target-agent-hostname NAME runs the ceremony in its --remote mode).
+# agent, instead of dispatching them; see that script for its guards. A containment whose agent has
+# a control endpoint that is one of its own host's addresses (agent and server on ONE host) ends
+# refused|self_host (exit 2) by design; the check compares addresses only, so a server in a container
+# or VM reached at a bridge address is not one. A containment round trip needs the server on another
+# host: --target-agent-hostname NAME with --console-access-to-agent runs the ceremony in its --remote
+# mode. This wrapper forwards neither --record nor --probe-target, --ttl-seconds or --exceptions, so
+# a retained record or a verified containment needs the script run directly (--record,
+# --probe-target).
 # scripts/test/instructions-risk-classification.json is the authority.
 #
 # A destructive/forensic run is by hand, on a dedicated disposable stack. NOTE: --risks
@@ -112,10 +117,13 @@ Optional:
   --target-agent-hostname NAME
                            network-disrupt only: the agent's own hostname. The
                            ceremony then runs --remote (this machine is the
-                           server's host, the agent is another machine); without
-                           it the agent must be on this host, and then the
-                           agent refuses the containment (refused|self_host,
-                           exit 2) because its control endpoint is this host
+                           server's host, the agent is another machine) and
+                           needs --console-access-to-agent as well (exit 2
+                           without it); without it the agent must be on this
+                           host, and then the agent refuses the containment
+                           (refused|self_host, exit 2) when its control
+                           endpoint is one of this host's own addresses (the
+                           check compares addresses only)
   --console-access-to-agent
                            network-disrupt, with --target-agent-hostname: you
                            are at the agent's console (the ceremony requires it)

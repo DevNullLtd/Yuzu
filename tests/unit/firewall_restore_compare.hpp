@@ -15,9 +15,11 @@
  *     == end
  *
  * Whoever read a section writes it with write_section(): a read that did not run, timed out, was
- * clipped or exited non-zero is `[failed]`, never its partial text, so an unreadable snapshot can
- * never compare equal to itself and a case cannot pass on two failed reads. A root-owned helper
- * (`yuzu-fw-helper snapshot`) writes the same format for the Linux agent account.
+ * clipped or exited non-zero is `[failed]` and the partial text is never kept as the section's
+ * content, so an unreadable snapshot can never compare equal to itself and a case cannot pass on
+ * two failed reads. A root-owned helper (`yuzu-fw-helper snapshot`) writes the same format for the
+ * Linux agent account; for a tool that exits non-zero it prints what the tool wrote and then the
+ * `[failed]` marker, and a section that carries the marker is unreadable whatever precedes it.
  *
  * Per OS (the sections are the names in `label`):
  *   Windows  `profiles` (one line per profile: name and its defaults) and `rules` (one line per
@@ -29,7 +31,8 @@
  *            normalised away; `-P` lines are defaults; every other line is a multiset.
  *   macOS    `pf rules`, `pf status` (the `Status:` line, compared by its state word only because
  *            the line also carries the uptime), `pf references` (the line count) and `yuzu anchor`
- *            (anything in it after the noise is residue).
+ *            (anything in it after the noise is residue; an anchor that is not loaded is written
+ *            empty by the caller, see pf_anchor_absent).
  *
  * restored = both snapshots readable and nothing changed, went missing, appeared, was left
  * disabled, had a default changed or left a Yuzu residue.
@@ -582,6 +585,38 @@ inline void compare_macos(const Parsed& a, const Parsed& b, Verdict& v) {
             return std::string{line};
     }
     return {};
+}
+
+/// The number of rule lines in a pf rules section's text: every line except blanks and the ALTQ
+/// notices `pfctl -s rules` prints on stderr (`No ALTQ support in kernel`, `ALTQ related functions
+/// disabled`). The snapshot merges stderr, the plugin counts stdout only, so the two counts are the
+/// same only with those lines left out.
+[[nodiscard]] inline std::size_t count_pf_rule_lines(std::string_view pf_rules_text) {
+    std::size_t count = 0;
+    for (const auto line : fq::detail::split(pf_rules_text, '\n'))
+        if (!detail::is_pf_noise(line))
+            ++count;
+    return count;
+}
+
+/// Is the yuzu pf anchor simply not loaded? `pfctl -a <anchor> -s rules` exits non-zero for an
+/// anchor that does not exist (`DIOCGETRULES: Invalid argument`), which is not an unreadable
+/// host: the plugin itself reads it as "no anchor" after two good main reads (PfLeg::read_status).
+/// True only when BOTH main pf reads completed, the anchor call ran to a non-zero exit (it did
+/// start, was not killed by a signal or the deadline and was not clipped: `ran_to_exit`, with
+/// `exit_code` > 0) and no output line is a sudo refusal. The caller then records the anchor
+/// section EMPTY; in every other case a read that did not complete is `[failed]`. The pfctl wording
+/// is deliberately not keyed on: only the exit status and the sudo prefixes are.
+[[nodiscard]] inline bool pf_anchor_absent(bool main_reads_complete, bool ran_to_exit, int exit_code,
+                                           std::string_view output) {
+    if (!main_reads_complete || !ran_to_exit || exit_code <= 0)
+        return false;
+    for (const auto raw : fq::detail::split(output, '\n')) {
+        const auto line = detail::trim(raw);
+        if (line.starts_with("sudo:") || line.starts_with("sudo-rs:"))
+            return false;
+    }
+    return true;
 }
 
 /// The number of rules in the raw `nft -a list ruleset` text: the lines that end in a rule handle

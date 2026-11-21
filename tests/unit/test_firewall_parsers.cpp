@@ -1093,7 +1093,8 @@ TEST_CASE("#6611 macos_state_rows: the anchor and rule reads are gated and expla
     CHECK_FALSE(any_row_starts_with(clipped, "error|pf:anchors"));
 }
 
-TEST_CASE("macos_state_rows: pf|unknown if and only if the pf info error row, every combination",
+TEST_CASE("macos_state_rows: pf|unknown comes with the pf info error row exactly when the read "
+          "did not complete, every combination",
           "[firewall]") {
     for (const bool info_ok : {false, true})
         for (const bool rules_ok : {false, true}) {
@@ -1106,6 +1107,12 @@ TEST_CASE("macos_state_rows: pf|unknown if and only if the pf info error row, ev
             CHECK(has_row(rows, "ruleset|unknown") == !rules_ok);
             CHECK(any_row_starts_with(rows, "error|pf:rules:") == !rules_ok);
         }
+    // a read that completed but said neither Enabled nor Disabled is `pf|unknown` ALONE: there is
+    // no error row, because nothing failed to run (the README says so)
+    const auto garbled = macos_state_rows(done(std::string{kAlfOn}), done("Status: ???\n"), done(""),
+                                          done("pass all\n"));
+    CHECK(has_row(garbled, "pf|unknown"));
+    CHECK_FALSE(any_row_starts_with(garbled, "error|pf:info:"));
 }
 
 TEST_CASE("#4375 macos_rules_rows: pf rule lines are sanitised at the rule site", "[firewall]") {

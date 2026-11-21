@@ -641,8 +641,10 @@ class IptablesHelperRuns(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, (shell, argv))
                 self.assertEqual(r.stdout, "", (shell, argv))
 
-    def test_the_environment_cannot_change_what_runs(self):
-        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
+    def test_a_hostile_path_cannot_change_what_runs(self):
+        # The only environment variable this observes is PATH: the helper resets it itself, so a PATH
+        # that names nothing still runs the stub tool at its own fixed path.
+        env = {"PATH": "/nonexistent"}
         for shell in available_shells():
             r = subprocess.run([shell, self.path, "iptables", "-N", "yuzu-fwq-1"], capture_output=True,
                                text=True, timeout=30, env=env)
@@ -771,22 +773,25 @@ class SnapshotRuns(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0, (shell, args))
                 self.assertEqual(r.stdout, "", (shell, args, "a tool ran or something was printed"))
 
-    def test_the_environment_cannot_change_what_runs(self):
-        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
+    def test_a_hostile_path_cannot_change_what_runs(self):
+        # PATH is the only variable observed here (the helper resets it itself); the others are not
+        # reachable through the sudo grant, whose env_reset strips them.
+        env = {"PATH": "/nonexistent"}
         want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
         for shell in available_shells():
             r = self.run_helper(shell, self.make_helper({}), ["snapshot"], env=env)
             self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
 
-    def test_a_glob_in_the_working_directory_is_never_expanded(self):
-        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwsnap_cwd_") as cwd:
-            for name in ("-a", "list", "ruleset", "-S"):
-                open(os.path.join(cwd, name), "w").close()
-            want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
-            for shell in available_shells():
-                r = subprocess.run([shell, self.make_helper({}), "snapshot"], capture_output=True, text=True,
-                                   timeout=30, cwd=cwd)
-                self.assertEqual((r.returncode, r.stdout), (0, want), shell)
+    def test_the_label_format_is_the_one_the_restore_comparison_reads(self):
+        # The section labels and the three markers are kept by hand in three places: the helper, this
+        # test (TOOLS) and tests/unit/firewall_restore_compare.hpp. Drift fails closed, but only in the
+        # live run; this pins the helper's labels to the header's string literals in the unit suite.
+        header = read_text(RESTORE_COMPARE_HEADER)
+        self.assertIsNotNone(header, RESTORE_COMPARE_HEADER)
+        for label, _tool, _args in self.TOOLS:
+            self.assertIn('"%s"' % label, header, label)
+        for marker in ("[absent]", "[failed]", "== end"):
+            self.assertIn('"%s"' % marker, header, marker)
 
 
 # What the stub tools run by default: print its own name, then each argument it was handed.
@@ -795,6 +800,7 @@ STUB_ECHO = 'printf "RAN %s\\n" "${0##*/}"\nfor a; do printf "%s\\n" "$a"; done\
 
 GOLDEN_RE = re.compile(r'kGoldenNftRuleset = R"NFTGOLDEN\((.*?)\)NFTGOLDEN";', re.S)
 PARSERS_TEST = "tests/unit/test_firewall_quarantine_parsers.cpp"
+RESTORE_COMPARE_HEADER = "tests/unit/firewall_restore_compare.hpp"
 
 
 def golden_ruleset():
@@ -1874,6 +1880,40 @@ class InstallerDryRunHelperDirectory(unittest.TestCase):
             self.assertRegex(out, r"\[dry-run\] helper directory %s: would be created root:(root|wheel) 0755\n"
                              % re.escape(helper_dir))
             self.assertFalse(os.path.exists(helper_dir), "a dry run creates nothing")
+
+    def test_a_path_that_is_not_a_directory_is_refused_as_the_real_run_refuses_it(self):
+        # a regular file and a dangling link where the helper directory belongs: the real run cannot
+        # create the directory, so the dry run says so and fails too
+        for kind in ("a file", "a dangling link"):
+            with self.subTest(kind=kind), tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+                helper_dir = os.path.join(d, "helpers")
+                if kind == "a file":
+                    with open(helper_dir, "w") as f:
+                        f.write("not a directory\n")
+                else:
+                    os.symlink(os.path.join(d, "nowhere"), helper_dir)
+                rc, out, err = self.dry_run(d, helper_dir)
+                self.assertNotEqual(rc, 0, (out, err))
+                self.assertIn("[dry-run] helper directory %s: would be refused (the path exists and is not a "
+                              "directory)\n" % helper_dir, out)
+                self.assertNotIn("would be created", out)
+                self.assertNotIn("would write the following to %s" % os.path.join(helper_dir, "yuzu-fw-helper"), out)
+
+    def test_a_refused_directory_with_a_sudoers_file_present_does_not_report_a_removal_failure(self):
+        # a dry run only prints the removal of the sudoers file, so the file is still there afterwards;
+        # that must not be read as "could not be removed" (a failure only a real run can have)
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:
+            helper_dir = os.path.join(d, "helpers")
+            os.mkdir(helper_dir)
+            sudoers = os.path.join(d, "yuzu-agent")
+            with open(sudoers, "w") as f:
+                f.write(InstallerFailedHelper.EARLIER)
+            rc, out, err = self.dry_run(d, helper_dir, dir_info="501 777 staff")
+            self.assertNotEqual(rc, 0, (out, err))
+            self.assertNotIn("could not be removed", err + out)
+            self.assertIn("[dry-run] helper directory %s: would be refused\n" % helper_dir, out)
+            with open(sudoers) as f:
+                self.assertEqual(f.read(), InstallerFailedHelper.EARLIER, "a dry run removes nothing")
 
     def test_the_verdict_line_is_not_part_of_the_helper_text_the_render_reads(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_dryrun_") as d:

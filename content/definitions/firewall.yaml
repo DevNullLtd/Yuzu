@@ -33,9 +33,12 @@ metadata:
     rule count (root-only; unknown/empty without it); unreadable checks report
     unknown, never a false-safe value, and a macOS read that did not complete is
     named by an error row (error|appfirewall:globalstate:<token>,
-    error|pf:info:<token>, error|pf:anchors:<token>, error|pf:rules:<token>).
-    On Linux, an nftables probe whose dumps disagree on the ruleset generation
-    is read once more before it is distrusted (fallthrough|nftables:generation:changed),
+    error|pf:info:<token>, error|pf:anchors:<token>, error|pf:rules:<token>);
+    a read that completed but whose text is not recognised reads unknown with
+    no error row.
+    On Linux, an nftables probe whose dumps disagree on the ruleset generation,
+    or whose chain or rule dump tears, is read once more (when 2 seconds of
+    its budget remain) before it is distrusted (fallthrough|nftables:generation:changed),
     a ruleset that keeps changing reads torn_persistent, and ufw or iptables
     output that is not in the expected shape reads unknown with
     error|ufw:unrecognised_output or error|iptables:unrecognised_output.
@@ -89,10 +92,11 @@ spec:
           this is the nftables/ufw/iptables rule count; on macOS it is the pf
           rule count (root-only). Linux "error" rows:
           nftables:<table|chain|rule>:<eperm|timeout|foreign_flood|...> for a
-          refused/failed dump, or fd_exhausted for EMFILE/ENFILE on the
-          nftables socket, or ufw:unrecognised_output / iptables:unrecognised_output
+          refused/failed dump, nftables:generation:<changed|torn_persistent>
+          when clean dumps disagreed on the ruleset generation, or
+          fd_exhausted for EMFILE/ENFILE on the nftables socket, or ufw:unrecognised_output / iptables:unrecognised_output
           for output that finished but is not in the expected shape. macOS
-          "error" rows: appfirewall:<globalstate|listapps>:<token> or
+          "error" rows: appfirewall:globalstate:<token> or
           pf:<info|anchors|rules>:<token>, where the token is not_run,
           timeout, truncated or exit:<n>. Linux "fallthrough" rows:
           nftables:<chain|rule|generation>:<reason>, one row for each dump
@@ -268,8 +272,10 @@ metadata:
     in-flight containment change on this device. The Linux packaged unit
     refuses every containment action (privilege_unavailable). A device whose
     control endpoint is one of its own addresses (loopback included), or whose
-    own addresses cannot be read, is never contained: it answers
+    own addresses cannot be read, is never contained: every apply is checked,
+    whoever sent it, before the privilege check, and it answers
     refused|self_host or refused|own_addresses_unreadable and changes nothing.
+    An apply to a device whose own record is already active is not checked.
   tags: [security, quarantine, incident-response, network]
 
 spec:

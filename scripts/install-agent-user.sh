@@ -43,7 +43,9 @@
 #       macOS), the only programs the sudoers file lets the agent account run as root for
 #       the work that needs more than a fixed command:
 #         yuzu-fw-helper   firewall containment: iptables / ip6tables and the nftables
-#                          ruleset load on Linux, the pf anchor load on macOS
+#                          ruleset load on Linux, the pf anchor load on macOS; and one
+#                          read-only word, snapshot, that lists the host's nftables and
+#                          iptables rulesets (on a Mac it prints [absent] sections)
 #         yuzu-svc-helper  services.set_start_mode: systemctl enable|disable|mask|unmask on
 #                          Linux, launchctl enable|disable on macOS
 #       Linux: /usr/local/sbin.  macOS: /Library/PrivilegedHelperTools.
@@ -104,7 +106,11 @@
 # ARGUMENTS
 # ─────────
 #   --dry-run        Print every command the script would run, without
-#                    executing any of them. Use this first.
+#                    executing any of them. Use this first. It also prints the
+#                    verdict on each helper directory (ok, warn, would be refused
+#                    or would be created) and exits 1 when the real run would
+#                    refuse it: owned by anyone but root, writable by all users,
+#                    or a path that exists and is not a directory.
 #   --check          Verify the install is correct (user exists with
 #                    expected attributes, sudoers file present + valid,
 #                    both helpers present with the expected owner, mode
@@ -1712,6 +1718,10 @@ install_helper() {
             [[ $v == ok || $v == warn ]] || v="would be refused"
             echo "[dry-run] helper directory $dir: $v"
             check_helper_dir "$dir" || return 1
+        elif [[ -e "$dir" || -L "$dir" ]]; then
+            # A dangling link or a file where the directory belongs: the real run cannot create it.
+            echo "[dry-run] helper directory $dir: would be refused (the path exists and is not a directory)"
+            return 1
         else
             echo "[dry-run] helper directory $dir: would be created root:$ROOT_GROUP 0755"
         fi
@@ -2008,7 +2018,9 @@ case "$ACTION" in
         cap_rc=0
         strip_file_capabilities || cap_rc=$?
         if [[ "$helper_rc" -ne 0 ]]; then
-            if [[ -e "$SUDOERS_FILE" ]]; then
+            # A dry run only prints the removal, so the file still exists there: it is a failure only
+            # when a real run could not remove it.
+            if [[ "$DRY_RUN" -ne 1 && -e "$SUDOERS_FILE" ]]; then
                 fail "a root-owned helper was not installed and $SUDOERS_FILE could not be removed: remove it by hand, correct the helper directory and re-run this installer"
             fi
             fail "a root-owned helper was not installed, so $SUDOERS_FILE was removed: until the helper directory is corrected (owned by root, not writable by all users) and this installer is re-run, every sudo-backed action fails on a non-root agent, firewall containment and services.set_start_mode included"

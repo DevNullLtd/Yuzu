@@ -2269,17 +2269,31 @@ gate and the same `503` on a degraded read apply to them. **Any other value, an 
 > `allow_set_not_applied`), and the whitelist is not on the device until it is released and quarantined
 > again.
 >
-> **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** A device whose
-> control endpoint is one of its own addresses, loopback included, or whose own addresses it cannot
-> read, answers every apply with that refusal and is never contained, so the record never confirms
-> (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after 15 minutes. The
-> record still refuses operator commands to the device. The server keeps re-dispatching, so nothing
-> ends the record by itself: end it with `DELETE /api/v1/quarantine/{agent_id}`, and with
-> `?force=true` when that answers `202`. A device that was never contained holds no rules, so it
-> answers a release with `status|inactive`, and a plain `DELETE` ends the record. A single-host stack
-> (agent and server on one machine) ends this way whenever the agent reaches the server at one of the
-> host's own addresses, loopback included; a server in a container or VM on the same host reached at a
-> bridge address is the one case that is not refused. See
+> **A device that refuses (`refused|self_host`, `refused|own_addresses_unreadable`).** Every
+> `firewall.quarantine` apply is checked, whoever sent it: an operator's dispatch, the reconciler's
+> apply (a record created over REST is only ever applied by the reconciler) or an MCP re-apply. A
+> device whose control endpoint is one of its own addresses, loopback included, or whose own
+> addresses it cannot read, answers the apply with that refusal and is never contained, so the record
+> never confirms (`last_confirmed_at` stays `0`) and `YuzuQuarantineEndpointUnconfirmed` fires after
+> 15 minutes. The device changes nothing and stores no record; the refusal is in the apply's stored
+> reply (the `status|refused|<token>` row, `GET /api/v1/responses/{command_id}`) and in the agent log.
+> `own_addresses_unreadable` is permanent where the agent cannot read its interfaces (for example a
+> unit or seccomp profile that denies `AF_NETLINK`): allow `AF_NETLINK` for the agent, the agent log
+> names the errno. An apply to a device whose own record is already active is not checked (it keeps
+> its stored set and answers as described above). The record still refuses operator commands to the
+> device. The server keeps re-dispatching, so nothing ends the record by itself: end it with
+> `DELETE /api/v1/quarantine/{agent_id}`. A device that was never contained holds no rules, so it
+> answers a release with `status|inactive` and a plain `DELETE` ends the record; where the device
+> refuses the release (the packaged Linux unit, `privilege_unavailable`) the record stays `releasing`:
+> poll, do not repeat the `DELETE`, and use `?force=true` only if it is still `releasing` (see the
+> `DELETE` section below). A single-host stack (agent and server on one machine) ends this way
+> whenever the agent reaches the server at one of the host's own addresses, loopback included. A
+> server in a container or VM on the same host reached at a bridge address is not refused: that host
+> is contained with `forward` at policy drop and no rules, so forwarded traffic is dropped and the
+> server's published ports vanish for the whole fleet; a server apply carries no time limit and the
+> 60-second repair undoes a rule removed by hand. A host that runs the server while its agent reaches
+> a remote gateway or VIP passes the check the same way. The exits are the `DELETE` while the API is
+> reachable, otherwise console recovery: stop the agent service first, then remove the table. See
 > `docs/user-manual/security-hardening.md` "A device that is its own server is never contained".
 >
 > **`status`** is `active`, or `releasing` while a release the device has not yet confirmed is in
