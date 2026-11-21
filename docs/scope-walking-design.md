@@ -123,8 +123,8 @@ expiry, readiness, completeness and the materialization generation before using 
 The generation identifies the committed membership even if PostgreSQL failover rolls back a
 previous materialization of the same pending set. A generation mismatch reloads the IDs.
 A set without a generation uses the ordinary joined read. An expired, unpinned set
-is refused as a `from_result_set:` scope even before the GC sweep removes it (reads,
-`parent_id` seeding and re-evaluation still accept it; follow-up in ADR-0036); expiry is judged on the serving replica's
+is refused as a `from_result_set:` scope even before the GC sweep removes it (`get`, `members`,
+`list_by_owner` and `resolve_alias` still return it; follow-up in ADR-0036); expiry is judged on the serving replica's
 clock, the clock that writes `ttl_at` and that the GC sweep deletes by. The caller's current
 device visibility still bounds the result.
 

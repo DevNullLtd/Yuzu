@@ -410,7 +410,7 @@ transition table, which would capture every member row a `gc_sweep` cascade remo
 temporary files and fail the sweep under a `temp_file_limit` on every pass, nor an AFTER row
 trigger, which queues one in-memory event per cascaded row for the whole pass. INSERT and UPDATE
 keep their transition tables, at the cost of about 5 MB more temporary space for a
-100,000-member fill (measured on PostgreSQL 16 at the default `work_mem`): DELETE's single-slot
+100,000-member fill (measured on PostgreSQL 16 at the default `work_mem`: 4.7 MB of temporary files without the trigger, 9.9 MB with it): DELETE's single-slot
 marker would write the header once per change of set in a bulk load that interleaves sets. A cascade from a
 `result_sets` delete writes nothing, because the header is gone: one key probe per set and one
 expression per row (about 0.55 s instead of 0.45 s for a 1M-row cascade, measured once on

@@ -307,8 +307,8 @@ const std::vector<pg::PgMigration>& migrations() {
         //     bulk load costs one header UPDATE per affected set per statement, never one per row.
         //     The price is a transition tuplestore of the inserted rows: a 100,000-member fill
         //     needs about 5 MB more temporary space than before v7 (measured on PostgreSQL 16 at
-        //     the default work_mem: it failed under temp_file_limit 8 MB and succeeded at 12 MB,
-        //     against 6 MB without the trigger). Not DELETE's single-slot marker shape: a bulk
+        //     the default work_mem: 4.7 MB of temporary files without the trigger, 9.9 MB with it;
+        //     it failed under temp_file_limit 8 MB and succeeded at 12 MB). Not DELETE's single-slot marker shape: a bulk
         //     load interleaving sets would then write the header once per change of set, which
         //     is per-row generation writes on a large load.
         //   DELETE: BEFORE, row-level, at any trigger depth (a DELETE issued from another
