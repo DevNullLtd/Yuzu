@@ -1171,7 +1171,8 @@ bool role_is_superuser(const std::string& dsn) {
 
 // The cascade from gc_sweep's header delete must not depend on temporary-file space: a DELETE
 // transition table would capture every cascaded member row and fail the sweep, every pass, under
-// a temp_file_limit (and an AFTER row trigger would queue an in-memory event per row). Setting temp_file_limit needs a superuser, so the case skips otherwise.
+// a temp_file_limit (and an AFTER row trigger would queue an in-memory event per row).
+// Setting temp_file_limit needs a superuser, so the case skips otherwise.
 TEST_CASE("ResultSetStore: a GC sweep cascading many member rows succeeds under a small "
           "temp_file_limit",
           "[pg][result_set][gc][member_cache]") {
@@ -1262,6 +1263,12 @@ TEST_CASE("ResultSetStore: a store opened without the re-stamp triggers in force
                                always + "result_set_members_restamp_del");
         // Re-running v7 at the next open recreates the trigger.
         repair = "UPDATE public.schema_meta SET version = 6 WHERE store = 'result_set_store'";
+    }
+    SECTION("a DELETE function without its pinned search_path") {
+        exec_sql(db.dsn(), "ALTER FUNCTION result_set_store.result_set_members_restamp_deleted() "
+                           "RESET search_path");
+        repair = "ALTER FUNCTION result_set_store.result_set_members_restamp_deleted() "
+                 "SET search_path = pg_catalog, pg_temp";
     }
     SECTION("a SECURITY DEFINER DELETE function") {
         exec_sql(db.dsn(), "ALTER FUNCTION result_set_store.result_set_members_restamp_deleted() "

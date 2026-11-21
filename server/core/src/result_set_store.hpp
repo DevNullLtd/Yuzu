@@ -77,11 +77,12 @@
 /// per-transaction marker; TRUNCATE re-stamps every set that carries a generation. Every INSERT,
 /// UPDATE and DELETE re-stamp locks the header row, a pending one included, so an out-of-band
 /// write is ordered against `materialize`'s stamping UPDATE; TRUNCATE is ordered by its ACCESS
-/// EXCLUSIVE lock on `result_set_members` instead. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
-/// writes nothing: its header is gone and every cached copy reads `NotFound`. The constructor
-/// checks that the four triggers are present, ENABLE ALWAYS, of v7's shape and bound to v7's
-/// function bodies; when they are not, or the check cannot be read, it logs an error and
-/// retains nothing, so every read takes the joined read.
+/// EXCLUSIVE lock on `result_set_members` instead. A delete that cascades from `result_sets`
+/// (`delete_set`, `gc_sweep`) writes nothing: its header is gone and every cached copy reads
+/// `NotFound`. The constructor checks that the four triggers are present, ENABLE ALWAYS, of v7's
+/// shape and bound to v7's function bodies; when they are not, or the check cannot be read, it
+/// retains nothing, so every read takes the joined read, and logs an error when caching is
+/// enabled (a nonzero budget).
 /// A writer that bypasses triggers (`ALTER TABLE ... DISABLE TRIGGER`, `pg_restore
 /// --disable-triggers`), or that writes `membership_generation` directly, while servers are
 /// running breaks the invariant; every replica must then be restarted
