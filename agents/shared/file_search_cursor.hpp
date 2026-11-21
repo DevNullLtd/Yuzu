@@ -12,14 +12,19 @@
 //
 // Trust rule for consumers: the decoder is pure, it opens nothing. Cursor names are only ever
 // COMPARED with the entries of a real directory listing, never joined into a path that is opened.
-// There is no MAC or secret: a forged cursor can only move the resume point inside the same
-// validated query (the query hash must match), which is the accepted design.
+// This token carries no MAC or secret of its own: it is unauthenticated, and a consumer that believes
+// what it carries (prior_gaps, the resume point) must authenticate the ENCLOSING token. The search
+// plugin's fsv1 token does (HMAC-SHA-256 under a per-process key, file_search_volumes.hpp), so a cursor
+// that reaches this decoder through it was issued by this agent process; the query hash is only a
+// binding to the validated query, not a proof of origin.
 //
-// Recovery: the agent keeps no cursor state. The same cursor replayed re-walks the same slice
-// (duplicates possible, no skip of its own). A crash mid-slice issues no cursor, so the caller
-// retries the previous one. A slice that completes the walk issues no cursor and may return the resume
-// position itself, so strictly_advances applies only to a cursor that is issued. One cursor covers
-// one root, so a failing volume never advances another volume's position.
+// Recovery: the agent keeps no cursor state, but a cursor is valid only in the agent process that issued
+// it. The same cursor replayed to that process re-walks the same slice (duplicates possible, no skip of
+// its own). A crash mid-slice issues no cursor, so the caller retries the previous one. After an agent
+// restart every earlier cursor is refused (bad_cursor) and the search starts again. A slice that
+// completes the walk issues no cursor and may return the resume position itself, so strictly_advances
+// applies only to a cursor that is issued. One cursor covers one root, so a failing volume never advances
+// another volume's position.
 // Retries of one cursor are counted by the caller and bounded (file_search_governor.hpp: stalls).
 //
 // Transitions: strictly_advances accepts exactly two, each with the same query hash,
@@ -41,8 +46,8 @@
 //
 // Coverage: gap rows are slice-local. The cursor carries only their running count (prior_gaps),
 // so a final slice can never report complete after an earlier slice reported a gap. That count is
-// caller-held and unauthenticated like the rest of the cursor: a caller that edits it degrades
-// only its own answer.
+// caller-held and unauthenticated in this token; it is trusted only because the enclosing fsv1 token
+// that carries it is authenticated, so a caller cannot edit it.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
 // this directory (docs/cpp-conventions.md).

@@ -4,8 +4,9 @@
  * SearchState; the caller holds the cursor and loops.
  *
  * THE FLOW of run_slice, in order (each step is a return point; every one releases the slot):
- *   1. decode the cursor (strictly; a forged one answers `invalid` before any boundary is called) and
- *      refuse invalid GovernorLimits before a governor is built;
+ *   1. decode the cursor (strictly, and its mac under the process's key: a cursor this agent process did
+ *      not issue, a forged one or one from before an agent restart, answers `invalid`/bad_cursor before any
+ *      boundary is called) and refuse invalid GovernorLimits before a governor is built;
  *   2. take the single-flight slot (a second call answers `busy` at once, touching nothing);
  *   3. drop abandoned workers that have returned; two still running answer `busy`;
  *   4. read the mount table (unreadable or malformed answers `failed`, mount_table_unreadable), plan the
@@ -115,6 +116,7 @@ struct Boundaries {
     std::function<bool()> stop_requested; // optional: polled between entries; true ends the walk
     fsr::GovernorLimits limits{};         // the defaults are the ruled slice, entry and row budgets
     Os os{Os::linux_os};
+    CursorKey cursor_key{};               // the process's cursor key; all zero (never set) is refused
 };
 
 /// Counters of one slice, for the heartbeat tags and the log: each is 0 or 1 except `gaps`.
@@ -322,10 +324,12 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         return out;
     };
 
-    // 1. the cursor, strictly, then the limits
+    // 1. the key, the cursor strictly under it, then the limits
+    if (std::ranges::all_of(b.cursor_key, [](unsigned char byte) { return byte == 0; }))
+        return bare(Status::failed, to_token(Fault::internal_error)); // a key nobody set would sign any token
     std::optional<VolumeCursor> outer;
     if (!req.cursor.empty()) {
-        outer = decode_volume_cursor(req.cursor, qh);
+        outer = decode_volume_cursor(req.cursor, qh, b.cursor_key);
         if (!outer || outer->inner.sequence >= kMaxSlices)
             return bare(Status::invalid, to_token(RequestError::bad_cursor));
     }
@@ -439,7 +443,7 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         const VolumeCursor prev{index, plan.units_hash, plan.refused_hash, inner};
         if (!volume_advances(prev, next))
             return std::unexpected(CursorEnd{to_token(Fault::cursor_refused)});
-        std::string token = encode_volume_cursor(next);
+        std::string token = encode_volume_cursor(next, b.cursor_key);
         if (token.empty()) // a non-complete stop must never read as "finished"
             return std::unexpected(CursorEnd{to_token(Fault::internal_error)});
         return token;

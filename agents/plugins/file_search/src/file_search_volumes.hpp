@@ -41,23 +41,34 @@
  * in volumes_dropped and make the verdict partial. A mount point longer than kMaxVolumePathBytes cannot
  * be a row and is counted the same way. Prune sets are computed before the cap.
  *
- * THE FSV1 CURSOR wraps the unchanged fs1 cursor:  fsv1.<volume index>.<units hash>.<refused hash>.<fs1>
+ * THE FSV1 CURSOR wraps the unchanged fs1 cursor:  fsv1.<volume index>.<units hash>.<refused hash>.<fs1>.<mac>
  * The units hash covers the walk units only (mount point, label, root, fstype, in order); the refused hash
  * covers the refused rows (mount point, reason). A changed units hash ends the search. A changed refused
  * hash does not: refused mounts come and go (overlays, snaps, automounts) and are only re-reported.
  * Decoding is strict: every accepted token re-encodes to itself.
+ *
+ * THE MAC. The verdict is cumulative through the cursor (its prior_gaps, and the units and refused sets it
+ * names), so a cursor an agent did not issue must never be believed: a forged last-unit token would read
+ * `complete` over volumes never searched. The <mac> is the first 16 bytes (32 lowercase hex digits) of
+ * HMAC-SHA-256, under a per-process key the agent draws once (file_search_posix.cpp), over every other
+ * byte of the token. The inner fs1 token is not authenticated on its own; this enclosing token is. Both
+ * codec calls take the key as a required parameter. The mac is compared with no early exit, and a token
+ * whose mac is not exact is refused before its inner token is decoded. A token is therefore valid only in
+ * the agent process that issued it: after an agent restart it is refused and the search starts again.
  */
 #pragma once
 
 #include <file_search_coverage.hpp>
 #include <file_search_cursor.hpp>
 #include <file_search_governor.hpp>
+#include <hmac_sha256.hpp>
 #include <network_fstype.hpp>
 #include <sha256.hpp>
 
 #include "file_search_rows.hpp"
 
 #include <algorithm>
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -295,39 +306,67 @@ struct VolumeCursor {
 
 inline constexpr std::string_view kVolumeCursorPrefix = "fsv1";
 
+/// The per-process key the cursor mac is made under. All zero means "never set": run_slice refuses it.
+inline constexpr std::size_t kCursorKeyBytes = 32;
+using CursorKey = std::array<unsigned char, kCursorKeyBytes>;
+
+inline constexpr std::size_t kCursorMacHexBytes = 32; // 16 bytes of HMAC-SHA-256, lowercase hex
+
 namespace detail {
 
+[[nodiscard]] inline bool is_lower_hex(std::string_view s, std::size_t n) noexcept {
+    return s.size() == n && std::ranges::all_of(s, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
 [[nodiscard]] inline bool is_hash16(std::string_view s) noexcept {
-    return s.size() == 16 && std::ranges::all_of(s, [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+    return is_lower_hex(s, 16);
+}
+
+[[nodiscard]] inline std::string cursor_mac(const CursorKey& key, std::string_view message) {
+    return yuzu::shared::hmac_sha256_hex(std::string_view(reinterpret_cast<const char*>(key.data()), key.size()), message)
+        .substr(0, kCursorMacHexBytes);
+}
+
+/// Both strings are kCursorMacHexBytes long when the token split. Every byte is compared: no early exit.
+[[nodiscard]] inline bool mac_equal(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size())
+        return false;
+    unsigned diff = 0;
+    for (std::size_t i = 0; i < a.size(); ++i)
+        diff |= static_cast<unsigned>(static_cast<unsigned char>(a[i]) ^ static_cast<unsigned char>(b[i]));
+    return diff == 0;
 }
 
 } // namespace detail
 
 /// Empty when the inner cursor has no spelling (an invalid position) or a field is not canonical.
-[[nodiscard]] inline std::string encode_volume_cursor(const VolumeCursor& c) {
+[[nodiscard]] inline std::string encode_volume_cursor(const VolumeCursor& c, const CursorKey& key) {
     if (c.index >= kMaxVolumes || !detail::is_hash16(c.units_hash) || !detail::is_hash16(c.refused_hash))
         return {};
     const std::string inner = fsr::encode_cursor(c.inner);
     if (inner.empty())
         return {};
-    return std::string(kVolumeCursorPrefix) + "." + std::to_string(c.index) + "." + c.units_hash + "." +
-           c.refused_hash + "." + inner;
+    const std::string token = std::string(kVolumeCursorPrefix) + "." + std::to_string(c.index) + "." + c.units_hash + "." +
+                              c.refused_hash + "." + inner;
+    const std::string mac = detail::cursor_mac(key, token);
+    return token + "." + mac;
 }
 
-/// The five fields of a token, strictly: nullopt for any other spelling. The inner token is returned as
-/// text; it is decoded by fsr::decode_cursor.
+/// The six fields of a token, strictly: nullopt for any other spelling. The inner token is returned as
+/// text; it is decoded by fsr::decode_cursor, and only after the mac has been checked.
 struct VolumeTokenFields {
     std::size_t index{0};
     std::string units_hash;
     std::string refused_hash;
     std::string inner;
+    std::string mac;
 };
 
 [[nodiscard]] inline std::optional<VolumeTokenFields> split_volume_cursor(std::string_view token) {
     if (token.size() > fsr::kMaxCursorTokenBytes + 128)
         return std::nullopt;
     std::string_view rest = token;
-    std::string_view f[4];
+    std::string_view f[5];
     for (auto& field : f) {
         const auto dot = rest.find('.');
         if (dot == std::string_view::npos)
@@ -344,23 +383,29 @@ struct VolumeTokenFields {
     const std::size_t index = static_cast<std::size_t>(std::stoul(std::string(f[1])));
     if (index >= kMaxVolumes || !detail::is_hash16(f[2]) || !detail::is_hash16(f[3]))
         return std::nullopt;
-    if (!rest.starts_with(fsr::kCursorPrefix) || rest.find('.') != std::string_view::npos)
+    // the inner token is the fifth field and the mac is what is left, the sixth: 32 hex digits, no dot
+    if (!f[4].starts_with(fsr::kCursorPrefix) || !detail::is_lower_hex(rest, kCursorMacHexBytes))
         return std::nullopt;
-    return VolumeTokenFields{index, std::string(f[2]), std::string(f[3]), std::string(rest)};
+    return VolumeTokenFields{index, std::string(f[2]), std::string(f[3]), std::string(f[4]), std::string(rest)};
 }
 
-/// Decodes a token for the query whose hash is `expected`. Nothing is opened. Every accepted token
-/// re-encodes to itself.
+/// Decodes a token for the query whose hash is `expected`, issued under `key`. Nothing is opened. A token
+/// whose mac is not exact is refused before its inner token is read. Every accepted token re-encodes to
+/// itself.
 [[nodiscard]] inline std::optional<VolumeCursor> decode_volume_cursor(std::string_view token,
-                                                                      const fsr::QueryHash& expected) {
+                                                                      const fsr::QueryHash& expected,
+                                                                      const CursorKey& key) {
     const auto fields = split_volume_cursor(token);
     if (!fields)
+        return std::nullopt;
+    const std::string_view signed_part = token.substr(0, token.size() - fields->mac.size() - 1);
+    if (!detail::mac_equal(fields->mac, detail::cursor_mac(key, signed_part)))
         return std::nullopt;
     auto inner = fsr::decode_cursor(fields->inner, expected);
     if (!inner)
         return std::nullopt;
     VolumeCursor c{fields->index, fields->units_hash, fields->refused_hash, std::move(*inner)};
-    if (encode_volume_cursor(c) != token)
+    if (encode_volume_cursor(c, key) != token)
         return std::nullopt;
     return c;
 }

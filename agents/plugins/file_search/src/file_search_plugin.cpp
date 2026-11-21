@@ -197,6 +197,8 @@ public:
 #if !defined(_WIN32)
         if (!pin_module())
             return std::unexpected(yuzu::PluginError{1, "file_search: the plugin module could not be pinned"});
+        if (!fs_plugin::posix_init_cursor_key())
+            return std::unexpected(yuzu::PluginError{1, "file_search: the cursor key could not be drawn"});
         fs_plugin::posix_clear_stop();
         const std::lock_guard<std::mutex> lock(g_heartbeat_mutex);
         g_plugin_ctx = ctx.raw();

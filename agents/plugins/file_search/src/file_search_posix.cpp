@@ -13,6 +13,11 @@
  * (file_search_plugin.cpp) so no worker can ever run unmapped code, and nothing here is touched after
  * shutdown() returns except by such a worker, through state it owns.
  *
+ * THE CURSOR KEY. 32 random bytes from getentropy, drawn once per process on first use and held for the life
+ * of the (pinned) module: init draws it and fails if it cannot, and a re-init never draws another. It is
+ * never written anywhere. A cursor is a token the agent signs under it (file_search_volumes.hpp), so a
+ * cursor is valid only in the agent process that issued it.
+ *
  * THE SLOT. One atomic flag, taken with compare_exchange by run_slice on the pool thread before it reads any
  * state and released only by that pool thread's RAII guard (file_search_driver.hpp). A second concurrent call
  * answers busy at once. A worker never touches it: it sets only its own done flag.
@@ -53,6 +58,7 @@
 #include <thread>
 #include <utility>
 
+#include <sys/random.h>
 #include <unistd.h>
 
 #if defined(__APPLE__)
@@ -79,6 +85,24 @@ std::atomic<bool> g_stop{false};
 [[nodiscard]] SearchState& search_state() {
     static SearchState state;
     return state;
+}
+
+/// The process's cursor key. Drawn once, by whichever call comes first; a failed draw is final for the
+/// process, so init keeps failing rather than the plugin running with a key it cannot vouch for.
+struct CursorKeyHolder {
+    CursorKey key{};
+    bool ok{false};
+};
+
+[[nodiscard]] const CursorKeyHolder& cursor_key_holder() {
+    static const CursorKeyHolder holder = [] {
+        CursorKeyHolder h;
+        h.ok = ::getentropy(h.key.data(), h.key.size()) == 0;
+        if (!h.ok)
+            h.key.fill(0); // never leave a partial draw behind
+        return h;
+    }();
+    return holder;
 }
 
 #if defined(__APPLE__)
@@ -295,7 +319,12 @@ SliceResult run_posix_slice(const Request& req) {
     b.sleep = [](std::chrono::milliseconds d) { std::this_thread::sleep_for(d); };
     b.stop_requested = [] { return g_stop.load(std::memory_order_acquire); };
     b.os = kOs;
+    b.cursor_key = cursor_key_holder().key; // all zero if the draw failed: run_slice refuses it
     return run_slice(req, b);
+}
+
+bool posix_init_cursor_key() noexcept {
+    return cursor_key_holder().ok;
 }
 
 void posix_request_stop() noexcept {

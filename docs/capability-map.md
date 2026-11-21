@@ -667,6 +667,8 @@ Partial — read-only posture only (Wave 8 PR8.6; refs #282, `docs/roadmap.md` I
 
 `filesystem` plugin.
 
+`file_search` plugin `search`: on-demand, resumable search of the local disks of a device by leaf-name glob under one absolute root, one slice per call with a cursor the agent signs and a per-volume coverage verdict, reporting each match's type, size, modification time and extents (names, types, sizes, times and extents only: a matched file is opened and never read, no hash is taken). `FileRetrieval` securable, `AdminOrApproval`, default-off, not single-target; the rows it stores are read in the Forensics tier (global `Forensics:Read`). Linux and macOS constrained, Windows planned. *(Evidence: `agents/plugins/file_search/README.md`.)*
+
 ### 10.3 File Content Read (by Line) :white_check_mark: `T1`
 
 `filesystem` plugin `read` action with `offset` (1-based line number) and `limit` (max lines, configurable) parameters for line-range access.
@@ -1898,6 +1900,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | system_hardening | Y | Y | Y | Security |
 | filesystem | Y | Y | Y | File System |
 | filesystem_posture | 🟡 | 🟡 | Y | File System |
+| file_search | - | 🟡 | 🟡 | File System |
 | registry | Y | - | - | System Config |
 | wmi | Y | - | - | System Config |
 | windows_optional_features | Y | - | - | System Config |
@@ -1922,7 +1925,7 @@ ADR-0070 D5/R1: operators register third-party CRL sources through `/api/v1/cryp
 | chargen | Y | Y | Y | Test/Debug |
 | example | Y | Y | Y | Test/Debug |
 
-**74 plugin directories: 72 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 74 at HEAD, 2026-11-16, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
+**75 plugin directories: 73 production plugins plus the two test/debug plugins (`chargen`, `example`)**, which appear in the table but are excluded from the headline count (`ls -d agents/plugins/*/` = 75 at HEAD, 2026-11-21, after the earlier device-containment plugin was removed: containment is now the `firewall` plugin's four actions). Coverage spans hardware, peripherals, network, security posture, filesystem, registry, WMI, WiFi, WoL, IOC, device containment, certificates, content distribution, user interaction and more, across cross-platform and Windows-only plugins. Corrections in this pass: `pkg_inventory` Windows is supported (was shown `-`); constrained legs are now shown `🟡` instead of `Y`; and the former `software_usage` "planned" row is removed — usage metering shipped as `app_usage` (§27.2, §35.6). The previous recount history (51 → 71 between 2026-09-15 and 2026-11) is in git history.
 ---
 
 ## Appendix B: Foundation Tier Status

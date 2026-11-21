@@ -37,7 +37,7 @@ metadata:
     stating whether the slice ran, and a coverage row stating whether everything under the
     root was searched, so an empty result is never confusable with a failed or partial one.
     Only local filesystem types on the allow-list are searched; every other mount under the
-    root is named by its own volume row with the reason. Results are a point-in-time read, not
+    root is named by its own volume row with the reason. A search of more than one slice is not
     a snapshot. Off until enabled; a non-administrator also needs an approval. What is stored
     is readable only with Forensics:Read. The Windows leg is planned and answers one
     unsupported status row.
@@ -74,9 +74,9 @@ spec:
           A leaf-name glob matched against each entry name, never the whole path: * matches
           any run of characters and ? any one character; there is no regex. A pattern with too
           few literal characters, too many * or a forbidden byte is refused with its own token,
-          so it cannot be made to match everything. Names compare the way the device's own
-          system compares them: byte for byte on Linux, by Unicode normalisation and case
-          folding on macOS.
+          so it cannot be made to match everything. Names compare by the rule of the agent's
+          OS: byte for byte on Linux; on macOS normalised to NFC and case-folded whatever the
+          volume's own rule.
         validation:
           maxLength: 128
       kinds:
@@ -93,8 +93,10 @@ spec:
         displayName: Resume Cursor
         description: >
           The token of the cursor row of the previous slice of this same search; leave empty
-          for the first slice. A token that was not issued for this root, pattern and kinds is
-          refused with bad_cursor before anything is read.
+          for the first slice. A cursor is valid only in the agent process that issued it, for
+          this root, pattern and kinds: a token the agent did not issue, and any token from
+          before an agent restart, is refused with bad_cursor before anything is read, and the
+          search starts again without one.
         validation:
           maxLength: 32896
 

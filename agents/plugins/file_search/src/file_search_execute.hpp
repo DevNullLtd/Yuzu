@@ -138,6 +138,11 @@ inline int execute_search(yuzu::CommandContext& ctx, std::string_view action, st
 [[nodiscard]] RunOutcome<WorkResult> run_on_worker(std::chrono::milliseconds timeout,
                                                    std::function<WorkResult()> work);
 
+/// Draws the process's cursor key (32 bytes from getentropy) if it has not been drawn; false if it cannot be,
+/// and then no search runs. Never drawn again once it succeeded, so a re-init keeps the cursors it issued
+/// valid for as long as the process lives.
+[[nodiscard]] bool posix_init_cursor_key() noexcept;
+
 /// Asks a slice that is running to end at the next entry (the stop flag the worker polls). Idempotent.
 void posix_request_stop() noexcept;
 

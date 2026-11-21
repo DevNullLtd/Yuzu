@@ -23,8 +23,13 @@
  *    cap case.
  *  - hashes: the units hash covering a refused row, or the refused hash ignoring one, fails the hash case.
  *  - fsv1: accepting a non-canonical spelling (leading zero, sign, uppercase or short hash, an index of
- *    kMaxVolumes, a dot in the inner token) fails the refusal table; decoding without the query check
- *    fails the foreign-query refusal.
+ *    kMaxVolumes, a dot in the inner token, a mac that is not 32 lowercase hex digits) fails the refusal
+ *    table; decoding without the query check fails the foreign-query refusal.
+ *  - fsv1 mac: not checking it, checking only part of the token, comparing it under another key or with
+ *    an early exit on a short mac, or reading the inner token before it, fails the forgery cases (an
+ *    edited index, either hash, the gap count or the inner token under the old mac; every one-character
+ *    edit of a token; a wrong key); a mac that is not HMAC-SHA-256 of the rest of the token truncated to
+ *    16 bytes fails the pinned-vector case.
  *  - volume_advances: accepting a skipped index, a changed units hash, a backward sequence, a stale
  *    position or a changed generation on the move to the next unit fails the transition table; refusing a
  *    changed refused hash fails the accepting case.
@@ -35,6 +40,7 @@
 #include "file_search_volumes.hpp"
 
 #include <file_search_cursor.hpp>
+#include <hmac_sha256.hpp>
 #include <network_fstype.hpp>
 
 #include <algorithm>
@@ -400,6 +406,21 @@ fsr::QueryHash hash_of(std::uint8_t b) {
     return h;
 }
 
+/// The fixed key the cases sign with; `fill` makes another.
+CursorKey test_key(unsigned char fill = 0x42) {
+    CursorKey k{};
+    k.fill(fill);
+    return k;
+}
+const CursorKey kKey = test_key();
+
+/// body + "." + mac, the way the codec signs a token: the 16 leading bytes of HMAC-SHA-256 as hex, computed
+/// here from the primitive, not by the codec.
+std::string signed_with(const CursorKey& key, const std::string& body) {
+    const std::string_view k(reinterpret_cast<const char*>(key.data()), key.size());
+    return body + "." + yuzu::shared::hmac_sha256_hex(k, body).substr(0, 32);
+}
+
 VolumeCursor cursor_at(std::size_t index, std::uint64_t sequence, std::uint32_t generation = 0,
                        std::uint32_t prior_gaps = 0, fsr::Position pos = {}, std::uint8_t q = 7) {
     VolumeCursor c;
@@ -425,38 +446,60 @@ fsr::Position pos_in(std::string dir, std::string after) {
 
 } // namespace
 
-TEST_CASE("file_search volumes: the fsv1 cursor round-trips through its five fields",
+TEST_CASE("file_search volumes: the fsv1 cursor round-trips through its six fields",
           "[file_search][file_search_volumes]") {
     const VolumeCursor c = cursor_at(3, 12, 1, 4, pos_in("a", "b"));
-    const std::string token = encode_volume_cursor(c);
+    const std::string token = encode_volume_cursor(c, kKey);
     REQUIRE_FALSE(token.empty());
     CHECK(token.starts_with("fsv1.3.0123456789abcdef.fedcba9876543210.fs1:"));
-    const auto back = decode_volume_cursor(token, hash_of(7));
+    const auto back = decode_volume_cursor(token, hash_of(7), kKey);
     REQUIRE(back.has_value());
     CHECK(*back == c);
-    CHECK(encode_volume_cursor(*back) == token);
+    CHECK(encode_volume_cursor(*back, kKey) == token);
 
     const auto fields = split_volume_cursor(token);
     REQUIRE(fields.has_value());
     CHECK(fields->index == 3);
     CHECK(fields->units_hash == "0123456789abcdef");
     CHECK(fields->inner.starts_with("fs1:"));
+    CHECK(fields->mac.size() == 32);
+    CHECK(token.ends_with("." + fields->mac));
 
     // the first volume, the last volume
     for (const std::size_t i : {std::size_t{0}, kMaxVolumes - 1})
-        CHECK(decode_volume_cursor(encode_volume_cursor(cursor_at(i, 1)), hash_of(7)).has_value());
+        CHECK(decode_volume_cursor(encode_volume_cursor(cursor_at(i, 1), kKey), hash_of(7), kKey).has_value());
+
+    // the framing around the inner token, at its widest, stays inside the slack the splitter and the
+    // definition's maxLength allow beyond the fs1 bound
+    const std::string widest = encode_volume_cursor(cursor_at(kMaxVolumes - 1, 1), kKey);
+    const auto widest_fields = split_volume_cursor(widest);
+    REQUIRE(widest_fields.has_value());
+    CHECK(widest.size() - widest_fields->inner.size() <= 128);
 }
 
-TEST_CASE("file_search volumes: every non-canonical or forged spelling is refused before anything is called",
+TEST_CASE("file_search volumes: the mac is HMAC-SHA-256 of the rest of the token, 16 bytes of it, as hex",
+          "[file_search][file_search_volumes]") {
+    const std::string token = encode_volume_cursor(cursor_at(2, 5, 0, 1, pos_in("a", "b")), kKey);
+    const std::string body = token.substr(0, token.rfind('.'));
+    CHECK(token == signed_with(kKey, body));
+    // RFC 4231 test case 2: key "Jefe", data "what do ya want for nothing?"
+    CHECK(yuzu::shared::hmac_sha256_hex("Jefe", "what do ya want for nothing?").starts_with("5bdcc146bf60754e6a042426089575c7"));
+    // a different key makes a different mac over the same body
+    CHECK(signed_with(test_key(0x43), body) != token);
+}
+
+TEST_CASE("file_search volumes: every non-canonical spelling is refused even when it is signed",
           "[file_search][file_search_volumes]") {
     const VolumeCursor c = cursor_at(3, 12);
-    const std::string good = encode_volume_cursor(c);
-    REQUIRE(decode_volume_cursor(good, hash_of(7)).has_value());
-    const std::string inner = good.substr(good.find("fs1:"));
+    const std::string good = encode_volume_cursor(c, kKey);
+    REQUIRE(decode_volume_cursor(good, hash_of(7), kKey).has_value());
+    const std::size_t fs1_at = good.find("fs1:");
+    const std::string inner = good.substr(fs1_at, good.rfind('.') - fs1_at); // without its mac
     const std::string uh = "0123456789abcdef";
     const std::string rh = "fedcba9876543210";
 
-    const std::vector<std::string> bad = {
+    // every body is signed with the agent's key, so only its spelling can refuse it
+    const std::vector<std::string> bodies = {
         "",
         "fsv1",
         "fsv2.3." + uh + "." + rh + "." + inner,           // another version
@@ -472,34 +515,97 @@ TEST_CASE("file_search volumes: every non-canonical or forged spelling is refuse
         "fsv1.3." + uh + "0." + rh + "." + inner,          // long hash
         "fsv1.3." + uh + "." + rh + "x." + inner,
         "fsv1.3." + uh + "." + rh + "." + "xs1:" + inner.substr(4),
-        "fsv1.3." + uh + "." + rh + "." + inner + ".",      // a sixth field
+        "fsv1.3." + uh + "." + rh + "." + inner + ".",      // a seventh field
         "fsv1.3." + uh + "." + rh + "." + inner + ".x",
         "fsv1.3." + uh + "." + rh + "." + inner + "\n",
         "fsv1.3." + uh + "." + rh,                          // no inner token
         "fsv1.3." + uh + "." + rh + ".",
         "fsv1.3." + uh + "." + rh + ".fs1:",                // an inner token with no body
+    };
+    for (const auto& body : bodies) {
+        const std::string t = signed_with(kKey, body);
+        INFO(t);
+        CHECK_FALSE(decode_volume_cursor(t, hash_of(7), kKey).has_value());
+    }
+    // a mac that is not 32 lowercase hex digits, however the rest is spelled
+    const std::string body = good.substr(0, good.rfind('.'));
+    const std::string mac = good.substr(good.rfind('.') + 1);
+    std::string upper = mac;
+    std::ranges::transform(upper, upper.begin(),
+                           [](char ch) { return ch >= 'a' && ch <= 'f' ? static_cast<char>(ch - 32) : ch; });
+    std::vector<std::string> bad = {
+        "",
         " " + good,
         good + " ",
+        body,                              // no mac
+        body + ".",                        // an empty mac
+        body + "." + mac.substr(1),        // 31 digits
+        body + "." + mac + "0",            // 33 digits
+        body + "." + mac.substr(0, 31) + "g",
     };
+    if (upper != mac) // a mac of digits only has no uppercase spelling
+        bad.push_back(body + "." + upper);
     for (const auto& t : bad) {
         INFO(t);
-        CHECK_FALSE(decode_volume_cursor(t, hash_of(7)).has_value());
+        CHECK_FALSE(decode_volume_cursor(t, hash_of(7), kKey).has_value());
     }
     // an inner token of another query, and a hostile one, never decode
-    CHECK_FALSE(decode_volume_cursor(good, hash_of(8)).has_value());
-    CHECK_FALSE(decode_volume_cursor(std::string(100000, 'f'), hash_of(7)).has_value());
+    CHECK_FALSE(decode_volume_cursor(good, hash_of(8), kKey).has_value());
+    CHECK_FALSE(decode_volume_cursor(std::string(100000, 'f'), hash_of(7), kKey).has_value());
     CHECK_FALSE(split_volume_cursor(std::string(100000, '.')).has_value());
 
     // a value the encoder cannot spell is no token
     VolumeCursor oversized = c;
     oversized.index = kMaxVolumes;
-    CHECK(encode_volume_cursor(oversized).empty());
+    CHECK(encode_volume_cursor(oversized, kKey).empty());
     VolumeCursor bad_hash = c;
     bad_hash.units_hash = "nothex";
-    CHECK(encode_volume_cursor(bad_hash).empty());
+    CHECK(encode_volume_cursor(bad_hash, kKey).empty());
     VolumeCursor bad_pos = c;
     bad_pos.inner.position.after = std::string(300, 'a'); // not a position fs1 can spell
-    CHECK(encode_volume_cursor(bad_pos).empty());
+    CHECK(encode_volume_cursor(bad_pos, kKey).empty());
+}
+
+TEST_CASE("file_search volumes: a token edited under its old mac, or signed under another key, is refused",
+          "[file_search][file_search_volumes]") {
+    const VolumeCursor c = cursor_at(2, 5, 0, 7, pos_in("a", "b"));
+    const std::string good = encode_volume_cursor(c, kKey);
+    REQUIRE(decode_volume_cursor(good, hash_of(7), kKey).has_value());
+    const std::string old_mac = good.substr(good.rfind('.') + 1);
+
+    // Each edit is a token the encoder spells correctly; the old mac is the only thing it carries over.
+    VolumeCursor index = c;
+    index.index = 3; // skip a unit
+    VolumeCursor units = c;
+    units.units_hash = "ffffffffffffffff";
+    VolumeCursor refused = c;
+    refused.refused_hash = "ffffffffffffffff";
+    VolumeCursor gaps = c;
+    gaps.inner.prior_gaps = 0; // forget the gaps an earlier slice reported
+    VolumeCursor inner = c;
+    inner.inner.position = pos_in("a", "c");
+    for (const VolumeCursor* edit : {&index, &units, &refused, &gaps, &inner}) {
+        const std::string own = encode_volume_cursor(*edit, kKey);
+        REQUIRE(decode_volume_cursor(own, hash_of(7), kKey).has_value()); // spelled right and signed right
+        const std::string spliced = own.substr(0, own.rfind('.') + 1) + old_mac;
+        INFO(spliced);
+        CHECK_FALSE(decode_volume_cursor(spliced, hash_of(7), kKey).has_value());
+    }
+
+    // another process's key, and a key of the same length that differs in one byte
+    CHECK_FALSE(decode_volume_cursor(good, hash_of(7), test_key(0x43)).has_value());
+    CHECK_FALSE(decode_volume_cursor(encode_volume_cursor(c, test_key(0x43)), hash_of(7), kKey).has_value());
+    CursorKey near_key = kKey;
+    near_key.back() ^= 1;
+    CHECK_FALSE(decode_volume_cursor(good, hash_of(7), near_key).has_value());
+
+    // no single-character edit of the token, anywhere, is accepted
+    for (std::size_t i = 0; i < good.size(); ++i) {
+        std::string t = good;
+        t[i] = t[i] == 'a' ? 'b' : 'a';
+        INFO("position " << i);
+        CHECK_FALSE(decode_volume_cursor(t, hash_of(7), kKey).has_value());
+    }
 }
 
 TEST_CASE("file_search volumes: volume_advances accepts exactly the two transitions",

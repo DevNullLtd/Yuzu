@@ -1,14 +1,22 @@
 // libFuzzer harness for agents/plugins/file_search/src/file_search_volumes.hpp -- the fsv1 volume
 // cursor that carries an on-demand file search across mounts (fsv1.<index>.<units hash>.<refused
-// hash>.<fs1 token>), and the transition rule that decides whether one cursor may follow another.
+// hash>.<fs1 token>.<mac>), and the transition rule that decides whether one cursor may follow another.
 // The token is wholly caller controlled, so the decoder must be total, and every accepted token must
 // be the canonical spelling of what it decodes to (the harness aborts otherwise).
+//
+// THE MAC. A mutation of the raw input almost never carries a valid mac, so it would die at the mac
+// check and the inner decoder would never be reached. Each input is therefore decoded twice: as it
+// came (it must be refused unless it happens to be a token this harness's key signed), and re-signed,
+// with everything after its last dot replaced by the mac of everything before it, so a mutation of any
+// other field reaches the field checks and the inner decoder. The mac is computed here from the HMAC
+// primitive, not by the codec, so the harness is an independent check of what the codec signs.
 //
 // Registered in tests/fuzz/meson.build AND .clusterfuzzlite/build.sh - keep the two in sync when
 // adding sources.
 
 #include "../../agents/plugins/file_search/src/file_search_volumes.hpp"
 #include "../../agents/shared/base64.hpp"
+#include "../../agents/shared/hmac_sha256.hpp"
 
 #include <cstddef>
 #include <cstdint>
@@ -33,13 +41,37 @@ std::string flipped(std::string hash) {
     return hash;
 }
 
+fs::CursorKey key_of(unsigned char fill) {
+    fs::CursorKey k{};
+    k.fill(fill);
+    return k;
+}
+
+/// `body` + "." + the first 16 bytes (32 hex digits) of HMAC-SHA-256 of `body` under `key`.
+std::string sign(const fs::CursorKey& key, std::string_view body) {
+    const std::string_view k(reinterpret_cast<const char*>(key.data()), key.size());
+    return std::string(body) + "." + yuzu::shared::hmac_sha256_hex(k, body).substr(0, fs::kCursorMacHexBytes);
+}
+
 } // namespace
 
 extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size) {
-    const std::string_view token(reinterpret_cast<const char*>(data), size);
+    static const fs::CursorKey kKey = key_of(0x5a);
+    static const fs::CursorKey kOtherKey = key_of(0xa5);
+
+    const std::string_view raw(reinterpret_cast<const char*>(data), size);
+    // As it came: total, and never accepted without a valid mac (which a mutation cannot make).
+    if (const auto as_is = fs::decode_volume_cursor(raw, fsr::QueryHash{}, kKey))
+        require(fs::encode_volume_cursor(*as_is, kKey) == raw);
+
+    // Re-signed: everything after the last dot is replaced by the mac of everything before it.
+    const auto last_dot = raw.rfind('.');
+    const std::string resigned =
+        last_dot == std::string_view::npos ? std::string(raw) : sign(kKey, raw.substr(0, last_dot));
+    const std::string_view token = resigned;
 
     // The expected query hash is lifted from the inner fs1 token's own body (bytes 1..16) when the
-    // token has five well-formed fields, so mutations reach the inner decoder instead of dying at
+    // token has six well-formed fields, so mutations reach the inner decoder instead of dying at
     // query_mismatch.
     fsr::QueryHash expected{};
     if (const auto fields = fs::split_volume_cursor(token)) {
@@ -51,13 +83,15 @@ extern "C" int LLVMFuzzerTestOneInput(const std::uint8_t* data, std::size_t size
                         expected[i] = static_cast<std::uint8_t>((*body)[1 + i]);
     }
 
-    const auto r = fs::decode_volume_cursor(token, expected);
+    const auto r = fs::decode_volume_cursor(token, expected, kKey);
     if (!r) {
-        (void)fs::decode_volume_cursor(token, fsr::QueryHash{}); // total whatever the expected hash is
+        (void)fs::decode_volume_cursor(token, fsr::QueryHash{}, kKey); // total whatever the expected hash is
         return 0;
     }
+    // A token signed under one key is nothing under another.
+    require(!fs::decode_volume_cursor(token, expected, kOtherKey));
     require(r->index < fs::kMaxVolumes);
-    require(fs::encode_volume_cursor(*r) == token); // canonical by proof
+    require(fs::encode_volume_cursor(*r, kKey) == token); // canonical by proof
 
     // The transition validator, on whatever was accepted. A cursor never advances to itself.
     require(!fs::volume_advances(*r, *r));

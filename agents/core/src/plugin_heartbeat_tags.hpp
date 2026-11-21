@@ -21,7 +21,7 @@
  * agent's contribution via IEEE-754. A plugin publishing more than
  * kPluginHeartbeatMaxKeys keys has the excess silently dropped (sorted,
  * truncated) with no warning to the plugin author. file_search publishes exactly the cap, so a ninth
- * key there would be dropped; every other consumer publishes at most 6 (component_inventory).
+ * key there would be dropped; every other consumer publishes at most 6 (component_inventory is the widest).
  */
 
 #include <wire_utf8.hpp> // scrub_wire_bytes: heartbeat tag values must be UTF-8

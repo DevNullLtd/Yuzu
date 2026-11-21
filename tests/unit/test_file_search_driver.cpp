@@ -59,6 +59,13 @@ using yuzu::component_inventory::ListResult;
 
 namespace {
 
+/// A fixed cursor key for the rig; `other` makes a key the agent under test does not hold.
+CursorKey test_key(unsigned char fill = 0x42) {
+    CursorKey k{};
+    k.fill(fill);
+    return k;
+}
+
 // ---- the world ----
 
 struct Rig {
@@ -99,6 +106,7 @@ struct Rig {
         };
         b.now = [this] { return fs.clock; };
         b.sleep = [this](std::chrono::milliseconds d) { fs.clock += d; };
+        b.cursor_key = test_key();
         fs.add_dir("/r");
         mounts.add("/", "ext4", "8:1");
     }
@@ -891,8 +899,8 @@ TEST_CASE("file_search driver: a stall count belongs to one cursor, and an evict
     rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
     rig.mode = Rig::Mode::reject;
     const auto attempt = [&](std::uint64_t seq, std::uint32_t gen = 0) {
-        return run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(cursor_at(rig, 0, seq, gen))), rig.b)
-            .reason;
+        const std::string token = encode_volume_cursor(cursor_at(rig, 0, seq, gen), rig.b.cursor_key);
+        return run_slice(make_request(kCtl, "/r", "files", token), rig.b).reason;
     };
 
     CHECK(attempt(1) == "rejected");
@@ -976,7 +984,7 @@ TEST_CASE("file_search driver: the slice maximum ends the search with its own re
     rig.fs.add_file("/r/data/yuzu-fs-control-2.bin", "");
     rig.fs.add_file("/r/data/other.txt", ""); // a second entry, so a one-entry budget cuts the walk
     const auto cursor_at_seq = [&](std::size_t index, std::uint64_t seq) {
-        return encode_volume_cursor(cursor_at(rig, index, seq));
+        return encode_volume_cursor(cursor_at(rig, index, seq), rig.b.cursor_key);
     };
     // the next cursor would be number kMaxSlices: the first unit finishes, the second is never searched
     const SliceResult end = run_slice(make_request(kCtl, "/r", "files", cursor_at_seq(0, kMaxSlices - 1)), rig.b);
@@ -1033,14 +1041,28 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
 
     VolumeCursor foreign = good; // another query's cursor
     foreign.inner.query_hash[0] ^= 0xFF;
-    const std::string good_token = encode_volume_cursor(good);
-    const std::string inner = good_token.substr(good_token.find("fs1:"));
+    const std::string good_token = encode_volume_cursor(good, rig.b.cursor_key);
+    const std::size_t fs1_at = good_token.find("fs1:");
+    const std::string inner = good_token.substr(fs1_at, good_token.rfind('.') - fs1_at); // without its mac
+    const auto signed_with = [](const CursorKey& key, const std::string& text) {
+        return text + "." + detail::cursor_mac(key, text);
+    };
+    const std::string body = good_token.substr(0, good_token.rfind('.'));
+    std::string flipped_mac = good_token; // one digit of the mac changed
+    flipped_mac.back() = flipped_mac.back() == '0' ? '1' : '0';
     const std::vector<std::string> forged = {
         "fs1:AAAA",
         "garbage",
-        encode_volume_cursor(foreign),
-        "fsv1.64." + plan.units_hash + "." + plan.refused_hash + "." + inner, // an index of kMaxVolumes
-        "fsv1.0.ZZZZZZZZZZZZZZZZ." + plan.refused_hash + "." + inner,         // a hash that is not hex
+        encode_volume_cursor(foreign, rig.b.cursor_key),
+        // spelled as no token can be, even under the agent's own key
+        signed_with(rig.b.cursor_key, "fsv1.64." + plan.units_hash + "." + plan.refused_hash + "." + inner), // kMaxVolumes
+        signed_with(rig.b.cursor_key, "fsv1.0.ZZZZZZZZZZZZZZZZ." + plan.refused_hash + "." + inner),        // not hex
+        // right spelling, but not signed by this agent process
+        body,                                           // no mac at all
+        signed_with(test_key(0x43), body),              // another process's key
+        flipped_mac,
+        good_token + "0",                               // a mac one digit long
+        good_token.substr(0, good_token.size() - 1),
     };
     for (const auto& c : forged) {
         const SliceResult r = run_slice(make_request(kCtl, "/r", "files", c), rig.b);
@@ -1055,7 +1077,8 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     // a well-formed cursor of a changed unit set ends the search once the table has been read
     VolumeCursor moved = good;
     moved.units_hash = "ffffffffffffffff";
-    const SliceResult changed = run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(moved)), rig.b);
+    const SliceResult changed =
+        run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(moved, rig.b.cursor_key)), rig.b);
     CHECK(changed.status == Status::failed);
     CHECK(changed.reason == "mount_table_changed");
     CHECK(changed.cursor.empty());
@@ -1065,7 +1088,87 @@ TEST_CASE("file_search driver: a forged cursor is refused before any boundary is
     // the right hashes with a unit index past the plan are refused too
     VolumeCursor past = good;
     past.index = 5;
-    CHECK(run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(past)), rig.b).status == Status::invalid);
+    CHECK(run_slice(make_request(kCtl, "/r", "files", encode_volume_cursor(past, rig.b.cursor_key)), rig.b).status ==
+          Status::invalid);
+}
+
+TEST_CASE("file_search driver: a cursor this agent did not issue cannot finish a search over volumes it never searched",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.mounts.add("/r/usb", "vfat", "8:9").add("/r/more", "ext4", "8:2");
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/more/yuzu-fs-control-2.bin", "");
+    const VolumePlan plan = rig.plan();
+    REQUIRE(plan.units.size() == 2);   // the root's mount, then /r/more
+    REQUIRE(plan.refused.size() == 1); // the vfat mount at /r/usb
+
+    // The honest search reads partial: the refused mount was never searched.
+    const Run honest = search(rig, kCtl);
+    REQUIRE(honest.slices.size() == 2);
+    CHECK(starts(row_of(honest.last(), "coverage|"), "coverage|partial|"));
+    CHECK(count_rows(honest, "volume|/r/usb|vfat|not_searched|fstype_not_allowed|") == 1);
+
+    // A caller builds the token that would end the search at its last unit, with no gap carried and both
+    // hashes read off the plan, and signs it with a key it holds. The agent refuses it: no mount table is
+    // read, no worker is started, no coverage is stated.
+    const VolumeCursor last_unit = cursor_at(rig, 1, 1);
+    rig.mount_reads = 0;
+    rig.runner_calls = 0;
+    const SliceResult forged = run_slice(
+        make_request(kCtl, "/r", "files", encode_volume_cursor(last_unit, test_key(0x43))), rig.b);
+    CHECK(forged.status == Status::invalid);
+    CHECK(forged.reason == "bad_cursor");
+    CHECK(forged.rows.size() == 1);
+    CHECK(forged.cursor.empty());
+    CHECK(rig.mount_reads == 0);
+    CHECK(rig.runner_calls == 0);
+
+    // Control: the same cursor signed with the agent's own key is believed. The key is the only barrier.
+    const SliceResult trusted = run_slice(
+        make_request(kCtl, "/r", "files", encode_volume_cursor(last_unit, rig.b.cursor_key)), rig.b);
+    CHECK(trusted.status == Status::ok);
+    CHECK(rig.mount_reads == 1);
+}
+
+TEST_CASE("file_search driver: a cursor from before an agent restart is refused and the search starts again",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.mounts.add("/r/more", "ext4", "8:2");
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.fs.add_file("/r/more/yuzu-fs-control-2.bin", "");
+    const SliceResult first = run_slice(make_request(kCtl), rig.b);
+    REQUIRE(first.status == Status::ok);
+    REQUIRE_FALSE(first.cursor.empty());
+
+    rig.b.cursor_key = test_key(0x77); // a new process draws a new key
+    rig.mount_reads = 0;
+    const SliceResult after = run_slice(make_request(kCtl, "/r", "files", first.cursor), rig.b);
+    CHECK(after.status == Status::invalid);
+    CHECK(after.reason == "bad_cursor");
+    CHECK(rig.mount_reads == 0);
+
+    // Starting again needs no cursor and finishes the search under the new key.
+    const Run again = search(rig, kCtl);
+    CHECK(again.last().status == Status::ok);
+    CHECK(again.last().cursor.empty());
+    CHECK(starts(row_of(again.last(), "coverage|"), "coverage|complete|"));
+}
+
+TEST_CASE("file_search driver: a cursor key nobody set is refused before a cursor, a mount table or a worker",
+          "[file_search][file_search_driver]") {
+    Rig rig;
+    rig.fs.add_file("/r/yuzu-fs-control-1.bin", "");
+    rig.b.cursor_key = CursorKey{}; // the default: all zero
+    const std::vector<std::string> cursors = {"", "fsv1.0.0123456789abcdef.fedcba9876543210.fs1:AAAA.00000000000000000000000000000000"};
+    for (const std::string& cursor : cursors) {
+        const SliceResult r = run_slice(make_request(kCtl, "/r", "files", cursor), rig.b);
+        CHECK(r.status == Status::failed);
+        CHECK(r.reason == "internal_error");
+        CHECK(r.cursor.empty());
+    }
+    CHECK(rig.mount_reads == 0);
+    CHECK(rig.runner_calls == 0);
+    CHECK(rig.legs.empty());
 }
 
 TEST_CASE("file_search driver: an unreadable or malformed mount table ends the slice with no walk",
@@ -1197,7 +1300,7 @@ TEST_CASE("file_search driver: a refused mount appearing between slices is repor
     REQUIRE_FALSE(two.cursor.empty());
     CHECK(count_rows(Run{{two}}, "volume|/r/tmpx|tmpfs|not_searched|fstype_not_allowed|") == 1);
     const auto qh = fsr::query_hash(make_request(kCtl).query);
-    const auto next = decode_volume_cursor(two.cursor, qh);
+    const auto next = decode_volume_cursor(two.cursor, qh, rig.b.cursor_key);
     REQUIRE(next.has_value());
     CHECK(next->inner.prior_gaps == 1); // the count rose
     CHECK(next->refused_hash == rig.plan().refused_hash);
@@ -1220,7 +1323,7 @@ TEST_CASE("file_search driver: a resumed slice whose unit root can no longer be 
     const SliceResult one = run_slice(make_request(kCtl), rig.b);
     REQUIRE(one.status == Status::ok);
     REQUIRE_FALSE(one.cursor.empty());
-    const auto cursor = decode_volume_cursor(one.cursor, fsr::query_hash(make_request(kCtl).query));
+    const auto cursor = decode_volume_cursor(one.cursor, fsr::query_hash(make_request(kCtl).query), rig.b.cursor_key);
     REQUIRE(cursor.has_value());
     REQUIRE_FALSE(cursor->inner.position == fsr::Position{}); // a position inside the unit, not a fresh start
 
