@@ -440,9 +440,8 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
 
 AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
     // inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>], machine-context MSI
-    // products. The producer now sends a sixth token (the registry-map upgrade code); it has no
-    // installed_software slot on this branch, so it is read past and ignored, and a five-token
-    // row is still accepted.
+    // products. The sixth token (the registry-map upgrade code) is read past and mapped to no
+    // entry field; a five-token row is still accepted.
     // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
     // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
     // malformed. A constrained status (an enumeration error or a failed property

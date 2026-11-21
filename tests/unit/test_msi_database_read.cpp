@@ -59,8 +59,9 @@ TEST_CASE("msi database read: the slot is free again once a read has returned",
 #ifndef _WIN32
 
 TEST_CASE("msi database read: off Windows the API is unavailable", "[msi_packages][msi_database_read]") {
-    static msi::SingleFlightSlot slot;
-    const auto r = msi::read_property_table(slot, "/nowhere.msi", milliseconds{30000});
+    // The exported, process-wide overload the plugin calls: nothing else takes that slot off
+    // Windows, so it cannot be Busy, and the worker must have released it by the time it returns.
+    const auto r = msi::read_property_table("/nowhere.msi", milliseconds{30000});
     REQUIRE(r.status == msi::ReadStatus::Completed);
     CHECK(r.outcome.kind == msi::Outcome::Kind::ApiUnavailable);
     CHECK(r.outcome.props.product_code.empty());

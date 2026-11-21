@@ -8,9 +8,10 @@
  * shapes a registry does not hold (a missing package, a corrupt one, a timeout, a busy slot,
  * a ceiling rejection, row breakers) are built in the test.
  *
- * Nothing here opens a file, a registry key or a process: the host is a fake that records
- * what it was asked, and the handle a package open holds is a counter, so the test can prove
- * the handle is held while the database is read.
+ * No registry key, package or process is opened: the OS boundary is a fake that records what
+ * it was asked, and the handle a package open holds is a counter, so the test can prove the
+ * handle is held while the database is read. The only files read are the committed fixture
+ * and, in the lexical case, four source files (small, local, read once).
  */
 #include <catch2/catch_test_macros.hpp>
 

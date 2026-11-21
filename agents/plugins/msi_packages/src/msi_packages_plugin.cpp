@@ -229,29 +229,27 @@ constexpr REGSAM kRead64 = KEY_READ | KEY_WOW64_64KEY;
 
 bool key_absent(LSTATUS rc) { return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND; }
 
-// Reads one string value into `out`. 0 on success, with `out` empty when the value is
-// absent; else the failing code. A value that is not a string (ERROR_INVALID_DATA) or is
-// longer than kMaxValueChars (ERROR_MORE_DATA) is a failure, never a silent empty.
-unsigned read_string_value(HKEY key, const wchar_t* name, std::string& out) {
-    out.clear();
+// Reads one string value. An absent value is an empty string; any failure is the code. A value
+// that is not a string (ERROR_INVALID_DATA) or is longer than kMaxValueChars (ERROR_MORE_DATA)
+// is a failure, never a silent empty.
+std::expected<std::string, unsigned> read_string_value(HKEY key, const wchar_t* name) {
     DWORD type = 0;
     DWORD bytes = 0;
     LSTATUS rc = RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes);
     if (rc == ERROR_FILE_NOT_FOUND)
-        return 0;
+        return std::string{};
     if (rc != ERROR_SUCCESS)
-        return static_cast<unsigned>(rc);
+        return std::unexpected(static_cast<unsigned>(rc));
     if (type != REG_SZ && type != REG_EXPAND_SZ)
-        return ERROR_INVALID_DATA;
+        return std::unexpected(static_cast<unsigned>(ERROR_INVALID_DATA));
     if (bytes > rec::kMaxValueChars * sizeof(wchar_t))
-        return ERROR_MORE_DATA;
+        return std::unexpected(static_cast<unsigned>(ERROR_MORE_DATA));
     std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 1, L'\0');
     DWORD got = bytes;
     rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &got);
     if (rc != ERROR_SUCCESS)
-        return static_cast<unsigned>(rc);
-    out = yuzu::win::reg_sz_to_utf8(buf.data(), got);
-    return 0;
+        return std::unexpected(static_cast<unsigned>(rc));
+    return yuzu::win::reg_sz_to_utf8(buf.data(), got);
 }
 
 // Calls on_name(std::string) -> bool (false = stop) for each subkey name of `key`. 0 when the
@@ -309,9 +307,12 @@ read_install_properties(const std::string& packed) {
                   {L"Publisher", &p.publisher},            {L"InstallLocation", &p.install_location},
                   {L"InstallSource", &p.install_source},   {L"LocalPackage", &p.local_package},
                   {L"InstallDate", &p.install_date}};
-    for (const auto& v : values)
-        if (const unsigned vrc = read_string_value(key.get(), v.name, *v.dest); vrc != 0)
-            return std::unexpected(rec::registry_failure_token(vrc));
+    for (const auto& v : values) {
+        auto value = read_string_value(key.get(), v.name);
+        if (!value)
+            return std::unexpected(rec::registry_failure_token(value.error()));
+        *v.dest = std::move(*value);
+    }
     return p;
 }
 
@@ -334,17 +335,19 @@ std::vector<std::string> read_profile_roots() {
     std::string profiles_dir;
     yuzu::win::RegKey list;
     if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0, kRead64, list.put()) ==
-            ERROR_SUCCESS &&
-        read_string_value(list.get(), L"ProfilesDirectory", profiles_dir) != 0)
-        profiles_dir.clear();
+        ERROR_SUCCESS) {
+        if (auto dir = read_string_value(list.get(), L"ProfilesDirectory"))
+            profiles_dir = std::move(*dir);
+    }
     if (profiles_dir.empty())
         profiles_dir = "%SystemDrive%\\Users";
     const std::wstring expanded = yuzu::win::expand_env_strings(yuzu::win::to_wide(profiles_dir));
     roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
+    // The shared builder owns the system-profile filter (and drops a duplicated SID).
     const auto profiles = yuzu::win::enumerate_profile_list();
-    for (const auto& p : profiles.records)
-        if (!p.profile_image_path.empty() && !yuzu::profiles::is_system_sid(p.sid))
-            roots.push_back(p.profile_image_path);
+    for (const auto& p : yuzu::profiles::build_profile_list(profiles.records, {}))
+        if (!p.profile_path.empty())
+            roots.push_back(p.profile_path);
     return roots;
 }
 

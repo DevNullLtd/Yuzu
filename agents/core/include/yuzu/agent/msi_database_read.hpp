@@ -106,7 +106,9 @@ public:
         busy_.notify_all();
     }
     [[nodiscard]] bool in_flight() const noexcept { return busy_.load(std::memory_order_acquire); }
-    /// Blocks until the slot is free (no polling). For quiesce and for tests.
+    /// Blocks until the slot is free, with no polling and no timeout. For tests: a production
+    /// wait must be bounded, which is why the plugin's shutdown quiesce polls read_in_flight()
+    /// against a deadline.
     void wait_free() const noexcept { busy_.wait(true, std::memory_order_acquire); }
 
 private:

@@ -2204,9 +2204,9 @@ TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_package
         CHECK(r.entries.empty());
     }
     SECTION("a 6-token row with an empty sixth token maps exactly as the 5-token row does") {
-        // The producer sends the registry-map upgrade code as a sixth token. Until the consuming
-        // adapter lands the token is read past, so an EMPTY sixth token (no single upgrade code
-        // for the product) must map identically; this case holds before and after that adapter.
+        // The producer sends the registry-map upgrade code as a sixth token. An EMPTY sixth token
+        // (no single upgrade code for the product) must map exactly as the five-token row does,
+        // whether the adapter reads past the token or consumes it.
         const auto five = parse_msi_packages_list_inventory_output(nl({ok_status, good}));
         const auto six = parse_msi_packages_list_inventory_output(nl({ok_status, good + "|"}));
         REQUIRE(five.status == Status::ok);

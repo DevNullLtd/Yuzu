@@ -7,6 +7,7 @@
 
 #include <bounded_wait.hpp> // yuzu::shared::bounded_call_ex (agents/shared)
 
+#include <expected>
 #include <utility>
 
 #ifdef _WIN32
@@ -61,16 +62,15 @@ private:
     MSIHANDLE h_ = 0;
 };
 
-// Reads string field `field` of `rec` into `out`. ERROR_SUCCESS, or the failing code
-// (ERROR_MORE_DATA when the value is longer than kMaxPropertyChars).
-UINT read_field(MSIHANDLE rec, unsigned field, std::wstring& out) {
+// Reads string field `field` of `rec`. The failing code on error (ERROR_MORE_DATA when the
+// value is longer than kMaxPropertyChars).
+std::expected<std::wstring, UINT> read_field(MSIHANDLE rec, unsigned field) {
     std::wstring buf(kMaxPropertyChars + 1, L'\0');
     DWORD cch = static_cast<DWORD>(buf.size());
     const UINT rc = ::MsiRecordGetStringW(rec, field, buf.data(), &cch);
     if (rc != ERROR_SUCCESS)
-        return rc;
-    out.assign(buf.c_str()); // cut at the first NUL, as the registry readers do
-    return ERROR_SUCCESS;
+        return std::unexpected(rc);
+    return std::wstring(buf.c_str()); // cut at the first NUL, as the registry readers do
 }
 
 // Only the five Property rows the plugin reads; every other row is skipped by name.
@@ -128,26 +128,24 @@ Outcome read_worker(const std::string& path_utf8) {
                 out.rc = rc != ERROR_SUCCESS ? rc : ERROR_MORE_DATA;
                 return out;
             }
-            std::wstring name;
-            rc = read_field(rec.get(), 1, name);
-            if (rc == ERROR_MORE_DATA)
-                continue; // a name this long is none of the five wanted ones
-            if (rc != ERROR_SUCCESS) {
+            const auto name = read_field(rec.get(), 1);
+            if (!name) {
+                if (name.error() == ERROR_MORE_DATA)
+                    continue; // a name this long is none of the five wanted ones
                 out.kind = Outcome::Kind::ReadFailed;
-                out.rc = rc;
+                out.rc = name.error();
                 return out;
             }
-            std::string* dest = slot_for(out.props, name);
+            std::string* dest = slot_for(out.props, *name);
             if (dest == nullptr)
                 continue;
-            std::wstring value;
-            rc = read_field(rec.get(), 2, value);
-            if (rc != ERROR_SUCCESS) {
+            const auto value = read_field(rec.get(), 2);
+            if (!value) {
                 out.kind = Outcome::Kind::ReadFailed;
-                out.rc = rc; // ERROR_MORE_DATA: a wanted value over the character cap
+                out.rc = value.error(); // ERROR_MORE_DATA: a wanted value over the character cap
                 return out;
             }
-            *dest = yuzu::win::from_wide(value.c_str());
+            *dest = yuzu::win::from_wide(value->c_str());
         }
         out.kind = Outcome::Kind::Ok;
         return out;

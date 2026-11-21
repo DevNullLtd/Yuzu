@@ -345,8 +345,8 @@ TEST_CASE("msi_packages plugin: installer_records answers a leading status row a
     REQUIRE(status.size() == 4);
     CHECK(status[0] == "status");
     CHECK(status[1] == "installer_records");
-    // A refused identity (the UserData tree is for SYSTEM and administrators) is a legitimate
-    // constrained answer; what it must never be is unsupported on Windows.
+    // An identity the UserData tree refuses gets a legitimate constrained answer; what it must
+    // never be is unsupported on Windows.
     CHECK((status[2] == "supported" || status[2] == "constrained"));
     if (status[2] == "supported")
         CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
