@@ -15,10 +15,6 @@
 #include <string>
 #include <vector>
 
-#ifndef YUZU_TEST_FIXTURE_DIR
-#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
-#endif
-
 using yuzu::server::MatchResult;
 using yuzu::server::MatchTier;
 using yuzu::server::NormalizedTitle;

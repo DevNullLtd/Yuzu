@@ -7,7 +7,6 @@
 #include "software_normalization_pack.hpp"
 
 #include <algorithm>
-#include <array>
 #include <map>
 #include <set>
 #include <string>
@@ -353,41 +352,26 @@ TEST_CASE("a title that resolved through a re-keyed seed alias still resolves to
           "[normalization][pack]") {
     // Two seed rows changed their stored alias key: the dangling "-" of ".NET Runtime - 8.0.1"
     // and the "@3" of the Homebrew formula are no longer part of the normalised title. The
-    // alias key a title now forms is the key the NEW seed holds, and it names the product the
-    // old key named, so a pack loaded from this seed resolves both exactly as before.
+    // key a title now forms is the one the NEW seed holds, and it names the product the old key
+    // named, so a pack loaded from this seed resolves both exactly as before.
     const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
-    struct Case {
-        const char* ecosystem;
-        const char* raw_name;
-        const char* raw_publisher;
-        const char* old_alias_key; ///< what the pre-SAM-51 normaliser formed (and stored)
-        const char* new_alias_key;
-        const char* norm_key;      ///< the product both keys resolve to
-    };
-    const std::array<Case, 2> cases{{
-        {"windows", "Microsoft .NET Runtime - 8.0.1 (x64)", "Microsoft Corporation",
-         "microsoft .net runtime -", "microsoft .net runtime", "microsoft:.net runtime"},
-        {"brew", "openssl@3", "", "openssl@3", "openssl", "openssl:openssl"},
-    }};
-    for (const auto& c : cases) {
-        CAPTURE(c.ecosystem, c.raw_name);
-        const std::string key = alias_key(normalize_title(c.raw_name));
-        CHECK(key == c.new_alias_key);
-        CHECK(key != c.old_alias_key); // the stored key of an older pack no longer matches
-        const std::string publisher = normalize_vendor(c.raw_publisher);
-        const auto row = std::find_if(p->rows.begin(), p->rows.end(), [&](const PackRow& r) {
-            return r.ecosystem == c.ecosystem && r.raw_name == key &&
-                   (r.raw_publisher.empty() || r.raw_publisher == publisher);
+    const auto key_of = [&](const char* ecosystem, const std::string& alias) -> std::string {
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(), [&](const PackRow& r) {
+            return r.ecosystem == ecosystem && r.raw_name == alias;
         });
-        REQUIRE(row != p->rows.end());
-        CHECK(row->norm_key == c.norm_key);
-    }
+        return it == p->rows.end() ? std::string{"<no row>"} : it->norm_key;
+    };
+    const std::string dotnet = alias_key(normalize_title("Microsoft .NET Runtime - 8.0.1 (x64)"));
+    CHECK(dotnet == "microsoft .net runtime");
+    CHECK(dotnet != "microsoft .net runtime -"); // the key a pre-SAM-51 pack stored
+    CHECK(key_of("windows", dotnet) == "microsoft:.net runtime");
+
+    const std::string brew = alias_key(normalize_title("openssl@3"));
+    CHECK(brew == "openssl");
+    CHECK(brew != "openssl@3"); // the key a pre-SAM-51 pack stored
+    CHECK(key_of("brew", brew) == "openssl:openssl");
     // A server that still holds the OLD pack forms the new key `openssl` for `openssl@3`: the
     // generic any-ecosystem `openssl` row (unchanged by SAM-51) names the same product.
-    const auto generic = std::find_if(p->rows.begin(), p->rows.end(), [](const PackRow& r) {
-        return r.ecosystem.empty() && r.raw_name == "openssl" && r.raw_publisher.empty();
-    });
-    REQUIRE(generic != p->rows.end());
-    CHECK(generic->norm_key == "openssl:openssl");
+    CHECK(key_of("", "openssl") == "openssl:openssl");
 }
