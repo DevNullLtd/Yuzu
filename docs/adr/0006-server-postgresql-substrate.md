@@ -129,9 +129,9 @@ scaffolding were dropped, not migrated. Full record: `docs/auth-architecture.md`
 persistent authentication store" and `.claude/agents/authdb.md`; ladder entry:
 `docs/postgres-migration-ladder.md` "Done".
 
-## Proposed amendment (2026-11-21) — retention-bound cold records
+## Amendment (2026-11-21) — retention-bound cold records
 
-**Status: proposed.** This amendment would permit ClickHouse to serve as the cold store of
+**Design approved by the platform owner on 2026-11-21.** This amendment permits ClickHouse to serve as the cold store of
 record for append-only, retention-bound records. A feature using the exception must specify
 the record, retention period, authorized reads, export acknowledgement and safe reap rule.
 The first proposed use is finalized criteria-run verdicts (ADR-0075 R11). Migrating command
@@ -148,6 +148,36 @@ through core after the warm copy expires. A caller denied on the warm read recei
 same denial on the cold read. Failed or partially acknowledged exports leave the warm
 evidence readable under the same gates. Core retries idempotently and permits the warm
 reaper to remove the records only after the retention deadline and confirmed export.
+
+### PostgreSQL capacity during an export outage
+
+Before enabling the export-dependent reap rule, bound the total warm space that criteria runs
+can consume across all core replicas. Every create and re-run must atomically reserve capacity
+before writing cohort members or scheduling collection. Use a conservative byte bound for the
+admitted cohort, including its largest permitted terminal representation and indexes. Charge
+existing warm records and outstanding reservations, including runs still gathering. Keep the
+charge through export acknowledgement until the warm storage is reaped and reusable. Recover
+reservations after restart and reconcile existing warm runs before opening admission on upgrade.
+
+Keep separate operational headroom for ordinary PostgreSQL transactions, WAL and maintenance.
+If the request cannot fit even with an empty backlog, report the supported size limit. If the
+backlog consumes the budget, headroom is low, or capacity cannot be established, refuse new
+criteria work before materialization with a retryable capacity error. Ordinary reads and
+unrelated writes continue. Admitted runs have room to finish, and unexported verdicts remain
+available. Resume admission after pressure falls below a recovery threshold.
+
+Page export work from PostgreSQL with bounded batches and concurrency. Release database
+transactions and connections before waiting on ClickHouse. On a sink outage, back off retries
+with jitter and bound recovery throughput. Report charged bytes, available headroom, oldest
+unexported age and admission refusals so an operator can distinguish a backlog from an
+oversized request.
+
+Verify with ClickHouse offline, concurrent fleet-sized create and re-run requests on multiple
+core replicas, a core restart and ordinary PostgreSQL traffic. The acceptance criteria are
+bounded warm usage and retry load, completion of previously admitted runs, and continued
+unrelated database service within its operating targets. Restore ClickHouse and verify exact
+export counts, safe reaping and automatic resumption of admission. Size the default budget
+and thresholds using measured storage and WAL growth before enabling this feature.
 
 The implementing change enables that guarantee when cold export ships. A release containing
 only the warm implementation documents its warm-only retention in the operator manual and
