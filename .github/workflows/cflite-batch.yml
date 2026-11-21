@@ -66,6 +66,8 @@ on:
     # KEEP IN SYNC with cflite-pr.yml's paths (and .clusterfuzzlite/build.sh).
     paths:
       - 'agents/shared/file_search_*'
+      - 'agents/plugins/file_search/src/file_search_*'
+      - 'agents/plugins/component_inventory/src/component_walk*'
       - 'agents/shared/base64*'
       - 'agents/shared/wire_utf8*'
       - 'agents/shared/sha256*'

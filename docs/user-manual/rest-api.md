@@ -11696,6 +11696,11 @@ Its audit detail is marked `protective_exempt=true` (`protective_exempt=partial`
 rule delivery, disable or remove the rules instead. The response returns the row that was **written**,
 not the effective state, in the same shape as the `GET` above.
 
+**Plugins that start off.** `execution_artifacts`, `browser_inventory`, `privacy_permissions`,
+`remote_access_audit`, `process_introspect` and `file_search` are seeded as switched off when the server
+starts, and a restart does not overwrite a choice an operator has made. Turn one on with this `PUT` and
+`enabled` set to `true`.
+
 **Errors:** `400` (invalid JSON, missing or non-boolean `enabled`, non-string `reason`, invalid
 plugin/action/os/reason, or `?os=` present but empty), `413`, `500` (the store write failed and may or
 may not have been applied: see "After a `500`" below), `503` (store unavailable, or the audit row could not be saved).
