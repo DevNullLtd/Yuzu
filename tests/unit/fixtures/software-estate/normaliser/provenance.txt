@@ -1,0 +1,55 @@
+Normaliser fixture: s2_cases.tsv
+================================
+
+Loaded by tests/unit/server/test_product_normalize.cpp (the "S-2" test cases) through
+YUZU_TEST_FIXTURE_DIR. Columns: kind (title or vendor), input, wanted normalised title or vendor,
+wanted edition, wanted version, defect (1 to 7; 0 = a control row that must not change).
+
+Where the inputs came from
+--------------------------
+The S-2 proxy spike (2026-11-03) ran the SAM.4 normaliser over the installed-software lists of
+three developer machines: a macOS laptop, a Windows 11 host and Ubuntu 26.04 under WSL. Only the
+product name and publisher strings were kept. The rows marked CAPTURED below are strings
+present verbatim in that list; the rest are SYNTHETIC: written for this fixture to probe a rule
+boundary or to pin a form that must not move, and not claimed to be captured from any device.
+
+CAPTURED titles (defects 1 to 4 and 6)
+  Home                                                              macOS app
+  Pro Display Calibrator                                            macOS app
+  7-Zip 26.04 (x64 edition)                                         Windows Installer product
+  Microsoft Visual C++ 2015-2022 Redistributable (x86) - 14.44.35211
+  Microsoft Visual C++ v14 Redistributable (x64) - 14.50.35719
+  Windows Software Development Kit - Windows 10.0.26100.7705
+  python@3.14, postgresql@18, erlang@28                             Homebrew formulae
+  python3.14, postgresql-18, gcc-15                                 deb packages
+CAPTURED vendors
+  macOS Software Signing, Microsoft Corporation, Python Software Foundation
+
+SYNTHETIC rows
+  Defect 5 probes: Software AG, Software, Example L.L.C. (the S-2 report probed "Software AG",
+    "Software" and "L.L.C." by hand; "Example L.L.C." shows the suffix stripped from a name).
+  Defect 7: Microsoft Office Professional Plus 2019 - en-us (an S-2 probe of the documented Office
+    installer naming, not a captured title). Pinned as it is today, with the plus and locale words
+    still in the title; the issue below tracks the decision.
+  Controls: Windows 11 Pro, Microsoft Office Home and Business 2019, 7-Zip 23.01 (x64), the
+    Visual C++ 2015-2022 (x64), 2013 and 2010 rows, and the vendors Adobe Systems Incorporated,
+    Oracle America, Inc., The Apache Software Foundation, Check Point Software Technologies Ltd.,
+    L.L.C., Example Software GmbH & Co. KG, Example S.A.S., Example KG, Example Co.
+
+Issues (one per reproduced defect, plus two for behaviour this fixture pins and does not change)
+  #8443  defect 1  a lone edition word normalises to an empty title
+  #8444  defect 2  a leading edition word is taken as a false edition
+  #8445  defect 3  "edition)" survives after an architecture word
+  #8446  defect 4  a bare "-" separator is left in the title
+  #8447  defect 5  vendor suffix words stripped anywhere, and a vendor reduced to nothing
+  #8448  defect 6  versions inside names (name@version fixed; glued versions are a design limit)
+  #8449  defect 7  "Plus" and the locale suffix stay in the title (not fixed)
+  #8450  control   single-year Visual C++ titles share one title across generations (not changed)
+  #8451  control   compound legal forms are not reduced (not changed)
+
+Reproduction: against the normaliser at the base commit 0c68ac5043, 18 of the 34 rows fail: every
+row of defects 1 to 5, the name@version rows of defect 6, the defect 7 row (by its dangling dash),
+the three Visual C++ control rows (by their dangling dash) and the Example Software GmbH & Co. KG
+control (it changes once, by design). All 34 pass after the fix. The glued-version rows of defect 6
+(python3.14, postgresql-18, gcc-15) and the other controls pass on both: they pin behaviour that
+must not move. The old output of each failing row is in the PR body.

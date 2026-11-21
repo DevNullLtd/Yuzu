@@ -11,6 +11,22 @@ A statement elsewhere on this page that a rollback, a mixed fleet or an in-place
 
 Running `dev` between releases? Some entries below describe changes on `dev` that are not in a release yet. For what a `git pull` of `dev` changed, run the repository script `python3 scripts/whats-new.py` (`--versions` for the version bumps, rebuild notes and Docker image bumps); see `changelog.d/README.md`.
 
+## Behaviour change: the software title and vendor normaliser changed, and the seed alias pack is 2026.11.2
+
+**In short.** Affected: any server that already has a stored alias pack (every install past its first boot), and the installed-software title and vendor keys it derives. To do: after the upgrade, replace the stored pack with the shipped one (`POST /api/v1/inventory/software/normalization/pack` with `content/software-normalization/aliases.csv`, or the MCP tool `replace_software_normalization_pack`; see [REST API](rest-api.md#post-apiv1inventorysoftwarenormalizationpack)). Until you do, the seed's `.NET Runtime - 8.0.1 (x64)` title stops resolving and a title whose cleaned-up form changed can read as a removal plus an install; nothing is lost.
+
+**What changed.** The cleaned-up form of a title or publisher is the product's key, so these rules change keys:
+
+- An edition word (`Home`, `Pro`, `Standard`, ...) is an edition only after a title word. `Home` is now the title `home`, and `Pro Display Calibrator` the title `pro display calibrator` with no `pro` edition; `Windows 11 Pro` is still `windows` with edition `pro`. A lone edition word in an alias's `edition` column is still that edition.
+- The word `edition` right after an architecture or edition word is dropped: `7-Zip 26.04 (x64 edition)` is `7-zip`, no longer `7-zip edition)`.
+- A bare `-` token is dropped, so `Microsoft Visual C++ 2015-2022 Redistributable (x86) - 14.44.35211` is `microsoft visual c++ 2015-2022 redistributable`, no longer ending in ` -`. Year ranges such as `2015-2022` stay in the title.
+- A Homebrew `name@version` token keeps the name and supplies the version: `openssl@3` is `openssl`, version `3`.
+- Only the trailing run of legal-suffix words is stripped from a publisher, and the last word is never stripped, so `macOS Software Signing` and `Software AG` keep their names and `Software` is no longer empty. `l.l.c.` is a suffix word. Compound forms (`GmbH & Co. KG`) are still not reduced, so `Example Software GmbH & Co. KG` changes once, from `example & kg` to `example software gmbh & co. kg`.
+
+**Two seed rows change key.** `windows,Microsoft .NET Runtime - 8.0.1 (x64)` (line 78 of the earlier `aliases.csv`) was stored under the key `microsoft .net runtime -` and is now `microsoft .net runtime`; `brew,openssl@3` (line 113 of the earlier `aliases.csv`) was stored under `openssl@3` and is now `openssl`. The product each row points at is unchanged. A server with a stored pack keeps the old keys, because a newer server never replaces a stored pack on its own. Until the pack is replaced, a `Microsoft .NET Runtime - 8.0.1 (x64)` title is labelled `unnormalized` and queued for curation; a Homebrew `openssl@3` title keeps resolving to OpenSSL, through the seed's generic `openssl` row. Replacing the pack re-resolves every title, and both resolve to the same products as before. A fresh install loads the new seed and is not affected. A replace is refused with `409` only when the pack's version equals the stored one; `2026.11.2` differs from the earlier seed's `2026.11.1`.
+
+**A one-time remove and install in the software change feed.** A row's change identity includes its cleaned-up key. A device row whose key changed under these rules (for example a title that carried a trailing `-`) shows, at the next time that row changes version, as one removal of the old row and one install of the new row, not as an upgrade. Rows that do not change are not rewritten. Curated aliases are keyed the same way, so a curated alias for an affected title stops matching until it is curated again; the queue lists such a title.
+
 ## ⚠️ Breaking: `device.filesystem.search_dir` is bounded, refuses a regex lookahead and reports what it skipped (#6478)
 
 This describes the build in a fresh deployment (see "Deployment contract (hard cutover)" in the Forensics section of this page): every writer runs this build, and this page is not a procedure for a rolling or mixed-version upgrade.

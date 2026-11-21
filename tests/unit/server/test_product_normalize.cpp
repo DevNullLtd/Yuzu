@@ -9,8 +9,15 @@
 #include "product_normalize.hpp"
 
 #include <array>
+#include <filesystem>
+#include <fstream>
+#include <set>
 #include <string>
 #include <vector>
+
+#ifndef YUZU_TEST_FIXTURE_DIR
+#define YUZU_TEST_FIXTURE_DIR "tests/unit/fixtures"
+#endif
 
 using yuzu::server::MatchResult;
 using yuzu::server::MatchTier;
@@ -25,6 +32,7 @@ using yuzu::server::make_norm_key;
 using yuzu::server::match_confidence;
 using yuzu::server::match_product;
 using yuzu::server::norm_key;
+using yuzu::server::normalize_edition;
 using yuzu::server::normalize_title;
 using yuzu::server::normalize_vendor;
 
@@ -347,4 +355,220 @@ TEST_CASE("expiry alert constants", "[normalize]") {
     CHECK(kExpiryAlertBuckets == std::array<int, 4>{30, 14, 7, 1});
     CHECK(kRearmSecs == 7 * 24 * 3600);
     CHECK(kRearmSecs == 604800);
+}
+
+// -- SAM-51: the normaliser defects found by the S-2 proxy -----------------------------------
+//
+// tests/unit/fixtures/software-estate/normaliser/s2_cases.tsv holds the real titles and vendors
+// (provenance.txt next to it says where each came from) with the output each must give. A row
+// per defect 1 to 7 plus controls for the neighbouring forms that must not move.
+
+namespace {
+
+struct S2Row {
+    std::string kind; ///< "title" or "vendor"
+    std::string input;
+    std::string want; ///< the normalised title, or the normalised vendor
+    std::string want_edition;
+    std::string want_version;
+    int defect{};     ///< 1 to 7, or 0 for a control
+    std::size_t line{};
+};
+
+// kind, input, want, want_edition, want_version, defect; `#` lines and blank lines are skipped.
+const std::vector<S2Row>& s2_rows() {
+    static const std::vector<S2Row> rows = [] {
+        std::vector<S2Row> out;
+        const auto path = std::filesystem::path{YUZU_TEST_FIXTURE_DIR} / "software-estate" /
+                          "normaliser" / "s2_cases.tsv";
+        std::ifstream in(path);
+        REQUIRE(in.is_open());
+        std::string line;
+        std::size_t n = 0;
+        while (std::getline(in, line)) {
+            ++n;
+            if (!line.empty() && line.back() == '\r')
+                line.pop_back();
+            if (line.empty() || line.front() == '#')
+                continue;
+            std::vector<std::string> f;
+            std::size_t pos = 0;
+            for (;;) {
+                const auto tab = line.find('\t', pos);
+                f.push_back(line.substr(pos, tab == std::string::npos ? tab : tab - pos));
+                if (tab == std::string::npos)
+                    break;
+                pos = tab + 1;
+            }
+            REQUIRE(f.size() == 6);
+            REQUIRE((f[0] == "title" || f[0] == "vendor"));
+            out.push_back({f[0], f[1], f[2], f[3], f[4], std::stoi(f[5]), n});
+        }
+        return out;
+    }();
+    return rows;
+}
+
+} // namespace
+
+TEST_CASE("every S-2 fixture row normalises to its expected title, edition, version or vendor",
+          "[normalize][s2]") {
+    for (const auto& r : s2_rows()) {
+        CAPTURE(r.line, r.input, r.defect);
+        if (r.kind == "title") {
+            const NormalizedTitle nt = normalize_title(r.input);
+            CHECK(nt.title == r.want);
+            CHECK(nt.edition == r.want_edition);
+            CHECK(nt.version == r.want_version);
+        } else {
+            CHECK(normalize_vendor(r.input) == r.want);
+        }
+    }
+}
+
+TEST_CASE("the S-2 fixture holds a row for each of the defects 1 to 7 and for the controls",
+          "[normalize][s2]") {
+    std::set<int> defects;
+    for (const auto& r : s2_rows())
+        defects.insert(r.defect);
+    for (int d = 0; d <= 7; ++d)
+        CHECK(defects.count(d) == 1);
+    CHECK(s2_rows().size() >= 30);
+}
+
+TEST_CASE("normalize_title is idempotent on its own output for every S-2 title row",
+          "[normalize][s2]") {
+    for (const auto& r : s2_rows()) {
+        if (r.kind != "title")
+            continue;
+        CAPTURE(r.line, r.input);
+        const std::string once = normalize_title(r.input).title;
+        CHECK(normalize_title(once).title == once);
+    }
+}
+
+TEST_CASE("normalize_vendor never returns empty for a non-empty input that is not an origin "
+          "label",
+          "[normalize][s2]") {
+    std::vector<std::string> inputs;
+    for (const auto& r : s2_rows())
+        if (r.kind == "vendor")
+            inputs.push_back(r.input);
+    // Names made only of legal-suffix words: the last token is never stripped.
+    for (const char* v : {"Inc.", "Software", "Ltd. Inc.", "Corp Corporation", "Foundation",
+                          "Co.", "Company Technologies Software Systems"})
+        inputs.emplace_back(v);
+    for (const auto& v : inputs) {
+        CAPTURE(v);
+        CHECK_FALSE(normalize_vendor(v).empty());
+    }
+    // An origin label is still no vendor, and blank input stays blank.
+    CHECK(normalize_vendor("via:brew").empty());
+    CHECK(normalize_vendor("   ").empty());
+}
+
+TEST_CASE("an edition word is an edition only after a title word", "[normalize][s2]") {
+    SECTION("after a kept token it is still an edition") {
+        const NormalizedTitle nt = normalize_title("Windows 11 Pro");
+        CHECK(nt.title == "windows");
+        CHECK(nt.edition == "pro");
+    }
+    SECTION("a leading edition word is a title word and never leaves the title empty") {
+        for (const char* raw : {"Home", "Pro", "Professional", "Express 2019 (x64)", "STANDARD"}) {
+            CAPTURE(raw);
+            const NormalizedTitle nt = normalize_title(raw);
+            CHECK_FALSE(nt.title.empty());
+            CHECK(nt.edition.empty());
+        }
+    }
+    SECTION("the first edition word after a title word wins; a later one is dropped") {
+        const NormalizedTitle nt = normalize_title("Home Pro Enterprise");
+        CHECK(nt.title == "home");
+        CHECK(nt.edition == "pro");
+    }
+    SECTION("the word 'edition' is dropped only right after an architecture or edition word") {
+        CHECK(normalize_title("Studio Pro Edition").title == "studio");
+        CHECK(normalize_title("Studio (64-bit edition)").title == "studio");
+        CHECK(normalize_title("Collector's Edition Pack").title == "collector's edition pack");
+    }
+}
+
+TEST_CASE("a standalone dash is dropped and a dashed word is kept", "[normalize][s2]") {
+    CHECK(normalize_title("Tool - Extras").title == "tool extras");
+    CHECK(normalize_title("Tool - 1.2").title == "tool");
+    CHECK(normalize_title("-").title.empty());
+    CHECK(normalize_title("7-Zip e-mail x-ray").title == "7-zip e-mail x-ray");
+}
+
+TEST_CASE("name@version sets the version only when none was seen earlier", "[normalize][s2]") {
+    SECTION("a formula token keeps its name and supplies the version") {
+        const NormalizedTitle nt = normalize_title("openssl@3");
+        CHECK(nt.title == "openssl");
+        CHECK(nt.version == "3");
+        CHECK(normalize_title("Node@v18.2").version == "18.2");
+    }
+    SECTION("an earlier version wins, a later one is dropped") {
+        const NormalizedTitle nt = normalize_title("Acme 2.0 tool@3");
+        CHECK(nt.title == "acme tool");
+        CHECK(nt.version == "2.0");
+        CHECK(normalize_title("tool@3 2.0").version == "3");
+    }
+    SECTION("an @ without a version-shaped tail, or with two @, is left alone") {
+        CHECK(normalize_title("user@example.com").title == "user@example.com");
+        CHECK(normalize_title("a@b@3").title == "a@b@3");
+        CHECK(normalize_title("name@").title == "name@");
+        CHECK(normalize_title("@3").title == "@3");
+    }
+    SECTION("the name part is classified like any token, so the result is idempotent") {
+        for (const char* raw : {"x64@3", "pro@3", "foo pro@3", "1@2", "(openssl@3)"}) {
+            CAPTURE(raw);
+            const std::string once = normalize_title(raw).title;
+            CHECK(normalize_title(once).title == once);
+        }
+    }
+}
+
+TEST_CASE("a year range stays in the title and is never the version", "[normalize][s2]") {
+    const NormalizedTitle nt = normalize_title("Microsoft Visual C++ 2015-2022 Redistributable (x64)");
+    CHECK(nt.title == "microsoft visual c++ 2015-2022 redistributable");
+    CHECK(nt.version.empty());
+    CHECK(normalize_title("Foo 2015-2022 Bar").version.empty());
+    // A single year still reads as the version (filed, not changed here).
+    CHECK(normalize_title("Microsoft Visual C++ 2013 Redistributable").version == "2013");
+}
+
+TEST_CASE("only a trailing run of legal-suffix words is stripped and the last token survives",
+          "[normalize][s2]") {
+    CHECK(normalize_vendor("Example Software Foundation Inc.") == "example");
+    CHECK(normalize_vendor("Software Inc.") == "software");
+    CHECK(normalize_vendor("Inc. Ltd.") == "inc.");
+    CHECK(normalize_vendor("Acme Technologies Software Systems") == "acme");
+    CHECK(normalize_vendor("Systems Acme") == "systems acme"); // a leading suffix word is a name
+    CHECK(normalize_vendor("Example L.L.C.") == "example");
+    // The alias table is still consulted on the stripped form.
+    CHECK(normalize_vendor("Oracle America, Inc.") == "oracle");
+}
+
+TEST_CASE("compound legal forms are not reduced; kg, co and & are not suffix words",
+          "[normalize][s2]") {
+    CHECK(normalize_vendor("Example Software GmbH & Co. KG") == "example software gmbh & co. kg");
+    CHECK(normalize_vendor("Example KG") == "example kg");
+    CHECK(normalize_vendor("Example Co") == "example co");
+    CHECK(normalize_vendor("Example S.A.S.") == "example s.a.s.");
+}
+
+TEST_CASE("normalize_edition reads an edition column and refuses any other word",
+          "[normalize][s2]") {
+    CHECK(normalize_edition("Standard") == "standard");
+    CHECK(normalize_edition("  PRO ") == "pro");
+    CHECK(normalize_edition("Home") == "home");
+    CHECK(normalize_edition("Enterprise x64") == "enterprise");
+    CHECK(normalize_edition("2019 Standard") == "standard");
+    CHECK(normalize_edition("standard enterprise") == "standard"); // the first wins
+    CHECK(normalize_edition("").empty());
+    CHECK(normalize_edition("   ").empty());
+    CHECK(normalize_edition("2019").empty());
+    CHECK(normalize_edition("gold").empty());
+    CHECK(normalize_edition("Standard Edition").empty());
+    CHECK(normalize_edition("Pro Display").empty());
 }

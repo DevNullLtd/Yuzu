@@ -7,6 +7,7 @@
 #include "software_normalization_pack.hpp"
 
 #include <algorithm>
+#include <array>
 #include <map>
 #include <set>
 #include <string>
@@ -112,6 +113,35 @@ TEST_CASE("parse rejects an edition column that contradicts raw_name and accepts
     CHECK(it->norm_key == "microsoft:office:professional");
 
     CHECK(contains(error_of(pack(kV, "windows,Foo,,Acme,Foo,gold,other,\n")),
+                   "edition is not a recognised edition token"));
+}
+
+TEST_CASE("an edition column is parsed as an edition, and a lone edition word as a raw_name is a "
+          "title",
+          "[normalization][pack]") {
+    // The edition column takes an edition word on its own, though normalize_title would now read
+    // a leading edition word as a title word.
+    for (const char* edition : {"Pro", "Home", "Standard", "Enterprise x64"}) {
+        CAPTURE(edition);
+        const auto p = parse_normalization_pack(pack(
+            kV, std::string{"windows,Contoso Studio,,Contoso,Studio,"} + edition + ",other,\n"));
+        REQUIRE(p.has_value());
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(),
+                                     [](const PackRow& r) { return r.raw_name == "contoso studio"; });
+        REQUIRE(it != p->rows.end());
+        CHECK(it->edition == normalize_edition(edition));
+        CHECK(it->norm_key == "contoso:studio:" + it->edition);
+    }
+    // A raw_name that is one edition word names a product ("Home"), not an empty title.
+    const auto home = parse_normalization_pack(pack(kV, "macos,Home,,Apple,Home,,other,\n"));
+    REQUIRE(home.has_value());
+    const auto it = std::find_if(home->rows.begin(), home->rows.end(),
+                                 [](const PackRow& r) { return r.raw_name == "home"; });
+    REQUIRE(it != home->rows.end());
+    CHECK(it->edition.empty());
+    CHECK(it->norm_key == "apple:home");
+    // The column still refuses any word that is no edition.
+    CHECK(contains(error_of(pack(kV, "windows,Foo,,Acme,Foo,Pro Display,other,\n")),
                    "edition is not a recognised edition token"));
 }
 
@@ -255,7 +285,7 @@ TEST_CASE("the embedded seed parses with the shipped version and every key in no
           "[normalization][pack]") {
     const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
     REQUIRE(p.has_value());
-    CHECK(p->pack_version == "2026.11.1");
+    CHECK(p->pack_version == "2026.11.2");
     CHECK(p->rows.size() >= kMinSeedRows);
     for (const auto& r : p->rows) {
         CAPTURE(r.raw_name);
@@ -287,4 +317,77 @@ TEST_CASE("the embedded seed gives every product ONE identity", "[normalization]
     CHECK(has_key("libreoffice:libreoffice"));
     CHECK_FALSE(has_key("mysql:mysql"));
     CHECK_FALSE(has_key("the document:libreoffice"));
+}
+
+TEST_CASE("the embedded seed keeps its edition rows and maps python3.14 and postgresql-18 onto "
+          "their existing products",
+          "[normalization][pack]") {
+    const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    const auto key_of = [&](const char* raw_name) -> std::string {
+        const auto it = std::find_if(p->rows.begin(), p->rows.end(),
+                                     [&](const PackRow& r) { return r.raw_name == raw_name; });
+        return it == p->rows.end() ? std::string{"<no row>"} : it->norm_key;
+    };
+    // The glued-version names are rows of their own: a version inside a name is not stripped.
+    CHECK(key_of("python3.14") == key_of("python3"));
+    CHECK(key_of("python3.14") == "python:python");
+    CHECK(key_of("postgresql-18") == key_of("postgresql"));
+    CHECK(key_of("postgresql-18") == "postgresql:postgresql");
+
+    // Seed rows with an edition column parsed through normalize_edition: one product per edition.
+    const std::set<std::string> want{
+        "microsoft:sql server:standard",    "microsoft:sql server:enterprise",
+        "microsoft:sql server:express",     "microsoft:visual studio:community",
+        "microsoft:visual studio:professional", "microsoft:visual studio:enterprise",
+    };
+    std::set<std::string> got;
+    for (const auto& r : p->rows)
+        if (want.count(r.norm_key) != 0)
+            got.insert(r.norm_key);
+    CHECK(got == want);
+}
+
+TEST_CASE("a title that resolved through a re-keyed seed alias still resolves to the same product "
+          "after the SAM-51 pack bump",
+          "[normalization][pack]") {
+    // Two seed rows changed their stored alias key: the dangling "-" of ".NET Runtime - 8.0.1"
+    // and the "@3" of the Homebrew formula are no longer part of the normalised title. The
+    // alias key a title now forms is the key the NEW seed holds, and it names the product the
+    // old key named, so a pack loaded from this seed resolves both exactly as before.
+    const auto p = parse_normalization_pack(kSoftwareNormalizationSeed);
+    REQUIRE(p.has_value());
+    struct Case {
+        const char* ecosystem;
+        const char* raw_name;
+        const char* raw_publisher;
+        const char* old_alias_key; ///< what the pre-SAM-51 normaliser formed (and stored)
+        const char* new_alias_key;
+        const char* norm_key;      ///< the product both keys resolve to
+    };
+    const std::array<Case, 2> cases{{
+        {"windows", "Microsoft .NET Runtime - 8.0.1 (x64)", "Microsoft Corporation",
+         "microsoft .net runtime -", "microsoft .net runtime", "microsoft:.net runtime"},
+        {"brew", "openssl@3", "", "openssl@3", "openssl", "openssl:openssl"},
+    }};
+    for (const auto& c : cases) {
+        CAPTURE(c.ecosystem, c.raw_name);
+        const std::string key = alias_key(normalize_title(c.raw_name));
+        CHECK(key == c.new_alias_key);
+        CHECK(key != c.old_alias_key); // the stored key of an older pack no longer matches
+        const std::string publisher = normalize_vendor(c.raw_publisher);
+        const auto row = std::find_if(p->rows.begin(), p->rows.end(), [&](const PackRow& r) {
+            return r.ecosystem == c.ecosystem && r.raw_name == key &&
+                   (r.raw_publisher.empty() || r.raw_publisher == publisher);
+        });
+        REQUIRE(row != p->rows.end());
+        CHECK(row->norm_key == c.norm_key);
+    }
+    // A server that still holds the OLD pack forms the new key `openssl` for `openssl@3`: the
+    // generic any-ecosystem `openssl` row (unchanged by SAM-51) names the same product.
+    const auto generic = std::find_if(p->rows.begin(), p->rows.end(), [](const PackRow& r) {
+        return r.ecosystem.empty() && r.raw_name == "openssl" && r.raw_publisher.empty();
+    });
+    REQUIRE(generic != p->rows.end());
+    CHECK(generic->norm_key == "openssl:openssl");
 }
