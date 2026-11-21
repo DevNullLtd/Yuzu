@@ -31,6 +31,7 @@
  */
 #pragma once
 
+#include "component_java_parsers.hpp" // java_detail::iequals
 #include "component_legs.hpp"
 #include "component_walk.hpp"
 
@@ -147,15 +148,6 @@ namespace win_detail {
     return c >= 'a' && c <= 'z' ? static_cast<char>(c - 'a' + 'A') : c;
 }
 
-[[nodiscard]] constexpr bool ascii_equal_fold(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size())
-        return false;
-    for (std::size_t i = 0; i < a.size(); ++i)
-        if (ascii_upper(a[i]) != ascii_upper(b[i]))
-            return false;
-    return true;
-}
-
 [[nodiscard]] constexpr bool is_drive_letter(char c) noexcept {
     return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
 }
@@ -208,7 +200,7 @@ namespace win_detail {
         if (!win_detail::is_drive_relative_walk_path(root))
             continue;
         const bool repeat = std::ranges::any_of(
-            out, [&](const std::string& kept) { return win_detail::ascii_equal_fold(kept, root); });
+            out, [&](const std::string& kept) { return java_detail::iequals(kept, root); });
         if (!repeat)
             out.push_back(std::move(root));
     }
@@ -230,7 +222,7 @@ namespace win_detail {
 /// is case-insensitive; a directory is listed under the case it was created with).
 [[nodiscard]] inline bool is_windows_excluded_dir(const std::vector<std::string>& excluded, std::string_view dir) {
     return std::ranges::any_of(excluded,
-                               [&](const std::string& e) { return win_detail::ascii_equal_fold(e, dir); });
+                               [&](const std::string& e) { return java_detail::iequals(e, dir); });
 }
 
 /// Test seam: whether the volume of this drive letter (upper case) is a local fixed disk.

@@ -107,20 +107,6 @@ constexpr std::size_t kBatchBytes = 64u * 1024; // one GetFileInformationByHandl
     return GetDriveTypeW(root) == DRIVE_FIXED;
 }
 
-[[nodiscard]] Targets machine_targets() {
-    const auto program_files = known_folder_wtf8(FOLDERID_ProgramFilesX64);
-    const auto program_files_x86 = known_folder_wtf8(FOLDERID_ProgramFilesX86);
-    if (program_files && program_files_x86) {
-        const auto candidates = windows_candidate_roots(*program_files, *program_files_x86);
-        if (!candidates.empty())
-            return plan_windows_targets(candidates, is_fixed_drive);
-    }
-    // No root list: nothing is walked, and the answer says so rather than reading as an empty host.
-    Targets t;
-    t.mount_table_unreadable = true;
-    return t;
-}
-
 /// What a handle says about its file right now: the pair unchanged() compares, and the attributes the
 /// open checks.
 struct Stamp {
@@ -211,11 +197,21 @@ struct Stamp {
 } // namespace
 
 Targets scan_targets() {
-    return machine_targets();
+    const auto program_files = known_folder_wtf8(FOLDERID_ProgramFilesX64);
+    const auto program_files_x86 = known_folder_wtf8(FOLDERID_ProgramFilesX86);
+    if (program_files && program_files_x86) {
+        const auto candidates = windows_candidate_roots(*program_files, *program_files_x86);
+        if (!candidates.empty())
+            return plan_windows_targets(candidates, is_fixed_drive);
+    }
+    // No root list: nothing is walked, and the answer says so rather than reading as an empty host.
+    Targets t;
+    t.mount_table_unreadable = true;
+    return t;
 }
 
 Targets scan_native_targets() {
-    return machine_targets();
+    return scan_targets();
 }
 
 FsOps make_fs_ops(const Targets& /*targets*/) {

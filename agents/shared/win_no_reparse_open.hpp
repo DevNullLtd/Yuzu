@@ -36,11 +36,12 @@
 //
 // TWO OPENS, ONE MECHANISM. `open_file_no_reparse` opens a regular file for reading (the read
 // primitive behind the runtimes plugin's JVM `release` read); `open_dir_no_reparse` opens a
-// directory for listing (the component_inventory Windows leg), through the same root handle, the
-// same `drive_relative_name` filter and the same OBJ_DONT_REPARSE | FILE_OPEN_REPARSE_POINT
-// NtCreateFile call, with the same status mapping. The directory variant adds one by-handle check
-// of its own (below) because a leaf reparse point is opened as itself, not followed. The file open
-// is unchanged by it.
+// directory for listing (the component_inventory Windows leg). Both call ONE private body,
+// `no_reparse_detail::open_relative`, which owns the volume-root handle, the `drive_relative_name`
+// filter, the OBJ_DONT_REPARSE | FILE_OPEN_REPARSE_POINT NtCreateFile call and the status
+// mapping, so the two cannot drift apart; a caller supplies only the access mask and the
+// file-or-directory create option. The directory variant adds one by-handle check of its own
+// (below) because a leaf reparse point is opened as itself, not followed.
 //
 // The Windows body is `#ifdef _WIN32`; `drive_relative_name` is pure and above the guard so every
 // OS tests it.
@@ -98,7 +99,6 @@ namespace yuzu::win {
 #include <winternl.h> // UNICODE_STRING, OBJECT_ATTRIBUTES, IO_STATUS_BLOCK, NTSTATUS (after windows.h)
 
 #include <limits>
-#include <utility>
 
 namespace yuzu::win {
 
@@ -194,12 +194,12 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
     return owned;
 }
 
-} // namespace no_reparse_detail
-
-/// Open `path` (`X:\...` or `X:/...`) for reading with no reparse point followed below the drive
-/// root. See the file banner for the mechanism and the status mapping.
-[[nodiscard]] inline NoReparseOpenResult open_file_no_reparse(const std::wstring& path) {
-    using namespace no_reparse_detail;
+/// The one no-reparse open: `path` (`X:\...` or `X:/...`) relative to the verified volume-root
+/// handle, with `desired_access` and `kind` (kFileNonDirectoryFile or kFileDirectoryFile) and
+/// nothing else varying. Owns OBJ_DONT_REPARSE, FILE_OPEN_REPARSE_POINT, the share mask and the
+/// status mapping; see the file banner for the mechanism.
+inline NoReparseOpenResult open_relative(const std::wstring& path, ACCESS_MASK desired_access,
+                                         ULONG kind) {
     NoReparseOpenResult result;
 
     const auto relative = drive_relative_name(path);
@@ -238,9 +238,9 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
     HANDLE raw = INVALID_HANDLE_VALUE;
     IO_STATUS_BLOCK iosb{};
     const NTSTATUS status = nt_create_file(
-        &raw, FILE_GENERIC_READ, &attrs, &iosb, /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
+        &raw, desired_access, &attrs, &iosb, /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
-        kFileNonDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
+        kind | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
         /*EaBuffer=*/nullptr, /*EaLength=*/0);
     if (status >= 0) {
         result.file = NoReparseHandle(raw); // owned at the statement it is produced
@@ -253,72 +253,33 @@ inline NoReparseHandle open_volume_root(wchar_t drive_letter) {
     return result;
 }
 
+} // namespace no_reparse_detail
+
+/// Open `path` (`X:\...` or `X:/...`) for reading with no reparse point followed below the drive
+/// root. See the file banner for the mechanism and the status mapping.
+[[nodiscard]] inline NoReparseOpenResult open_file_no_reparse(const std::wstring& path) {
+    return no_reparse_detail::open_relative(path, FILE_GENERIC_READ,
+                                            no_reparse_detail::kFileNonDirectoryFile);
+}
+
 /// Open the directory `path` (`X:\...` or `X:/...`, never the bare drive root) for listing with no
-/// reparse point followed below the drive root: the file open's mechanism with FILE_DIRECTORY_FILE
-/// and list access. The status mapping is the file open's. One more refusal: a leaf that is a
-/// reparse point is opened as itself (FILE_OPEN_REPARSE_POINT, never its target), so the handle's own
-/// attributes are read before it is returned and a reparse point, or anything that is not a
-/// directory, is `refused` with the handle closed. The returned handle is synchronous: list it with
+/// reparse point followed below the drive root. One refusal beyond the file open's: a leaf
+/// reparse point is opened as itself (never its target), so the handle's own attributes are read
+/// before it is returned and a reparse point, or anything that is not a directory, is `refused`
+/// with the handle closed. The returned handle is synchronous: list it with
 /// GetFileInformationByHandleEx(FileIdBothDirectoryInfo).
 [[nodiscard]] inline NoReparseOpenResult open_dir_no_reparse(const std::wstring& path) {
-    using namespace no_reparse_detail;
-    NoReparseOpenResult result;
-
-    const auto relative = drive_relative_name(path);
-    if (!relative)
-        return result; // refused: a name the NT open would resolve differently
-
-    const NtCreateFileFn nt_create_file = resolve_ntcreatefile();
-    if (nt_create_file == nullptr) {
-        result.status = NoReparseOpen::unsupported;
+    NoReparseOpenResult result = no_reparse_detail::open_relative(
+        path, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        no_reparse_detail::kFileDirectoryFile);
+    if (result.status != NoReparseOpen::ok)
         return result;
-    }
-
-    // UNICODE_STRING::Length is a USHORT byte count.
-    const std::size_t bytes = relative->size() * sizeof(wchar_t);
-    if (bytes > (std::numeric_limits<USHORT>::max)())
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (GetFileInformationByHandle(result.file.get(), &info) &&
+        (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
+        !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT))
         return result;
-
-    const NoReparseHandle root = open_volume_root(path[0]);
-    if (root.get() == INVALID_HANDLE_VALUE)
-        return result;
-
-    UNICODE_STRING name{};
-    name.Length = static_cast<USHORT>(bytes);
-    name.MaximumLength = name.Length;
-    // const_cast proof: as in open_file_no_reparse, the Buffer is an input NtCreateFile never writes
-    // through, borrowing `*relative`, a local that outlives the call below.
-    name.Buffer = const_cast<PWSTR>(relative->c_str());
-
-    OBJECT_ATTRIBUTES attrs{};
-    attrs.Length = sizeof(attrs);
-    attrs.RootDirectory = root.get();
-    attrs.ObjectName = &name;
-    attrs.Attributes = kObjCaseInsensitive | kObjDontReparse;
-
-    HANDLE raw = INVALID_HANDLE_VALUE;
-    IO_STATUS_BLOCK iosb{};
-    const NTSTATUS status = nt_create_file(
-        &raw, FILE_LIST_DIRECTORY | FILE_READ_ATTRIBUTES | SYNCHRONIZE, &attrs, &iosb,
-        /*AllocationSize=*/nullptr, /*FileAttributes=*/0,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, kFileOpen,
-        kFileDirectoryFile | kFileSynchronousIoNonalert | kFileOpenReparsePoint,
-        /*EaBuffer=*/nullptr, /*EaLength=*/0);
-    if (status >= 0) {
-        NoReparseHandle owned(raw); // owned at the statement it is produced
-        BY_HANDLE_FILE_INFORMATION info{};
-        if (GetFileInformationByHandle(owned.get(), &info) &&
-            (info.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) &&
-            !(info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT)) {
-            result.file = std::move(owned);
-            result.status = NoReparseOpen::ok;
-        } // else refused: a leaf reparse point opened as itself, or not a directory; closed here
-    } else if (status == kStatusObjectNameNotFound || status == kStatusObjectPathNotFound) {
-        result.status = NoReparseOpen::absent;
-    } else if (status == kStatusInvalidParameter) {
-        result.status = NoReparseOpen::unsupported;
-    } // else refused (STATUS_REPARSE_POINT_ENCOUNTERED, access denied, ...)
-    return result;
+    return {}; // refused: a leaf reparse point opened as itself, or not a directory; closed here
 }
 
 } // namespace yuzu::win

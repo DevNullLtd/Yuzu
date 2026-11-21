@@ -36,6 +36,8 @@
 #include <binary_header_macho.hpp> // yuzu::shared::binary_header::read_macho (agents/shared)
 #include <binary_header_pe.hpp>    // yuzu::shared::binary_header::read_pe_version (agents/shared)
 
+#include "component_java_parsers.hpp" // java_detail::iequals (ASCII case-insensitive equality)
+
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
@@ -239,16 +241,7 @@ struct NumericTail {
 
 /// A Windows library is a name of at least one character before a `.dll` extension.
 [[nodiscard]] constexpr bool is_windows_native_candidate(std::string_view leaf) noexcept {
-    constexpr std::string_view kExt = ".dll";
-    if (leaf.size() <= kExt.size())
-        return false;
-    const auto tail = leaf.substr(leaf.size() - kExt.size());
-    for (std::size_t i = 0; i < kExt.size(); ++i) {
-        const char c = tail[i] >= 'A' && tail[i] <= 'Z' ? static_cast<char>(tail[i] - 'A' + 'a') : tail[i];
-        if (c != kExt[i])
-            return false;
-    }
-    return true;
+    return leaf.size() > 4 && java_detail::iequals(leaf.substr(leaf.size() - 4), ".dll");
 }
 
 enum class NativeVersionSource { filename, elf, macho, pe, unreadable };
