@@ -245,15 +245,22 @@ Host fixture_host() {
     return h;
 }
 
+// A distinct, well-formed packed name (as the registry holds it) for the i-th synthetic
+// product, with the braced code it unpacks to.
+FxProduct synthetic_product(std::size_t i, rec::InstallProps props) {
+    std::string packed = std::format("{:032X}", i);
+    std::string braced = *rec::unpack_guid(packed);
+    return {std::move(packed), std::move(braced), std::move(props)};
+}
+
 // A host of `n` products that all have a readable cached package.
 Host many_readable(std::size_t n) {
     Host h;
     for (std::size_t i = 0; i < n; ++i) {
-        const std::string braced = std::format("{{{:08X}-0000-4000-8000-000000000000}}", i + 1);
         rec::InstallProps p;
         p.display_name = std::format("Product {}", i);
         p.local_package = std::format("C:\\WINDOWS\\Installer\\{:08x}.msi", i + 1);
-        h.products.push_back({*rec::pack_guid(braced), braced, p});
+        h.products.push_back(synthetic_product(i + 1, std::move(p)));
     }
     return h;
 }
@@ -277,9 +284,6 @@ TEST_CASE("installer records: the packed GUID codec matches an independent imple
         const auto un = rec::unpack_guid(p.packed);
         REQUIRE(un.has_value());
         CHECK(*un == p.braced);
-        // pack then unpack is the identity, and pack is the inverse of unpack
-        CHECK(rec::pack_guid(*un) == p.packed);
-        CHECK(rec::unpack_guid(*rec::pack_guid(p.braced)) == p.braced);
     }
     for (const auto& u : fx.upgrades)
         CHECK(rec::unpack_guid(u.packed) == u.braced);
@@ -287,8 +291,6 @@ TEST_CASE("installer records: the packed GUID codec matches an independent imple
     // The example Windows Installer's own documentation gives.
     CHECK(rec::unpack_guid("68AB67CA7DA73301B744CAF070E41400") ==
           "{AC76BA86-7AD7-1033-7B44-AC0F074E4100}");
-    CHECK(rec::pack_guid("{AC76BA86-7AD7-1033-7B44-AC0F074E4100}") ==
-          "68AB67CA7DA73301B744CAF070E41400");
     // Lower-case hex is accepted and the result is upper case.
     CHECK(rec::unpack_guid("68ab67ca7da73301b744caf070e41400") ==
           "{AC76BA86-7AD7-1033-7B44-AC0F074E4100}");
@@ -302,10 +304,6 @@ TEST_CASE("installer records: a wrong length or a non-hex key name is refused",
     CHECK_FALSE(rec::unpack_guid("68AB67CA7DA73301B744CAF070E4140G").has_value());  // 'G'
     CHECK_FALSE(rec::unpack_guid("{AC76BA86-7AD7-1033-7B44-AC0F074E4100}").has_value());
     CHECK_FALSE(rec::unpack_guid(std::string("68AB67CA7DA73301B744CAF070E4140\0", 32)).has_value());
-    CHECK_FALSE(rec::pack_guid("AC76BA86-7AD7-1033-7B44-AC0F074E4100").has_value()); // no braces
-    CHECK_FALSE(rec::pack_guid("{AC76BA86-7AD7-1033-7B44-AC0F074E410}").has_value());
-    CHECK_FALSE(rec::pack_guid("{AC76BA86_7AD7_1033_7B44_AC0F074E4100}").has_value());
-    CHECK_FALSE(rec::pack_guid("{ZC76BA86-7AD7-1033-7B44-AC0F074E4100}").has_value());
 }
 
 TEST_CASE("installer records: the path gate", "[msi_packages][installer_records]") {
@@ -397,7 +395,6 @@ TEST_CASE("installer records: an orphaned package is a row reason and the status
     const auto set = run(h);
 
     const auto& r = record_of(set, kSevenZip);
-    CHECK(r.state == rec::PackageState::missing);
     CHECK(r.reason == "package_missing");
     CHECK(r.db.product_code.empty());
     CHECK(std::find(h.read.begin(), h.read.end(), "c:\\windows\\installer\\3f405162.MSI") ==
@@ -418,12 +415,11 @@ TEST_CASE("installer records: a corrupt package keeps its row, names the code an
     const auto set = run(h);
 
     const auto& r = record_of(set, kRuntime);
-    CHECK(r.state == rec::PackageState::unreadable);
     CHECK(r.reason == "package_unreadable:1620");
     CHECK(r.db.product_name.empty());
     // siblings are read on both sides of it
-    CHECK(record_of(set, kPythonLauncher).state == rec::PackageState::ok);
-    CHECK(record_of(set, kUserProfileProduct).state == rec::PackageState::ok);
+    CHECK(record_of(set, kPythonLauncher).reason.empty());
+    CHECK(record_of(set, kUserProfileProduct).reason.empty());
     CHECK_FALSE(set.constraints.any_failure());
     CHECK(rec::render(set)[0] == "status|installer_records|supported|-");
 }
@@ -453,16 +449,12 @@ TEST_CASE("installer records: row-level reasons for a path that is not, or canno
     const auto set = run(h);
 
     // refused by the opener
-    CHECK(record_of(set, kCMake).state == rec::PackageState::path_refused);
     CHECK(record_of(set, kCMake).reason == "package_path_refused");
     // refused by the path gate before any open: not under <windir>\Installer
-    CHECK(record_of(set, kOutsideInstaller).state == rec::PackageState::path_refused);
     CHECK(record_of(set, kOutsideInstaller).reason == "package_path_refused");
     CHECK(std::find(h.opened.begin(), h.opened.end(), "C:\\Temp\\relocated.msi") == h.opened.end());
     // nothing recorded to open
-    CHECK(record_of(set, kNoLocalPackage).state == rec::PackageState::not_recorded);
     CHECK(record_of(set, kNoLocalPackage).reason == "no_local_package");
-    CHECK(record_of(set, kNoProperties).state == rec::PackageState::not_recorded);
     CHECK(record_of(set, kNoProperties).reason == "no_install_properties");
     CHECK(record_of(set, kNoProperties).props.display_name.empty());
     // none of those constrains the answer
@@ -472,12 +464,12 @@ TEST_CASE("installer records: row-level reasons for a path that is not, or canno
 TEST_CASE("installer records: a failed registry read constrains the answer and keeps the siblings",
           "[msi_packages][installer_records]") {
     Host h = fixture_host();
-    const auto bad = *rec::pack_guid(kCMake);
+    const std::string bad = "0516257B54C15B5439D24AFCA53204C3"; // CMake, as the registry names it
     h.props_failure[bad] = std::string{rec::kTokenAccessDenied};
     const auto set = run(h);
 
     CHECK(record_of(set, kCMake).reason == "install_properties_unreadable");
-    CHECK(record_of(set, kPythonLauncher).state == rec::PackageState::ok);
+    CHECK(record_of(set, kPythonLauncher).reason.empty());
     CHECK(rec::render(set)[0] ==
           "status|installer_records|constrained|windows:installer_records:access_denied");
     CHECK(rec::registry_failure_token(5) == "windows:installer_records:access_denied");
@@ -509,7 +501,7 @@ TEST_CASE("installer records: a subkey that is not a packed GUID is counted, nev
 TEST_CASE("installer records: the row cap stops the walk at 5000 rows", "[msi_packages][installer_records]") {
     Host h;
     for (std::size_t i = 0; i < rec::kMaxRecords + 1; ++i)
-        h.raw_names.push_back(*rec::pack_guid(std::format("{{{:08X}-0000-4000-8000-000000000000}}", i)));
+        h.raw_names.push_back(std::format("{:032X}", i));
     const auto set = run(h);
 
     CHECK(set.records.size() == 5000);
@@ -545,10 +537,9 @@ TEST_CASE("installer records: the first timeout stops further opens and skips th
     h.answers["c:\\windows\\installer\\00000002.msi"] = timed_out;
     const auto set = run(h);
 
-    CHECK(set.records[0].state == rec::PackageState::ok);
+    CHECK(set.records[0].reason.empty());
     for (std::size_t i = 1; i < 5; ++i) {
         INFO(i);
-        CHECK(set.records[i].state == rec::PackageState::deadline_skipped);
         CHECK(set.records[i].reason == "deadline_skipped");
     }
     CHECK(h.read.size() == 2);   // the second timed out; nothing was read after it
@@ -569,7 +560,7 @@ TEST_CASE("installer records: a busy slot on the first read opens nothing more",
         CHECK(h.opened.size() == 1);
         CHECK(h.read.size() == 1);
         for (const auto& r : set.records)
-            CHECK(r.state == rec::PackageState::deadline_skipped);
+            CHECK(r.reason == "deadline_skipped");
         CHECK(rec::render(set)[0] == "status|installer_records|constrained|windows:installer_records:msi_db:busy");
     }
 }
@@ -584,9 +575,9 @@ TEST_CASE("installer records: package reads share one 45 second budget",
     CHECK(h.opened.size() == 10);
     for (const auto d : h.deadlines)
         CHECK(d == milliseconds{5000});
-    CHECK(set.records[8].state == rec::PackageState::ok);
+    CHECK(set.records[8].reason.empty());
     for (std::size_t i = 9; i < 12; ++i)
-        CHECK(set.records[i].state == rec::PackageState::deadline_skipped);
+        CHECK(set.records[i].reason == "deadline_skipped");
     CHECK(rec::render(set)[0] == "status|installer_records|constrained|windows:installer_records:msi_db:deadline");
 
     // each read is asked for min(5 s, what is left): eleven 4 s reads leave 1 s for the twelfth
@@ -596,7 +587,7 @@ TEST_CASE("installer records: package reads share one 45 second budget",
     REQUIRE(g.deadlines.size() == 12);
     CHECK(g.deadlines[10] == milliseconds{5000});
     CHECK(g.deadlines[11] == milliseconds{1000});
-    CHECK(set2.records[12].state == rec::PackageState::deadline_skipped);
+    CHECK(set2.records[12].reason == "deadline_skipped");
     CHECK(rec::render(set2)[0] == "status|installer_records|constrained|windows:installer_records:msi_db:deadline");
 }
 
@@ -651,8 +642,7 @@ TEST_CASE("installer records: an install path under the user profiles is withhel
     p.local_package = "C:\\Users\\jsmith\\x.msi";
     p.install_location = "C:\\UsersX\\keep";
     p.install_source = "\\\\?\\C:\\Users\\jsmith\\dl";
-    g.products.push_back({*rec::pack_guid("{11111111-2222-4333-8444-555555555555}"),
-                          "{11111111-2222-4333-8444-555555555555}", p});
+    g.products.push_back(synthetic_product(1, p));
     const auto set2 = run(g);
     CHECK(set2.records[0].reason == "package_path_refused");
     CHECK(set2.records[0].props.local_package == "withheld:user_path");
@@ -671,8 +661,7 @@ TEST_CASE("installer records: row breakers cannot break a row", "[msi_packages][
     p.install_location = "C:\\A|B\\";
     p.install_source = "C:\\\n\\";
     p.local_package = "C:\\WINDOWS\\Installer\\xy.msi";
-    h.products.push_back({*rec::pack_guid("{11111111-2222-4333-8444-555555555555}"),
-                          "{11111111-2222-4333-8444-555555555555}", p});
+    h.products.push_back(synthetic_product(1, p));
     msi::ReadResult db;
     db.status = msi::ReadStatus::Completed;
     db.outcome.kind = msi::Outcome::Kind::Ok;
@@ -754,7 +743,6 @@ TEST_CASE("installer records: a product under no upgrade code, or under two, get
 
     // under two upgrade codes in the fixture
     CHECK(*map.resolve(kOutsideInstaller) == "");
-    CHECK(map.ambiguous == 1);
     // named under none
     for (const auto* none : {kSevenZip, kRuntime, kNoLocalPackage, kNoProperties})
         CHECK(*map.resolve(none) == "");
@@ -780,7 +768,7 @@ TEST_CASE("installer records: over its cap the upgrade map leaves every token em
     {
         FxUpgrade u{"02B4A1E7D3C586F4A910B2C3D4E5F607", "", {}};
         for (std::size_t i = 0; i < rec::kMaxUpgradeValueNames + 1; ++i)
-            u.products.push_back(*rec::pack_guid(std::format("{{{:08X}-0000-4000-8000-000000000000}}", i)));
+            u.products.push_back(std::format("{:032X}", i));
         std::vector<FxUpgrade> up{load_fixture().upgrades[0], u};
         const auto map = build_map(up);
         CHECK(map.over_cap);
@@ -793,12 +781,12 @@ TEST_CASE("installer records: over its cap the upgrade map leaves every token em
     }
     // 20,001 subkeys: the builder tells the walk to stop at the 20,001st
     {
-        std::vector<FxUpgrade> up(rec::kMaxUpgradeSubkeys + 10,
+        std::vector<FxUpgrade> up(rec::kMaxSubkeysVisited + 10,
                                   FxUpgrade{"02B4A1E7D3C586F4A910B2C3D4E5F607", "", {}});
         std::size_t calls = 0;
         const auto map = build_map(up, std::nullopt, &calls);
         CHECK(map.over_cap);
-        CHECK(calls == rec::kMaxUpgradeSubkeys + 1);
+        CHECK(calls == rec::kMaxSubkeysVisited + 1);
         CHECK(*map.resolve(kPythonLauncher) == "");
     }
 }

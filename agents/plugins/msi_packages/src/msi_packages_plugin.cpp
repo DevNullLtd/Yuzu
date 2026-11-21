@@ -654,15 +654,9 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     if (upgrades.over_cap)
         spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; every upgrade_code "
                      "token is empty for this dispatch");
-    else if (!upgrades.failure) {
-        std::size_t none = 0;
-        for (const auto& p : roster.products)
-            none += p.upgrade_code.empty() ? 1 : 0;
-        if (none != 0 || upgrades.ambiguous != 0 || upgrades.bad_names != 0)
-            spdlog::info("msi_packages: upgrade_code empty for {} product(s) ({} named under more "
-                         "than one upgrade code); {} map name(s) not a packed GUID",
-                         none, upgrades.ambiguous, upgrades.bad_names);
-    }
+    else if (upgrades.bad_names != 0)
+        spdlog::warn("msi_packages: {} UpgradeCodes name(s) are not a packed GUID and were skipped",
+                     upgrades.bad_names);
     for (auto& row : inv::render(roster))
         ctx.write_output(std::move(row));
     if (roster.constraint)

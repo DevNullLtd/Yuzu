@@ -65,7 +65,6 @@ inline constexpr std::size_t kMaxRecords = 5000;
 /// Subkeys visited at most under Products, GUID-shaped or not (a planted key stuffed with
 /// junk names must not pin the walk); the same bound applies under UpgradeCodes.
 inline constexpr std::size_t kMaxSubkeysVisited = 20000;
-inline constexpr std::size_t kMaxUpgradeSubkeys = 20000;
 /// Value names read under one UpgradeCodes subkey at most (a code is named by a handful
 /// of products). The shell reads at most one past this so the builder can tell.
 inline constexpr std::size_t kMaxUpgradeValueNames = 256;
@@ -173,22 +172,6 @@ namespace detail {
     return true;
 }
 
-/// Braced GUID -> packed 32-digit upper-case form (the inverse of unpack_guid). nullopt
-/// for anything that is not a braced GUID.
-[[nodiscard]] inline std::optional<std::string> pack_guid(std::string_view braced) {
-    if (!is_braced_guid(braced))
-        return std::nullopt;
-    const std::string g = detail::upper_hex(braced);
-    const std::string_view v{g};
-    std::string out;
-    out += detail::reversed(v.substr(1, 8));
-    out += detail::reversed(v.substr(10, 4));
-    out += detail::reversed(v.substr(15, 4));
-    out += detail::pair_swapped(v.substr(20, 4));
-    out += detail::pair_swapped(v.substr(25, 12));
-    return out;
-}
-
 /// A well-formed braced GUID in upper case; anything else unchanged. Product and upgrade
 /// codes are compared and joined in this form (one machine registers its product code in
 /// lower case, so a code is never trusted to arrive in the case the map spells it).
@@ -275,13 +258,11 @@ struct InstallProps {
     std::string install_date;
 };
 
-enum class PackageState { ok, missing, path_refused, unreadable, deadline_skipped, not_recorded };
-
 struct InstallerRecord {
     std::string product_code; ///< unpacked from the Products subkey name, upper case
     InstallProps props;
-    yuzu::agent::msi::PropertyTable db; ///< the cached package's Property rows (empty unless ok)
-    PackageState state = PackageState::not_recorded;
+    /// the cached package's Property rows (empty unless the package was read)
+    yuzu::agent::msi::PropertyTable db;
     std::string reason; ///< the row-level reason, empty when there is none
 };
 
@@ -351,23 +332,19 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
             return;
         }
         if (!package_path_allowed(r.props.local_package, ctx.windows_dir)) {
-            r.state = PackageState::path_refused;
             r.reason = std::string{kReasonRefused};
             return;
         }
         if (reads_stopped) {
-            r.state = PackageState::deadline_skipped;
             r.reason = std::string{kReasonDeadline};
             return;
         }
         auto opened = open_package(r.props.local_package);
         if (opened.status == OpenStatus::absent) {
-            r.state = PackageState::missing;
             r.reason = std::string{kReasonMissing};
             return;
         }
         if (opened.status != OpenStatus::ok) {
-            r.state = PackageState::path_refused;
             r.reason = std::string{kReasonRefused};
             return;
         }
@@ -375,7 +352,6 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
         if (remaining <= std::chrono::milliseconds{0}) {
             reads_stopped = true;
             set.constraints.add_failure(kTokenDbDeadline);
-            r.state = PackageState::deadline_skipped;
             r.reason = std::string{kReasonDeadline};
             return;
         }
@@ -386,16 +362,13 @@ RecordSet collect_records(const Context& ctx, Enumerate&& enumerate, ReadPropert
             reads_stopped = true;
             set.constraints.add_failure(res.status == ReadStatus::TimedOut ? kTokenDbDeadline
                                                                            : kTokenDbBusy);
-            r.state = PackageState::deadline_skipped;
             r.reason = std::string{kReasonDeadline};
             return;
         }
         if (res.outcome.kind != Outcome::Kind::Ok) {
-            r.state = PackageState::unreadable;
             r.reason = unreadable_reason(res.outcome);
             return;
         }
-        r.state = PackageState::ok;
         r.db = res.outcome.props;
         r.db.product_code = normalise_guid(r.db.product_code);
         r.db.upgrade_code = normalise_guid(r.db.upgrade_code);
@@ -494,7 +467,6 @@ struct UpgradeMap {
         bool ambiguous = false;
     };
     std::unordered_map<std::string, Entry> by_product; ///< upper-case braced product code
-    std::size_t ambiguous = 0;  ///< products named under more than one upgrade code
     std::size_t bad_names = 0;  ///< subkey or value names that are not packed GUIDs (skipped)
     bool over_cap = false;      ///< too many subkeys or value names: every token is empty
     std::optional<std::string> failure; ///< a read fault (anything but an absent key)
@@ -521,7 +493,7 @@ UpgradeMap build_upgrade_map(Enumerate&& enumerate) {
     UpgradeMap m;
     std::size_t subkeys = 0;
     const auto on_upgrade = [&](std::string packed_upgrade, std::vector<std::string> names) -> bool {
-        if (++subkeys > kMaxUpgradeSubkeys || names.size() > kMaxUpgradeValueNames) {
+        if (++subkeys > kMaxSubkeysVisited || names.size() > kMaxUpgradeValueNames) {
             m.over_cap = true;
             return false;
         }
@@ -543,12 +515,8 @@ UpgradeMap build_upgrade_map(Enumerate&& enumerate) {
         return true;
     };
     m.failure = enumerate(on_upgrade);
-    if (m.over_cap || m.failure) {
+    if (m.over_cap || m.failure)
         m.by_product.clear(); // every token empty (over cap) or the roster constrained (fault)
-    } else {
-        for (const auto& [code, e] : m.by_product)
-            m.ambiguous += e.ambiguous ? 1 : 0;
-    }
     return m;
 }
 

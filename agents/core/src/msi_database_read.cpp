@@ -21,7 +21,6 @@
 #include <msi.h>
 #include <msiquery.h>
 
-#include <string_view>
 #include <vector>
 
 #include "win_str.hpp" // yuzu::win::to_wide / from_wide (agents/shared)
@@ -44,10 +43,6 @@ struct SlotRelease {
 };
 
 #ifdef _WIN32
-
-// Only the five Property rows the plugin reads; every other row is skipped by name.
-constexpr std::wstring_view kWanted[] = {L"ProductCode", L"UpgradeCode", L"ProductVersion",
-                                         L"Manufacturer", L"ProductName"};
 
 // RAII owner of one MSIHANDLE, closed on the worker's own thread.
 class MsiHandle {
@@ -78,16 +73,17 @@ UINT read_field(MSIHANDLE rec, unsigned field, std::wstring& out) {
     return ERROR_SUCCESS;
 }
 
+// Only the five Property rows the plugin reads; every other row is skipped by name.
 std::string* slot_for(PropertyTable& t, const std::wstring& name) {
-    if (name == kWanted[0])
+    if (name == L"ProductCode")
         return &t.product_code;
-    if (name == kWanted[1])
+    if (name == L"UpgradeCode")
         return &t.upgrade_code;
-    if (name == kWanted[2])
+    if (name == L"ProductVersion")
         return &t.product_version;
-    if (name == kWanted[3])
+    if (name == L"Manufacturer")
         return &t.manufacturer;
-    if (name == kWanted[4])
+    if (name == L"ProductName")
         return &t.product_name;
     return nullptr;
 }

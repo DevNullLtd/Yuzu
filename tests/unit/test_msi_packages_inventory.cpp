@@ -153,16 +153,22 @@ inv::Inventory run(FakeSource& src, const rec::UpgradeMap* map = nullptr) {
 }
 
 constexpr const char* kUpgradeA = "{7E1A4B20-5C3D-4F68-9A01-2B3C4D5E6F70}";
-constexpr const char* kUpgradeB = "{7E1A4B21-5C3D-4F68-9A01-2B3C4D5E6F71}";
-constexpr const char* kUpgradeC = "{7E1A4B22-5C3D-4F68-9A01-2B3C4D5E6F72}";
+
+// The packed spellings the registry holds (the names in installer-records-system.txt) of the
+// CMake and 7-Zip and of the three upgrade codes.
+constexpr const char* kPackedCMake = "0516257B54C15B5439D24AFCA53204C3";
+constexpr const char* kPackedSevenZip = "96F071321C0420726240000010000000";
+constexpr const char* kPackedUpgradeA = "02B4A1E7D3C586F4A910B2C3D4E5F607";
+constexpr const char* kPackedUpgradeB = "12B4A1E7D3C586F4A910B2C3D4E5F617";
+constexpr const char* kPackedUpgradeC = "22B4A1E7D3C586F4A910B2C3D4E5F627";
 
 // SYNTHETIC upgrade codes over products of the real capture: CMake is named under one upgrade
 // code, 7-Zip under two (so it has no single answer), every other product under none.
 rec::UpgradeMap make_map(std::optional<std::string> failure = std::nullopt) {
     return rec::build_upgrade_map([&](auto&& on_upgrade) -> std::optional<std::string> {
-        on_upgrade(*rec::pack_guid(kUpgradeA), std::vector<std::string>{*rec::pack_guid(kCMake)});
-        on_upgrade(*rec::pack_guid(kUpgradeB), std::vector<std::string>{*rec::pack_guid(kSevenZip)});
-        on_upgrade(*rec::pack_guid(kUpgradeC), std::vector<std::string>{*rec::pack_guid(kSevenZip)});
+        on_upgrade(kPackedUpgradeA, std::vector<std::string>{kPackedCMake});
+        on_upgrade(kPackedUpgradeB, std::vector<std::string>{kPackedSevenZip});
+        on_upgrade(kPackedUpgradeC, std::vector<std::string>{kPackedSevenZip});
         return failure;
     });
 }
