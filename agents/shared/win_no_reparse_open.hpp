@@ -1,5 +1,5 @@
-// win_no_reparse_open.hpp -- open ONE local-drive file with no reparse point followed anywhere
-// below the drive root, in a single kernel name resolution.
+// win_no_reparse_open.hpp -- open ONE local-drive file or directory with no reparse point
+// followed anywhere below the drive root, in a single kernel name resolution.
 //
 // WHY. A path-resolving open (CreateFileW on `X:\a\b\file`) follows a reparse point in any
 // ancestor directory, and a separate attribute check of each ancestor first leaves a window in

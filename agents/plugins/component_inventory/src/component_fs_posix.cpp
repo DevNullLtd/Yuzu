@@ -36,7 +36,8 @@
  *    reached under a stale name; what is returned is always a real directory or file opened with no
  *    link followed, never the target of a link.
  *
- * No Windows code: that leg is a later change and the shell answers `planned` there.
+ * No Windows code: the Windows leg is component_fs_win.cpp, over the pure decisions in
+ * component_legs_win.hpp.
  */
 #include "component_legs.hpp"
 

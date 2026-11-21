@@ -33,6 +33,10 @@
  *  - accepting a drive root, a UNC path or a repeated root in windows_candidate_roots fails the roots
  *    case: one walk could spend its entry budget on a whole drive.
  *  - comparing the WindowsApps path case-sensitively fails the exclusion case.
+ *  - a windows_walk_policy that excludes nothing fails both WindowsApps cases, which build their policy
+ *    from it: it is the function the plugin hands the walk for `scan` and for `native`, so the plugin
+ *    cannot drop the exclusion without this builder changing.
+ *  - treating a failed known-folder lookup as an empty host (supported, no rows) fails the lookup case.
  *  - dropping `policy` from scan()'s call to walk() (or from answer_scan's call to scan()) fails the scan
  *    case: WindowsApps would be listed, nothing counted, and the status row would carry no token.
  *  - opening a file by its joined path (a path-resolving open) fails the junction cases on Windows: the
@@ -58,6 +62,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <vector>
 
 #if defined(_WIN32)
@@ -280,7 +285,7 @@ TEST_CASE("component_legs_win: the roots are both Program Files trees in walk or
 TEST_CASE("component_legs_win: WindowsApps is excluded by exact path, case-insensitively, and counted",
           "[component_inventory][fs_win]") {
     const std::vector<std::string> roots = {"C:/Program Files", "C:/Program Files (x86)"};
-    const auto excluded = windows_native_excluded_dirs(roots);
+    const auto excluded = windows_excluded_dirs(roots);
     REQUIRE(excluded.size() == 2);
     CHECK(excluded[0] == "C:/Program Files/WindowsApps");
     CHECK(excluded[1] == "C:/Program Files (x86)/WindowsApps");
@@ -314,11 +319,13 @@ TEST_CASE("component_legs_win: WindowsApps is excluded by exact path, case-insen
         return r;
     };
     fs.now = [] { return std::chrono::steady_clock::time_point{}; };
-    WalkPolicy policy;
+    // The policy the plugin hands the walk (windows_walk_policy), with `native`'s candidate test.
+    Targets one;
+    one.roots = {"C:/Program Files"};
+    WalkPolicy policy = windows_walk_policy(one);
     policy.is_candidate = &is_windows_native_candidate;
-    policy.skip_dir = [&](const std::string& dir) { return is_windows_excluded_dir(excluded, dir); };
 
-    const std::vector<std::string> one_root = {"C:/Program Files"};
+    const std::vector<std::string>& one_root = one.roots;
     const WalkResult w = walk(one_root, WalkLimits{}, fs, std::chrono::steady_clock::time_point::max(), policy);
     CHECK(w.stop == Stop::complete);
     CHECK(w.stats.dirs_excluded == 1);
@@ -351,9 +358,7 @@ TEST_CASE("component_legs_win: the scan keeps out of WindowsApps too and says so
     };
     Targets t;
     t.roots = {"C:/Program Files"};
-    const auto excluded = windows_native_excluded_dirs(t.roots);
-    WalkPolicy policy; // the scan's: Java archives (the default candidate test), WindowsApps skipped
-    policy.skip_dir = [&](const std::string& dir) { return is_windows_excluded_dir(excluded, dir); };
+    const WalkPolicy policy = windows_walk_policy(t); // the scan's: Java archives, WindowsApps skipped
 
     fx::MemTree tree = build();
     const Answer a = answer_scan("windows", t, [&](const Targets&) { return tree.ops(); }, WalkLimits{}, policy);
@@ -376,6 +381,48 @@ TEST_CASE("component_legs_win: the scan keeps out of WindowsApps too and says so
     CHECK(b.res.stats.dirs_excluded == 0);
     CHECK(b.lines[0] == "status|scan|supported|-");
     CHECK(row_paths(b).size() == 3);
+}
+
+// ---- the roots from the two known-folder lookups ----
+
+TEST_CASE("component_legs_win: a failed known-folder lookup walks nothing and says so, never an empty host",
+          "[component_inventory][fs_win]") {
+    int asked = 0;
+    const FixedDriveTest fixed = [&asked](char) {
+        ++asked;
+        return true;
+    };
+    using Folder = std::optional<std::string>;
+
+    // Both lookups answered: both roots, in order, the flag clear.
+    const Targets ok = windows_targets_from_known_folders(Folder{"C:\\Program Files"},
+                                                          Folder{"C:\\Program Files (x86)"}, fixed);
+    CHECK(ok.roots == std::vector<std::string>{"C:/Program Files", "C:/Program Files (x86)"});
+    CHECK_FALSE(ok.mount_table_unreadable);
+    CHECK(asked == 2);
+
+    // Either lookup failing: no roots, the flag set, the drive test never asked.
+    asked = 0;
+    for (const auto& [pf, pf86] : {std::pair{Folder{}, Folder{"C:\\Program Files (x86)"}},
+                                   std::pair{Folder{"C:\\Program Files"}, Folder{}},
+                                   std::pair{Folder{}, Folder{}}}) {
+        const Targets t = windows_targets_from_known_folders(pf, pf86, fixed);
+        CHECK(t.roots.empty());
+        CHECK(t.mount_table_unreadable);
+    }
+    // Both answered but neither is a usable root (a UNC path, an empty string): the same answer.
+    const Targets unusable = windows_targets_from_known_folders(Folder{"\\\\server\\share\\pf"}, Folder{""}, fixed);
+    CHECK(unusable.roots.empty());
+    CHECK(unusable.mount_table_unreadable);
+    CHECK(asked == 0);
+
+    // A usable root on a drive that is not fixed is a skipped root, not a failed lookup.
+    const Targets removable = windows_targets_from_known_folders(Folder{"D:\\Program Files"},
+                                                                 Folder{"D:\\Program Files (x86)"},
+                                                                 [](char) { return false; });
+    CHECK(removable.roots.empty());
+    CHECK(removable.roots_network_skipped == 2);
+    CHECK_FALSE(removable.mount_table_unreadable);
 }
 
 // ---- the fixed-volume rule ----

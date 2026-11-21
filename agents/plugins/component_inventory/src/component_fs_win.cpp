@@ -197,17 +197,9 @@ struct Stamp {
 } // namespace
 
 Targets scan_targets() {
-    const auto program_files = known_folder_wtf8(FOLDERID_ProgramFilesX64);
-    const auto program_files_x86 = known_folder_wtf8(FOLDERID_ProgramFilesX86);
-    if (program_files && program_files_x86) {
-        const auto candidates = windows_candidate_roots(*program_files, *program_files_x86);
-        if (!candidates.empty())
-            return plan_windows_targets(candidates, is_fixed_drive);
-    }
-    // No root list: nothing is walked, and the answer says so rather than reading as an empty host.
-    Targets t;
-    t.mount_table_unreadable = true;
-    return t;
+    // The rule (a failed lookup walks nothing and says so) is windows_targets_from_known_folders'.
+    return windows_targets_from_known_folders(known_folder_wtf8(FOLDERID_ProgramFilesX64),
+                                              known_folder_wtf8(FOLDERID_ProgramFilesX86), is_fixed_drive);
 }
 
 Targets scan_native_targets() {

@@ -54,7 +54,7 @@ class ComponentInventoryDefinitionColumns(unittest.TestCase):
     def test_native_row_grammar_and_closed_version_sources(self):
         cols = {c["name"]: c for c in _definition("native")["spec"]["result"]["columns"]}
         self.assertEqual(cols["kind"]["example"], "native")
-        # The server's closed version_source set (installed_software_v3.hpp) already holds all four.
+        # The server's closed version_source set (installed_software_v3.hpp) already holds all five.
         self.assertEqual(cols["version_source"]["values"], ["filename", "elf", "macho", "pe", "unreadable"])
         self.assertEqual(cols["version_source"]["example"], "filename")
         self.assertEqual(_definition("scan")["spec"]["result"]["columns"][4]["values"],

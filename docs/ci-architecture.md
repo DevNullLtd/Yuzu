@@ -4812,7 +4812,9 @@ the 2026-10-04 re-balance; A's did not).
 Every CI leg selects the shards by `--suite agent` (ci.yml Linux step and Windows step,
 nightly.yml windows-asan) or runs `meson test` unfiltered (macOS, nightly and
 sanitizer legs); none selects the old entry name. `agent tsan-heavy checkpoints`
-is unsharded and unchanged.
+is unsharded and unchanged. `component_inventory windows host walk` (Windows only, suite `agent`,
+240 s) is a separate entry too: it runs the one hidden `[.][component_inventory_host_walk]` case, which
+walks the host's real Program Files twice (one walk per action, 45 s each at most) and has no room in a shard.
 
 Partition rule and measured balance live in the comment above the entries in
 `tests/meson.build`: a case runs in the lowest-numbered shard holding any of its

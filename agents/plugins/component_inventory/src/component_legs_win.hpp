@@ -210,7 +210,7 @@ namespace win_detail {
 /// The directories the `scan` and `native` walks must not list, by exact path: `WindowsApps` directly
 /// under each root. Those are the Store packages, owned by the package manager and unreadable to most accounts;
 /// the walk counts each one it meets (WalkStats::dirs_excluded), it never skips one silently.
-[[nodiscard]] inline std::vector<std::string> windows_native_excluded_dirs(const std::vector<std::string>& roots) {
+[[nodiscard]] inline std::vector<std::string> windows_excluded_dirs(const std::vector<std::string>& roots) {
     std::vector<std::string> out;
     out.reserve(roots.size());
     for (const auto& r : roots)
@@ -223,6 +223,18 @@ namespace win_detail {
 [[nodiscard]] inline bool is_windows_excluded_dir(const std::vector<std::string>& excluded, std::string_view dir) {
     return std::ranges::any_of(excluded,
                                [&](const std::string& e) { return java_detail::iequals(e, dir); });
+}
+
+/// The walk policy both Windows actions share: WindowsApps under each of `t`'s roots is skipped (and
+/// counted by the walk). The candidate test is the default one, Java archives, which is the `scan`
+/// action's; `native` replaces it. The plugin builds its policy here and the tests run this same
+/// function, so a policy that dropped the exclusion would fail on every OS.
+[[nodiscard]] inline WalkPolicy windows_walk_policy(const Targets& t) {
+    WalkPolicy p;
+    p.skip_dir = [excluded = windows_excluded_dirs(t.roots)](const std::string& dir) {
+        return is_windows_excluded_dir(excluded, dir);
+    };
+    return p;
 }
 
 /// Test seam: whether the volume of this drive letter (upper case) is a local fixed disk.
@@ -244,6 +256,23 @@ using FixedDriveTest = std::function<bool(char drive)>;
         else
             ++t.roots_network_skipped;
     }
+    return t;
+}
+
+/// Pure. The roots of both actions from the two known-folder lookups (nullopt: that lookup failed),
+/// the 64-bit tree first, in walk order. Both lookups must have answered and at least one path must be
+/// a usable root; otherwise nothing is walked and mount_table_unreadable is set, so a failed lookup is
+/// a constrained answer and never an empty host. `is_fixed_drive` is not asked in that case.
+[[nodiscard]] inline Targets windows_targets_from_known_folders(const std::optional<std::string>& program_files,
+                                                                const std::optional<std::string>& program_files_x86,
+                                                                const FixedDriveTest& is_fixed_drive) {
+    if (program_files && program_files_x86) {
+        const auto candidates = windows_candidate_roots(*program_files, *program_files_x86);
+        if (!candidates.empty())
+            return plan_windows_targets(candidates, is_fixed_drive);
+    }
+    Targets t;
+    t.mount_table_unreadable = true;
     return t;
 }
 
@@ -420,8 +449,8 @@ namespace yuzu::component_inventory {
 [[nodiscard]] Targets scan_targets();
 
 /// The roots of the `native` action: the same Program Files trees. The WindowsApps directory under
-/// each is excluded by the plugin's walk policy (windows_native_excluded_dirs), not by the roots; the
-/// `scan` action's walk is given the same exclusion.
+/// each is excluded by the plugin's walk policy (windows_walk_policy), not by the roots; the `scan`
+/// action's walk is given the same exclusion.
 [[nodiscard]] Targets scan_native_targets();
 
 /// The filesystem the walk goes through: every directory and file is opened relative to its volume

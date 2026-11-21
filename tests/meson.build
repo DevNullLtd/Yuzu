@@ -132,6 +132,9 @@ elif host_machine.system() == 'windows'
   # test_app_usage_local_dispatcher.cpp's foreign-owner case calls SetNamedSecurityInfoW and
   # AdjustTokenPrivileges directly, as echo_test_deps' Windows block does for its DACL cases.
   agent_test_native_deps += cxx.find_library('advapi32')
+  # component_fs_win.cpp is compiled into this exe (SAM-49): SHGetKnownFolderPath is shell32's; its
+  # CoTaskMemFree comes from ole32, above.
+  agent_test_native_deps += cxx.find_library('shell32')
 endif
 
 # ── Test fixture: FROZEN ABI3-layout plugin (PLAN-03 — real backward-compat) ──
@@ -686,7 +689,7 @@ agent_test_exe = executable(
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
     'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
-    'unit/test_component_fs_win.cpp',           # SAM-49: Windows filesystem leg (reparse refusal, read_at, unchanged) over a salted real tree; root planning portable
+    'unit/test_component_fs_win.cpp',            # SAM-49: Windows filesystem leg (reparse refusal, read_at, unchanged) over a salted real tree; root planning portable
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
     'unit/test_runtimes_local_dispatcher.cpp',   # Wave 10 PR10.1-b: real plugin via LocalDispatcher, unguarded on every OS
@@ -1261,6 +1264,24 @@ foreach shard, spec : agent_shard_specs
     depends: agent_shard_deps,
   )
 endforeach
+
+# The component_inventory dispatcher's Windows host walk (SAM-49). The case dispatches the real plugin's
+# `scan` and `native` over this host's own Program Files; each walk ends only at the plugin's own
+# budget (WalkLimits: 400,000 entries, 45 s), so two walks bound the case at about 90 s, under 50% of
+# this entry's 240 s (docs/testing/unit-test-conventions.md "Budget rule"). No shard has that room (A
+# measures 98-102 s on the Windows MSVC debug leg, above), so the case is hidden from every shard by
+# its [.] tag and runs here alone. Windows only: the case does not exist elsewhere. No
+# --allow-running-no-tests, so a renamed tag fails loudly, as on 'agent tsan-heavy checkpoints'.
+if host_machine.system() == 'windows'
+  test(
+    'component_inventory windows host walk',
+    agent_test_exe,
+    args: ['[component_inventory_host_walk]', '--durations=yes'],
+    suite: 'agent',
+    timeout: 240,
+    depends: agent_shard_deps,
+  )
+endif
 
 # Structural partition-invariant check for the agent shards (#5073): proves, against
 # the real compiled binary via --list-tests, that every case matched by

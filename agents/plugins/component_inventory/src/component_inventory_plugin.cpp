@@ -1,7 +1,7 @@
 /**
  * component_inventory_plugin.cpp -- installed software components found by reading application
  * trees: Java archives (.jar/.war/.ear) and the libraries nested inside them, and the versioned
- * shared libraries (ELF .so, Mach-O .dylib) shipped inside applications. A software-inventory fact
+ * shared libraries (ELF .so, Mach-O .dylib, PE .dll) shipped inside applications. A software-inventory fact
  * read from the files themselves, so it sees components no package manager owns.
  *
  * Actions (neither takes a parameter; the roots come from the OS leg and from nothing a request can
@@ -147,36 +147,26 @@ constexpr auto kNativeCandidate = &yuzu::component_inventory::is_linux_native_ca
 const yuzu::component_inventory::NativeParse kNativeParse = yuzu::component_inventory::describe_linux_file;
 #endif
 
-#if defined(_WIN32)
-// WindowsApps under each root that was planned, compared ASCII case-insensitively. Both actions walk
-// the same roots, so both keep out of it; the walk counts each one it meets (package_tree_skipped).
-std::function<bool(const std::string&)> windows_skip_dir(const yuzu::component_inventory::Targets& t) {
-    return [excluded = yuzu::component_inventory::windows_native_excluded_dirs(t.roots)](const std::string& dir) {
-        return yuzu::component_inventory::is_windows_excluded_dir(excluded, dir);
-    };
-}
-#endif
-
 // The scan's walk reads Java archives (the default candidate test). Only the Windows scan excludes a
 // tree today; the Linux and macOS scan walk excludes nothing, as before.
 yuzu::component_inventory::WalkPolicy scan_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
     yuzu::component_inventory::WalkPolicy p;
 #if defined(_WIN32)
-    p.skip_dir = windows_skip_dir(t);
+    p = yuzu::component_inventory::windows_walk_policy(t); // WindowsApps kept out and counted
 #endif
     return p;
 }
 
 yuzu::component_inventory::WalkPolicy native_policy([[maybe_unused]] const yuzu::component_inventory::Targets& t) {
-    yuzu::component_inventory::WalkPolicy p;
-    p.is_candidate = kNativeCandidate;
 #if defined(_WIN32)
-    p.skip_dir = windows_skip_dir(t);
+    yuzu::component_inventory::WalkPolicy p = yuzu::component_inventory::windows_walk_policy(t);
 #else
+    yuzu::component_inventory::WalkPolicy p;
     p.skip_dir = [excluded = yuzu::component_inventory::native_excluded_dirs()](const std::string& dir) {
         return std::ranges::find(excluded, dir) != excluded.end();
     };
 #endif
+    p.is_candidate = kNativeCandidate;
     return p;
 }
 
