@@ -12,7 +12,9 @@
 /// absent costs only its own section.
 ///   installed_apps.list_inventory           blob rows (the 12 original fields + install_location)
 ///   pkg_inventory.packages                  Homebrew formulae/casks and Chocolatey packages
-///                                           (ecosystems `brew`, `chocolatey`)
+///                                           (ecosystems `brew`, `chocolatey`); a Homebrew
+///                                           machine row also fills install_date and
+///                                           install_location, a user-scope row is not mapped
 ///   pkg_inventory.managers                  presence rows: `homebrew` (publisher `Homebrew`),
 ///                                           `chocolatey` and `winget` (labelled `via:`)
 ///   pkg_inventory.store_packages            active snaps/flatpaks and Appx packages
@@ -130,10 +132,14 @@ YUZU_EXPORT std::vector<SwEntry> parse_installed_apps_output(const std::string& 
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_managers_output(const std::string& out);
 
 /// Adapt `pkg_inventory` `packages` output (`status|packages|<level>|...` plus
-/// `package|homebrew|<id>|<version>|<formula|cask>`): formula -> kind `pkg`,
-/// cask -> kind `app`, ecosystem `brew`. Windows Chocolatey rows
+/// `package|homebrew|<id>|<version>|<formula|cask>`, optionally widened to eleven tokens with
+/// `|<install_time or ->|<tap or ->|<on_request or ->|<machine|user>|<owner or ->|<prefix>`):
+/// formula -> kind `pkg`, cask -> kind `app`, ecosystem `brew`. An eleven-token `machine` row
+/// maps its install_time (digits only) to install_date and its prefix to install_location (the
+/// v3 writer still gates that to machine roots); tap, on_request and owner are not mapped, and a
+/// `user` (or any non-`machine`) row is seen and not mapped. Windows Chocolatey rows
 /// (`package|chocolatey|<id>|<version or ->|pkg`) -> kind `pkg`, ecosystem
-/// `chocolatey`, version empty when `-`.
+/// `chocolatey`, version empty when `-`. A row of any other width is dropped.
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& out);
 
 /// Adapt `pkg_inventory` `store_packages` output (`status|store_packages|<level>|...`

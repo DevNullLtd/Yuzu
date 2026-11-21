@@ -166,3 +166,37 @@ TEST_CASE("mount_entries: hostile input neither overflows, throws nor loops", "[
     const auto minor = mount_entries("1 0 0:4294967296 / /x rw - ext4 /d rw\n");
     CHECK(minor.malformed == 1);
 }
+
+TEST_CASE("under_network_mount: segment-boundary match, a root mount covers everything",
+          "[network_fstype]") {
+    const std::vector<std::string> mounts{"/Users/test", "/mnt/nfs"};
+    CHECK(under_network_mount("/Users/test", mounts));           // exact
+    CHECK(under_network_mount("/Users/test/homebrew", mounts));  // a child
+    CHECK_FALSE(under_network_mount("/Users/tester", mounts));   // shared name prefix, other segment
+    CHECK_FALSE(under_network_mount("/Users", mounts));          // an ancestor is not under
+    CHECK_FALSE(under_network_mount("/Users/test", {}));         // empty mount list
+    const std::vector<std::string> root{"/"};
+    CHECK(under_network_mount("/Users/user", root));
+}
+
+TEST_CASE("touches_network_mount: under a mount or containing one", "[network_fstype]") {
+    const std::vector<std::string> mounts{"/Users/test/homebrew"};
+    CHECK(touches_network_mount("/Users/test/homebrew/Cellar", mounts)); // under
+    CHECK(touches_network_mount("/Users/test", mounts));                 // contains
+    CHECK(touches_network_mount("/Users", mounts));                      // contains
+    CHECK(touches_network_mount("/", mounts));                           // contains
+    CHECK_FALSE(touches_network_mount("/Users/tester", mounts));         // unrelated sibling
+    CHECK_FALSE(touches_network_mount("/Users/test/homebrew2", mounts)); // segment boundary
+    CHECK_FALSE(touches_network_mount("/Users/test", {}));
+}
+
+TEST_CASE("touches_network_mount: a name prefix is not a path prefix, and no mounts touch nothing",
+          "[network_fstype]") {
+    // The path ends mid-name before a deeper mount (`user` / `users/homebrew`): not a parent.
+    const std::vector<std::string> deeper{"/Users/users/homebrew"};
+    CHECK_FALSE(touches_network_mount("/Users/user", deeper));
+    // The path's last segment is a name prefix of the mount's (`test` / `tester`): not a parent.
+    const std::vector<std::string> sibling{"/Users/tester"};
+    CHECK_FALSE(touches_network_mount("/Users/test", sibling));
+    CHECK_FALSE(touches_network_mount("/", {}));
+}

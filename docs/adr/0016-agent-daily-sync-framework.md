@@ -496,6 +496,44 @@ else the `PACKAGER` tag.
 > affected; the per-item shortfall rule above is unchanged. See the Update of
 > 2026-11-09 below.)
 
+> **Update (2026-11-20):** a `pkg_inventory.packages` Homebrew row is five or eleven
+> tokens, for either manager, on purpose. A five-token Homebrew row maps as before, with
+> empty `install_date` and `install_location`. Any other width is dropped under a
+> `supported` status, and a supported answer with fewer rows is an authoritative section,
+> so narrowing the accepted widths would delete a device's stored rows. Five is the width
+> the adapter already accepted, kept as it was. An eleven-token `machine` row fills
+> `install_date` (the install receipt's install time, formula rows only) and
+> `install_location` (the machine prefix, kept by the slot 13 allowlist), so a formula or
+> cask installed under both machine prefixes is two rows, one per `install_location`. A
+> `user`-scope row is never collected, and the receipt's tap, its requested flag and the
+> owner have no slot. The v3 contract, its slots and the hash functions are unchanged.
+>
+> *One-time ledger effect on a carried database.* `install_location` is part of a row's
+> identity (a changed location is "a removal and an install", below), and a Homebrew
+> row's location goes from empty to the machine prefix. A fresh database is not affected:
+> the first full section for a facet is a baseline and writes no ledger rows (the
+> Baseline rule, below), and a supported deployment starts from a fresh database. Only a
+> development or UAT database that already holds a Mac's Homebrew rows from an earlier
+> build is affected (an in-place upgrade is not a supported path). On that Mac's first
+> sync from this build each Homebrew formula and cask row is recorded as one `remove` and
+> one `install` at an unchanged version. They show in
+> `GET /api/v1/inventory/software/changes`, the MCP `list_software_changes`, the
+> summary's install and removal counts and `yuzu_software_changes_total{kind}`. A pair is
+> recognisable: the same device, facet `pkg_inventory.packages`, name and version, one
+> `observed_at`; a reinstall at an unchanged version writes nothing, so that shape only
+> means the record's location, arch or vendor changed. There is no cause label. The pairs
+> are pruned with the ledger after 400 days and need no action.
+>
+> *Deviation from the per-user rule in the Decision.* The Decision says per-user
+> enumeration is "a later, gated, pseudonymized addition". `pkg_inventory.packages` now
+> lists a per-user Homebrew on the command surface, ungated (`Inventory`, execute gate
+> `None`) and with the home directory's name in clear as the row's owner. That is
+> deliberate, under the owner's rulings of 2026-11-18 (the owner name, inside `packages`)
+> and 2026-11-20 (no receipt field is read or carried on a user row: its install time, tap
+> and requested flag are `-`). The sync still never collects a user row. ADR-0024 D11's
+> pseudonymous `user_ref` is not reused: that ADR confines it to its own source and
+> requires any other use to be its own decision.
+
 Mechanics:
 
 - The fields ride **inside** the `plugin_data["installed_software"]` blob — no

@@ -35,6 +35,8 @@
  *  - pointing the plugin's run_macos at run_macos_at         -> the entry-point busy case (Apple only)
  *  - dropping the per-entry wall-clock check in count_subdirs -> the managers zero-clock case
  *  - leaking a Dir/fd on an early return                     -> the fd-balance case
+ *  - reading the receipt of a user-prefix row (dropping the machine-scope condition in
+ *    append_package_rows_from)                               -> the user-row cases (`-|-|-` expected)
  *  - opening a marker as one joined path instead of open_under_prefix's per-hop
  *    O_NOFOLLOW                                            -> the symlinked Library and prefix cases
  *  - dropping the caller-side `walk_budget` record, or the count_taps budget check
@@ -52,7 +54,10 @@
 #include "pkg_inventory_test_support.hpp"
 #include "test_helpers.hpp" // yuzu::test::TempDir
 
+#include <algorithm>
+#include <cerrno>
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
 #include <initializer_list>
@@ -232,11 +237,15 @@ TEST_CASE("pkg_inventory macos tree manifest: the committed capture parses",
     std::string err;
     REQUIRE(load_tree_manifest(entries, err));
     INFO(err);
-    CHECK(entries.size() == 11); // ten Cellar version directories + the empty Caskroom
+    CHECK(entries.size() == 14); // ten Cellar version directories + three receipts + the empty Caskroom
 
     const auto* fmt = find_entry(entries, "opt/homebrew/Cellar/fmt/12.2.0");
     REQUIRE(fmt != nullptr);
     CHECK(fmt->kind == Payload::dir);
+    const auto* receipt = find_entry(entries, "opt/homebrew/Cellar/xz/5.8.3/INSTALL_RECEIPT.json");
+    REQUIRE(receipt != nullptr);
+    CHECK(receipt->kind == Payload::text);
+    CHECK(receipt->data.find("\"tap\": \"homebrew/core\"") != std::string::npos);
     const auto* casks = find_entry(entries, "opt/homebrew/Caskroom");
     REQUIRE(casks != nullptr);
     CHECK(casks->kind == Payload::dir);
@@ -302,13 +311,16 @@ yuzu::pkg_inventory::Action g_leg_action = yuzu::pkg_inventory::Action::managers
 /// slot, or (Apple only) the plugin's own `run_macos` entry point that execute() calls.
 enum class Via { at, guarded, entry };
 Via g_leg_via = Via::at;
+const yuzu::pkg_inventory::mac::UserPrefixConfig* g_leg_ucfg = nullptr;
 
 int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam* /*params*/,
                 std::size_t /*param_count*/) {
     yuzu::CommandContext ctx{raw};
+    const yuzu::pkg_inventory::mac::UserPrefixConfig none{};
+    const auto& ucfg = g_leg_ucfg != nullptr ? *g_leg_ucfg : none;
     switch (g_leg_via) {
     case Via::guarded:
-        return yuzu::pkg_inventory::mac::run_macos_guarded(ctx, g_leg_action, *g_leg_root);
+        return yuzu::pkg_inventory::mac::run_macos_guarded(ctx, g_leg_action, *g_leg_root, ucfg);
 #if defined(__APPLE__)
     case Via::entry: return yuzu::pkg_inventory::run_macos(ctx, g_leg_action);
 #else
@@ -316,20 +328,23 @@ int leg_execute(YuzuCommandContext* raw, const char* /*action*/, const YuzuParam
 #endif
     case Via::at: break;
     }
-    return yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root);
+    return yuzu::pkg_inventory::mac::run_macos_at(ctx, g_leg_action, *g_leg_root, ucfg);
 }
 
-yuzu::agent::LocalDispatcher::Result run_leg(const fs::path& root, yuzu::pkg_inventory::Action a,
-                                             Via via = Via::at) {
+yuzu::agent::LocalDispatcher::Result
+run_leg(const fs::path& root, yuzu::pkg_inventory::Action a, Via via = Via::at,
+        const yuzu::pkg_inventory::mac::UserPrefixConfig* ucfg = nullptr) {
     g_leg_root = &root;
     g_leg_action = a;
     g_leg_via = via;
+    g_leg_ucfg = ucfg;
     YuzuPluginDescriptor descriptor{};
     descriptor.execute = &leg_execute;
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(&descriptor, "probe");
     g_leg_root = nullptr;
     g_leg_via = Via::at;
+    g_leg_ucfg = nullptr;
     return result;
 }
 
@@ -367,19 +382,27 @@ TEST_CASE("pkg_inventory macos: package rows over the real-capture tree",
 
     CHECK_FALSE(token.has_value());
     // Sorted by formula name; version is the real directory name. The Caskroom
-    // is empty in the capture, so there are formula rows only.
+    // is empty in the capture, so there are formula rows only. Three formulae carry a
+    // captured receipt (ccache, cmake: requested; xz: pulled in as a dependency); the other
+    // seven have none in the manifest, so their receipt fields are `-`.
+    const std::string tail = "|machine|-|/opt/homebrew";
     const std::vector<std::string> expected{
-        "package|homebrew|ccache|4.13.6_1|formula", "package|homebrew|cmake|4.4.2|formula",
-        "package|homebrew|fmt|12.2.0|formula",      "package|homebrew|lz4|1.10.0|formula",
-        "package|homebrew|meson|1.12.0|formula",    "package|homebrew|ninja|1.13.2|formula",
-        "package|homebrew|openssl@3|3.6.3|formula", "package|homebrew|sqlite|3.53.4|formula",
-        "package|homebrew|xz|5.8.3|formula",        "package|homebrew|zstd|1.5.7_1|formula",
+        "package|homebrew|ccache|4.13.6_1|formula|1787233798|homebrew/core|true" + tail,
+        "package|homebrew|cmake|4.4.2|formula|1787233798|homebrew/core|true" + tail,
+        "package|homebrew|fmt|12.2.0|formula|-|-|-" + tail,
+        "package|homebrew|lz4|1.10.0|formula|-|-|-" + tail,
+        "package|homebrew|meson|1.12.0|formula|-|-|-" + tail,
+        "package|homebrew|ninja|1.13.2|formula|-|-|-" + tail,
+        "package|homebrew|openssl@3|3.6.3|formula|-|-|-" + tail,
+        "package|homebrew|sqlite|3.53.4|formula|-|-|-" + tail,
+        "package|homebrew|xz|5.8.3|formula|1787233794|homebrew/core|false" + tail,
+        "package|homebrew|zstd|1.5.7_1|formula|-|-|-" + tail,
     };
     REQUIRE(rows.size() == expected.size());
     for (std::size_t i = 0; i < expected.size(); ++i) {
         INFO("row " << i);
         CHECK(rows[i] == expected[i]);
-        CHECK(split_fields_escape_aware(rows[i]).size() == 5);
+        CHECK(split_fields_escape_aware(rows[i]).size() == 11);
     }
 }
 
@@ -494,8 +517,8 @@ TEST_CASE("pkg_inventory macos: a whole-action walk budget stops a breadth-distr
     // budget stopped BEFORE pkg-b's version listing started, so what pkg-a
     // already produced is a constraint, not a discard.
     REQUIRE(rows.size() == 2);
-    CHECK(rows[0] == "package|homebrew|pkg-a|1.0.0|formula");
-    CHECK(rows[1] == "package|homebrew|pkg-a|1.0.1|formula");
+    CHECK(rows[0] == "package|homebrew|pkg-a|1.0.0|formula|-|-|-|machine|-|/opt/homebrew");
+    CHECK(rows[1] == "package|homebrew|pkg-a|1.0.1|formula|-|-|-|machine|-|/opt/homebrew");
 }
 
 TEST_CASE("pkg_inventory macos: a budget that dies at a container boundary is still a constraint",
@@ -521,8 +544,8 @@ TEST_CASE("pkg_inventory macos: a budget that dies at a container boundary is st
     REQUIRE(token.has_value());
     CHECK(*token == "macos:homebrew_caskroom:walk_budget");
     REQUIRE(rows.size() == 2);
-    CHECK(rows[0] == "package|homebrew|pkg-a|1.0|formula");
-    CHECK(rows[1] == "package|homebrew|pkg-b|1.0|formula");
+    CHECK(rows[0] == "package|homebrew|pkg-a|1.0|formula|-|-|-|machine|-|/opt/homebrew");
+    CHECK(rows[1] == "package|homebrew|pkg-b|1.0|formula|-|-|-|machine|-|/opt/homebrew");
 }
 
 TEST_CASE("pkg_inventory macos: a Cellar of plain files that eats the budget hides nothing silently",
@@ -653,7 +676,8 @@ TEST_CASE("pkg_inventory macos seam: a clean tree reaches the wire as supported 
     const auto prows = captured_rows(packages.captured);
     REQUIRE(prows.size() == 11); // status row + the ten captured formula rows
     CHECK(prows[0] == "status|packages|supported|-");
-    CHECK(prows[1] == "package|homebrew|ccache|4.13.6_1|formula");
+    CHECK(prows[1] == "package|homebrew|ccache|4.13.6_1|formula|1787233798|homebrew/core|true|machine|-|"
+                      "/opt/homebrew");
     CHECK(packages.result_status == YUZU_RESULT_STATUS_OK);
     CHECK(packages.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
 }
@@ -785,14 +809,35 @@ TEST_CASE("pkg_inventory macos seam: the plugin's own run_macos entry point walk
     CHECK(rows[0] == "status|packages|constrained|macos:packages:busy");
     CHECK(busy.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
 }
+
+TEST_CASE("pkg_inventory macos: production_user_prefix_config maps the mount reader's answer onto the "
+          "user-walk guard",
+          "[pkg_inventory][macos][user][mounts]") {
+    using namespace yuzu::pkg_inventory;
+    // This mapping is the only production setter of the fail-closed flag: a failed read must be
+    // `mounts_unreadable` (the user walk is then skipped with a token), never an empty guard.
+    // MUTATION: `cfg.mounts_unreadable = !mounts` -> `= false` fails the first block.
+    const auto failed = mac::production_user_prefix_config(
+        []() -> std::optional<std::vector<std::string>> { return std::nullopt; });
+    CHECK(failed.mounts_unreadable);
+    CHECK(failed.network_mounts.empty());
+
+    const auto ok = mac::production_user_prefix_config([]() -> std::optional<std::vector<std::string>> {
+        return std::vector<std::string>{"/Volumes/x"};
+    });
+    CHECK_FALSE(ok.mounts_unreadable);
+    CHECK(ok.network_mounts == std::vector<std::string>{"/Volumes/x"});
+}
 #endif // defined(__APPLE__)
 
 TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exactly as they found them",
           "[pkg_inventory][macos][walk]") {
     using namespace yuzu::pkg_inventory;
-    // Peak use is two fds; every early return between acquire and release (a refused
-    // symlink hop, a failed openat, a truncated listing, a budget stop) must give
-    // them back.
+    // Peak use is five fds, in the user walk (/Users, a home, its prefix, a container and one id
+    // directory); a machine-prefix walk peaks at four (container, id, version directory and its
+    // receipt file). Every early return between acquire and release (a refused symlink hop, a
+    // failed openat, a truncated listing, a budget stop, an owner or home-name refusal, a mount
+    // guard, an unreadable home) must give them back.
     yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_fdbalance_"};
     fs::create_directories(dir.path / "elsewhere/Cellar/evil/1.0");
     fs::create_directories(dir.path / "opt");
@@ -806,6 +851,36 @@ TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exact
     fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "usr/local/Cellar/link", ec);
     REQUIRE_FALSE(ec);
 
+    // A Users tree too: a real home with both candidates, a symlinked home, a symlinked Cellar.
+    fs::create_directories(dir.path / "Users/alpha/homebrew/Cellar/a/1.0/sub");
+    fs::create_directories(dir.path / "Users/alpha/homebrew/Caskroom/c/1.0");
+    fs::create_directories(dir.path / "Users/alpha/.homebrew/Cellar/b/1.0");
+    fs::create_directories(dir.path / "Users/beta/homebrew");
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "Users/beta/homebrew/Cellar", ec);
+    REQUIRE_FALSE(ec);
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "Users/linkhome", ec);
+    REQUIRE_FALSE(ec);
+    fs::create_directories(dir.path / "Users/caf\xc3\xa9/homebrew/Cellar/n/1.0"); // owner_name_unsupported
+    fs::create_directories(dir.path / "Users/locked/homebrew/Cellar/x/1.0");
+    {
+        std::ofstream receipt(dir.path / "Users/alpha/homebrew/Cellar/a/1.0/INSTALL_RECEIPT.json");
+        receipt << R"({"time": 1767225600})";
+    }
+    // An unreadable home (as root the mode is no barrier and the walk simply reads it). Declared
+    // after the TempDir, so the mode is restored before the tree is removed on every exit path.
+    const auto locked_home = dir.path / "Users/locked";
+    REQUIRE(::chmod(locked_home.c_str(), 0000) == 0);
+    ModeGuard restore_home{locked_home, 0755};
+    mac::UserPrefixConfig ucfg;
+    ucfg.min_home_uid = 0;
+    auto mounted = ucfg; // a network-mounted home, and a mount inside a candidate prefix
+    mounted.network_mounts = {"/Users/alpha", "/Users/beta/homebrew"};  // personal-data-ok: synthetic test path
+    auto unreadable = ucfg;
+    unreadable.mounts_unreadable = true;
+    auto users_mounted = ucfg;
+    users_mounted.network_mounts = {"/Users"};
+    const mac::UserPrefixConfig* const configs[] = {&ucfg, &mounted, &unreadable, &users_mounted};
+
     Limits tight;
     tight.max_entries_per_dir = 1; // truncated listings
     Limits expired;
@@ -817,9 +892,548 @@ TEST_CASE("pkg_inventory macos: walks leave the process's file descriptors exact
     std::optional<std::string> token;
     for (const Limits* lim : all_limits) {
         (void)mac::macos_manager_rows_at(dir.path, token, *lim);
-        (void)mac::macos_package_rows_at(dir.path, token, *lim);
+        for (const auto* cfg : configs) (void)mac::macos_package_rows_at(dir.path, token, *lim, *cfg);
+    }
+    // The whole-action budget dying at every point of the walk, machine and user prefixes alike.
+    for (std::size_t n = 0; n <= 48; ++n) {
+        Limits sweep;
+        sweep.max_walk_entries = n;
+        (void)mac::macos_package_rows_at(dir.path, token, sweep, ucfg);
+    }
+    {
+        // An owner mismatch injected below the walk: the prefix is opened, refused and closed.
+        const auto home = posix::open_dir_no_follow((dir.path / "Users/alpha").string());
+        REQUIRE(home.dir.valid());
+        std::vector<std::string> rows;
+        yuzu::shared::ConstraintAccumulator acc;
+        auto budget = WalkBudget::from(defaults);
+        (void)mac::detail::append_home_prefix_rows(home.dir, static_cast<std::uint32_t>(::geteuid()) + 1,
+                                                   "alpha", ucfg, defaults, rows, acc, budget);
+        CHECK(acc.reason() == "macos:homebrew_user_prefix:owner_mismatch");
+    }
+    {
+        // A symlinked /Users: refused at the first hop, nothing left open.
+        yuzu::test::TempDir linked{"yuzu_test_pkg_inventory_macos_fdbalance_users_link_"};
+        fs::create_directories(linked.path / "elsewhere/alpha/homebrew/Cellar/a/1.0");
+        fs::create_directory_symlink(linked.path / "elsewhere", linked.path / "Users", ec);
+        REQUIRE_FALSE(ec);
+        (void)mac::macos_package_rows_at(linked.path, token, defaults, ucfg);
+        REQUIRE(token.has_value());
+        CHECK(*token == "macos:user_homes:not_a_directory");
     }
     CHECK(open_fd_count() == before);
 }
+
+// ── receipts and user-owned prefixes ─────────────────────────────────────
+
+namespace {
+
+constexpr std::string_view kGoodReceipt =
+    R"({"installed_on_request": true, "time": 1767225600, "source": {"tap": "homebrew/core"}})";
+constexpr std::string_view kMachineTail = "|machine|-|/opt/homebrew";
+
+void write_text(const fs::path& p, std::string_view body) {
+    fs::create_directories(p.parent_path());
+    std::ofstream out(p, std::ios::binary);
+    REQUIRE(out.good());
+    out << body;
+}
+
+/// A formula `id`/`ver` under `<root>/Users/<home>/<cand>/Cellar`, with a good receipt.
+void make_user_formula(const fs::path& root, const std::string& home, const std::string& cand,
+                       const std::string& id, const std::string& ver) {
+    const auto v = root / "Users" / home / cand / "Cellar" / id / ver;
+    fs::create_directories(v);
+    write_text(v / "INSTALL_RECEIPT.json", kGoodReceipt);
+}
+
+/// A user-scope formula row. Its install time, tap and requested flag are always `-`: no receipt
+/// under a user-owned prefix is opened, although make_user_formula plants a good one.
+std::string user_row(const std::string& id, const std::string& ver, const std::string& home,
+                     const std::string& cand) {
+    return "package|homebrew|" + id + "|" + ver + "|formula|-|-|-|user|" + home + "|~/" + cand;
+}
+
+/// The unprivileged config the happy-path cases use: every uid counts as a real home.
+yuzu::pkg_inventory::mac::UserPrefixConfig any_uid_config() {
+    yuzu::pkg_inventory::mac::UserPrefixConfig c;
+    c.min_home_uid = 0;
+    return c;
+}
+
+std::uint32_t euid32() { return static_cast<std::uint32_t>(::geteuid()); }
+
+bool leaks(const std::vector<std::string>& rows, const std::optional<std::string>& token,
+           const fs::path& root) {
+    const auto bad = [&](const std::string& t) {
+        return t.find("/Users/") != std::string::npos || t.find(root.string()) != std::string::npos;
+    };
+    for (const auto& r : rows)
+        if (bad(r)) return true;
+    return token && bad(*token);
+}
+
+} // namespace
+
+TEST_CASE("pkg_inventory macos receipts: a symlink, FIFO, directory or oversized receipt gives `-`, "
+          "never a token or a hang",
+          "[pkg_inventory][macos][walk][receipt]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_receipt_bad_"};
+    const auto cellar = dir.path / "opt/homebrew/Cellar";
+    write_text(cellar / "good/1.0/INSTALL_RECEIPT.json", kGoodReceipt);
+    fs::create_directories(cellar / "sym/1.0");
+    std::error_code ec;
+    fs::create_symlink(cellar / "good/1.0/INSTALL_RECEIPT.json", cellar / "sym/1.0/INSTALL_RECEIPT.json",
+                       ec);
+    REQUIRE_FALSE(ec);
+    fs::create_directories(cellar / "fifo/1.0");
+    REQUIRE(::mkfifo((cellar / "fifo/1.0/INSTALL_RECEIPT.json").c_str(), 0600) == 0);
+    fs::create_directories(cellar / "dirr/1.0/INSTALL_RECEIPT.json");
+    write_text(cellar / "big/1.0/INSTALL_RECEIPT.json",
+               std::string{kGoodReceipt} + std::string(kMaxBrewReceiptBytes, ' '));
+
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    const std::vector<std::string> expected{
+        "package|homebrew|big|1.0|formula|-|-|-" + std::string{kMachineTail},
+        "package|homebrew|dirr|1.0|formula|-|-|-" + std::string{kMachineTail},
+        "package|homebrew|fifo|1.0|formula|-|-|-" + std::string{kMachineTail},
+        "package|homebrew|good|1.0|formula|1767225600|homebrew/core|true" + std::string{kMachineTail},
+        "package|homebrew|sym|1.0|formula|-|-|-" + std::string{kMachineTail},
+    };
+    CHECK(rows == expected);
+}
+
+TEST_CASE("pkg_inventory macos receipts: a cask never reads a receipt, even a planted one",
+          "[pkg_inventory][macos][walk][receipt]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_receipt_cask_"};
+    write_text(dir.path / "opt/homebrew/Caskroom/somecask/1.0/INSTALL_RECEIPT.json", kGoodReceipt);
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token);
+    CHECK_FALSE(token.has_value());
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == "package|homebrew|somecask|1.0|cask|-|-|-" + std::string{kMachineTail});
+}
+
+TEST_CASE("pkg_inventory macos receipts: the owner rule gates parsing (injected owner, no root)",
+          "[pkg_inventory][macos][walk][receipt]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_receipt_owner_"};
+    write_text(dir.path / "v/INSTALL_RECEIPT.json", kGoodReceipt);
+    const auto vdir = posix::open_dir_no_follow((dir.path / "v").string());
+    REQUIRE(vdir.dir.valid());
+
+    const auto own = mac::detail::read_brew_receipt(vdir.dir, euid32());
+    CHECK(own.install_time == "1767225600");
+    CHECK(own.tap == "homebrew/core");
+    CHECK(own.on_request == "true");
+
+    const auto foreign = mac::detail::read_brew_receipt(vdir.dir, euid32() + 1);
+    CHECK(foreign.install_time.empty());
+    CHECK(foreign.tap.empty());
+    CHECK(foreign.on_request.empty());
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: a home's own prefixes are listed after the machine "
+          "rows, as user rows with no absolute path, and a valid receipt under a user prefix never "
+          "reaches a row",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_ok_"};
+    write_text(dir.path / "opt/homebrew/Cellar/mach/1.0/INSTALL_RECEIPT.json", kGoodReceipt);
+    make_user_formula(dir.path, "beta", "homebrew", "tool", "2.0");
+    make_user_formula(dir.path, "alpha", "homebrew", "wget", "1.0");
+    make_user_formula(dir.path, "alpha", ".homebrew", "jq", "1.7");
+    fs::create_directories(dir.path / "Users/alpha/homebrew/Caskroom/mycask/3.1");
+    write_text(dir.path / "Users/.localized", "");        // dotfile: not a home
+    write_text(dir.path / "Users/plainfile", "x");        // not a directory
+
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+    CHECK_FALSE(token.has_value());
+    const std::vector<std::string> expected{
+        "package|homebrew|mach|1.0|formula|1767225600|homebrew/core|true" + std::string{kMachineTail},
+        user_row("wget", "1.0", "alpha", "homebrew"),
+        "package|homebrew|mycask|3.1|cask|-|-|-|user|alpha|~/homebrew",
+        user_row("jq", "1.7", "alpha", ".homebrew"),
+        user_row("tool", "2.0", "beta", "homebrew"),
+    };
+    CHECK(rows == expected);
+    for (const auto& row : rows)
+        CHECK(split_fields_escape_aware(row).size() == 11);
+    CHECK_FALSE(leaks(rows, token, dir.path));
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: a home below the uid floor is skipped silently",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_floor_"};
+    make_user_formula(dir.path, "alpha", "homebrew", "wget", "1.0");
+    CHECK(mac::UserPrefixConfig{}.min_home_uid == 500); // production floor: below it is a system account
+    mac::UserPrefixConfig cfg;
+    cfg.min_home_uid = euid32() + 1; // the temp tree's owner is below the floor
+    std::optional<std::string> token;
+    CHECK(mac::macos_package_rows_at(dir.path, token, Limits{}, cfg).empty());
+    CHECK_FALSE(token.has_value());
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: a symlinked home or candidate and a plain file are "
+          "skipped, and the link target's packages never appear",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_links_"};
+    make_user_formula(dir.path, "../elsewhere1", "homebrew", "secret1", "9.9"); // Users/../elsewhere1
+    fs::create_directories(dir.path / "Users");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere1", dir.path / "Users/linkhome", ec);
+    REQUIRE_FALSE(ec);
+    fs::create_directories(dir.path / "elsewhere2/Cellar/secret2/9.9");
+    fs::create_directories(dir.path / "Users/alpha");
+    fs::create_directory_symlink(dir.path / "elsewhere2", dir.path / "Users/alpha/homebrew", ec);
+    REQUIRE_FALSE(ec);
+    write_text(dir.path / "Users/beta/homebrew", "not a directory");
+    write_text(dir.path / "Users/beta/.homebrew", "not a directory either");
+
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+    CHECK(rows.empty());
+    CHECK_FALSE(token.has_value());
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: a symlinked Cellar in a real prefix constrains the "
+          "answer with a named token",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_cellar_link_"};
+    fs::create_directories(dir.path / "elsewhere/secret/9.9");
+    fs::create_directories(dir.path / "Users/alpha/homebrew");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "Users/alpha/homebrew/Cellar", ec);
+    REQUIRE_FALSE(ec);
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+    CHECK(rows.empty());
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_cellar:not_a_directory");
+    CHECK_FALSE(leaks(rows, token, dir.path));
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: network mounts are never touched",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_mounts_"};
+    make_user_formula(dir.path, "alpha", "homebrew", "wget", "1.0");
+    make_user_formula(dir.path, "beta", "homebrew", "tool", "2.0");
+    std::optional<std::string> token;
+
+    // /Users itself on a mount: no home is opened.
+    auto cfg = any_uid_config();
+    cfg.network_mounts = {"/Users"};
+    CHECK(mac::macos_package_rows_at(dir.path, token, Limits{}, cfg).empty());
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:user_homes:network_mount");
+
+    // One home on a mount: a token, and the other home is still walked.
+    cfg.network_mounts = {"/Users/alpha"};  // personal-data-ok: synthetic test path
+    auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:user_homes:network_mount");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == user_row("tool", "2.0", "beta", "homebrew"));
+
+    // A mount INSIDE a candidate prefix: that prefix is never opened.
+    cfg.network_mounts = {"/Users/alpha/homebrew/Cellar"};  // personal-data-ok: synthetic test path
+    rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_prefix:network_mount");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0] == user_row("tool", "2.0", "beta", "homebrew"));
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: an unreadable mount table skips the user walk with a "
+          "token and keeps the machine rows",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_mounts_unreadable_"};
+    write_text(dir.path / "opt/homebrew/Cellar/mach/1.0/INSTALL_RECEIPT.json", kGoodReceipt);
+    make_user_formula(dir.path, "alpha", "homebrew", "wget", "1.0");
+    auto cfg = any_uid_config();
+    cfg.mounts_unreadable = true;
+    std::optional<std::string> token;
+    const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:user_homes:mounts_unreadable");
+    REQUIRE(rows.size() == 1);
+    CHECK(rows[0].find("|machine|") != std::string::npos);
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: every bound stops the user walk and is recorded once",
+          "[pkg_inventory][macos][walk][user][limits]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_caps_"};
+    for (const char* home : {"alpha", "beta"}) {
+        make_user_formula(dir.path, home, "homebrew", "a", "1.0");
+        make_user_formula(dir.path, home, "homebrew", "b", "1.0");
+    }
+    const auto cfg = any_uid_config();
+    std::optional<std::string> token;
+
+    // /Users listing cut at the entry cap: the one home read is kept, the cut is named. The cap
+    // also cuts that home's Cellar to one id, so exactly one row survives. Which home and which id
+    // is readdir order (the listing is capped before it is sorted), so the row is matched against
+    // every candidate rather than a fixed pair.
+    Limits entry_cap;
+    entry_cap.max_entries_per_dir = 1;
+    auto rows = mac::macos_package_rows_at(dir.path, token, entry_cap, cfg);
+    REQUIRE(token.has_value());
+    CHECK(token->find("macos:user_homes:entry_cap") != std::string::npos);
+    REQUIRE(rows.size() == 1);
+    std::vector<std::string> candidates;
+    for (const char* id : {"a", "b"})
+        for (const char* home : {"alpha", "beta"})
+            candidates.push_back(user_row(id, "1.0", home, "homebrew"));
+    CHECK(std::find(candidates.begin(), candidates.end(), rows[0]) != candidates.end());
+
+    // Whole-action walk budget spent by the /Users listing itself: nothing is opened.
+    Limits budget;
+    budget.max_walk_entries = 2;
+    rows = mac::macos_package_rows_at(dir.path, token, budget, cfg);
+    CHECK(rows.empty());
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:user_homes:walk_budget");
+
+    // Whole-action walk budget spent between homes. /Users lists 2 entries; alpha's Cellar lists
+    // 2 ids and one version each (4 more), so 6 ends exactly as alpha's Cellar is done: the
+    // first home's two rows are kept, the Caskroom boundary check records the stop, and the
+    // second home is never read.
+    budget.max_walk_entries = 6;
+    rows = mac::macos_package_rows_at(dir.path, token, budget, cfg);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0] == user_row("a", "1.0", "alpha", "homebrew"));
+    CHECK(rows[1] == user_row("b", "1.0", "alpha", "homebrew"));
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_caskroom:walk_budget");
+
+    // One more entry: alpha finishes, and the budget dies inside beta's Cellar listing before
+    // any beta id is opened (the per-id check records the stop under the Cellar source).
+    budget.max_walk_entries = 7;
+    rows = mac::macos_package_rows_at(dir.path, token, budget, cfg);
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[1] == user_row("b", "1.0", "alpha", "homebrew"));
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_cellar:walk_budget");
+
+    // Row cap under the user source: one row, then the walk stops (the second home is not read).
+    Limits row_cap;
+    row_cap.max_package_rows = 1;
+    rows = mac::macos_package_rows_at(dir.path, token, row_cap, cfg);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_cellar:row_cap");
+
+    // Byte cap under the user source: exactly one user row fits.
+    Limits byte_cap;
+    byte_cap.max_output_bytes =
+        user_row("a", "1.0", "alpha", "homebrew").size() + 1;
+    rows = mac::macos_package_rows_at(dir.path, token, byte_cap, cfg);
+    REQUIRE(rows.size() == 1);
+    REQUIRE(token.has_value());
+    CHECK(*token == "macos:homebrew_user_cellar:byte_cap");
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: a home name that cannot be a wire field is refused, "
+          "and a home with only an empty ~/.homebrew yields nothing",
+          "[pkg_inventory][macos][walk][user]") {
+    using namespace yuzu::pkg_inventory;
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_name_"};
+        make_user_formula(dir.path, "caf\xc3\xa9", "homebrew", "wget", "1.0"); // non-ASCII name
+        make_user_formula(dir.path, "zed", "homebrew", "tool", "2.0");
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        REQUIRE(token.has_value());
+        CHECK(*token == "macos:homebrew_user_prefix:owner_name_unsupported");
+        REQUIRE(rows.size() == 1); // the refused home gave no row; the next home is still read
+        CHECK(rows[0] == user_row("tool", "2.0", "zed", "homebrew"));
+    }
+    {
+        // Its own tree: a repeated token is dropped by the accumulator, so beside the home
+        // above this half could not fail. Only a bad-name home, with Homebrew's state dir.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_name_empty_"};
+        fs::create_directories(dir.path / "Users/n\xc3\xa9" "e/.homebrew");
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        CHECK(rows.empty());
+        CHECK_FALSE(token.has_value());
+    }
+}
+
+TEST_CASE("pkg_inventory macos user prefixes: the prefix owner must equal the home's (injected "
+          "owner, no root)",
+          "[pkg_inventory][macos][walk][user][owner]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_owner_"};
+    fs::create_directories(dir.path / "home/homebrew/Cellar/planted/1.0");
+    const auto home = posix::open_dir_no_follow((dir.path / "home").string());
+    REQUIRE(home.dir.valid());
+    const Limits lim;
+    const mac::UserPrefixConfig cfg;
+
+    {
+        std::vector<std::string> rows;
+        yuzu::shared::ConstraintAccumulator acc;
+        auto budget = WalkBudget::from(lim);
+        (void)mac::detail::append_home_prefix_rows(home.dir, euid32(), "alpha", cfg, lim, rows, acc,
+                                                   budget);
+        CHECK_FALSE(acc.any_failure());
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0].find("|user|alpha|~/homebrew") != std::string::npos);
+    }
+    {
+        std::vector<std::string> rows;
+        yuzu::shared::ConstraintAccumulator acc;
+        auto budget = WalkBudget::from(lim);
+        (void)mac::detail::append_home_prefix_rows(home.dir, euid32() + 1, "alpha", cfg, lim, rows,
+                                                   acc, budget);
+        CHECK(rows.empty());
+        CHECK(acc.reason() == "macos:homebrew_user_prefix:owner_mismatch");
+        CHECK(acc.incomplete());
+    }
+}
+
+TEST_CASE("pkg_inventory macos ownership (root only): another account's prefix is refused, "
+          "another account's receipt is dropped, and a tree owned by one other account is read",
+          "[pkg_inventory][macos][walk][user][owner]") {
+    using namespace yuzu::pkg_inventory;
+    if (::geteuid() != 0) SKIP("needs root to chown a tree to another account");
+    constexpr uid_t kOther = 12345;
+    const auto chown_to = [&](const fs::path& p) {
+        return ::chown(p.c_str(), kOther, static_cast<gid_t>(-1)) == 0;
+    };
+    {
+        // Root can still be refused (a container, a user namespace): that is a SKIP, not a failure.
+        yuzu::test::TempDir probe{"yuzu_test_pkg_inventory_macos_root_probe_"};
+        if (!chown_to(probe.path) && (errno == EPERM || errno == EINVAL))
+            SKIP("the host refuses chown to another account");
+    }
+    {
+        // A user prefix owned by someone other than the home's owner: never opened.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_root_prefix_"};
+        make_user_formula(dir.path, "alpha", "homebrew", "planted", "1.0");
+        REQUIRE(chown_to(dir.path / "Users/alpha/homebrew"));
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        CHECK(rows.empty());
+        REQUIRE(token.has_value());
+        CHECK(*token == "macos:homebrew_user_prefix:owner_mismatch");
+        CHECK(token->find("planted") == std::string::npos);
+    }
+    {
+        // A MACHINE-prefix receipt owned by someone other than its version directory's owner:
+        // the row stays, its receipt fields are `-`.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_root_receipt_"};
+        const auto receipt = dir.path / "opt/homebrew/Cellar/wget/1.0/INSTALL_RECEIPT.json";
+        write_text(receipt, kGoodReceipt);
+        REQUIRE(chown_to(receipt));
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token);
+        CHECK_FALSE(token.has_value());
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "package|homebrew|wget|1.0|formula|-|-|-" + std::string{kMachineTail});
+    }
+    {
+        // One other account owns a user home and its prefix (a real second user), and another
+        // owns a machine version directory with its receipt (an admin who installed Homebrew):
+        // each is compared with its own directory's owner, never with the agent's uid.
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_root_owned_"};
+        make_user_formula(dir.path, "alpha", "homebrew", "wget", "1.0");
+        REQUIRE(chown_to(dir.path / "Users/alpha"));
+        REQUIRE(chown_to(dir.path / "Users/alpha/homebrew"));
+        const auto vdir = dir.path / "opt/homebrew/Cellar/mach/1.0";
+        write_text(vdir / "INSTALL_RECEIPT.json", kGoodReceipt);
+        REQUIRE(chown_to(vdir));
+        REQUIRE(chown_to(vdir / "INSTALL_RECEIPT.json"));
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, any_uid_config());
+        CHECK_FALSE(token.has_value());
+        const std::vector<std::string> expected{
+            "package|homebrew|mach|1.0|formula|1767225600|homebrew/core|true" +
+                std::string{kMachineTail},
+            user_row("wget", "1.0", "alpha", "homebrew"),
+        };
+        CHECK(rows == expected);
+    }
+}
+
+TEST_CASE("pkg_inventory macos failed-open (not root): an unreadable user prefix constrains the answer, "
+          "an unreadable machine receipt is `-` and no token",
+          "[pkg_inventory][macos][walk][user][receipt]") {
+    using namespace yuzu::pkg_inventory;
+    // Root (or CAP_DAC_OVERRIDE) reads through mode 000, which the Linux lane runs as.
+    if (::geteuid() == 0) SKIP("running as root (or CAP_DAC_OVERRIDE): permission bits bypassed");
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_eacces_user_prefix_"};
+        make_user_formula(dir.path, "alpha", "homebrew", "locked", "1.0");
+        make_user_formula(dir.path, "beta", "homebrew", "tool", "2.0");
+        const auto locked = dir.path / "Users/alpha/homebrew";
+        REQUIRE(::chmod(locked.c_str(), 0000) == 0);
+        ModeGuard restore{locked, 0755};
+        const auto cfg = any_uid_config();
+
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token, Limits{}, cfg);
+        REQUIRE(token.has_value());
+        CHECK(*token == "macos:homebrew_user_prefix:permission_denied");
+        REQUIRE(rows.size() == 1); // the other home is still read
+        CHECK(rows[0] == user_row("tool", "2.0", "beta", "homebrew"));
+
+        const auto leg = run_leg(dir.path, Action::packages, Via::at, &cfg);
+        CHECK(leg.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+        CHECK(leg.result_provenance == "macos:homebrew_user_prefix:permission_denied");
+    }
+    {
+        yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_eacces_receipt_"};
+        const auto receipt = dir.path / "opt/homebrew/Cellar/wget/1.0/INSTALL_RECEIPT.json";
+        write_text(receipt, kGoodReceipt);
+        REQUIRE(::chmod(receipt.c_str(), 0000) == 0);
+        ModeGuard restore{receipt, 0644};
+        std::optional<std::string> token;
+        const auto rows = mac::macos_package_rows_at(dir.path, token);
+        CHECK_FALSE(token.has_value()); // a receipt is never a reason to constrain the answer
+        REQUIRE(rows.size() == 1);
+        CHECK(rows[0] == "package|homebrew|wget|1.0|formula|-|-|-" + std::string{kMachineTail});
+    }
+}
+
+TEST_CASE("pkg_inventory macos seam: a user-prefix failure reaches BOTH the status row and the "
+          "typed status through run_macos_at",
+          "[pkg_inventory][macos][seam][user]") {
+    using namespace yuzu::pkg_inventory;
+    yuzu::test::TempDir dir{"yuzu_test_pkg_inventory_macos_user_seam_"};
+    write_text(dir.path / "opt/homebrew/Cellar/mach/1.0/INSTALL_RECEIPT.json", kGoodReceipt);
+    fs::create_directories(dir.path / "elsewhere");
+    fs::create_directories(dir.path / "Users/alpha/homebrew");
+    std::error_code ec;
+    fs::create_directory_symlink(dir.path / "elsewhere", dir.path / "Users/alpha/homebrew/Cellar", ec);
+    REQUIRE_FALSE(ec);
+    const auto cfg = any_uid_config();
+
+    const auto packages = run_leg(dir.path, Action::packages, Via::at, &cfg);
+    CHECK(packages.rc == 0);
+    const auto prows = captured_rows(packages.captured);
+    REQUIRE_FALSE(prows.empty());
+    CHECK(prows[0] == "status|packages|constrained|macos:homebrew_user_cellar:not_a_directory");
+    CHECK(packages.result_status == YUZU_RESULT_STATUS_CONSTRAINED);
+    CHECK(packages.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+    CHECK(packages.result_provenance == "macos:homebrew_user_cellar:not_a_directory");
+
+    // `managers` never walks /Users: the same tree answers it in full.
+    const auto managers = run_leg(dir.path, Action::managers, Via::at, &cfg);
+    CHECK(managers.result_status == YUZU_RESULT_STATUS_OK);
+}
+
 
 #endif // !defined(_WIN32)

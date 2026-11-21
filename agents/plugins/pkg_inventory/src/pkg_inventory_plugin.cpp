@@ -1,5 +1,5 @@
 /**
- * pkg_inventory_plugin.cpp — machine-scope package-manager inventory for Yuzu.
+ * pkg_inventory_plugin.cpp — package-manager inventory for Yuzu.
  *
  * Actions:
  *   "managers"       — which package managers are present on this host and their
@@ -8,7 +8,8 @@
  *                      dnf, pacman, apk, snap, flatpak) and Windows (Chocolatey
  *                      and winget presence) ship.
  *   "packages"       — macOS Homebrew formulae and casks (Cellar/Caskroom
- *                      directory names) and Windows Chocolatey packages (lib\<id>
+ *                      directory names; machine-prefix formula rows also carry
+ *                      receipt fields) and Windows Chocolatey packages (lib\<id>
  *                      nuspec versions). Linux is UNSUPPORTED by construction
  *                      (see below).
  *   "store_packages" — Linux snaps and flatpak apps/runtimes from the system
@@ -16,9 +17,13 @@
  *                      users. macOS is UNSUPPORTED by design (installed_apps owns
  *                      the application list).
  *
- * SCOPE. MACHINE-SCOPE ONLY: per-user package stores (npm global-vs-user, pip
- * user installs, cargo, per-user Homebrew) are out of scope and deferred to
- * the user-context session helper (docs/adr/3003-user-session-helper.md).
+ * SCOPE. The macOS `packages` action reads the machine Homebrew prefixes and the
+ * user-owned Homebrew prefixes under /Users (~/homebrew, ~/.homebrew). A machine-prefix
+ * formula row also carries its install receipt (tap, install time, installed-on-request);
+ * no receipt under a user-owned prefix is opened, and a user row carries directory names
+ * only. Every other per-user package store (npm global-vs-user, pip user installs, cargo)
+ * is out of scope and deferred to the user-context session helper
+ * (docs/adr/3003-user-session-helper.md); `managers` reports machine prefixes only.
  *
  * LINUX SCOPE. `managers` is tool identity/presence plus a few capture-backed
  * counts (versions are not read); `store_packages` lists snaps and flatpaks,
@@ -88,9 +93,13 @@ const YuzuActionDescriptor kActionDescriptors[] = {
         {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr,
          "installed_apps.list_inventory owns the Linux package roster"},
         /* .macos_leg   = */
-        {YUZU_SUPPORT_SUPPORTED, 1, "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names",
-         "cask rows and the Intel prefix are exercised by synthetic in-code layouts only, never a "
-         "real capture"},
+        {YUZU_SUPPORT_SUPPORTED, 1,
+         "Cellar/<formula>/<version>, Caskroom/<cask>/<version> directory names under the machine "
+         "prefixes and the user-owned ~/homebrew and ~/.homebrew prefixes (owner must equal the "
+         "home's); one bounded INSTALL_RECEIPT.json read per machine-prefix formula version (tap, "
+         "install time, installed-on-request); no receipt under a user-owned prefix is opened",
+         "cask rows, the Intel prefix and user-prefix rows are covered by in-code layouts and none is "
+         "in the committed capture"},
         /* .windows_leg = */
         {YUZU_SUPPORT_SUPPORTED, 1,
          "chocolatey lib\\<id>\\<id>.nuspec, one bounded read per package, <version> by a bounded "
@@ -128,8 +137,9 @@ public:
     std::string_view name() const noexcept override { return "pkg_inventory"; }
     std::string_view version() const noexcept override { return "1.0.0"; }
     std::string_view description() const noexcept override {
-        return "Machine-scope package-manager inventory (managers, packages and store_packages); "
-               "per-user package stores are out of scope, deferred to the user-session helper";
+        return "Package-manager inventory (managers, packages and store_packages); macOS packages "
+               "include Homebrew install receipts and user-owned Homebrew prefixes; other per-user "
+               "package stores are out of scope, deferred to the user-session helper";
     }
 
     const char* const* actions() const noexcept override {
