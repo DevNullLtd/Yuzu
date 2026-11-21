@@ -839,7 +839,7 @@ TEST_CASE("slot 14 attributes: a value that is not canonical is dropped and the 
           std::string(kUpgradeCodeAttr) + ";", std::string(kUpgradeCodeAttr) + ";aaa=1",
           std::string(kUpgradeCodeAttr) + "=", std::string(kUpgradeCodeAttr) + "\n",
           std::string(kUpgradeCodeAttr) + std::string(1100, 'x')}) {
-        CAPTURE(bad.size());
+        CAPTURE(bad);
         SwEntry e = alpha();
         e.attributes = bad;
         CHECK(v3_normal_form(e).attributes.empty());

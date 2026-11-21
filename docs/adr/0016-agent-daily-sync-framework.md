@@ -447,7 +447,9 @@ else the `PACKAGER` tag.
 > `InstalledProductName`/`VersionString`/`Publisher`. The product code travels in
 > the blob's extended-tail `package_id` field (the tail appended after the twelve
 > v2 fields); the tail's first two slots, `install_location` and
-> `uninstall_string`, stay reserved and empty (#5186). A `constrained`
+> `uninstall_string`, stay reserved and empty (#5186). (**Superseded 2026-11-21:**
+> slot 14 is the stored attribute field on the v3 path, see the 2026-11-21 Update; no
+> uninstall string is collected.) A `constrained`
 > enumeration, or a product-property read that fails for any reason other than
 > the product not having the property, fails the action and skips the whole
 > cycle, like `pkg_inventory.packages`. (**Superseded 2026-11-09:** a constrained or
@@ -1833,7 +1835,7 @@ Five REST v1 reads over the typed installed-software store, all `Inventory:Read`
 **Dropped from the earlier read-model plan, with reasons.**
 
 - Tombstones for removed packages: dropped. A removal is already a hard delete plus a `remove` ledger row carrying the name, publisher and version, so no read needs a `removed_at` filter and the change feed is the record of removals.
-- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it.
+- Reading the reserved slot 14 (`uninstall_string`): dropped. The slot stays reserved and empty in the v3 record (#5186), stays in the hash as an empty slot, and no read exposes it; nothing in the host or feed views needs it. (**Superseded 2026-11-21:** slot 14 is now the stored attribute field on the v3 path, see the 2026-11-21 Update; no uninstall string is collected, and the field is still on no read route.)
 - A separate freshness field per row: dropped. The row `status` (`current`, `unconfirmed`, `disabled`) and `last_confirmed_at`, derived from the facet state, already say how fresh a row is, and the hosts read exposes both per facet.
 - Device record fields on the host rows (OS, serial, system UUID, MAC addresses, agent version): dropped. A host row carries `agent_id`, the roster `hostname`, `last_seen` and the facet states, the same hostname join the lookup rows use. The full device record is served by the hardware list under the behavioural-PII access audit (`emit_behavioral_audit`), while these five routes audit set-and-proceed, so joining those fields here would change this route's audit contract and data tier, which this change neither planned nor reviewed. The runbook sends the operator to `GET /api/v1/devices/{id}` for the OS and the agent version. Which fields belong on a host row is tracked by #7784.
 - A `scope` parameter on the hosts list: dropped as unbacked, the same ruling that leaves `scope=expr` off the installs route; nothing in this read model resolves a scope expression. The hosts list reads `q`, `last_synced_before`, `limit` and `cursor` only, and the caller's gate scope is applied on every page, so a request cannot widen or narrow it.
@@ -1934,8 +1936,12 @@ change, migration or parser change.
 - **Canonical form.** `key=value` pairs joined by `;`, keys in strictly ascending byte order, each key at
   most once, no leading or trailing `;`, no empty key or value, the whole field at most 1,024 bytes (the
   v3 field cap). The empty string means no attributes and is what the slot carried before this change. A
-  value holds no `;`, no `=` and no control byte (which covers NUL and both wire separators, `0x1E` and
-  `0x1F`). The form is checked, never repaired: a value that is not already canonical is not rewritten.
+  value holds no `;`, no `=` and no control byte (`0x00-0x1F` and `0x7F`, which covers NUL and both
+  wire separators, `0x1E` and `0x1F`). The validator checks and never repairs: a canonical value is
+  returned unchanged and anything else is refused whole, so nothing is re-ordered, re-cased or trimmed
+  into shape. The only step before it is the field step every slot gets (the agent's `clamp_field`, the
+  server's scrub-and-clamp), so a canonical value with a stray wire separator or NUL appended is sent
+  as the canonical value.
 - **One key registry.** `kAttributeKeys` in `common/include/yuzu/install_row_attributes.hpp` is a closed,
   name-sorted table of `{name, validator}` (a `static_assert` pins the order), and the same header holds
   `canonical_attributes`, `attribute_value` and `make_attributes`. The agent writer, the agent adapters
@@ -1950,9 +1956,10 @@ change, migration or parser change.
   `package_id` (index 14). The agent's `SwEntry.attributes` and the server's `SoftwareEntry.attributes`
   sit in that position, so member order stays wire order, and both comparators order rows by
   `install_location`, then `attributes`, then `package_id`, then `source`.
-- **Agent.** `v3_normal_form` keeps a row's attributes only when they are already canonical and drops
-  them otherwise: the writer never sends what the server would refuse, and the row then hashes exactly
-  as if the slot were empty. The `msi_packages.list_inventory` adapter accepts a row of five or six
+- **Agent.** `v3_normal_form` keeps a row's attributes, after the field step, only when they are
+  already canonical and drops them otherwise: the writer never sends what the server would refuse,
+  and the row then hashes exactly as if the slot were empty. The `msi_packages.list_inventory`
+  adapter accepts a row of five or six
   tokens; a sixth token that is a braced GUID in either case becomes `upgrade_code={UPPER}`, and any other
   sixth token is ignored and the row is kept. No producer sends a sixth token yet: until the
   `msi_packages` producer change lands, nothing on the wire changes.

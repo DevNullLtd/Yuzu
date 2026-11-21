@@ -518,9 +518,10 @@ const std::vector<pg::PgMigration>& migrations() {
          // SAM-46: wire slot 14 of the v3 `+` record carries the validated install-row attribute
          // field (common/include/yuzu/install_row_attributes.hpp), stored beside install_location.
          // A constant-default ADD COLUMN is metadata-only on every supported Postgres version (the
-         // v5 and v12 precedent): no table rewrite and no index build, only the brief catalog-change
-         // lock. A row already there reads '', which is what its slot 14 hashed as, so no stored
-         // section hash moves. IF NOT EXISTS keeps a white-box schema_meta rewind idempotent.
+         // v5 and v12 precedent): no table rewrite and no index build, only the brief
+         // catalog-change lock. A row already there reads '', which is what its slot 14 hashed
+         // as, so no stored section hash moves. IF NOT EXISTS keeps a white-box schema_meta
+         // rewind idempotent.
          "ALTER TABLE installed_software "
          "ADD COLUMN IF NOT EXISTS attributes TEXT NOT NULL DEFAULT '';"},
     };
@@ -1094,10 +1095,10 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
     // Blob contract v2 + extended tail: 12 fields always; the 4-field tail (slots 13-16:
     // install_location, attributes, package_id, source) is appended (all four)
     // ONLY when package_id or source is non-empty; slots 13-14 are written empty on this v2
-    // path (see below); the v3 section hash is the one that carries them. A v2 agent's records therefore hash
-    // to exactly the pre-extension bytes, so its stored content_hash keeps matching
-    // (no permanent need_full loop). The agent side (the v3 writer's record_of / v3_section_hash
-    // in agents/core/src/installed_software_v3.cpp) MUST mirror this rule;
+    // path (see below); the v3 section hash is the one that carries them. A v2 agent's records
+    // therefore hash to exactly the pre-extension bytes, so its stored content_hash keeps
+    // matching (no permanent need_full loop). The agent side (the v3 writer's record_of /
+    // v3_section_hash in agents/core/src/installed_software_v3.cpp) MUST mirror this rule;
     // parse_software_blob accepts both shapes. Fields 0x1F-separated, records 0x1E-
     // terminated.
     std::string canon;

@@ -21,6 +21,7 @@
 
 #include "sync_source_installed_software.hpp" // SwEntry
 
+#include <yuzu/install_row_attributes.hpp>
 #include <yuzu/plugin.h> // YUZU_EXPORT
 
 #include <cstddef>
@@ -42,6 +43,10 @@ inline constexpr std::size_t kV3MaxDeletions = 20000;   ///< `-` records per cal
 inline constexpr std::size_t kV3MaxComponents = 20000;  ///< `comp` records per call
 inline constexpr std::size_t kV3MaxFieldLen = 1024;
 inline constexpr std::string_view kV3Header = "\037v3\036";
+// Both sides clamp slot 14 to kV3MaxFieldLen before the validator runs, so a one-sided change
+// would let a clamp cut a value the validator then accepts on one side only.
+static_assert(yuzu::install_attrs::kMaxAttributesLen == kV3MaxFieldLen,
+              "attribute field cap must equal the v3 per-field cap");
 
 /// Bytes reserved per status-only section when a row-bearing section is sized against the blob
 /// cap. A status-only `S` record carries no base and no expect, so at worst it is 1 + 1 + 64
@@ -126,14 +131,15 @@ inline constexpr int kV3MaxCanonicalPasses = 8;
 /// field through clamp_field, the canonical epoch and release, and install_location through
 /// machine_install_location and attributes through canonical_attributes (a value that is not
 /// already canonical becomes empty). A fixed point:
-/// `v3_normal_form(v3_normal_form(x)) == v3_normal_form(x)` over every field (tests/unit/test_installed_software_v3.cpp pins it over the privacy corpus).
+/// `v3_normal_form(v3_normal_form(x)) == v3_normal_form(x)` over every field
+/// (tests/unit/test_installed_software_v3.cpp pins it over the privacy corpus).
 /// Every hash below is taken over this form.
 [[nodiscard]] YUZU_EXPORT SwEntry v3_normal_form(const SwEntry& e);
 
 /// Normal form of every row, nameless rows dropped (the server drops them too), then sorted and
 /// de-duplicated in the server's comparator order (name .. distro_version, install_location,
-/// attributes, package_id, source; byte-wise). Order- and duplicate-independent input in, one canonical
-/// vector out.
+/// attributes, package_id, source; byte-wise). Order- and duplicate-independent input in, one
+/// canonical vector out.
 [[nodiscard]] YUZU_EXPORT std::vector<SwEntry> v3_normalise_rows(std::vector<SwEntry> rows);
 
 // ── Records and hashes (installed software) ──────────────────────────────────────────────

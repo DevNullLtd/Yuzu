@@ -78,6 +78,10 @@ inline constexpr std::size_t kV3MaxDeletions = 20000;  ///< `-` records per call
 inline constexpr std::size_t kV3MaxComponents = 20000; ///< `comp` records per call
 inline constexpr std::size_t kV3MaxFieldLen = 1024;
 inline constexpr std::size_t kV3MaxFacetLen = 64;
+// Both sides clamp slot 14 to kV3MaxFieldLen before the validator runs, so a one-sided change
+// would let a clamp cut a value the validator then accepts on one side only.
+static_assert(yuzu::install_attrs::kMaxAttributesLen == kV3MaxFieldLen,
+              "attribute field cap must equal the v3 per-field cap");
 
 inline constexpr std::string_view kV3Header = "\037v3\036";
 inline constexpr std::string_view kComponentInventoryFacet = "component_inventory";

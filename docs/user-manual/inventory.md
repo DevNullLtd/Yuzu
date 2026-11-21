@@ -214,8 +214,9 @@ cadences.
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
   `package_id`; the REST and MCP software routes do not return that column yet)
-  and the machine-context guarantee. Install location and uninstall string are
-  not collected (wire slots 13-14 stay reserved and empty, #5186). If the
+  and the machine-context guarantee. An `msi` row's `install_location` (wire slot
+  13) is empty, no uninstall string is read, sent or stored, and slot 14 is the
+  `attributes` field described below. If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
 
   **Python interpreters** are collected through `runtimes` `python` (all three OSes;
@@ -377,13 +378,14 @@ cadences.
   `--inventory-disable`. The same holds for `list_inventory` dispatched directly
   as a command (it has no instruction definition, but the catalogue admits it at
   `Inventory:Read`): its fourteenth token is the raw location, minimised only by
-  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has `install_location` and
-  `uninstall_string` slots. In the v2 blob they are reserved: the server ignores
-  them and stores neither, and an agent that fills them gets a full-resend request
-  every cycle. The sectioned v3 blob stores `install_location` and keeps
-  `uninstall_string` reserved (see "Install type, scope and location, and the
-  sectioned report" below). This build's agent sends `install_location` (the Windows
-  `InstallLocation`, the macOS `.app` path) and never `uninstall_string`; since a path under a
+  the daily-sync writer, and the Response store keeps it as sent. The sync blob also has two
+  trailing slots, 13 and 14: `install_location` and the `attributes` field (slot 14 was
+  reserved for an uninstall string until 2026-11-21 and never carried one). In the v2 blob the server stores neither,
+  and an agent that fills them gets a full-resend request every cycle. The sectioned v3 blob
+  stores both (see "Install type, scope and location, and the sectioned report" below, where
+  the `attributes` bullet lives). This build's agent sends `install_location` (the Windows
+  `InstallLocation`, the macOS `.app` path) and, in slot 14, only a validated attribute field,
+  never an uninstall string; since a path under a
   user's profile names an account, the location is an allowlist: the agent canonicalises the
   value (quotes, padding, doubled separators, `.` and `..` segments, the `\\?\` prefix and the
   macOS `/System/Volumes/Data` spelling) and keeps it, in one spelling (case is kept), only when it sits under a

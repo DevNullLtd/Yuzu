@@ -188,9 +188,9 @@ SoftwareEntry full_v2_entry() {
     return e;
 }
 
-// full_v2_entry() plus the stored extended-tail fields. Wire slot 14 (uninstall_string) is
-// reserved and has no member; slot 13 (install_location) is a member only the v3 `+` record
-// fills, so the v2 path neither stores nor hashes either.
+// full_v2_entry() plus the stored extended-tail fields. Wire slots 13 (install_location) and 14
+// (attributes) are members only the v3 `+` record fills, so the v2 path neither stores nor hashes
+// either.
 SoftwareEntry full_extended_entry() {
     SoftwareEntry e = full_v2_entry();
     e.package_id = "bash-5.2.21-3.fc40.x86_64";
@@ -4654,12 +4654,13 @@ TEST_CASE("canonical_section_hash is order and duplicate independent, 16 slots a
           "4f5f399d1a8f2cb7e94eee0487cf6dbb86b2bcdbb7b266fbc2869bd92b338fdd");
     CHECK(SoftwareInventoryStore::canonical_section_hash({}) == kEmptySectionHash);
 
-    // Every stored field, install_location included, moves the hash; no conditional tail: a
-    // row with an empty package_id and source still writes all 16 slots, so it differs from
-    // the same row with only the tail changed.
+    // Every stored field, install_location and attributes included, moves the hash; no
+    // conditional tail: a row with an empty package_id and source still writes all 16 slots, so
+    // it differs from the same row with only the tail changed.
     const auto base = SoftwareInventoryStore::canonical_section_hash({a});
-    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::package_id,
-                       &SoftwareEntry::source, &SoftwareEntry::distro_version}) {
+    for (auto field : {&SoftwareEntry::install_location, &SoftwareEntry::attributes,
+                       &SoftwareEntry::package_id, &SoftwareEntry::source,
+                       &SoftwareEntry::distro_version}) {
         SoftwareEntry other = a;
         other.*field = "zz";
         CHECK(SoftwareInventoryStore::canonical_section_hash({other}) != base);

@@ -10,13 +10,15 @@
 // key at most once, no trailing `;`, the whole field at most kMaxAttributesLen bytes. The empty
 // string is the canonical "no attributes" and is what the slot carried before this field existed
 // (reserved, always empty), so a row without attributes hashes to the bytes it always did. A
-// value holds no `;`, no `=` and no control byte (which covers NUL, 0x1E and 0x1F, the wire
-// separators). Every key is in the closed table below and its value passes that key's validator.
+// value holds no `;`, no `=` and no control byte (0x00-0x1F and 0x7F, which covers NUL and the
+// wire separators 0x1E and 0x1F). Every key is in the closed table below and its value passes
+// that key's validator.
 //
 // ADDING A KEY (SAM-45b and later): one row in kAttributeKeys, in name order, with a validator and
 // a golden vector in the agent and server tests. No wire change, no migration, no parser change.
 // A new key is a contract change on both ends of the wire: land the table row, the validator and
-// the golden together.
+// the golden together. With a second key, also add a make_attributes test case: a value carrying
+// `;<that key>=<valid value>` must be refused.
 //
 // Pure: std only, no I/O, no store or wire types, so it stays inside the common/include firewall.
 
@@ -33,7 +35,8 @@
 namespace yuzu::install_attrs {
 
 /// Whole-field cap (bytes). Equal to the v3 per-field cap (kV3MaxFieldLen), so the server's
-/// per-field clamp never alters a value this header accepted.
+/// per-field clamp never alters a value this header accepted. The equality is static_assert'ed
+/// beside each kV3MaxFieldLen (agent and server).
 inline constexpr std::size_t kMaxAttributesLen = 1024;
 
 namespace detail {
@@ -55,7 +58,7 @@ namespace detail {
 }
 
 /// A value byte the wire cannot carry: the pair and key separators and every control byte
-/// (NUL, 0x1E and 0x1F included).
+/// (0x00-0x1F and 0x7F, which covers NUL and the wire separators 0x1E and 0x1F).
 [[nodiscard]] constexpr bool is_forbidden_value_byte(char c) noexcept {
     const auto u = static_cast<unsigned char>(c);
     return c == ';' || c == '=' || u < 0x20 || u == 0x7F;
@@ -138,6 +141,10 @@ make_attributes(std::span<const std::pair<std::string_view, std::string_view>> p
     std::ranges::sort(sorted);
     std::string out;
     for (const auto& [key, value] : sorted) {
+        // Checked per pair, before the join: a value carrying `;` or `=` would read back as a
+        // pair the caller never passed.
+        if (std::ranges::any_of(value, detail::is_forbidden_value_byte))
+            return std::nullopt;
         if (!out.empty())
             out += ';';
         out += key;
