@@ -223,11 +223,10 @@ inline void copy_sidecar_by_descriptor(const std::filesystem::path& from,
         return;
     }
     partial.created = true;
-    bool ok = false;
+    bool ok = true;
     {
         const yuzu::shared::ScopedFile dst{out};
         char buf[64 * 1024];
-        ok = true;
         for (;;) {
             const ssize_t n = ::read(src.fd(), buf, sizeof buf);
             if (n < 0 && errno == EINTR)
