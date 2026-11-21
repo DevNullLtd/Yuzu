@@ -15,12 +15,15 @@ regressible — nothing fails loudly when one is broken.
 1. **Every claimed command is resolved by EXACTLY ONE** of `record_terminal` (terminal, memoised) or
    `release` (transient — queue-full only). Otherwise its claim leaks.
 
-2. **`record_terminal` is called BEFORE the terminal wire Write.** The durable record is the source
-   of truth; the send is replayable. A new terminal-write site that forgets this degrades that
-   command to RUNNING-forever / outcome-lost.
+2. **For a claimed command, `record_terminal` is called BEFORE the terminal wire Write.** The durable
+   record is the source of truth; the send is replayable. (A command refused before the claim, such as
+   one with a NUL parameter, has no record to write: it claims nothing and is answered `REJECTED` once.)
+   A new terminal-write site that forgets this degrades that command to RUNNING-forever / outcome-lost.
 
-3. **The `__guard__` side channel is the ONLY dispatch that bypasses the claim.** Gate on the
-   literal, so dedup stays the SAFE DEFAULT for any future reserved-name command.
+3. **The `__guard__` side channel is the ONLY dispatch that skips claiming for a reason of its own.**
+   Gate on the literal, so dedup stays the SAFE DEFAULT for any future reserved-name command. (The one
+   other path that never claims is a refusal made BEFORE the claim step, such as a parameter holding a
+   NUL byte: it is answered `REJECTED` and nothing is dispatched, so no claim exists to leak.)
 
 4. **A duplicate NEVER re-executes.** Terminal replays the stored frame; InFlight answers RUNNING
    (indeterminate).
@@ -109,6 +112,17 @@ gates 1's queue-full release are decided by the pure, proto-free `agents/core/sr
 `agent.cpp`'s claim block acts on its answer, and `tests/test_agent_command_dedup_wiring_lexical.py`
 pins that it still calls both functions and acts on every field. A change to which commands are
 claimed, or to replay / RUNNING / proceed, belongs in the header, not inline.
+
+## A command killed mid-execution
+
+A command killed in the middle of its plugin call (SIGKILL, including the 60 s `TimeoutStopSec` of the
+packaged unit) leaves its in-flight row in `command_outcomes`. The ring (`prune_locked`) evicts
+TERMINAL rows only, nothing sweeps an in-flight row at boot, and `release` runs only from a live
+process, so the row answers `RUNNING` for that command id until the agent's dedup database is removed; it is never evicted. To clear it, stop the agent, remove
+`<data-dir>/command_dedup.db` (`/var/lib/yuzu-agent/command_dedup.db` under the packaged unit), then start it;
+this forfeits replay protection for commands issued before the removal. The quarantine reconciler re-dispatches containment under a fresh
+command id, and an operator re-issues any other command under a new id. A boot sweep is not part of
+this build and is tracked as a follow-up issue (#3664).
 
 ## Two further contracts
 

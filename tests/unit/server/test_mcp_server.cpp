@@ -2568,13 +2568,15 @@ TEST_CASE("MCP 2g PR2: every tool advertises all four spec hints, coherent with 
         const bool idempotent = a["idempotentHint"];
         const bool open_world = a["openWorldHint"];
 
-        // Closed managed fleet: never open-world, with EXACTLY two exceptions (ADR-0070 R1,
-        // slice 2b-1a): register_revocation_source and update_revocation_source resolve the
-        // administrator-registered CRL host to show its address class, the only outbound reach
-        // any tool has (no tool fetches a CRL; the refresh job does). A third open-world tool is
-        // a new outbound surface and needs its own security review, not an edit here.
+        // Closed managed fleet: never open-world, with EXACTLY three exceptions: (ADR-0070 R1,
+        // slice 2b-1a) register_revocation_source and update_revocation_source resolve the
+        // administrator-registered CRL host to show its address class; and create_offload_target,
+        // whose url the server POSTs fleet events to (the outbound reach is the delivery worker's,
+        // registered by this call; its destination-address guard is #4816). A further open-world
+        // tool is a new outbound surface and needs its own security review, not an edit here.
         CHECK(open_world == (name == "register_revocation_source" ||
-                             name == "update_revocation_source"));
+                             name == "update_revocation_source" ||
+                             name == "create_offload_target"));
         // readOnlyHint is mechanically the Read operation.
         CHECK(read_only == (operation == "Read"));
         // Coherence: a read-only tool is neither destructive, and reads are idempotent.
@@ -18780,6 +18782,13 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
         CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
                           {{"tool", "execute_instruction"}, {"reason", reason}})
                   .value() == 1.0);
+        // The refusal is audited as a `denied` row that names the reason.
+        bool audited = false;
+        for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+            if (ts.audit_log[k].find("|denied") != std::string::npos &&
+                ts.audit_details[k].find(reason) != std::string::npos)
+                audited = true;
+        CHECK(audited);
     };
 
     SECTION("plugin over 128 bytes") {
@@ -18804,6 +18813,18 @@ TEST_CASE("MCP Integration: execute_instruction enforces input bounds on the ope
                             R"({"plugin":"os_info","action":"version","params":{"k":")" + big +
                             R"("}})"),
                         "param_value_len");
+    }
+    SECTION("a params key with a NUL byte (sg10: counted under param_key_invalid)") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"targets\u0000x":"v"}})"),
+                        "param_key_invalid");
+    }
+    SECTION("a params key with a control byte") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"a\u0007b":"v"}})"),
+                        "param_key_invalid");
+    }
+    SECTION("a params value with a NUL byte") {
+        expect_rejected(call_with(R"({"plugin":"os_info","action":"version","params":{"k":"v\u0000w"}})"),
+                        "param_key_invalid");
     }
     SECTION("a params key over 256 bytes") {
         const std::string big_key(257, 'k');
@@ -19093,7 +19114,7 @@ TEST_CASE("MCP transport body cap admits a maximal execute_instruction and clamp
     // size so adding a reason without documenting it fails here rather than
     // shipping an undocumented label.
     INFO("adding a reason? update docs/user-manual/metrics.md and this count");
-    CHECK(kExecInstrBoundReasons.size() == 14); // +target_conflict (#2500)
+    CHECK(kExecInstrBoundReasons.size() == 15); // +target_conflict (#2500), +param_key_invalid (sg10)
 }
 
 // ── 26d. Schema <-> handler-constant cross-check (#2437) ─────────────────
@@ -25827,6 +25848,54 @@ TEST_CASE("MCP execute_bundle denies an out-of-scope target agent, dispatches an
 // an admin's bundle step on an AdminOrApproval-gated pair was refused
 // ApprovalRequired unconditionally. This is the full-stack version of the
 // orchestrator-level falsifier in test_bundle_orchestrator.cpp.
+// sg10 / UP-1: a bundle step whose params key the agent would truncate is refused -32602, audited and
+// counted, and nothing is dispatched.
+TEST_CASE("MCP execute_bundle: a step params key with a NUL or control byte is refused, audited and "
+          "counted (sg10)",
+          "[pg][mcp][bundle][sg10]") {
+    YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
+    pg::PgPool pool{{.conninfo = db.dsn(), .size = 4}};
+    yuzu::server::ResponseStore store(pool);
+    REQUIRE(store.is_open());
+    yuzu::MetricsRegistry reg;
+    bool dispatched = false;
+    McpTestServer ts;
+    ts.response_store_for_test = &store;
+    ts.metrics_for_test = &reg;
+    ts.caller_fn_for_test = [](const auth::Session&) -> yuzu::server::DispatchCaller {
+        std::unordered_set<std::string> s{"agent-A"};
+        return yuzu::server::DispatchCaller{.exec_visible = yuzu::server::authz::VisibleSet{s},
+                                            .principal_is_admin = true};
+    };
+    ts.start_with_dispatch([&dispatched](const std::string&, const std::string&,
+                                         const std::vector<std::string>&, const std::string&,
+                                         const std::unordered_map<std::string, std::string>&,
+                                         const std::string&, const yuzu::server::DispatchCaller&)
+                               -> yuzu::server::ConfinedDispatchOutcome {
+        dispatched = true;
+        return {.sent = 1, .command_id = "cmd"};
+    });
+    for (const char* key : {"targets\\u0000x", "a\\u0007b"}) {
+        auto res = ts.call(
+            std::string(R"({"jsonrpc":"2.0","method":"tools/call","id":4,"params":{"name":"execute_bundle","arguments":{"agent_id":"agent-A","steps":[{"plugin":"os_info","action":"uptime","params":{")") +
+            key + R"(":"h"}}]}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+    }
+    CHECK_FALSE(dispatched);
+    bool saw = false;
+    for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+        if (ts.audit_log[k] == "bundle.dispatch|denied" &&
+            ts.audit_details[k] == "reason=param_key_invalid")
+            saw = true;
+    CHECK(saw);
+    CHECK(reg.counter("yuzu_server_dispatch_target_rejected_total",
+                      {{"route", "bundle"}, {"reason", "param_key_invalid"}})
+              .value() == 2.0);
+}
+
 TEST_CASE("MCP execute_bundle threads the caller's principal_is_admin into DispatchFn (#1398)",
           "[pg][mcp][bundle][1398]") {
     YUZU_REQUIRE_PG_DB_TPL(db, responsestore_tpl);
@@ -44648,6 +44717,32 @@ TEST_CASE("MCP B5: all 14 new tools are advertised in tools/list", "[mcp][integr
 
 // ── Offload targets ─────────────────────────────────────────────────────────
 
+TEST_CASE("MCP B5: create_offload_target refuses a link-local / metadata destination "
+          "(-32602, destination_refused audit row)",
+          "[pg][mcp][integration][b5][security]") {
+    yuzu::test::OffloadTargetStorePg store;
+    McpTestServer ts;
+    ts.offload_target_store_for_test = store.get();
+    ts.start();
+    int id = 0;
+    for (const char* url : {"http://169.254.169.254/latest", "http://2852039166/x"}) {
+        auto res = ts.call(
+            R"({"jsonrpc":"2.0","method":"tools/call","id":)" + std::to_string(++id) +
+            R"(,"params":{"name":"create_offload_target","arguments":{"name":"meta","url":")" +
+            std::string(url) + R"(","auth_type":"none"}}})");
+        REQUIRE(res);
+        auto body = nlohmann::json::parse(res->body);
+        REQUIRE(body.contains("error"));
+        CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
+        bool saw = false;
+        for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+            if (ts.audit_log[k] == "offload_target.create|denied" &&
+                ts.audit_details[k] == "destination_refused")
+                saw = true;
+        CHECK(saw);
+    }
+}
+
 TEST_CASE("MCP B5: offload-target CRUD lifecycle over a LIVE store — "
           "list/create/get/list_offload_target_deliveries/delete",
           "[pg][mcp][integration][b5]") {
@@ -50823,6 +50918,7 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         {{{"definition_id", std::string(129, 'x')}}, "ident_len"},
         {{{"definition_id", "d"}, {"params", many}}, "param_count"},
         {{{"definition_id", "d"}, {"params", {{std::string(257, 'k'), "v"}}}}, "param_key_len"},
+        {{{"definition_id", "d"}, {"params", {{std::string("targets\0x", 9), "v"}}}}, "param_key_invalid"},
         {{{"definition_id", "d"}, {"params", {{"k", std::string(65537, 'v')}}}}, "param_value_len"},
         {{{"definition_id", "d"}, {"scope", std::string(8193, 's')}}, "scope_len"},
         {{{"definition_id", "d"}, {"agent_ids", nlohmann::json::array()}}, "agent_ids_empty"},
@@ -50831,7 +50927,9 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
     };
     for (const auto& c : cases) {
         INFO(c.reason);
+        yuzu::MetricsRegistry idef_reg;
         McpTestServer ts;
+        ts.metrics_for_test = &idef_reg;
         Rig rig;
         rig.defs["d"] = yuzu::test::instr_exec::make_def("d", "ping", "always");
         idef_start(ts, rig, "operator");
@@ -50842,6 +50940,19 @@ TEST_CASE("MCP execute_instruction_definition: input bounds and targeting shape 
         CHECK(body["error"]["code"] == yuzu::server::mcp::kInvalidParams);
         CHECK(rig.calls.empty());
         CHECK(rig.approvals.empty()); // refused BEFORE the approval step
+        // Every bound reason is counted under the definition tool's own label.
+        CHECK(idef_reg.counter("yuzu_mcp_tool_args_too_large_total",
+                               {{"tool", "execute_instruction_definition"}, {"reason", c.reason}})
+                  .value() == 1.0);
+        if (std::string(c.reason) == "param_key_invalid") {
+            // sg10: audited like every other refused argument (a `denied` row naming the reason).
+            bool saw = false;
+            for (std::size_t k = 0; k < ts.audit_log.size(); ++k)
+                if (ts.audit_log[k].find("|denied") != std::string::npos &&
+                    ts.audit_details[k].find("param_key_invalid") != std::string::npos)
+                    saw = true;
+            CHECK(saw);
+        }
     }
 }
 

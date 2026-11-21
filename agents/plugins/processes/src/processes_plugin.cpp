@@ -21,9 +21,22 @@
 
 #include "processes_rows.hpp"
 
+#include <bounded_file_hash.hpp> // yuzu::shared::hash_fd_regular (Linux image hash)
+#include <helper_budget.hpp>      // HelperBudget + the hash_unavailable markers
+#include <proc_stat.hpp>           // parse_stat_start_ticks / same_process: detect a recycled pid
+#include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
+#ifndef _WIN32
+#include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
+#endif
+#include <local_path_policy.hpp> // yuzu::shared::local_path (Windows/macOS image path guard)
+
 #include <algorithm>
+#include <cstdint>
+#include <optional>
 #include <array>
 #include <cctype>
+#include <chrono>
+#include <cstddef>
 #include <format>
 #include <string>
 #include <string_view>
@@ -44,8 +57,10 @@
 
 #ifdef __linux__
 #include <dirent.h>
+#include <fcntl.h>    // open (O_NONBLOCK on the exe link)
 #include <fstream>
-#include <unistd.h> // readlink
+#include <sys/stat.h> // fstat (identity key)
+#include <unistd.h>   // readlink, close
 #endif
 
 #ifdef __APPLE__
@@ -59,6 +74,7 @@ struct ProcessInfo {
     unsigned long pid;
     unsigned long ppid = 0; // parent PID (0 when unknown / a root) — for list_tree
     std::string name;
+    std::optional<std::uint64_t> start_ticks; // Linux: /proc/<pid>/stat starttime at enumeration
 };
 
 std::string to_lower(std::string_view sv) {
@@ -91,6 +107,15 @@ std::vector<ProcessInfo> enumerate_processes() {
     return procs;
 }
 #elif defined(__linux__)
+std::optional<std::uint64_t> read_start_ticks(unsigned long pid) {
+    std::ifstream ifs("/proc/" + std::to_string(pid) + "/stat");
+    if (!ifs.is_open())
+        return std::nullopt;
+    std::string line;
+    std::getline(ifs, line);
+    return yuzu::shared::parse_stat_start_ticks(line);
+}
+
 std::vector<ProcessInfo> enumerate_processes() {
     std::vector<ProcessInfo> procs;
     DIR* proc_dir = opendir("/proc");
@@ -112,13 +137,15 @@ std::vector<ProcessInfo> enumerate_processes() {
         if (!is_pid)
             continue;
 
+        ProcessInfo pi;
+        pi.pid = std::stoul(entry->d_name);
+        // The start time is read BEFORE the status file (the name) is read and once more AFTER it:
+        // a pid recycled in between would otherwise pair one process's name with another's start time.
+        const auto ticks_before = read_start_ticks(pi.pid);
         std::string status_path = std::string("/proc/") + entry->d_name + "/status";
         std::ifstream ifs(status_path);
         if (!ifs.is_open())
             continue;
-
-        ProcessInfo pi;
-        pi.pid = std::stoul(entry->d_name);
         std::string line;
         bool have_name = false, have_ppid = false;
         while (std::getline(ifs, line)) {
@@ -137,6 +164,10 @@ std::vector<ProcessInfo> enumerate_processes() {
             if (have_name && have_ppid)
                 break; // PPid follows Name in /proc/<pid>/status — both captured
         }
+        const auto ticks_after = read_start_ticks(pi.pid);
+        if (ticks_before && ticks_after && *ticks_before != *ticks_after)
+            continue; // recycled while its name was read: the row would carry two processes' fields
+        pi.start_ticks = ticks_before;
         procs.push_back(std::move(pi));
     }
     closedir(proc_dir);
@@ -215,8 +246,9 @@ std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::P
     std::string path = yuzu::shared::readlink_noting(tally, link.c_str());
     if (path.empty())
         return "";
-    // A replaced/removed binary reads as "<path> (deleted)" — strip the marker;
-    // sha256_file then fails honestly (the on-disk image is gone).
+    // A replaced/removed binary reads as "<path> (deleted)" — strip the marker for DISPLAY only.
+    // This text is never opened (Linux): the hash goes through hash_process_image's open of
+    // /proc/<pid>/exe itself, which is the kernel's own reference to the running image.
     if (path.ends_with(" (deleted)"))
         path.erase(path.size() - 10);
     return path;
@@ -232,6 +264,146 @@ std::string resolve_exe_path(unsigned long pid, [[maybe_unused]] yuzu::shared::P
 #else
 std::string resolve_exe_path(unsigned long, yuzu::shared::ProcAccessTally&) {
     return "";
+}
+#endif
+
+// SHA-256 of a process's on-disk image, "" when it cannot be hashed honestly. `cache` maps an
+// image identity to its hash (many PIDs share one executable).
+//
+// The path came from QueryFullProcessImageNameW / readlink / proc_pidpath for a process ANY user
+// can start, so it is attacker-influenced:
+//   Linux   - open /proc/<pid>/exe (a magic link: the open yields the very inode the process runs,
+//             a "(deleted)" image included, and re-resolves no path text), O_NONBLOCK, then
+//             fstat the descriptor and hash only a regular file with a byte cap and a deadline.
+//             The cache is keyed by (dev, ino), not by path text.
+//   Windows/macOS - refuse a network / device / non-fixed-drive path (agents/shared/
+//             local_path_policy.hpp) before anything opens it: a UNC image path would make the
+//             LocalSystem agent authenticate to the share's host.
+constexpr std::size_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
+using HashCache = std::unordered_map<std::string, std::string>;
+
+constexpr auto kPerImageBudget = std::chrono::seconds(30);
+constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
+constexpr int kMaxStuckHelpers = 2; // helpers left behind per action, at most (2 x 30 s < the 120 s budget)
+
+#if defined(__linux__)
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
+// One image on a bounded helper (bounded_wait.hpp): an open or read of a file on a stalled
+// filesystem cannot hold the command worker past the budget (the helper owns its descriptor; at most
+// 64 helpers per plugin DSO; a refused or timed-out call reads `hash_unavailable:timeout`).
+// The identity key (dev:ino) comes back with the hash so a replaced binary is not conflated.
+struct ImageHash {
+    std::string key;
+    std::string hash;
+};
+
+ImageHash hash_linux_image(unsigned long pid, std::chrono::steady_clock::time_point deadline,
+                           const std::shared_ptr<yuzu::shared::ImageHashCache>& cache) {
+    ImageHash out;
+    yuzu::shared::ScopedFile fd{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
+                                       O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
+    if (!fd.valid())
+        return out;
+    struct stat st{};
+    if (::fstat(fd.fd(), &st) != 0 || !S_ISREG(st.st_mode))
+        return out;
+    // Identity of the OPENED image (dev, inode, size, mtime): looked up after the open and before the
+    // read, so the expensive hash runs once per distinct image and a replaced image never gets a
+    // stale hash.
+    out.key = yuzu::shared::image_identity_key(st);
+    if (auto hit = cache->get(out.key)) {
+        out.hash = std::move(*hit);
+        return out;
+    }
+    auto r = yuzu::shared::hash_fd_regular(fd.fd(), kMaxImageHashBytes, deadline);
+    if (r.status == yuzu::shared::HashStatus::ok) {
+        out.hash = std::move(r.hex);
+        cache->put(out.key, out.hash);
+    } else if (r.status == yuzu::shared::HashStatus::timeout) {
+        // The cooperative per-image deadline: the same marker a helper that did not finish reads,
+        // never an empty hash (which means unreadable, not a regular file or over the cap).
+        out.hash = yuzu::shared::kHashUnavailableTimeout;
+    }
+    return out;
+}
+
+// There is NO network-mount judgement on this path: the image is opened through /proc/<pid>/exe, a
+// kernel reference to the running image, never through path text. The bound is the helper.
+struct ImageGuard {}; // Linux needs no mount-table snapshot (see below)
+
+// A hash cache lives for ONE action (created per dispatch, shared with that action's bounded
+// helpers, gone when the action returns): an image replaced between two dispatches is always
+// re-hashed. Within an action it is keyed by the OPENED image's identity (dev, inode, size, mtime,
+// ctime), never by path text.
+using ActionCache = std::shared_ptr<yuzu::shared::ImageHashCache>;
+ActionCache make_action_cache() { return std::make_shared<yuzu::shared::ImageHashCache>(); }
+
+std::string hash_process_image(unsigned long pid, const std::string& path, const ActionCache& cache,
+                               const ImageGuard&, std::chrono::steady_clock::time_point action_deadline,
+                               yuzu::shared::HelperBudget& budget) {
+    if (path.empty())
+        return {};
+    const auto now = std::chrono::steady_clock::now();
+    // Once the per-action cap of helpers left behind (or the action budget) is reached no further
+    // helper is started: the row says so (`hash_unavailable:skipped`) instead of reading as an empty
+    // hash, and a dispatch cannot burn through the plugin's helper ceiling.
+    if (now >= action_deadline || !budget.may_start())
+        return yuzu::shared::kHashUnavailableSkipped;
+    const auto remaining = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+    const auto deadline = now + remaining;
+    auto result = yuzu::shared::bounded_call_ex(
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining),
+        [pid, deadline, cache]() { return hash_linux_image(pid, deadline, cache); });
+    budget.note(result.status);
+    if (result.status != yuzu::shared::BoundedCallStatus::Completed || !result.value)
+        return yuzu::shared::kHashUnavailableTimeout;
+    const auto& img = *result.value;
+    return img.key.empty() ? std::string{} : img.hash;
+}
+#else
+using ImageGuard = yuzu::shared::local_path::LocalPathGuard;
+using ActionCache = HashCache; // Windows/macOS: path text within one action (judged local paths)
+ActionCache make_action_cache() { return {}; }
+
+// Windows and macOS: the image path text is judged (UNC/device/non-fixed drive, or on/symlinked into
+// a listed network mount) before anything opens it, and judge + hash run on a bounded helper.
+std::string hash_process_image(unsigned long, const std::string& path, ActionCache& cache,
+                               const ImageGuard& guard,
+                               std::chrono::steady_clock::time_point action_deadline,
+                               yuzu::shared::HelperBudget& budget) {
+    if (path.empty())
+        return {};
+    if (const auto it = cache.find(path); it != cache.end())
+        return it->second;
+    const auto now = std::chrono::steady_clock::now();
+    std::string hash;
+    if (now >= action_deadline || !budget.may_start()) {
+        hash = yuzu::shared::kHashUnavailableSkipped;
+    } else {
+        const auto allowed =
+            std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+        auto result = yuzu::shared::bounded_call_ex(
+            std::chrono::duration_cast<std::chrono::milliseconds>(allowed), [path, guard]() -> std::string {
+                if (yuzu::shared::local_path::refused(guard.refusal(path)))
+                    return {};
+                return yuzu::agent::sha256_file(path, kMaxImageHashBytes);
+            });
+        budget.note(result.status);
+        hash = yuzu::shared::hash_field_for(result.status, result.value ? std::move(*result.value) : std::string{});
+    }
+    cache.emplace(path, hash);
+    return hash;
 }
 #endif
 
@@ -347,24 +519,39 @@ private:
     // on-disk image + its resolved path on each node (so the tree is the single
     // process view — no separate flat hashed list). ppid is 0 for a root / unresolved
     // parent; sha256/path are empty when the path can't be resolved or the image is
-    // gone/too large. Hashing mirrors do_list_hashed (per-path cache, bounded read).
+    // gone/too large. Hashing mirrors do_list_hashed (per-action cache, bounded read).
+    // The name, the path and the hash of one row are three separate reads of a pid that can be
+    // recycled in between. A row is kept only when the process start time read before the name and
+    // the one read after the hash agree. On a mismatch the path is dropped and a real digest reads
+    // `hash_unavailable:pid_reused` (the pid belongs to another process),
+    // `hash_unavailable:pid_unverified` (the first start-time read failed, so reuse cannot be told
+    // from the same process) or `hash_unavailable:pid_exited` (its stat is unreadable); an existing `timeout`/`skipped`
+    // marker or empty hash is left as it was. Linux only: Windows and macOS have no such guard.
+    static void settle_row([[maybe_unused]] const ProcessInfo& p, [[maybe_unused]] std::string& path,
+                           [[maybe_unused]] std::string& hash) {
+#if defined(__linux__)
+        if (path.empty())
+            return;
+        const auto settle = yuzu::shared::settle_row_for(
+            yuzu::shared::classify_pid(p.start_ticks, read_start_ticks(p.pid)), hash);
+        if (settle.drop_path)
+            path.clear();
+        if (!settle.hash_cause.empty())
+            hash = yuzu::shared::hash_unavailable(settle.hash_cause);
+#endif
+    }
+
     int do_list_tree(yuzu::CommandContext& ctx) {
-        static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
-        std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        auto hash_cache = make_action_cache(); // one action only
+        const ImageGuard guard;
         yuzu::shared::ProcAccessTally tally; // WP13 UP14
+        const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+        yuzu::shared::HelperBudget budget{kMaxStuckHelpers};
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid, tally);
-            std::string hash;
-            if (!path.empty()) {
-                auto it = hash_cache.find(path);
-                if (it != hash_cache.end()) {
-                    hash = it->second;
-                } else {
-                    hash = yuzu::agent::sha256_file(path, kMaxHashBytes);
-                    hash_cache.emplace(path, hash);
-                }
-            }
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
+            settle_row(p, path, hash);
             ctx.write_output(yuzu::processes::format_tree_row(p.pid, p.ppid, p.name, hash, path));
         }
         report_exe_gaps(ctx, tally);
@@ -373,26 +560,20 @@ private:
 
     // proc|pid|name|sha256|path. The on-disk image is hashed (lowercase hex);
     // unique paths are hashed once (many PIDs share one executable). The hash is
-    // bounded (kMaxHashBytes) so an oversized image can't turn a live query into a
+    // bounded (kMaxImageHashBytes) so an oversized image can't turn a live query into a
     // multi-GB read. sha256/path are empty when the path can't be resolved (kernel
     // threads, access-denied) or the file is gone/too large — rendered honestly.
     int do_list_hashed(yuzu::CommandContext& ctx) {
-        static constexpr std::size_t kMaxHashBytes = 512ull * 1024 * 1024; // 512 MiB cap
         auto procs = enumerate_processes();
-        std::unordered_map<std::string, std::string> hash_cache; // path -> sha256
+        auto hash_cache = make_action_cache(); // one action only
+        const ImageGuard guard;
         yuzu::shared::ProcAccessTally tally; // WP13 UP14
+        const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+        yuzu::shared::HelperBudget budget{kMaxStuckHelpers};
         for (const auto& p : procs) {
             std::string path = resolve_exe_path(p.pid, tally);
-            std::string hash;
-            if (!path.empty()) {
-                auto it = hash_cache.find(path);
-                if (it != hash_cache.end()) {
-                    hash = it->second;
-                } else {
-                    hash = yuzu::agent::sha256_file(path, kMaxHashBytes);
-                    hash_cache.emplace(path, hash);
-                }
-            }
+            std::string hash = hash_process_image(p.pid, path, hash_cache, guard, action_deadline, budget);
+            settle_row(p, path, hash);
             ctx.write_output(yuzu::processes::format_hashed_row(p.pid, p.name, hash, path));
         }
         report_exe_gaps(ctx, tally);

@@ -173,6 +173,7 @@
 #include "quarantine_store.hpp"
 #include "quarantine_containment_reconciler.hpp" // #3425: reconnect re-application
 #include "refusal_log_throttle.hpp"
+#include "outbound_destination_guard.hpp"
 #include "resolver_pool_metrics.hpp"
 #include "result_set_matcher.hpp"
 #include "result_set_members.hpp" // #4990
@@ -761,6 +762,10 @@ public:
         oidc_resolver_publisher_.register_metrics(
             metrics_, ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
             ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+        // The webhook / offload delivery resolver pool, described and pre-seeded the same way.
+        delivery_resolver_publisher_.register_metrics(
+            metrics_, ::yuzu::server::delivery_resolver_pool_capacity(),
+            ::yuzu::server::delivery_resolver_outcome_counts());
         // Pre-seed every reason so absent() alerting and rate() read 0, not "no series".
         for (const char* reason :
              {"own_addresses_unavailable", "dns_unavailable", "dns_timeout", "dns_busy",
@@ -1714,6 +1719,16 @@ public:
             metrics_.counter("yuzu_server_dispatch_target_rejected_total",
                              {{"route", route},
                               {"reason", std::string(yuzu::server::kReasonDestructiveUntargeted)}});
+        // sg10 / UP-1: `param_key_invalid` (a params key the agent would truncate, refused at the
+        // ingress) on every surface that counts it, pre-seeded so absent() alerting holds. The MCP
+        // execute_instruction counts it under yuzu_mcp_tool_args_too_large_total instead;
+        // execute_instruction_definition counts route="mcp" here (the shared execute core), and
+        // execute_bundle counts route="bundle".
+        for (const char* route : {"command", "command_v1", "instruction_execute", "mcp", "schedule", "bundle",
+                                  "policy_fragment"})
+            metrics_.counter("yuzu_server_dispatch_target_rejected_total",
+                             {{"route", route},
+                              {"reason", std::string(yuzu::server::kReasonParamKeyInvalid)}});
         // Stored `parameter_schema` refusals on the instruction execute route: a separate
         // family (a validation refusal, not a targeting one), seeded in workflow_routes.cpp.
         seed_instruction_param_rejected_metrics(metrics_);
@@ -2975,7 +2990,9 @@ public:
         metrics_.describe("yuzu_server_webhook_delivery_success_total",
                           "Webhook deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_webhook_delivery_failed_total",
-                          "Webhook deliveries that failed (connection error, non-2xx, exception)",
+                          "Webhook deliveries that failed (connection error, non-2xx, exception); a delivery "
+                          "declined before any connect is counted under "
+                          "yuzu_server_webhook_delivery_refused_total instead",
                           "counter");
         // ADR-0057 (gov Gate 3 sre): these three joined the family above but
         // were missing describe()/pre-seed, the same HC-1-class parity gap
@@ -2998,8 +3015,36 @@ public:
                           "Offload-target deliveries that completed with a 2xx response", "counter");
         metrics_.describe("yuzu_server_offload_delivery_failed_total",
                           "Offload-target deliveries that failed (connection error, non-2xx, "
-                          "exception, or a tampered non-http(s) URL)",
+                          "exception, or a tampered non-http(s) URL); a delivery declined before any "
+                          "connect is counted under yuzu_server_offload_delivery_refused_total "
+                          "instead",
                           "counter");
+        // Deliveries DECLINED before any connect because the destination is a refused address or
+        // did not resolve (outbound_destination_guard.hpp, #4816). Counted here and NOT in the
+        // `_failed_total` counters above, so a refusal can never be mistaken for a flaky receiver
+        // (nor hide inside it). Closed `cause` set, pre-seeded.
+        for (const char* kind : {"webhook", "offload"}) {
+            const std::string name = std::string("yuzu_server_") + kind + "_delivery_refused_total";
+            metrics_.describe(name,
+                              std::string(kind == std::string("webhook") ? "Webhook" : "Offload-target") +
+                                  " deliveries declined before any connect, by cause: "
+                                  "destination_refused (a resolved or literal address is link-local, "
+                                  "cloud-metadata, unspecified, multicast or reserved) or "
+                                  "destination_unresolved (the name did not resolve) or "
+                                  "destination_resolver_busy (the delivery resolver pool was full)",
+                              "counter");
+            for (const char* cause : {"destination_refused", "destination_unresolved",
+                                      "destination_resolver_busy"})
+                metrics_.counter(name, {{"cause", cause}});
+        }
+        // A delivery whose name resolved to more than four vetted addresses tries only the first
+        // four (outbound_url_policy.hpp, kMaxDeliveryConnectAddresses); counted so the truncation
+        // is visible. Described and pre-seeded like its siblings.
+        metrics_.describe("yuzu_server_delivery_connect_addresses_truncated_total",
+                          "Webhook or offload-target deliveries whose name resolved to more than "
+                          "four vetted addresses and so tried only the first four",
+                          "counter");
+        metrics_.counter("yuzu_server_delivery_connect_addresses_truncated_total");
         // The two drop counters (closed `reason` set) and the delivery pool gauges are described
         // and pre-seeded together, shared with the tests (delivery_pool_metrics.hpp).
         yuzu::server::register_delivery_pool_metrics(metrics_);
@@ -8605,6 +8650,26 @@ public:
                         startup_failed_ = true;
                     } else {
                         webhook_store_->set_metrics(&metrics_);
+                        // A delivery DECLINED because its destination is a refused address or did
+                        // not resolve gets its own audit row (throttled per webhook by the store).
+                        // System attribution: no operator is on this path. The store is destroyed
+                        // (workers joined) before audit_store_.
+                        webhook_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:webhook-delivery",
+                                     .principal_role = "system",
+                                     .action = "webhook.delivery.declined",
+                                     .target_type = "webhook",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         legacy_sqlite_probe::harden_legacy_file_0600(
                             cfg_.db_dir() / "webhooks.db", "WebhookStore");
                         legacy_sqlite_probe::warn_if_legacy_rows(
@@ -8698,6 +8763,23 @@ public:
                         startup_failed_ = true;
                     } else {
                         offload_target_store_->set_metrics(&metrics_);
+                        // As the webhook sink above: a declined delivery gets its own audit row.
+                        offload_target_store_->set_delivery_refused_sink(
+                            [this](std::int64_t id, std::string_view cause,
+                                   std::string_view cls, const std::string& url_detail) {
+                                if (!audit_store_ || !audit_store_->is_open())
+                                    return;
+                                (void)audit_store_->log(
+                                    {.timestamp = std::time(nullptr),
+                                     .principal = "system:offload-delivery",
+                                     .principal_role = "system",
+                                     .action = "offload_target.delivery.declined",
+                                     .target_type = "offload_target",
+                                     .target_id = std::to_string(id),
+                                     .detail = std::format("cause={} class={} {}", cause,
+                                                           cls.empty() ? "-" : cls, url_detail),
+                                     .result = "denied"});
+                            });
                         agent_service_.set_offload_target_store(offload_target_store_.get());
                         // ADR-0010 §Decision 3 evidence surface (gov Gate 6
                         // compliance-officer, contract floor — the
@@ -10651,6 +10733,10 @@ public:
                     metrics_, ::yuzu::server::oidc::oidc_resolver_in_flight(),
                     ::yuzu::server::oidc::oidc_resolver_pool_capacity(),
                     ::yuzu::server::oidc::oidc_resolver_outcome_counts());
+                delivery_resolver_publisher_.publish(
+                    metrics_, ::yuzu::server::delivery_resolver_in_flight(),
+                    ::yuzu::server::delivery_resolver_pool_capacity(),
+                    ::yuzu::server::delivery_resolver_outcome_counts());
                 // Webhook and offload delivery pool backlog, from the same tick. A store that is
                 // not open reads 0 (never a stale value).
                 {
@@ -14913,7 +14999,8 @@ private:
             [this](std::string_view principal, std::string_view securable,
                    yuzu::server::authz::Operation op) {
                 return dispatch_has_permission(principal, securable, op);
-            });
+            },
+            &parameters); // sg10: the send path always passes the parameters (param-escalated securable)
 
         if (!decision) {
             const auto& denial = decision.error();
@@ -18845,6 +18932,7 @@ private:
                              .resolve_session_fn = resolve_session_fn,
                              .audit_fn = audit_fn,
                              .schedule_engine = schedule_engine_.get(),
+                             .metrics = &metrics_,
                          });
 
         // #2542 PR-11: the 3-route legacy pre-v1 Responses API
@@ -19953,10 +20041,11 @@ private:
             // `test_operator_surface_twins.cpp` exercise; the fail-closed
             // cases and the legacy-open posture are documented there.
             .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                   const std::string& action) -> bool {
+                                   const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                 return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                rbac_store_.get(), principal,
-                                                               plugin, action);
+                                                               plugin, action, parameters);
             },
             // #6096: the outbox as the spent-ticket ledger (clock-free). A missing store
             // is an error, not an empty answer, so the runner holds rather than fires.
@@ -19999,10 +20088,11 @@ private:
                 // re-verified AGAIN here at send time (authority may have changed
                 // between enqueue and delivery), the load-bearing re-authorization.
                 .arming_check = [this](const std::string& principal, const std::string& plugin,
-                                       const std::string& action) -> bool {
+                                       const std::string& action,
+                const std::unordered_map<std::string, std::string>& parameters) -> bool {
                     return yuzu::server::schedule_arming_permitted(capability_registry_,
                                                                    rbac_store_.get(), principal,
-                                                                   plugin, action);
+                                                                   plugin, action, parameters);
                 },
                 .should_stop = [this] { return stop_requested_.load(std::memory_order_acquire); },
                 // #3678 (R4): the dispatch counts (DispatchPosition) the retry limit is
@@ -25786,6 +25876,8 @@ private:
     /// registered the metrics; nothing else reads or writes it.
     yuzu::server::ResolverPoolPublisher oidc_resolver_publisher_{
         yuzu::server::kOidcResolverMetrics};
+    yuzu::server::ResolverPoolPublisher delivery_resolver_publisher_{
+        yuzu::server::kDeliveryResolverMetrics};
     /// PR1.9c: the composed classification ruleset `build_classified_command`
     /// consults on every dispatch — core (this package) plus the six
     /// per-group plugin catalogues (p7/p10-p13). A STATIC ruleset, constructed

@@ -192,3 +192,18 @@ TEST_CASE("schedule_params_to_map: round-trips the output of "
     CHECK(m.at("zeta") == "last");
     CHECK(m.at("count") == "7");
 }
+
+// sg10 / UP-1: the ONE schedule-parameters gate (the route and the engine backstop) refuses a key the
+// agent would truncate, so a schedule cannot be created that denies at every fire.
+TEST_CASE("schedule params: a key with a NUL or control byte, or a NUL string value, is refused",
+          "[schedule][params][sg10]") {
+    using yuzu::server::ScheduleParamsError;
+    for (const char* raw : {R"({"targets\u0000x":"h"})", R"({"a\u0007b":"h"})", R"({"k":"v\u0000w"})"}) {
+        auto r = yuzu::server::validate_and_canonicalize_schedule_params(raw);
+        REQUIRE_FALSE(r.has_value());
+        CHECK(r.error() == ScheduleParamsError::kMalformedKey);
+    }
+    CHECK(yuzu::server::validate_and_canonicalize_schedule_params(R"({"targets":"h"})").has_value());
+    CHECK(std::string(to_string(ScheduleParamsError::kMalformedKey)).find("param_key_invalid") !=
+          std::string::npos);
+}

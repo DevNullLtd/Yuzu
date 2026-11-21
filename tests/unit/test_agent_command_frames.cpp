@@ -45,3 +45,43 @@ TEST_CASE("agent command frames: the final frame carries the action and the exit
     CHECK(none_out.action().empty());
     CHECK(none_fin.action().empty());
 }
+
+TEST_CASE("agent command frames: one oversized output line is cut under the frame cap at a UTF-8 boundary",
+          "[agent][command_frames]") {
+    using yuzu::agent::clamp_output_line;
+    using yuzu::agent::kMaxOutputLineBytes;
+    CHECK(clamp_output_line("short") == "short");
+    const std::string at_cap(kMaxOutputLineBytes, 'a');
+    CHECK(clamp_output_line(at_cap) == at_cap);
+
+    const std::string big(kMaxOutputLineBytes + 12345, 'b');
+    const auto cut = clamp_output_line(big);
+    CHECK(cut.size() <= kMaxOutputLineBytes);
+    CHECK(cut.ends_with(yuzu::agent::kOutputLineTruncatedMarker));
+
+    // A multi-byte character straddling the cut point is dropped whole, never split. For each
+    // character width and each offset into it, pad so the nominal cut lands exactly there.
+    const std::size_t nominal = kMaxOutputLineBytes - yuzu::agent::kOutputLineTruncatedMarker.size();
+    const char* const chars[] = {"\xC3\xA9", "\xE2\x82\xAC", "\xF0\x9F\x98\x80"}; // 2, 3, 4 bytes
+    for (const std::string_view ch : chars) {
+        const std::size_t n = ch.size();
+        for (std::size_t k = 1; k < n; ++k) {
+            std::size_t pad = 0;
+            while ((nominal - pad) % n != k)
+                ++pad;
+            std::string text(pad, 'a');
+            while (text.size() < kMaxOutputLineBytes + 100)
+                text.append(ch);
+            const auto out = clamp_output_line(text);
+            CHECK(out.size() <= kMaxOutputLineBytes);
+            const auto body = out.substr(0, out.size() - yuzu::agent::kOutputLineTruncatedMarker.size());
+            CHECK(body.size() == nominal - k); // backed up over exactly the k continuation bytes
+            CHECK((body.size() - pad) % n == 0);
+        }
+    }
+
+    // A run of bare continuation bytes (invalid UTF-8) backs up to the start, never past it.
+    const std::string bad(kMaxOutputLineBytes + 100, '\x80');
+    const auto bcut = clamp_output_line(bad);
+    CHECK(bcut == std::string{yuzu::agent::kOutputLineTruncatedMarker});
+}

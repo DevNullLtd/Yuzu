@@ -36,12 +36,20 @@ spec:
         type: string
         displayName: Volume Path
         description: >
-          Directory or volume root to measure (e.g. "C:\", "/", "/var").
+          Directory or volume root to measure (e.g. "C:\", "/", "/var"). A UNC
+          or device path (two leading separators) is refused; on the agent a
+          path on a network mount, symlinked into one, or on a non-fixed
+          Windows drive answers `error|path_refused:...` (a host whose root
+          filesystem is network-mounted must be given an explicit local path).
           Defaults to the platform root if omitted (C:\ on Windows, / on
           Linux and macOS); reported free space is the caller-usable figure,
           not raw free blocks.
         validation:
           maxLength: 4096
+          # a UNC or device spelling (two leading separators) would make a Windows LocalSystem
+          # agent authenticate to the named host; the agent refuses it too. RE2 (no lookahead):
+          # empty, or a first character that is not a separator, or ONE leading separator.
+          pattern: '^($|[^\\/].*|[\\/]([^\\/].*)?)$'
 
   result:
     # The plugin emits a single pipe row `disk|<path>|<total>|<free>|<percent_used>`

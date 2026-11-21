@@ -616,3 +616,22 @@ TEST_CASE("REST offload-targets: a denied row for a mimicking name uses the audi
     }
     CHECK(h.audit_log[0].target_id == h.audit_log[1].target_id);
 }
+
+TEST_CASE("REST offload-targets: create refuses a link-local / metadata destination with 400 and a "
+          "destination_refused audit row",
+          "[rest][offload][pg][security]") {
+    OffloadHarness h;
+    for (const char* url : {"http://169.254.169.254/latest", "http://2852039166/x", "http://0/x"}) {
+        h.audit_log.clear();
+        nlohmann::json body = {{"name", "siem"}, {"url", url}, {"batch_size", 1}};
+        auto res = h.sink.Post("/api/v1/offload-targets", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        bool saw_refused = false;
+        for (const auto& rec : h.audit_log)
+            if (rec.action == "offload_target.create" && rec.result == "denied" &&
+                rec.detail == "destination_refused")
+                saw_refused = true;
+        CHECK(saw_refused);
+    }
+}

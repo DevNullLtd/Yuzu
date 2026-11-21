@@ -1,4 +1,5 @@
 #include "policy_store.hpp"
+#include "dispatch_target_shape.hpp" // check_params_key_shape (sg10 / UP-1)
 
 #include "cel_eval.hpp"
 #include "compliance_eval.hpp"
@@ -484,6 +485,12 @@ PolicyStore::create_fragment(const std::string& yaml_source) {
     nlohmann::json post_params_json = nlohmann::json::object();
     for (const auto& [k, v] : post_params_map)
         post_params_json[k] = v;
+    // sg10 / UP-1: a parameter key the agent would truncate (control byte, NUL, invalid UTF-8) or a
+    // NUL value is refused at creation, never stored (the same rule every ingress applies).
+    for (const auto* m : {&check_params_json, &fix_params_json, &post_params_json}) {
+        if (const auto bad = yuzu::server::check_params_key_shape(*m))
+            return std::unexpected(std::string(bad->reason) + ": " + bad->message);
+    }
 
     if (!check_compliance.empty()) {
         check_compliance = cel::migrate_expression(check_compliance);

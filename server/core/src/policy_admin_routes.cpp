@@ -124,6 +124,13 @@ void PolicyAdminRoutes::register_routes(HttpRouteSink& sink,
                 // available here without re-extracting.
                 bool is_conflict = is_conflict_error(result.error());
                 bool is_degraded = is_db_error(result.error());
+                if (result.error().rfind(std::string(yuzu::server::kReasonParamKeyInvalid) + ":", 0) == 0) {
+                    // sg10 / UP-1: counted and audited like every other ingress refusal.
+                    yuzu::server::count_param_key_invalid(metrics_, "policy_fragment");
+                    audit_fn_(req, "policy_fragment.create", "denied", "policy_fragment",
+                              PolicyStore::peek_fragment_name(yaml_source),
+                              std::string("reason=") + std::string(yuzu::server::kReasonParamKeyInvalid));
+                }
                 res.status = is_conflict ? 409 : (is_degraded ? 503 : 400);
                 if (is_conflict) {
                     // iter-M1: target_id is the fragment name (parsed from

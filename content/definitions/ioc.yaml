@@ -70,7 +70,14 @@ spec:
         description: >
           Comma-separated list of file paths (e.g. `C:\bad.exe` or
           `/tmp/bad.bin`) to check for existence and size. Also used as
-          the target set for file_hashes comparison.
+          the target set for file_hashes comparison. At most 64 paths (more
+          is refused). A network or device path (UNC, `\\.\`, a non-fixed
+          Windows drive, a path under or symlinked into a network mount) and,
+          for hashing, a file under /proc, /sys or /dev is NOT examined: it
+          is named in a `coverage|<path>|not_examined|<cause>` row, never
+          reported as a clean absence; a file that does not exist is a
+          definitive answer (examined), so a clean device reads `complete`. Hashing reads only regular files of
+          at most 512 MiB within one 60 s deadline.
       ports:
         type: string
         displayName: Ports
@@ -86,9 +93,17 @@ spec:
         description: >
           Which IOC category this row checked. `error` appears only once,
           in place of all rows (no header row, no check run, rc 1), when no
-          IOC parameter was provided (`error|none|false|...`) or more than
-          100 domains were (`error|domains|false|Too many domains ...`).
-        values: [ip, domain, hash, file, port, error]
+          IOC parameter was provided (`error|none|false|...`), when more
+          than 64 file_paths or 256 file_hashes were given, or when more
+          than 100 domains were (`error|domains|false|Too many domains ...`).
+          `coverage` rows
+          (only when file_paths was given) say what was NOT examined: one
+          `coverage|<path>|not_examined|<cause>` row per unexamined path
+          (cause: network_or_device, non_fixed_drive, mount_table_unreadable,
+          unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file,
+          not_regular, too_large, timeout, unreadable) and a closing
+          `coverage|*|complete|...` or `coverage|*|partial|...` row.
+        values: [ip, domain, hash, file, port, coverage, error]
         example: ip
         platforms: [windows, linux, darwin]
       - name: value
@@ -98,9 +113,10 @@ spec:
         example: "127.0.0.1"
         platforms: [windows, linux, darwin]
       - name: matched
-        type: bool
+        type: string
         description: >-
-          Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false.
+          For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial.
+        values: ['true', 'false', not_examined, complete, partial]
         example: "true"
         platforms: [windows, linux, darwin]
       - name: detail

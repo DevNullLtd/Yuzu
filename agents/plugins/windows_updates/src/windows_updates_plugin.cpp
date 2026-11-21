@@ -19,11 +19,14 @@
 #include <yuzu/plugin.hpp>
 
 #include "windows_updates_parsers.hpp" // pure installed/missing parse+format helpers
+#include <bounded_wait.hpp>        // bounded_call_ex: a name lookup cannot hold the command worker
+#include <outbound_address_policy.hpp> // address-class refusal for caller-supplied targets 
 
 #include <algorithm>
 #include <array>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <format>
@@ -778,6 +781,23 @@ ConnTarget parse_url(const std::string& url) {
     return t;
 }
 
+#ifdef _WIN32
+// WSAStartup / WSACleanup as a scope: the cleanup runs on every return, early ones included.
+struct WsaSession {
+    WsaSession() { WSADATA wsa; WSAStartup(MAKEWORD(2, 2), &wsa); }
+    ~WsaSession() { WSACleanup(); }
+    WsaSession(const WsaSession&) = delete;
+    WsaSession& operator=(const WsaSession&) = delete;
+};
+#endif
+
+// An addrinfo list owned from the moment getaddrinfo returns it: a string allocation (or any other
+// exception) between the lookup and the free cannot leak it.
+struct AddrInfoFree {
+    void operator()(struct addrinfo* p) const noexcept { if (p) freeaddrinfo(p); }
+};
+using AddrInfoList = std::unique_ptr<struct addrinfo, AddrInfoFree>;
+
 struct DnsResult {
     bool ok{false};
     std::string ip;
@@ -788,10 +808,12 @@ struct DnsResult {
 DnsResult test_dns(const std::string& host) {
     DnsResult r;
     auto start = std::chrono::steady_clock::now();
-    struct addrinfo hints{}, *res = nullptr;
+    struct addrinfo hints{}, *raw = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
-    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &res);
+    int rc = getaddrinfo(host.c_str(), nullptr, &hints, &raw);
+    const AddrInfoList list{raw};
+    struct addrinfo* res = raw;
     auto elapsed = std::chrono::steady_clock::now() - start;
     r.ms = std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count();
     if (rc != 0) {
@@ -806,8 +828,28 @@ DnsResult test_dns(const std::string& host) {
         inet_ntop(AF_INET6, &reinterpret_cast<sockaddr_in6*>(res->ai_addr)->sin6_addr, buf, sizeof(buf));
     }
     r.ip = buf;
-    freeaddrinfo(res);
     return r;
+}
+
+// A resolved address a caller-supplied target may never name -- loopback, unspecified,
+// link-local (cloud metadata 169.254.169.254), multicast or reserved. RFC 1918 stays allowed: a
+// WSUS server is routinely on a private network, and the platform defaults are not judged at all.
+// An unparseable address fails closed.
+bool address_never_probeable(const std::string& ip) {
+    namespace ob = yuzu::shared::outbound;
+    in6_addr a6{};
+    if (inet_pton(AF_INET6, ip.c_str(), &a6) == 1) {
+        ob::Ipv6 b{};
+        std::memcpy(b.data(), &a6, b.size());
+        return ob::never_probeable(ob::classify_ipv6(b));
+    }
+    in_addr a4{};
+    if (inet_pton(AF_INET, ip.c_str(), &a4) == 1) {
+        ob::Ipv4 b{};
+        std::memcpy(b.data(), &a4, b.size());
+        return ob::never_probeable(ob::classify_ipv4(b));
+    }
+    return true;
 }
 
 struct TcpResult {
@@ -818,11 +860,14 @@ struct TcpResult {
 
 TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     TcpResult r;
-    struct addrinfo hints{}, *res = nullptr;
+    struct addrinfo hints{}, *raw = nullptr;
     hints.ai_family = AF_UNSPEC;
     hints.ai_socktype = SOCK_STREAM;
     auto port_str = std::to_string(port);
-    if (getaddrinfo(host.c_str(), port_str.c_str(), &hints, &res) != 0) {
+    const int gai = getaddrinfo(host.c_str(), port_str.c_str(), &hints, &raw);
+    const AddrInfoList list{raw};
+    struct addrinfo* res = raw;
+    if (gai != 0) {
         r.error = "dns failed";
         return r;
     }
@@ -831,7 +876,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
 
 #ifdef _WIN32
     SOCKET sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock == INVALID_SOCKET) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    if (sock == INVALID_SOCKET) { r.error = "socket failed"; return r; }
     unsigned long mode = 1;
     ioctlsocket(sock, FIONBIO, &mode);
     connect(sock, res->ai_addr, static_cast<int>(res->ai_addrlen));
@@ -856,7 +901,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     closesocket(sock);
 #else
     int sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (sock < 0) { freeaddrinfo(res); r.error = "socket failed"; return r; }
+    if (sock < 0) { r.error = "socket failed"; return r; }
     int flags = fcntl(sock, F_GETFL, 0);
     fcntl(sock, F_SETFL, flags | O_NONBLOCK);
     connect(sock, res->ai_addr, res->ai_addrlen);
@@ -876,8 +921,7 @@ TcpResult test_tcp(const std::string& host, int port, int timeout_s) {
     close(sock);
 #endif
 
-    freeaddrinfo(res);
-    return r;
+    return r; // `list` frees the addrinfo exactly once
 }
 
 std::vector<std::string> get_default_patch_targets() {
@@ -954,9 +998,13 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
     if (timeout_s > 60) timeout_s = 60;
 
 #ifdef _WIN32
-    WSADATA wsa;
-    WSAStartup(MAKEWORD(2, 2), &wsa);
+    const WsaSession wsa_session; // WSACleanup on EVERY exit path (including the early returns)
 #endif
+
+    // Caller-supplied targets make this action a network probe from the endpoint : cap how
+    // many one dispatch may name, and refuse the addresses no patch source lives at.
+    constexpr size_t kMaxCallerTargets = 16;
+    const bool caller_supplied = !targets_str.empty();
 
     std::vector<std::string> targets;
     if (targets_str.empty()) {
@@ -977,24 +1025,84 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
             if (comma == std::string::npos) break;
             pos = comma + 1;
         }
+        if (targets.size() > kMaxCallerTargets) {
+            ctx.write_output(std::format("error|too many targets (max {})", kMaxCallerTargets));
+            return 1;
+        }
     }
 
     int reachable = 0;
     int failed = 0;
 
+    // ONE deadline for the whole dispatch (the default targets included): per-target timeouts
+    // alone multiplied by the target count held a command worker for minutes (16 targets at a 3 s
+    // timeout took ~48 s; the 60 s default maximum extrapolates to ~16 min). The deadline bounds
+    // both the name lookup and the connect (each is clamped to what is left, see plan_target), so
+    // a dispatch ends by 60 s plus the poll granularity. A target reached after the deadline is
+    // reported skipped, never silently dropped.
+    constexpr auto kDispatchBudget = std::chrono::seconds(60);
+    const auto dispatch_deadline = std::chrono::steady_clock::now() + kDispatchBudget;
+
     for (const auto& url : targets) {
         auto target = parse_url(url);
 
-        // DNS test
-        auto dns = test_dns(target.host);
+        const auto plan = yuzu::windows_updates::plan_target(dispatch_deadline,
+                                                             std::chrono::steady_clock::now(), timeout_s);
+        if (plan.skip) {
+            ctx.write_output(std::format("target|{}|skipped|dispatch_deadline_exceeded", url));
+            ++failed;
+            continue;
+        }
+
+        // DNS test: getaddrinfo has no timeout of its own, so the lookup runs on a bounded helper
+        // (bounded_wait.hpp) and a name that does not answer in time is a failed lookup instead of a
+        // command worker held for the resolver's own timeout. (The helper itself may stay blocked
+        // until the resolver gives up; it holds a helper slot, never the command worker.)
+        // RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+        // same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+        // DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+        // filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+        // process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+        // STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+        // ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+        // each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+        // reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+        // lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+        // bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+        // Adjudication belongs to governance, not to this file.
+        auto bounded_dns = yuzu::shared::bounded_call_ex(
+            std::chrono::seconds(plan.timeout_s), [host = target.host]() { return test_dns(host); });
+        DnsResult dns;
+        if (bounded_dns.status == yuzu::shared::BoundedCallStatus::Completed && bounded_dns.value) {
+            dns = std::move(*bounded_dns.value);
+        } else {
+            dns.error = "name resolution timed out";
+        }
+        if (dns.ok && caller_supplied && address_never_probeable(dns.ip)) {
+            // No resolved address and no connect attempt: this must not be an oracle for what a
+            // loopback / link-local / metadata name resolves to or listens on.
+            ctx.write_output(std::format("target|{}|refused|address_not_probeable", url));
+            ++failed;
+            continue;
+        }
         ctx.write_output(std::format("target|{}|dns_ok|{}|dns_ms|{}|ip|{}",
             url, dns.ok ? "true" : "false", dns.ms,
             dns.ok ? dns.ip : dns.error));
 
         if (!dns.ok) { ++failed; continue; }
 
-        // TCP test
-        auto tcp = test_tcp(target.host, target.port, timeout_s);
+        // TCP test: the connect timeout is recomputed AFTER the lookup against the same dispatch
+        // deadline, so a slow lookup shortens the connect and the dispatch ends by the deadline.
+        const auto connect_plan = yuzu::windows_updates::plan_target(
+            dispatch_deadline, std::chrono::steady_clock::now(), timeout_s);
+        if (connect_plan.skip) {
+            ctx.write_output(std::format("target|{}|skipped|dispatch_deadline_exceeded", url));
+            ++failed;
+            continue;
+        }
+        // Connect to the address that was just classified, not to the name: a second lookup of
+        // the same name is a rebinding window past the check above.
+        auto tcp = test_tcp(dns.ip, target.port, connect_plan.timeout_s);
         ctx.write_output(std::format("target|{}|tcp_ok|{}|tcp_ms|{}",
             url, tcp.ok ? "true" : "false", tcp.ms));
 
@@ -1009,10 +1117,6 @@ int do_patch_connectivity(yuzu::CommandContext& ctx, yuzu::Params params) {
 
     ctx.write_output(std::format("summary|targets_tested|{}|targets_reachable|{}|targets_failed|{}",
         targets.size(), reachable, failed));
-
-#ifdef _WIN32
-    WSACleanup();
-#endif
 
     return 0;
 }

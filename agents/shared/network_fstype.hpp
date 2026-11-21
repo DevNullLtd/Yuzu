@@ -19,8 +19,11 @@
 // virtiofs, lustre, beegfs, gfs2, ocfs2, gpfs, panfs, vboxsf, vmhgfs, prl_fs, autofs (a direct-map
 // trigger point blocks on traversal), and the "fuse.<suffix>" types that are network-backed. It does
 // NOT see a STACKED filesystem (an overlay/ecryptfs/loop over a dead network mount reports its own
-// local type) or a bare `fuse` mount (many are local): that needs a bounded-call seam in agent
-// core, not a longer list. Echo's
+// local type: an `overlay` whose lowerdir is NFS is the common container case) or a bare `fuse`
+// mount (many are local) or a `fuse.<suffix>` the list does not name (the suffix list grows with
+// the network-backed FUSE clients; an unlisted one is a residual): that needs a bounded-call seam
+// in agent core, not a longer list. Callers that must not claim more say "network mounts of the
+// listed types", never "network mounts". Echo's
 // echo_mapdrive_collector.cpp keeps a deliberately different, map-drive-specific set.
 //
 // Platform-agnostic pure C++, no OS call, no I/O: the zero-dependency leaf-helper convention of
@@ -58,6 +61,7 @@ namespace yuzu::shared {
 [[nodiscard]] inline bool is_network_fstype(std::string_view fstype) noexcept {
     constexpr std::string_view kExact[] = {"nfs",   "nfs3",      "nfs4",   "cifs",   "smb3",
                                            "smbfs", "afs",       "ceph",   "glusterfs", "9p",
+                                           "ncpfs", "coda",    "smb2",
                                            "virtiofs", "lustre", "beegfs", "gfs2",   "ocfs2",
                                            "gpfs",  "panfs",     "vboxsf", "vmhgfs", "prl_fs",
                                            "autofs"};
@@ -69,7 +73,15 @@ namespace yuzu::shared {
         const auto suffix = fstype.substr(kFusePrefix.size());
         constexpr std::string_view kFuseSuffixes[] = {"sshfs",  "s3fs",      "davfs", "rclone",
                                                       "cephfs", "glusterfs", "nfs",   "smb",
-                                                      "ceph-fuse", "vmhgfs-fuse", "prl_fsd"};
+                                                      "ceph-fuse", "vmhgfs-fuse", "prl_fsd",
+                                                      // object-store / cloud-drive / distributed
+                                                      // FUSE clients whose backing store is remote
+                                                      "gcsfuse", "goofys", "blobfuse", "blobfuse2",
+                                                      "ossfs", "obsfs", "cosfs", "juicefs",
+                                                      "mfsmount", "moosefs", "lizardfs", "seaweedfs",
+                                                      "weed", "curlftpfs", "httpfs2", "s3ql",
+                                                      "onedrive", "google-drive-ocamlfuse",
+                                                      "davfs2", "fuse-nfs"};
         for (const auto s : kFuseSuffixes) {
             if (suffix == s) return true;
         }
@@ -102,13 +114,69 @@ namespace yuzu::shared {
     return out;
 }
 
+/// FUSE subtypes known to be LOCAL (a file-backed or in-kernel-adjacent view, no remote server): the
+/// strict reading of `fuse.<suffix>` treats every other FUSE mount as network-capable.
+[[nodiscard]] inline bool is_known_local_fuse_suffix(std::string_view suffix) noexcept {
+    constexpr std::string_view kLocal[] = {"portal",  "gvfsd-fuse", "lxcfs",   "snapfuse", "squashfuse",
+                                           "ntfs-3g", "ntfs3g",     "fuseiso", "archivemount", "encfs"};
+    for (const auto s : kLocal)
+        if (suffix == s)
+            return true;
+    return false;
+}
+
+namespace detail {
+
+/// True when `path` is `mount` or lies under it on a segment boundary.
+[[nodiscard]] inline bool path_on_or_under(std::string_view path, std::string_view mount) noexcept {
+    while (mount.size() > 1 && mount.back() == '/')
+        mount.remove_suffix(1);
+    if (mount.empty())
+        return false;
+    if (mount == "/" || path == mount)
+        return true;
+    return path.size() > mount.size() && path.compare(0, mount.size(), mount) == 0 &&
+           path[mount.size()] == '/';
+}
+
+/// The `key=` value of a comma-separated super-options string ("" if absent).
+[[nodiscard]] inline std::string_view option_value(std::string_view options,
+                                                   std::string_view key) noexcept {
+    std::size_t pos = 0;
+    while (pos <= options.size()) {
+        const auto comma = options.find(',', pos);
+        const auto item =
+            options.substr(pos, comma == std::string_view::npos ? std::string_view::npos : comma - pos);
+        if (item.size() > key.size() && item.substr(0, key.size()) == key && item[key.size()] == '=')
+            return item.substr(key.size() + 1);
+        if (comma == std::string_view::npos)
+            break;
+        pos = comma + 1;
+    }
+    return {};
+}
+
+} // namespace detail
+
 /// The mount points of network-backed filesystems in /proc/self/mountinfo text. A line is
 /// `id parent maj:min root mount_point options [optional...] - fstype source super_options`;
 /// the mount point is field 5 and the filesystem type follows the ` - ` separator. A malformed
 /// line is skipped (it names no mount we can avoid); a well-formed line of a local type is not
 /// reported.
-[[nodiscard]] inline std::vector<std::string> network_mount_points(std::string_view mountinfo) {
+///
+/// `strict` (the path guard's reading; the default keeps every other consumer unchanged) also
+/// reports (1) every `fuse` / `fuse.<suffix>` mount whose suffix is not a known-local one (an
+/// unlisted FUSE client can be network-backed and a stopped daemon wedges a reader in D state) and
+/// (2) an `overlay` mount whose lowerdir/upperdir/workdir lies on or under a network mount point
+/// (the common container case: an overlay over NFS reports its own local type).
+[[nodiscard]] inline std::vector<std::string> network_mount_points(std::string_view mountinfo,
+                                                                   bool strict = false) {
     std::vector<std::string> out;
+    struct Overlay {
+        std::string mount_point;
+        std::string options;
+    };
+    std::vector<Overlay> overlays;
     std::size_t pos = 0;
     while (pos < mountinfo.size()) {
         const auto nl = mountinfo.find('\n', pos);
@@ -128,9 +196,47 @@ namespace yuzu::shared {
         }
         if (mount_point.empty()) continue;
         const auto after = line.substr(sep + 3);
-        const auto fstype = after.substr(0, after.find(' '));
-        if (!is_network_fstype(fstype)) continue;
+        const auto fstype_end = after.find(' ');
+        const auto fstype = after.substr(0, fstype_end);
+        bool network = is_network_fstype(fstype);
+        if (!network && strict) {
+            if (fstype == "fuse")
+                network = true;
+            else if (fstype.substr(0, 5) == "fuse.")
+                network = !is_known_local_fuse_suffix(fstype.substr(5));
+            else if (fstype == "overlay" && fstype_end != std::string_view::npos) {
+                // <source> <super_options>
+                const auto rest = after.substr(fstype_end + 1);
+                const auto src_end = rest.find(' ');
+                if (src_end != std::string_view::npos)
+                    overlays.push_back({unescape_mountinfo(mount_point),
+                                        std::string(rest.substr(src_end + 1))});
+            }
+        }
+        if (!network) continue;
         out.push_back(unescape_mountinfo(mount_point));
+    }
+    for (const auto& ov : overlays) {
+        bool over_network = false;
+        for (const std::string_view key : {"lowerdir", "upperdir", "workdir"}) {
+            const auto value = detail::option_value(ov.options, key);
+            std::size_t p = 0;
+            while (!value.empty() && p <= value.size() && !over_network) {
+                const auto colon = value.find(':', p);
+                const auto dir = unescape_mountinfo(
+                    value.substr(p, colon == std::string_view::npos ? std::string_view::npos : colon - p));
+                for (const auto& m : out)
+                    if (detail::path_on_or_under(dir, m)) {
+                        over_network = true;
+                        break;
+                    }
+                if (colon == std::string_view::npos)
+                    break;
+                p = colon + 1;
+            }
+        }
+        if (over_network)
+            out.push_back(ov.mount_point);
     }
     return out;
 }

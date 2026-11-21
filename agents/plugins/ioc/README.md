@@ -26,6 +26,8 @@ flowchart LR
   WIN & MAC & LIN --> ROWS["pipe rows + UNDECLARED status"] --> RS[("ResponseStore")] --> API["REST /api/responses"]
 ```
 
+**`file_paths`/`file_hashes` are validated, bounded and never silently skipped.** Every path is examined once per action on a bounded helper thread (60 s for the whole action; a stalled filesystem reads `timeout` and cannot hold a command-pool worker, though the helper itself can stay blocked until the filesystem answers). Judging (`agents/shared/local_path_policy.hpp`, mount table read once) comes first. Windows refuses UNC/device/reserved-name paths and non-fixed drives, then normalises the spelling (relative, `.`/`..`, `/` and `\\?\X:\` forms become one absolute `X:\...` path) and opens handle-relative with no reparse point followed, so a junction to a share is never traversed; a directory or reparse-point leaf reads `reparse_or_not_a_file`. Linux and macOS resolve symlinks (touching nothing under a network mount; a `..` after a missing component is `unresolvable`), refuse a path on or symlinked into a mount of a listed network type (any FUSE that is not a known-local type and an overlay over a network mount included), refuse `/proc`, `/sys` and `/dev` (`/proc/kmsg` would consume the kernel ring buffer), then open component by component relative to the parent descriptor with no symlink followed and check the opened file's filesystem type (network, FUSE, pseudo), so there is no window between judging and opening. Hashing reads only regular files of at most 512 MiB, once per file for all IOC hashes. **A path that was not examined is reported, not reported as absent:** each one gets a `coverage|<path>|not_examined|<cause>` row (cause: `network_or_device`, `non_fixed_drive`, `mount_table_unreadable`, `unresolvable`, `pseudo_filesystem`, `symlink`, `reparse_or_not_a_file`, `not_regular`, `too_large`, `timeout`, `unreadable`; `unreadable` includes a permission error), the `hash` rows say how many paths were not examined, and a closing `coverage|*|complete|...` or `coverage|*|partial|...` row states the total. A file that does not exist is a definitive answer, not a gap: `file|<path>|false|File not found` and a clean `complete`. More than 64 `file_paths` or 256 `file_hashes` is refused with an `error` row. There is no operator override for a network-mounted path. In a `coverage` row the third column holds the state word (`not_examined`, `complete`, `partial`), not a boolean.
+
 ## OS capability
 
 <!-- BEGIN GENERATED: plugin-doc-gen capability -->
@@ -58,7 +60,7 @@ No external binaries or subprocesses on any OS — all three legs read OS-native
 | `security.ioc.check` | `ip_addresses` | string | no | - | - | Comma-separated list of IP addresses (e.g. `192.168.1.100`) to check against active connections' local and remote addresses. Windows and macOS enumerate TCP and UDP; Linux enumerates TCP only (no /proc/net/udp read). |
 | `security.ioc.check` | `domains` | string | no | - | - | Comma-separated list of domain names (e.g. `evil.example.com`) to check. On Windows this queries the DNS resolver cache; on Linux/macOS it is an exact hostname or alias match against /etc/hosts (comments stripped, case-insensitive, one trailing dot ignored; the address column is never matched). At most 100 domains per command (counted after splitting on commas, trimming whitespace and dropping empty entries; duplicates count); more is refused with an error row and nothing is checked. |
 | `security.ioc.check` | `file_hashes` | string | no | - | - | Comma-separated list of SHA-256 hashes (e.g. `2c26b46b68ffc68ff99b453c1d30413413422d706483bfa0f98a5e886266e7ae`), lower- or upper-case. Compared against every file in file_paths; without file_paths every hash reports unmatched with "No target file paths specified for hash comparison". |
-| `security.ioc.check` | `file_paths` | string | no | - | - | Comma-separated list of file paths (e.g. `C:\bad.exe` or `/tmp/bad.bin`) to check for existence and size. Also used as the target set for file_hashes comparison. |
+| `security.ioc.check` | `file_paths` | string | no | - | - | Comma-separated list of file paths (e.g. `C:\bad.exe` or `/tmp/bad.bin`) to check for existence and size. Also used as the target set for file_hashes comparison. At most 64 paths (more is refused). A network or device path (UNC, `\\.\`, a non-fixed Windows drive, a path under or symlinked into a network mount) and, for hashing, a file under /proc, /sys or /dev is NOT examined: it is named in a `coverage\|<path>\|not_examined\|<cause>` row, never reported as a clean absence; a file that does not exist is a definitive answer (examined), so a clean device reads `complete`. Hashing reads only regular files of at most 512 MiB within one 60 s deadline. |
 | `security.ioc.check` | `ports` | string | no | - | - | Comma-separated list of port numbers (e.g. `4444`) to check against the same connection table as ip_addresses — Linux sees TCP listeners only, Windows and macOS see TCP and UDP. |
 <!-- END GENERATED -->
 
@@ -71,9 +73,9 @@ Pipe-delimited rows, `type|value|matched|detail` (`ioc_plugin.cpp:809`). Unlike 
 
 | Field | Type | Values | Available | Example | Description |
 |---|---|---|---|---|---|
-| `type` | string | `ip` `domain` `hash` `file` `port` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears only once, in place of all rows (no header row, no check run, rc 1), when no IOC parameter was provided (`error\|none\|false\|...`) or more than 100 domains were (`error\|domains\|false\|Too many domains ...`). |
+| `type` | string | `ip` `domain` `hash` `file` `port` `coverage` `error` | Windows, Linux, macOS | `ip` | Which IOC category this row checked. `error` appears only once, in place of all rows (no header row, no check run, rc 1), when no IOC parameter was provided (`error\|none\|false\|...`), when more than 64 file_paths or 256 file_hashes were given, or when more than 100 domains were (`error\|domains\|false\|Too many domains ...`). `coverage` rows (only when file_paths was given) say what was NOT examined: one `coverage\|<path>\|not_examined\|<cause>` row per unexamined path (cause: network_or_device, non_fixed_drive, mount_table_unreadable, unresolvable, pseudo_filesystem, symlink, reparse_or_not_a_file, not_regular, too_large, timeout, unreadable) and a closing `coverage\|*\|complete\|...` or `coverage\|*\|partial\|...` row. |
 | `value` | string | - | Windows, Linux, macOS | `127.0.0.1` | The IOC value that was checked, copied from the input parameter with any literal `\|` escaped to `\\|`. Values: free text. |
-| `matched` | bool | - | Windows, Linux, macOS | `true` | Whether the IOC was found on this endpoint. Always `false` for the single `error` row. Values: true, false. |
+| `matched` | string | `true` `false` `not_examined` `complete` `partial` | Windows, Linux, macOS | `true` | For `ip`, `domain`, `hash` and `port` rows, whether the IOC was found on this endpoint (`true`/`false`); for `file` rows, whether the file exists. For a `coverage` row, the completeness token: `not_examined` on a per-path row, then `complete` or `partial` on the closing `coverage\|*` row. Always `false` for the single `error` row. A string, not a boolean: the coverage rows carry tokens. Values: true, false, not_examined, complete, partial. |
 | `detail` | string | - | Windows, Linux, macOS | `Found in /etc/hosts` | Human-readable explanation of the match or non-match (e.g. which PID owns a connection, or why a check could not run; on Windows `DNS resolver cache could not be read` when the cache was unreadable, with the result also marked constrained). Values: free text. |
 <!-- END GENERATED -->
 
@@ -92,7 +94,7 @@ On Linux and macOS this plugin does not set a typed result status; the agent rec
 ## Sample output
 
 <!-- BEGIN GENERATED: plugin-doc-gen samples -->
-**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 4c1360bf4eef
+**Windows** — captured: windows Microsoft Windows NT 10.0.26200.0 x64 · bare-metal · 2026-09-07 · SYSTEM · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -103,7 +105,7 @@ port|22|true|Listening (pid 5148)
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 4c1360bf4eef
+**macOS** — captured: macos macOS 26.6.2 arm64 · bare-metal · 2026-09-07 · euid 501 (jsmith) · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -114,7 +116,7 @@ port|22|false|No listening service on this port
 [result_status] UNDECLARED / UNKNOWN
 ```
 
-**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 4c1360bf4eef
+**Linux** — captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-07 · euid 0 · leg-hash 2be3916eae08
 
 ```
 == action=check ip_addresses=127.0.0.1 domains=localhost ports=22
@@ -137,7 +139,7 @@ port|22|false|No listening service on this port
 ## Source and tests
 
 <!-- BEGIN GENERATED: plugin-doc-gen source -->
-- Plugin: `agents/plugins/ioc/src/ioc_parsers.hpp` · `agents/plugins/ioc/src/ioc_plugin.cpp`
+- Plugin: `agents/plugins/ioc/src/ioc_examined.hpp` · `agents/plugins/ioc/src/ioc_parsers.hpp` · `agents/plugins/ioc/src/ioc_plugin.cpp`
 - Definitions: `content/definitions/ioc.yaml`
 - Capability rows: `server/core/src/capability_decls/plugin_action_catalogue_d.hpp`
 - Tests: `tests/unit/test_ioc_domain_cap.cpp` · `tests/unit/test_ioc_parsers.cpp`

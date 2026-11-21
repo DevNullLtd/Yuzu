@@ -822,6 +822,8 @@ Two consequences worth planning for:
 
 ### Reconnect re-application (#3425), re-verify and drift
 
+The reserved lane governs worker admission while a pool is running. It does not bound pool teardown. When the stream drops the agent destroys the pool. A queued ordinary task that has not started is answered REJECTED ("agent reconnecting") without running and an ordinary command's stagger sleep ends within about a second. A queued protective action is never rejected: it runs, with no stagger sleep, before the pool is destroyed. The agent then waits, with no bound, for every task already RUNNING its plugin to return before it reconnects; a command blocked in the kernel holds that wait, the reserved lane does not help, and a quarantine or `__guard__.push_rules` sent after the drop is not received until it returns (#8247). The 20 s shutdown watchdog does not cover this wait. On Linux the `yuzu-agent` unit sets `TimeoutStopSec=60`: a stop still waiting at 60 s ends in SIGKILL (`status=9/KILL`), and the unit is left `failed` (`Result=timeout`) and stopped: systemd does not restart a unit whose stop was requested, so it stays down until it is started again. A reconnect teardown has no such budget.
+
 A device quarantined while **offline** is contained at the control plane immediately (the gate above
 refuses it), but its own firewall cannot be touched until a dispatch reaches it. The
 `QuarantineContainmentReconciler` closes that automatically. For every record not yet confirmed:

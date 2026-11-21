@@ -53,6 +53,18 @@ struct BundleStepSpec {
 /// non-object `params`, oversized params. Duplicate `(plugin, action)` steps are
 /// ALLOWED and preserved in request order (ADR-0011 §61-64 — demux is by
 /// command_id, so duplicates with different params are unambiguous).
+/// A rejected steps document: the human-readable message and a TYPED kind, so a caller that audits or
+/// counts a refusal by cause (`param_key_invalid`) never classifies it by matching message text.
+struct BundleStepsError {
+    enum class Kind { kOther, kParamKeyInvalid };
+    std::string message;
+    Kind kind{Kind::kOther};
+};
+
+/// `validate_bundle_steps` with the typed error (the ingress surfaces that count by cause use this).
+[[nodiscard]] std::expected<std::vector<BundleStepSpec>, BundleStepsError>
+validate_bundle_steps_typed(std::string_view steps_json, std::size_t max_steps = kMaxBundleSteps);
+
 [[nodiscard]] std::expected<std::vector<BundleStepSpec>, std::string>
 validate_bundle_steps(std::string_view steps_json, std::size_t max_steps = kMaxBundleSteps);
 

@@ -57,6 +57,18 @@ inline constexpr ResolverPoolMetricNames kOidcResolverMetrics{
     "out in the last 3 s, or the admission check did not complete). Mirrored from the pool "
     "every 15 s; non-zero only on POSIX builds"};
 
+inline constexpr ResolverPoolMetricNames kDeliveryResolverMetrics{
+    "yuzu_server_delivery_resolver_in_flight",
+    "yuzu_server_delivery_resolver_pool_capacity",
+    "yuzu_server_delivery_resolver_lookups_total",
+    "Name lookups outstanding in the resolver pool webhook and offload-target delivery uses, "
+    "published every 15 s; a value at the pool's cap means a delivery whose destination host must "
+    "be resolved is declined (destination_resolver_busy) until lookups return",
+    "Slots in the resolver pool webhook and offload-target delivery uses, published every 15 s",
+    "Name lookups made through the webhook and offload-target delivery resolver pool, by outcome: "
+    "ok, not_found, temporary, timeout, busy (the pool was full or a worker could not be started). "
+    "Mirrored from the pool every 15 s"};
+
 class ResolverPoolPublisher {
 public:
     explicit ResolverPoolPublisher(const ResolverPoolMetricNames& names) noexcept

@@ -4578,10 +4578,14 @@ static const ToolDef kTools[] = {
      "never echoed back by any tool — only has_credential (bool) is ever readable afterward "
      "(ADR-0010). url must be http:// or https://; batch_size 1 delivers each event "
      "immediately, >1 accumulates up to that many events per POST. Additive (mints a new "
-     "target, overwrites nothing) but a duplicate name is rejected. url is NOT restricted "
-     "to external hosts - a caller with Infrastructure:Write can point deliveries at any "
-     "reachable address, including the server's own loopback/internal network (no SSRF "
-     "guard on this field today, same posture as REST's twin). Requires "
+     "target, overwrites nothing) but a duplicate name is rejected. Open-world: the server "
+     "POSTs to url. A url whose host is a link-local/cloud-metadata, unspecified, multicast or "
+     "reserved address (or a numeric spelling of one, e.g. 2852039166) is refused with -32602 "
+     "(audited as destination_refused); at delivery a host name is resolved once, every answer "
+     "is vetted and the connect is pinned to a vetted address, and a declined delivery is "
+     "logged destination_refused or destination_unresolved. Loopback and private ranges are NOT "
+     "refused: a caller with Infrastructure:Write can still point deliveries at the server's "
+     "own loopback or internal network (opt-in policy: #4816). Requires "
      "Infrastructure:Write.",
      R"j({"type":"object","properties":{)j"
      R"j("name":{"type":"string","minLength":1,"maxLength":256,"description":"Unique target name; a duplicate is rejected"},)j"
@@ -7191,7 +7195,10 @@ static const std::unordered_map<std::string, ToolAnnotation> kToolAnnotation = {
     // mint_upload_grant above). A duplicate name/license_key is REJECTED,
     // never silently reused -> each successful call mints a distinct id ->
     // not idempotent.
-    {"create_offload_target", {ToolEffect::Additive, false, "Create offload target"}},
+    // openWorldHint is true: the server POSTs fleet events to the administrator-supplied url (an
+    // outbound reach beyond Yuzu's own stores, like the CRL-source registration tools below).
+    {"create_offload_target",
+     {ToolEffect::Additive, false, "Create offload target", /*open_world=*/true}},
     {"activate_platform_license", {ToolEffect::Additive, false, "Activate platform license"}},
     // create_software_deployment is ALSO a pure INSERT (same shape as the two
     // above), but its kToolSecurityRows operation is Execute (matching the
@@ -23620,6 +23627,10 @@ McpServer::HandlerFn McpServer::build_handler(
                             too_large("param_count", std::format("params must have at most {} keys", kExecInstrParamCountMax));
                             return;
                         }
+                        if (auto bad = yuzu::server::check_params_key_shape(p)) {
+                            too_large(bad->reason, bad->message);
+                            return;
+                        }
                         for (const auto& [k, v] : p.items()) {
                             // Key length is NOT expressible in the served schema
                             // (the subset has no propertyNames/maxProperties), so
@@ -25957,9 +25968,15 @@ McpServer::HandlerFn McpServer::build_handler(
                                     "application/json");
                     return;
                 }
-                auto specs = validate_bundle_steps(args["steps"].dump());
+                auto specs = validate_bundle_steps_typed(args["steps"].dump());
                 if (!specs) {
-                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error()),
+                    if (specs.error().kind == BundleStepsError::Kind::kParamKeyInvalid) {
+                        // sg10 / UP-1: counted and audited like every other ingress refusal.
+                        count_param_key_invalid(metrics, "bundle");
+                        (void)audit_fn(req, "bundle.dispatch", "denied", "Execution", "",
+                                       std::string("reason=") + std::string(kReasonParamKeyInvalid));
+                    }
+                    res.set_content(error_response(id, kInvalidParams, "steps: " + specs.error().message),
                                     "application/json");
                     return;
                 }
@@ -29206,7 +29223,17 @@ McpServer::HandlerFn McpServer::build_handler(
                     // store_unavailable/db_error are store/infra degradation
                     // (kInternalError + retry_after_ms) — distinct in the
                     // audit record even where the outcome collapses.
-                    if (result.error() == OffloadWriteError::invalid_input) {
+                    if (result.error() == OffloadWriteError::destination_refused) {
+                        (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
+                                 "destination_refused");
+                        res.set_content(
+                            a4_error(kInvalidParams,
+                                     "target rejected: url host is a link-local, cloud-metadata, "
+                                     "unspecified, multicast or reserved address (or a numeric "
+                                     "spelling of one); offload destinations may not be in those "
+                                     "address classes"),
+                            "application/json");
+                    } else if (result.error() == OffloadWriteError::invalid_input) {
                         (void)yuzu::server::detail::try_persist_audit(audit_fn, req, "offload_target.create", "denied", "offload_target", audit_token(name),
                                  "validation_failed");
                         res.set_content(

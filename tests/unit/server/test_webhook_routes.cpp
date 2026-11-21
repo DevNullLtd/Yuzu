@@ -585,3 +585,26 @@ TEST_CASE("REST webhooks[pg]: a lost failure row still marks Sec-Audit-Failed on
     CHECK(gone->status == 404);
     CHECK(gone->get_header_value("Sec-Audit-Failed") == "true");
 }
+
+TEST_CASE("REST webhooks[pg]: POST 400 destination_refused for a metadata / link-local host and "
+          "nothing stored",
+          "[rest][webhook][pg][security]") {
+    WebhookRouteHarness h;
+    for (const char* url : {"http://169.254.169.254/latest/meta-data", "http://2852039166/x",
+                            "http://0xa9fea9fe/x", "https://0.0.0.0/x"}) {
+        h.audit_log.clear();
+        nlohmann::json body = {{"url", url}};
+        auto res = h.sink.Post("/api/webhooks", body.dump());
+        REQUIRE(res);
+        CHECK(res->status == 400);
+        // The denial is its own audit reason, distinct from a typo's `invalid_url`.
+        bool saw_refused = false;
+        for (const auto& rec : h.audit_log)
+            if (rec.detail == "destination_refused" && rec.result == "denied")
+                saw_refused = true;
+        CHECK(saw_refused);
+    }
+    auto list = h.sink.Get("/api/webhooks");
+    REQUIRE(list);
+    CHECK(nlohmann::json::parse(list->body)["webhooks"].empty());
+}

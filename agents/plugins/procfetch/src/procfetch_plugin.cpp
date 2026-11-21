@@ -26,8 +26,12 @@
 
 #include "procfetch_row.hpp"
 
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <memory>
 #include <format>
 #include <fstream>
 #include <string>
@@ -36,7 +40,15 @@
 #include <vector>
 
 #if defined(__linux__) || defined(__APPLE__)
+#include <fcntl.h>
 #include <openssl/evp.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
+#include <image_hash_cache.hpp>   // identity-keyed (dev, inode, size, mtime) hash cache
+#include <helper_budget.hpp>      // HelperBudget + hash_unavailable markers
+#include <bounded_wait.hpp>      // bounded_call_ex: a stalled filesystem cannot hold the command worker
+#include <local_path_policy.hpp> // posix_open_checked / the path guard (macOS image path)
 #endif
 #ifdef __APPLE__
 #include <libproc.h>
@@ -56,6 +68,9 @@
 // clang-format on
 #include <bcrypt.h>
 #include <win_str.hpp>  // shared yuzu::win wide<->UTF-8 helpers (#1681)
+#include <local_path_policy.hpp>   // refuse UNC / device / non-fixed-drive image paths
+#include <helper_budget.hpp>      // hash_unavailable:<cause> tokens
+#include <win_no_reparse_open.hpp> // handle-relative OBJ_DONT_REPARSE open
 #pragma comment(lib, "bcrypt.lib")
 #include <charconv>
 #include <tlhelp32.h>
@@ -66,44 +81,121 @@ namespace {
 // -- POSIX (Linux + macOS) shared SHA-1 ---------------------------------------
 #if defined(__linux__) || defined(__APPLE__)
 
-std::string sha1_of_file_posix(const std::filesystem::path& path) {
-    std::ifstream f(path, std::ios::binary);
-    if (!f)
-        return {};
+struct EvpCtxDeleter {
+    void operator()(EVP_MD_CTX* c) const noexcept { EVP_MD_CTX_free(c); }
+};
+using EvpCtx = std::unique_ptr<EVP_MD_CTX, EvpCtxDeleter>;
 
-    auto* ctx = EVP_MD_CTX_new();
-    if (!ctx)
-        return {};
+constexpr std::uint64_t kMaxImageHashBytes = 512ull * 1024 * 1024; // 512 MiB, refused (not truncated)
+constexpr auto kPerImageBudget = std::chrono::seconds(30);
+constexpr auto kActionBudget = std::chrono::seconds(120); // all images together
+constexpr int kMaxStuckHelpers = 2; // helpers left behind per action, at most (2 x 30 s < the 120 s budget)
 
-    if (EVP_DigestInit_ex(ctx, EVP_sha1(), nullptr) != 1) {
-        EVP_MD_CTX_free(ctx);
+// SHA-1 of an OPEN descriptor: a regular file of at most kMaxImageHashBytes, read within `deadline`
+// (cooperative; the caller bounds the call itself, see hash_image_bounded). Any failure, including
+// a read error part-way, is "not hashed" (empty): never the SHA-1 of a truncated prefix.
+std::string sha1_of_fd(int fd, std::chrono::steady_clock::time_point deadline) {
+    struct stat st{};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        static_cast<std::uint64_t>(st.st_size) > kMaxImageHashBytes)
         return {};
-    }
-
-    char buf[65536];
-    while (f.read(buf, sizeof(buf)) || f.gcount() > 0) {
-        if (EVP_DigestUpdate(ctx, buf, static_cast<size_t>(f.gcount())) != 1) {
-            EVP_MD_CTX_free(ctx);
+    const EvpCtx ctx{EVP_MD_CTX_new()};
+    if (!ctx || EVP_DigestInit_ex(ctx.get(), EVP_sha1(), nullptr) != 1)
+        return {};
+    unsigned char buf[65536];
+    std::uint64_t total = 0;
+    for (;;) {
+        if (std::chrono::steady_clock::now() >= deadline)
             return {};
-        }
-        if (f.gcount() < static_cast<std::streamsize>(sizeof(buf)))
+        const ssize_t n = ::read(fd, buf, sizeof(buf));
+        if (n < 0)
+            return {};
+        if (n == 0)
             break;
+        total += static_cast<std::uint64_t>(n);
+        if (total > kMaxImageHashBytes ||
+            EVP_DigestUpdate(ctx.get(), buf, static_cast<size_t>(n)) != 1)
+            return {};
     }
-
     unsigned char hash[EVP_MAX_MD_SIZE];
     unsigned int hash_len = 0;
-    if (EVP_DigestFinal_ex(ctx, hash, &hash_len) != 1) {
-        EVP_MD_CTX_free(ctx);
+    if (EVP_DigestFinal_ex(ctx.get(), hash, &hash_len) != 1)
         return {};
-    }
-    EVP_MD_CTX_free(ctx);
-
     std::string hex;
     hex.reserve(hash_len * 2);
-    for (unsigned int i = 0; i < hash_len; ++i) {
+    for (unsigned int i = 0; i < hash_len; ++i)
         hex += std::format("{:02x}", hash[i]);
-    }
     return hex;
+}
+
+// RESIDUAL (bounded helper inside a plugin DSO; the discovery and power_health plugins record the
+// same one): `bounded_call_ex` runs `fn` on a detached thread whose code lives in THIS plugin's
+// DSO. After a timeout the thread can still be running (blocked in the kernel on a stalled
+// filesystem or resolver) when `shutdown()` returns; the host dlclose()s plugins only at final
+// process exit (agent.cpp), and the shipped DSOs happen to stay mapped (each exports
+// STB_GNU_UNIQUE symbols) -- an accident, not a guarantee, and a plain DSO would fault. The
+// ceiling is per DSO, not process-wide: `g_outstanding_bounded_calls` is an `inline` variable, so
+// each plugin has its own 64 slots, a slot is released only by the worker, and a refused call
+// reads as a timeout. Moving the primitive into agent-core would not remove the residual (the
+// lambda bodies stay here), so it is accepted as the precedent trade (plugin.hpp: "accept a
+// bounded resource residue instead"). The drain barrier that would close it is tracked as #8204.
+// Adjudication belongs to governance, not to this file.
+// Hash one process image on a bounded helper: the open and the read of a file on a stalled
+// filesystem cannot hold the command worker past `budget` (bounded_wait.hpp; the helper owns its
+// descriptor and copies, and shares the identity-keyed cache). Linux opens /proc/<pid>/exe itself
+// (the kernel's reference to the running image: no path text is re-resolved); macOS opens the judged
+// path handle-relative with no symlink followed. O_NONBLOCK: a FIFO is refused, never waited on.
+// The cache key is the OPENED image's identity (dev, inode, size, mtime), looked up after the open and
+// before the read: the readlink text is only shown, never a key, so a replaced or aliased image
+// never receives another process's hash.
+std::string hash_image_bounded(int pid, const std::string& path,
+                               const yuzu::shared::local_path::LocalPathGuard& guard,
+                               const std::shared_ptr<yuzu::shared::ImageHashCache>& cache,
+                               std::chrono::steady_clock::time_point action_deadline, yuzu::shared::HelperBudget& helpers) {
+    const auto now = std::chrono::steady_clock::now();
+    // At most kMaxStuckHelpers helpers per action may be left behind (timed out, or refused at the
+    // process-wide ceiling): past that the remaining images read as not hashed WITHOUT starting
+    // another, so one dispatch cannot burn through the helper ceiling.
+    if (now >= action_deadline || !helpers.may_start())
+        return yuzu::shared::kHashUnavailableSkipped; // a marker, never an empty hash
+    const auto budget = std::min<std::chrono::steady_clock::duration>(kPerImageBudget, action_deadline - now);
+    const auto deadline = now + budget;
+    auto result = yuzu::shared::bounded_call_ex(
+        std::chrono::duration_cast<std::chrono::milliseconds>(budget),
+        [pid, path, guard, cache, deadline]() -> std::string {
+            yuzu::shared::ScopedFile fd;
+#if defined(__linux__)
+            (void)path;
+            (void)guard;
+            fd = yuzu::shared::ScopedFile{::open(("/proc/" + std::to_string(pid) + "/exe").c_str(),
+                                                 O_RDONLY | O_NONBLOCK | O_NOCTTY | O_CLOEXEC)};
+            if (!fd.valid())
+                return {};
+#else
+            (void)pid;
+            namespace lp = yuzu::shared::local_path;
+            const auto j = guard.judge(path);
+            if (lp::refused(j.refusal))
+                return {};
+            auto o = lp::posix_open_checked(j.resolved.empty() ? path : j.resolved,
+                                            O_RDONLY | O_NONBLOCK | O_NOCTTY, /*require_regular=*/true);
+            if (!o.opened())
+                return {};
+            fd = std::move(o.file);
+#endif
+            struct stat st{};
+            if (::fstat(fd.fd(), &st) != 0 || !S_ISREG(st.st_mode))
+                return {};
+            const auto key = yuzu::shared::image_identity_key(st);
+            if (auto hit = cache->get(key))
+                return *hit;
+            auto hex = sha1_of_fd(fd.fd(), deadline);
+            if (!hex.empty())
+                cache->put(key, hex);
+            return hex;
+        });
+    helpers.note(result.status);
+    return yuzu::shared::hash_field_for(result.status, result.value ? std::move(*result.value) : std::string{});
 }
 
 #endif // POSIX
@@ -127,8 +219,11 @@ std::string resolve_exe(const std::filesystem::path& link, yuzu::shared::ProcAcc
 }
 
 void enumerate_and_stream(yuzu::CommandContext& ctx) {
-    std::unordered_map<std::string, std::string> sha_cache;
+    const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
     std::error_code ec;
+    const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
+    const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+    yuzu::shared::HelperBudget helpers{kMaxStuckHelpers};
     yuzu::shared::ProcAccessTally tally; // WP13 UP14
 
     for (const auto& entry : std::filesystem::directory_iterator("/proc", ec)) {
@@ -149,18 +244,11 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
 
         std::string exe_path = resolve_exe(entry.path() / "exe", tally);
         std::string sha1;
-        if (!exe_path.empty()) {
-            std::error_code fe;
-            if (std::filesystem::exists(exe_path, fe)) {
-                auto it = sha_cache.find(exe_path);
-                if (it != sha_cache.end()) {
-                    sha1 = it->second;
-                } else {
-                    sha1 = sha1_of_file_posix(exe_path);
-                    sha_cache.emplace(exe_path, sha1);
-                }
-            }
-        }
+        // The hash comes from /proc/<pid>/exe itself (never the readlink text, which is only shown),
+        // on a bounded helper, regular files only, capped and deadline-bounded, cached by the
+        // opened image's identity.
+        if (!exe_path.empty())
+            sha1 = hash_image_bounded(pid, exe_path, path_guard, image_cache, action_deadline, helpers);
 
         ctx.write_output(
             yuzu::procfetch::format_row(pid, name, exe_path, sha1));
@@ -188,7 +276,10 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
         return;
     size_t pid_count = static_cast<size_t>(got) / sizeof(pid_t);
 
-    std::unordered_map<std::string, std::string> sha_cache;
+    const auto image_cache = std::make_shared<yuzu::shared::ImageHashCache>();
+    const yuzu::shared::local_path::LocalPathGuard path_guard; // one mount-table snapshot per run
+    const auto action_deadline = std::chrono::steady_clock::now() + kActionBudget;
+    yuzu::shared::HelperBudget helpers{kMaxStuckHelpers};
     char path_buf[PROC_PIDPATHINFO_MAXSIZE];
 
     for (size_t i = 0; i < pid_count; ++i) {
@@ -216,18 +307,8 @@ void enumerate_and_stream(yuzu::CommandContext& ctx) {
             continue;
 
         std::string sha1;
-        if (!exe_path.empty()) {
-            std::error_code fe;
-            if (std::filesystem::exists(exe_path, fe)) {
-                auto it = sha_cache.find(exe_path);
-                if (it != sha_cache.end()) {
-                    sha1 = it->second;
-                } else {
-                    sha1 = sha1_of_file_posix(exe_path);
-                    sha_cache.emplace(exe_path, sha1);
-                }
-            }
-        }
+        if (!exe_path.empty())
+            sha1 = hash_image_bounded(static_cast<int>(pid), exe_path, path_guard, image_cache, action_deadline, helpers);
 
         ctx.write_output(yuzu::procfetch::format_row(static_cast<int>(pid), name, exe_path, sha1));
     }
@@ -256,33 +337,66 @@ std::string get_process_image_path(DWORD pid) {
 }
 
 std::string sha1_of_file(const std::string& path, BCRYPT_ALG_HANDLE alg) {
-    HANDLE file = CreateFileA(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING,
-                              FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE)
-        return {};
+    // The image path belongs to a process any standard user can start, so it can be a share
+    // (`\\server\share\x.exe`). Opening it as the LocalSystem agent would authenticate the machine
+    // account to that host. Classify BEFORE any open (a refused path reads `hash_unavailable:not_examined`), then open
+    // handle-relative with no reparse point followed so a junction or symlink in the path cannot
+    // redirect the open either.
+    //
+    // A hash that was not produced is a `hash_unavailable:<cause>` token in this column, never an
+    // empty string (empty = no image path could be resolved for the process): `not_examined` (a
+    // network, device or non-fixed-drive path, refused before any open), `unreadable` (the open
+    // failed: gone, a reparse point, access denied: the shared opener does not say which, so
+    // `access_denied` is not emitted), `not_regular` (not a disk file) and `unreadable` for a hash
+    // or read failure. `timeout` and `too_large` do not occur here: this leg has no helper, byte cap
+    // or deadline.
+    if (yuzu::shared::local_path::refused(yuzu::shared::local_path::local_path_refusal(path)))
+        return yuzu::shared::hash_unavailable("not_examined");
+    const auto opened = yuzu::win::open_file_no_reparse(yuzu::win::to_wide(path));
+    if (opened.status != yuzu::win::NoReparseOpen::ok)
+        return yuzu::shared::hash_unavailable("unreadable");
+    const HANDLE file = opened.file.get(); // owned by `opened`; closed on every exit path
+    if (::GetFileType(file) != FILE_TYPE_DISK)
+        return yuzu::shared::hash_unavailable("not_regular");
 
-    BCRYPT_HASH_HANDLE hash_handle = nullptr;
+    // The hash handle is owned from creation: every return below destroys it exactly once.
+    struct BcryptHash {
+        BCRYPT_HASH_HANDLE h = nullptr;
+        ~BcryptHash() {
+            if (h)
+                BCryptDestroyHash(h);
+        }
+    } hash_guard;
+    BCRYPT_HASH_HANDLE& hash_handle = hash_guard.h;
     NTSTATUS status = BCryptCreateHash(alg, &hash_handle, nullptr, 0, nullptr, 0, 0);
-    if (status != 0) {
-        CloseHandle(file);
-        return {};
-    }
+    if (status != 0)
+        return yuzu::shared::hash_unavailable("unreadable");
 
+    // A read error or a hash failure part-way through must NOT finish the digest: that would
+    // return the SHA-1 of a truncated prefix as if it were the image's hash. Any failure is "not
+    // hashed" (empty). ReadFile on a synchronous handle returns TRUE with 0 bytes at end of file.
     char buf[65536];
     DWORD bytes_read = 0;
-    while (ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr) && bytes_read > 0) {
+    bool complete = false;
+    for (;;) {
+        if (!ReadFile(file, buf, sizeof(buf), &bytes_read, nullptr))
+            break; // read error: not complete
+        if (bytes_read == 0) {
+            complete = true;
+            break;
+        }
         status = BCryptHashData(hash_handle, reinterpret_cast<PUCHAR>(buf), bytes_read, 0);
         if (status != 0)
             break;
     }
-    CloseHandle(file);
+    if (!complete)
+        return yuzu::shared::hash_unavailable("unreadable");
 
     unsigned char hash[20]; // SHA-1 is 20 bytes
     status = BCryptFinishHash(hash_handle, hash, sizeof(hash), 0);
-    BCryptDestroyHash(hash_handle);
 
     if (status != 0)
-        return {};
+        return yuzu::shared::hash_unavailable("unreadable");
 
     std::string hex;
     hex.reserve(40);

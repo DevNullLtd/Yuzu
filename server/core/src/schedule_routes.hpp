@@ -115,6 +115,7 @@
 /// pinned by this module's PG-backed test coverage, now produced by
 /// `perm_fn`/`require_permission` alone.
 
+#include <yuzu/metrics.hpp>
 #include <yuzu/server/auth.hpp>
 
 #include <httplib.h>
@@ -156,6 +157,9 @@ struct Deps {
     /// `ServerImpl::schedule_engine_`. Null -> every route answers 503
     /// without touching it.
     ScheduleEngine* schedule_engine{nullptr};
+    /// Counts `yuzu_server_dispatch_target_rejected_total{route="schedule",reason="param_key_invalid"}`.
+    /// Null -> not counted.
+    yuzu::MetricsRegistry* metrics{nullptr};
 };
 
 /// Register all 4 Schedules API routes against `sink`.

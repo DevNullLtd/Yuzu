@@ -23,12 +23,11 @@
 ///     or unparseable classification means the capability does not exist",
 ///     never a permissive default;
 ///   * a `system_reserved` capability (BR-003) — a schedule is OPERATOR-
-///     authored but fires through `command_dispatch_fn`, which dispatches as
-///     `DispatchCaller{.system = true}`, and the chokepoint's system_reserved
-///     guard only refuses NON-system callers. Without this branch an operator
-///     who may not dispatch `echo.fleet_snapshot` directly could schedule it —
-///     the definition ships operator-referencable — and the fire would reach
-///     the fleet under system authority. Refused here, where the operator's
+///     authored and fires through the outbox as the arming principal's re-resolved
+///     (non-system) caller. The chokepoint refuses a system_reserved row to
+///     every non-system caller too, but a definition that ships
+///     operator-referencable (`echo.fleet_snapshot`) would otherwise be armed
+///     and then fail at every fire; refused here, where the operator's
 ///     provenance is still known;
 ///   * a missing or unopened `RbacStore`.
 ///
@@ -40,21 +39,31 @@
 #include "rbac_store.hpp"
 
 #include <string>
+#include <unordered_map>
 
 namespace yuzu::server {
 
-/// Decide whether `principal` may still arm `plugin.action`. `rbac` may be
-/// null (denies). Pure with respect to its inputs — no metrics, no logging,
+/// Decide whether `principal` may still arm `plugin.action` with `parameters`. `rbac` may be
+/// null (denies). The securable judged is `effective_securable(cap, &parameters)`, the SAME rule
+/// `classify_and_authorize_dispatch` applies on the send path: a scheduled / outbox dispatch fires
+/// as the arming principal's re-resolved (NOT system) caller, so the send chokepoint asks that
+/// principal for the escalated securable too; the arming check refuses earlier, at fire and at
+/// delivery, so a schedule or queued command the principal could not send never arms
+/// (`windows_updates.patch_connectivity` + `targets` is `Infrastructure`).
+/// Pure with respect to its inputs — no metrics, no logging,
 /// no audit: the caller owns those, so this can be exercised directly in a
 /// unit test with a real registry and a `:memory:` store.
 [[nodiscard]] inline bool schedule_arming_permitted(const CommandCapabilityRegistry& registry,
                                                     const RbacStore* rbac,
                                                     const std::string& principal,
                                                     const std::string& plugin,
-                                                    const std::string& action) {
+                                                    const std::string& action,
+                                                    const std::unordered_map<std::string, std::string>& parameters) {
     const auto classified = registry.classify(plugin, action);
     if (!classified)
         return false;
+    if (!parameters_well_formed(parameters))
+        return false; // UP-1: never arm on a key the agent would truncate
     if (classified->system_reserved)
         return false;
     if (rbac == nullptr || !rbac->is_open())
@@ -63,7 +72,7 @@ namespace yuzu::server {
         // Legacy-open arms for everyone EXCEPT an engine principal, whose only authority is an
         // explicit RBAC grant (and RBAC is off here).
         return !yuzu::server::authz::is_engine_principal_name(principal);
-    return rbac->check_permission(principal, std::string(classified->securable),
+    return rbac->check_permission(principal, std::string(effective_securable(*classified, &parameters)),
                                   std::string(yuzu::server::authz::to_string(classified->operation)));
 }
 

@@ -2,6 +2,7 @@
 
 #include "delivery_pool_metrics.hpp"
 
+#include "outbound_destination_guard.hpp"
 #include "outbound_url_policy.hpp"
 
 #include "mcp_jsonrpc.hpp" // mcp::json_exceeds_depth / kMcpMaxJsonDepth: shared #2437 depth guard
@@ -434,6 +435,15 @@ std::expected<int64_t, OffloadWriteError> OffloadTargetStore::create_target(
             "OffloadTargetStore: rejected target with control bytes in event_types: {}", name);
         return std::unexpected(OffloadWriteError::invalid_input);
     }
+    // A LITERAL link-local / metadata / unspecified / multicast / reserved destination is refused
+    // here (#4816); names are vetted at delivery (outbound_destination_guard.hpp).
+    if (url_literal_destination_refused(url)) {
+        spdlog::warn("OffloadTargetStore: rejected target whose url host is a link-local, metadata, "
+                     "unspecified, multicast or reserved address or a numeric spelling of one "
+                     "(target name: {})",
+                     name);
+        return std::unexpected(OffloadWriteError::destination_refused);
+    }
 
     // Serial-PK allocate-before-encrypt (ADR-0010 Amendment): reserve the
     // row id on its own short lease (released before encrypting), encrypt
@@ -801,6 +811,30 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
         return;
     }
 
+    // Vet the destination before the credential is decrypted or a socket opened (#4816). A name is
+    // resolved ONCE (through the delivery resolver pool) and the connects below go only to addresses
+    // that were judged; link-local/metadata, unspecified, multicast and reserved addresses, an
+    // unresolvable name and a busy resolver all decline the delivery, record why, and are counted
+    // under `refused_total{cause}` (NOT delivery_failed_total). Loopback and private ranges are
+    // deliberately NOT refused (outbound_destination_guard.hpp; the opt-in policy is #4816's
+    // separate setting).
+    const VettedDestination vetted = vet_delivery_destination(tgt.url, std::chrono::seconds(3), lookup_for_test_);
+    if (vetted.verdict != DestinationVerdict::Allow) {
+        const char* cause = destination_cause(vetted.verdict);
+        record_delivery(tgt.id, event_type, event_count, payload_body, 0, cause);
+        if (metrics_)
+            metrics_->counter("yuzu_server_offload_delivery_refused_total", {{"cause", cause}})
+                .increment();
+        if (refusal_throttle_.admit(tgt.id)) {
+            spdlog::warn("OffloadTargetStore: delivery to {} (target {}) declined - {}{}{}",
+                         url_log_host(tgt.url), tgt.id, cause,
+                         *vetted.refused_class != '\0' ? ": " : "", vetted.refused_class);
+            if (refused_sink_)
+                refused_sink_(tgt.id, cause, vetted.refused_class, url_audit_detail(tgt.url));
+        }
+        return;
+    }
+
     // Decrypt-on-use at the dispatch site, right before the credential is
     // needed for the auth header/signature — never cached/batched across
     // this target's flush lifetime (ADR-0010 §Consequences permits caching
@@ -837,11 +871,6 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
     try {
         // One parser for validation and delivery (outbound_url_policy.hpp).
         const auto [scheme, host_port, path] = url_delivery_parts(tgt.url);
-
-        httplib::Client cli(scheme + "://" + host_port);
-        cli.set_connection_timeout(5);
-        cli.set_read_timeout(10);
-        cli.set_write_timeout(10);
 
         httplib::Headers headers;
         headers.emplace("Content-Type", "application/json");
@@ -882,7 +911,36 @@ void OffloadTargetStore::deliver_single(const OffloadDeliveryTarget& tgt,
             break;
         }
 
-        auto result = cli.Post(path, headers, payload_body, "application/json");
+        // A resolved name keeps its dual-stack fallback: each vetted address (IPv4 first) is tried
+        // in turn, every one of them judged above. A literal host has nothing to pin.
+        std::vector<std::string> targets =
+            vetted.pinned_ips.empty() ? std::vector<std::string>{std::string{}} : vetted.pinned_ips;
+        if (targets.size() > kMaxDeliveryConnectAddresses) { // PERF-1: bounded fallback
+            spdlog::warn("OffloadTargetStore: {} vetted addresses for {}, trying the first {} only",
+                         targets.size(), url_log_host(tgt.url), kMaxDeliveryConnectAddresses);
+            if (metrics_)
+                metrics_->counter("yuzu_server_delivery_connect_addresses_truncated_total").increment();
+            targets.resize(kMaxDeliveryConnectAddresses);
+        }
+        httplib::Result result;
+        for (const auto& ip : targets) {
+            httplib::Client cli(scheme + "://" + host_port);
+            if (!ip.empty())
+                cli.set_hostname_addr_map({{vetted.host, ip}});
+            cli.set_connection_timeout(5);
+            cli.set_read_timeout(10);
+            cli.set_write_timeout(10);
+            result = cli.Post(path, headers, payload_body, "application/json");
+            if (result)
+                break;
+            // Move to the next vetted address ONLY when no connection was made (the connect failed or
+            // the CONNECT timed out: nothing was sent): once the POST may have reached the receiver
+            // (a read or write error or timeout) a second POST to another address would deliver the
+            // event twice.
+            if (result.error() != httplib::Error::Connection &&
+                result.error() != httplib::Error::ConnectionTimeout)
+                break;
+        }
         if (result) {
             status_code = result->status;
         } else {

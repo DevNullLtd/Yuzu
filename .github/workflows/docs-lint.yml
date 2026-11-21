@@ -214,6 +214,12 @@ jobs:
       - name: Guardian/Spark log-injection tripwire (#4665)
         run: python3 tests/test_guardian_spark_log_injection_tripwire.py
 
+      # filesystem.exists must refuse a network/device path up front and never fall back to the
+      # raw caller path (the refusal is Windows-only code, so this pins the shape on every host).
+      # Also registered in tests/meson.build for local `meson test --suite docs` parity.
+      - name: filesystem exists has no raw-path fallback
+        run: python3 tests/test_filesystem_exists_no_raw_fallback_lexical.py
+
       # Per-family seam-enforcement scaffold (ADR-0031 migration step 3, WS-A4
       # item 1): a family's presentation/handler TUs must not reach a store
       # directly. check-seam-closure.py walks each declared family TU's

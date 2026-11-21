@@ -1,4 +1,4 @@
-captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 6e02e2f89c34
+captured: linux Debian GNU/Linux 13 (trixie) aarch64 · container · 2026-09-06 · euid 0 · leg-hash 60b58499489d
 == action=download url=https://www.example.com/ path=/tmp/yuzu_capture/yuzu_capture_download.html
 status|ok
 path|/tmp/yuzu_capture/yuzu_capture_download.html

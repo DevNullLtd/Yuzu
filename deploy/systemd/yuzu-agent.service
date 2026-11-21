@@ -57,6 +57,20 @@ ExecStart=/usr/local/bin/yuzu-agent \
     --data-dir /var/lib/yuzu-agent
 Restart=always
 RestartSec=10
+# A stop waits, with no bound of the agent's own, for every command already running its plugin to
+# return (the command pool's join; a command blocked in the kernel on a stalled mount or resolver
+# holds it, and the agent's 20 s shutdown watchdog does not cover it). 60 s lets an ordinary
+# stop finish and then ends a stuck one with SIGKILL (status=9/KILL) instead of waiting out
+# systemd's default. A stop that ends this way leaves the unit failed (Result=timeout) and stopped:
+# systemd does not restart a unit whose stop was requested, so it stays down until it is
+# started again. The wait also covers a protective
+# action (a firewall containment) that runs while the command pool closes: its drain is
+# unbounded and, during a systemd stop, inside this budget, so a long drain ends in SIGKILL too, and a command killed
+# mid-execution leaves an in-flight dedup row that answers RUNNING for its command id; to clear
+# it, stop the agent, remove /var/lib/yuzu-agent/command_dedup.db, start it (docs/command-dedup.md).
+# The server unit uses 210 s and
+# the gateway unit 40 s.
+TimeoutStopSec=60
 WorkingDirectory=/var/lib/yuzu-agent
 StateDirectory=yuzu-agent
 

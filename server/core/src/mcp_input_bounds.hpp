@@ -12,6 +12,7 @@
 #include "bundle_service.hpp"        // kMaxParamCountPerStep / kMaxParamKeyLen / kMaxParamValueLen
                                      // (also kMaxBundleSteps, which the sizing test reaches
                                      // through this header)
+#include "command_capability.hpp"    // parameter_key_well_formed (sg10, UP-1)
 #include "dispatch_target_shape.hpp" // BoundViolation + check_targeting_shape: the
                                      // omitted-vs-supplied rule, shared with the REST
                                      // twins (#2500) because it was never MCP-specific
@@ -67,10 +68,12 @@ inline constexpr std::size_t kExecInstrParamKeyMaxLen = kMaxParamKeyLen;      //
 /// `docs/user-manual/metrics.md`. The boot pre-seed follows automatically; the
 /// docs copy does not, and a test asserts this array's size so the third copy
 /// cannot be forgotten quietly.
-inline constexpr std::array<std::string_view, 14> kExecInstrBoundReasons{
+inline constexpr std::array<std::string_view, 15> kExecInstrBoundReasons{
     // Length/count bounds.
     "ident_len",       "scope_len",       "param_count",     "param_key_len",
     "param_value_len", "agent_ids_count", "agent_id_len",
+    // sg10 / UP-1: a params key with a control byte or invalid UTF-8, or a NUL value.
+    "param_key_invalid",
     // Targeting shape (#2437 split 3): a type-confused or supplied-but-empty
     // target is REJECTED, never silently dropped and never widened to
     // `__all__`. `ident_empty` subsumes the handler's old bare
@@ -304,6 +307,8 @@ check_exec_instruction_shape(const nlohmann::json& args) {
             return BoundViolation{"param_count",
                                   std::format("params must have at most {} keys",
                                               kExecInstrParamCountMax)};
+        if (auto bad = yuzu::server::check_params_key_shape(p))
+            return bad;
         for (const auto& [k, v] : p.items()) {
             (void)v;
             if (k.size() > kExecInstrParamKeyMaxLen)

@@ -768,6 +768,10 @@ spec:
           Comma-separated list of URLs to test connectivity against.
           If empty, uses platform-default patch servers (e.g. Windows Update
           endpoints, apt/yum/dnf repos, macOS Software Update).
+          At most 16 targets (more is refused). A target that resolves to a
+          loopback, unspecified, link-local (cloud metadata), multicast or
+          reserved address is answered `refused|address_not_probeable` with
+          no connect attempt; RFC 1918 targets (a WSUS server) are allowed.
           Example: "https://update.microsoft.com,https://download.windowsupdate.com"
       timeout_seconds:
         type: int32

@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <unordered_map>
 #include <vector>
 #include "ascii_fold.hpp" // #4990: the one ASCII plugin-name fold
 
@@ -106,7 +107,89 @@ struct CommandCapability {
     /// designated-initializer row value-initializes to `Unspecified` (the
     /// zero enumerator), which every fragment's compile-time sweep rejects.
     ExecuteGate execute_gate{ExecuteGate::Unspecified};
+    /// OPTIONAL parameter-dependent securable (sg10). When BOTH are non-empty and the dispatch's
+    /// parameters carry a NON-EMPTY value under `param_escalation_key`, the RBAC check (and the
+    /// securable reported on a denial and on the returned row) uses `param_escalation_securable`
+    /// instead of `securable`. Empty (the default) = the row's securable is the only one. Today
+    /// only `windows_updates.patch_connectivity` (a caller-supplied `targets` probe is an
+    /// `Infrastructure` read, the built-in default targets stay `SoftwareDeployment`). Evaluated
+    /// ONLY where the parameters are passed to `classify_and_authorize_dispatch`
+    /// (`ServerImpl::build_classified_command`, the one send path).
+    std::string_view param_escalation_key{};
+    std::string_view param_escalation_securable{};
 };
+
+/// The ONE well-formedness rule for dispatch parameters (sg10, UP-1). A parameter KEY must hold no
+/// byte below 0x20 and no 0x7F and be valid UTF-8; a VALUE must hold no NUL. The agent hands every
+/// key to a plugin as a C string and the SDK compares C strings, so a key `targets\0x` is read by
+/// the plugin as `targets` while a server-side exact `find("targets")` misses it: a gate keyed on a
+/// parameter name would be silently bypassed. Rejecting (never truncating) such a key at the listed
+/// ingress surfaces (see `check_params_key_shape`'s list in dispatch_target_shape.hpp) and at the chokepoint closes that split; a path with no ingress check is refused at the chokepoint as a Forbidden denial. EXTEND this function; never fork a second one.
+[[nodiscard]] inline bool parameter_key_well_formed(std::string_view key) noexcept {
+    std::size_t i = 0;
+    const std::size_t n = key.size();
+    while (i < n) {
+        const auto c = static_cast<unsigned char>(key[i]);
+        if (c < 0x20 || c == 0x7F)
+            return false;
+        std::size_t len = 1;
+        if (c >= 0x80) {
+            if (c >= 0xC2 && c <= 0xDF)
+                len = 2;
+            else if (c >= 0xE0 && c <= 0xEF)
+                len = 3;
+            else if (c >= 0xF0 && c <= 0xF4)
+                len = 4;
+            else
+                return false;
+            if (i + len > n)
+                return false;
+            for (std::size_t k = 1; k < len; ++k)
+                if ((static_cast<unsigned char>(key[i + k]) & 0xC0) != 0x80)
+                    return false;
+            const auto c1 = static_cast<unsigned char>(key[i + 1]);
+            if ((c == 0xE0 && c1 < 0xA0) || (c == 0xED && c1 > 0x9F) ||
+                (c == 0xF0 && c1 < 0x90) || (c == 0xF4 && c1 > 0x8F))
+                return false;
+        }
+        i += len;
+    }
+    return true;
+}
+
+[[nodiscard]] inline bool
+parameters_well_formed(const std::unordered_map<std::string, std::string>& parameters) noexcept {
+    for (const auto& [k, v] : parameters) {
+        if (!parameter_key_well_formed(k) || v.find('\0') != std::string::npos)
+            return false;
+    }
+    return true;
+}
+
+/// The ONE rule for a row's parameter-dependent securable (sg10). Returns
+/// `param_escalation_securable` when the row declares an escalation AND `parameters` carries a
+/// NON-EMPTY value (whitespace counts as non-empty, a non-string value arrives already stringified
+/// by the caller's decoder) under `param_escalation_key`; otherwise the row's own `securable`.
+/// `parameters == nullptr` = the caller cannot know them: the row's own securable (the escalation
+/// is then NOT evaluated). Used by BOTH `classify_and_authorize_dispatch` (send) and
+/// `schedule_arming_permitted` (schedule/outbox arming) so the two can never judge a dispatch
+/// under different securables.
+[[nodiscard]] inline std::string_view
+effective_securable(const CommandCapability& cap,
+                    const std::unordered_map<std::string, std::string>* parameters) {
+    if (parameters != nullptr && !cap.param_escalation_key.empty() &&
+        !cap.param_escalation_securable.empty()) {
+        // A malformed parameter set is never truncated or ignored: it is judged under the
+        // escalated (stricter) securable, and the callers additionally DENY it outright
+        // (`parameters_well_formed`).
+        if (!parameters_well_formed(*parameters))
+            return cap.param_escalation_securable;
+        if (const auto it = parameters->find(std::string(cap.param_escalation_key));
+            it != parameters->end() && !it->second.empty())
+            return cap.param_escalation_securable;
+    }
+    return cap.securable;
+}
 
 namespace detail {
 /// The per-fragment compile-time sweep every `capability_decls/*.hpp` file
@@ -118,6 +201,10 @@ namespace detail {
 all_gates_specified(std::span<const CommandCapability> rows) {
     for (const auto& row : rows) {
         if (row.execute_gate == ExecuteGate::Unspecified)
+            return false;
+        // sg10: `param_escalation_key` and `param_escalation_securable` are set together or not at
+        // all; half a pair would silently disable `effective_securable`'s escalation.
+        if (row.param_escalation_key.empty() != row.param_escalation_securable.empty())
             return false;
     }
     return true;
