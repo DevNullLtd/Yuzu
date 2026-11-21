@@ -1,9 +1,9 @@
 # ADR-0075: Criteria runs: three-valued verdicts over several inputs, stored as a result set
 
-- **Status:** Proposed (draft 4)
-- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (draft 4)
+- **Status:** Proposed (draft 5)
+- **Date:** 2026-11-18 (draft 1); 2026-11-20 (drafts 2 and 3); 2026-11-21 (drafts 4 and 5)
 - **Owner:** Nathan Dornbrook / platform (block `0xxx`; see `docs/adr/README.md`)
-- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D58, made between 2026-11-07 and
+- **Deciders:** Nathan Dornbrook. The owner's decisions D1 to D59, made between 2026-11-07 and
   2026-11-21 while reviewing a contributed criteria-run plan (version 4.1, 2026-11-06). This ADR
   cites them by number in brackets, for example (D25). It writes them down; it does not reopen them.
   Where a later decision replaced part of an earlier one, the later one is cited.
@@ -23,7 +23,7 @@
   (the instruction operation digest) and ADR-1014 (armed conduits), all Proposed in the `1xxx`
   block. The response-store ADR (D30) is not yet written.
 - **Code references:** every `path:line` in this ADR is at `DevNullLtd/Yuzu@f4cc683af1`. Drafts 2
-  to 4 were written on a branch whose only change from that commit is this file, so the code is
+  to 5 were written on a branch whose only change from that commit is this file, so the code is
   the same.
 
 ## Binding status
@@ -35,9 +35,11 @@ Slice 1 is a **breaking change** to three shipping surfaces (R3.3). It ships wit
 fragment and an upgrade note in `docs/user-manual/upgrading.md`, not with a deprecation window
 (D48). Both are owed by the implementing PR; this ADR adds neither.
 
-No point is left open for the owner. The question draft 3 left open (Q54) and the four points it
-proposed for confirmation are now owner decisions (D54 to D58), and the text below states them as
-decided. What remains for the implementing PRs is mechanism only, listed under *Not decided here*.
+The question draft 4 raised, the operator tier's posture for `CriteriaRun:Execute`, is now an owner
+decision (D59), stated in R9.1. Draft 5 also re-cuts slice 1 into a sequence of thirteen
+independently mergeable PRs (*Slices*), because D47 to D59 made it too large for one. Two points the
+re-cut raises are listed under *Open points*; everything else left to the implementing PRs is
+mechanism, listed under *Not decided here*.
 
 ## Context
 
@@ -434,13 +436,22 @@ path uses it.
 4. ADR-0072's `complete` and `incomplete` are not overloaded for the verdict counts. When an act
    phase arrives, "decided" means a `not_assessed` count of zero (D16).
 
-### R9. Authority (D6, D19, D20 parts 2-4, D21, D22, D39)
+### R9. Authority (D6, D19, D20 parts 2-4, D21, D22, D39, D58, D59)
 
 1. **A new securable, `CriteriaRun`**, seeded to Administrator only. `CriteriaRun:Execute` starts a
    run; `CriteriaRun:Read` reads one. Neither is implied by `Inventory:Read` or `Execution:Execute`.
    It is the 40th securable (39 are seeded today: `rbac_store.cpp:569`;
    `test_rbac_store.cpp:332`). The MCP mirror (`mcp_server.cpp:6227`), the MCP tier and annotation
    rows, and the OpenAPI and SOC 2 inventory rows are updated in the same change (D19).
+   - **Operator-tier admission** (D59). `tier_allows` gains an operator-tier rule admitting
+     `CriteriaRun:Execute` with no approval, beside the rule that admits `Execution:Execute` the
+     same way (`mcp_policy.hpp:129-130`). It covers creation and re-run alike (R12.6). It gives the
+     tier no reach it lacks today: in slice 1 a run only reads stored inventory; from slice 3 a
+     dispatching input still passes its own `Execution:Execute` gate (R9.3, D21), which the tier
+     already admits; and RBAC still applies, with `CriteriaRun` seeded to Administrator only.
+     `tier_allows` is keyed on the pair for every transport (`auth_routes.cpp:1263`), so the same
+     rule admits an operator-tier token on `POST /api/v1/criteria-runs`. The readonly tier is
+     refused, because it admits Read operations only (`mcp_policy.hpp:75-77`).
    - **Supervised-tier approval** (D19, D58). On a supervised-tier MCP token, `CriteriaRun:Execute`
      needs an approval ticket, as `Execution:Execute` does: a `requires_approval` row is added beside
      it (`mcp_policy.hpp:159-160`). `create_criteria_run` mints and redeems its ticket through the
@@ -479,7 +490,12 @@ path uses it.
    `api_token_store.hpp:1219`). An unreadable token store holds sends rather than ending the run.
    A confirmed revocation or expiry ends the run, and pending devices become
    `withheld:authority_withdrawn`.
-9. A service-scoped token is refused on the run entry point, as on the existing producers.
+9. A service-scoped token is refused on the run entry point, as on the existing producers. A
+   service-scoped re-run of a `criteria_run` set stays refused too: the re-run floor (R12.6) goes
+   through `require_permission`, whose service-scoped branch refuses every pair while
+   `kServiceScopeGlobalSafe` is empty (`auth_routes.cpp:1086`; `service_scope_policy.hpp:38`),
+   even though `reevaluate_result_set`'s MCP row is `ServiceScopeClass::confined`
+   (`mcp_server.cpp:5784`). The re-run PR pins this with a test.
 
 `PowerManagement:Read` and `Decommission:Read` would also fit the widened class 2. Flooring them
 is a separate consistency change, not part of this ADR.
@@ -529,7 +545,7 @@ prerequisites:
    90 days the record can say "device D was in a cohort of N, of which M matched", but not D's own
    verdict.
 
-### R12. Re-runs and refusals (D13, D32, D38, D42, D53, D58)
+### R12. Re-runs and refusals (D13, D32, D38, D42, D53, D58, D59)
 
 1. **An operator may re-run a run, from slice 1** (D42). The existing re-eval action
    (`POST /api/v1/result-sets/{id}/re-eval`, MCP `reevaluate_result_set`) accepts
@@ -565,7 +581,9 @@ prerequisites:
         `Execution:Execute`.
       - Every other kind keeps `Execution:Execute`, unchanged.
    4. **MCP.** The tier row for `reevaluate_result_set` (`mcp_server.cpp:5784`) admits either
-      securable, and the per-kind RBAC check runs after the load. Tier still runs before RBAC.
+      securable, and the per-kind RBAC check runs after the load. Tier still runs before RBAC. The
+      operator tier admits a re-run of a `criteria_run` set with no approval, as it admits creation
+      (R9.1, D59).
    5. **The supervised-tier approval pre-check** follows the same order. It checks
       `Execution:Execute` and reads the stored set before a ticket is minted or redeemed
       (`mcp_server.cpp:10191-10208`, `:10238-10291`); that check becomes the same floor (D53, D58).
@@ -642,7 +660,8 @@ prerequisites:
 - re-eval of `criteria_run` sets, behind the floor, the owned-set load and the stored-kind gate,
   with the supervised-tier ticket bound to the kind and the input-spec digest (R12.1, R12.2, R12.6,
   R12.7);
-- the `CriteriaRun:Execute` supervised-tier approval row, shared by creation and re-run (R9.1);
+- the `CriteriaRun:Execute` operator-tier admission and supervised-tier approval rows, shared by
+  creation and re-run (R9.1);
 - the matched-only scope atom and the incomplete-set marking (R14.1 to R14.3, D54);
 - the export to ClickHouse and the reap guard (R11).
 
@@ -660,19 +679,46 @@ prerequisites:
    `no_inventory`. The status becomes `final` (store `materialized`), `ttl_at` is reset, the summary
    audit event is written and the export starts (R11).
 
-**Prerequisites, each its own change:**
-- the agent's v3 writer (D34): already shipped (`sync_source_installed_software.cpp:1099-1111`);
-- the `CriteriaRun` securable and the widened class 2 with its floor entry (R9.1, R9.2);
-- the matcher's K3, quantifiers, combinators and typed comparison (R4.1 to R4.12);
-- the libversion pin, by content hash (R4.10): either the vcpkg port at the pinned baseline, with
-  its Windows DLL build and the `version.lib` name clash settled by `build-ci`, or a reimplementation
-  pinned to one libversion commit; under either route, libversion's corpus as a Yuzu conformance
-  test;
-- the move of `inventory_query` onto the matcher and the refusal of the old shape (R3.2, R3.3),
-  with its `changelog.d/` fragment and upgrade note;
-- the four store changes (R10);
-- `ttl_at` from creation (R11.1);
-- the ADR-0006 exception and the ClickHouse cold store (R11.3 to R11.5).
+**Delivery: thirteen PRs.** Slice 1 is too large to review as one change, so it lands as the
+sequence below. Each PR is reviewable on its own and leaves `dev` shippable. None adds code that
+waits unused for a later PR, and none adds a refusal that a later PR deletes: where a later PR
+widens behaviour, it extends code that is already live (re-eval's accepted kinds, `gc_sweep`'s
+predicate, the run's read paths). One prerequisite is already met and needs no PR: the agent's v3
+writer (D34; `sync_source_installed_software.cpp:1099-1111`).
+
+| PR | What it lands | Needs | Routed-concern rows it triggers (at `f4cc683af1`) |
+|---|---|---|---|
+| 1.1 | The ADR-0006 exception for the ClickHouse cold store (D27). Docs only. | none | Postgres substrate |
+| 1.2 | Member sets cached by result-set id within a byte budget (R10.1). | none | Postgres substrate; scope walking |
+| 1.3 | Member loads in keyset pages where a whole set is not needed (R10.2). | none | Postgres substrate; scope walking |
+| 1.4 | Member inserts by `COPY` or in chunks, not one `unnest` statement (R10.3). | none | Postgres substrate; scope walking |
+| 1.5 | `materialize()` enforces a per-kind cap, today's 100,000 for every existing kind; closes #7433 (R10.4). | none | Postgres substrate; scope walking; agentic-first (the refusal's A4 shape) |
+| 1.6 | The matcher evaluates in K3 and folds once, at the top; quantifiers and `and`/`or`/`not` over row tests; the `missing_value`, `malformed_value` and `row_bound` causes (R4.1 to R4.3, R4.5). Live at once for the matchers `echo_query` and `instruction_result` already accept. | none | scope walking; agentic-first A5 (the matcher's input schema in the producer tools) |
+| 1.7 | `lt`, `le`, `gt`, `ge`; `"as"` on ordering, `eq` and `in`; the strict number domain with its bounds; no text ordering (R4.7 to R4.9, R4.11; D50, D52, D57). | 1.6 | scope walking; agentic-first A5 |
+| 1.8 | `"as":"version"`: the libversion order, its pin by content hash, and the libversion corpus as a Yuzu conformance test (R4.10; D51). | 1.7 | scope walking; agentic-first A5. No row covers vcpkg or `meson.build`: `build-ci` and `cross-platform` review it under their own triggers (the Windows DLL build and the `version.lib` clash) |
+| 1.9 | `inventory_query` moved onto the matcher, reading `installed_software` through `SoftwareInventoryStore` (with any per-device read beside `query_software`); the coverage mapping and the confirmation test (R5); the old `conditions[]` shape refused on all three surfaces; `POST /api/v1/inventory/evaluate` on the same evaluation (D55); `inventory_eval`'s grammar deleted; the cases re-pinned (R3.2, R3.3, R4.12; D47, D48). Breaking: `changelog.d/` fragment and upgrade note. | 1.8 | agent daily-sync and installed-software inventory (`inventory_*`, `software_inventory_store.*`); Postgres substrate (a new store read); authentication and RBAC (a list read of per-agent data stays on `authorize_list_read`); agentic-first (the changed MCP input schema); scope walking |
+| 1.10 | Criteria runs: the `CriteriaRun` securable and its mirrors, class 2 reworded and `CriteriaRun:Read` floored (R9.1, R9.2; D19, D39); the operator-tier and supervised-tier rows (D58, D59); `POST /api/v1/criteria-runs` and MCP `create_criteria_run` with named-input combinators, `"logic":"k3"` and the verdict mapping (R4.4, R4.6); the `criteria_run` kind, cohort and excluded count (R9.3, R9.4); the read at start and settling at the deadline (R6.1 to R6.3, R6.6); write-once verdict and cause columns (R7.1); the status table and counts (R8; D56); the creation audit verb and the summary event at final (R11.7); `ttl_at` from creation and the warm setting (R11.1, R11.2); the matched-only atom and incomplete-set marking (R14.1 to R14.3; D54). | 1.2 to 1.5, 1.9 | authentication and RBAC; authorization-topology floor; service-scoped confinement (the new route refuses a service-scoped token); MCP server (`mcp_policy.hpp`); headless platform (a new REST route and MCP tool); agentic-first; pre-auth body cap and MFA step-up (a new mutating route must be classified in both tables); scope walking (`agent_registry.cpp`); Postgres substrate (member columns); clock-guarded retention (`ttl_at` for the new kind); observability and data architecture (the audit verb and event) |
+| 1.11 | The read on a device's first `ReportInventory` or `ProxyInventory` receipt in the window, through the in-memory waiting set (R6.4, R6.5). | 1.10 | agent daily-sync (the two handlers); gateway-upstream peer authorization (`gateway_service_impl.*`) |
+| 1.12 | Re-eval of `criteria_run` sets: the floor on either securable, `load_owned`, the gate by stored kind, the MCP row, the approval pre-check and the ticket bound to the kind and the input-spec digest; the route description; a test that a service-scoped re-run is refused (R12.1, R12.2, R12.6, R12.7, R9.9; D42, D53, D58, D59). | 1.10 | MCP server (the approval pre-check); authentication and RBAC; service-scoped confinement; headless platform (a changed approval gate); agentic-first A5; scope walking |
+| 1.13 | Export at final to the ClickHouse cold store: the `ReplacingMergeTree` table, the deterministic batches and `insert_deduplication_token` on `ClickHouseSink`, `exported_at`, the reap guard in `gc_sweep`, and the unexported-set metric and alert (R11.3 to R11.6). | 1.1, 1.10 | Postgres substrate (the exception; `deploy/` for `release-deploy`); clock-guarded retention (`gc_sweep`'s predicate); observability (the metric and the shipped alert rule); data architecture |
+
+Every PR that changes C++ also triggers the C++ conventions and resource-ownership rows, and
+`docs-writer` reviews every PR. These are the rows this design reaches; each PR's governance run
+still matches the tables row by row against its own diff.
+
+Order and parallel work:
+- 1.1 to 1.5 are independent of each other and of the matcher line, and can be reviewed in parallel.
+- The matcher line is strictly ordered, 1.6 → 1.7 → 1.8 → 1.9: each widens the grammar the next
+  builds on, and 1.9 cannot delete the old grammar until the new one can say everything it said,
+  versions included.
+- 1.10 is the smallest unit that can create a run. Its parts cannot be split without leaving one
+  unused or unsafe: a securable that gates nothing, verdict columns nobody writes, or (D54) a run
+  that can be used as a scope before the matched-only filter exists.
+- 1.11, 1.12 and 1.13 each need only 1.10 (and 1.13 also 1.1), and can land in any order. Between
+  1.10 and 1.11, a device that is not fresh at start waits for the deadline and settles as `stale`
+  or `no_inventory`; between 1.10 and 1.12, re-eval refuses a `criteria_run` set with today's
+  refusal (`rest_api_v1.cpp:16945-16950`), which 1.12 widens rather than deletes; between 1.10 and
+  1.13, a run is reaped at final plus the warm setting with no cold copy (see *Open points*).
 
 **Not in slice 1:** live inputs, deliver-on-connect, token checks per delivery, `definition_changed`,
 `definition_disabled`, `transient:<status>`, any act phase, and reads by anyone but the creator.
@@ -710,7 +756,8 @@ response-store ADR and ADR-1013's digest.
   - A supervised-tier token cannot start a run over REST; it uses the MCP ticket flow, and an
     approver re-approves every re-run (R9.1, R12.7).
   - "Installed before a date" cannot be expressed until an `"as":"date"` domain exists (R4.11).
-  - Slice 1 waits on four store changes, the securable, the matcher work and the cold store.
+  - Slice 1 is thirteen PRs, and a run cannot be created until ten of them have landed (1.2 to
+    1.10).
   - Until every agent sends v3, `NONE` and `ALL` read `not_assessed:coverage_unproven` on old agents.
   - Under a facet that stays Partial, `ANY` reads `not_assessed:unconfirmed` once its rows are older
     than the window.
@@ -793,7 +840,15 @@ reaches, as of `f4cc683af1`:
 - the MCP server's tier-before-RBAC ordering and approval rules (the `CriteriaRun:Execute`
   approval row, the `reevaluate_result_set` row and its approval pre-check and ticket binding,
   R9.1, R12.6, R12.7);
-- the build and vcpkg toolchain, if the libversion pin is taken as a vcpkg dependency (R4.10).
+- the pre-auth body cap and MFA step-up tables (the new mutating route), the headless-platform row
+  (a new REST route and MCP tool, and a changed approval pre-check), and gateway-upstream peer
+  authorization (the ingest hook in `gateway_service_impl.cpp`);
+- observability and data architecture (the audit verb, the summary event, the export metric and
+  alert).
+
+The slice-1 table under *Slices* maps these rows to the PR that triggers each. The libversion pin,
+if taken as a vcpkg dependency (R4.10), is reviewed by `build-ci` under its own trigger; no
+routed-concern row covers `vcpkg.json` or `meson.build`.
 
 ## Not decided here
 
@@ -813,8 +868,18 @@ reaches, as of `f4cc683af1`:
 
 ## Open points
 
-None. No owner question is open, and no point awaits the owner's confirmation. What is left for the
-implementing PRs is mechanism, listed under *Not decided here*.
+Two points raised by draft 5's re-cut of slice 1. Neither reopens a decision.
+
+1. **The confirmation window in the single-input producer.** PR 1.9 puts the coverage mapping (R5)
+   into the evaluation that `inventory_query` shares with runs, so `NONE` and `ALL` over a part that
+   is not Full fold to false there too. R5.4 measures its confirmation window "at run start", from
+   the resolved sync interval. A single-input producer has no run start and no window. Whether it
+   applies R5.4 measured at the time of the request (and so resolves the interval per device), or
+   applies only the coverage mapping (R5.2, R5.5) and leaves R5.4 to runs, is not decided.
+2. **A release between PRs 1.10 and 1.13.** A release cut in that gap would ship runs whose verdicts
+   are reaped at final plus 20 minutes with no cold copy, against R11.3's 90 days. Either that is an
+   acceptable, documented intermediate state, or 1.13 must merge before the next release tag after
+   1.10.
 
 Settled since draft 1: run status and causes (R8, R4; D41), re-runs in slice 1 (R12.1; D42), a row
 under a Partial facet (R5.4; D43), an early transient status (R7.2 to R7.4; D44), retention against
@@ -830,3 +895,6 @@ Settled since draft 3: the matched-only scope filter and the incompleteness abor
 status table onto the store's three statuses, `failed` included (R8.1; D56), the number-domain
 bounds as constants (R4.9; D57), and the supervised-tier approval for creating and re-running a run,
 with the re-run ticket's binding (R9.1, R12.7; D58).
+
+Settled since draft 4: the operator tier admits `CriteriaRun:Execute` with no approval, for creation
+and re-run (R9.1, R12.6; D59).
