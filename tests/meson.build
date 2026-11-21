@@ -272,6 +272,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
     'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
+    'unit/test_filesystem_search_dir.cpp',  # #6478: pure search_dir core over the shared bounded walk (limits, injected clock/cancel/probe/mounts) + row escaping
+    'unit/test_filesystem_search_dir_dispatcher.cpp',  # #6478: real filesystem plugin via LocalDispatcher -- search_dir rows, error rows, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -499,6 +501,7 @@ agent_test_exe = executable(
                                                 # attribution action driven end to end via LocalDispatcher
                                                 # (Darwin-only, self-gated) -- same shape as
                                                 # test_wave3_pr31_macos_actions.cpp
+    'unit/test_proc_access.cpp',              # WP13 UP14: /proc refusal tally (agents/shared/proc_access.hpp)
     'unit/test_netstat_parsers.cpp',          # gate-2 remediation: pure escape_pipes() CR/LF handling
                                                 # (netstat_parsers.hpp, portable, every host)
     'unit/test_os_info_macos.cpp',            # Wave 3 PR3.1: os_info_macos.hpp SystemVersion.plist extractor (pure, every host)
@@ -670,6 +673,7 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
+    'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
@@ -680,6 +684,7 @@ agent_test_exe = executable(
     'unit/test_file_search_governor.cpp',        # file search core: slice governor with injected clock and sleep (agents/shared/file_search_governor.hpp), portable
     'unit/test_file_search_resume_contract.cpp', # file search core: walk_ordered + cursor transitions + governor + coverage composed over MemTree (the resume contract), portable
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
+    'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
@@ -997,6 +1002,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
+  )
+endif
+
+# ── WP01 re-registration audit budget under allocation failure (separate binary, deliberately) ──
+# test_reregistration_audit_budget_alloc.cpp replaces the global operator new to inject
+# std::bad_alloc at every allocation point (see its header): absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  reregistration_budget_alloc_exe = executable(
+    'yuzu_reregistration_budget_alloc_tests',
+    files('unit/server/test_reregistration_audit_budget_alloc.cpp'),
+    include_directories: [include_directories('../server/core/src')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'reregistration audit budget allocation failure',
+    reregistration_budget_alloc_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'server',
+    timeout: 300,
   )
 endif
 
@@ -1932,6 +1956,8 @@ if build_server
       'unit/server/test_cert_reloader.cpp',
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
+      'unit/server/test_agent_reregistration_gate.cpp', # WP01: re-registration proof-of-identity decision
+      'unit/server/test_agent_witnessed_leaf.cpp', # WP01: witnessed-gateway-leaf proof predicate (real certs)
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
@@ -2043,6 +2069,7 @@ if build_server
       'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_agent_register_mtls_proof.cpp', # WP01: direct-path proof derivation over real mTLS (PG-backed enrollment)
       'unit/server/test_gateway_peer_policy.cpp', # gateway-upstream peer authorization: certificate facts, pin set, admission policy
       'unit/server/test_gateway_peer_guard.cpp', # gateway-upstream peer authorization: guard over real mTLS, descriptor sweep, audit budget
       'unit/server/test_gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot resolution matrix + boot pin set
@@ -3623,6 +3650,17 @@ test('per-artifact SBOM generator',
   timeout: 60,
 )
 
+# The vendored-components manifest (server/core/vendored-components.json) that
+# puts yuzu-server's web assets and QR-code library on its SBOMs: fails when a
+# file under server/core/vendor/ or server/core/static/ is added or changed
+# without a matching entry. Mutations run on a scratch copy.
+test('vendored components manifest',
+  _python3_test,
+  args: [files('test_vendored_components.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
 # Agent-only Windows and macOS releases (ADR-0035 ladder step 2): release.yml's
 # Windows/macOS jobs build no server and no server installer, the old archive
 # names are gone, and every place that names a platform archive agrees on one
@@ -4883,6 +4921,60 @@ test('same-site gate production wiring lexical gate',
   suite: 'docs',
   timeout: 30,
 )
+# WP13 F21: the installer sets no file capability and strips any it finds (lexical + executed
+# `--dry-run` with tool stubs + in-memory mutants; nothing runs as root).
+test('agent installer no file capabilities (WP13/F21)',
+  _python3_test,
+  args: [files('test_agent_installer_no_file_caps.py')],
+  suite: 'docs',
+  timeout: 90,
+)
+# WP13 UP14: the /proc walkers declare a refused read as CONSTRAINED (source-text only).
+test('proc access status lexical gate (WP13/UP14)',
+  _python3_test,
+  args: [files('test_proc_access_status_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: the shared C++ tokenizer used by the lexical gates: direct self-test of the shapes they
+# rely on (escaped-quote and raw strings, comment forms, #if 0 forms).
+test('cpp lex helper self-test (WP13)',
+  _python3_test,
+  args: [files('cpp_lex_helper.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that Linux set_start_mode judges the readback with start_mode_readback_matches, runs
+# it with stderr unmerged and reports the state (source-text only).
+test('services set_start_mode readback wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_services_readback_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13: pins that the Echo $Module drain passes the real file-version stamp (read from the open
+# image) into SigningCache (source-text only; nothing builds the Windows leg here).
+test('echo module signing wiring lexical gate (WP13)',
+  _python3_test,
+  args: [files('test_echo_module_signing_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F52: pins that agent.cpp runs the allowlist startup decision (refuse to start) before
+# PluginLoader::scan and passes allowlist_required (source-text only, so Python).
+test('plugin allowlist startup wiring lexical gate',
+  _python3_test,
+  args: [files('test_plugin_allowlist_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP13/F19: the root macOS agent must never exec Homebrew's user-owned brew (source-text only).
+test('installed_apps no-brew lexical gate',
+  _python3_test,
+  args: [files('test_installed_apps_no_brew_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
 # #8159: the agent's Registered line logs session_fp, and no script parses session= from it.
 test('agent session id log wiring lexical gate',
   _python3_test,
@@ -5176,6 +5268,20 @@ if (_bash_test.found() and meson.can_run_host_binaries() and build_agent
   )
 endif
 
+# WP13/F52 EXECUTED refusal: the real yuzu-agent with a missing/empty/junk --plugin-allowlist must
+# log the refusal and exit non-zero without loading a plugin (the lexical test cannot see a lost
+# async log line or an exit code).
+if (_python3_test.found() and meson.can_run_host_binaries() and build_agent
+    and host_machine.system() == 'linux')
+  test('agent plugin allowlist refusal (executed, WP13/F52)',
+    _python3_test,
+    args: [files('test_agent_allowlist_refusal_executed.py'), yuzu_agent_exe],
+    suite: 'agent',
+    timeout: 180,
+    depends: [yuzu_agent_exe],
+  )
+endif
+
 # End-to-end fake-Meson contract. In particular, an expired/malformed flake
 # registry must fail before the real test runner could be invoked. The script
 # uses POSIX executable fakes and returns a clean platform skip on Windows.
@@ -5282,7 +5388,7 @@ test('gateway peer restart-advice docs lint',
   _python3_test,
   args: [files('test_gateway_peer_restart_advice_lint.py')],
   suite: 'docs',
-  timeout: 10,
+  timeout: 30,
 )
 
 # RBAC doc/seed parity (#480): rbac.md's system-role, securable-type, operation
@@ -5342,6 +5448,29 @@ test('response store read tripwire selftest',
 test('forensics tier wiring lexical',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP01: the agent re-registration proof gate must stay wired into BOTH ingest paths, server.cpp
+# must wire/clear the hooks, and the test seam must not leak into production. Unit tests use fake
+# hooks, so only this lexical gate (plus its mutation selftest) guards the production wiring.
+test('reregistration gate wiring lexical',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('reregistration gate wiring lexical selftest',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP01: the refusal message is copied byte for byte into the gateway (neutral for its circuit
+# breaker), its eunit and the gateway manual; a drifted copy counts every refusal as a breaker failure.
+test('reregistration refusal literal lexical',
+  _python3_test,
+  args: [files('test_reregistration_refusal_literal_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

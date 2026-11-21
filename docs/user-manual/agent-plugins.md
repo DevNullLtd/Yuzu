@@ -25,7 +25,7 @@ The `echo` plugin was named `tar` before 2026-10 (`tar.dll`, `tar.so`, `tar.dyli
 | `browser_policy` | 🟡 🟡 ✅ | Enterprise-managed Chrome, Chromium and Edge browser policy inventory | [README](../../agents/plugins/browser_policy/README.md) |
 | `certificates` | ✅ ✅ ✅ | Certificate inventory and management for system stores | [README](../../agents/plugins/certificates/README.md) |
 | `chargen` | ✅ ✅ ✅ | RFC 864 character generator — streams rotating ASCII lines | [README](../../agents/plugins/chargen/README.md) |
-| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives) | [README](../../agents/plugins/component_inventory/README.md) |
+| `component_inventory` | 🟡 ✅ ✅ | Installed software components found in application trees (Java archives, native libraries) | [README](../../agents/plugins/component_inventory/README.md) |
 | `content_dist` | ✅ ✅ ✅ | Content staging — download, verify, execute, and manage staged files (no shell-out) | [README](../../agents/plugins/content_dist/README.md) |
 | `device_identity` | ✅ ✅ ✅ | Reports device hostname, domain membership, and AD organizational unit | [README](../../agents/plugins/device_identity/README.md) |
 | `diagnostics` | ✅ ✅ ✅ | Agent diagnostics — log level, certificates, connection info | [README](../../agents/plugins/diagnostics/README.md) |
@@ -157,6 +157,7 @@ sha256sum /opt/yuzu/plugins/*.so > /etc/yuzu/plugin-allowlist.txt
 **Behavior:**
 
 - If `--plugin-allowlist` is not set, all plugins in the plugin directory are loaded (default).
+- If `--plugin-allowlist` IS set but the file is missing, unreadable, empty or has no valid entry, the agent refuses to start (critical log, non-zero exit, nothing loaded) rather than loading every plugin unverified. Individually malformed lines are skipped with a warning as long as at least one valid entry remains.
 - If set, only plugins listed in the allowlist file are loaded, and only if their hash matches.
 - Plugins not in the allowlist or with a hash mismatch are logged as errors and skipped.
 - The allowlist is checked **before** `dlopen`/`LoadLibrary`, so tampered binaries never execute code.

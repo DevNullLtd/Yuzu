@@ -31,7 +31,7 @@
       "definition_ids": [],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable",
           "mechanism": "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
           "rung": "1",
           "support": "supported"
@@ -55,7 +55,7 @@
       "definition_ids": [],
       "legs": {
         "linux": {
-          "fallback": "",
+          "fallback": "CONSTRAINED/PARTIAL when another user's /proc/<pid>/exe is unreadable (no CAP_SYS_PTRACE): processes:exe_unreadable",
           "mechanism": "/proc enumeration + readlink(/proc/<pid>/exe) + SHA-256",
           "rung": "1",
           "support": "supported"
@@ -102,7 +102,7 @@
     }
   ],
   "caveats": [
-    "**No typed result status, ever.** Every action on every OS reports `UNDECLARED / UNKNOWN /` in every capture — the plugin has no `set_result_status` call at all, so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir(\"/proc\")`) and \"this host genuinely has zero processes\" are indistinguishable on the wire.",
+    "**Typed result status only for one Linux gap.** On Linux, `list_hashed` and `list_tree` set `CONSTRAINED`/`PARTIAL` (`processes:exe_unreadable`) when another user's `/proc/<pid>/exe` is unreadable; for an unprivileged agent that is the steady state. Every other action and OS reports `UNDECLARED / UNKNOWN /` in every capture (Windows and macOS `list_hashed`/`list_tree` included), so an enumeration failure (a failed `CreateToolhelp32Snapshot` or `opendir(\"/proc\")`) and \"this host genuinely has zero processes\" are indistinguishable on the wire, and on Windows and macOS a refused image-path read blanks a row's `path`/`sha256` without any status.",
     "**`list_hashed`/`list_tree` have no privilege-model row.** `docs/agent-privilege-model.md:83` covers `processes.fetch`/`echo.process_tree` (needing `cap_sys_ptrace` on Linux to inspect non-child processes) — that is a different action id, not present in this plugin's descriptor, so it must not be read as documenting `list_hashed`/`list_tree`. Both were captured only as root/SYSTEM/unprivileged-but-same-user, so a production unprivileged Linux capture (where `readlink(/proc/<pid>/exe)` on another user's process would be denied) has not been taken; add the row when it is.",
     "**512 MiB hash cap refuses, not truncates.** `sha256_file()` returns an empty hash for any image over the cap rather than hashing a truncated prefix (`agents/core/src/plugin_loader.cpp:79-95`) — an empty `sha256` on a real, resolved `path` can mean \"oversized,\" not just \"unreadable.\"",
     "**Row fields are neutralised, and only a trailing backslash is folded.** Every action (`list`, `query`, `list_hashed`, `list_tree`) builds its rows in `processes_rows.hpp`: `|`, CR and LF in a name or path become a space and a trailing backslash becomes `/` (it would otherwise glue onto the next `|`). Interior backslashes are kept, so a Windows path stays readable (the same backslash rule as `procfetch`, `wmi`, `installed_apps`, `network_config` and `filesystem`; unlike them, `processes` folds a `|` to a space because its consumers split rows on a raw `|`). An agent on a build before this change still emits unsanitised `query` rows and glues a trailing backslash until it is upgraded.",
@@ -278,7 +278,20 @@
     }
   ],
   "readme": "agents/plugins/processes/README.md",
-  "result_status": [],
+  "result_status": [
+    {
+      "completeness": "UNKNOWN",
+      "provenance": "(empty)",
+      "status": "`UNDECLARED` (default)",
+      "when": "Every Windows and macOS run, and a Linux run where every process was readable."
+    },
+    {
+      "completeness": "PARTIAL",
+      "provenance": "`processes:exe_unreadable`",
+      "status": "`CONSTRAINED`",
+      "when": "`list_hashed` and `list_tree` readlink of `/proc/<pid>/exe` was refused (EACCES/EPERM) for at least one process, so its `path` and `sha256` are empty. Rows are still emitted (a kernel thread also renders with an empty path), so the status, not the rows, says the list is incomplete. Grant `CAP_SYS_PTRACE` to the agent process only if that detail is needed; the packaged unit and the dev installer do not. **Linux only:** a refused read on macOS or Windows can still blank a row while the status stays `OK`, and other `/proc` readers are not tallied; treat `OK` there as not proof of completeness (tracked in #8165)."
+    }
+  ],
   "samples": {
     "linux": {
       "actions": [
