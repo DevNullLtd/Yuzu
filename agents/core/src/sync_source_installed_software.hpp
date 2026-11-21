@@ -77,10 +77,14 @@ struct SwEntry {
     std::string distro_id;        // /etc/os-release ID
     std::string distro_version;   // /etc/os-release VERSION_ID
     // Wire slot 13. Machine-scope roots only: the v3 writer keeps a location only under a known
-    // machine root (installed_software_v3.hpp machine_install_location). Slot 14 (uninstall_string) is
-    // reserved and always sent empty (#5186). Inserted here, between distro_version and
-    // package_id, so the member order stays the wire order.
+    // machine root (installed_software_v3.hpp machine_install_location). Inserted here, between
+    // distro_version and package_id, so the member order stays the wire order.
     std::string install_location;
+    // Wire slot 14: validated `key=value` attributes in the canonical form of
+    // common/include/yuzu/install_row_attributes.hpp (SAM-46; the slot was the reserved
+    // uninstall_string, #5186, always sent empty). Empty = none. The v3 writer keeps only a value
+    // that is already canonical (v3_normal_form), so an adapter builds it with make_attributes.
+    std::string attributes;
     std::string package_id;
     std::string source; // "<plugin>.<action>" that produced the row
 };

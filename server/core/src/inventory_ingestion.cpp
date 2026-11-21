@@ -66,7 +66,8 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // the v2 grammar was never re-classified for them (#5186). An agent that hashes real values
 // there gets need_full until the server accepts them. The blob-v3 `+` record
 // (inventory_blob_v3.hpp) is the path that stores slot 13, after ADR-0016 §8 was re-opened for
-// it in the v10 Update; slot 14 stays reserved there too. A shorter record (v1
+// it in the v10 Update, and slot 14 (the validated install-row attribute field, SAM-46); on THIS
+// v2 path slot 14 is still discarded. A shorter record (v1
 // 4-field, v2 12-field) parses fine: the token walk stops at the record's end, leaving the
 // remaining fields default-empty
 // (the documented mixed-version behaviour — an old agent's rows store with empty

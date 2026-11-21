@@ -9,6 +9,8 @@
 #include "installed_software_v3.hpp"
 #include "sync_canonical.hpp"
 
+#include <yuzu/install_row_attributes.hpp>
+
 // The server's parser (header-only): the oracle for the wire. Reached by path, not by putting
 // server/core/src on the agent tests' include path, so no server header can shadow an agent one.
 #include "../../server/core/src/inventory_blob_v3.hpp"
@@ -28,6 +30,18 @@ constexpr const char* kPkgs = "pkg_inventory.packages";
 constexpr const char* kPy = "runtimes.python";
 constexpr const char* kEmptyHash =
     "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+
+// SAM-46 golden: alpha() carrying `upgrade_code`. The record bytes and both digests are pinned
+// identically in tests/unit/server/test_software_inventory_store.cpp (the cross-side contract).
+// Recipe (one row, so the row hash and the section hash are the same digest):
+//   printf 'Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}\037pkg-a\037installed_apps.list_inventory\036' | shasum -a 256
+constexpr const char* kUpgradeCodeAttr = "upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}";
+constexpr const char* kUpgradeCodeRowHash =
+    "0aa32899b7f2568e9a7a1163032565effb71f319771abdeb47986368174a5ae5";
+const std::string kUpgradeCodeRecord =
+    std::string("Alpha\x1f" "1.0\x1f" "Pub\x1f" "2026-01-01\x1f" "app\x1f" "windows\x1f\x1f\x1f"
+                "x64\x1f\x1f\x1f\x1f" "C:\\Program Files\\Alpha\x1f") +
+    kUpgradeCodeAttr + "\x1f" "pkg-a\x1f" "installed_apps.list_inventory\x1e";
 
 SwEntry alpha() {
     SwEntry a;
@@ -113,7 +127,7 @@ Parsed parse_like_server(const std::string& blob) {
             if (f[0] == "+") {
                 REQUIRE(f.size() == 17);
                 CHECK_FALSE(f[3].empty());                 // publisher, slot 3
-                CHECK(f[14].empty());                      // slot 14 reserved
+                CHECK(yuzu::install_attrs::canonical_attributes(f[14])); // slot 14, empty or canonical
                 CHECK(f[16] == sec.header[1]);             // source == facet
                 sec.adds.push_back(f);
             } else if (f[0] == "-") {
@@ -135,7 +149,7 @@ AckedSet acked_of(const SectionPlan& p) {
 
 } // namespace
 
-TEST_CASE("v3_record: 16 slots, slot 14 empty, 0x1F-joined, 0x1E-terminated; row hash pinned",
+TEST_CASE("v3_record: 16 slots, an empty slot 14, 0x1F-joined, 0x1E-terminated; row hash pinned",
           "[v3][writer][hash]") {
     const std::string rec = v3_record(alpha());
     CHECK(rec.back() == '\x1e');
@@ -143,7 +157,7 @@ TEST_CASE("v3_record: 16 slots, slot 14 empty, 0x1F-joined, 0x1E-terminated; row
     REQUIRE(slots.size() == 16);
     CHECK(slots[0] == "Alpha");
     CHECK(slots[12] == "C:\\Program Files\\Alpha");
-    CHECK(slots[13].empty()); // slot 14 (1-based), the reserved uninstall_string
+    CHECK(slots[13].empty()); // slot 14 (1-based), the attribute field: none on this row
     CHECK(slots[14] == "pkg-a");
     CHECK(slots[15] == kApps);
     // The server's instance_key of this row (= the one-row section hash).
@@ -626,7 +640,7 @@ std::string server_record(const srv::SoftwareEntry& e) {
                                         e.install_date, e.kind,           e.ecosystem,
                                         e.epoch,      e.release,          e.arch,
                                         e.signature_status, e.distro_id,  e.distro_version,
-                                        e.install_location, std::string_view{}, e.package_id,
+                                        e.install_location, e.attributes,       e.package_id,
                                         e.source};
     std::string out;
     for (std::size_t i = 0; i < 16; ++i) {
@@ -641,10 +655,10 @@ std::string server_record(const srv::SoftwareEntry& e) {
 bool server_less(const srv::SoftwareEntry& a, const srv::SoftwareEntry& b) {
     return std::tie(a.name, a.version, a.publisher, a.install_date, a.kind, a.ecosystem, a.epoch,
                     a.release, a.arch, a.signature_status, a.distro_id, a.distro_version,
-                    a.install_location, a.package_id, a.source) <
+                    a.install_location, a.attributes, a.package_id, a.source) <
            std::tie(b.name, b.version, b.publisher, b.install_date, b.kind, b.ecosystem, b.epoch,
                     b.release, b.arch, b.signature_status, b.distro_id, b.distro_version,
-                    b.install_location, b.package_id, b.source);
+                    b.install_location, b.attributes, b.package_id, b.source);
 }
 
 std::string server_section_hash(std::vector<srv::SoftwareEntry> rows) {
@@ -677,11 +691,11 @@ srv::V3Section server_section(const std::string& blob) {
     return parsed->sections[0];
 }
 
-// The 15 stored fields of an agent row, for field-wise equality (SwEntry has no operator==).
+// The 16 stored fields of an agent row, for field-wise equality (SwEntry has no operator==).
 std::vector<std::string> fields_of(const SwEntry& e) {
     return {e.name,  e.version, e.publisher, e.install_date, e.kind, e.ecosystem,
             e.epoch, e.release, e.arch, e.signature_status, e.distro_id, e.distro_version,
-            e.install_location, e.package_id, e.source};
+            e.install_location, e.attributes, e.package_id, e.source};
 }
 
 // The shapes that once made the planner hash one record and the writer transmit another: a
@@ -703,6 +717,10 @@ std::vector<SwEntry> trigger_rows() {
     eco.publisher.clear();
     eco.ecosystem = std::string(kV3MaxFieldLen, 'x');
     rows.push_back(eco);
+    SwEntry attr = alpha();
+    attr.name = "with-attributes";
+    attr.attributes = kUpgradeCodeAttr;
+    rows.push_back(attr);
     rows.push_back(alpha());
     return rows;
 }
@@ -730,6 +748,7 @@ TEST_CASE("the planned section hash is the hash over the server-parsed wire reco
             CAPTURE(i, p.adds[i].name);
             CHECK(sec.rows[i].publisher == p.adds[i].publisher);
             CHECK(sec.rows[i].install_location == p.adds[i].install_location);
+            CHECK(sec.rows[i].attributes == p.adds[i].attributes);
         }
     }
     // The label is clamped on the planner's side, so the server keeps it whole.
@@ -785,6 +804,98 @@ TEST_CASE("a delta against the acknowledged FULL applies on the server-parsed se
     CHECK(server_section_hash(applied) == wire.expect);
     CHECK(server_section_hash(applied) ==
           plan_section(kApps, after, std::nullopt, false).section_hash);
+}
+
+TEST_CASE("slot 14 attributes: the golden record bytes and hash are pinned, and an empty slot is unchanged",
+          "[v3][writer][hash][attributes]") {
+    SwEntry e = alpha();
+    e.attributes = kUpgradeCodeAttr;
+    // The literal bytes: slot 14 is the sixteen-slot record's index 13, between install_location
+    // and package_id.
+    CHECK(v3_record(e) == kUpgradeCodeRecord);
+    const auto slots =
+        split(std::string_view(v3_record(e)).substr(0, v3_record(e).size() - 1), '\x1f');
+    REQUIRE(slots.size() == 16);
+    CHECK(slots[12] == "C:\\Program Files\\Alpha");
+    CHECK(slots[13] == kUpgradeCodeAttr);
+    CHECK(slots[14] == "pkg-a");
+    CHECK(v3_row_hash(e) == kUpgradeCodeRowHash);
+    CHECK(v3_section_hash({e}) == kUpgradeCodeRowHash);
+    // Adding an attribute moves the hash; the same row with none is the pre-SAM-46 pin.
+    CHECK(v3_row_hash(alpha()) == "c573935d6af97c9deaef2b526cb01a3dabc2d3958b7e69b289968a6e80dbf229");
+    CHECK(v3_row_hash(e) != v3_row_hash(alpha()));
+    // The wire `+` record is "+" then the same bytes, and the server's parser keeps the slot.
+    const auto sec = server_section(write_v3_blob({plan_section(kApps, {e}, std::nullopt, false)}).blob);
+    REQUIRE(sec.rows.size() == 1);
+    CHECK(sec.rows[0].attributes == kUpgradeCodeAttr);
+}
+
+TEST_CASE("slot 14 attributes: a value that is not canonical is dropped and the row hashes as if empty",
+          "[v3][writer][hash][attributes]") {
+    const std::string lower = "upgrade_code={12345678-90ab-cdef-1234-567890abcdef}";
+    for (const std::string& bad :
+         {lower, std::string("upgrade_code=12345678-90AB-CDEF-1234-567890ABCDEF"),
+          std::string("upgrade_code="), std::string("unknown=1"),
+          std::string(kUpgradeCodeAttr) + ";", std::string(kUpgradeCodeAttr) + ";aaa=1",
+          std::string(kUpgradeCodeAttr) + "=", std::string(kUpgradeCodeAttr) + "\n",
+          std::string(kUpgradeCodeAttr) + std::string(1100, 'x')}) {
+        CAPTURE(bad.size());
+        SwEntry e = alpha();
+        e.attributes = bad;
+        CHECK(v3_normal_form(e).attributes.empty());
+        CHECK(v3_record(e) == v3_record(alpha()));
+        CHECK(v3_row_hash(e) == v3_row_hash(alpha()));
+        // The planner never sends it either: the server would refuse the section.
+        const auto sec =
+            server_section(write_v3_blob({plan_section(kApps, {e}, std::nullopt, false)}).blob);
+        CHECK(sec.rows[0].attributes.empty());
+    }
+    // A canonical value is a fixed point of the normal form.
+    SwEntry ok = alpha();
+    ok.attributes = kUpgradeCodeAttr;
+    CHECK(v3_normal_form(v3_normal_form(ok)).attributes == kUpgradeCodeAttr);
+    // The field step is the one every field gets (and the server applies on receipt): a wire
+    // separator or NUL is stripped first, so a canonical value with one appended is the canonical
+    // value, and the writer sends exactly the bytes the server will hash.
+    for (const char junk : {'\x1f', '\x1e', '\0'}) {
+        SwEntry padded = alpha();
+        padded.attributes = std::string(kUpgradeCodeAttr) + junk;
+        CHECK(v3_normal_form(padded).attributes == kUpgradeCodeAttr);
+        CHECK(v3_row_hash(padded) == kUpgradeCodeRowHash);
+    }
+}
+
+TEST_CASE("slot 14 attributes: the entry order places attributes after install_location and before package_id",
+          "[v3][writer][hash][attributes]") {
+    const auto names = [](const std::vector<SwEntry>& rows) {
+        std::vector<std::string> out;
+        for (const auto& r : rows)
+            out.push_back(r.package_id);
+        return out;
+    };
+    SwEntry lo = alpha();
+    lo.attributes = "upgrade_code={00000000-0000-0000-0000-000000000000}";
+    SwEntry hi = alpha();
+    hi.attributes = "upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}";
+    // Attributes decide before package_id: the row with the larger package_id sorts first when
+    // its attributes are smaller.
+    lo.package_id = "zzz";
+    hi.package_id = "aaa";
+    CHECK(names(v3_normalise_rows({hi, lo})) == std::vector<std::string>{"zzz", "aaa"});
+    // install_location decides before attributes: the smaller location sorts first even though
+    // its attributes are larger.
+    SwEntry loc_a = hi;
+    loc_a.install_location = "C:\\Program Files\\A";
+    SwEntry loc_b = lo;
+    loc_b.install_location = "C:\\Program Files\\B";
+    const auto rows = v3_normalise_rows({loc_b, loc_a});
+    REQUIRE(rows.size() == 2);
+    CHECK(rows[0].install_location == "C:\\Program Files\\A");
+    // Two rows differing only in attributes are two rows, not duplicates.
+    SwEntry plain = alpha();
+    SwEntry attr = alpha();
+    attr.attributes = kUpgradeCodeAttr;
+    CHECK(v3_normalise_rows({plain, attr, plain, attr}).size() == 2);
 }
 
 TEST_CASE("write_v3_blob writes the planned record byte for byte: the planner is the one normalisation point",

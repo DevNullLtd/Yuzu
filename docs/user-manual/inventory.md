@@ -537,7 +537,7 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
 
 ### Install type, scope and location, and the sectioned report
 
-Each stored software row carries four more attributes. They are read-side facts today: the
+Each stored software row carries five more attributes. They are read-side facts today: the
 fleet query, catalogue and device pages do not return them yet, so they are visible only in the
 database.
 
@@ -569,6 +569,16 @@ database.
   v3 blob: a row from a v2 report has an empty `purl` until its device's first v3 report. The
   value is indexed, and the store can look up the devices carrying exactly one `purl`; the REST
   installs lookup returns it and filters on it, and the dashboard and the MCP tool do not yet.
+- **`attributes`** is a validated `key=value` field a collector can attach to a row (wire slot 14),
+  empty for a row that has none: pairs joined by `;`, keys in ascending order, each at most once.
+  One key exists today, `upgrade_code`: the MSI UpgradeCode of a Windows product, which is the same
+  for every version of that product, written as a braced GUID in upper-case hex, for example
+  `upgrade_code={12345678-90AB-CDEF-1234-567890ABCDEF}`. The server stores it only from the v3 blob
+  (the v2 blob's slot is ignored), keeps it in the row's section hash, and does not return it from
+  any read route, dashboard page or MCP tool yet. No collector reports an `upgrade_code` yet. A
+  value the server cannot read as a valid attribute field refuses that one section (reason
+  `bad_attributes`, below). Two rows that differ only in `attributes` are two rows, and an
+  attribute-only change at the same version writes no change-feed entry.
 
 **The per-source report (blob v3).** A v3 report is a list of sections, one per collector source,
 each with a status (`full`, `delta`, `constrained`, `timeout`, `oversize`, `not_collected` or
@@ -640,9 +650,9 @@ whatever the source: the older per-source behaviours that removed a constrained 
 section that broke the blob v3 grammar, and the warn-level server log line "v3 section(s) ...
 refused" names the agent and the reason. The reason is one of `unknown_facet`, `duplicate_facet`,
 `unknown_status`, `rows_in_status_only`, `delete_in_full`, `wrong_record_for_facet`,
-`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`, `row_cap`,
-`nul_byte` or `unterminated`. The agent resends the same bytes, so a refusal never clears on its
-own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
+`source_mismatch`, `unknown_record`, `bad_record`, `bad_row_hash`, `bad_version_source`,
+`bad_attributes`, `row_cap`, `nul_byte` or `unterminated`. The agent resends the same bytes, so a
+refusal never clears on its own, and the refused facet keeps its previous rows and section hash (its rows go stale; nothing is
 deleted) until the agent is fixed. The one exception is a device's first v3 call that applies a section: its v2 rows were
 already replaced, so a facet refused then has no rows to keep. `facet="unknown"` on the counter means the server does not
 recognise the name: that is a version-skew incident (an agent and a server of different builds),

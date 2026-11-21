@@ -514,6 +514,15 @@ const std::vector<pg::PgMigration>& migrations() {
          "ON CONFLICT (id) DO NOTHING;"
          "CREATE INDEX IF NOT EXISTS software_components_name_idx "
          "ON software_components (name, agent_id, kind, path_hash);"},
+        {13,
+         // SAM-46: wire slot 14 of the v3 `+` record carries the validated install-row attribute
+         // field (common/include/yuzu/install_row_attributes.hpp), stored beside install_location.
+         // A constant-default ADD COLUMN is metadata-only on every supported Postgres version (the
+         // v5 and v12 precedent): no table rewrite and no index build, only the brief catalog-change
+         // lock. A row already there reads '', which is what its slot 14 hashed as, so no stored
+         // section hash moves. IF NOT EXISTS keeps a white-box schema_meta rewind idempotent.
+         "ALTER TABLE installed_software "
+         "ADD COLUMN IF NOT EXISTS attributes TEXT NOT NULL DEFAULT '';"},
     };
     return kMigrations;
 }
@@ -542,13 +551,12 @@ std::string sha256_hex(const std::string& in) {
     return out;
 }
 
-// Sort/dedup key walks every STORED field in blob order (name..source; wire slot 14 is
-// reserved and not stored; slot 13, install_location, is '' on the v2 path) so two entries
-// differing only in one field are distinct rows, not duplicates.
+// Sort/dedup key walks every STORED field in blob order (name..source; slots 13 and 14,
+// install_location and attributes, are '' on the v2 path) so two entries differing only in one
+// field are distinct rows, not duplicates.
 // The agent (v3_normalise_rows in installed_software_v3.cpp) sorts and dedups on the same fields in
 // the same order, package_id and source last; the two must stay identical or the canonical
-// hashes diverge → permanent always-full. Records differing only in the reserved slot
-// 14 collapse to one row here.
+// hashes diverge → permanent always-full.
 bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
     if (a.name != b.name)
         return a.name < b.name;
@@ -576,6 +584,8 @@ bool entry_less(const SoftwareEntry& a, const SoftwareEntry& b) {
         return a.distro_version < b.distro_version;
     if (a.install_location != b.install_location)
         return a.install_location < b.install_location;
+    if (a.attributes != b.attributes)
+        return a.attributes < b.attributes;
     if (a.package_id != b.package_id)
         return a.package_id < b.package_id;
     return a.source < b.source;
@@ -587,7 +597,7 @@ bool entry_equal(const SoftwareEntry& a, const SoftwareEntry& b) {
            a.epoch == b.epoch && a.release == b.release && a.arch == b.arch &&
            a.signature_status == b.signature_status && a.distro_id == b.distro_id &&
            a.distro_version == b.distro_version && a.install_location == b.install_location &&
-           a.package_id == b.package_id && a.source == b.source;
+           a.attributes == b.attributes && a.package_id == b.package_id && a.source == b.source;
 }
 
 // Sort + dedup in place so both the canonical hash and the persisted rows are
@@ -598,9 +608,11 @@ void normalize(std::vector<SoftwareEntry>& entries) {
     entries.erase(std::unique(entries.begin(), entries.end(), entry_equal), entries.end());
 }
 
-// One row in the blob-v3 canonical form: ALL 16 wire slots (slot 14, uninstall_string, is
-// reserved and always empty), 0x1F-joined, 0x1E-terminated. No conditional tail. This is the
-// byte form the section hash is taken over, and the form `instance_key` hashes for one row.
+// One row in the blob-v3 canonical form: ALL 16 wire slots (slot 14 is the attribute field,
+// empty when a row carries none), 0x1F-joined, 0x1E-terminated. No conditional tail. This is the
+// byte form the section hash is taken over, and the form `instance_key` hashes for one row. Wire
+// slot 14 is index 13 of `slots`, between install_location (12) and package_id (14); the agent's
+// record_of (installed_software_v3.cpp) builds the same array.
 void append_section_record(std::string& out, const SoftwareEntry& e) {
     const std::string_view slots[16] = {e.name,
                                         e.version,
@@ -615,7 +627,7 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
                                         e.distro_id,
                                         e.distro_version,
                                         e.install_location,
-                                        std::string_view{},
+                                        e.attributes,
                                         e.package_id,
                                         e.source};
     for (std::size_t i = 0; i < 16; ++i) {
@@ -630,7 +642,7 @@ void append_section_record(std::string& out, const SoftwareEntry& e) {
 // INSERT below. The column list, the SELECT list, the unnest() alias list and this array order
 // are one contract; kInsertColumnCount sizes the array and must equal the column count (nothing
 // checks it against the SQL, so change them together).
-constexpr std::size_t kInsertColumnCount = 20;
+constexpr std::size_t kInsertColumnCount = 21;
 
 // Copies a failed result's SQLSTATE into `*out` when the caller asked for it.
 void take_sqlstate(const pg::PgResult& res, std::string* out) {
@@ -641,8 +653,8 @@ void take_sqlstate(const pg::PgResult& res, std::string* out) {
 }
 
 // Batched insert (#1664): one statement carrying the per-row columns as parallel text[]
-// arrays — agent_id is the scalar $1, so the param count is a constant 21 regardless of row
-// count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.1k rows (21
+// arrays — agent_id is the scalar $1, so the param count is a constant 22 regardless of row
+// count. A multi-row VALUES would hit libpq's 65535-parameter ceiling at ~3.0k rows (22
 // params/row); up to kMaxEntries (20k) rows arrive here. unnest() pairs the arrays
 // positionally and they are equal-length by construction. Collapsing up to 20k single-row
 // INSERTs into one statement shrinks the transaction's connection-hold + statement_timeout
@@ -680,6 +692,7 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
         cols[17].emplace_back(e.identity_key);
         cols[18].emplace_back(e.instance_key);
         cols[19].emplace_back(e.purl);
+        cols[20].emplace_back(e.attributes);
     }
     std::vector<std::string> params;
     params.reserve(kInsertColumnCount + 1);
@@ -691,13 +704,14 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
         "INSERT INTO software_inventory_store.installed_software "
         "(agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, "
         "release, arch, signature_status, distro_id, distro_version, install_location, "
-        "package_id, source, install_type, install_scope, identity_key, instance_key, purl) "
-        "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu "
+        "package_id, source, install_type, install_scope, identity_key, instance_key, purl, "
+        "attributes) "
+        "SELECT $1, n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu, atr "
         "FROM unnest($2::text[], $3::text[], $4::text[], $5::text[], $6::text[], "
         "$7::text[], $8::text[], $9::text[], $10::text[], $11::text[], $12::text[], "
         "$13::text[], $14::text[], $15::text[], $16::text[], $17::text[], $18::text[], "
-        "$19::text[], $20::text[], $21::text[]) "
-        "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu)",
+        "$19::text[], $20::text[], $21::text[], $22::text[]) "
+        "AS t(n, v, p, d, k, e, ep, r, a, s, di, dv, il, pk, so, it, sc, ik, ink, pu, atr)",
         params);
     if (ins.status() != PGRES_COMMAND_OK) {
         take_sqlstate(ins, sqlstate);
@@ -709,15 +723,15 @@ bool insert_entries(PGconn* c, const std::string& agent_id_s,
 // Per-kind ledger row counts, indexed by SoftwareChangeKind.
 using ChangeCounts = std::array<std::int64_t, kSoftwareChangeKinds.size()>;
 
-// The facet's stored rows as SoftwareEntry values: the 15 stored wire fields (so the section hash
+// The facet's stored rows as SoftwareEntry values: the 16 stored wire fields (so the section hash
 // can be recomputed from the table) plus the derived identity_key/instance_key (the ledger diff).
 bool read_facet_rows(PGconn* c, const std::string& agent_id_s, const std::string& facet,
                      std::vector<SoftwareEntry>& out) {
     pg::PgResult r = pg::exec_params(
         c,
         "SELECT name, version, publisher, install_date, kind, ecosystem, epoch, release, arch, "
-        "signature_status, distro_id, distro_version, install_location, package_id, source, "
-        "identity_key, instance_key "
+        "signature_status, distro_id, distro_version, install_location, attributes, package_id, "
+        "source, identity_key, instance_key "
         "FROM software_inventory_store.installed_software WHERE agent_id = $1 AND source = $2",
         std::vector<std::string>{agent_id_s, facet});
     if (r.status() != PGRES_TUPLES_OK)
@@ -731,8 +745,8 @@ bool read_facet_rows(PGconn* c, const std::string& agent_id_s, const std::string
             &e.name,         &e.version,          &e.publisher,        &e.install_date,
             &e.kind,         &e.ecosystem,        &e.epoch,            &e.release,
             &e.arch,         &e.signature_status, &e.distro_id,        &e.distro_version,
-            &e.install_location, &e.package_id,   &e.source,           &e.identity_key,
-            &e.instance_key};
+            &e.install_location, &e.attributes,   &e.package_id,        &e.source,
+            &e.identity_key, &e.instance_key};
         for (std::size_t col = 0; col < std::size(fields); ++col)
             *fields[col] = PQgetvalue(r.get(), i, static_cast<int>(col));
         out.push_back(std::move(e));
@@ -1078,9 +1092,9 @@ bool add_status_filter(std::string& sql, std::vector<std::string>& params, int& 
 std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> entries) {
     normalize(entries);
     // Blob contract v2 + extended tail: 12 fields always; the 4-field tail (slots 13-16:
-    // install_location, uninstall_string, package_id, source) is appended (all four)
-    // ONLY when package_id or source is non-empty; slots 13-14 are reserved and written
-    // empty (see below). A v2 agent's records therefore hash
+    // install_location, attributes, package_id, source) is appended (all four)
+    // ONLY when package_id or source is non-empty; slots 13-14 are written empty on this v2
+    // path (see below); the v3 section hash is the one that carries them. A v2 agent's records therefore hash
     // to exactly the pre-extension bytes, so its stored content_hash keeps matching
     // (no permanent need_full loop). The agent side (the v3 writer's record_of / v3_section_hash
     // in agents/core/src/installed_software_v3.cpp) MUST mirror this rule;
@@ -1113,9 +1127,9 @@ std::string SoftwareInventoryStore::canonical_hash(std::vector<SoftwareEntry> en
         canon += '\x1f';
         canon += e.distro_version;
         if (!e.package_id.empty() || !e.source.empty()) {
-            // Slots 13-14 (install_location, uninstall_string) are reserved: always empty
-            // here, so an agent that hashes real values gets need_full until the server
-            // accepts them (ADR-0016 §8 re-classification, #5186).
+            // Slots 13-14 (install_location, attributes) are empty here: the v2 path neither
+            // stores nor hashes them (#5186), so an agent that hashes real values gets
+            // need_full until it speaks v3, where the section hash carries both.
             canon += "\x1f\x1f";
             canon += '\x1f';
             canon += e.package_id;
@@ -1387,7 +1401,8 @@ SoftwareInventoryStore::SoftwareInventoryStore(pg::PgPool& pool) : pool_(pool) {
         {"installed_software",
          "agent_id, name, version, publisher, install_date, kind, ecosystem, epoch, release, "
          "arch, signature_status, distro_id, distro_version, package_id, source, install_id, "
-         "install_type, install_scope, install_location, identity_key, instance_key, purl"},
+         "install_type, install_scope, install_location, identity_key, instance_key, purl, "
+         "attributes"},
         {"inventory_state", "agent_id, source, content_hash, first_seen, last_seen"},
         {"software_facet_state",
          "agent_id, facet, status, token, section_hash, enabled, last_confirmed_at, duration_ms, "

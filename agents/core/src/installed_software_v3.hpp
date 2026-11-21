@@ -124,22 +124,23 @@ inline constexpr int kV3MaxCanonicalPasses = 8;
 
 /// The stored form of one row, exactly what the server holds after its own field step: every
 /// field through clamp_field, the canonical epoch and release, and install_location through
-/// machine_install_location. A fixed point: `v3_normal_form(v3_normal_form(x)) == v3_normal_form(x)`
-/// over every field (tests/unit/test_installed_software_v3.cpp pins it over the privacy corpus).
+/// machine_install_location and attributes through canonical_attributes (a value that is not
+/// already canonical becomes empty). A fixed point:
+/// `v3_normal_form(v3_normal_form(x)) == v3_normal_form(x)` over every field (tests/unit/test_installed_software_v3.cpp pins it over the privacy corpus).
 /// Every hash below is taken over this form.
 [[nodiscard]] YUZU_EXPORT SwEntry v3_normal_form(const SwEntry& e);
 
 /// Normal form of every row, nameless rows dropped (the server drops them too), then sorted and
 /// de-duplicated in the server's comparator order (name .. distro_version, install_location,
-/// package_id, source; byte-wise). Order- and duplicate-independent input in, one canonical
+/// attributes, package_id, source; byte-wise). Order- and duplicate-independent input in, one canonical
 /// vector out.
 [[nodiscard]] YUZU_EXPORT std::vector<SwEntry> v3_normalise_rows(std::vector<SwEntry> rows);
 
 // ── Records and hashes (installed software) ──────────────────────────────────────────────
 
-/// One row in the section-hash form: ALL 16 wire slots (slot 14, the reserved uninstall_string,
-/// empty; no conditional tail), 0x1F-joined and 0x1E-terminated. The wire `+` record is "+" US
-/// then this.
+/// One row in the section-hash form: ALL 16 wire slots (slot 14 is the validated attribute field,
+/// empty when a row carries none; no conditional tail), 0x1F-joined and 0x1E-terminated. The wire
+/// `+` record is "+" US then this.
 [[nodiscard]] YUZU_EXPORT std::string v3_record(const SwEntry& e);
 /// SHA-256 hex of v3_record(e): the server's `instance_key`, the value a `-` record names.
 [[nodiscard]] YUZU_EXPORT std::string v3_row_hash(const SwEntry& e);
