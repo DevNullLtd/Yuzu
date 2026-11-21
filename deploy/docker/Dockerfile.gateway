@@ -48,6 +48,11 @@
 # resolved with `docker buildx imagetools inspect
 # hexpm/erlang:28.5.0.8-alpine-3.23.8` on 2026-11-20. The release's ERTS comes
 # from this image (`include_erts`), so this pin IS the OTP the gateway ships.
+# Trust basis: trust on first use. hexpm publishes no signature for its images,
+# so the digest proves only that every build uses the bytes resolved that day;
+# scripts/ci/check-gateway-base-index.py and the abi-guard check the Alpine
+# release and musl, not the publisher, and the release image gate scans the
+# result. Re-resolve and review the digest on every bump.
 FROM hexpm/erlang:28.5.0.8-alpine-3.23.8@sha256:1fc35219ea9db671006cfd87d2aa645bc80268a49d90a93c592abdb49edc8e26 AS deps
 
 # BuildKit sets TARGETARCH from --platform (and from the host when it is not
@@ -76,8 +81,9 @@ RUN apk add --no-cache git
 #     --certificate-identity \
 #       https://github.com/erlang/rebar3/.github/workflows/publish.yml@refs/tags/3.27.3 \
 #     --type slsaprovenance1 rebar3
-# (the release's rebar3.sigstore asset). Bump the URL, the checksum and the
-# version check below together, and re-verify the provenance.
+# after downloading both `rebar3` and `rebar3.sigstore` from the 3.27.3 release
+# page; `sha256sum rebar3` gives the checksum below. Bump the URL, the checksum
+# and the version check below together, and re-verify the provenance.
 ADD --checksum=sha256:f1d87d78decfc56b87d971c75ee6355698ec0c49fadd57f2c056043b7ca291b5 --chmod=755 \
     https://github.com/erlang/rebar3/releases/download/3.27.3/rebar3 /usr/local/bin/rebar3
 RUN rebar3 version | grep -q '^rebar 3\.27\.3 on Erlang/OTP 28 '

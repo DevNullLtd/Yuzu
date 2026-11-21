@@ -3203,8 +3203,10 @@ jobs:
           done
           mapfile -t attempts < <(printf '%s\n' "${!seen[@]}" | sort -n)
           for n in "${attempts[@]}"; do
-            [[ -s "trivy-${name}.attempt-${n}.gate.txt" ]] \
-              || { err "attempt $n has files but no trivy-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            for scanner in trivy grype; do
+              [[ -s "${scanner}-${name}.attempt-${n}.gate.txt" ]] \
+                || { err "attempt $n has files but no ${scanner}-${name}.attempt-${n}.gate.txt; not attaching anything"; exit 1; }
+            done
           done
 
           # The journals: legal prefixes only, each beside a passing gate. Exit

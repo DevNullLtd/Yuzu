@@ -101,6 +101,18 @@ fails the build when the two stages cannot safely run the same release:
 | `... is not a plain dotted version` | A version could not be read, for example an OTP release candidate or a patched OTP (`28.5.0.8**`). Build from a released OTP. |
 | `could not compare versions (apk printed ...)` | `apk version -t` gave no usable answer for versions that looked valid. Report it with the `abi-guard:` line; do not bypass the step. |
 
+### Gateway image build fails downloading rebar3
+
+The deps stage of `deploy/docker/Dockerfile.gateway` adds rebar3 from its GitHub
+release (`ADD --checksum=sha256:...`), and BuildKit checks the pinned sha256 before
+the file is used. The build host therefore needs `github.com` and its release-asset
+download host, besides Docker Hub and Hex.
+
+| Message | Fix |
+|---------|-----|
+| A download error at the `ADD --checksum=sha256:... rebar3` step | Give the build host access to `github.com`, or build where it has it (CI). |
+| A checksum mismatch at that step | The bytes are not the pinned rebar3 release. Do not change the checksum to make the build pass; see `docs/erlang-gateway-build.md` for how the pin is verified and bumped. |
+
 ## Certificate Errors
 
 | Check | Fix |

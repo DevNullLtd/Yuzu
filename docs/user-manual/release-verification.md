@@ -167,8 +167,10 @@ What this does **not** gate:
 - PostgreSQL itself in `yuzu-postgres`: its packages come from the PostgreSQL project's repository,
   which publishes no advisories the scanner matches, and the image holds them at the pinned minor.
 - Anything statically linked into the server and agent binaries. The gateway's bundled Erlang/OTP
-  runtime is matched by grype only (Trivy does not identify it): a vulnerability grype's data does not
-  attribute to that OTP version is not gated.
+  runtime (`yuzu-gateway` ships OTP 28.5.0.8, ERTS 16.4.0.7; grype's report lists it as the `erlang`
+  package; the release scan refuses a gateway image in which grype does not find it) is matched by
+  grype only (Trivy does not identify it): a vulnerability grype's data does not attribute to that
+  OTP version is not gated.
 - The integrity of the vulnerability databases themselves: their publishers do not sign them. Each
   report records which database the scan used (Trivy's registry digest; grype's archive name, checksum
   and build time), so it can be identified afterwards, but a database altered before the download is
@@ -181,7 +183,8 @@ every package), `trivy-<image>.attempt-<N>.txt` (the same as a table) and
 date, the OS, the OS package count, the coverage, the advisory-data check, the accepted-findings
 file's hash and the result), and grype's `grype-<image>.attempt-<N>.json`, `.txt` and `.gate.txt`
 (the grype version, the database's archive, checksum and build time, the image ID, the detected
-distribution, the match counts, the accepted-findings file's hash and grype's result). `<N>` is the
+distribution, the matches not accepted and the accepted ones with the fixable CRITICALs among each,
+the components grype was required to find, the accepted-findings file's hash and grype's result). `<N>` is the
 release workflow's run attempt; every attempt's reports are
 kept, a refused or cancelled attempt's (`gate: FAIL: <reason>`, `gate: FAIL: cancelled ...`)
 included. Beside each attempt whose scan passed is its publish journal,

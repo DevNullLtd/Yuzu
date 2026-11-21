@@ -185,6 +185,21 @@ GRYPE_SHA256_LINUX_ARM64="b7815598d48da78bfd16f5b98ef28e1bb09c03d34fc8c3e350f99b
 # names one archive and its sha256; the gate downloads that archive itself and
 # checks it before grype imports it, so grype never fetches a DB on its own.
 GRYPE_DB_URL="https://grype.anchore.io/databases/v6"
+# The DB providers whose freshness the gate requires: the OS families of the
+# published images (each with a Trivy canary) and NVD, which supplies the
+# matches for binaries grype identifies by version, the gateway's Erlang/OTP
+# runtime among them.
+GRYPE_REQUIRED_PROVIDERS=(nvd alpine debian ubuntu)
+# Components grype must catalogue in an image (NAME=component...): the reason
+# grype runs at all. Trivy does not see the gateway's Erlang/OTP runtime, and
+# grype's JSON lists only matches, so without this a runtime grype stopped
+# recognising would read as clean.
+# Both gateway images were checked to catalogue erlang 28.5.0.8 (from the
+# bundled ERTS's beam.smp) with grype 0.121.3 on 2026-11-20.
+declare -A GRYPE_REQUIRED_COMPONENTS=(
+    [yuzu-gateway]="erlang"
+    [yuzu-gateway-chisel]="erlang"
+)
 
 # The DB sources, tried in order: Trivy 0.70.0's defaults (the Google mirror of
 # Docker Hub's aquasec/trivy-db, then GitHub's), named explicitly. Each tag is
@@ -651,7 +666,7 @@ else
         || die "could not fetch the grype DB listing $GRYPE_DB_URL/latest.json (within ${RESOLVE_DEADLINE}s; treated as a failure)"
 fi
 if ! glist_info="$("${CHECKS[@]}" grype-db-listing "$glisting")"; then
-    die "the grype DB listing is stale, unreadable or not in the shape the gate accepts (above); re-run once the published DB is current"
+    die "the grype DB listing is stale, unreadable or not in the shape the gate accepts (above): a stale one, re-run once the published DB is current; a status other than active, the pinned grype's DB schema is retired and grype needs a bump"
 fi
 gdb_path="$(printf '%s\n' "$glist_info" | sed -n 's/^path=//p')"
 gdb_sum="$(printf '%s\n' "$glist_info" | sed -n 's/^checksum=//p')"
@@ -674,6 +689,12 @@ if ! gstat="$("${CHECKS[@]}" grype-db-status "$WORK/grype-db-status.json" --buil
     cat "$WORK/grype-db-status.err" >&2 || true
     die "grype's status of the imported DB is not the DB this run downloaded and verified, or it is stale (above)"
 fi
+run_grype "$RESOLVE_DEADLINE" db providers -o json > "$WORK/grype-db-providers.json" 2>"$WORK/grype-db-status.err" || true
+if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" "${GRYPE_REQUIRED_PROVIDERS[@]}")"; then
+    cat "$WORK/grype-db-status.err" >&2 || true
+    die "a grype DB provider the gate needs (${GRYPE_REQUIRED_PROVIDERS[*]}) is missing or older than 72 hours (above); re-run once the published DB is current"
+fi
+printf '%s\n' "$gprov" | sed 's/^/    /'
 GRYPE_DB_REF="$GRYPE_DB_URL/$gdb_path ($gdb_sum, schema $gdb_schema, built $gdb_built)"
 printf '%s\n' "$gstat" | sed 's/^/    /'
 echo "    $GRYPE_DB_REF"
@@ -714,11 +735,12 @@ advisory_canary() {
 # image or cannot judge it.
 ARCHIVE="$WORK/image.tar"
 grype_scan() {
-    local n="$1" img="$2" want_family="$3" id stem gjson gtable ginfo gres rc
-    local distro="?" matches="?" ignored="?" fcrit="?" gid="?"
+    local n="$1" img="$2" want_family="$3" id stem gjson gtable gcdx ginfo gres rc comps="" cinfo=""
+    local distro="?" matches="?" ignored="?" fcrit="?" fcrit_acc="?" gid="?"
     stem="grype-${n}${ATTEMPT_SUFFIX}"
     gjson="$WORK/${stem}.json"
     gtable="$WORK/${stem}.txt"
+    gcdx="$WORK/${stem}.cdx.json"
     echo "==> $n: grype"
     # The image's local ID (`docker image inspect` never pulls), then a `docker
     # save` of that ID (never pulls either): what grype reads is the image in
@@ -750,7 +772,7 @@ grype_scan() {
     # The record: every severity, fixed or not, and the accepted findings
     # (ignoredMatches), as JSON and as a table, in one scan. Not -q: it would
     # hide grype's error messages too, so stderr is kept and shown on failure.
-    if ! run_grype "$SCAN_DEADLINE" -c "$GRYPE_CONFIG" -o "json=$gjson" -o "table=$gtable" \
+    if ! run_grype "$SCAN_DEADLINE" -c "$GRYPE_CONFIG" -o "json=$gjson" -o "table=$gtable" -o "cyclonedx-json=$gcdx" \
             "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" \
         || ! ginfo="$("${CHECKS[@]}" grype-report "$gjson")" \
         || [ ! -s "$gtable" ]; then
@@ -770,8 +792,22 @@ grype_scan() {
     matches="$(printf '%s\n' "$ginfo" | sed -n 's/^matches=//p')"
     ignored="$(printf '%s\n' "$ginfo" | sed -n 's/^ignored=//p')"
     fcrit="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical=//p')"
+    fcrit_acc="$(printf '%s\n' "$ginfo" | sed -n 's/^fixable_critical_accepted=//p')"
     local dver
     dver="$(printf '%s\n' "$ginfo" | sed -n 's/^distro_version=//p')"
+    # The components grype must have catalogued in this image (see
+    # GRYPE_REQUIRED_COMPONENTS), from its CycloneDX output of the same scan.
+    comps="${GRYPE_REQUIRED_COMPONENTS[$n]:-}"
+    local comps_ok=1 comps_desc="none required"
+    if [ -n "$comps" ]; then
+        # shellcheck disable=SC2086 # a space-separated list of component names
+        if cinfo="$("${CHECKS[@]}" grype-components "$gcdx" $comps)"; then
+            comps_desc="$(printf '%s\n' "$cinfo" | sed -n 's/^component_//p' | tr '\n' ' ' | sed 's/=/ /g; s/ $//')"
+        else
+            comps_ok=0
+            comps_desc="MISSING (required: $comps)"
+        fi
+    fi
 
     # The gate: only matches with a fix, fail at CRITICAL. grype exits 2 when
     # the threshold is crossed and 1 on an error; anything but 0 and 2 is an
@@ -781,8 +817,19 @@ grype_scan() {
         "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?
     rm -f "$ARCHIVE"
     case "$rc" in
-        0) if [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
-               err "$img: grype detected distro '${distro:-none}', not the $want_family whose OS packages Trivy scanned: grype matched none of them (treated as a failure)"
+        0) if [ "$comps_ok" != 1 ]; then
+               err "$img: grype did not catalogue $comps, the component it runs on this image for (above); a grype or base-image change stopped it recognising the runtime (treated as a failure)"
+               gres="FAIL: grype did not catalogue $comps"
+               failed=1
+           elif [ "$fcrit" != 0 ]; then
+               # The gate scan passed, but the record scan of the same archive
+               # lists a fixable CRITICAL that no acceptance covers: the two
+               # scans disagree, and a pass must not be published beside it.
+               err "$img: grype's gate scan passed but its record lists $fcrit fixable CRITICAL not accepted (treated as a failure)"
+               gres="FAIL: grype's record and gate scans disagree"
+               failed=1
+           elif [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then
+               err "$img: grype did not detect the OS ($want_family): it detected distro '${distro:-none}', so it matched none of the OS packages Trivy scanned (treated as a failure)"
                gres="FAIL: grype did not detect the OS ($want_family)"
                failed=1
            else
@@ -804,7 +851,9 @@ grype_scan() {
             "image id: $id" \
             "image id (grype): $gid" \
             "distro: ${distro:-none} ${dver}" \
-            "matches: $matches (fixable CRITICAL before acceptances and the gate's own scan: $fcrit), accepted: $ignored"
+            "matches: $matches not accepted, of them fixable CRITICAL: $fcrit (the gate's verdict is its own scan below)" \
+            "accepted (ignoredMatches): $ignored, of them fixable CRITICAL: $fcrit_acc" \
+            "required components: $comps_desc"
     fi
     grype_reported[$n]=1
 }

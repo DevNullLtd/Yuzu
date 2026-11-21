@@ -195,6 +195,16 @@ GRYPE_STUB = textwrap.dedent(
         os.makedirs(os.path.join(cache, "6"), exist_ok=True)
         open(os.path.join(cache, "6", "vulnerability.db"), "w").write(open(args[2]).read())
         sys.exit(0)
+    if args[:2] == ["db", "providers"]:
+        built = os.environ["STUB_GRYPE_BUILT"]
+        rows = [{"name": n, "version": "1", "dateCaptured": built}
+                for n in ("nvd", "alpine", "debian", "ubuntu", "rhel")]
+        if mode == "provider-stale":
+            rows[0]["dateCaptured"] = "2001-01-01T00:00:00Z"
+        if mode == "provider-missing":
+            rows = rows[1:]
+        print(json.dumps(rows))
+        sys.exit(0)
     if args[:2] == ["db", "status"]:
         db = os.path.join(cache, "6", "vulnerability.db")
         st = {"schemaVersion": os.environ["STUB_GRYPE_SCHEMA"], "built": os.environ["STUB_GRYPE_BUILT"],
@@ -216,13 +226,15 @@ GRYPE_STUB = textwrap.dedent(
     if "--fail-on" in args:
         if mode == "gate-error":
             sys.exit(1)
+        if mode == "disagree":
+            sys.exit(0)
         if mode == "findings" and not suppressed:
             print("CRITICAL finding table")
             sys.exit(2)
         sys.exit(0)
     if mode == "report-error":
         sys.exit(1)
-    outs = dict(a.split("=", 1) for a in args if a.startswith(("json=", "table=")))
+    outs = dict(a.split("=", 1) for a in args if a.startswith(("json=", "table=", "cyclonedx-json=")))
     distro = os.environ.get("STUB_GRYPE_DISTRO", "debian:12.15")
     fam, _, ver = distro.partition(":")
     match = {"vulnerability": {"id": fid, "severity": "Critical", "fix": {"state": "fixed"}},
@@ -230,12 +242,15 @@ GRYPE_STUB = textwrap.dedent(
     rep = {"descriptor": {"name": "grype", "version": "0.121.3"},
            "source": {"type": "image", "target": {"imageID": "sha256:" + "9" * 64}},
            "distro": {"name": fam, "version": ver} if fam else {},
-           "matches": [match] if mode == "findings" and not suppressed else [],
+           "matches": [match] if mode in ("findings", "disagree") and not suppressed else [],
            "ignoredMatches": [match] if mode == "findings" and suppressed else []}
     if mode == "not-grype":
         rep = {"SchemaVersion": 2}
     open(outs["json"], "w").write(json.dumps(rep))
     open(outs["table"], "w").write("" if mode == "empty-table" else "NAME INSTALLED TYPE VULNERABILITY\\n")
+    comps = [] if mode == "no-erlang" else [{"name": "erlang", "version": "28.5.0.8", "type": "application"}]
+    if "cyclonedx-json" in outs:
+        open(outs["cyclonedx-json"], "w").write(json.dumps({"bomFormat": "CycloneDX", "components": comps}))
     sys.exit(0)
     """
 )
@@ -1194,6 +1209,30 @@ class GateBehaviour(unittest.TestCase):
         for suffix in (".json", ".txt"):
             self.assertTrue((rep / f"grype-img{suffix}").is_file(), suffix)
 
+    def test_grype_must_catalogue_the_gateways_otp_runtime(self):
+        rep = self.tmp / "rep-ok"
+        r = self.run_gate("yuzu-gateway=img:1", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn("required components: erlang 28.5.0.8",
+                      (rep / "grype-yuzu-gateway.gate.txt").read_text(encoding="utf-8"))
+        rec = [a for a in self.gscans() if "--fail-on" not in a][0]
+        self.assertTrue(any(x.startswith("cyclonedx-json=") for x in rec), rec)
+        rep = self.tmp / "rep-none"
+        r = self.run_gate("yuzu-gateway=img:1", grype_mode="no-erlang", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype did not catalogue erlang",
+                      (rep / "grype-yuzu-gateway.gate.txt").read_text(encoding="utf-8"))
+        # An image with no required component is not held to it.
+        r = self.run_gate("yuzu-server=img:1", grype_mode="no-erlang")
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+
+    def test_a_pass_beside_a_record_with_an_unaccepted_fixable_critical_fails(self):
+        rep = self.tmp / "rep"
+        r = self.run_gate("img:1", grype_mode="disagree", extra=("--report-dir", str(rep)))
+        self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+        self.assertIn("gate: FAIL: grype's record and gate scans disagree",
+                      (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
     def test_grype_errors_fail_closed(self):
         for mode, why in (("gate-error", "FAIL: grype exited 1"), ("report-error", "could not scan"),
                           ("not-grype", "could not scan"), ("empty-table", "could not scan")):
@@ -1211,6 +1250,20 @@ class GateBehaviour(unittest.TestCase):
         self.assertEqual(self.gscans(), [])
         self.assertIn("FAIL: not an image in the local Docker daemon",
                       (rep / "grype-gone.gate.txt").read_text(encoding="utf-8"))
+
+    def test_an_early_grype_failure_is_not_reported_again_as_stopped(self):
+        # Without --report-dir the early-fail paths must still mark the image as
+        # judged, or the exit trap adds a false "gate stopped" summary row.
+        for kw in ({"missing": "gone:1"}, {"env_extra": {"STUB_DOCKER_MODE": "save-error"}}):
+            with self.subTest(**{k: str(v) for k, v in kw.items()}):
+                summ = self.tmp / "summary.md"
+                summ.unlink(missing_ok=True)
+                extra_env = dict(kw.get("env_extra", {}), GITHUB_STEP_SUMMARY=str(summ))
+                r = self.run_gate("gone:1", missing=kw.get("missing", ""), env_extra=extra_env)
+                self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
+                rows = [ln for ln in summ.read_text(encoding="utf-8").splitlines() if "(grype)" in ln]
+                self.assertEqual(len(rows), 1, rows)
+                self.assertNotIn("gate stopped", rows[0])
 
     def test_an_export_failure_or_a_non_id_answer_fails(self):
         for dmode, why in (("save-error", "could not export"), ("garbage-id", "not an image in the local")):
@@ -1283,6 +1336,8 @@ class GateBehaviour(unittest.TestCase):
             "import fails": ({}, "import-error", "could not import"),
             "status mismatch": ({}, "status-mismatch", "not the DB this run verified"),
             "status invalid": ({}, "status-invalid", "not valid"),
+            "provider stale": ({}, "provider-stale", "provider nvd"),
+            "provider missing": ({}, "provider-missing", "provider 'nvd' is not in the DB"),
         }
         for label, (fixture, gmode, why) in cases.items():
             with self.subTest(label):
@@ -1294,8 +1349,13 @@ class GateBehaviour(unittest.TestCase):
 
     def test_grype_acceptance_is_honoured_by_scope_and_only_when_approved(self):
         ok = self.write_grype_ignore(self.grype_entry())
-        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=ok, extra=("--release",))
+        rep = self.tmp / "rep-accepted"
+        r = self.run_gate("img:1", grype_mode="findings", grype_ignore=ok,
+                          extra=("--release", "--report-dir", str(rep)))
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        g = (rep / "grype-img.gate.txt").read_text(encoding="utf-8")
+        self.assertIn("matches: 0 not accepted, of them fixable CRITICAL: 0", g)
+        self.assertIn("accepted (ignoredMatches): 1, of them fixable CRITICAL: 1", g)
         # A pending approval is not honoured by a release, and is outside one.
         pend = self.write_grype_ignore(self.grype_entry(approved_on=None, approval_ref="pending"))
         r = self.run_gate("img:1", grype_mode="findings", grype_ignore=pend, extra=("--release",))
@@ -1401,9 +1461,12 @@ class GrypeMutants(unittest.TestCase):
             return self.run_gate("img:1", grype_mode="findings", grype_ignore=ign, extra=("--release",), gate=gate)
 
         cases = [
+            # With the disagreement check also off: it independently refuses a
+            # pass beside an unaccepted fixable CRITICAL in the record.
             ("grype exit 2 read as a pass", findings,
              [('--fail-on critical -o table \\\n        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || rc=$?',
-               '--fail-on critical -o table \\\n        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || true')], []),
+               '--fail-on critical -o table \\\n        "docker-archive:$ARCHIVE" 2>"$WORK/grype.err" || true'),
+              ('           elif [ "$fcrit" != 0 ]; then', '           elif false; then')], []),
             ("grype not run on a Trivy-covered image", findings,
              [('    grype_scan "$name" "$image" "$want_family"\n', "")], []),
             ("DB archive checksum not checked", with_db(tamper=True),
@@ -1418,12 +1481,56 @@ class GrypeMutants(unittest.TestCase):
             ("OS cross-check dropped", no_os,
              [('if [ -n "$want_family" ] && [ "$distro" != "$want_family" ]; then',
                'if false; then')], []),
+            ("required component not checked", lambda gate: self.run_gate("yuzu-gateway=img:1",
+                                                                          grype_mode="no-erlang", gate=gate),
+             [('        0) if [ "$comps_ok" != 1 ]; then', '        0) if false; then')], []),
+            ("scan disagreement ignored", lambda gate: self.run_gate("img:1", grype_mode="disagree", gate=gate),
+             [('           elif [ "$fcrit" != 0 ]; then', '           elif false; then')], []),
+            ("provider freshness not checked", with_db("provider-stale"),
+             [('if ! gprov="$("${CHECKS[@]}" grype-db-providers "$WORK/grype-db-providers.json" '
+               '"${GRYPE_REQUIRED_PROVIDERS[@]}")"; then', 'if ! gprov="$(true)"; then')], []),
             ("pending grype acceptance honoured in a release", pending_in_release,
              [('[ "$RELEASE" = 0 ] || gign_flags+=(--require-approved)', ':')], []),
         ]
         for label, scenario, gate_edits, checks_edits in cases:
             with self.subTest(mutant=label):
                 self.assert_killed(label, scenario, gate_edits, checks_edits)
+
+
+@unittest.skipUnless(have_bash(), "image-publish.sh is a bash script")
+class PublishNeedsBothScanners(unittest.TestCase):
+    """image-publish.sh opens a journal only when Trivy's AND grype's gate.txt
+    for the attempt both exist and record exactly `gate: pass` (WP15)."""
+
+    def open_with(self, scanners, verdict="gate: pass"):
+        d = Path(tempfile.mkdtemp(prefix="yuzu_test_publish_open_"))
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        for sc in scanners:
+            (d / f"{sc}-yuzu-gateway.attempt-1.gate.txt").write_text(f"image: x\n{verdict}\n")
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GITHUB_")}
+        r = subprocess.run(["bash", str(PUBLISH), "open", str(d), "yuzu-gateway", "1"],
+                           env=env, capture_output=True, text=True, timeout=60)
+        return r, (d / "publish-yuzu-gateway.attempt-1.txt").exists()
+
+    def test_both_passing_opens_the_journal(self):
+        r, opened = self.open_with(("trivy", "grype"))
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertTrue(opened)
+
+    def test_a_missing_scanner_report_refuses(self):
+        for present, missing in ((("trivy",), "grype"), (("grype",), "trivy")):
+            with self.subTest(missing=missing):
+                r, opened = self.open_with(present)
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"no {missing}-yuzu-gateway.attempt-1.gate.txt", r.stdout + r.stderr)
+                self.assertFalse(opened)
+
+    def test_a_grype_refusal_refuses(self):
+        d_r, opened = self.open_with(("trivy",))
+        self.assertFalse(opened)
+        r, opened = self.open_with(("trivy", "grype"), verdict="gate: FAIL: fixable CRITICAL")
+        self.assertNotEqual(r.returncode, 0)
+        self.assertFalse(opened)
 
 
 @unittest.skipUnless(have_bash(), "uses the gate's checker the same way the gate does")
@@ -1778,6 +1885,10 @@ class Checks(unittest.TestCase):
             "no name": {"package_name": None},
             "no version": {"package_version": None},
             "glob name": {"package_name": "erl*"},
+            "regex plus (grype reads names as regex)": {"package_name": '"libstdc++"'},
+            "regex bracket": {"package_name": '"erl[a]ng"'},
+            "regex alternation": {"package_name": '"erlang|zzz"'},
+            "regex anchors": {"package_name": '"^erlang$"'},
             "glob version": {"package_version": "28.*"},
             "bracket version": {"package_version": '"28.5.[0-9]"'},
             "space name": {"package_name": '"erl ang"'},
@@ -1903,8 +2014,15 @@ class Checks(unittest.TestCase):
         r = report(good)
         self.assertEqual(r.returncode, 0, r.stderr)
         for line in ("distro_family=alpine", "distro_version=3.23.8", "matches=2", "ignored=1",
-                     "fixable_critical=1", "image_id=sha256:" + "9" * 64, "grype_version=0.121.3"):
+                     "fixable_critical=1", "fixable_critical_accepted=1", "image_id=sha256:" + "9" * 64,
+                     "grype_version=0.121.3"):
             self.assertIn(line, r.stdout.splitlines())
+        # The record scan applies acceptances: a fixable CRITICAL that is only in
+        # ignoredMatches is accepted, never counted as not accepted (C-1).
+        r = report(dict(good, matches=[unfixed], ignoredMatches=[crit, crit]))
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("fixable_critical=0", r.stdout.splitlines())
+        self.assertIn("fixable_critical_accepted=2", r.stdout.splitlines())
         for label, d in {"trivy report": {"SchemaVersion": 2, "ArtifactName": "x", "Results": []},
                          "no matches": {"descriptor": {"name": "grype"}},
                          "matches not a list": dict(good, matches={}),
@@ -2268,11 +2386,13 @@ class AttachBundleReport(unittest.TestCase):
     def write_report(self, result="pass", upto="tagged", attempt=2, digest=DIGEST_E, text=None):
         d = self.work / "bundle-gate"
         stem = f"yuzu-agent-bundle-chisel.attempt-{attempt}"
-        (d / f"trivy-{stem}.json").write_text('{"SchemaVersion": 2}\n')
-        (d / f"trivy-{stem}.txt").write_text("table\n")
         lines = ["image: yuzu-agent-bundle-chisel (sha256:1)", f"run attempt: {attempt}", f"gate: {result}",
                  "scanned at: 2026-11-18T00:00:00Z"]
-        (d / f"trivy-{stem}.gate.txt").write_text("\n".join(lines) + "\n")
+        # Both scanners' reports, as image-vuln-gate.sh writes them.
+        for scanner in ("trivy", "grype"):
+            (d / f"{scanner}-{stem}.json").write_text('{"SchemaVersion": 2}\n')
+            (d / f"{scanner}-{stem}.txt").write_text("table\n")
+            (d / f"{scanner}-{stem}.gate.txt").write_text("\n".join(lines) + "\n")
         j = d / f"publish-{stem}.txt"
         body = text if text is not None else journal(upto, digest=digest, attempt=attempt)
         if body is None:
@@ -2317,7 +2437,8 @@ class AttachBundleReport(unittest.TestCase):
         return a["id"]
 
     SUMS = "yuzu-agent-bundle-chisel-image-vuln-gate.attempt-2.SHA256SUMS"
-    FILES = (["trivy-yuzu-agent-bundle-chisel.attempt-2." + s for s in ("gate.txt", "json", "txt")]
+    FILES = ([f"{sc}-yuzu-agent-bundle-chisel.attempt-2." + s for sc in ("trivy", "grype")
+              for s in ("gate.txt", "json", "txt")]
              + ["publish-yuzu-agent-bundle-chisel.attempt-2.txt"])
 
     def complete_first_run(self):
@@ -2325,6 +2446,19 @@ class AttachBundleReport(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.log.unlink()
         return r
+
+    def test_an_attempt_missing_a_scanners_gate_report_attaches_nothing(self):
+        # Both scanners write a .gate.txt on every exit; an attempt without one
+        # of them is not the gate's output, so nothing is attached (WP15).
+        for scanner in ("trivy", "grype"):
+            with self.subTest(missing=scanner):
+                f = self.work / "bundle-gate" / f"{scanner}-yuzu-agent-bundle-chisel.attempt-2.gate.txt"
+                f.unlink()
+                r = self.run_attach()
+                self.assertNotEqual(r.returncode, 0, r.stdout + r.stderr)
+                self.assertIn(f"no {scanner}-yuzu-agent-bundle-chisel.attempt-2.gate.txt", r.stdout + r.stderr)
+                self.assertEqual(self.uploads(), [])
+                self.write_report()
 
     def test_attaches_every_report_with_a_signed_list(self):
         self.complete_first_run()

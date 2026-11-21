@@ -20,7 +20,10 @@
 #     both are required, so an entry never hides the vulnerability in every
 #     package or in every version of one. `package_type` (the TYPE column,
 #     e.g. apk, binary) narrows it further and is optional. No whitespace or
-#     glob character in any of them.
+#     glob character in any of them. grype reads the NAME as a regular
+#     expression, so a name may also hold no `+`, brackets, `|`, `\`, `^`, `$`,
+#     `*`, `?`, parentheses or braces: a package such as `libstdc++` cannot be
+#     accepted here, and its finding fails the gate until it is fixed.
 #   - `statement`, `expired_at`, `approved_by`, `approval_ref` and
 #     `approved_on`: exactly as in .trivyignore.yaml (its header has the
 #     rules): why the finding does not apply, with the evidence; an unquoted

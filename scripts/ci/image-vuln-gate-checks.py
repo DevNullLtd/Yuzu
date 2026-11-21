@@ -146,10 +146,25 @@ Every subcommand fails CLOSED (exit 1) on anything it cannot read.
       at most MAX_DB_AGE_HOURS old: the DB grype will scan with is the one the
       gate downloaded and verified.
 
+  grype-db-providers PROVIDERS_JSON PROVIDER...
+      Read `grype db providers -o json` and fail unless every named provider
+      is listed with a dateCaptured at most MAX_DB_AGE_HOURS old (and not more
+      than an hour in the future). The DB's own `built` time says when it was
+      assembled, not how fresh each source in it is: a provider whose capture
+      went stale would otherwise read as current.
+
+  grype-components CYCLONEDX_JSON NAME...
+      Read grype's CycloneDX output (every catalogued component) and fail
+      unless each NAME is a component with a version. Used for an image whose
+      point in running grype is a component Trivy cannot see (the gateway's
+      Erlang/OTP runtime, `erlang`): grype's JSON report lists only matches, so
+      a runtime grype never catalogued would otherwise read as clean.
+
   grype-report REPORT_JSON
       Read a GRYPE JSON report (another scanner's report is refused) and print
       grype_version=, image_id=, distro_family=, distro_version=, matches=,
-      ignored= and fixable_critical= lines.
+      ignored=, fixable_critical= (in matches: not accepted) and
+      fixable_critical_accepted= (in ignoredMatches: accepted) lines.
 """
 
 import datetime as dt
@@ -175,10 +190,17 @@ ENTRY_KEYS = ("id", "paths", "purls", "statement", "expired_at", "approved_by",
 LIST_KEYS = ("paths", "purls")
 GRYPE_ENTRY_KEYS = ("id", "package_name", "package_version", "package_type", "statement", "expired_at",
                     "approved_by", "approved_on", "approval_ref")
-# grype matches an ignore rule's package name, version and type by equality;
-# none of them may hold a glob character or whitespace all the same, so an
+# grype 0.121.3 matches an ignore rule's package version and type by equality,
+# but its package NAME as an anchored regular expression: checked 2026-11-20
+# against a real match, `er+lang`, `erl[a]ng`, `erlang|zzz`, `e\wlang` and
+# `^erlang$` all suppressed package `erlang`, `erlang++` (an invalid pattern)
+# suppressed nothing, while `e.lang`, `rlang` and `erlan` did not match (`.` is
+# read literally). So a name may hold only characters grype reads literally:
+# no `+`, brackets, `|`, `\`, `^`, `$`, `*`, `?`, parentheses or braces. A
+# package whose name needs one (libstdc++) cannot be accepted here; its finding
+# fails the gate until it is fixed. No field may hold whitespace either, so an
 # entry cannot be read as wider than one package version.
-GRYPE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:@/-]{0,213}$")
+GRYPE_PACKAGE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@/-]{0,213}$")
 GRYPE_PACKAGE_VERSION = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._+:~-]{0,127}$")
 GRYPE_PACKAGE_TYPE = re.compile(r"^[a-z][a-z0-9-]{0,31}$")
 GRYPE_DB_PATH = re.compile(r"^vulnerability-db_v6\.[0-9]+\.[0-9]+_[0-9TZ:.-]+_[0-9]+\.tar\.(?:zst|gz|xz)$")
@@ -237,6 +259,9 @@ TRIVY_RESULT_NAMES = frozenset(n.casefold() for n in (
 # OS families the gate has a canary for (canary-rootfs). Every image the
 # release publishes is on one of these; another family fails the gate until a
 # canary is added for it.
+# The gate's grype OS cross-check compares these names with grype's
+# distro.name, which uses the same three spellings; a family added here must be
+# checked against grype's name for it, or every image of that family is refused.
 CANARY_FAMILIES = ("debian", "ubuntu", "alpine")
 OS_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/+~-]{0,63}$")
 # A pre-release marker in an OS version: Alpine `_alpha`/`_beta`/`_pre`/`_rc`/
@@ -521,7 +546,8 @@ def grype_scope_errors(tag, e, errors):
         if v is None:
             errors.append(f"{tag}: no `{k}` ({what}; never a bare id: an entry is one package version)")
         elif not rx.match(v):
-            errors.append(f"{tag}: {k} {v!r} must be {what}, with no whitespace or glob character")
+            errors.append(f"{tag}: {k} {v!r} must be {what}, with no whitespace, glob or regular-expression "
+                          f"character (grype reads a package name as a regular expression)")
     t = e.get("package_type")
     if t is not None and not GRYPE_PACKAGE_TYPE.match(t):
         errors.append(f"{tag}: package_type {t!r} must be a grype package type (lower-case, e.g. apk, binary)")
@@ -1138,6 +1164,60 @@ def cmd_grype_db_status(path, built, schema):
     return 0
 
 
+def cmd_grype_db_providers(path, required):
+    try:
+        with open(path, encoding="utf-8") as f:
+            rows = json.load(f)
+        if not isinstance(rows, list) or not all(isinstance(r, dict) for r in rows):
+            raise ValueError("not a JSON list of provider objects")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype db providers {path} is missing or unreadable ({e})", file=sys.stderr)
+        return 1
+    by_name = {r.get("name"): r for r in rows if isinstance(r.get("name"), str)}
+    problems = []
+    for name in required:
+        r = by_name.get(name)
+        if r is None:
+            problems.append(f"provider {name!r} is not in the DB")
+            continue
+        captured = r.get("dateCaptured")
+        why = _db_age_problem(f"provider {name}", captured if isinstance(captured, str) else repr(captured))
+        if why:
+            problems.append(why)
+        else:
+            print(f"provider_{name}={captured}")
+    if problems:
+        for m in problems:
+            print(f"grype db providers: {m}", file=sys.stderr)
+        return 1
+    return 0
+
+
+def cmd_grype_components(path, names):
+    try:
+        d = _load_json_object(path, "grype CycloneDX output")
+        comps = d.get("components")
+        if not isinstance(comps, list):
+            raise ValueError(f"{path} has no components list")
+    except (OSError, ValueError, RecursionError) as e:
+        print(f"grype components: cannot read {e}", file=sys.stderr)
+        return 1
+    found = {}
+    for comp in comps:
+        if isinstance(comp, dict) and isinstance(comp.get("name"), str) and isinstance(comp.get("version"), str) \
+                and comp["version"]:
+            found.setdefault(comp["name"], comp["version"])
+    missing = [n for n in names if n not in found]
+    for n in names:
+        if n in found:
+            print(f"component_{n}={found[n]}")
+    if missing:
+        print(f"grype did not catalogue {', '.join(missing)} (with a version) in the image, so it could not "
+              f"match its vulnerabilities", file=sys.stderr)
+        return 1
+    return 0
+
+
 def cmd_grype_report(path):
     try:
         d = _load_json_object(path, "grype report")
@@ -1152,14 +1232,21 @@ def cmd_grype_report(path):
         target = source.get("target") if isinstance(source, dict) else None
         if not isinstance(distro, dict) or (target is not None and not isinstance(target, dict)):
             raise ValueError(f"{path}: distro or source.target is not an object")
-        crit = 0
-        for m in d["matches"]:
-            v = m.get("vulnerability") if isinstance(m, dict) else None
-            if not isinstance(v, dict):
-                raise ValueError(f"{path}: a match has no vulnerability object")
-            fix = v.get("fix") if isinstance(v.get("fix"), dict) else {}
-            if v.get("severity") == "Critical" and fix.get("state") == "fixed":
-                crit += 1
+        def fixable_critical(rows):
+            n = 0
+            for m in rows:
+                v = m.get("vulnerability") if isinstance(m, dict) else None
+                if not isinstance(v, dict):
+                    raise ValueError(f"{path}: a match has no vulnerability object")
+                fix = v.get("fix") if isinstance(v.get("fix"), dict) else {}
+                if v.get("severity") == "Critical" and fix.get("state") == "fixed":
+                    n += 1
+            return n
+
+        # The record scan already applies the acceptances: an accepted finding
+        # is in ignoredMatches, not matches. Count both, never one as the other.
+        crit = fixable_critical(d["matches"])
+        crit_accepted = fixable_critical(ignored)
     except (OSError, ValueError, RecursionError, AttributeError) as e:
         print(f"grype report: cannot read {e}", file=sys.stderr)
         return 1
@@ -1170,6 +1257,7 @@ def cmd_grype_report(path):
     print(f"matches={len(d['matches'])}")
     print(f"ignored={len(ignored)}")
     print(f"fixable_critical={crit}")
+    print(f"fixable_critical_accepted={crit_accepted}")
     return 0
 
 
@@ -1213,6 +1301,10 @@ def main(argv):
             pos, f = flags(argv[1:], {"--built": True, "--schema": True})
             if len(pos) == 1 and f.get("--built") and f.get("--schema"):
                 return cmd_grype_db_status(pos[0], f["--built"], f["--schema"])
+        elif len(argv) >= 3 and argv[0] == "grype-db-providers":
+            return cmd_grype_db_providers(argv[1], argv[2:])
+        elif len(argv) >= 3 and argv[0] == "grype-components":
+            return cmd_grype_components(argv[1], argv[2:])
         elif len(argv) == 2 and argv[0] == "grype-report":
             return cmd_grype_report(argv[1])
         elif argv and argv[0] == "db-age":
