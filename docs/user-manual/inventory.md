@@ -425,8 +425,8 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   `/opt`. macOS: `/Library/Java`, `/usr/local`, `/opt/homebrew` and `/Applications`. The root list
   holds no per-user location, so an archive under a home directory is not looked for (a property of
   the list: an archive found under a root is read wherever it sits). Windows is not read yet: it
-  answers one `unsupported` status row (`windows:planned`). Python and Node components are not
-  collected.
+  answers one `unsupported` status row (`windows:planned`). Python distributions and Node packages
+  are listed by the `python` and `node` actions, described below.
 - **What a row holds.** Kind (`java`), name, version, where the version came from (`filename`,
   `pom`, `manifest`, or `unreadable` when no source gives one), path (a nested library is
   `<archive path>!<entry>`), size, modification time and the application folder it sits under.
@@ -534,6 +534,55 @@ Mach-O `.dylib` files on macOS. It reads each library's header in-process; no pr
   no heartbeat cost counters.
 - **When it runs.** On demand only, as an instruction, once enabled. The daily report does not
   carry these rows yet.
+
+### Python distributions and Node packages (`component_inventory`, `python` and `node`)
+
+The `component_inventory` plugin's `python` action (instruction `crossplatform.components.python`)
+lists installed Python distributions, and its `node` action (instruction
+`crossplatform.components.node`) lists installed Node packages. Both read each package's metadata
+file in-process; no process is started, no `python` or `node` is run and no script is run. Unlike
+`native`, **both are switched on from the start**: there is no kill-switch row to lift.
+
+- **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. `python`
+  on Linux: each `python3` or `python3.<digits>` directory in `/usr/local/lib`, then `/opt`; on
+  macOS: `/Library/Frameworks/Python.framework/Versions`, then each `python3.<digits>` directory in
+  `/opt/homebrew/lib` and `/usr/local/lib`. `/usr/lib` is not a root on Linux: the package manager
+  owns the interpreters under it and their distributions are already package rows. `node` on Linux:
+  `/usr/lib/node_modules`, `/usr/local/lib/node_modules` and `/opt`; on macOS:
+  `/opt/homebrew/lib/node_modules`, `/usr/local/lib/node_modules` and `/Applications`. Per-user
+  installs (home directories, `~/.local`, `~/.nvm`), custom prefixes and packages packed into an
+  Electron `asar` archive are not looked for. Windows is not read yet: each action answers one
+  `unsupported` status row (`windows:planned`).
+- **What a row holds.** Kind (`python` or `node`), name, version, where the version came from
+  (`version_source`), path of the metadata file, size, modification time and the application folder
+  it sits under. For `python` the value is `metadata`, `filename` or `unreadable`; for `node` it is
+  `package_json` or `unreadable`.
+- **How the version is read.** For `python`, from the first 16 KiB of a `METADATA` file (in a
+  `.dist-info` directory), a `PKG-INFO` file (in an `.egg-info` directory) or a single-file
+  `.egg-info`. A row with `version_source` `filename` means the metadata file could not be read or
+  parsed and the version came from the directory name; such a row is not counted by the
+  informational `version_unreadable` token. For `node`, from the first 64 KiB of the `package.json`
+  of a package directly under `node_modules` (or `node_modules/@scope`); a file larger than that, or
+  one that is not a JSON object or nests too deeply, is still listed from its directory name with
+  `version_source` `unreadable`. An unreadable metadata file is a gap in one row and does not make
+  the scan incomplete.
+- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 3,000 rows per application folder)
+  with 20,000 rows in all. `python` walks to a depth of 8; `node` nests at most 8 levels of
+  `node_modules`. Inside `site-packages` and `dist-packages` only the `.dist-info` and `.egg-info`
+  directories are listed, and for `node` nothing below a package other than its own `node_modules`
+  is listed, so an installed package's source tree is never walked; that is by design, not a gap,
+  and the count of directories passed over goes to the agent log, not to the status row.
+- **When the list may be incomplete.** The status row reads `constrained` and names one cause: a
+  bound that was reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`,
+  `dir_truncated`), a directory or the mount table that could not be read (`dir_unreadable`,
+  `mount_table_unreadable`), `archive_changed` when a metadata file changed or vanished while it was
+  read, or `internal_error`. `supported` with no rows means none was found at those roots, not that
+  none is installed.
+- **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
+  read of up to 45 seconds on one device that cannot be cancelled once started. `python` and `node`
+  publish no heartbeat cost counters.
+- **When it runs.** On demand only, as an instruction. The daily report does not carry these rows,
+  so they do not appear in the software inventory views.
 
 ### Install type, scope and location, and the sectioned report
 

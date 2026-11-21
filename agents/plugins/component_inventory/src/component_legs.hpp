@@ -65,11 +65,12 @@ using ChildLister = std::function<std::optional<std::vector<std::string>>(const 
 
 /// The machine roots the `python` action walks, in walk order. A Python install is a directory
 /// `python3` or `python3.<digits>` beside the libraries, and the scan wants the distributions inside it,
-/// so this lists ONE directory per OS through `children` (it is the only function in this header that
-/// does I/O, and only through the injected lister) and keeps those names; nothing else under it is
-/// walked here. Linux: each child of /usr/local/lib named `python3` or `python3.<digits>`, then /opt.
-/// /usr/lib is NOT a root: the interpreter trees under it are owned by the package manager and their
-/// distributions are already package rows, the same principle the `native` roots state above. macOS:
+/// so this lists the parent directories named below through `children` (one on Linux, two on macOS;
+/// it is the only function in this header that does I/O, and only through the injected lister) and
+/// keeps those names; nothing else under them is walked here. Linux: each child of /usr/local/lib
+/// named `python3` or `python3.<digits>`, then /opt. /usr/lib is NOT a root: the interpreter trees
+/// under it are owned by the package manager and their distributions are already package rows, the
+/// same principle the `native` roots state above. macOS:
 /// /Library/Frameworks/Python.framework/Versions, then each child of /opt/homebrew/lib and
 /// /usr/local/lib named `python3.<digits>`. A parent the lister could not list is itself kept as a
 /// candidate in its children's place, so it takes the checks every other root takes: counted when on a

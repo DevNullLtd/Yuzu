@@ -127,7 +127,10 @@ template <class Keep, class Fill>
     };
 
     // At most one row per candidate, and the walk already holds its candidates to the section and
-    // per-anchor caps: this loop keeps no quota of its own.
+    // per-anchor caps: this loop keeps no quota of its own. The caps therefore count candidates
+    // before `keep` runs (the walk sees only the leaf name), so same-named files of the wrong shape
+    // use the quota and a noisy tree can end `anchor_rows` or `section_rows` with fewer rows than
+    // the cap; the answer is still honestly constrained.
     for (const auto& c : walked.candidates) {
         if (fs.now() >= deadline) {
             record(Stop::budget_time);
