@@ -591,7 +591,7 @@ implementation is.
 | mgmt_posture | posture | windows | planned | 1 | NetGetJoinInformation + HKLM\\SOFTWARE\\Microsoft\\Enrollments and CloudDomainJoin\\JoinInfo registry reads | not read yet: one unsupported status row, windows:planned |
 | middleware | ibm_mq | linux | supported | 1 | /etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name under each installation's FilePath; no dspmqver | - |
 | middleware | ibm_mq | macos | planned | 1 | installer-metadata read, not yet wired on macOS (every product) | planned; the action answers a single unsupported status row on this OS |
-| middleware | ibm_mq | windows | planned | 1 | HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both registry views | planned; the action answers a single unsupported status row on this OS |
+| middleware | ibm_mq | windows | constrained | 1 | HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both registry views | not yet verified against a real capture |
 | msi_packages | list | linux | unsupported | - | - | - |
 | msi_packages | list | macos | supported | 2 | pkgutil via bounded argv runner | - |
 | msi_packages | list | windows | supported | 1 | msi_api | - |

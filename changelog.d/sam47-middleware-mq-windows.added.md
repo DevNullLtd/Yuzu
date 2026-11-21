@@ -1,0 +1,1 @@
+- **middleware**: the `ibm_mq` action now reads IBM MQ installations on Windows from the registry (both views), and the bounded zip directory reader moves to `agents/shared` for reuse; the Windows leg reports as constrained until it is verified against a real capture.

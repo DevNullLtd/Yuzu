@@ -1,6 +1,8 @@
 /**
  * middleware_runner.hpp -- the GENERIC runner of the middleware plugin: one product leg of the table
- * (agents/shared/middleware_products.hpp) turned into data rows and status tokens.
+ * (agents/shared/middleware_products.hpp) turned into data rows and status tokens. Two runners, one
+ * per leg shape of the table: run_leg reads FILES (Linux), run_reg_leg reads the REGISTRY (Windows,
+ * the registry section below). Both build rows with format_row against the same budget.
  *
  * Pure orchestration. No OS header, no filesystem library, no logging, no thread: every OS touch goes
  * through the `Fs` the caller passes, every per-item shortfall through the `Log` callable, so the
@@ -55,6 +57,32 @@
  * exhausted, ends the walk with `<os>:middleware:walk:row_cap`; the candidate being resolved when
  * the Fs budget ran dry gets no row, because its version is no longer trustworthy.
  *
+ * THE REGISTRY LEG (run_reg_leg, MiddlewareRegFs). The Fs owns every registry call, both registry
+ * views and the entries-visited budget, and answers with an Outcome, never an exception:
+ *
+ *   RegKeys reg_subkeys(std::string_view hklm_key)
+ *               the subkey NAMES of HKLM\<key> (`truncated` = cut at the Fs's own cap; `out` = why not,
+ *               when it is not ok)
+ *   Read    reg_value(std::string_view hklm_key, std::string_view subkey, std::string_view value,
+ *                     std::size_t cap)
+ *               the REG_SZ text of HKLM\<key>\<subkey> value `value`, or why not
+ *   exhausted() / os()   as above
+ *
+ * HKLM only: nothing here names a hive. Failure never reads as absent:
+ *
+ *   installation key absent (both views)                supported, zero rows (none found)
+ *   key denied (a view refused, nothing from the other) CONSTRAINED  <probe>:permission_denied
+ *   key failed in any other way                         CONSTRAINED  <probe>:unreadable
+ *   more than kMaxRows subkeys, or cut by the Fs        CONSTRAINED  <probe>:row_cap; the first
+ *                                                       kMaxRows kept, in sorted order
+ *   entries / row / byte budget out (walk or Fs)        CONSTRAINED  walk:row_cap
+ *   some subkeys without a path value, at least one
+ *     with it                                           supported; one log line per dropped
+ *                                                       subkey (ItemReason::malformed)
+ *   every subkey without a path value                   CONSTRAINED  <probe>:malformed; wrong value
+ *                                                       names fail loudly on a host with the product
+ *   a version value missing / refused / not text        supported; logged; that row's version is "-"
+ *
  * ORDER OF THE VERSION PROBES (a per-item decision, fixed): for a candidate, every dir_name probe in
  * table order; a listing is judged ONCE per distinct sub-directory and in this order --
  *   1. out is refused / network / symlink      -> ItemReason::path_refused
@@ -108,6 +136,14 @@ struct Listing {
     Read::Outcome out = Read::Outcome::ok;
 };
 
+/// The subkeys of one registry key (MiddlewareRegFs::reg_subkeys). A default-built answer is a
+/// failure, never an empty success.
+struct RegKeys {
+    std::vector<std::string> names;
+    bool truncated = false;
+    Read::Outcome out = Read::Outcome::failed;
+};
+
 template <class F>
 concept MiddlewareFs = requires(F& fs, const F& cfs) {
     { fs.read_abs(std::string_view{}, std::size_t{}) } -> std::same_as<Read>;
@@ -115,6 +151,18 @@ concept MiddlewareFs = requires(F& fs, const F& cfs) {
     { cfs.exhausted() } -> std::convertible_to<bool>;
     { cfs.os() } -> std::convertible_to<std::string_view>;
 };
+
+template <class F>
+concept MiddlewareRegFs = requires(F& fs, const F& cfs) {
+    { fs.reg_subkeys(std::string_view{}) } -> std::same_as<RegKeys>;
+    { fs.reg_value(std::string_view{}, std::string_view{}, std::string_view{}, std::size_t{}) }
+        -> std::same_as<Read>;
+    { cfs.exhausted() } -> std::convertible_to<bool>;
+    { cfs.os() } -> std::convertible_to<std::string_view>;
+};
+
+/// The most bytes of one registry value text the runner asks for (an install path or a version).
+inline constexpr std::size_t kMaxRegValueBytes = 64 * 1024;
 
 /// A leg's row budget with both limits clamped to the production ceilings.
 [[nodiscard]] inline yuzu::shared::RowByteBudget
@@ -263,6 +311,91 @@ template <MiddlewareFs Fs, class Log>
         }
         rows.push_back(std::move(row));
     }
+    return rows;
+}
+
+/// Runs one REGISTRY leg of `p` over `fs` (the table's reg_subkeys enumerator, then its reg_value
+/// version probes) and returns its DATA rows, with the same contract as run_leg: enumeration failures
+/// are `<os>:middleware:<probe id>:<cause>` tokens in `acc`, per-item shortfalls go to `log` only, a
+/// leg with no probes yields nothing.
+template <MiddlewareRegFs Fs, class Log>
+[[nodiscard]] std::vector<std::string> run_reg_leg(const Product& p, const OsLeg& leg, Fs& fs,
+                                                   yuzu::shared::ConstraintAccumulator& acc,
+                                                   yuzu::shared::RowByteBudget& budget, Log&& log)
+    requires std::invocable<Log&, std::string_view, std::string_view, ItemReason, std::string_view>
+{
+    std::vector<std::string> rows;
+    if (leg.probes.empty())
+        return rows;
+    const std::string_view os = fs.os();
+    const auto fail = [&](std::string_view source, Cause c) {
+        acc.add_failure(make_token(os, source, c));
+    };
+
+    // 1. the enumerator: every subkey of probes[0]'s key is a candidate.
+    const Probe& enumerator = leg.probes[0]; // products_well_formed() guarantees a reg_subkeys
+    RegKeys keys = fs.reg_subkeys(enumerator.path);
+    if (keys.out == Read::Outcome::absent)
+        return rows; // no such key in either view: none found, and not a failure
+    if (keys.out != Read::Outcome::ok) {
+        // the registry has two failure causes: a refusal, and anything else
+        fail(enumerator.id, keys.out == Read::Outcome::denied ? Cause::permission_denied
+                                                              : Cause::unreadable);
+        return rows;
+    }
+    if (fs.exhausted()) { // the listing ran the entries budget dry: its names are not the whole key
+        fail("walk", Cause::row_cap);
+        return rows;
+    }
+    std::sort(keys.names.begin(), keys.names.end());
+    if (keys.truncated || keys.names.size() > kMaxRows) {
+        fail(enumerator.id, Cause::row_cap);
+        if (keys.names.size() > kMaxRows)
+            keys.names.resize(kMaxRows);
+    }
+
+    // 2. per candidate: its install path, then the version from the first reg_value probe that
+    //    yields text, then its row.
+    std::size_t dropped = 0;
+    for (const std::string& name : keys.names) {
+        Candidate c{name, {}, {}};
+        Read path = fs.reg_value(enumerator.path, name, enumerator.path_key, kMaxRegValueBytes);
+        const bool usable = path.out == Read::Outcome::ok && !path.text.empty();
+        if (usable) {
+            c.install_path = std::move(path.text);
+            for (std::size_t i = 1; i < leg.probes.size() && c.version.empty(); ++i) {
+                const Probe& pr = leg.probes[i];
+                Read v = fs.reg_value(enumerator.path, name, pr.name_key, kMaxRegValueBytes);
+                if (v.out == Read::Outcome::ok && !v.text.empty())
+                    c.version = std::move(v.text);
+                else
+                    log(std::string_view{p.id}, std::string_view{pr.id},
+                        (v.out == Read::Outcome::ok || v.out == Read::Outcome::absent)
+                            ? ItemReason::missing
+                            : ItemReason::unreadable,
+                        std::string_view{name});
+            }
+        }
+        if (fs.exhausted()) { // the reads ran the entries budget dry: this candidate gets no row
+            fail("walk", Cause::row_cap);
+            return rows;
+        }
+        if (!usable) {
+            // A data-shape fault of ONE subkey: logged, its siblings are kept.
+            ++dropped;
+            log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::malformed,
+                std::string_view{name});
+            continue;
+        }
+        std::string row = format_row(p.id, p.title, c.name, c.version, c.install_path, "");
+        if (!budget.charge(row.size())) {
+            fail("walk", Cause::row_cap);
+            return rows;
+        }
+        rows.push_back(std::move(row));
+    }
+    if (!keys.names.empty() && dropped == keys.names.size())
+        fail(enumerator.id, Cause::malformed); // every subkey dropped: incomplete, not "none found"
     return rows;
 }
 

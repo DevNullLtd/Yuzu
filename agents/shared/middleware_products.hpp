@@ -5,14 +5,23 @@
  * one row per middleware product, one leg per OS, one ordered probe list per leg.
  *
  * A product is DATA, not code. The generic runner (agents/plugins/middleware/src/
- * middleware_runner.hpp) reads a leg's probes in order:
+ * middleware_runner.hpp) reads a leg's probes in order. A leg is one of two shapes, and the table
+ * refuses a mix:
  *
+ * FILE LEG (Linux), run_leg:
  *   probes[0]   the ENUMERATOR, a kv_file probe: one absolute file holding one stanza per
  *               installation (opened by a header line); every stanza yields a candidate (name_key,
  *               path_key).
  *   probes[1..] dir_name probes: per candidate, list `<install_path>/<path>` and read the version out
  *               of a FILE NAME in it (no file content is read). The first probe whose grammar matches
  *               a name wins.
+ *
+ * REGISTRY LEG (Windows), run_reg_leg; HKEY_LOCAL_MACHINE only, never a user hive:
+ *   probes[0]   the ENUMERATOR, a reg_subkeys probe: every subkey of one fixed key (`path`, relative to
+ *               HKLM, backslash-separated) is a candidate NAMED BY THE SUBKEY; `path_key` is the
+ *               REG_SZ value of the subkey holding its install path.
+ *   probes[1..] reg_value probes: per candidate, the version is the REG_SZ value named `name_key` on
+ *               the candidate's own key. The first probe that yields text wins.
  *
  * A leg is PLANNED exactly when it has no probes. macOS is PLANNED for every product, so the plugin
  * declares one shared constant for it instead of a leg per product. Every field is a plain
@@ -40,6 +49,8 @@ namespace yuzu::middleware {
 enum class ProbeKind : std::uint8_t {
     kv_file,  ///< one absolute file of `key=value` lines, split into stanzas
     dir_name, ///< the version is a substring of a file NAME in a directory under the install path
+    reg_subkeys, ///< enumerator: every subkey of one HKLM key is a candidate (path, path_key)
+    reg_value,   ///< version: the REG_SZ value `name_key` on the candidate's own registry key
 };
 
 /// The file-name grammar of a dir_name probe. Name == prefix + rest + suffix, rest non-empty.
@@ -56,12 +67,12 @@ struct Probe {
     const char* id; ///< [a-z0-9_]+, unique within the leg; the `<source>` of this probe's status tokens
     ProbeKind kind;
     /// kv_file: the absolute file. dir_name: the sub-directory under a candidate's install path
-    /// (a single component, no separator).
+    /// (a single component, no separator). reg_subkeys: the key under HKLM, backslash-separated.
     const char* path;
     /// kv_file: the exact header line that opens a stanza.
     const char* stanza;
-    const char* name_key;    ///< kv_file: the key naming the installation
-    const char* path_key;    ///< kv_file: the key holding its install path
+    const char* name_key;    ///< kv_file: the key naming the installation. reg_value: the value name
+    const char* path_key;    ///< kv_file and reg_subkeys: the key / value holding its install path
     const char* name_prefix; ///< dir_name: file-name prefix
     const char* name_suffix; ///< dir_name: file-name suffix
     NameForm name_form;      ///< dir_name: the grammar between prefix and suffix
@@ -104,6 +115,18 @@ inline constexpr std::array<Probe, 3> kIbmMqLinuxProbes{{
      NameForm::exact},
 }};
 
+/// IBM MQ on Windows: every subkey of `Installation` is one installation, named by the subkey; its
+/// `FilePath` value is the install path and its `VRMF` value the version, read in both registry views.
+/// The key and the two value names come from IBM's documentation, NOT from a capture of a real
+/// install, so the leg is CONSTRAINED: the runner turns a wrong spelling into a loud
+/// `installation_key:malformed` on a host that has the product.
+inline constexpr std::array<Probe, 2> kIbmMqWindowsProbes{{
+    {"installation_key", ProbeKind::reg_subkeys, "SOFTWARE\\IBM\\WebSphere MQ\\Installation",
+     nullptr, nullptr, "FilePath", nullptr, nullptr, NameForm::exact},
+    {"vrmf", ProbeKind::reg_value, nullptr, nullptr, "VRMF", nullptr, nullptr, nullptr,
+     NameForm::exact},
+}};
+
 inline constexpr std::array<Product, 1> kProducts{{
     {.id = "ibm_mq",
      .title = "IBM MQ",
@@ -114,10 +137,10 @@ inline constexpr std::array<Product, 1> kProducts{{
                "/etc/opt/mqm/mqinst.ini Installation: stanzas; version from the swidtag file name "
                "under each installation's FilePath; no dspmqver",
                nullptr, kIbmMqLinuxProbes},
-     .windows = {YUZU_SUPPORT_PLANNED,
+     .windows = {YUZU_SUPPORT_CONSTRAINED,
                  "HKLM\\SOFTWARE\\IBM\\WebSphere MQ\\Installation\\<name> FilePath/VRMF in both "
                  "registry views",
-                 kPlannedNote, {}}},
+                 "not yet verified against a real capture", kIbmMqWindowsProbes}},
 }};
 
 [[nodiscard]] constexpr const Product* find_product(std::string_view id) noexcept {
@@ -171,9 +194,40 @@ namespace detail {
     return true;
 }
 
+/// A key path under HKLM: backslash-separated plain components, no leading or trailing backslash, no
+/// empty, `.` or `..` component and no `/` (the registry has no relative or forward-slash form).
+[[nodiscard]] constexpr bool is_plain_reg_path(std::string_view s) noexcept {
+    if (s.empty() || s.front() == '\\' || s.back() == '\\' || s.find('/') != std::string_view::npos)
+        return false;
+    std::size_t pos = 0;
+    while (pos <= s.size()) {
+        auto bs = s.find('\\', pos);
+        if (bs == std::string_view::npos)
+            bs = s.size();
+        const std::string_view part = s.substr(pos, bs - pos);
+        if (part.empty() || part == "." || part == "..")
+            return false;
+        pos = bs + 1;
+    }
+    return true;
+}
+
+[[nodiscard]] constexpr bool is_registry_kind(ProbeKind k) noexcept {
+    return k == ProbeKind::reg_subkeys || k == ProbeKind::reg_value;
+}
+
+/// An enumerator is a kv_file (file leg) or a reg_subkeys (registry leg) probe.
 [[nodiscard]] constexpr bool enumerator_well_formed(const Probe& p) noexcept {
+    if (p.kind == ProbeKind::reg_subkeys)
+        return is_plain_reg_path(sv(p.path)) && !sv(p.path_key).empty();
     return p.kind == ProbeKind::kv_file && is_plain_abs_path(sv(p.path)) &&
            !sv(p.name_key).empty() && !sv(p.path_key).empty() && !sv(p.stanza).empty();
+}
+
+/// A version probe follows its enumerator's shape: dir_name after kv_file, reg_value after
+/// reg_subkeys.
+[[nodiscard]] constexpr bool reg_value_probe_well_formed(const Probe& p) noexcept {
+    return p.kind == ProbeKind::reg_value && !sv(p.name_key).empty();
 }
 
 [[nodiscard]] constexpr bool dir_probe_well_formed(const Probe& p) noexcept {
@@ -183,7 +237,9 @@ namespace detail {
            !sv(p.name_prefix).empty() && !sv(p.name_suffix).empty();
 }
 
-[[nodiscard]] constexpr bool leg_well_formed(const OsLeg& leg) noexcept {
+/// `registry` is true for the Windows leg: it holds registry probes only, and the Linux leg holds
+/// file probes only (run_leg and run_reg_leg each read their own shape and nothing else).
+[[nodiscard]] constexpr bool leg_well_formed(const OsLeg& leg, bool registry) noexcept {
     if (leg.support != YUZU_SUPPORT_PLANNED && leg.support != YUZU_SUPPORT_CONSTRAINED &&
         leg.support != YUZU_SUPPORT_SUPPORTED)
         return false;
@@ -198,7 +254,11 @@ namespace detail {
         for (std::size_t j = 0; j < i; ++j)
             if (sv(leg.probes[j].id) == sv(p.id))
                 return false;
-        if (!(i == 0 ? enumerator_well_formed(p) : dir_probe_well_formed(p)))
+        if (is_registry_kind(p.kind) != registry)
+            return false;
+        const bool version_ok =
+            registry ? reg_value_probe_well_formed(p) : dir_probe_well_formed(p);
+        if (!(i == 0 ? enumerator_well_formed(p) : version_ok))
             return false;
     }
     return true;
@@ -227,7 +287,7 @@ namespace detail {
             if (detail::sv(table[j].id) == detail::sv(p.id) ||
                 detail::sv(table[j].ecosystem) == detail::sv(p.ecosystem))
                 return false;
-        if (!detail::leg_well_formed(p.linux) || !detail::leg_well_formed(p.windows))
+        if (!detail::leg_well_formed(p.linux, false) || !detail::leg_well_formed(p.windows, true))
             return false;
     }
     return true;

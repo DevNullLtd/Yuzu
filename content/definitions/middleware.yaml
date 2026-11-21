@@ -3,18 +3,19 @@
 ## subprocess. Table-driven: one action per product of agents/shared/middleware_products.hpp.
 ## Plugin: middleware | Actions: ibm_mq
 ##
-## SHIPPED LEG: Linux only, rung 1 (installer-metadata file reads; no `dspmqver` or `dspmqinst`
+## SHIPPED LEGS: Linux and Windows, rung 1 (installer-metadata reads; no `dspmqver` or `dspmqinst`
 ## process is ever started).
 ##   Linux ibm_mq: /etc/opt/mqm/mqinst.ini `Installation:` stanzas (Name, FilePath); the version
 ##                 comes from the PRODUCT tag file name under each installation's FilePath/swidtag
 ##                 (`ibm.com_IBM_MQ*-<v>.swidtag`, else exactly `IBM_MQ-<v>.mqtag`). Bundled
 ##                 component tags (GSKit, JRE, Runtime, Messages_*) never name the product.
+##   Windows ibm_mq: every subkey of HKLM\SOFTWARE\IBM\WebSphere MQ\Installation, in both registry
+##                 views, is one installation named by the subkey; `FilePath` is its install path and
+##                 `VRMF` its version. The two value names come from vendor documentation, not a
+##                 capture, so the leg is declared constrained until a real install confirms them.
 ##
-## WINDOWS AND macOS: planned; the action answers a single unsupported status row on this OS.
-## Until then every action on those hosts answers a single
-## `status|<action>|unsupported|<windows|macos>:planned` row. The planned Windows mechanism is
-## declared in the product table (HKLM\SOFTWARE\IBM\WebSphere MQ\Installation\<name> in both
-## registry views).
+## macOS: planned; the action answers a single unsupported status row
+## (`status|<action>|unsupported|macos:planned`).
 ##
 ## Every action's output is: one `status|<action>|<level>|<reason>` row FIRST, then zero or
 ## more `<action>|<title>|<name>|<version>|<install_path>|<edition>` rows. A `supported` status
@@ -32,20 +33,22 @@ metadata:
   displayName: IBM MQ Inventory
   version: 1.0.0
   description: >
-    Reports installed IBM MQ installations on Linux: one row per installation
-    (title, name, version, install path). Reads the /etc/opt/mqm/mqinst.ini
-    `Installation:` stanzas and takes the version from the product tag file name
-    under each installation's FilePath/swidtag. No `dspmqver` process is started.
+    Reports installed IBM MQ installations on Linux and Windows: one row per
+    installation (title, name, version, install path). On Linux it reads the
+    /etc/opt/mqm/mqinst.ini `Installation:` stanzas and takes the version from the
+    product tag file name under each installation's FilePath/swidtag. On Windows it
+    reads the HKLM Installation subkeys in both registry views (FilePath and VRMF
+    values; the value names are unverified against a real capture). No `dspmqver`
+    process is started.
     A `supported` status with no rows means no registered installation was found;
     a `constrained` status means a read failed or was skipped and the list may be
-    incomplete. Windows and macOS: planned; the action answers a single
-    unsupported status row on this OS
-    (`status|ibm_mq|unsupported|<windows|macos>:planned`).
+    incomplete. macOS: planned; the action answers a single unsupported status row
+    (`status|ibm_mq|unsupported|macos:planned`).
   tags: [middleware, ibm_mq, inventory]
 
 spec:
   type: question
-  platforms: [linux]
+  platforms: [linux, windows]
 
   execution:
     plugin: middleware
@@ -65,32 +68,32 @@ spec:
         description: 'Row shape discriminator (the wire row''s leading tag). Values: status (exactly one per result, always first), ibm_mq (one per installation found).'
         values: [status, ibm_mq]
         example: ibm_mq
-        platforms: [linux]
+        platforms: [linux, windows]
       - name: title
         type: string
         description: 'Product display name, fixed per action (IBM MQ). Status rows: the action name.'
         example: IBM MQ
-        platforms: [linux]
+        platforms: [linux, windows]
       - name: name
         type: string
-        description: 'Installation name: the mqinst.ini Name value, for example Installation1. Status rows: the level (supported, constrained or unsupported).'
+        description: 'Installation name: the mqinst.ini Name value (Linux) or the installation registry subkey name (Windows), for example Installation1. Status rows: the level (supported, constrained or unsupported).'
         example: Installation1
-        platforms: [linux]
+        platforms: [linux, windows]
       - name: version
         type: string
-        description: 'Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. VRM (version.release.modification): the fix-pack level is not carried, so a fix pack 9.3.5.1 reports 9.3.5. Status rows: the comma-joined failure tokens, or -.'
+        description: 'Installation version taken from the product tag file name (ibm.com_IBM_MQ*-<v>.swidtag, else IBM_MQ-<v>.mqtag; component tags such as GSKit or Runtime never name the product), or "-" when it cannot be read. Linux: VRM (version.release.modification), the fix-pack level is not carried, so a fix pack 9.3.5.1 reports 9.3.5. Windows: the VRMF registry value as the installer wrote it. Status rows: the comma-joined failure tokens, or -.'
         example: 9.4.5
-        platforms: [linux]
+        platforms: [linux, windows]
       - name: install_path
         type: string
-        description: 'Absolute path of the installation (the mqinst.ini FilePath value).'
+        description: 'Absolute path of the installation (the mqinst.ini FilePath value on Linux, the FilePath registry value on Windows).'
         example: /opt/mqm
-        platforms: [linux]
+        platforms: [linux, windows]
       - name: edition
         type: string
         description: 'Always "-" for ibm_mq: the installer metadata the agent reads carries no edition field.'
         example: "-"
-        platforms: [linux]
+        platforms: [linux, windows]
 
   readablePayload: "List installed IBM MQ installations"
 
