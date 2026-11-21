@@ -771,7 +771,8 @@ generate_fw_helper_content() {
 # snapshot takes exactly one argument, the word snapshot, and only reads. It prints three sections,
 # each headed by a line `== <label>` and holding the tool's output: `== nft -a list ruleset`,
 # `== iptables -S` and `== ip6tables -S`. A tool that is not installed prints `[absent]` and one that
-# exits non-zero adds a `[failed]` line after whatever it printed. The listing ends with `== end`,
+# exits non-zero adds a `[failed]` line after whatever it printed (a newline is written first, so the
+# marker never joins a line the tool left unfinished). The listing ends with `== end`,
 # the whole of it is cut at 1048576 bytes, and the exit status is 0. A listing that was cut has no
 # `== end`. The tools are run with their own fixed arguments and nothing from the caller. It reads
 # the host ruleset, which includes rule handles, and writes nothing.
@@ -844,7 +845,9 @@ tok_is() {
 }
 
 # snap_one LABEL TOOL ARGS: one section of the snapshot. Reads only: the tool is run with the
-# fixed arguments the caller of this function names, and its standard error is dropped.
+# fixed arguments the caller of this function names, and its standard error is dropped. A failed
+# tool's marker is written after a newline, so it is a line of its own even when the tool died in
+# the middle of one (a reader that matches the whole line `[failed]` then always sees it).
 snap_one() {
     printf '== %s\n' "$1"
     snap_tool=$2
@@ -853,7 +856,7 @@ snap_one() {
         printf '[absent]\n'
         return 0
     fi
-    "$snap_tool" "$@" 2>/dev/null || printf '[failed]\n'
+    "$snap_tool" "$@" 2>/dev/null || printf '\n[failed]\n'
 }
 
 # host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 1 MiB, so a listing

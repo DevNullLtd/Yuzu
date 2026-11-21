@@ -734,9 +734,21 @@ class SnapshotRuns(unittest.TestCase):
         for shell in available_shells():
             r = self.run_helper(shell, self.make_helper({"/usr/sbin/iptables": failing}), ["snapshot"])
             self.assertEqual((r.returncode, r.stderr), (0, ""), (shell, "the helper exits 0 and drops stderr"))
-            self.assertIn("== iptables -S\npartial\n[failed]\n== ip6tables -S\n", r.stdout, shell)
+            self.assertIn("== iptables -S\npartial\n\n[failed]\n== ip6tables -S\n", r.stdout, shell)
             self.assertTrue(r.stdout.endswith("== end\n"), shell)
             self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+
+    def test_the_failed_marker_is_a_line_of_its_own_even_after_a_half_written_line(self):
+        # A tool that dies in the middle of a line must not leave the marker glued to it: a reader
+        # that matches the whole line `[failed]` (the restore comparison does) would miss it.
+        halfway = 'printf "table inet filter {\\n\\tchain input {"; exit 1\n'
+        for shell in available_shells():
+            r = self.run_helper(shell, self.make_helper({"/usr/sbin/nft": halfway}), ["snapshot"])
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertIn("\tchain input {\n[failed]\n== iptables -S\n", r.stdout, shell)
+            self.assertIn("[failed]", r.stdout.split("\n"), (shell, "the marker is not a whole line"))
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+            self.assertTrue(r.stdout.endswith("== end\n"), shell)
 
     def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
         big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
