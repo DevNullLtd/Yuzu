@@ -267,6 +267,7 @@ inline constexpr std::array<UnitOsRow, 251> kUnitOs{{
     {"msi_packages", "list", kWin | kMac},
     {"msi_packages", "product_codes", kWin | kMac},
     {"msi_packages", "list_inventory", kWin},
+    {"msi_packages", "installer_records", kWin},
     {"netprobe", "icmp", kWin | kLin | kMac},
     {"netprobe", "tcp", kWin | kLin | kMac},
     {"netprobe", "dns", kWin | kLin | kMac},

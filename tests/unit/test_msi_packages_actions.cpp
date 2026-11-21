@@ -38,8 +38,10 @@
 
 #include "local_dispatcher.hpp"
 
+#include <cctype>
 #include <cstdlib>
 #include <filesystem>
+#include <map>
 #include <optional>
 #include <set>
 #include <sstream>
@@ -135,8 +137,8 @@ std::vector<std::string> split_lines(const std::string& captured) {
 
 #if defined(__APPLE__)
 
-TEST_CASE("msi_packages plugin: the descriptor declares the three actions and macOS answers "
-          "list_inventory unsupported",
+TEST_CASE("msi_packages plugin: the descriptor declares the four actions and macOS answers "
+          "list_inventory and installer_records unsupported",
           "[msi_packages][posix_actions]") {
     auto plugin = load_msi_packages_plugin();
     if (!plugin) {
@@ -145,7 +147,8 @@ TEST_CASE("msi_packages plugin: the descriptor declares the three actions and ma
     std::vector<std::string> names;
     for (const char* const* a = plugin->descriptor->actions; a && *a; ++a)
         names.emplace_back(*a);
-    CHECK(names == std::vector<std::string>{"list", "product_codes", "list_inventory"});
+    CHECK(names == std::vector<std::string>{"list", "product_codes", "list_inventory",
+                                            "installer_records"});
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "list_inventory");
@@ -153,6 +156,13 @@ TEST_CASE("msi_packages plugin: the descriptor declares the three actions and ma
     CHECK(split_lines(result.captured) ==
           std::vector<std::string>{"status|list_inventory|unsupported|macos:owned_by_installed_apps"});
     CHECK(result.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
+
+    // Windows Installer records exist only on Windows: one status row, rc 0, no rec rows.
+    auto records = dispatcher.run(plugin->descriptor, "installer_records");
+    CHECK(records.rc == 0);
+    CHECK(split_lines(records.captured) ==
+          std::vector<std::string>{"status|installer_records|unsupported|macos:no_windows_installer"});
+    CHECK(records.result_status == YUZU_RESULT_STATUS_UNAVAILABLE);
 }
 
 TEST_CASE("msi_packages plugin: list executes real pkgutil --pkgs/--pkg-info argv",
@@ -204,6 +214,26 @@ std::size_t raw_token_count(const std::string& line) {
     return n;
 }
 
+std::vector<std::string> split_pipes(const std::string& line) {
+    std::vector<std::string> out;
+    std::size_t pos = 0;
+    for (;;) {
+        const auto bar = line.find('|', pos);
+        if (bar == std::string::npos) {
+            out.push_back(line.substr(pos));
+            return out;
+        }
+        out.push_back(line.substr(pos, bar - pos));
+        pos = bar + 1;
+    }
+}
+
+std::string upper_ascii(std::string s) {
+    for (char& c : s)
+        c = static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+    return s;
+}
+
 bool enumerate_codes(DWORD ctx, const wchar_t* sid, std::set<std::string>& out, UINT& rc_out) {
     wchar_t code[39]{};
     MSIINSTALLCONTEXT got{};
@@ -233,7 +263,8 @@ TEST_CASE("msi_packages plugin: list_inventory shape on the real Windows leg",
     std::vector<std::string> names;
     for (const char* const* a = plugin->descriptor->actions; a && *a; ++a)
         names.emplace_back(*a);
-    CHECK(names == std::vector<std::string>{"list", "product_codes", "list_inventory"});
+    CHECK(names == std::vector<std::string>{"list", "product_codes", "list_inventory",
+                                            "installer_records"});
 
     yuzu::agent::LocalDispatcher dispatcher;
     auto result = dispatcher.run(plugin->descriptor, "list_inventory");
@@ -249,7 +280,7 @@ TEST_CASE("msi_packages plugin: list_inventory shape on the real Windows leg",
     bool any_named = false;
     for (std::size_t i = 1; i < lines.size(); ++i) {
         CHECK(lines[i].rfind("inv|{", 0) == 0);
-        CHECK(raw_token_count(lines[i]) == 5);
+        CHECK(raw_token_count(lines[i]) == 6); // code, name, version, publisher, upgrade_code
         const auto code_end = lines[i].find('|', 4);
         REQUIRE(code_end != std::string::npos);
         CHECK(code_end - 4 == 38); // {GUID}
@@ -296,6 +327,85 @@ TEST_CASE("msi_packages plugin: list_inventory never lists a per-user-only produ
     for (const auto& line : split_lines(result.captured))
         for (const auto& c : per_user_only)
             CHECK(line.find(c) == std::string::npos);
+}
+
+TEST_CASE("msi_packages plugin: installer_records answers a leading status row and well-formed rec rows",
+          "[msi_packages][installer_records][windows_actions]") {
+    auto plugin = load_msi_packages_plugin();
+    if (!plugin) {
+        FAIL("msi_packages.dll not found -- the plugin did not build");
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto result = dispatcher.run(plugin->descriptor, "installer_records");
+    CHECK(result.rc == 0);
+
+    const auto lines = split_lines(result.captured);
+    REQUIRE_FALSE(lines.empty());
+    const auto status = split_pipes(lines[0]);
+    REQUIRE(status.size() == 4);
+    CHECK(status[0] == "status");
+    CHECK(status[1] == "installer_records");
+    // A refused identity (the UserData tree is for SYSTEM and administrators) is a legitimate
+    // constrained answer; what it must never be is unsupported on Windows.
+    CHECK((status[2] == "supported" || status[2] == "constrained"));
+    if (status[2] == "supported")
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_FULL);
+    else
+        CHECK(result.result_completeness == YUZU_RESULT_COMPLETENESS_PARTIAL);
+
+    for (std::size_t i = 1; i < lines.size(); ++i) {
+        INFO(lines[i]);
+        const auto f = split_pipes(lines[i]);
+        REQUIRE(f.size() == 15);
+        CHECK(f[0] == "rec");
+        CHECK(f[1].size() == 38); // {GUID}, unpacked from the registry key name
+        CHECK(f[1].front() == '{');
+        CHECK(f[1].back() == '}');
+        CHECK_FALSE(f[14].empty()); // the reason column is `-` when there is none, never empty
+    }
+}
+
+TEST_CASE("msi_packages plugin: a package upgrade code equals list_inventory's sixth token",
+          "[msi_packages][installer_records][windows_actions]") {
+    auto plugin = load_msi_packages_plugin();
+    if (!plugin) {
+        FAIL("msi_packages.dll not found -- the plugin did not build");
+    }
+    yuzu::agent::LocalDispatcher dispatcher;
+    const auto inventory = split_lines(dispatcher.run(plugin->descriptor, "list_inventory").captured);
+    if (inventory.size() <= 1)
+        SKIP("this host has no machine-context MSI products");
+    const auto records = split_lines(dispatcher.run(plugin->descriptor, "installer_records").captured);
+    REQUIRE_FALSE(records.empty());
+    const auto status = split_pipes(records[0]);
+    REQUIRE(status.size() == 4);
+    if (status[2] != "supported")
+        SKIP("installer_records was " << status[2] << " (" << status[3] << ") on this identity");
+
+    // the sixth token of each list_inventory row, keyed by upper-cased product code
+    std::map<std::string, std::string> sixth;
+    for (std::size_t i = 1; i < inventory.size(); ++i) {
+        const auto f = split_pipes(inventory[i]);
+        REQUIRE(f.size() == 6);
+        sixth[upper_ascii(f[1])] = f[5];
+    }
+
+    // A product whose cached package carries an UpgradeCode must be given that same code by the
+    // registry map. A disagreement is an escalation (the map and the databases cannot both be
+    // the source), never something to paper over here.
+    std::size_t with_upgrade_code = 0;
+    for (std::size_t i = 1; i < records.size(); ++i) {
+        const auto f = split_pipes(records[i]);
+        REQUIRE(f.size() == 15);
+        if (f[9].empty())
+            continue;
+        ++with_upgrade_code;
+        INFO("product " << f[1] << " package upgrade code " << f[9]);
+        const auto it = sixth.find(upper_ascii(f[1]));
+        REQUIRE(it != sixth.end());
+        CHECK(it->second == f[9]);
+    }
+    CHECK(with_upgrade_code > 0);
 }
 
 TEST_CASE("msi_packages plugin: the legacy list action is unchanged by list_inventory",

@@ -50,7 +50,7 @@ using yuzu::server::DispatchClass;
 using yuzu::server::Mutability;
 namespace authz = yuzu::server::authz;
 
-inline constexpr std::array<CommandCapability, 43> kPluginActionCatalogueD{{
+inline constexpr std::array<CommandCapability, 44> kPluginActionCatalogueD{{
     // ── tags (agents/plugins/tags/src/tags_plugin.cpp) ──────────────────────
     // Local <data_dir>/tags.json store; no server round-trip. All 7 actions
     // from the plugin's actions() table, in order.
@@ -386,6 +386,16 @@ inline constexpr std::array<CommandCapability, 43> kPluginActionCatalogueD{{
     {
         .plugin = "msi_packages",
         .action = "list_inventory",
+        .dispatch_class = DispatchClass::ReadOnly,
+        .mutability = Mutability::None,
+        .securable = "Inventory",
+        .operation = authz::Operation::Read,
+        .risk_tier = authz::RiskTier::Low,
+        .execute_gate = ExecuteGate::None,
+    },
+    {
+        .plugin = "msi_packages",
+        .action = "installer_records",
         .dispatch_class = DispatchClass::ReadOnly,
         .mutability = Mutability::None,
         .securable = "Inventory",

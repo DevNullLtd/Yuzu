@@ -1,6 +1,7 @@
 Directory: tests/unit/fixtures/software-estate/msi_packages/windows/
 Captured 2026-10-17 for the msi_packages list_inventory tests (test_msi_packages_inventory.cpp,
-loaded through YUZU_TEST_FIXTURE_DIR).
+loaded through YUZU_TEST_FIXTURE_DIR). products-system.txt is a capture; installer-records-system.txt
+and corrupt-package.msi (last section) are NOT captures.
 
 products-system.txt
   Status: REAL CAPTURE, one redaction (below)
@@ -34,3 +35,37 @@ products-system.txt
             returned ERROR_MORE_DATA (234) with the reported length excluding the NUL (15 for
             "Python Launcher"). These are the codes the plugin treats as "the product has no such
             property"; any other code is a failed read.
+
+installer-records-system.txt
+  Status: SYNTHETIC. It is hand-written, not captured, and must not be read as evidence of what a
+          Windows host registers. No Windows capture of the Installer UserData tree was available
+          when the installer_records action was written, so the Windows leg of that action is
+          declared CONSTRAINED ("not yet verified against a real capture") until a capture on a
+          Windows host replaces this file.
+  Used by:  test_msi_installer_records.cpp (loaded through YUZU_TEST_FIXTURE_DIR).
+  Format:   the shape `reg query` shows for
+              HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData\S-1-5-18\Products\<packed>\InstallProperties
+            and for HKLM\SOFTWARE\Classes\Installer\UpgradeCodes: a Products subkey name is a product
+            code in Windows Installer's packed 32-digit form (the first three GUID groups reversed
+            whole, each pair of digits swapped in the last two), the InstallProperties values are
+            REG_SZ strings (InstallDate as YYYYMMDD, LocalPackage as C:\WINDOWS\Installer\<hex>.msi),
+            and each UpgradeCodes subkey is a packed upgrade code whose value NAMES are packed
+            product codes. The packed forms were produced by an independent implementation of the
+            documented rule and checked against the published example
+            {AC76BA86-7AD7-1033-7B44-AC0F074E4100} = 68AB67CA7DA73301B744CAF070E41400.
+  Origin of the values:
+            product codes, names, versions and publishers of the first four products are copied from
+            products-system.txt (the real capture above) for realism; every other value (the
+            LocalPackage names, install dates and sources, the user-profile paths under the
+            synthetic account `jsmith`, and ALL five upgrade codes) is invented and carries no host
+            data. The upgrade codes are NOT the codes those products really register.
+  Shapes:   seven products with an InstallProperties key (one with a user-profile install location
+            and source, one whose LocalPackage is outside the Installer directory, one with no
+            LocalPackage), one Products subkey with no InstallProperties key, and five UpgradeCodes
+            subkeys (one product named under two upgrade codes). The missing-package and
+            corrupt-package shapes are built in the test, not stored here.
+
+corrupt-package.msi
+  Status: SYNTHETIC. A small file that is not an OLE compound document, so MsiOpenDatabaseW refuses
+          it. It is opened only by the Windows-only body of test_msi_database_read.cpp, which copies
+          it into a yuzu_test_ scratch directory first.

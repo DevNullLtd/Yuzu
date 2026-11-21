@@ -1,9 +1,9 @@
 /**
  * msi_packages_inventory.hpp -- pure row builder for msi_packages.list_inventory.
  *
- * No Windows headers: the OS boundary (MsiEnumProductsExW / MsiGetProductInfoExW)
- * is injected as two callables, so the builder is unit-tested on every OS from a
- * committed real capture.
+ * No Windows headers: the OS boundary (MsiEnumProductsExW / MsiGetProductInfoExW, and
+ * the UpgradeCodes registry map) is injected as three callables, so the builder is
+ * unit-tested on every OS from a committed real capture.
  *
  * Wire grammar (consumed by parse_msi_packages_list_inventory_output in
  * agents/core/src/sync_source_installed_software.cpp). The status row is
@@ -11,12 +11,21 @@
  * the same helper pkg_inventory uses and the collector parses with:
  *
  *   status|list_inventory|<supported|constrained|unsupported>|<tokens or ->
- *   inv|<product_code>|<name>|<version>|<publisher>      (one per product)
+ *   inv|<product_code>|<name>|<version>|<publisher>|<upgrade_code>   (one per product)
  *
  * The status row always leads. There is no sentinel row: zero products is
  * `status|list_inventory|supported|-` and nothing else. A property the product
  * does not have is an EMPTY token, never `-`; a property read that FAILS makes
  * the status row `constrained` (see classify_property_error).
+ *
+ * upgrade_code is the braced upper-case UpgradeCode the Installer registry map
+ * (HKLM\SOFTWARE\Classes\Installer\UpgradeCodes) records for the product, EMPTY
+ * when the map names the product under no upgrade code or under more than one, or
+ * is absent or over its cap (msi_installer_records.hpp build_upgrade_map). It is a
+ * registry read only, so it is the same every day for the same installed set. A
+ * FAILED read of the map is a failure token that constrains the roster, exactly as a
+ * failed property read does, so no row is sent with a token a fault emptied. The
+ * collector tolerates a fifth or a sixth token.
  */
 #pragma once
 
@@ -79,6 +88,7 @@ struct Product {
     std::string name;
     std::string version;
     std::string publisher;
+    std::string upgrade_code;
 };
 
 struct Inventory {
@@ -95,6 +105,9 @@ struct Inventory {
 /// the read FAILED, a failure token: a failed read is never reported as an absent
 /// one. The first such token makes the roster constrained (the rows read are kept),
 /// unless the enumeration itself failed, whose token takes priority.
+/// `upgrade_code_of(code)` returns the product's upgrade code (empty when there is none)
+/// or, when the map read FAILED, a failure token that is handled exactly like a failed
+/// property read.
 ///
 /// An advertised-but-not-installed product is enumerated by the OS, but
 /// InstalledProductName, VersionString and Publisher are installed-only
@@ -102,8 +115,8 @@ struct Inventory {
 /// or ERROR_UNKNOWN_PROPERTY, which the shell maps to an empty value), so it
 /// renders `inv|{code}|||` and the collector drops the empty name. That is
 /// deliberate, not an oversight.
-template <class Enumerate, class Property>
-Inventory collect(Enumerate&& enumerate, Property&& property) {
+template <class Enumerate, class Property, class UpgradeCodeOf>
+Inventory collect(Enumerate&& enumerate, Property&& property, UpgradeCodeOf&& upgrade_code_of) {
     Inventory inv;
     std::optional<std::string> property_failure;
     auto read = [&](const std::string& code, std::string_view prop) {
@@ -119,6 +132,11 @@ Inventory collect(Enumerate&& enumerate, Property&& property) {
         p.name = read(code, kPropName);
         p.version = read(code, kPropVersion);
         p.publisher = read(code, kPropPublisher);
+        std::expected<std::string, std::string> upgrade = upgrade_code_of(code);
+        if (upgrade)
+            p.upgrade_code = std::move(*upgrade);
+        else if (!property_failure)
+            property_failure = std::move(upgrade.error());
         p.code = std::move(code);
         inv.products.push_back(std::move(p));
     };
@@ -146,7 +164,7 @@ inline std::string strip_row_breakers(std::string_view v) {
     return out;
 }
 
-/// inv|<code>|<name>|<version>|<publisher>; empty stays empty.
+/// inv|<code>|<name>|<version>|<publisher>|<upgrade_code>; empty stays empty.
 [[nodiscard]] inline std::string format_inventory_row(const Product& p) {
     std::string out = "inv|";
     out += strip_row_breakers(p.code);
@@ -156,6 +174,8 @@ inline std::string strip_row_breakers(std::string_view v) {
     out += strip_row_breakers(p.version);
     out += '|';
     out += strip_row_breakers(p.publisher);
+    out += '|';
+    out += strip_row_breakers(p.upgrade_code);
     return out;
 }
 

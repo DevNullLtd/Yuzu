@@ -15,6 +15,7 @@
  */
 #include <catch2/catch_test_macros.hpp>
 
+#include "msi_installer_records.hpp"
 #include "msi_packages_inventory.hpp"
 
 #include <algorithm>
@@ -33,6 +34,7 @@
 
 namespace fs = std::filesystem;
 namespace inv = yuzu::msi_packages::inventory;
+namespace rec = yuzu::msi_packages::records;
 
 namespace {
 
@@ -132,7 +134,9 @@ struct FakeSource {
     }
 };
 
-inv::Inventory run(FakeSource& src) {
+// The upgrade-code callable: served from the pure map builder, as the plugin does. A null map
+// answers every product with no upgrade code.
+inv::Inventory run(FakeSource& src, const rec::UpgradeMap* map = nullptr) {
     return inv::collect(
         [&](unsigned c, auto&& on_code) { return src.enumerate(c, on_code); },
         [&](const std::string& code, unsigned c,
@@ -140,7 +144,27 @@ inv::Inventory run(FakeSource& src) {
             if (src.failing.count({code, std::string{p}}))
                 return std::unexpected(std::string{"windows:msi_prop:1610"});
             return src.property(code, c, p).value_or(std::string{});
+        },
+        [&](const std::string& code) -> std::expected<std::string, std::string> {
+            if (map == nullptr)
+                return std::string{};
+            return map->resolve(code);
         });
+}
+
+constexpr const char* kUpgradeA = "{7E1A4B20-5C3D-4F68-9A01-2B3C4D5E6F70}";
+constexpr const char* kUpgradeB = "{7E1A4B21-5C3D-4F68-9A01-2B3C4D5E6F71}";
+constexpr const char* kUpgradeC = "{7E1A4B22-5C3D-4F68-9A01-2B3C4D5E6F72}";
+
+// SYNTHETIC upgrade codes over products of the real capture: CMake is named under one upgrade
+// code, 7-Zip under two (so it has no single answer), every other product under none.
+rec::UpgradeMap make_map(std::optional<std::string> failure = std::nullopt) {
+    return rec::build_upgrade_map([&](auto&& on_upgrade) -> std::optional<std::string> {
+        on_upgrade(*rec::pack_guid(kUpgradeA), std::vector<std::string>{*rec::pack_guid(kCMake)});
+        on_upgrade(*rec::pack_guid(kUpgradeB), std::vector<std::string>{*rec::pack_guid(kSevenZip)});
+        on_upgrade(*rec::pack_guid(kUpgradeC), std::vector<std::string>{*rec::pack_guid(kSevenZip)});
+        return failure;
+    });
 }
 
 } // namespace
@@ -189,17 +213,18 @@ TEST_CASE("msi inventory: render emits the status row first then the captured pr
         return {};
     };
     CHECK(lines[1] ==
-          std::string{"inv|"} + kPythonLauncher + "|Python Launcher|3.14.6150.0|Python Software Foundation");
+          std::string{"inv|"} + kPythonLauncher + "|Python Launcher|3.14.6150.0|Python Software Foundation|");
     const auto cmake = find_line(std::string{"inv|"} + kCMake);
-    CHECK(cmake == std::string{"inv|"} + kCMake + "|CMake|4.3.4|Kitware");
+    CHECK(cmake == std::string{"inv|"} + kCMake + "|CMake|4.3.4|Kitware|");
 
     for (std::size_t i = 0; i < lines.size(); ++i) {
         // InstallLocation and InstallSource are never emitted.
         CHECK(lines[i].find("C:\\Program Files\\CMake") == std::string::npos);
         if (i == 0)
             continue;
-        // The collector splits on RAW '|' with no escape awareness: exactly 5 tokens.
-        CHECK(split_raw(lines[i]).size() == 5);
+        // The collector splits on RAW '|' with no escape awareness: exactly 6 tokens (the sixth
+        // is the upgrade code, empty here: no map was given).
+        CHECK(split_raw(lines[i]).size() == 6);
         CHECK(lines[i].find("\\|") == std::string::npos);
     }
     CHECK(find_line(std::string{"inv|"} + kPerUserCode).empty());
@@ -218,7 +243,7 @@ TEST_CASE("msi inventory: a property that is not set is an empty field",
         return l.rfind(std::string{"inv|"} + kSevenZip, 0) == 0;
     });
     REQUIRE(it != lines.end());
-    CHECK(*it == std::string{"inv|"} + kSevenZip + "|7-Zip 26.04 (x64 edition)|26.04.00.0|");
+    CHECK(*it == std::string{"inv|"} + kSevenZip + "|7-Zip 26.04 (x64 edition)|26.04.00.0||");
 
     // SYNTHETIC, the advertised-only shape: nothing readable at all.
     FakeSource none;
@@ -227,7 +252,7 @@ TEST_CASE("msi inventory: a property that is not set is an empty field",
     const auto adv = inv::render(run(none));
     REQUIRE(adv.size() == 119);
     CHECK(adv[0] == "status|list_inventory|supported|-");
-    CHECK(adv[1] == std::string{"inv|"} + kPythonLauncher + "|||");
+    CHECK(adv[1] == std::string{"inv|"} + kPythonLauncher + "||||");
 }
 
 TEST_CASE("msi inventory: an enumeration failure is constrained and keeps the rows read",
@@ -326,19 +351,25 @@ TEST_CASE("msi inventory: row breakers are deleted and a backslash is kept",
     p.publisher = "Contoso\\Tools";
     const auto row = inv::format_inventory_row(p);
 
-    CHECK(row == "inv|{11111111-2222-3333-4444-555555555555}|ABCD|1.0|Contoso\\Tools");
-    CHECK(split_raw(row).size() == 5);
+    CHECK(row == "inv|{11111111-2222-3333-4444-555555555555}|ABCD|1.0|Contoso\\Tools|");
+    CHECK(split_raw(row).size() == 6);
     CHECK(row.find("\\|") == std::string::npos);
 
     // a NUL would cut the row at write_output's C string and drop the product
     inv::Product n;
     n.code = "{11111111-2222-3333-4444-555555555555}";
     n.name = std::string("A\0B", 3);
-    CHECK(inv::format_inventory_row(n) == "inv|{11111111-2222-3333-4444-555555555555}|AB||");
+    CHECK(inv::format_inventory_row(n) == "inv|{11111111-2222-3333-4444-555555555555}|AB|||");
 
     inv::Product q;
     q.code = "{AAAAAAAA-|-BBBB}";
-    CHECK(inv::format_inventory_row(q) == "inv|{AAAAAAAA--BBBB}|||");
+    CHECK(inv::format_inventory_row(q) == "inv|{AAAAAAAA--BBBB}||||");
+
+    // the upgrade code is a field like any other: a breaker in it is deleted
+    inv::Product u;
+    u.code = "{11111111-2222-3333-4444-555555555555}";
+    u.upgrade_code = "{7E1A|4B20}\n";
+    CHECK(inv::format_inventory_row(u) == "inv|{11111111-2222-3333-4444-555555555555}||||{7E1A4B20}");
 }
 
 TEST_CASE("msi inventory: unsupported status rows and the dash for empty tokens",
@@ -357,4 +388,81 @@ TEST_CASE("msi inventory: zero products is one status row and no sentinel",
     const auto lines = inv::render(run(src));
     REQUIRE(lines.size() == 1);
     CHECK(lines[0] == "status|list_inventory|supported|-");
+}
+
+TEST_CASE("msi inventory: rows always carry six tokens, the sixth empty without a single upgrade code",
+          "[msi_packages][msi_inventory]") {
+    FakeSource src;
+    src.rows = load_fixture();
+    const auto map = make_map();
+    const auto roster = run(src, &map);
+    CHECK_FALSE(roster.constraint.has_value());
+    const auto lines = inv::render(roster);
+
+    REQUIRE(lines.size() == 119);
+    CHECK(lines[0] == "status|list_inventory|supported|-");
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        CHECK(split_raw(lines[i]).size() == 6);
+    const auto sixth = [&](std::string_view code) {
+        for (const auto& l : lines)
+            if (l.rfind(std::string{"inv|"} + std::string{code} + "|", 0) == 0)
+                return split_raw(l)[5];
+        FAIL("no row for " << code);
+        return std::string{};
+    };
+    CHECK(sixth(kCMake) == kUpgradeA);       // one upgrade code names it
+    CHECK(sixth(kSevenZip).empty());          // two do: no single answer
+    CHECK(sixth(kPythonLauncher).empty());    // none does
+    // the upgrade code is data on the product, not a name or a version
+    for (const auto& p : roster.products)
+        CHECK(p.upgrade_code == (p.code == kCMake ? kUpgradeA : ""));
+}
+
+TEST_CASE("msi inventory: the same map and product list give byte-identical rows every time",
+          "[msi_packages][msi_inventory]") {
+    // The server hashes the row into instance_key, so a token that changed between two runs over
+    // the same installed set would churn the stored rows.
+    FakeSource a;
+    a.rows = load_fixture();
+    FakeSource b;
+    b.rows = load_fixture();
+    const auto map = make_map();
+    const auto first = inv::render(run(a, &map));
+    const auto second = inv::render(run(b, &map));
+    CHECK(first == second);
+    const auto again = inv::render(run(b, &map));
+    CHECK(first == again);
+}
+
+TEST_CASE("msi inventory: a map read fault constrains the roster; an absent map leaves the sixth token empty",
+          "[msi_packages][msi_inventory]") {
+    // a fault: the status row names it, every row is still there, and no sixth token is served
+    FakeSource src;
+    src.rows = load_fixture();
+    const auto faulty = make_map(rec::upgrade_map_failure_token(5));
+    const auto roster = run(src, &faulty);
+    REQUIRE(roster.constraint.has_value());
+    CHECK(*roster.constraint == "windows:msi_upgrade_map:5");
+    const auto lines = inv::render(roster);
+    CHECK(lines[0] == "status|list_inventory|constrained|windows:msi_upgrade_map:5");
+    CHECK(lines.size() == 119);
+    for (std::size_t i = 1; i < lines.size(); ++i)
+        CHECK(split_raw(lines[i])[5].empty());
+
+    // an enumeration failure keeps its priority over a map fault
+    FakeSource both;
+    both.rows = load_fixture();
+    both.fail_token = "windows:msi_enum:1610";
+    both.fail_after = 2;
+    CHECK(inv::render(run(both, &faulty))[0] == "status|list_inventory|constrained|windows:msi_enum:1610");
+
+    // an absent UpgradeCodes key is an empty map, not a fault: supported, every sixth token empty
+    FakeSource absent;
+    absent.rows = load_fixture();
+    const auto none = rec::build_upgrade_map(
+        [](auto&&) -> std::optional<std::string> { return std::nullopt; });
+    const auto clean = inv::render(run(absent, &none));
+    CHECK(clean[0] == "status|list_inventory|supported|-");
+    for (std::size_t i = 1; i < clean.size(); ++i)
+        CHECK(split_raw(clean[i])[5].empty());
 }

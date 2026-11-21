@@ -601,6 +601,9 @@ implementation is.
 | msi_packages | list_inventory | linux | unsupported | - | - | no Windows Installer on Linux |
 | msi_packages | list_inventory | macos | unsupported | - | - | installed_apps.list_inventory owns the pkgutil receipt roster (ecosystem macos_pkgutil) |
 | msi_packages | list_inventory | windows | supported | 1 | msi_api (MsiEnumProductsExW machine context) | machine context only: per-user MSI products are never listed; measured as SYSTEM and as an admin user, non-elevated unmeasured |
+| msi_packages | installer_records | linux | unsupported | - | - | no Windows Installer on Linux |
+| msi_packages | installer_records | macos | unsupported | - | - | Windows Installer records exist only on Windows |
+| msi_packages | installer_records | windows | constrained | 1 | registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached package | not yet verified against a real capture; machine context only; nothing is executed; 5000 records, 5 s per package, 45 s of package reads per dispatch |
 | netprobe | icmp | linux | constrained | 1 | SOCK_DGRAM ICMP ping socket | requires net.ipv4.ping_group_range to admit the process group; reports not-permitted otherwise |
 | netprobe | icmp | macos | supported | 1 | SOCK_DGRAM ICMP ping socket | - |
 | netprobe | icmp | windows | supported | 1 | IcmpSendEcho | - |

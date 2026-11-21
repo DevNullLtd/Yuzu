@@ -2071,7 +2071,7 @@ std::string msi_rendered_fixture(std::size_t* machine_rows = nullptr) {
         REQUIRE(f.size() == 7);
         if (f[1] != "4")
             continue; // the per-user row (ctx 2) is never listed
-        inv.products.push_back({f[0], f[3], f[4], f[5]});
+        inv.products.push_back({f[0], f[3], f[4], f[5], {}});
     }
     if (machine_rows)
         *machine_rows = inv.products.size();
@@ -2126,7 +2126,7 @@ TEST_CASE("msi_packages adapter: a pipe-bearing product survives the producer/co
     // the adapter drops it and entries.size() == 1 fails.
     msi::Inventory inv;
     inv.products.push_back({"{11111111-2222-3333-4444-555555555555}", "Foo | Bar Agent", "1.0",
-                            "Foo | Bar Ltd"});
+                            "Foo | Bar Ltd", {}});
     std::string out;
     for (const auto& row : msi::render(inv))
         out += row + '\n';
@@ -2196,13 +2196,29 @@ TEST_CASE("msi_packages adapter: status grammar", "[sync][parse][adapter][msi_pa
 TEST_CASE("msi_packages adapter: row shape", "[sync][parse][adapter][msi_packages]") {
     const std::string ok_status = "status|list_inventory|supported|-";
     const std::string good = "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0|Pub";
-    SECTION("a 4-token and a 6-token inv row are dropped, never truncated or padded") {
-        // MUTATION: split_tokens truncation to 5 would map the 6-token row.
+    SECTION("a 4-token and a 7-token inv row are dropped, never truncated or padded") {
+        // MUTATION: split_tokens truncation to 6 would map the 7-token row.
         const auto r = parse_msi_packages_list_inventory_output(
-            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|extra",
-                good + "|extra|more"}));
+            nl({ok_status, "inv|{AAAAAAAA-0000-0000-0000-000000000001}|App|1.0", good + "|u|more"}));
         CHECK(r.status == Status::ok);
         CHECK(r.entries.empty());
+    }
+    SECTION("a 6-token row with an empty sixth token maps exactly as the 5-token row does") {
+        // The producer sends the registry-map upgrade code as a sixth token. Until the consuming
+        // adapter lands the token is read past, so an EMPTY sixth token (no single upgrade code
+        // for the product) must map identically; this case holds before and after that adapter.
+        const auto five = parse_msi_packages_list_inventory_output(nl({ok_status, good}));
+        const auto six = parse_msi_packages_list_inventory_output(nl({ok_status, good + "|"}));
+        REQUIRE(five.status == Status::ok);
+        REQUIRE(six.status == Status::ok);
+        REQUIRE(five.entries.size() == 1);
+        REQUIRE(six.entries.size() == 1);
+        CHECK(six.entries[0].name == five.entries[0].name);
+        CHECK(six.entries[0].version == five.entries[0].version);
+        CHECK(six.entries[0].publisher == five.entries[0].publisher);
+        CHECK(six.entries[0].package_id == five.entries[0].package_id);
+        CHECK(six.entries[0].kind == five.entries[0].kind);
+        CHECK(six.entries[0].ecosystem == five.entries[0].ecosystem);
     }
     SECTION("an empty code is mapped with an empty package_id (the adapter invents no key)") {
         const auto r = parse_msi_packages_list_inventory_output(nl({ok_status, "inv||name|1|pub"}));
@@ -3047,8 +3063,13 @@ TEST_CASE("characterisation: msi list_inventory",
               res("ok", "",
                   {entry_of("n", "", "", "pkg", "msi", "{aaaaaaaa-0000-0000-0000-000000000001}")}));
     }
+    SECTION("a sixth token (the producer's upgrade code) is read past and maps the same row") {
+        const auto five = run({sup, "inv|" + code + "|App|1.0|Pub"});
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|"}) == five);
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|{BBBBBBBB-0000-0000-0000-000000000002}"}) == five);
+    }
     SECTION("rows that are not mapped") {
-        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) == res("ok", ""));
+        CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|upgrade|extra"}) == res("ok", ""));
         CHECK(run({sup, "msi|" + code + "|App|1.0|-"}) == res("ok", ""));
         CHECK(run({sup, "package|homebrew|a|1|formula"}) == res("ok", ""));
         CHECK(run({sup, "INV|" + code + "|App|1.0|Pub"}) == res("ok", ""));
@@ -4696,8 +4717,8 @@ TEST_CASE("collector: every inventory action's rows carry exactly the publisher 
     g_fake[2].out["list"] = capture_section("windows_optional_features", "windows.txt", "list");
     {
         msi::Inventory inv;
-        inv.products.push_back({"{A}", "Contoso Msi", "1.0", "Contoso Ltd"});
-        inv.products.push_back({"{B}", "Vendorless Msi", "1.0", ""});
+        inv.products.push_back({"{A}", "Contoso Msi", "1.0", "Contoso Ltd", {}});
+        inv.products.push_back({"{B}", "Vendorless Msi", "1.0", "", {}});
         std::string out;
         for (const auto& row : msi::render(inv))
             out += row + '\n';

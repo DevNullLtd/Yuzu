@@ -6,6 +6,10 @@
  *   "product_codes"  — Returns compact list of package identifiers.
  *   "list_inventory" — Machine-context MSI products for the daily
  *                      installed-software inventory (see below).
+ *   "installer_records" — Windows only. What Windows Installer itself recorded
+ *                      per machine product (the InstallProperties registry values
+ *                      and the Property table of the cached package), read-only
+ *                      and bounded; see msi_installer_records.hpp.
  *
  * Windows: `list` and `product_codes` enumerate MSI products via
  *   MsiEnumProductsA; the code slot is a real {GUID} product code. They stay on
@@ -16,7 +20,15 @@
  *   MsiEnumProductsExW(szUserSid=NULL, MSIINSTALLCONTEXT_MACHINE) and reads
  *   InstalledProductName / VersionString / Publisher with MsiGetProductInfoExW.
  *   Per-user products are never listed by it. The wire grammar and the pure row
- *   builder live in msi_packages_inventory.hpp.
+ *   builder live in msi_packages_inventory.hpp. Its sixth token is the product's
+ *   UpgradeCode from the Installer registry map (HKLM\SOFTWARE\Classes\Installer\
+ *   UpgradeCodes, read once per dispatch with Reg*W; no file is opened).
+ *   `installer_records` enumerates HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\
+ *   Installer\UserData\S-1-5-18\Products (64-bit view, Reg*W), gates each LocalPackage
+ *   path, holds a no-reparse handle on the file and hands the read of its Property table
+ *   to agent-core (agents/core/src/msi_database_read.cpp), which owns the detached,
+ *   single-flight, bounded worker so nothing here can run on a thread that outlives this
+ *   plugin. No product is opened, repaired, installed or configured.
  * macOS: enumerates `pkgutil --pkgs` receipts; the code slot is the honest
  *   reverse-domain package identifier (e.g. "com.apple.pkg.Core") — never a
  *   fabricated GUID.
@@ -29,15 +41,20 @@
 
 #include <yuzu/plugin.hpp>
 
+#include <chrono>
 #include <expected>
 #include <format>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <thread>
+#include <vector>
 
+#include "msi_installer_records.hpp"
 #include "msi_packages_inventory.hpp"
 
 namespace inv = yuzu::msi_packages::inventory;
+namespace rec = yuzu::msi_packages::records;
 
 #ifdef _WIN32
 #ifndef WIN32_LEAN_AND_MEAN
@@ -50,7 +67,14 @@ namespace inv = yuzu::msi_packages::inventory;
 #include <msi.h>
 #pragma comment(lib, "msi.lib")
 
+#include <spdlog/spdlog.h>
+
+#include <win_no_reparse_open.hpp> // yuzu::win::open_file_no_reparse (installer_records)
+#include <win_profiles.hpp>        // enumerate_profile_list / expand_env_strings (privacy roots)
+#include <win_reg_handle.hpp>      // yuzu::win::RegKey
 #include <win_str.hpp> // yuzu::win::to_wide / from_wide (list_inventory W/Ex leg)
+
+#include <yuzu/agent/msi_database_read.hpp> // bounded read of a cached package's Property table
 
 // String property names for MsiGetProductInfoA
 static constexpr const char* kInstalledProductName = "InstalledProductName";
@@ -189,6 +213,216 @@ std::expected<std::string, std::string> read_product_property(const std::string&
     // NUL-terminated scan (not the reported length): a value is cut at its first
     // NUL, as the registry readers do (win_str.hpp reg_sz_to_utf8).
     return yuzu::win::from_wide(buf.c_str());
+}
+
+// ── installer_records / upgrade-code map: registry shell ────────────────────────
+//
+// Reg*W only (never Reg*A), always the 64-bit view, machine hive only: the per-user
+// UserData trees (a user SID) are never read. Every decision (caps, reasons, tokens,
+// the privacy rule) is in msi_installer_records.hpp; this is plumbing.
+constexpr const wchar_t* kProductsKey =
+    L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Installer\\UserData\\S-1-5-18\\Products";
+constexpr const wchar_t* kUpgradeCodesKey = L"SOFTWARE\\Classes\\Installer\\UpgradeCodes";
+constexpr const wchar_t* kProfileListKey =
+    L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\ProfileList";
+constexpr REGSAM kRead64 = KEY_READ | KEY_WOW64_64KEY;
+
+bool key_absent(LSTATUS rc) { return rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND; }
+
+// Reads one string value into `out`. 0 on success, with `out` empty when the value is
+// absent; else the failing code. A value that is not a string (ERROR_INVALID_DATA) or is
+// longer than kMaxValueChars (ERROR_MORE_DATA) is a failure, never a silent empty.
+unsigned read_string_value(HKEY key, const wchar_t* name, std::string& out) {
+    out.clear();
+    DWORD type = 0;
+    DWORD bytes = 0;
+    LSTATUS rc = RegQueryValueExW(key, name, nullptr, &type, nullptr, &bytes);
+    if (rc == ERROR_FILE_NOT_FOUND)
+        return 0;
+    if (rc != ERROR_SUCCESS)
+        return static_cast<unsigned>(rc);
+    if (type != REG_SZ && type != REG_EXPAND_SZ)
+        return ERROR_INVALID_DATA;
+    if (bytes > rec::kMaxValueChars * sizeof(wchar_t))
+        return ERROR_MORE_DATA;
+    std::vector<wchar_t> buf(bytes / sizeof(wchar_t) + 1, L'\0');
+    DWORD got = bytes;
+    rc = RegQueryValueExW(key, name, nullptr, &type, reinterpret_cast<LPBYTE>(buf.data()), &got);
+    if (rc != ERROR_SUCCESS)
+        return static_cast<unsigned>(rc);
+    out = yuzu::win::reg_sz_to_utf8(buf.data(), got);
+    return 0;
+}
+
+// Calls on_name(std::string) -> bool (false = stop) for each subkey name of `key`. 0 when the
+// walk ended or was stopped, else the failing code. A key name is at most 255 characters, so
+// the 256-character buffer cannot overflow.
+template <class OnName>
+LSTATUS walk_subkey_names(HKEY key, OnName&& on_name) {
+    wchar_t name[256];
+    for (DWORD i = 0;; ++i) {
+        DWORD len = 256;
+        const LSTATUS rc =
+            RegEnumKeyExW(key, i, name, &len, nullptr, nullptr, nullptr, nullptr);
+        if (rc == ERROR_NO_MORE_ITEMS)
+            return ERROR_SUCCESS;
+        if (rc != ERROR_SUCCESS)
+            return rc;
+        if (!on_name(yuzu::win::from_wide(name, static_cast<int>(len))))
+            return ERROR_SUCCESS;
+    }
+}
+
+// Products subkeys (packed product codes). An absent key is an empty walk.
+template <class OnKey>
+std::optional<std::string> enumerate_product_keys(OnKey&& on_key) {
+    yuzu::win::RegKey root;
+    LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProductsKey, 0, kRead64, root.put());
+    if (key_absent(rc))
+        return std::nullopt;
+    if (rc != ERROR_SUCCESS)
+        return rec::registry_failure_token(static_cast<unsigned>(rc));
+    rc = walk_subkey_names(root.get(), on_key);
+    if (rc != ERROR_SUCCESS)
+        return rec::registry_failure_token(static_cast<unsigned>(rc));
+    return std::nullopt;
+}
+
+// The InstallProperties values of one product. nullopt = the product has no such key;
+// a failure token = the read FAILED (never reported as an absent key).
+std::expected<std::optional<rec::InstallProps>, std::string>
+read_install_properties(const std::string& packed) {
+    // `packed` was validated as 32 hex digits by the caller, so it cannot add a path segment.
+    const std::wstring path =
+        std::wstring(kProductsKey) + L"\\" + yuzu::win::to_wide(packed) + L"\\InstallProperties";
+    yuzu::win::RegKey key;
+    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, path.c_str(), 0, kRead64, key.put());
+    if (key_absent(rc))
+        return std::optional<rec::InstallProps>{};
+    if (rc != ERROR_SUCCESS)
+        return std::unexpected(rec::registry_failure_token(static_cast<unsigned>(rc)));
+    rec::InstallProps p;
+    const struct {
+        const wchar_t* name;
+        std::string* dest;
+    } values[] = {{L"DisplayName", &p.display_name},       {L"DisplayVersion", &p.display_version},
+                  {L"Publisher", &p.publisher},            {L"InstallLocation", &p.install_location},
+                  {L"InstallSource", &p.install_source},   {L"LocalPackage", &p.local_package},
+                  {L"InstallDate", &p.install_date}};
+    for (const auto& v : values)
+        if (const unsigned vrc = read_string_value(key.get(), v.name, *v.dest); vrc != 0)
+            return std::unexpected(rec::registry_failure_token(vrc));
+    return p;
+}
+
+// The Installer's own package cache lives under the system Windows directory.
+std::string system_windows_directory() {
+    wchar_t buf[MAX_PATH]{};
+    const UINT n = GetSystemWindowsDirectoryW(buf, MAX_PATH);
+    if (n == 0 || n >= MAX_PATH)
+        return {};
+    return yuzu::win::from_wide(buf, static_cast<int>(n));
+}
+
+// The user profiles directory and each profile's folder, for the privacy rule. A failed
+// read of either falls back to the default `%SystemDrive%\Users`: this only widens what is
+// withheld, so it never needs to fail the answer.
+std::vector<std::string> read_profile_roots() {
+    std::vector<std::string> roots;
+    std::string profiles_dir;
+    yuzu::win::RegKey list;
+    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, kProfileListKey, 0, kRead64, list.put()) ==
+            ERROR_SUCCESS &&
+        read_string_value(list.get(), L"ProfilesDirectory", profiles_dir) != 0)
+        profiles_dir.clear();
+    if (profiles_dir.empty())
+        profiles_dir = "%SystemDrive%\\Users";
+    const std::wstring expanded = yuzu::win::expand_env_strings(yuzu::win::to_wide(profiles_dir));
+    roots.push_back(yuzu::win::from_wide(expanded.c_str(), static_cast<int>(expanded.size())));
+    const auto profiles = yuzu::win::enumerate_profile_list();
+    for (const auto& p : profiles.records)
+        if (!p.profile_image_path.empty())
+            roots.push_back(p.profile_image_path);
+    return roots;
+}
+
+// A package opened with no reparse point followed below the drive root; the handle is held
+// until this object is destroyed, which the collector arranges to be after the database read.
+struct OpenedPackage {
+    rec::OpenStatus status = rec::OpenStatus::refused;
+    yuzu::win::NoReparseHandle hold;
+};
+
+OpenedPackage open_package(const std::string& path) {
+    OpenedPackage out;
+    const std::wstring wide = yuzu::win::to_wide(path);
+    if (wide.size() < 3)
+        return out;
+    const wchar_t root[] = {wide[0], L':', L'\\', L'\0'};
+    if (GetDriveTypeW(root) != DRIVE_FIXED)
+        return out; // refused: only a local fixed drive is ever opened
+    auto opened = yuzu::win::open_file_no_reparse(wide);
+    if (opened.status == yuzu::win::NoReparseOpen::absent) {
+        out.status = rec::OpenStatus::absent;
+        return out;
+    }
+    if (opened.status != yuzu::win::NoReparseOpen::ok)
+        return out;
+    BY_HANDLE_FILE_INFORMATION info{};
+    if (!GetFileInformationByHandle(opened.file.get(), &info) ||
+        (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0)
+        return out;
+    out.hold = std::move(opened.file);
+    out.status = rec::OpenStatus::ok;
+    return out;
+}
+
+// UpgradeCodes subkeys with their value names (packed product codes), at most
+// kMaxUpgradeValueNames + 1 of each. An absent key is an empty walk.
+template <class OnUpgrade>
+std::optional<std::string> enumerate_upgrade_codes(OnUpgrade&& on_upgrade) {
+    yuzu::win::RegKey root;
+    const LSTATUS rc = RegOpenKeyExW(HKEY_LOCAL_MACHINE, kUpgradeCodesKey, 0, kRead64, root.put());
+    if (key_absent(rc))
+        return std::nullopt;
+    if (rc != ERROR_SUCCESS)
+        return rec::upgrade_map_failure_token(static_cast<unsigned>(rc));
+    std::optional<std::string> failure;
+    const LSTATUS walk = walk_subkey_names(root.get(), [&](std::string packed) {
+        yuzu::win::RegKey sub;
+        const LSTATUS orc =
+            RegOpenKeyExW(root.get(), yuzu::win::to_wide(packed).c_str(), 0, kRead64, sub.put());
+        if (key_absent(orc))
+            return true; // removed since it was listed
+        if (orc != ERROR_SUCCESS) {
+            failure = rec::upgrade_map_failure_token(static_cast<unsigned>(orc));
+            return false;
+        }
+        std::vector<std::string> names;
+        wchar_t vname[256];
+        for (DWORD j = 0; names.size() <= rec::kMaxUpgradeValueNames; ++j) {
+            DWORD len = 256;
+            const LSTATUS vrc =
+                RegEnumValueW(sub.get(), j, vname, &len, nullptr, nullptr, nullptr, nullptr);
+            if (vrc == ERROR_NO_MORE_ITEMS)
+                break;
+            if (vrc == ERROR_MORE_DATA) {
+                names.emplace_back(); // longer than any packed code: counted as not a GUID
+                continue;
+            }
+            if (vrc != ERROR_SUCCESS) {
+                failure = rec::upgrade_map_failure_token(static_cast<unsigned>(vrc));
+                return false;
+            }
+            names.push_back(yuzu::win::from_wide(vname, static_cast<int>(len)));
+        }
+        return on_upgrade(std::move(packed), std::move(names));
+    });
+    if (failure)
+        return failure;
+    if (walk != ERROR_SUCCESS)
+        return rec::upgrade_map_failure_token(static_cast<unsigned>(walk));
+    return std::nullopt;
 }
 #elif defined(__APPLE__)
 // Direct-argv, shell-free replacement for the old `/bin/sh -c` hop (Wave 4
@@ -406,9 +640,26 @@ int do_product_codes(yuzu::CommandContext& ctx) {
 // A status answer is not a failed command, so every leg returns 0.
 int do_list_inventory(yuzu::CommandContext& ctx) {
 #ifdef _WIN32
+    // The upgrade-code map is a registry read, once per dispatch: no file is opened and no
+    // worker is started for it, so the sixth token is the same every day for the same set.
+    const auto upgrades = rec::build_upgrade_map(
+        [](auto&& on_upgrade) { return enumerate_upgrade_codes(on_upgrade); });
     const auto roster = inv::collect(
         [](unsigned c, auto&& on_code) { return enumerate_machine_products(c, on_code); },
-        read_product_property);
+        read_product_property,
+        [&upgrades](const std::string& code) { return upgrades.resolve(code); });
+    if (upgrades.over_cap)
+        spdlog::warn("msi_packages: the UpgradeCodes map is over its cap; every upgrade_code "
+                     "token is empty for this dispatch");
+    else if (!upgrades.failure) {
+        std::size_t none = 0;
+        for (const auto& p : roster.products)
+            none += p.upgrade_code.empty() ? 1 : 0;
+        if (none != 0 || upgrades.ambiguous != 0 || upgrades.bad_names != 0)
+            spdlog::info("msi_packages: upgrade_code empty for {} product(s) ({} named under more "
+                         "than one upgrade code); {} map name(s) not a packed GUID",
+                         none, upgrades.ambiguous, upgrades.bad_names);
+    }
     for (auto& row : inv::render(roster))
         ctx.write_output(std::move(row));
     if (roster.constraint)
@@ -429,11 +680,46 @@ int do_list_inventory(yuzu::CommandContext& ctx) {
     return 0;
 }
 
+// installer_records: what Windows Installer recorded per machine product. Buffer-then-emit
+// (the status row leads); a status answer is not a failed command, so every leg returns 0.
+int do_installer_records(yuzu::CommandContext& ctx) {
+#ifdef _WIN32
+    rec::Context rctx;
+    rctx.windows_dir = system_windows_directory();
+    rctx.profile_roots = read_profile_roots();
+    const auto set = rec::collect_records(
+        rctx, [](auto&& on_key) { return enumerate_product_keys(on_key); }, read_install_properties,
+        open_package, [](const std::string& path, std::chrono::milliseconds deadline) {
+            return yuzu::agent::msi::read_property_table(path, deadline);
+        });
+    if (set.non_guid_subkeys != 0)
+        spdlog::warn("msi_packages: {} Products subkey(s) are not a packed GUID and were skipped",
+                     set.non_guid_subkeys);
+    for (auto& row : rec::render(set))
+        ctx.write_output(std::move(row));
+    if (set.constraints.any_failure())
+        ctx.set_result_status(YUZU_RESULT_STATUS_CONSTRAINED, YUZU_RESULT_COMPLETENESS_PARTIAL,
+                              set.constraints.reason());
+    else
+        ctx.set_result_status(YUZU_RESULT_STATUS_OK, YUZU_RESULT_COMPLETENESS_FULL, "");
+#else
+#if defined(__APPLE__)
+    constexpr std::string_view token = "macos:no_windows_installer";
+#else
+    constexpr std::string_view token = "linux:no_msi";
+#endif
+    ctx.write_output(rec::unsupported_status_row(token));
+    ctx.set_result_status(YUZU_RESULT_STATUS_UNAVAILABLE, YUZU_RESULT_COMPLETENESS_PARTIAL, token);
+#endif
+    return 0;
+}
+
 // ── ABI4 capability declarations (#2204) ────────────────────────────────────
 //
 // windows: MsiEnumProductsA/MsiGetProductInfoA (list, product_codes) and
 // MsiEnumProductsExW/MsiGetProductInfoExW (list_inventory) -- native MSI API,
-// rung 1.
+// rung 1. installer_records: Reg*W over the Installer UserData tree plus a bounded,
+// read-only open of the cached package database (agent-core) -- also rung 1.
 // macos: pkgutil --pkgs / --pkg-info via the bounded argv runner (Wave 4
 // PR4.3a, ADR-3002 rung 2) -- direct argv, no shell hop; ships via
 // msi_packages_macos.hpp's pure parsers, unchanged.
@@ -457,6 +743,16 @@ const YuzuActionDescriptor kActionDescriptors[] = {
      {YUZU_SUPPORT_SUPPORTED, 1, "msi_api (MsiEnumProductsExW machine context)",
       "machine context only: per-user MSI products are never listed; measured as SYSTEM and "
       "as an admin user, non-elevated unmeasured"}},
+    {"installer_records",
+     /* linux   = */ {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "no Windows Installer on Linux"},
+     /* macos   = */
+     {YUZU_SUPPORT_UNSUPPORTED, 0, nullptr, "Windows Installer records exist only on Windows"},
+     /* windows = */
+     {YUZU_SUPPORT_CONSTRAINED, 1,
+      "registry (Installer UserData, Reg*W) + bounded read-only MsiOpenDatabaseW of the cached "
+      "package",
+      "not yet verified against a real capture; machine context only; nothing is executed; "
+      "5000 records, 5 s per package, 45 s of package reads per dispatch"}},
 };
 
 } // namespace
@@ -470,7 +766,8 @@ public:
     }
 
     const char* const* actions() const noexcept override {
-        static const char* acts[] = {"list", "product_codes", "list_inventory", nullptr};
+        static const char* acts[] = {"list", "product_codes", "list_inventory",
+                                     "installer_records", nullptr};
         return acts;
     }
 
@@ -483,7 +780,18 @@ public:
 
     yuzu::Result<void> init(yuzu::PluginContext& /*ctx*/) override { return {}; }
 
-    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {}
+    // Bounded quiesce (never an unbounded join): the package-read worker runs agent-core code
+    // only, so it cannot touch this plugin after an unload whichever way this resolves; the wait
+    // just lets a read that is about to finish do so before the process tears down.
+    void shutdown(yuzu::PluginContext& /*ctx*/) noexcept override {
+#ifdef _WIN32
+        const auto deadline =
+            std::chrono::steady_clock::now() + 2 * yuzu::agent::msi::kPackageDeadline;
+        while (yuzu::agent::msi::read_in_flight() &&
+               std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));
+#endif
+    }
 
     int execute(yuzu::CommandContext& ctx, std::string_view action,
                 yuzu::Params /*params*/) override {
@@ -497,6 +805,8 @@ public:
                 return do_product_codes(ctx);
             if (action == "list_inventory")
                 return do_list_inventory(ctx);
+            if (action == "installer_records")
+                return do_installer_records(ctx);
 
             ctx.write_output(std::format("unknown action: {}", action));
             return 1;

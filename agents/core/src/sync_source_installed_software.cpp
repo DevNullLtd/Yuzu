@@ -439,7 +439,10 @@ AdaptedRows parse_pkg_inventory_managers_output(const std::string& out) {
 }
 
 AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
-    // inv|<product_code>|<name>|<version>|<publisher>, machine-context MSI products.
+    // inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>], machine-context MSI
+    // products. The producer now sends a sixth token (the registry-map upgrade code); it has no
+    // installed_software slot on this branch, so it is read past and ignored, and a five-token
+    // row is still accepted.
     // The producer deletes '|', tab, CR, LF and NUL from the fields (msi_packages_inventory.hpp
     // strip_row_breakers), so no unescape is needed here and an over-wide row can only be
     // malformed. A constrained status (an enumeration error or a failed property
@@ -447,7 +450,7 @@ AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out) {
     return adapt_pkg_inventory(out, "list_inventory",
                                [](const std::vector<std::string_view>& tok,
                                   std::vector<SwEntry>& entries) {
-        if (tok[0] != "inv" || tok.size() != 5)
+        if (tok[0] != "inv" || (tok.size() != 5 && tok.size() != 6))
             return false;
         SwEntry e;
         e.name = clamp_field(tok[2], kV3MaxFieldLen);
