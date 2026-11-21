@@ -10,7 +10,7 @@
  * mqinst.ini is the REAL byte-exact file of that registered install (one stanza, 64 trailing spaces
  * in Description, no Primary key; provenance.txt has the sha256 and cites IBM's documentation).
  * The only synthetic input is kTwoInstallationsInline below, a clearly labelled inline string, and
- * every registry case: no Windows capture exists yet (fixtures/middleware/windows/provenance.txt), so
+ * every registry case: no Windows capture exists yet, so
  * FakeRegFs scripts SYNTHETIC installations.
  * Fixtures are read via YUZU_TEST_FIXTURE_DIR and REQUIREd to exist -- a missing fixture fails,
  * never skips.
@@ -36,6 +36,8 @@
  *  - registry failure never reads as absent: mapping a denied or failed key to an empty `supported`
  *    fails the registry enumerator-outcome case; dropping the every-subkey-dropped token fails the
  *    "no usable FilePath" case.
+ *  - a refused or failed view keeps its sibling's rows: returning at the token even when the Fs
+ *    holds names fails the "names beside a refused / failed view" cases.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -277,10 +279,11 @@ struct FakeRegFs {
     std::size_t exhaust_after_reads = SIZE_MAX; // exhausted() once this many values were read
     std::vector<std::string> read_calls;      // "<key>|<subkey>|<value>"
 
-    void put_keys(std::vector<std::string> names) {
-        keys[kRegKey] = mw::RegKeys{std::move(names), false, mw::Read::Outcome::ok};
+    /// `o` other than ok scripts a refused / failed view beside one that answered with `names`.
+    void put_keys(std::vector<std::string> names, mw::Read::Outcome o = mw::Read::Outcome::ok) {
+        keys[kRegKey] = mw::RegKeys{std::move(names), o};
     }
-    void put_keys_outcome(mw::Read::Outcome o) { keys[kRegKey] = mw::RegKeys{{}, false, o}; }
+    void put_keys_outcome(mw::Read::Outcome o) { keys[kRegKey] = mw::RegKeys{{}, o}; }
     void put_value(const std::string& sub, const std::string& value, std::string text) {
         values[std::string{kRegKey} + "|" + sub + "|" + value] =
             mw::Read{mw::Read::Outcome::ok, std::move(text)};
@@ -298,7 +301,7 @@ struct FakeRegFs {
     mw::RegKeys reg_subkeys(std::string_view key) {
         const auto it = keys.find(std::string{key});
         if (it == keys.end())
-            return mw::RegKeys{{}, false, mw::Read::Outcome::absent};
+            return mw::RegKeys{{}, mw::Read::Outcome::absent};
         return it->second;
     }
     mw::Read reg_value(std::string_view key, std::string_view sub, std::string_view value,
@@ -1572,6 +1575,22 @@ TEST_CASE("middleware registry runner: every enumerator outcome yields exactly i
             CHECK(r.data().empty());
         }
     }
+    SECTION("names beside a refused view: permission_denied, and the answering view's rows are kept") {
+        fs.put_keys({"A", "B"}, mw::Read::Outcome::denied);
+        fs.put_install("A", "C:\\a", "1.0.0.0");
+        fs.put_install("B", "C:\\b", "2.0.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|1.0.0.0|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|2.0.0.0|C:/b|-"});
+    }
+    SECTION("names beside a failed view: unreadable, and the answering view's rows are kept") {
+        fs.put_keys({"A"}, mw::Read::Outcome::failed);
+        fs.put_install("A", "C:\\a", "1.0.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|1.0.0.0|C:/a|-"});
+    }
 }
 
 TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and logged", "[middleware]") {
@@ -1686,12 +1705,6 @@ TEST_CASE("middleware registry runner: the row cap keeps the first rows in sorte
         const LegRun r = run_reg(fs);
         CHECK(reg_status(r) == "supported|-");
         CHECK(r.data().size() == mw::kMaxRows);
-    }
-    SECTION("an Fs that cut its own listing says row_cap too") {
-        fs.keys[kRegKey] = mw::RegKeys{{"I000"}, true, mw::Read::Outcome::ok};
-        const LegRun r = run_reg(fs);
-        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:row_cap");
-        CHECK(r.data().size() == 1);
     }
 }
 

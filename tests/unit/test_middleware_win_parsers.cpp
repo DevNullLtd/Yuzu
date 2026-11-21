@@ -4,7 +4,7 @@
  * unguarded, over a FakeOps: nothing here opens a registry key.
  *
  * SYNTHETIC. No Windows capture exists yet: the value names `FilePath` and `VRMF` come from the
- * vendor's documentation, not a capture (tests/unit/fixtures/middleware/windows/provenance.txt), so
+ * vendor's documentation, not a capture, so
  * every installation below is an inline, labelled-synthetic one.
  *
  * MUTATION NOTES (each assertion fails if the named wiring is removed):
@@ -12,6 +12,8 @@
  *  - de-duplication: dropping the case-insensitive compare fails the "present in both views" case.
  *  - failure never reads as absent: returning `absent` unless both views are `absent` is the rule;
  *    mapping a denied view to absent fails the "absent and denied" cases.
+ *  - an answering view's names beside a refused or failed one: returning plain `ok` whenever there
+ *    are names (the old rule) fails the "names in one view, the other denied / failed" cases.
  *  - value fall-through: falling through to the 32-bit view on a DENIED first answer fails the
  *    "denied is the answer" case.
  *  - decide_value: treating a non-text value as text fails the REG_DWORD / REG_BINARY case.
@@ -113,7 +115,6 @@ TEST_CASE("middleware windows: reg_subkeys merges the 64-bit and 32-bit views", 
         const mw::RegKeys k = fs.reg_subkeys(kKey);
         CHECK(k.out == mw::Read::Outcome::ok);
         CHECK(k.names == std::vector<std::string>{"Installation1", "Installation2"});
-        CHECK_FALSE(k.truncated);
     }
     SECTION("one only in the 32-bit view, the 64-bit key absent") {
         ops.put_names(RegView::v32, kKey, {"Installation9"});
@@ -172,6 +173,28 @@ TEST_CASE("middleware windows: reg_subkeys never reads a failure as absent", "[m
         const mw::RegKeys k = fs.reg_subkeys(kKey);
         CHECK(k.out == mw::Read::Outcome::ok);
         CHECK(k.names.empty());
+    }
+    SECTION("names in one view, the other denied: denied, and the names are kept") {
+        ops.put_names(RegView::v64, kKey, {"Installation1", "Installation2"});
+        ops.put_list_status(RegView::v32, kKey, RegStatus::denied);
+        auto fs = make(ops);
+        const mw::RegKeys k = fs.reg_subkeys(kKey);
+        CHECK(k.out == mw::Read::Outcome::denied);
+        CHECK(k.names == std::vector<std::string>{"Installation1", "Installation2"});
+    }
+    SECTION("names in one view, the other failed: failed, and the names are kept") {
+        ops.put_list_status(RegView::v64, kKey, RegStatus::failed);
+        ops.put_names(RegView::v32, kKey, {"Installation9"});
+        auto fs = make(ops);
+        const mw::RegKeys k = fs.reg_subkeys(kKey);
+        CHECK(k.out == mw::Read::Outcome::failed);
+        CHECK(k.names == std::vector<std::string>{"Installation9"});
+    }
+    SECTION("one view denied and the other failed: a refusal outranks a failure") {
+        ops.put_list_status(RegView::v64, kKey, RegStatus::failed);
+        ops.put_list_status(RegView::v32, kKey, RegStatus::denied);
+        auto fs = make(ops);
+        CHECK(fs.reg_subkeys(kKey).out == mw::Read::Outcome::denied);
     }
     SECTION("a refused view's names are never used") {
         win::RegListing bad;
@@ -280,7 +303,7 @@ TEST_CASE("middleware windows: the plugin sources use only the wide registry cal
     namespace fs = std::filesystem;
     const fs::path dir = fs::path{YUZU_PLUGIN_SRC_DIR} / "middleware" / "src";
     REQUIRE(fs::exists(dir));
-    std::size_t scanned = 0;
+    bool scanned_win_tu = false; // the one TU that holds the registry calls
     for (const auto& e : fs::directory_iterator{dir}) {
         const auto ext = e.path().extension();
         if (ext != ".hpp" && ext != ".cpp")
@@ -288,10 +311,10 @@ TEST_CASE("middleware windows: the plugin sources use only the wide registry cal
         std::ifstream in{e.path(), std::ios::binary};
         REQUIRE(in.is_open());
         const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
-        ++scanned;
+        scanned_win_tu = scanned_win_tu || e.path().filename() == "middleware_win.cpp";
         INFO("file: " << e.path().string());
         for (const char* banned : {"RegOpenKeyExA", "RegQueryValueExA", "RegEnumKeyExA", "RegGetValueA"})
             CHECK(text.find(banned) == std::string::npos);
     }
-    CHECK(scanned >= 8);
+    CHECK(scanned_win_tu);
 }

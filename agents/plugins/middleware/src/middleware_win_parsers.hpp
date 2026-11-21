@@ -21,14 +21,15 @@
  * THE MERGE (a 32-bit installation registers under WOW6432Node, which the 32-bit view shows as the
  * plain key). FAILURE NEVER READS AS ABSENT:
  *
- *   reg_subkeys  names = the de-duplicated union of both views (ASCII case-insensitive, 64-bit
- *                spelling first);
+ *   reg_subkeys  names = the de-duplicated union of the names of the views that ANSWERED (ASCII
+ *                case-insensitive, 64-bit spelling first); a refused or failed view contributes
+ *                none, and the names the other view gave are returned whatever the outcome;
  *                absent in BOTH views            -> absent
- *                any names                       -> ok
- *                else any view denied            -> denied (never absent: an unreadable hive is not
- *                                                   "none found")
- *                else any view failed            -> failed
- *                else                            -> ok, zero names
+ *                else any view denied            -> denied (never absent, never plain ok: an
+ *                                                   unreadable view is not "none found", and the
+ *                                                   installations it holds may be missing)
+ *                else any view failed            -> failed (likewise)
+ *                else                            -> ok (zero names = the key exists and is empty)
  *   reg_value    the 64-bit view first; the 32-bit view ONLY when the first is absent. A denied,
  *                failed or oversized first answer is the answer.
  *
@@ -139,14 +140,12 @@ public:
         }
         if (absent == 2)
             out.out = Read::Outcome::absent;
-        else if (!out.names.empty())
-            out.out = Read::Outcome::ok;
         else if (denied)
-            out.out = Read::Outcome::denied;
+            out.out = Read::Outcome::denied; // the names of the other view stay in `out.names`
         else if (failed)
             out.out = Read::Outcome::failed;
         else
-            out.out = Read::Outcome::ok; // the key exists and is empty
+            out.out = Read::Outcome::ok; // answered; zero names = the key exists and is empty
         return out;
     }
 

@@ -61,8 +61,9 @@
  * views and the entries-visited budget, and answers with an Outcome, never an exception:
  *
  *   RegKeys reg_subkeys(std::string_view hklm_key)
- *               the subkey NAMES of HKLM\<key> (`truncated` = cut at the Fs's own cap; `out` = why not,
- *               when it is not ok)
+ *               the subkey NAMES of HKLM\<key> the Fs could read, and `out` = why the read was not
+ *               whole, when it is not ok (a refused or failed view can still leave the names of the
+ *               view that answered: those are kept, see below)
  *   Read    reg_value(std::string_view hklm_key, std::string_view subkey, std::string_view value,
  *                     std::size_t cap)
  *               the REG_SZ text of HKLM\<key>\<subkey> value `value`, or why not
@@ -71,10 +72,13 @@
  * HKLM only: nothing here names a hive. Failure never reads as absent:
  *
  *   installation key absent (both views)                supported, zero rows (none found)
- *   key denied (a view refused, nothing from the other) CONSTRAINED  <probe>:permission_denied
- *   key failed in any other way                         CONSTRAINED  <probe>:unreadable
- *   more than kMaxRows subkeys, or cut by the Fs        CONSTRAINED  <probe>:row_cap; the first
+ *   key refused in either view                          CONSTRAINED  <probe>:permission_denied; rows:
+ *                                                       those of the view that answered, if any
+ *   key failed in either view, in any other way         CONSTRAINED  <probe>:unreadable; rows: as
+ *                                                       above (a refusal outranks a failure)
+ *   more than kMaxRows subkeys                          CONSTRAINED  <probe>:row_cap; the first
  *                                                       kMaxRows kept, in sorted order
+ *   a listing the Fs's entries budget cut               CONSTRAINED  walk:row_cap; no rows
  *   entries / row / byte budget out (walk or Fs)        CONSTRAINED  walk:row_cap
  *   a subkey whose path value was refused (denied)      CONSTRAINED  <probe>:permission_denied;
  *                                                       that installation gets no row, its
@@ -144,7 +148,6 @@ struct Listing {
 /// failure, never an empty success.
 struct RegKeys {
     std::vector<std::string> names;
-    bool truncated = false;
     Read::Outcome out = Read::Outcome::failed;
 };
 
@@ -342,20 +345,22 @@ template <MiddlewareRegFs Fs, class Log>
     if (keys.out == Read::Outcome::absent)
         return rows; // no such key in either view: none found, and not a failure
     if (keys.out != Read::Outcome::ok) {
-        // the registry has two failure causes: a refusal, and anything else
+        // the registry has two failure causes: a refusal, and anything else. The token constrains
+        // the answer; names the Fs still holds (one view refused or failed, the other answered) are
+        // walked, so a refused view never makes the installations of the other disappear.
         fail(enumerator.id, keys.out == Read::Outcome::denied ? Cause::permission_denied
                                                               : Cause::unreadable);
-        return rows;
+        if (keys.names.empty())
+            return rows;
     }
     if (fs.exhausted()) { // the listing ran the entries budget dry: its names are not the whole key
         fail("walk", Cause::row_cap);
         return rows;
     }
     std::sort(keys.names.begin(), keys.names.end());
-    if (keys.truncated || keys.names.size() > kMaxRows) {
+    if (keys.names.size() > kMaxRows) {
         fail(enumerator.id, Cause::row_cap);
-        if (keys.names.size() > kMaxRows)
-            keys.names.resize(kMaxRows);
+        keys.names.resize(kMaxRows);
     }
 
     // 2. per candidate: its install path, then the version from the first reg_value probe that
