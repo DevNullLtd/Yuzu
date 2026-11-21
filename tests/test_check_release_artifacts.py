@@ -67,16 +67,18 @@ def journal_text(img: str, attempt: int, upto: str = "tagged", digest: str = "a"
     return "".join(lines[l] + "\n" for l in LABELS[:LABELS.index(upto) + 1])
 
 
-def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str = "trivy",
+def write_reports(d: Path, img: str, attempt: int, verdict: str = "pass", scanner: str | None = None,
                   upto=None) -> None:
-    """One attempt's gate reports; with `upto`, its publish journal too. A
-    passing Trivy attempt gets a `tagged` journal unless upto says otherwise
-    (`upto=""`: no journal)."""
-    stem = f"{scanner}-{img}.attempt-{attempt}"
-    (d / f"{stem}.json").write_text(json.dumps({"ArtifactName": img}))
-    (d / f"{stem}.txt").write_text("table\n")
-    (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\ngate: {verdict}\n")
-    if upto is None and scanner == "trivy" and verdict == "pass":
+    """One attempt's gate reports, both scanners' (Trivy and grype, as the gate
+    writes them) unless `scanner` names one; with `upto`, its publish journal
+    too. A passing two-scanner attempt gets a `tagged` journal unless upto says
+    otherwise (`upto=""`: no journal)."""
+    for sc in ([scanner] if scanner else ["trivy", "grype"]):
+        stem = f"{sc}-{img}.attempt-{attempt}"
+        (d / f"{stem}.json").write_text(json.dumps({"ArtifactName": img}))
+        (d / f"{stem}.txt").write_text("table\n")
+        (d / f"{stem}.gate.txt").write_text(f"image: {img}\nrun attempt: {attempt}\ngate: {verdict}\n")
+    if upto is None and scanner is None and verdict == "pass":
         upto = "tagged"
     if upto:
         (d / f"publish-{img}.attempt-{attempt}.txt").write_text(journal_text(img, attempt, upto, f"{attempt:x}" * 64))
@@ -183,22 +185,25 @@ class GateReports(unittest.TestCase):
         self.assertEqual(set(script_gate_report_images()), images)
 
     def test_each_missing_report_fails(self):
+        # Both scanners' reports are required for the published attempt (WP15).
         for img in script_gate_report_images():
-            for suffix in ("json", "txt", "gate.txt"):
-                with self.subTest(report=f"trivy-{img}.attempt-1.{suffix}"), \
-                        tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
-                    d = Path(t)
-                    make_artifacts(d)
-                    (d / f"trivy-{img}.attempt-1.{suffix}").unlink()
-                    r = self.run_script(d)
-                    self.assertNotEqual(r.returncode, 0)
-                    self.assertIn(f"trivy-{img}.attempt-1.{suffix}", r.stdout + r.stderr)
+            for scanner in ("trivy", "grype"):
+                for suffix in ("json", "txt", "gate.txt"):
+                    with self.subTest(report=f"{scanner}-{img}.attempt-1.{suffix}"), \
+                            tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
+                        d = Path(t)
+                        make_artifacts(d)
+                        (d / f"{scanner}-{img}.attempt-1.{suffix}").unlink()
+                        r = self.run_script(d)
+                        self.assertNotEqual(r.returncode, 0)
+                        self.assertIn(f"{scanner}-{img}.attempt-1.{suffix}", r.stdout + r.stderr)
 
     def test_an_image_with_no_report_at_all_fails(self):
         with tempfile.TemporaryDirectory(prefix="yuzu_test_rel_") as t:
             d = Path(t)
             make_artifacts(d)
-            for f in [*d.glob("trivy-yuzu-postgres.*"), *d.glob("publish-yuzu-postgres.*")]:
+            for f in [*d.glob("trivy-yuzu-postgres.*"), *d.glob("grype-yuzu-postgres.*"),
+                      *d.glob("publish-yuzu-postgres.*")]:
                 f.unlink()
             r = self.run_script(d)
             self.assertNotEqual(r.returncode, 0)
