@@ -452,8 +452,8 @@ TEST_CASE("file_search plugin: a root that is a link is refused with its own tok
     yuzu::agent::StandalonePluginContext pctx("file_search", {});
     REQUIRE(plugin->descriptor->init(pctx.get()) == 0);
 
-    Fixture fx{"yuzu_test_fs_disp_"};
     yuzu::test::ScopeExit shutdown_on_exit{[&] { plugin->descriptor->shutdown(pctx.get()); }};
+    Fixture fx{"yuzu_test_fs_disp_"};
     write_file(fx.root / "real" / "yuzu-fs-control-link-1.bin", "x");
     fs::create_directory_symlink(fx.root / "real", fx.root / "lnk");
 

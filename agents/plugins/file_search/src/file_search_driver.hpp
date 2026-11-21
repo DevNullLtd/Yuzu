@@ -560,7 +560,7 @@ inline void add_bounded_gap(std::vector<fsr::Gap>& gaps, std::size_t& dropped, s
         vol.reason = reason_for(res.stop, gov.health);
     }
 
-    NextCursor next = std::nullopt;
+    NextCursor next = std::unexpected(CursorEnd{to_token(Fault::internal_error)});
     if (!complete && gov.health != fsr::Health::ok) { // stalled or unstable: final
         counters.stalled = gov.health == fsr::Health::stalled ? 1 : 0;
         counters.unstable = gov.health == fsr::Health::unstable ? 1 : 0;
