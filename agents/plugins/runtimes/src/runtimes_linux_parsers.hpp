@@ -865,6 +865,12 @@ inline MountScan scan_mounts(const char* path, std::size_t max_total = kMaxMount
             }
             const auto fields = parse_release_file(rr.text);
             if (fields.oversized) acc.add_failure(kTokFieldOversized);
+            // A version-less file yields no row (jvm_row): decided before the probe, so it costs
+            // no budget and no bin token.
+            if (fields.java_version.empty() && fields.java_runtime_version.empty()) {
+                acc.add_failure(kTokReleaseUnparsable);
+                continue;
+            }
             std::optional<JvmFlavour> fallback = JvmFlavour::unmodelled; // IMAGE_TYPE decides
             if (!has_image_type(fields)) {
                 fallback = flavour_from_bin(hh.get(), /*java_known=*/false, acc, budget);

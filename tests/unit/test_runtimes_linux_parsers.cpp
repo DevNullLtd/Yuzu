@@ -1160,8 +1160,10 @@ TEST_CASE("runtimes linux: each bin flavour probe is charged to the entries-visi
     // entries_visited = 5 + k admits exactly k rows and then reports row_cap (the home whose probe
     // cannot be paid gets no row and the walk stops). MUTATION: charging nothing for the probe
     // returns all five rows with no row_cap at every limit below 10; charging a probe that
-    // IMAGE_TYPE made unnecessary fails the last case.
+    // IMAGE_TYPE made unnecessary fails the typed case; probing a home that can never yield a row
+    // (no version key) turns the version-less case into row_cap.
     const char* const kNoType = "JAVA_VERSION=\"17.0.1\"\n";
+    const char* const kNoVersion = "IMPLEMENTOR=\"Vendor\"\n";
     const char* const kTyped = "JAVA_VERSION=\"17.0.1\"\nIMAGE_TYPE=\"JDK\"\n";
     const std::string missing_then_cap = std::string{lnx::kTokReleaseMissing} + "," + std::string{lnx::kTokRowCap};
     struct Case { const char* release; std::size_t entries, rows; std::string reason; };
@@ -1171,7 +1173,8 @@ TEST_CASE("runtimes linux: each bin flavour probe is charged to the entries-visi
              Case{kNoType, 7, 2, std::string{lnx::kTokRowCap}},
              Case{kNoType, 5, 0, std::string{lnx::kTokRowCap}},         // the listing spends it all
              Case{"", 7, 2, missing_then_cap},                          // no release file: the same charge
-             Case{kTyped, 5, 5, ""}}) {                                 // IMAGE_TYPE decides: no probe, no charge
+             Case{kTyped, 5, 5, ""},                                    // IMAGE_TYPE decides: no probe, no charge
+             Case{kNoVersion, 5, 0, std::string{lnx::kTokReleaseUnparsable}}}) { // no row: no probe, no charge
         INFO("entries_visited=" << c.entries << " has_release=" << (*c.release != '\0')
                                 << " has_image_type=" << (c.release == kTyped));
         yuzu::test::TempDir dir{"yuzu_test_runtimes_flavour_cap_"};
