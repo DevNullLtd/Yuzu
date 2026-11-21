@@ -52,7 +52,8 @@ namespace {
 // than adding a name here. The set holds five names, for one reason: each has a REST twin that
 // exists only under /api/v1, and the ledger keys rows on fragment/legacy routes (a v1-keyed row is
 // legal only with an `exception:` status, which would be false for a tool that HAS a twin), so no
-// legal row exists yet. #6700 decides the row shape.
+// legal row exists yet. Each name leaves with the row that retires it (#6700, or the dashboard Usage
+// view's fragment row for `get_dex_apps_usage`).
 //  - three /crypto tools (`export_crypto_cbom`, `list_crypto_widgets`,
 //    `set_crypto_dashboard_layout`): the recorded owner ruling on #6558 PR 2, tracked by #6700.
 //  - `list_hardware_ci_records` (REST twin GET /api/v1/hardware-ci): the name was added with the
@@ -60,7 +61,7 @@ namespace {
 //    recorded on #6700.
 //  - `get_dex_apps_usage` (REST twin GET /api/v1/dex/apps/usage): the route is ledgered only
 //    under its /api/v1 key, which allows an exception and nothing else, so no row can name the
-//    tool until the dashboard Usage view's fragment row lands. Dropped with that row.
+//    tool until the dashboard Usage view's fragment row lands (#6700 for the row shape).
 // The change that lands #6700's row shape deletes the names above and lowers the cap back to 0.
 const std::set<std::string> kLedgerBackfill{"export_crypto_cbom", "list_crypto_widgets",
                                             "set_crypto_dashboard_layout",

@@ -142,8 +142,8 @@ DexUsageRefusalClass dex_usage_refusal_class(const DexUsageRefusal& f) {
 std::expected<DexUsageMcpRequest, std::string> dex_usage_mcp_request(const json& args) {
     if (!args.is_object())
         return std::unexpected(std::string("arguments must be a JSON object"));
-    for (const auto& [key, value] : args.items()) {
-        (void)value;
+    for (const auto& item : args.items()) {
+        const std::string& key = item.key();
         if (key != "window" && key != "platform" && key != "slice" && key != "group" &&
             key != "tag_key" && key != "floor") {
             // Cap first, neutralise second (as dex_score_policy_mcp_request does).
@@ -151,7 +151,8 @@ std::expected<DexUsageMcpRequest, std::string> dex_usage_mcp_request(const json&
                                    "'");
         }
     }
-    // A string argument's value, or the default when absent; nullopt-by-error for a non-string.
+    // Reads a string argument into `out` (the default when absent). Returns an error message for a
+    // non-string, or an empty string on success.
     const auto text = [&args](const char* name, const char* fallback,
                               std::string& out) -> std::string {
         const auto it = args.find(name);
