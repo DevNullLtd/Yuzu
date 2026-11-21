@@ -59,10 +59,14 @@ updates:
     #     is the 26.04 LTS (already used by the chiselled images), done by
     #     hand (declined #1140).
     #   hexpm/erlang: Dockerfile.gateway's builder (WP15). Its tag is the full
-    #     OTP and Alpine release (28.5.0.8-alpine-3.23.8), so a new OTP patch
-    #     arrives as a version bump; block the major, as for erlang above. A
-    #     bump to a tag on another Alpine release fails the build's abi-guard
-    #     and scripts/ci/check-gateway-base-index.py's tag check.
+    #     OTP and Alpine release (28.5.0.8-alpine-3.23.8). Dependabot compares
+    #     only tags with the same suffix (-alpine-3.23.8), so it offers an OTP
+    #     patch only while hexpm still publishes one on that Alpine patch, and
+    #     never a tag on another Alpine release: once hexpm moves to a newer
+    #     Alpine patch, re-pin the builder by hand (docs/dependency-updates.md).
+    #     The major is blocked, as for erlang above. A hand re-pin onto another
+    #     Alpine release fails the build's abi-guard and
+    #     scripts/ci/check-gateway-base-index.py's tag check.
     #   alpine: only Dockerfile.gateway's runtime stage uses it, and it must
     #     stay on the Alpine release the hexpm/erlang builder is built on (#2150).
     #     The 3.23 -> 3.24 auto-bump (#1377, reported in #2110) put the

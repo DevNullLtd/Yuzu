@@ -1261,7 +1261,11 @@ after Trivy:
   runs `--only-fixed --fail-on critical`: exit 0 passes, 2 is a finding, anything else is an
   error and fails closed. grype's `.gate.txt` records the grype version, the DB (below), the image
   ID (as the gate resolved it and as grype read it), the distro grype detected, the match counts,
-  the acceptance file's hash and what was in force, and the result.
+  the acceptance file's hash and what was in force, and the result. The two IDs are recorded, not
+  compared: on a daemon with the containerd image store `docker image inspect` returns the image's
+  manifest or index digest and grype the config digest, so they legitimately differ there (checked
+  on Docker 29.10 with the containerd store: `docker save` of the index digest of a partly pulled
+  multi-platform image succeeds, and grype reads it).
 - **OS cross-check.** When Trivy scanned the image's OS packages (`coverage: covered`), grype must
   have detected the same OS family; otherwise it matched none of those packages and the image
   fails (`grype did not detect the OS (<family>)`). An image listed as not covered has no OS
@@ -1285,8 +1289,12 @@ after Trivy:
   and is refused on GitHub Actions, like `TRIVY_BIN`; `YUZU_GRYPEIGNORE` names another acceptance
   file, which goes through the same parser.
 
+Disk: the imported grype DB takes about 3.3 GB and each image's `docker save` archive the image's
+size, both under the run's work directory (removed on exit; the archive after each image), on top
+of Trivy's DB.
+
 `tests/test_image_vuln_gate.py` runs the gate against a stub grype and a stub docker for each of
-these rules, and requires each rule's mutant (grype's exit 2 read as a pass, grype not run, the
+these rules (no CI job runs the real scanners outside a release), and requires each rule's mutant (grype's exit 2 read as a pass, grype not run, the
 archive checksum or the imported DB's status not checked, the DB age not checked, the OS
 cross-check dropped, a pending acceptance honoured in a release) to give the wrong answer on its
 scenario.
@@ -1687,7 +1695,12 @@ pinned, the Dependabot cooldown) and checks the tarball against a sha256 pinned 
 taken from the release's checksums file, whose signature was verified with `cosign verify-blob`
 (identity `anchore/grype` `release.yaml@refs/heads/main`) when pinned; re-verify on a bump. It
 installs into the same per-run directory and keeps its DB and the image archive there. grype
-(Apache-2.0) is a CI-time tool only; it ships in no image.
+(Apache-2.0) is a CI-time tool only; it ships in no image. A bump also runs the real gate once by
+hand on a locally built image and on one with a known fixable CRITICAL, because the CI tests use a
+stub grype; the pin was checked that way on 2026-11-20 (the rebuilt gateway passed; the OTP
+28.5.0.2 builder base failed on CVE-2026-89422; a generated `ignore:` rule for that CVE, package
+`erlang` `28.5.0.2` `binary`, moved exactly that match to `ignoredMatches`, and the same rule with
+another version suppressed nothing).
 
 **Accepting a finding.** Add an entry to `.trivyignore.yaml` with a scope, a `statement` (why it
 does not apply, with the evidence), an unquoted `expired_at` at most 92 days out, `approved_by`

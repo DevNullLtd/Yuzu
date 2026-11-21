@@ -249,6 +249,14 @@ GATE_DOCKER_STUB = textwrap.dedent(
     with open(os.environ["STUB_DOCKER_LOG"], "a", encoding="utf-8") as f:
         f.write(" ".join(args) + "\\n")
     mode = os.environ.get("STUB_DOCKER_MODE", "ok")
+    if args[:2] == ["image", "inspect"] and os.environ.get("STUB_DOCKER_NO_STALE_ARCHIVE") == "1":
+        # The previous image's `docker save` archive must be gone before the
+        # next image is resolved: archives are full images, on a shared runner.
+        import glob
+        stale = glob.glob(os.path.join(os.environ["RUNNER_TEMP"], "yuzu-image-vuln-gate.*", "image.tar"))
+        if stale:
+            sys.stderr.write("stale archive: %s\\n" % stale)
+            sys.exit(1)
     if args[:2] == ["image", "inspect"]:
         if args[-1] in os.environ.get("STUB_MISSING_IMAGES", "").split(","):
             sys.exit(1)
@@ -1211,6 +1219,11 @@ class GateBehaviour(unittest.TestCase):
                 r = self.run_gate("img:1", extra=("--report-dir", str(rep)), env_extra={"STUB_DOCKER_MODE": dmode})
                 self.assertEqual(r.returncode, 1, r.stdout + r.stderr)
                 self.assertIn(why, (rep / "grype-img.gate.txt").read_text(encoding="utf-8"))
+
+    def test_each_image_archive_is_removed_before_the_next_image(self):
+        r = self.run_gate("a=img:1", "b=img:2", env_extra={"STUB_DOCKER_NO_STALE_ARCHIVE": "1"})
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertEqual(len([c for c in self.dcalls() if c.startswith("save ")]), 2, self.dcalls())
 
     def test_a_trivy_failure_still_runs_grype_for_the_record(self):
         rep = self.tmp / "rep"

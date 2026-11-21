@@ -734,6 +734,7 @@ grype_scan() {
         failed=1
         summary "| $n (grype) | - | - | not a local image |"
         write_grype_gate_txt "$n" "$img" "FAIL: not an image in the local Docker daemon"
+        grype_reported[$n]=1
         return 0
     fi
     rm -f "$ARCHIVE"
@@ -743,6 +744,7 @@ grype_scan() {
         failed=1
         summary "| $n (grype) | - | - | could not export |"
         write_grype_gate_txt "$n" "$img" "FAIL: could not export the image for grype" "image id: $id"
+        grype_reported[$n]=1
         return 0
     fi
     # The record: every severity, fixed or not, and the accepted findings
@@ -759,6 +761,7 @@ grype_scan() {
         summary "| $n (grype) | - | - | could not scan |"
         [ -z "$REPORT_DIR" ] || [ ! -s "$gjson" ] || cp "$gjson" "$REPORT_DIR/"
         write_grype_gate_txt "$n" "$img" "FAIL: grype could not scan the image" "image id: $id"
+        grype_reported[$n]=1
         return 0
     fi
     cat "$gtable"

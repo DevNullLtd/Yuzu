@@ -205,7 +205,9 @@ RUN --mount=type=bind,from=builder,source=/build-abi.env,target=/tmp/build-abi.e
            "(sys_sigaltstack internal error, #1743). Needs OTP >= $otp_fix_min or musl < 1.2.6; see docs/operations/troubleshooting.md."; \
       exit 1; fi
 
-RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl \
+# zlib: the hexpm-built beam.smp links the system libz.so.1 (the erlang:28-alpine
+# one did not); declared so a slimmer base cannot drop it.
+RUN apk add --no-cache ncurses-libs libstdc++ libgcc openssl zlib \
     # bind-tools (dig) + iproute2: HA WS-4 #4555 — gateway-entrypoint.sh
     # resolves this node's own advertised distribution address by DNS-A-record
     # lookup + local-interface intersection BEFORE the BEAM starts. Busybox's
