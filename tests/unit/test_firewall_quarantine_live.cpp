@@ -18,13 +18,29 @@
  * rc == 0 must set the variable first (rc 4 means the environment is unset, or an
  * OS filter matched nothing).
  *
+ * Who runs it: root / Administrator, OR the agent account after
+ * `scripts/install-agent-user.sh --check` is clean on the host. The agent account reaches the
+ * host firewall the way the agent does, through the sudo grants the installer wrote (`sudo -n --`
+ * with the fixed lines and the root-owned helper), so a non-root run proves those grants work
+ * and every read below goes through them; the Linux snapshot is the helper's `snapshot` word,
+ * and the pf reads are the exact granted pfctl lines. Two things a non-root account cannot do
+ * (`pfctl -d`, a read of the nftables dump over netlink) are skipped or answered honestly, with
+ * the reason named. The environment is passed explicitly with `env` (`sudo -u <account> env
+ * NAME=value ... yuzu_agent_tests`): sudo-rs ignores -E.
+ *
+ * The control endpoint (YUZU_FQ_SERVER_ADDRESS) must be on ANOTHER host. A containment whose own
+ * control endpoint is the host itself is refused (`refused|self_host`), so a one-host run ends
+ * there by design; the case for that refusal runs with this host's own address.
+ *
  * Run (on a disposable or operator-attended host):
  *   YUZU_FIREWALL_QUARANTINE_LIVE=1 \
- *   YUZU_FQ_SERVER_ADDRESS=<ip:port reachable control endpoint> \
+ *   YUZU_FQ_SERVER_ADDRESS=<ip:port reachable control endpoint on another host> \
  *   YUZU_FQ_PROBE_TARGET=<ip:port reachable BEFORE the quarantine> \
  *   [YUZU_FQ_STREAM_TARGET=<ip:port of an HTTP server, for the pre-established-stream case>] \
  *     (the control-stream case opens a stream to YUZU_FQ_SERVER_ADDRESS the same way and
- *     SKIPs when that endpoint is not an HTTP server) \
+ *     SKIPs when that endpoint is not an HTTP server; both stream cases drain the first reply
+ *     to its Content-Length and SKIP when the server does not frame its reply, or closes after
+ *     it) \
  *   [YUZU_FQ_OPERATOR_EXCEPTION=<addr[:port][/proto][/dir], e.g. 10.0.0.5:22/tcp/in>] \
  *   yuzu_agent_tests '[firewall_quarantine_live]'
  *
@@ -32,6 +48,10 @@
  * source is passed as YUZU_FQ_OPERATOR_EXCEPTION. A 120 s watchdog releases the
  * quarantine if a case hangs (the standalone harness has no trigger engine, so
  * the plugin's own TTL trigger cannot fire here).
+ *
+ * "Restored" is an identity comparison of two readable snapshots (firewall_restore_compare.hpp):
+ * every read that did not complete is written `[failed]` whoever ran it, so a case can never pass
+ * on two failed reads, and an unreadable baseline fails the case before anything is applied.
  *
  * Loads the BUILT plugin (firewall.dll / firewall.so / firewall.dylib) the way
  * the agent does and drives it through LocalDispatcher. With
@@ -48,7 +68,9 @@
 
 #include <catch2/catch_test_macros.hpp>
 
+#include "firewall_parsers.hpp"
 #include "firewall_quarantine_parsers.hpp"
+#include "firewall_restore_compare.hpp"
 #include "local_dispatcher.hpp"
 #include "test_helpers.hpp"
 
@@ -59,14 +81,21 @@
 #include <yuzu/plugin.hpp>
 
 #include <icmp_probe.hpp>
+#ifndef _WIN32
+#include <sudo_argv.hpp> // the agent's own `sudo -n --` wrapper (a no-op for root)
+#endif
 
+#include <algorithm>
 #include <atomic>
+#include <cctype>
+#include <cerrno>
 #include <chrono>
 #include <condition_variable>
 #include <cstdlib>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
+#include <iterator>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -85,6 +114,8 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #else
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -94,6 +125,7 @@
 #endif
 
 namespace fq = yuzu::firewall::quarantine;
+namespace fr = yuzu::test::fwrestore;
 namespace fs = std::filesystem;
 
 namespace {
@@ -171,11 +203,68 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
     return false;
 }
 
-/// Runs a tool and returns its combined output ("" when it did not run).
+/// The remainder of the first `<key>|...` row, or nullopt when there is none.
+[[nodiscard]] std::optional<std::string> row_value(const std::string& captured, const std::string& key) {
+    const auto prefix = key + "|";
+    for (const auto& r : rows_of(captured))
+        if (r.rfind(prefix, 0) == 0)
+            return r.substr(prefix.size());
+    return std::nullopt;
+}
+
+[[nodiscard]] std::size_t count_prefixed(const std::string& captured, const std::string& prefix) {
+    std::size_t n = 0;
+    for (const auto& r : rows_of(captured))
+        n += r.rfind(prefix, 0) == 0 ? 1 : 0;
+    return n;
+}
+
+[[nodiscard, maybe_unused]] bool is_integer(const std::string& s) {
+    return !s.empty() && std::all_of(s.begin(), s.end(), [](unsigned char c) { return std::isdigit(c) != 0; });
+}
+
+/// The number of non-empty lines of a snapshot's section, or nullopt when it has none.
+[[nodiscard, maybe_unused]] std::optional<std::size_t> section_lines(const std::string& snapshot,
+                                                                     std::string_view name) {
+    const auto body = fr::section(snapshot, name);
+    if (!body)
+        return std::nullopt;
+    return rows_of(*body).size();
+}
+
+/// Runs a tool and returns the whole result, stderr merged unless asked otherwise. A caller that
+/// must tell "it ran and printed nothing" from "it did not run, timed out, was clipped or failed"
+/// needs the exit code and the flags, which capture() drops.
+[[nodiscard]] yuzu::agent::SubprocessResult capture_result(const std::vector<std::string>& argv,
+                                                           std::chrono::milliseconds deadline = 60s,
+                                                           bool merge_stderr = true) {
+    return yuzu::agent::run_bounded_subprocess(
+        argv, yuzu::agent::SubprocessOptions{.deadline = deadline, .merge_stderr = merge_stderr});
+}
+
+/// Runs a tool and returns its combined output ("" when it did not run). For a caller that only
+/// needs the text; a read the verdict depends on goes through capture_result().
 [[nodiscard, maybe_unused]] std::string capture(const std::vector<std::string>& argv) {
-    auto res = yuzu::agent::run_bounded_subprocess(
-        argv, yuzu::agent::SubprocessOptions{.deadline = 60s, .merge_stderr = true});
+    auto res = capture_result(argv);
     return res.tool_ran ? res.output : std::string{};
+}
+
+/// A privileged tool run the way the agent account runs it: `sudo -n --` in front of one of the
+/// granted lines or the helper, and nothing at all when this process is root.
+[[nodiscard, maybe_unused]] std::vector<std::string> harness_sudo(std::vector<std::string> argv) {
+#ifdef _WIN32
+    return argv;
+#else
+    return yuzu::shared::sudo_wrap(std::move(argv));
+#endif
+}
+
+[[nodiscard, maybe_unused]] bool running_as_root() {
+#ifdef _WIN32
+    return true; // the live Windows run is Administrator
+#else
+    return ::geteuid() == 0;
+#endif
 }
 
 #ifdef _WIN32
@@ -191,37 +280,158 @@ std::expected<yuzu::agent::PluginHandle, yuzu::agent::LoadError> load_firewall()
 }
 #endif
 
-/// The host firewall as text, for the byte-identical-after-release check.
+#if defined(_WIN32)
+constexpr fr::Os kThisOs = fr::Os::win;
+#elif defined(__APPLE__)
+constexpr fr::Os kThisOs = fr::Os::mac;
+#else
+constexpr fr::Os kThisOs = fr::Os::lin;
+#endif
+
+/// A snapshot whose one read failed: it can never compare equal to anything, itself included.
+[[nodiscard, maybe_unused]] std::string failed_snapshot() {
+    std::string out;
+    fr::write_section(out, "snapshot", false, "");
+    fr::finish(out);
+    return out;
+}
+
+/// The host firewall as sectioned text (firewall_restore_compare.hpp), for the restore check.
+/// Every section is written by fr::write_section from the completeness of ITS read, so a read that
+/// did not run, timed out, was clipped or exited non-zero is `[failed]` here whoever ran it.
 [[nodiscard]] std::string firewall_snapshot() {
 #if defined(_WIN32)
-    const std::string netsh = "C:\\Windows\\System32\\netsh.exe";
-    return capture({netsh, "advfirewall", "show", "allprofiles"}) +
-           capture({netsh, "advfirewall", "firewall", "show", "rule", "name=all"});
+    // One PowerShell command, ASCII only, as -EncodedCommand so no quoting rule can change it. The
+    // script sets $ErrorActionPreference = 'Stop' first: a failing cmdlet exits non-zero and the
+    // whole read is `[failed]`, never a shorter list. Standard error is NOT merged into the output.
+    const auto res = capture_result(
+        {"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe", "-NoProfile", "-NonInteractive",
+         "-EncodedCommand", fr::utf16le_base64(fr::windows_snapshot_script())},
+        180s, /*merge_stderr=*/false);
+    return yuzu::firewall::subprocess_complete(res) ? res.output : failed_snapshot();
 #elif defined(__linux__)
-    return capture({"/usr/sbin/nft", "list", "ruleset"}) + capture({"/usr/sbin/iptables-save"}) +
-           capture({"/usr/sbin/ip6tables-save"});
+    if (!running_as_root()) {
+        // The agent account: the helper's read-only `snapshot` word, through the sudo grant the
+        // installer wrote. Its text is the snapshot, used only when the call completed.
+        const auto res = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}));
+        return yuzu::firewall::subprocess_complete(res) ? res.output : failed_snapshot();
+    }
+    // Root: the same three tools with the helper's labels and arguments. A tool that is not
+    // executable is `[absent]`.
+    struct Tool {
+        std::string_view label;
+        std::string_view path;
+        std::vector<std::string> args;
+    };
+    const Tool tools[] = {{fr::label::kNft, fq::kNftPath, {"-a", "list", "ruleset"}},
+                          {fr::label::kIptables, fq::kIptablesPath, {"-S"}},
+                          {fr::label::kIp6tables, fq::kIp6tablesPath, {"-S"}}};
+    std::string out;
+    for (const auto& t : tools) {
+        if (::access(std::string{t.path}.c_str(), X_OK) != 0) {
+            fr::write_absent(out, t.label);
+            continue;
+        }
+        std::vector<std::string> argv{std::string{t.path}};
+        argv.insert(argv.end(), t.args.begin(), t.args.end());
+        const auto res = capture_result(argv);
+        fr::write_section(out, t.label, yuzu::firewall::subprocess_complete(res), res.output);
+    }
+    fr::finish(out);
+    return out;
 #else
-    // pf: the main ruleset, the Status line and the enable-reference count. `-s info`
-    // also carries counters and uptime, which are never byte-identical, so only the
-    // Status line is compared; the reference rows are counted, not compared as text.
-    std::string out = capture({"/sbin/pfctl", "-s", "rules"});
-    out += fq::pf_enabled(capture({"/sbin/pfctl", "-s", "info"})) ? "\nStatus: Enabled" : "\nStatus: Disabled";
-    out += "\nreferences=" +
-           std::to_string(fq::parse_pf_references(capture({"/sbin/pfctl", "-s", "References"})).size());
+    // macOS: the four granted pfctl lines (a root run needs no sudo). The Status line is recorded
+    // raw, never as a derived Enabled/Disabled: a state that could not be read has no such line,
+    // and the snapshot is then unreadable.
+    const auto pf = [](std::vector<std::string> args) {
+        args.insert(args.begin(), "/sbin/pfctl");
+        return capture_result(harness_sudo(std::move(args)));
+    };
+    std::string out;
+    const auto rules = pf({"-s", "rules"});
+    fr::write_section(out, fr::label::kPfRules, yuzu::firewall::subprocess_complete(rules), rules.output);
+    const auto info = pf({"-s", "info"});
+    fr::write_section(out, fr::label::kPfStatus, yuzu::firewall::subprocess_complete(info),
+                      fr::pf_status_line(info.output));
+    const auto refs = pf({"-s", "References"});
+    fr::write_section(out, fr::label::kPfReferences, yuzu::firewall::subprocess_complete(refs), refs.output);
+    const auto anchor = pf({"-a", std::string{fq::kPfAnchor}, "-s", "rules"});
+    fr::write_section(out, fr::label::kYuzuAnchor, yuzu::firewall::subprocess_complete(anchor), anchor.output);
+    fr::finish(out);
     return out;
 #endif
 }
 
-/// The rules the containment put in force, as text, for "this address is (not) in
-/// the live ruleset". macOS reads our anchor: `pfctl -s rules` lists only the main
-/// ruleset.
+/// The snapshot taken BEFORE a case changes anything: it must be readable, or the case stops
+/// here (a restore check against an unreadable baseline proves nothing).
+[[nodiscard]] std::string baseline_snapshot() {
+    auto text = firewall_snapshot();
+    INFO("baseline snapshot:\n" << text.substr(0, 2000));
+    REQUIRE(fr::readable(kThisOs, text));
+    return text;
+}
+
+/// The restore check: the baseline must be readable, the snapshot taken now must be readable, and
+/// nothing may differ (counters and handles normalised away, Store package churn reported and
+/// never failing). Replaces every byte-for-byte comparison of two dumps.
+void check_restored(const std::string& before) {
+    REQUIRE(fr::readable(kThisOs, before));
+    const auto verdict = fr::compare(kThisOs, before, firewall_snapshot());
+    INFO(fr::describe(verdict));
+    CHECK(verdict.restored);
+}
+
+/// The rules the containment put in force, as text, for "this address is (not) in the live
+/// ruleset". Read the way the agent account reads them: our nft table through the granted
+/// `nft list table` line, the iptables generation through the helper, our pf anchor through the
+/// granted anchor line.
 [[nodiscard, maybe_unused]] std::string contained_rules_text() {
 #if defined(__APPLE__)
-    return capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"});
+    return capture(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", "rules"}));
+#elif defined(__linux__)
+    std::string out = capture(harness_sudo(fq::nft_list_argv()));
+    for (const auto tool : {fq::kIptablesPath, fq::kIp6tablesPath}) {
+        const fq::Argv plan{std::string{tool}, "-S"};
+        if (running_as_root()) {
+            out += capture(plan);
+        } else if (const auto helper = fq::iptables_helper_argv(plan)) {
+            out += capture(harness_sudo(*helper));
+        }
+    }
+    return out;
 #else
     return firewall_snapshot();
 #endif
 }
+
+/// The listed rules mention `needle`, or do not, with the listing known to have been read: an
+/// empty listing proves no absence (the read failed, or the host is not contained at all).
+void check_listed(std::string_view needle, bool expect_present) {
+    const auto text = contained_rules_text();
+    REQUIRE_FALSE(text.empty());
+    CHECK((text.find(needle) != std::string::npos) == expect_present);
+}
+
+#if defined(__linux__)
+/// Another actor deleting our nft table: the granted `nft delete table` line.
+void tamper_delete_nft_table() { (void)capture(harness_sudo(fq::nft_delete_argv())); }
+
+/// Another actor removing our iptables jump: through the helper, or the tool itself as root.
+void tamper_remove_ipt_jump(std::uint32_t generation) {
+    const fq::Argv plan{std::string{fq::kIptablesPath}, "-D", "INPUT", "-j", fq::ipt_chain(generation)};
+    if (running_as_root())
+        (void)capture(plan);
+    else if (const auto helper = fq::iptables_helper_argv(plan))
+        (void)capture(harness_sudo(*helper));
+}
+#endif
+
+#if defined(__APPLE__)
+/// Another actor emptying our pf anchor (`what` is `rules` or `nat`): the granted anchor flushes.
+void tamper_flush_anchor(const char* what) {
+    (void)capture(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", what}));
+}
+#endif
 
 // ── a tiny portable TCP client (probe + pre-established stream) ─────────────
 
@@ -265,6 +475,108 @@ void close_sock(SockT s) { ::close(s); }
                     : (r.refused ? fq::ProbeOutcome::refused : fq::ProbeOutcome::timeout);
 }
 
+/// The address this host would use to reach `endpoint`: a UDP socket connected to it, asked for its
+/// own name. A UDP connect sends nothing (it only picks the route), so this learns the address
+/// without touching the network. nullopt when it cannot be learned.
+[[nodiscard]] std::optional<std::string> own_address_toward(const std::string& endpoint) {
+    const auto ep = split_endpoint(endpoint);
+    if (!ep || !net_init())
+        return std::nullopt;
+    auto dst = yuzu::shared::resolve_first(ep->first, AF_UNSPEC);
+    if (!dst)
+        return std::nullopt;
+    yuzu::shared::set_port(*dst, ep->second);
+    const SockT sock = ::socket(dst->family, SOCK_DGRAM, IPPROTO_UDP);
+    if (sock == kBadSock)
+        return std::nullopt;
+    std::optional<std::string> out;
+    if (::connect(sock, reinterpret_cast<const sockaddr*>(&dst->addr), dst->addr_len) == 0) {
+        sockaddr_storage name{};
+#ifdef _WIN32
+        int len = sizeof(name);
+#else
+        socklen_t len = sizeof(name);
+#endif
+        if (::getsockname(sock, reinterpret_cast<sockaddr*>(&name), &len) == 0) {
+            char text[INET6_ADDRSTRLEN]{};
+            if (name.ss_family == AF_INET &&
+                ::inet_ntop(AF_INET, &reinterpret_cast<const sockaddr_in*>(&name)->sin_addr, text, sizeof(text)))
+                out = text;
+            else if (name.ss_family == AF_INET6 &&
+                     ::inet_ntop(AF_INET6, &reinterpret_cast<const sockaddr_in6*>(&name)->sin6_addr, text,
+                                 sizeof(text)))
+                out = text;
+        }
+    }
+    close_sock(sock);
+    return out;
+}
+
+/// What the bytes read so far say about one HTTP reply (headers to CRLFCRLF, a case-insensitive
+/// Content-Length, the body length reached). `unframed` covers a reply whose length the client
+/// cannot know, and a server that closes after it: no Content-Length, an HTTP/1.0 status line
+/// without `Connection: keep-alive`, any `Connection: close`. A server that closes after its reply
+/// proves nothing about whether the stream survived, so such a reply cannot back the stream cases.
+enum class HttpReply { need_more, complete, unframed };
+
+[[nodiscard]] HttpReply http_reply_state(std::string_view buf) {
+    const auto end = buf.find("\r\n\r\n");
+    if (end == std::string_view::npos)
+        return HttpReply::need_more;
+    const auto head = buf.substr(0, end);
+    const auto body_len = buf.size() - (end + 4);
+
+    const auto lower = [](std::string_view in) {
+        std::string out;
+        for (const char c : in)
+            out += (c >= 'A' && c <= 'Z') ? static_cast<char>(c - 'A' + 'a') : c;
+        return out;
+    };
+    const auto trim = [](std::string_view in) {
+        while (!in.empty() && (in.front() == ' ' || in.front() == '\t'))
+            in.remove_prefix(1);
+        while (!in.empty() && (in.back() == ' ' || in.back() == '\t'))
+            in.remove_suffix(1);
+        return in;
+    };
+
+    const auto status_end = head.find("\r\n");
+    const bool http10 = head.substr(0, status_end).starts_with("HTTP/1.0");
+    std::optional<std::size_t> content_length;
+    bool bad_length = false, keep_alive = false, close = false;
+    std::size_t pos = status_end == std::string_view::npos ? head.size() : status_end + 2;
+    while (pos < head.size()) {
+        const auto next = head.find("\r\n", pos);
+        const auto line = head.substr(pos, next == std::string_view::npos ? next : next - pos);
+        pos = next == std::string_view::npos ? head.size() : next + 2;
+        const auto colon = line.find(':');
+        if (colon == std::string_view::npos)
+            continue;
+        const auto name = lower(trim(line.substr(0, colon)));
+        const auto value = lower(trim(line.substr(colon + 1)));
+        if (name == "content-length") {
+            if (value.empty() || value.size() > 15 ||
+                value.find_first_not_of("0123456789") != std::string::npos)
+                bad_length = true;
+            else
+                content_length = static_cast<std::size_t>(std::stoull(value));
+        } else if (name == "connection") {
+            close = close || value.find("close") != std::string::npos;
+            keep_alive = keep_alive || value.find("keep-alive") != std::string::npos;
+        }
+    }
+    if (close || (http10 && !keep_alive) || bad_length || !content_length)
+        return HttpReply::unframed;
+    return body_len >= *content_length ? HttpReply::complete : HttpReply::need_more;
+}
+
+/// How the first request on a kept stream went.
+enum class FirstReply { complete, unframed, silent, ended };
+
+/// What a request on a stream that predates the apply got: any byte back, nothing before the
+/// receive timeout, or the stream ending (EOF, a reset or a failed send).
+enum class StreamReply { answered, silent, ended };
+
 /// A kept-open HTTP/1.1 connection: proves whether an ESTABLISHED stream survives.
 class KeptStream {
 public:
@@ -283,20 +595,100 @@ public:
         s_ = ::socket(dst->family, SOCK_STREAM, IPPROTO_TCP);
         if (s_ == kBadSock)
             return false;
+#if defined(SO_NOSIGPIPE)
+        const int on = 1; // a send on a stream the peer ended is a failed send, not a signal
+        ::setsockopt(s_, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
+#endif
         set_timeouts(5000);
         return ::connect(s_, reinterpret_cast<const sockaddr*>(&dst->addr), dst->addr_len) == 0;
     }
-    /// Sends one request and reports whether ANY reply byte comes back in time.
-    [[nodiscard]] bool answers(int wait_ms) {
-        static const char kReq[] = "GET / HTTP/1.1\r\nHost: yuzu-live\r\nConnection: keep-alive\r\n\r\n";
+
+    /// Sends one request and reads the reply to its Content-Length, so nothing of it is left in
+    /// the socket to be mistaken for a later answer. `unframed` when the server's reply cannot
+    /// back a stream case (see http_reply_state); `silent` when no complete reply came in time.
+    [[nodiscard]] FirstReply first_reply(int wait_ms) {
         set_timeouts(wait_ms);
-        if (::send(s_, kReq, static_cast<int>(sizeof(kReq) - 1), 0) <= 0)
-            return false;
-        char buf[256];
-        return ::recv(s_, buf, sizeof(buf), 0) > 0;
+        if (!send_request())
+            return FirstReply::ended;
+        std::string got;
+        char buf[1024];
+        for (;;) {
+            const auto n = ::recv(s_, buf, static_cast<int>(sizeof(buf)), 0);
+            if (n > 0) {
+                got.append(buf, static_cast<std::size_t>(n));
+                switch (http_reply_state(got)) {
+                case HttpReply::complete:
+                    return FirstReply::complete;
+                case HttpReply::unframed:
+                    return FirstReply::unframed;
+                case HttpReply::need_more:
+                    break;
+                }
+                if (got.size() > 65536)
+                    return FirstReply::unframed;
+                continue;
+            }
+            if (n == 0) {
+                end_reason_ = "the peer closed the stream";
+                return FirstReply::ended;
+            }
+            return was_timeout() ? FirstReply::silent : ended_by_error();
+        }
     }
 
+    /// Sends one more request on the same stream and reports what came back.
+    [[nodiscard]] StreamReply request(int wait_ms) {
+        set_timeouts(wait_ms);
+        if (!send_request())
+            return StreamReply::ended;
+        char buf[256];
+        const auto n = ::recv(s_, buf, static_cast<int>(sizeof(buf)), 0);
+        if (n > 0)
+            return StreamReply::answered;
+        if (n == 0) {
+            end_reason_ = "the peer closed the stream";
+            return StreamReply::ended;
+        }
+        if (was_timeout())
+            return StreamReply::silent;
+        (void)ended_by_error();
+        return StreamReply::ended;
+    }
+
+    /// Why the last call ended the stream, for the log.
+    [[nodiscard]] const std::string& end_reason() const noexcept { return end_reason_; }
+
 private:
+    [[nodiscard]] bool send_request() {
+        static const char kReq[] = "GET / HTTP/1.1\r\nHost: yuzu-live\r\nConnection: keep-alive\r\n\r\n";
+#if defined(MSG_NOSIGNAL)
+        constexpr int kFlags = MSG_NOSIGNAL;
+#else
+        constexpr int kFlags = 0;
+#endif
+        if (::send(s_, kReq, static_cast<int>(sizeof(kReq) - 1), kFlags) > 0)
+            return true;
+        end_reason_ = "the send failed (" + last_error_text() + ")";
+        return false;
+    }
+    [[nodiscard]] static std::string last_error_text() {
+#ifdef _WIN32
+        return "winsock error " + std::to_string(::WSAGetLastError());
+#else
+        return "errno " + std::to_string(errno);
+#endif
+    }
+    [[nodiscard]] static bool was_timeout() {
+#ifdef _WIN32
+        return ::WSAGetLastError() == WSAETIMEDOUT;
+#else
+        return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
+    }
+    FirstReply ended_by_error() {
+        end_reason_ = "the receive failed (" + last_error_text() + ")";
+        return FirstReply::ended;
+    }
     void set_timeouts(int ms) {
 #ifdef _WIN32
         const DWORD t = static_cast<DWORD>(ms);
@@ -309,6 +701,7 @@ private:
 #endif
     }
     SockT s_ = kBadSock;
+    std::string end_reason_;
 };
 
 /// Releases a quarantine the test left behind if a case hangs or throws: the
@@ -678,6 +1071,41 @@ TEST_CASE("quarantine repair=1: a loopback rig still answers inactive, repair ne
     CHECK_FALSE(rig.record().has_value());
 }
 
+TEST_CASE("live harness: http_reply_state frames a reply by its Content-Length or calls it unframed",
+          "[agent][firewall_quarantine]") {
+    const auto state = [](std::string_view reply) { return http_reply_state(reply); };
+    const std::string headers = "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 5\r\n\r\n";
+
+    // a complete reply: headers and exactly the declared body, and more than it (a pipelined byte)
+    CHECK(state(headers + "hello") == HttpReply::complete);
+    CHECK(state(headers + "hello!") == HttpReply::complete);
+    CHECK(state("HTTP/1.1 204 No Content\r\nContent-Length: 0\r\n\r\n") == HttpReply::complete);
+    // more is needed: headers only, a short body, a header split mid-way, no header end yet
+    CHECK(state(headers) == HttpReply::need_more);
+    CHECK(state(headers + "hel") == HttpReply::need_more);
+    CHECK(state("HTTP/1.1 200 OK\r\nContent-Len") == HttpReply::need_more);
+    CHECK(state("HTTP/1.1 200 OK\r\nContent-Length: 5\r\n") == HttpReply::need_more);
+    CHECK(state("") == HttpReply::need_more);
+    // the header name is case-insensitive
+    CHECK(state("HTTP/1.1 200 OK\r\ncontent-LENGTH:5\r\n\r\nhello") == HttpReply::complete);
+    CHECK(state("HTTP/1.1 200 OK\r\nCONTENT-LENGTH: 5 \r\n\r\nhel") == HttpReply::need_more);
+
+    // no Content-Length: the client cannot know where the reply ends
+    CHECK(state("HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n") == HttpReply::unframed);
+    CHECK(state("HTTP/1.1 200 OK\r\n\r\nbody") == HttpReply::unframed);
+    CHECK(state("HTTP/1.1 200 OK\r\nContent-Length: five\r\n\r\nhello") == HttpReply::unframed);
+    CHECK(state("HTTP/1.1 200 OK\r\nContent-Length: \r\n\r\n") == HttpReply::unframed);
+
+    // HTTP/1.0 closes after the reply unless it says keep-alive
+    CHECK(state("HTTP/1.0 200 OK\r\nContent-Length: 5\r\n\r\nhello") == HttpReply::unframed);
+    CHECK(state("HTTP/1.0 200 OK\r\nContent-Length: 5\r\nConnection: keep-alive\r\n\r\nhello") == HttpReply::complete);
+    CHECK(state("HTTP/1.0 200 OK\r\nContent-Length: 5\r\nconnection: Keep-Alive\r\n\r\nhel") == HttpReply::need_more);
+
+    // Connection: close in any letter case, however well framed, is a close after the reply
+    for (const char* close : {"Connection: close", "connection: CLOSE", "CONNECTION: Close", "Connection: keep-alive, close"})
+        CHECK(state(std::string{"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n"} + close + "\r\n\r\nhello") == HttpReply::unframed);
+}
+
 TEST_CASE("agent core: enumerate_own_addresses answers a non-empty list of literals",
           "[agent][firewall_quarantine]") {
     // The shell of the self-host check reads this; nullopt would make every quarantine refuse
@@ -694,7 +1122,7 @@ TEST_CASE("agent core: enumerate_own_addresses answers a non-empty list of liter
 TEST_CASE("live: apply, verify the block, release restores the host byte-identical",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = firewall_snapshot();
+    const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
@@ -713,7 +1141,7 @@ TEST_CASE("live: apply, verify the block, release restores the host byte-identic
     INFO(rel.captured);
     CHECK(has_row(rel.captured, "status|inactive"));
     CHECK(probe(env.probe_target) != fq::ProbeOutcome::timeout); // reachable again
-    CHECK(firewall_snapshot() == before);                        // nothing left behind, nothing lost
+    check_restored(before);                                      // nothing left behind, nothing lost
     CHECK_FALSE(rig.record().has_value());
 }
 
@@ -727,13 +1155,31 @@ TEST_CASE("live: a pre-established prohibited stream stops carrying data on appl
     KeptStream stream;
     if (!stream.open(target))
         SKIP("YUZU_FQ_STREAM_TARGET (or the probe target) did not accept a connection");
-    if (!stream.answers(3000))
-        SKIP("the stream target is not an HTTP server that answers a keep-alive request");
+    // The first reply is drained to its Content-Length, so no byte of it is left to be read as an
+    // answer after the apply.
+    switch (stream.first_reply(3000)) {
+    case FirstReply::complete:
+        break;
+    case FirstReply::unframed:
+        SKIP("the stream target's reply is not length-framed (no Content-Length, HTTP/1.0 without "
+             "keep-alive, or Connection: close): a close after the reply proves nothing about the stream");
+    case FirstReply::silent:
+        SKIP("the stream target did not answer a keep-alive request in time");
+    case FirstReply::ended:
+        SKIP("the stream target closed the stream after (or instead of) its first reply");
+    }
 
     const auto q = rig.run("quarantine", env.quarantine_params());
     REQUIRE(rig.has_status(q.captured, "active"));
     // The stream was ESTABLISHED before the apply; a second request on it must go unanswered.
-    CHECK_FALSE(stream.answers(3000));
+    // Only a receive timeout is proof: a stream that ended (EOF, a reset, a failed send) cannot
+    // tell the containment from the server closing it, which is a SKIP with its reason, not a pass.
+    const auto after = stream.request(3000);
+    INFO("stream end: " << stream.end_reason());
+    if (after == StreamReply::ended)
+        SKIP("the stream ended instead of going silent, so this case cannot tell the containment "
+             "from the server closing it: " + stream.end_reason());
+    CHECK(after == StreamReply::silent); // an answer fails the case
 }
 
 #ifdef _WIN32
@@ -782,21 +1228,32 @@ TEST_CASE("live: a control-channel stream open before the apply keeps carrying d
     KeptStream stream;
     if (!stream.open(env.server))
         SKIP("the control endpoint did not accept a connection");
-    if (!stream.answers(3000))
+    switch (stream.first_reply(3000)) {
+    case FirstReply::complete:
+        break;
+    case FirstReply::unframed:
+        SKIP("the control endpoint's reply is not length-framed (no Content-Length, HTTP/1.0 without "
+             "keep-alive, or Connection: close)");
+    case FirstReply::silent:
         SKIP("the control endpoint is not an HTTP server that answers a keep-alive request");
+    case FirstReply::ended:
+        SKIP("the control endpoint closed the stream after (or instead of) its first reply");
+    }
 
     const auto q = rig.run("quarantine", env.quarantine_params());
     REQUIRE(rig.has_status(q.captured, "active"));
     // The stream predates the apply and, on macOS, the `pfctl -F states` that follows the load.
     // The control rules are stateless in both directions, so the flush cannot touch it: no
-    // reconnect, the reply still arrives. (A rebuilt state would lose the TCP window scale.)
-    CHECK(stream.answers(3000));
+    // reconnect, the reply still arrives. (A rebuilt state would lose the TCP window scale.) This
+    // case expects the stream to survive, so only an answer passes it.
+    INFO("stream end: " << stream.end_reason());
+    CHECK(stream.request(3000) == StreamReply::answered);
 }
 
 TEST_CASE("live: a control channel that cannot be reached rolls the apply back",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = firewall_snapshot();
+    const auto before = baseline_snapshot();
     // Both inputs name a TEST-NET address nothing answers on: the verify's control check must fail.
     LiveRig rig("203.0.113.1:50051", "203.0.113.1");
     const auto q = rig.run("quarantine", env.quarantine_params());
@@ -804,7 +1261,7 @@ TEST_CASE("live: a control channel that cannot be reached rolls the apply back",
     CHECK(q.rc == 1);
     CHECK(has_row(q.captured, "rolled_back|control_unreachable"));
     CHECK_FALSE(rig.record().has_value());
-    CHECK(firewall_snapshot() == before);
+    check_restored(before);
 }
 
 TEST_CASE("live: quarantine_allow adds and removes an exception through the plugin action",
@@ -817,7 +1274,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     REQUIRE(rig.record().has_value());
     const auto gen0 = rig.record()->generation;
     const std::string exception = "198.18.0.9:22/tcp/in";
-    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+    check_listed("198.18.0.9", false);
 
     const auto add = rig.run("quarantine_allow", {{"op", "add"}, {"exceptions", exception}});
     INFO(add.captured);
@@ -827,7 +1284,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     REQUIRE(rig.record().has_value());
     CHECK(rig.record()->generation == gen0 + 1);
     CHECK(rig.record()->phase == fq::Phase::active);
-    CHECK(contained_rules_text().find("198.18.0.9") != std::string::npos); // live, not just recorded
+    check_listed("198.18.0.9", true); // live, not just recorded
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);           // still contained
 
     const auto rm = rig.run("quarantine_allow", {{"op", "remove"}, {"exceptions", exception}});
@@ -837,7 +1294,7 @@ TEST_CASE("live: quarantine_allow adds and removes an exception through the plug
     CHECK_FALSE(has_prefix(rm.captured, "allow|exception|198.18.0.9"));
     REQUIRE(rig.record().has_value());
     CHECK(rig.record()->generation == gen0 + 2);
-    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+    check_listed("198.18.0.9", false);
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
 
     CHECK(has_row(rig.run("release").captured, "status|inactive"));
@@ -867,13 +1324,13 @@ TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
 
     // the OS no longer enforces what the record says: degraded
 #if defined(__linux__)
-    (void)capture({"/usr/sbin/nft", "delete", "table", "inet", "yuzu_quarantine"});
-    (void)capture({"/usr/sbin/iptables", "-D", "INPUT", "-j", "yuzu-fwq-" + std::to_string(rec->os.ipt_gen)});
+    tamper_delete_nft_table();
+    tamper_remove_ipt_jump(rec->os.ipt_gen);
 #elif defined(_WIN32)
     (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
                    "firewallpolicy", "blockinbound,allowoutbound"});
 #elif defined(__APPLE__)
-    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
+    tamper_flush_anchor("rules");
 #endif
     const auto degraded = rig.run("quarantine_status");
     CHECK(has_prefix(degraded.captured, "status|degraded|"));
@@ -882,7 +1339,7 @@ TEST_CASE("live: quarantine_status shapes", "[.][firewall_quarantine_live]") {
 TEST_CASE("live: init completes an interrupted release and re-applies a lost containment",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = firewall_snapshot();
+    const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
@@ -896,23 +1353,26 @@ TEST_CASE("live: init completes an interrupted release and re-applies a lost con
     rig.put_record(releasing);
     rig.restart();
     CHECK_FALSE(rig.record().has_value());
-    CHECK(firewall_snapshot() == before);
+    check_restored(before);
 
     // a reboot: the record says active, the OS lost the rules; init restores them before any dispatch
     REQUIRE(rig.has_status(rig.run("quarantine", env.quarantine_params()).captured, "active"));
     rec = rig.record();
     REQUIRE(rec.has_value());
 #if defined(__linux__)
-    (void)capture({"/usr/sbin/nft", "delete", "table", "inet", "yuzu_quarantine"});
+    tamper_delete_nft_table();
 #elif defined(_WIN32)
     (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
                    "firewallpolicy", "blockinbound,allowoutbound"});
 #elif defined(__APPLE__)
     // the anchor is gone and pf is off while our (same-boot) token is still on record:
-    // the repair path -- release the dead token, take a fresh one, reload
-    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
-    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "nat"});
-    (void)capture({"/sbin/pfctl", "-d"});
+    // the repair path -- release the dead token, take a fresh one, reload. `pfctl -d` is not a
+    // line the agent account is granted, so only a root run switches pf off; the anchor flushes
+    // alone still lose the containment.
+    tamper_flush_anchor("rules");
+    tamper_flush_anchor("nat");
+    if (running_as_root())
+        (void)capture({"/sbin/pfctl", "-d"});
 #endif
     rig.restart();
     CHECK(rig.has_status(rig.run("quarantine_status").captured, "active"));
@@ -970,13 +1430,13 @@ TEST_CASE("live: the repair self-check re-applies a containment the host lost, f
 
     // another actor undoes the containment
 #if defined(__linux__)
-    (void)capture({"/usr/sbin/nft", "delete", "table", "inet", "yuzu_quarantine"});
+    tamper_delete_nft_table();
 #elif defined(_WIN32)
     (void)capture({"C:\\Windows\\System32\\netsh.exe", "advfirewall", "set", "allprofiles",
                    "firewallpolicy", "blockinbound,allowoutbound"});
 #elif defined(__APPLE__)
-    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "rules"});
-    (void)capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-F", "nat"});
+    tamper_flush_anchor("rules");
+    tamper_flush_anchor("nat");
 #endif
     CHECK(probe(env.probe_target) != fq::ProbeOutcome::timeout); // honestly uncontained
 
@@ -989,7 +1449,7 @@ TEST_CASE("live: the repair self-check re-applies a containment the host lost, f
     CHECK(has_row(fixed.captured, "note|repair_tick=1"));
     CHECK(has_row(fixed.captured, "note|repaired=1"));
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout);
-    CHECK(contained_rules_text().find("198.18.0.9") == std::string::npos);
+    check_listed("198.18.0.9", false);
     const auto after = rig.record();
     REQUIRE(after.has_value());
     CHECK(after->phase == fq::Phase::active);
@@ -1032,18 +1492,197 @@ TEST_CASE("live: a ttl release is a no-op before expiry and releases after",
     CHECK_FALSE(rig.record().has_value());
 }
 
+TEST_CASE("live: quarantine is refused self_host when the control endpoint is this host's own address",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    // This host's own address, learned by a UDP connect to the probe target (nothing is sent). It
+    // is the control endpoint the plugin is told about, so the refusal comes before anything else.
+    const auto own = own_address_toward(env.probe_target);
+    if (!own)
+        SKIP("this host's own address toward the probe target could not be learned");
+    if (own->rfind("127.", 0) == 0 || *own == "::1")
+        SKIP("the route to the probe target is the loopback: no non-loopback own address to use");
+    const auto before = baseline_snapshot();
+    const std::string server = (own->find(':') != std::string::npos ? "[" + *own + "]" : *own) + ":50051";
+    LiveRig rig(server, *own);
+    const auto q = rig.run("quarantine", env.quarantine_params());
+    check_refused(q, "self_host"); // rc 1, the refusal rows, UNAVAILABLE / PARTIAL / firewall:refused
+    CHECK_FALSE(rig.record().has_value());
+    check_restored(before);
+}
+
+TEST_CASE("live: state reports what the OS tool reports, and the host is left as it was",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    const auto before = baseline_snapshot();
+    PluginRig rig(env.server, env.server_ip());
+    const auto r = rig.run("state");
+    INFO(r.captured);
+    REQUIRE(r.rc == 0);
+    const auto ruleset = row_value(r.captured, "ruleset");
+    REQUIRE(ruleset.has_value()); // every terminal state carries a count row, `unknown` when it could not be read
+
+#if defined(_WIN32)
+    // Three profile rows that agree with the snapshot, and the true rule count. The snapshot is read
+    // again after the action and the count may match either: the Store app-package rules churn.
+    const auto after = firewall_snapshot();
+    REQUIRE(fr::readable(kThisOs, after));
+    const auto profiles = fr::section(before, fr::label::kProfiles).value_or("");
+    for (const char* name : {"Domain", "Private", "Public"}) {
+        const auto row = row_value(r.captured, std::string{"profile|"} + name);
+        INFO(name);
+        REQUIRE(row.has_value());
+        const auto line = profiles.find(std::string{name} + "|enabled=");
+        REQUIRE(line != std::string::npos);
+        const bool snapshot_on = profiles.compare(line + std::string_view{name}.size() + 9, 4, "True") == 0;
+        CHECK(*row == (snapshot_on ? "enabled" : "disabled"));
+    }
+    if (*ruleset != "unknown") {
+        const auto n = static_cast<std::size_t>(std::stoull(*ruleset));
+        CHECK((n == section_lines(before, fr::label::kRules) || n == section_lines(after, fr::label::kRules)));
+    } else {
+        CHECK(has_prefix(r.captured, "error|rules_count:"));
+    }
+#elif defined(__linux__)
+    const auto backend = row_value(r.captured, "backend");
+    REQUIRE(backend.has_value());
+    const auto state = row_value(r.captured, "state");
+    REQUIRE(state.has_value());
+    CHECK((*state == "active" || *state == "inactive" || *state == "unknown" || *state == "running"));
+    CHECK((*state != "unknown" || *ruleset == "unknown")); // an unknown state never carries a count
+    if (running_as_root() && *backend == "nftables") {
+        const auto nft = fr::section(before, fr::label::kNft);
+        REQUIRE(nft.has_value());
+        CHECK(*ruleset == std::to_string(fr::count_nft_rules(*nft)));
+        // a root run on a quiet host: nothing was torn and no generation moved
+        CHECK_FALSE(has_prefix(r.captured, "fallthrough|nftables:"));
+        CHECK_FALSE(has_prefix(r.captured, "error|nftables:"));
+    } else if (running_as_root() && *backend == "iptables") {
+        const auto ipt = fr::section(before, fr::label::kIptables);
+        REQUIRE(ipt.has_value());
+        std::size_t appended = 0;
+        for (const auto& line : rows_of(*ipt))
+            appended += line.rfind("-A ", 0) == 0 ? 1 : 0;
+        CHECK(*ruleset == std::to_string(appended));
+    } else if (!running_as_root() && *state == "unknown") {
+        // The agent account cannot read the ruleset itself (netlink dumps and iptables need root):
+        // an honest unknown is the right answer, and it must say why, unless the backend that
+        // answered is one whose refusal is a silent exit status (iptables, ufw) or none answered.
+        CHECK((has_prefix(r.captured, "error|") || has_prefix(r.captured, "fallthrough|") ||
+               *backend == "iptables" || *backend == "ufw" || *backend == "none"));
+    }
+#else
+    // macOS: the Application Firewall state is an unprivileged read, run here directly.
+    const auto alf = capture_result({"/usr/libexec/ApplicationFirewall/socketfilterfw", "--getglobalstate"});
+    REQUIRE(yuzu::firewall::subprocess_complete(alf));
+    const auto want = yuzu::firewall::parse_alf_global_state(alf.output);
+    CHECK(row_value(r.captured, "state") == std::string{yuzu::firewall::to_string(want.state)});
+    CHECK(has_row(r.captured, "mode|block_all") == want.block_all);
+    // pf needs root: unreadable is `unknown` plus the row that says why, readable is the tool's word
+    const auto pf = row_value(r.captured, "pf");
+    REQUIRE(pf.has_value());
+    CHECK((*pf == "unknown") == has_prefix(r.captured, "error|pf:info:"));
+    CHECK((*ruleset == "unknown") == has_prefix(r.captured, "error|pf:rules:"));
+    if (running_as_root()) {
+        const auto status = fr::section(before, fr::label::kPfStatus).value_or("");
+        CHECK(*pf == (status.find("Status: Enabled") != std::string::npos ? "enabled" : "disabled"));
+        CHECK(ruleset == std::to_string(section_lines(before, fr::label::kPfRules).value_or(0)));
+    }
+#endif
+    check_restored(before); // a read changes nothing
+}
+
+TEST_CASE("live: rules lists what the OS tool lists, and the host is left as it was",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    const auto before = baseline_snapshot();
+    PluginRig rig(env.server, env.server_ip());
+    const auto r = rig.run("rules");
+    INFO(r.captured);
+    REQUIRE(r.rc == 0);
+    const auto ruleset = row_value(r.captured, "ruleset");
+    REQUIRE(ruleset.has_value());
+
+#if defined(_WIN32)
+    // At most 100 rule rows; `ruleset|100` and `truncated|true` exactly when the host has more.
+    const auto rule_rows = count_prefixed(r.captured, "rule|");
+    CHECK(rule_rows <= 100);
+    const auto after = firewall_snapshot();
+    REQUIRE(fr::readable(kThisOs, after));
+    const auto host_rules = std::max(section_lines(before, fr::label::kRules).value_or(0),
+                                     section_lines(after, fr::label::kRules).value_or(0));
+    if (*ruleset != "unknown") {
+        CHECK(*ruleset == std::to_string(rule_rows));
+        if (host_rules > 100) {
+            CHECK(rule_rows == 100);
+            CHECK(has_row(r.captured, "truncated|true"));
+        } else {
+            CHECK_FALSE(has_row(r.captured, "truncated|true"));
+        }
+    } else {
+        CHECK(has_prefix(r.captured, "error|enum_next:"));
+    }
+#elif defined(__linux__)
+    const auto backend = row_value(r.captured, "backend");
+    REQUIRE(backend.has_value());
+    if (running_as_root() && *backend == "nftables") {
+        const auto nft = fr::section(before, fr::label::kNft);
+        REQUIRE(nft.has_value());
+        const auto n = fr::count_nft_rules(*nft);
+        CHECK(*ruleset == std::to_string(n));
+        CHECK(count_prefixed(r.captured, "rule|nftables|") >= n); // the rule handles, plus the base chains
+    } else if (!running_as_root()) {
+        CHECK((*ruleset == "unknown" || is_integer(*ruleset))); // honest, never a fabricated count
+    }
+#else
+    // macOS: the app list is an unprivileged read, run here directly
+    const auto listed = capture_result({"/usr/libexec/ApplicationFirewall/socketfilterfw", "--listapps"});
+    REQUIRE(yuzu::firewall::subprocess_complete(listed));
+    CHECK(count_prefixed(r.captured, "app|") == yuzu::firewall::parse_alf_listapps(listed.output).size());
+    CHECK((*ruleset == "unknown") == has_prefix(r.captured, "error|pf:rules:"));
+    if (running_as_root())
+        CHECK(*ruleset == std::to_string(section_lines(before, fr::label::kPfRules).value_or(0)));
+#endif
+    check_restored(before);
+}
+
+#if defined(__linux__)
+TEST_CASE("live (linux, agent account): the helper's snapshot word answers through sudo -n and refuses an argument",
+          "[.][firewall_quarantine_live]") {
+    LIVE_OR_SKIP(env);
+    if (running_as_root())
+        SKIP("runs as the agent account: a root run does not go through the helper");
+    const auto snap = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot"}));
+    INFO(snap.output.substr(0, 2000));
+    REQUIRE(yuzu::firewall::subprocess_complete(snap));
+    CHECK(snap.output.size() <= 1048576);
+    CHECK(fr::readable(fr::Os::lin, snap.output)); // headed sections and the == end trailer
+
+    // the word takes no argument: with one it is refused (exit 64) and prints no listing
+    const auto extra = capture_result(harness_sudo({std::string{fq::kFwHelperPath}, "snapshot", "extra"}));
+    INFO(extra.output);
+    CHECK(extra.tool_ran);
+    CHECK(extra.exit_code == 64);
+    CHECK(extra.output.find("== ") == std::string::npos);
+}
+#endif
+
 #if defined(__linux__) || defined(__APPLE__)
 namespace {
 
-/// Real nft / pfctl, real temp files, but every ruleset load after the first fails:
+/// Real nft / pfctl, real staged files, but every ruleset load after the first fails:
 /// a runner forced to fail in the middle of an update. A load is `nft -f <file>` or
-/// `pfctl -a <anchor> -f <file>`.
+/// `pfctl -a <anchor> -f <file>` (an agent that is root), or the helper's `nft load <file>` /
+/// `pf load <file>` (the agent account). Every other call goes through `sudo -n --` for a
+/// non-root run, as the plugin's own runner does.
 struct FlakyLoadRunner {
     int loads = 0;
     int fail_from_load = 2;
     fq::Runner fn() {
         return [this](const fq::Argv& argv, std::chrono::milliseconds budget) {
-            const bool is_load = argv.size() > 1 && (argv[1] == "-f" || (argv.size() == 5 && argv[3] == "-f"));
+            const bool is_load = argv.size() > 1 && (argv[1] == "-f" || (argv.size() == 5 && argv[3] == "-f") ||
+                                                     (argv.size() == 4 && (argv[1] == "nft" || argv[1] == "pf") &&
+                                                      argv[2] == "load"));
             if (is_load && ++loads >= fail_from_load) {
                 fq::ToolResult t;
                 t.ran = true;
@@ -1052,7 +1691,7 @@ struct FlakyLoadRunner {
                 return t;
             }
             auto res = yuzu::agent::run_bounded_subprocess(
-                argv, yuzu::agent::SubprocessOptions{.deadline = budget, .merge_stderr = true});
+                harness_sudo(argv), yuzu::agent::SubprocessOptions{.deadline = budget, .merge_stderr = true});
             fq::ToolResult t;
             t.ran = res.tool_ran;
             t.exit_code = res.exit_code;
@@ -1084,23 +1723,42 @@ struct MemStore final : fq::StateStore {
     }
 };
 
-fq::Stage real_stage() {
-    return [](std::string_view stem, std::string_view suffix,
-              std::string_view contents) -> std::optional<fq::StagedFile> {
-        auto tmp = yuzu::TempFile::create(stem, suffix);
-        if (!tmp)
-            return std::nullopt;
-        {
-            std::ofstream f(tmp->path(), std::ios::binary | std::ios::trunc);
-            f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
-        }
-        auto holder = std::make_shared<yuzu::TempFile>(std::move(*tmp));
-        // The core vets the staged path against the directory it was created in
-        // (a TMPDIR that ends in a slash is normalised so the two agree).
-        const auto norm = std::filesystem::path(holder->path()).lexically_normal();
-        return fq::StagedFile{norm.string(), holder, norm.parent_path().string()};
-    };
+/// How a leg built directly by a test reaches the privileged tool: itself as root, the helper
+/// as the agent account (the same decision the plugin makes from the euid).
+[[nodiscard]] fq::ToolAccess harness_access() {
+    return running_as_root() ? fq::ToolAccess::direct : fq::ToolAccess::helper;
 }
+
+/// A private `<TempDir>/firewall-staging` (mode 0700, a real directory) and a Stage that writes
+/// each ruleset into it as `yuzu-fwq-<random>.<suffix>`: the shape the helper's path check
+/// accepts, which a file in the system temp directory is not.
+struct StagingDir {
+    yuzu::test::TempDir root{"yuzu_test_fq_stage_"};
+    std::string dir;
+    StagingDir() {
+        std::error_code ec;
+        const auto path = (root.path / "firewall-staging").lexically_normal();
+        fs::create_directories(path, ec);
+        REQUIRE_FALSE(ec);
+        fs::permissions(path, fs::perms::owner_all, fs::perm_options::replace, ec);
+        REQUIRE_FALSE(ec);
+        dir = path.string();
+    }
+    [[nodiscard]] fq::Stage stage() const {
+        return [dir = dir](std::string_view stem, std::string_view suffix,
+                           std::string_view contents) -> std::optional<fq::StagedFile> {
+            auto tmp = yuzu::TempFile::create(stem, suffix, dir);
+            if (!tmp)
+                return std::nullopt;
+            {
+                std::ofstream f(tmp->path(), std::ios::binary | std::ios::trunc);
+                f.write(contents.data(), static_cast<std::streamsize>(contents.size()));
+            }
+            auto holder = std::make_shared<yuzu::TempFile>(std::move(*tmp));
+            return fq::StagedFile{holder->path(), holder, dir};
+        };
+    }
+};
 
 } // namespace
 #endif
@@ -1112,8 +1770,10 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     if (::access("/usr/sbin/nft", X_OK) != 0)
         SKIP("nft is not installed on this host");
     FlakyLoadRunner runner;
-    // The live run needs root (LIVE_OR_SKIP), and a root agent runs nft itself: no helper.
-    fq::NftLeg leg(runner.fn(), real_stage(), fq::ToolAccess::direct);
+    // Root runs nft itself; the agent account loads through the helper, from a staging directory
+    // the helper's path check accepts.
+    StagingDir staging;
+    fq::NftLeg leg(runner.fn(), staging.stage(), harness_access());
     MemStore store;
     fq::Env fenv{leg, store,
                  [](const std::string& ip, int port, std::chrono::milliseconds t) {
@@ -1135,12 +1795,13 @@ TEST_CASE("live (linux nft): a failed update keeps the previous generation in fo
     req.probe_target = env.probe_target;
     const auto applied = fq::apply_and_verify(fenv, req, dl);
     REQUIRE((applied.status == "active"));
-    const auto table_before = capture({"/usr/sbin/nft", "list", "table", "inet", "yuzu_quarantine"});
+    const auto table_before = capture(harness_sudo(fq::nft_list_argv()));
+    REQUIRE_FALSE(table_before.empty());
 
     fq::Deadline dl2;
     const auto upd = fq::update(fenv, true, {*fq::parse_exception("198.18.0.9:22/tcp/in")}, dl2);
     CHECK(upd.status == "update_failed");
-    CHECK(capture({"/usr/sbin/nft", "list", "table", "inet", "yuzu_quarantine"}) == table_before);
+    CHECK(capture(harness_sudo(fq::nft_list_argv())) == table_before);
     CHECK(probe(env.probe_target) == fq::ProbeOutcome::timeout); // still blocked
     REQUIRE(store.s.has_value());
     CHECK(store.s->phase == fq::Phase::active);
@@ -1164,7 +1825,7 @@ std::optional<std::string> live_boot_time() {
 }
 
 [[nodiscard]] std::string pf_anchor_capture(const char* what) {
-    return capture({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what});
+    return capture(harness_sudo({"/sbin/pfctl", "-a", std::string{fq::kPfAnchor}, "-s", what}));
 }
 
 } // namespace
@@ -1172,7 +1833,7 @@ std::optional<std::string> live_boot_time() {
 TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release restores pf byte-identical",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
-    const auto before = firewall_snapshot();
+    const auto before = baseline_snapshot();
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
@@ -1183,22 +1844,23 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
 
     // Captured for the PR narrative: design-note open questions 3 (References layout),
     // 6 (Anchors layout) and 7 (a flush of an anchor that does not exist).
-    const auto anchors = capture({"/sbin/pfctl", "-a", "com.apple", "-s", "Anchors"});
+    const auto anchors = capture(harness_sudo({"/sbin/pfctl", "-a", "com.apple", "-s", "Anchors"}));
     INFO("-a com.apple -s Anchors:\n" << anchors);
-    INFO("-s References:\n" << capture({"/sbin/pfctl", "-s", "References"}));
+    INFO("-s References:\n" << capture(harness_sudo({"/sbin/pfctl", "-s", "References"})));
     INFO("anchor -s rules:\n" << pf_anchor_capture("rules"));
     INFO("anchor -s nat:\n" << pf_anchor_capture("nat"));
     CHECK(anchors.find(std::string{fq::kPfAnchorLeaf}) != std::string::npos);
     CHECK(fq::pf_siblings_before(anchors).empty()); // nothing is evaluated before us
-    CHECK(fq::pf_anchor_referenced(capture({"/sbin/pfctl", "-s", "rules"})));
+    CHECK(fq::pf_anchor_referenced(capture(harness_sudo({"/sbin/pfctl", "-s", "rules"}))));
     CHECK(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
     CHECK(rig.has_status(rig.run("quarantine_status").captured, "active"));
 
     const auto rel = rig.run("release");
     INFO(rel.captured);
     CHECK(has_row(rel.captured, "status|inactive"));
-    // main ruleset, Status line and reference count equal their pre-quarantine values
-    CHECK(firewall_snapshot() == before);
+    // main ruleset, Status line (by its state word) and reference lines equal their
+    // pre-quarantine values, and our anchor holds nothing
+    check_restored(before);
     // our anchor is empty, not merely unreferenced
     CHECK_FALSE(fq::pf_anchor_enforcing(pf_anchor_capture("rules")));
 }
@@ -1206,6 +1868,10 @@ TEST_CASE("live (macOS pf): the sub-anchor loads, sorts first, and release resto
 TEST_CASE("live (macOS pf): pf switched off behind the plugin's back is reported, then repaired",
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
+    // `pfctl -d` is not one of the lines the agent account is granted: only root can be the
+    // "other actor" that switches pf off.
+    if (!running_as_root())
+        SKIP("pfctl -d is not granted to the agent account, so only a root run can switch pf off");
     LiveRig rig(env.server, env.server_ip());
     Watchdog dog(120s, [&] { (void)rig.run("release"); });
 
@@ -1234,8 +1900,10 @@ TEST_CASE("live (macOS pf): a failed update keeps the previous generation in for
           "[.][firewall_quarantine_live]") {
     LIVE_OR_SKIP(env);
     FlakyLoadRunner runner;
-    // The live run needs root (LIVE_OR_SKIP), and a root agent runs pfctl itself: no helper.
-    fq::PfLeg leg(runner.fn(), real_stage(), live_boot_time, fq::ToolAccess::direct);
+    // Root runs pfctl itself; the agent account loads through the helper, from a staging
+    // directory the helper's path check accepts.
+    StagingDir staging;
+    fq::PfLeg leg(runner.fn(), staging.stage(), live_boot_time, harness_access());
     MemStore store;
     fq::Env fenv{leg, store,
                  [](const std::string& ip, int port, std::chrono::milliseconds t) {
