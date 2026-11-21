@@ -641,6 +641,138 @@ class IptablesHelperRuns(unittest.TestCase):
             self.assertEqual((r.returncode, r.stdout), (0, "RAN stub-iptables\n-N\nyuzu-fwq-1\n"), shell)
 
 
+@unittest.skipIf(sys.platform == "win32", "runs the helper under a POSIX shell")
+class SnapshotRuns(unittest.TestCase):
+    """`yuzu-fw-helper snapshot`, the one read-only word of the helper: the helper text run with its
+    three tool paths replaced by stubs. It runs each tool with exactly its own fixed arguments
+    (nothing from the caller), prints one headed section per tool, then `== end`, and is cut at one
+    MiB. It is run under each POSIX shell found (sh, dash, bash), like the other helper cases."""
+
+    # (section label, the tool path the helper names once, the arguments it must be run with)
+    TOOLS = (
+        ("nft -a list ruleset", "/usr/sbin/nft", ["-a", "list", "ruleset"]),
+        ("iptables -S", "/usr/sbin/iptables", ["-S"]),
+        ("ip6tables -S", "/usr/sbin/ip6tables", ["-S"]),
+    )
+    CAP = 1048576
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix="yuzu_test_fwsnap_")
+        cls.counter = 0
+        for _label, tool, _args in cls.TOOLS:
+            assert helper_text().count(tool) == 1, "the helper must name %s exactly once" % tool
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.tmp.cleanup()
+
+    def make_helper(self, bodies):
+        """The helper with each tool path replaced by a stub whose script body is bodies[tool]; a
+        tool whose body is None is replaced by a path that does not exist (not installed)."""
+        type(self).counter += 1
+        d = os.path.join(self.tmp.name, "case%d" % self.counter)
+        os.mkdir(d)
+        text = helper_text()
+        for _label, tool, _args in self.TOOLS:
+            body = bodies.get(tool, STUB_ECHO)
+            stub = os.path.join(d, "stub-" + os.path.basename(tool))
+            if body is not None:
+                with open(stub, "w") as f:
+                    f.write("#!/bin/sh\n" + body)
+                os.chmod(stub, 0o755)
+            text = text.replace(tool, stub)
+        path = os.path.join(d, "yuzu-fw-helper")
+        with open(path, "w") as f:
+            f.write(text)
+        return path
+
+    def run_helper(self, shell, path, args, env=None):
+        return subprocess.run([shell, path] + list(args), capture_output=True, text=True, timeout=30, env=env)
+
+    @staticmethod
+    def expected_listing(stub_names):
+        """What the echo stubs make the whole listing: each section's header, the stub's own name
+        and the arguments it was handed, one per line, and the end line."""
+        out = ""
+        for (label, _tool, args), name in zip(SnapshotRuns.TOOLS, stub_names):
+            out += "== %s\n" % label + "RAN %s\n" % name + "".join(a + "\n" for a in args)
+        return out + "== end\n"
+
+    def test_the_sections_come_in_order_each_with_the_tools_own_fixed_arguments(self):
+        want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
+        for shell in available_shells():
+            r = self.run_helper(shell, self.make_helper({}), ["snapshot"])
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+
+    def test_a_tool_that_is_not_installed_is_absent_and_the_rest_still_run(self):
+        for shell in available_shells():
+            r = self.run_helper(shell, self.make_helper({"/usr/sbin/nft": None}), ["snapshot"])
+            self.assertEqual(r.returncode, 0, shell)
+            lines = r.stdout.split("\n")
+            self.assertEqual(lines[:2], ["== nft -a list ruleset", "[absent]"], shell)
+            self.assertIn("== iptables -S", lines, shell)
+            self.assertEqual(lines[-2:], ["== end", ""], shell)
+            # all three absent: three headed sections holding only the marker, then the end
+            none = {t: None for _l, t, _a in self.TOOLS}
+            r = self.run_helper(shell, self.make_helper(none), ["snapshot"])
+            self.assertEqual(
+                (r.returncode, r.stdout),
+                (0, "== nft -a list ruleset\n[absent]\n== iptables -S\n[absent]\n== ip6tables -S\n[absent]\n== end\n"),
+                shell)
+
+    def test_a_tool_that_exits_non_zero_is_marked_failed_after_what_it_printed(self):
+        failing = 'printf "partial\\n"; echo "to stderr" >&2; exit 3\n'
+        for shell in available_shells():
+            r = self.run_helper(shell, self.make_helper({"/usr/sbin/iptables": failing}), ["snapshot"])
+            self.assertEqual((r.returncode, r.stderr), (0, ""), (shell, "the helper exits 0 and drops stderr"))
+            self.assertIn("== iptables -S\npartial\n[failed]\n== ip6tables -S\n", r.stdout, shell)
+            self.assertTrue(r.stdout.endswith("== end\n"), shell)
+            self.assertEqual(r.stdout.count("[failed]"), 1, shell)
+
+    def test_a_listing_longer_than_the_cap_is_cut_and_has_no_end_line(self):
+        big = "head -c 1100000 /dev/zero | tr '\\000' 'a'\n"
+        for shell in available_shells():
+            r = subprocess.run([shell, self.make_helper({"/usr/sbin/nft": big}), "snapshot"],
+                               capture_output=True, timeout=60)
+            self.assertEqual(r.returncode, 0, shell)
+            self.assertEqual(len(r.stdout), self.CAP, shell)
+            self.assertNotIn(b"== end", r.stdout, shell)
+            self.assertTrue(r.stdout.startswith(b"== nft -a list ruleset\naaaa"), shell)
+
+    def test_anything_but_exactly_the_one_word_exits_non_zero_having_run_nothing(self):
+        bad = ([], [""], ["SNAPSHOT"], ["Snapshot"], ["snapshot "], [" snapshot"], ["-snapshot"],
+               ["snapshots"], ["snapshot", ""], ["snapshot", "extra"], ["snapshot", "snapshot"],
+               ["snapshot", "-a", "list", "ruleset"], ["iptables", "snapshot"], ["snapshot;id"],
+               ["snapshot", "--help"], ["--snapshot"], ["status"], ["list"])
+        helper = self.make_helper({})
+        for shell in available_shells():
+            for args, r in zip(bad, run_all([[shell, helper] + list(a) for a in bad])):
+                self.assertNotEqual(r.returncode, 0, (shell, args))
+                self.assertEqual(r.stdout, "", (shell, args, "a tool ran or something was printed"))
+
+    def test_the_environment_cannot_change_what_runs(self):
+        env = dict(os.environ, PATH="/nonexistent", IFS="-", ENV="/nonexistent", BASH_ENV="/nonexistent")
+        want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
+        for shell in available_shells():
+            r = self.run_helper(shell, self.make_helper({}), ["snapshot"], env=env)
+            self.assertEqual((r.returncode, r.stdout, r.stderr), (0, want, ""), shell)
+
+    def test_a_glob_in_the_working_directory_is_never_expanded(self):
+        with tempfile.TemporaryDirectory(prefix="yuzu_test_fwsnap_cwd_") as cwd:
+            for name in ("-a", "list", "ruleset", "-S"):
+                open(os.path.join(cwd, name), "w").close()
+            want = self.expected_listing(["stub-nft", "stub-iptables", "stub-ip6tables"])
+            for shell in available_shells():
+                r = subprocess.run([shell, self.make_helper({}), "snapshot"], capture_output=True, text=True,
+                                   timeout=30, cwd=cwd)
+                self.assertEqual((r.returncode, r.stdout), (0, want), shell)
+
+
+# What the stub tools run by default: print its own name, then each argument it was handed.
+STUB_ECHO = 'printf "RAN %s\\n" "${0##*/}"\nfor a; do printf "%s\\n" "$a"; done\n'
+
+
 GOLDEN_RE = re.compile(r'kGoldenNftRuleset = R"NFTGOLDEN\((.*?)\)NFTGOLDEN";', re.S)
 PARSERS_TEST = "tests/unit/test_firewall_quarantine_parsers.cpp"
 

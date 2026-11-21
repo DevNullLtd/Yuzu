@@ -536,6 +536,9 @@ EOF
 # pfctl grant. The anchor name sorts first among Apple's com.apple/* sub-anchors, and the release
 # flush is -F rules / -F nat on that anchor only (never -F all: that is global). The installer
 # writes the helper before this file; a host without it is provisioned with this build's installer.
+# The helper also takes one read-only word, snapshot, with no other argument; on a Mac it finds none
+# of the nft or iptables tools and prints empty sections, and the pf reads below stay on the exact
+# pfctl lines.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 $ACCOUNT_NAME ALL=(root) NOPASSWD: /sbin/pfctl -E
 EOF
@@ -587,7 +590,9 @@ EOF
 # takes a file name or an argument pattern. A sudo regular expression could pin the arguments in
 # this file instead, but it needs sudo 1.9.10, which RHEL 8 and 9, Ubuntu 22.04 and earlier and
 # Debian 11 do not ship. The installer writes the helper before this file; a host without it is
-# provisioned with this build's installer.
+# provisioned with this build's installer. The helper also takes one read-only word, snapshot,
+# with no other argument: it prints the nft and iptables listings of the host (at most 1 MiB) and
+# changes nothing, so the agent account can read the host ruleset through this same line.
 $ACCOUNT_NAME ALL=(root) NOPASSWD: $FW_HELPER_PATH
 
 # firewall plugin — nftables containment (own table inet yuzu_quarantine). The ruleset is loaded
@@ -731,6 +736,7 @@ generate_fw_helper_content() {
 # Usage: yuzu-fw-helper iptables|ip6tables <tokens>
 #        yuzu-fw-helper nft load <path>
 #        yuzu-fw-helper pf load <path>
+#        yuzu-fw-helper snapshot
 # <tokens> are exactly those of one of these shapes (<ours> is a yuzu-fwq-<generation>[-f] chain,
 # the generation 1 to 10 digits and at most 2147483647):
 #   -S
@@ -755,6 +761,14 @@ generate_fw_helper_content() {
 # The caller's arguments are never passed on. Each branch below matches the token count and the
 # fixed tokens, validates the variable ones, and execs the tool with an argument list made of its
 # own literals plus the validated values. Anything else exits 64, having run nothing.
+#
+# snapshot takes exactly one argument, the word snapshot, and only reads. It prints three sections,
+# each headed by a line `== <label>` and holding the tool's output: `== nft -a list ruleset`,
+# `== iptables -S` and `== ip6tables -S`. A tool that is not installed prints `[absent]` and one that
+# exits non-zero adds a `[failed]` line after whatever it printed. The listing ends with `== end`,
+# the whole of it is cut at 1048576 bytes, and the exit status is 0. A listing that was cut has no
+# `== end`. The tools are run with their own fixed arguments and nothing from the caller. It reads
+# the host ruleset, which includes rule handles, and writes nothing.
 #
 # nft load <path> and pf load <path>: <path> is absolute, at most 512 characters with no control
 # character, in a directory named firewall-staging, and its file name is yuzu-fwq-<letters, digits,
@@ -821,6 +835,31 @@ tok_is() {
         "$2") return 0 ;;
     esac
     return 1
+}
+
+# snap_one LABEL TOOL ARGS: one section of the snapshot. Reads only: the tool is run with the
+# fixed arguments the caller of this function names, and its standard error is dropped.
+snap_one() {
+    printf '== %s\n' "$1"
+    snap_tool=$2
+    shift 2
+    if [ ! -x "$snap_tool" ]; then
+        printf '[absent]\n'
+        return 0
+    fi
+    "$snap_tool" "$@" 2>/dev/null || printf '[failed]\n'
+}
+
+# host_snapshot: yuzu-fw-helper snapshot. Never returns. The group is cut at 1 MiB, so a listing
+# that was cut has no end line.
+host_snapshot() {
+    {
+        snap_one 'nft -a list ruleset' "$NFT" -a list ruleset
+        snap_one 'iptables -S' "$IPT" -S
+        snap_one 'ip6tables -S' "$IP6T" -S
+        printf '== end\n'
+    } | head -c 1048576
+    exit 0
 }
 
 all_digits() {
@@ -1396,6 +1435,12 @@ pf_load() {
     exit $?
 }
 
+# snapshot is the only one-argument action; a bare call, or one that is not exactly that word, is
+# refused (snapshot with anything after it falls through to the refusal of the case below).
+if [ $# -eq 1 ]; then
+    tok_is "$1" snapshot || refuse
+    host_snapshot
+fi
 [ $# -ge 2 ] || refuse
 case $1 in
     iptables) tool=$IPT ;;

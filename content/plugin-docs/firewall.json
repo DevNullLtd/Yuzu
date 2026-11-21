@@ -1010,6 +1010,7 @@
       "changelog.d/2026-11-11-firewall-only-containment.removed.md",
       "changelog.d/2026-11-21-firewall-lab-readiness.changed.md",
       "changelog.d/2026-11-21-firewall-lab-readiness.fixed.md",
+      "changelog.d/2026-11-21-firewall-lab-readiness.security.md",
       "changelog.d/7530-firewall-protective-set.changed.md"
     ],
     "definitions": [
