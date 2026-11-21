@@ -1247,7 +1247,8 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
         // middleware
         {"middleware.ibm_mq",
          "List installed IBM MQ installations by version and install path from installer metadata "
-         "(Linux: mqinst.ini + swidtag names; no subprocess; Windows and macOS planned)"},
+         "(Linux: mqinst.ini + swidtag names; Windows: registry Installation subkeys, value names "
+         "unverified against a real install; no subprocess; macOS planned)"},
         // storage
         {"storage.set", "Store a key-value pair in persistent storage"},
         {"storage.get", "Retrieve a value by key from persistent storage"},

@@ -38,6 +38,12 @@
  *    "no usable FilePath" case.
  *  - a refused or failed view keeps its sibling's rows: returning at the token even when the Fs
  *    holds names fails the "names beside a refused / failed view" cases.
+ *  - a FilePath that failed to read is a fault, not a drop: treating every non-denied non-ok path
+ *    answer as a data-shape drop (the old rule) fails the "failed in any other way" cases (a
+ *    healthy sibling would answer `supported` without that installation).
+ *  - a wrong version value name is loud: dropping the every-row-versionless token fails the "no
+ *    VRMF anywhere" cases; counting a refused / failed / empty value as absent fails the "only
+ *    blanks its row" case.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -352,7 +358,7 @@ LegRun run(FakeFs& fs, yuzu::shared::RowByteBudget budget = mw::make_row_budget(
 
 
 /// Runs the ibm_mq Windows leg over `fs` and checks the wire rules of its status row: every token is
-/// `windows:middleware:<installation_key|walk>:<cause>` and never a per-item spelling.
+/// `windows:middleware:<installation_key|vrmf|walk>:<cause>` and never a per-item spelling.
 LegRun run_reg(FakeRegFs& fs, yuzu::shared::RowByteBudget budget = mw::make_row_budget()) {
     const mw::Product& p = *mw::find_product("ibm_mq");
     yuzu::shared::ConstraintAccumulator acc;
@@ -373,7 +379,7 @@ LegRun run_reg(FakeRegFs& fs, yuzu::shared::RowByteBudget budget = mw::make_row_
             REQUIRE(is_wire_token(t));
             const auto parts = split_on(t, ':');
             CHECK(parts[0] == "windows");
-            CHECK((parts[2] == "installation_key" || parts[2] == "walk"));
+            CHECK((parts[2] == "installation_key" || parts[2] == "vrmf" || parts[2] == "walk"));
             CHECK(parts[3] != "missing");
             CHECK(parts[3] != "path_refused");
         }
@@ -1618,7 +1624,7 @@ TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and 
     }
     SECTION("a wrong-type or oversized FilePath is a data-shape drop, not a constraint") {
         fs.put_keys({"Bin", "Big", "Good"});
-        fs.put_value_outcome("Bin", "FilePath", mw::Read::Outcome::failed);
+        fs.put_value_outcome("Bin", "FilePath", mw::Read::Outcome::not_text);
         fs.put_value_outcome("Big", "FilePath", mw::Read::Outcome::oversized);
         fs.put_install("Good", "C:\\mq", "9.3.0.0");
         const LegRun r = run_reg(fs);
@@ -1628,7 +1634,7 @@ TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and 
     }
 }
 
-TEST_CASE("middleware registry runner: a refused FilePath constrains and never reads as absent",
+TEST_CASE("middleware registry runner: a refused or failed FilePath constrains, never reads absent",
           "[middleware]") {
     FakeRegFs fs;
     SECTION("beside a usable sibling: permission_denied, the sibling's row is kept") {
@@ -1659,26 +1665,92 @@ TEST_CASE("middleware registry runner: a refused FilePath constrains and never r
         CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
         CHECK(r.data().empty());
     }
+    SECTION("failed in any other way, beside a usable sibling: unreadable, the sibling is kept") {
+        for (const auto o : {mw::Read::Outcome::failed, mw::Read::Outcome::refused,
+                             mw::Read::Outcome::network, mw::Read::Outcome::symlink}) {
+            FakeRegFs f2;
+            f2.put_keys({"Broken", "Good"});
+            f2.put_value_outcome("Broken", "FilePath", o);
+            f2.put_install("Good", "C:\\mq", "9.3.0.0");
+            const LegRun r = run_reg(f2);
+            CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+            CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+            CHECK(r.events == std::vector<LogEvent>{
+                                  ev("installation_key", mw::ItemReason::unreadable, "Broken")});
+            // the failed installation's version is never asked for
+            CHECK(std::none_of(f2.read_calls.begin(), f2.read_calls.end(),
+                               [](const std::string& c) {
+                                   return c == std::string{kRegKey} + "|Broken|VRMF";
+                               }));
+        }
+    }
+    SECTION("failed, alone: unreadable, not malformed") {
+        fs.put_keys({"Broken"});
+        fs.put_value_outcome("Broken", "FilePath", mw::Read::Outcome::failed);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data().empty());
+    }
+    SECTION("failed, beside a data-shape drop: unreadable alone, no malformed token") {
+        fs.put_keys({"Broken", "NoPath"});
+        fs.put_value_outcome("Broken", "FilePath", mw::Read::Outcome::failed);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:unreadable");
+        CHECK(r.data().empty());
+    }
 }
 
-TEST_CASE("middleware registry runner: a missing VRMF leaves version dash and no token", "[middleware]") {
+TEST_CASE("middleware registry runner: no VRMF anywhere is loud, one beside a sibling is not",
+          "[middleware]") {
     FakeRegFs fs;
-    SECTION("absent") {
+    SECTION("absent on the only installation: vrmf malformed, the row is kept with version dash") {
         fs.put_keys({"A"});
         fs.put_install("A", "C:\\mq", "");
         const LegRun r = run_reg(fs);
-        CHECK(reg_status(r) == "supported|-");
+        CHECK(reg_status(r) == "constrained|windows:middleware:vrmf:malformed");
         CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/mq|-"});
         CHECK(r.events == std::vector<LogEvent>{ev("vrmf", mw::ItemReason::missing, "A")});
     }
-    SECTION("refused or not text") {
-        fs.put_keys({"A"});
-        fs.put_install("A", "C:\\mq", "");
-        fs.put_value_outcome("A", "VRMF", mw::Read::Outcome::denied);
+    SECTION("absent on every one of two installations: the token once, both rows kept") {
+        fs.put_keys({"A", "B"});
+        fs.put_install("A", "C:\\a", "");
+        fs.put_install("B", "C:\\b", "");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:vrmf:malformed");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|-|C:/b|-"});
+    }
+    SECTION("absent on one beside a sibling that has it: supported, that row's version is dash") {
+        fs.put_keys({"A", "B"});
+        fs.put_install("A", "C:\\a", "");
+        fs.put_install("B", "C:\\b", "9.3.0.0");
         const LegRun r = run_reg(fs);
         CHECK(reg_status(r) == "supported|-");
-        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/mq|-"});
-        CHECK(r.events == std::vector<LogEvent>{ev("vrmf", mw::ItemReason::unreadable, "A")});
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/a|-",
+                                                   "ibm_mq|IBM MQ|B|9.3.0.0|C:/b|-"});
+        CHECK(r.events == std::vector<LogEvent>{ev("vrmf", mw::ItemReason::missing, "A")});
+    }
+    SECTION("a refused, failed, oversized, empty or non-text value only blanks its row") {
+        struct Case {
+            mw::Read::Outcome out;
+            const char* text;
+            mw::ItemReason reason;
+        };
+        for (const Case& c :
+             {Case{mw::Read::Outcome::denied, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::failed, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::oversized, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::not_text, "", mw::ItemReason::unreadable},
+              Case{mw::Read::Outcome::ok, "", mw::ItemReason::missing}}) {
+            FakeRegFs f2;
+            f2.put_keys({"A"});
+            f2.put_install("A", "C:\\mq", "");
+            f2.put_value_outcome("A", "VRMF", c.out);
+            const LegRun r = run_reg(f2);
+            CHECK(reg_status(r) == "supported|-");
+            CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|A|-|C:/mq|-"});
+            CHECK(r.events == std::vector<LogEvent>{ev("vrmf", c.reason, "A")});
+        }
     }
 }
 

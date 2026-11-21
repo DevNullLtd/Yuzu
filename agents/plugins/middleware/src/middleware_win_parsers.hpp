@@ -15,8 +15,9 @@
  *       the text of one REG_SZ / REG_EXPAND_SZ value of HKLM\<key> (unexpanded), or why not.
  *
  * Both answer a RegStatus: ok | absent (key or value not there) | denied (access refused) | oversized
- * (a value over `cap`, read_sz only) | failed (anything else, including a value of any other type:
- * decide_value is the ONE rule for that, shared with the real ops).
+ * (a value over `cap`, read_sz only) | not_text (a value of any type other than REG_SZ and
+ * REG_EXPAND_SZ, read_sz only: decide_value is the ONE rule for that, shared with the real ops) |
+ * failed (anything else: a genuine read failure, never a wrong-typed value).
  *
  * THE MERGE (a 32-bit installation registers under WOW6432Node, which the 32-bit view shows as the
  * plain key). FAILURE NEVER READS AS ABSENT:
@@ -28,7 +29,8 @@
  *                else any view denied            -> denied (never absent, never plain ok: an
  *                                                   unreadable view is not "none found", and the
  *                                                   installations it holds may be missing)
- *                else any view failed            -> failed (likewise)
+ *                else any view failed            -> failed (likewise; a listing never yields
+ *                                                   oversized or not_text: they fail closed here)
  *                else                            -> ok (zero names = the key exists and is empty)
  *   reg_value    the 64-bit view first; the 32-bit view ONLY when the first is absent. A denied,
  *                failed or oversized first answer is the answer.
@@ -41,14 +43,13 @@
 
 #include "middleware_runner.hpp"
 
-#include <user_profile_model.hpp> // yuzu::profiles::iequals_ascii
-
-#include <algorithm>
+#include <cctype>
 #include <concepts>
 #include <cstddef>
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <unordered_set>
 #include <utility>
 #include <vector>
 
@@ -59,7 +60,7 @@ inline constexpr std::size_t kMaxRegEntries = 65536;
 
 enum class RegView : std::uint8_t { v64, v32 };
 
-enum class RegStatus : std::uint8_t { ok, absent, denied, oversized, failed };
+enum class RegStatus : std::uint8_t { ok, absent, denied, oversized, not_text, failed };
 
 struct RegListing {
     RegStatus status = RegStatus::failed; ///< a default-built answer is a failure, never "none"
@@ -76,12 +77,13 @@ struct RegText {
 enum class RegValueKind : std::uint8_t { sz, expand_sz, other };
 
 /// The ONE rule for a value's usability, used by RealRegOps and tested here: only REG_SZ and
-/// REG_EXPAND_SZ are text (a DWORD or binary value is `failed`, never text), and a value over `cap`
+/// REG_EXPAND_SZ are text (a DWORD or binary value is `not_text`, never text and never `failed`: a
+/// wrong-typed value is a data-shape fault, a read that failed is not), and a value over `cap`
 /// bytes is `oversized`. `ok` means "go on and read it".
 [[nodiscard]] constexpr RegStatus decide_value(RegValueKind kind, std::size_t size_bytes,
                                                std::size_t cap) noexcept {
     if (kind == RegValueKind::other)
-        return RegStatus::failed;
+        return RegStatus::not_text;
     return size_bytes > cap ? RegStatus::oversized : RegStatus::ok;
 }
 
@@ -99,9 +101,19 @@ namespace detail {
     case RegStatus::absent:    return Read::Outcome::absent;
     case RegStatus::denied:    return Read::Outcome::denied;
     case RegStatus::oversized: return Read::Outcome::oversized;
+    case RegStatus::not_text:  return Read::Outcome::not_text;
     case RegStatus::failed:    break;
     }
     return Read::Outcome::failed;
+}
+
+/// The key under which two registry names are one name: ASCII-folded, as Windows compares key names
+/// (std::tolower on an unsigned char, the rule yuzu::profiles::iequals_ascii uses).
+[[nodiscard]] inline std::string fold_ascii(std::string_view s) {
+    std::string out{s};
+    for (char& c : out)
+        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return out;
 }
 
 } // namespace detail
@@ -114,6 +126,7 @@ public:
 
     [[nodiscard]] RegKeys reg_subkeys(std::string_view hklm_key) {
         RegKeys out;
+        std::unordered_set<std::string> seen; // folded names of both views: a hash set, not a scan
         int absent = 0;
         bool denied = false;
         bool failed = false;
@@ -124,17 +137,14 @@ public:
                 visited_ += l.names.size();
                 if (l.truncated)
                     spent_ = true;
-                for (std::string& n : l.names) {
-                    const auto same = [&](const std::string& have) {
-                        return yuzu::profiles::iequals_ascii(have, n);
-                    };
-                    if (!n.empty() && std::none_of(out.names.begin(), out.names.end(), same))
+                for (std::string& n : l.names)
+                    if (!n.empty() && seen.insert(detail::fold_ascii(n)).second)
                         out.names.push_back(std::move(n));
-                }
                 break;
             case RegStatus::absent: ++absent; break;
             case RegStatus::denied: denied = true; break;
             case RegStatus::oversized:
+            case RegStatus::not_text:
             case RegStatus::failed: failed = true; break;
             }
         }

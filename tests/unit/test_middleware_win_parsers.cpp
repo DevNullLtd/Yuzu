@@ -16,8 +16,12 @@
  *    are names (the old rule) fails the "names in one view, the other denied / failed" cases.
  *  - value fall-through: falling through to the 32-bit view on a DENIED first answer fails the
  *    "denied is the answer" case.
- *  - decide_value: treating a non-text value as text fails the REG_DWORD / REG_BINARY case.
+ *  - decide_value: treating a non-text value as text fails the REG_DWORD / REG_BINARY case;
+ *    answering `failed` for it (the old rule, which made a wrong-typed value and a read failure one
+ *    status) fails the same case and the reg_value mapping case.
  *  - budget: not counting a view's names fails the exhausted() cases.
+ *  - de-duplication cost: a linear scan of the names so far instead of a hash set is correct but
+ *    quadratic; it is not asserted here (no clock), the budget-sized case pins the result only.
  */
 #include <catch2/catch_test_macros.hpp>
 
@@ -26,9 +30,6 @@
 #include <middleware_products.hpp>
 
 #include <cstddef>
-#include <filesystem>
-#include <fstream>
-#include <iterator>
 #include <map>
 #include <string>
 #include <string_view>
@@ -238,16 +239,27 @@ TEST_CASE("middleware windows: reg_value reads the 64-bit view first", "[middlew
         CHECK(r.out == mw::Read::Outcome::denied);
         CHECK(r.text.empty());
     }
-    SECTION("failed and oversized map to their own outcomes with no text") {
+    SECTION("failed, oversized and not_text map to their own outcomes with no text") {
         ops.put_value_status(RegView::v64, key, "FilePath", RegStatus::failed);
         ops.put_value_status(RegView::v64, key, "VRMF", RegStatus::oversized);
+        ops.put_value_status(RegView::v64, key, "Bin", RegStatus::not_text);
         auto fs = make(ops);
         const mw::Read a = fs.reg_value(kKey, "Installation1", "FilePath", 4096);
         const mw::Read b = fs.reg_value(kKey, "Installation1", "VRMF", 4096);
+        const mw::Read c = fs.reg_value(kKey, "Installation1", "Bin", 4096);
         CHECK(a.out == mw::Read::Outcome::failed);
         CHECK(a.text.empty());
         CHECK(b.out == mw::Read::Outcome::oversized);
         CHECK(b.text.empty());
+        CHECK(c.out == mw::Read::Outcome::not_text);
+        CHECK(c.text.empty());
+    }
+    SECTION("a wrong-typed 64-bit value is the answer: the 32-bit view is not tried") {
+        ops.put_value_status(RegView::v64, key, "FilePath", RegStatus::not_text);
+        ops.put_text(RegView::v32, key, "FilePath", "C:\\mq32");
+        auto fs = make(ops);
+        CHECK(fs.reg_value(kKey, "Installation1", "FilePath", 4096).out ==
+              mw::Read::Outcome::not_text);
     }
 }
 
@@ -257,9 +269,47 @@ TEST_CASE("middleware windows: decide_value accepts only text within the cap", "
     STATIC_REQUIRE(win::decide_value(RegValueKind::expand_sz, 10, 64) == RegStatus::ok);
     STATIC_REQUIRE(win::decide_value(RegValueKind::sz, 64, 64) == RegStatus::ok);
     STATIC_REQUIRE(win::decide_value(RegValueKind::sz, 65, 64) == RegStatus::oversized);
-    // a REG_DWORD or REG_BINARY value (any non-text type) is failed, never text, whatever its size
-    STATIC_REQUIRE(win::decide_value(RegValueKind::other, 4, 64) == RegStatus::failed);
-    STATIC_REQUIRE(win::decide_value(RegValueKind::other, 9999, 64) == RegStatus::failed);
+    // a REG_DWORD or REG_BINARY value (any non-text type) is not_text, never text and never
+    // `failed` (a read failure), whatever its size
+    STATIC_REQUIRE(win::decide_value(RegValueKind::other, 4, 64) == RegStatus::not_text);
+    STATIC_REQUIRE(win::decide_value(RegValueKind::other, 9999, 64) == RegStatus::not_text);
+}
+
+TEST_CASE("middleware windows: reg_subkeys fails closed on a status a listing never yields",
+          "[middleware]") {
+    // a listing never yields oversized or not_text; if an ops did, the merge fails closed
+    FakeOps ops;
+    ops.put_list_status(RegView::v64, kKey, RegStatus::not_text);
+    ops.put_names(RegView::v32, kKey, {"Installation1"});
+    auto fs = make(ops);
+    const mw::RegKeys k = fs.reg_subkeys(kKey);
+    CHECK(k.out == mw::Read::Outcome::failed);
+    CHECK(k.names == std::vector<std::string>{"Installation1"});
+}
+
+TEST_CASE("middleware windows: names split across the views at the entries budget are merged once",
+          "[middleware]") {
+    // kMaxRegEntries names, half in each view, the 32-bit half being the 64-bit names in another
+    // case: every name is one installation, in the 64-bit spelling, and the budget is met exactly,
+    // not exceeded. (The merge is a hash set; a scan per name would be quadratic here. No clock.)
+    constexpr std::size_t kHalf = win::kMaxRegEntries / 2;
+    std::vector<std::string> lower;
+    std::vector<std::string> upper;
+    lower.reserve(kHalf);
+    upper.reserve(kHalf);
+    for (std::size_t i = 0; i < kHalf; ++i) {
+        lower.push_back("inst" + std::to_string(i));
+        upper.push_back("INST" + std::to_string(i));
+    }
+    FakeOps ops;
+    ops.put_names(RegView::v64, kKey, lower);
+    ops.put_names(RegView::v32, kKey, upper);
+    auto fs = make(ops);
+    const mw::RegKeys k = fs.reg_subkeys(kKey);
+    CHECK(k.out == mw::Read::Outcome::ok);
+    CHECK(k.names.size() == kHalf);
+    CHECK(k.names == lower);
+    CHECK_FALSE(fs.exhausted());
 }
 
 TEST_CASE("middleware windows: the entries budget sets exhausted()", "[middleware]") {
@@ -295,26 +345,4 @@ TEST_CASE("middleware windows: the entries budget sets exhausted()", "[middlewar
         (void)fs.reg_value(kKey, "I1", "VRMF", 16);
         CHECK(fs.exhausted());
     }
-}
-
-TEST_CASE("middleware windows: the plugin sources use only the wide registry calls", "[middleware]") {
-    // Registry strings are read with Reg*W (win_str.hpp), never Reg*A: an ANSI call mangles a
-    // non-ASCII install path. This lexical check keeps one from appearing in the plugin directory.
-    namespace fs = std::filesystem;
-    const fs::path dir = fs::path{YUZU_PLUGIN_SRC_DIR} / "middleware" / "src";
-    REQUIRE(fs::exists(dir));
-    bool scanned_win_tu = false; // the one TU that holds the registry calls
-    for (const auto& e : fs::directory_iterator{dir}) {
-        const auto ext = e.path().extension();
-        if (ext != ".hpp" && ext != ".cpp")
-            continue;
-        std::ifstream in{e.path(), std::ios::binary};
-        REQUIRE(in.is_open());
-        const std::string text{std::istreambuf_iterator<char>{in}, std::istreambuf_iterator<char>{}};
-        scanned_win_tu = scanned_win_tu || e.path().filename() == "middleware_win.cpp";
-        INFO("file: " << e.path().string());
-        for (const char* banned : {"RegOpenKeyExA", "RegQueryValueExA", "RegEnumKeyExA", "RegGetValueA"})
-            CHECK(text.find(banned) == std::string::npos);
-    }
-    CHECK(scanned_win_tu);
 }

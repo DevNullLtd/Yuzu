@@ -18,7 +18,8 @@
  * and the registry runner in test_middleware_parsers.cpp.
  *
  * The plugin sources are also scanned for any way of starting a process (the shared bounded runner
- * included), because a version probe's output cannot show that a binary was never run.
+ * included), because a version probe's output cannot show that a binary was never run, and for an
+ * ANSI registry call (the daily-sync rule: registry strings are read with Reg*W only).
  *
  * The descriptors and the action list are GENERATED from the product table
  * (agents/shared/middleware_products.hpp); the descriptor cases below pin them to that table, so
@@ -323,7 +324,7 @@ TEST_CASE("middleware plugin: a throwing leg is contained and reported as intern
 // discard the output and still answer `-`), and scripts/ci/check-plugin-spawn-lexical.sh accepts
 // `yuzu::agent::run_bounded_subprocess`. So the acquisition boundary is pinned at the source: the
 // same source-tripwire family as the YUZU_AGENT_SRC_DIR tests, a few small files read once.
-TEST_CASE("middleware plugin: no source spawns a process directly or through the shared runner",
+TEST_CASE("middleware plugin: no source spawns a process or calls an ANSI registry function",
           "[middleware][contract][subprocess]") {
     // Positive controls: the scan sees each way of starting a process, and ignores prose and
     // quoted text, so the real scan below cannot pass vacuously.
@@ -354,6 +355,11 @@ TEST_CASE("middleware plugin: no source spawns a process directly or through the
         const std::string text{std::istreambuf_iterator<char>{in},
                                std::istreambuf_iterator<char>{}};
         CHECK(spawn_identifiers(text).empty());
+        // The ANSI-registry ban is a plain find on the RAW text, not through spawn_identifiers
+        // (which strips comments and strings): an ANSI call mangles a non-ASCII install path.
+        for (const char* banned :
+             {"RegOpenKeyExA", "RegQueryValueExA", "RegEnumKeyExA", "RegGetValueA"})
+            CHECK(text.find(banned) == std::string::npos);
         scanned.insert(f.filename().string());
     }
     for (const char* must : {"middleware_products.hpp", "middleware_parsers.hpp",

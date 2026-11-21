@@ -72,6 +72,8 @@
  * HKLM only: nothing here names a hive. Failure never reads as absent:
  *
  *   installation key absent (both views)                supported, zero rows (none found)
+ *   installation key present with no subkey             supported, zero rows (none found): a key
+ *                                                       that answered and is empty registers none
  *   key refused in either view                          CONSTRAINED  <probe>:permission_denied; rows:
  *                                                       those of the view that answered, if any
  *   key failed in either view, in any other way         CONSTRAINED  <probe>:unreadable; rows: as
@@ -84,12 +86,29 @@
  *                                                       that installation gets no row, its
  *                                                       siblings are kept; one log line
  *                                                       (ItemReason::unreadable)
+ *   a subkey whose path value failed to read, in any
+ *     other way (not absent, empty, oversized or
+ *     wrong-typed, and not refused)                     CONSTRAINED  <probe>:unreadable; as above:
+ *                                                       no row, not counted as dropped, siblings
+ *                                                       kept, one log line (ItemReason::unreadable)
  *   some subkeys with an ABSENT, empty, oversized or
- *     wrong-type path value, at least one with it       supported; one log line per dropped
+ *     wrong-type (not_text) path value, at least one
+ *     usable                                            supported; one log line per dropped
  *                                                       subkey (ItemReason::malformed)
  *   every subkey with such a path value                 CONSTRAINED  <probe>:malformed; wrong value
  *                                                       names fail loudly on a host with the product
- *   a version value missing / refused / not text        supported; logged; that row's version is "-"
+ *   a version value missing / refused / failed /
+ *     oversized / empty / not text, beside a row that
+ *     has its version                                   supported; logged; that row's version "-"
+ *   EVERY row built has a version value ABSENT on its
+ *     key (every version probe answered absent), at
+ *     least one row                                     CONSTRAINED  <version probe id>:malformed
+ *                                                       (`vrmf:malformed`); the rows are kept with
+ *                                                       "-": a wrong version value name fails
+ *                                                       loudly on a host with the product. Only an
+ *                                                       ABSENT value counts: a refused, failed,
+ *                                                       oversized, empty or non-text one only
+ *                                                       blanks its row
  *
  * ORDER OF THE VERSION PROBES (a per-item decision, fixed): for a candidate, every dir_name probe in
  * table order; a listing is judged ONCE per distinct sub-directory and in this order --
@@ -132,7 +151,11 @@ struct Candidate {
 };
 
 struct Read {
-    enum class Outcome { ok, absent, refused, network, symlink, denied, oversized, failed };
+    /// `not_text` = a registry value of a type other than a string (the registry leg only): a
+    /// wrong-typed value is a data-shape fault, never to be confused with a read that `failed`.
+    enum class Outcome {
+        ok, absent, refused, network, symlink, denied, oversized, failed, not_text
+    };
     Outcome out = Outcome::failed; ///< a default-built Read is a failure, never an empty success
     std::string text;
 };
@@ -192,9 +215,28 @@ namespace detail {
     case Read::Outcome::ok:
     case Read::Outcome::absent:
     case Read::Outcome::refused:
+    case Read::Outcome::not_text:
     case Read::Outcome::failed:    break;
     }
     return Cause::unreadable;
+}
+
+/// A registry install-path value that did not read, judged: true = a READ fault (refused, or failed
+/// in any other way: the installation is there and its path is unknown), false = a data-shape fault
+/// of that one subkey (absent, empty, oversized or wrong-typed). Not for `ok`.
+[[nodiscard]] constexpr bool reg_path_fault(Read::Outcome o) noexcept {
+    switch (o) {
+    case Read::Outcome::absent:
+    case Read::Outcome::oversized:
+    case Read::Outcome::not_text:
+    case Read::Outcome::ok:        return false;
+    case Read::Outcome::denied:
+    case Read::Outcome::refused:
+    case Read::Outcome::network:
+    case Read::Outcome::symlink:
+    case Read::Outcome::failed:    break;
+    }
+    return true;
 }
 
 [[nodiscard]] constexpr bool path_refused(Read::Outcome o) noexcept {
@@ -366,15 +408,20 @@ template <MiddlewareRegFs Fs, class Log>
     // 2. per candidate: its install path, then the version from the first reg_value probe that
     //    yields text, then its row.
     std::size_t dropped = 0;
+    std::size_t versionless = 0; // rows whose every version probe answered ABSENT
     for (const std::string& name : keys.names) {
         Candidate c{name, {}, {}};
         Read path = fs.reg_value(enumerator.path, name, enumerator.path_key, kMaxRegValueBytes);
         const bool usable = path.out == Read::Outcome::ok && !path.text.empty();
+        bool every_version_absent = false;
         if (usable) {
             c.install_path = std::move(path.text);
+            every_version_absent = leg.probes.size() > 1;
             for (std::size_t i = 1; i < leg.probes.size() && c.version.empty(); ++i) {
                 const Probe& pr = leg.probes[i];
                 Read v = fs.reg_value(enumerator.path, name, pr.name_key, kMaxRegValueBytes);
+                if (v.out != Read::Outcome::absent)
+                    every_version_absent = false;
                 if (v.out == Read::Outcome::ok && !v.text.empty())
                     c.version = std::move(v.text);
                 else
@@ -389,11 +436,13 @@ template <MiddlewareRegFs Fs, class Log>
             fail("walk", Cause::row_cap);
             return rows;
         }
-        if (path.out == Read::Outcome::denied) {
-            // An ACCESS fault, never a data-shape one: the installation exists but its path was
-            // refused, so the answer is incomplete. It gets no row, is not counted in `dropped` (the
-            // token already constrains the answer) and its siblings are kept.
-            fail(enumerator.id, Cause::permission_denied);
+        if (!usable && detail::reg_path_fault(path.out)) {
+            // An ACCESS or READ fault, never a data-shape one: the installation exists but its path
+            // could not be read (refused, or failed in any other way), so the answer is incomplete.
+            // It gets no row, is not counted in `dropped` (the token already constrains the answer)
+            // and its siblings are kept.
+            fail(enumerator.id, path.out == Read::Outcome::denied ? Cause::permission_denied
+                                                                  : Cause::unreadable);
             log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::unreadable,
                 std::string_view{name});
             continue;
@@ -411,9 +460,16 @@ template <MiddlewareRegFs Fs, class Log>
             return rows;
         }
         rows.push_back(std::move(row));
+        if (every_version_absent)
+            ++versionless;
     }
     if (!keys.names.empty() && dropped == keys.names.size())
         fail(enumerator.id, Cause::malformed); // every subkey dropped: incomplete, not "none found"
+    // No installation has a version value at all: a misspelt version value name is
+    // indistinguishable from a product that records none, and a quiet `-` on every row would read
+    // as the latter. One row beside a sibling that has its version stays a logged `-`.
+    if (!rows.empty() && versionless == rows.size())
+        fail(leg.probes[1].id, Cause::malformed);
     return rows;
 }
 

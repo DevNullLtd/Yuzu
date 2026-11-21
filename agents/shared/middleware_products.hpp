@@ -25,8 +25,10 @@
  *
  * A leg is PLANNED exactly when it has no probes. macOS is PLANNED for every product, so the plugin
  * declares one shared constant for it instead of a leg per product. Every field is a plain
- * constant: the table is checked at compile time by products_well_formed(), so a malformed row is a
- * build failure, never a runtime surprise.
+ * constant, and products_well_formed() checks the table at compile time: the shapes it lists below
+ * are a build failure, never a runtime surprise. It does not refuse an unused field left set on a
+ * probe, nor a probe id equal to a runner token source (`walk`, `mountinfo`); review keeps those
+ * out.
  *
  * VOCABULARY GATE. tests/test_software_vocabulary_consistency.py reads the designated initialisers
  * of the `ecosystem` and `kind` fields of the table below with a regular expression. Keep them as
@@ -118,9 +120,12 @@ inline constexpr std::array<Probe, 3> kIbmMqLinuxProbes{{
 /// IBM MQ on Windows: every subkey of `Installation` is one installation, named by the subkey; its
 /// `FilePath` value is the install path and its `VRMF` value the version, read in both registry views.
 /// The key and the two value names come from IBM's documentation, NOT from a capture of a real
-/// install, so the leg is CONSTRAINED: the runner turns a wrong spelling (an absent or empty
-/// FilePath) into a loud `installation_key:malformed` on a host that has the product; a FilePath
-/// the host refuses to read is `installation_key:permission_denied`.
+/// install, so the leg is CONSTRAINED and the runner keeps a wrong spelling loud on a host that has
+/// the product: no subkey with a usable FilePath is `installation_key:malformed`, and no row built
+/// with a VRMF value is `vrmf:malformed` (the rows are kept, version `-`). A FilePath the host
+/// refuses to read is `installation_key:permission_denied`, one that failed to read in any other
+/// way `installation_key:unreadable`. A key that is present and holds no subkey is `supported`
+/// with no rows.
 inline constexpr std::array<Probe, 2> kIbmMqWindowsProbes{{
     {"installation_key", ProbeKind::reg_subkeys, "SOFTWARE\\IBM\\WebSphere MQ\\Installation",
      nullptr, nullptr, "FilePath", nullptr, nullptr, NameForm::exact},
