@@ -49,7 +49,7 @@
 /// the claim: a replaced regular file is a recorded residual on that platform (SQLite holds its
 /// files without FILE_SHARE_DELETE, so a live database another process has open cannot lose its
 /// name there; unproven until the MSVC leg runs).
-/// Four residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// Five residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
 /// unsupported). The release of a claim that is not the judged file is also by name, so a file a
