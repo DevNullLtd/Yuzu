@@ -7046,6 +7046,8 @@ TEST_CASE("ingest_inventory_report v3: slot 14 rides the wire as the attribute f
         w_hdr() + w_sec(kV3Apps, "full") + w_plus("Alpha", kV3Apps, "", kUpgradeCode) +
         w_sec(kV3Pkgs, "full") + w_plus("Bad", kV3Pkgs, "", "uninstall.exe /x");
     agentpb::InventoryReport rep;
+    // content_hashes names which sources came due; without it the report ingests nothing.
+    (*rep.mutable_content_hashes())["installed_software"] = "claimed-and-ignored";
     (*rep.mutable_plugin_data())["installed_software"] = blob;
     agentpb::InventoryAck ack;
     yuzu::server::ingest_inventory_report(store, "agent-wa", rep, ack, &metrics);
