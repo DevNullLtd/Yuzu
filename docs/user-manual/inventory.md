@@ -286,8 +286,9 @@ cadences.
   swidtag file names, on Windows the `HKLM\SOFTWARE\IBM\WebSphere MQ\Installation` subkeys in
   both registry views (`FilePath` and `VRMF` values). The Windows value names come from IBM's
   documentation, not from a capture of a real install, so that leg is declared `constrained`
-  until one confirms them; an installation key with no readable `FilePath` shows as
-  `windows:middleware:installation_key:malformed`, never as an empty list. The Linux read is
+  until one confirms them; an installation key whose `FilePath` is missing or not text shows as
+  `windows:middleware:installation_key:malformed` when none has one, and a `FilePath` the registry
+  refuses shows as `windows:middleware:installation_key:permission_denied`, never as an empty list. The Linux read is
   readable by an unprivileged account (measured as a throwaway
   unprivileged uid on one IBM MQ 9.4.5.0 Ubuntu-debs install; not measured as the packaged
   `yuzu-agent` account or on another version or distribution; the Windows read is not measured). If the answer is `constrained`

@@ -118,8 +118,9 @@ inline constexpr std::array<Probe, 3> kIbmMqLinuxProbes{{
 /// IBM MQ on Windows: every subkey of `Installation` is one installation, named by the subkey; its
 /// `FilePath` value is the install path and its `VRMF` value the version, read in both registry views.
 /// The key and the two value names come from IBM's documentation, NOT from a capture of a real
-/// install, so the leg is CONSTRAINED: the runner turns a wrong spelling into a loud
-/// `installation_key:malformed` on a host that has the product.
+/// install, so the leg is CONSTRAINED: the runner turns a wrong spelling (an absent or empty
+/// FilePath) into a loud `installation_key:malformed` on a host that has the product; a FilePath
+/// the host refuses to read is `installation_key:permission_denied`.
 inline constexpr std::array<Probe, 2> kIbmMqWindowsProbes{{
     {"installation_key", ProbeKind::reg_subkeys, "SOFTWARE\\IBM\\WebSphere MQ\\Installation",
      nullptr, nullptr, "FilePath", nullptr, nullptr, NameForm::exact},

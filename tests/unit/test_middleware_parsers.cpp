@@ -1604,8 +1604,7 @@ TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and 
         CHECK(r.events == std::vector<LogEvent>{ev("installation_key", mw::ItemReason::malformed, "Bad")});
     }
     SECTION("every subkey dropped is an incomplete answer, never an empty supported") {
-        fs.put_keys({"A", "B"});
-        fs.put_value_outcome("B", "FilePath", mw::Read::Outcome::denied);
+        fs.put_keys({"A", "B"}); // neither has a FilePath value: absent, a data-shape fault
         const LegRun r = run_reg(fs);
         CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:malformed");
         CHECK(r.data().empty());
@@ -1616,6 +1615,49 @@ TEST_CASE("middleware registry runner: a subkey without FilePath is dropped and 
         fs.put_value("A", "FilePath", "");
         const LegRun r = run_reg(fs);
         CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:malformed");
+    }
+    SECTION("a wrong-type or oversized FilePath is a data-shape drop, not a constraint") {
+        fs.put_keys({"Bin", "Big", "Good"});
+        fs.put_value_outcome("Bin", "FilePath", mw::Read::Outcome::failed);
+        fs.put_value_outcome("Big", "FilePath", mw::Read::Outcome::oversized);
+        fs.put_install("Good", "C:\\mq", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "supported|-");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+        CHECK(r.events.size() == 2);
+    }
+}
+
+TEST_CASE("middleware registry runner: a refused FilePath constrains and never reads as absent",
+          "[middleware]") {
+    FakeRegFs fs;
+    SECTION("beside a usable sibling: permission_denied, the sibling's row is kept") {
+        fs.put_keys({"Denied", "Good"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        fs.put_install("Good", "C:\\mq", "9.3.0.0");
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data() == std::vector<std::string>{"ibm_mq|IBM MQ|Good|9.3.0.0|C:/mq|-"});
+        CHECK(r.events ==
+              std::vector<LogEvent>{ev("installation_key", mw::ItemReason::unreadable, "Denied")});
+        // the refused installation's version is never asked for
+        CHECK(std::none_of(fs.read_calls.begin(), fs.read_calls.end(), [](const std::string& c) {
+            return c == std::string{kRegKey} + "|Denied|VRMF";
+        }));
+    }
+    SECTION("alone: permission_denied, not malformed") {
+        fs.put_keys({"Denied"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data().empty());
+    }
+    SECTION("beside a data-shape drop: permission_denied alone, no malformed token") {
+        fs.put_keys({"Denied", "NoPath"});
+        fs.put_value_outcome("Denied", "FilePath", mw::Read::Outcome::denied);
+        const LegRun r = run_reg(fs);
+        CHECK(reg_status(r) == "constrained|windows:middleware:installation_key:permission_denied");
+        CHECK(r.data().empty());
     }
 }
 

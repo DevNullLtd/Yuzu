@@ -76,10 +76,14 @@
  *   more than kMaxRows subkeys, or cut by the Fs        CONSTRAINED  <probe>:row_cap; the first
  *                                                       kMaxRows kept, in sorted order
  *   entries / row / byte budget out (walk or Fs)        CONSTRAINED  walk:row_cap
- *   some subkeys without a path value, at least one
- *     with it                                           supported; one log line per dropped
+ *   a subkey whose path value was refused (denied)      CONSTRAINED  <probe>:permission_denied;
+ *                                                       that installation gets no row, its
+ *                                                       siblings are kept; one log line
+ *                                                       (ItemReason::unreadable)
+ *   some subkeys with an ABSENT, empty, oversized or
+ *     wrong-type path value, at least one with it       supported; one log line per dropped
  *                                                       subkey (ItemReason::malformed)
- *   every subkey without a path value                   CONSTRAINED  <probe>:malformed; wrong value
+ *   every subkey with such a path value                 CONSTRAINED  <probe>:malformed; wrong value
  *                                                       names fail loudly on a host with the product
  *   a version value missing / refused / not text        supported; logged; that row's version is "-"
  *
@@ -379,6 +383,15 @@ template <MiddlewareRegFs Fs, class Log>
         if (fs.exhausted()) { // the reads ran the entries budget dry: this candidate gets no row
             fail("walk", Cause::row_cap);
             return rows;
+        }
+        if (path.out == Read::Outcome::denied) {
+            // An ACCESS fault, never a data-shape one: the installation exists but its path was
+            // refused, so the answer is incomplete. It gets no row, is not counted in `dropped` (the
+            // token already constrains the answer) and its siblings are kept.
+            fail(enumerator.id, Cause::permission_denied);
+            log(std::string_view{p.id}, std::string_view{enumerator.id}, ItemReason::unreadable,
+                std::string_view{name});
+            continue;
         }
         if (!usable) {
             // A data-shape fault of ONE subkey: logged, its siblings are kept.
