@@ -20,10 +20,11 @@ Any other 64-hex-digit token in a NOTICE fails as unbound, so a hash cannot be
 recorded in a shape this test silently skips. A NOTICE recording no hash at all
 is not this test's concern (qrcodegen today).
 
-Overlap: when the vendored-components manifest from branch
-fix/wp15-web-assets-sbom lands, `artifact-sbom.py check-vendored` also checks
-that each NOTICE hash is SOME listed file's hash. This test binds each hash to
-the file the NOTICE names, which that check does not.
+Overlap: `artifact-sbom.py check-vendored` (server/core/vendored-components.json)
+also checks every NOTICE hash, but per component: each hash a NOTICE records
+must be the hash of a file of a component that names that NOTICE as its
+`notice`. This test binds each hash to the one file the NOTICE's own
+`Vendored file:` line or table row names, which that check does not.
 
 Stdlib only; never edits the checkout (the self-tests use a scratch copy).
 """

@@ -272,6 +272,8 @@ agent_test_exe = executable(
     'unit/test_filesystem_local_dispatcher.cpp', # #4728: real filesystem plugin via LocalDispatcher -- `replace` through the shared atomic write
     'unit/test_filesystem_find_by_hash.cpp',  # #5624: pure find_by_hash walk core (limits, injected clock/cancel/hasher) + real no-follow fd hasher over TempDir
     'unit/test_filesystem_find_by_hash_dispatcher.cpp',  # #5624: real filesystem plugin via LocalDispatcher -- byte-identical clean output, trailer + CONSTRAINED/PARTIAL
+    'unit/test_filesystem_search_dir.cpp',  # #6478: pure search_dir core over the shared bounded walk (limits, injected clock/cancel/probe/mounts) + row escaping
+    'unit/test_filesystem_search_dir_dispatcher.cpp',  # #6478: real filesystem plugin via LocalDispatcher -- search_dir rows, error rows, trailer + CONSTRAINED/PARTIAL
     'unit/test_confined_fs_rules.cpp',
     'unit/test_confined_fs_walk.cpp',
     'unit/test_confined_fs_posix.cpp',
@@ -671,6 +673,7 @@ agent_test_exe = executable(
     'unit/test_runtimes_parsers.cpp',            # Wave 10 PR10.1-b: pure parsers over REAL CAPTURE fixtures, unguarded on every OS
     'unit/test_component_zip.cpp',               # component_inventory: bounded zip reader (wave 1)
     'unit/test_component_java_parsers.cpp',      # component_inventory: Java manifest/pom parsers (wave 1)
+    'unit/test_component_native_parsers.cpp',    # component_inventory: the native adapter over the shared binary_header readers (outcome mapping, universal slice choice), name and version rules, deterministic sweep (SAM-22)
     'unit/test_component_walk.cpp',              # component_inventory: bounded walk policy over an in-memory tree and a fake clock, unguarded on every OS
     'unit/test_component_walk_ordered.cpp',      # file search core: sorted depth-first resumable walk_ordered over MemTree and a fake clock, unguarded on every OS
     'unit/test_network_fstype_mounts.cpp',       # shared mount-table entries + local filesystem allow-list (agents/shared/network_fstype.hpp), portable
@@ -686,6 +689,7 @@ agent_test_exe = executable(
     'unit/test_file_search_posix_shell.cpp',     # file search plugin: the POSIX shell's own pieces -- extents of real files, the macOS name rule and mount converter, the thread-capability planner (body POSIX-only; the capability syscalls Linux-only and root-only)
     'unit/test_file_search_local_dispatcher.cpp', # file search plugin: real plugin via LocalDispatcher, unguarded on every OS (one real slice over a fixture under the build root on POSIX)
     'unit/test_component_scan.cpp',              # component_inventory: portable scan over an in-memory tree and a fake clock, archives built as bytes; one POSIX-only case through the real leg
+    'unit/test_component_native_scan.cpp',       # component_inventory: native-library scan over an in-memory tree and a fake clock; one POSIX-only case through the real leg and parsers (SAM-22)
     'unit/test_component_fs_posix.cpp',          # component_inventory: POSIX filesystem leg (body POSIX-only)
     'unit/test_component_inventory_local_dispatcher.cpp',  # component_inventory: real plugin via LocalDispatcher, unguarded on every OS (dispatches scan on Windows only)
     'unit/test_runtimes_linux_parsers.cpp',      # Wave 10 PR10.1-b: Linux walk over materialized tree manifests (REAL CAPTURE structure plus labelled reconstructions; walk bodies POSIX-only)
@@ -1008,6 +1012,25 @@ if host_machine.system() == 'linux' and get_option('b_sanitize') == 'none'
     args: ['--allow-running-no-tests', '--durations=yes'],
     suite: 'agent',
     timeout: 60,
+  )
+endif
+
+# ── WP01 re-registration audit budget under allocation failure (separate binary, deliberately) ──
+# test_reregistration_audit_budget_alloc.cpp replaces the global operator new to inject
+# std::bad_alloc at every allocation point (see its header): absent under sanitizers and on Windows.
+if host_machine.system() != 'windows' and get_option('b_sanitize') == 'none'
+  reregistration_budget_alloc_exe = executable(
+    'yuzu_reregistration_budget_alloc_tests',
+    files('unit/server/test_reregistration_audit_budget_alloc.cpp'),
+    include_directories: [include_directories('../server/core/src')],
+    dependencies: [catch2_dep],
+  )
+  test(
+    'reregistration audit budget allocation failure',
+    reregistration_budget_alloc_exe,
+    args: ['--allow-running-no-tests', '--durations=yes'],
+    suite: 'server',
+    timeout: 300,
   )
 endif
 
@@ -1946,6 +1969,8 @@ if build_server
       'unit/server/test_cert_reloader.cpp',
       'unit/server/test_x509_ca.cpp',
       'unit/server/test_ca_store.cpp',
+      'unit/server/test_agent_reregistration_gate.cpp', # WP01: re-registration proof-of-identity decision
+      'unit/server/test_agent_witnessed_leaf.cpp', # WP01: witnessed-gateway-leaf proof predicate (real certs)
       'unit/server/test_ca_routes.cpp',
       'unit/server/test_crl_publisher.cpp', # HA WS-6 CRL follow-ups (#4828/#4831)
       'unit/server/test_kek_routes.cpp', # #2395 track D — KEK rotation REST surface
@@ -2057,6 +2082,7 @@ if build_server
       'unit/server/test_ota_total_admission.cpp', # server-wide OTA gate occupancy (#913)
       'unit/server/test_ota_audit_key.cpp', # OTA identity-deny audit bucket key (#416/#913)
       'unit/server/test_ota_identity_mtls.cpp', # OTA identity audit bound over real mTLS (#416)
+      'unit/server/test_agent_register_mtls_proof.cpp', # WP01: direct-path proof derivation over real mTLS (PG-backed enrollment)
       'unit/server/test_gateway_peer_policy.cpp', # gateway-upstream peer authorization: certificate facts, pin set, admission policy
       'unit/server/test_gateway_peer_guard.cpp', # gateway-upstream peer authorization: guard over real mTLS, descriptor sweep, audit budget
       'unit/server/test_gateway_peer_resolution.cpp', # gateway-upstream peer authorization: boot resolution matrix + boot pin set
@@ -3576,16 +3602,19 @@ test('qa-stack gateway crash signatures',
   timeout: 30,
 )
 # WP15/S9: the release image vulnerability gate (scripts/ci/image-vuln-gate.sh)
-# fails closed, run against a stub trivy; plus lexical tripwires that every
+# fails closed, run against a stub trivy, a stub grype and a stub docker; the
+# grype rules' mutants must be killed; plus lexical tripwires that every
 # release.yml publish job runs it before its push and pre-release.yml scans
 # every published image. Hermetic, no Docker; the bash cases skip on Windows.
 test('image vulnerability gate',
   _python3_test,
   args: [files('test_image_vuln_gate.py')],
   suite: 'docs',
-  # 68-92 s when the runner is loaded (CI hit 60.02 s on PR #8315 with the old
-  # limit of 60): many cases each run the gate script and a stub trivy.
-  timeout: 240,
+  # Many cases each run the gate script with its stubs. Before the grype path
+  # it took 41 s on an idle workstation and 68-92 s on a loaded CI runner (CI
+  # hit 60.02 s on PR #8315 with the old limit of 60); with it (WP15), 86 s on
+  # the same workstation, so a loaded runner can need about 190 s.
+  timeout: 480,
 )
 
 # WP15/S9: the publish journal (scripts/ci/image-publish.sh). A table of gate
@@ -3633,6 +3662,17 @@ test('release artifact gate',
 test('per-artifact SBOM generator',
   _python3_test,
   args: [files('test_artifact_sbom.py')],
+  suite: 'docs',
+  timeout: 60,
+)
+
+# The vendored-components manifest (server/core/vendored-components.json) that
+# puts yuzu-server's web assets and QR-code library on its SBOMs: fails when a
+# file under server/core/vendor/ or server/core/static/ is added or changed
+# without a matching entry. Mutations run on a scratch copy.
+test('vendored components manifest',
+  _python3_test,
+  args: [files('test_vendored_components.py')],
   suite: 'docs',
   timeout: 60,
 )
@@ -5452,6 +5492,29 @@ test('file_search read tier tripwire selftest',
 test('forensics tier wiring lexical',
   _python3_test,
   args: [files('test_forensics_tier_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP01: the agent re-registration proof gate must stay wired into BOTH ingest paths, server.cpp
+# must wire/clear the hooks, and the test seam must not leak into production. Unit tests use fake
+# hooks, so only this lexical gate (plus its mutation selftest) guards the production wiring.
+test('reregistration gate wiring lexical',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+test('reregistration gate wiring lexical selftest',
+  _python3_test,
+  args: [files('test_reregistration_gate_wiring_lexical_selftest.py')],
+  suite: 'docs',
+  timeout: 30,
+)
+# WP01: the refusal message is copied byte for byte into the gateway (neutral for its circuit
+# breaker), its eunit and the gateway manual; a drifted copy counts every refusal as a breaker failure.
+test('reregistration refusal literal lexical',
+  _python3_test,
+  args: [files('test_reregistration_refusal_literal_lexical.py')],
   suite: 'docs',
   timeout: 30,
 )

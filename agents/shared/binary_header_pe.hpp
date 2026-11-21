@@ -361,6 +361,11 @@ read_pe_version(const Source& src, const PeLimits& lim = {}, ReadBudget budget =
     const auto opt_off = checked_add(*lfanew, 24);
     if (!opt_off)
         return fail(ParseError::truncated);
+    // The declared optional header must lie inside the file, whichever return follows: a size that
+    // runs past the end is truncated whether or not the file has a resource directory.
+    const auto opt_end = checked_add(*opt_off, opt_size);
+    if (!opt_end || *opt_end > rd.size())
+        return fail(ParseError::truncated);
     constexpr std::size_t kMaxOptRead = 112 + 16 * 8; // PE32+ fixed part + 16 directory entries
     auto opt = rd.read(*opt_off, opt_size < kMaxOptRead ? opt_size : kMaxOptRead);
     if (!opt)

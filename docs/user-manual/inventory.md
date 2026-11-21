@@ -213,7 +213,7 @@ cadences.
   rather than a product silently disappearing. The same product normally also has an `app`/`windows`
   row from `installed_apps`' registry walk, so a Windows host normally carries
   two rows per MSI product. The `msi` row adds the product code (stored as
-  `package_id`; the REST and MCP software routes do not return that column yet)
+  `package_id`, which the REST and MCP software routes return on each row)
   and the machine-context guarantee. Install location and uninstall string are
   not collected (wire slots 13-14 stay reserved and empty, #5186). If the
   enumeration itself fails the source is reported `constrained` (see Troubleshooting).
@@ -480,14 +480,60 @@ unpacked (the archive's directory and, when needed, two small entries are read).
   between archives, so one blocked read is not interrupted. On the packaged Linux unit the agent
   holds `CAP_DAC_READ_SEARCH`, so permission-restricted directories are readable there and
   `dir_unreadable` is rare.
-- **Switching it off.** The per-plugin kill switch (`component_inventory/scan`,
-  `PUT /api/v1/plugin-config/component_inventory/kill-switch`) turns the action off. The permanent
+- **Switching it off.** The kill switch (`PUT /api/v1/plugin-config/component_inventory/kill-switch`,
+  with `action` set to `scan`) turns the action off. The permanent
   customer opt-out of ADR-0028 Decisions 2 and 8 is still open (#7737).
 - **What the rows reveal.** Names, versions, paths and application folder names as they appear on
   disk, which is a detailed software inventory for the device; the names of nested libraries can
   reveal a customer's internal dependency names.
 - **When it runs.** On demand only, as an instruction. The daily report does not carry these rows
   yet, so they do not appear in the software inventory views.
+
+### Native libraries (`component_inventory`, `native`)
+
+The `component_inventory` plugin's `native` action (instruction `crossplatform.components.native`)
+lists the versioned shared libraries shipped inside applications: ELF `.so` files on Linux and
+Mach-O `.dylib` files on macOS. It reads each library's header in-process; no process is started.
+**It is switched off until an operator enables it** (below).
+
+- **Switching it on.** The server refuses the action until an operator lifts its kill-switch row:
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch` with `action` set to `native` and
+  `enabled` true. The row is separate from `scan`, which stays on. A server restart never overwrites
+  an operator's own setting.
+- **Where.** Linux: `/opt` and `/usr/local/lib`. macOS: `/Applications`, `/usr/local` and
+  `/opt/homebrew`. The package manager's own trees are not read: on Linux `/usr/lib` and the other
+  system library directories are not roots, and on macOS the Homebrew Cellar trees
+  (`/usr/local/Cellar`, `/opt/homebrew/Cellar`) are not entered. Windows is not read yet: it answers
+  one `unsupported` status row (`windows:planned`). Extension-less macOS framework binaries are not
+  listed.
+- **What a row holds.** Kind (`native`), name (the SONAME on Linux or the install name on macOS,
+  without its suffix and version), version, where the version came from (`filename`, `elf`, `macho`
+  or `unreadable`), path, size, modification time and the application folder it sits under.
+- **How the version is read.** On Linux, from the file name's `.so.<version>` suffix
+  (`libssl.so.3.0.13` reads `3.0.13`), else from the SONAME's suffix. On macOS, from the library's
+  Mach-O `current_version` when it is not `0.0.0`, else from the file name's version
+  (`libfoo.1.2.dylib` reads `1.2`). A library whose header cannot be read inside the fixed
+  bounds, or that names no version, is still listed from its file name with `version_source`
+  `unreadable`; that is a gap in one row and does not make the scan incomplete. A file whose name
+  looks like a library but whose header says it is not one is not listed.
+- **Bounds.** The scan's (400,000 directory entries, 45 seconds, 32 levels, 50,000 entries per
+  directory, 3,000 rows per application folder) with 5,000 rows in all. Per library, at most 128
+  ELF program headers, 4,096 dynamic entries, a 255-byte name, 16 fat slices and 1,024 load
+  commands in 512 KiB; a count past one of those makes that library `unreadable`, never a partial
+  answer. A universal Mach-O file is read through its first slice that has no error and is a
+  dynamic library.
+- **When the list may be incomplete.** The status row reads `constrained` for the same causes as
+  `scan` (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`, `dir_unreadable`,
+  `dir_truncated`, `mount_table_unreadable`), and `archive_changed` when a library changed or
+  vanished while it was read. On a `supported` answer, the Homebrew Cellar trees the scan did not
+  enter are named by the informational token `package_tree_skipped`, beside the `scan` tokens.
+  A Mac with very large application bundles can use the whole entry budget in `/Applications`, so
+  read a `budget_entries` answer as the part of the host reached.
+- **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
+  read of up to 45 seconds on one device that cannot be cancelled once started. `native` publishes
+  no heartbeat cost counters.
+- **When it runs.** On demand only, as an instruction, once enabled. The daily report does not
+  carry these rows yet.
 
 ### Install type, scope and location, and the sectioned report
 
@@ -996,15 +1042,17 @@ curl -H "Authorization: Bearer $TOKEN" -o affected.csv \
   [rest-api.md](rest-api.md); `format`, `purl` and `vers` are REST-only (the MCP tool takes
   every other parameter).
 - Success body: `{"data": {"software": [...], "count": N, "devices_omitted": M, "totals":
-  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 23 fields: the 14
+  {...} | null, ...}, "meta": {"api_version": "v1"}}`. Each REST row has 24 fields: the 15
   package fields `{agent_id, name, version, publisher, install_date, kind, ecosystem, epoch,
-  release, arch, signature_status, distro_id, distro_version, source}` — `""` where the
+  release, arch, signature_status, distro_id, distro_version, source, package_id}` — `""` where the
   ecosystem does not store them (see the availability matrix above); `source` is the
-  `<plugin>.<action>` that produced the row — plus the lookup fields `hostname`, `last_seen`
+  `<plugin>.<action>` that produced the row; `package_id` is the source's own package
+  identifier (the Windows Installer product code on `msi_packages.list_inventory` rows, an
+  empty string when the source sets none) — plus the lookup fields `hostname`, `last_seen`
   (the device's last poll), `status` (`current`, `unconfirmed` or `disabled`),
   `last_confirmed_at`, `install_type`, `install_scope`, `install_location`,
   `instance_key` and `purl` (the canonical Package URL, `null` when the row has none). The MCP
-  tool's rows carry the same 23 fields.
+  tool's rows carry the same 24 fields.
 - **Searching by Package URL and by `vers:` range.** `purl=` returns the rows whose stored
   purl equals the value byte for byte (no prefix or case matching, and it must start `pkg:`),
   so give the full canonical purl as the row shows it, URL-encoded; it needs no `name`, and it
@@ -1077,7 +1125,7 @@ a statement timeout there degrades the page to a 503 (tracked in #5698). A conti
 
 `GET /api/v1/inventory/software/export?format=jsonl|csv|xlsx` writes every installed-software row
 that matches your filters as one download, with no paging: JSONL is one JSON object per line,
-CSV is the 23 columns of the list under a single header row, and XLSX is the same 23 columns as a
+CSV is the 24 columns of the list under a single header row, and XLSX is the same 24 columns as a
 one-sheet workbook you can open directly (a bold, frozen header row, every cell text). It takes the filters of the
 route above (`format=json` is not accepted, and `cursor` and `limit` are refused). It is
 confined to your scope like the rest of the Inventory reads; a wide scope is filtered on the
@@ -1963,7 +2011,7 @@ The server keeps the dates after which a software title or an operating system v
 - **A corrected date.** Both dates stay stored, each with its own last-seen time. While hosts keep repeating the old date it stays current; once they stop and 48 hours pass, the old date is stale, never wins again and raises no conflict. A declaration that no host repeats falls below every rule.
 - **The shipped rules.** The server ships rules for PostgreSQL, Python, Node.js, .NET (runtime and SDK), Ubuntu, Debian and Red Hat Enterprise Linux, each row naming the public page its date came from, in `content/software-lifecycle/rules.csv`. The shipped dates were read from those pages in November 2026. A release whose date could not be confirmed is left out and reads `unknown`; Windows and macOS releases are not covered yet. At every start the server replaces its stored shipped rules with the ones in the binary, so a newer server's rules always apply. Rule files are limited to 256 KiB, 5000 rows and 256 bytes per field, and a file with any defect is refused whole.
 - **If the store cannot open.** The schema is created at start, so the database role needs `CREATE` on the database. The server refuses to start, like the other Postgres stores, when the store cannot open or when the shipped rules cannot be parsed, are empty or cannot be loaded; the log line (`[PG] Refusing to start: software lifecycle ...`) states which and why, and `/readyz` lists `software_lifecycle_store` among its checks. An unparseable or empty shipped rule set is a defective build; a failed open or a failed load is a database fault, so check the role's `CREATE` right and then the Postgres log. A read that cannot be answered is reported as unavailable, never as an empty or `supported` answer. The two counters are in [Metrics](metrics.md#software-lifecycle-store-metrics).
-- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000). The same three operations are MCP tools, `list_software_lifecycle_rules`, `import_software_lifecycle_rules` and `delete_software_lifecycle_rules`: each calls the same function as its route, under the same global grant, limits, refusals and audit rows, and is available to a supervised-tier MCP token ([MCP tools](mcp.md)); the whole JSON-RPC request is also capped at 4 MiB before routing, so a large `cle` file whose JSON-escaped form plus the envelope passes that cap is refused by the transport. The catalogue identity and `package_id` half of the lifecycle surface is not part of this and is not built yet (#6090).
+- **Importing rules.** An administrator loads a rule file with `POST /api/v1/inventory/software/lifecycle/rules` (global `Inventory:Write`), lists the stored rules of a source with `GET` (`Inventory:Read`) and removes the imported set with `DELETE` ([REST API](rest-api.md#software-lifecycle-rules)). The formats are `csv` and `cle` only. `csv` is the rule-file grammar above. `cle` is a Common Lifecycle Enumeration document (ECMA-428 1st edition, schema 1.0.0). An import **replaces the whole `imported` set** and never touches the `shipped` or `external` rules. The file is read all or nothing: a `csv` body of at most 256 KiB, a `cle` body of at most 4 MiB, and at most 5000 rules either way. An imported CLE rule applies to every version of its product: a CLE record that names one exact version, or a version range, is skipped and counted in the answer's `skipped` list, never stored as a prefix, because the rule model matches by dot-component prefix (a stored `3.8` would also claim `3.8.10`). A CLE identifier that lists more than 5000 aliases is refused. Because `imported` outranks `shipped` for the same event, an imported rule overrides the shipped date for the versions it covers. OpenEoX import is not offered yet: its published schema does not name a product (follow-up: #8000). The same three operations are MCP tools, `list_software_lifecycle_rules`, `import_software_lifecycle_rules` and `delete_software_lifecycle_rules`: each calls the same function as its route, under the same global grant, limits, refusals and audit rows, and is available to a supervised-tier MCP token ([MCP tools](mcp.md)); the whole JSON-RPC request is also capped at 4 MiB before routing, so a large `cle` file whose JSON-escaped form plus the envelope passes that cap is refused by the transport. The catalogue identity and `package_id` half of the lifecycle surface is not part of this and is not built yet (#8357).
 - **What is not kept.** Superseded declared dates are not deleted yet; nothing writes them until hosts report support-end dates, and their retention ships with that reporting.
 
 ## Device-identity inventory (`device_ci`)

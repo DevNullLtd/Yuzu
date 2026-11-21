@@ -1670,7 +1670,7 @@ The binding rules above are prospective. Pre-existing surfaces that do not compl
        under the same global `Inventory` grant, the same limits and the same
        `requested` and outcome audit rows; the step-up class of the two writes
        mirrors the REST rows (exempt pending an owner ruling). The catalogue
-       identity and `package_id` half of the lifecycle surface is held with #6090
+       identity and `package_id` half of the lifecycle surface is held with #8357
        and is not built; roadmap row SAM.9-mcp stays open for it. Over MCP the
        whole JSON-RPC request is capped at 4 MiB before routing, so an import file
        whose JSON-escaped form plus the envelope passes that cap is refused by the

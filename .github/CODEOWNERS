@@ -53,6 +53,7 @@
 /.github/CODEOWNERS                                    @fjarvis @Tr3kkR
 /.trivyignore.yaml                                     @fjarvis @Tr3kkR
 /.grype.yaml                                           @fjarvis @Tr3kkR
+/.grypeignore.yaml                                     @fjarvis @Tr3kkR
 /scripts/ci/image-vuln-gate*                           @fjarvis @Tr3kkR
 /scripts/ci/image-identity.sh                          @fjarvis @Tr3kkR
 /scripts/ci/image-publish.sh                           @fjarvis @Tr3kkR

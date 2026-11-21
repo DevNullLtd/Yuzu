@@ -19535,6 +19535,15 @@ TEST_CASE("#4353 field-bound schemas equal the handler constants", "[mcp][bounds
         CHECK(it->second.at(c.ptr).get<std::size_t>() == c.expected);
     }
 
+    // The REST twin's OpenAPI item states the same three matcher field bounds (#6478).
+    const auto openapi = nlohmann::json::parse(yuzu::server::openapi_spec_json());
+    const auto& rest_matcher = openapi.at(nlohmann::json::json_pointer(
+        "/paths/~1result-sets~1from-instruction-result/post/requestBody/content/application~1json"
+        "/schema/properties/matcher/properties"));
+    CHECK(rest_matcher.at("column").value("maxLength", std::size_t{0}) == kMatcherColumnMaxLen);
+    CHECK(rest_matcher.at("op").value("maxLength", std::size_t{0}) == kMatcherOpMaxLen);
+    CHECK(rest_matcher.at("value").value("maxLength", std::size_t{0}) == kMatcherValueMaxLen);
+
     // The three software tools' exact property key sets and published vocabulary enums (a dropped
     // or renamed property, or a drifted enum, is an advertisement the handler no longer honours).
     const std::map<std::string, std::set<std::string>> software_keys = {
@@ -41334,6 +41343,11 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             CHECK(body["error"]["message"].get<std::string>().find("matcher") !=
                   std::string::npos);
         }
+        // None of those refusals is the size bound, so none is counted as an input bound.
+        CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                          {{"tool", "create_result_set_from_instruction_result"},
+                           {"reason", "arg_too_large"}})
+                  .value() == 0.0);
     }
 
     SECTION("create_result_set_from_instruction_result: oversized instruction_id, matcher "
@@ -41364,6 +41378,42 @@ TEST_CASE("MCP result-sets: oversized fields are rejected by the #4353 handler-s
             auto body = nlohmann::json::parse(res->body);
             REQUIRE(body.contains("error"));
             CHECK(body["error"]["code"] == kInvalidParams);
+            // The check is the admission function the REST twin shares (#6478); this tool's
+            // text and its input-bound counter are what they were.
+            CHECK(body["error"]["message"] ==
+                  "a matcher field exceeds its bound (column<=128, op<=32, value<=512 bytes)");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
+        }
+        SECTION("the matcher as a whole: the one text the REST twin also sends, counted like "
+                "the fields above (#6478)") {
+            auto res = ts.call(
+                R"({"jsonrpc":"2.0","method":"tools/call","id":9,"params":{"name":"create_result_set_from_instruction_result","arguments":{"instruction_id":"x","matcher":{"column":"c","op":"in","value_set":[")" +
+                std::string(rs_matcher::kMatcherMaxBytes, 'v') + R"("]}}}})");
+            REQUIRE(res);
+            auto body = nlohmann::json::parse(res->body);
+            REQUIRE(body.contains("error"));
+            CHECK(body["error"]["code"] == kInvalidParams);
+            CHECK(body["error"]["message"] ==
+                  "RESULT_SET_BAD_REQUEST: matcher exceeds 65536 bytes as compact JSON");
+            CHECK(reg.counter("yuzu_mcp_tool_args_too_large_total",
+                              {{"tool", "create_result_set_from_instruction_result"},
+                               {"reason", "arg_too_large"}})
+                      .value() == 1.0);
+            // An input bound is audited as one: a denied row that names the envelope's
+            // correlation id. The refusal is permanent, so the retry hint is null.
+            const auto cid = body["error"]["data"].at("correlation_id").get<std::string>();
+            CHECK_FALSE(cid.empty());
+            CHECK(body["error"]["data"].at("retry_after_ms").is_null());
+            const auto row =
+                std::find(ts.audit_details.begin(), ts.audit_details.end(),
+                          "input bound exceeded: RESULT_SET_BAD_REQUEST: matcher exceeds 65536 "
+                          "bytes as compact JSON correlation_id=" + cid);
+            REQUIRE(row != ts.audit_details.end());
+            CHECK(ts.audit_log[row - ts.audit_details.begin()] ==
+                  "mcp.create_result_set_from_instruction_result|denied");
         }
         SECTION("params value (Gate 2 MEDIUM finding: matches execute_instruction's "
                 "65536-byte params-value convention)") {
@@ -57522,6 +57572,8 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         INFO(std::string(confined ? "confined caller" : "unfiltered caller"));
         Sam35ReadRig rig(confined ? VisibleSet{std::unordered_set<std::string>{"a1"}}
                                   : VisibleSet{});
+        // One row with a product code, one without.
+        rig.fakes.installs[0].entry.package_id = "{PID-1}";
         CHECK(rig.mcp_data("list_software_hosts") ==
               rig.rest_data("/api/v1/inventory/software/hosts"));
         CHECK(rig.mcp_data("list_software_hosts", R"({"q":"web"})") ==
@@ -57538,6 +57590,10 @@ TEST_CASE("MCP SAM-35 reads: the payload equals the REST route's data object for
         }
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1"})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1"));
+        const auto host = rig.mcp_data("get_software_host", R"({"agent_id":"a1"})");
+        REQUIRE(host["software"].size() == 2);
+        CHECK(host["software"][0]["package_id"] == "{PID-1}");
+        CHECK(host["software"][1]["package_id"] == "");
         CHECK(rig.mcp_data("get_software_host", R"({"agent_id":"a1","limit":1})") ==
               rig.rest_data("/api/v1/inventory/software/hosts/a1?limit=1"));
         CHECK(rig.mcp_data("list_software_changes") ==
@@ -59381,6 +59437,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
           "confined caller; both representations are kept",
           "[mcp][inventory][software][sam21]") {
     Sam21Reads fakes;
+    fakes.installs[0].entry.package_id = "{PID-MCP}";
     const auto rq = swl::parse_list_params(swl::Params{{"name", "git"}});
     REQUIRE(rq);
     for (const bool confined : {false, true}) {
@@ -59421,6 +59478,7 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
         CHECK(row["status"] == "current");
         CHECK(row["last_confirmed_at"] == 1'700'000'100);
         CHECK(row["purl"] == "pkg:brew/git@1.0");
+        CHECK(row["package_id"] == "{PID-MCP}");
         if (confined) {
             CHECK(structured["count"] == 1);
             CHECK(structured["totals"].is_null());
@@ -59432,8 +59490,10 @@ TEST_CASE("MCP query_installed_software: structuredContent is the lookup core's 
             CHECK_FALSE(structured.contains("totals_omitted"));
         }
         // The other row (a2) has no roster entry: null, never "".
-        if (!confined)
+        if (!confined) {
             CHECK(structured["software"][1]["hostname"].is_null());
+            CHECK(structured["software"][1]["package_id"] == "");
+        }
     }
 }
 
@@ -59852,8 +59912,12 @@ TEST_CASE("MCP lookup tools: tools/list serves both new tools read-only with typ
                 CHECK(out.contains(key));
             for (const char* key : {"hostname", "last_seen", "status", "last_confirmed_at",
                                     "install_type", "install_scope", "install_location",
-                                    "instance_key", "purl"})
+                                    "instance_key", "purl", "package_id"})
                 CHECK(out["software"]["items"]["properties"].contains(key));
+            const auto& item = out["software"]["items"];
+            CHECK(item["properties"]["package_id"]["type"] == "string");
+            CHECK(std::find(item["required"].begin(), item["required"].end(), "package_id") !=
+                  item["required"].end());
         }
         if (name == "sync_hardware_software") {
             CHECK(t["inputSchema"]["properties"]["confirm"]["type"] == "boolean");

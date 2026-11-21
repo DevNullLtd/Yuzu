@@ -613,6 +613,8 @@ before reading it) but is counted as `store_not_open` on list-gated routes. The 
 panel and the `/crypto` drill write no row for a refused caller (confined or holding no grant). Do not state that confined
 operators cannot read the certificate inventory without these qualifications.
 
+**Addendum — re-registration of an already-enrolled agent id (CC6.1/CC6.3/CC7.2, WP01, 2026-11-18).** An agent id is an identifier, not a secret, and `Register` and the gateway-relayed `ProxyRegister` would otherwise re-admit any already-approved id on the caller's say-so. This build asks for proof (the agent's current certificate, or a fresh single-use enrollment token), but **the default mode is `audit`, which does NOT enforce it: in `audit` a certificate-less caller that knows an enrolled agent id can still re-register it and be issued a certificate.** The control is in force only under `--agent-reregistration-proof=enforce`, which needs the explicit setting on every server replica and, for agents behind a gateway, a gateway whose agent listener witnesses client certificates (`witness_client_cert`); a plaintext, wizard, demo or UAT gateway cannot satisfy it. Do not describe the platform to a customer or in a questionnaire as "agent re-registration requires proof" without saying which mode is set. Coverage limits: `--no-tls`, TLS without a client CA, agents carrying operator-CA certificates and expired leaves are not covered. What the audit trail records: `agent.reregistration_refused` (enforce refusals), `agent.reregistration_unproven` (audit-mode admissions of an unproven re-registration), `agent.reenrolled_with_token`, and `ca.cert.revoked` with `reason=reenrolled`. **The evidence is best effort, not a complete record:** rows are budgeted and can be dropped; for audit-mode `agent.reregistration_unproven` rows the ids of dropped rows are named in chunked summary rows only when the summary flush succeeds (a process kill loses the open window and the queue, ids are cut to 24 characters, and unnamed ids are counted as an upper bound while the process survives); enforce-mode `agent.reregistration_refused` rows use an older per-key budget, and a dropped refusal row is counted only by action (`yuzu_register_reregistration_audit_dropped_total{action="agent.reregistration_refused"}`), never named; the alerts that watch these counters are sample rules in `docs/prometheus/yuzu-alerts.yml` that nothing this repo ships loads or routes, so they are not a live control until an operator wires them; the authoritative count of decisions is the unbudgeted metric `yuzu_register_reregistration_total`. Residuals tracked, with a review date of 2027-03-01: a holder of an unspent single-use token can re-enrol any live-leaf agent id (accepted token-custody trust, #8171); the token can be consumed without a leaf issued, and an agent holding a certificate file inside the first two thirds of its life sends no certificate request (#8252, #8253); supersede of the older leaf is best effort with no durable owed marker (#8254); an operator-revoked leaf cannot be cleared and blocks renewal of that agent id until it expires (#8255). The gateway-witness trust is the same as for `gateway_observed_peer` (`docs/pki-architecture.md`, R-6). Evidence and runbook: `docs/pki-architecture.md` "Re-registration proof (WP01)", `docs/user-manual/audit-log.md`, `docs/user-manual/metrics.md`, `docs/user-manual/security-hardening.md` "Agent re-registration proof: alert runbook", `docs/security-reviews/wp01-agent-reregistration-identity-2026-11-17.md`.
+
 **Addendum: the last-Administrator guard for account lifecycle (CC6.1/CC6.2,
 #4966).** Deactivating, deleting or demoting the last active local administrator
 account is now refused on the Settings user delete and role change and on every SCIM
@@ -1119,8 +1121,9 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   have a CycloneDX and an SPDX SBOM inside the release's cosign-signed `SHA256SUMS`
   (`scripts/check-release-artifacts.sh` refuses a release without them; the agent-bundle image's
   SBOM stays a workflow artifact). Verification: `docs/user-manual/release-verification.md`.
-- *Pre-push gate:* `release.yml` scans every published image with a pinned Trivy before the push
-  and refuses a fixable CRITICAL that is not accepted, a stale or not-freshly-downloaded DB, an
+- *Pre-push gate:* `release.yml` scans every published image with two pinned scanners, Trivy and
+  grype (grype also sees the gateway's Erlang/OTP runtime, which Trivy does not), before the push
+  and refuses a fixable CRITICAL from either that is not accepted, a stale or not-freshly-downloaded DB, an
   image whose OS release has no demonstrable advisory data, and an unlisted image whose OS
   packages the scanner cannot see. The push carries no release tag (the agent bundle's carries a
   `:candidate-<run>-<N>` tag, never a release tag); the tags move only after the
@@ -1135,7 +1138,7 @@ acceptance records; WP15/S9).** What exists, for a questionnaire or an auditor's
   Not kept: anything from an attempt whose runner was killed (SIGKILL, a lost runner) before the
   upload, or whose report upload and its one retry both failed, which leaves no record at all; and a refusal never followed by a release, which exists only
   as the 90-day artifact, shorter than a Type II window: export it if the period needs it.
-- *Acceptances:* `.trivyignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
+- *Acceptances:* `.trivyignore.yaml`, `.grypeignore.yaml` and `scripts/ci/image-vuln-gate-not-covered.txt` entries
   carry an approver, a date and a pull-request reference, which the gate checks for FORMAT ONLY;
   the control is the pull-request review of changes to those files, the gate scripts and the
   workflows (`docs/ci-architecture.md` "What the approval fields are, and what the control is").

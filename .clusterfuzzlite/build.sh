@@ -14,7 +14,7 @@
 # EXACT repo-name case — CFLite mounts the checkout at $SRC/Yuzu (see the
 # Dockerfile comment).
 SRC_DIR="$SRC/Yuzu"
-INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
+INC="-I$SRC_DIR/server/core/src -I$SRC_DIR/agents/shared -I$SRC_DIR/common/include -I$SRC/nlohmann_json/include"
 STD="-std=c++23"
 
 build_target() {
@@ -42,6 +42,9 @@ build_target fuzz_binary_header_elf \
 
 build_target fuzz_binary_header_macho \
   "$SRC_DIR/tests/fuzz/fuzz_binary_header_macho.cpp"
+
+build_target fuzz_component_native \
+  "$SRC_DIR/tests/fuzz/fuzz_component_native.cpp"
 
 build_target fuzz_deployment_parse \
   "$SRC_DIR/tests/fuzz/fuzz_deployment_parse.cpp"
