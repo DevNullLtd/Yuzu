@@ -128,3 +128,27 @@ permanent v1 dead-write — sessions were always in-memory-authoritative) and th
 scaffolding were dropped, not migrated. Full record: `docs/auth-architecture.md` "AuthDB —
 persistent authentication store" and `.claude/agents/authdb.md`; ladder entry:
 `docs/postgres-migration-ladder.md` "Done".
+
+## Proposed amendment (2026-11-21) — retention-bound cold records
+
+**Status: proposed.** This amendment would permit ClickHouse to serve as the cold store of
+record for append-only, retention-bound records. A feature using the exception must specify
+the record, retention period, authorized reads, export acknowledgement and safe reap rule.
+The first proposed use is finalized criteria-run verdicts (ADR-0075 R11). Migrating command
+responses requires its own response-store decision.
+
+| Responsibility | Storage and access |
+|---|---|
+| Transactional state, authorization, pending work and export progress | PostgreSQL. Core owns the transaction that marks an export complete. |
+| Finalized records within a feature's cold retention period | ClickHouse. Core owns the credentials for these tables and mediates every read, including counts and aggregates, under the feature's existing authorization rules. Grafana receives no datasource for these tables. |
+| Analytics and dashboards | Existing analytics feeds retain their own access and retention policies. |
+
+For criteria runs, a creator with the required read grant can retrieve retained evidence
+through core after the warm copy expires. A caller denied on the warm read receives the
+same denial on the cold read. Failed or partially acknowledged exports leave the warm
+evidence readable under the same gates. Core retries idempotently and permits the warm
+reaper to remove the records only after the retention deadline and confirmed export.
+
+The implementing change enables that guarantee when cold export ships. A release containing
+only the warm implementation documents its warm-only retention in the operator manual and
+upgrade notes (ADR-0075 R11.9).
