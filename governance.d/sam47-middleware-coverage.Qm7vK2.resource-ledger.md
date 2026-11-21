@@ -1,6 +1,6 @@
 # Resource Ledger — middleware registry leg (IBM MQ on Windows) and shared zip directory reader
 
-Range: `0c68ac5043833decce953e5cb3f45d173374d7d1..6aae12e3da` (branch `feat/sam-47-middleware-coverage`)
+Range: `0c68ac5043833decce953e5cb3f45d173374d7d1..8f390e36b5` (branch `feat/sam-47-middleware-coverage`)
 
 Run: `governance.d/sam47-middleware-coverage.Qm7vK2.jsonl`
 
@@ -33,4 +33,4 @@ on this host (syntax-checked with the mingw script); the lifetimes below are rea
 |---|---|---|
 | Plugin ABI boundary (`execute_action` try/catch) | `middleware_legs.hpp` | `run_windows` is a new `LegFn` behind the same guard: an exception (for example `std::bad_alloc` on the value buffer) becomes `status\|<action>\|constrained\|internal_error` and never crosses the ABI. |
 | Linux leg (`run_leg`, `middleware_linux.cpp`) | unchanged | Not edited. `leg_well_formed` gained a `registry` parameter; the Linux call passes `false`. |
-| Installed-software sync worker | `sync_source_installed_software.cpp` | Not edited; it now receives `supported` Windows answers. The worker is the bounded detached worker (60 s), the only wall-clock bound on this plugin (see finding SAM47-S1: the merge is quadratic until fixed). |
+| Installed-software sync worker | `sync_source_installed_software.cpp` | Not edited; it now receives `supported` Windows answers. The worker is the bounded detached worker (60 s), the only wall-clock bound on this plugin (finding SAM47-S1, the quadratic de-dup, is fixed in the governance r1 round). |
