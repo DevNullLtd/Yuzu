@@ -49,7 +49,7 @@
 /// the claim: a replaced regular file is a recorded residual on that platform (SQLite holds its
 /// files without FILE_SHARE_DELETE, so a live database another process has open cannot lose its
 /// name there; unproven until the MSVC leg runs).
-/// Three residuals remain on POSIX. The original is re-examined and then dropped by name, and
+/// Four residuals remain on POSIX. The original is re-examined and then dropped by name, and
 /// POSIX has no unlink-if-same-inode, so a second recovery that drops the name AND creates a new
 /// file at it inside that gap loses its file (two agent processes on one data directory are
 /// unsupported). The release of a claim that is not the judged file is also by name, so a file a
@@ -521,8 +521,9 @@ quarantine_corrupt_db(const std::filesystem::path& path, std::int64_t epoch_seco
         // Rename failed: preserve by copy (fails rather than overwrite), then drop the original.
         // Never through a link: a link's target is not the evidence.
         // The copy runs only when no entry of any kind (a dangling link included) is at the
-        // destination, examined without following a link: copy_file's own exists check follows
-        // one, and a link's target is not ours to write.
+        // destination, examined without following a link. That keeps a link out of an injected
+        // copy and of Windows' copy_file (its own exists check follows one); the POSIX descriptor
+        // copy also refuses it itself (O_EXCL|O_NOFOLLOW). A link's target is not ours to write.
         std::error_code cec = std::make_error_code(std::errc::not_supported);
         bool copy_ran = false;
 #ifndef _WIN32

@@ -1870,6 +1870,33 @@ TEST_CASE("CommandDedupStore: a fresh store that cannot be created after a quara
     REQUIRE(next.has_value());
     CHECK(next->claim("cmd-after-recovery").status == ClaimStatus::Claimed);
 }
+
+TEST_CASE("sqlite_quarantine: a failed default sidecar copy reports the partial copy removed "
+          "(whole path, no copy seam)",
+          "[command_dedup][corruption][quarantine_fs]") {
+    // Only the rename is made to fail; the real descriptor copy then creates its destination and
+    // every write fails (EFBIG), so it removes what it made. The note must carry that outcome: it
+    // is the one branch that turns the descriptor copy's result into the operator's note.
+    yuzu::test::TempDir dir{"yuzu_test_cmddedup_qfs_"};
+    const auto db = dir.path / "command_dedup.db";
+    write_bytes(db, "main");
+    const fs::path wal{db.string() + "-wal"};
+    write_bytes(wal, "wal bytes"); // fixtures are written before the size limit is in force
+
+    sq::FsOps ops;
+    ops.move = [](const fs::path&, const fs::path&, std::error_code& ec) {
+        ec = std::make_error_code(std::errc::permission_denied);
+    };
+    FileSizeLimit no_writes;
+    const auto r = dq::quarantine_corrupt_db(db, 1234, ops);
+    REQUIRE(r.dest.has_value());
+    const fs::path partial{r.dest->string() + "-wal"};
+    CHECK(fs::symlink_status(partial).type() == fs::file_type::not_found);
+    CHECK(fs::symlink_status(wal).type() == fs::file_type::not_found);
+    REQUIRE(r.notes.size() == 1);
+    CHECK(r.notes[0].find("its content is not kept") != std::string::npos);
+    CHECK(r.notes[0].find("the partial copy was removed") != std::string::npos);
+}
 #endif
 
 #ifndef _WIN32
