@@ -2753,7 +2753,7 @@ TEST_CASE("collector: installed_software carries the 01:00-05:00 local nightly w
 // --- Adapter characterisation: the whole observable result of each status-row adapter ---
 //
 // Every cell asserts the whole observable result of an adapter: status, reason, entry count and
-// ALL fifteen fields of every entry. The cells reach the adapters only through the four binders
+// ALL sixteen fields of every entry. The cells reach the adapters only through the four binders
 // below, so how an adapter is bound is the binders' concern alone and the expectations stay put. Status rows are written as raw text (not through a formatter) so
 // they are independent of the producer.
 
@@ -2763,8 +2763,8 @@ std::string show_entry(const SwEntry& e) {
     std::string s;
     for (const std::string* f : {&e.name, &e.version, &e.publisher, &e.install_date, &e.kind,
                                  &e.ecosystem, &e.epoch, &e.release, &e.arch, &e.signature_status,
-                                 &e.distro_id, &e.distro_version, &e.install_location, &e.package_id,
-                                 &e.source}) {
+                                 &e.distro_id, &e.distro_version, &e.install_location,
+                                 &e.attributes, &e.package_id, &e.source}) {
         s += *f;
         s += ',';
     }
@@ -3080,9 +3080,11 @@ TEST_CASE("characterisation: msi list_inventory",
               res("ok", "",
                   {entry_of("n", "", "", "pkg", "msi", "{aaaaaaaa-0000-0000-0000-000000000001}")}));
     }
-    SECTION("an optional sixth token is the upgrade code: a row of that width is mapped, never dropped") {
-        // The attribute itself is pinned in "msi_packages adapter: row shape"; `show` does not
-        // render it, so here only the row's survival and mapping are characterised.
+    SECTION("an optional sixth token is the upgrade code: a row of that width is mapped, never "
+            "dropped") {
+        // `show` renders the attributes field, so a sixth token that is not a braced GUID is
+        // pinned here to leave it empty; a valid upgrade code is pinned in "msi_packages adapter:
+        // row shape".
         CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|extra"}) ==
               res("ok", "", {entry_of("App", "1.0", "Pub", "pkg", "msi", code)}));
         CHECK(run({sup, "inv|" + code + "|App|1.0|Pub|"}) ==

@@ -4725,6 +4725,35 @@ TEST_CASE("canonical_section_hash pins a row carrying an install-row attribute (
           SoftwareInventoryStore::canonical_hash({plain}));
 }
 
+TEST_CASE("canonical_section_hash sorts attributes after install_location and before package_id "
+          "(SAM-46 order pin)",
+          "[software_inventory][v3][hash][attributes]") {
+    // The real server entry_less is not reachable from a test, but the section hash is taken over
+    // the rows in its order. Two rows whose attributes and package_id disagree about which sorts
+    // first pin the position: attributes decide, so the row with the smaller attributes (and the
+    // larger package_id) is written first. Moving attributes after package_id in entry_less or in
+    // the record form changes these bytes, and so this digest. Recipe (the agent's slot order):
+    //   printf 'Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={00000000-0000-0000-0000-000000000000}\037zzz\037installed_apps.list_inventory\036Alpha\0371.0\037Pub\0372026-01-01\037app\037windows\037\037\037x64\037\037\037\037C:\\Program Files\\Alpha\037upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}\037aaa\037installed_apps.list_inventory\036' | shasum -a 256
+    SoftwareEntry lo;
+    lo.name = "Alpha";
+    lo.version = "1.0";
+    lo.publisher = "Pub";
+    lo.install_date = "2026-01-01";
+    lo.kind = "app";
+    lo.ecosystem = "windows";
+    lo.arch = "x64";
+    lo.install_location = "C:\\Program Files\\Alpha";
+    lo.attributes = "upgrade_code={00000000-0000-0000-0000-000000000000}";
+    lo.package_id = "zzz";
+    lo.source = kV3Apps;
+    SoftwareEntry hi = lo;
+    hi.attributes = "upgrade_code={FFFFFFFF-FFFF-FFFF-FFFF-FFFFFFFFFFFF}";
+    hi.package_id = "aaa";
+    const char* kPinned = "f61a695310eff3d26ea732c700a9e30a12df2bd1e417ea6f5e543404d19c13a3";
+    CHECK(SoftwareInventoryStore::canonical_section_hash({lo, hi}) == kPinned);
+    CHECK(SoftwareInventoryStore::canonical_section_hash({hi, lo}) == kPinned);
+}
+
 TEST_CASE("canonical_section_hash pins a row whose publisher is an origin label (via:brew)",
           "[software_inventory][v3][hash][vendor]") {
     // The agent writes `via:<ecosystem>` into slot 3 when a source declares no vendor; the server
@@ -5992,11 +6021,13 @@ TEST_CASE("v3: a delta section carrying an attribute change applies and matches 
     CHECK(led[0][0] == "install");
     CHECK(led[0][1] == "Gamma");
 
-    // A delta that names the row by the OLD attribute's key no longer finds it: need-full is the
-    // protocol's answer, nothing is written.
+    // A delta on the held base that names the row by the OLD attribute's key no longer finds it:
+    // the `-` set returns fewer rows than it names, so the section is a mismatch (the base is
+    // held, so it is not need-full), rolled back, nothing is written.
     const auto stale = store.apply_installed_software_v3(
         "agent-ad", v3_report({v3_delta(kV3Apps, after, {b1, c1}, {a1}, {})}));
-    CHECK(stale[0].outcome != V3SectionOutcome::kStored);
+    REQUIRE(stale.size() == 1);
+    CHECK(stale[0].outcome == V3SectionOutcome::kMismatch);
     CHECK(attributes_of(pool, "agent-ad", "Alpha") == kOtherUpgradeCode);
 }
 
@@ -6039,9 +6070,11 @@ TEST_CASE("migration v13 adds the attributes column over live rows, keeps their 
         REQUIRE(store.is_open());
         shape();
         // Every pre-existing row reads '' (what its slot 14 hashed as), so no stored hash moves.
-        for (const auto& row : sql_rows(pool, "SELECT attributes FROM "
+        const auto held_rows = sql_rows(pool, "SELECT attributes FROM "
                                               "software_inventory_store.installed_software "
-                                              "WHERE agent_id = 'agent-mg'"))
+                                              "WHERE agent_id = 'agent-mg'");
+        REQUIRE(held_rows.size() == 2); // Alpha and Beta: an empty result must not pass the loop
+        for (const auto& row : held_rows)
             CHECK(row[0].empty());
         CHECK(facet_status(pool, "agent-mg", kV3Apps) == "full/" + held);
         // The held rows still hash to the held section hash: a delta on that base verifies against

@@ -152,10 +152,11 @@ YUZU_EXPORT AdaptedRows parse_pkg_inventory_packages_output(const std::string& o
 YUZU_EXPORT AdaptedRows parse_pkg_inventory_store_packages_output(const std::string& out);
 
 /// Adapt `msi_packages` `list_inventory` output (`status|list_inventory|<level>|...` plus
-/// five-token `inv|<product_code>|<name>|<version>|<publisher>`). Each row becomes
-/// {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
-/// (no case normalisation). An empty name is seen-not-mapped. The producer strips `|`,
-/// tab, CR, LF and NUL from the fields, so no unescape is needed.
+/// five or six token `inv|<product_code>|<name>|<version>|<publisher>[|<upgrade_code>]`). Each
+/// row becomes {kind=pkg, ecosystem=msi} with package_id = the product code exactly as registered
+/// (no case normalisation); a sixth token that is a braced GUID is kept as the `upgrade_code`
+/// attribute, any other sixth token is ignored. An empty name is seen-not-mapped. The producer
+/// strips `|`, tab, CR, LF and NUL from the fields, so no unescape is needed.
 YUZU_EXPORT AdaptedRows parse_msi_packages_list_inventory_output(const std::string& out);
 
 /// Whether the `runtimes` `python` vendor column is read as a vendor on this host's OS: true on

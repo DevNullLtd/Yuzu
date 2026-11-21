@@ -127,7 +127,8 @@ Parsed parse_like_server(const std::string& blob) {
             if (f[0] == "+") {
                 REQUIRE(f.size() == 17);
                 CHECK_FALSE(f[3].empty());                 // publisher, slot 3
-                CHECK(yuzu::install_attrs::canonical_attributes(f[14])); // slot 14, empty or canonical
+                // slot 14: empty or canonical
+                CHECK(yuzu::install_attrs::canonical_attributes(f[14]));
                 CHECK(f[16] == sec.header[1]);             // source == facet
                 sec.adds.push_back(f);
             } else if (f[0] == "-") {
@@ -195,12 +196,13 @@ TEST_CASE("v3_section_hash is order and duplicate independent and matches the se
     bare.publisher.clear();
     CHECK(v3_section_hash({bare}) != v3_section_hash({wget}));
 
-    // Every stored field moves the hash, install_location included.
+    // Every stored field moves the hash, install_location and attributes included. The attributes
+    // value must be one the normal form keeps (a non-canonical field is dropped and hashes empty).
     const auto base = v3_section_hash({alpha()});
-    for (auto field : {&SwEntry::install_location, &SwEntry::package_id, &SwEntry::source,
-                       &SwEntry::distro_version}) {
+    for (auto field : {&SwEntry::install_location, &SwEntry::attributes, &SwEntry::package_id,
+                       &SwEntry::source, &SwEntry::distro_version}) {
         SwEntry other = alpha();
-        other.*field = "/opt/zz";
+        other.*field = field == &SwEntry::attributes ? kUpgradeCodeAttr : "/opt/zz";
         CHECK(v3_section_hash({other}) != base);
     }
 }
@@ -806,7 +808,8 @@ TEST_CASE("a delta against the acknowledged FULL applies on the server-parsed se
           plan_section(kApps, after, std::nullopt, false).section_hash);
 }
 
-TEST_CASE("slot 14 attributes: the golden record bytes and hash are pinned, and an empty slot is unchanged",
+TEST_CASE("slot 14 attributes: the golden record bytes and hash are pinned, and an empty slot is "
+          "unchanged",
           "[v3][writer][hash][attributes]") {
     SwEntry e = alpha();
     e.attributes = kUpgradeCodeAttr;
@@ -822,15 +825,18 @@ TEST_CASE("slot 14 attributes: the golden record bytes and hash are pinned, and 
     CHECK(v3_row_hash(e) == kUpgradeCodeRowHash);
     CHECK(v3_section_hash({e}) == kUpgradeCodeRowHash);
     // Adding an attribute moves the hash; the same row with none is the pre-SAM-46 pin.
-    CHECK(v3_row_hash(alpha()) == "c573935d6af97c9deaef2b526cb01a3dabc2d3958b7e69b289968a6e80dbf229");
+    CHECK(v3_row_hash(alpha()) ==
+          "c573935d6af97c9deaef2b526cb01a3dabc2d3958b7e69b289968a6e80dbf229");
     CHECK(v3_row_hash(e) != v3_row_hash(alpha()));
     // The wire `+` record is "+" then the same bytes, and the server's parser keeps the slot.
-    const auto sec = server_section(write_v3_blob({plan_section(kApps, {e}, std::nullopt, false)}).blob);
+    const auto sec =
+        server_section(write_v3_blob({plan_section(kApps, {e}, std::nullopt, false)}).blob);
     REQUIRE(sec.rows.size() == 1);
     CHECK(sec.rows[0].attributes == kUpgradeCodeAttr);
 }
 
-TEST_CASE("slot 14 attributes: a value that is not canonical is dropped and the row hashes as if empty",
+TEST_CASE("slot 14 attributes: a value that is not canonical is dropped and the row hashes as if "
+          "empty",
           "[v3][writer][hash][attributes]") {
     const std::string lower = "upgrade_code={12345678-90ab-cdef-1234-567890abcdef}";
     for (const std::string& bad :
@@ -865,7 +871,8 @@ TEST_CASE("slot 14 attributes: a value that is not canonical is dropped and the 
     }
 }
 
-TEST_CASE("slot 14 attributes: the entry order places attributes after install_location and before package_id",
+TEST_CASE("slot 14 attributes: the entry order places attributes after install_location and "
+          "before package_id",
           "[v3][writer][hash][attributes]") {
     const auto names = [](const std::vector<SwEntry>& rows) {
         std::vector<std::string> out;

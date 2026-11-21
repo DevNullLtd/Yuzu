@@ -884,7 +884,8 @@ v2 parser is unchanged.
 **Containment.** A grammar violation inside a section refuses that section only: a `+`, `-` or
 `comp` record in a status-only section; a `-` record in a `full` section; a `+` source other
 than the facet; `+` in `component_inventory` or `comp` anywhere else; an unknown status, facet or
-record kind; a malformed row hash; an unknown `version_source`; a repeated facet; a row over the
+record kind; a malformed row hash; an unknown `version_source`; a `+` whose slot 14 is not a
+canonical attribute field (`bad_attributes`); a repeated facet; a row over the
 per-call cap; a record holding a NUL byte; a final record with no terminator. The rest of a refused section is skipped to the next `S`, and the other sections
 still apply. A defect that cannot be attributed to a facet fails the whole blob (a record before
 any section, a header with no section after it, an `S` record whose facet is empty or outside
@@ -1939,9 +1940,12 @@ change, migration or parser change.
   value holds no `;`, no `=` and no control byte (`0x00-0x1F` and `0x7F`, which covers NUL and both
   wire separators, `0x1E` and `0x1F`). The validator checks and never repairs: a canonical value is
   returned unchanged and anything else is refused whole, so nothing is re-ordered, re-cased or trimmed
-  into shape. The only step before it is the field step every slot gets (the agent's `clamp_field`, the
-  server's scrub-and-clamp), so a canonical value with a stray wire separator or NUL appended is sent
-  as the canonical value.
+  into shape. The only step before it is the field step every slot gets, and the two sides differ: the
+  agent's `clamp_field` scrubs invalid UTF-8, clamps the length and then strips `0x1F`, `0x1E` and NUL,
+  so a canonical value with a stray wire separator or NUL appended is sent as the canonical value; the
+  server's scrub-and-clamp only repairs invalid UTF-8 and clamps the length and strips nothing (a NUL
+  is refused as `nul_byte`, and a stray `0x1F` or `0x1E` is a framing fault of the record, never a slot
+  value).
 - **One key registry.** `kAttributeKeys` in `common/include/yuzu/install_row_attributes.hpp` is a closed,
   name-sorted table of `{name, validator}` (a `static_assert` pins the order), and the same header holds
   `canonical_attributes`, `attribute_value` and `make_attributes`. The agent writer, the agent adapters
@@ -1976,8 +1980,9 @@ change, migration or parser change.
   pinned by one golden vector whose literal record bytes and SHA-256 are identical in
   `tests/unit/test_installed_software_v3.cpp` and `tests/unit/server/test_software_inventory_store.cpp`;
   both fail if either side moves.
-- **Not in this change.** Any REST, MCP or UI field for `attributes` (stored, not yet on a read route);
-  any use of an attribute in `identity_key` or the change ledger (the ledger pairs rows by identity and
+- **Not in this change.** Any REST, MCP or UI field for `attributes` (stored, not yet on a read route;
+  #8441 exposes `upgrade_code` on the installed-software read routes, then the MCP twin); any use of
+  an attribute in `identity_key` or the change ledger (the ledger pairs rows by identity and
   version, so an attribute-only change at the same version writes no ledger event); the v2 path, where
   slot 14 is still parsed and discarded.
 

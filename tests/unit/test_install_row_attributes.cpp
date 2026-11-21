@@ -63,7 +63,8 @@ TEST_CASE("a malformed upgrade_code is refused", "[install_attrs]") {
     CHECK(refused("upgrade_code={12345678_90AB-CDEF-1234-567890ABCDEF}"));
 }
 
-TEST_CASE("an unknown key, a duplicate key, an out-of-order key and an empty key or value are refused",
+TEST_CASE("an unknown key, a duplicate key, an out-of-order key and an empty key or value are "
+          "refused",
           "[install_attrs]") {
     CHECK(refused("unknown=1"));
     CHECK(refused(std::string("aaa=1;") + kField)); // unknown, and out of order's mirror image
@@ -73,8 +74,8 @@ TEST_CASE("an unknown key, a duplicate key, an out-of-order key and an empty key
     CHECK(refused("=" + std::string(kGuid)));       // empty key
     CHECK(refused("upgrade_code"));                 // no `=`
     CHECK(refused(";"));
-    CHECK(refused(";" + kField));                   // leading `;`
-    CHECK(refused(kField + ";"));                   // trailing `;`
+    CHECK(refused(";" + kField)); // leading `;`
+    CHECK(refused(kField + ";")); // trailing `;`
     CHECK(refused(kField + ";;"));
     CHECK(refused("UPGRADE_CODE=" + std::string(kGuid))); // keys are case-sensitive
 }
@@ -112,7 +113,13 @@ TEST_CASE("canonical_attributes is idempotent", "[install_attrs]") {
     }
 }
 
-TEST_CASE("a field over 1024 bytes is refused", "[install_attrs]") {
+TEST_CASE("an over-long field is refused, but the 1024 cap itself is not observable yet",
+          "[install_attrs]") {
+    // With one key the longest canonical field is 51 bytes, so every input near the cap is
+    // refused by the key or value rules first, whatever the cap says: no input can tell
+    // `size() > kMaxAttributesLen` from `>=`, `+ 1` or its removal. Only the constant is pinned
+    // here. The boundary pair (a canonical field of exactly kMaxAttributesLen bytes accepted, one
+    // byte more refused) arrives with the second key, when a canonical field can reach the cap.
     static_assert(kMaxAttributesLen == 1024);
     CHECK(refused(kField + std::string(kMaxAttributesLen, 'x')));
     CHECK(refused(std::string(kMaxAttributesLen + 1, 'a')));

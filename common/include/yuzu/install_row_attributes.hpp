@@ -19,6 +19,17 @@
 // A new key is a contract change on both ends of the wire: land the table row, the validator and
 // the golden together. With a second key, also add a make_attributes test case: a value carrying
 // `;<that key>=<valid value>` must be refused.
+//   - Validator bytes: a validator must reject every byte the canonical form uses as a separator
+//     (`;`, `=`) and every byte the field step would strip, so it accepts only bytes the field
+//     step leaves unchanged. The agent's clamp_field strips 0x1F, 0x1E and NUL (after scrubbing
+//     invalid UTF-8) and the server's scrub-and-clamp strips nothing, so a value holding one would
+//     read differently on the two ends of the hash. The screen in canonical_attributes and
+//     make_attributes already refuses these bytes in every value; keep it ahead of any validator.
+//   - Key side: a key name is joined into the field unescaped, so a name holds no `;`, `=` or
+//     control byte, and make_attributes joins the caller's key before it checks it (a pair whose
+//     key carries `;` or `=` could read back as two). With one key the table lookup in
+//     canonical_attributes refuses that. With a second key, make_attributes must look every key
+//     up in kAttributeKeys first (tracked in #8361).
 //
 // Pure: std only, no I/O, no store or wire types, so it stays inside the common/include firewall.
 

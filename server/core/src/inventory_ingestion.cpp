@@ -59,9 +59,9 @@ static_assert(kMaxBlobBytes == kV3MaxBlobBytes && kMaxEntries == kV3MaxRows &&
 // Parse the canonical wire blob into rows: entries are 0x1E-separated; each is
 // 0x1F-separated in blob contract v2 + extended tail field order (name, version,
 // publisher, install_date, kind, ecosystem, epoch, release, arch, signature_status,
-// distro_id, distro_version, install_location, uninstall_string, package_id,
+// distro_id, distro_version, install_location, attributes, package_id,
 // source) — the same byte form the agent hashes (ADR-0016 §4), so the server
-// re-hash matches. Slots 13-14 (install_location, uninstall_string) are RESERVED on THIS
+// re-hash matches. Slots 13-14 (install_location, attributes) are RESERVED on THIS
 // (v2) path: they are consumed to keep the positions but never stored or hashed, because
 // the v2 grammar was never re-classified for them (#5186). An agent that hashes real values
 // there gets need_full until the server accepts them. The blob-v3 `+` record
@@ -89,7 +89,7 @@ std::optional<std::vector<SoftwareEntry>> parse_software_blob(const std::string&
         std::string_view rec(blob.data() + i, rec_end - i);
         if (!rec.empty()) {
             SoftwareEntry e;
-            std::string reserved_13, reserved_14; // install_location, uninstall_string: never kept
+            std::string reserved_13, reserved_14; // install_location, attributes: never kept
             std::string* fields[16] = {&e.name,
                                        &e.version,
                                        &e.publisher,
