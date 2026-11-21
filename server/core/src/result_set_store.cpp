@@ -368,7 +368,9 @@ bool to_bool(const char* s) { return s != nullptr && s[0] == 't'; }
 // 'O' fails the check too. NotInForce and Unreadable both keep the member cache off.
 enum class MemberTriggerCheck { InForce, NotInForce, Unreadable };
 
-[[nodiscard]] MemberTriggerCheck member_triggers_in_force(PGconn* conn) {
+[[nodiscard]] MemberTriggerCheck query_member_triggers(PGconn* conn) {
+    // tgattr: PostgreSQL refuses a column list on a trigger with transition tables, so this
+    // conjunct cannot fail for a trigger that passes the rest; it is defence in depth only.
     pg::PgResult res = pg::exec_params(
         conn,
         "SELECT count(*) = 4 AND COALESCE(bool_and("
@@ -409,6 +411,23 @@ enum class MemberTriggerCheck { InForce, NotInForce, Unreadable };
     }
     return to_bool(PQgetvalue(res.get(), 0, 0)) ? MemberTriggerCheck::InForce
                                                 : MemberTriggerCheck::NotInForce;
+}
+
+// pg_get_expr qualifies a name that the session's search_path would resolve elsewhere, so the
+// deparse comparison runs under a pinned search_path, in a transaction that is rolled back.
+[[nodiscard]] MemberTriggerCheck member_triggers_in_force(PGconn* conn) {
+    {
+        pg::PgResult begin{PQexec(conn, "BEGIN; SET LOCAL search_path = pg_catalog, pg_temp")};
+        if (!begin.ok()) {
+            spdlog::error("ResultSetStore: could not start the re-stamp trigger check: {}",
+                          PQerrorMessage(conn));
+            pg::PgResult rollback{PQexec(conn, "ROLLBACK")};
+            return MemberTriggerCheck::Unreadable;
+        }
+    }
+    const MemberTriggerCheck check = query_member_triggers(conn);
+    pg::PgResult rollback{PQexec(conn, "ROLLBACK")};
+    return check;
 }
 
 constexpr const char* kRowCols =

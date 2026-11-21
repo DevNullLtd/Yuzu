@@ -74,9 +74,10 @@
 /// delete issued from another trigger, a future code path): INSERT and UPDATE re-stamp, per
 /// statement, the sets named in their transition tables; DELETE (BEFORE, per row) re-stamps the
 /// set the row belonged to, skipping the following rows of the same set by a single-slot
-/// per-transaction marker; TRUNCATE re-stamps every set that carries a generation. Every
-/// re-stamp locks the header row, a pending one included, so an out-of-band write is ordered
-/// against `materialize`'s stamping UPDATE. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
+/// per-transaction marker; TRUNCATE re-stamps every set that carries a generation. Every INSERT,
+/// UPDATE and DELETE re-stamp locks the header row, a pending one included, so an out-of-band
+/// write is ordered against `materialize`'s stamping UPDATE; TRUNCATE is ordered by its ACCESS
+/// EXCLUSIVE lock on `result_set_members` instead. A delete that cascades from `result_sets` (`delete_set`, `gc_sweep`)
 /// writes nothing: its header is gone and every cached copy reads `NotFound`. The constructor
 /// checks that the four triggers are present, ENABLE ALWAYS, of v7's shape and bound to v7's
 /// function bodies; when they are not, or the check cannot be read, it logs an error and

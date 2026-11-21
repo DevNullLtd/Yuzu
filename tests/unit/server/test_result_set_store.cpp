@@ -34,6 +34,7 @@
 #include <format>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_set>
 #include <vector>
@@ -1309,6 +1310,13 @@ TEST_CASE("ResultSetStore: an out-of-band member write on a pending set is order
         write = "INSERT INTO result_set_store.result_set_members VALUES (" + id + ", 'oob-dev')";
         expected = {"dev-1", "oob-dev"};
     }
+    SECTION("UPDATE") {
+        exec_sql(db.dsn(), "INSERT INTO result_set_store.result_set_members VALUES (" + id +
+                               ", 'oob-dev')");
+        write = "UPDATE result_set_store.result_set_members SET device_id = 'oob-dev-2' "
+                "WHERE result_set_id = " + id + " AND device_id = 'oob-dev'";
+        expected = {"dev-1", "oob-dev-2"};
+    }
     SECTION("DELETE") {
         exec_sql(db.dsn(), "INSERT INTO result_set_store.result_set_members VALUES (" + id +
                                ", 'oob-dev')");
@@ -1319,6 +1327,11 @@ TEST_CASE("ResultSetStore: an out-of-band member write on a pending set is order
 
     PgConn oob{PQconnectdb(db.dsn().c_str())};
     REQUIRE(PQstatus(oob.get()) == CONNECTION_OK);
+    // Opened before the fill starts, so nothing between the thread's start and its join can
+    // throw (a REQUIRE there would destroy a joinable thread). jthread joins on unwind anyway; a
+    // blocked fill is bounded by the pool's lock_timeout.
+    PgConn probe{PQconnectdb(db.dsn().c_str())};
+    REQUIRE(PQstatus(probe.get()) == CONNECTION_OK);
     {
         PgResult r{PQexec(oob.get(), ("BEGIN; " + write).c_str())};
         INFO(PQresultErrorMessage(r.get()));
@@ -1326,15 +1339,18 @@ TEST_CASE("ResultSetStore: an out-of-band member write on a pending set is order
     }
     std::atomic<bool> filled{false};
     bool fill_ok = false;
-    std::thread fill([&] {
+    std::jthread fill([&] {
         fill_ok = warm.materialize(rs->id, {"dev-1"}).has_value();
         filled = true;
     });
     // Wait until the fill is blocked on a lock (the fix) or has finished (the defect).
     bool fill_waited = false;
     for (int i = 0; i < 500 && !filled; ++i) {
-        if (query_scalar(db.dsn(), "SELECT count(*) FROM pg_stat_activity WHERE datname = "
-                                   "current_database() AND wait_event_type = 'Lock'") != "0") {
+        PgResult waiting{PQexec(probe.get(),
+                                "SELECT count(*) FROM pg_stat_activity WHERE datname = "
+                                "current_database() AND wait_event_type = 'Lock'")};
+        if (waiting.status() == PGRES_TUPLES_OK && PQntuples(waiting.get()) == 1 &&
+            std::string_view(PQgetvalue(waiting.get(), 0, 0)) != "0") {
             fill_waited = true;
             break;
         }

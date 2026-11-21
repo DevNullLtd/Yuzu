@@ -402,9 +402,10 @@ INSERT and UPDATE are statement-level and re-stamp the sets in their transition 
 load costs one header update per affected set per statement, never one per row; DELETE is a
 BEFORE row trigger, at any trigger depth, whose `WHEN` clause skips the rest of a run of one
 set's rows (a transaction-ID-keyed, transaction-local, single-slot marker: interleaved sets
-re-stamp more often, never less); TRUNCATE re-stamps every stamped set. Every re-stamp writes the
-header row whatever its generation (NULL stays NULL), so it holds the header lock to commit and
-is ordered against `materialize`'s stamping UPDATE of a pending set. DELETE is neither a
+re-stamp more often, never less); TRUNCATE re-stamps every stamped set. Every INSERT, UPDATE and
+DELETE re-stamp writes the header row whatever its generation (NULL stays NULL), so it holds the
+header lock to commit and is ordered against `materialize`'s stamping UPDATE of a pending set;
+TRUNCATE is ordered by its ACCESS EXCLUSIVE lock on the member table instead. DELETE is neither a
 transition table, which would capture every member row a `gc_sweep` cascade removes, spill to
 temporary files and fail the sweep under a `temp_file_limit` on every pass, nor an AFTER row
 trigger, which queues one in-memory event per cascaded row for the whole pass. A cascade from a

@@ -133,8 +133,9 @@ the members, and triggers on `result_set_members` (store migration v7) re-stamp 
 other writer: an INSERT or UPDATE re-stamps, per statement, the sets it touched; a DELETE
 re-stamps the set of each row it removes, once per run of one set's rows (also when issued
 from inside another trigger); a TRUNCATE re-stamps every set that has a generation. Each
-re-stamp locks the set's header, also a pending one, so an out-of-band write and the fill of a
-pending set are ordered and the fill's generation covers the write. A
+INSERT, UPDATE or DELETE re-stamp locks the set's header, also a pending one, so an out-of-band
+write and the fill of a pending set are ordered and the fill's generation covers the write (a
+TRUNCATE is ordered by its exclusive lock on the member table). A
 bulk load costs one header update per set per statement, never one per member row. A delete
 that cascades from `result_sets` writes nothing, since the header is gone and every cached copy
 reads it as not found; DELETE is a BEFORE row trigger so that such a cascade (the GC sweep's)
