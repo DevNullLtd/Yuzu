@@ -1131,10 +1131,13 @@ TEST_CASE("ResultSetStore: the product writers' cascades do not re-stamp other s
     ResultSetStore store{pool};
     auto doomed = store.create_materialized(req("alice"), {"dev-1"});
     auto kept = store.create_materialized(req("alice"), {"dev-2"});
+    auto other = store.create_materialized(req("alice"), {"dev-3"});
     REQUIRE(doomed.has_value());
     REQUIRE(kept.has_value());
+    REQUIRE(other.has_value());
     REQUIRE(store.member_set_owned(doomed->id, "alice").has_value());
     const auto kept_generation = generation_of(db.dsn(), kept->id);
+    const auto other_generation = generation_of(db.dsn(), other->id);
 
     SECTION("delete_set cascades") {
         REQUIRE(store.delete_set(doomed->id).has_value());
@@ -1157,6 +1160,7 @@ TEST_CASE("ResultSetStore: the product writers' cascades do not re-stamp other s
     exec_sql(db.dsn(), "DELETE FROM result_set_store.result_set_members WHERE device_id = "
                        "'dev-2'");
     CHECK(generation_of(db.dsn(), kept->id) != kept_generation);
+    CHECK(generation_of(db.dsn(), other->id) == other_generation); // an independent set
 }
 
 bool role_is_superuser(const std::string& dsn) {
