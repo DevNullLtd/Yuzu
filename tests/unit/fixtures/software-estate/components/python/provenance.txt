@@ -1,4 +1,7 @@
-Real Python distribution metadata, captured verbatim with `cat` (no pip, no python run to produce them).
+Real Python distribution metadata, captured with `cat` (no pip, no python run to produce them).
+One edit only: the Author-email address on line 7 of debian-six-1.16.0.PKG-INFO was replaced with
+redacted@example.com for the personal-data guard. The mailing-list address distutils-sig@python.org in
+the other two files is kept as captured.
 
 venv-pip-25.0.1.METADATA
   Image:  python:3.12-slim (python@sha256:5e2bdb1b0d542d5039cffb8181c65930093949194a65c365dfb1b0fe13a4fa5b)

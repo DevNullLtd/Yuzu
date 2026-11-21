@@ -10,6 +10,8 @@
  *  - node prune: dropping node_policy().skip_dir lists a package's `src` and nesting 9.
  *  - read caps: reading more than 16 KiB / 64 KiB + 1 fails the reads assertions.
  *  - changed file: dropping the unchanged() check fails the archive_changed case.
+ *  - truncated parent listing: dropping `|| lr.truncated` in make_child_lister fails the cut-listing roots case.
+ *  - network-mount child: dropping Type::network_mount from make_child_lister fails the live-lister case.
  *  - dispatch: not clearing dirs_excluded puts `package_tree_skipped` on the status row; not calling
  *    on_pruned fails the logged-once case; walking on an unreadable table fails the guard case.
  */
@@ -186,6 +188,7 @@ TEST_CASE("python scan: only the first 16 KiB of a metadata file is read",
     REQUIRE(tree.reads.size() == 1);
     CHECK(tree.reads[0].offset == 0);
     CHECK(tree.reads[0].len == kMaxPythonMetadataBytes);
+    CHECK(tree.reads[0].len == 16384); // the documented 16 KiB, not only whatever the constant says
 }
 
 TEST_CASE("python scan: the bounds are pinned by value", "[runtime][component_pkg_scan][component_inventory]") {
@@ -291,6 +294,11 @@ TEST_CASE("node scan: an oversized or non-object package.json is a row with sour
         CHECK(rd.len <= kMaxPackageJsonBytes + 1);
     }
     CHECK(tree.total_opens == 4);
+    // The documented 64 KiB + 1, as literal numbers: the oversized file is read to exactly the cap.
+    CHECK(kMaxPackageJsonBytes == 65536);
+    const auto big_read = std::ranges::find(tree.reads, "/r/node_modules/big/package.json", &MemTree::Read::path);
+    REQUIRE(big_read != tree.reads.end());
+    CHECK(big_read->len == 65537);
 
     FakeTargets t;
     Pruned pruned;
@@ -308,6 +316,39 @@ TEST_CASE("node scan: a package.json with no usable name falls back to the direc
     CHECK(r.rows[0].name == "dirname");
     CHECK(r.rows[0].version == "4.5.6");
     CHECK(r.rows[0].version_source == "package_json");
+}
+
+TEST_CASE("pkg scan: a read that fails after a successful open is an unreadable row, never a constraint",
+          "[runtime][component_pkg_scan][component_inventory]") {
+    SECTION("python: the directory name speaks, as for a file that would not open") {
+        MemTree tree;
+        const std::string meta = "/r/site-packages/requests-2.31.0.dist-info/METADATA";
+        tree.add_file(meta, kPyMeta);
+        tree.fail_read = [](const std::string&, std::uint64_t, std::size_t) { return true; };
+        const auto r = py(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "requests");
+        CHECK(r.rows[0].version == "2.31.0");
+        CHECK(r.rows[0].version_source == "filename");
+        CHECK(r.rows[0].size == std::string(kPyMeta).size()); // the open succeeded; only the read failed
+        CHECK(tree.total_opens == 1);
+        REQUIRE(tree.reads.size() == 1); // one read, no retry
+    }
+    SECTION("node: no version, source unreadable") {
+        MemTree tree;
+        tree.add_file("/r/node_modules/a/package.json", pkg_json("a", "1.0.0"));
+        tree.fail_read = [](const std::string&, std::uint64_t, std::size_t) { return true; };
+        const auto r = nd(tree);
+        CHECK(r.stop == Stop::complete);
+        REQUIRE(r.rows.size() == 1);
+        CHECK(r.rows[0].name == "a");
+        CHECK(r.rows[0].version.empty());
+        CHECK(r.rows[0].version_source == "unreadable");
+        CHECK(r.version_unreadable == 1);
+        CHECK(tree.total_opens == 1);
+        REQUIRE(tree.reads.size() == 1);
+    }
 }
 
 // ---- shared completeness behaviour ----
@@ -536,5 +577,53 @@ TEST_CASE("python roots: a parent that cannot be listed is offered as a candidat
         CHECK(mixed == std::vector<std::string>{"/usr/local/lib", "/opt"});
 #endif
     }
+}
+
+TEST_CASE("python roots: a parent listing cut at the entry cap is offered as a root, never as a partial set of names",
+          "[runtime][component_pkg_scan][posix][component_inventory]") {
+    // MUTATION: ignoring ListResult::truncated in make_child_lister keeps python3.12 as a root and drops
+    // the parent, so a partial set of names would read as the whole one.
+    std::size_t cap_seen = 0;
+    const auto list = [&cap_seen](const std::string&, std::size_t cap) {
+        cap_seen = cap;
+        ListResult r;
+        r.entries = {{"python3.12", DirEntry::Type::dir}}; // what the cut listing happened to hold
+        r.truncated = true;
+        return r;
+    };
+    const auto lister = make_child_lister(list);
+    CHECK_FALSE(lister("/usr/local/lib").has_value());
+    CHECK(cap_seen == 50000); // the walk's own per-directory cap, as a literal
+
+    const auto roots = python_candidate_roots(lister);
+    CHECK(std::ranges::find(roots, "/usr/local/lib") != roots.end());
+    for (const auto& root : roots)
+        CHECK_FALSE(root.ends_with("/python3.12"));
+}
+
+TEST_CASE("python roots: the live lister keeps directories, links and network mounts, and nothing it could not list in full",
+          "[runtime][component_pkg_scan][posix][component_inventory]") {
+    using Type = DirEntry::Type;
+    ListResult whole;
+    whole.entries = {{"python3.10", Type::dir},   {"python3.11", Type::link},       {"python3.12", Type::network_mount},
+                     {"python3.13", Type::file},  {"python3.14", Type::other}};
+    const auto lister = make_child_lister([&](const std::string&, std::size_t) { return whole; });
+    CHECK(lister("/x") == std::optional<std::vector<std::string>>{{"python3.10", "python3.11", "python3.12"}});
+
+    ListResult failed;
+    failed.error = true;
+    CHECK_FALSE(make_child_lister([&](const std::string&, std::size_t) { return failed; })("/x").has_value());
+
+    // A python3.N that is itself a network mount is never opened here, but it must be counted as skipped.
+    const auto roots = python_candidate_roots(lister);
+    std::vector<std::string> mounts;
+    for (const auto& root : roots)
+        if (root.ends_with("/python3.12"))
+            mounts.push_back(root);
+    REQUIRE_FALSE(mounts.empty());
+    const auto t = plan_targets(roots, mounts, true);
+    CHECK(t.roots_network_skipped == mounts.size());
+    for (const auto& m : mounts)
+        CHECK(std::ranges::find(t.roots, m) == t.roots.end());
 }
 #endif

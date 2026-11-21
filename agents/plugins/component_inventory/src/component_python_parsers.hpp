@@ -132,14 +132,20 @@ inline std::optional<std::string_view> python_metadata_owner(std::string_view pa
 }
 
 /// First `Name:` and `Version:` header of `head` (header block only, up to the first blank line).
+/// A `head` of exactly kMaxPythonMetadataBytes was cut by the read cap, so its final line, when it has
+/// no terminating newline, may be a header cut short ("Version: 1.2" of a file declaring 1.2.3.4.5):
+/// that line is ignored, and a header it would have supplied is missing, as for an absent header.
 inline std::optional<PyDist> parse_python_metadata(std::string_view head) {
     using namespace python_detail;
     if (head.size() > kMaxPythonMetadataBytes)
         head = head.substr(0, kMaxPythonMetadataBytes);
+    const bool cut = head.size() == kMaxPythonMetadataBytes;
     std::optional<std::string_view> name, version;
     std::size_t pos = 0;
     while (pos < head.size()) {
         auto eol = head.find('\n', pos);
+        if (eol == std::string_view::npos && cut)
+            break; // the read ended inside this line
         auto line = head.substr(pos, eol == std::string_view::npos ? std::string_view::npos : eol - pos);
         pos = eol == std::string_view::npos ? head.size() : eol + 1;
         if (!line.empty() && line.back() == '\r')

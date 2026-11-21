@@ -59,6 +59,6 @@
     "url": "git+https://github.com/jridgewell/sourcemaps.git",
     "directory": "packages/sourcemap-codec"
   },
-  "author": "Justin Ridgewell <justin@ridgewell.name>",
+  "author": "Justin Ridgewell <redacted@example.com>",
   "license": "MIT"
 }

@@ -326,13 +326,13 @@ metadata:
     means a bound was hit or something could not be read in full, so the list may be incomplete,
     and it names its one cause. A metadata file that cannot be read gets a row anyway, with
     version_source `unreadable`; that does not make the scan incomplete. The directories the walk
-    skips by design are not named on the status row; their count goes to the agent log. `supported`
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
     with no rows means none was found at those roots, not that none is installed. The result is a
     live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
     and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
     repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
-    Retryable causes: budget_time, dir_unreadable, archive_changed (a file changed or vanished while
-    read), mount_table_unreadable, internal_error.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
   tags: [components, python, inventory]
 
 spec:
@@ -441,13 +441,13 @@ metadata:
     means a bound was hit or something could not be read in full, so the list may be incomplete,
     and it names its one cause. A metadata file that cannot be read gets a row anyway, with
     version_source `unreadable`; that does not make the scan incomplete. The directories the walk
-    skips by design are not named on the status row; their count goes to the agent log. `supported`
+    skips by design are not named on the status row; their count is logged by the plugin at info level. `supported`
     with no rows means none was found at those roots, not that none is installed. The result is a
     live read made when the instruction runs, not a stored snapshot, at a cost of up to 45 seconds
     and 400,000 directory entries, and it cannot be cancelled once started. Terminal causes (a
     repeat gives the same answer): budget_entries, section_rows, anchor_rows, depth, dir_truncated.
-    Retryable causes: budget_time, dir_unreadable, archive_changed (a file changed or vanished while
-    read), mount_table_unreadable, internal_error.
+    Retryable causes: budget_time, dir_unreadable, archive_changed (a file's size or modification
+    time changed while it was read), mount_table_unreadable, internal_error.
   tags: [components, node, inventory]
 
 spec:

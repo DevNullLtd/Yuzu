@@ -68,6 +68,10 @@ TEST_CASE("python metadata: headers only, first Name/Version, either line end",
     REQUIRE(d);
     CHECK(d->name == "a");
     CHECK(d->version == "2.0");
+    // The first Name: wins over a later one, as the first Version: does.
+    d = parse_python_metadata("Name: first\nName: second\nVersion: 1\n"sv);
+    REQUIRE(d);
+    CHECK(d->name == "first");
     // Missing either field.
     CHECK_FALSE(parse_python_metadata("Name: a\n"sv).has_value());
     CHECK_FALSE(parse_python_metadata("Version: 1\n"sv).has_value());
@@ -88,6 +92,44 @@ TEST_CASE("python metadata: a head that ends mid-line is bounded",
     // Mid-line cut inside the Version header.
     std::string cut = "Name: a\nVersion: 1.0";
     CHECK(parse_python_metadata(cut)->version == "1.0");
+}
+
+TEST_CASE("python metadata: the bounds are pinned by literal value", "[runtime][component_inventory][python]") {
+    CHECK(kMaxPythonMetadataBytes == 16384);
+    CHECK(kMaxPythonNameBytes == 256);
+    CHECK(kMaxPythonVersionBytes == 128);
+}
+
+TEST_CASE("python metadata: a header line cut by the read cap is never taken as complete",
+          "[runtime][component_inventory][python]") {
+    // A head of exactly the cap whose last line has no newline ends inside that line.
+    const auto head_of = [](std::size_t total, std::string_view prefix, std::string_view tail) {
+        std::string s{prefix};
+        s.append(total - prefix.size() - tail.size(), 'x');
+        s += tail;
+        REQUIRE(s.size() == total);
+        return s;
+    };
+    const auto head_ending = [&head_of](std::string_view prefix, std::string_view tail) {
+        return head_of(16384, prefix, tail);
+    };
+    // "Version: 1.2" is the front of a declared 1.2.3.4.5: no version, so the directory name speaks.
+    const auto cut_version = head_ending("Name: a\nSummary: ", "\nVersion: 1.2");
+    CHECK_FALSE(parse_python_metadata(cut_version).has_value());
+    const auto c = python_component("/sp/a-1.2.3.4.5.dist-info/METADATA"sv, cut_version);
+    CHECK(c.version == "1.2.3.4.5");
+    CHECK(c.version_source == "filename");
+    // The same for a Name: header cut short.
+    CHECK_FALSE(parse_python_metadata(head_ending("Version: 1.0\nSummary: ", "\nName: ab")).has_value());
+    // A buffer larger than the cap is clamped to it and is cut the same way.
+    std::string big = head_ending("Name: a\nSummary: ", "\nVersion: 1.2");
+    big += ".3.4.5\n\nbody";
+    CHECK_FALSE(parse_python_metadata(big).has_value());
+
+    // Controls: a newline-terminated final line, or a head shorter than the cap, is complete.
+    CHECK(parse_python_metadata(head_ending("Name: a\nSummary: ", "\nVersion: 1.2\n"))->version == "1.2");
+    CHECK(parse_python_metadata("Name: a\nVersion: 1.2"sv)->version == "1.2"); // a short file may end there
+    CHECK(parse_python_metadata(head_of(16383, "Name: a\nSummary: ", "\nVersion: 1.2"))->version == "1.2");
 }
 
 TEST_CASE("python metadata: bad values are rejected", "[runtime][component_inventory][python]") {

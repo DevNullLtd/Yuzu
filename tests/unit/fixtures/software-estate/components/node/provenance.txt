@@ -8,9 +8,11 @@ captured 2026-11-21. The app manifest was
 and the tree was produced with `npm install --package-lock-only` then
 `npm ci --ignore-scripts` (41 packages, deepest nesting 2). The container only
 installed the tree; each file below was then read verbatim with `find` and `cp`
-from the host mount. One edit only: a contributor e-mail address on line 23 of
-debug.package.json was replaced with redacted@example.com for the personal-data
-guard; nothing else was edited.
+from the host mount. Four edits only, each replacing a contributor e-mail address
+with redacted@example.com for the personal-data guard: the three contributor
+addresses on lines 21 to 23 of debug.package.json and the author address on line
+62 of jridgewell-sourcemap-codec.package.json. Names and every other byte are
+as captured.
 
 A node_modules directory is gitignored, so each file is stored flat as
 <label>.package.json; the real in-tree path it came from is below and is the

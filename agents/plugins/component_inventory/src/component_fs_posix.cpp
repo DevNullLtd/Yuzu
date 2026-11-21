@@ -458,23 +458,32 @@ Targets scan_native_targets() {
     return scan_targets(native_candidate_roots(), read_network_mounts);
 }
 
+ChildLister make_child_lister(const decltype(FsOps::list)& list) {
+    return [list](const std::string& dir) -> std::optional<std::vector<std::string>> {
+        const ListResult lr = list(dir, WalkLimits{}.max_dir_entries);
+        // A listing cut at the walk's per-directory cap holds only some of the python3.N names, and the
+        // walk reports the same cut as dir_truncated. Offering the parent as a root in their place makes
+        // the answer say so; a partial root set must never read as the whole one.
+        if (lr.error || lr.truncated)
+            return std::nullopt;
+        std::vector<std::string> names;
+        for (const auto& e : lr.entries)
+            // A network mount is kept too: it is never opened here, and as a root it is counted into
+            // roots_network_skipped by plan_targets instead of vanishing uncounted.
+            if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link ||
+                e.type == DirEntry::Type::network_mount)
+                names.push_back(e.name);
+        return names;
+    };
+}
+
 Targets scan_python_targets() {
     const auto mounts = read_network_mounts();
     if (!mounts)
         return scan_targets({}, [] { return std::nullopt; }); // no table, no listing: reported as unreadable
     const PosixFs fs{*mounts};
-    const ChildLister children = [&fs](const std::string& dir) -> std::optional<std::vector<std::string>> {
-        // A listing cut at the walk's per-directory cap offers the names it got; a parent that large is
-        // not a Python library directory.
-        const ListResult lr = fs.list(dir, WalkLimits{}.max_dir_entries);
-        if (lr.error)
-            return std::nullopt;
-        std::vector<std::string> names;
-        for (const auto& e : lr.entries)
-            if (e.type == DirEntry::Type::dir || e.type == DirEntry::Type::link)
-                names.push_back(e.name);
-        return names;
-    };
+    const ChildLister children = make_child_lister(
+        [&fs](const std::string& dir, std::size_t cap) { return fs.list(dir, cap); });
     return scan_targets(python_candidate_roots(children), [&mounts] { return mounts; });
 }
 

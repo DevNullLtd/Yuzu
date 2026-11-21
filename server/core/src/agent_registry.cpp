@@ -1231,6 +1231,18 @@ const std::unordered_map<std::string, std::string>& AgentRegistry::action_descri
          "version source, path, size and anchor application, at most 5,000 rows (Linux and "
          "macOS; Windows planned; read-only, no subprocess; package-owned trees are not read; "
          "switched off until an operator enables it)"},
+        {"component_inventory.python",
+         "List installed Python distributions (the METADATA, PKG-INFO or .egg-info file of each) "
+         "under the machine-wide Python roots, with name, version, version source, path, size "
+         "and anchor application, at most 20,000 rows (Linux and macOS; Windows planned; "
+         "read-only, no subprocess, nothing is run; per-user installs are not read; enabled "
+         "by default)"},
+        {"component_inventory.node",
+         "List installed Node packages (the package.json of each package under a node_modules "
+         "directory) under the machine-wide Node roots, with name, version, version source, "
+         "path, size and anchor application, at most 20,000 rows (Linux and macOS; Windows "
+         "planned; read-only, no subprocess, nothing is run; per-user installs are not read; "
+         "enabled by default)"},
         // runtimes
         {"runtimes.dotnet",
          "List installed .NET (Core/5+) shared frameworks and SDKs by flavour, version and "

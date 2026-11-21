@@ -543,6 +543,10 @@ lists installed Python distributions, and its `node` action (instruction
 file in-process; no process is started, no `python` or `node` is run and no script is run. Unlike
 `native`, **both are switched on from the start**: there is no kill-switch row to lift.
 
+- **Switching it off.** Either action can be turned off with the kill switch:
+  `PUT /api/v1/plugin-config/component_inventory/kill-switch?action=python` (or `?action=node`)
+  with the JSON body `{"enabled": false}` and an optional `reason`. The row is separate for each
+  action and from `scan` and `native`.
 - **Where.** Linux and macOS only, in machine-wide locations only, walked in this order. `python`
   on Linux: each `python3` or `python3.<digits>` directory in `/usr/local/lib`, then `/opt`; on
   macOS: `/Library/Frameworks/Python.framework/Versions`, then each `python3.<digits>` directory in
@@ -571,13 +575,14 @@ file in-process; no process is started, no `python` or `node` is run and no scri
   `node_modules`. Inside `site-packages` and `dist-packages` only the `.dist-info` and `.egg-info`
   directories are listed, and for `node` nothing below a package other than its own `node_modules`
   is listed, so an installed package's source tree is never walked; that is by design, not a gap,
-  and the count of directories passed over goes to the agent log, not to the status row.
+  and the count of directories passed over is logged by the plugin at info level, not put on the
+  status row.
 - **When the list may be incomplete.** The status row reads `constrained` and names one cause: a
   bound that was reached (`budget_entries`, `budget_time`, `section_rows`, `anchor_rows`, `depth`,
   `dir_truncated`), a directory or the mount table that could not be read (`dir_unreadable`,
-  `mount_table_unreadable`), `archive_changed` when a metadata file changed or vanished while it was
-  read, or `internal_error`. `supported` with no rows means none was found at those roots, not that
-  none is installed.
+  `mount_table_unreadable`), `archive_changed` when a metadata file's size or modification time
+  changed while it was read, or `internal_error`. `supported` with no rows means none was found at
+  those roots, not that none is installed.
 - **What it costs, and who can run it.** The same roles and `Inventory` read grant as `scan`; a live
   read of up to 45 seconds on one device that cannot be cancelled once started. `python` and `node`
   publish no heartbeat cost counters.
