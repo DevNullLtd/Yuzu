@@ -1310,7 +1310,8 @@ other tool or action nothing below applies: one approval, one call.
   (another root, pattern, kinds, action or target set, including one device widened to a group or
   the fleet) is a different subject and needs its own approval.
 - **First use.** Spends the ticket exactly as for any other call (steps 1 to 6 above), and is the
-  call that starts the 24-hour window.
+  call that starts the 24-hour window. The window runs from the first use, not from the approval,
+  so the last slice can fall up to 24 hours after the approval's own 7-day lifetime.
 - **Later slices.** A call that carries a token (a non-empty string of printable ASCII, no space,
   in `params.cursor`) and the `approval_id` rides the already-spent ticket, with no new approval,
   when ALL hold: the same principal who submitted and consumed it makes the call; the arguments
@@ -1320,8 +1321,10 @@ other tool or action nothing below applies: one approval, one call.
 - **Refusals.** Every other case answers `-32003` `PermissionDenied`, "approval already used
   (one-time ticket)", whatever the cause (another principal, the window passed, a different
   surface), so the answer is no probe for who holds a ticket or how old it is; the audit record
-  names it (`continuation_not_covered`). A store fault answers like any other approval lookup
-  fault (`-32603`, retry) and never says the ticket is spent. A call without a token, or with a
+  names it (`continuation_not_covered`). A call whose arguments differ from the ticket's never
+  reaches this step: it gets the ordinary mismatch refusal ("approval_id does not match this tool
+  and arguments") and writes no `continuation_not_covered` row. A store fault answers like any
+  other approval lookup fault (`-32603`, retry) and never says the ticket is spent. A call without a token, or with a
   value that is not a token (empty, a space or control byte, not a string), always needs an
   unspent ticket, so a first slice that fails before it returns a cursor needs a new approval.
 - **The agent decides whether a token is real.** The server only sees that a non-empty token is
@@ -1907,8 +1910,8 @@ lookup step, or the consume step's own origin+submitter binding comparison — a
 foreign-origin or foreign-submitter ticket cannot be told apart from an
 innocent one for the duration of the fault, and the refusal comes back as
 `-32603` (below), not this `-32003`. `yuzu_mcp_approval_masked_denials_total`
-counts those refusals specifically, and the audit row carries a `(lookup)` or
-`(origin/submitter unverified)` suffix, so the event is not silently
+counts those refusals specifically, and the audit row carries a `(lookup)`, a
+`(continuation)` or an `(origin/submitter unverified)` suffix, so the event is not silently
 indistinguishable from ordinary store contention.
 
 **A third cause is not a ticket problem at all: `approve_request` and

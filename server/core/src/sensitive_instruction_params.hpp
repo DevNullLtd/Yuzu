@@ -39,13 +39,23 @@
 /// never kept: an agent-issued resume token (`cursor`, the continuation parameter the capability
 /// catalogue declares) is meaningful only to the dispatch it continues, so a stored copy of a
 /// request carries no use and only widens what a reader of the history can see. They are erased
-/// from every persisted copy and refused in a schedule exactly like the secrets above, but they are
-/// deliberately NOT in `kRedactedInstructionParamKeys`: that list is the SECRET classification, and
-/// four other consumers read it (the Console mask `YUZU_OX_SECRET_PARAMS`, the `secret_params`
-/// hint in `instruction_definition_model.cpp`, the sensitive flag in `hardware_action_form.hpp`,
-/// and the wording of the schedule refusal). A resume token must not make a form mask its field or
-/// a definition advertise a secret. Every `continuation_param` the catalogue declares MUST be listed
-/// here (`test_capability_catalogue.cpp` pins it).
+/// from the execution record (every create-before-dispatch site calls the redactor below) and
+/// refused in a schedule exactly like the secrets above; for an `execute_instruction` call the
+/// approval's bound subject leaves them out too (`approval_continuation.hpp`, `ticket_subject`).
+/// They are deliberately NOT in `kRedactedInstructionParamKeys`: that list is the SECRET
+/// classification, and four other consumers read it (the Console mask `YUZU_OX_SECRET_PARAMS`, the
+/// `secret_params` hint in `instruction_definition_model.cpp`, the sensitive flag in
+/// `hardware_action_form.hpp`, and the wording of the schedule refusal). A resume token must not
+/// make a form mask its field or a definition advertise a secret. Every `continuation_param` the
+/// catalogue declares MUST be listed here (`test_capability_catalogue.cpp` pins it). A name on this
+/// second list is reserved for every plugin: it is keyed by bare parameter name, so any instruction
+/// parameter with that name is erased from the execution record and refused in a schedule,
+/// whichever plugin declares it.
+///
+/// What still holds a token: a cursor placed in a bundle step or a definition run stays in that
+/// approval's recorded arguments, and the cursor each slice issues is stored as its `cursor` result
+/// row in the Forensics tier. The agent seals the token, so no stored copy of it shows a name the
+/// search found.
 
 #include <nlohmann/json.hpp>
 
@@ -59,7 +69,8 @@ inline constexpr std::string_view kRedactedInstructionParamKeys[] = {"grant_secr
                                                                      "client_secret"};
 
 /// Parameters that are never retained and are not secrets (see the file header). The agent's resume
-/// token: the server dispatches it to the agent unchanged and keeps no copy.
+/// token: the server dispatches it to the agent unchanged and erases it from the execution record
+/// in the redactor below; the file header says what still holds it.
 inline constexpr std::string_view kUnretainedInstructionParamKeys[] = {"cursor"};
 
 [[nodiscard]] inline bool is_redacted_instruction_param_key(std::string_view key) {

@@ -24436,8 +24436,8 @@ McpServer::HandlerFn McpServer::build_handler(
                                           {{"op", "mark_cancelled"}, {"surface", "mcp"}})
                                 .increment();
                     }
-                    mcp_audit("failure",
-                              std::string("dispatch_exception execution_id=") + execution_id);
+                    mcp_audit("failure", std::string("dispatch_exception execution_id=") +
+                                             execution_id + approval_audit_join);
                     res.set_content(error_response(id, kInternalError, "dispatch failed"),
                                     "application/json");
                     return;

@@ -382,8 +382,8 @@ ScheduleEngine::create_schedule(const InstructionSchedule& sched) {
             "cannot be stored in a schedule — dispatch the instruction directly with a fresh "
             "value instead");
     // A resume token (`cursor`) is not a secret, but it is never kept: the server erases it from
-    // every stored copy of a request, and a schedule's stored blob is what fires, so it cannot be
-    // erased here either. Refused with its own wording, not the secret one.
+    // the execution record, and a schedule's stored blob is what fires, so it cannot be erased
+    // here either. Refused with its own wording, not the secret one.
     if (schedule_params_contain_unretained_key(*canon_params))
         return std::unexpected(
             "parameters contain a resume token that cannot be stored in a schedule — remove "

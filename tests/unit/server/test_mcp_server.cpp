@@ -18438,8 +18438,11 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     };
     ts.start_with_dispatch(dispatch, "operator");
 
+    // A resume token rides in `params`: the agent must still receive it, but the stored execution
+    // record must not keep it (`kUnretainedInstructionParamKeys`); the redactor is keyed on the
+    // parameter name for every plugin, so this case's own plugin pair serves.
     auto res = ts.call(
-        R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version"}}})");
+        R"({"jsonrpc":"2.0","method":"tools/call","id":231,"params":{"name":"execute_instruction","arguments":{"plugin":"os_info","action":"version","params":{"root":"/data","cursor":"tok-1"}}}})");
     REQUIRE(res);
     REQUIRE(res->status == 200);
 
@@ -18467,6 +18470,15 @@ TEST_CASE("MCP Integration: execute_instruction populates execution_id and threa
     CHECK(exec->status == "running");
     CHECK(exec->dispatched_by == "test-user"); // McpTestServer auth_fn sets username="test-user"
     CHECK(exec->agents_targeted == 3);         // set_agents_targeted called with sent=3
+
+    // The agent got the cursor unchanged; the stored copy of the request does not hold it, and
+    // still records what was searched.
+    REQUIRE(ts.last_dispatch_params.count("cursor") == 1);
+    CHECK(ts.last_dispatch_params.at("cursor") == "tok-1");
+    auto stored = nlohmann::json::parse(exec->parameter_values);
+    REQUIRE(stored.is_object());
+    CHECK(stored.contains("root"));
+    CHECK_FALSE(stored.contains("cursor"));
 }
 
 // ── 24. Null dispatch_fn ──────────────────────────────────────────────────

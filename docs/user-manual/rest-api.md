@@ -14120,6 +14120,10 @@ transaction did not report success) answers `503` with `error.outcome` set to `u
 `retry_after_ms`, audited `result=failure`, `detail=outcome_unknown`: the schedule may or may not
 exist, so list schedules before creating it again.
 
+A `parameters` object that carries a resume token (`cursor`) or a classified secret key (a grant
+secret or id, or a client secret) is `400` with the refusal text in `error`, and nothing is created;
+no audit row is written for this refusal.
+
 #### `DELETE /api/schedules/{id}`
 
 Delete a schedule you created. Requires `Schedule:Delete`; a schedule created by another

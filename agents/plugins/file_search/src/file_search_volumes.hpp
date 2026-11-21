@@ -58,7 +58,8 @@
  * and the search starts again.
  *
  * THE SEAL. The fs1 body names every directory of the walk position and the last entry, and a caller
- * sends the cursor back as a request parameter that the server keeps and other principals can read, so the
+ * sends the cursor back as a request parameter, and the server stores the token (the `cursor` result row, and
+ * a request copy on the paths that do not erase it) where other principals can read it, so the
  * issued token never carries a readable name. The fs1 body is XORed with a keystream of HMAC-SHA-256
  * blocks, block n = HMAC(K_seal, <mac>.<n>), K_seal = HMAC(key, kCursorSealLabel); the field stays `fs1:`
  * and strict base64 of the same length, so every size bound stands. The mac is a function of the whole

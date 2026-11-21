@@ -854,6 +854,8 @@ public:
     /// is refused learns nothing about WHICH condition failed. An empty argument or an origin that
     /// names no concrete surface is `false` too. A store failure is an error, never `false`, so the
     /// caller can answer it as it answers any other store fault on the lookup (fail closed, retry).
+    /// One production caller, the MCP C8 cover arm; a second caller is a security decision (the
+    /// #1398 routed row).
     [[nodiscard]] std::expected<bool, StoreReadError>
     covers_continuation(const std::string& id, const std::string& principal,
                         ApprovalOrigin expected_origin, const std::string& definition_id,
